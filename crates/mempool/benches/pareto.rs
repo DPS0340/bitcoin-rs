@@ -3,7 +3,7 @@
 //! Both arms run over one identical fixture in one process, so the before/after
 //! ratio comes from a single run and cannot be confounded by the rebuild and
 //! baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+//! CONCEPTS.md → *Paired-arm benchmark*.
 //!
 //! `before_sorted` is `SortedParetoFront`, the flat vector that did a linear
 //! `remove` and a full `sort_by` on every insert. `after_ordered` is

@@ -38,9 +38,8 @@ const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
 //
 // Re-measured after the block source was matched to Core's; the numbers this
 // rationale first carried (157.8s at 32, 173.1s at 16) came from the contended
-// REST harness. Same conclusion, sounder evidence — see
-// `docs/solutions/performance-issues/`. Kept as a cap rather than raised to
-// `available_parallelism` so a many-core host does not oversubscribe
+// REST harness. Same conclusion, sounder evidence — see CONCEPTS.md
+// → *Contended-harness tuning artefact*. Kept as a cap rather than raised to
 // verification against the rest of the apply pipeline; widen only against a
 // fresh measurement on the target hardware.
 const MAX_SCRIPT_VERIFY_THREADS: usize = 32;

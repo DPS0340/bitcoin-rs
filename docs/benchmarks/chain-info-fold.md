@@ -11,7 +11,7 @@ end-to-end `Handler::dispatch` benchmarks.
 
 Because the historical A/B ran both arms in that single process, the ratio
 could not be confounded by the rebuild and baseline drift recorded in
-`docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+CONCEPTS.md → *Paired-arm benchmark*.
 
 ## What was wrong
 

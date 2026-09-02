@@ -20,8 +20,8 @@ core.*
 /data/
 .env
 
-# Re-include project plan tracked in-repo (global ~/.gitignore drops PLAN.md).
-!PLAN.md
+# Agent task scratch is temporary; acceptance criteria belong in issues/PRs.
+.agent-tasks/
 !DEVIATIONS.md
 .antigravitycli/
 

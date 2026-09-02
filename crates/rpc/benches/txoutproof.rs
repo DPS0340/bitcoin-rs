@@ -3,7 +3,7 @@
 //! Both arms of the set run over one identical fixture in one process, so the
 //! before/after ratio comes from a single run and cannot be confounded by the
 //! rebuild and baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+//! CONCEPTS.md → *Paired-arm benchmark*.
 //!
 //! `before_scan` is the pre-index path: no `tx_index` on the `Context`, so the
 //! handler walks every block record, loads each body, deserializes it and hashes
@@ -19,7 +19,7 @@
 //! mainnet is near a million. The scan arm is linear in the number of records,
 //! so the ratio here is a lower bound on the ratio at tip, not a prediction of
 //! it — see
-//! `docs/solutions/best-practices/small-window-benchmarks-do-not-predict-at-scale-throughput.md`.
+//! CONCEPTS.md → *Sync regimes*.
 //!
 //! Two positions are benchmarked because the scan is position-dependent and the
 //! index is not: `first_block` is the scan's best case (it stops immediately)

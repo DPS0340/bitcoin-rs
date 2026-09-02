@@ -6,7 +6,7 @@ Leaf plan: `.outline/sdd/leaves/rec-a12-plan.md`.
 
 Implementer brief: `.outline/sdd/briefs/rec-a12.md`.
 
-Task goals: `.agent-tasks/rec-a12/GOALS.md`.
+
 
 A checked box requires evidence. Pending evidence stays unchecked.
 
@@ -124,7 +124,7 @@ Evidence:
 - [ ] Every named A1 mutation fails its intended red test and is reverted.
 Evidence:
 
-- Mutation-proof file at .agent-tasks/rec-a12/tests/mutation-proof.txt with 12 A1 mutations
+- Mutation-proof file (retired by #232)
 - Each mutation describes the production change and the expected test failure
 - Mutations verified by code inspection: generation revocation, namespace owner matching, child validation, heartbeat stop, adapter one-snapshot load
 

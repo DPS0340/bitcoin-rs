@@ -226,4 +226,4 @@ message processing under identical stimulus). It does not measure
 download-bound IBD: a loopback fixture imposes no real bandwidth constraint,
 so these numbers cannot be compared with full-sync figures. Host-level claims
 still need the custody conventions in
-`docs/solutions/architecture-patterns/native-benchmark-custody.md`.
+CONCEPTS.md → *Matched-harness comparison*.

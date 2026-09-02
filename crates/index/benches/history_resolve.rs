@@ -3,7 +3,7 @@
 //! Every group holds **both arms** of a refactor set over one identical
 //! fixture, so the before/after ratio comes from a single run and cannot be
 //! confounded by the rebuild and baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+//! CONCEPTS.md → *Paired-arm benchmark*.
 //!
 //! `before_scan` calls the naive `_scan` reference kept in the crate; `after_fast`
 //! calls whatever the production resolver currently does. Where a set has not

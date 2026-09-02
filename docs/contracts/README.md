@@ -3,16 +3,16 @@
 A contract doc states behavior the code must keep, and names where the code
 proves it. Every normative claim cites the file that implements it and the
 test that pins it, both present in the tree. A contract page is short: the
-invariants, the owners, the proof. Explanation lives in `docs/solutions/`,
-history in `docs/plans/`.
+invariants, the owners, the proof. Explanation lives 
+
 
 ## Documentation roles
 
 Documentation in this repository follows explicit ownership and precedence:
 
 - `docs/contracts/`: current normative behavior, invariants, and ownership rules;
-- `docs/solutions/`: historical decisions, evidence, and benchmark notes; informative, not normative;
-- `docs/plans/` and `PLAN.md`: execution history and implementation planning; informative and archivable;
+
+
 - `CONCEPTS.md`: project-specific domain vocabulary only;
 - README/getting-started: user workflows and concise subsystem summaries that link to the owning contract;
 - code comments: local invariants, lock/commit ordering, unsafe justification, and non-obvious constraints;
@@ -29,7 +29,7 @@ When documents disagree, use this order:
 2. Source comments (rustdoc and inline comments) come next. They explain
    local intent and invariants. They do not override the contract.
 3. Specialized domain policies under `docs/policies/` define detailed wire/parity matrices; pointer pages below fold those policies into this precedence chain.
-4. Everything else is informative context: `docs/solutions/`, `docs/plans/`, `docs/benchmarks/`, `CONCEPTS.md`, and consumer `README.md` files.
+4. Everything else is informative context: `docs/benchmarks/`, `CONCEPTS.md`, and consumer `README.md` files.
 
 On conflict between a contract page and the code, the drift is a bug. Fix the
 code or amend the contract in the same commit. Never reword the contract to

@@ -7,7 +7,7 @@ existed for it.
 Harness: `crates/mempool/benches/pareto.rs`. Criterion, both arms of the refactor
 set in one group over one fixture in one process, so the ratio cannot be
 confounded by the rebuild and baseline drift recorded in
-`docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+CONCEPTS.md → *Paired-arm benchmark*.
 
 ## What was wrong
 
@@ -209,7 +209,7 @@ re-run against `--test pareto_ordering` directly.
 - **The half-second figure is an extrapolation** from an exponent measured over
   200-51,200 transactions, quoted to say the quadratic is gone, not as a
   prediction of behaviour on a real mempool. See
-  `docs/solutions/best-practices/small-window-benchmarks-do-not-predict-at-scale-throughput.md`.
+  CONCEPTS.md → *Sync regimes*.
 - **The ancestor and descendant walks are bounded by policy, not by the code.**
   A node configured with `max_ancestors`/`max_descendants` in the millions would
   make the refresh closure large again. The claim is that the cost no longer

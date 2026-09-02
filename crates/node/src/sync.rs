@@ -92,8 +92,8 @@ const PEER_INFLIGHT_BUDGET: usize = PENDING_BUDGET;
 /// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (16, `net_processing.cpp`). A deep
 /// per-peer pipeline under fan-out reproduces the recorded head-of-line
 /// collapse; a shallow stripe without the fallback reproduces the early-height
-/// under-fill regression — both are pinned in
-/// `docs/solutions/architecture-patterns/multi-peer-block-download-requires-core-stalling-disconnect.md`.
+/// under-fill regression — both were established by a live-tested and reverted
+/// attempt (commit 5608279, recoverable from git history).
 const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 /// Minimum peer population that can fill the 128-block window at Core's
 /// 16-block per-peer floor. Below this count, one healthy peer's deep

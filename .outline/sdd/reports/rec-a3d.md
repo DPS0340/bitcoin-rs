@@ -189,5 +189,5 @@ test recovery_evidence::tests::oversized_evidence_file_is_ignored ... ok
   multi-backend, added torn-meta and stale-tmp tests.
 - `docs/contracts/chain-events.md` — added G11 proven-by entries and
   updated the live-gaps note.
-- `docs/solutions/architecture-patterns/node-reorg-execution-design.md`
+- docs/contracts/ (normative contracts)
   — updated crash-recovery row with honest G11 coverage statement.

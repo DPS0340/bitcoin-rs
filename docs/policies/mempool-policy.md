@@ -13,7 +13,7 @@ Both admission outlets must quote the same verdict for the same transaction and 
 | Setting | Value |
 | :--- | :--- |
 | Reference implementation | Bitcoin Core |
-| Pinned version | **31.1** (the version already recorded in `docs/benchmarks/data/end-to-end-sync/` custody JSONs) |
+| Pinned version | **31.1** (the version already recorded in custody evidence) |
 | Min relay fee default | 1 000 sat/kvB (`MempoolLimits::default`) |
 | Incremental relay fee default | 1 000 sat/kvB (`DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB`) |
 | Dust relay fee default | 3 000 sat/kvB (`FeeRate::DUST`) |

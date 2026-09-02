@@ -8,7 +8,7 @@ hash-to-record resolver under `getblock`, `getblockheader`, `getblockstats`,
 Harness: `crates/rpc/benches/blocklookup.rs`. Criterion, both arms of the
 refactor set in one group over one fixture in one process, so the ratio cannot be
 confounded by the rebuild and baseline drift recorded in
-`docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+CONCEPTS.md → *Paired-arm benchmark*.
 
 ## What was wrong
 

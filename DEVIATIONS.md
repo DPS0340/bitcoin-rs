@@ -1,4 +1,4 @@
-# Implementation Deviations from PLAN.md
+# Implementation deviations from the original plan
 
 This is a historical deviation ledger for the original plan, not a statement of
 the current architecture. It retains audit evidence for superseded Electrum work;
@@ -7,26 +7,26 @@ and `docs/getting-started.md`.
 
 The Task 0 audit corrections in section 0 were verified against the crates.io
 registry via `cargo info <crate>` and `cargo info <crate>@<version>` on
-**2026-05-19** under Rust toolchain `1.85.0` (the MSRV `PLAN.md` declared at
+**2026-05-19** under Rust toolchain `1.85.0` (the MSRV the original plan declared at
 audit time). Later sections are not covered by that verification stamp; each
 carries only the evidence it explicitly states. The *Resolved version-floor
 deviations* table below postdates that audit.
 
 ## 0. Workspace bootstrap (Task 0) — dependency audit corrections
 
-The `PLAN.md` "Dependency audit 2026-05-19" section overstated several version
+The original plan "Dependency audit 2026-05-19" section overstated several version
 numbers. The corrections below preserve the audit's intent (latest stable line
 compatible with the Rust 1.85 MSRV) while reflecting the actual registry state.
 
 ### Crate-name fix
 
-| In `PLAN.md` | Reality on crates.io | Why |
+| In the original plan | Reality on crates.io | Why |
 |---|---|---|
 | `arc_swap` | `arc-swap` | The crates.io registry name uses a hyphen. Rust `use arc_swap::…` still works (cargo maps hyphen→underscore in identifiers). |
 
-### Version-floor fixes (`PLAN.md` floor > latest stable)
+### Version-floor fixes (original plan floor > latest stable)
 
-| Crate | `PLAN.md` floor | Latest stable | Floor we use |
+| Crate | original plan floor | Latest stable | Floor we use |
 |---|---|---|---|
 | `parking_lot` | `>=0.13` | `0.12.5` | `>=0.12.5, <0.13` |
 | `bitcoinkernel` | `>=0.1` | `0.2.1` | `>=0.2, <0.3` |
@@ -38,7 +38,7 @@ not re-derive the original downgrade.
 
 | Crate | Historical downgrade | Now pinned | What resolved it |
 |---|---|---|---|
-| `rust-rocksdb` | `>=0.44, <0.45` (0.44.2) | `>=0.50, <0.51` (0.50.0) | upstream released the floor `PLAN.md` asked for |
+| `rust-rocksdb` | `>=0.44, <0.45` (0.44.2) | `>=0.50, <0.51` (0.50.0) | upstream released the floor the original plan asked for |
 | `fjall` | `>=2.11, <3.0` (2.11.2) | `>=3.1.4, <4` (3.1.8) | upstream released 3.1 |
 | `redb` | `>=2.6, <3.0` (2.6.3) | `>=4.1, <5` (4.2.0) | upstream released 4.x |
 | `criterion` | `>=0.7, <0.8` (0.7.0, MSRV-bound) | `>=0.8.2, <0.9` (0.8.2) | toolchain moved from 1.85 to 1.95.0 |
@@ -49,7 +49,7 @@ not re-derive the original downgrade.
 
 ### Feature-name fixes
 
-| Crate | `PLAN.md` features | Reality on the floor we pin | Action |
+| Crate | original plan features | Reality on the floor we pin | Action |
 |---|---|---|---|
 | `bitcoin_hashes 0.14` | `["asm"]` | 0.14 has no `asm` feature (only `alloc`, `std`, `bitcoin-io`, `io`, `schemars`, `serde`, `small-hash`). The asm path arrives transitively via `sha2 = ["asm"]`. | Drop `"asm"`; keep `"std"`. |
 | `secp256k1 0.31` | `["rand-std", …]` | The feature is `rand`, not `rand-std`. | Rename. |
@@ -60,7 +60,7 @@ not re-derive the original downgrade.
 
 | Crate | Latest on crates.io | We pin | Why |
 |---|---|---|---|
-| `bitcoin` | `0.33.0-beta` | `>=0.32.9, <0.33` | `0.33` is still beta; PLAN.md stays on stable `0.32.x`. |
+| `bitcoin` | `0.33.0-beta` | `>=0.32.9, <0.33` | `0.33` is still beta; the original plan stays on stable `0.32.x`. |
 | `bitcoin_hashes` | `0.20.0` | `>=0.14, <0.15` | Aligned with `bitcoin 0.32` transitive pin. |
 | `secp256k1` | `0.32.0-beta.2` | `>=0.31.1, <0.32` | Stable `0.31.x`; `0.32` still beta. |
 | `smallvec` | `2.0.0-alpha.12` | `>=1.15, <2` | Stable `1.x`; `2.0` still alpha. |
@@ -94,7 +94,7 @@ so MDBX no longer needs an elevated-toolchain CI lane.
 - `cargo build -p bitcoin-rs` (default features) does **not** link `bitcoinkernel`; `cargo build -p bitcoin-rs --features kernel` does. Builds with `kernel` require system dependencies (`cmake` and `libboost-dev`).
 - Workspace CI: `clippy`/`test` jobs build with `FULL_NODE_FEATURES: "rocksdb,fjall,redb,mdbx,kernel"` under Rust 1.95.0 with `libboost-dev` and `cmake` installed up front. The obsolete `kernel-node` job is replaced by `kernel-parity`, while `portable-check` exercises the `--no-default-features` path without C++ build dependencies.
 
-### What this means for PLAN.md gates
+### What this means for the original plan gates
 
 - **G3 (kernel parity)** is exercised on the `kernel-parity` CI lane (`--features kernel`); builds with `kernel` validate all script classes through bitcoinkernel. The default binary build (`cargo build -p bitcoin-rs`) does not include `kernel` and uses the portable interpreter (Taproot key-path only).
 - **G7 (4-backend equivalence)** runs in the default full-node CI matrix: rocksdb ↔ fjall ↔ redb ↔ mdbx.
@@ -316,7 +316,7 @@ block-body serving is now wired through `load_active_block_at_height`
 
 ## §8 — Task 8: index rows carry transaction byte positions
 
-`PLAN.md` Task 8 specifies porting electrs verbatim, and electrs writes
+The original plan Task 8 specifies porting electrs verbatim, and electrs writes
 `(8-byte prefix || height)` keys with **empty** values. This implementation puts
 a packed `TxPosition[n]` in that unused value: the `(offset, length)` byte range
 of every transaction that produced the row, within its block's serialized body.
@@ -364,9 +364,9 @@ in `CONCEPTS.md`. The residual accepted: a stale offset landing exactly on a
 transaction boundary whose transaction also matches, while a different
 transaction in that block matches too.
 
-## §9 — UTXO record payload encoding, and the arena PLAN.md specified
+## §9 — UTXO record payload encoding, and the arena the original plan specified
 
-`PLAN.md` design principle 8 specifies a `bumpalo::Bump` arena per shard for
+The original plan design principle 8 specifies a `bumpalo::Bump` arena per shard for
 UTXO record storage. The shipped implementation deviated earlier to one heap
 allocation per record via `ThinRecordBuf`; this section records why the arena
 is now **rejected on measurement** rather than merely deferred, and what
@@ -386,7 +386,7 @@ measured before any work started (`docs/benchmarks/utxo-memory.md`):
 
 An arena removes an overhead that measurement puts at a few percent, at the cost
 of a self-referential per-shard structure (`self_cell!` over a pinned `Bump`)
-plus the round-robin `defrag_one_shard` PLAN.md Task 5 Step 7 also specifies.
+plus the round-robin `defrag_one_shard` the original plan Task 5 Step 7 also specifies.
 Do not start it without new evidence; the two numbers above are the evidence
 against it.
 
@@ -407,7 +407,7 @@ Three things about this are deviations worth naming:
 - **`height` is not hoisted into the record header**, which would save three
   bytes more. It needs "every output of a record shares one height" to hold, and
   BIP30's duplicate coinbase txids are exactly where it might not.
-- **The snapshot disk format is unchanged.** `PLAN.md`'s successor step called
+- **The snapshot disk format is unchanged.** The original plan's successor step called
   for a v5 file format; disk size is not a G14 budget item (the budgets are tip
   RSS and Electrum p95), so the invariant that step really protects was covered
   instead by a golden vector generated from a v4 build —

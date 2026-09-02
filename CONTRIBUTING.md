@@ -128,4 +128,4 @@ Key rules:
 - [docs/contracts/](docs/contracts/) — Normative architectural and protocol contracts
 - [docs/getting-started.md](docs/getting-started.md) — Node setup and configuration
 - [CONCEPTS.md](CONCEPTS.md) — Domain terminology and concepts
-- [PLAN.md](PLAN.md) — Historical milestone and gate verification plan
+

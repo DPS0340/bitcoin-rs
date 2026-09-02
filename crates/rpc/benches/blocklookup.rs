@@ -12,7 +12,7 @@
 //!
 //! Both arms of the refactor set run here over one fixture in one process, so
 //! the ratio cannot be confounded by the rebuild and baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+//! CONCEPTS.md → *Paired-arm benchmark*.
 //! `before_scan` is the linear find that was there; `after_search` is
 //! [`record_at_height_hash`], the binary search plus duplicate-height walk that
 //! replaced it.

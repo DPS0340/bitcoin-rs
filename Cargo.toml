@@ -31,7 +31,7 @@ authors      = ["metaphorics"]
 # Workspace dependencies.
 #
 # Every floor and feature set below was verified against crates.io via
-# `cargo info` on 2026-05-19. The PLAN.md "Tech-Stack Dependency Table"
+# `cargo info` on 2026-05-19. The original implementation plan "Tech-Stack Dependency Table"
 # carries the rationale; this section is the authoritative reflection.
 # ============================================================================
 [workspace.dependencies]

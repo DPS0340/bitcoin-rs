@@ -11,7 +11,7 @@ This policy applies to the P2P transport and peer-protocol surface of `bitcoin-r
 | Setting | Value |
 | :--- | :--- |
 | Reference implementation | Bitcoin Core |
-| Pinned version | **31.1** (the version already recorded in `docs/benchmarks/data/end-to-end-sync/` custody JSONs) |
+| Pinned version | **31.1** (the version already recorded in custody evidence) |
 | Protocol version advertised | `70016` (`crates/p2p/src/wire.rs::PROTOCOL_VERSION`) |
 | Transport | BIP324 v1 envelope only |
 

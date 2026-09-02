@@ -163,7 +163,7 @@ verification commands, CI workflows, and crate architecture conventions.
 - [docs/README.md](docs/README.md) — Documentation index
 - [docs/contracts/](docs/contracts/) — Normative architecture and protocol contracts
 - [CONCEPTS.md](CONCEPTS.md) — Domain terminology and concepts
-- [PLAN.md](PLAN.md) — Project roadmap and historical milestones (G1–G15 verification gates)
+
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Development workflow and CI guidelines
 
 ## License

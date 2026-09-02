@@ -5,10 +5,10 @@
 | Issue | Lane | Status | Artifact |
 |-------|------|--------|----------|
 | #34 | offline-full-validation | **blocked** | Blocking fact recorded |
-| #35 | p2p-loopback | **passed** | `docs/benchmarks/data/comp-lanes/p2p-loopback-result-fixture.json` |
+| #35 | p2p-loopback | **passed** | p2p-loopback fixture (retired by #224) |
 | #41 | muhash-rpc | **blocked** | Blocking fact recorded |
 
-Combined lane report: `docs/benchmarks/data/comp-lanes/comp-lanes-report-v1.json`
+Combined lane report: comp-lanes report (retired by #224)
 
 ## What comparator machinery already exists
 
@@ -85,9 +85,9 @@ the existing comparators.
 
 ### Durable artifacts
 
-- `docs/benchmarks/data/comp-lanes/comp-lanes-report-v1.json`: combined
+- comp-lanes report (retired by #224): combined
   lane report from a live run on this host
-- `docs/benchmarks/data/comp-lanes/p2p-loopback-result-fixture.json`:
+- p2p-loopback fixture (retired by #224):
   the P2P loopback result artifact from the same run
 
 ## Per-issue status
@@ -142,7 +142,7 @@ deterministic fixture nodes (tiny Python scripts that connect, echo,
 read the exact corpus length, and write state files) over real loopback
 sockets.
 
-**Artifact**: `docs/benchmarks/data/comp-lanes/p2p-loopback-result-fixture.json`
+**Artifact**: p2p-loopback fixture (retired by #224)
 - Schema: `p2p-loopback-result-v2`
 - 7 pairs, 14 arms, alternating core/candidate order
 - All six correctness gates true: `bytes_equal`, `peer_parameters_equal`,
@@ -175,7 +175,7 @@ The campaign lane (`comp_lanes.py`) runs all three comparators and
 produces a combined `comp-lanes-report-v1` artifact. This is the "lane
 that runs them" — it dispatches to each comparator and collects results.
 
-**Artifact**: `docs/benchmarks/data/comp-lanes/comp-lanes-report-v1.json`
+**Artifact**: comp-lanes report (retired by #224)
 - Schema: `comp-lanes-report-v1`
 - Three lanes: #34 (blocked), #35 (passed), #41 (blocked)
 - `report_sha256` verified against canonical serialization

@@ -1,6 +1,6 @@
 # Optimization candidate survey and outcomes
 
-The two-phase performance campaign finished what `PLAN.md` scheduled. Everything
+The two-phase performance campaign finished what the original implementation plan scheduled. Everything
 in it either landed — the index read path, the v5 record codec — or was
 **rejected on its own measurement** and recorded as such: the decoded-block cache
 (`docs/benchmarks/index-read-path.md`) and the `bumpalo` arena (`DEVIATIONS.md`
@@ -161,7 +161,7 @@ thousands of entries, not millions, and `TinyVec` sorting is cache-friendly.
 
 **Before implementing:** build the missing benchmark first. A sorted structure
 with O(log n) insert is the obvious replacement, but the campaign's own lesson
-(`docs/solutions/best-practices/benchmark-the-operation-the-workload-performs-not-the-one-the-api-exposes.md`)
+(CONCEPTS.md → *Directory-layout record*)
 is that the obvious replacement is worth nothing until the harness is shaped like
 the workload — here, acceptance and template building, not `insert` in isolation.
 
@@ -215,7 +215,7 @@ measurement has not been run.
 
 ## F — the record-encoding savings not taken
 
-`PLAN.md` projected 17 B/output from four changes. Three shipped and measured
+The original implementation plan projected 17 B/output from four changes. Three shipped and measured
 11.75 (`docs/benchmarks/utxo-memory.md`). The two remaining, ~3 B/output each:
 
 - **Core-style scriptPubKey compression** — P2PKH 25→21, P2SH 23→21, P2PK

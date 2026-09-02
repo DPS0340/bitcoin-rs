@@ -76,10 +76,12 @@ The two distinct cost regimes any sync measurement must name before its numbers 
 
 ## Benchmark evidence
 
-All benchmark evidence and campaign tooling is retired by #224. The sealed evidence
-ledger is at `docs/benchmarks/data/evidence-retirement-v1.json`; the 36-cell
-historical matrix is at `docs/benchmarks/data/historical-evidence-matrix-v1.json`.
-The seven live benchmark targets are listed in `.agent-tasks/224/GOALS.md`.
+All benchmark campaign evidence and tooling is retired by #224. The seven
+retained Criterion benchmark targets are compiled in the `bench-smoke` CI lane
+(`bitcoin-rs-consensus --bench merkle`, `bitcoin-rs-consensus --bench verify_tx`,
+`bitcoin-rs-storage --bench kvstore_backends`, `bitcoin-rs-utxo --bench record_codec`,
+`bitcoin-rs-utxo --bench utxo_commit`, `bitcoin-rs-mining --bench candidate`,
+`bitcoin-rs-node --bench sync_pipeline`).
 ## Consensus validation
 
 ### bitcoinkernel
@@ -91,16 +93,12 @@ Removed historical script verification backend. Previously linked as an extracte
 The network-independent reference target used by Bitcoin Core's difficulty
 calculation: compact nBits `0x1d00ffff`, rather than the selected network's
 PoW limit. Confusing the two makes every network report difficulty `1.0` at
-its easiest target. See
-`docs/solutions/logic-errors/core-float-parity-is-value-parity-not-json-text-parity.md`.
-
+its easiest target.
 ### Float value/text parity
 The distinction between equal IEEE-754 values and equal serialized spellings.
 Core's UniValue uses `%.16g`, while the live RPC path's sonic-rs serializer
 uses shortest-round-trip formatting, so compatibility means preserving the
-value and operation order, not forcing JSON text to match. See
-`docs/solutions/logic-errors/core-float-parity-is-value-parity-not-json-text-parity.md`.
-
+value and operation order, not forcing JSON text to match.
 ### Rust interpreter (portable posture)
 The pure-Rust script verification path maintained alongside the bitcoinkernel default. Enabled under `--no-default-features` without C++ build dependencies. Its non-Taproot path is a stub that accepts only a bare `OP_TRUE` spend with an empty scriptSig and witness, so it cannot validate ordinary spends either, and it has no Taproot script-path support. What it does verify is the Taproot key path, in full. It is retained for differential testing and lightweight non-production environments; a mainnet sync stops early on the first real spend.
 
@@ -108,7 +106,7 @@ The pure-Rust script verification path maintained alongside the bitcoinkernel de
 Parsing each block exactly once with `bitcoinkernel::Block::new` (wrapped as `KernelBlock` in `crates/consensus/src/kernel.rs`) and reusing that parse for everything downstream. It supplies three things at once: the **txids** (Core's `CTransaction` hashes itself while deserializing, using the SHA-256 implementation Core selects at runtime — `avx2(8way)` on Skylake-SP), and the **transaction objects** that script preparation borrows via `TransactionRef` instead of re-serializing. It replaced a scalar `compute_txid` pass plus a per-transaction `encode::serialize` → `Transaction::new` round-trip, cutting `script_prepare` from 18.55s to 4.29s and the 0→150k replay from 137.3s to 121.9s. The costing lesson generalizes: **price a replacement by everything it subsumes**, not by the line item that motivated it — costed against parse-and-serialize alone the same change scores +1.54s and looks like a loss.
 
 ### Parallel granularity (per-item cost rule)
-Whether a fan-out pays is decided by per-item work against dispatch cost, not by how parallelizable the loop looks. Measured both directions on the same apply path: script checks (~100 µs per input) wanted *more* parallelism, and a sweep lowering `MIN_PARALLEL_SCRIPT_CHECKS` from 16 to 4 read as 1.15× before it was refuted as a contended-harness artefact (see *Contended-harness tuning artefact*; the standing constant is 32, `crates/consensus/src/verify_tx.rs`); UTXO lookups (~500 ns) wanted *none*, and deleting two rayon fan-outs bought 1.07× and 1.11×. Merkle nodes (~2.6 µs) sit in between: Rayon task fan-out over scalar nodes measured neutral-to-worse (SIMD multi-buffer hashing is a different lever because it reduces cost per group rather than changing task granularity). A threshold has an interior optimum in both directions — below 4 the script threshold turns back up, and pool width peaks at 32 then degrades at 64. Always gate on **elapsed**, never on the stage being targeted: parallel prepare makes `script_prepare` 30% faster and the whole run 4% slower by contending with the script-verify pool. See `docs/solutions/performance-issues/processing-bound-sync-performance-evolution.md`.
+Whether a fan-out pays is decided by per-item work against dispatch cost, not by how parallelizable the loop looks. Measured both directions on the same apply path: script checks (~100 µs per input) wanted *more* parallelism, and a sweep lowering `MIN_PARALLEL_SCRIPT_CHECKS` from 16 to 4 read as 1.15× before it was refuted as a contended-harness artefact (see *Contended-harness tuning artefact*; the standing constant is 32, `crates/consensus/src/verify_tx.rs`); UTXO lookups (~500 ns) wanted *none*, and deleting two rayon fan-outs bought 1.07× and 1.11×. Merkle nodes (~2.6 µs) sit in between: Rayon task fan-out over scalar nodes measured neutral-to-worse (SIMD multi-buffer hashing is a different lever because it reduces cost per group rather than changing task granularity). A threshold has an interior optimum in both directions — below 4 the script threshold turns back up, and pool width peaks at 32 then degrades at 64. Always gate on **elapsed**, never on the stage being targeted: parallel prepare makes `script_prepare` 30% faster and the whole run 4% slower by contending with the script-verify pool. 
 
 The AVX2 Merkle result pins the distinction. Reusing prepared txids and hashing eight independent 64-byte parent pairs in SIMD lanes cut the matched fjall replay from 56.517s to 48.020s (1.177×), while scalar-library swaps and Rayon folds had failed. SIMD paid because it reduced the cost of a homogeneous batch without scheduling more tasks. The same candidate passed the RocksDB and redb gates at 1.171× and 1.112×.
 
@@ -120,23 +118,21 @@ The allocator is part of the harness too. At commit `ff2615a`, the same local
 56.16s / 396.50 CPU-s with production-matched mimalloc. The allocator changed
 wall scheduling, not total work, and raised peak RSS by 15.8%. A replay control
 must therefore match the production allocator and report RSS with both time
-axes. See
-`docs/solutions/performance/allocator-parity-changes-wall-not-cpu.md`.
-
-The final prepared-txid plus AVX2 Merkle panel follows this rule: three candidate and three Core runs were interleaved on CPU set `0-31`, with a 30-second cooldown, identical local blocks 0→150k, and full validation. The medians were 49.356s versus 64.914s wall and 390.542s versus 481.092s CPU, so bitcoin-rs led by 1.315× wall and 1.232× CPU. All three storage backends reached the same tip and UTXO commitments. See `docs/benchmarks/data/end-to-end-sync/avx2-merkle-custody-v1.json`.
+axes.
+The final prepared-txid plus AVX2 Merkle panel follows this rule: three candidate and three Core runs were interleaved on CPU set `0-31`, with a 30-second cooldown, identical local blocks 0→150k, and full validation. The medians were 49.356s versus 64.914s wall and 390.542s versus 481.092s CPU, so bitcoin-rs led by 1.315× wall and 1.232× CPU. All three storage backends reached the same tip and UTXO commitments.
 
 ### Script-flag exceptions (BIP16Exception)
-The historical blocks Bitcoin Core hardcodes in `consensus.script_flag_exceptions` (chainparams) to be validated under a reduced script-verification flag set, because they contain spends valid under the rules in force at the time but invalid under a later-enforced flag. As of Core v29: mainnet block 170060 (`…ac4f9c22`, the BIP16/P2SH exception) and 692261 (`…e1e395ad`, the Taproot exception); testnet3 block 394; none on testnet4/signet/regtest. The two **P2SH waivers** (170060, 394) are reproduced explicitly by `Network::is_bip16_p2sh_exception` (keyed by block hash, mainnet/testnet3 only); missing them rejects canonical blocks and wedges full-validation sync past the assume-valid height. The **692261 Taproot override** needs no rs exception: Core's override only strips TAPROOT (which Core defaults on for all blocks), and rs already height-gates taproot (`is_taproot_active`, 709632 > 692261) so it never sets TAPROOT there — its computed flags already match Core's effective set. Compare *effective* flag sets, not raw overrides. See `docs/solutions/architecture-patterns/p2sh-flag-must-honor-core-script-flag-exceptions.md`.
+The historical blocks Bitcoin Core hardcodes in `consensus.script_flag_exceptions` (chainparams) to be validated under a reduced script-verification flag set, because they contain spends valid under the rules in force at the time but invalid under a later-enforced flag. As of Core v29: mainnet block 170060 (`…ac4f9c22`, the BIP16/P2SH exception) and 692261 (`…e1e395ad`, the Taproot exception); testnet3 block 394; none on testnet4/signet/regtest. The two **P2SH waivers** (170060, 394) are reproduced explicitly by `Network::is_bip16_p2sh_exception` (keyed by block hash, mainnet/testnet3 only); missing them rejects canonical blocks and wedges full-validation sync past the assume-valid height. The **692261 Taproot override** needs no rs exception: Core's override only strips TAPROOT (which Core defaults on for all blocks), and rs already height-gates taproot (`is_taproot_active`, 709632 > 692261) so it never sets TAPROOT there — its computed flags already match Core's effective set. Compare *effective* flag sets, not raw overrides. 
 
 ### CI lane parity
-The rule that a branch is green only against the commands in `.github/workflows/ci.yml`, never against a local approximation of them. Three differences bite: `-D warnings` on the `clippy` and `kernel-parity` lanes promotes every warning the workspace lint job merely reports (`dead_code`, `needless_borrow`, `doc_markdown`, `needless_collect`, `too_many_lines`); a virtual workspace silently drops `--workspace --features`, so the four-backend and kernel surface is only reached through `-p bitcoin-rs --no-default-features --features "$FULL_NODE_FEATURES"` plus a separate `-p bitcoin-rs-node` pass for its test targets; and `kernel-parity` adds `--include-ignored` on a debug profile. `cargo deny` belongs in the same sweep and is a bug report, not lint noise. See `docs/solutions/best-practices/workspace-clippy-does-not-predict-the-d-warnings-lanes.md`.
+The rule that a branch is green only against the commands in `.github/workflows/ci.yml`, never against a local approximation of them. Three differences bite: `-D warnings` on the `clippy` and `kernel-parity` lanes promotes every warning the workspace lint job merely reports (`dead_code`, `needless_borrow`, `doc_markdown`, `needless_collect`, `too_many_lines`); a virtual workspace silently drops `--workspace --features`, so the four-backend and kernel surface is only reached through `-p bitcoin-rs --no-default-features --features "$FULL_NODE_FEATURES"` plus a separate `-p bitcoin-rs-node` pass for its test targets; and `kernel-parity` adds `--include-ignored` on a debug profile. `cargo deny` belongs in the same sweep and is a bug report, not lint noise. 
 
 ### CPU-seconds as a first-class metric
 The rule that a throughput change is measured against CPU time as well as wall time, because a many-core idle benchmark host lets wall-clock tuning spend cores for free. Sampling `utime+stime` from `/proc/<pid>/stat` while polling height is enough; no profiler or metrics plumbing is required, and per-thread attribution comes from summing `/proc/<pid>/task/*/stat` by thread name.
 
-The controlled one-peer daemon IBD panel in [`docs/benchmarks/data/end-to-end-sync/daemon-ibd-custody-v1.json`](docs/benchmarks/data/end-to-end-sync/daemon-ibd-custody-v1.json) establishes the current bounded network-regime baseline across mainnet 0–150,000: Bitcoin Core median elapsed time is 73.459s against bitcoin-rs 89.576s. Core's elapsed time was 0.820× bitcoin-rs's elapsed time, so Core delivered 1.219× bitcoin-rs throughput. The 2× throughput target is unmet on this bounded daemon workload. This benchmark measures single-peer requester and apply behavior over loopback P2P on early blocks; it does not generalize to current-tip blocks or multi-peer Internet IBD. Earlier uncontrolled loopback measurements (such as 76.3s wall / 318.4s CPU vs Core 42.5s / 65.0s) showed a wider CPU gap that highlighted rayon spin and oversubscription risks before pool capping.
+The controlled one-peer daemon IBD panel establishes the current bounded network-regime baseline across mainnet 0–150,000: Bitcoin Core median elapsed time is 73.459s against bitcoin-rs 89.576s. Core's elapsed time was 0.820× bitcoin-rs's elapsed time, so Core delivered 1.219× bitcoin-rs throughput. The 2× throughput target is unmet on this bounded daemon workload. This benchmark measures single-peer requester and apply behavior over loopback P2P on early blocks; it does not generalize to current-tip blocks or multi-peer Internet IBD. Earlier uncontrolled loopback measurements (such as 76.3s wall / 318.4s CPU vs Core 42.5s / 65.0s) showed a wider CPU gap that highlighted rayon spin and oversubscription risks before pool capping.
 
-The matched local-file processing panel at commit `ff2615a` supersedes the older processing-bound CPU deficit: production-matched bitcoin-rs measured 56.16s / 396.50 CPU-s against Core 31.0 at 64.74s / 477.82 CPU-s. The network-bound daemon IBD results remain valid for their download-and-apply regime; they cannot be carried into the local replay regime. See `docs/solutions/performance/allocator-parity-changes-wall-not-cpu.md`.
+The matched local-file processing panel at commit `ff2615a` supersedes the older processing-bound CPU deficit: production-matched bitcoin-rs measured 56.16s / 396.50 CPU-s against Core 31.0 at 64.74s / 477.82 CPU-s. The network-bound daemon IBD results remain valid for their download-and-apply regime; they cannot be carried into the local replay regime.
 
 The final AVX2 panel adds the same proof after the Merkle change: bitcoin-rs beat Core by 1.315× wall and 1.232× CPU while using 1.042× its peak RSS. The CPU result rules out a wall-only win bought by extra parallel work; the kernel batches eight hashes in SIMD lanes inside one task.
 
@@ -147,10 +143,10 @@ The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_glob
 The failure mode where a parallelism constant is tuned while the benchmark harness competes with the node for CPU, so the measured optimum is a property of the contention rather than of the code. In this repo it produced two wrong constants. `MIN_PARALLEL_SCRIPT_CHECKS` was walked down to 4 by a sweep whose harness fetched every block over REST from a second `bitcoind` on the same cores; the inflated serial path made ever-finer fan-out look free and the curve read as monotonic. Re-measured against local block files the ordering **inverts** — 4 becomes the worst point tested on both wall and CPU, and the optimum is 32 (75.5s / 649.6s versus 84.4s / 946.6s). The global rayon pool was the same mistake in a different guise: uncapped, it cost nothing measurable in wall time on an idle many-core host. Two rules follow: never tune a parallelism constant against a harness that shares CPU with the node, because contention changes the shape of the curve and not merely its offset; and never tune one on wall alone, because both bad constants were wall-optimal on the host that chose them. See also `CPU-seconds as a first-class metric` and `Global rayon pool cap`.
 
 ### Commit point (multi-store mutation)
-The mutation that makes a multi-store operation visible. It identifies the state transition that readers treat as complete; it does not make every preceding mutation atomic. For an authoritative block disconnect, the commit point is the `applied_tip` rollback. It runs after the UTXO undo and the block-level coinstats rewind. `TxIndex` is derived state outside this transaction: publishing the applied tip increments its revision and wakes its worker, which later reconciles separate durable capability watermarks. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. The UTXO undo can fail after some shards changed, so it cannot be retried. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (the authoritative state can be partly rolled back). An in-flight marker in `UndoData` is armed before the first authoritative mutation. A fatal outcome closes apply admission and triggers process shutdown. Startup refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
+The mutation that makes a multi-store operation visible. It identifies the state transition that readers treat as complete; it does not make every preceding mutation atomic. For an authoritative block disconnect, the commit point is the `applied_tip` rollback. It runs after the UTXO undo and the block-level coinstats rewind. `TxIndex` is derived state outside this transaction: publishing the applied tip increments its revision and wakes its worker, which later reconciles separate durable capability watermarks. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. The UTXO undo can fail after some shards changed, so it cannot be retried. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (the authoritative state can be partly rolled back). An in-flight marker in `UndoData` is armed before the first authoritative mutation. A fatal outcome closes apply admission and triggers process shutdown. Startup refuses to serve the torn state. See *Disconnect marker phase* and `docs/contracts/` for the normative contracts.
 
 ### Deferred block-body index durability
-The `KvStore::write_deferred` path (`crates/storage/src/trait_.rs`), which writes a batch without forcing its own fsync and leaves durability to the next checkpoint flush. Block-body index rows use it because a lost row is rebuilt from the block file, so paying `Durability::None` per batch and one ordered flush at the checkpoint beats an fsync per batch. Correctness rests on flush ordering, not on the batch itself: the body bytes must be durable before the index row that points at them is published. See `docs/solutions/performance-issues/defer-redb-block-body-index-durability.md`.
+The `KvStore::write_deferred` path (`crates/storage/src/trait_.rs`), which writes a batch without forcing its own fsync and leaves durability to the next checkpoint flush. Block-body index rows use it because a lost row is rebuilt from the block file, so paying `Durability::None` per batch and one ordered flush at the checkpoint beats an fsync per batch. Correctness rests on flush ordering, not on the batch itself: the body bytes must be durable before the index row that points at them is published.
 
 ### TxIndex capability watermarks
 The two versioned durable `(height, block hash)` cursors that identify the exact active-chain prefixes represented by independently ready row families. `TxLookup` owns `TxConfirmed`; `ScriptHistory` owns `Funding` and `Spending`; `BlockHeaders` is shared rollback-integrity metadata. `--txindex` enables and publicly advertises `TxLookup`. `--scriptindex` enables the generic script UTXO and transaction-history view, and builds internal `TxLookup` rows for Esplora prevout, fee, and exact-transaction projections; it never changes Core txindex advertisement. When the cursors start together, one block-body scan prepares both families and one atomic batch writes their rows and both final watermarks. When they differ, the lagging capability advances or rolls back independently to the applied tip; the worker does not add an intermediate convergence boundary. Height alone cannot prove identity across a reorg. On startup, an older or unversioned derived-index format is deleted in bounded batches and rebuilt from the active chain before either capability becomes queryable; this never touches UTXO or block-body data.
@@ -186,7 +182,7 @@ or weaken checkpoint durability.
 The nonblocking notification published immediately after a committed `applied_tip.store`. The publisher increments an atomic revision with `Release` ordering and calls `try_send` on a capacity-one channel. Channel tokens may coalesce or be dropped because they are only wake hints. While a forward batch is pending, each hint returns the worker to reconciliation without changing the batch's original fixed deadline. The worker checks the authoritative revision before it sleeps and also wakes on a bounded timeout when caught up.
 
 ### Provably unspendable outputs (UTXO admission)
-Outputs the UTXO set never admits because no spend of them can ever be valid: an output whose `scriptPubKey` starts with `OP_RETURN`, and one longer than `MAX_SCRIPT_SIZE`. Excluding them at admission keeps the set smaller without changing any consensus outcome, so the snapshot codec carries its own version tag, `bitcoin-rs-utxo-spendable-v1`, and a set written by an older codec is not interchangeable with one written by this rule. See `docs/solutions/logic-errors/exclude-provably-unspendable-utxos.md`.
+Outputs the UTXO set never admits because no spend of them can ever be valid: an output whose `scriptPubKey` starts with `OP_RETURN`, and one longer than `MAX_SCRIPT_SIZE`. Excluding them at admission keeps the set smaller without changing any consensus outcome, so the snapshot codec carries its own version tag, `bitcoin-rs-utxo-spendable-v1`, and a set written by an older codec is not interchangeable with one written by this rule.
 
 ### Undo record
 
@@ -273,9 +269,7 @@ The parallel rows still pay roughly 11s of dispatch across 21,474 fan-outs. The
 diagnosis is a scaling sweep, not a profiler: measure the stage at 1, 4 and 32
 threads and compare the speedup against the thread count. Coarsening each
 dispatch does not fix it and makes it worse, because it throttles the blocks
-that were scaling; only issuing fewer, larger dispatches does. See
-`docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
-
+that were scaling; only issuing fewer, larger dispatches does.
 ### Window script batching
 
 Verifying the ordered transaction unit of several consecutive blocks in one
@@ -297,9 +291,7 @@ three-run interleaved attribution panel showed that deleting the duplicate
 commit-time transaction pass for matching proofs cut replay medians from
 48.414266s / 406.954276s CPU to 30.438702s / 254.642286s. The proof bypass
 applies only at the transaction-validation slot: block rules and BIP30 remain
-before it; coinbase maturity and BIP68 remain after it. See
-`docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
-
+before it; coinbase maturity and BIP68 remain after it.
 ### Script-check floor
 
 The native reference baseline for script verification, calculated by running the exact captured input corpus through `CPubKey::Verify` from `libbitcoinkernel-sys 0.3.0` (via bitcoinkernel 0.2.1, embedding Bitcoin Core 31.99.0 development sources: public key parsing, lax DER parsing, signature normalization, and `secp256k1_ecdsa_verify`). The capture pipeline uses same-open parse-stream custody to emit 24 fixed-order u64 counters and four file-bound native streams (`BRSCTX1\0` contexts, `BRSJRN1\0` journal, `BRSREC1\0` records, and 24-counter JSON).
@@ -313,7 +305,7 @@ Native `CPubKey::Verify` execution averages 39.32 µs per attempt ($Y$), while w
 Replay state stability across all three storage backends (`fjall`, `rocksdb`, `redb`) is
 covered by the g10_reorg_deep gate (`bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs`),
 which exercises `switch_to_branch` parent/back reorg with durable bodies and undo
-records and asserts exact invariant equality. Evidence is sealed in `evidence-retirement-v1.json`.
+records and asserts exact invariant equality. 
 The terminal-proof and offline-recovery campaigns previously described here are
 retired by #224; their custodian artifacts are listed in the evidence ledger.
 

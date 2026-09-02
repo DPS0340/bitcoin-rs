@@ -7,7 +7,7 @@ number existed for it.
 Harness: `crates/rpc/benches/txoutproof.rs`. Criterion, both arms of the refactor
 set in one group over one fixture in one process, so the ratio cannot be
 confounded by the rebuild and baseline drift recorded in
-`docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+CONCEPTS.md → *Paired-arm benchmark*.
 
 The arms differ by whether the `Context` carries a txindex. `before_scan` is the
 pre-index path: no `tx_index`, so the handler walks every block record, loads
@@ -86,7 +86,7 @@ at **36 seconds to 6 minutes** of unbounded work.
 
 Real blocks range from a single coinbase to a few thousand transactions, so
 neither shape is the chain and neither bound is a prediction. See
-`docs/solutions/best-practices/small-window-benchmarks-do-not-predict-at-scale-throughput.md`
+CONCEPTS.md → *Sync regimes*
 for why neither number should be scaled naively.
 
 Note also what the fixture cannot show: at 200-2,000 records, `Context::block_by_height`
