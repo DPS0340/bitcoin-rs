@@ -13,6 +13,8 @@
 
 /// Rayon-backed Schnorr verification helpers.
 pub mod batch;
+/// Transaction signature checker: ECDSA, Schnorr, locktime, and sequence verification.
+pub mod checker;
 /// Script verification wrapper.
 pub mod interpreter;
 /// Native script parsing, classification, and building helpers.
@@ -24,7 +26,7 @@ pub mod stack;
 /// Taproot verification helpers.
 pub mod taproot;
 
-pub use interpreter::{Interpreter, ScriptError, VerifyFlags};
+pub use interpreter::{Interpreter, ScriptErrCode, ScriptError, VerifyFlags};
 pub use script::{
     EarlyEndOfScript, Instruction, Instructions, is_multisig, is_op_return, is_p2a, is_p2pk,
     is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, is_push_only, is_witness_program,

@@ -5,6 +5,7 @@
 //! are handled by the verification backend wired into the consensus crate.
 
 use std::borrow::Cow;
+use std::fmt;
 
 use bitcoin_rs_primitives::{Sighash, SighashCache, Tx, TxOut};
 use secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
@@ -171,6 +172,182 @@ impl From<VerifyFlags> for u32 {
     }
 }
 
+/// Core-named script error codes, one variant per case in `ScriptErrorString`.
+///
+/// The [`fmt::Display`] impl renders the exact Core case name (without the
+/// `SCRIPT_ERR_` prefix) so error messages match Bitcoin Core's
+/// `script_error.cpp` output.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ScriptErrCode {
+    /// `SCRIPT_ERR_EVAL_FALSE`
+    EvalFalse,
+    /// `SCRIPT_ERR_VERIFY`
+    Verify,
+    /// `SCRIPT_ERR_EQUALVERIFY`
+    EqualVerify,
+    /// `SCRIPT_ERR_CHECKMULTISIGVERIFY`
+    CheckMultisigVerify,
+    /// `SCRIPT_ERR_CHECKSIGVERIFY`
+    CheckSigVerify,
+    /// `SCRIPT_ERR_NUMEQUALVERIFY`
+    NumEqualVerify,
+    /// `SCRIPT_ERR_SCRIPT_SIZE`
+    ScriptSize,
+    /// `SCRIPT_ERR_PUSH_SIZE`
+    PushSize,
+    /// `SCRIPT_ERR_OP_COUNT`
+    OpCount,
+    /// `SCRIPT_ERR_STACK_SIZE`
+    StackSize,
+    /// `SCRIPT_ERR_SIG_COUNT`
+    SigCount,
+    /// `SCRIPT_ERR_PUBKEY_COUNT`
+    PubkeyCount,
+    /// `SCRIPT_ERR_BAD_OPCODE`
+    BadOpcode,
+    /// `SCRIPT_ERR_DISABLED_OPCODE`
+    DisabledOpcode,
+    /// `SCRIPT_ERR_INVALID_STACK_OPERATION`
+    InvalidStackOperation,
+    /// `SCRIPT_ERR_INVALID_ALTSTACK_OPERATION`
+    InvalidAltstackOperation,
+    /// `SCRIPT_ERR_OP_RETURN`
+    OpReturn,
+    /// `SCRIPT_ERR_UNBALANCED_CONDITIONAL`
+    UnbalancedConditional,
+    /// `SCRIPT_ERR_NEGATIVE_LOCKTIME`
+    NegativeLocktime,
+    /// `SCRIPT_ERR_UNSATISFIED_LOCKTIME`
+    UnsatisfiedLocktime,
+    /// `SCRIPT_ERR_SIG_HASHTYPE`
+    SigHashtype,
+    /// `SCRIPT_ERR_SIG_DER`
+    SigDer,
+    /// `SCRIPT_ERR_MINIMALDATA`
+    MinimalData,
+    /// `SCRIPT_ERR_SIG_PUSHONLY`
+    SigPushonly,
+    /// `SCRIPT_ERR_SIG_HIGH_S`
+    SigHighS,
+    /// `SCRIPT_ERR_SIG_NULLDUMMY`
+    SigNullDummy,
+    /// `SCRIPT_ERR_MINIMALIF`
+    MinimalIf,
+    /// `SCRIPT_ERR_SIG_NULLFAIL`
+    SigNullFail,
+    /// `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS`
+    DiscourageUpgradableNops,
+    /// `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM`
+    DiscourageUpgradableWitnessProgram,
+    /// `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION`
+    DiscourageUpgradableTaprootVersion,
+    /// `SCRIPT_ERR_DISCOURAGE_OP_SUCCESS`
+    DiscourageOpSuccess,
+    /// `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_PUBKEYTYPE`
+    DiscourageUpgradablePubkeyType,
+    /// `SCRIPT_ERR_PUBKEYTYPE`
+    PubkeyType,
+    /// `SCRIPT_ERR_CLEANSTACK`
+    CleanStack,
+    /// `SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH`
+    WitnessProgramWrongLength,
+    /// `SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY`
+    WitnessProgramWitnessEmpty,
+    /// `SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH`
+    WitnessProgramMismatch,
+    /// `SCRIPT_ERR_WITNESS_MALLEATED`
+    WitnessMalleated,
+    /// `SCRIPT_ERR_WITNESS_MALLEATED_P2SH`
+    WitnessMalleatedP2sh,
+    /// `SCRIPT_ERR_WITNESS_UNEXPECTED`
+    WitnessUnexpected,
+    /// `SCRIPT_ERR_WITNESS_PUBKEYTYPE`
+    WitnessPubkeyType,
+    /// `SCRIPT_ERR_SCHNORR_SIG_SIZE`
+    SchnorrSigSize,
+    /// `SCRIPT_ERR_SCHNORR_SIG_HASHTYPE`
+    SchnorrSigHashtype,
+    /// `SCRIPT_ERR_SCHNORR_SIG`
+    SchnorrSig,
+    /// `SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE`
+    TaprootWrongControlSize,
+    /// `SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT`
+    TapscriptValidationWeight,
+    /// `SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG`
+    TapscriptCheckMultiSig,
+    /// `SCRIPT_ERR_TAPSCRIPT_MINIMALIF`
+    TapscriptMinimalIf,
+    /// `SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY`
+    TapscriptEmptyPubkey,
+    /// `SCRIPT_ERR_OP_CODESEPARATOR`
+    OpCodeSeparator,
+    /// `SCRIPT_ERR_SIG_FINDANDDELETE`
+    SigFindAndDelete,
+    /// `SCRIPT_ERR_SCRIPTNUM`
+    ScriptNum,
+}
+
+impl fmt::Display for ScriptErrCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::EvalFalse => "EVAL_FALSE",
+            Self::Verify => "VERIFY",
+            Self::EqualVerify => "EQUALVERIFY",
+            Self::CheckMultisigVerify => "CHECKMULTISIGVERIFY",
+            Self::CheckSigVerify => "CHECKSIGVERIFY",
+            Self::NumEqualVerify => "NUMEQUALVERIFY",
+            Self::ScriptSize => "SCRIPT_SIZE",
+            Self::PushSize => "PUSH_SIZE",
+            Self::OpCount => "OP_COUNT",
+            Self::StackSize => "STACK_SIZE",
+            Self::SigCount => "SIG_COUNT",
+            Self::PubkeyCount => "PUBKEY_COUNT",
+            Self::BadOpcode => "BAD_OPCODE",
+            Self::DisabledOpcode => "DISABLED_OPCODE",
+            Self::InvalidStackOperation => "INVALID_STACK_OPERATION",
+            Self::InvalidAltstackOperation => "INVALID_ALTSTACK_OPERATION",
+            Self::OpReturn => "OP_RETURN",
+            Self::UnbalancedConditional => "UNBALANCED_CONDITIONAL",
+            Self::NegativeLocktime => "NEGATIVE_LOCKTIME",
+            Self::UnsatisfiedLocktime => "UNSATISFIED_LOCKTIME",
+            Self::SigHashtype => "SIG_HASHTYPE",
+            Self::SigDer => "SIG_DER",
+            Self::MinimalData => "MINIMALDATA",
+            Self::SigPushonly => "SIG_PUSHONLY",
+            Self::SigHighS => "SIG_HIGH_S",
+            Self::SigNullDummy => "SIG_NULLDUMMY",
+            Self::MinimalIf => "MINIMALIF",
+            Self::SigNullFail => "SIG_NULLFAIL",
+            Self::DiscourageUpgradableNops => "DISCOURAGE_UPGRADABLE_NOPS",
+            Self::DiscourageUpgradableWitnessProgram => "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
+            Self::DiscourageUpgradableTaprootVersion => "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION",
+            Self::DiscourageOpSuccess => "DISCOURAGE_OP_SUCCESS",
+            Self::DiscourageUpgradablePubkeyType => "DISCOURAGE_UPGRADABLE_PUBKEYTYPE",
+            Self::PubkeyType => "PUBKEYTYPE",
+            Self::CleanStack => "CLEANSTACK",
+            Self::WitnessProgramWrongLength => "WITNESS_PROGRAM_WRONG_LENGTH",
+            Self::WitnessProgramWitnessEmpty => "WITNESS_PROGRAM_WITNESS_EMPTY",
+            Self::WitnessProgramMismatch => "WITNESS_PROGRAM_MISMATCH",
+            Self::WitnessMalleated => "WITNESS_MALLEATED",
+            Self::WitnessMalleatedP2sh => "WITNESS_MALLEATED_P2SH",
+            Self::WitnessUnexpected => "WITNESS_UNEXPECTED",
+            Self::WitnessPubkeyType => "WITNESS_PUBKEYTYPE",
+            Self::SchnorrSigSize => "SCHNORR_SIG_SIZE",
+            Self::SchnorrSigHashtype => "SCHNORR_SIG_HASHTYPE",
+            Self::SchnorrSig => "SCHNORR_SIG",
+            Self::TaprootWrongControlSize => "TAPROOT_WRONG_CONTROL_SIZE",
+            Self::TapscriptValidationWeight => "TAPSCRIPT_VALIDATION_WEIGHT",
+            Self::TapscriptCheckMultiSig => "TAPSCRIPT_CHECKMULTISIG",
+            Self::TapscriptMinimalIf => "TAPSCRIPT_MINIMALIF",
+            Self::TapscriptEmptyPubkey => "TAPSCRIPT_EMPTY_PUBKEY",
+            Self::OpCodeSeparator => "OP_CODESEPARATOR",
+            Self::SigFindAndDelete => "SIG_FINDANDDELETE",
+            Self::ScriptNum => "SCRIPTNUM",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Script execution errors surfaced by the script crate.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ScriptError {
@@ -204,6 +381,12 @@ pub enum ScriptError {
     TaprootUnsupportedWitness {
         /// Number of witness elements supplied for the P2TR spend.
         elements: usize,
+    },
+    /// The script evaluated to a Core-named failure.
+    #[error("script failed: {code}")]
+    Invalid {
+        /// Core's script error name for this failure.
+        code: ScriptErrCode,
     },
 }
 
