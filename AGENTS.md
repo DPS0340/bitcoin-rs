@@ -1,52 +1,37 @@
-## Consensus
+# AGENTS.md
 
-- Consensus authority is `libbitcoinkernel`. The Rust `Interpreter`
-  (`--no-default-features`) is a differential-testing surface, never a
-  production validation path.
-- Parse each block once via `KernelBlock`; downstream borrows that parse (txids,
-  `TransactionRef`), never re-serializes.
-- Assume-valid skips script checks only after the active header chain proves
-  the pinned anchor hash; sub-anchor or diverged chains verify fully.
-- Internal `Network` is the consensus selector only. `--network` (incl.
-  `drynet4`) changes P2P identity and bootstrap atomically; `drynet4` keeps
-  mainnet consensus.
-- Core RPC parity is value parity, not JSON text parity.
-- No wallet, no private keys, no signing/funding RPCs.
+This file defines how agents should work in this repository. It is not an
+architecture specification or a second source of subsystem truth.
 
-## Chain state
-
-- All chain mutation (sync, reorg, consensus-affecting RPC) goes through
-  `ChainControl` under the chain-transition guard; nothing else touches the
-  block tree or UTXO set. Whole-chainstate reads (`scantxoutset`) share that
-  guard; multi-query responses (Esplora) fail with 503 rather than compose
-  across an applied-tip change.
-- Disconnect marker is armed before the first UTXO mutation and cleared only
-  by the checkpoint that publishes the rolled-back state; startup refuses
-  `InFlight`/`RolledBack`; a `Fatal` disconnect shuts the process down. On
-  reorg, `pubsequence` emits `D` events tip-first before `C`.
-- Undo records are keyed by height and block hash and survive disconnects.
-- Derived indexes (`TxIndex`, filters) are outside the authoritative
-  transaction; queries gate on their capability watermarks and refuse partial
-  answers. Rows sharing a key across same-height blocks are checked against the
-  identity-bearing header row before deletion.
-- Window script batching: the front half of apply runs once per block; a
-  `BlockValidationProof` is single-use, bypasses only the transaction-validation
-  slot, and commit re-derives every bound field, discarding on mismatch.
-  `commit_apply` never re-enters.
-
-## Storage
-
-- Breaking on-disk change: increment the single `CURRENT_SCHEMA` epoch, one
-  reader, one writer, no converter or legacy fallback; the node never deletes
-  user data, it demands a resync. A UTXO-admission semantics change is a
-  snapshot codec version change.
-- `CURRENT` is the only checkpoint commit point; body bytes are durable before
-  any index row pointing at them is published.
-- Weaker durability (`write_deferred`) is opt-in at the exact call site; never
-  weaken a backend-wide write primitive.
-- One logical record has exactly one byte string: minimal varints, narrowest
-  directory width, compact/escape amount forms as exact complements.
-
-## Vocab
-
-CONCEPTS.md is the repository common vocabulary, utilize and manipulate it when you need it.
+- Before changing a settled area, read `CONCEPTS.md`, the owning crate docs and
+  source, relevant policies and tests, and the current issue/PR. Treat the
+  closest authoritative owner as the source of truth rather than restating it
+  here.
+- Keep one clear current authority for each concept, invariant, and state
+  transition. Do not duplicate architecture across `AGENTS.md`, `CONCEPTS.md`,
+  solution notes, source comments, and tests just to make a local change easier.
+- Preserve ownership boundaries. Change state and invariants through their
+  existing owner instead of adding parallel state, shadow models, broad
+  wrappers, or speculative abstractions. Add a new abstraction only for a
+  concrete current consumer or contract.
+- Prefer clean cutovers. When replacing an interface, state path, or data
+  layout, remove the superseded path in the same change unless an explicit
+  compatibility contract requires it.
+- Tests should protect authoritative behavior and invariants, not reproduce the
+  implementation in another place. Prefer regression cases at the boundary
+  that owns the contract.
+- Development experiments are disposable by default. Alternative A/B
+  implementations, benchmark campaign outputs, profiler captures, temporary
+  fixtures, migration/oracle scaffolding, review logs, and agent scratch should
+  not become permanent repository state merely because they were useful during
+  development.
+- Keep only the winning production path after an experiment. Retain a benchmark
+  or fixture on `main` only when it is intentionally maintained as a recurring
+  performance, correctness, compatibility, or protocol contract.
+- Put acceptance criteria in the issue or PR. Put execution proof and raw run
+  evidence in CI logs/artifacts or the PR discussion. Keep local plans and
+  scratch under ignored `.agent-tasks/`. Git history is the archive for
+  superseded repository state.
+- When durable knowledge changes, update its authoritative owner and remove or
+  reconcile overlapping stale descriptions. Do not copy the new architecture
+  into `AGENTS.md`.
