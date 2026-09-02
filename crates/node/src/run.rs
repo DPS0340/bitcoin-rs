@@ -937,7 +937,7 @@ mod tests {
         config.data_dir = temp.path().join("node-success");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.script_index = false;
+        config.script_index = crate::config::ScriptIndexMode::Disabled;
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
@@ -973,7 +973,7 @@ mod tests {
         config.data_dir = temp.path().join("node");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.script_index = false;
+        config.script_index = crate::config::ScriptIndexMode::Disabled;
         config.p2p_listen.clear();
         config.metrics_bind = None;
         // Force a bootstrap worker to spawn (fixed-peer path) so the drain

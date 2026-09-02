@@ -119,6 +119,60 @@ pub struct ZmqPublication {
     pub hwm: u32,
 }
 
+/// How much of the derived `ScriptIndex` a node maintains.
+///
+/// `ScriptIndex` is rebuildable derived state, so the mode is a capability
+/// selection rather than a storage compatibility question: `utxo` maintains
+/// the compact live-output view, `full` adds historical funding/spending rows.
+///
+/// The boolean spellings remain behaviorally compatible: `--scriptindex`,
+/// `--scriptindex=true`, and `BITCOIN_RS_SCRIPTINDEX=true` all mean
+/// [`Self::Full`], and `false` means [`Self::Disabled`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptIndexMode {
+    /// No `ScriptIndex` capability is maintained.
+    #[default]
+    Disabled,
+    /// Maintain only the compact live-output view.
+    Utxo,
+    /// Maintain both the live-output view and historical script activity.
+    Full,
+}
+
+impl ScriptIndexMode {
+    /// Whether any `ScriptIndex` capability is enabled.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Whether historical funding/spending rows are maintained.
+    ///
+    /// Only `full` keeps history; `utxo` deliberately avoids paying the
+    /// storage cost of full historical script indexing.
+    #[must_use]
+    pub const fn keeps_history(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Parses a mode from a configuration value.
+    ///
+    /// Accepts the historical boolean spellings for compatibility: `true`
+    /// means `full` and `false` means disabled. Parsing is case-insensitive.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "utxo" => Some(Self::Utxo),
+            // `true` is the historical boolean spelling and must keep meaning
+            // `full`; it is a separate pattern for that readability, not a
+            // distinct outcome.
+            "full" | "true" | "1" | "yes" => Some(Self::Full),
+            "false" | "0" | "no" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
 /// Fully merged node configuration. Fixed-peer hostnames are intentionally
 /// resolved later by the P2P bootstrap worker.
 #[derive(Clone, Deserialize)]
@@ -140,8 +194,8 @@ pub struct Config {
     pub rest: bool,
     /// JSON-RPC authentication configuration.
     pub rpc_auth: Auth,
-    /// Whether the generic script index is enabled for address and scripthash Esplora routes.
-    pub script_index: bool,
+    /// Which `ScriptIndex` capabilities the node maintains.
+    pub script_index: ScriptIndexMode,
     /// P2P listener bind addresses.
     pub p2p_listen: Vec<SocketAddr>,
     /// Whether DNS seeds are used for peer bootstrap.
@@ -303,7 +357,7 @@ impl Config {
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port())),
             rest: false,
             rpc_auth: Auth::default(),
-            script_index: false,
+            script_index: ScriptIndexMode::Disabled,
             p2p_listen: vec![SocketAddr::from(([0, 0, 0, 0], network.default_p2p_port()))],
             dns_seeds_enabled: true,
             connect: Vec::new(),
@@ -407,7 +461,7 @@ impl Config {
         }
         if self.blockfilterindex {
             ensure!(
-                self.txindex || self.script_index,
+                self.txindex || self.script_index.is_enabled(),
                 "blockfilterindex requires txindex"
             );
             ensure!(
@@ -522,16 +576,16 @@ impl Config {
             crate::bitcoin_conf_compat::apply_file(&mut config, path)?;
         }
         if let Some(layer) = &toml_layer {
-            config.apply_layer(layer);
+            config.apply_layer(layer)?;
         }
-        config.apply_layer(&env_layer);
-        config.apply_layer(cli);
+        config.apply_layer(&env_layer)?;
+        config.apply_layer(cli)?;
         config.validate()?;
         Ok(config)
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_layer(&mut self, layer: &ConfigLayer) {
+    fn apply_layer(&mut self, layer: &ConfigLayer) -> Result<()> {
         if let Some(network) = layer.network {
             self.apply_network_selection(network);
         }
@@ -562,8 +616,12 @@ impl Config {
                 layer.rpc_password.clone().unwrap_or(old_password),
             );
         }
-        if let Some(script_index) = layer.script_index {
-            self.script_index = script_index;
+        if let Some(script_index) = &layer.script_index {
+            self.script_index = ScriptIndexMode::parse(script_index).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid scriptindex value `{script_index}`: expected `utxo`, `full`, or a boolean"
+                )
+            })?;
         }
         if let Some(p2p_listen) = &layer.p2p_listen {
             self.p2p_listen.clone_from(p2p_listen);
@@ -638,6 +696,7 @@ impl Config {
         if let Some(height) = layer.assume_valid_height {
             self.assume_valid_height = height;
         }
+        Ok(())
     }
 
     fn apply_network_selection(&mut self, selection: NetworkSelection) {
@@ -713,7 +772,7 @@ pub(crate) struct ConfigLayer {
         num_args = 0..=1,
         default_missing_value = "true"
     )]
-    pub(crate) script_index: Option<bool>,
+    pub(crate) script_index: Option<String>,
     #[arg(long = "p2p-listen", value_delimiter = ',')]
     pub(crate) p2p_listen: Option<Vec<SocketAddr>>,
     #[arg(long = "dns-seeds-enabled")]
@@ -783,8 +842,8 @@ pub(crate) struct ConfigLayer {
 }
 
 impl ConfigLayer {
-    pub(crate) fn apply_to(&self, config: &mut Config) {
-        config.apply_layer(self);
+    pub(crate) fn apply_to(&self, config: &mut Config) -> Result<()> {
+        config.apply_layer(self)
     }
 
     fn from_env<E, K, V>(env: E) -> Result<Self>
@@ -807,7 +866,7 @@ impl ConfigLayer {
                 "BITCOIN_RS_RPC_USER" => layer.rpc_user = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_PASSWORD" => layer.rpc_password = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_COOKIE" => layer.rpc_cookie = Some(PathBuf::from(value)),
-                "BITCOIN_RS_SCRIPTINDEX" => layer.script_index = Some(parse_bool(value)?),
+                "BITCOIN_RS_SCRIPTINDEX" => layer.script_index = Some(value.to_owned()),
                 "BITCOIN_RS_P2P_LISTEN" => layer.p2p_listen = Some(parse_socket_list(value)?),
                 "BITCOIN_RS_DNS_SEEDS_ENABLED" => {
                     layer.dns_seeds_enabled = Some(parse_bool(value)?);

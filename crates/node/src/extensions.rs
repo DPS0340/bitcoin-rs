@@ -53,7 +53,7 @@ pub fn compiled_descriptors() -> Vec<&'static ExtensionDescriptor> {
 #[must_use]
 pub fn enabled_capabilities(config: &Config) -> Vec<&'static str> {
     let mut enabled = Vec::new();
-    if config.txindex || config.script_index {
+    if config.txindex || config.script_index.is_enabled() {
         enabled.push(TXINDEX_CAPABILITY);
     }
     if config.blockfilterindex {
@@ -208,7 +208,8 @@ mod tests {
         let config = config_with(|config| config.txindex = true);
         assert_eq!(enabled_capabilities(&config), vec![TXINDEX_CAPABILITY]);
 
-        let config = config_with(|config| config.script_index = true);
+        let config =
+            config_with(|config| config.script_index = crate::config::ScriptIndexMode::Full);
         assert_eq!(enabled_capabilities(&config), vec![TXINDEX_CAPABILITY]);
 
         let config = config_with(|config| {

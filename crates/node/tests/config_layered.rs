@@ -1,7 +1,7 @@
 //! Integration tests for the bitcoin-rs node.
 
 use anyhow::Result;
-use bitcoin_rs_node::{Auth, Config, Network};
+use bitcoin_rs_node::{Auth, Config, Network, ScriptIndexMode};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -223,7 +223,8 @@ fn p2p_magic_override_requires_an_explicit_peer() {
 #[test]
 fn script_index_is_valid_without_core_txindex() -> Result<()> {
     let mut config = Config::default_for_network(Network::Regtest);
-    config.script_index = true;
+    config.script_index = ScriptIndexMode::Full;
+
     config.txindex = false;
 
     config.validate()?;
@@ -239,7 +240,7 @@ fn scriptindex_cli_flag_enables_the_index() -> Result<()> {
         ["bitcoin-rs-node", "--scriptindex"],
     )?;
 
-    assert!(config.script_index);
+    assert_eq!(config.script_index, ScriptIndexMode::Full);
     Ok(())
 }
 
@@ -254,10 +255,110 @@ fn scriptindex_environment_enables_the_index() -> Result<()> {
         ],
         ["bitcoin-rs-node"],
     )?;
-
     assert!(!config.txindex);
-    assert!(config.script_index);
+    assert_eq!(config.script_index, ScriptIndexMode::Full);
     Ok(())
+}
+
+// `scriptindex=utxo` and `scriptindex=full` are the two active levels from
+// #225. `utxo` maintains only the compact live-output view; `full` adds the
+// historical funding/spending rows. There is intentionally no history-only
+// mode.
+#[test]
+fn scriptindex_modes_parse_utxo_and_full() -> Result<()> {
+    let utxo = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        ["bitcoin-rs-node", "--scriptindex=utxo"],
+    )?;
+    assert_eq!(utxo.script_index, ScriptIndexMode::Utxo);
+
+    let full = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        ["bitcoin-rs-node", "--scriptindex=full"],
+    )?;
+    assert_eq!(full.script_index, ScriptIndexMode::Full);
+    Ok(())
+}
+
+/// The boolean spellings must keep meaning `full`, so an existing
+/// `--scriptindex` / `BITCOIN_RS_SCRIPTINDEX=true` deployment keeps its
+/// historical behaviour after the mode split.
+#[test]
+fn boolean_scriptindex_spellings_mean_full_not_utxo() -> Result<()> {
+    let bare = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        ["bitcoin-rs-node", "--scriptindex"],
+    )?;
+    assert_eq!(
+        bare.script_index,
+        ScriptIndexMode::Full,
+        "bare --scriptindex must stay `full`, not `utxo`"
+    );
+
+    let explicit_true = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        ["bitcoin-rs-node", "--scriptindex=true"],
+    )?;
+    assert_eq!(explicit_true.script_index, ScriptIndexMode::Full);
+
+    let env_true = Config::from_layered_sources(
+        None,
+        None,
+        [("BITCOIN_RS_SCRIPTINDEX", "true")],
+        ["bitcoin-rs-node"],
+    )?;
+    assert_eq!(env_true.script_index, ScriptIndexMode::Full);
+
+    let disabled = Config::from_layered_sources(
+        None,
+        None,
+        [("BITCOIN_RS_SCRIPTINDEX", "false")],
+        ["bitcoin-rs-node"],
+    )?;
+    assert_eq!(disabled.script_index, ScriptIndexMode::Disabled);
+    Ok(())
+}
+
+/// Only `full` maintains history. `utxo` deliberately avoids the storage cost
+/// of historical script indexing, and `disabled` maintains nothing. This is
+/// the capability selection #225's endpoint matrix gates on.
+#[test]
+fn mode_capability_predicates_select_history_and_live() {
+    assert!(!ScriptIndexMode::Disabled.is_enabled());
+    assert!(!ScriptIndexMode::Disabled.keeps_history());
+
+    assert!(ScriptIndexMode::Utxo.is_enabled());
+    assert!(
+        !ScriptIndexMode::Utxo.keeps_history(),
+        "utxo mode must not maintain historical funding/spending rows"
+    );
+
+    assert!(ScriptIndexMode::Full.is_enabled());
+    assert!(ScriptIndexMode::Full.keeps_history());
+}
+
+/// An unrecognised mode must be rejected rather than silently degrading to a
+/// default, or an operator typo would quietly disable a configured index.
+#[test]
+fn an_unrecognised_scriptindex_mode_is_rejected() {
+    let result = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        ["bitcoin-rs-node", "--scriptindex=history-only"],
+    );
+    assert!(
+        result.is_err_and(|error| error.to_string().contains("invalid scriptindex value")),
+        "a typo must be an error, not a silent default"
+    );
 }
 
 #[test]

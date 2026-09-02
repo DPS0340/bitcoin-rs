@@ -10,7 +10,7 @@ pub fn apply_file(config: &mut Config, path: &Path) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read bitcoin.conf {}", path.display()))?;
     let layer = parse_for_network(&text, config.network);
-    layer.apply_to(config);
+    layer.apply_to(config)?;
     Ok(())
 }
 
@@ -157,8 +157,11 @@ impl ConfigLayerMerge for ConfigLayer {
         if other.rpc_cookie.is_some() {
             self.rpc_cookie.clone_from(&other.rpc_cookie);
         }
+        // An unparseable value is preserved verbatim so the merge stays
+        // infallible; `Config::apply_layer` rejects it at the layer boundary
+        // where an error can be reported with the key it came from.
         if other.script_index.is_some() {
-            self.script_index = other.script_index;
+            self.script_index.clone_from(&other.script_index);
         }
         if other.p2p_listen.is_some() {
             self.p2p_listen.clone_from(&other.p2p_listen);

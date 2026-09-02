@@ -964,8 +964,8 @@ fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities
         // transactions to render prevouts and calculate fees. This is an
         // internal dependency; `tx_index_query` below still exposes it to Core
         // RPCs only for an explicit --txindex configuration.
-        tx_lookup: config.txindex || config.script_index,
-        script_history: config.script_index,
+        tx_lookup: config.txindex || config.script_index.is_enabled(),
+        script_history: config.script_index.keeps_history(),
     }
 }
 
@@ -1499,7 +1499,7 @@ impl NodeState {
                     adapter
                 }),
                 tx_runtime: tx_index_runtime.clone(),
-                txindex_enabled: config.txindex || config.script_index,
+                txindex_enabled: config.txindex || config.script_index.is_enabled(),
                 filter_status: filter_index
                     .as_ref()
                     .map(|handle| Arc::clone(&handle.status)),
@@ -1770,7 +1770,7 @@ impl NodeState {
     /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
     pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
-        if !self.config.script_index {
+        if !self.config.script_index.is_enabled() {
             return None;
         }
         self.tx_index_adapter.as_ref().map(|adapter| {
@@ -2257,7 +2257,7 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = false;
-        config.script_index = true;
+        config.script_index = crate::config::ScriptIndexMode::Full;
 
         let state = NodeState::open(config)?;
 
