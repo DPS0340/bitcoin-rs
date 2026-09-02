@@ -10,8 +10,8 @@ flat-file fixture. The `before_scan` and `after_fast` arms described below are
 historical evidence from the retired refactor harness; they are not current
 targets.
 
-The arms call different functions — the retained `*_scan` reference against the
-position-backed resolver — over the same rows and block files.
+The historical arms called different functions — the former `*_scan` reference
+against the position-backed resolver — over the same rows and block files.
 
 > **Harness correction, 2026-08-13 (second).** Between the resolver rewrite
 > landing and this revision, the two `electrum_methods.rs` arms were *literally
@@ -158,14 +158,14 @@ most once per matching transaction, via `Option::get_or_insert_with`.
 `resolve_unspent_outputs` no longer duplicates the walk at all — it delegates and
 drops the height. Pure code motion; no behavioural change.
 
-**Equivalence.** `crates/index/tests/resolver_equivalence.rs`, 8 tests against
-the naive `resolve_unspent_outputs*_scan` references retained in the crate:
-single funding output, one transaction paying the target twice (the lazy txid
-must be computed once and reused by both entries), two transactions paying the
-target in one block (ingest collapses these into a single row), multiple
-heights, an unresolvable height, an `OP_RETURN` target that ingest never indexed,
-a never-indexed scripthash, and a `proptest` over random block/transaction/output
-shapes. Equality is over the full result vector, not a spot check.
+**Historical equivalence (retired).** The former `resolver_equivalence`
+integration tests compared the unspent-output resolvers with naive scan-only
+references over single and multiple heights, duplicate matches, unresolvable
+heights, never-indexed scripts, and random block/transaction/output shapes.
+The tests and public scan-only oracle methods were retired with the A/B
+harness. Current resolver behavior is covered by the Indexer unit tests and
+the transaction-position contract tests; the private full-scan helpers remain
+the live fallback path.
 
 **Historical speed**, paired arms in one run, from the retired
 `crates/index/benches/history_resolve.rs` harness.
@@ -191,11 +191,9 @@ because it agrees with the paired result: `get_balance` and `listunspent` each
 fell about 50% at 1 and 8 heights. The 64-height groups are excluded per the
 noise floor above; on this run their identical arms disagreed by 1.7x.
 
-**Reference retention.** The `_scan` functions stay in the crate as the
-equivalence oracle and the `before` arm. They deliberately keep the eager txid:
-an oracle that shares an optimization with the implementation it checks cannot
-catch a fault in that optimization. They are not the fallback path; the measured
-fixtures show the positioned resolvers were faster.
+**Reference retirement.** The scan-only oracle and benchmark `before` arm were
+removed after the comparison was completed. The historical numbers above remain
+evidence for the lazy-txid change, not a current test or runtime contract.
 
 ## Landed: transaction byte positions in row values
 
@@ -232,35 +230,20 @@ correct and costs one scan per 2^64 pairs. The residual risk this accepts is a
 stale offset landing exactly on a transaction boundary *and* that transaction
 matching, while another transaction in the same block also matches.
 
-**Equivalence.** `crates/index/tests/tx_positions.rs`, 8 tests. The load-bearing
-one is `both_ingest_paths_write_identical_row_values`: the zero-copy path
-measures each range directly from the block slice, the decoded path derives it
-arithmetically from `Transaction::total_size()`, and nothing but a test keeps two
-different computations of the same number equal. Fixtures mix legacy and segwit
-transactions, and a separate case crosses the 253-transaction varint boundary.
-
-**Mutation-verified.** Both arithmetic terms were mutated and the suite caught
-each:
-
-| Mutation | Result |
-|---|---|
-| `VarInt::from(len).size()` -> literal `1` | caught by the varint-boundary test only |
-| `total_size()` -> `base_size()` (drops witness bytes) | caught by 3 tests |
-
-The varint mutation initially survived: every fixture had fewer than 253
-transactions, so a hardcoded 1 was correct for all of them, and the proptest's
-doc comment claimed a boundary coverage it did not have. The boundary test exists
-because of that miss. Mainnet blocks carry thousands of transactions, so the
-untested branch was the only one that matters in production.
+**Position values.** `crates/index/tests/tx_positions.rs`, 8 tests. The suite
+checks the persisted position encoding, exact transaction boundaries, current
+format markers, and the independent row-value contract. It intentionally does
+not retain equivalence coverage for a second ingest implementation; the index
+has one supported serialized-block ingest path.
 
 ## Landed: resolvers read only the transactions their positions name
 
 **Change.** `resolve_script_history`, `resolve_unspent_outputs{,_with_height}`
 and `resolve_transaction` now read each row's `TxPosition` list, fetch only
 those byte ranges through `BlockSource::block_bytes_at_height`, and decode only
-those transactions. The public `*_scan` methods survive as correctness oracles
-and benchmark `before` arms; production resolvers use private per-height full-scan
-helpers when positioned resolution fails.
+those transactions. Production resolvers use private per-height full-scan
+helpers when positioned resolution fails; the former public scan-only oracle
+methods were retired with the comparison harness.
 
 **The all-or-scan rule is what makes this safe.** A resolver falls back to a full
 block scan the moment any single position fails to resolve; it never skips a
@@ -328,48 +311,16 @@ The 64-height `subscribe` and `get_balance` groups, previously unusable at
 2.0-2.4x identical-arm spread, are now stable: the `after` arm got cheap enough
 that host thermal noise no longer dominates the group.
 
-**Equivalence.** `crates/index/tests/resolver_equivalence.rs`, 12 tests. Every
-assertion runs **twice** — once against a source that can serve ranges and once
-against one that declines — so the position path and the scan fallback are both
-checked against the same `_scan` oracle.
+**Current contract coverage.** The resolver unit tests retain ordinary indexed
+resolution and one deterministic fixture for an eight-byte prefix collision.
+Rows whose positions are stale, malformed, or blank are outside the valid
+watermark-backed index-state contract described in `CONCEPTS.md`, so they are
+not promoted to permanent fallback contracts here. The private all-or-scan
+fallback remains a defensive production path.
 
-**One of the twelve tests the read shape, not the result**, and it exists because
-the other eleven cannot catch the most likely regression. Equivalence is measured
-*against scanning*, so deleting the position path entirely leaves all eleven
-green. `the_position_path_reads_ranges_and_never_whole_blocks` counts the calls
-its source serves and asserts that the position path loads zero whole blocks and
-at least one range, and that a source declining ranges is the mirror image.
-Raised in review of PR #80.
-
-Beyond the shared fixtures:
-
-- `stale_positions_from_a_superseded_block_fall_back_to_scanning` indexes block
-  A and serves block B at the same height.
-- `a_stale_position_that_decodes_but_does_not_match_still_forces_a_scan` does the
-  same with both blocks holding equally sized transactions, so A's offset lands
-  exactly on a transaction boundary in B and yields a **valid** transaction that
-  funds something else.
-- `rows_without_positions_fall_back_to_scanning` blanks every row value to
-  reproduce a database written before this format.
-
-**Mutation-verified.**
-
-| Mutation | Result |
-|---|---|
-| `positioned_history`: skip a non-matching position instead of scanning | caught by the decodes-but-does-not-match test only |
-| `positioned_unspent_outputs`: same skip | caught by the same test only |
-| `TxPosition::cmp`: revert to derived lexicographic ordering | caught by the random-blocks proptest |
-
-The first two mutations initially **survived**. The original stale-position test
-only produced undecodable bytes, so any implementation bailed for the wrong
-reason; the decodes-but-does-not-match case had to be constructed deliberately,
-by making both blocks lay transactions at identical offsets. The all-or-scan rule
-is the one invariant standing between this design and silently short history, and
-it was untested until that fixture existed.
-
-The third mutation is why `TxPosition` implements `Ord` by hand: deriving it
-compares little-endian byte arrays lexicographically, so offset 256 would sort
-before offset 1, and stored positions would not be in block order. Emission order
+`TxPosition` implements `Ord` by hand: deriving it compares little-endian byte
+arrays lexicographically, so offset 256 would sort before offset 1, and stored
+positions would not be in block order. Emission order
 is contractual — Electrum clients hash the sequence to derive a status.
 
 ## Rejected: decoded-block cache

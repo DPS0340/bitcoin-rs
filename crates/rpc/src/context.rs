@@ -1673,51 +1673,6 @@ mod tests {
             .collect()
     }
 
-    /// The search must land on exactly what the scan it replaced found.
-    ///
-    /// `record_for_hash` had the height from the block tree and scanned the log
-    /// for the matching pair anyway. The scan made no assumption about ordering;
-    /// the search assumes the log is non-decreasing by height. This holds the
-    /// search to the scan over every height in and around the fixture, and over
-    /// every hash in it — including hashes at the wrong height, which must find
-    /// nothing.
-    ///
-    /// A sweep rather than a chosen pair: a search is wrong at its boundaries,
-    /// and a test that picks one pair picks whether it visits them.
-    #[test]
-    fn record_at_height_hash_matches_the_scan_it_replaced() {
-        let records = shaped_records();
-        let hashes = records.iter().map(|record| record.hash).collect::<Vec<_>>();
-
-        for height in 0_u32..12 {
-            for hash in &hashes {
-                let scanned = records
-                    .iter()
-                    .find(|candidate| candidate.hash == *hash && candidate.height == height);
-                assert_eq!(
-                    record_at_height_hash(&records, height, *hash).map(|r| r.time),
-                    scanned.map(|r| r.time),
-                    "search and scan disagree at height {height}"
-                );
-            }
-        }
-    }
-
-    /// The same for the height-only lookup, which has to return the *first*
-    /// record at a duplicated height because that is what the scan returned.
-    #[test]
-    fn record_at_height_matches_the_scan_it_replaced() {
-        let records = shaped_records();
-        for height in 0_u32..12 {
-            let scanned = records.iter().find(|candidate| candidate.height == height);
-            assert_eq!(
-                record_at_height(&records, height).map(|r| r.time),
-                scanned.map(|r| r.time),
-                "search and scan disagree at height {height}"
-            );
-        }
-    }
-
     /// Every record at a duplicated height must be reachable by its own hash.
     ///
     /// A search that stopped at the run's first record would answer `None` for

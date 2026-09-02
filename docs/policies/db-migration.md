@@ -60,8 +60,8 @@ existing column family is in the open set).
 `crates/utxo/src/snapshot.rs` serializes and deserializes the UTXO set.
 - `SnapshotHeader` stores `magic` (`0x55_54_58_4f`), `version` (`4`), `tip_hash` (32 bytes), `height` (`u32`), and `record_count` (`u64`).
 - Writer function `write_snapshot` emits version `4` (`SNAPSHOT_WRITE_VERSION`).
-- Reader function `read_snapshot` decodes legacy versions `2`, `3`, and `4`.
-- Reader function `read_snapshot_strict_v4` decodes version `4` exclusively, enforcing strict end-of-file validation and requiring a 384-byte `MuHash3072` trailer (`MUHASH_TRAILER_LEN`).
+- Reader function `read_snapshot_strict_v4` decodes version `4` exclusively, validates the declared record count, requires a 384-byte `MuHash3072` trailer (`MUHASH_TRAILER_LEN`), and rejects trailing bytes.
+- Legacy versions `2` and `3` are unsupported. The node rebuilds or resynchronizes chainstate instead of retaining a compatibility decoder.
 
 ### 2.4 Chainstate Checkpoint Directory
 `crates/node/src/checkpoint.rs` persists full chainstate checkpoints under `chainstate-checkpoints/`.
@@ -98,8 +98,8 @@ When changing the binary layout of the UTXO snapshot:
 2. Increment `UTXO_VERSION` in `crates/node/src/checkpoint.rs`.
 3. Update `UTXO_CODEC` in `crates/node/src/checkpoint.rs` to reflect the new layout.
 4. Define a new record header struct in `crates/utxo/src/snapshot.rs` (e.g., `SnapshotRecordHeaderV5`).
-5. Add a reading function for the new version in `read_snapshot_with_policy_observed`.
-6. Retain older read decoders in `read_snapshot` only if backward read support is explicitly required by project maintainers; otherwise, remove legacy decoders to enforce a clean cutover.
+5. Update the strict reader and its fixed compatibility fixture for the new version.
+6. Remove the previous reader and its unsupported-format tests unless maintainers explicitly document a recovery requirement that cannot be satisfied by rebuilding chainstate.
 
 ## 5. Datadir Compatibility and Startup Behavior
 

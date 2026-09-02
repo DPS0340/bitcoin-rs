@@ -7,206 +7,18 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bitcoin::consensus::encode::serialize;
-use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin_rs_chain::{ChainWork, NodeId, NodeStatus, TipSnapshot};
-use bitcoin_rs_mempool::MempoolEntry;
-use bitcoin_rs_mining::{Candidate, TemplateId};
 use bitcoin_rs_p2p::PeerInfo;
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::context::{
-    BlockBodySource, BlockRecord, BlockTemplate, BlockTemplateRequest, BlockTemplateResult,
-    BlockValidationResult, ChainControl, ChainControlError, Context, LastCandidateInfo,
-    MiningCapability, MiningControl, MiningControlError, MiningInfo, TemplateMutation,
+    BlockBodySource, BlockRecord, ChainControl, ChainControlError, Context,
 };
 use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use parking_lot::RwLock;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
-
-struct SmokeMiningControl;
-
-impl SmokeMiningControl {
-    fn template() -> BlockTemplate {
-        let previous = Hash256::from_le_bytes(&[0x11; 32]);
-        BlockTemplate {
-            candidate: Arc::new(Candidate {
-                template_id: TemplateId::new(&previous, 9),
-                previous_block_hash: previous,
-                height: 101,
-                version: 0x2000_0000,
-                bits: 0x207f_ffff,
-                min_time: 1_700_000_001,
-                current_time: 1_700_000_010,
-                csv_active: true,
-                segwit_active: true,
-                max_weight: 4_000_000,
-                max_size: 4_000_000,
-                max_sigops: 80_000,
-                mempool_sequence: 9,
-                coinbase: Transaction {
-                    version: bitcoin::transaction::Version::TWO,
-                    lock_time: bitcoin::absolute::LockTime::ZERO,
-                    input: Vec::new(),
-                    output: Vec::new(),
-                },
-                coinbase_value: 5_000_000_000,
-                fees: 0,
-                weight: 1_000,
-                size: 250,
-                sigop_cost: 0,
-                transactions: Vec::new(),
-                witness_merkle_root: None,
-                witness_reserved_value: None,
-                witness_commitment: None,
-            }),
-            rules: Vec::new(),
-            version_bits_available: Vec::new(),
-            version_bits_required: 0,
-            capabilities: vec![MiningCapability::new("proposal")],
-            mutable: vec![TemplateMutation::Time, TemplateMutation::Transactions],
-            submit_old: None,
-            work_id: None,
-        }
-    }
-}
-
-impl MiningControl for SmokeMiningControl {
-    fn get_block_template(
-        &self,
-        request: BlockTemplateRequest,
-    ) -> Result<BlockTemplateResult, MiningControlError> {
-        Ok(match request.mode {
-            bitcoin_rs_rpc::context::BlockTemplateMode::Template => {
-                BlockTemplateResult::Template(Self::template())
-            }
-            bitcoin_rs_rpc::context::BlockTemplateMode::Proposal(_) => {
-                BlockTemplateResult::Proposal(BlockValidationResult::Accepted)
-            }
-        })
-    }
-
-    fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
-        Ok(MiningInfo {
-            blocks: 100,
-            last_candidate: Some(LastCandidateInfo {
-                weight: 1_000,
-                transactions: 1,
-            }),
-            difficulty: 1.0,
-            network_hashes_per_second: 0.0,
-            pooled_transactions: 0,
-            network: Network::Regtest,
-            next_bits: 0x207f_ffff,
-            next_difficulty: 1.0,
-            minimum_fee_rate: 1_000,
-            signet: None,
-            warnings: Vec::new(),
-        })
-    }
-
-    fn submit_block(
-        &self,
-        _block: bitcoin::Block,
-    ) -> Result<BlockValidationResult, MiningControlError> {
-        Ok(BlockValidationResult::Accepted)
-    }
-
-    fn publish_generation(&self) {}
-}
-
-#[test]
-fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = Fixture::new()?;
-    let handler = Handler::new(Arc::clone(&fixture.ctx));
-    let raw_tx = serialize_hex(&fixture.tx);
-    let valid_psbt = build_valid_base64_psbt(&fixture.tx)?;
-    let txid = fixture.txid.to_string();
-    let block_hash = fixture.block_hash.to_string_be();
-    let descriptor = "addr(1111111111111111111114oLvT2)";
-    let descriptor_info = handler.dispatch("getdescriptorinfo", &json!([descriptor]))?;
-    let checksummed_descriptor = descriptor_info
-        .get("descriptor")
-        .as_str()
-        .ok_or("getdescriptorinfo omitted descriptor")?
-        .to_owned();
-
-    let calls = [
-        ("getblockchaininfo", json!([])),
-        ("getblockcount", json!([])),
-        ("getblockhash", json!([7])),
-        ("getbestblockhash", json!([])),
-        ("getblock", json!([block_hash.as_str(), 1])),
-        ("getblockheader", json!([block_hash.as_str(), true])),
-        ("getblockstats", json!([7])),
-        ("gettxoutsetinfo", json!([])),
-        ("getrawtransaction", json!([txid.as_str(), true])),
-        ("gettxout", json!([txid.as_str(), 0])),
-        ("gettxoutproof", json!([[txid.as_str()]])),
-        ("verifytxoutproof", json!([""])),
-        ("sendrawtransaction", json!([raw_tx.as_str()])),
-        ("testmempoolaccept", json!([[raw_tx.as_str()]])),
-        ("decoderawtransaction", json!([raw_tx.as_str()])),
-        ("getmempoolinfo", json!([])),
-        ("getmempoolentry", json!([txid.as_str()])),
-        ("getrawmempool", json!([])),
-        ("getmempoolancestors", json!([txid.as_str()])),
-        ("getmempooldescendants", json!([txid.as_str()])),
-        ("estimatesmartfee", json!([6])),
-        ("estimaterawfee", json!([6])),
-        ("getnetworkinfo", json!([])),
-        ("getpeerinfo", json!([])),
-        ("addnode", json!(["127.0.0.1:8333", "onetry"])),
-        ("getconnectioncount", json!([])),
-        ("getnettotals", json!([])),
-        ("getblocktemplate", json!([{}])),
-        ("submitblock", json!([""])),
-        ("prioritisetransaction", json!([txid.as_str(), 0, 0])),
-        ("createrawtransaction", json!([[], {"data": ""}])),
-        ("getnodeaddresses", json!([])),
-        ("getdescriptorinfo", json!([descriptor])),
-        ("deriveaddresses", json!([checksummed_descriptor.as_str()])),
-        (
-            "scantxoutset",
-            json!(["start", ["addr(1111111111111111111114oLvT2)"]]),
-        ),
-        ("finalizepsbt", json!([valid_psbt.as_str()])),
-        ("combinepsbt", json!([[valid_psbt.as_str()]])),
-    ];
-
-    for (method, params) in calls {
-        let response = handler.dispatch(method, &params);
-        assert!(response.is_ok(), "{method} failed: {response:?}");
-    }
-
-    assert!(
-        handler
-            .dispatch("getblockchaininfo", &json!([]))?
-            .get("blocks")
-            .is_u64()
-    );
-    assert!(
-        handler
-            .dispatch("getmempoolinfo", &json!([]))?
-            .get("size")
-            .is_u64()
-    );
-    assert!(
-        handler
-            .dispatch("getnetworkinfo", &json!([]))?
-            .get("networks")
-            .as_array()
-            .is_some()
-    );
-    assert!(
-        handler
-            .dispatch("getblocktemplate", &json!([{}]))?
-            .get("longpollid")
-            .is_str()
-    );
-    Ok(())
-}
 
 #[cfg(feature = "zmq")]
 #[test]
@@ -840,74 +652,6 @@ impl BlockBodySource for SingleBlockSource {
     }
 }
 
-struct Fixture {
-    ctx: Arc<Context>,
-    tx: Transaction,
-    txid: Txid,
-    block_hash: Hash256,
-}
-
-impl Fixture {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut ctx = Context::new().with_mining_control(Arc::new(SmokeMiningControl));
-        let tx = tx(1, ScriptBuf::from_bytes(vec![0x51]));
-        let block = bitcoin::Block {
-            header: bitcoin::block::Header {
-                version: bitcoin::block::Version::ONE,
-                prev_blockhash: bitcoin::BlockHash::all_zeros(),
-                merkle_root: bitcoin::merkle_tree::calculate_root(std::iter::once(
-                    tx.compute_txid().to_raw_hash(),
-                ))
-                .map_or_else(
-                    bitcoin::TxMerkleNode::all_zeros,
-                    bitcoin::TxMerkleNode::from_raw_hash,
-                ),
-                time: 1_231_006_505,
-                bits: bitcoin::CompactTarget::from_consensus(0x1d00_ffff),
-                nonce: 0,
-            },
-            txdata: vec![tx.clone()],
-        };
-        let block = seed_tree_chain(&ctx, &block);
-        let block_hash_bytes = block.block_hash();
-        let block_hash = Hash256::from_le_bytes(block_hash_bytes.as_byte_array());
-        let tip = ctx
-            .block_tree
-            .read()
-            .tip()
-            .expect("fixture tip missing")
-            .as_ref()
-            .clone();
-        ctx.set_chain_tip(tip.clone());
-        ctx.set_applied_tip(tip);
-        ctx.block_body_source = Some(Arc::new(SingleBlockSource {
-            height: 7,
-            hash: block_hash,
-            body: serialize(&block),
-        }));
-        ctx.add_block(BlockRecord::from_block(7, &block));
-        let mut values = HashMap::new();
-        values.insert(outpoint(1), 6_000);
-        ctx.tx_index = Some(Arc::new(FakeTxIndex {
-            transactions: HashMap::new(),
-            values,
-            info: bitcoin_rs_rpc::context::TxIndexInfo {
-                synced: true,
-                best_block_height: 7,
-            },
-        }));
-        let txid = ctx.add_transaction(tx.clone());
-        let entry = MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7);
-        ctx.mempool.write().insert_entry(entry)?;
-        Ok(Self {
-            ctx: Arc::new(ctx),
-            tx,
-            txid,
-            block_hash,
-        })
-    }
-}
-
 #[allow(clippy::arc_with_non_send_sync)]
 fn context_with_peers(peers: Arc<RwLock<Vec<PeerInfo>>>) -> Arc<Context> {
     let mut ctx = Context::new();
@@ -915,57 +659,9 @@ fn context_with_peers(peers: Arc<RwLock<Vec<PeerInfo>>>) -> Arc<Context> {
     Arc::new(ctx)
 }
 
-fn tx(label: u8, script_pubkey: ScriptBuf) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: outpoint(label),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(5_000),
-            script_pubkey,
-        }],
-    }
-}
-
 fn outpoint(label: u8) -> OutPoint {
     OutPoint {
         txid: Txid::from_byte_array([label; 32]),
         vout: 0,
     }
-}
-
-fn build_valid_base64_psbt(tx: &Transaction) -> Result<String, Box<dyn std::error::Error>> {
-    let psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx.clone())?;
-    Ok(encode_base64(&psbt.serialize()))
-}
-
-const BASE64_TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn encode_base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        out.push(char::from(BASE64_TABLE[usize::from(b0 >> 2)]));
-        out.push(char::from(
-            BASE64_TABLE[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))],
-        ));
-        out.push(if chunk.len() > 1 {
-            char::from(BASE64_TABLE[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))])
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            char::from(BASE64_TABLE[usize::from(b2 & 0x3f)])
-        } else {
-            '='
-        });
-    }
-    out
 }

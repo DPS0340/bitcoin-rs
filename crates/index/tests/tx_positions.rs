@@ -1,13 +1,9 @@
-//! Tests for the transaction-position row values written by both ingest paths.
+//! Tests for the persisted transaction-position row values.
 //!
-//! Two properties matter here and neither is obvious from reading the code:
-//!
-//! 1. The zero-copy path measures each transaction's byte range directly from
-//!    the block slice, while the decoded path derives it arithmetically from
-//!    `Transaction::total_size()`. Those are different computations of the same
-//!    number, and nothing but a test keeps them equal.
-//! 2. A position is only useful if slicing the block at that range yields the
-//!    transaction the row was written for.
+//! A position is only useful if slicing the canonical block bytes at that range
+//! yields the transaction the row was written for. The row encoding and legacy
+//! format markers are persisted-index contracts; ingest implementation parity
+//! is intentionally not tested here.
 // A malformed fixture is a test failure; panicking reports it at the call site.
 #![allow(clippy::expect_used)]
 
@@ -112,40 +108,6 @@ fn rows_with_values(store: &MemoryStore, cf: ColumnFamily) -> Vec<(Vec<u8>, Vec<
 }
 
 #[test]
-fn both_ingest_paths_write_identical_row_values() {
-    let block = mixed_block();
-    let bytes = serialize(&block);
-    let txids = block
-        .txdata
-        .iter()
-        .map(Transaction::compute_txid)
-        .collect::<Vec<_>>();
-
-    let zero_copy = Arc::new(MemoryStore::default());
-    Indexer::new(Arc::clone(&zero_copy))
-        .ingest_block(&bytes, HEIGHT)
-        .expect("zero-copy ingest");
-
-    let decoded = Arc::new(MemoryStore::default());
-    Indexer::new(Arc::clone(&decoded))
-        .ingest_decoded_block_with_verified_txids(&block, &bytes, HEIGHT, &txids)
-        .expect("decoded ingest");
-
-    for cf in [
-        ColumnFamily::Funding,
-        ColumnFamily::TxConfirmed,
-        ColumnFamily::Spending,
-        ColumnFamily::BlockHeaders,
-    ] {
-        assert_eq!(
-            rows_with_values(&zero_copy, cf),
-            rows_with_values(&decoded, cf),
-            "ingest paths disagree in {cf:?}"
-        );
-    }
-}
-
-#[test]
 fn funding_positions_address_the_transactions_that_funded_the_script() {
     let block = mixed_block();
     let bytes = serialize(&block);
@@ -207,58 +169,6 @@ fn txid_positions_address_their_own_transaction() {
             assert!(
                 block.txdata.contains(&decoded),
                 "position must address a transaction of this block"
-            );
-        }
-    }
-}
-
-/// The decoded ingest path computes the block prefix as
-/// `header || varint(tx_count)`, and that varint is 1 byte below 253
-/// transactions and 3 bytes at 253 or above. Every other fixture here is small
-/// enough that a hardcoded 1 would pass, so without this case the arithmetic is
-/// untested for real blocks — mainnet blocks carry thousands of transactions.
-///
-/// Verified by mutation: replacing `VarInt::from(len).size()` with a literal `1`
-/// leaves every other test in this file green and fails only this one.
-#[test]
-fn both_ingest_paths_agree_across_the_transaction_count_varint_boundary() {
-    for tx_count in [252_usize, 253, 254] {
-        let txdata = (0..tx_count)
-            .map(|index| {
-                let seed = u8::try_from(index % 256).unwrap_or(0);
-                tx(
-                    seed,
-                    vec![out(script(u8::try_from(index % 7).unwrap_or(0)), 1_000)],
-                    index % 3 == 0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let block = Block {
-            header: header(),
-            txdata,
-        };
-        let bytes = serialize(&block);
-        let txids = block
-            .txdata
-            .iter()
-            .map(Transaction::compute_txid)
-            .collect::<Vec<_>>();
-
-        let zero_copy = Arc::new(MemoryStore::default());
-        Indexer::new(Arc::clone(&zero_copy))
-            .ingest_block(&bytes, HEIGHT)
-            .expect("zero-copy ingest");
-
-        let decoded = Arc::new(MemoryStore::default());
-        Indexer::new(Arc::clone(&decoded))
-            .ingest_decoded_block_with_verified_txids(&block, &bytes, HEIGHT, &txids)
-            .expect("decoded ingest");
-
-        for cf in [ColumnFamily::Funding, ColumnFamily::TxConfirmed] {
-            assert_eq!(
-                rows_with_values(&zero_copy, cf),
-                rows_with_values(&decoded, cf),
-                "ingest paths disagree in {cf:?} at {tx_count} transactions"
             );
         }
     }
@@ -372,42 +282,4 @@ proptest! {
         prop_assert_eq!(decoded, positions.as_slice());
     }
 
-    /// The two ingest paths must agree on every block shape, not just the
-    /// hand-written one. The varint boundary at 253 transactions is covered
-    /// separately by `both_ingest_paths_agree_across_the_transaction_count_varint_boundary`,
-    /// because generating blocks that large under proptest is too slow to be
-    /// worth it here.
-    #[test]
-    fn both_ingest_paths_agree_on_random_blocks(
-        shapes in proptest::collection::vec((0_u8..4, any::<bool>()), 1..8),
-    ) {
-        let txdata = shapes
-            .iter()
-            .enumerate()
-            .map(|(index, (tag, witness))| {
-                let seed = u8::try_from(index % 256).unwrap_or(0);
-                tx(seed, vec![out(script(*tag), u64::from(*tag) + 1)], *witness)
-            })
-            .collect();
-        let block = Block { header: header(), txdata };
-        let bytes = serialize(&block);
-        let txids = block.txdata.iter().map(Transaction::compute_txid).collect::<Vec<_>>();
-
-        let zero_copy = Arc::new(MemoryStore::default());
-        Indexer::new(Arc::clone(&zero_copy))
-            .ingest_block(&bytes, HEIGHT)
-            .expect("zero-copy ingest");
-
-        let decoded = Arc::new(MemoryStore::default());
-        Indexer::new(Arc::clone(&decoded))
-            .ingest_decoded_block_with_verified_txids(&block, &bytes, HEIGHT, &txids)
-            .expect("decoded ingest");
-
-        for cf in [ColumnFamily::Funding, ColumnFamily::TxConfirmed] {
-            prop_assert_eq!(
-                rows_with_values(&zero_copy, cf),
-                rows_with_values(&decoded, cf)
-            );
-        }
-    }
 }

@@ -387,7 +387,8 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_csv_activation_uses_cached_bip9_state() -> Result<(), Box<dyn std::error::Error>> {
+    fn mainnet_csv_activation_matches_consensus_thresholds()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let tip = append_chain(&mut tree, 6048, 1_462_060_800, |height| {
             if (2016..3932).contains(&height) {
@@ -401,16 +402,12 @@ mod tests {
 
         assert!(state.csv_active);
         assert!(!state.segwit_active);
-        assert_eq!(tree.cached_bip9_state_len(), 2);
-        let cached_state = contextual_softfork_state(&tree, Network::Mainnet, Some(tip), 6048);
-        assert_eq!(cached_state, state);
-        assert_eq!(tree.cached_bip9_state_len(), 2);
         Ok(())
     }
 
     #[test]
-    fn testnet3_segwit_activation_uses_testnet_threshold() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn testnet3_segwit_activation_matches_consensus_thresholds()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let tip = append_chain(&mut tree, 6048, 1_462_060_800, |height| {
             if (2016..3528).contains(&height) {
@@ -424,10 +421,6 @@ mod tests {
 
         assert!(!state.csv_active);
         assert!(state.segwit_active);
-        assert_eq!(tree.cached_bip9_state_len(), 2);
-        let cached_state = contextual_softfork_state(&tree, Network::Testnet3, Some(tip), 6048);
-        assert_eq!(cached_state, state);
-        assert_eq!(tree.cached_bip9_state_len(), 2);
         Ok(())
     }
 

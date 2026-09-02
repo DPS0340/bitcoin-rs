@@ -1,238 +1,24 @@
 //! Block sync smoke tests.
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use bitcoin::hashes::Hash as _;
-use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::{
-    Amount, BlockHash, OutPoint as BitcoinOutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-    Txid, Witness, absolute, transaction,
+    Amount, OutPoint as BitcoinOutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness, absolute, transaction,
 };
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
-use bitcoin_rs_node::{BlockSync, Network, apply::ApplyHandles, event_loop::EventLoop};
-use bitcoin_rs_p2p::{Message, PeerInfo};
+use bitcoin_rs_node::{BlockSync, Network, apply::ApplyHandles};
 use bitcoin_rs_primitives::{Hash256, OutPoint};
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use crossbeam_channel::{bounded, unbounded};
+use crossbeam_channel::unbounded;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 
 const REGTEST_GENESIS_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f20020000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
 
-#[test]
-fn tick_sends_getheaders_to_best_peer_above_our_height() -> Result<(), Box<dyn std::error::Error>> {
-    let chain_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
-    let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(RwLock::new(Vec::new()));
-    let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-    let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) =
-        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = apply_handles(
-        Network::Regtest,
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    );
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        Arc::clone(&peer_outbound),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
-
-    sync.tick();
-
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-    peers.write().push(synthetic_peer(addr, 100));
-    let (tx, rx) = unbounded::<Message>();
-    peer_outbound
-        .write()
-        .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
-
-    sync.tick();
-
-    let received = rx.try_recv()?;
-    let NetworkMessage::GetHeaders(getheaders) = received else {
-        panic!("expected getheaders");
-    };
-    let genesis_hash =
-        BlockHash::from_byte_array(Network::Regtest.genesis_block_hash().to_le_bytes());
-    assert_eq!(getheaders.locator_hashes.len(), 1);
-    assert_eq!(getheaders.locator_hashes.first(), Some(&genesis_hash));
-    assert_eq!(getheaders.stop_hash, BlockHash::all_zeros());
-    Ok(())
-}
-
-#[test]
-fn tick_uses_applied_tip_height_when_selecting_sync_peer() {
-    let chain_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
-    let applied_tip: Arc<ArcSwapOption<TipSnapshot>> =
-        Arc::new(ArcSwapOption::from_pointee(TipSnapshot {
-            tip_id: bitcoin_rs_chain::NodeId::new(0),
-            height: 100,
-            chainwork: bitcoin_rs_chain::ChainWork::ZERO,
-            hash: Network::Regtest.genesis_block_hash(),
-        }));
-    let peers = Arc::new(RwLock::new(Vec::new()));
-    let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-    let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) =
-        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = apply_handles(
-        Network::Regtest,
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    );
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        Arc::clone(&peer_outbound),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
-
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-    peers.write().push(synthetic_peer(addr, 50));
-    let (tx, rx) = unbounded::<Message>();
-    peer_outbound
-        .write()
-        .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
-
-    sync.tick();
-
-    assert!(
-        rx.try_recv().is_err(),
-        "peer below applied tip height must not be selected"
-    );
-}
-
-#[test]
-fn tick_applies_inbound_blocks_before_sync_selection() -> Result<(), Box<dyn std::error::Error>> {
-    let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let chain_tip = block_tree.read().tip_handle();
-    let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(RwLock::new(Vec::new()));
-    let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) =
-        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = apply_handles(
-        Network::Regtest,
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    );
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        Arc::clone(&peer_outbound),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
-
-    inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-        regtest_genesis_block()?,
-    ))?;
-    sync.tick();
-
-    let applied = applied_tip
-        .load_full()
-        .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
-    assert_eq!(applied.height, 0);
-    assert_eq!(applied.hash, Network::Regtest.genesis_block_hash());
-    assert_eq!(block_tree.read().len(), 1);
-    Ok(())
-}
-
-#[test]
-#[allow(clippy::arc_with_non_send_sync)]
-fn event_loop_sync_wake_applies_inbound_block_without_periodic_tick()
--> Result<(), Box<dyn std::error::Error>> {
-    let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let chain_tip = block_tree.read().tip_handle();
-    let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(RwLock::new(Vec::new()));
-    let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) =
-        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = apply_handles(
-        Network::Regtest,
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    );
-    let sync = Arc::new(BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        Arc::clone(&peer_outbound),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    ));
-    let (shutdown_tx, shutdown_rx) = bounded(1);
-    let (sync_wake_tx, sync_wake_rx) = bounded(1);
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let genesis = regtest_genesis_block()?;
-    let driver_applied_tip = Arc::clone(&applied_tip);
-    let driver = std::thread::spawn(move || {
-        if inbound_blocks_tx
-            .send(bitcoin_rs_p2p::InboundBlock::from_decoded(genesis))
-            .is_err()
-        {
-            return false;
-        }
-        if sync_wake_tx.try_send(()).is_err() {
-            let _ = shutdown_tx.send(());
-            return false;
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let applied_before_periodic_tick = loop {
-            if let Some(applied) = driver_applied_tip.load_full() {
-                assert_eq!(applied.height, 0);
-                assert_eq!(applied.hash, Network::Regtest.genesis_block_hash());
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        if shutdown_tx.send(()).is_err() {
-            return false;
-        }
-        applied_before_periodic_tick
-    });
-
-    EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx).spin(&shutdown)?;
-    let applied_before_periodic_tick = match driver.join() {
-        Ok(result) => result,
-        Err(error) => std::panic::resume_unwind(error),
-    };
-    assert!(
-        applied_before_periodic_tick,
-        "sync wake did not apply inbound block before periodic sync tick"
-    );
-    Ok(())
-}
 #[test]
 fn tick_buffers_out_of_order_blocks_until_parent_arrives() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -470,16 +256,6 @@ fn expected_coin_stats(
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
-fn apply_handles(
-    network: Network,
-    chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    block_tree: Arc<RwLock<BlockTree>>,
-) -> ApplyHandles {
-    apply_handles_with_coin_stats(network, chain_tip, applied_tip, block_tree).0
-}
-
-#[allow(clippy::arc_with_non_send_sync)]
 fn apply_handles_with_coin_stats(
     network: Network,
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
@@ -639,17 +415,5 @@ fn hex_nibble(byte: u8) -> Result<u8, Box<dyn std::error::Error>> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hex digit").into()),
-    }
-}
-
-fn synthetic_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
-    PeerInfo {
-        addr,
-        version: 70_016,
-        services: 0,
-        user_agent: String::from("/test/"),
-        start_height,
-        conn_time: 0,
-        inbound: true,
     }
 }

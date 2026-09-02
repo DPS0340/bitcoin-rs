@@ -177,6 +177,12 @@ The nonblocking notification published immediately after a committed `applied_ti
 ### Provably unspendable outputs (UTXO admission)
 Outputs the UTXO set never admits because no spend of them can ever be valid: an output whose `scriptPubKey` starts with `OP_RETURN`, and one longer than `MAX_SCRIPT_SIZE`. Excluding them at admission keeps the set smaller without changing any consensus outcome, so the snapshot codec carries its own version tag, `bitcoin-rs-utxo-spendable-v1`, and a set written by an older codec is not interchangeable with one written by this rule. See `docs/solutions/logic-errors/exclude-provably-unspendable-utxos.md`.
 
+### UTXO snapshot read contract
+The node accepts only complete native version-4 snapshots: the exact magic and
+version, validated v4 records, the declared record count, a 384-byte MuHash
+trailer, and end-of-file. Versions 2 and 3 are unsupported; chainstate is
+rebuilt or resynchronized instead of being loaded through a legacy reader.
+
 ### Undo record
 
 The per-block inverse of a UTXO commit: the outputs the block spent, with
@@ -342,7 +348,13 @@ The former cost shape of every lossy-prefix index resolver: read the block once 
 The invariant that lets index row values carry transaction byte positions without a block tag. The valid-state prerequisite is strict: the single writer atomically commits every row mutation with its exact full-hash capability watermark, rolls rows back before a replacement, and snapshot queries accept a result only when every required watermark equals the applied tip and both revision and tip remain stable. The reader validates the complete position list before I/O: it must be nonempty, strictly increasing, unique, nonoverlapping, within the block bound, and free of arithmetic overflow. It then reads each range from the current canonical `(height, full hash)` and exact-checks the decoded txid or scripthash. If any position fails, the reader discards every tentative result for that row and scans the full block; it never skips one position and keeps the rest. This also handles ordinary 8-byte prefix collisions. A stale row under an accepted watermark requires manual mutation, broken backend atomicity, or storage corruption and is outside the valid index-state contract; a full scan cannot make an arbitrarily corrupted row key authoritative. A per-row block tag was rejected because it measured 0.66x on top of the 1.67x position cost. See *Prefix-row rescan cost* for the range-read gain and *Identity-bearing key* for the write-side rollback guard.
 
 ### Paired-arm benchmark
-A Criterion group holding the before and after implementations of one change over one identical fixture, so the ratio comes from a single run. Adopted because a stored baseline cannot be trusted across a rebuild, and because the before implementation is wanted anyway as the equivalence oracle — the same function serves both roles. Its second use is diagnostic: while both arms still call the same code, their spread *is* the harness noise floor, measured rather than assumed. That reading is what disqualified the 64-height `subscribe` and `get_balance` groups, whose identical arms differ by 2.0-2.4x on a laptop and therefore cannot resolve a 1.05x gate, while `get_history` held within 1%. A group that cannot resolve the gate does not get to report a win.
+A historical Criterion pattern holding the before and after implementations of
+one change over one identical fixture, so the ratio comes from a single run. It
+was useful while a refactor was under review because the before implementation
+also served as an independent equivalence oracle and exposed the harness noise
+floor. The retired before/oracle implementations and their equivalence tests
+are not current runtime or test contracts; retained benchmarks now measure
+shipped production paths and product-shaped workloads.
 
 ### Resolution-time sampling
 Recording a statistic when its outcome is known rather than when the subject arrives. The fee estimator counted a transaction against every confirmation target the moment it entered, so a fresh arrival was already a failure at every target and a burst silenced the estimator before anything had missed a deadline. It also broke the decay: the denominator had been decaying since entry while a confirmation arrived undecayed, reporting 81 successes in 100 as roughly 85%. Sampling numerator and denominator together at the moment a target resolves fixes both, because they then decay from the same block. The counterpart rule is that a subject leaving for an unrelated reason is untracked without being sampled: an eviction says something about the mempool, not about whether the transaction would have confirmed.
@@ -353,5 +365,10 @@ A record that keeps its per-item lookup keys and item lengths in fixed-width arr
 ### Canonical record spelling
 The rule that one logical record has exactly one byte string. Fixed-width fields give this away for free; variable-width encodings must enforce it, and `UtxoRecord` compares and hashes by bytes, so a second spelling makes equal records unequal. v5 needs three rules to keep it: a varint must be minimal, because `[0x80, 0x00]` also decodes to zero; a directory width must be the narrowest that fits, because a wider one describes the same record; and the compact amount form and the escape must be exact complements, so the compact form may encode only amounts the escape refuses and the escape refuses only amounts the compact form covers. The last of these is also a safety rule rather than a tidiness one: `read_varint` hands `decompress_amount` whatever a record contains and `validate_encoded` runs it over every output loaded from a snapshot, and the transform multiplies by up to a billion, so an unbounded input panics a debug build and wraps silently in a release one. `decompress_accepts_exactly_the_encoder_image` states the whole rule as one property over every `u64`.
 
-### Work-count assertion
+### Work-count assertion (historical)
+The former `find_output_decompresses_at_most_the_amount_it_returns` test and
+its `cfg(test)` decompression counter were retired in favor of observable UTXO
+correctness checks. This historical pattern is not a current runtime or test
+contract; performance-sensitive changes belong in a paired-arm benchmark.
+
 Asserting how much of an expensive operation a code path performs, instead of how long it takes. A wall-clock assertion in a test suite is a flake generator, and an assertion that a function merely returns something passes for a stub. `find_output_decompresses_at_most_the_amount_it_returns` counts `decompress_amount` calls behind a `cfg(test)` thread-local and requires one for a hit, none for a miss and none for `max_vout`, at any record size — which is the algorithmic claim the layout rests on, stated deterministically. The counterpart is the case a count cannot make: where the claim really is about elapsed time, the assertion belongs in a paired-arm benchmark, not a test.

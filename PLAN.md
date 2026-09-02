@@ -91,7 +91,7 @@ Stored once in `bitcoin-rs/Cargo.toml` under `[workspace.dependencies]`. Per-cra
 | `mimalloc` | `>=0.1.50` | `[]` | `#[global_allocator]` in `bin/bitcoin-rs`; latest 0.1.50 (2026-04) [purpleprotocol/mimalloc_rust](https://github.com/purpleprotocol/mimalloc_rust) |
 | `bitcoinkernel` | `>=0.2, <0.3` | `[]` | default-on consensus authority; active manifest line. Plan accepts the alpha cost because parity gating is the load-bearing safety net. |
 | `bitcoin` | `>=0.32, <0.33` | `["std", "secp-recovery", "serde"]` + the crate's rand feature (exact name in `Cargo.toml`) | encode/decode + types. Stay on stable 0.32.x; 0.33 is still `0.33.0-beta` as of 2026-05 — wait for final |
-| `secp256k1` | `>=0.31` | `["std", "alloc", "recovery", "rand", "serde", "global-context"]` | latest stable 0.31.x; 0.32 is still beta. Batch Schnorr `verify_schnorr_batch` available in 0.31+ |
+| `secp256k1` | `>=0.31` | `["std", "alloc", "recovery", "rand", "serde", "global-context"]` | latest stable 0.31.x; 0.32 is still beta. Used for the shipped Schnorr verification path |
 | `sha2` | `>=0.11, <0.12` | `[]` | active manifest line; 0.11 exposes no `std`/`asm` feature, so SHA acceleration changes require fresh G14 evidence |
 | `bitcoin_hashes` | `>=0.14.100, <0.15` | `["std"]` | active manifest line aligned with `bitcoin 0.32`; 0.14 exposes no `asm` feature and 1.0 breaks the current bitcoin-io graph |
 | `hashbrown` | `>=0.17.1, <0.18` | `["inline-more", "default-hasher", "allocator-api2"]` | `HashTable` API is the stable raw-insertion API (the old `raw-entry` API is deprecated); MSRV 1.95 matches; no `nightly` feature |
@@ -177,7 +177,7 @@ All gates must pass before bitcoin-rs is shippable. Not phased — these are fla
 
 **G5 — Electrum protocol parity.** Pointed at the same chain, our `crates/electrum` returns byte-identical responses to a reference electrs build for `blockchain.scripthash.{get_history,get_balance,subscribe,listunspent}`, `blockchain.transaction.get`, `blockchain.estimatefee`, `mempool.get_fee_histogram`, `server.{version,banner,donation_address,peers.subscribe}` over a 10 000-call random sample at tip.
 
-**G6 — Snapshot round-trip.** Driven in process through the snapshot API in `crates/utxo/src/snapshot.rs` (`write_snapshot`, then `read_snapshot_strict_v4`): reloading the written snapshot reproduces an identical UTXO set and coinstats hash. There is no CLI flag for this; the gate is `bin/bitcoin-rs/tests/gates/g06_snapshot_roundtrip.rs`, an `#[ignore]`d manual run over a populated UTXO set whose in-memory path is covered by `crates/utxo` unit tests. Format is `bitcoin-rs`'s own LE format (gocoin wire-compat dropped per ultrareview).
+**G6 — Snapshot round-trip.** Driven in process through the snapshot API in `crates/utxo/src/snapshot.rs` (`write_snapshot`, then `read_snapshot_strict_v4`): reloading a current-format snapshot reproduces the UTXO set and coinstats hash. The contract is covered by the focused `crates/utxo` tests and the fixed v4 golden fixture. Format is `bitcoin-rs`'s own LE format (gocoin wire-compat dropped per ultrareview).
 
 **G7 — Storage-backend equivalence.** RocksDB, MDBX (`signet-libmdbx`), fjall, and redb backends all pass G1–G6 with identical chain results. Backend promotion is decided from retained production-path node sync/apply measurements and correctness evidence; the retired generic KV workload is not a product performance contract.
 
@@ -291,14 +291,19 @@ git commit -am "feat(consensus): kernel-authoritative validator + Rust parallel 
 ### Task 3: `crates/script` — interpreter (legacy / segwit / taproot)
 
 **Files:**
-- Create: `crates/script/src/{lib,interpreter,opcodes,stack,sigops,sighash_cache,taproot}.rs`
+- Create: `crates/script/src/{lib,interpreter,opcodes,sigops,sighash_cache}.rs`
 - Test: `crates/script/tests/{interpreter,proptest}.rs`
 
-Port shape from `bitcoin/src/script/interpreter.cpp`. Stack is `tinyvec::ArrayVec<ScriptItem, 1000>` (MAX_STACK_DEPTH); script item is `enum ScriptItem { Num(i64), Bytes(SmallVec<[u8; 32]>) }`. Opcode dispatch is a flat `match` on `u8` — no jump table, no method lookup; LLVM produces a contiguous switch.
+The shipped implementation delegates script execution to the audited
+`bitcoin::Script` verifier and keeps the public surface limited to the
+production wrapper, opcode types, sigop counting, and sighash cache. A future
+hand-rolled interpreter must introduce its execution state together with a
+real production consumer and independent contract coverage; speculative stack,
+taproot-helper, and batch-verification modules are not retained.
 
 - [ ] **Step 1: Opcode constants** — copy from `bitcoin::blockdata::opcodes::all::*`, no re-derivation.
 
-- [ ] **Step 2: `Interpreter::execute(&Script, &mut Stack, flags) -> Result<bool, ScriptError>`** — main loop. Each opcode is its own function; the `match` is the dispatcher.
+- [ ] **Step 2: Hand-rolled execution** — only introduce an execution-state API when a production consumer exists; keep the current audited verifier as the only shipped path until then.
 
 - [ ] **Step 3: BIP66 strict-DER, BIP62 low-S** — per-rule, behind `flags`.
 
@@ -310,14 +315,14 @@ Port shape from `bitcoin/src/script/interpreter.cpp`. Stack is `tinyvec::ArrayVe
 
 - [ ] **Step 7: `script_tests.json` runner** — `crates/consensus`'s vector runner exercises this transitively, but a `crates/script`-local runner tests in isolation against `script_tests.json`.
 
-- [ ] **Step 8: Batch Schnorr verify** — when block has ≥16 taproot inputs, batch via `secp256k1::verify_schnorr_batch`. Bench delta committed.
+- [ ] **Step 8: Batch Schnorr verify** — deferred until a production caller and an at-scale benchmark establish a current contract; no standalone helper API is retained.
 
 - [ ] **Step 9: Property tests** — random valid p2pkh / p2wpkh / p2tr → assemble + execute → assert success. Random invalid → assert failure.
 
 - [ ] **Step 10: Commit.**
 
 ```bash
-git commit -am "feat(script): interpreter + sigops + taproot + batch schnorr" -m "Op: extend"
+git commit -am "feat(script): interpreter + sigops + taproot" -m "Op: extend"
 ```
 
 ---
@@ -815,7 +820,7 @@ git commit -am "feat(bin): bitcoin-rs binary" -m "Op: extend"
 ### Task 20: Verification gates G1–G15 — flat acceptance suite
 
 **Files:**
-- Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g06_snapshot_roundtrip,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
+- Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
 - CI: `.github/workflows/ci.yml`
 
 Each live gate is a `#[test]` under `bin/bitcoin-rs/tests/gates/`. Most are `#[ignore]`d manual gates that need live peers or external infrastructure. The former G14 artifact drivers and harness tests were retired with the completed performance campaign; current performance contracts live in the retained crate benchmarks. CI (`.github/workflows/ci.yml`) runs the non-ignored gates in the workspace test lane. Plan is "done" when all live gates are green for two consecutive CI runs on `main`.
