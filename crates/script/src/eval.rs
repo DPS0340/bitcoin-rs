@@ -1055,8 +1055,11 @@ fn dispatch(
             push_bytes(stack, &digest)?;
         }
         OP_CODESEPARATOR => {
+            // Core sets pbegincodehash = pc (the byte *after* the CODESEPARATOR
+            // opcode, since GetOp already advanced pc). The scriptCode for
+            // sighash must start after the CODESEPARATOR byte, not at it.
             *codeseparator_pos =
-                u32::try_from(instruction_start).map_err(|_| ScriptError::Invalid {
+                u32::try_from(instruction_start + 1).map_err(|_| ScriptError::Invalid {
                     code: ScriptErrCode::ScriptSize,
                 })?;
         }
@@ -1428,7 +1431,7 @@ fn check_multisig(
 
     // Clean up the actual arguments (keys + sigs + the two counts).
     let mut args = keys + sigs + 2;
-    let mut key_scan = keys + 1;
+    let mut key_scan = keys + 2;
     while args > 0 {
         if !success && flags.contains(VerifyFlags::NULLFAIL) && key_scan == 0 {
             let top = stack.peek().map_err(|_| invalid_stack())?;

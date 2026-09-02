@@ -59,6 +59,60 @@ pub struct TxSignatureChecker<'a> {
     annex: Option<Vec<u8>>,
 }
 
+/// Removes `OP_CODESEPARATOR` (0xab) opcodes from a script, matching Core's
+/// `CTransactionSignatureSerializer::SerializeScriptCode`. Bytes inside data
+/// pushes are preserved. The legacy sighash must exclude CS opcode bytes.
+fn remove_codeseparators(script: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(script.len());
+    let mut pos = 0;
+    while pos < script.len() {
+        let op = script[pos];
+        if op == 0xab {
+            // OP_CODESEPARATOR: skip this single byte.
+            pos += 1;
+        } else if (0x01..=0x4b).contains(&op) {
+            // Direct push: copy the opcode and the data bytes.
+            let end = pos + 1 + usize::from(op);
+            out.extend_from_slice(&script[pos..end.min(script.len())]);
+            pos = end;
+        } else if op == 0x4c {
+            // OP_PUSHDATA1: next byte is length.
+            let len_pos = pos + 1;
+            let len = script.get(len_pos).copied().unwrap_or(0);
+            let end = len_pos + 1 + usize::from(len);
+            out.extend_from_slice(&script[pos..end.min(script.len())]);
+            pos = end;
+        } else if op == 0x4d {
+            // OP_PUSHDATA2: next 2 bytes are length (LE).
+            let len_pos = pos + 1;
+            let len = u16::from_le_bytes([
+                script.get(len_pos).copied().unwrap_or(0),
+                script.get(len_pos + 1).copied().unwrap_or(0),
+            ]);
+            let end = len_pos + 2 + usize::from(len);
+            out.extend_from_slice(&script[pos..end.min(script.len())]);
+            pos = end;
+        } else if op == 0x4e {
+            // OP_PUSHDATA4: next 4 bytes are length (LE).
+            let len_pos = pos + 1;
+            let len = u32::from_le_bytes([
+                script.get(len_pos).copied().unwrap_or(0),
+                script.get(len_pos + 1).copied().unwrap_or(0),
+                script.get(len_pos + 2).copied().unwrap_or(0),
+                script.get(len_pos + 3).copied().unwrap_or(0),
+            ]);
+            let end = len_pos + 4 + usize::try_from(len).unwrap_or(usize::MAX);
+            out.extend_from_slice(&script[pos..end.min(script.len())]);
+            pos = end;
+        } else {
+            // Other opcode (including OP_0 = 0x00): copy single byte.
+            out.push(op);
+            pos += 1;
+        }
+    }
+    out
+}
+
 impl<'a> TxSignatureChecker<'a> {
     /// Builds a checker for one input of `tx`, with `prevouts` covering every
     /// input so taproot sighashes can commit to all spent outputs.
@@ -86,8 +140,8 @@ impl<'a> TxSignatureChecker<'a> {
     ///
     /// Enforces strict DER (`DERSIG`), low-S (`LOW_S`), hashtype validity and
     /// pubkey encoding (`STRICTENC`), compressed-only pubkeys in segwit
-    /// (`WITNESS_PUBKEYTYPE`), and `NULLFAIL` (empty sig = clean false,
-    /// non-empty failing sig = error).
+    /// (`WITNESS_PUBKEYTYPE`). `NULLFAIL` is enforced by the callers
+    /// (`eval_checksig` / `check_multisig` cleanup), not here.
     ///
     /// Returns `Ok(true)` when the signature is valid, `Ok(false)` when it is
     /// empty (clean failure), and `Err` when encoding or verification fails
@@ -133,11 +187,15 @@ impl<'a> TxSignatureChecker<'a> {
         ecdsa_sig.normalize_s();
 
         // Compute the sighash for the appropriate version.
+        // Core's CTransactionSignatureSerializer::SerializeScriptCode removes
+        // OP_CODESEPARATOR (0xab) opcode bytes from the scriptCode before
+        // hashing. Segwit v0 uses BIP143 which does not have this step.
         let sighash = match sigversion {
             SigVersion::Base => {
                 let raw_hashtype = u32::from(*hashtype_byte);
+                let cleaned = remove_codeseparators(script_code);
                 self.cache
-                    .legacy_signature_hash(self.input_index, script_code, raw_hashtype)
+                    .legacy_signature_hash(self.input_index, &cleaned, raw_hashtype)
                     .map_err(|e| sighash_to_script_error(&e))?
             }
             SigVersion::WitnessV0 => {
@@ -166,12 +224,11 @@ impl<'a> TxSignatureChecker<'a> {
             .verify_ecdsa(&message, &ecdsa_sig, &secp_pubkey)
             .is_ok();
 
-        if !verified && flags.contains(VerifyFlags::NULLFAIL) {
-            // NULLFAIL: a non-empty signature that fails verification is an error.
-            return Err(ScriptError::Invalid {
-                code: ScriptErrCode::SigNullFail,
-            });
-        }
+        // NULLFAIL is enforced by the callers (eval_checksig for CHECKSIG,
+        // check_multisig cleanup for CHECKMULTISIG), matching Core where
+        // CheckECDSASignature returns false without inspecting NULLFAIL.
+        // A sig that fails against one pubkey may succeed against another in
+        // multisig; an internal NULLFAIL check would fire prematurely.
 
         Ok(verified)
     }
@@ -328,8 +385,16 @@ impl<'a> TxSignatureChecker<'a> {
         };
         let tx_sequence = i64::from(input.sequence);
 
-        // Transaction version must be >= 2 for BIP68 rules.
-        if self.tx.version < 2 {
+        // Transaction version must be >= 2 for BIP68 rules. Core stores
+        // version as uint32_t, so 0xffffffff is a large positive number, not
+        // -1; compare as unsigned (bit-preserving) to match.
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_sign_loss,
+            reason = "Core stores tx version as uint32_t; bit-preserving cast to u32"
+        )]
+        let version_u32 = self.tx.version as u32;
+        if version_u32 < 2 {
             return false;
         }
 
@@ -618,7 +683,7 @@ mod tests {
 
     use super::{
         LOCKTIME_THRESHOLD, SEQUENCE_FINAL, SEQUENCE_LOCKTIME_DISABLE_FLAG,
-        SEQUENCE_LOCKTIME_TYPE_FLAG, SigVersion, TxSignatureChecker,
+        SEQUENCE_LOCKTIME_TYPE_FLAG, SigVersion, TxSignatureChecker, remove_codeseparators,
     };
     use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
 
@@ -907,7 +972,9 @@ mod tests {
         );
         assert_eq!(result_no_nullfail, Ok(false));
 
-        // With NULLFAIL: should be Err(SigNullFail).
+        // With NULLFAIL: check_ecdsa_signature returns Ok(false) — NULLFAIL
+        // enforcement is the caller's job (eval_checksig / check_multisig
+        // cleanup), not the checker's.
         let mut checker2 = TxSignatureChecker::new(&tx, 0, 50_000, &prevouts);
         let result_nullfail = checker2.check_ecdsa_signature(
             &sig,
@@ -918,14 +985,10 @@ mod tests {
                 .union(VerifyFlags::LOW_S)
                 .union(VerifyFlags::NULLFAIL),
         );
-        assert!(
-            matches!(
-                result_nullfail,
-                Err(ScriptError::Invalid {
-                    code: ScriptErrCode::SigNullFail
-                })
-            ),
-            "NULLFAIL must reject non-empty failing signature, got {result_nullfail:?}"
+        assert_eq!(
+            result_nullfail,
+            Ok(false),
+            "check_ecdsa_signature must not enforce NULLFAIL; caller does"
         );
     }
 
@@ -1155,58 +1218,6 @@ mod tests {
         assert_eq!(E::ScriptNum.to_string(), "SCRIPTNUM");
     }
 
-    /// Removes `OP_CODESEPARATOR` (0xab) opcodes from a script, matching Core's
-    /// `SerializeScriptCode`. Bytes inside data pushes are preserved.
-    fn remove_codeseparators(script: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(script.len());
-        let mut pos = 0;
-        while pos < script.len() {
-            let op = script[pos];
-            if op == 0xab {
-                // OP_CODESEPARATOR: skip this single byte.
-                pos += 1;
-            } else if (0x01..=0x4b).contains(&op) {
-                // Direct push: copy the opcode and the data bytes.
-                let end = pos + 1 + usize::from(op);
-                out.extend_from_slice(&script[pos..end.min(script.len())]);
-                pos = end;
-            } else if op == 0x4c {
-                // OP_PUSHDATA1: next byte is length.
-                let len_pos = pos + 1;
-                let len = script.get(len_pos).copied().unwrap_or(0);
-                let end = len_pos + 1 + usize::from(len);
-                out.extend_from_slice(&script[pos..end.min(script.len())]);
-                pos = end;
-            } else if op == 0x4d {
-                // OP_PUSHDATA2: next 2 bytes are length (LE).
-                let len_pos = pos + 1;
-                let len = u16::from_le_bytes([
-                    script.get(len_pos).copied().unwrap_or(0),
-                    script.get(len_pos + 1).copied().unwrap_or(0),
-                ]);
-                let end = len_pos + 2 + usize::from(len);
-                out.extend_from_slice(&script[pos..end.min(script.len())]);
-                pos = end;
-            } else if op == 0x4e {
-                // OP_PUSHDATA4: next 4 bytes are length (LE).
-                let len_pos = pos + 1;
-                let len = u32::from_le_bytes([
-                    script.get(len_pos).copied().unwrap_or(0),
-                    script.get(len_pos + 1).copied().unwrap_or(0),
-                    script.get(len_pos + 2).copied().unwrap_or(0),
-                    script.get(len_pos + 3).copied().unwrap_or(0),
-                ]);
-                let end = len_pos + 4 + usize::try_from(len).unwrap_or(usize::MAX);
-                out.extend_from_slice(&script[pos..end.min(script.len())]);
-                pos = end;
-            } else {
-                // Other opcode (including OP_0 = 0x00): copy single byte.
-                out.push(op);
-                pos += 1;
-            }
-        }
-        out
-    }
     // --- utility ---
 
     fn hex_decode(s: &str) -> Vec<u8> {

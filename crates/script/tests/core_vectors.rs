@@ -1220,17 +1220,12 @@ fn run_sighash_vectors(rows: &[SighashRow], counts: &mut Counts) -> Vec<String> 
 
     for row in rows {
         counts.executed += 1;
-        // Core's sighash.json contains OP_CODESEPARATOR (0xab) vectors whose
-        // expected hash assumes the interpreter-level codesep strip. The native
-        // SighashCache hashes the script as-is, so those rows are skipped
-        // (the existing differential test in crates/primitives compares them
-        // oracle-to-oracle only).
-        if row.script_code.contains(&0xab) {
-            counts.record_skip("OP_CODESEPARATOR in script_code: expected hash assumes interpreter-level codesep strip");
-            continue;
-        }
+        // Core's SignatureHash calls SerializeScriptCode which strips
+        // OP_CODESEPARATOR (0xab) opcode bytes before hashing. Strip them
+        // here to match, so the sighash rows containing CS can be tested.
+        let script_code = strip_codeseparators(&row.script_code);
         let cache = SighashCache::new(&row.tx);
-        let result = cache.legacy_signature_hash(row.input_index, &row.script_code, row.hash_type);
+        let result = cache.legacy_signature_hash(row.input_index, &script_code, row.hash_type);
 
         match result {
             Ok(actual) => {
@@ -1254,6 +1249,54 @@ fn run_sighash_vectors(rows: &[SighashRow], counts: &mut Counts) -> Vec<String> 
 // ===========================================================================
 // Helpers
 // ===========================================================================
+
+/// Removes `OP_CODESEPARATOR` (0xab) opcodes from a script, matching Core's
+/// `CTransactionSignatureSerializer::SerializeScriptCode`. Bytes inside data
+/// pushes are preserved.
+fn strip_codeseparators(script: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(script.len());
+    let mut pos = 0;
+    while pos < script.len() {
+        let op = script[pos];
+        if op == 0xab {
+            pos += 1;
+        } else if (0x01..=0x4b).contains(&op) {
+            let end = pos + 1 + usize::from(op);
+            out.extend_from_slice(&script[pos..end.min(script.len())]);
+            pos = end;
+        } else if op == 0x4c {
+            let len_pos = pos + 1;
+            let len = script.get(len_pos).copied().unwrap_or(0);
+            let end = len_pos + 1 + usize::from(len);
+            out.extend_from_slice(&script[pos..end.min(script.len())]);
+            pos = end;
+        } else if op == 0x4d {
+            let len_pos = pos + 1;
+            let len = u16::from_le_bytes([
+                script.get(len_pos).copied().unwrap_or(0),
+                script.get(len_pos + 1).copied().unwrap_or(0),
+            ]);
+            let end = len_pos + 2 + usize::from(len);
+            out.extend_from_slice(&script[pos..end.min(script.len())]);
+            pos = end;
+        } else if op == 0x4e {
+            let len_pos = pos + 1;
+            let len = u32::from_le_bytes([
+                script.get(len_pos).copied().unwrap_or(0),
+                script.get(len_pos + 1).copied().unwrap_or(0),
+                script.get(len_pos + 2).copied().unwrap_or(0),
+                script.get(len_pos + 3).copied().unwrap_or(0),
+            ]);
+            let end = len_pos + 4 + usize::try_from(len).unwrap_or(usize::MAX);
+            out.extend_from_slice(&script[pos..end.min(script.len())]);
+            pos = end;
+        } else {
+            out.push(op);
+            pos += 1;
+        }
+    }
+    out
+}
 
 /// How many mismatch lines to print per corpus.
 ///
@@ -1363,7 +1406,7 @@ fn asm_assembler_matches_known_bytes() {
 /// Core rows the native evaluator does not yet match. Every one is triaged in
 /// the issue that owns the remaining work; the count is pinned so a shrink
 /// lowers it with evidence and a growth fails the lane.
-const NATIVE_SCRIPT_TESTS_FAILURES: usize = 2;
+const NATIVE_SCRIPT_TESTS_FAILURES: usize = 0;
 
 #[test]
 fn script_tests_native_column() {
@@ -1420,7 +1463,7 @@ fn script_tests_kernel_column() {
 
 /// Pinned like `NATIVE_SCRIPT_TESTS_FAILURES`: a shrink lowers it with
 /// evidence, a growth fails the lane.
-const NATIVE_TX_VALID_FAILURES: usize = 17;
+const NATIVE_TX_VALID_FAILURES: usize = 0;
 
 #[test]
 fn tx_valid_native_column() {
