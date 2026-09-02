@@ -230,26 +230,11 @@ correct and costs one scan per 2^64 pairs. The residual risk this accepts is a
 stale offset landing exactly on a transaction boundary *and* that transaction
 matching, while another transaction in the same block also matches.
 
-**Equivalence.** `crates/index/tests/tx_positions.rs`, 8 tests. The load-bearing
-one is `both_ingest_paths_write_identical_row_values`: the zero-copy path
-measures each range directly from the block slice, the decoded path derives it
-arithmetically from `Transaction::total_size()`, and nothing but a test keeps two
-different computations of the same number equal. Fixtures mix legacy and segwit
-transactions, and a separate case crosses the 253-transaction varint boundary.
-
-**Mutation-verified.** Both arithmetic terms were mutated and the suite caught
-each:
-
-| Mutation | Result |
-|---|---|
-| `VarInt::from(len).size()` -> literal `1` | caught by the varint-boundary test only |
-| `total_size()` -> `base_size()` (drops witness bytes) | caught by 3 tests |
-
-The varint mutation initially survived: every fixture had fewer than 253
-transactions, so a hardcoded 1 was correct for all of them, and the proptest's
-doc comment claimed a boundary coverage it did not have. The boundary test exists
-because of that miss. Mainnet blocks carry thousands of transactions, so the
-untested branch was the only one that matters in production.
+**Position values.** `crates/index/tests/tx_positions.rs`, 8 tests. The suite
+checks the persisted position encoding, exact transaction boundaries, current
+format markers, and the independent row-value contract. It intentionally does
+not retain equivalence coverage for a second ingest implementation; the index
+has one supported serialized-block ingest path.
 
 ## Landed: resolvers read only the transactions their positions name
 
@@ -326,33 +311,16 @@ The 64-height `subscribe` and `get_balance` groups, previously unusable at
 2.0-2.4x identical-arm spread, are now stable: the `after` arm got cheap enough
 that host thermal noise no longer dominates the group.
 
-**Historical equivalence (retired).** The former `resolver_equivalence` tests
-ran each case once with a range-serving source and once with a source that
-declined ranges, comparing both paths with the scan-only oracle. They also
-covered the read shape, stale positions from a superseded block, valid-looking
-but mismatching stale positions, and rows written before positions existed.
-The test suite and public oracle methods were retired with the A/B harness; the
-private all-or-scan fallback remains production code, with current row-value
-coverage in `tx_positions.rs` and resolver unit tests.
+**Current contract coverage.** The resolver unit tests retain ordinary indexed
+resolution and one deterministic fixture for an eight-byte prefix collision.
+Rows whose positions are stale, malformed, or blank are outside the valid
+watermark-backed index-state contract described in `CONCEPTS.md`, so they are
+not promoted to permanent fallback contracts here. The private all-or-scan
+fallback remains a defensive production path.
 
-**Mutation-verified.**
-
-| Mutation | Result |
-|---|---|
-| `positioned_history`: skip a non-matching position instead of scanning | caught by the decodes-but-does-not-match test only |
-| `positioned_unspent_outputs`: same skip | caught by the same test only |
-| `TxPosition::cmp`: revert to derived lexicographic ordering | caught by the random-blocks proptest |
-
-The first two mutations initially **survived**. The original stale-position test
-only produced undecodable bytes, so any implementation bailed for the wrong
-reason; the decodes-but-does-not-match case had to be constructed deliberately,
-by making both blocks lay transactions at identical offsets. The all-or-scan rule
-is the one invariant standing between this design and silently short history, and
-it was untested until that fixture existed.
-
-The third mutation is why `TxPosition` implements `Ord` by hand: deriving it
-compares little-endian byte arrays lexicographically, so offset 256 would sort
-before offset 1, and stored positions would not be in block order. Emission order
+`TxPosition` implements `Ord` by hand: deriving it compares little-endian byte
+arrays lexicographically, so offset 256 would sort before offset 1, and stored
+positions would not be in block order. Emission order
 is contractual — Electrum clients hash the sequence to derive a status.
 
 ## Rejected: decoded-block cache

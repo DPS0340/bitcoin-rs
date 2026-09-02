@@ -787,71 +787,16 @@ impl<S: KvStore> Indexer<S> {
         block: &[u8],
         height: u32,
     ) -> Result<IndexRowCounts, IndexError> {
-        let (rows, _txid_count) = pending_rows_for_block(block, height, TxidSource::Compute)?;
-        self.ingest_rows(rows)
-    }
-
-    /// Walks one serialized block and reuses caller-supplied transaction IDs after validation.
-    ///
-    /// Falls back to hashing transactions from `block` for any missing or mismatched entry,
-    /// preserving `ingest_block` semantics for mismatched input.
-    pub fn ingest_block_with_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let (rows, txid_count) =
-            pending_rows_for_block(block, height, TxidSource::Validate(txids))?;
-        if txids.len() != txid_count {
-            return self.ingest_block(block, height);
-        }
-        self.ingest_rows(rows)
-    }
-
-    /// Walks one serialized block using caller-verified transaction IDs.
-    ///
-    /// This preserves [`Self::ingest_block_with_txids`] for untrusted callers while allowing
-    /// block-apply code to avoid hashing transactions a second time after it has already built
-    /// txids from the same block.
-    pub fn ingest_block_with_verified_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let (rows, txid_count) = pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
-        if txids.len() != txid_count {
-            return self.ingest_block(block, height);
-        }
-        self.ingest_rows(rows)
-    }
-
-    /// Walks one decoded block using caller-verified transaction IDs.
-    ///
-    /// The serialized block is retained only as the safe fallback path when the caller-provided
-    /// transaction-id count does not match the decoded block. Normal callers must pass the
-    /// consensus serialization of `block` as `serialized_block`.
-    pub fn ingest_decoded_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        serialized_block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        if txids.len() != block.txdata.len() {
-            return self.ingest_block_with_verified_txids(serialized_block, height, txids);
-        }
-        let rows = pending_rows_for_decoded_block(block, height, txids)?;
+        let rows = pending_rows_for_block(block, height)?;
         self.ingest_rows(rows)
     }
 
     /// Deletes every index row that ingesting `block` at `height` would have written.
     ///
     /// Derives the same txid, funding, spending, and header row keys as
-    /// [`Self::ingest_decoded_block_with_verified_txids`] by reusing the shared
-    /// row-construction code, then issues all deletions in a single atomic
-    /// [`KvStore::write`] batch. Either the entire block's rows are removed or
+    /// the block ingest path by reusing the shared row-construction code, then
+    /// issues all deletions in a single atomic [`KvStore::write`] batch. Either
+    /// the entire block's rows are removed or
     /// the method returns `Err` having deleted nothing observable.
     ///
     /// Deleting a row that is already absent is not an error: the indexer may
@@ -880,26 +825,6 @@ impl<S: KvStore> Indexer<S> {
             .map(bitcoin::Transaction::compute_txid)
             .collect();
         self.rollback_block_inner(block, height, &txids)
-    }
-
-    /// Same as [`Self::rollback_block`] but reuses caller-verified transaction
-    /// IDs, avoiding a second pass of `compute_txid` when the caller has
-    /// already computed them for merkle verification.
-    ///
-    /// Falls back to [`Self::rollback_block`] when the supplied txid count
-    /// does not match the block's transaction count, preserving semantics for
-    /// mismatched input.
-    pub fn rollback_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        self.flush()?;
-        if txids.len() != block.txdata.len() {
-            return self.rollback_block(block, height);
-        }
-        self.rollback_block_inner(block, height, txids)
     }
 
     fn rollback_block_inner(
@@ -1043,52 +968,34 @@ impl<S: KvStore> Indexer<S> {
 fn pending_rows_for_block_with_header(
     block: &[u8],
     height: u32,
-    txids: TxidSource<'_>,
     capabilities: IndexCapabilities,
-) -> Result<
-    (
-        PendingRows,
-        usize,
-        Option<[u8; crate::types::HEADER_ROW_SIZE]>,
-    ),
-    IndexError,
-> {
+) -> Result<(PendingRows, Option<[u8; crate::types::HEADER_ROW_SIZE]>), IndexError> {
     let mut rows = PendingRows::default();
     let mut header = None;
-    let txid_count = {
-        let mut visitor = IndexBlockVisitor {
-            rows: &mut rows,
-            header: &mut header,
-            height_bytes: height.to_le_bytes(),
-            txids,
-            txid_count: 0,
-            invalid_header_len: None,
-            block,
-            pending_funding: Vec::new(),
-            capabilities,
-        };
-        match bsl::Block::visit(block, &mut visitor) {
-            Ok(_) => visitor.txid_count,
-            Err(bitcoin_slices::Error::VisitBreak) => {
-                if let Some(len) = visitor.invalid_header_len {
-                    return Err(IndexError::InvalidHeaderLength { len });
-                }
-                return Err(IndexError::BlockParse(bitcoin_slices::Error::VisitBreak));
-            }
-            Err(error) => return Err(IndexError::BlockParse(error)),
-        }
+    let mut visitor = IndexBlockVisitor {
+        rows: &mut rows,
+        header: &mut header,
+        height_bytes: height.to_le_bytes(),
+        invalid_header_len: None,
+        block,
+        pending_funding: Vec::new(),
+        capabilities,
     };
-    Ok((rows, txid_count, header))
+    match bsl::Block::visit(block, &mut visitor) {
+        Ok(_) => Ok((rows, header)),
+        Err(bitcoin_slices::Error::VisitBreak) => {
+            if let Some(len) = visitor.invalid_header_len {
+                return Err(IndexError::InvalidHeaderLength { len });
+            }
+            Err(IndexError::BlockParse(bitcoin_slices::Error::VisitBreak))
+        }
+        Err(error) => Err(IndexError::BlockParse(error)),
+    }
 }
 
-fn pending_rows_for_block(
-    block: &[u8],
-    height: u32,
-    txids: TxidSource<'_>,
-) -> Result<(PendingRows, usize), IndexError> {
-    let (rows, txid_count, _) =
-        pending_rows_for_block_with_header(block, height, txids, IndexCapabilities::ALL)?;
-    Ok((rows, txid_count))
+fn pending_rows_for_block(block: &[u8], height: u32) -> Result<PendingRows, IndexError> {
+    let (rows, _) = pending_rows_for_block_with_header(block, height, IndexCapabilities::ALL)?;
+    Ok(rows)
 }
 
 fn pending_rows_for_decoded_block(
@@ -1108,8 +1015,8 @@ fn pending_rows_for_decoded_block(
     // Byte offsets are derived arithmetically rather than by re-serializing: a
     // serialized block is `header || varint(tx_count) || tx...`, so the first
     // transaction starts after the header and the count, and each subsequent one
-    // starts a `total_size()` further on. `both_ingest_paths_write_identical_row_values`
-    // pins this against the byte offsets the zero-copy path measures directly.
+    // starts a `total_size()` further on. The resulting ranges are the same
+    // serialized transaction boundaries used by the resolver's fast path.
     let prologue = crate::types::HEADER_ROW_SIZE + bitcoin::VarInt::from(block.txdata.len()).size();
     let mut offset = u32::try_from(prologue).map_err(|_| IndexError::UnaddressablePosition {
         offset: u64::try_from(prologue).unwrap_or(u64::MAX),
@@ -1351,8 +1258,6 @@ struct IndexBlockVisitor<'a> {
     rows: &'a mut PendingRows,
     header: &'a mut Option<[u8; crate::types::HEADER_ROW_SIZE]>,
     height_bytes: [u8; crate::types::HEIGHT_SIZE],
-    txids: TxidSource<'a>,
-    txid_count: usize,
     invalid_header_len: Option<usize>,
     /// The serialized block being visited, used as the base for byte offsets.
     block: &'a [u8],
@@ -1420,39 +1325,10 @@ impl Visitor for IndexBlockVisitor<'_> {
             });
         }
         if !self.capabilities.tx_lookup {
-            self.txid_count += 1;
             return ControlFlow::Continue(());
         }
-        match self.txids {
-            TxidSource::Compute => {
-                let txid = tx.txid_sha2();
-                self.push_txid_row(txid.as_slice(), position);
-            }
-            TxidSource::Validate(txids) => {
-                if let Some(txid) = txids.get(self.txid_count) {
-                    let computed = tx.txid_sha2();
-                    let txid_bytes: &[u8] = txid.as_ref();
-                    if txid_bytes == computed.as_slice() {
-                        self.push_txid_row(txid_bytes, position);
-                    } else {
-                        self.push_txid_row(computed.as_slice(), position);
-                    }
-                } else {
-                    let txid = tx.txid_sha2();
-                    self.push_txid_row(txid.as_slice(), position);
-                }
-            }
-            TxidSource::Trusted(txids) => {
-                if let Some(txid) = txids.get(self.txid_count) {
-                    let txid_bytes: &[u8] = txid.as_ref();
-                    self.push_txid_row(txid_bytes, position);
-                } else {
-                    let txid = tx.txid_sha2();
-                    self.push_txid_row(txid.as_slice(), position);
-                }
-            }
-        }
-        self.txid_count += 1;
+        let txid = tx.txid_sha2();
+        self.push_txid_row(txid.as_slice(), position);
         ControlFlow::Continue(())
     }
 
@@ -1491,13 +1367,6 @@ fn is_null_prevout(prevout: &bsl::OutPoint<'_>) -> bool {
 #[inline]
 fn is_op_return_script(script: &[u8]) -> bool {
     matches!(script.first(), Some(0x6a))
-}
-
-#[derive(Clone, Copy)]
-enum TxidSource<'a> {
-    Compute,
-    Validate(&'a [bitcoin::Txid]),
-    Trusted(&'a [bitcoin::Txid]),
 }
 
 /// Reads and decodes the single transaction a position names.
@@ -1994,8 +1863,7 @@ impl<S: KvStore> IndexWriter<S> {
                 watermark: self.watermark()?,
             });
         }
-        let (mut rows, _txid_count, header) =
-            pending_rows_for_block_with_header(body, height, TxidSource::Compute, capabilities)?;
+        let (mut rows, header) = pending_rows_for_block_with_header(body, height, capabilities)?;
         let header = header.ok_or(IndexError::InvalidHeaderLength { len: 0 })?;
         let actual_hash = bitcoin::BlockHash::hash(header.as_slice()).to_byte_array();
         if actual_hash != hash {
@@ -2223,50 +2091,6 @@ pub trait IndexerLike: Send + Sync {
         Ok(IndexFormat::Current)
     }
 
-    /// Walks `block` once and writes index rows, reusing precomputed transaction IDs when supported.
-    ///
-    /// The default implementation preserves existing implementations by ignoring `txids` and
-    /// delegating to [`IndexerLike::ingest_block`].
-    fn ingest_block_with_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = txids;
-        self.ingest_block(block, height)
-    }
-
-    /// Walks `block` once and writes index rows, trusting caller-verified transaction IDs when
-    /// supported.
-    ///
-    /// The default implementation preserves existing implementations by validating through
-    /// [`IndexerLike::ingest_block_with_txids`].
-    fn ingest_block_with_verified_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        self.ingest_block_with_txids(block, height, txids)
-    }
-
-    /// Walks a decoded block and writes rows, trusting caller-verified transaction IDs when
-    /// supported.
-    ///
-    /// The default implementation preserves existing implementations by validating through
-    /// [`IndexerLike::ingest_block_with_verified_txids`].
-    fn ingest_decoded_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        serialized_block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = block;
-        self.ingest_block_with_verified_txids(serialized_block, height, txids)
-    }
-
     /// Deletes every index row that ingesting `block` at `height` would have written.
     ///
     /// The inverse of the ingest methods above. The default returns
@@ -2283,21 +2107,6 @@ pub trait IndexerLike: Send + Sync {
     ) -> Result<IndexRowCounts, IndexError> {
         let _ = (block, height);
         Err(IndexError::UnsupportedRollback)
-    }
-
-    /// Same as [`IndexerLike::rollback_block`] but reuses caller-verified
-    /// transaction IDs when supported.
-    ///
-    /// The default implementation preserves existing implementations by
-    /// ignoring `txids` and delegating to [`IndexerLike::rollback_block`].
-    fn rollback_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = txids;
-        self.rollback_block(block, height)
     }
 
     /// Begins a batch of block ingests; rows are not flushed until [`IndexerLike::end_batch`].
@@ -2412,49 +2221,12 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         Self::ensure_format_version(self)
     }
 
-    fn ingest_block_with_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::ingest_block_with_txids(self, block, height, txids)
-    }
-
-    fn ingest_block_with_verified_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::ingest_block_with_verified_txids(self, block, height, txids)
-    }
-
-    fn ingest_decoded_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        serialized_block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::ingest_decoded_block_with_verified_txids(self, block, serialized_block, height, txids)
-    }
-
     fn rollback_block(
         &mut self,
         block: &bitcoin::Block,
         height: u32,
     ) -> Result<IndexRowCounts, IndexError> {
         Self::rollback_block(self, block, height)
-    }
-
-    fn rollback_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::rollback_block_with_verified_txids(self, block, height, txids)
     }
 
     fn begin_batch(&mut self) {
@@ -2552,91 +2324,6 @@ mod tests {
 
         let rows = indexer.iter_txid_rows(&txid)?;
         assert!(rows.contains(&TxidRow::row(&txid, HEIGHT)));
-        Ok(())
-    }
-
-    #[test]
-    fn decoded_verified_txid_ingest_matches_serialized_ingest()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let coinbase = tx(OutPoint::null(), ScriptBuf::from_bytes(vec![0x51, 0x04]));
-        let spender = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: spent_outpoint(9, 1),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![
-                TxOut {
-                    value: Amount::from_sat(5_000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x05]),
-                },
-                TxOut {
-                    value: Amount::from_sat(0),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]),
-                },
-            ],
-        };
-        let block = block(vec![coinbase, spender]);
-        let block_bytes = serialize(&block);
-        let txids = block
-            .txdata
-            .iter()
-            .map(Transaction::compute_txid)
-            .collect::<Vec<_>>();
-        let (_serialized_dir, mut serialized_indexer) = indexer()?;
-        let (_decoded_dir, mut decoded_indexer) = indexer()?;
-
-        let serialized_counts =
-            serialized_indexer.ingest_block_with_verified_txids(&block_bytes, HEIGHT, &txids)?;
-        let decoded_counts = decoded_indexer.ingest_decoded_block_with_verified_txids(
-            &block,
-            &block_bytes,
-            HEIGHT,
-            &txids,
-        )?;
-
-        assert_eq!(decoded_counts, serialized_counts);
-        assert_eq!(
-            stored_rows(&decoded_indexer)?,
-            stored_rows(&serialized_indexer)?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn decoded_verified_txid_ingest_mismatch_falls_back_to_serialized_ingest()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let decoded_block = block(vec![tx(
-            OutPoint::null(),
-            ScriptBuf::from_bytes(vec![0x51, 0x08]),
-        )]);
-        let serialized_block = block(vec![
-            tx(OutPoint::null(), ScriptBuf::from_bytes(vec![0x51, 0x06])),
-            tx(
-                spent_outpoint(10, 0),
-                ScriptBuf::from_bytes(vec![0x51, 0x07]),
-            ),
-        ]);
-        let serialized_block_bytes = serialize(&serialized_block);
-        let (_serialized_dir, mut serialized_indexer) = indexer()?;
-        let (_decoded_dir, mut decoded_indexer) = indexer()?;
-
-        let serialized_counts = serialized_indexer.ingest_block(&serialized_block_bytes, HEIGHT)?;
-        let decoded_counts = decoded_indexer.ingest_decoded_block_with_verified_txids(
-            &decoded_block,
-            &serialized_block_bytes,
-            HEIGHT,
-            &[],
-        )?;
-
-        assert_eq!(decoded_counts, serialized_counts);
-        assert_eq!(
-            stored_rows(&decoded_indexer)?,
-            stored_rows(&serialized_indexer)?
-        );
         Ok(())
     }
 

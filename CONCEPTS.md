@@ -365,5 +365,10 @@ A record that keeps its per-item lookup keys and item lengths in fixed-width arr
 ### Canonical record spelling
 The rule that one logical record has exactly one byte string. Fixed-width fields give this away for free; variable-width encodings must enforce it, and `UtxoRecord` compares and hashes by bytes, so a second spelling makes equal records unequal. v5 needs three rules to keep it: a varint must be minimal, because `[0x80, 0x00]` also decodes to zero; a directory width must be the narrowest that fits, because a wider one describes the same record; and the compact amount form and the escape must be exact complements, so the compact form may encode only amounts the escape refuses and the escape refuses only amounts the compact form covers. The last of these is also a safety rule rather than a tidiness one: `read_varint` hands `decompress_amount` whatever a record contains and `validate_encoded` runs it over every output loaded from a snapshot, and the transform multiplies by up to a billion, so an unbounded input panics a debug build and wraps silently in a release one. `decompress_accepts_exactly_the_encoder_image` states the whole rule as one property over every `u64`.
 
-### Work-count assertion
+### Work-count assertion (historical)
+The former `find_output_decompresses_at_most_the_amount_it_returns` test and
+its `cfg(test)` decompression counter were retired in favor of observable UTXO
+correctness checks. This historical pattern is not a current runtime or test
+contract; performance-sensitive changes belong in a paired-arm benchmark.
+
 Asserting how much of an expensive operation a code path performs, instead of how long it takes. A wall-clock assertion in a test suite is a flake generator, and an assertion that a function merely returns something passes for a stub. `find_output_decompresses_at_most_the_amount_it_returns` counts `decompress_amount` calls behind a `cfg(test)` thread-local and requires one for a hit, none for a miss and none for `max_vout`, at any record size — which is the algorithmic claim the layout rests on, stated deterministically. The counterpart is the case a count cannot make: where the claim really is about elapsed time, the assertion belongs in a paired-arm benchmark, not a test.
