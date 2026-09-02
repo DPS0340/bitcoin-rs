@@ -584,3 +584,37 @@ fn blocked_open_abandonment_detaches_and_poisons() {
 
     // If we reach here without hanging, the abandonment is truly bounded.
 }
+
+// ---------------------------------------------------------------------------
+// #208: txindex store open timeout — a stuck storage-engine recovery must
+// publish Failed, not spin forever
+// ---------------------------------------------------------------------------
+
+#[test]
+fn open_timeout_publishes_error_not_infinite_spin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Simulate a stuck open: the helper thread will sleep 10 seconds before
+    // even attempting the store open. The timeout is set to 1 second, so the
+    // deadline fires while the helper is still sleeping.
+    OPEN_DELAY_SECS.store(10, Ordering::Relaxed);
+    OPEN_TIMEOUT_OVERRIDE_SECS.store(1, Ordering::Relaxed);
+
+    let result = open_tx_index_with_timeout(
+        "fjall",
+        &dir.path().join("txindex"),
+        8 * 1024 * 1024,
+        DEFAULT_BATCH_LIMITS,
+        1,
+        &shutdown,
+    );
+
+    // Restore overrides immediately so other tests are not affected.
+    OPEN_DELAY_SECS.store(0, Ordering::Relaxed);
+    OPEN_TIMEOUT_OVERRIDE_SECS.store(0, Ordering::Relaxed);
+    let Err(TxIndexWorkerError::OpenTimeout { secs }) = result else {
+        panic!("expected OpenTimeout, got a different error variant");
+    };
+    assert_eq!(secs, 1, "timeout seconds must match the override");
+}

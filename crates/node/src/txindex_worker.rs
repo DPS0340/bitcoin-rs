@@ -85,6 +85,38 @@ const PREPARE_CHUNK_BLOCKS: usize = 128;
 const REVISION_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const FORWARD_BATCH_DELAY: Duration = Duration::from_millis(100);
 
+/// Maximum time the txindex worker waits for the storage engine to open and
+/// recover the index store. A store open that exceeds this deadline is
+/// treated as a wedge — the worker publishes `Failed` so the node stays
+/// operable without the index rather than spinning one thread at 100% CPU
+/// indefinitely. The deadline is a backstop, not a tight bound: the issue's
+/// own data shows fjall/lsm-tree manifest recovery of a 139 GiB store logs
+/// progress within seconds and then, when wedged, freezes block I/O for
+/// hours. Thirty minutes is far below the observed wedge and far above any
+/// legitimate recovery, so it cannot falsely kill a slow-but-progressing
+/// open while still surfacing a stuck one. The 30-second heartbeat already
+/// makes a slow open observable to an operator watching logs.
+const TXINDEX_OPEN_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Test-only override for the open timeout, in seconds. When non-zero it
+/// replaces [`TXINDEX_OPEN_TIMEOUT`] so tests can exercise the timeout path
+/// without waiting the production backstop.
+#[cfg(test)]
+static OPEN_TIMEOUT_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Returns the effective open timeout, honoring the test-only override.
+fn effective_open_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let override_secs = OPEN_TIMEOUT_OVERRIDE_SECS.load(Ordering::Relaxed);
+        if override_secs > 0 {
+            return Duration::from_secs(override_secs);
+        }
+    }
+    TXINDEX_OPEN_TIMEOUT
+}
+
 /// Shared wake/revision/health state owned by `NodeState` and referenced by
 /// `ApplyHandles`, the worker thread, and the query engine.
 #[derive(Debug)]
@@ -829,12 +861,13 @@ fn open_and_run(
     std::fs::create_dir_all(&txindex_dir)
         .map_err(|e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::Io(e)))?;
 
-    let open: OpenTxIndex = open_tx_index_on_worker(
+    let open: OpenTxIndex = open_tx_index_with_timeout(
         &spec.storage_backend,
         &txindex_dir,
         spec.cache_bytes,
         spec.batch_limits,
         spec.epoch,
+        shutdown,
     )?;
 
     // Check shutdown and generation immediately after backend open returns.
@@ -896,6 +929,74 @@ fn open_and_run(
     Ok(())
 }
 
+/// Opens the txindex store with a bounded deadline.
+///
+/// The storage engine open (fjall/lsm-tree recovery, rocksdb column-family
+/// open) can wedge on a large or partially-corrupted store, spinning one
+/// thread at 100% CPU indefinitely. This wrapper runs the open on a helper
+/// thread and waits with [`TXINDEX_OPEN_TIMEOUT`]. If the deadline fires, the
+/// helper thread is detached (it may eventually finish or hang — we cannot
+/// kill a thread) and `OpenTimeout` is returned so the worker publishes
+/// `Failed` and the node stays operable without the index.
+fn open_tx_index_with_timeout(
+    storage_backend: &str,
+    txindex_dir: &Path,
+    cache_bytes: u64,
+    batch_limits: PreparedBatchLimits,
+    epoch: u64,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<OpenTxIndex, TxIndexWorkerError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let backend = storage_backend.to_owned();
+    let dir = txindex_dir.to_path_buf();
+    let _join = thread::Builder::new()
+        .name("bitcoin-rs-txindex-open".to_owned())
+        .spawn(move || {
+            let result = open_tx_index_on_worker(&backend, &dir, cache_bytes, batch_limits, epoch);
+            let _ = tx.send(result);
+        })
+        .map_err(|e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::Io(e)))?;
+
+    // Poll in short slices so a shutdown during the open deadline
+    // exits promptly instead of waiting the full timeout.
+    let timeout = effective_open_timeout();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(TxIndexWorkerError::Stopped);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::error!(
+                timeout_secs = timeout.as_secs(),
+                backend = storage_backend,
+                dir = %txindex_dir.display(),
+                "txindex store open timed out — the storage engine recovery \
+                 appears stuck; detaching the open thread and publishing Failed"
+            );
+            return Err(TxIndexWorkerError::OpenTimeout {
+                secs: timeout.as_secs(),
+            });
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(TxIndexWorkerError::Storage(
+                    bitcoin_rs_storage::StorageError::Backend(
+                        "txindex open helper thread exited without result".to_owned(),
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// Test-only: when non-zero, `open_tx_index_on_worker` sleeps this many
+/// seconds before proceeding, simulating a stuck storage-engine recovery.
+#[cfg(test)]
+static OPEN_DELAY_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Opens the txindex store on the worker thread, preserving all backend
 /// constructors, cache paths, and batch limits.
 fn open_tx_index_on_worker(
@@ -905,6 +1006,13 @@ fn open_tx_index_on_worker(
     batch_limits: PreparedBatchLimits,
     epoch: u64,
 ) -> Result<OpenTxIndex, TxIndexWorkerError> {
+    #[cfg(test)]
+    {
+        let delay = OPEN_DELAY_SECS.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_secs(delay));
+        }
+    }
     match storage_backend {
         #[cfg(feature = "rocksdb")]
         "rocksdb" => {
@@ -2148,6 +2256,10 @@ enum TxIndexWorkerError {
     PendingDurableChanged,
     #[error("txindex storage error: {0}")]
     Storage(#[source] bitcoin_rs_storage::StorageError),
+    #[error(
+        "txindex store open timed out after {secs}s — the storage engine recovery may be stuck"
+    )]
+    OpenTimeout { secs: u64 },
     #[error("txindex index error: {0}")]
     Index(#[from] IndexError),
     #[error("txindex worker: missing body at height {height}, hash {hash}")]
