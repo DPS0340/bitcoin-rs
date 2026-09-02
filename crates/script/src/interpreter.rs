@@ -427,10 +427,9 @@ pub enum ScriptError {
 
 /// Public script verifier for the portable posture.
 ///
-/// Handles taproot key-path spends via the local BIP341 path; non-taproot spends
-/// (legacy, segwit-v0, taproot script-path) require the kernel production path.
-/// Without the kernel the stub accepts only empty `OP_TRUE` spends and rejects
-/// everything else.
+/// Executes legacy, `P2SH`, and segwit v0 spends through the native opcode
+/// evaluator, and taproot key-path spends via the local BIP341 path. Taproot
+/// script-path spends remain unimplemented and are rejected.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Interpreter;
 

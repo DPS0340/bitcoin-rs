@@ -13,9 +13,10 @@
 //!
 //! ## Two columns
 //!
-//! The native evaluator is currently a stub (taproot key-path + `OP_TRUE` only),
-//! so most `script_tests` rows will fail — that is expected. The kernel column
-//! should be near-green, proving the harness wiring rather than the evaluator.
+//! The native evaluator runs every non-taproot spend class. Each native column
+//! pins its remaining mismatch count, so a shrink lowers the constant with
+//! evidence and a growth fails the lane. The kernel column stays available
+//! under `--features kernel` as an oracle for the same rows.
 //!
 //! Run:
 //!
@@ -1359,6 +1360,11 @@ fn asm_assembler_matches_known_bytes() {
     );
 }
 
+/// Core rows the native evaluator does not yet match. Every one is triaged in
+/// the issue that owns the remaining work; the count is pinned so a shrink
+/// lowers it with evidence and a growth fails the lane.
+const NATIVE_SCRIPT_TESTS_FAILURES: usize = 36;
+
 #[test]
 fn script_tests_native_column() {
     let mut counts = Counts::default();
@@ -1374,16 +1380,14 @@ fn script_tests_native_column() {
         counts.executed > 0,
         "harness executed zero script_tests rows — wiring is broken"
     );
-    if !mismatches.is_empty() {
-        println!(
-            "  (native stub: {}/{} rows did not match expected — expected while evaluator is unfinished)",
-            mismatches.len(),
-            counts.executed,
-        );
-        for m in mismatches.iter().take(mismatch_print_limit()) {
-            println!("  {m}");
-        }
+    for m in mismatches.iter().take(mismatch_print_limit()) {
+        println!("  {m}");
     }
+    assert_eq!(
+        mismatches.len(),
+        NATIVE_SCRIPT_TESTS_FAILURES,
+        "script_tests native mismatches changed; triage each row, then move the pinned count"
+    );
 }
 
 #[cfg(feature = "kernel")]
@@ -1414,6 +1418,10 @@ fn script_tests_kernel_column() {
     }
 }
 
+/// Pinned like `NATIVE_SCRIPT_TESTS_FAILURES`: a shrink lowers it with
+/// evidence, a growth fails the lane.
+const NATIVE_TX_VALID_FAILURES: usize = 40;
+
 #[test]
 fn tx_valid_native_column() {
     let mut counts = Counts::default();
@@ -1426,16 +1434,14 @@ fn tx_valid_native_column() {
     let mismatches = run_tx_vectors_native(&rows, &mut counts);
     println!("tx_valid [native]: {counts}");
     assert!(counts.executed > 0, "harness executed zero tx_valid rows");
-    if !mismatches.is_empty() {
-        println!(
-            "  (native stub: {}/{} rows mismatched)",
-            mismatches.len(),
-            counts.executed,
-        );
-        for m in mismatches.iter().take(mismatch_print_limit()) {
-            println!("  {m}");
-        }
+    for m in mismatches.iter().take(mismatch_print_limit()) {
+        println!("  {m}");
     }
+    assert_eq!(
+        mismatches.len(),
+        NATIVE_TX_VALID_FAILURES,
+        "tx_valid native mismatches changed; triage each row, then move the pinned count"
+    );
 }
 
 #[cfg(feature = "kernel")]
@@ -1463,6 +1469,10 @@ fn tx_valid_kernel_column() {
     }
 }
 
+/// A `tx_invalid` mismatch means the evaluator ACCEPTED a transaction Core
+/// rejects, so this count is the one that must reach zero first.
+const NATIVE_TX_INVALID_FAILURES: usize = 2;
+
 #[test]
 fn tx_invalid_native_column() {
     let mut counts = Counts::default();
@@ -1475,16 +1485,14 @@ fn tx_invalid_native_column() {
     let mismatches = run_tx_vectors_native(&rows, &mut counts);
     println!("tx_invalid [native]: {counts}");
     assert!(counts.executed > 0, "harness executed zero tx_invalid rows");
-    if !mismatches.is_empty() {
-        println!(
-            "  (native stub: {}/{} rows mismatched)",
-            mismatches.len(),
-            counts.executed,
-        );
-        for m in mismatches.iter().take(mismatch_print_limit()) {
-            println!("  {m}");
-        }
+    for m in mismatches.iter().take(mismatch_print_limit()) {
+        println!("  {m}");
     }
+    assert_eq!(
+        mismatches.len(),
+        NATIVE_TX_INVALID_FAILURES,
+        "tx_invalid native mismatches changed; a wrongly accepted transaction is a consensus break"
+    );
 }
 
 #[cfg(feature = "kernel")]
