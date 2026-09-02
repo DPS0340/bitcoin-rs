@@ -1,6 +1,6 @@
 //! Inbound payloads received from peers.
 
-use bitcoin_rs_primitives::{Block, Header, consensus_bytes};
+use bitcoin_rs_primitives::{Block, Header, Tx, consensus_bytes};
 
 /// A block received from a peer with its wire payload preserved.
 ///
@@ -21,6 +21,27 @@ pub struct InboundHeaders {
     pub headers: Vec<Header>,
     /// Delivering connection, or `None` for local injection.
     pub source: Option<crate::PeerSource>,
+}
+
+/// A transaction received from a peer, ready for mempool admission.
+///
+/// The node's tx-ingress consumer drains these from the bounded P2P channel
+/// and evaluates each through the mempool acceptance policy. `source`
+/// identifies the delivering peer so admission origin and relay accounting
+/// can attribute the transaction correctly.
+pub struct InboundTx {
+    /// Decoded transaction.
+    pub tx: Tx,
+    /// Delivering connection.
+    pub source: crate::PeerSource,
+}
+
+impl InboundTx {
+    /// Wraps a decoded transaction with its delivering peer source.
+    #[must_use]
+    pub fn new(tx: Tx, source: crate::PeerSource) -> Self {
+        Self { tx, source }
+    }
 }
 
 impl InboundBlock {

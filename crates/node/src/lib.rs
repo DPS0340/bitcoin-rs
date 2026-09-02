@@ -68,6 +68,10 @@ pub mod signal;
 pub mod state;
 /// Block download orchestrator.
 pub mod sync;
+/// Inbound P2P transaction admission policy: orphan map and recent-rejects.
+pub mod tx_admission;
+/// P2P transaction ingress consumer.
+pub mod tx_ingress;
 mod txindex_worker;
 /// UTXO view adapter for consensus transaction checks.
 pub mod utxo_view;

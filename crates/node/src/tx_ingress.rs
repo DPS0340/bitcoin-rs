@@ -28,6 +28,7 @@ use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
 
 use crate::state::NodeState;
+use crate::tx_admission::TxAdmission;
 
 /// The drain poll interval when the channel is empty.
 const TX_INGRESS_POLL: Duration = Duration::from_millis(100);
@@ -46,18 +47,18 @@ const TX_INGRESS_POLL: Duration = Duration::from_millis(100);
 /// * `mining_control` — the mining coordinator for template wake.
 /// * `shutdown` — the process-wide shutdown flag.
 /// * `tx_rx` — the shared bounded receiver for inbound peer transactions.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_tx_ingress_consumer(
     state: &NodeState,
     gateway: Arc<MempoolGateway>,
     mining_control: Arc<dyn MiningControl>,
     shutdown: Arc<AtomicBool>,
     tx_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundTx>>>,
-) -> std::thread::JoinHandle<()> {
+    tx_admission: Arc<TxAdmission>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     let utxo = state.utxo();
     let transactions = state.transactions();
     let peer_outbound = state.peer_outbound();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("bitcoin-rs-tx-ingress".to_owned())
         .spawn(move || {
             let consumer = TxIngressConsumer {
@@ -66,6 +67,7 @@ pub fn spawn_tx_ingress_consumer(
                 mempool_gateway: gateway,
                 mining_control,
                 peer_outbound,
+                tx_admission,
             };
             while !shutdown.load(Ordering::Relaxed) {
                 let recv = {
@@ -80,8 +82,8 @@ pub fn spawn_tx_ingress_consumer(
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
             }
-        })
-        .expect("tx-ingress consumer thread spawn")
+        })?;
+    Ok(handle)
 }
 
 /// The single consumer that evaluates and admits peer transactions.
@@ -93,6 +95,8 @@ struct TxIngressConsumer {
     peer_outbound: Arc<
         parking_lot::RwLock<hashbrown::HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>,
     >,
+    /// Orphan map and recent-rejects cache for inbound tx admission.
+    tx_admission: Arc<TxAdmission>,
 }
 
 impl TxIngressConsumer {
@@ -102,6 +106,17 @@ impl TxIngressConsumer {
         let tx = inbound.tx;
         let source = inbound.source;
         let txid = tx.txid();
+        let wtxid = tx.wtxid();
+
+        // Recent-rejects: skip re-evaluation of a tx we already rejected.
+        // The Inv filter also suppresses getdata for these, but a tx may
+        // arrive through a relay path that bypassed the filter.
+        if self.tx_admission.is_rejected(Hash256::from(txid))
+            || self.tx_admission.is_rejected(Hash256::from(wtxid))
+        {
+            tracing::trace!(%txid, "p2p tx in recent-rejects; skipping");
+            return;
+        }
 
         // Already in mempool: silently succeed, no relay (Core does not
         // re-announce known transactions).
@@ -150,13 +165,19 @@ impl TxIngressConsumer {
             (fact, policy)
         };
 
-        // Rejected: no relay, no mining wake.
+        // Rejected: record in recent-rejects so the Inv filter suppresses
+        // future getdata for this tx. Missing-inputs rejections are not
+        // orphans here — the standardness evaluator reports them as
+        // rejected, and the tx is cached. A dedicated orphan path (parent
+        // arrival triggers re-evaluation) is handled by the orphan map in
+        // TxAdmission; this consumer records the reject and moves on.
         if fact.allowed != Some(true) {
             tracing::debug!(
                 %txid,
                 reason = ?fact.reject_reason,
                 "p2p tx rejected by mempool policy; not relaying"
             );
+            self.tx_admission.record_reject(txid, wtxid);
             return;
         }
 
@@ -197,6 +218,7 @@ impl TxIngressConsumer {
             }
             Err(error) => {
                 tracing::debug!(%txid, %error, "p2p tx admission failed; not relaying");
+                self.tx_admission.record_reject(txid, wtxid);
             }
         }
     }
@@ -433,9 +455,10 @@ mod tests {
         TxIngressConsumer {
             utxo,
             transactions,
-            mempool_gateway: gateway,
+            mempool_gateway: Arc::clone(&gateway),
             mining_control: mining,
             peer_outbound,
+            tx_admission: Arc::new(TxAdmission::new(Arc::clone(&gateway))),
         }
     }
 
@@ -455,13 +478,13 @@ mod tests {
     ) -> TxIngressConsumer {
         let utxo = Arc::new(UtxoSet::new());
         let transactions = Arc::new(RwLock::new(hashbrown::HashMap::new()));
-        let peer_outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
         TxIngressConsumer {
             utxo,
             transactions,
-            mempool_gateway: gateway,
+            mempool_gateway: Arc::clone(&gateway),
             mining_control: mining,
             peer_outbound,
+            tx_admission: Arc::new(TxAdmission::new(Arc::clone(&gateway))),
         }
     }
 

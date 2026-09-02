@@ -2,11 +2,13 @@ use std::cell::RefCell;
 
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
+use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, Tx, Txid, Wtxid};
 
 use crate::fsm::step;
 use crate::handshake::feature_messages;
-use crate::inv::{is_within_inventory_bound, request_inventory};
+use crate::inv::{
+    inventory_tx_hash, is_within_inventory_bound, request_inventory, request_inventory_filtered,
+};
 use crate::peer::{Peer, PeerState};
 use crate::wire::{Message, PeerError};
 
@@ -52,6 +54,30 @@ pub trait ChainQuery: Send + Sync {
     ) -> Result<InventoryServing, PeerError>;
 }
 
+/// Read-only transaction inventory view used by the Inv filter and the
+/// `getdata` tx responder.
+///
+/// Implemented by the node's admission layer ([`TxAdmission`] in the node
+/// crate); the p2p crate never owns mempool, orphan, or rejection state.
+/// The dispatch path consults this trait to suppress redundant `getdata`
+/// requests for transactions the node already holds and to serve
+/// transaction bodies in reply to `getdata`.
+pub trait TxInventory: Send + Sync {
+    /// Returns `true` when the node already holds the transaction identified
+    /// by `hash` — in the mempool, the orphan map, or the recent-rejects
+    /// cache. `wtxid_relay` is `true` when the peer negotiated BIP339, in
+    /// which case `hash` is a wtxid; otherwise it is a txid.
+    fn have_tx(&self, hash: Hash256, wtxid_relay: bool) -> bool;
+
+    /// Returns the witness transaction body for `txid`, or `None` when the
+    /// node does not have it. Used to answer `getdata` for txid-typed items.
+    fn get_tx(&self, txid: Txid) -> Option<Tx>;
+
+    /// Returns the witness transaction body for `wtxid`, or `None` when the
+    /// node does not have it. Used to answer BIP339 `getdata` (`WTx`) items.
+    fn get_tx_by_wtxid(&self, wtxid: Wtxid) -> Option<Tx>;
+}
+
 /// Chainless dispatch: collects the protocol responses and returns them.
 ///
 /// With `chain: None` responses can never contain a block body, so the batch
@@ -69,16 +95,40 @@ pub fn dispatch_inbound<S>(
     Ok(responses.into_inner())
 }
 
-/// Dispatch with an active-chain view.
+/// Dispatch with an active-chain view but no transaction-inventory filter.
+///
+/// Equivalent to [`dispatch_inbound_full`] with `tx_inventory: None`: every
+/// announced tx is requested, and tx-typed `getdata` items are reported
+/// missing. Kept for call sites (the listener) that have not yet been wired
+/// with a [`TxInventory`] handle.
+pub fn dispatch_inbound_with_chain<S>(
+    peer: &mut Peer<S>,
+    message: &Message,
+    chain: Option<&dyn ChainQuery>,
+    headroom: &dyn Fn() -> bool,
+    send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+) -> Result<(), PeerError> {
+    dispatch_inbound_full(peer, message, chain, None, headroom, send)
+}
+
+/// Dispatch with an active-chain view and a transaction-inventory filter.
 ///
 /// Every response is emitted through `send` in the identical order the
 /// former batch form produced (I8); `send` errors abort emission and
 /// propagate. `headroom` gates block-body materialization (I7) and is
 /// evaluated before each load.
-pub fn dispatch_inbound_with_chain<S>(
+///
+/// When `tx_inventory` is `Some`, the `inv` arm suppresses `getdata` for
+/// transactions the node already holds (mempool, orphan map, or
+/// recent-rejects) and the `getdata` arm serves tx bodies for tx-typed
+/// items the node has, reporting the rest as `notfound`. BIP339: when the
+/// peer advertised wtxid relay, tx inventory hashes are interpreted as
+/// wtxids; otherwise as txids.
+pub fn dispatch_inbound_full<S>(
     peer: &mut Peer<S>,
     message: &Message,
     chain: Option<&dyn ChainQuery>,
+    tx_inventory: Option<&dyn TxInventory>,
     headroom: &dyn Fn() -> bool,
     send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
 ) -> Result<(), PeerError> {
@@ -96,7 +146,16 @@ pub fn dispatch_inbound_with_chain<S>(
         }
         Message::Inv(items) => {
             step(peer, message)?;
-            if let Some(response) = request_inventory(items) {
+            let response = match tx_inventory {
+                Some(inv) => {
+                    let wtxid_relay = peer.wtxid_relay.peer_supported();
+                    request_inventory_filtered(items, &|item| {
+                        inventory_tx_hash(item).is_some_and(|hash| inv.have_tx(hash, wtxid_relay))
+                    })
+                }
+                None => request_inventory(items),
+            };
+            if let Some(response) = response {
                 send(response)?;
             }
         }
@@ -118,7 +177,7 @@ pub fn dispatch_inbound_with_chain<S>(
         Message::GetData(items) => {
             ensure_inventory_request_within_bounds(items)?;
             step(peer, message)?;
-            serve_getdata(chain, items, headroom, send)?;
+            serve_getdata(chain, tx_inventory, items, headroom, send)?;
         }
         _ => step(peer, message)?,
     }
@@ -144,12 +203,23 @@ fn headers_response(chain: Option<&dyn ChainQuery>, request: &GetHeadersMessage)
     Message::Headers(headers)
 }
 
-/// Serves one `getdata` through the sink. With no chain view the whole
-/// request is reported missing; otherwise blocks stream through the chain
-/// query behind the headroom gate, followed by at most one trailing
-/// notfound — the exact order the former batch form produced (I8).
+/// Serves one `getdata` through the sink.
+///
+/// When `tx_inventory` is `None` the behaviour is unchanged from the
+/// pre-tx-inventory path: with no chain view the whole request is reported
+/// missing; otherwise blocks stream through the chain query behind the
+/// headroom gate, followed by at most one trailing `notfound` (I8).
+///
+/// When `tx_inventory` is `Some`, tx-typed items are served from the
+/// transaction inventory (the node's mempool): a held tx is emitted as a
+/// `tx` message (witness serialization), and a tx the node does not have is
+/// collected into the trailing `notfound`. Block-typed items continue to
+/// stream through the chain query behind the headroom gate. BIP339 `WTx`
+/// items are resolved by wtxid; `Transaction`/`WitnessTransaction` items by
+/// txid.
 fn serve_getdata(
     chain: Option<&dyn ChainQuery>,
+    tx_inventory: Option<&dyn TxInventory>,
     items: &[Inventory],
     headroom: &dyn Fn() -> bool,
     send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
@@ -157,6 +227,73 @@ fn serve_getdata(
     if items.is_empty() {
         return Ok(());
     }
+
+    // Fast path: no tx inventory — the original block-only behaviour. This
+    // keeps every existing call site (listener, chainless dispatch, tests)
+    // byte-identical until a TxInventory handle is wired in.
+    let Some(inv) = tx_inventory else {
+        return serve_getdata_blocks(chain, items, headroom, send);
+    };
+
+    // Item-by-item: tx-typed items resolve through the tx inventory; block
+    // items stream through the chain query behind the headroom gate. The
+    // trailing notfound collects every unservable item in request order.
+    let mut not_found: Vec<Inventory> = Vec::new();
+    for item in items {
+        match item {
+            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                let native = Txid::from(Hash256::from_le_bytes(txid.as_byte_array()));
+                if let Some(tx) = inv.get_tx(native) {
+                    send(Message::Tx(tx))?;
+                } else {
+                    not_found.push(*item);
+                }
+            }
+            Inventory::WTx(wtxid) => {
+                let native = Wtxid::from(Hash256::from_le_bytes(wtxid.as_byte_array()));
+                if let Some(tx) = inv.get_tx_by_wtxid(native) {
+                    send(Message::Tx(tx))?;
+                } else {
+                    not_found.push(*item);
+                }
+            }
+            // Block-typed and unknown items: resolve through the chain
+            // query one at a time so headroom is honoured per load and block
+            // misses merge into the single trailing notfound. With no chain
+            // view every non-tx item is missing.
+            block_item => {
+                if let Some(chain) = chain {
+                    let outcome = chain.serve_inventory_blocks(
+                        std::slice::from_ref(block_item),
+                        headroom,
+                        &mut |block| send(Message::Block(block)),
+                    )?;
+                    if outcome.halted {
+                        return Err(PeerError::Protocol(
+                            "getdata serving halted: outbound production gate",
+                        ));
+                    }
+                    not_found.extend(outcome.not_found);
+                } else {
+                    not_found.push(*block_item);
+                }
+            }
+        }
+    }
+
+    if !not_found.is_empty() {
+        send(Message::NotFound(not_found))?;
+    }
+    Ok(())
+}
+
+/// Block-only `getdata` serving: the original pre-tx-inventory path.
+fn serve_getdata_blocks(
+    chain: Option<&dyn ChainQuery>,
+    items: &[Inventory],
+    headroom: &dyn Fn() -> bool,
+    send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+) -> Result<(), PeerError> {
     match chain {
         None => send(Message::NotFound(items.to_vec()))?,
         Some(chain) => {
@@ -202,11 +339,11 @@ mod tests {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::Magic;
     use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
-    use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
+    use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, Tx, Txid, Wtxid};
 
     use super::{
-        ChainQuery, InventoryServing, MAX_HEADERS_RESPONSE, MAX_LOCATOR_HASHES, dispatch_inbound,
-        dispatch_inbound_with_chain,
+        ChainQuery, InventoryServing, MAX_HEADERS_RESPONSE, MAX_LOCATOR_HASHES, TxInventory,
+        dispatch_inbound, dispatch_inbound_full, dispatch_inbound_with_chain,
     };
     use crate::connection::{OutboundBudget, PeerLease};
     use crate::inv::MAX_INV_PER_MSG;
@@ -729,6 +866,229 @@ mod tests {
             Err(PeerError::Protocol("getdata inventory too large"))
         ));
         assert_eq!(peer_snapshot(&peer), before);
+    }
+
+    // --- TxInventory filter and getdata tx serving tests ---
+
+    /// A fake TxInventory that knows a fixed set of txids/wtxids and can
+    /// serve their bodies.
+    struct FakeTxInventory {
+        txs_by_txid: hashbrown::HashMap<bitcoin::Txid, Tx>,
+        txs_by_wtxid: hashbrown::HashMap<bitcoin::Wtxid, Tx>,
+        have_hashes: hashbrown::HashSet<[u8; 32]>,
+    }
+
+    impl FakeTxInventory {
+        fn empty() -> Self {
+            Self {
+                txs_by_txid: hashbrown::HashMap::new(),
+                txs_by_wtxid: hashbrown::HashMap::new(),
+                have_hashes: hashbrown::HashSet::new(),
+            }
+        }
+
+        fn with_tx(mut self, tx: Tx) -> Self {
+            let txid = bitcoin::Txid::from_byte_array(*tx.txid().as_bytes());
+            let wtxid = bitcoin::Wtxid::from_byte_array(*tx.wtxid().as_bytes());
+            self.txs_by_txid.insert(txid, tx.clone());
+            self.txs_by_wtxid.insert(wtxid, tx);
+            self
+        }
+
+        fn with_have(mut self, hash: [u8; 32]) -> Self {
+            self.have_hashes.insert(hash);
+            self
+        }
+    }
+
+    impl TxInventory for FakeTxInventory {
+        fn have_tx(&self, hash: Hash256, _wtxid_relay: bool) -> bool {
+            self.have_hashes.contains(hash.as_byte_array())
+        }
+
+        fn get_tx(&self, txid: Txid) -> Option<Tx> {
+            let btid = bitcoin::Txid::from_byte_array(*txid.as_bytes());
+            self.txs_by_txid.get(&btid).cloned()
+        }
+
+        fn get_tx_by_wtxid(&self, wtxid: Wtxid) -> Option<Tx> {
+            let bwid = bitcoin::Wtxid::from_byte_array(*wtxid.as_bytes());
+            self.txs_by_wtxid.get(&bwid).cloned()
+        }
+    }
+
+    fn dummy_tx(byte: u8) -> Tx {
+        use bitcoin_rs_primitives::{OutPoint, TxIn, TxOut};
+        Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from(Hash256::from_le_bytes(&[byte; 32])),
+                    vout: 0,
+                },
+                script_sig: vec![byte],
+                sequence: 0xFFFF_FFFF,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x6A],
+            }],
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn inv_filter_suppresses_held_tx() {
+        let tx = dummy_tx(1);
+        let txid = tx.txid();
+        let inv_tx = Inventory::Transaction(bitcoin::Txid::from_byte_array(*txid.as_bytes()));
+        let inventory = FakeTxInventory::empty().with_have(*txid.as_bytes());
+        let mut peer = ready_peer();
+
+        let responses = dispatch_collect_full(
+            &mut peer,
+            &Message::Inv(vec![inv_tx]),
+            None,
+            Some(&inventory),
+        );
+
+        assert!(
+            responses.is_empty(),
+            "inv for a held tx must produce no getdata"
+        );
+    }
+
+    #[test]
+    fn inv_filter_passes_unheld_tx() {
+        let tx = dummy_tx(2);
+        let txid = tx.txid();
+        let inv_tx = Inventory::Transaction(bitcoin::Txid::from_byte_array(*txid.as_bytes()));
+        let inventory = FakeTxInventory::empty();
+        let mut peer = ready_peer();
+
+        let responses = dispatch_collect_full(
+            &mut peer,
+            &Message::Inv(vec![inv_tx]),
+            None,
+            Some(&inventory),
+        );
+
+        assert_eq!(
+            responses,
+            vec![Message::GetData(vec![inv_tx])],
+            "inv for an unheld tx must produce a getdata"
+        );
+    }
+
+    #[test]
+    fn getdata_serves_held_tx_and_notfound_for_missing() {
+        let tx = dummy_tx(3);
+        let txid = tx.txid();
+        let inv_held = Inventory::Transaction(bitcoin::Txid::from_byte_array(*txid.as_bytes()));
+        let inv_missing = Inventory::Transaction(bitcoin::Txid::from_byte_array([0xFF; 32]));
+        let inventory = FakeTxInventory::empty().with_tx(tx);
+        let mut peer = ready_peer();
+
+        let responses = dispatch_collect_full(
+            &mut peer,
+            &Message::GetData(vec![inv_held, inv_missing]),
+            None,
+            Some(&inventory),
+        );
+
+        assert_eq!(responses.len(), 2, "expected tx + notfound");
+        assert!(
+            matches!(responses[0], Message::Tx(_)),
+            "first response must be the held tx body"
+        );
+        assert_eq!(
+            responses[1],
+            Message::NotFound(vec![inv_missing]),
+            "second response must be notfound for the missing tx"
+        );
+    }
+
+    #[test]
+    fn getdata_wtxid_serves_held_tx() {
+        let tx = dummy_tx(4);
+        let wtxid = tx.wtxid();
+        let inv_wtx = Inventory::WTx(bitcoin::Wtxid::from_byte_array(*wtxid.as_bytes()));
+        let inventory = FakeTxInventory::empty().with_tx(tx);
+        let mut peer = ready_peer();
+
+        let responses = dispatch_collect_full(
+            &mut peer,
+            &Message::GetData(vec![inv_wtx]),
+            None,
+            Some(&inventory),
+        );
+
+        assert_eq!(responses.len(), 1, "expected one tx response");
+        assert!(
+            matches!(responses[0], Message::Tx(_)),
+            "wtxid-typed getdata for a held tx must serve its body"
+        );
+    }
+
+    #[test]
+    fn getdata_tx_without_inventory_reports_notfound() {
+        let inv_tx = Inventory::Transaction(bitcoin::Txid::from_byte_array([1; 32]));
+        let mut peer = ready_peer();
+
+        let responses =
+            dispatch_collect_full(&mut peer, &Message::GetData(vec![inv_tx]), None, None);
+
+        assert_eq!(
+            responses,
+            vec![Message::NotFound(vec![inv_tx])],
+            "getdata for tx without TxInventory must report notfound"
+        );
+    }
+
+    #[test]
+    fn inv_filter_bip339_wtxid() {
+        let tx = dummy_tx(5);
+        let wtxid = tx.wtxid();
+        let inv_wtx = Inventory::WTx(bitcoin::Wtxid::from_byte_array(*wtxid.as_bytes()));
+        let inventory = FakeTxInventory::empty().with_have(*wtxid.as_bytes());
+        let mut peer = ready_peer();
+        // Simulate BIP339 negotiation: peer advertised wtxid relay.
+        peer.wtxid_relay.mark_peer_supported();
+
+        let responses = dispatch_collect_full(
+            &mut peer,
+            &Message::Inv(vec![inv_wtx]),
+            None,
+            Some(&inventory),
+        );
+
+        assert!(
+            responses.is_empty(),
+            "BIP339 wtxid inv for a held tx must produce no getdata"
+        );
+    }
+
+    fn dispatch_collect_full<S>(
+        peer: &mut Peer<S>,
+        message: &Message,
+        chain: Option<&dyn ChainQuery>,
+        tx_inventory: Option<&dyn TxInventory>,
+    ) -> Vec<Message> {
+        let collected = RefCell::new(Vec::new());
+        dispatch_inbound_full(
+            peer,
+            message,
+            chain,
+            tx_inventory,
+            &|| true,
+            &mut |response| {
+                collected.borrow_mut().push(response);
+                Ok(())
+            },
+        )
+        .expect("dispatch must succeed");
+        collected.into_inner()
     }
 
     #[derive(Debug, PartialEq, Eq)]
