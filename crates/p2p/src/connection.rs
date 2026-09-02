@@ -199,10 +199,12 @@ pub const OUTBOUND_QUEUE_MAX_MESSAGES: usize = 4096;
 /// Admission tests usage before adding, so sixteen worst-case block messages
 /// fit: after fifteen, 60,000,360 bytes remain below this 64 MiB high-water.
 pub const OUTBOUND_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
-/// Consensus maximum serialized block size in `usize`; the `u64` profile
-/// constant in `peer` is its widening and the gate test pins them in
-/// lockstep.
-const BLOCK_SERIALIZED_SIZE: usize = 4_000_000;
+/// `usize` form of the consensus maximum serialized block size. The
+/// authoritative `u64` original and this `usize` form are both owned by
+/// `peer` ([`crate::MAX_BLOCK_SERIALIZED_SIZE`] and
+/// [`crate::MAX_BLOCK_SERIALIZED_SIZE_USIZE`]); `connection` references
+/// them rather than carrying an independent copy.
+const BLOCK_SERIALIZED_SIZE: usize = crate::MAX_BLOCK_SERIALIZED_SIZE_USIZE;
 
 /// Full framed-wire bytes reserved before loading a worst-case block body.
 ///
@@ -566,12 +568,28 @@ mod tests {
     }
 
     #[test]
-    fn production_gate_progress_invariant_and_reserve_arithmetic() {
-        // The reserve pins to the peer profile's `u64` constant without a
-        // truncating cast; an impossible conversion fails the gate.
-        let expected = crate::wire::HEADER_LEN
-            .checked_add(usize::try_from(crate::MAX_BLOCK_SERIALIZED_SIZE).unwrap_or(usize::MAX));
-        assert_eq!(Some(super::BLOCK_PRODUCTION_RESERVE_BYTES), expected);
+    fn block_production_reserve_admits_worst_case_block() {
+        // The reserve is derived from the authoritative consensus constant
+        // `MAX_BLOCK_SERIALIZED_SIZE` (owned by `peer`). A worst-case block
+        // body of exactly that many wire bytes (header + body) must be
+        // admissible into a queue whose byte cap equals the reserve. If the
+        // reserve did not match the authoritative constant, a real 4 MB
+        // block would be silently refused or the queue would over-reserve.
+        let worst_case_wire = crate::wire::HEADER_LEN
+            + usize::try_from(crate::MAX_BLOCK_SERIALIZED_SIZE).unwrap();
+        assert_eq!(
+            super::BLOCK_PRODUCTION_RESERVE_BYTES, worst_case_wire,
+            "reserve must equal header + authoritative max block size"
+        );
+        let budget = super::OutboundBudget::with_block_reserve(
+            1,
+            super::BLOCK_PRODUCTION_RESERVE_BYTES,
+            super::BLOCK_PRODUCTION_RESERVE_BYTES,
+        );
+        assert!(
+            budget.admit(worst_case_wire),
+            "a worst-case block must be admissible when the byte cap equals the reserve"
+        );
 
         // Empty-queue progress arm: the first worst-case body is always
         // allowed, even when its reserve alone exceeds the byte cap.
