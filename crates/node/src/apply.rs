@@ -8323,8 +8323,10 @@ mod consensus_rule_tests {
     /// In-memory bodies, so a branch switch can reload the blocks it needs.
     #[derive(Default)]
     pub(super) struct MapBodyStore {
-        pub(super) bodies: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
-        pub(super) failed_reads: parking_lot::RwLock<HashSet<(u32, bitcoin_rs_primitives::Hash256)>>,
+        pub(super) bodies:
+            parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
+        pub(super) failed_reads:
+            parking_lot::RwLock<HashSet<(u32, bitcoin_rs_primitives::Hash256)>>,
     }
 
     struct ReorgBodyLoadingFixture {
@@ -10158,9 +10160,8 @@ mod chain_generation_tests {
                 spend_txid = Some(block.txs[1].txid());
             }
             let raw = bytes::Bytes::from(consensus_bytes(&block));
-            let tip =
-                crate::apply::apply_block_with_serialized(&handles, &block, raw.clone())
-                    .unwrap_or_else(|error| panic!("apply block {height}: {error}"));
+            let tip = crate::apply::apply_block_with_serialized(&handles, &block, raw.clone())
+                .unwrap_or_else(|error| panic!("apply block {height}: {error}"));
             bodies
                 .bodies
                 .write()

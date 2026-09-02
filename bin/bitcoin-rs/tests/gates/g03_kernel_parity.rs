@@ -92,7 +92,9 @@ fn block_parse_parity() -> TestResult {
             native_count,
             kernel_count,
             "block {} (hash {}): transaction count mismatch: native={}, kernel={}",
-            path.file_name().expect("path should have filename").to_string_lossy(),
+            path.file_name()
+                .expect("path should have filename")
+                .to_string_lossy(),
             native_hash,
             native_count,
             kernel_count,
@@ -106,7 +108,9 @@ fn block_parse_parity() -> TestResult {
                 native_txid,
                 kernel_txid,
                 "block {} (hash {}): txid mismatch at tx[{i}]: native={}, kernel={}",
-                path.file_name().expect("path should have filename").to_string_lossy(),
+                path.file_name()
+                    .expect("path should have filename")
+                    .to_string_lossy(),
                 native_hash,
                 native_txid,
                 kernel_txid,
