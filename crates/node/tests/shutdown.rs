@@ -20,7 +20,7 @@ fn run_exits_cleanly_after_fast_shutdown_signal() -> Result<()> {
     config.storage_backend = "redb".to_owned();
     config.rpc_bind = loopback(0);
     config.rpc_auth = Auth::basic("user", "password");
-    config.script_index = false;
+    config.script_index = bitcoin_rs_node::config::ScriptIndexMode::Disabled;
     config.p2p_listen.clear();
     config.metrics_bind = None;
     config = config.with_shutdown_receiver(shutdown_rx);
