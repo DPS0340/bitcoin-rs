@@ -763,6 +763,13 @@ impl BlockBodySource for StoredBlockBodySource {
 
 const PRUNEHEIGHT_METADATA_KEY: &[u8] = b"node:pruneheight";
 
+/// A checkpoint restore more than this many blocks behind the durable
+/// applied-tip witness is a catastrophic rollback, not a routine resume.
+/// The restore is still accepted — the chainstate is valid — but the node
+/// logs at ERROR and the warning snapshot carries the gap so operators
+/// and RPC consumers can see the node is starting far behind where it was.
+const STALE_RESTORE_ERROR_THRESHOLD: u32 = 1000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResumeSource {
     Cold,
@@ -1401,6 +1408,20 @@ impl NodeState {
                             .map_or(0, |d| d.as_secs()),
                     )
                     .context("write checkpoint-fallback event marker")?;
+                let gap = witness_height.saturating_sub(restored_height);
+                if gap > STALE_RESTORE_ERROR_THRESHOLD {
+                    tracing::error!(
+                        witness_height,
+                        restored_height,
+                        gap,
+                        threshold = STALE_RESTORE_ERROR_THRESHOLD,
+                        "stale checkpoint restore: chainstate is {gap} blocks behind \
+                         the last durable applied-tip witness — the node is proceeding \
+                         with a valid but far-behind tip; crash recovery will replay \
+                         the gap from stored bodies when present, otherwise the sync \
+                         layer must re-fetch it"
+                    );
+                }
             }
         }
         // Anchor the initial snapshot before `restored_applied_tip` is moved
@@ -4382,6 +4403,62 @@ mod tests {
         assert!(
             !witness_path2.exists(),
             "no witness must be written when checkpoint fails before publication"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // #208: a checkpoint restore far behind the durable witness must be loud
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stale_checkpoint_restore_surfaces_warning_not_silence() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        config.script_index = crate::config::ScriptIndexMode::Disabled;
+
+        // Apply genesis and publish a checkpoint at height 0.
+        let state = NodeState::open(config.clone())?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        state.write_clean_checkpoint()?;
+        drop(state);
+
+        // Simulate the #208 scenario: the node previously ran far ahead
+        // (height 5000) and published a checkpoint there, writing a witness
+        // at that height. A crash or clean stop left the checkpoint tree
+        // pinned at height 0 while the witness records height 5000.
+        let genesis_hex = config.network.genesis_block_hash().to_string_be();
+        let stale_witness = crate::recovery_evidence::AppliedTipWitness::new(
+            genesis_hex,
+            1, // older epoch
+            5000,
+            "cccc",
+            1000,
+        );
+        crate::recovery_evidence::write_witness(&data_dir, &stale_witness)?;
+
+        // Reopen: the checkpoint at height 0 is restored, the witness at
+        // 5000 triggers checkpoint-fallback detection. The warning store
+        // must carry the fallback warning — the restore must not be silent.
+        let resumed = NodeState::open(config.clone())?;
+        let warnings = resumed.warning_store().warnings();
+        assert!(
+            !warnings.is_empty(),
+            "a stale checkpoint restore 5000 blocks behind the witness must \
+             produce at least one rollback warning, not silence"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("height 5000")),
+            "the warning must name the witness height; got: {warnings:?}"
+        );
+        assert_eq!(
+            resumed.resume_source(),
+            ResumeSource::Checkpoint,
+            "the checkpoint is still accepted — it is valid, just stale"
         );
         Ok(())
     }
