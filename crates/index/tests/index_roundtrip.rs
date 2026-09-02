@@ -313,70 +313,8 @@ fn watermark_roundtrip_and_invalid_rejection() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
-fn format_version_rejection() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[4, 0, 0, 0],
-    )?;
-    assert!(matches!(
-        IndexWriter::open(store),
-        Err(IndexError::UnsupportedTxIndexFormatVersion { version: 4 })
-    ));
-    Ok(())
-}
-
-#[test]
-fn unversioned_rows_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    let mut indexer = Indexer::new(Arc::clone(&store));
-    let body = read_fixture(0)?;
-    indexer.ingest_block(&body, 0)?;
-
-    assert!(matches!(
-        IndexWriter::open(Arc::clone(&store)),
-        Err(IndexError::LegacyCursorlessIndex)
-    ));
-    Ok(())
-}
-
-#[test]
-fn reset_index_replaces_an_incompatible_derived_format() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &2_u32.to_le_bytes(),
-    )?;
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::TxConfirmed,
-        b"old",
-        b"row",
-    )?;
-
-    IndexWriter::reset_index(store.as_ref())?;
-
-    assert!(
-        IndexWriter::open(Arc::clone(&store))?
-            .watermark()?
-            .is_none()
-    );
-    assert_eq!(
-        store.count(bitcoin_rs_storage::ColumnFamily::TxConfirmed),
-        0
-    );
-    Ok(())
-}
-
-#[test]
 fn invalid_watermark_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[3, 0, 0, 0],
-    )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'T'],
@@ -774,33 +712,12 @@ fn batch_caps_admit_oversized_first_block() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn format_version_requires_exact_bytes() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    // Extra trailing byte must be rejected even though the prefix is version 3.
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[3, 0, 0, 0, 0],
-    )?;
-    assert!(matches!(
-        IndexWriter::open(store),
-        Err(IndexError::UnsupportedTxIndexFormatVersion { version: 3 })
-    ));
-    Ok(())
-}
-
-#[test]
 fn commit_forward_accepts_terminal_height() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     let current = IndexWatermark {
         height: u32::MAX - 1,
         hash: [0; 32],
     };
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[3, 0, 0, 0],
-    )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'T'],
@@ -836,11 +753,6 @@ fn commit_forward_rejects_height_overflow() -> Result<(), Box<dyn std::error::Er
         height: u32::MAX,
         hash: [0xab; 32],
     };
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[3, 0, 0, 0],
-    )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'T'],

@@ -33,7 +33,6 @@ pub enum IndexError {
     },
     /// A transaction's byte range in the block does not fit the `u32` that
     /// [`crate::types::TxPosition`] stores.
-    ///
     /// Unreachable for any consensus-valid block — a block is capped far below
     /// 4 GiB — but the arithmetic is checked rather than wrapped, and the
     /// failure is an addressing limit, not a malformed header.
@@ -50,12 +49,6 @@ pub enum IndexError {
     InvalidPrefixRowLength {
         /// Actual key length observed in storage.
         len: usize,
-    },
-    /// The `TxIndex` format version is not supported.
-    #[error("unsupported TxIndex format version {version}")]
-    UnsupportedTxIndexFormatVersion {
-        /// Format version value found in the store.
-        version: u32,
     },
     /// A serialized block header does not hash to the expected identity.
     #[error(
@@ -94,12 +87,9 @@ pub enum IndexError {
         /// Watermark found in the store.
         actual: Option<IndexWatermark>,
     },
-    /// A prepared transition cannot mix with legacy buffered rows.
-    #[error("cannot write prepared TxIndex mutations with buffered legacy rows")]
-    PendingLegacyRows,
-    /// `TxIndex` tables exist but the format-version key is missing.
-    #[error("TxIndex tables are present without a versioned watermark")]
-    LegacyCursorlessIndex,
+    /// A prepared transition cannot mix with buffered rows.
+    #[error("cannot write prepared TxIndex mutations with buffered rows")]
+    PendingBufferedRows,
     /// A crash-recovery marker for a capability rebuild was malformed.
     #[error("invalid TxIndex capability reset marker")]
     InvalidResetMarker,
@@ -107,8 +97,6 @@ pub enum IndexError {
 
 // Reserved metadata keys in `ColumnFamily::UtxoMeta`. The 0x00 prefix is reserved for
 // TxIndex metadata; data row keys begin with ASCII letters only and can never collide.
-const FORMAT_VERSION_KEY: &[u8] = &[0x00, b'V'];
-const FORMAT_VERSION_VALUE: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 const TX_LOOKUP_WATERMARK_KEY: &[u8] = &[0x00, b'T'];
 const SCRIPT_HISTORY_WATERMARK_KEY: &[u8] = &[0x00, b'S'];
 const RESET_CAPABILITIES_KEY: &[u8] = &[0x00, b'R'];
@@ -717,74 +705,6 @@ impl<S: KvStore> Indexer<S> {
             }
         }
         Ok(None)
-    }
-
-    /// Reports whether this index's rows carry transaction positions, adopting
-    /// the current format when the index is empty.
-    ///
-    /// Reading is always correct either way — a row without positions takes the
-    /// scan fallback — so this exists to tell an operator which path their node
-    /// is on, not to gate correctness. The difference is three orders of
-    /// magnitude on history resolution, which is worth a startup line.
-    ///
-    /// An index with rows but no version marker predates the format and is
-    /// reported as [`IndexFormat::Legacy`]. The marker is written only for an
-    /// empty index, because that is the only case where every row that will ever
-    /// exist is going to be written with positions. Writing it for a populated
-    /// legacy index would claim positions that are not there.
-    pub fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
-        match self.read_format_version()? {
-            Some(FormatMarker::Version(found)) => {
-                return Ok(if found == INDEX_FORMAT_VERSION {
-                    IndexFormat::Current
-                } else {
-                    IndexFormat::Legacy { found: Some(found) }
-                });
-            }
-            Some(FormatMarker::Unreadable { len }) => {
-                return Ok(IndexFormat::UnreadableMarker { len });
-            }
-            None => {}
-        }
-        if self.has_any_header()? {
-            return Ok(IndexFormat::Legacy { found: None });
-        }
-        let mut batch = self.store.new_batch();
-        batch.put(
-            ColumnFamily::UtxoMeta,
-            INDEX_FORMAT_VERSION_KEY,
-            &INDEX_FORMAT_VERSION.to_le_bytes(),
-        );
-        self.store.write(batch)?;
-        Ok(IndexFormat::Current)
-    }
-
-    fn read_format_version(&self) -> Result<Option<FormatMarker>, IndexError> {
-        let Some(bytes) = self
-            .store
-            .get(ColumnFamily::UtxoMeta, INDEX_FORMAT_VERSION_KEY)?
-        else {
-            return Ok(None);
-        };
-        let Ok(encoded) = <[u8; 4]>::try_from(bytes.as_slice()) else {
-            // Reported as its own outcome rather than folded into version 0: an
-            // operator told "your index is at version 0" deletes and re-syncs,
-            // which is the wrong response to bytes that should be a `u32` and
-            // are not.
-            return Ok(Some(FormatMarker::Unreadable { len: bytes.len() }));
-        };
-        Ok(Some(FormatMarker::Version(u32::from_le_bytes(encoded))))
-    }
-
-    /// True when the header column family holds at least one row.
-    ///
-    /// Deliberately not `header_count`: a legacy index takes this branch on
-    /// every single start, and counting reads every row in the column family
-    /// and allocates an 80-byte array per row — roughly a million of each at
-    /// mainnet height — to answer a question that is only ever yes or no.
-    fn has_any_header(&self) -> Result<bool, IndexError> {
-        let mut rows = self.store.iter_prefix(ColumnFamily::BlockHeaders, &[])?;
-        Ok(rows.next().transpose()?.is_some())
     }
 
     const FLUSH_THRESHOLD_ROWS: usize = 500_000;
@@ -1689,28 +1609,9 @@ pub struct IndexWriter<S: KvStore> {
 }
 
 impl<S: KvStore> IndexWriter<S> {
-    /// Opens a writer over `store`, rejecting unversioned index tables.
+    /// Opens a writer over the current datadir's index store.
     pub fn open(store: std::sync::Arc<S>) -> Result<Self, IndexError> {
         let indexer = Indexer::new(store);
-        match indexer
-            .store
-            .get(ColumnFamily::UtxoMeta, FORMAT_VERSION_KEY)?
-        {
-            Some(value) => {
-                if value.as_slice() != FORMAT_VERSION_VALUE {
-                    let version = value
-                        .get(..4)
-                        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                        .map_or(0, u32::from_le_bytes);
-                    return Err(IndexError::UnsupportedTxIndexFormatVersion { version });
-                }
-            }
-            None => {
-                if has_any_index_row(&*indexer.store)? {
-                    return Err(IndexError::LegacyCursorlessIndex);
-                }
-            }
-        }
         Self::resume_capability_reset(indexer.store.as_ref())?;
         Ok(Self { indexer })
     }
@@ -1723,48 +1624,6 @@ impl<S: KvStore> IndexWriter<S> {
     /// Loads both independently durable capability watermarks.
     pub fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
         self.indexer.watermarks()
-    }
-
-    /// Deletes every derived index row in bounded batches and initializes the
-    /// current format marker so startup can rebuild it from the active chain.
-    ///
-    /// This is intentionally limited to derived `TxLookup`/`ScriptIndex` data;
-    /// it never touches the UTXO set or block bodies.
-    pub fn reset_index(store: &S) -> Result<(), IndexError> {
-        for cf in [
-            ColumnFamily::TxConfirmed,
-            ColumnFamily::Funding,
-            ColumnFamily::Spending,
-            ColumnFamily::BlockHeaders,
-        ] {
-            loop {
-                let scan = store.scan_prefix_bounded(cf, &[], RESET_SCAN_LIMIT)?;
-                if scan.rows.is_empty() {
-                    break;
-                }
-                let mut batch = store.new_batch();
-                for (key, _) in scan.rows {
-                    batch.delete(cf, &key);
-                }
-                store.write_deferred(batch)?;
-                if scan.complete {
-                    break;
-                }
-            }
-        }
-        store.flush()?;
-
-        let mut batch = store.new_batch();
-        batch.delete(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY);
-        batch.delete(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY);
-        batch.delete(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY);
-        batch.put(
-            ColumnFamily::UtxoMeta,
-            FORMAT_VERSION_KEY,
-            &FORMAT_VERSION_VALUE,
-        );
-        store.write_durable(batch)?;
-        Ok(())
     }
 
     /// Marks selected derived rows unavailable, deletes them in bounded batches,
@@ -1782,11 +1641,6 @@ impl<S: KvStore> IndexWriter<S> {
             ColumnFamily::UtxoMeta,
             RESET_CAPABILITIES_KEY,
             &[capabilities.to_mask()],
-        );
-        batch.put(
-            ColumnFamily::UtxoMeta,
-            FORMAT_VERSION_KEY,
-            &FORMAT_VERSION_VALUE,
         );
         if capabilities.tx_lookup {
             batch.delete(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY);
@@ -1949,11 +1803,6 @@ impl<S: KvStore> IndexWriter<S> {
             last.ok_or(IndexError::NonContiguousPrepared { watermark: current })?;
         let mut store_batch = self.indexer.store.new_batch();
         put_rows(&mut store_batch, &merged);
-        store_batch.put(
-            ColumnFamily::UtxoMeta,
-            FORMAT_VERSION_KEY,
-            &FORMAT_VERSION_VALUE,
-        );
         put_selected_watermarks(&mut store_batch, capabilities, Some(final_watermark));
         self.indexer.store.write_durable(store_batch)?;
         self.indexer.last_counts = merged.counts();
@@ -2033,11 +1882,6 @@ impl<S: KvStore> IndexWriter<S> {
                     .script_history
                     .is_some_and(|watermark| watermark.height >= current.height));
         delete_rows(&mut store_batch, &prepared.rows, !unselected_keeps_identity);
-        store_batch.put(
-            ColumnFamily::UtxoMeta,
-            FORMAT_VERSION_KEY,
-            &FORMAT_VERSION_VALUE,
-        );
         put_selected_watermarks(&mut store_batch, capabilities, prev);
         self.indexer.store.write_deferred(store_batch)?;
         self.indexer.store.flush()?;
@@ -2052,7 +1896,7 @@ impl<S: KvStore> IndexWriter<S> {
 
     fn ensure_prepared_ready(&self) -> Result<(), IndexError> {
         if self.indexer.batch_depth != 0 || !self.indexer.pending_rows.is_empty() {
-            return Err(IndexError::PendingLegacyRows);
+            return Err(IndexError::PendingBufferedRows);
         }
         Ok(())
     }
@@ -2066,22 +1910,6 @@ impl<S: KvStore> IndexReader for IndexWriter<S> {
     }
 }
 
-fn has_any_index_row<S: KvStore>(store: &S) -> Result<bool, IndexError> {
-    for cf in [
-        ColumnFamily::TxConfirmed,
-        ColumnFamily::Funding,
-        ColumnFamily::Spending,
-        ColumnFamily::BlockHeaders,
-    ] {
-        let mut iter = store.iter_prefix(cf, &[])?;
-        if let Some(entry) = iter.next() {
-            let _ = entry?;
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Storage-agnostic block-ingest interface.
 ///
 /// Use this trait when consumers must hold the indexer behind a trait
@@ -2089,15 +1917,6 @@ fn has_any_index_row<S: KvStore>(store: &S) -> Result<bool, IndexError> {
 pub trait IndexerLike: Send + Sync {
     /// Walks `block` once and writes index rows. See `Indexer::ingest_block`.
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError>;
-
-    /// Reports the row-value format. See [`Indexer::ensure_format_version`].
-    ///
-    /// Defaults to [`IndexFormat::Current`] for the in-memory and stub indexers
-    /// used in tests, which have no persisted rows and therefore no legacy ones.
-    /// A store-backed implementation must override this.
-    fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
-        Ok(IndexFormat::Current)
-    }
 
     /// Deletes every index row that ingesting `block` at `height` would have written.
     ///
@@ -2152,48 +1971,6 @@ pub trait IndexerLike: Send + Sync {
     ) -> Result<Option<u64>, IndexError>;
 }
 
-/// Metadata key marking which row-value format an index was written with.
-const INDEX_FORMAT_VERSION_KEY: &[u8] = b"index:format_version";
-
-/// Current row-value format. Version 1 added transaction byte positions to
-/// funding and txid row values; version 0 (unmarked) has empty values.
-pub const INDEX_FORMAT_VERSION: u32 = 1;
-
-/// Which row-value format an opened index carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IndexFormat {
-    /// Rows carry transaction positions; resolvers take the fast path.
-    Current,
-    /// Rows predate transaction positions; resolvers scan whole blocks.
-    ///
-    /// Correct but far slower. Clearing the index directory and re-syncing
-    /// rebuilds it in the current format.
-    Legacy {
-        /// The version marker found, or `None` when the index carries none.
-        found: Option<u32>,
-    },
-    /// A version marker exists but is not the 4 little-endian bytes of a `u32`.
-    ///
-    /// Resolvers scan, exactly as for [`Self::Legacy`], but the operator
-    /// response differs: this is damaged metadata, not an old index, and
-    /// deleting the directory would discard the evidence of whatever wrote it.
-    UnreadableMarker {
-        /// Byte length of the marker value that failed to decode.
-        len: usize,
-    },
-}
-
-/// What the format-version marker key holds, when it is present at all.
-enum FormatMarker {
-    /// Four little-endian bytes that decoded to this version.
-    Version(u32),
-    /// Present, but not a 4-byte little-endian `u32`.
-    Unreadable {
-        /// Byte length of the value found.
-        len: usize,
-    },
-}
-
 /// Provides block lookups for resolving lossy index prefixes to full identities.
 ///
 /// The index column families store 8-byte prefixes of txids/scripthashes/outpoints.
@@ -2223,10 +2000,6 @@ pub trait BlockSource {
 impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_block(self, block, height)
-    }
-
-    fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
-        Self::ensure_format_version(self)
     }
 
     fn rollback_block(

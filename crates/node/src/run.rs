@@ -574,7 +574,7 @@ fn spawn_fixed_peer_bootstrap(
 /// Flow:
 /// 1. Install JSON tracing on stderr.
 /// 2. Open / create the node data directory and resolve state.
-/// 3. Resume an authenticated chainstate checkpoint, or run legacy crash recovery on cold/header-only startup.
+/// 3. Resume an authenticated chainstate checkpoint, or run crash recovery on a cold startup.
 /// 4. Acquire a shutdown signal — either the in-process receiver wired via
 ///    [`Config::with_shutdown_receiver`] (tests) or a fresh SIGINT/SIGTERM
 ///    handler (production).
@@ -588,7 +588,7 @@ pub fn run(mut config: Config) -> Result<()> {
 
     let injected_shutdown = config.shutdown_signal.take();
     let state = NodeState::open(config)?;
-    if state.resume_source() != crate::state::ResumeSource::Checkpoint {
+    if state.resume_source() == crate::state::ResumeSource::Cold {
         crash_recovery::recover_if_needed(&state)?;
     }
 

@@ -22,12 +22,6 @@ const TXID_RUN_GROUPING_MAX_SHARDS: usize = 8;
 /// Errors returned by UTXO mutation and snapshot operations.
 #[derive(Debug, Error)]
 pub enum UtxoError {
-    /// A legacy snapshot v2 bitmap only represents vouts `0..64`.
-    #[error("snapshot v2 vout {vout} exceeds bitmap range 0..64")]
-    VoutOutOfRange {
-        /// Invalid vout.
-        vout: u32,
-    },
     /// A script does not fit the snapshot and record `u16` length field.
     #[error("script_pubkey is too large for a u16 length: {len} bytes")]
     ScriptTooLarge {
@@ -77,22 +71,6 @@ pub enum UtxoError {
     SnapshotOutputCountTooLarge {
         /// Live output count in one transaction-level record.
         count: usize,
-    },
-    /// Snapshot vout count does not match the bitmap.
-    #[error("snapshot record vout count {vout_count} does not match bitmap {bitmap:#018x}")]
-    SnapshotVoutCountMismatch {
-        /// Vout bitmap from the record.
-        bitmap: u64,
-        /// Vout count from the record.
-        vout_count: u8,
-    },
-    /// Snapshot vout is not present in the legacy record bitmap.
-    #[error("snapshot v2 vout {vout} is not present in bitmap {bitmap:#018x}")]
-    SnapshotVoutBitmapMismatch {
-        /// Vout bitmap from the record.
-        bitmap: u64,
-        /// Output index from the record body.
-        vout: u32,
     },
     /// Snapshot record serialized the same vout more than once.
     #[error("snapshot record duplicates vout {vout}")]

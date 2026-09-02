@@ -242,7 +242,7 @@ conservative number** and the one quoted above.
 v5 keeps v4's record header and replaces the per-output layout:
 
 ```
-txid(32) || output_count(4) || legacy_inline_len(1) || widths(1)
+txid(32) || output_count(4) || inline_len(1) || widths(1)
 || vout_dir  : one fixed-width little-endian entry per output
 || len_dir   : one fixed-width payload length per output
 || payloads  : varint(amount) [|| raw amount] || varint(height << 1 | coinbase) || script

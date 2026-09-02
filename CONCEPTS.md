@@ -180,8 +180,29 @@ Outputs the UTXO set never admits because no spend of them can ever be valid: an
 ### UTXO snapshot read contract
 The node accepts only complete native version-4 snapshots: the exact magic and
 version, validated v4 records, the declared record count, a 384-byte MuHash
-trailer, and end-of-file. Versions 2 and 3 are unsupported; chainstate is
-rebuilt or resynchronized instead of being loaded through a legacy reader.
+trailer, and end-of-file. Versions 2 and 3 are unsupported; an incompatible
+snapshot makes startup fail with an explicit datadir remove-and-resync
+instruction instead of selecting a legacy reader or a validated-headers
+fallback.
+
+### Datadir schema marker
+The one current persistent-format authority at the datadir root, stored in
+`CURRENT_SCHEMA` as a serialized epoch marker and initialized and file-synced
+before any checkpoint or KV store opens. An unmarked non-empty directory is
+implicitly baseline epoch 0: it is adopted and marked while epoch 0 is current,
+but fails before normal startup once the epoch advances. A malformed marker or
+older epoch is an incompatible datadir. Network/backend datadir ownership and
+multi-process locking are separate configuration and lifecycle concerns, not
+part of the persistent schema marker; see [issue #242](https://github.com/gosuda/bitcoin-rs/issues/242).
+The node never deletes or converts state.
+`Cold` means there is no committed checkpoint: no checkpoint root and a root
+containing only unpublished generation/temp residue both take this path. If
+`CURRENT` exists, only its referenced generation is considered; an invalid
+referenced generation is current-state corruption and has no legacy fallback.
+Ordinary filesystem I/O failures remain operational errors and are not
+reclassified as datadir incompatibility. Directory-entry durability is
+guaranteed only on platforms that support directory syncing. See
+`docs/policies/db-migration.md`.
 
 ### Undo record
 
@@ -360,7 +381,7 @@ shipped production paths and product-shaped workloads.
 Recording a statistic when its outcome is known rather than when the subject arrives. The fee estimator counted a transaction against every confirmation target the moment it entered, so a fresh arrival was already a failure at every target and a burst silenced the estimator before anything had missed a deadline. It also broke the decay: the denominator had been decaying since entry while a confirmation arrived undecayed, reporting 81 successes in 100 as roughly 85%. Sampling numerator and denominator together at the moment a target resolves fixes both, because they then decay from the same block. The counterpart rule is that a subject leaving for an unrelated reason is untracked without being sampled: an eviction says something about the mempool, not about whether the transaction would have confirmed.
 
 ### Directory-layout record
-A record that keeps its per-item lookup keys and item lengths in fixed-width arrays in front of the items, rather than inline with them. `UtxoRecord` v5 is `txid || output_count || legacy_inline_len || widths || vout_dir || len_dir || payloads`, where each directory entry is the narrowest little-endian width the record needs. The reason is random access: the hot read is `find_output(vout)` — every spent input resolves through `Shard::get`/`get_entry`/`get_meta` — and in a flat variable-length layout each field's length is what locates the next one, so finding output `i` walks the bytes of outputs `0..i`, scripts included. That was measured at 4.4-4.9x slower than the fixed-width v4 it replaced. With directories a lookup scans one dense byte array and sums a second, touching about two bytes per output instead of thirty-five. The two layouts cross over near 64 outputs: below it v5's fixed setup dominates and it is about 3 ns slower at the measured mainnet average of 3.626 outputs per record, above it the scan dominates and v5 wins by up to 1.58x. Storing lengths rather than script lengths is what makes the directory free — the script is whatever remains of its payload, so no length is stored twice. See `docs/benchmarks/utxo-memory.md`.
+A record that keeps its per-item lookup keys and item lengths in fixed-width arrays in front of the items, rather than inline with them. `UtxoRecord` v5 is `txid || output_count || inline_len || widths || vout_dir || len_dir || payloads`, where each directory entry is the narrowest little-endian width the record needs. The reason is random access: the hot read is `find_output(vout)` — every spent input resolves through `Shard::get`/`get_entry`/`get_meta` — and in a flat variable-length layout each field's length is what locates the next one, so finding output `i` walks the bytes of outputs `0..i`, scripts included. That was measured at 4.4-4.9x slower than the fixed-width v4 it replaced. With directories a lookup scans one dense byte array and sums a second, touching about two bytes per output instead of thirty-five. The two layouts cross over near 64 outputs: below it v5's fixed setup dominates and it is about 3 ns slower at the measured mainnet average of 3.626 outputs per record, above it the scan dominates and v5 wins by up to 1.58x. Storing lengths rather than script lengths is what makes the directory free — the script is whatever remains of its payload, so no length is stored twice. See `docs/benchmarks/utxo-memory.md`.
 
 ### Canonical record spelling
 The rule that one logical record has exactly one byte string. Fixed-width fields give this away for free; variable-width encodings must enforce it, and `UtxoRecord` compares and hashes by bytes, so a second spelling makes equal records unequal. v5 needs three rules to keep it: a varint must be minimal, because `[0x80, 0x00]` also decodes to zero; a directory width must be the narrowest that fits, because a wider one describes the same record; and the compact amount form and the escape must be exact complements, so the compact form may encode only amounts the escape refuses and the escape refuses only amounts the compact form covers. The last of these is also a safety rule rather than a tidiness one: `read_varint` hands `decompress_amount` whatever a record contains and `validate_encoded` runs it over every output loaded from a snapshot, and the transform multiplies by up to a billion, so an unbounded input panics a debug build and wraps silently in a release one. `decompress_accepts_exactly_the_encoder_image` states the whole rule as one property over every `u64`.

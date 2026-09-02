@@ -292,7 +292,7 @@ serving remains deferred.
 - `getblockchaininfo` surfaces real `chainwork` as a 64-character lowercase big-endian hex string via `rpc::Context::chainwork_hex()`.
 - `Network::is_{bip34,bip65,bip66,csv,segwit,taproot}_active(height) -> bool` const fns carry the per-network activation tables from Core's `chainparams.cpp`.
 - `getblockchaininfo`'s `initialblockdownload` follows Core's definition: `chainwork >= nMinimumChainWork && tip age <= 24h`, latched false once satisfied, matching `UpdateIBDStatus` / `Chain::IsTipRecent`. `Network::minimum_chain_work()` carries that per-network constant from the same `kernel/chainparams.cpp` the assume-valid anchor comes from. **It is Core's per-release tuning, not a consensus rule, and goes stale as the chain grows** — it needs re-copying whenever the pinned Core revision moves. Core's `-maxtipage` override is not wired; the 24-hour default stands. IBD is evaluated, and therefore latched, when an RPC caller asks for it, rather than continuously during validation as in Core.
-- `getblockchaininfo`'s `verificationprogress` is Core's `GuessVerificationProgress`: transactions verified over transactions estimated to exist, extrapolated from the per-network `ChainTxData` observation `Network::chain_tx_data()` carries from `kernel/chainparams.cpp`, and switching to a height-derived tip age within two hours of the tip exactly as Core does. **`ChainTxData` is Core's per-release tuning, not a consensus rule, and goes stale as the chain grows** — it needs re-copying whenever the pinned Core revision moves. When `Context::chain_tx_count()` is `None` — a datadir written before the node tracked a cumulative transaction count, which cannot be recovered without re-reading every block body — the field falls back to the old `applied / headers` height ratio rather than reporting Core's `0.0`, because a confident zero on a synced node breaks every caller that gates on this value. That fallback disappears once such a node resyncs.
+- `getblockchaininfo`'s `verificationprogress` is Core's `GuessVerificationProgress`: transactions verified over transactions estimated to exist, extrapolated from the per-network `ChainTxData` observation `Network::chain_tx_data()` carries from `kernel/chainparams.cpp`, and switching to a height-derived tip age within two hours of the tip exactly as Core does. **`ChainTxData` is Core's per-release tuning, not a consensus rule, and goes stale as the chain grows** — it needs re-copying whenever the pinned Core revision moves. When `Context::chain_tx_count()` is `None` — for example on a cold node before the counter has been established — the field falls back to the old `applied / headers` height ratio rather than reporting Core's `0.0`, because a confident zero on a synced node breaks every caller that gates on this value. An incompatible persisted datadir cannot reach this state: the current `CURRENT_SCHEMA` policy refuses it before startup.
 - Active-chain DAA retarget validation is wired into header acceptance and `apply_block`: non-retarget heights inherit parent `nBits` unless the network's minimum-difficulty exception applies, retarget heights recompute the expected target over the prior interval with Core's 4x timespan clamp, the network proof-of-work limit cap, and Testnet4's BIP94 period-base rule. Unit coverage pins header pre-insertion rejection, boundary accept/reject cases, clamp behavior, testnet minimum-difficulty exception, and Testnet4 BIP94 behavior.
 - Electrum TLS cert config is honored as plaintext-with-warning until a
   matching `electrum_tls_key` field lands; the warning surfaces on every
@@ -337,15 +337,16 @@ Spending rows are unchanged: nothing resolves them back to transactions today.
 
 ### Compatibility
 
-Keys, key ordering and row counts are untouched, so an existing index keeps
-working — a row with an empty value takes the whole-block scan path, which is the
-verbatim electrs behaviour and is retained as `*_scan`. Nothing forces a reindex;
-clearing the index directory and re-syncing is what earns the fast path.
+The current position-bearing row values preserve keys, key ordering, and row
+counts. Resolvers still retain the all-or-scan safety rule when a current
+position cannot be resolved, but that is not a migration path for an older
+index.
 
-`ColumnFamily::UtxoMeta` carries an `index:format_version` marker, adopted only
-when the index is empty. A populated index without one is reported as
-`IndexFormat::Legacy` and the node logs a startup warning naming the directory to
-delete. It does not refuse to start: reads stay correct either way.
+`CURRENT_SCHEMA` now owns compatibility for the index stores as well as chainstate.
+A missing marker on a non-empty directory or an incompatible epoch fails before
+any index store opens. The node never deletes or rebuilds derived rows
+automatically; the operator replaces or quarantines the datadir and resyncs. A
+marked current datadir writes only the current position-bearing row format.
 
 ### The rule that makes it safe
 
