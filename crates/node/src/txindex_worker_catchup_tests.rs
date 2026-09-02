@@ -487,3 +487,269 @@ fn stale_watermark_self_heals_across_reorg() -> Result<(), Box<dyn std::error::E
     assert!(fixture.no_a_only_rows()?, "A-only rows must be rolled back");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #229 regression: parallel prepare in catch_up_to
+// ---------------------------------------------------------------------------
+
+/// Writer wrapper that tracks the maximum number of concurrently in-flight
+/// `prepare_block_for` calls. Under the old serial loop the max is always 1;
+/// under the parallelized `par_iter` path it exceeds 1 whenever the rayon
+/// pool has more than one worker.
+struct ConcurrencyTrackingWriter {
+    inner: Arc<dyn TxIndexWriter>,
+    current: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl ConcurrencyTrackingWriter {
+    fn new(inner: Arc<dyn TxIndexWriter>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            current: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+        })
+    }
+
+    fn max_concurrent(&self) -> usize {
+        self.max.load(Ordering::Acquire)
+    }
+}
+
+impl TxIndexWriter for ConcurrencyTrackingWriter {
+    fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError> {
+        self.inner.fenced_watermarks()
+    }
+
+    fn prepare_block(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        self.inner.prepare_block(height, hash, body)
+    }
+
+    fn prepare_block_for(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        let current = self.current.fetch_add(1, Ordering::AcqRel) + 1;
+        let prev_max = self.max.load(Ordering::Acquire);
+        if current > prev_max {
+            self.max.store(current, Ordering::Release);
+        }
+        // Yield to increase the chance of overlap on a single-threaded
+        // pool; on a multi-threaded pool the parallel iterator already
+        // overlaps calls.
+        std::thread::yield_now();
+        let result = self
+            .inner
+            .prepare_block_for(capabilities, height, hash, body);
+        self.current.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+
+    fn commit_forward_with_cursor(
+        &self,
+        fence: IndexWriteFence,
+        batch: PreparedBatch,
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<IndexWatermark, IndexError> {
+        self.inner.commit_forward_with_cursor(fence, batch, cursor)
+    }
+
+    fn commit_rollback_one_for_with_cursor(
+        &self,
+        fence: IndexWriteFence,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<(), IndexError> {
+        self.inner
+            .commit_rollback_one_for_with_cursor(fence, capabilities, prev, body, cursor)
+    }
+
+    fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
+        self.inner.reset_capabilities(capabilities)
+    }
+
+    fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, IndexError> {
+        self.inner.consumer_cursor()
+    }
+
+    fn commit_consumer_cursor(
+        &self,
+        fence: IndexWriteFence,
+        cursor: &[u8],
+    ) -> Result<(), IndexError> {
+        self.inner.commit_consumer_cursor(fence, cursor)
+    }
+}
+
+/// Builds a single branch of `count` parent-linked regtest blocks from
+/// `genesis`, inserts headers into `tree`, and stores bodies in `bodies`.
+fn long_branch(
+    tree: &mut BlockTree,
+    mut prev: BlockHash,
+    label: u8,
+    count: u32,
+) -> Result<Vec<FixtureBlock>, Box<dyn std::error::Error>> {
+    let mut blocks = Vec::new();
+    for height in 1..=count {
+        let mut block = Block {
+            header: Header {
+                version: 1,
+                prev_blockhash: prev,
+                merkle_root: Hash256::default(),
+                time: height,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            txs: vec![coinbase(label, height)],
+        };
+        block.header.merkle_root = merkle_root(&block)
+            .ok_or_else(|| std::io::Error::other("fixture block has a merkle root"))?;
+        while !pow_met(block.header.bits, block.block_hash().0) {
+            block.header.nonce = block
+                .header
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("fixture nonce space"))?;
+        }
+        let block_hash = block.block_hash();
+        let hash = block_hash.0;
+        tree.insert_header(block.header, NodeStatus::HeaderValid)?;
+        blocks.push(FixtureBlock {
+            height,
+            hash,
+            body: consensus_bytes(&block),
+            block,
+        });
+        prev = block_hash;
+    }
+    Ok(blocks)
+}
+
+/// Regression test for #229: `catch_up_to` must prepare blocks in parallel
+/// across the rayon pool, not serially on the writer thread. The test wraps
+/// a real `RwLock<IndexWriter<FjallStore>>` with a concurrency tracker and
+/// asserts that `prepare_block_for` is called concurrently (max > 1) when
+/// processing a multi-block chunk.
+///
+/// Against the old serial loop, `max_concurrent` would always be 1 because
+/// each `prepare_block_for` call completes before the next begins. The
+/// `RwLock`-backed writer allows shared read locks, so the parallel `par_iter`
+/// path overlaps calls.
+#[test]
+fn catch_up_to_prepares_blocks_in_parallel() -> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block();
+    let genesis_hash = genesis.block_hash().0;
+    let mut tree = BlockTree::new();
+    tree.insert_header(genesis.header, NodeStatus::HeaderValid)?;
+
+    // Build a branch long enough to exercise the parallel path. 16 blocks
+    // is enough to observe concurrency on a multi-core rayon pool while
+    // keeping the test fast.
+    let count = 16;
+    let a = long_branch(&mut tree, genesis.block_hash(), 0xaa, count)?;
+
+    let mut bodies = MapBodyStore::new();
+    bodies.insert(0, genesis_hash, consensus_bytes(&genesis));
+    for block in &a {
+        bodies.insert(block.height, block.hash, block.body.clone());
+    }
+    let bodies = Arc::new(bodies);
+
+    let dir = tempfile::tempdir()?;
+    let store = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+    // Use RwLock (not Mutex) so prepare_block_for takes a shared read lock
+    // and parallel calls don't serialize.
+    let rw_writer: Arc<dyn TxIndexWriter> =
+        Arc::new(parking_lot::RwLock::new(IndexWriter::open(store, 1)?));
+    let tracking = ConcurrencyTrackingWriter::new(rw_writer);
+    let tracking_writer: Arc<dyn TxIndexWriter> = tracking.clone();
+
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded(4);
+    let runtime = Arc::new(TxIndexRuntime::new(wake_tx));
+    let applied_tip = Arc::new(ArcSwapOption::empty());
+    let worker = Worker {
+        runtime,
+        writer: tracking_writer,
+        applied_tip: Arc::clone(&applied_tip),
+        block_tree: Arc::new(RwLock::new(tree)),
+        body_store: Some(bodies),
+        batch_limits: DEFAULT_BATCH_LIMITS,
+        enabled: bitcoin_rs_index::IndexCapabilities::ALL,
+        rollback_rebuild_cutover: u32::MAX,
+        wake_rx,
+        chain_events: crate::txindex_worker::detached_chain_publisher(),
+        quiet_period: REVISION_QUIET_PERIOD,
+        batch_delay: Duration::ZERO,
+    };
+
+    // Publish the tip at the end of the branch.
+    let last = a.last().expect("branch has blocks");
+    let tip_id = worker
+        .block_tree
+        .read()
+        .lookup(last.hash)
+        .expect("branch tip is in the tree");
+    let tree_guard = worker.block_tree.read();
+    let node = tree_guard.node(tip_id).map_err(|_| "tree node exists")?;
+    applied_tip.store(Some(Arc::new(TipSnapshot {
+        tip_id,
+        height: node.height,
+        chainwork: node.chainwork,
+        hash: node.hash,
+    })));
+    drop(tree_guard);
+
+    let mut pending = None;
+    let (fence, watermarks) = tracking.fenced_watermarks()?;
+
+    let action = worker.catch_up_to(
+        applied_tip.load_full().as_deref().unwrap(),
+        fence,
+        watermarks,
+        None,
+        bitcoin_rs_index::IndexCapabilities::ALL,
+        &mut pending,
+    )?;
+
+    // If the action is Buffered, commit the pending batch to advance the
+    // watermark. If Progressed or CaughtUp, the batch was already committed.
+    if matches!(action, ReconcileAction::Buffered) {
+        assert!(
+            worker.commit_pending(&mut pending)?,
+            "commit_pending should succeed"
+        );
+    }
+
+    // The watermark should have advanced to the tip.
+    let wm = tracking.fenced_watermarks()?.1.tx_lookup;
+    assert_eq!(
+        wm,
+        Some(IndexWatermark {
+            height: last.height,
+            hash: last.hash.to_le_bytes(),
+        }),
+        "watermark should match the branch tip after catch-up"
+    );
+
+    // The key assertion: prepare_block_for was called concurrently.
+    // With the old serial loop, max_concurrent would be 1. With the
+    // parallelized par_iter path, it should be > 1 on any multi-core host.
+    let max = tracking.max_concurrent();
+    assert!(
+        max > 1,
+        "prepare_block_for should run concurrently (max={max}), \
+         indicating the rayon parallelization from #229 is active"
+    );
+
+    Ok(())
+}

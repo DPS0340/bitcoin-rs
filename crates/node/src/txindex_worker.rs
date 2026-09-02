@@ -37,8 +37,9 @@ use bitcoin_rs_storage::PrefixScanLimit;
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
+use rayon::prelude::*;
 
-use crate::apply::PruneBodyStore;
+use crate::apply::{PruneBodyReader, PruneBodyStore};
 use crate::block_source::NodeBlockSource;
 
 /// Bounded scan limits used by the query engine.
@@ -76,6 +77,11 @@ pub(crate) const REDB_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
 
 const IDENTITY_CHUNK_BLOCKS: u32 = 65_536;
 const POSITION_PREFETCH_BLOCKS: usize = 65_536;
+/// Maximum number of blocks whose bodies are held in memory and whose
+/// `prepare_block_for` row-build work is fanned out across the rayon pool
+/// in one parallel prepare step. Bounds memory while keeping the CPU-bound
+/// decode/row-build off the single writer thread.
+const PREPARE_CHUNK_BLOCKS: usize = 128;
 const REVISION_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const FORWARD_BATCH_DELAY: Duration = Duration::from_millis(100);
 
@@ -956,7 +962,7 @@ where
     S: bitcoin_rs_storage::KvStore + Send + Sync + 'static,
 {
     let writer = open_writer(&store, epoch)?;
-    let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::Mutex::new(writer));
+    let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::RwLock::new(writer));
     let reader: Arc<dyn bitcoin_rs_index::IndexReader> =
         Arc::new(bitcoin_rs_index::Indexer::new(store));
     Ok(OpenTxIndex {
@@ -1074,6 +1080,78 @@ where
         cursor: &[u8],
     ) -> Result<(), IndexError> {
         self.lock().commit_consumer_cursor(fence, cursor)
+    }
+}
+
+/// `RwLock`-backed writer: `prepare_block_for` and `consumer_cursor` take a
+/// shared read lock so the CPU-bound decode/row-build can run concurrently
+/// across the rayon pool, while `commit_*`, `fenced_watermarks`, and
+/// `reset_capabilities` take an exclusive write lock to preserve the
+/// single-writer atomic commit and watermark semantics.
+impl<S> TxIndexWriter for RwLock<IndexWriter<S>>
+where
+    S: bitcoin_rs_storage::KvStore + Send + Sync + 'static,
+{
+    fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError> {
+        self.write().fenced_watermarks()
+    }
+
+    fn prepare_block(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        self.read().prepare_block(height, hash, body)
+    }
+
+    fn prepare_block_for(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        self.read()
+            .prepare_block_for(capabilities, height, hash, body)
+    }
+
+    fn commit_forward_with_cursor(
+        &self,
+        fence: IndexWriteFence,
+        batch: PreparedBatch,
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<IndexWatermark, IndexError> {
+        self.write()
+            .commit_forward_with_cursor(fence, batch, cursor)
+    }
+
+    fn commit_rollback_one_for_with_cursor(
+        &self,
+        fence: IndexWriteFence,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<(), IndexError> {
+        self.write()
+            .commit_rollback_one_for_with_cursor(fence, capabilities, prev, body, cursor)
+    }
+
+    fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
+        self.write().reset_capabilities(capabilities)
+    }
+
+    fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, IndexError> {
+        self.read().consumer_cursor()
+    }
+
+    fn commit_consumer_cursor(
+        &self,
+        fence: IndexWriteFence,
+        cursor: &[u8],
+    ) -> Result<(), IndexError> {
+        self.write().commit_consumer_cursor(fence, cursor)
     }
 }
 
@@ -1202,6 +1280,13 @@ struct BlockIdentity {
     height: u32,
     hash: [u8; 32],
     parent_hash: [u8; 32],
+}
+
+/// Outcome of one sub-chunk prepare-and-admit step.
+enum ChunkAction {
+    Continue,
+    Stalled,
+    Progressed,
 }
 
 impl Worker {
@@ -1735,49 +1820,22 @@ impl Worker {
                 .prefetch_positions(&requests)
                 .map_err(TxIndexWorkerError::Storage)?;
 
-            for identity in identities {
-                if self.runtime.should_stop() {
-                    return Ok(ReconcileAction::Stalled);
-                }
-
-                let hash = Hash256::from_le_bytes(&identity.hash);
-                let Some(body) = body_reader
-                    .load_block_body(identity.height, hash)
-                    .map_err(TxIndexWorkerError::Storage)?
-                else {
-                    if !state.batch.is_empty() {
-                        *pending = Some(state);
-                    }
-                    return Ok(ReconcileAction::Stalled);
-                };
-
-                let prepared = self
-                    .writer
-                    .prepare_block_for(capabilities, identity.height, identity.hash, &body)
-                    .map_err(TxIndexWorkerError::Index)?;
-                drop(body);
-                if self.runtime.should_stop() {
-                    return Ok(ReconcileAction::Stalled);
-                }
-                if identity.height > 0 && prepared.parent_hash != identity.parent_hash {
-                    return Err(TxIndexWorkerError::MissingTargetChain {
-                        height: identity.height,
-                    });
-                }
-
-                if state.batch.try_push(prepared).is_err() {
-                    return if self.sync_and_commit(state)?.is_some() {
-                        Ok(ReconcileAction::Progressed)
-                    } else {
-                        Ok(ReconcileAction::Stalled)
-                    };
-                }
-                if state.batch.is_full() {
-                    return if self.sync_and_commit(state)?.is_some() {
-                        Ok(ReconcileAction::Progressed)
-                    } else {
-                        Ok(ReconcileAction::Stalled)
-                    };
+            // Sub-chunk: load bodies serially (preserving the reader's
+            // prefetch state), prepare blocks in parallel across the rayon
+            // pool, then push prepared blocks into the batch in height order.
+            // The single-writer commit and watermark publish remain the only
+            // ordering points (#209 invariants).
+            for sub_chunk in identities.chunks(PREPARE_CHUNK_BLOCKS) {
+                match self.prepare_and_admit_chunk(
+                    sub_chunk,
+                    &mut body_reader,
+                    capabilities,
+                    &mut state,
+                    pending,
+                )? {
+                    ChunkAction::Continue => {}
+                    ChunkAction::Stalled => return Ok(ReconcileAction::Stalled),
+                    ChunkAction::Progressed => return Ok(ReconcileAction::Progressed),
                 }
             }
         }
@@ -1785,6 +1843,120 @@ impl Worker {
         self.finish_catch_up(state, chunk_end, target, pending)
     }
 
+    /// Loads bodies serially, prepares blocks in parallel across the rayon pool,
+    /// then admits them into the batch in height order on the single writer
+    /// thread. Returns `Stalled` if a body is missing or shutdown was requested,
+    /// `Progressed` if the batch filled and was committed, or `Continue` to keep
+    /// processing.
+    #[allow(clippy::too_many_lines)]
+    fn prepare_and_admit_chunk(
+        &self,
+        sub_chunk: &[BlockIdentity],
+        body_reader: &mut Box<dyn PruneBodyReader + '_>,
+        capabilities: IndexCapabilities,
+        state: &mut PendingForward,
+        pending: &mut Option<PendingForward>,
+    ) -> Result<ChunkAction, TxIndexWorkerError> {
+        if self.runtime.should_stop() {
+            return Ok(ChunkAction::Stalled);
+        }
+
+        // Load bodies serially through the single reader.
+        let mut bodies = Vec::with_capacity(sub_chunk.len());
+        for identity in sub_chunk {
+            if self.runtime.should_stop() {
+                return Ok(ChunkAction::Stalled);
+            }
+            let hash = Hash256::from_le_bytes(&identity.hash);
+            match body_reader.load_block_body(identity.height, hash) {
+                Ok(Some(body)) => bodies.push(body),
+                Ok(None) => {
+                    if !state.batch.is_empty() {
+                        let replacement = PendingForward {
+                            fence: state.fence,
+                            watermarks: state.watermarks,
+                            capabilities: state.capabilities,
+                            durable: state.durable,
+                            batch: PreparedBatch::new(self.batch_limits),
+                            deadline: state.deadline,
+                        };
+                        *pending = Some(std::mem::replace(state, replacement));
+                    }
+                    return Ok(ChunkAction::Stalled);
+                }
+                Err(e) => return Err(TxIndexWorkerError::Storage(e)),
+            }
+        }
+
+        // Prepare blocks in parallel. Each call takes a shared read lock on the
+        // RwLock-backed writer, so the CPU-bound decode/row-build runs
+        // concurrently across pool threads.
+        let prepared: Vec<Result<PreparedBlock, IndexError>> = sub_chunk
+            .par_iter()
+            .zip(bodies.par_iter())
+            .map(|(identity, body)| {
+                self.writer.prepare_block_for(
+                    capabilities,
+                    identity.height,
+                    identity.hash,
+                    body.as_slice(),
+                )
+            })
+            .collect();
+        drop(bodies);
+
+        if self.runtime.should_stop() {
+            return Ok(ChunkAction::Stalled);
+        }
+
+        // Push prepared blocks into the batch in height order on the single
+        // writer thread.
+        for (result, identity) in prepared.into_iter().zip(sub_chunk.iter()) {
+            let prepared = result.map_err(TxIndexWorkerError::Index)?;
+            if identity.height > 0 && prepared.parent_hash != identity.parent_hash {
+                return Err(TxIndexWorkerError::MissingTargetChain {
+                    height: identity.height,
+                });
+            }
+            if state.batch.try_push(prepared).is_err() {
+                let replacement = PendingForward {
+                    fence: state.fence,
+                    watermarks: state.watermarks,
+                    capabilities: state.capabilities,
+                    durable: state.durable,
+                    batch: PreparedBatch::new(self.batch_limits),
+                    deadline: state.deadline,
+                };
+                return if self
+                    .sync_and_commit(std::mem::replace(state, replacement))?
+                    .is_some()
+                {
+                    Ok(ChunkAction::Progressed)
+                } else {
+                    Ok(ChunkAction::Stalled)
+                };
+            }
+            if state.batch.is_full() {
+                let replacement = PendingForward {
+                    fence: state.fence,
+                    watermarks: state.watermarks,
+                    capabilities: state.capabilities,
+                    durable: state.durable,
+                    batch: PreparedBatch::new(self.batch_limits),
+                    deadline: state.deadline,
+                };
+                return if self
+                    .sync_and_commit(std::mem::replace(state, replacement))?
+                    .is_some()
+                {
+                    Ok(ChunkAction::Progressed)
+                } else {
+                    Ok(ChunkAction::Stalled)
+                };
+            }
+        }
+        Ok(ChunkAction::Continue)
+    }
     fn finish_catch_up(
         &self,
         state: PendingForward,
@@ -1960,6 +2132,7 @@ enum CursorCommit {
     NotAligned,
 }
 
+#[derive(Debug)]
 enum ReconcileAction {
     Progressed,
     Buffered,
