@@ -1,6 +1,6 @@
 //! Shared node state aggregating subsystem handles.
 //!
-//! V1 keeps this deliberately minimal: it owns the resolved [`Config`], the
+//! V1 keeps this deliberately minimal: it owns the resolved [`NodeConfig`], the
 //! data-directory path, the open chainstate storage backend, and the replay log
 //! used by [`crate::crash_recovery`]. Subsystem wiring (chain / utxo / mempool
 //! / index / p2p / rpc / script_index) parks here as the integration point matures.
@@ -34,7 +34,7 @@ use bitcoin_rs_storage::{ColumnFamily, FlatFileBlockStore, KvStore, WriteBatch};
 use bitcoin_rs_utxo::UtxoSet;
 use parking_lot::{Mutex, RwLock};
 
-use crate::Config;
+use crate::NodeConfig;
 
 // One active generation of outbound requests is enough to keep the drain fed;
 // extra backlog is overload and must fail fast at producers.
@@ -481,7 +481,7 @@ enum NodeStorage {
 impl NodeStorage {
     /// Opens the configured backend for the chainstate namespace with its
     /// cache share from the process budget.
-    fn open(config: &Config, chainstate_cache_bytes: u64) -> Result<Self> {
+    fn open(config: &NodeConfig, chainstate_cache_bytes: u64) -> Result<Self> {
         let chainstate_dir = config.data_dir.join("chainstate");
         std::fs::create_dir_all(&chainstate_dir)
             .with_context(|| format!("create chainstate_dir {}", chainstate_dir.display()))?;
@@ -965,7 +965,7 @@ impl fmt::Display for CompiledStorageFeatures {
     }
 }
 
-fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities {
+fn tx_index_capabilities(config: &NodeConfig) -> bitcoin_rs_index::IndexCapabilities {
     bitcoin_rs_index::IndexCapabilities {
         // ScriptIndex-backed Esplora responses need exact historical
         // transactions to render prevouts and calculate fees. This is an
@@ -977,7 +977,7 @@ fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities
 }
 
 fn build_tx_index_open_spec(
-    config: &Config,
+    config: &NodeConfig,
     txindex_cache_bytes: u64,
     epoch: u64,
 ) -> Result<Option<crate::txindex_worker::TxIndexOpenSpec>> {
@@ -1024,7 +1024,7 @@ fn build_tx_index_open_spec(
 /// keeps starting; the capability reports as disabled.
 #[allow(clippy::too_many_arguments)]
 fn open_filter_index(
-    config: &Config,
+    config: &NodeConfig,
     cache_bytes: u64,
     applied_tip: Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>,
     block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
@@ -1129,7 +1129,7 @@ pub struct NodeState {
     /// Published by `write_clean_checkpoint` and read by the pruner, which must
     /// not delete an undo record a crash-restore would still need.
     durable_tip_height: Arc<AtomicU32>,
-    config: Config,
+    config: NodeConfig,
     data_dir: PathBuf,
     checkpoint_data_dir: cap_std::fs::Dir,
     #[cfg(test)]
@@ -1192,7 +1192,10 @@ impl NodeState {
     /// backend.
     #[allow(clippy::arc_with_non_send_sync)]
     #[allow(clippy::too_many_lines)]
-    pub fn open(config: Config) -> Result<Self> {
+    pub fn open(
+        config: NodeConfig,
+        mempool_observer: Option<&Arc<dyn bitcoin_rs_mempool::MempoolObserver>>,
+    ) -> Result<Self> {
         config.validate()?;
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
@@ -1565,7 +1568,7 @@ impl NodeState {
                     );
                     Some(observer)
                 } else {
-                    config.mempool_observer.clone()
+                    mempool_observer.cloned()
                 };
             let observer = crate::mempool_observer::NodeMutationObserver::new(
                 sequence,
@@ -1695,7 +1698,7 @@ impl NodeState {
 
     /// Returns a borrow of the resolved configuration.
     #[must_use]
-    pub const fn config(&self) -> &Config {
+    pub const fn config(&self) -> &NodeConfig {
         &self.config
     }
 
@@ -2292,12 +2295,12 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir()?;
-        let config = crate::Config {
+        let config = crate::NodeConfig {
             data_dir: dir.path().join("node"),
-            ..crate::Config::default()
+            ..crate::NodeConfig::default()
         };
 
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let utxo = state.utxo();
         let mempool = state.mempool();
 
@@ -2316,10 +2319,10 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let tree = state.block_tree();
 
         assert!(
@@ -2332,10 +2335,10 @@ mod tests {
     #[test]
     fn open_constructs_coin_stats_listener() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let snapshot = state.coin_stats().snapshot();
         assert_eq!(
             snapshot.tx_count, 0,
@@ -2347,10 +2350,10 @@ mod tests {
     #[test]
     fn open_skips_tx_index_when_disabled() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         assert!(
             state.tx_index_query().is_none(),
@@ -2366,11 +2369,11 @@ mod tests {
     #[test]
     fn open_constructs_tx_index_when_enabled() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = true;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let (Some(a), Some(b)) = (state.tx_index_query(), state.tx_index_query()) else {
             panic!("txindex query engine missing when enabled");
         };
@@ -2391,13 +2394,13 @@ mod tests {
     #[test]
     fn script_index_builds_without_advertising_core_txindex() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = false;
         config.script_index = crate::config::ScriptIndexMode::Full;
 
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         assert!(state.apply_handles().tx_index_runtime.is_some());
         assert!(state.tx_index_query().is_none());
@@ -2441,12 +2444,12 @@ mod tests {
         // `disabled`: no script index at all, so no query adapter is handed
         // out. The answer is a definite "not available", not a retry.
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = false;
         config.script_index = crate::config::ScriptIndexMode::Disabled;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _ = state.apply_block(&crate::Network::Regtest.genesis_block())?;
         assert!(
             state.script_index_query().is_none(),
@@ -2458,12 +2461,12 @@ mod tests {
         // store, so opening must fail loudly rather than start a node that
         // would advertise a live view nothing backs.
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = false;
         config.script_index = crate::config::ScriptIndexMode::Utxo;
-        let error = match NodeState::open(config) {
+        let error = match NodeState::open(config, None) {
             Ok(_) => panic!("utxo must be rejected while no live store backs it"),
             Err(error) => error,
         };
@@ -2477,12 +2480,12 @@ mod tests {
         // `full`: the accepted mode. It converges on a concrete answer — an
         // empty set for an unfunded script — rather than retrying forever.
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = false;
         config.script_index = crate::config::ScriptIndexMode::Full;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _ = state.apply_block(&crate::Network::Regtest.genesis_block())?;
         let Some(query) = state.script_index_query() else {
             panic!("full mode must hand out a script-index query adapter")
@@ -2516,17 +2519,17 @@ mod tests {
     #[test]
     fn drop_joins_txindex_worker_before_reopen() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = true;
 
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             assert!(state.tx_index_query().is_some());
         }
 
-        let reopened = NodeState::open(config)?;
+        let reopened = NodeState::open(config, None)?;
         assert!(reopened.tx_index_query().is_some());
         Ok(())
     }
@@ -2534,13 +2537,13 @@ mod tests {
     #[test]
     fn open_rejects_txindex_with_pruning() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = true;
         config.prune_target_mb = 1;
 
-        let error = match NodeState::open(config) {
+        let error = match NodeState::open(config, None) {
             Ok(_) => anyhow::bail!("txindex with pruning must be rejected"),
             Err(error) => error,
         };
@@ -2556,10 +2559,10 @@ mod tests {
     #[test]
     fn open_constructs_block_sync_orchestrator() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let sync_a = state.sync();
         let sync_b = state.sync();
         assert!(
@@ -2572,10 +2575,10 @@ mod tests {
     #[test]
     fn open_constructs_empty_applied_tip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         assert!(
             state.applied_tip().load_full().is_none(),
@@ -2589,10 +2592,10 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         assert!(
             state.peers().read().is_empty(),
@@ -2606,10 +2609,10 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         assert!(state.peer_outbound().read().is_empty());
         Ok(())
@@ -2618,10 +2621,10 @@ mod tests {
     #[test]
     fn zmq_publisher_handle_defaults_to_noop() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let publisher = state.zmq_publisher();
         // No-op publisher accepts publish calls silently.
         publisher.publish_hashblock(bitcoin_rs_primitives::Hash256::default());
@@ -2631,7 +2634,7 @@ mod tests {
     #[test]
     fn zmq_publisher_handle_reports_active_metadata() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.zmqpubhashblock = vec!["inproc://state-zmq-pubhashblock".to_owned()];
@@ -2642,7 +2645,7 @@ mod tests {
         config.zmqpubhashtxhwm = Some(18);
         config.zmqpubrawblockhwm = Some(19);
         config.zmqpubrawtxhwm = Some(20);
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         let notifications = state.active_zmq_notifications();
         let notification_types: Vec<_> = notifications
@@ -2664,10 +2667,10 @@ mod tests {
     #[test]
     fn inbound_headers_sender_is_unbounded_clone_target() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let tx1 = state.inbound_headers_sender();
         let tx2 = state.inbound_headers_sender();
         tx1.send(bitcoin_rs_p2p::InboundHeaders {
@@ -2686,10 +2689,10 @@ mod tests {
     #[test]
     fn inbound_blocks_sender_is_clonable_into_listener_threads() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _tx1 = state.inbound_blocks_sender();
         let _tx2 = state.inbound_blocks_sender();
         Ok(())
@@ -2698,10 +2701,10 @@ mod tests {
     #[test]
     fn inbound_blocks_channel_is_bounded_against_flood() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let tx = state.inbound_blocks_sender();
         let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         // No `tick` drains the channel in this unit test, so it fills to the
@@ -2724,12 +2727,12 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir()?;
-        let config = crate::Config {
+        let config = crate::NodeConfig {
             data_dir: dir.path().join("node"),
-            ..crate::Config::default()
+            ..crate::NodeConfig::default()
         };
 
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let chain_tip = state.chain_tip();
         let blocks = state.blocks();
         let transactions = state.transactions();
@@ -2749,18 +2752,18 @@ mod tests {
     #[test]
     fn apply_handles_follow_txindex_availability() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("without-txindex");
         config.p2p_listen.clear();
         config.txindex = false;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         assert!(state.apply_handles().tx_index_runtime.is_none());
 
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("with-txindex");
         config.p2p_listen.clear();
         config.txindex = true;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         assert!(state.apply_handles().tx_index_runtime.is_some());
         Ok(())
     }
@@ -2768,12 +2771,12 @@ mod tests {
     #[test]
     fn prune_service_is_absent_when_config_disables_pruning() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 0;
 
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         assert!(state.prune_service().is_none());
         Ok(())
@@ -2782,11 +2785,11 @@ mod tests {
     #[test]
     fn apply_block_persists_body_under_pruning_key_when_pruning_disabled() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 0;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
 
@@ -2807,10 +2810,10 @@ mod tests {
     #[test]
     fn persisting_same_block_body_twice_appends_once() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[7_u8; 32]);
         let body = b"idempotent block body";
 
@@ -2832,7 +2835,7 @@ mod tests {
     #[test]
     fn legacy_block_body_datadir_is_refused() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("legacy-node");
         config.p2p_listen.clear();
         std::fs::create_dir_all(config.data_dir.join("chainstate"))?;
@@ -2848,7 +2851,7 @@ mod tests {
         drop(store);
 
         let datadir = config.data_dir.display().to_string();
-        let Err(error) = NodeState::open(config) else {
+        let Err(error) = NodeState::open(config, None) else {
             anyhow::bail!("legacy inline block body unexpectedly opened");
         };
         let message = error.to_string();
@@ -2865,19 +2868,19 @@ mod tests {
         let serialized = bytes::Bytes::from(consensus_bytes(&block));
 
         let dir_a = tempfile::tempdir()?;
-        let mut config_a = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config_a = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config_a.data_dir = dir_a.path().join("node-a");
         config_a.p2p_listen.clear();
         config_a.prune_target_mb = 0;
-        let state_a = NodeState::open(config_a)?;
+        let state_a = NodeState::open(config_a, None)?;
         state_a.apply_block(&block)?;
 
         let dir_b = tempfile::tempdir()?;
-        let mut config_b = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config_b = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config_b.data_dir = dir_b.path().join("node-b");
         config_b.p2p_listen.clear();
         config_b.prune_target_mb = 0;
-        let state_b = NodeState::open(config_b)?;
+        let state_b = NodeState::open(config_b, None)?;
         crate::apply::apply_block_with_serialized(&state_b.apply_handles(), &block, serialized)?;
 
         let body_a = state_a
@@ -2903,12 +2906,12 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
 
         let expected = {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             assert_eq!(
                 state.chain_tx_count_handle().load(Ordering::Relaxed),
                 0,
@@ -2932,7 +2935,7 @@ mod tests {
         // change the count was unrecoverable after a restart: the applied tip
         // came back from the checkpoint at its real height with nothing behind
         // it to sum. The number now rides along with the tip.
-        let resumed = NodeState::open(config)?;
+        let resumed = NodeState::open(config, None)?;
         assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
         assert!(
             resumed.blocks().read().is_empty(),
@@ -2954,11 +2957,11 @@ mod tests {
         }
 
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
         for height in 10_u32..=12 {
@@ -3014,11 +3017,11 @@ mod tests {
         }
 
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
         for height in 10_u32..=12 {
@@ -3106,7 +3109,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
@@ -3116,7 +3119,7 @@ mod tests {
         let current_file = blocks_dir.join("blk00001.dat");
         std::fs::write(&prunable_file, [])?;
         std::fs::write(&current_file, [])?;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
 
@@ -3179,7 +3182,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
@@ -3195,7 +3198,7 @@ mod tests {
         std::fs::write(&prunable_file, &prunable_bytes)?;
         std::fs::write(blocks_dir.join("blk00001.dat"), [])?;
 
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         // The hash is not needed: this test counts bytes in files, not bodies.
@@ -3256,11 +3259,11 @@ mod tests {
     #[test]
     fn manual_prune_removes_pruned_block_transactions_from_cache() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
         let pruned_block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
@@ -3311,13 +3314,13 @@ mod tests {
     #[test]
     fn prune_service_restores_persisted_pruneheight_on_reopen() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
 
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
             let Some(service) = state.prune_service() else {
                 anyhow::bail!("prune service should exist when prune_target_mb > 0");
@@ -3328,7 +3331,7 @@ mod tests {
             assert_eq!(result.pruneheight, 11);
         }
 
-        let reopened = NodeState::open(config)?;
+        let reopened = NodeState::open(config, None)?;
         let Some(service) = reopened.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
         };
@@ -3342,11 +3345,11 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
-        let state = NodeState::open(config.clone())?;
+        let state = NodeState::open(config.clone(), None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let Some(service) = state.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
@@ -3377,7 +3380,7 @@ mod tests {
         drop(service);
         drop(handles);
         drop(state);
-        let reopened = NodeState::open(config)?;
+        let reopened = NodeState::open(config, None)?;
         let Some(reopened_service) = reopened.prune_service() else {
             anyhow::bail!("prune service should exist after reopen");
         };
@@ -3405,11 +3408,11 @@ mod tests {
     #[test]
     fn prune_refuses_after_apply_admission_closes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let Some(service) = state.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
@@ -3480,10 +3483,10 @@ mod tests {
         }
 
         let dir = tempfile::tempdir()?;
-        let mut authority_config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut authority_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         authority_config.data_dir = dir.path().join("authority");
         authority_config.p2p_listen.clear();
-        let authority_state = NodeState::open(authority_config)?;
+        let authority_state = NodeState::open(authority_config, None)?;
         publish_applied_tip_height(&authority_state, 12 + CORE_REORG_SAFETY_MARGIN);
         let data_dir = dir.path().join("node");
         std::fs::create_dir_all(data_dir.join("chainstate"))?;
@@ -3573,10 +3576,10 @@ mod tests {
         }
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let genesis_tip = state.apply_block(&genesis)?;
         let expected_utxo_hash = state.utxo().with_stable_view(stable_hash)?;
@@ -3587,10 +3590,10 @@ mod tests {
         ));
         drop(state);
 
-        let mut reopen_config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut reopen_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         reopen_config.data_dir = data_dir.clone();
         reopen_config.p2p_listen.clear();
-        let resumed = NodeState::open(reopen_config.clone())?;
+        let resumed = NodeState::open(reopen_config.clone(), None)?;
         assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
         let applied = resumed
             .applied_tip()
@@ -3647,7 +3650,7 @@ mod tests {
         assert_eq!(snapshot.muhash_trailer, rescanned.muhash.finalize());
         drop(resumed);
 
-        let resumed_again = NodeState::open(reopen_config)?;
+        let resumed_again = NodeState::open(reopen_config, None)?;
         assert_eq!(resumed_again.resume_source(), ResumeSource::Checkpoint);
         assert_eq!(resumed_again.coin_stats().snapshot(), rescanned);
         Ok(())
@@ -3668,17 +3671,17 @@ mod tests {
 
         for backend in backends {
             let dir = tempfile::tempdir()?;
-            let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+            let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
             config.data_dir = dir.path().join(backend);
             config.storage_backend = backend.to_owned();
             config.p2p_listen.clear();
             let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             state.apply_block(&genesis)?;
             state.write_clean_checkpoint()?;
             drop(state);
 
-            let resumed = NodeState::open(config)?;
+            let resumed = NodeState::open(config, None)?;
             assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
             resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
         }
@@ -3690,24 +3693,24 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node-g2");
         let samples = dir.path().join("g2.samples");
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
         config.g2_muhash_samples = Some(samples.clone());
         config.g2_muhash_tip_height = Some(2);
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
         let before = state.coin_stats().snapshot();
         state.write_clean_checkpoint()?;
         drop(state);
 
-        let mut reopen_config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut reopen_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         reopen_config.data_dir = data_dir;
         reopen_config.p2p_listen.clear();
         reopen_config.g2_muhash_samples = Some(samples);
         reopen_config.g2_muhash_tip_height = Some(2);
-        let resumed = NodeState::open(reopen_config)?;
+        let resumed = NodeState::open(reopen_config, None)?;
         assert_eq!(resumed.coin_stats().snapshot(), before);
         resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
         let rolling = resumed.coin_stats().snapshot();
@@ -3722,10 +3725,10 @@ mod tests {
     #[test]
     fn shutdown_arc_is_shared_with_apply_handles() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         assert!(Arc::ptr_eq(
             &state.shutdown(),
             &state.apply_handles().shutdown
@@ -3737,10 +3740,10 @@ mod tests {
     fn checkpoint_refuses_inflight_disconnect_and_preserves_state() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
         assert!(matches!(
@@ -3793,17 +3796,17 @@ mod tests {
     fn torn_disconnect_refusal_names_authoritative_stores_to_remove() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
-        let state = NodeState::open(config.clone())?;
+        let state = NodeState::open(config.clone(), None)?;
         state.apply_handles().undo_store.arm_disconnect(
             10,
             bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xcd; 32]),
         )?;
         drop(state);
 
-        let error = match NodeState::open(config) {
+        let error = match NodeState::open(config, None) {
             Ok(_) => anyhow::bail!("node reopened with an armed disconnect marker"),
             Err(error) => error,
         };
@@ -3822,10 +3825,10 @@ mod tests {
     #[test]
     fn publish_checkpoint_refuses_when_no_applied_tip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let Err(error) = state.publish_checkpoint() else {
             anyhow::bail!("checkpoint publication succeeded without an applied tip");
         };
@@ -3840,10 +3843,10 @@ mod tests {
     fn publish_checkpoint_returns_generation_and_reopens() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir;
         config.p2p_listen.clear();
-        let state = NodeState::open(config.clone())?;
+        let state = NodeState::open(config.clone(), None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let tip = state.apply_block(&genesis)?;
         let generation = state.publish_checkpoint()?;
@@ -3853,7 +3856,7 @@ mod tests {
         );
         drop(state);
 
-        let resumed = NodeState::open(config)?;
+        let resumed = NodeState::open(config, None)?;
         assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
         let applied = resumed
             .applied_tip()
@@ -3867,17 +3870,17 @@ mod tests {
     #[test]
     fn process_epoch_is_strictly_monotonic_across_restart() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
 
-        let first = NodeState::open(config.clone())?
+        let first = NodeState::open(config.clone(), None)?
             .active_chain_snapshot()
             .epoch;
-        let second = NodeState::open(config.clone())?
+        let second = NodeState::open(config.clone(), None)?
             .active_chain_snapshot()
             .epoch;
-        let third = NodeState::open(config)?.active_chain_snapshot().epoch;
+        let third = NodeState::open(config, None)?.active_chain_snapshot().epoch;
         assert!(first > 0, "a fresh data dir allocates epoch 1, got {first}");
         assert!(
             second > first,
@@ -3893,11 +3896,11 @@ mod tests {
     #[test]
     fn active_chain_snapshot_starts_at_genesis_on_fresh_node() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
 
-        let state = NodeState::open(config.clone())?;
+        let state = NodeState::open(config.clone(), None)?;
         let epoch = state.chain_event_publisher().epoch();
         assert_eq!(
             state.active_chain_snapshot(),
@@ -3915,12 +3918,12 @@ mod tests {
     #[test]
     fn active_chain_snapshot_anchors_at_restored_tip_after_restart() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
 
         let (tip, first_epoch) = {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
             let tip = state.apply_block(&genesis)?;
             assert!(matches!(
@@ -3930,7 +3933,7 @@ mod tests {
             (tip, state.active_chain_snapshot().epoch)
         };
 
-        let resumed = NodeState::open(config)?;
+        let resumed = NodeState::open(config, None)?;
         assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
         let snapshot = resumed.active_chain_snapshot();
         assert_eq!(snapshot.tip_hash, tip.hash);
@@ -3951,11 +3954,11 @@ mod tests {
     #[test]
     fn record_publishes_snapshot_and_hints_in_commit_order() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
 
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let publisher = state.chain_event_publisher();
         let epoch = publisher.epoch();
         let hash_a = Hash256::from_le_bytes(&[0xAA; 32]);
@@ -4013,11 +4016,11 @@ mod tests {
     #[test]
     fn record_drops_hints_when_channel_full() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
 
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let publisher = state.chain_event_publisher();
         let rx = state.chain_event_hints();
         for sequence in 1..=super::CHAIN_HINT_CHANNEL_LIMIT {
@@ -4080,11 +4083,11 @@ mod tests {
         std::fs::create_dir_all(&data_dir)?;
         std::fs::write(data_dir.join("process-epoch"), b"seven\n")?;
 
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir;
         config.p2p_listen.clear();
 
-        let Err(error) = NodeState::open(config) else {
+        let Err(error) = NodeState::open(config, None) else {
             anyhow::bail!("a corrupt process-epoch file must refuse startup");
         };
         assert!(
@@ -4215,11 +4218,11 @@ mod tests {
         std::fs::write(data_dir.join("process-epoch"), b"41\n")?;
         std::os::unix::fs::symlink("process-epoch", data_dir.join(".process-epoch.lock"))?;
 
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
 
-        let Err(error) = NodeState::open(config) else {
+        let Err(error) = NodeState::open(config, None) else {
             anyhow::bail!("a symlinked epoch lock must refuse startup");
         };
         assert!(
@@ -4248,11 +4251,11 @@ mod tests {
             rustix::fs::Mode::from_raw_mode(0o600),
         )?;
 
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
 
-        let Err(error) = NodeState::open(config) else {
+        let Err(error) = NodeState::open(config, None) else {
             anyhow::bail!("a non-regular epoch lock must refuse startup");
         };
         assert!(
@@ -4354,11 +4357,11 @@ mod tests {
     fn witness_is_published_only_after_current_root_sync() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
 
-        let state = NodeState::open(config.clone())?;
+        let state = NodeState::open(config.clone(), None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let tip = state.apply_block(&genesis)?;
 
@@ -4381,11 +4384,11 @@ mod tests {
         // and no new witness must be written for the failed checkpoint.
         let dir2 = tempfile::tempdir()?;
         let data_dir2 = dir2.path().join("node");
-        let mut config2 = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config2 = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config2.data_dir = data_dir2.clone();
         config2.p2p_listen.clear();
 
-        let state2 = NodeState::open(config2.clone())?;
+        let state2 = NodeState::open(config2.clone(), None)?;
         let genesis2 = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state2.apply_block(&genesis2)?;
 
@@ -4415,13 +4418,13 @@ mod tests {
     fn stale_checkpoint_restore_surfaces_warning_not_silence() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
         config.script_index = crate::config::ScriptIndexMode::Disabled;
 
         // Apply genesis and publish a checkpoint at height 0.
-        let state = NodeState::open(config.clone())?;
+        let state = NodeState::open(config.clone(), None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
         state.write_clean_checkpoint()?;
@@ -4444,7 +4447,7 @@ mod tests {
         // Reopen: the checkpoint at height 0 is restored, the witness at
         // 5000 triggers checkpoint-fallback detection. The warning store
         // must carry the fallback warning — the restore must not be silent.
-        let resumed = NodeState::open(config.clone())?;
+        let resumed = NodeState::open(config.clone(), None)?;
         let warnings = resumed.warning_store().warnings();
         assert!(
             !warnings.is_empty(),

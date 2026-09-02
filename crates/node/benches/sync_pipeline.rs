@@ -20,7 +20,7 @@ use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
 use bitcoin_rs_index::BlockSource as _;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
-    BlockSync, Config, Network, NoOpZmqPublisher, TxIndexRuntime,
+    BlockSync, Network, NoOpZmqPublisher, NodeConfig, TxIndexRuntime,
     apply::ApplyHandles,
     state::NodeState,
     sync::{SyncBudget, default_sync_budget},
@@ -392,25 +392,25 @@ impl BlockBodySource for InstalledBlockBody {
 
 fn open_regtest_state() -> (TempDir, NodeState) {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = dir.path().join("node");
     config.p2p_listen.clear();
     config.txindex = false;
-    let state =
-        NodeState::open(config).unwrap_or_else(|error| panic!("open node state failed: {error}"));
+    let state = NodeState::open(config, None)
+        .unwrap_or_else(|error| panic!("open node state failed: {error}"));
     (dir, state)
 }
 
 #[cfg(feature = "rocksdb")]
 fn open_pruned_regtest_state() -> (TempDir, NodeState) {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = dir.path().join("node");
     config.p2p_listen.clear();
     "rocksdb".clone_into(&mut config.storage_backend);
     config.txindex = false;
     config.prune_target_mb = 1;
-    let state = NodeState::open(config)
+    let state = NodeState::open(config, None)
         .unwrap_or_else(|error| panic!("open pruned node state failed: {error}"));
     (dir, state)
 }
@@ -756,7 +756,7 @@ impl ProductionStateSyncFixture {
         Self::with_config(peer_count, config)
     }
 
-    fn with_config(peer_count: usize, config: Config) -> Self {
+    fn with_config(peer_count: usize, config: NodeConfig) -> Self {
         Self::with_config_and_header_blocks(
             peer_count,
             config,
@@ -792,13 +792,13 @@ impl ProductionStateSyncFixture {
 
     fn with_config_and_header_blocks(
         peer_count: usize,
-        mut config: Config,
+        mut config: NodeConfig,
         populate_blocks: impl FnOnce(&mut BlockTree) -> Vec<Block>,
         expected_getdata_count: usize,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
         config.data_dir = dir.path().join("node");
-        let state = NodeState::open(config)
+        let state = NodeState::open(config, None)
             .unwrap_or_else(|error| panic!("open node state failed: {error}"));
         let blocks = {
             let block_tree = state.block_tree();
@@ -948,8 +948,8 @@ impl ProductionStateSyncFixture {
     }
 }
 
-fn production_state_config() -> Config {
-    let mut config = Config::default_for_network(Network::Regtest);
+fn production_state_config() -> NodeConfig {
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.p2p_listen.clear();
     config.txindex = false;
     config

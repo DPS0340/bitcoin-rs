@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 use bitcoin::Network as BitcoinNetwork;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hashes::Hash as _;
-use bitcoin_rs_node::{Config, Network, state::NodeState};
+use bitcoin_rs_node::{Network, NodeConfig, state::NodeState};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn regtest_config(dir: &std::path::Path, blockfilterindex: bool) -> Config {
-    let mut config = Config::default_for_network(Network::Regtest);
+fn regtest_config(dir: &std::path::Path, blockfilterindex: bool) -> NodeConfig {
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = dir.join("node");
     config.p2p_listen.clear();
     config.txindex = true;
@@ -91,7 +91,7 @@ fn wait_for_filter_sync(state: &NodeState, target_height: u32) -> TestResult {
 #[test]
 fn extension_validation_rejects_incompatible_capabilities() {
     // Missing dependency: the reference extension requires txindex rows.
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.blockfilterindex = true;
     let error = match bitcoin_rs_node::extensions::validate_extensions(&config) {
         Ok(()) => panic!("blockfilterindex without txindex must be rejected"),
@@ -111,9 +111,9 @@ fn extension_validation_rejects_incompatible_capabilities() {
         "blockfilterindex requires prune disabled"
     );
 
-    // The same checks hold as a Config::validate backstop.
+    // The same checks hold as a NodeConfig::validate backstop.
     let error = match config.validate() {
-        Ok(()) => panic!("Config::validate must repeat the extension checks"),
+        Ok(()) => panic!("NodeConfig::validate must repeat the extension checks"),
         Err(error) => error,
     };
     assert_eq!(
@@ -134,8 +134,8 @@ fn filter_extension_tip_equivalence_disabled_vs_enabled() -> TestResult {
     let disabled_dir = tempfile::tempdir()?;
     let enabled_dir = tempfile::tempdir()?;
 
-    let disabled = NodeState::open(regtest_config(disabled_dir.path(), false))?;
-    let enabled = NodeState::open(regtest_config(enabled_dir.path(), true))?;
+    let disabled = NodeState::open(regtest_config(disabled_dir.path(), false), None)?;
+    let enabled = NodeState::open(regtest_config(enabled_dir.path(), true), None)?;
     assert!(
         enabled.filter_index_query().is_some(),
         "enabled filter extension must expose its query adapter"
@@ -194,7 +194,7 @@ fn filter_extension_restarts_reconcile_from_persisted_pointer() -> TestResult {
 
     let tip;
     {
-        let state = NodeState::open(config.clone())?;
+        let state = NodeState::open(config.clone(), None)?;
         apply_fixture_block(&state, &genesis)?;
         apply_fixture_block(&state, &child)?;
         tip = applied_tip(&state);
@@ -204,7 +204,7 @@ fn filter_extension_restarts_reconcile_from_persisted_pointer() -> TestResult {
         // hash-addressed rows, the pointer, and the consumer cursor.
     }
 
-    let reopened = NodeState::open(config)?;
+    let reopened = NodeState::open(config, None)?;
     assert_eq!(applied_tip(&reopened), tip, "tip restores from checkpoint");
     wait_for_filter_sync(&reopened, tip.0)?;
     let query = reopened.filter_index_query().expect("filter query");
@@ -221,7 +221,7 @@ fn filter_extension_apply_outpaces_a_lagging_consumer() -> TestResult {
     // Core sync never waits for the consumer: apply five blocks in a row and
     // assert the applied tip advanced before the filter index caught up.
     let dir = tempfile::tempdir()?;
-    let state = NodeState::open(regtest_config(dir.path(), true))?;
+    let state = NodeState::open(regtest_config(dir.path(), true), None)?;
 
     let mut blocks = vec![genesis_block(BitcoinNetwork::Regtest)];
     for height in 1_u8..=5 {

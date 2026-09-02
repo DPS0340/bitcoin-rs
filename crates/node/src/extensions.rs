@@ -18,7 +18,7 @@ use bitcoin_rs_ext_api::{
 use bitcoin_rs_rpc::context::TxIndexQuery;
 use parking_lot::Mutex;
 
-use crate::Config;
+use crate::NodeConfig;
 
 /// Capability id of the Core-compatible transaction index.
 pub const TXINDEX_CAPABILITY: &str = "txindex";
@@ -51,7 +51,7 @@ pub fn compiled_descriptors() -> Vec<&'static ExtensionDescriptor> {
 
 /// Capability ids enabled by the runtime toggles of `config`.
 #[must_use]
-pub fn enabled_capabilities(config: &Config) -> Vec<&'static str> {
+pub fn enabled_capabilities(config: &NodeConfig) -> Vec<&'static str> {
     let mut enabled = Vec::new();
     if config.txindex || config.script_index.is_enabled() {
         enabled.push(TXINDEX_CAPABILITY);
@@ -66,13 +66,13 @@ pub fn enabled_capabilities(config: &Config) -> Vec<&'static str> {
 ///
 /// Called by `run` before `NodeState::open`, so an invalid combination fails
 /// before any storage is opened and before networking exists.
-/// `Config::validate` keeps the same checks as a backstop for direct openers.
+/// `NodeConfig::validate` keeps the same checks as a backstop for direct openers.
 ///
 /// # Errors
 ///
 /// Names the capability and the missing or conflicting dependency with the
 /// literal `"<capability> requires <dependency>"` phrasing.
-pub fn validate_extensions(config: &Config) -> anyhow::Result<()> {
+pub fn validate_extensions(config: &NodeConfig) -> anyhow::Result<()> {
     let enabled = enabled_capabilities(config);
     for descriptor in compiled_descriptors() {
         if !enabled.contains(&descriptor.id) {
@@ -194,8 +194,8 @@ impl CapabilityProvider for NodeCapabilities {
 mod tests {
     use super::*;
 
-    fn config_with(build: impl FnOnce(&mut Config)) -> Config {
-        let mut config = Config::default_for_network(bitcoin_rs_primitives::Network::Regtest);
+    fn config_with(build: impl FnOnce(&mut NodeConfig)) -> NodeConfig {
+        let mut config = NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest);
         build(&mut config);
         config
     }

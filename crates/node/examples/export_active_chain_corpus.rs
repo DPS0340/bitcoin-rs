@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use bitcoin::hex::DisplayHex as _;
 use bitcoin_rs_node::Network;
-use bitcoin_rs_node::config::Config;
+use bitcoin_rs_node::config::NodeConfig;
 use bitcoin_rs_node::corpus::bounded_diagnostic_path;
 use bitcoin_rs_node::state::NodeState;
 
@@ -29,13 +29,13 @@ fn main() -> Result<()> {
         let Some(data_dir) = args.data_dir.as_ref() else {
             bail!("exactly one corpus source must be configured");
         };
-        let mut config = Config::default_for_network(network);
+        let mut config = NodeConfig::default_for_network(network);
         config.data_dir.clone_from(data_dir);
         config.storage_backend.clone_from(&args.storage_backend);
         config.p2p_listen.clear();
         config.dns_seeds_enabled = false;
 
-        let state = NodeState::open(config).context("open node state")?;
+        let state = NodeState::open(config, None).context("open node state")?;
         bitcoin_rs_node::corpus::export_active_chain_corpus(
             &state,
             network,

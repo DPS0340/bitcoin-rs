@@ -19,7 +19,7 @@ use bitcoin_rs_mempool::{
     MutationOutcome, MutationResult, PolicyError, RbfError, RemovalReason, ReplacementCandidate,
 };
 use bitcoin_rs_node::reorg::{ReorgError, invalidate_block};
-use bitcoin_rs_node::{Config, Network, state::NodeState};
+use bitcoin_rs_node::{Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes};
 use bitcoin_rs_rpc::context::{
@@ -1651,10 +1651,10 @@ impl ChainControl for NodeInvalidator {
 
 fn open_regtest_state() -> Result<(NodeState, tempfile::TempDir), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = dir.path().join("node");
     config.p2p_listen.clear();
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
     Ok((state, dir))
 }
 

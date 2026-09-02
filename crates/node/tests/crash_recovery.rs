@@ -21,7 +21,7 @@
 #![cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
 
 use anyhow::{Context as _, Result};
-use bitcoin_rs_node::{Config, Network, crash_recovery, state::NodeState};
+use bitcoin_rs_node::{Network, NodeConfig, crash_recovery, state::NodeState};
 
 /// Returns the list of storage backends compiled into this test binary.
 fn available_backends() -> Vec<&'static str> {
@@ -35,8 +35,8 @@ fn available_backends() -> Vec<&'static str> {
     .collect()
 }
 
-fn make_config(temp: &tempfile::TempDir, backend: &str) -> Config {
-    let mut config = Config::default_for_network(Network::Regtest);
+fn make_config(temp: &tempfile::TempDir, backend: &str) -> NodeConfig {
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join(format!("node-{backend}"));
     backend.clone_into(&mut config.storage_backend);
     config.p2p_listen.clear();
@@ -53,14 +53,14 @@ fn recovery_replays_from_last_committed_height_to_tip() -> Result<()> {
         let config = make_config(&temp, backend);
 
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             for height in 1..=10 {
                 state.record_synthetic_block_for_recovery(height)?;
             }
             crash_recovery::set_last_committed_height(&state, 7)?;
         }
 
-        let restarted = NodeState::open(config)?;
+        let restarted = NodeState::open(config, None)?;
         crash_recovery::recover_if_needed(&restarted)?;
 
         let meta = crash_recovery::read_meta(&restarted)?.context("missing recovery metadata")?;
@@ -92,7 +92,7 @@ fn recovery_meta_write_leaves_readable_sidecar_without_tmp() -> Result<()> {
         let meta_path = config.data_dir.join("recovery_meta.json");
         let tmp_path = config.data_dir.join("recovery_meta.json.tmp");
         {
-            let state = NodeState::open(config)?;
+            let state = NodeState::open(config, None)?;
             state.record_synthetic_block_for_recovery(3)?;
         }
 
@@ -125,7 +125,7 @@ fn torn_meta_after_crash_is_refused() -> Result<()> {
 
         // Establish a clean state at height 5.
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             for height in 1..=5 {
                 state.record_synthetic_block_for_recovery(height)?;
             }
@@ -139,7 +139,7 @@ fn torn_meta_after_crash_is_refused() -> Result<()> {
         let meta_path = config.data_dir.join("recovery_meta.json");
         std::fs::write(&meta_path, b"{ this is not valid json }")?;
 
-        let restarted = NodeState::open(config)?;
+        let restarted = NodeState::open(config, None)?;
         let result = crash_recovery::read_meta(&restarted);
         assert!(
             result.is_err(),
@@ -168,7 +168,7 @@ fn stale_tmp_after_crash_does_not_corrupt_recovery() -> Result<()> {
         // Establish a clean state at height 8, then simulate an interrupted
         // apply by rewinding last_committed_height to 5.
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             for height in 1..=8 {
                 state.record_synthetic_block_for_recovery(height)?;
             }
@@ -181,7 +181,7 @@ fn stale_tmp_after_crash_does_not_corrupt_recovery() -> Result<()> {
         std::fs::write(&tmp_path, b"garbage from a crashed write")?;
 
         // Restart: recovery reads the valid .json and ignores the stale .tmp.
-        let restarted = NodeState::open(config)?;
+        let restarted = NodeState::open(config, None)?;
         crash_recovery::recover_if_needed(&restarted)?;
 
         let meta = crash_recovery::read_meta(&restarted)?.context("missing recovery metadata")?;
@@ -314,7 +314,7 @@ fn crash_recovery_replays_from_stored_bodies_after_crash() -> Result<()> {
 
         // Phase 1: open, apply genesis, publish checkpoint at height 0.
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             let tip = state.apply_block(&genesis)?;
             assert_eq!(tip.height, 0, "{backend}: genesis should be height 0");
             state.publish_checkpoint()?;
@@ -322,7 +322,7 @@ fn crash_recovery_replays_from_stored_bodies_after_crash() -> Result<()> {
 
         // Phase 2: reopen, apply blocks 1–3, crash (drop without checkpoint).
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             let mut prev = genesis_hash;
             for height in 1..=3_u32 {
                 let block = mine_regtest_block(prev, height, genesis.header.time + height)?;
@@ -338,7 +338,7 @@ fn crash_recovery_replays_from_stored_bodies_after_crash() -> Result<()> {
 
         // Phase 3: reopen — checkpoint restores to height 0, recovery meta
         // says height 3 with a tip hash.
-        let restarted = NodeState::open(config)?;
+        let restarted = NodeState::open(config, None)?;
         let restored_tip = restarted
             .applied_tip()
             .load()
@@ -400,12 +400,12 @@ fn production_apply_writes_meta_with_tip_hash() -> Result<()> {
         let genesis = Network::Regtest.genesis_block();
 
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             state.apply_block(&genesis)?;
         }
 
         // Reopen and check that the meta was written by the production path.
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let meta = crash_recovery::read_meta(&state)?
             .with_context(|| format!("{backend}: recovery meta should exist after apply"))?;
         assert_eq!(
@@ -450,7 +450,7 @@ fn periodic_checkpoint_anchors_progress_without_clean_shutdown() -> Result<()> {
         // Phase 1: open, apply genesis, publish a clean checkpoint at height 0.
         // This is the "old" checkpoint that must be superseded by the periodic one.
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
             state.apply_block(&genesis)?;
             state.publish_checkpoint()?;
         }
@@ -460,7 +460,7 @@ fn periodic_checkpoint_anchors_progress_without_clean_shutdown() -> Result<()> {
         // to publish. Then stop the worker and drop the state WITHOUT a clean
         // checkpoint — this simulates a crash/kill mid-sync.
         {
-            let state = NodeState::open(config.clone())?;
+            let state = NodeState::open(config.clone(), None)?;
 
             // Start the periodic checkpoint worker with a 3-block cadence
             // and a 1-hour time fallback (so only the block count fires).
@@ -522,7 +522,7 @@ fn periodic_checkpoint_anchors_progress_without_clean_shutdown() -> Result<()> {
 
         // Phase 3: reopen — the checkpoint should restore to height 4 (the
         // periodic checkpoint), not height 0 (the clean-shutdown one).
-        let restarted = NodeState::open(config)?;
+        let restarted = NodeState::open(config, None)?;
         let restored_tip = restarted
             .applied_tip()
             .load()
@@ -561,7 +561,7 @@ fn periodic_checkpoint_published_during_sync_without_shutdown() -> Result<()> {
 
         // Open, apply genesis (no clean checkpoint this time — the periodic
         // worker should be the only publisher).
-        let state = NodeState::open(config.clone())?;
+        let state = NodeState::open(config.clone(), None)?;
         state.apply_block(&genesis)?;
 
         // Start the periodic checkpoint worker with a 2-block cadence.
@@ -614,7 +614,7 @@ fn periodic_checkpoint_published_during_sync_without_shutdown() -> Result<()> {
         drop(state);
 
         // Reopen and verify the checkpoint restored to height 3.
-        let restarted = NodeState::open(config)?;
+        let restarted = NodeState::open(config, None)?;
         let restored_tip = restarted
             .applied_tip()
             .load()

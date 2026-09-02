@@ -19,7 +19,7 @@ use anyhow::{Context as _, Result, bail};
 #[cfg(feature = "checksig-census")]
 use bitcoin_rs_consensus::census_checkpoint;
 use bitcoin_rs_node::Network;
-use bitcoin_rs_node::config::Config;
+use bitcoin_rs_node::config::NodeConfig;
 use bitcoin_rs_node::corpus::{
     ArchiveInfo, CoreRestClient, CoreRestError, CorpusEntry, CorpusManifest, FetchedBlock,
     bounded_diagnostic_path, fetch_rest_block,
@@ -519,11 +519,11 @@ fn prepare_file_inputs(args: &Args) -> Result<FileInputs> {
 }
 /// Builds the replay node configuration from parsed arguments.
 ///
-/// `--dbcache-mb` (default 450) flows into `Config::dbcache_mb` before
+/// `--dbcache-mb` (default 450) flows into `NodeConfig::dbcache_mb` before
 /// `NodeState::open` divides the budget across storage namespaces; the offline
 /// benchmark controller always passes its shared cell budget explicitly.
-fn replay_config(args: &Args) -> Config {
-    let mut config = Config::default_for_network(Network::Mainnet);
+fn replay_config(args: &Args) -> NodeConfig {
+    let mut config = NodeConfig::default_for_network(Network::Mainnet);
     config.data_dir.clone_from(&args.data_dir);
     config.storage_backend.clone_from(&args.storage_backend);
     config.p2p_listen.clear();
@@ -564,7 +564,7 @@ fn main() -> Result<()> {
         None
     };
 
-    let state = NodeState::open(config).context("open node state")?;
+    let state = NodeState::open(config, None).context("open node state")?;
     let mut apply_handles = state.apply_handles();
     // Offline tool: no header sync loop ever runs, so a hash-pinned gate would
     // stay untrusted and silently force full verification when the configured
@@ -1623,7 +1623,7 @@ mod tests {
         assert_eq!(args.dbcache_mb, 450);
         assert_eq!(replay_config(&args).dbcache_mb, 450);
         assert_eq!(
-            Config::default_for_network(Network::Mainnet).dbcache_mb,
+            NodeConfig::default_for_network(Network::Mainnet).dbcache_mb,
             450
         );
     }

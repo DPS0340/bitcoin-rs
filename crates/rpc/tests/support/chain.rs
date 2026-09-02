@@ -8,7 +8,7 @@
 //! chain-bound keys to.
 
 use super::{GateResult, fail};
-use bitcoin_rs_node::{Config, Network, state::NodeState};
+use bitcoin_rs_node::{Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
 
@@ -107,8 +107,8 @@ pub(crate) fn current_tip(state: &NodeState) -> GateResult<bitcoin_rs_chain::Tip
 
 /// Regtest configuration bound to `dir` with no P2P listener.
 #[must_use]
-pub(crate) fn regtest_config(dir: &std::path::Path) -> Config {
-    let mut config = Config::default_for_network(Network::Regtest);
+pub(crate) fn regtest_config(dir: &std::path::Path) -> NodeConfig {
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = dir.to_path_buf();
     config.p2p_listen.clear();
     config

@@ -115,8 +115,11 @@ impl Node {
     /// [`NodeError::Startup`] names the failed configuration check, storage
     /// open, crash recovery, or service bind.
     #[allow(clippy::unused_async)] // async by contract; the body is synchronous today.
-    pub async fn start(config: crate::Config) -> Result<Self, NodeError> {
-        let (state, services, context) = crate::run::start_node(config, false)
+    pub async fn start(
+        config: crate::NodeConfig,
+        runtime: crate::RuntimeInputs,
+    ) -> Result<Self, NodeError> {
+        let (state, services, context) = crate::run::start_node(config, runtime, false)
             .map_err(|error| NodeError::Startup(error.to_string()))?;
         Ok(Self {
             state,
@@ -488,7 +491,7 @@ pub(crate) mod testing {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::Config;
+    use crate::NodeConfig;
     use bitcoin_rs_mempool::{MempoolEntry, MempoolObserver};
     use bitcoin_rs_primitives::{OutPoint, TxIn, TxOut};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
@@ -537,8 +540,8 @@ mod tests {
 
     /// Embedded-node config: isolated regtest datadir, P2P listeners off,
     /// ephemeral RPC bind, no metrics listener.
-    fn embedded_config(data_dir: &std::path::Path) -> Config {
-        let mut config = Config::default_for_network(Network::Regtest);
+    fn embedded_config(data_dir: &std::path::Path) -> NodeConfig {
+        let mut config = NodeConfig::default_for_network(Network::Regtest);
         config.data_dir = data_dir.to_path_buf();
         config.p2p_listen.clear();
         config.rpc_bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
@@ -581,9 +584,13 @@ mod tests {
         let publisher = Arc::new(RecordingSequencePublisher::default());
         let recording: Arc<dyn crate::zmq_publisher::ZmqPublisher> = publisher.clone();
         let observer: Arc<dyn MempoolObserver> = Arc::new(MempoolSequenceObserver::new(recording));
-        let config = embedded_config(&dir.path().join("node")).with_mempool_observer(observer);
+        let config = embedded_config(&dir.path().join("node"));
 
-        let node = testing::block_on(Node::start(config)).expect("embedded node starts");
+        let node = testing::block_on(Node::start(
+            config,
+            crate::RuntimeInputs::default().with_mempool_observer(observer),
+        ))
+        .expect("embedded node starts");
 
         // Fund two spendable confirmed outputs in the live UTXO set: one the
         // broadcast spends, one the direct-insert control below spends.

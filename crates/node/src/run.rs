@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossbeam_channel::{TrySendError, bounded};
 
-use crate::config::Config;
+use crate::config::{NodeConfig, RuntimeInputs};
 use crate::event_loop::EventLoop;
 use crate::state::NodeState;
 use crate::{crash_recovery, logging, shutdown};
@@ -137,7 +137,7 @@ fn build_rpc_auth(node_auth: &crate::Auth) -> Result<bitcoin_rs_rpc::Auth> {
 /// of leaving detached listener threads outliving a failed startup.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn spawn_p2p_listeners(
-    config: &bitcoin_rs_node::Config,
+    config: &bitcoin_rs_node::NodeConfig,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     network_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     peers: &PeerRegistry,
@@ -154,7 +154,7 @@ fn spawn_p2p_listeners(
     >,
     services: &mut NodeServices,
 ) -> anyhow::Result<()> {
-    let magic = bitcoin::p2p::Magic::from_bytes(config.p2p_magic());
+    let magic = bitcoin::p2p::Magic::from_bytes(config.p2p_magic);
     for addr in &config.p2p_listen {
         let listener_addr = *addr;
         let listener_shutdown = std::sync::Arc::clone(shutdown);
@@ -245,7 +245,7 @@ fn spawn_p2p_outbound_drain(
     >,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     let outbound_rx = state.p2p_outbound_receiver();
-    let magic = bitcoin::p2p::Magic::from_bytes(state.config().p2p_magic());
+    let magic = bitcoin::p2p::Magic::from_bytes(state.config().p2p_magic);
     let outbound_registry = state.peers();
     let outbound_peer_outbound = state.peer_outbound();
     let outbound_banned = state.banned_subnets();
@@ -319,7 +319,7 @@ fn spawn_p2p_outbound_drain(
 /// Returns `Ok(None)` when DNS bootstrap is disabled or the network is regtest (both cases
 /// require no background refill).
 fn spawn_dns_peer_maintenance(
-    config: &Config,
+    config: &NodeConfig,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     network_active: Arc<AtomicBool>,
     peer_outbound: PeerOutboundMap,
@@ -904,7 +904,8 @@ impl Drop for StartupGuard {
 /// failed startup and no joinable handle is dropped.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn start_node(
-    mut config: Config,
+    config: NodeConfig,
+    runtime: RuntimeInputs,
     install_signals: bool,
 ) -> Result<(
     NodeState,
@@ -913,9 +914,9 @@ pub(crate) fn start_node(
 )> {
     cap_global_thread_pool();
 
-    let injected_shutdown = config.shutdown_signal.take();
+    let injected_shutdown = runtime.shutdown;
     crate::extensions::validate_extensions(&config)?;
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, runtime.mempool_observer.as_ref())?;
     let mut guard = StartupGuard {
         state: Some(state),
         services: NodeServices::default(),
@@ -1110,15 +1111,15 @@ pub(crate) fn start_node(
 /// 1. Install JSON tracing on stderr.
 /// 2. `start_node` — validate config, open state, recover, spawn services.
 /// 3. Wait for a shutdown decision — the in-process receiver wired via
-///    [`Config::with_shutdown_receiver`] (tests) or a fresh SIGINT/SIGTERM
-///    handler (production) drives the event loop, which owns the decision.
+///    [`RuntimeInputs::shutdown`] (tests) or a fresh SIGINT/SIGTERM handler
+///    (production) drives the event loop, which owns the decision.
 /// 4. Service shutdown — the one ordered teardown in
 ///    [`TeardownMode::CleanShutdown`]: join every worker and the signal
 ///    handler, then publish one immutable clean-shutdown chainstate
 ///    checkpoint.
-pub fn run(config: Config) -> Result<()> {
+pub fn run(config: NodeConfig, runtime: RuntimeInputs) -> Result<()> {
     logging::install_tracing(&config.log_level)?;
-    let (state, services, context) = start_node(config, true)?;
+    let (state, services, context) = start_node(config, runtime, true)?;
     let node = crate::embed::node_from_parts(state, services, context);
     let shutdown = node.state.shutdown();
     // The event loop owns the shutdown channel; the flag is its published
@@ -1252,7 +1253,7 @@ mod tests {
     #[test]
     fn clean_shutdown_publishes_checkpoint_and_returns_success() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let mut config = Config::default_for_network(crate::Network::Regtest);
+        let mut config = NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = temp.path().join("node-success");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
@@ -1260,7 +1261,7 @@ mod tests {
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
-        let state = crate::state::NodeState::open(config.clone())?;
+        let state = crate::state::NodeState::open(config.clone(), None)?;
         state.apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block())?;
         state.write_clean_checkpoint()?;
         drop(state);
@@ -1273,11 +1274,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
         shutdown_tx.send(())?;
         let reopen_config = config.clone();
-        config = config.with_shutdown_receiver(shutdown_rx);
-        run(config)?;
+        run(config, RuntimeInputs::default().with_shutdown(shutdown_rx))?;
         assert_ne!(std::fs::read(current_path)?, previous_current);
 
-        let resumed = crate::state::NodeState::open(reopen_config)?;
+        let resumed = crate::state::NodeState::open(reopen_config, None)?;
         assert_eq!(
             resumed.resume_source(),
             crate::state::ResumeSource::Checkpoint
@@ -1288,7 +1288,7 @@ mod tests {
     #[test]
     fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let mut config = Config::default_for_network(crate::Network::Regtest);
+        let mut config = NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = temp.path().join("node");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
@@ -1301,7 +1301,7 @@ mod tests {
         // regression that moves `?` back onto `write_clean_checkpoint`.
         config.connect = vec!["127.0.0.1:1".to_owned()];
 
-        let state = crate::state::NodeState::open(config.clone())?;
+        let state = crate::state::NodeState::open(config.clone(), None)?;
         state.apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block())?;
         state.write_clean_checkpoint()?;
         drop(state);
@@ -1313,12 +1313,12 @@ mod tests {
         let previous_current = std::fs::read(&current_path)?;
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
         shutdown_tx.send(())?;
-        config = config.with_shutdown_receiver(shutdown_rx);
+
         crate::checkpoint::inject_next_checkpoint_failpoint(
             crate::checkpoint::CheckpointFailpoint::ManifestWrite,
         );
 
-        assert!(run(config).is_err());
+        assert!(run(config, RuntimeInputs::default().with_shutdown(shutdown_rx)).is_err());
         assert_eq!(std::fs::read(current_path)?, previous_current);
         assert!(
             bootstrap_drain_was_reached(),
@@ -1335,7 +1335,7 @@ mod tests {
     #[test]
     fn teardown_join_failure_completes_cleanup_and_suppresses_checkpoint() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let mut config = Config::default_for_network(crate::Network::Regtest);
+        let mut config = NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = temp.path().join("node-join-failure");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
@@ -1343,7 +1343,7 @@ mod tests {
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
-        let state = crate::state::NodeState::open(config.clone())?;
+        let state = crate::state::NodeState::open(config.clone(), None)?;
         state.apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block())?;
         state.write_clean_checkpoint()?;
         let current_path = config
@@ -1374,7 +1374,7 @@ mod tests {
         drop(state);
 
         // The graph's storage was released by the same teardown.
-        let resumed = crate::state::NodeState::open(config)?;
+        let resumed = crate::state::NodeState::open(config, None)?;
         assert_eq!(
             resumed.resume_source(),
             crate::state::ResumeSource::Checkpoint,
@@ -1394,7 +1394,7 @@ mod tests {
     #[test]
     fn teardown_joins_bootstrap_worker_beyond_former_deadline() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let mut config = Config::default_for_network(crate::Network::Regtest);
+        let mut config = NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = temp.path().join("node-slow-bootstrap");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
@@ -1402,7 +1402,7 @@ mod tests {
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
-        let state = crate::state::NodeState::open(config.clone())?;
+        let state = crate::state::NodeState::open(config.clone(), None)?;
         state.apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block())?;
         state.write_clean_checkpoint()?;
         let current_path = config
@@ -1466,7 +1466,7 @@ mod tests {
     #[test]
     fn late_bootstrap_panic_suppresses_checkpoint() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let mut config = Config::default_for_network(crate::Network::Regtest);
+        let mut config = NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = temp.path().join("node-late-failure");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
@@ -1474,7 +1474,7 @@ mod tests {
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
-        let state = crate::state::NodeState::open(config.clone())?;
+        let state = crate::state::NodeState::open(config.clone(), None)?;
         state.apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block())?;
         state.write_clean_checkpoint()?;
         let current_path = config
@@ -1524,7 +1524,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
 
         // Daemon path: run() with an injected pre-sent shutdown receiver.
-        let mut daemon_config = Config::default_for_network(crate::Network::Regtest);
+        let mut daemon_config = NodeConfig::default_for_network(crate::Network::Regtest);
         daemon_config.data_dir = temp.path().join("daemon");
         daemon_config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         daemon_config.rpc_auth = crate::Auth::basic("user", "password");
@@ -1533,9 +1533,11 @@ mod tests {
         daemon_config.metrics_bind = None;
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
         shutdown_tx.send(())?;
-        let daemon_config = daemon_config.with_shutdown_receiver(shutdown_rx);
         let stages_before = shutdown::take_shutdown_stages_reached();
-        run(daemon_config)?;
+        run(
+            daemon_config,
+            RuntimeInputs::default().with_shutdown(shutdown_rx),
+        )?;
         assert_eq!(
             shutdown::take_shutdown_stages_reached(),
             stages_before + 1,
@@ -1544,7 +1546,7 @@ mod tests {
 
         // Embedded path: start_node with real signal handling, stopped
         // through the same teardown the daemon uses.
-        let mut embedded_config = Config::default_for_network(crate::Network::Regtest);
+        let mut embedded_config = NodeConfig::default_for_network(crate::Network::Regtest);
         embedded_config.data_dir = temp.path().join("embedded");
         embedded_config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         embedded_config.rpc_auth = crate::Auth::basic("user", "password");
@@ -1553,7 +1555,8 @@ mod tests {
         embedded_config.metrics_bind = None;
         let installed_before = crate::signal::testing::installed_total();
         let closed_before = crate::signal::testing::closed_total();
-        let (state, services, context) = start_node(embedded_config, true)?;
+        let (state, services, context) =
+            start_node(embedded_config, RuntimeInputs::default(), true)?;
         let node = crate::embed::node_from_parts(state, services, context);
         node.shutdown_blocking()?;
         assert_eq!(
@@ -1574,14 +1577,14 @@ mod tests {
 
         // Second embedded lifecycle on the same datadir: no stale signal
         // handler from the first, and the clean checkpoint resumes.
-        let mut reopen_config = Config::default_for_network(crate::Network::Regtest);
+        let mut reopen_config = NodeConfig::default_for_network(crate::Network::Regtest);
         reopen_config.data_dir = temp.path().join("embedded");
         reopen_config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         reopen_config.rpc_auth = crate::Auth::basic("user", "password");
         reopen_config.script_index = crate::config::ScriptIndexMode::Disabled;
         reopen_config.p2p_listen.clear();
         reopen_config.metrics_bind = None;
-        let (state, services, context) = start_node(reopen_config, true)?;
+        let (state, services, context) = start_node(reopen_config, RuntimeInputs::default(), true)?;
         let node = crate::embed::node_from_parts(state, services, context);
         node.shutdown_blocking()?;
         assert_eq!(
@@ -1812,7 +1815,7 @@ mod tests {
     // thread exits on the first loop condition check after the initial bootstrap.
     #[test]
     fn maintenance_loop_exits_on_shutdown() -> anyhow::Result<()> {
-        let config = Config::default_for_network(bitcoin_rs_primitives::Network::Signet);
+        let config = NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Signet);
         let shutdown = Arc::new(AtomicBool::new(false));
         let peer_outbound = empty_peer_outbound();
         let (dial_tx, _dial_rx) = crossbeam_channel::unbounded();
@@ -1852,7 +1855,7 @@ mod tests {
         // early-return path by confirming it returns Ok(None) when connect is empty.
         // The function reads state.config().connect, so we verify the public contract
         // through the DNS path: spawn_dns_peer_maintenance returns Some when seeds exist.
-        let config = Config::default_for_network(bitcoin_rs_primitives::Network::Signet);
+        let config = NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Signet);
         assert!(
             config.connect.is_empty(),
             "default signet config must have no --connect peers"
@@ -1881,8 +1884,8 @@ mod tests {
 
     #[test]
     fn maintenance_does_not_spawn_for_regtest_or_disabled_dns() {
-        let regtest = Config::default_for_network(bitcoin_rs_primitives::Network::Regtest);
-        let mut disabled = Config::default_for_network(bitcoin_rs_primitives::Network::Signet);
+        let regtest = NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest);
+        let mut disabled = NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Signet);
         disabled.dns_seeds_enabled = false;
 
         for config in [regtest, disabled] {

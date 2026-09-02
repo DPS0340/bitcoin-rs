@@ -28,7 +28,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail, ensure};
 use bitcoin::hex::DisplayHex as _;
 use bitcoin_rs_node::Network;
-use bitcoin_rs_node::config::Config;
+use bitcoin_rs_node::config::NodeConfig;
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_primitives::Hash256;
 use rustix::fs::{AtFlags, Mode, OFlags, StatxFlags};
@@ -225,8 +225,8 @@ fn verify_durable_reorg(
         .context("publish clean checkpoint after durable reconnect")
 }
 
-fn node_config(args: &Args) -> Config {
-    let mut config = Config::default_for_network(Network::Mainnet);
+fn node_config(args: &Args) -> NodeConfig {
+    let mut config = NodeConfig::default_for_network(Network::Mainnet);
     config.storage_backend.clone_from(&args.storage_backend);
     config.p2p_listen.clear();
     config.dns_seeds_enabled = false;
@@ -736,7 +736,7 @@ impl core::ops::Deref for AnchoredState<'_> {
 fn open_anchored_state<'a>(anchor: &'a AnchoredDir, args: &Args) -> Result<AnchoredState<'a>> {
     let mut config = node_config(args);
     config.data_dir = anchor.state_path();
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
     Ok(AnchoredState {
         state,
         _anchor: anchor,

@@ -50,7 +50,7 @@ impl NodeHarness {
     pub(crate) fn open() -> GateResult<Self> {
         let datadir = tempfile::tempdir()?;
         let config = regtest_config(&datadir.path().join("node"));
-        let state = NodeState::open(config).map_err(fail)?;
+        let state = NodeState::open(config, None).map_err(fail)?;
         apply_genesis(&state)?;
         Ok(Self {
             state,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bitcoin_rs_mempool::MempoolGateway;
-use bitcoin_rs_node::{Config, state::NodeState};
+use bitcoin_rs_node::{Network, NodeConfig, state::NodeState};
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_utxo::UtxoSet;
 use tempfile::tempdir;
@@ -20,14 +20,16 @@ use tempfile::tempdir;
 #[allow(clippy::too_many_lines)]
 fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
     let dir = tempdir()?;
-    let mut config = Config::default();
-    config.data_dir = dir.path().join("node");
+    let mut config = NodeConfig {
+        data_dir: dir.path().join("node"),
+        ..NodeConfig::default_for_network(Network::Regtest)
+    };
     config.txindex = true;
     config.zmqpubhashblock = vec!["inproc://rpc-wiring-zmq-pubhashblock".to_owned()];
     config.zmqpubhashblockhwm = Some(21);
     config.zmqpubsequence = vec!["inproc://rpc-wiring-zmq-pubsequence".to_owned()];
     config.zmqpubsequencehwm = Some(22);
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
 
     let chain_tip = state.chain_tip();
     let applied_tip = state.applied_tip();
@@ -161,10 +163,12 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
 #[test]
 fn rpc_context_omits_indexer_when_node_txindex_is_disabled() -> Result<()> {
     let dir = tempdir()?;
-    let mut config = Config::default();
-    config.data_dir = dir.path().join("node");
+    let mut config = NodeConfig {
+        data_dir: dir.path().join("node"),
+        ..NodeConfig::default_for_network(Network::Regtest)
+    };
     config.txindex = false;
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
 
     assert!(state.tx_index_query().is_none());
     Ok(())

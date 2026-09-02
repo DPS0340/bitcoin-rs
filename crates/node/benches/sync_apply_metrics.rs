@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use bitcoin_rs_chain::{BlockTree, NodeStatus};
 use bitcoin_rs_node::{
-    Config, Network,
+    Network, NodeConfig,
     metrics::{MetricValue, MetricsHandle},
     state::NodeState,
 };
@@ -303,7 +303,7 @@ impl StagedSyncApplyFixture {
         config.txindex = true;
         let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
         config.data_dir = dir.path().join("node");
-        let state = NodeState::open(config)
+        let state = NodeState::open(config, None)
             .unwrap_or_else(|error| panic!("open staged sync state failed: {error}"));
         let blocks = {
             let block_tree = state.block_tree();
@@ -407,8 +407,8 @@ fn storage_backend() -> &'static str {
     }
 }
 
-fn production_state_config() -> Config {
-    let mut config = Config::default_for_network(Network::Regtest);
+fn production_state_config() -> NodeConfig {
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.p2p_listen.clear();
     config.txindex = false;
     config
@@ -416,13 +416,13 @@ fn production_state_config() -> Config {
 
 fn open_regtest_state(backend: &str, txindex: bool) -> (TempDir, NodeState) {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = dir.path().join("node");
     backend.clone_into(&mut config.storage_backend);
     config.p2p_listen.clear();
     config.txindex = txindex;
-    let state =
-        NodeState::open(config).unwrap_or_else(|error| panic!("open node state failed: {error}"));
+    let state = NodeState::open(config, None)
+        .unwrap_or_else(|error| panic!("open node state failed: {error}"));
     (dir, state)
 }
 

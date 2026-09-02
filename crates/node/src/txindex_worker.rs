@@ -473,7 +473,7 @@ pub(crate) struct TxIndexOpenSpec {
 
 /// Test-only keyed open gate. Holds the worker inside the open phase until
 /// released, proving RPC binds and queries see `Opening` while the store is
-/// not yet open. `#[cfg(test)]` only — not a production trait or `Config` field.
+/// not yet open. `#[cfg(test)]` only — not a production trait or `NodeConfig` field.
 #[cfg(test)]
 pub(crate) static TXINDEX_OPEN_GATE: std::sync::LazyLock<
     parking_lot::Mutex<Option<crossbeam_channel::Receiver<()>>>,

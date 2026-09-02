@@ -60,11 +60,11 @@ mod tests {
         let genesis_hash = block.block_hash().0;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = true;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let outcome = import_block(&state, &bytes)?;
 
         assert_eq!(outcome.tx_count, 1, "genesis has one transaction");
@@ -231,10 +231,10 @@ mod tests {
         let block_bytes = consensus_bytes(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -278,10 +278,10 @@ mod tests {
         let block_bytes = encode_block(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Mainnet);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Mainnet);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -323,10 +323,10 @@ mod tests {
         let block_bytes = encode_block(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -372,10 +372,10 @@ mod tests {
         let follow_up_bytes = consensus_bytes(&follow_up);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
         let _follow_up = import_block(&state, &follow_up_bytes)?;
@@ -402,10 +402,10 @@ mod tests {
         let follow_up_bytes = consensus_bytes(&follow_up);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
         let _follow_up = import_block(&state, &follow_up_bytes)?;
@@ -442,10 +442,10 @@ mod tests {
         let block_bytes = consensus_bytes(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -476,10 +476,10 @@ mod tests {
         let genesis_block = Block::consensus_decode(&genesis_bytes)?;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let mut coinbase_block = genesis_block.clone();
@@ -554,10 +554,10 @@ mod tests {
         let block_bytes = consensus_bytes(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -589,10 +589,10 @@ mod tests {
         let mut block = Block::consensus_decode(&genesis_bytes)?;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let synthetic_tip = seed_synthetic_header_tip(&state, 499)?;
 
         block.header.prev_blockhash = BlockHash(synthetic_tip.hash);

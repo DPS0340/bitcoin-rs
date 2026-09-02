@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use bitcoin_rs_mempool::{MempoolGateway, MempoolObserver, MutationOutcome, MutationResult};
-use bitcoin_rs_node::{Config, MiningCoordinator, Network, state::NodeState};
+use bitcoin_rs_node::{MiningCoordinator, Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{
     Block, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
@@ -137,10 +137,10 @@ fn template_mines_to_tip_and_drains_mempool() -> Result<()> {
 /// directory alive for the whole test body (freed when the guard drops).
 fn open_regtest() -> Result<(NodeState, tempfile::TempDir)> {
     let dir = tempfile::tempdir()?;
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = dir.path().join("node");
     config.p2p_listen.clear();
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
     Ok((state, dir))
 }
 

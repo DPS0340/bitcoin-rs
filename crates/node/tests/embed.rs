@@ -10,7 +10,7 @@ use std::task::{Context, Poll, Waker};
 use anyhow::{Result, bail};
 use bitcoin_rs_mempool::MutationOutcome;
 use bitcoin_rs_node::state::NodeState;
-use bitcoin_rs_node::{Config, Network, Node, NodeError};
+use bitcoin_rs_node::{Network, Node, NodeConfig, NodeError};
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
@@ -50,7 +50,7 @@ fn embedded_node_lifecycle_round_trip() -> Result<()> {
     // next block once the tip reaches height 100 — the same fixture shape
     // the mining e2e test uses.
     let (seed_tip_hash, first_block_hash, first_block_bytes) = {
-        let state = NodeState::open(seed_config(&data_dir))?;
+        let state = NodeState::open(seed_config(&data_dir), None)?;
         state.apply_block(&Network::Regtest.genesis_block())?;
         let outcome = seed_chain(&state, SEED_BLOCKS)?;
         state.publish_checkpoint()?;
@@ -61,7 +61,10 @@ fn embedded_node_lifecycle_round_trip() -> Result<()> {
     // --- start an embedded node on the seeded datadir -----------------------
     let spawn_config = embedded_config(&data_dir)?;
     let reopen_config = spawn_config.clone();
-    let node = block_on(Node::start(spawn_config))?;
+    let node = block_on(Node::start(
+        spawn_config,
+        bitcoin_rs_node::RuntimeInputs::default(),
+    ))?;
 
     assert_embedded_node_readiness(&node, seed_tip_hash, first_block_hash, &first_block_bytes)?;
 
@@ -71,7 +74,10 @@ fn embedded_node_lifecycle_round_trip() -> Result<()> {
     block_on(node.shutdown())?;
 
     // Reopen the same datadir: the clean checkpoint resumes without a daemon.
-    let node = block_on(Node::start(reopen_config))?;
+    let node = block_on(Node::start(
+        reopen_config,
+        bitcoin_rs_node::RuntimeInputs::default(),
+    ))?;
     assert_eq!(
         node.snapshot().tip_height,
         SEED_BLOCKS,
@@ -203,16 +209,16 @@ fn assert_broadcast_and_lookups(node: &Node) -> Result<()> {
     Ok(())
 }
 
-/// Config for chain seeding: isolated regtest datadir, P2P listeners off.
-fn seed_config(data_dir: &std::path::Path) -> Config {
-    let mut config = Config::default_for_network(Network::Regtest);
+/// `NodeConfig` for chain seeding: isolated regtest datadir, P2P listeners off.
+fn seed_config(data_dir: &std::path::Path) -> NodeConfig {
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = data_dir.to_path_buf();
     config.p2p_listen.clear();
     config
 }
 
-/// Config for the embedded node: ephemeral RPC bind on the seeded datadir.
-fn embedded_config(data_dir: &std::path::Path) -> Result<Config> {
+/// `NodeConfig` for the embedded node: ephemeral RPC bind on the seeded datadir.
+fn embedded_config(data_dir: &std::path::Path) -> Result<NodeConfig> {
     let mut config = seed_config(data_dir);
     let rpc_bind: std::net::SocketAddr = "127.0.0.1:0".parse()?;
     config.rpc_bind = rpc_bind;
@@ -407,7 +413,7 @@ fn dropped_node_releases_services_and_datadir_for_reopen() -> Result<()> {
     let data_dir = dir.path().join("node");
 
     let (_seed_tip_hash, _first, _bytes) = {
-        let state = NodeState::open(seed_config(&data_dir))?;
+        let state = NodeState::open(seed_config(&data_dir), None)?;
         state.apply_block(&Network::Regtest.genesis_block())?;
         let outcome = seed_chain(&state, 1)?;
         state.publish_checkpoint()?;
@@ -418,7 +424,10 @@ fn dropped_node_releases_services_and_datadir_for_reopen() -> Result<()> {
     let seeded_current = std::fs::read(&current_path)?;
 
     {
-        let node = block_on(Node::start(embedded_config(&data_dir)?))?;
+        let node = block_on(Node::start(
+            embedded_config(&data_dir)?,
+            bitcoin_rs_node::RuntimeInputs::default(),
+        ))?;
         assert_eq!(node.snapshot().tip_height, 1);
         // Deliberately no `shutdown`: the Drop impl must stop every service
         // and release the storage before this block ends — and must not
@@ -431,7 +440,7 @@ fn dropped_node_releases_services_and_datadir_for_reopen() -> Result<()> {
     );
 
     // The released datadir reopens and resumes the seeded checkpoint.
-    let resumed = NodeState::open(seed_config(&data_dir))?;
+    let resumed = NodeState::open(seed_config(&data_dir), None)?;
     let tip = resumed
         .applied_tip()
         .load_full()
@@ -440,7 +449,10 @@ fn dropped_node_releases_services_and_datadir_for_reopen() -> Result<()> {
     drop(resumed);
 
     // And a whole second embedded lifecycle starts and stops cleanly on it.
-    let node = block_on(Node::start(embedded_config(&data_dir)?))?;
+    let node = block_on(Node::start(
+        embedded_config(&data_dir)?,
+        bitcoin_rs_node::RuntimeInputs::default(),
+    ))?;
     assert_eq!(node.snapshot().tip_height, 1);
     block_on(node.shutdown())?;
     Ok(())
@@ -464,13 +476,19 @@ fn startup_failure_after_state_open_rolls_back_releases_state() -> Result<()> {
 
     let mut held_config = embedded_config(&held_dir)?;
     held_config.rpc_bind = port;
-    let held = block_on(Node::start(held_config))?;
+    let held = block_on(Node::start(
+        held_config,
+        bitcoin_rs_node::RuntimeInputs::default(),
+    ))?;
 
     // Node B targets the same port: `start_node` opens B's state first,
     // then fails at the RPC bind. The rollback must release B's state.
     let mut failed_config = embedded_config(&failed_dir)?;
     failed_config.rpc_bind = port;
-    match block_on(Node::start(failed_config)) {
+    match block_on(Node::start(
+        failed_config,
+        bitcoin_rs_node::RuntimeInputs::default(),
+    )) {
         Err(NodeError::Startup(message)) => {
             let lowered = message.to_lowercase();
             assert!(
@@ -485,7 +503,7 @@ fn startup_failure_after_state_open_rolls_back_releases_state() -> Result<()> {
     }
 
     // B's datadir is free: open it directly.
-    let resumed = NodeState::open(seed_config(&failed_dir))?;
+    let resumed = NodeState::open(seed_config(&failed_dir), None)?;
     drop(resumed);
 
     // A is unaffected and still shuts down cleanly.

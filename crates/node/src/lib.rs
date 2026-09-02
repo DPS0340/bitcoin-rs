@@ -78,7 +78,7 @@ pub mod zmq_publisher;
 
 pub use bitcoin_rs_primitives::Network;
 pub use block_source::NodeBlockSource;
-pub use config::{Auth, Config, ScriptIndexMode};
+pub use config::{Auth, NodeConfig, RuntimeInputs, ScriptIndexMode, UserConfig};
 pub use embed::{Node, NodeError, SyncProgress};
 pub use mining::{GenerationKey, MiningCoordinator};
 pub use p2p_chain::NodeP2pChainQuery;

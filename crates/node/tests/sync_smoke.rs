@@ -12,7 +12,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
-    BlockSync, Config, Network, apply::ApplyHandles, event_loop::EventLoop, state::NodeState,
+    BlockSync, Network, NodeConfig, apply::ApplyHandles, event_loop::EventLoop, state::NodeState,
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::encode::double_sha256;
@@ -241,13 +241,13 @@ fn event_loop_sync_wake_applies_inbound_block_without_periodic_tick()
 fn tick_writes_g2_muhash_sample_for_applied_genesis() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let samples_path = temp.path().join("g2.samples");
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join("node");
     config.storage_backend = "redb".to_owned();
     config.p2p_listen.clear();
     config.g2_muhash_samples = Some(samples_path.clone());
     config.g2_muhash_tip_height = Some(1);
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
 
     state.sync().tick();
 
@@ -273,13 +273,13 @@ fn tick_writes_g2_muhash_sample_for_applied_genesis() -> Result<(), Box<dyn std:
 fn node_state_open_rejects_g2_tip_height_without_sample_path()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join("node");
     config.storage_backend = "redb".to_owned();
     config.p2p_listen.clear();
     config.g2_muhash_tip_height = Some(10_000);
 
-    let Err(error) = NodeState::open(config) else {
+    let Err(error) = NodeState::open(config, None) else {
         panic!("G2 tip height without sample path must fail");
     };
 
@@ -747,7 +747,7 @@ fn tick_writes_g14_utxo_commit_sample_for_applied_genesis() -> Result<(), Box<dy
     let temp = tempfile::tempdir()?;
     let samples_path = temp.path().join("g14-utxo.samples.json");
     let genesis_hash = Network::Regtest.genesis_block_hash().to_string_be();
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join("node");
     config.storage_backend = "redb".to_owned();
     config.p2p_listen.clear();
@@ -756,7 +756,7 @@ fn tick_writes_g14_utxo_commit_sample_for_applied_genesis() -> Result<(), Box<dy
     config.g14_utxo_commit_ibd_stop_height = Some(0);
     config.g14_utxo_commit_ibd_start_hash = Some(genesis_hash.clone());
     config.g14_utxo_commit_ibd_stop_hash = Some(genesis_hash);
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
     assert!(!samples_path.exists());
 
     state.sync().tick();
@@ -787,7 +787,7 @@ fn tick_skips_g14_utxo_commit_samples_outside_window() -> Result<(), Box<dyn std
     let temp = tempfile::tempdir()?;
     let samples_path = temp.path().join("g14-utxo.samples.json");
     let stop_hash = format!("{:064x}", 1_u32);
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join("node");
     config.storage_backend = "redb".to_owned();
     config.p2p_listen.clear();
@@ -796,7 +796,7 @@ fn tick_skips_g14_utxo_commit_samples_outside_window() -> Result<(), Box<dyn std
     config.g14_utxo_commit_ibd_stop_height = Some(1);
     config.g14_utxo_commit_ibd_start_hash = Some(stop_hash.clone());
     config.g14_utxo_commit_ibd_stop_hash = Some(stop_hash);
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
 
     state.sync().tick();
 
@@ -814,7 +814,7 @@ fn apply_buffers_g14_utxo_commit_samples_until_stop_height()
     let block1 = child_coinbase_block(&genesis, 1)?;
     let start_hash = Network::Regtest.genesis_block_hash().to_string_be();
     let stop_hash = Hash256::from_le_bytes(block1.block_hash().as_bytes()).to_string_be();
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join("node");
     config.storage_backend = "redb".to_owned();
     config.p2p_listen.clear();
@@ -823,7 +823,7 @@ fn apply_buffers_g14_utxo_commit_samples_until_stop_height()
     config.g14_utxo_commit_ibd_stop_height = Some(1);
     config.g14_utxo_commit_ibd_start_hash = Some(start_hash);
     config.g14_utxo_commit_ibd_stop_hash = Some(stop_hash);
-    let state = NodeState::open(config)?;
+    let state = NodeState::open(config, None)?;
     assert!(!samples_path.exists());
 
     state.apply_block(&genesis)?;
@@ -857,7 +857,7 @@ fn node_open_rejects_existing_g14_utxo_commit_samples() -> Result<(), Box<dyn st
     let samples_path = temp.path().join("g14-utxo.samples.json");
     std::fs::write(&samples_path, b"stale evidence")?;
     let genesis_hash = Network::Regtest.genesis_block_hash().to_string_be();
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join("node");
     config.storage_backend = "fjall".to_owned();
     config.p2p_listen.clear();
@@ -867,7 +867,7 @@ fn node_open_rejects_existing_g14_utxo_commit_samples() -> Result<(), Box<dyn st
     config.g14_utxo_commit_ibd_start_hash = Some(genesis_hash.clone());
     config.g14_utxo_commit_ibd_stop_hash = Some(genesis_hash);
 
-    let result = NodeState::open(config);
+    let result = NodeState::open(config, None);
     let Err(error) = result else {
         panic!("expected existing G14 evidence path to fail");
     };

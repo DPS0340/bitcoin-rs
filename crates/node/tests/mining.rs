@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use bitcoin_rs_node::{Config, MiningCoordinator, Network, state::NodeState};
+use bitcoin_rs_node::{MiningCoordinator, Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid};
 use bitcoin_rs_rpc::context::{
@@ -18,13 +18,13 @@ use parking_lot::Mutex;
 
 fn open_regtest() -> anyhow::Result<NodeState> {
     let dir = tempfile::tempdir()?;
-    let mut config = Config::default_for_network(Network::Regtest);
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = dir.path().join("node");
     config.p2p_listen.clear();
     // Keep the tempdir alive for the process lifetime of this test by leaking it.
     // NodeState retains open files under data_dir for the test duration.
     std::mem::forget(dir);
-    NodeState::open(config)
+    NodeState::open(config, None)
 }
 
 fn coordinator(state: &NodeState) -> MiningCoordinator {
@@ -65,11 +65,11 @@ fn advance_mempool_sequence(state: &NodeState) -> anyhow::Result<()> {
 
 fn open_network(network: Network) -> anyhow::Result<NodeState> {
     let dir = tempfile::tempdir()?;
-    let mut config = Config::default_for_network(network);
+    let mut config = NodeConfig::default_for_network(network);
     config.data_dir = dir.path().join("node");
     config.p2p_listen.clear();
     std::mem::forget(dir);
-    NodeState::open(config)
+    NodeState::open(config, None)
 }
 
 fn apply_genesis_for(state: &NodeState, network: Network) -> anyhow::Result<()> {
