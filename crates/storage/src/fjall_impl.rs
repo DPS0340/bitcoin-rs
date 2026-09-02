@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use bytes::Bytes;
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
+use fjall::config::CompressionPolicy;
+use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
 use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
 
@@ -41,8 +42,16 @@ impl FjallStore {
             .map_err(StorageError::backend)?;
         let mut keyspaces = Vec::with_capacity(ColumnFamily::ALL.len());
         for cf in ColumnFamily::ALL.iter().copied() {
+            // Fjall's default compression policy is [None, None, Lz4] — LZ4 only
+            // on the last level. L0 and L1 data blocks are uncompressed, which
+            // means data that has not yet compacted to the final level is stored
+            // raw. For a node whose working set lives in L0 (small chain, or
+            // recently written data), this wastes disk. Apply LZ4 on every
+            // level, matching RocksDB's configuration.
+            let opts = KeyspaceCreateOptions::default()
+                .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4));
             keyspaces.push(
-                db.keyspace(cf.name(), KeyspaceCreateOptions::default)
+                db.keyspace(cf.name(), || opts)
                     .map_err(StorageError::backend)?,
             );
         }
@@ -51,6 +60,21 @@ impl FjallStore {
             keyspaces,
             write_lock: parking_lot::Mutex::new(()),
         })
+    }
+
+    /// Forces all memtables to flush to SST files and waits for completion.
+    ///
+    /// This rotates every keyspace's active memtable and blocks until the
+    /// flush worker has written the sealed memtables to disk. It is the
+    /// correct way to ensure all written data is in durable SST files rather
+    /// than only in the journal, and is used by clean-shutdown and footprint
+    /// measurement.
+    pub fn force_flush_memtables(&self) -> Result<(), StorageError> {
+        for ks in &self.keyspaces {
+            ks.rotate_memtable_and_wait()
+                .map_err(StorageError::backend)?;
+        }
+        Ok(())
     }
 
     fn keyspace(&self, cf: ColumnFamily) -> Result<&Keyspace, StorageError> {
