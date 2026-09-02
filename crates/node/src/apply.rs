@@ -10018,13 +10018,27 @@ mod chain_generation_tests {
     /// An observer that captures the gateway's `stable_generation` when a
     /// mutation fires. We pass the gateway in via an Arc.
     struct GatewayGenerationRecorder {
-        gateway: Arc<bitcoin_rs_mempool::MempoolGateway>,
+        /// Bound after the gateway exists: the gateway owns the observer, so
+        /// the observer cannot own the gateway at construction. An unbound
+        /// recorder records `None`, which fails the caller's assertion rather
+        /// than passing quietly.
+        gateway: std::sync::OnceLock<Arc<bitcoin_rs_mempool::MempoolGateway>>,
         seen: Mutex<Vec<Option<u64>>>,
+    }
+
+    impl GatewayGenerationRecorder {
+        fn bind(&self, gateway: &Arc<bitcoin_rs_mempool::MempoolGateway>) {
+            let _ = self.gateway.set(Arc::clone(gateway));
+        }
     }
 
     impl MempoolObserver for GatewayGenerationRecorder {
         fn on_mutation(&self, _result: &MutationResult) {
-            self.seen.lock().push(self.gateway.stable_generation());
+            let generation = self
+                .gateway
+                .get()
+                .and_then(|gateway| gateway.stable_generation());
+            self.seen.lock().push(generation);
         }
     }
 
@@ -10157,20 +10171,18 @@ mod chain_generation_tests {
     #[test]
     fn observer_sees_none_during_connect() {
         let (mut handles, genesis, _genesis_hash) = setup_regtest_with_genesis();
-        let gateway = Arc::clone(&handles.mempool_gateway);
         let recorder = Arc::new(GatewayGenerationRecorder {
-            gateway,
+            gateway: std::sync::OnceLock::new(),
             seen: Mutex::new(Vec::new()),
         });
         let observer: Arc<dyn MempoolObserver> = recorder.clone();
-        // Replace the shared gateway with one that has the observer installed
-        // at construction time (the new PublishState design sets the observer
-        // in `new`, not via `install_observer`).
         let pool = handles.mempool_gateway.pool().clone();
-        handles.mempool_gateway = Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
+        let gateway = Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
             pool,
             Some(observer),
         ));
+        recorder.bind(&gateway);
+        handles.mempool_gateway = gateway;
 
         let block = mined_block_with_prev_hash_and_transactions(
             genesis.block_hash(),
@@ -10226,7 +10238,9 @@ mod chain_generation_tests {
             }
             let mut txs = vec![coinbase];
             if height == 101 {
-                let first = first_txid.expect("block 1 txid must exist");
+                let Some(first) = first_txid else {
+                    panic!("block 1 txid must exist")
+                };
                 txs.push(Tx {
                     version: 2,
                     inputs: vec![TxIn {
@@ -10260,20 +10274,24 @@ mod chain_generation_tests {
             prev_hash = block.block_hash();
             tip_hash = tip.hash;
         }
-        let spend_txid = spend_txid.expect("block 101 must have a spend tx");
+        let Some(spend_txid) = spend_txid else {
+            panic!("block 101 must have a spend tx")
+        };
 
         // Install the generation recorder before invalidation so it captures
         // every mempool mutation during reconsideration.
-        let gateway = Arc::clone(&handles.mempool_gateway);
         let recorder = Arc::new(GatewayGenerationRecorder {
-            gateway,
+            gateway: std::sync::OnceLock::new(),
             seen: Mutex::new(Vec::new()),
         });
         let observer: Arc<dyn MempoolObserver> = recorder.clone();
-        assert!(
-            handles.mempool_gateway.install_observer(observer).is_ok(),
-            "install observer"
-        );
+        let pool = handles.mempool_gateway.pool().clone();
+        let gateway = Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
+            pool,
+            Some(observer),
+        ));
+        recorder.bind(&gateway);
+        handles.mempool_gateway = gateway;
 
         crate::reorg::invalidate_block(&handles, tip_hash)
             .unwrap_or_else(|error| panic!("invalidate tip: {error}"));

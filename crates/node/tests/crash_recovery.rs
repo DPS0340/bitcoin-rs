@@ -3,7 +3,7 @@
 //! Exercises the recovery-meta sidecar protocol (`crates/node/src/crash_recovery.rs`)
 //! over every backend compiled into this test binary.  Each test loops over
 //! `available_backends()` so a single `cargo test --features rocksdb,fjall,redb`
-//! invocation exercises RocksDB, fjall, and redb in one run.
+//! invocation exercises `RocksDB`, fjall, and redb in one run.
 //!
 //! Proof surface:
 //! - **Simulated interrupted apply**: advance `height` past
@@ -25,20 +25,20 @@ use bitcoin_rs_node::{Config, Network, crash_recovery, state::NodeState};
 
 /// Returns the list of storage backends compiled into this test binary.
 fn available_backends() -> Vec<&'static str> {
-    let mut backends = Vec::new();
-    #[cfg(feature = "rocksdb")]
-    backends.push("rocksdb");
-    #[cfg(feature = "fjall")]
-    backends.push("fjall");
-    #[cfg(feature = "redb")]
-    backends.push("redb");
-    backends
+    [
+        cfg!(feature = "rocksdb").then_some("rocksdb"),
+        cfg!(feature = "fjall").then_some("fjall"),
+        cfg!(feature = "redb").then_some("redb"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn make_config(temp: &tempfile::TempDir, backend: &str) -> Config {
     let mut config = Config::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join(format!("node-{backend}"));
-    config.storage_backend = backend.to_owned();
+    backend.clone_into(&mut config.storage_backend);
     config.p2p_listen.clear();
     config
 }

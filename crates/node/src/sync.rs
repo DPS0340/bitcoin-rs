@@ -8601,13 +8601,11 @@ mod tests {
         let descendant_hash = Hash256::from_le_bytes(fork_blocks[1].block_hash().as_bytes());
         assert!(
             invalidated.contains(&invalid_hash),
-            "the failed block must be in the invalidated set: {:?}",
-            invalidated
+            "the failed block must be in the invalidated set: {invalidated:?}"
         );
         assert!(
             invalidated.contains(&descendant_hash),
-            "the descendant must be in the invalidated set: {:?}",
-            invalidated
+            "the descendant must be in the invalidated set: {invalidated:?}"
         );
         // The block tree must mark the entire subtree Invalid.
         {

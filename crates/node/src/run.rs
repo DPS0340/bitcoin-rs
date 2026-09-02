@@ -1318,7 +1318,7 @@ mod tests {
         config.data_dir = temp.path().join("node-join-failure");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.script_index = false;
+        config.script_index = crate::config::ScriptIndexMode::Disabled;
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
@@ -1377,7 +1377,7 @@ mod tests {
         config.data_dir = temp.path().join("node-slow-bootstrap");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.script_index = false;
+        config.script_index = crate::config::ScriptIndexMode::Disabled;
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
@@ -1449,7 +1449,7 @@ mod tests {
         config.data_dir = temp.path().join("node-late-failure");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.script_index = false;
+        config.script_index = crate::config::ScriptIndexMode::Disabled;
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
@@ -1507,7 +1507,7 @@ mod tests {
         daemon_config.data_dir = temp.path().join("daemon");
         daemon_config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         daemon_config.rpc_auth = crate::Auth::basic("user", "password");
-        daemon_config.script_index = false;
+        daemon_config.script_index = crate::config::ScriptIndexMode::Disabled;
         daemon_config.p2p_listen.clear();
         daemon_config.metrics_bind = None;
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
@@ -1527,7 +1527,7 @@ mod tests {
         embedded_config.data_dir = temp.path().join("embedded");
         embedded_config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         embedded_config.rpc_auth = crate::Auth::basic("user", "password");
-        embedded_config.script_index = false;
+        embedded_config.script_index = crate::config::ScriptIndexMode::Disabled;
         embedded_config.p2p_listen.clear();
         embedded_config.metrics_bind = None;
         let installed_before = crate::signal::testing::installed_total();
@@ -1557,7 +1557,7 @@ mod tests {
         reopen_config.data_dir = temp.path().join("embedded");
         reopen_config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         reopen_config.rpc_auth = crate::Auth::basic("user", "password");
-        reopen_config.script_index = false;
+        reopen_config.script_index = crate::config::ScriptIndexMode::Disabled;
         reopen_config.p2p_listen.clear();
         reopen_config.metrics_bind = None;
         let (state, services, context) = start_node(reopen_config, true)?;

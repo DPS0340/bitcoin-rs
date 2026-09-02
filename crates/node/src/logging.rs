@@ -94,14 +94,16 @@ mod tests {
     fn default_filter_parses_successfully() {
         // The default directive must be a valid EnvFilter parse. If a
         // typo or invalid target name were introduced, this would fail.
-        EnvFilter::try_new(DEFAULT_FILTER)
-            .expect("DEFAULT_FILTER must parse as a valid EnvFilter directive");
+        EnvFilter::try_new(DEFAULT_FILTER).unwrap_or_else(|error| {
+            panic!("DEFAULT_FILTER must parse as a valid EnvFilter directive: {error}")
+        });
     }
 
     #[test]
     fn bare_debug_directive_parses_successfully() {
         let directive = build_filter_directive("debug");
-        EnvFilter::try_new(&directive)
-            .expect("bare-debug directive with per-target caps must parse");
+        EnvFilter::try_new(&directive).unwrap_or_else(|error| {
+            panic!("bare-debug directive with per-target caps must parse: {error}")
+        });
     }
 }
