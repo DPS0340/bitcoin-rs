@@ -192,7 +192,10 @@ marker initialized and synced before any checkpoint or KV store opens. A
 missing marker on a non-empty directory, a malformed marker, or an older epoch
 is an incompatible datadir and fails before normal startup; the node never
 deletes or converts it. The `Cold` startup path therefore means only a marked
-new directory with no checkpoint root. See `docs/policies/db-migration.md`.
+new directory with no checkpoint root. Checkpoint format mismatches and
+structural corruption still require explicit resync, while ordinary filesystem
+I/O failures remain operational errors and are not reclassified as datadir
+incompatibility. See `docs/policies/db-migration.md`.
 
 ### Undo record
 

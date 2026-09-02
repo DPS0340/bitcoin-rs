@@ -32,15 +32,29 @@ pub(crate) fn ensure_current_schema(data: &Dir) -> io::Result<()> {
         Ok(bytes) => validate_current_schema(&bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut stale_temp = false;
+            let mut has_other_entry = false;
             for entry in data.entries()? {
                 let entry = entry?;
                 if entry.file_name().to_str() == Some(CURRENT_SCHEMA_TEMP_FILE) {
                     stale_temp = true;
                 } else {
-                    return Err(incompatible_schema(
-                        "datadir has no CURRENT_SCHEMA marker and is not empty",
-                    ));
+                    has_other_entry = true;
                 }
+            }
+            if has_other_entry {
+                // Another opener may have published CURRENT_SCHEMA after the
+                // initial read but before this directory scan completed.
+                // Recheck once before classifying the non-empty directory as
+                // an incompatible legacy datadir.
+                return match read_file(data, CURRENT_SCHEMA_FILE, 16) {
+                    Ok(bytes) => validate_current_schema(&bytes),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Err(incompatible_schema(
+                            "datadir has no CURRENT_SCHEMA marker and is not empty",
+                        ))
+                    }
+                    Err(error) => Err(error),
+                };
             }
             if stale_temp {
                 // This is a reserved temporary marker left by an interrupted

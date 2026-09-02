@@ -550,6 +550,14 @@ pub(crate) enum IncompatibleCheckpoint {
 }
 
 #[derive(Debug, Error)]
+pub(crate) enum CheckpointLoadError {
+    #[error(transparent)]
+    Incompatible(#[from] IncompatibleCheckpoint),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Error)]
 pub(crate) enum CheckpointError {
     #[error("checkpoint I/O failed: {0}")]
     Io(#[from] std::io::Error),
@@ -652,108 +660,157 @@ impl Write for HashingWriter<'_> {
 pub(crate) fn load_checkpoint_from_dir(
     data_dir: &Dir,
     config: HeaderCheckpointConfig,
-) -> Result<CheckpointLoad, IncompatibleCheckpoint> {
+) -> Result<CheckpointLoad, CheckpointLoadError> {
     let root = match CheckpointRoot::open_existing(data_dir, CHECKPOINT_ROOT) {
         Ok(Some(root)) => root,
         Ok(None) => return Ok(CheckpointLoad::Cold),
-        Err(error) => return Err(incompatible_io("open checkpoint root", &error)),
+        Err(error) => return Err(classify_open_error("open checkpoint root", error)),
     };
 
     let current = match read_current(&root) {
         Ok(Some(current)) => current,
         Ok(None) => {
-            return Err(IncompatibleCheckpoint::Invalid {
-                reason: "checkpoint root is missing CURRENT".to_owned(),
-            });
+            return Err(CheckpointLoadError::Incompatible(
+                IncompatibleCheckpoint::Invalid {
+                    reason: "checkpoint root is missing CURRENT".to_owned(),
+                },
+            ));
         }
-        Err(error) => return Err(incompatible_load_error(error)),
+        Err(error) => return Err(classify_load_error(error)),
     };
     let generation_dir = root.open_dir(&current.directory).map_err(|error| {
-        incompatible_io(
+        classify_open_error(
             &format!("open checkpoint generation {}", current.directory),
-            &error,
+            error,
         )
     })?;
     let manifest = match read_manifest(&generation_dir, &current, config) {
         Ok(manifest) => manifest,
-        Err(error) => return Err(incompatible_load_error(error)),
+        Err(error) => return Err(classify_load_error(error)),
     };
     if manifest.headers.version != HEADER_VERSION {
-        return Err(IncompatibleCheckpoint::UnsupportedVersion {
-            component: "headers",
-            version: manifest.headers.version,
-        });
+        return Err(CheckpointLoadError::Incompatible(
+            IncompatibleCheckpoint::UnsupportedVersion {
+                component: "headers",
+                version: manifest.headers.version,
+            },
+        ));
     }
     if manifest.headers.codec != HEADER_CODEC {
-        return Err(IncompatibleCheckpoint::Invalid {
-            reason: format!(
-                "unexpected headers checkpoint codec {}",
-                manifest.headers.codec
-            ),
-        });
+        return Err(CheckpointLoadError::Incompatible(
+            IncompatibleCheckpoint::Invalid {
+                reason: format!(
+                    "unexpected headers checkpoint codec {}",
+                    manifest.headers.codec
+                ),
+            },
+        ));
     }
 
     let restored_headers = match load_headers(&generation_dir, config, &manifest) {
         Ok(headers) => headers,
         Err(CheckpointError::Header(HeaderCheckpointError::UnsupportedVersion { actual })) => {
-            return Err(IncompatibleCheckpoint::UnsupportedVersion {
-                component: "headers",
-                version: actual,
-            });
+            return Err(CheckpointLoadError::Incompatible(
+                IncompatibleCheckpoint::UnsupportedVersion {
+                    component: "headers",
+                    version: actual,
+                },
+            ));
         }
-        Err(error) => {
-            return Err(IncompatibleCheckpoint::Invalid {
-                reason: error.to_string(),
-            });
-        }
+        Err(error) => return Err(classify_checkpoint_error(error)),
     };
     if manifest.utxo.version != UTXO_VERSION {
-        return Err(IncompatibleCheckpoint::UnsupportedVersion {
-            component: "UTXO",
-            version: manifest.utxo.version,
-        });
+        return Err(CheckpointLoadError::Incompatible(
+            IncompatibleCheckpoint::UnsupportedVersion {
+                component: "UTXO",
+                version: manifest.utxo.version,
+            },
+        ));
     }
     if manifest.coinstats.version != COINSTATS_VERSION {
-        return Err(IncompatibleCheckpoint::UnsupportedVersion {
-            component: "CoinStats",
-            version: manifest.coinstats.version,
-        });
+        return Err(CheckpointLoadError::Incompatible(
+            IncompatibleCheckpoint::UnsupportedVersion {
+                component: "CoinStats",
+                version: manifest.coinstats.version,
+            },
+        ));
     }
     if manifest.utxo.codec != UTXO_CODEC || manifest.coinstats.codec != COINSTATS_CODEC {
-        return Err(IncompatibleCheckpoint::Invalid {
-            reason: format!(
-                "unexpected payload codecs UTXO={} CoinStats={}",
-                manifest.utxo.codec, manifest.coinstats.codec
-            ),
-        });
+        return Err(CheckpointLoadError::Incompatible(
+            IncompatibleCheckpoint::Invalid {
+                reason: format!(
+                    "unexpected payload codecs UTXO={} CoinStats={}",
+                    manifest.utxo.codec, manifest.coinstats.codec
+                ),
+            },
+        ));
     }
     match load_payloads(&generation_dir, &manifest, restored_headers) {
         Ok(restored) => Ok(CheckpointLoad::Complete(Box::new(restored))),
-        Err(error) => Err(IncompatibleCheckpoint::Invalid {
+        Err(error) => Err(classify_checkpoint_error(error)),
+    }
+}
+
+fn classify_load_error(error: LoadStageError) -> CheckpointLoadError {
+    match error {
+        LoadStageError::Incompatible(error) => CheckpointLoadError::Incompatible(error),
+        LoadStageError::Candidate(error) => classify_checkpoint_error(error),
+    }
+}
+
+fn classify_checkpoint_error(error: CheckpointError) -> CheckpointLoadError {
+    match error {
+        CheckpointError::Io(error)
+        | CheckpointError::Utxo(bitcoin_rs_utxo::UtxoError::Io(error))
+        | CheckpointError::Storage(bitcoin_rs_storage::StorageError::Io(error)) => {
+            classify_checkpoint_io(error)
+        }
+        error => CheckpointLoadError::Incompatible(IncompatibleCheckpoint::Invalid {
             reason: error.to_string(),
         }),
     }
 }
 
-fn incompatible_load_error(error: LoadStageError) -> IncompatibleCheckpoint {
-    match error {
-        LoadStageError::Incompatible(error) => error,
-        LoadStageError::Candidate(error) => IncompatibleCheckpoint::Invalid {
-            reason: error.to_string(),
-        },
+fn classify_open_error(operation: &str, error: std::io::Error) -> CheckpointLoadError {
+    if is_checkpoint_corruption(&error) {
+        return CheckpointLoadError::Incompatible(IncompatibleCheckpoint::Invalid {
+            reason: format!("{operation} failed: {error}"),
+        });
     }
+    CheckpointLoadError::Io(error)
 }
 
-fn incompatible_io(operation: &str, error: &std::io::Error) -> IncompatibleCheckpoint {
-    IncompatibleCheckpoint::Invalid {
-        reason: format!("{operation} failed: {error}"),
+fn checkpoint_file_error(name: &str, error: std::io::Error) -> CheckpointError {
+    if is_checkpoint_corruption(&error) {
+        return CheckpointError::Invalid(format!("checkpoint file {name:?} failed: {error}"));
     }
+    CheckpointError::Io(error)
+}
+
+fn classify_checkpoint_io(error: std::io::Error) -> CheckpointLoadError {
+    if is_checkpoint_corruption(&error) {
+        return CheckpointLoadError::Incompatible(IncompatibleCheckpoint::Invalid {
+            reason: error.to_string(),
+        });
+    }
+    CheckpointLoadError::Io(error)
+}
+
+fn is_checkpoint_corruption(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::IsADirectory
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 #[cfg(test)]
 fn load_checkpoint(
     data_dir: &Path,
     config: HeaderCheckpointConfig,
-) -> Result<CheckpointLoad, IncompatibleCheckpoint> {
+) -> Result<CheckpointLoad, CheckpointLoadError> {
     let data_dir = match open_data_dir(data_dir) {
         Ok(data_dir) => data_dir,
         Err(_) => return Ok(CheckpointLoad::Cold),
@@ -1176,7 +1233,7 @@ fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, LoadStageErr
     let bytes = match read_file(root.dir(), CURRENT_FILE, MAX_CHECKPOINT_METADATA_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(CheckpointError::Io(error).into()),
+        Err(error) => return Err(checkpoint_file_error(CURRENT_FILE, error).into()),
     };
     let current: CurrentV1 = serde_json::from_slice(&bytes).map_err(CheckpointError::Json)?;
     if current.version != CURRENT_VERSION {
@@ -1212,7 +1269,7 @@ fn read_manifest(
     config: HeaderCheckpointConfig,
 ) -> Result<CheckpointManifestV1, LoadStageError> {
     let bytes = read_file(generation_dir, MANIFEST_FILE, MAX_CHECKPOINT_METADATA_BYTES)
-        .map_err(CheckpointError::Io)?;
+        .map_err(|error| checkpoint_file_error(MANIFEST_FILE, error))?;
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if digest != decode_hex::<32>(&current.manifest_sha256)? {
         return Err(
@@ -1356,7 +1413,9 @@ fn load_payloads_inner(
     }
 
     let mut coinstats_bytes = Vec::with_capacity(COIN_STATS_ENCODED_LEN + 16);
-    coinstats_file.read_to_end(&mut coinstats_bytes)?;
+    coinstats_file
+        .read_to_end(&mut coinstats_bytes)
+        .map_err(|error| checkpoint_file_error(COINSTATS_FILE, error))?;
     let coin_stats = decode_coinstats_artifact(&coinstats_bytes)?;
     validate_coinstats_manifest(&coin_stats, &manifest.coinstats)?;
     // Transaction count is chain metadata and cannot be derived from live coins.
@@ -1511,8 +1570,11 @@ fn valid_current_temp_name(name: &str) -> bool {
 }
 
 fn open_regular_file(dir: &Dir, name: &str, expected_len: u64) -> Result<File, CheckpointError> {
-    let file = open_file(dir, name)?;
-    let actual_len = file.metadata()?.len();
+    let file = open_file(dir, name).map_err(|error| checkpoint_file_error(name, error))?;
+    let actual_len = file
+        .metadata()
+        .map_err(|error| checkpoint_file_error(name, error))?
+        .len();
     if actual_len != expected_len {
         return Err(CheckpointError::Invalid(format!(
             "checkpoint artifact {name:?} has {actual_len} bytes, expected {expected_len}"
@@ -1537,7 +1599,9 @@ fn verify_artifact(
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut bytes = 0_u64;
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| checkpoint_file_error(name, error))?;
         if read == 0 {
             break;
         }
@@ -1552,7 +1616,8 @@ fn verify_artifact(
             "checkpoint artifact {name:?} length or SHA256 mismatch"
         )));
     }
-    file.seek(SeekFrom::Start(0))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| checkpoint_file_error(name, error))?;
     Ok(file)
 }
 
@@ -1752,13 +1817,33 @@ mod tests {
 
     use super::{
         CHECKPOINT_ROOT, COINSTATS_FILE, CURRENT_FILE, CheckpointFailpoint, CheckpointLoad,
-        CheckpointManifestV1, CheckpointWrite, CurrentV1, HEADER_PREFIX_LEN, HEADERS_FILE,
-        HeaderCheckpointConfig, HeaderCheckpointError, HeaderCheckpointPoint, HeaderCheckpointTip,
-        HeaderCheckpointWrite, IncompatibleCheckpoint, MANIFEST_FILE, UTXO_FILE, encode_header,
-        load_checkpoint, read_headers, write_checkpoint_with_failpoint, write_headers,
+        CheckpointLoadError, CheckpointManifestV1, CheckpointWrite, CurrentV1, HEADER_PREFIX_LEN,
+        HEADERS_FILE, HeaderCheckpointConfig, HeaderCheckpointError, HeaderCheckpointPoint,
+        HeaderCheckpointTip, HeaderCheckpointWrite, IncompatibleCheckpoint, MANIFEST_FILE,
+        UTXO_FILE, encode_header, load_checkpoint, read_headers, write_checkpoint_with_failpoint,
+        write_headers,
     };
 
     const NETWORK: Network = Network::Regtest;
+
+    #[test]
+    fn transient_checkpoint_io_is_not_classified_as_incompatible() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "checkpoint locked");
+        let classified = super::classify_checkpoint_error(super::CheckpointError::Io(error));
+        let CheckpointLoadError::Io(error) = classified else {
+            panic!("transient checkpoint I/O was classified as datadir incompatibility");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "checkpoint locked");
+
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
+        let classified = super::classify_open_error("open checkpoint root", error);
+        let CheckpointLoadError::Io(error) = classified else {
+            panic!("transient checkpoint-open I/O was classified as datadir incompatibility");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "root locked");
+    }
 
     #[test]
     fn round_trip_replays_consensus_validated_active_chain()
@@ -2231,8 +2316,10 @@ mod tests {
             manifest.utxo.version = 3;
         })?;
 
-        let Err(IncompatibleCheckpoint::UnsupportedVersion { component, version }) =
-            load_checkpoint(dir.path(), config())
+        let Err(CheckpointLoadError::Incompatible(IncompatibleCheckpoint::UnsupportedVersion {
+            component,
+            version,
+        })) = load_checkpoint(dir.path(), config())
         else {
             return Err("unsupported UTXO snapshot unexpectedly loaded".into());
         };
@@ -2348,10 +2435,12 @@ mod tests {
 
         assert!(matches!(
             load_checkpoint(dir.path(), config()),
-            Err(super::IncompatibleCheckpoint::UnsupportedVersion {
-                component: "headers",
-                version: 2
-            })
+            Err(super::CheckpointLoadError::Incompatible(
+                super::IncompatibleCheckpoint::UnsupportedVersion {
+                    component: "headers",
+                    version: 2
+                }
+            ))
         ));
         Ok(())
     }
