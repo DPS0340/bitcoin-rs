@@ -321,6 +321,7 @@ fn unix_time_secs() -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use bitcoin_rs_mempool::{

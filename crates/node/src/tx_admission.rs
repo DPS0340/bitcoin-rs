@@ -294,6 +294,7 @@ impl TxInventory for TxAdmission {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits};
