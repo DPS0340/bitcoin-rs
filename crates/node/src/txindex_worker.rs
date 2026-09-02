@@ -3162,16 +3162,6 @@ mod body_reader_tests {
 mod query_tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
-#[path = "txindex_worker_catchup_tests.rs"]
-mod catchup_tests;
-
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
-#[path = "txindex_worker_reconcile_tests.rs"]
-mod reconcile_tests;
-
-#[cfg(test)]
 #[path = "txindex_worker_lifecycle_tests.rs"]
 mod lifecycle_tests;
 

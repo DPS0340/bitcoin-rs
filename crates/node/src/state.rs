@@ -1339,7 +1339,6 @@ impl NodeState {
                 );
                 let source = match resume_source {
                     ResumeSource::Cold => "cold",
-                    ResumeSource::HeadersOnly => "headers-only",
                     ResumeSource::Checkpoint => "checkpoint",
                 };
                 reporter

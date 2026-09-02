@@ -15,7 +15,7 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_rpc::context::{BlockLog, BlockRecord};
 use bitcoin_rs_utxo::{
     LiveOutput, LiveOutputMeta, UtxoSet, is_coinbase_tx,
-    connect::{BlockChangeError, BlockValueTotals, SpentOutputLookup, build_block_changes},
+    connect::{BlockChangeError, SpentOutputLookup, build_block_changes},
 };
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
