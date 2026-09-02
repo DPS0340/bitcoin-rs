@@ -6,26 +6,10 @@ pub fn step<S>(peer: &mut Peer<S>, message: &Message) -> Result<(), PeerError> {
     match message {
         Message::Version(version) => receive_version(peer, version.clone()),
         Message::Verack => receive_verack(peer),
-        Message::SendHeaders => {
-            ensure_negotiating_or_ready(peer)?;
-            peer.capabilities.send_headers = true;
-            Ok(())
+        Message::SendHeaders | Message::SendAddrV2 | Message::WtxidRelay => {
+            ensure_negotiating_or_ready(peer)
         }
-        Message::SendAddrV2 => {
-            ensure_negotiating_or_ready(peer)?;
-            peer.capabilities.addr_v2 = true;
-            Ok(())
-        }
-        Message::WtxidRelay => {
-            ensure_negotiating_or_ready(peer)?;
-            peer.wtxid_relay.mark_peer_supported();
-            Ok(())
-        }
-        Message::SendCmpct(send_cmpct) => {
-            ensure_negotiating_or_ready(peer)?;
-            peer.compact_blocks.record_remote_preference(send_cmpct);
-            Ok(())
-        }
+        Message::SendCmpct(_) => ensure_negotiating_or_ready(peer),
         _ => {
             if peer.state == PeerState::Ready {
                 Ok(())
@@ -80,33 +64,27 @@ const fn ensure_negotiating_or_ready<S>(peer: &Peer<S>) -> Result<(), PeerError>
 mod tests {
     use std::io::Cursor;
 
-    use bitcoin::p2p::Magic;
-    use bitcoin::p2p::message_compact_blocks::SendCmpct;
-
     use super::*;
+    use bitcoin::p2p::Magic;
 
     #[test]
-    fn sendcmpct_while_ready_updates_compact_block_state() -> Result<(), PeerError> {
+    fn sendcmpct_while_ready_is_accepted() -> Result<(), PeerError> {
         let mut peer = peer_in_state(PeerState::Ready);
         let message = sendcmpct_message(true, 2);
 
         step(&mut peer, &message)?;
 
-        assert_eq!(peer.compact_blocks.remote_send_compact, Some(true));
-        assert_eq!(peer.compact_blocks.remote_version, Some(2));
         assert_eq!(peer.state, PeerState::Ready);
         Ok(())
     }
 
     #[test]
-    fn sendcmpct_during_negotiation_updates_compact_block_state() -> Result<(), PeerError> {
+    fn sendcmpct_during_negotiation_is_accepted() -> Result<(), PeerError> {
         let mut peer = peer_in_state(PeerState::VersionExchange);
         let message = sendcmpct_message(false, 1);
 
         step(&mut peer, &message)?;
 
-        assert_eq!(peer.compact_blocks.remote_send_compact, Some(false));
-        assert_eq!(peer.compact_blocks.remote_version, Some(1));
         assert_eq!(peer.state, PeerState::VersionExchange);
         Ok(())
     }
@@ -114,7 +92,6 @@ mod tests {
     #[test]
     fn sendcmpct_while_disconnected_is_rejected_without_state_mutation() {
         let mut peer = peer_in_state(PeerState::Disconnected);
-        let before = peer.compact_blocks;
         let message = sendcmpct_message(true, 2);
 
         let result = step(&mut peer, &message);
@@ -123,7 +100,6 @@ mod tests {
             result,
             Err(PeerError::Protocol("feature negotiation outside handshake"))
         ));
-        assert_eq!(peer.compact_blocks, before);
         assert_eq!(peer.state, PeerState::Disconnected);
     }
 
@@ -134,7 +110,7 @@ mod tests {
     }
 
     const fn sendcmpct_message(send_compact: bool, version: u64) -> Message {
-        Message::SendCmpct(SendCmpct {
+        Message::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
             send_compact,
             version,
         })

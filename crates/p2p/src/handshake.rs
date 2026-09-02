@@ -1,6 +1,5 @@
 use std::io::{Cursor, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
 use std::time::Instant;
 
 use bitcoin::p2p::ServiceFlags;
@@ -86,68 +85,45 @@ pub fn run_inbound_handshake<S: Read + Write>(
     our_nonce: u64,
     our_start_height: i32,
     lease: &PeerLease,
-    totals: Option<&Arc<crate::TrafficTotals>>,
     deadline: Instant,
 ) -> Result<(), PeerError> {
-    let (remote_version, _) = read_handshake_message(peer, lease, totals, deadline)?;
+    let (remote_version, _) = read_handshake_message(peer, lease, deadline)?;
     let responses = dispatch_inbound(peer, &remote_version)?;
 
     peer.state = PeerState::VersionExchange;
     send_handshake_message(
         peer,
         &Message::Version(version_message(our_nonce, our_start_height)),
-        lease,
-        totals,
     )?;
     for response in responses {
-        send_handshake_message(peer, &response, lease, totals)?;
+        send_handshake_message(peer, &response)?;
     }
 
     while peer.state != PeerState::Ready {
-        let (inbound, _) = read_handshake_message(peer, lease, totals, deadline)?;
+        let (inbound, _) = read_handshake_message(peer, lease, deadline)?;
         let responses = dispatch_inbound(peer, &inbound)?;
         for response in responses {
-            send_handshake_message(peer, &response, lease, totals)?;
+            send_handshake_message(peer, &response)?;
         }
     }
 
     Ok(())
 }
 
-/// Sends one handshake message, accounting its wire bytes on the connection.
-///
-/// Handshake writes leave the connection thread directly, before the
-/// per-connection writer exists, so this phase's telemetry owner is the
-/// connection itself: bytes land on the lease's [`crate::PeerStats`] and,
-/// when the entry point was built from a `NetworkControls` instance, on the
-/// shared aggregate totals.
+/// Sends one handshake message directly on the connection.
 pub(crate) fn send_handshake_message<S: Read + Write>(
     peer: &mut Peer<S>,
     message: &Message,
-    lease: &PeerLease,
-    totals: Option<&Arc<crate::TrafficTotals>>,
 ) -> Result<(), PeerError> {
     peer.send(message)?;
-    let wire_len =
-        u64::try_from(crate::wire::HEADER_LEN + crate::wire::encode_payload(message)?.len())
-            .unwrap_or(u64::MAX);
-    lease.stats().record_sent(wire_len);
-    lease.stats().record_msg_sent();
-    if let Some(totals) = totals {
-        totals.record_sent(wire_len);
-    }
     Ok(())
 }
 
 /// Reads one handshake message, retrying transient poll timeouts.
 ///
-/// Wire bytes of every message read are accounted on the connection's
-/// telemetry and, when present, the shared aggregate totals, mirroring the
-/// message loop's reader accounting so handshake traffic is observable.
 pub(crate) fn read_handshake_message<S: Read>(
     peer: &mut Peer<S>,
     lease: &PeerLease,
-    totals: Option<&Arc<crate::TrafficTotals>>,
     deadline: Instant,
 ) -> Result<(Message, bytes::Bytes), PeerError> {
     loop {
@@ -160,16 +136,7 @@ pub(crate) fn read_handshake_message<S: Read>(
             )));
         }
         match read_message(&mut peer.stream, peer.magic) {
-            Ok((message, raw)) => {
-                let wire_len =
-                    u64::try_from(raw.len() + crate::wire::HEADER_LEN).unwrap_or(u64::MAX);
-                lease.stats().record_recv(wire_len);
-                lease.stats().record_msg_recv();
-                if let Some(totals) = totals {
-                    totals.record_recv(wire_len);
-                }
-                return Ok((message, raw));
-            }
+            Ok((message, raw)) => return Ok((message, raw)),
             Err(PeerError::Io(error))
                 if matches!(
                     error.kind(),
@@ -209,7 +176,6 @@ mod tests {
     use bitcoin::p2p::Magic;
 
     use super::{Peer, PeerError, PeerState, run_inbound_handshake, version_message};
-    use crate::handshake::feature_messages;
     use crate::wire::{Message, write_message};
 
     struct ScriptedStream {
@@ -265,7 +231,6 @@ mod tests {
             1,
             0,
             &lease,
-            None,
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         )?;
 
@@ -279,26 +244,6 @@ mod tests {
             !peer.stream.written.is_empty(),
             "wire responses are written"
         );
-
-        let outbound_version = peer
-            .receiver
-            .try_recv()
-            .map_err(|_| PeerError::Protocol("missing outbound version"))?;
-        assert!(matches!(outbound_version, Message::Version(_)));
-
-        for expected in feature_messages() {
-            let actual = peer
-                .receiver
-                .try_recv()
-                .map_err(|_| PeerError::Protocol("missing outbound feature message"))?;
-            assert_eq!(actual, expected);
-        }
-
-        let outbound_verack = peer
-            .receiver
-            .try_recv()
-            .map_err(|_| PeerError::Protocol("missing outbound verack"))?;
-        assert_eq!(outbound_verack, Message::Verack);
 
         Ok(())
     }

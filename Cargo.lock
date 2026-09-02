@@ -358,23 +358,15 @@ dependencies = [
 name = "bitcoin-rs-p2p"
 version = "0.4.0"
 dependencies = [
- "arc-swap",
  "bitcoin",
  "bitcoin-rs-primitives",
- "bitcoin-rs-storage",
- "bytemuck",
  "bytes",
  "crossbeam-channel",
  "hashbrown 0.17.1",
  "parking_lot",
- "proptest",
  "sha2 0.11.0",
- "smallvec",
- "tempfile",
  "thiserror",
- "tinyvec",
  "tracing",
- "zerocopy",
 ]
 
 [[package]]

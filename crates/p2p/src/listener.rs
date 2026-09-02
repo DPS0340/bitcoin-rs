@@ -26,16 +26,13 @@ type PeerReadyHandle = Option<Arc<dyn Fn(crate::PeerSource) + Send + Sync>>;
 
 /// State shared by the listener and every connection thread it spawns.
 ///
-/// The peer lifecycle and ban list are the authoritative stores shared with the
-/// node and its network control plane; `activity` and `totals` carry the
-/// kill-switch and aggregate traffic accounting and are present only when the
-/// entry point was built from a [`crate::NetworkControls`] instance.
+/// The peer lifecycle owns live leases and ready metadata. Ban policy and
+/// network activity are shared inputs supplied by the node.
 #[derive(Clone)]
 struct ConnectionShared {
     peer_lifecycle: Arc<crate::PeerLifecycle>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
-    activity: Option<Arc<crate::NetworkActivity>>,
-    totals: Option<Arc<crate::TrafficTotals>>,
+    network_active: Arc<AtomicBool>,
     chain_query: ChainQueryHandle,
     peer_ready: PeerReadyHandle,
 }
@@ -44,29 +41,14 @@ impl ConnectionShared {
     fn from_lifecycle(
         peer_lifecycle: Arc<crate::PeerLifecycle>,
         banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
+        network_active: Arc<AtomicBool>,
         chain_query: ChainQueryHandle,
         peer_ready: PeerReadyHandle,
     ) -> Self {
         Self {
             peer_lifecycle,
             banned,
-            activity: None,
-            totals: None,
-            chain_query,
-            peer_ready,
-        }
-    }
-
-    fn from_controls(
-        controls: &Arc<crate::NetworkControls>,
-        chain_query: ChainQueryHandle,
-        peer_ready: PeerReadyHandle,
-    ) -> Self {
-        Self {
-            peer_lifecycle: controls.peer_lifecycle(),
-            banned: Arc::clone(controls.banned()),
-            activity: Some(Arc::clone(controls.activity())),
-            totals: Some(Arc::clone(controls.totals())),
+            network_active,
             chain_query,
             peer_ready,
         }
@@ -203,11 +185,13 @@ pub fn serve_with_shutdown_with_lifecycle_and_chain_and_sync_wake(
     sync_wake_tx: Option<Sender<()>>,
     peer_ready: PeerReadyHandle,
 ) -> Result<(), ListenerError> {
-    let mut shared =
-        ConnectionShared::from_lifecycle(peer_lifecycle, banned, chain_query, peer_ready);
-    shared.activity = Some(Arc::new(crate::NetworkActivity::from_shared(
+    let shared = ConnectionShared::from_lifecycle(
+        peer_lifecycle,
+        banned,
         network_active,
-    )));
+        chain_query,
+        peer_ready,
+    );
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
         blocks_tx: inbound_blocks_tx,
@@ -256,11 +240,7 @@ fn serve_connections(
                     tracing::debug!(peer_addr = %peer_addr, "p2p inbound rejected: banned");
                     continue;
                 }
-                if shared
-                    .activity
-                    .as_ref()
-                    .is_some_and(|activity| !activity.is_active())
-                {
+                if !shared.network_active.load(Ordering::Acquire) {
                     drop(stream);
                     tracing::debug!(peer_addr = %peer_addr, "p2p inbound rejected: network inactive");
                     continue;
@@ -291,33 +271,6 @@ fn serve_connections(
     Ok(())
 }
 
-/// Binds `addr` and runs the accept loop driven by one
-/// [`crate::NetworkControls`] instance.
-///
-/// Unlike the part-wise entry points, the listener enforces the control
-/// plane's network-activity switch on new inbound connections and accounts
-/// aggregate traffic into its shared totals.
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-pub fn serve_with_controls(
-    addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
-    magic: Magic,
-    controls: Arc<crate::NetworkControls>,
-    inbound_headers_tx: Sender<crate::InboundHeaders>,
-    inbound_blocks_tx: Sender<crate::InboundBlock>,
-    chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
-    sync_wake_tx: Option<Sender<()>>,
-    peer_ready: PeerReadyHandle,
-) -> Result<(), ListenerError> {
-    let shared = ConnectionShared::from_controls(&controls, chain_query, peer_ready);
-    let inbound_sync_sinks = InboundSyncSinks {
-        headers_tx: inbound_headers_tx,
-        blocks_tx: inbound_blocks_tx,
-        wake_tx: sync_wake_tx,
-    };
-    serve_connections(addr, &shutdown, magic, &shared, &inbound_sync_sinks)
-}
-
 /// Spawns an outbound connection using an already shared lifecycle authority.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub fn spawn_outbound_connection_with_lifecycle_and_chain_and_sync_wake(
@@ -332,40 +285,13 @@ pub fn spawn_outbound_connection_with_lifecycle_and_chain_and_sync_wake(
     sync_wake_tx: Option<Sender<()>>,
     peer_ready: PeerReadyHandle,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
-    let mut shared =
-        ConnectionShared::from_lifecycle(peer_lifecycle, banned, chain_query, peer_ready);
-    shared.activity = Some(Arc::new(crate::NetworkActivity::from_shared(
+    let shared = ConnectionShared::from_lifecycle(
+        peer_lifecycle,
+        banned,
         network_active,
-    )));
-    spawn_outbound(
-        addr,
-        magic,
-        shared,
-        InboundSyncSinks {
-            headers_tx: inbound_headers_tx,
-            blocks_tx: inbound_blocks_tx,
-            wake_tx: sync_wake_tx,
-        },
-    )
-}
-
-/// Spawns an outbound connection driven by one [`crate::NetworkControls`]
-/// instance.
-///
-/// The dial is refused while the control plane's network-activity switch is
-/// off, and aggregate traffic is accounted into the shared totals.
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-pub fn spawn_outbound_connection_with_controls(
-    addr: SocketAddr,
-    magic: Magic,
-    controls: Arc<crate::NetworkControls>,
-    inbound_headers_tx: Sender<crate::InboundHeaders>,
-    inbound_blocks_tx: Sender<crate::InboundBlock>,
-    chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
-    sync_wake_tx: Option<Sender<()>>,
-    peer_ready: PeerReadyHandle,
-) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
-    let shared = ConnectionShared::from_controls(&controls, chain_query, peer_ready);
+        chain_query,
+        peer_ready,
+    );
     spawn_outbound(
         addr,
         magic,
@@ -411,11 +337,7 @@ fn run_outbound_connection(
     if crate::subnet::is_banned(&shared.banned.read(), addr.ip(), SystemTime::now()) {
         return Err(crate::wire::PeerError::BannedDestination(addr.ip()));
     }
-    if shared
-        .activity
-        .as_ref()
-        .is_some_and(|activity| !activity.is_active())
-    {
+    if !shared.network_active.load(Ordering::Acquire) {
         return Err(crate::wire::PeerError::Protocol("network inactive"));
     }
 
@@ -437,14 +359,7 @@ fn run_outbound_connection(
     let nonce = generate_nonce(addr);
     let mut peer = Peer::new(stream, magic);
     let handshake_deadline = Instant::now() + HANDSHAKE_READ_TIMEOUT;
-    if let Err(error) = run_outbound_handshake(
-        &mut peer,
-        nonce,
-        0,
-        &lease,
-        shared.totals.as_ref(),
-        handshake_deadline,
-    ) {
+    if let Err(error) = run_outbound_handshake(&mut peer, nonce, 0, &lease, handshake_deadline) {
         shared.peer_lifecycle.remove_current(addr, &lease);
         let _ = peer.stream.shutdown(std::net::Shutdown::Both);
         if lease.is_cancelled() {
@@ -464,10 +379,6 @@ fn run_outbound_connection(
     let handshake_now = SystemTime::now();
     let conn_time = unix_secs(handshake_now);
     let info = crate::PeerInfo::outbound_from_version(addr, remote_version, conn_time);
-    lease
-        .stats()
-        .set_time_offset(remote_version.timestamp - unix_secs_i64(handshake_now));
-
     run_connected_session(
         &mut peer,
         addr,
@@ -485,19 +396,18 @@ fn run_outbound_handshake<S: std::io::Read + std::io::Write>(
     nonce: u64,
     start_height: i32,
     lease: &crate::PeerLease,
-    totals: Option<&Arc<crate::TrafficTotals>>,
     deadline: Instant,
 ) -> Result<(), crate::wire::PeerError> {
     let outbound_messages = crate::handshake::start(peer, nonce, start_height);
     for message in outbound_messages {
-        crate::handshake::send_handshake_message(peer, &message, lease, totals)?;
+        crate::handshake::send_handshake_message(peer, &message)?;
     }
 
     while peer.state != crate::peer::PeerState::Ready {
-        let (inbound, _) = crate::handshake::read_handshake_message(peer, lease, totals, deadline)?;
+        let (inbound, _) = crate::handshake::read_handshake_message(peer, lease, deadline)?;
         let responses = crate::dispatch::dispatch_inbound(peer, &inbound)?;
         for response in responses {
-            crate::handshake::send_handshake_message(peer, &response, lease, totals)?;
+            crate::handshake::send_handshake_message(peer, &response)?;
         }
     }
 
@@ -563,14 +473,7 @@ fn run_handshake(
     let nonce = generate_nonce(peer_addr);
     let mut peer = Peer::new(stream, magic);
     let handshake_deadline = Instant::now() + HANDSHAKE_READ_TIMEOUT;
-    if let Err(error) = run_inbound_handshake(
-        &mut peer,
-        nonce,
-        0,
-        &lease,
-        shared.totals.as_ref(),
-        handshake_deadline,
-    ) {
+    if let Err(error) = run_inbound_handshake(&mut peer, nonce, 0, &lease, handshake_deadline) {
         shared.peer_lifecycle.remove_current(peer_addr, &lease);
         let _ = peer.stream.shutdown(std::net::Shutdown::Both);
         if lease.is_cancelled() {
@@ -590,10 +493,6 @@ fn run_handshake(
     let handshake_now = SystemTime::now();
     let conn_time = unix_secs(handshake_now);
     let info = crate::PeerInfo::inbound_from_version(peer_addr, remote_version, conn_time);
-    lease
-        .stats()
-        .set_time_offset(remote_version.timestamp - unix_secs_i64(handshake_now));
-
     run_connected_session(
         &mut peer,
         peer_addr,
@@ -627,20 +526,13 @@ fn run_connected_session(
             .stream
             .try_clone()
             .map_err(crate::wire::PeerError::Io)?;
-        spawn_connection_writer(
-            writer_stream,
-            magic,
-            outbound_rx,
-            peer_addr,
-            lease.stats_handle(),
-            shared.totals.clone(),
-        )
-        .map_err(crate::wire::PeerError::Io)
+        spawn_connection_writer(writer_stream, magic, outbound_rx, peer_addr)
+            .map_err(crate::wire::PeerError::Io)
     })();
     let writer = match setup_result {
         Ok(handle) => handle,
         Err(error) => {
-            // The lease was already registered into peer_outbound at
+            // The lease was already registered into the peer lifecycle at
             // handshake time.  Run the same cleanup the normal exit path
             // does so a spawn failure (e.g. EAGAIN under thread/fd
             // pressure) does not leave a phantom peer registered.
@@ -681,7 +573,6 @@ fn run_connected_session(
             &lease,
             inbound_sync_sinks,
             shared.chain_query.as_deref(),
-            shared.totals.as_ref(),
         )
     })();
 
@@ -710,7 +601,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
     lease: &crate::PeerLease,
     inbound_sync_sinks: &InboundSyncSinks,
     chain_query: Option<&dyn crate::dispatch::ChainQuery>,
-    totals: Option<&Arc<crate::TrafficTotals>>,
 ) -> Result<(), crate::wire::PeerError> {
     use crate::peer::PeerState;
     use std::time::Instant;
@@ -742,14 +632,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
         match read_result {
             Ok((message, raw)) => {
                 last_inbound = Instant::now();
-                let wire_len = raw.len() + crate::wire::HEADER_LEN;
-                lease
-                    .stats()
-                    .record_recv(u64::try_from(wire_len).unwrap_or(u64::MAX));
-                lease.stats().record_msg_recv();
-                if let Some(totals) = totals {
-                    totals.record_recv(u64::try_from(wire_len).unwrap_or(u64::MAX));
-                }
                 tracing::trace!(
                     peer_addr = %peer_addr,
                     command = ?std::mem::discriminant(&message),
@@ -763,9 +645,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                     }
                     bitcoin::p2p::message::NetworkMessage::Block(block) => {
                         inbound_sync_sinks.send_block(lease.source(peer_addr), block, raw);
-                    }
-                    bitcoin::p2p::message::NetworkMessage::Pong(nonce) => {
-                        lease.stats().complete_ping(nonce, unix_micros());
                     }
                     _ => {}
                 }
@@ -793,29 +672,19 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 /// Spawns a per-connection writer thread that drains queued outbound messages
 /// and writes them to the peer. Decoupling writes from the blocking inbound
 /// read ensures a momentarily silent peer can never delay outbound sends (the
-/// next `getdata` during IBD). Sent bytes are accounted on the connection's
-/// telemetry and, when present, the shared aggregate totals. Exits when every
-/// sender drops or a write fails.
+/// next `getdata` during IBD). Exits when every sender drops or a write fails.
 fn spawn_connection_writer(
     mut stream: TcpStream,
     magic: Magic,
     outbound_rx: crossbeam_channel::Receiver<crate::Message>,
     peer_addr: SocketAddr,
-    stats: Arc<crate::PeerStats>,
-    totals: Option<Arc<crate::TrafficTotals>>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("bitcoin-rs-p2p-writer-{peer_addr}"))
         .spawn(move || {
             while let Ok(message) = outbound_rx.recv() {
                 match crate::wire::write_message(&mut stream, magic, &message) {
-                    Ok(bytes) => {
-                        stats.record_sent(u64::try_from(bytes).unwrap_or(u64::MAX));
-                        stats.record_msg_sent();
-                        if let Some(totals) = totals.as_ref() {
-                            totals.record_sent(u64::try_from(bytes).unwrap_or(u64::MAX));
-                        }
-                    }
+                    Ok(_) => {}
                     Err(error) => {
                         tracing::debug!(peer_addr = %peer_addr, %error, "p2p writer thread exiting");
                         break;
@@ -828,19 +697,6 @@ fn spawn_connection_writer(
 fn unix_secs(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
-}
-
-fn unix_secs_i64(now: SystemTime) -> i64 {
-    now.duration_since(UNIX_EPOCH).map_or(0, |duration| {
-        i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
-    })
-}
-fn unix_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-        })
 }
 
 fn wake_sync(sync_wake_tx: Option<&Sender<()>>) {
@@ -1056,7 +912,7 @@ mod lease_tests {
         let mut peer = Peer::new(UnreadableStream, Magic::BITCOIN);
         peer.state = PeerState::Ready;
 
-        assert!(run_message_loop(&mut peer, addr, &lease, &sinks(), None, None).is_ok());
+        assert!(run_message_loop(&mut peer, addr, &lease, &sinks(), None).is_ok());
     }
 
     #[test]
@@ -1099,7 +955,7 @@ mod lease_tests {
         );
         peer.state = PeerState::Ready;
 
-        assert!(run_message_loop(&mut peer, addr, &old, &test_sinks, None, None).is_ok());
+        assert!(run_message_loop(&mut peer, addr, &old, &test_sinks, None).is_ok());
         assert!(
             headers_rx.try_recv().is_err(),
             "a message completed after replacement must not be enqueued"
@@ -1122,7 +978,7 @@ mod lease_tests {
         let mut peer = Peer::new(ContinuingStream(Arc::clone(&reads)), Magic::BITCOIN);
         peer.state = PeerState::Ready;
 
-        assert!(run_message_loop(&mut peer, addr, &lease, &sinks(), None, None).is_err());
+        assert!(run_message_loop(&mut peer, addr, &lease, &sinks(), None).is_err());
         assert_eq!(reads.load(Ordering::Relaxed), 2);
     }
 
@@ -1225,10 +1081,16 @@ mod resilient_accept_tests {
 
     fn shared_state() -> ConnectionShared {
         let peer_registry = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
+        let leases = Arc::new(RwLock::new(hashbrown::HashMap::new()));
         let banned = Arc::new(RwLock::new(Vec::new()));
-        let lifecycle = Arc::new(crate::PeerLifecycle::new(peer_registry, peer_outbound));
-        ConnectionShared::from_lifecycle(lifecycle, banned, None, None)
+        let lifecycle = Arc::new(crate::PeerLifecycle::new(peer_registry, leases));
+        ConnectionShared::from_lifecycle(
+            lifecycle,
+            banned,
+            Arc::new(AtomicBool::new(true)),
+            None,
+            None,
+        )
     }
 
     fn sinks() -> InboundSyncSinks {
@@ -1291,7 +1153,7 @@ mod resilient_accept_tests {
 mod writer_setup_cleanup_tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use bitcoin::p2p::Magic;
     use parking_lot::RwLock;
@@ -1337,7 +1199,13 @@ mod writer_setup_cleanup_tests {
         let outbound: OutboundMap = Arc::new(RwLock::new(hashbrown::HashMap::new()));
         let banned = Arc::new(RwLock::new(Vec::new()));
         let lifecycle = Arc::new(crate::PeerLifecycle::new(peer_registry, outbound.clone()));
-        let shared = ConnectionShared::from_lifecycle(lifecycle, banned, None, None);
+        let shared = ConnectionShared::from_lifecycle(
+            lifecycle,
+            banned,
+            Arc::new(AtomicBool::new(true)),
+            None,
+            None,
+        );
 
         let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(outbound_tx);
@@ -1368,7 +1236,7 @@ mod writer_setup_cleanup_tests {
         assert!(result.is_err(), "writer setup failure must return Err");
         assert!(
             outbound.read().is_empty(),
-            "peer_outbound must be cleaned up after writer setup failure"
+            "peer lifecycle must be cleaned up after writer setup failure"
         );
     }
 }

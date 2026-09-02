@@ -382,18 +382,12 @@ mod tests {
     struct PeerSnapshot {
         state: PeerState,
         handshake: (bool, bool),
-        capabilities: (bool, bool, bool),
     }
 
     fn peer_snapshot<S>(peer: &Peer<S>) -> PeerSnapshot {
         PeerSnapshot {
             state: peer.state,
             handshake: (peer.received_verack, peer.remote_version.is_some()),
-            capabilities: (
-                peer.capabilities.send_headers,
-                peer.capabilities.addr_v2,
-                peer.wtxid_relay.peer_supported(),
-            ),
         }
     }
 
