@@ -98,69 +98,53 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use bitcoin::p2p::ServiceFlags;
-    use bitcoin::p2p::address::Address;
-    use bitcoin::p2p::message_network::VersionMessage;
-
-    fn fake_version() -> VersionMessage {
-        VersionMessage {
+    fn peer_info_with_services(services: u64) -> PeerInfo {
+        PeerInfo {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333),
             version: 70_016,
-            services: ServiceFlags::NETWORK,
-            timestamp: 0,
-            receiver: Address::new(
-                &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333),
-                ServiceFlags::NONE,
-            ),
-            sender: Address::new(
-                &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 8333),
-                ServiceFlags::NETWORK,
-            ),
-            nonce: 0,
-            user_agent: "/test:0.1/".to_owned(),
-            start_height: 7,
-            relay: true,
+            services,
+            user_agent: String::new(),
+            start_height: 0,
+            conn_time: 0,
+            inbound: false,
         }
     }
 
+    /// `services_names` is Bitcoin Core-compatible `getpeerinfo` output: the
+    /// recognized service bits decode to Core's canonical names in bit order,
+    /// and unrecognized bits are dropped. This pins the external RPC contract,
+    /// not the helper's internal representation.
     #[test]
-    fn outbound_from_version_sets_inbound_false() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
-        let version = fake_version();
-        let info = PeerInfo::outbound_from_version(addr, &version, 100);
-        assert!(!info.inbound);
-        assert_eq!(info.start_height, 7);
-        assert_eq!(info.conn_time, 100);
-    }
+    fn services_names_match_bitcoin_core_service_flag_names() {
+        let all_known = (1_u64 << 0)  // NETWORK
+            | (1_u64 << 1)            // GETUTXO
+            | (1_u64 << 2)            // BLOOM
+            | (1_u64 << 3)            // WITNESS
+            | (1_u64 << 6)            // COMPACT_FILTERS
+            | (1_u64 << 10)           // NETWORK_LIMITED
+            | (1_u64 << 11);          // P2P_V2
 
-    #[test]
-    fn inbound_from_version_sets_inbound_true() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
-        let version = fake_version();
-        let info = PeerInfo::inbound_from_version(addr, &version, 100);
-        assert!(info.inbound);
-    }
-
-    #[test]
-    fn services_names_decodes_inbound_peer_with_network_witness() {
-        let mut version = fake_version();
-        version.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        let info = PeerInfo::inbound_from_version(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333),
-            &version,
-            0,
+        assert_eq!(
+            peer_info_with_services(all_known).services_names(),
+            vec![
+                "NETWORK",
+                "GETUTXO",
+                "BLOOM",
+                "WITNESS",
+                "COMPACT_FILTERS",
+                "NETWORK_LIMITED",
+                "P2P_V2",
+            ]
         );
-        assert_eq!(info.services_names(), vec!["NETWORK", "WITNESS"]);
-    }
 
-    #[test]
-    fn services_names_empty_for_no_flags() {
-        let mut version = fake_version();
-        version.services = ServiceFlags::NONE;
-        let info = PeerInfo::inbound_from_version(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333),
-            &version,
-            0,
+        // No recognized bits -> no names (Core reports an empty array).
+        assert!(peer_info_with_services(0).services_names().is_empty());
+
+        // Unrecognized bits (e.g. bit 63) contribute no names.
+        assert!(
+            peer_info_with_services(1_u64 << 63)
+                .services_names()
+                .is_empty()
         );
-        assert!(info.services_names().is_empty());
     }
 }

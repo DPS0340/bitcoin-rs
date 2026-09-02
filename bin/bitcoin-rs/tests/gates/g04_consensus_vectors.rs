@@ -3,16 +3,25 @@
 
 #![allow(clippy::expect_used)]
 
-/// Gate G4 re-runs the consensus crate vector tests under the umbrella gate
-/// package so `cargo test -p bitcoin-rs` reports the shippability gate.
+/// Gate G4 runs only the consensus crate's vector test binary — the
+/// shippability criterion (Core's `tx_valid`, `tx_invalid`, `script_tests`,
+/// `sighash` vectors pass) — rather than re-running the whole consensus crate
+/// suite, whose unit tests already have their own owner.
 #[test]
 fn consensus_test_vectors() {
     let status = std::process::Command::new(env!("CARGO"))
-        .args(["test", "-p", "bitcoin-rs-consensus", "--no-fail-fast"])
+        .args([
+            "test",
+            "-p",
+            "bitcoin-rs-consensus",
+            "--test",
+            "vectors",
+            "--no-fail-fast",
+        ])
         .status()
         .expect("spawn cargo");
     assert!(
         status.success(),
-        "consensus crate tests must pass — these include tx_valid.json, tx_invalid.json, script_tests.json, sighash.json"
+        "consensus vector tests must pass — tx_valid.json, tx_invalid.json, script_tests.json, sighash.json"
     );
 }
