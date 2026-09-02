@@ -477,8 +477,13 @@ impl<S: KvStore> Indexer<S> {
     ///
     /// Returns every `HashPrefixRow` whose 8-byte prefix matches the scripthash's
     /// scan prefix, decoded from `ColumnFamily::Funding`. Rows are returned in
-    /// the iteration order of the underlying store (typically lexicographic, so
-    /// (prefix, height) ascending).
+    /// the iteration order of the underlying store: byte-lexicographic over
+    /// `prefix || height`, where the height is **little-endian** -- so within
+    /// one prefix this is NOT numeric height order (height 256, `[0,1,0,0]`,
+    /// sorts before height 1, `[1,0,0,0]`). Callers that need chronological
+    /// order must sort; every production consumer does, and bounded scans that
+    /// truncate fail closed instead of serving a byte-order prefix of the rows.
+    /// Pinned by `funding_row_iteration_order_is_not_numeric_height_order`.
     ///
     /// The 8-byte prefix is lossy: callers MUST resolve heights back to full
     /// transactions via block storage to confirm scripthash identity.
@@ -498,7 +503,10 @@ impl<S: KvStore> Indexer<S> {
     /// `ScriptHistoryEntry::confirmed` for every transaction in that block that has
     /// at least one output matching `scripthash` exactly.
     ///
-    /// Entries are returned in iteration order (lexicographic by prefix||height).
+    /// Entries are returned in storage iteration order, which is not numeric
+    /// height order (heights are little-endian in the key -- see
+    /// [`Self::iter_funding_rows`]). Callers that present history
+    /// chronologically must sort above this layer, and do.
     /// Heights not resolvable by `source` are skipped.
     ///
     /// The lossy 8-byte prefix is exact-resolved here: only transactions whose
@@ -2292,6 +2300,48 @@ mod tests {
         assert_eq!(
             indexer.iter_funding_rows(scripthash)?,
             vec![ScriptHashRow::row(scripthash, HEIGHT)]
+        );
+        Ok(())
+    }
+
+    /// The stored iteration order is byte order, not height order.
+    ///
+    /// Heights are little-endian in the key, so 256 (`[0,1,0,0]`) sorts before
+    /// 1 (`[1,0,0,0]`) within one prefix. #226's audit found the previous doc
+    /// contract claiming "(prefix, height) ascending", which this order
+    /// falsifies; no production reader relies on it -- the Esplora and worker
+    /// paths sort in memory, and truncated bounded scans fail closed -- but
+    /// nothing pinned that fact, so a reader could have started relying on the
+    /// documented order and been wrong only at heights past 255. This test is
+    /// that pin: if the height encoding ever becomes sortable (#226 Q3), the
+    /// expectation below flips and the doc contract must flip with it.
+    #[test]
+    fn funding_row_iteration_order_is_not_numeric_height_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let script = ScriptBuf::from_bytes(vec![0x51, 0x03]);
+        let (_dir, mut indexer) = indexer()?;
+
+        // Same script funded at numeric heights 1 and 256, ingested in
+        // numeric order.
+        indexer.ingest_block(
+            &serialize(&block(vec![tx(spent_outpoint(3, 0), script.clone())])),
+            1,
+        )?;
+        indexer.ingest_block(
+            &serialize(&block(vec![tx(spent_outpoint(4, 0), script.clone())])),
+            256,
+        )?;
+
+        let scripthash = ScriptHash::from_script_bytes(script.as_bytes());
+        let rows = indexer.iter_funding_rows(scripthash)?;
+        let heights: Vec<u32> = rows.iter().map(|row| row.height()).collect();
+
+        assert_eq!(
+            heights,
+            vec![256, 1],
+            "little-endian heights iterate in byte order, not numeric order; \
+             if this starts returning [1, 256] the encoding became sortable and \
+             every ordering doc contract in this file must be revisited"
         );
         Ok(())
     }
