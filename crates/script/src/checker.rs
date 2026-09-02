@@ -108,10 +108,17 @@ impl<'a> TxSignatureChecker<'a> {
             return Ok(false);
         };
 
-        // Parse the DER portion; invalid DER is a clean false.
-        let Ok(ecdsa_sig) = EcdsaSig::from_der(der_sig) else {
+        // Parse the DER portion using lax DER parsing (Core's
+        // `ecdsa_signature_parse_der_lax`), then normalize to low-S before
+        // verification (Core's `secp256k1_ecdsa_signature_normalize`). Strict
+        // DER enforcement is handled separately by `check_signature_encoding`
+        // under the DERSIG flag; the verification path itself always uses lax
+        // parsing so pre-BIP66 signatures still verify. Invalid DER is a
+        // clean false.
+        let Ok(mut ecdsa_sig) = EcdsaSig::from_der_lax(der_sig) else {
             return Ok(false);
         };
+        ecdsa_sig.normalize_s();
 
         // Compute the sighash for the appropriate version.
         let sighash = match sigversion {

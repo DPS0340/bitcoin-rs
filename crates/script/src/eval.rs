@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 
 use crate::checker::{SigVersion, TxSignatureChecker};
 use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
-use crate::script::{Instruction, instructions, opcode};
+use crate::script::{Instruction, instructions, opcode, push_data};
 use crate::stack::{ScriptItem, Stack};
 
 use bitcoin_hashes::{Hash as _, ripemd160, sha1};
@@ -1214,7 +1214,8 @@ fn eval_checksig(
         SigVersion::Base | SigVersion::WitnessV0 => {
             let mut code = script_code(codeseparator_pos, instruction_start, script);
             if sigversion == SigVersion::Base {
-                let (cleaned, found) = remove_all(&code, sig);
+                let needle = push_data(sig);
+                let (cleaned, found) = remove_all(&code, &needle);
                 code = cleaned;
                 if found > 0 && flags.contains(VerifyFlags::CONST_SCRIPTCODE) {
                     return Err(ScriptError::Invalid {
@@ -1347,7 +1348,8 @@ fn check_multisig(
                 .peek_at(keys + 2 + index)
                 .map_err(|_| invalid_stack())?;
             let sig = item_bytes(sig_item).into_owned();
-            let (cleaned, found) = remove_all(&code, &sig);
+            let needle = push_data(&sig);
+            let (cleaned, found) = remove_all(&code, &needle);
             code = cleaned;
             if found > 0 && flags.contains(VerifyFlags::CONST_SCRIPTCODE) {
                 return Err(ScriptError::Invalid {
@@ -1360,7 +1362,7 @@ fn check_multisig(
     let mut success = true;
     let mut keys_left = keys;
     let mut sigs_left = sigs;
-    let mut key_depth = keys + 1;
+    let mut key_depth = 1;
     let mut sig_depth = keys + 2;
     while success && sigs_left > 0 {
         let sig_item = stack.peek_at(sig_depth).map_err(|_| invalid_stack())?;

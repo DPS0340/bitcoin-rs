@@ -1363,7 +1363,7 @@ fn asm_assembler_matches_known_bytes() {
 /// Core rows the native evaluator does not yet match. Every one is triaged in
 /// the issue that owns the remaining work; the count is pinned so a shrink
 /// lowers it with evidence and a growth fails the lane.
-const NATIVE_SCRIPT_TESTS_FAILURES: usize = 36;
+const NATIVE_SCRIPT_TESTS_FAILURES: usize = 2;
 
 #[test]
 fn script_tests_native_column() {
@@ -1420,7 +1420,7 @@ fn script_tests_kernel_column() {
 
 /// Pinned like `NATIVE_SCRIPT_TESTS_FAILURES`: a shrink lowers it with
 /// evidence, a growth fails the lane.
-const NATIVE_TX_VALID_FAILURES: usize = 40;
+const NATIVE_TX_VALID_FAILURES: usize = 17;
 
 #[test]
 fn tx_valid_native_column() {
@@ -1471,7 +1471,7 @@ fn tx_valid_kernel_column() {
 
 /// A `tx_invalid` mismatch means the evaluator ACCEPTED a transaction Core
 /// rejects, so this count is the one that must reach zero first.
-const NATIVE_TX_INVALID_FAILURES: usize = 2;
+const NATIVE_TX_INVALID_FAILURES: usize = 0;
 
 #[test]
 fn tx_invalid_native_column() {
