@@ -1,7 +1,6 @@
 # AGENTS.md
 
-Read `CONCEPTS.md` and `docs/solutions/` before touching a settled area; update
-both when adding durable knowledge.
+CONCEPTS.md is the repository common vocabulary, utilize and manipulate it when you need it.
 
 ## Consensus
 
