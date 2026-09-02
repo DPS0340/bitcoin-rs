@@ -275,6 +275,24 @@ impl TxAdmission {
     }
 }
 
+/// [`TxInventory`] forwarding to the inherent admission lookups so the p2p
+/// dispatch path can filter inbound `inv` announcements against the orphan
+/// map, recent-rejects cache, and mempool, and serve `getdata` tx bodies.
+/// The p2p crate holds this as `&dyn TxInventory`; the node owns the state.
+impl TxInventory for TxAdmission {
+    fn have_tx(&self, hash: Hash256, wtxid_relay: bool) -> bool {
+        self.have_tx(hash, wtxid_relay)
+    }
+
+    fn get_tx(&self, txid: Txid) -> Option<Tx> {
+        self.get_tx(txid)
+    }
+
+    fn get_tx_by_wtxid(&self, wtxid: Wtxid) -> Option<Tx> {
+        self.get_tx_by_wtxid(wtxid)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
