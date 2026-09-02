@@ -1209,9 +1209,22 @@ fn run_sighash_vectors(rows: &[SighashRow], counts: &mut Counts) -> Vec<String> 
 // ===========================================================================
 
 fn reference_path(name: &str) -> std::path::PathBuf {
+    // Anchored at this crate rather than the process working directory, so the
+    // corpora resolve identically from the workspace root, from a worktree at
+    // any depth, and from a bare `cargo test -p bitcoin-rs-script`.
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = crate_dir
+        .ancestors()
+        .find(|dir| dir.join(".references").is_dir())
+        .unwrap_or(crate_dir);
+    // The tracked copy is the authority: `.references` is a local checkout of
+    // Core and is not in git, so a CI run that fell back to it would either
+    // fail to find the corpus or grade against a different one.
     let candidates = [
-        std::path::PathBuf::from(".references/bitcoin/src/test/data").join(name),
-        std::path::PathBuf::from("../consensus/tests/vectors").join(name),
+        crate_dir.join("../consensus/tests/vectors").join(name),
+        workspace_root
+            .join(".references/bitcoin/src/test/data")
+            .join(name),
     ];
     for candidate in &candidates {
         if candidate.exists() {

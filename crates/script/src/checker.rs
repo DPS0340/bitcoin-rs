@@ -1036,8 +1036,14 @@ mod tests {
 
     #[test]
     fn sighash_json_corpus_legacy_path() {
-        let json_str =
-            include_str!("../../../../../../.references/bitcoin/src/test/data/sighash.json");
+        // The tracked corpus, not the untracked `.references` checkout of Core:
+        // this test must grade against the same rows on every machine.
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../consensus/tests/vectors/sighash.json");
+        let json_str = std::fs::read_to_string(&corpus).unwrap_or_else(|error| {
+            panic!("sighash.json unreadable at {}: {error}", corpus.display())
+        });
+        let json_str = json_str.as_str();
         let data: serde_json::Value =
             serde_json::from_str(json_str).unwrap_or_else(|e| panic!("sighash.json parse: {e}"));
 
