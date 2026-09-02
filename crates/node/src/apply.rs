@@ -514,9 +514,24 @@ pub(crate) struct FlatFilePruneBodyStore<S: KvStore> {
 enum PositionLookup {
     Direct,
     Prefetched {
-        entries: Vec<(u32, Hash256, BlockFilePosition)>,
+        entries: Vec<(u32, Hash256, Option<BlockFilePosition>)>,
         next: usize,
     },
+}
+
+fn decode_body_position(
+    height: u32,
+    encoded: Option<&[u8]>,
+) -> Result<Option<BlockFilePosition>, StorageError> {
+    encoded
+        .map(|bytes| {
+            BlockFilePosition::decode(bytes).ok_or_else(|| {
+                StorageError::IncompatibleData(format!(
+                    "block-body index row for height {height} is not a 16-byte flat-file position"
+                ))
+            })
+        })
+        .transpose()
 }
 
 struct FlatFilePruneBodyReader<'a> {
@@ -554,14 +569,7 @@ impl PruneBodyReader for FlatFilePruneBodyReader<'_> {
             .copied()
             .zip(values)
             .map(|((height, hash), value)| {
-                let position = value
-                    .as_deref()
-                    .and_then(BlockFilePosition::decode)
-                    .ok_or_else(|| {
-                        StorageError::IncompatibleData(format!(
-                            "block-body index row for height {height} is not a 16-byte flat-file position"
-                        ))
-                    })?;
+                let position = decode_body_position(height, value.as_deref())?;
                 Ok((height, hash, position))
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
@@ -577,17 +585,10 @@ impl PruneBodyReader for FlatFilePruneBodyReader<'_> {
         let position = match &mut self.positions {
             PositionLookup::Direct => {
                 let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
-                let Some(encoded) = self
+                let encoded = self
                     .index
-                    .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
-                else {
-                    return Ok(None);
-                };
-                BlockFilePosition::decode(&encoded).ok_or_else(|| {
-                    StorageError::IncompatibleData(format!(
-                        "block-body index row for height {height} is not a 16-byte flat-file position"
-                    ))
-                })?
+                    .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?;
+                decode_body_position(height, encoded.as_deref())?
             }
             PositionLookup::Prefetched { entries, next } => {
                 let Some(&(expected_height, expected_hash, position)) = entries.get(*next) else {
@@ -603,6 +604,9 @@ impl PruneBodyReader for FlatFilePruneBodyReader<'_> {
                 *next += 1;
                 position
             }
+        };
+        let Some(position) = position else {
+            return Ok(None);
         };
         self.files.load(position, height, *hash.as_byte_array())
     }
@@ -628,19 +632,12 @@ impl<S: KvStore> FlatFilePruneBodyStore<S> {
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<BlockFilePosition>, StorageError> {
         let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
-        let Some(encoded) = self
-            .index
-            .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(BlockFilePosition::decode(&encoded).ok_or_else(
-            || {
-                StorageError::IncompatibleData(format!(
-                    "block-body index row for height {height} is not a 16-byte flat-file position"
-                ))
-            },
-        )?))
+        decode_body_position(
+            height,
+            self.index
+                .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
+                .as_deref(),
+        )
     }
 }
 
@@ -656,17 +653,12 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         body: &[u8],
     ) -> Result<(), StorageError> {
         let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
-        let existing = self
-            .index
-            .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
-            .map(|bytes| {
-                BlockFilePosition::decode(&bytes).ok_or_else(|| {
-                    StorageError::IncompatibleData(
-                        "block-body index row is not a 16-byte flat-file position".to_owned(),
-                    )
-                })
-            })
-            .transpose()?;
+        let existing = decode_body_position(
+            height,
+            self.index
+                .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
+                .as_deref(),
+        )?;
         let position = self
             .files
             .persist(existing, height, *hash.as_byte_array(), body)?;
@@ -824,6 +816,56 @@ mod body_position_prefetch_tests {
         index.write(batch)?;
         let Err(error) = store.load_block_body(7, hash) else {
             return Err("malformed body row must fail closed".into());
+        };
+        assert!(matches!(error, StorageError::IncompatibleData(_)));
+
+        let mut reader = store.reader()?;
+        let Err(error) = reader.load_block_body(7, hash) else {
+            return Err("malformed body row must fail closed in the direct reader".into());
+        };
+        assert!(matches!(error, StorageError::IncompatibleData(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_prefetched_body_row_is_missing_not_incompatible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let index = Arc::new(bitcoin_rs_storage::FjallStore::open(
+            temp.path().join("index"),
+        )?);
+        let files = Arc::new(FlatFileBlockStore::open(temp.path())?);
+        let store = FlatFilePruneBodyStore::open(index, files);
+        let hash = Hash256::from_le_bytes(&[8_u8; 32]);
+        let mut reader = store.reader()?;
+
+        reader.prefetch_positions(&[(7, hash)])?;
+        assert_eq!(reader.load_block_body(7, hash)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_prefetched_body_row_is_incompatible_not_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let index = Arc::new(bitcoin_rs_storage::FjallStore::open(
+            temp.path().join("index"),
+        )?);
+        let files = Arc::new(FlatFileBlockStore::open(temp.path())?);
+        let store = FlatFilePruneBodyStore::open(index.clone(), files);
+        let hash = Hash256::from_le_bytes(&[7_u8; 32]);
+        let key = bitcoin_rs_storage::pruning::block_body_key(7, hash);
+        let mut batch = index.new_batch();
+        batch.put(
+            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+            &key,
+            b"legacy-inline-body",
+        );
+        index.write(batch)?;
+
+        let mut reader = store.reader()?;
+        let Err(error) = reader.prefetch_positions(&[(7, hash)]) else {
+            return Err("malformed prefetched body row must fail closed".into());
         };
         assert!(matches!(error, StorageError::IncompatibleData(_)));
         Ok(())
