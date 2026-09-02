@@ -29,9 +29,12 @@ use parking_lot::Mutex;
 
 use crate::state::NodeState;
 use crate::tx_admission::TxAdmission;
+use crate::tx_relay::{PeerRelaySink, TxRelayQueue, spawn_tx_relay_worker};
 
 /// The drain poll interval when the channel is empty.
 const TX_INGRESS_POLL: Duration = Duration::from_millis(100);
+/// Bounded capacity of the outbound tx-relay queue.
+const TX_RELAY_QUEUE_CAPACITY: usize = 1024;
 
 /// Spawns the single tx-ingress consumer thread.
 ///
@@ -58,6 +61,9 @@ pub fn spawn_tx_ingress_consumer(
     let utxo = state.utxo();
     let transactions = state.transactions();
     let peer_outbound = state.peer_outbound();
+    let (relay, relay_rx) = TxRelayQueue::new(TX_RELAY_QUEUE_CAPACITY);
+    let relay_sink = PeerRelaySink::new(peer_outbound);
+    spawn_tx_relay_worker(relay_sink, relay_rx, Arc::clone(&shutdown))?;
     let handle = std::thread::Builder::new()
         .name("bitcoin-rs-tx-ingress".to_owned())
         .spawn(move || {
@@ -66,7 +72,7 @@ pub fn spawn_tx_ingress_consumer(
                 transactions,
                 mempool_gateway: gateway,
                 mining_control,
-                peer_outbound,
+                relay,
                 tx_admission,
             };
             while !shutdown.load(Ordering::Relaxed) {
@@ -92,9 +98,9 @@ struct TxIngressConsumer {
     transactions: Arc<parking_lot::RwLock<hashbrown::HashMap<Txid, Tx>>>,
     mempool_gateway: Arc<MempoolGateway>,
     mining_control: Arc<dyn MiningControl>,
-    peer_outbound: Arc<
-        parking_lot::RwLock<hashbrown::HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>,
-    >,
+    /// Outbound relay queue: enqueues `inv` announcements for the relay
+    /// worker without blocking mempool admission.
+    relay: TxRelayQueue,
     /// Orphan map and recent-rejects cache for inbound tx admission.
     tx_admission: Arc<TxAdmission>,
 }
@@ -211,7 +217,7 @@ impl TxIngressConsumer {
                         && matches!(c.outcome, bitcoin_rs_mempool::MutationOutcome::Accepted)
                 });
                 if accepted {
-                    self.relay_tx(txid, tx.wtxid());
+                    self.relay.announce(txid, tx.wtxid(), Some(source.connection_id().get()));
                     self.mining_control.publish_generation();
                     tracing::trace!(%txid, "p2p tx admitted and relayed");
                 }
@@ -288,21 +294,6 @@ impl TxIngressConsumer {
         }
 
         contexts
-    }
-
-    /// Relays a transaction to all connected peers via `inv` announcement.
-    fn relay_tx(&self, txid: Txid, _wtxid: Wtxid) {
-        use bitcoin::p2p::message_blockdata::Inventory;
-
-        let inv = Inventory::Transaction(bitcoin::hashes::Hash::from_byte_array(*txid.as_bytes()));
-        let message = bitcoin_rs_p2p::Message::Inv(vec![inv]);
-
-        let peers = self.peer_outbound.read();
-        for (addr, lease) in peers.iter() {
-            if let Err(error) = lease.send(message.clone()) {
-                tracing::debug!(peer_addr = %addr, %error, "failed to relay tx inv to peer");
-            }
-        }
     }
 
     /// Returns the current applied tip height.
@@ -452,13 +443,13 @@ mod tests {
         utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0xBB; 32]))
             .expect("utxo commit must succeed");
         let transactions = Arc::new(RwLock::new(hashbrown::HashMap::new()));
-        let peer_outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
+        let (relay, _relay_rx) = TxRelayQueue::new(TX_RELAY_QUEUE_CAPACITY);
         TxIngressConsumer {
             utxo,
             transactions,
             mempool_gateway: Arc::clone(&gateway),
             mining_control: mining,
-            peer_outbound,
+            relay,
             tx_admission: Arc::new(TxAdmission::new(Arc::clone(&gateway))),
         }
     }
@@ -479,12 +470,13 @@ mod tests {
     ) -> TxIngressConsumer {
         let utxo = Arc::new(UtxoSet::new());
         let transactions = Arc::new(RwLock::new(hashbrown::HashMap::new()));
+        let (relay, _relay_rx) = TxRelayQueue::new(TX_RELAY_QUEUE_CAPACITY);
         TxIngressConsumer {
             utxo,
             transactions,
             mempool_gateway: Arc::clone(&gateway),
             mining_control: mining,
-            peer_outbound,
+            relay,
             tx_admission: Arc::new(TxAdmission::new(Arc::clone(&gateway))),
         }
     }

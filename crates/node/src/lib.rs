@@ -72,6 +72,9 @@ pub mod sync;
 pub mod tx_admission;
 /// P2P transaction ingress consumer.
 pub mod tx_ingress;
+/// Outbound transaction relay worker: announce accepted txs to peers
+/// excluding the source connection.
+pub mod tx_relay;
 mod txindex_worker;
 /// UTXO view adapter for consensus transaction checks.
 pub mod utxo_view;
