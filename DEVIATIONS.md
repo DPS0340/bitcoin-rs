@@ -337,15 +337,16 @@ Spending rows are unchanged: nothing resolves them back to transactions today.
 
 ### Compatibility
 
-Keys, key ordering and row counts are untouched, so an existing index keeps
-working — a row with an empty value takes the whole-block scan path, which is the
-verbatim electrs behaviour and is retained as `*_scan`. Nothing forces a reindex;
-clearing the index directory and re-syncing is what earns the fast path.
+The current position-bearing row values preserve keys, key ordering, and row
+counts. Resolvers still retain the all-or-scan safety rule when a current
+position cannot be resolved, but that is not a migration path for an older
+index.
 
-`ColumnFamily::UtxoMeta` carries an `index:format_version` marker, adopted only
-when the index is empty. A populated index without one is reported as
-`IndexFormat::Legacy` and the node logs a startup warning naming the directory to
-delete. It does not refuse to start: reads stay correct either way.
+`CURRENT_SCHEMA` now owns compatibility for the index stores as well as chainstate.
+A missing marker on a non-empty directory or an incompatible epoch fails before
+any index store opens. The node never deletes or rebuilds derived rows
+automatically; the operator replaces or quarantines the datadir and resyncs. A
+marked current datadir writes only the current position-bearing row format.
 
 ### The rule that makes it safe
 

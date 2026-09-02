@@ -14,9 +14,10 @@ use cap_std::fs::{Dir, File, OpenOptions};
 
 /// Name of the datadir-wide clean-cutover schema marker.
 pub(crate) const CURRENT_SCHEMA_FILE: &str = "CURRENT_SCHEMA";
-/// Current persistent format epoch. Increment this for a schema-breaking
-/// storage change; no converter or compatibility reader accompanies the bump.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 1;
+const CURRENT_SCHEMA_TEMP_FILE: &str = ".CURRENT_SCHEMA.tmp";
+// This serialized marker is the single source of truth for the current
+// persistent format epoch. Increment it for a schema-breaking storage change;
+// no converter or compatibility reader accompanies the bump.
 const CURRENT_SCHEMA_BYTES: &[u8] = b"1\n";
 
 pub(crate) fn open_data_dir(path: &Path) -> io::Result<Dir> {
@@ -30,42 +31,35 @@ pub(crate) fn ensure_current_schema(data: &Dir) -> io::Result<()> {
     match read_file(data, CURRENT_SCHEMA_FILE, 16) {
         Ok(bytes) => validate_current_schema(&bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if data
-                .entries()
-                .map_err(|error| {
-                    io::Error::new(error.kind(), format!("list datadir entries: {error}"))
-                })?
-                .next()
-                .transpose()
-                .map_err(|error| {
-                    io::Error::new(error.kind(), format!("read datadir entry: {error}"))
-                })?
-                .is_some()
-            {
-                return Err(incompatible_schema(
-                    "datadir has no CURRENT_SCHEMA marker and is not empty",
-                ));
+            let mut stale_temp = false;
+            for entry in data.entries()? {
+                let entry = entry?;
+                if entry.file_name().to_str() == Some(CURRENT_SCHEMA_TEMP_FILE) {
+                    stale_temp = true;
+                } else {
+                    return Err(incompatible_schema(
+                        "datadir has no CURRENT_SCHEMA marker and is not empty",
+                    ));
+                }
+            }
+            if stale_temp {
+                // This is a reserved temporary marker left by an interrupted
+                // initialization, not user data. Removing it lets the next
+                // attempt start a fresh atomic publication.
+                data.remove_file(CURRENT_SCHEMA_TEMP_FILE)?;
             }
 
-            let mut marker = match create_file(data, CURRENT_SCHEMA_FILE) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    return validate_current_schema(&read_file(data, CURRENT_SCHEMA_FILE, 16)?);
-                }
-                Err(error) => return Err(error),
-            };
-            marker.write_all(CURRENT_SCHEMA_BYTES).map_err(|error| {
-                io::Error::new(error.kind(), format!("write CURRENT_SCHEMA: {error}"))
-            })?;
-            marker.sync_all().map_err(|error| {
-                io::Error::new(error.kind(), format!("sync CURRENT_SCHEMA: {error}"))
-            })?;
+            let mut marker = create_file(data, CURRENT_SCHEMA_TEMP_FILE)?;
+            marker.write_all(CURRENT_SCHEMA_BYTES)?;
+            marker.sync_all()?;
+            drop(marker);
+            data.rename(CURRENT_SCHEMA_TEMP_FILE, data, CURRENT_SCHEMA_FILE)?;
             sync_dir(data)
-                .map_err(|error| io::Error::new(error.kind(), format!("sync datadir: {error}")))
         }
-        Err(error) => Err(incompatible_schema(format!(
-            "could not read CURRENT_SCHEMA: {error}"
-        ))),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Err(incompatible_schema(
+            format!("invalid CURRENT_SCHEMA: {error}"),
+        )),
+        Err(error) => Err(error),
     }
 }
 
@@ -73,9 +67,9 @@ fn validate_current_schema(bytes: &[u8]) -> io::Result<()> {
     if bytes == CURRENT_SCHEMA_BYTES {
         return Ok(());
     }
-    Err(incompatible_schema(format!(
-        "CURRENT_SCHEMA is not the current datadir schema epoch {CURRENT_SCHEMA_VERSION}"
-    )))
+    Err(incompatible_schema(
+        "CURRENT_SCHEMA is not the current datadir schema epoch",
+    ))
 }
 
 fn incompatible_schema(reason: impl Into<String>) -> io::Error {

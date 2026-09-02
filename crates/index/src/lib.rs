@@ -9,10 +9,10 @@ pub mod mempool;
 pub mod types;
 
 pub use index::{
-    BlockSource, INDEX_FORMAT_VERSION, IndexCapabilities, IndexCapability, IndexError, IndexFormat,
-    IndexReader, IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriter, Indexer,
-    IndexerLike, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptHistoryEntry,
-    TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    BlockSource, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexRowCounts,
+    IndexWatermark, IndexWatermarks, IndexWriter, Indexer, IndexerLike, PreparedBatch,
+    PreparedBatchLimits, PreparedBlock, ScriptHistoryEntry, TxIndexScan, TxIndexScanRow,
+    TxIndexSnapshot,
 };
 pub use mempool::{MempoolRowCounts, MempoolRowWriter};
 pub use types::{

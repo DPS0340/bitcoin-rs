@@ -1,8 +1,8 @@
 //! Tests for the persisted transaction-position row values.
 //!
 //! A position is only useful if slicing the canonical block bytes at that range
-//! yields the transaction the row was written for. The row encoding and legacy
-//! format markers are persisted-index contracts; ingest implementation parity
+//! yields the transaction the row was written for. The row encoding is a
+//! persisted-index contract; ingest implementation parity
 //! is intentionally not tested here.
 // A malformed fixture is a test failure; panicking reports it at the call site.
 #![allow(clippy::expect_used)]
@@ -18,8 +18,8 @@ use bitcoin::{
     TxMerkleNode, TxOut, Txid, Witness, absolute, block, transaction,
 };
 use bitcoin_rs_index::types::{TxPosition, TxPositionValue};
-use bitcoin_rs_index::{IndexFormat, Indexer, ScriptHash};
-use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch as _};
+use bitcoin_rs_index::{Indexer, ScriptHash};
+use bitcoin_rs_storage::{ColumnFamily, KvStore};
 use proptest::prelude::*;
 
 use common::MemoryStore;
@@ -172,85 +172,6 @@ fn txid_positions_address_their_own_transaction() {
             );
         }
     }
-}
-
-#[test]
-fn an_empty_index_adopts_the_current_format() {
-    let store = Arc::new(MemoryStore::default());
-    let indexer = Indexer::new(Arc::clone(&store));
-
-    assert_eq!(
-        indexer.ensure_format_version().expect("read format"),
-        IndexFormat::Current
-    );
-    // The marker persists, so a later open reports the same without re-deciding.
-    assert_eq!(
-        Indexer::new(store).ensure_format_version().expect("reopen"),
-        IndexFormat::Current
-    );
-}
-
-#[test]
-fn a_populated_index_without_a_marker_is_legacy() {
-    // Rows but no marker is exactly what a database written before this format
-    // looks like. Adopting the current version here would claim positions that
-    // are not in those rows.
-    let store = Arc::new(MemoryStore::default());
-    let mut indexer = Indexer::new(Arc::clone(&store));
-    indexer
-        .ingest_block(&serialize(&mixed_block()), HEIGHT)
-        .expect("ingest");
-    // Undo the marker the ingest path never writes, in case a future change adds
-    // one: this test is about the no-marker state specifically.
-    let mut batch = store.new_batch();
-    batch.delete(ColumnFamily::UtxoMeta, b"index:format_version");
-    store.write(batch).expect("clear marker");
-
-    assert_eq!(
-        indexer.ensure_format_version().expect("read format"),
-        IndexFormat::Legacy { found: None }
-    );
-}
-
-/// None of these may be trusted as current, and an unreadable marker must be
-/// distinguishable from a genuine version 0.
-///
-/// Both take the scan path, so the distinction is not behavioural — it is
-/// diagnostic. Reporting damaged bytes as "version 0" sends the operator to
-/// delete the index directory, which destroys the only evidence of whatever
-/// wrote them.
-#[test]
-fn an_older_marker_is_legacy_and_an_unreadable_one_is_reported_as_such() {
-    let store = Arc::new(MemoryStore::default());
-    let indexer = Indexer::new(Arc::clone(&store));
-
-    for (bytes, expected) in [
-        (vec![0_u8; 4], IndexFormat::Legacy { found: Some(0) }),
-        (
-            99_u32.to_le_bytes().to_vec(),
-            IndexFormat::Legacy { found: Some(99) },
-        ),
-        (vec![1_u8], IndexFormat::UnreadableMarker { len: 1 }),
-        (vec![1_u8; 9], IndexFormat::UnreadableMarker { len: 9 }),
-        (Vec::new(), IndexFormat::UnreadableMarker { len: 0 }),
-    ] {
-        let mut batch = store.new_batch();
-        batch.put(ColumnFamily::UtxoMeta, b"index:format_version", &bytes);
-        store.write(batch).expect("write marker");
-        assert_eq!(
-            indexer.ensure_format_version().expect("read format"),
-            expected,
-            "marker {bytes:?} must not be trusted as current"
-        );
-    }
-}
-
-#[test]
-fn an_empty_value_decodes_to_none() {
-    // Rows written before this format carry an empty value. A reader must treat
-    // that as "no positions available, scan the block", never as "this block has
-    // zero matching transactions".
-    assert!(TxPositionValue::decode(&[]).is_none());
 }
 
 #[test]

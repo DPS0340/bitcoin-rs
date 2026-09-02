@@ -230,9 +230,9 @@ correct and costs one scan per 2^64 pairs. The residual risk this accepts is a
 stale offset landing exactly on a transaction boundary *and* that transaction
 matching, while another transaction in the same block also matches.
 
-**Position values.** `crates/index/tests/tx_positions.rs`, 8 tests. The suite
-checks the persisted position encoding, exact transaction boundaries, current
-format markers, and the independent row-value contract. It intentionally does
+**Position values.** `crates/index/tests/tx_positions.rs` covers the persisted
+position encoding, exact transaction boundaries, and the independent row-value
+contract. It intentionally does
 not retain equivalence coverage for a second ingest implementation; the index
 has one supported serialized-block ingest path.
 

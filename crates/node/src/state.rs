@@ -713,21 +713,7 @@ fn open_writer<S>(
 where
     S: bitcoin_rs_storage::KvStore,
 {
-    match bitcoin_rs_index::IndexWriter::open(Arc::clone(store)) {
-        Ok(writer) => Ok(writer),
-        Err(
-            error @ (bitcoin_rs_index::IndexError::LegacyCursorlessIndex
-            | bitcoin_rs_index::IndexError::UnsupportedTxIndexFormatVersion { .. }),
-        ) => {
-            tracing::warn!(
-                %error,
-                "resetting incompatible derived transaction index for rebuild"
-            );
-            bitcoin_rs_index::IndexWriter::reset_index(store.as_ref())?;
-            bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
-        }
-        Err(error) => Err(error),
-    }
+    bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
 }
 
 fn open_tx_index_store<S>(
@@ -1994,6 +1980,8 @@ mod tests {
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::write(config.data_dir.join(".CURRENT_SCHEMA.tmp"), b"partial")?;
 
         let _state = NodeState::open(config.clone())?;
         assert_eq!(
@@ -2004,6 +1992,7 @@ mod tests {
             )?,
             b"1\n"
         );
+        assert!(!config.data_dir.join(".CURRENT_SCHEMA.tmp").exists());
         assert!(config.data_dir.join("chainstate").exists());
         Ok(())
     }
@@ -2870,10 +2859,6 @@ mod tests {
             .get("directory")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| std::io::Error::other("CURRENT has no generation directory"))?;
-        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            root.join(directory).join("manifest-v1.json"),
-        )?)?;
-        assert_eq!(manifest["utxo"]["trailer_kind"], "scanned");
         let snapshot_file = std::fs::File::open(root.join(directory).join("utxo-v4.dat"))?;
         let mut snapshot_reader = std::io::BufReader::new(snapshot_file);
         let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut snapshot_reader)?;

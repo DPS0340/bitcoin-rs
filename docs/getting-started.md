@@ -93,9 +93,11 @@ Address and scripthash routes return `503` until `--scriptindex` catches up, or
 when it is disabled. These index modes are incompatible with pruning
 because backfill and reorg repair require durable block bodies.
 
-The ScriptIndex format does not migrate an existing legacy index. At startup,
-the node deletes incompatible derived index data in bounded batches and rebuilds
-it before exposing `--scriptindex` or `--txindex` queries.
+The datadir schema marker covers the transaction and script indexes as well as
+chainstate. An unmarked or incompatible datadir fails before any derived index
+store opens; the operator must replace or quarantine it and resync. A marked
+current datadir can then build `--scriptindex` and `--txindex` state from the
+active chain.
 
 Change the RPC credentials before exposing the port anywhere. The defaults are
 a development convenience, not a secret. `--rpc-cookie` takes a Core-style

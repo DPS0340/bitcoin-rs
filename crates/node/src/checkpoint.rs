@@ -38,12 +38,9 @@ const CURRENT_FORMAT: &str = "bitcoin-rs-chainstate-current";
 const MANIFEST_FORMAT: &str = "bitcoin-rs-chainstate-checkpoint";
 const HEADER_CODEC: &str = "bitcoin-rs-canonical-headers";
 const UTXO_CODEC: &str = "bitcoin-rs-utxo-spendable-v1";
-// This identifier is written into `manifest-v1.json` and matched on load, so it
-// is an on-disk value, not a crate reference. `bitcoin-rs-coinstats` was merged
-// into `bitcoin-rs-utxo` (issue #164) and no longer exists as a crate. The
-// spelling remains part of the current format; changing it requires a schema
-// epoch bump and an explicit resync.
-const COINSTATS_CODEC: &str = "bitcoin-rs-coinstats";
+// This identifier is written into `manifest-v1.json` and matched on load. It
+// is an on-disk value; changing it requires a schema epoch bump and resync.
+const COINSTATS_CODEC: &str = "bitcoin-rs-coinstats-v1";
 const CURRENT_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
 const UTXO_VERSION: u32 = 4;
@@ -478,13 +475,6 @@ struct UtxoArtifactV1 {
     record_count: u64,
     output_count: u64,
     muhash_trailer_sha256: String,
-    trailer_kind: TrailerKindV1,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum TrailerKindV1 {
-    Scanned,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -901,7 +891,6 @@ fn write_checkpoint_inner(
             "scanned UTXO snapshot has a zero MuHash trailer".to_owned(),
         ));
     }
-    let trailer_kind = TrailerKindV1::Scanned;
     let persisted_stats = fused_stats;
 
     let mut coinstats_file = create_file(&staging, COINSTATS_FILE)?;
@@ -964,7 +953,6 @@ fn write_checkpoint_inner(
             record_count,
             output_count: persisted_stats.utxo_count,
             muhash_trailer_sha256: hex_encode(&Sha256::digest(trailer)),
-            trailer_kind,
         },
         coinstats: CoinStatsArtifactV1 {
             file: COINSTATS_FILE.to_owned(),
@@ -1736,16 +1724,13 @@ mod tests {
     /// requires an explicit full resync (`docs/policies/db-migration.md`). That
     /// failure is invisible to a round-trip test and expensive in production.
     ///
-    /// `bitcoin-rs-coinstats` is the case that motivated this: the crate of that
-    /// name was merged into `bitcoin-rs-utxo` (issue #164), so the identifier now
-    /// spells something that no longer exists and reads like leftovers. It is
-    /// not. Changing it to match the new module is the mistake this test exists
-    /// to stop.
+    /// These identifiers are the current schema's on-disk codec names. Changing
+    /// one requires a schema epoch bump and an explicit resync.
     #[test]
-    fn manifest_codec_identifiers_are_frozen() {
+    fn manifest_codec_identifiers_are_current_and_frozen() {
         assert_eq!(super::HEADER_CODEC, "bitcoin-rs-canonical-headers");
         assert_eq!(super::UTXO_CODEC, "bitcoin-rs-utxo-spendable-v1");
-        assert_eq!(super::COINSTATS_CODEC, "bitcoin-rs-coinstats");
+        assert_eq!(super::COINSTATS_CODEC, "bitcoin-rs-coinstats-v1");
         assert_eq!(super::CURRENT_FORMAT, "bitcoin-rs-chainstate-current");
         assert_eq!(super::MANIFEST_FORMAT, "bitcoin-rs-chainstate-checkpoint");
     }
@@ -2519,9 +2504,6 @@ mod tests {
         let root = dir.path().join(CHECKPOINT_ROOT);
         let current: CurrentV1 = serde_json::from_slice(&fs::read(root.join(CURRENT_FILE))?)?;
         let generation = root.join(current.directory);
-        let manifest: CheckpointManifestV1 =
-            serde_json::from_slice(&fs::read(generation.join(MANIFEST_FILE))?)?;
-        assert_eq!(manifest.utxo.trailer_kind, super::TrailerKindV1::Scanned);
         let mut reader = std::io::BufReader::new(std::fs::File::open(generation.join(UTXO_FILE))?);
         let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut reader)?;
         assert_ne!(snapshot.muhash_trailer, [0_u8; 384]);
