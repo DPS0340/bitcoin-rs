@@ -656,7 +656,7 @@ pub(crate) fn load_checkpoint_from_dir(
     let root = match CheckpointRoot::open_existing(data_dir, CHECKPOINT_ROOT) {
         Ok(Some(root)) => root,
         Ok(None) => return Ok(CheckpointLoad::Cold),
-        Err(error) => return Err(incompatible_io("open checkpoint root", error)),
+        Err(error) => return Err(incompatible_io("open checkpoint root", &error)),
     };
 
     let current = match read_current(&root) {
@@ -671,7 +671,7 @@ pub(crate) fn load_checkpoint_from_dir(
     let generation_dir = root.open_dir(&current.directory).map_err(|error| {
         incompatible_io(
             &format!("open checkpoint generation {}", current.directory),
-            error,
+            &error,
         )
     })?;
     let manifest = match read_manifest(&generation_dir, &current, config) {
@@ -744,7 +744,7 @@ fn incompatible_load_error(error: LoadStageError) -> IncompatibleCheckpoint {
     }
 }
 
-fn incompatible_io(operation: &str, error: std::io::Error) -> IncompatibleCheckpoint {
+fn incompatible_io(operation: &str, error: &std::io::Error) -> IncompatibleCheckpoint {
     IncompatibleCheckpoint::Invalid {
         reason: format!("{operation} failed: {error}"),
     }
