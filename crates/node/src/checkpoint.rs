@@ -1200,8 +1200,7 @@ fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, CheckpointEr
     if current.directory != expected_directory || !valid_generation_name(&current.directory) {
         return Err(CheckpointError::Invalid(
             "CURRENT generation directory does not match its generation".to_owned(),
-        )
-        .into());
+        ));
     }
     decode_hex::<32>(&current.manifest_sha256)?;
     Ok(Some(current))
