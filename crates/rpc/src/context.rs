@@ -994,20 +994,12 @@ pub struct ContextHandles {
     pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     /// Network state.
     pub network: Arc<RwLock<NetworkState>>,
-    /// Whether the node accepts or starts P2P connections.
-    pub network_active: Arc<core::sync::atomic::AtomicBool>,
-    /// Shared identity-aware lifecycle authority for peer mutations.
-    pub peer_lifecycle: Arc<bitcoin_rs_p2p::PeerLifecycle>,
+    /// P2P runtime owner for peer state and network controls.
+    pub p2p: Arc<bitcoin_rs_p2p::P2pService>,
     /// Shared block tree.
     pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
     /// Consensus network.
     pub chain_network: Network,
-    /// Channel that requests outbound P2P connections.
-    pub p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
-    /// Manual IP/CIDR bans.
-    pub banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
-    /// Persisted `addnode add` entries.
-    pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
     /// Complete transaction-index query adapter.
     pub tx_index: Option<Arc<dyn TxIndexQuery>>,
     /// Generic script-index query adapter.
@@ -1070,21 +1062,12 @@ pub struct Context {
     /// Network selector used by handlers needing consensus parameters (e.g.
     /// difficulty calculation).
     pub chain_network: Network,
-    /// Whether outbound and inbound network activity is enabled through RPC.
-    pub network_active: Arc<core::sync::atomic::AtomicBool>,
-    /// Shared identity-aware lifecycle authority for peer mutations.
-    pub peer_lifecycle: Arc<bitcoin_rs_p2p::PeerLifecycle>,
+    /// P2P runtime owner for peer state and network controls.
+    pub p2p: Arc<bitcoin_rs_p2p::P2pService>,
     /// Shared in-memory block tree.
     pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
     /// Optional durable block body reader for metadata-only block records.
     pub block_body_source: Option<Arc<dyn BlockBodySource>>,
-    /// Optional outbound channel for `addnode` to request new P2P connections.
-    /// `None` for embedded/test callers without a live P2P listener.
-    pub p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
-    /// Manual IP/CIDR bans shared with P2P enforcement.
-    pub banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
-    /// Persisted `addnode add` entries.
-    pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
     /// Active ZMQ PUB notifications.
     pub zmq_notifications: Arc<[ZmqNotification]>,
     /// Configured node debug-log path for `getrpcinfo`.
@@ -1126,9 +1109,10 @@ impl Context {
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
         utxo.set_listener(Box::new(coin_stats_listener.clone()));
         let coin_stats = Arc::new(coin_stats_listener);
-        let peer_lifecycle = Arc::new(bitcoin_rs_p2p::PeerLifecycle::new(
-            Arc::new(RwLock::new(Vec::new())),
-            Arc::new(RwLock::new(HashMap::new())),
+        let shutdown = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
+            bitcoin_rs_p2p::P2pServiceConfig::default(),
+            shutdown,
         ));
         Self {
             chain_tip: Arc::new(ArcSwapOption::empty()),
@@ -1146,16 +1130,12 @@ impl Context {
             script_index: None,
             prune_service: None,
             chain_control: None,
-            peer_lifecycle,
-            network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+            p2p,
             mining_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
             chain_network: Network::Mainnet,
             block_tree: Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
             block_body_source: None,
-            p2p_outbound_sender: None,
-            banned: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
@@ -1180,13 +1160,9 @@ impl Context {
             script_index: handles.script_index,
             network: handles.network,
             chain_network: handles.chain_network,
-            peer_lifecycle: handles.peer_lifecycle,
-            network_active: handles.network_active,
+            p2p: handles.p2p,
             block_tree: handles.block_tree,
             block_body_source: None,
-            p2p_outbound_sender: handles.p2p_outbound_sender,
-            banned: handles.banned,
-            added_nodes: handles.added_nodes,
             prune_service: None,
             chain_control: None,
             mining_control: None,
@@ -1194,6 +1170,13 @@ impl Context {
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
         }
+    }
+
+    /// Replaces the P2P owner for an embedded caller or a focused test.
+    #[must_use]
+    pub fn with_p2p(mut self, p2p: Arc<bitcoin_rs_p2p::P2pService>) -> Self {
+        self.p2p = p2p;
+        self
     }
 
     /// Attaches the internal transaction lookup required for Esplora output
@@ -1806,29 +1789,22 @@ mod tests {
             bitcoin_rs_utxo::stats::CoinStats::default(),
         ));
         let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
-        let banned = Arc::new(RwLock::new(Vec::<bitcoin_rs_p2p::BannedSubnet>::new()));
-        let added_nodes = Arc::new(RwLock::new(Vec::new()));
-        let network_active = Arc::new(core::sync::atomic::AtomicBool::new(true));
-        let peer_lifecycle = Arc::new(bitcoin_rs_p2p::PeerLifecycle::new(
-            Arc::new(RwLock::new(Vec::new())),
-            Arc::new(RwLock::new(HashMap::new())),
+        let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
+            bitcoin_rs_p2p::P2pServiceConfig::default(),
+            Arc::new(core::sync::atomic::AtomicBool::new(false)),
         ));
         let ctx = Context::from_handles(ContextHandles {
             chain_tip: Arc::clone(&chain_tip),
             applied_tip: Arc::clone(&applied_tip),
             mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            peer_lifecycle,
+            p2p: Arc::clone(&p2p),
             blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::clone(&utxo),
             coin_stats: Arc::clone(&coin_stats),
             network: Arc::new(RwLock::new(NetworkState::default())),
-            network_active: Arc::clone(&network_active),
             block_tree: Arc::clone(&block_tree),
             chain_network: Network::Mainnet,
-            p2p_outbound_sender: None,
-            banned: Arc::clone(&banned),
-            added_nodes: Arc::clone(&added_nodes),
             tx_index: None,
             script_index: None,
         });
@@ -1853,16 +1829,8 @@ mod tests {
             "block_tree must be shared with caller"
         );
         assert!(
-            Arc::ptr_eq(&ctx.network_active, &network_active),
-            "network activity must be shared with caller"
-        );
-        assert!(
-            Arc::ptr_eq(&ctx.banned, &banned),
-            "banned must be shared with caller"
-        );
-        assert!(
-            Arc::ptr_eq(&ctx.added_nodes, &added_nodes),
-            "added_nodes must be shared with caller"
+            Arc::ptr_eq(&ctx.p2p, &p2p),
+            "p2p service must be shared with caller"
         );
     }
 

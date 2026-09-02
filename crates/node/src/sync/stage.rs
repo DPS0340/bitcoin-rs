@@ -6,7 +6,7 @@ use std::{
 use bitcoin_rs_primitives::Hash256;
 use hashbrown::{HashMap, hash_map::Entry};
 
-use super::window::SyncBudget;
+use bitcoin_rs_p2p::SyncBudget;
 
 #[derive(Debug)]
 pub(super) struct BlockStager {

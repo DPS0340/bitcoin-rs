@@ -15,7 +15,6 @@ use bitcoin_rs_rpc::context::{
 };
 use core::fmt;
 use core::mem::size_of;
-use crossbeam_channel::{Receiver, Sender};
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,10 +31,6 @@ use bitcoin_rs_utxo::UtxoSet;
 use parking_lot::{Mutex, RwLock};
 
 use crate::Config;
-
-// One active generation of outbound requests is enough to keep the drain fed;
-// extra backlog is overload and must fail fast at producers.
-pub(crate) const P2P_OUTBOUND_QUEUE_LIMIT: usize = 8;
 
 // Bounds transient inbound-block buffering between the per-peer listener
 // threads and the single-threaded `BlockSync::tick` drain. Decoded inbound
@@ -835,17 +830,8 @@ pub struct NodeState {
     blocks: Arc<RwLock<BlockLog>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     network: Arc<RwLock<NetworkState>>,
-    /// Shared P2P admission switch controlled by `setnetworkactive`.
-    network_active: Arc<AtomicBool>,
-    /// Single lifecycle authority shared by sync, RPC, and P2P connections.
-    peer_lifecycle: Arc<bitcoin_rs_p2p::PeerLifecycle>,
-    banned: Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
-    p2p_outbound_tx: crossbeam_channel::Sender<std::net::SocketAddr>,
-    p2p_outbound_rx: Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>>,
-    inbound_headers_tx: Sender<bitcoin_rs_p2p::InboundHeaders>,
-    inbound_headers_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>>,
-    inbound_blocks_tx: Sender<bitcoin_rs_p2p::InboundBlock>,
-    inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
+    /// P2P-owned lifecycle, control state, and worker runtime.
+    p2p: Arc<bitcoin_rs_p2p::P2pService>,
     apply_handles: crate::apply::ApplyHandles,
     sync: Arc<crate::BlockSync>,
     replayed: Mutex<Vec<u32>>,
@@ -1012,24 +998,28 @@ impl NodeState {
             None => (None, None, None),
         };
         let network = Arc::new(RwLock::new(NetworkState::default()));
-        let network_active = Arc::new(AtomicBool::new(true));
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let banned = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let peer_lifecycle = Arc::new(bitcoin_rs_p2p::PeerLifecycle::new(
-            Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
-        ));
-        let (p2p_outbound_tx, p2p_outbound_rx_raw) =
-            crossbeam_channel::bounded(P2P_OUTBOUND_QUEUE_LIMIT);
-        let p2p_outbound_rx = Arc::new(Mutex::new(p2p_outbound_rx_raw));
-        let (inbound_headers_tx, inbound_headers_rx_raw) =
-            crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundHeaders>();
-        let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-        let (inbound_blocks_tx, inbound_blocks_rx_raw) =
-            crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
-        let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
+            bitcoin_rs_p2p::P2pServiceConfig {
+                listen_addrs: config.p2p_listen.clone(),
+                magic: bitcoin::p2p::Magic::from_bytes(config.p2p_magic()),
+                dns_seeds_enabled: config.dns_seeds_enabled,
+                dns_seeds: config
+                    .network
+                    .dns_seeds()
+                    .iter()
+                    .map(|seed| (*seed).to_owned())
+                    .collect(),
+                dns_port: config.network.default_p2p_port(),
+                fixed_peers: config.connect.clone(),
+                outbound_active_limit: 8,
+                outbound_peer_target: 8,
+                outbound_queue_limit: 8,
+                inbound_block_queue_limit: INBOUND_BLOCK_CHANNEL_LIMIT,
+                download_budget: crate::sync::default_sync_budget(),
+            },
+            Arc::clone(&shutdown),
+        ));
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
@@ -1055,11 +1045,11 @@ impl NodeState {
             )),
         };
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
-        let sync = Arc::new(crate::BlockSync::new_with_lifecycle(
+        let sync = Arc::new(crate::BlockSync::new_with_p2p(
             apply_handles.clone(),
-            Arc::clone(&peer_lifecycle),
-            Arc::clone(&inbound_headers_rx),
-            Arc::clone(&inbound_blocks_rx),
+            Arc::clone(&p2p),
+            p2p.inbound_headers_receiver(),
+            p2p.inbound_blocks_receiver(),
         ));
         // A restored checkpoint is durable at its own height by definition, so
         // start there rather than at zero, which would refuse all undo pruning.
@@ -1108,15 +1098,7 @@ impl NodeState {
             blocks,
             transactions,
             network,
-            network_active,
-            peer_lifecycle,
-            banned,
-            p2p_outbound_tx,
-            p2p_outbound_rx,
-            inbound_headers_tx,
-            inbound_headers_rx,
-            inbound_blocks_tx,
-            inbound_blocks_rx,
+            p2p,
             apply_handles,
             sync,
             replayed: Mutex::new(Vec::new()),
@@ -1332,72 +1314,10 @@ impl NodeState {
         Arc::clone(&self.network)
     }
 
-    /// Returns the shared P2P admission switch exposed to RPC and P2P workers.
+    /// Returns the P2P subsystem owner.
     #[must_use]
-    pub fn network_active(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.network_active)
-    }
-
-    /// Returns the shared identity-aware P2P lifecycle authority.
-    #[must_use]
-    pub fn peer_lifecycle(&self) -> Arc<bitcoin_rs_p2p::PeerLifecycle> {
-        Arc::clone(&self.peer_lifecycle)
-    }
-
-    /// Returns the shared manual IP/subnet ban list exposed to RPC and P2P.
-    #[must_use]
-    pub fn banned_subnets(&self) -> Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>> {
-        Arc::clone(&self.banned)
-    }
-
-    /// Returns a cloned sender that RPC `addnode` uses to request outbound P2P connections.
-    #[must_use]
-    pub fn p2p_outbound_sender(&self) -> crossbeam_channel::Sender<std::net::SocketAddr> {
-        self.p2p_outbound_tx.clone()
-    }
-
-    /// Returns the shared receiver consumed by the outbound P2P drain worker.
-    #[must_use]
-    pub fn p2p_outbound_receiver(
-        &self,
-    ) -> Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>> {
-        Arc::clone(&self.p2p_outbound_rx)
-    }
-
-    /// Returns a cloned `Sender` that the P2P listener pushes inbound
-    /// `Headers` batches into. The matching `Receiver` is consumed by
-    /// `BlockSync::tick` to extend the `BlockTree`.
-    #[must_use]
-    pub fn inbound_headers_sender(&self) -> Sender<bitcoin_rs_p2p::InboundHeaders> {
-        self.inbound_headers_tx.clone()
-    }
-
-    /// Returns the shared receiver handle consumed by `BlockSync::tick`.
-    ///
-    /// Exposed so tests and `BlockSync::new` can wire the channel; production
-    /// code calls `state.sync()` and lets the orchestrator own the drain.
-    #[must_use]
-    pub fn inbound_headers_rx_handle(
-        &self,
-    ) -> Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>> {
-        Arc::clone(&self.inbound_headers_rx)
-    }
-
-    /// Returns a cloned `Sender` that the P2P listener pushes inbound
-    /// `Block` messages into. The matching `Receiver` is consumed by
-    /// `BlockSync::tick` to apply downloaded blocks.
-    #[must_use]
-    pub fn inbound_blocks_sender(&self) -> Sender<bitcoin_rs_p2p::InboundBlock> {
-        self.inbound_blocks_tx.clone()
-    }
-
-    /// Returns the shared receiver handle consumed by `BlockSync::tick`.
-    ///
-    /// Exposed so tests and `BlockSync::new` can wire the channel; production
-    /// code calls `state.sync()` and lets the orchestrator own the drain.
-    #[must_use]
-    pub fn inbound_blocks_rx_handle(&self) -> Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>> {
-        Arc::clone(&self.inbound_blocks_rx)
+    pub fn p2p(&self) -> Arc<bitcoin_rs_p2p::P2pService> {
+        Arc::clone(&self.p2p)
     }
 
     /// Returns the shared block-download orchestrator.
@@ -1697,14 +1617,14 @@ mod tests {
         let state = NodeState::open(config)?;
 
         assert!(
-            state.peer_lifecycle.ready_peers().is_empty(),
+            state.p2p().lifecycle().ready_peers().is_empty(),
             "freshly opened registry is empty"
         );
         Ok(())
     }
 
     #[test]
-    fn open_constructs_empty_peer_outbound_map() -> anyhow::Result<()> {
+    fn open_constructs_empty_p2p_connections() -> anyhow::Result<()> {
         use tempfile::tempdir;
 
         let dir = tempdir()?;
@@ -1713,7 +1633,7 @@ mod tests {
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
 
-        assert!(state.peer_lifecycle.live_addresses().is_empty());
+        assert!(state.p2p().lifecycle().live_addresses().is_empty());
         Ok(())
     }
 
@@ -1770,8 +1690,8 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
-        let tx1 = state.inbound_headers_sender();
-        let tx2 = state.inbound_headers_sender();
+        let tx1 = state.p2p().inbound_headers_sender();
+        let tx2 = state.p2p().inbound_headers_sender();
         tx1.send(bitcoin_rs_p2p::InboundHeaders {
             headers: Vec::new(),
             source: None,
@@ -1792,8 +1712,8 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
-        let _tx1 = state.inbound_blocks_sender();
-        let _tx2 = state.inbound_blocks_sender();
+        let _tx1 = state.p2p().inbound_blocks_sender();
+        let _tx2 = state.p2p().inbound_blocks_sender();
         Ok(())
     }
 
@@ -1804,7 +1724,7 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
-        let tx = state.inbound_blocks_sender();
+        let tx = state.p2p().inbound_blocks_sender();
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         // No `tick` drains the channel in this unit test, so it fills to the
         // bound; the block past the limit must be rejected rather than queued

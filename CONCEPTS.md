@@ -48,7 +48,7 @@ A peer that holds up the apply frontier by having been assigned a frontier block
 Stalling detection is the mechanism that identifies the staller and, in the reference (Bitcoin Core) design, disconnects it so another peer can supply the blocking block. Without stalling detection, a staller freezes apply progress until a long fixed timeout elapses.
 
 ### Peer lifecycle ownership
-Only the shared `PeerLifecycle` mutates live `PeerLease` and ready-peer state. The node, RPC, sync, and listener share one lifecycle authority; ready snapshots and callbacks carry `PeerSource`, and sends or disconnects remain identity-checked. Address equality alone never authorizes a lifecycle mutation. See `docs/solutions/architecture-patterns/p2p-owns-peer-lifecycle.md`.
+`P2pService` owns P2P control state, workers, and download policy; its shared `PeerLifecycle` is the only live-lease and ready-peer mutation boundary. Ready snapshots and callbacks carry `PeerSource`, and sends or disconnects remain identity-checked. Address equality alone never authorizes a lifecycle mutation. See `docs/solutions/architecture-patterns/p2p-owns-peer-lifecycle.md`.
 
 ### assumevalid
 A validation mode that skips script-signature verification for blocks at or below a configured trusted height while still performing every other consensus check, used to accelerate IBD without abandoning validation; blocks above the height are fully verified. Mainnet nodes in `bitcoin-rs` default to assume-valid enabled at anchor height 938343.
