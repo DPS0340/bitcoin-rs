@@ -811,6 +811,17 @@ impl BlockSync {
                     "block sync: connect failed"
                 );
             }
+            Err(crate::reorg::ReorgError::DisconnectBodyLost {
+                disconnected,
+                stopped_at,
+                ..
+            }) => {
+                tracing::debug!(
+                    disconnected,
+                    stopped_at,
+                    "block sync: disconnect body unreadable mid-rollback, coherent at reached tip"
+                );
+            }
             Err(error) => {
                 tracing::warn!(%error, "block sync: branch switch failed");
             }

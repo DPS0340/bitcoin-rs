@@ -8355,6 +8355,12 @@ mod consensus_rule_tests {
             parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
         pub(super) failed_reads:
             parking_lot::RwLock<HashSet<(u32, bitcoin_rs_primitives::Hash256)>>,
+        /// Bodies that succeed on the first read but fail on every subsequent
+        /// read, simulating a storage failure between the preflight and
+        /// execution passes of a streamed reorg.
+        pub(super) fail_on_second_read:
+            parking_lot::RwLock<HashSet<(u32, bitcoin_rs_primitives::Hash256)>>,
+        read_counts: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), u32>>,
     }
 
     struct ReorgBodyLoadingFixture {
@@ -8376,6 +8382,16 @@ mod consensus_rule_tests {
                 return Err(StorageError::Backend(
                     "injected block-body read failure".to_owned(),
                 ));
+            }
+            if self.fail_on_second_read.read().contains(&(height, hash)) {
+                let mut counts = self.read_counts.write();
+                let count = counts.entry((height, hash)).or_insert(0);
+                *count += 1;
+                if *count >= 2 {
+                    return Err(StorageError::Backend(
+                        "injected second-read failure".to_owned(),
+                    ));
+                }
             }
             Ok(self.bodies.read().get(&(height, hash)).cloned())
         }
@@ -9082,6 +9098,168 @@ mod consensus_rule_tests {
             handles.undo_store.load_disconnect_marker()?,
             marker_before,
             "body decode failure must not arm the disconnect marker"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deep_reorg_deeper_than_the_stream_window_lands_on_the_fork_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = bodies.clone();
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = Hash256::from(genesis.block_hash());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        // Build a 20-block old chain — deeper than DISCONNECT_STREAM_WINDOW (8).
+        let mut prev = genesis.block_hash();
+        for seed in 1_u8..=20 {
+            let block = mined_block_with_prev_hash_and_transactions(
+                prev,
+                vec![coinbase_transaction(seed)],
+            )?;
+            let raw = bytes::Bytes::from(consensus_bytes(&block));
+            let tip = apply_block_with_serialized(&handles, &block, raw.clone())?;
+            bodies
+                .bodies
+                .write()
+                .insert((tip.height, tip.hash), raw.to_vec());
+            prev = block.block_hash();
+        }
+
+        // Build a 21-block fork from genesis (heavier by one block).
+        let mut fork_prev = genesis.block_hash();
+        let mut fork_target = None;
+        for (height, seed) in (1_u32..=21).zip(101_u8..=121) {
+            let block = mined_block_with_prev_hash_and_transactions(
+                fork_prev,
+                vec![coinbase_transaction(seed)],
+            )?;
+            let hash = Hash256::from(block.block_hash());
+            bodies
+                .bodies
+                .write()
+                .insert((height, hash), consensus_bytes(&block));
+            let mut tree = handles.block_tree.write();
+            fork_target = Some(tree.insert_header(block.header, NodeStatus::HeaderValid)?);
+            fork_prev = block.block_hash();
+        }
+        let fork_target = fork_target.ok_or_else(|| anyhow::anyhow!("fork has no target"))?;
+        let fork_tip_hash = Hash256::from(fork_prev);
+
+        crate::reorg::switch_to_branch(&handles, fork_target, |_| None, |_| {})?;
+
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(fork_tip_hash),
+            "deep reorg must land on the fork tip"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.height),
+            Some(21),
+            "deep reorg must reach fork height"
+        );
+        // 21 fork coinbase outputs (genesis coinbase was never applied to the
+        // UTXO set — only the 20 old blocks were, and they were disconnected).
+        assert_eq!(
+            utxo.len(),
+            21,
+            "UTXO set must contain exactly the fork coinbase outputs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_body_read_failure_mid_rollback_reports_disconnect_body_lost_not_panic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = bodies.clone();
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = Hash256::from(genesis.block_hash());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        // Build a 20-block old chain.
+        let mut prev = genesis.block_hash();
+        let mut old_tips = Vec::new();
+        for seed in 1_u8..=20 {
+            let block = mined_block_with_prev_hash_and_transactions(
+                prev,
+                vec![coinbase_transaction(seed)],
+            )?;
+            let raw = bytes::Bytes::from(consensus_bytes(&block));
+            let tip = apply_block_with_serialized(&handles, &block, raw.clone())?;
+            bodies
+                .bodies
+                .write()
+                .insert((tip.height, tip.hash), raw.to_vec());
+            old_tips.push(tip);
+            prev = block.block_hash();
+        }
+
+        // Build a 21-block fork from genesis.
+        let mut fork_prev = genesis.block_hash();
+        let mut fork_target = None;
+        for (height, seed) in (1_u32..=21).zip(101_u8..=121) {
+            let block = mined_block_with_prev_hash_and_transactions(
+                fork_prev,
+                vec![coinbase_transaction(seed)],
+            )?;
+            let hash = Hash256::from(block.block_hash());
+            bodies
+                .bodies
+                .write()
+                .insert((height, hash), consensus_bytes(&block));
+            let mut tree = handles.block_tree.write();
+            fork_target = Some(tree.insert_header(block.header, NodeStatus::HeaderValid)?);
+            fork_prev = block.block_hash();
+        }
+        let fork_target = fork_target.ok_or_else(|| anyhow::anyhow!("fork has no target"))?;
+
+        // Mark the body at height 5 (16th in the tip-down disconnect list,
+        // inside the second window of 8) to fail on its second read. The
+        // preflight pass reads it once (succeeds); the execution pass reads
+        // it again (fails), proving the mid-rollback recovery path.
+        let target_tip = &old_tips[4]; // height 5
+        bodies
+            .fail_on_second_read
+            .write()
+            .insert((target_tip.height, target_tip.hash));
+
+        let outcome = crate::reorg::switch_to_branch(&handles, fork_target, |_| None, |_| {});
+
+        // With DISCONNECT_STREAM_WINDOW = 8, the first window (heights 20..13)
+        // disconnects fully (8 blocks), then the second window's load fails at
+        // height 5. The chain is coherent at height 12.
+        let Err(crate::reorg::ReorgError::DisconnectBodyLost {
+            disconnected,
+            stopped_at,
+            ..
+        }) = outcome
+        else {
+            panic!("expected DisconnectBodyLost, got {outcome:?}");
+        };
+        assert_eq!(
+            disconnected, 8,
+            "first window of 8 must disconnect before the second window's load fails"
+        );
+        assert_eq!(
+            stopped_at, 12,
+            "tip must be at height 12 after 8 disconnects from height 20"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.height),
+            Some(12),
+            "applied tip must be at the height reached by the completed window"
         );
         Ok(())
     }

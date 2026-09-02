@@ -19,6 +19,17 @@ use hashbrown::{HashMap, HashSet};
 use crate::apply::ApplyHandles;
 use crate::{ApplyError, DisconnectError};
 
+/// Maximum number of disconnect-side block bodies held in memory at once
+/// during the streaming execution pass.
+///
+/// The disconnect walk is strictly serial — each disconnect produces the
+/// applied tip the next consumes — so this window is a memory ceiling, not a
+/// throughput buffer. At the consensus-maximum block size of 4 MiB, 8 bodies
+/// cap peak serialized payload at 32 MiB, negligible next to the UTXO working
+/// set of a full node. 4 would underutilize sequential storage read locality;
+/// 16 would double the ceiling for no throughput gain in a serial walk.
+pub(crate) const DISCONNECT_STREAM_WINDOW: usize = 8;
+
 /// Invalidates `hash` and its descendants, then moves applied chainstate to the
 /// best remaining valid tip.
 pub fn invalidate_block(
@@ -58,15 +69,18 @@ pub fn invalidate_block(
         };
 
         let plan = current_reorg_plan(handles, target)?;
-        let (disconnect, connect) = if let Some(plan) = plan.as_ref() {
-            let mut no_staged_body = |_| None;
-            (
-                load_branch_bodies(handles, &plan.disconnect, &mut no_staged_body)?,
-                load_branch_bodies(handles, &plan.connect, &mut no_staged_body)?,
-            )
-        } else {
-            (Vec::new(), Vec::new())
+        let mut no_staged_body = |_| None;
+        let (disconnect_nodes, connect) = match plan.as_ref() {
+            Some(plan) => {
+                let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
+                let connect = load_branch_bodies(handles, &plan.connect, &mut no_staged_body)?;
+                (disconnect_nodes, connect)
+            }
+            None => (Vec::new(), Vec::new()),
         };
+        if !disconnect_nodes.is_empty() {
+            preflight_disconnect_bodies(handles, &disconnect_nodes, &mut no_staged_body)?;
+        }
 
         let published_target = {
             let mut tree = handles.block_tree.write();
@@ -86,7 +100,13 @@ pub fn invalidate_block(
         };
         debug_assert_eq!(published_target, target);
 
-        let (progress, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
+        let (progress, outcome) = execute_streamed_plan(
+            handles,
+            &disconnect_nodes,
+            &connect,
+            &proof,
+            &mut no_staged_body,
+        );
         match &outcome {
             // A fatal disconnect marker left the chainstate torn: abort
             // without reconsidering anything.
@@ -97,15 +117,19 @@ pub fn invalidate_block(
             Ok(()) => {
                 reconsider_disconnected_transactions(
                     handles,
-                    &disconnect[..progress.disconnected],
+                    &disconnect_nodes,
+                    progress.disconnected,
                     &connect[..progress.connected],
+                    &mut no_staged_body,
                 );
                 let _ = proof.finish();
             }
             Err(_) => reconsider_disconnected_transactions(
                 handles,
-                &disconnect[..progress.disconnected],
+                &disconnect_nodes,
+                progress.disconnected,
                 &connect[..progress.connected],
+                &mut no_staged_body,
             ),
         }
         return outcome;
@@ -213,6 +237,29 @@ pub enum ReorgError {
         #[source]
         source: Box<DisconnectError>,
     },
+    /// A disconnect-side body that the preflight pass proved readable could
+    /// not be loaded when the streaming execution pass reached it. Storage
+    /// can fail between the two passes — a body present and valid in
+    /// preflight may be gone or unreadable by the time the walk arrives.
+    ///
+    /// Earlier disconnects in this switch stand: each committed fully, so the
+    /// chain is coherent at whatever tip the walk reached. No rollback is
+    /// attempted, because rolling back means disconnecting, and the body
+    /// needed for the next disconnect is the one that just became
+    /// unreadable. A later switch can move the chain from here once the body
+    /// is available again.
+    #[error(
+        "reorg stopped at height {stopped_at} after {disconnected} disconnects: body lost mid-rollback: {source}"
+    )]
+    DisconnectBodyLost {
+        /// Fully disconnected blocks before the loss, in plan order.
+        disconnected: usize,
+        /// Height the applied tip reached before stopping.
+        stopped_at: u32,
+        /// Why the body could not be loaded.
+        #[source]
+        source: Box<Self>,
+    },
     /// A connect failed after some of the new branch was applied.
     ///
     /// The chain is consistent at a prefix of the target branch: every block
@@ -290,7 +337,8 @@ where
         {
             return Err(ReorgError::MissingBody { hash, height });
         }
-        let disconnect = load_branch_bodies(handles, &plan.disconnect, &mut staged_body)?;
+        let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
+        preflight_disconnect_bodies(handles, &disconnect_nodes, &mut staged_body)?;
 
         let transition = handles
             .begin_chain_transition()
@@ -316,8 +364,13 @@ where
             .begin_chain_change()
             .map_err(|_| ReorgError::Unavailable(Box::new(ApplyError::Shutdown)))?;
         let proof = crate::apply::ChainChangeProof::new(transition, guard);
-
-        let (progress, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
+        let (progress, outcome) = execute_streamed_plan(
+            handles,
+            &disconnect_nodes,
+            &connect,
+            &proof,
+            &mut staged_body,
+        );
         match &outcome {
             // A fatal disconnect marker left the chainstate torn: abort
             // without reconsidering anything.
@@ -328,8 +381,10 @@ where
             // while the chain transition is still held.
             _ => reconsider_disconnected_transactions(
                 handles,
-                &disconnect[..progress.disconnected],
+                &disconnect_nodes,
+                progress.disconnected,
                 &connect[..progress.connected],
+                &mut staged_body,
             ),
         }
         for body in &connect[..progress.connected] {
@@ -356,36 +411,94 @@ struct LoadedPlanProgress {
     connected: usize,
 }
 
-fn execute_loaded_plan(
+/// Validates that every disconnect-side body is present, decodable, and
+/// hash-correct without retaining any of them.
+///
+/// This is the first of two passes: it discovers a missing or corrupt
+/// old-branch body before the rollback starts, preserving the "nothing was
+/// touched" failure model for body-load errors. The execution pass
+/// ([`execute_streamed_plan`]) re-reads each body in a bounded window;
+/// storage can fail between the two passes, and that mid-rollback failure is
+/// reported as [`ReorgError::DisconnectBodyLost`].
+fn preflight_disconnect_bodies<F>(
     handles: &ApplyHandles,
-    disconnect: &[LoadedBranchBody],
+    nodes: &[(Hash256, u32)],
+    staged_body: &mut F,
+) -> core::result::Result<(), ReorgError>
+where
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+{
+    for (hash, height) in nodes {
+        load_branch_body(handles, *hash, *height, staged_body)?;
+    }
+    Ok(())
+}
+
+/// Returns the current applied-tip height, or 0 when no tip is set.
+fn applied_tip_height(handles: &ApplyHandles) -> u32 {
+    handles.applied_tip.load_full().map_or(0, |tip| tip.height)
+}
+
+fn execute_streamed_plan<F>(
+    handles: &ApplyHandles,
+    disconnect_nodes: &[(Hash256, u32)],
     connect: &[LoadedBranchBody],
     proof: &crate::apply::ChainChangeProof<'_>,
-) -> (LoadedPlanProgress, core::result::Result<(), ReorgError>) {
+    staged_body: &mut F,
+) -> (LoadedPlanProgress, core::result::Result<(), ReorgError>)
+where
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+{
     let mut progress = LoadedPlanProgress {
         disconnected: 0,
         connected: 0,
     };
-    for body in disconnect {
-        match crate::apply::disconnect_block_admitted(handles, &body.block, proof) {
-            Ok(_) => progress.disconnected += 1,
-            Err(error @ (DisconnectError::Fatal { .. } | DisconnectError::MarkerStuck { .. })) => {
-                handles.admission.close_permanently();
-                return (progress, Err(ReorgError::Fatal(Box::new(error))));
+
+    // Disconnect: stream bodies in bounded windows. Each window is fully
+    // loaded before any of its blocks are disconnected, so a load failure
+    // within a window leaves the chain at the tip the previous window
+    // reached — no partial disconnect within the window.
+    for window in disconnect_nodes.chunks(DISCONNECT_STREAM_WINDOW) {
+        let mut bodies = Vec::with_capacity(window.len());
+        for (hash, height) in window {
+            match load_branch_body(handles, *hash, *height, staged_body) {
+                Ok(body) => bodies.push(body),
+                Err(source) => {
+                    return (
+                        progress,
+                        Err(ReorgError::DisconnectBodyLost {
+                            disconnected: progress.disconnected,
+                            stopped_at: applied_tip_height(handles),
+                            source: Box::new(source),
+                        }),
+                    );
+                }
             }
-            Err(error) => {
-                return (
-                    progress,
-                    Err(ReorgError::Refused {
-                        disconnected: progress.disconnected,
-                        stopped_at: body.height,
-                        source: Box::new(error),
-                    }),
-                );
+        }
+        for body in bodies {
+            match crate::apply::disconnect_block_admitted(handles, &body.block, proof) {
+                Ok(_) => progress.disconnected += 1,
+                Err(
+                    error @ (DisconnectError::Fatal { .. } | DisconnectError::MarkerStuck { .. }),
+                ) => {
+                    handles.admission.close_permanently();
+                    return (progress, Err(ReorgError::Fatal(Box::new(error))));
+                }
+                Err(error) => {
+                    return (
+                        progress,
+                        Err(ReorgError::Refused {
+                            disconnected: progress.disconnected,
+                            stopped_at: body.height,
+                            source: Box::new(error),
+                        }),
+                    );
+                }
             }
         }
     }
 
+    // Connect: from the loaded prefix (bounded by staging).
     for body in connect {
         match crate::apply::apply_block_with_serialized_admitted(
             handles,
@@ -444,11 +557,20 @@ fn execute_loaded_plan(
 /// connected prefix put back on-chain are excluded by txid, matching Core's
 /// `ReconsiderDisconnectedTransactions`: they are confirmed again, not
 /// disconnected. An empty disconnect set flows through as the no-op it is.
-fn reconsider_disconnected_transactions(
+///
+/// Disconnect bodies are re-read from storage one at a time rather than
+/// retained from the execution pass, keeping memory bounded by
+/// [`DISCONNECT_STREAM_WINDOW`] across the entire reorg. A body that cannot
+/// be re-read is skipped, matching Core's best-effort re-add contract.
+fn reconsider_disconnected_transactions<F>(
     handles: &ApplyHandles,
-    disconnect: &[LoadedBranchBody],
+    disconnect_nodes: &[(Hash256, u32)],
+    disconnected_count: usize,
     reconnected: &[LoadedBranchBody],
-) {
+    staged_body: &mut F,
+) where
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+{
     let height = handles.applied_tip.load_full().map_or(0, |tip| tip.height);
     let time = u64::from(current_unix_seconds());
     let still_on_chain: HashSet<Txid> = reconnected
@@ -457,7 +579,10 @@ fn reconsider_disconnected_transactions(
         .collect();
     let mut offered: HashMap<Txid, Vec<u64>> = HashMap::new();
     let mut entries = Vec::new();
-    for body in disconnect.iter().rev() {
+    for (hash, block_height) in disconnect_nodes[..disconnected_count].iter().rev() {
+        let Ok(body) = load_branch_body(handles, *hash, *block_height, staged_body) else {
+            continue;
+        };
         for tx in &body.block.txs {
             if is_coinbase(tx) || still_on_chain.contains(&tx.txid()) {
                 continue;
