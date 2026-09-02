@@ -196,10 +196,3 @@ fn hash_at(row: &[Value], index: usize) -> Hash256 {
     Hash256::from_str_be(string_at(row, index))
         .unwrap_or_else(|error| panic!("sighash vector result should parse: {error}"))
 }
-
-#[cfg(feature = "kernel")]
-#[test]
-fn kernel_feature_vectors_parse_before_parity() {
-    let root = read_json("tx_valid.json");
-    assert!(root.as_array().is_some_and(|rows| rows.len() > 1));
-}

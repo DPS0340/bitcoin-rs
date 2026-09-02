@@ -25,6 +25,8 @@ parking_lot.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile = "3"
+bitcoin-rs-consensus.workspace = true
+bitcoin-rs-primitives.workspace = true
 
 [features]
 default = ["fjall", "redb", "zmq"]
