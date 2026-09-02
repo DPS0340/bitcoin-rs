@@ -38,8 +38,15 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
   to the caller.
 - Observers are best-effort mirrors. Observer errors and panics never affect
   the committed mutation. An observer must never route mutations back
-  through the gateway or otherwise take the mempool write lock: re-entrancy
-  deadlocks.
+  through the gateway or otherwise take the mempool lock — read or write:
+  the callback runs under the gateway's publish mutex (step 5), so any pool
+  acquisition from the observer path can deadlock against a concurrent
+  writer or re-enter the gateway. The accepted-mutation mining wake threads
+  the last change's sequence into `MempoolSequenceWake::publish_generation_from`,
+  which builds the generation key from `applied_tip` plus that sequence and
+  never touches the mempool read lock (`crates/node/src/mining.rs`); the
+  node observer routes every mutation through it
+  (`crates/node/src/mempool_observer.rs`, `NodeMutationObserver::on_mutation`).
 
 ### `MPL-02`: Atomic mutation records and sequence assignment
 
@@ -118,3 +125,15 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
 - `crates/node/src/zmq_publisher.rs`:
   `mempool_event_payloads_carry_reversed_txid_label_and_le_sequence`,
   `sequence_event_payload_uses_core_hash_orientation_and_label`.
+- `crates/node/src/mining.rs`:
+  `attached_signal_forwards_sequence_wake_without_mempool_lock`,
+  `sequence_wake_falls_back_when_not_attached`.
+- `crates/node/tests/mining.rs`:
+  `publish_generation_from_does_not_take_mempool_lock`,
+  `concurrent_publish_generation_paths_do_not_deadlock`,
+  `long_poll_returns_quickly_on_mempool_sequence_wake`.
+- `crates/node/tests/tx_ingress_e2e.rs`:
+  `accepted_peer_tx_is_admitted_and_relayed_excluding_the_source`,
+  `below_min_relay_tx_is_rejected_recorded_and_never_relayed`
+  (peer tx over a real socket: dispatch filter, admission through the
+  observer-installed gateway, source-excluding relay).
