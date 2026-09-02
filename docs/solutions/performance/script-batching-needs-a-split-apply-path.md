@@ -68,7 +68,7 @@ Core `CPubKey::Verify` over the same captured input corpus.
 
 ## The measured floor and residual
 
-The CHECKSIG census ([checksig-census-and-the-script-check-floor.md](checksig-census-and-the-script-check-floor.md)) counted all 2,868,199 input checks across mainnet 0..150,000. Every check executes exactly one `OP_CHECKSIG` and one successful ECDSA verification ($a = 1.0$).
+The CHECKSIG census counted all 2,868,199 input checks across mainnet 0..150,000. Every check executes exactly one `OP_CHECKSIG` and one successful ECDSA verification ($a = 1.0$).
 
 Native Core `CPubKey::Verify` takes **39.32 µs** per attempt ($Y$), while
 width-1 kernel verification takes **73.62 µs** per check ($X$). The residual
@@ -355,7 +355,7 @@ fjall, RocksDB, and redb. The full panel, external wall values, artifact
 digests, and backend proofs are in the `checkpoint-write-buffer-custody-v1`
 custody packet (commit `3092eabf`).
 
-## Enlarge exact checkpoint MuHash batches
+## Enlarge exact CoinStats MuHash batches
 
 The buffered writer left 2.660571s in the checkpoint tail. An attribution-only
 probe kept the CoinStats traversal but disabled its independent MuHash

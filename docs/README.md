@@ -19,11 +19,13 @@ This page maps it to what you might want.
   [source-compatibility.md](policies/source-compatibility.md) covers the
   toolchain and dependency rules;
   [db-migration.md](policies/db-migration.md) covers on-disk schema changes.
-- [benchmarks/](benchmarks/) holds the benchmark methodology in
-  [end-to-end-sync.md](benchmarks/end-to-end-sync.md). Read the methodology
-  before quoting any number: the results depend on CPU pinning and on whether
-  the harness competes with the node. Raw run evidence lives in the
-  corresponding PR discussions, not in the tree.
+- [benchmarks/](benchmarks/) holds the retained benchmark notes:
+  [end-to-end-sync.md](benchmarks/end-to-end-sync.md),
+  [index-read-path.md](benchmarks/index-read-path.md), and
+  [utxo-memory.md](benchmarks/utxo-memory.md). Read the methodology before
+  quoting any number: the results depend on CPU pinning and on whether the
+  harness competes with the node. Raw run evidence lives in the corresponding
+  PR discussions, not in the tree.
 
 ## Explanation
 
