@@ -1122,8 +1122,13 @@ impl<S: KvStore> Indexer<S> {
     ///
     /// Returns every `HashPrefixRow` whose 8-byte prefix matches the scripthash's
     /// scan prefix, decoded from `ColumnFamily::Funding`. Rows are returned in
-    /// the iteration order of the underlying store (typically lexicographic, so
-    /// (prefix, height) ascending).
+    /// the iteration order of the underlying store (lexicographic by key bytes).
+    ///
+    /// **Height ordering caveat:** the 4-byte height suffix is little-endian,
+    /// so lexicographic byte order does **not** match numeric height order
+    /// within one prefix. For example, height 256 (`00 01 00 00`) sorts before
+    /// height 1 (`01 00 00 00`). Callers that need chronological order must
+    /// sort the returned rows by numeric height after exact-resolving them.
     ///
     /// The 8-byte prefix is lossy: callers MUST resolve heights back to full
     /// transactions via block storage to confirm scripthash identity.
@@ -1143,8 +1148,11 @@ impl<S: KvStore> Indexer<S> {
     /// `ScriptHistoryEntry::confirmed` for every transaction in that block that has
     /// at least one output matching `scripthash` exactly.
     ///
-    /// Entries are returned in iteration order (lexicographic by prefix||height).
-    /// Heights not resolvable by `source` are skipped.
+    /// Entries are returned in store iteration order (lexicographic by key
+    /// bytes). Because the height suffix is little-endian, this is **not**
+    /// numeric height order within a prefix; callers needing chronological
+    /// order must sort by numeric height. Heights not resolvable by `source`
+    /// are skipped.
     ///
     /// The lossy 8-byte prefix is exact-resolved here: only transactions whose
     /// output scripthash matches the full 32-byte `scripthash` are emitted.
@@ -3338,6 +3346,53 @@ mod tests {
         assert_eq!(
             indexer.iter_funding_rows(scripthash)?,
             vec![ScriptHashRow::row(scripthash, HEIGHT)]
+        );
+        Ok(())
+    }
+
+    /// Proves that lexicographic key byte order does **not** match numeric
+    /// height order within one prefix, because the height suffix is
+    /// little-endian. Height 256 is `[0x00, 0x01, 0x00, 0x00]`, height 1 is
+    /// `[0x01, 0x00, 0x00, 0x00]`, so byte order puts 256 before 1.
+    ///
+    /// This pins the corrected doc contract on `iter_funding_rows`: callers
+    /// needing chronological order must sort by numeric height after
+    /// exact-resolving rows, never rely on store iteration order.
+    #[test]
+    fn iter_funding_rows_height_order_is_le_byte_order_not_numeric()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let script = vec![0x51, 0x01];
+        let scripthash = ScriptHash::from_script_bytes(&script);
+        let (_dir, mut indexer) = indexer()?;
+
+        let tx_at_1 = tx(spent_outpoint(1, 0), script.clone());
+        let tx_at_256 = tx(spent_outpoint(2, 0), script);
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx_at_1])), 1)?;
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx_at_256])), 256)?;
+        indexer.flush()?;
+
+        let rows = indexer.iter_funding_rows(scripthash)?;
+        assert_eq!(rows.len(), 2, "two heights funded the same script");
+
+        // Store iteration order is LE byte order, so 256 precedes 1.
+        assert_eq!(
+            rows[0].height(),
+            256,
+            "LE byte order puts height 256 before height 1, not numeric order"
+        );
+        assert_eq!(rows[1].height(), 1);
+
+        // The corollary: numeric sort produces the opposite order, so no
+        // caller may treat raw iteration order as chronological.
+        let mut numeric = rows.clone();
+        numeric.sort_by_key(|row| row.height());
+        assert_eq!(
+            numeric.iter().map(|row| row.height()).collect::<Vec<_>>(),
+            vec![1, 256]
+        );
+        assert_ne!(
+            rows, numeric,
+            "store iteration order must differ from numeric height order"
         );
         Ok(())
     }
