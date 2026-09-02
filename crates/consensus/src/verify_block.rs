@@ -764,7 +764,8 @@ mod tests {
                 merkle_root_and_mutation(&mut in_place),
                 "leaf count {leaf_count}"
             );
-            let (_, mutated) = merkle_root_and_mutation_borrowed(&leaves).unwrap();
+            let (_, mutated) = merkle_root_and_mutation_borrowed(&leaves)
+                .expect("borrowed merkle root over a non-empty leaf set");
             assert!(mutated, "leaf count {leaf_count}");
         }
     }
@@ -791,7 +792,8 @@ mod tests {
         for leaf_count in [1usize, 2, 3, 4, 5, 6, 7, 8, 9] {
             let leaves = txids(leaf_count);
             let mut expected = leaves.clone();
-            let (root, mutated) = candidate_merkle(&mut expected).unwrap();
+            let (root, mutated) =
+                candidate_merkle(&mut expected).expect("merkle root over a non-empty leaf set");
             // Matching root: Ok, unless the tree is genuinely mutated.
             let matching = Block {
                 header: header_with(root.into()),
@@ -820,7 +822,8 @@ mod tests {
         // A genuinely mutated tree with a matching root reports MerkleMutation.
         let duplicated = vec![txid(1), txid(1)];
         let mut expected = duplicated.clone();
-        let (root, mutated) = candidate_merkle(&mut expected).unwrap();
+        let (root, mutated) =
+            candidate_merkle(&mut expected).expect("merkle root over duplicated leaves");
         assert!(mutated);
         let mutated_block = Block {
             header: header_with(root.into()),
