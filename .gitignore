@@ -27,3 +27,4 @@ core.*
 
 # lean-ctx local tooling cache
 .lean-ctx/
+.cargo-tmp/

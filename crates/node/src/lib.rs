@@ -20,6 +20,8 @@ pub mod bitcoin_conf_compat;
 pub mod block_source;
 mod checkpoint;
 mod checkpoint_fs;
+/// Periodic chainstate checkpoint publication during sync.
+mod checkpoint_worker;
 /// Layered node configuration.
 pub mod config;
 /// Block corpus manifest for contiguous archive integrity.

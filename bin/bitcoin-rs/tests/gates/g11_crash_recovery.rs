@@ -18,6 +18,10 @@
 //!   the sidecar) is refused on restart — `read_meta` returns `Err`, not
 //!   a silent default.
 //! - Stale `.tmp` tolerance: an orphaned `.tmp` left by a crashed write
+//! - Periodic checkpoint publication: the worker publishes a checkpoint
+//!   during sync without any clean shutdown, and a killed-and-reopened
+//!   node resumes from the periodic checkpoint rather than the older
+//!   clean-shutdown one (issue #219).
 //!   does not interfere with recovery; the valid `.json` is read and the
 //!   next `write_meta` cleans up the stale temp.
 //!
@@ -72,6 +76,8 @@ fn crash_recovery_gate() {
         "recovery_meta_write_leaves_readable_sidecar_without_tmp",
         "torn_meta_after_crash_is_refused",
         "stale_tmp_after_crash_does_not_corrupt_recovery",
+        "periodic_checkpoint_anchors_progress_without_clean_shutdown",
+        "periodic_checkpoint_published_during_sync_without_shutdown",
     ];
 
     let output = output_or_panic(

@@ -423,3 +423,207 @@ fn production_apply_writes_meta_with_tip_hash() -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Periodic checkpoint publication tests (issue #219).
+//
+// These tests prove the periodic checkpoint worker publishes a checkpoint
+// during sync without any clean shutdown, and that a killed-and-reopened
+// node resumes from the periodic checkpoint rather than the older
+// clean-shutdown one.
+// ---------------------------------------------------------------------------
+
+/// Periodic checkpoint: apply genesis (clean checkpoint at height 0), start
+/// the checkpoint worker with a 3-block cadence, apply 4 blocks, wait for
+/// the worker to publish, drop the state without a clean checkpoint, reopen,
+/// and assert the resumed tip is at height 4 (the periodic checkpoint), not
+/// height 0 (the clean-shutdown checkpoint).
+#[test]
+fn periodic_checkpoint_anchors_progress_without_clean_shutdown() -> Result<()> {
+    for backend in available_backends() {
+        let temp = tempfile::tempdir()?;
+        let config = make_config(&temp, backend);
+
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = genesis.block_hash();
+
+        // Phase 1: open, apply genesis, publish a clean checkpoint at height 0.
+        // This is the "old" checkpoint that must be superseded by the periodic one.
+        {
+            let state = NodeState::open(config.clone())?;
+            state.apply_block(&genesis)?;
+            state.publish_checkpoint()?;
+        }
+
+        // Phase 2: reopen, start the periodic checkpoint worker with a 3-block
+        // cadence, apply 4 blocks (past the cadence), and wait for the worker
+        // to publish. Then stop the worker and drop the state WITHOUT a clean
+        // checkpoint — this simulates a crash/kill mid-sync.
+        {
+            let state = NodeState::open(config.clone())?;
+
+            // Start the periodic checkpoint worker with a 3-block cadence
+            // and a 1-hour time fallback (so only the block count fires).
+            let worker = state.start_periodic_checkpoint(3, std::time::Duration::from_hours(1))?;
+
+            let mut prev = genesis_hash;
+            for height in 1..=4_u32 {
+                let block = mine_regtest_block(prev, height, genesis.header.time + height)?;
+                let tip = state.apply_block(&block)?;
+                assert_eq!(
+                    tip.height, height,
+                    "{backend}: block {height} should apply at height {height}"
+                );
+                prev = block.block_hash();
+            }
+
+            // Wait for the worker to publish. The worker polls every 5s, but
+            // the checkpoint write itself is synchronous and quick for a tiny
+            // regtest chainstate. Poll the checkpoint CURRENT file until it
+            // names a generation whose restored height exceeds 0.
+            let checkpoint_root = config.data_dir.join("chainstate-checkpoints");
+            let mut published = false;
+            for _ in 0..60 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if let Ok(current_bytes) = std::fs::read(checkpoint_root.join("CURRENT")) {
+                    if let Ok(current) = serde_json::from_slice::<serde_json::Value>(&current_bytes)
+                    {
+                        if let Some(generation) = current
+                            .get("generation")
+                            .and_then(serde_json::Value::as_u64)
+                        {
+                            // A generation > 1 means a second checkpoint was published
+                            // (generation 1 was the clean-shutdown one at height 0).
+                            if generation > 1 {
+                                published = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(
+                published,
+                "{backend}: periodic checkpoint should have been published after 4 blocks with cadence 3"
+            );
+
+            // Stop the worker before dropping the state so it releases
+            // database locks. Then drop state without a clean checkpoint —
+            // simulates a crash.
+            state
+                .shutdown()
+                .store(true, std::sync::atomic::Ordering::Release);
+            match worker.join() {
+                Ok(()) => {}
+                Err(payload) => panic!("checkpoint worker thread panicked: {payload:?}"),
+            }
+            drop(state);
+        }
+
+        // Phase 3: reopen — the checkpoint should restore to height 4 (the
+        // periodic checkpoint), not height 0 (the clean-shutdown one).
+        let restarted = NodeState::open(config)?;
+        let restored_tip = restarted
+            .applied_tip()
+            .load()
+            .as_ref()
+            .map_or(0, |t| t.height);
+        assert_eq!(
+            restored_tip, 4,
+            "{backend}: periodic checkpoint should restore to height 4, not the clean-shutdown height 0"
+        );
+
+        // The recovery sidecar should also agree: after the periodic checkpoint
+        // rewrote it, the sidecar height should be 4.
+        let meta = crash_recovery::read_meta(&restarted)?.with_context(|| {
+            format!("{backend}: recovery meta should exist after periodic checkpoint")
+        })?;
+        assert_eq!(
+            meta.height, 4,
+            "{backend}: sidecar height should be 4 after periodic checkpoint publication"
+        );
+    }
+    Ok(())
+}
+
+/// Periodic checkpoint exists without shutdown: apply genesis, start the
+/// worker with a 2-block cadence, apply 3 blocks, wait for publication, and
+/// assert a checkpoint generation exists — all without ever calling
+/// `publish_checkpoint` or shutting down cleanly.
+#[test]
+fn periodic_checkpoint_published_during_sync_without_shutdown() -> Result<()> {
+    for backend in available_backends() {
+        let temp = tempfile::tempdir()?;
+        let config = make_config(&temp, backend);
+
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = genesis.block_hash();
+
+        // Open, apply genesis (no clean checkpoint this time — the periodic
+        // worker should be the only publisher).
+        let state = NodeState::open(config.clone())?;
+        state.apply_block(&genesis)?;
+
+        // Start the periodic checkpoint worker with a 2-block cadence.
+        let worker = state.start_periodic_checkpoint(2, std::time::Duration::from_hours(1))?;
+
+        let mut prev = genesis_hash;
+        for height in 1..=3_u32 {
+            let block = mine_regtest_block(prev, height, genesis.header.time + height)?;
+            let tip = state.apply_block(&block)?;
+            assert_eq!(
+                tip.height, height,
+                "{backend}: block {height} should apply at height {height}"
+            );
+            prev = block.block_hash();
+        }
+
+        // Wait for the worker to publish a checkpoint.
+        let checkpoint_root = config.data_dir.join("chainstate-checkpoints");
+        let mut published = false;
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(current_bytes) = std::fs::read(checkpoint_root.join("CURRENT")) {
+                if let Ok(current) = serde_json::from_slice::<serde_json::Value>(&current_bytes) {
+                    if let Some(generation) = current
+                        .get("generation")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        if generation >= 1 {
+                            published = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            published,
+            "{backend}: periodic checkpoint should have been published after 3 blocks with cadence 2"
+        );
+
+        // Shut down the worker by setting the shutdown flag and joining,
+        // then drop the state (no clean checkpoint publication).
+        state
+            .shutdown()
+            .store(true, std::sync::atomic::Ordering::Release);
+        match worker.join() {
+            Ok(()) => {}
+            Err(payload) => panic!("checkpoint worker thread panicked: {payload:?}"),
+        }
+        drop(state);
+
+        // Reopen and verify the checkpoint restored to height 3.
+        let restarted = NodeState::open(config)?;
+        let restored_tip = restarted
+            .applied_tip()
+            .load()
+            .as_ref()
+            .map_or(0, |t| t.height);
+        assert_eq!(
+            restored_tip, 3,
+            "{backend}: periodic checkpoint should restore to height 3 without any clean shutdown"
+        );
+    }
+    Ok(())
+}
