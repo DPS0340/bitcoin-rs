@@ -115,9 +115,9 @@ fn network_name(ip: IpAddr) -> &'static str {
 
 pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    let peers = ctx.peers.read();
+    let peers = ctx.peer_lifecycle.ready_peers();
     let total = peers.len();
-    let inbound = peers.iter().filter(|p| p.inbound).count();
+    let inbound = peers.iter().filter(|peer| peer.info.inbound).count();
     let outbound = total.saturating_sub(inbound);
     let network_active = ctx.network_active.load(Ordering::SeqCst);
     Ok(json!({
@@ -146,9 +146,10 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
 
 pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    let peers = ctx.peers.read();
+    let peers = ctx.peer_lifecycle.ready_peers();
     let mut array = Vec::with_capacity(peers.len());
-    for (id, peer) in peers.iter().enumerate() {
+    for (id, ready_peer) in peers.iter().enumerate() {
+        let peer = &ready_peer.info;
         array.push(json!({
             "id": id,
             "addr": peer.addr.to_string(),
@@ -258,12 +259,9 @@ pub(crate) fn setnetworkactive(ctx: &Arc<Context>, params: &Value) -> Result<Val
     ctx.network_active.store(state, Ordering::SeqCst);
     if !state {
         // Connection owners remove their own lease and peer metadata after
-        // observing cancellation. Clearing this map here would make that
-        // identity check fail and leave stale peers in the registry.
-        let leases = ctx.peer_outbound.read();
-        for lease in leases.values() {
-            lease.cancel();
-        }
+        // observing cancellation. The lifecycle keeps the map intact until
+        // those owners perform their identity-checked teardown.
+        ctx.peer_lifecycle.cancel_all();
     }
     Ok(json!(state))
 }
@@ -339,34 +337,27 @@ pub(crate) fn disconnectnode(ctx: &Arc<Context>, params: &Value) -> Result<Value
         .and_then(JsonValueTrait::as_u64)
         .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
 
-    // Verify the peer is currently connected before mutating anything.
-    let found = {
-        let peers = ctx.peers.read();
+    // Snapshot the selected connection identity before requesting teardown.
+    // `disconnect_source` will preserve a same-address replacement if one
+    // wins the race after this snapshot.
+    let source = {
+        let peers = ctx.peer_lifecycle.ready_peers();
         match nodeid {
-            Some(id) => id < peers.len() && peers[id].addr == addr,
-            None => peers.iter().any(|p| p.addr == addr),
+            Some(id) => peers
+                .get(id)
+                .filter(|peer| peer.info.addr == addr)
+                .map(|peer| peer.source),
+            None => peers
+                .into_iter()
+                .find(|peer| peer.info.addr == addr)
+                .map(|peer| peer.source),
         }
     };
-    if !found {
+    let Some(source) = source else {
         return Err(RpcError::NotFound("Node not found in connected nodes"));
-    }
-
-    // Cancel and drop the outbound lease, if one exists for this address.
-    // Inbound peers have no lease; they are removed from `peers` below and
-    // the connection layer finalises teardown.
-    let lease = ctx.peer_outbound.write().remove(&addr);
-    if let Some(lease) = lease {
-        lease.cancel();
-    }
-
-    // Remove the matching peer from the live registry.
-    let mut peers = ctx.peers.write();
-    if let Some(id) = nodeid {
-        if id < peers.len() && peers[id].addr == addr {
-            peers.remove(id);
-        }
-    } else {
-        peers.retain(|p| p.addr != addr);
+    };
+    if !ctx.peer_lifecycle.disconnect_source(source) {
+        return Err(RpcError::NotFound("Node was replaced before disconnect"));
     }
 
     Ok(Value::new_null())
@@ -374,7 +365,7 @@ pub(crate) fn disconnectnode(ctx: &Arc<Context>, params: &Value) -> Result<Value
 
 pub(crate) fn getconnectioncount(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    let count = ctx.peers.read().len();
+    let count = ctx.peer_lifecycle.ready_peers().len();
     Ok(json!(count))
 }
 
@@ -410,7 +401,8 @@ pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Val
     let mut entries: Vec<sonic_rs::Value> = Vec::new();
 
     // Live peers carry real service flags and handshake times.
-    for peer in ctx.peers.read().iter() {
+    for ready_peer in ctx.peer_lifecycle.ready_peers() {
+        let peer = &ready_peer.info;
         if !seen.insert(peer.addr) {
             continue;
         }
@@ -577,7 +569,19 @@ mod ping_tests {
 mod addnode_validation_tests {
     use super::*;
     use alloc::sync::Arc;
+    use bitcoin_rs_p2p::{PeerInfo, PeerLease};
+    use crossbeam_channel::unbounded;
     use sonic_rs::JsonValueTrait;
+
+    fn register_peer(ctx: &Context, info: PeerInfo, ready: bool) -> PeerLease {
+        let (tx, _rx) = unbounded();
+        let lease = PeerLease::new(tx);
+        assert!(!ctx.peer_lifecycle.register(info.addr, &lease));
+        if ready {
+            assert!(ctx.peer_lifecycle.publish_ready(info.addr, &lease, info));
+        }
+        lease
+    }
 
     #[test]
     fn addnode_rejects_bad_address() {
@@ -715,31 +719,29 @@ mod addnode_validation_tests {
 
     #[test]
     fn disconnectnode_cancels_lease_and_removes_peer() {
-        use bitcoin_rs_p2p::{PeerInfo, PeerLease};
-        use crossbeam_channel::unbounded;
-
         let addr: SocketAddr = "127.0.0.1:8333".parse().unwrap();
         let ctx = Context::new();
-        ctx.peers.write().push(PeerInfo {
-            addr,
-            version: 70_016,
-            services: 9,
-            user_agent: "test".to_owned(),
-            start_height: 0,
-            conn_time: 0,
-            inbound: false,
-        });
-        let (tx, _rx) = unbounded();
-        let lease = PeerLease::new(tx);
-        ctx.peer_outbound.write().insert(addr, lease.clone());
+        let lease = register_peer(
+            &ctx,
+            PeerInfo {
+                addr,
+                version: 70_016,
+                services: 9,
+                user_agent: "test".to_owned(),
+                start_height: 0,
+                conn_time: 0,
+                inbound: false,
+            },
+            true,
+        );
         let ctx = Arc::new(ctx);
 
         let result = disconnectnode(&ctx, &json!([addr.to_string().as_str()]))
             .unwrap_or_else(|err| panic!("disconnectnode failed: {err}"));
         assert!(result.is_null());
         assert!(lease.is_cancelled());
-        assert!(ctx.peer_outbound.read().is_empty());
-        assert!(ctx.peers.read().is_empty());
+        assert!(ctx.peer_lifecycle.live_addresses().is_empty());
+        assert!(ctx.peer_lifecycle.ready_peers().is_empty());
     }
 }
 
@@ -792,15 +794,15 @@ mod admin_rpc_tests {
         let (tx_b, _rx_b) = unbounded();
         let lease_a = PeerLease::new(tx_a);
         let lease_b = PeerLease::new(tx_b);
-        ctx.peer_outbound.write().insert(addr_a, lease_a.clone());
-        ctx.peer_outbound.write().insert(addr_b, lease_b.clone());
+        assert!(!ctx.peer_lifecycle.register(addr_a, &lease_a));
+        assert!(!ctx.peer_lifecycle.register(addr_b, &lease_b));
         let ctx = Arc::new(ctx);
 
         let _ = setnetworkactive(&ctx, &json!([false]))
             .unwrap_or_else(|err| panic!("setnetworkactive failed: {err}"));
         assert!(lease_a.is_cancelled());
         assert!(lease_b.is_cancelled());
-        assert_eq!(ctx.peer_outbound.read().len(), 2);
+        assert_eq!(ctx.peer_lifecycle.live_addresses().len(), 2);
     }
 
     #[test]
@@ -1026,7 +1028,8 @@ mod ban_state_tests {
 mod getnodeaddresses_tests {
     use super::*;
     use alloc::sync::Arc;
-    use bitcoin_rs_p2p::PeerInfo;
+    use bitcoin_rs_p2p::{PeerInfo, PeerLease};
+    use crossbeam_channel::unbounded;
     use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
     fn peer(addr: &str, services: u64) -> PeerInfo {
@@ -1039,6 +1042,13 @@ mod getnodeaddresses_tests {
             conn_time: 100,
             inbound: false,
         }
+    }
+
+    fn register_peer(ctx: &Context, info: PeerInfo) {
+        let (tx, _rx) = unbounded();
+        let lease = PeerLease::new(tx);
+        assert!(!ctx.peer_lifecycle.register(info.addr, &lease));
+        assert!(ctx.peer_lifecycle.publish_ready(info.addr, &lease, info));
     }
 
     #[test]
@@ -1055,7 +1065,7 @@ mod getnodeaddresses_tests {
     #[test]
     fn returns_live_peer_addresses() {
         let ctx = Context::new();
-        ctx.peers.write().push(peer("127.0.0.1:8333", 9));
+        register_peer(&ctx, peer("127.0.0.1:8333", 9));
         let ctx = Arc::new(ctx);
         let result = getnodeaddresses(&ctx, &json!([0]))
             .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
@@ -1085,7 +1095,7 @@ mod getnodeaddresses_tests {
     #[test]
     fn deduplicates_peer_and_added_node() {
         let ctx = Context::new();
-        ctx.peers.write().push(peer("127.0.0.1:8333", 9));
+        register_peer(&ctx, peer("127.0.0.1:8333", 9));
         ctx.added_nodes
             .write()
             .push("127.0.0.1:8333".parse().unwrap());
@@ -1101,9 +1111,9 @@ mod getnodeaddresses_tests {
     #[test]
     fn count_limits_results() {
         let ctx = Context::new();
-        ctx.peers.write().push(peer("127.0.0.1:8333", 9));
-        ctx.peers.write().push(peer("127.0.0.2:8333", 9));
-        ctx.peers.write().push(peer("127.0.0.3:8333", 9));
+        register_peer(&ctx, peer("127.0.0.1:8333", 9));
+        register_peer(&ctx, peer("127.0.0.2:8333", 9));
+        register_peer(&ctx, peer("127.0.0.3:8333", 9));
         let ctx = Arc::new(ctx);
         let result = getnodeaddresses(&ctx, &json!([2]))
             .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
@@ -1116,8 +1126,8 @@ mod getnodeaddresses_tests {
     #[test]
     fn default_count_returns_one() {
         let ctx = Context::new();
-        ctx.peers.write().push(peer("127.0.0.1:8333", 9));
-        ctx.peers.write().push(peer("127.0.0.2:8333", 9));
+        register_peer(&ctx, peer("127.0.0.1:8333", 9));
+        register_peer(&ctx, peer("127.0.0.2:8333", 9));
         let ctx = Arc::new(ctx);
         let result = getnodeaddresses(&ctx, &json!([]))
             .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));

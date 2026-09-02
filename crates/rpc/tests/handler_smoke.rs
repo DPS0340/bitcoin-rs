@@ -10,7 +10,7 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin_rs_chain::{ChainWork, NodeId, NodeStatus, TipSnapshot};
-use bitcoin_rs_p2p::PeerInfo;
+use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerLifecycle};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::context::{
     BlockBodySource, BlockRecord, ChainControl, ChainControlError, Context,
@@ -405,7 +405,7 @@ fn chain_rpcs_report_applied_tip_separately_from_headers() -> Result<(), Box<dyn
 }
 
 #[test]
-fn network_peer_methods_read_shared_peer_registry() -> Result<(), Box<dyn std::error::Error>> {
+fn network_peer_methods_read_shared_peer_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     let peers = Arc::new(RwLock::new(vec![PeerInfo {
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333),
         version: 70_016,
@@ -655,7 +655,18 @@ impl BlockBodySource for SingleBlockSource {
 #[allow(clippy::arc_with_non_send_sync)]
 fn context_with_peers(peers: Arc<RwLock<Vec<PeerInfo>>>) -> Arc<Context> {
     let mut ctx = Context::new();
-    ctx.peers = peers;
+    let infos = peers.read().clone();
+    let lifecycle = Arc::new(PeerLifecycle::new(
+        peers,
+        Arc::new(RwLock::new(HashMap::new())),
+    ));
+    for info in infos {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = PeerLease::new(tx);
+        lifecycle.register(info.addr, &lease);
+        lifecycle.publish_ready(info.addr, &lease, info);
+    }
+    ctx.peer_lifecycle = lifecycle;
     Arc::new(ctx)
 }
 
