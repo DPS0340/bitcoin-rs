@@ -29,8 +29,14 @@
 
 use std::str::FromStr;
 
+use bitcoin::ScriptBuf;
+use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
+use bitcoin::taproot::{LeafVersion, TaprootBuilder};
+use bitcoin_rs_primitives::tapleaf_hash;
 use bitcoin_rs_primitives::{Hash256, OutPoint, SighashCache, Tx, TxIn, TxOut, Txid, deserialize};
-use bitcoin_rs_script::{Interpreter, ScriptError, VerifyFlags, opcode, push_data, push_int};
+use bitcoin_rs_script::{
+    Interpreter, ScriptError, VerifyFlags, opcode, push_data, push_int, taproot,
+};
 
 // ===========================================================================
 // Script error code model — Core's `ScriptErrorString` names
@@ -668,6 +674,102 @@ impl std::fmt::Display for Counts {
 // Corpus 1: script_tests.json
 // ===========================================================================
 
+// Core's `script_json_test` fills three markers the JSON corpus cannot express
+// as hex (`src/test/script_tests.cpp:925-945`, `:968-974`):
+//
+//   `#SCRIPT# <asm>`            - assemble `<asm>` with ParseScript, push the
+//                                 script bytes as the witness element;
+//   `#CONTROLBLOCK#`            - TaprootBuilder::Add(0, <last element>,
+//                                 TAPROOT_LEAF_TAPSCRIPT) then Finalize(key0),
+//                                 push the resulting control block;
+//   `0x51 0x20 #TAPROOTOUTPUT#` - scriptPubKey becomes OP_1 <output key>.
+//
+// `key0` is the fixed secret `vchKey0` at `script_tests.cpp:183`, the 32-byte
+// big-endian scalar 1.
+
+/// Core's `vchKey0`: the secret scalar the placeholder tree commits to.
+const CORE_TAPROOT_INTERNAL_SECRET: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+];
+
+/// Core's `#SCRIPT#` marker: the rest of the element is tapscript in Core's ASM
+/// dialect, not hex (`script_tests.cpp:931-935`).
+const SCRIPT_PLACEHOLDER: &str = "#SCRIPT#";
+
+/// Core's `#CONTROLBLOCK#` marker: the witness element is replaced by the
+/// generated control block committing to the preceding `#SCRIPT#` leaf
+/// (`script_tests.cpp:937-944`).
+const CONTROL_BLOCK_PLACEHOLDER: &str = "#CONTROLBLOCK#";
+
+/// The `scriptPubKey` spelling Core matches before substituting the output key
+/// (`script_tests.cpp:968-974`).
+const TAPROOT_OUTPUT_ASM: &str = "0x51 0x20 #TAPROOTOUTPUT#";
+
+/// The single-leaf tree Core auto-generates for one `#SCRIPT#`/`#CONTROLBLOCK#`
+/// pair: the witness element to append, and the program `#TAPROOTOUTPUT#` pays to.
+struct TaprootPlaceholder {
+    control_block: Vec<u8>,
+    output_key: [u8; 32],
+}
+
+/// Builds the placeholder tree for `leaf_script`, mirroring Core's
+/// `TaprootBuilder::Add(0, script, TAPROOT_LEAF_TAPSCRIPT).Finalize(key0)`.
+///
+/// The tree is assembled with rust-bitcoin's builder - an independent
+/// implementation of BIP341 - and then checked against this crate's own
+/// `taproot::compute_taproot_merkle_root` and `taproot::verify_taproot_commitment`
+/// before it is handed to the interpreter, so a row can never be graded against
+/// a commitment the driver itself would reject.
+fn build_taproot_placeholder(leaf_script: &[u8]) -> Result<TaprootPlaceholder, String> {
+    let secp = Secp256k1::new();
+    let secret = SecretKey::from_slice(&CORE_TAPROOT_INTERNAL_SECRET)
+        .map_err(|e| format!("Core's fixed key0 must be a valid secret: {e}"))?;
+    let keypair = Keypair::from_secret_key(&secp, &secret);
+    let (internal, _) = XOnlyPublicKey::from_keypair(&keypair);
+    let script = ScriptBuf::from_bytes(leaf_script.to_vec());
+
+    let builder = TaprootBuilder::new()
+        .add_leaf_with_ver(0, script.clone(), LeafVersion::TapScript)
+        .map_err(|e| format!("single-leaf taproot tree must build: {e}"))?;
+    let spend_info = builder
+        .finalize(&secp, internal)
+        .map_err(|_| "a one-leaf tree must finalize".to_owned())?;
+    let control_bytes = spend_info
+        .control_block(&(script, LeafVersion::TapScript))
+        .ok_or("the leaf Core adds must have a control block")?
+        .serialize();
+    let output_key = spend_info.output_key().serialize();
+
+    // The tree's own merkle root must be the tapleaf hash this crate computes,
+    // and this crate's commitment check must accept the pair it just generated.
+    let tapleaf = tapleaf_hash(taproot::TAPROOT_LEAF_TAPSCRIPT, leaf_script);
+    let core_root = spend_info
+        .merkle_root()
+        .ok_or("a one-leaf tree has a merkle root")?;
+    let core_root_bytes: &[u8] = core_root.as_ref();
+    if core_root_bytes != tapleaf.as_byte_array() {
+        return Err(format!(
+            "tapleaf hash disagreement: rust-bitcoin {core_root:?}, this crate {tapleaf:?}"
+        ));
+    }
+    let our_root = taproot::compute_taproot_merkle_root(&control_bytes, &tapleaf);
+    if our_root.as_byte_array() != tapleaf.as_byte_array() {
+        return Err(format!(
+            "compute_taproot_merkle_root must return the tapleaf for an empty path, got {our_root:?}"
+        ));
+    }
+    if !taproot::verify_taproot_commitment(&control_bytes, &output_key, &tapleaf) {
+        return Err(
+            "the generated control block failed this crate's own commitment check".to_owned(),
+        );
+    }
+
+    Ok(TaprootPlaceholder {
+        control_block: control_bytes,
+        output_key,
+    })
+}
+
 struct ScriptTestRow {
     script_sig: Vec<u8>,
     script_pubkey: Vec<u8>,
@@ -694,7 +796,7 @@ fn load_script_tests(counts: &mut Counts) -> Result<Vec<ScriptTestRow>, String> 
         .ok_or("script_tests.json root is not an array")?;
 
     let mut rows = Vec::new();
-    for (index, row) in arr.iter().enumerate() {
+    'row: for (index, row) in arr.iter().enumerate() {
         let Some(arr) = row.as_array() else {
             continue;
         };
@@ -705,11 +807,27 @@ fn load_script_tests(counts: &mut Counts) -> Result<Vec<ScriptTestRow>, String> 
                 (Some(&arr[0]), 1, 2, 3, 4, 5)
             } else if arr.len() >= 4 {
                 (None, 0, 1, 2, 3, 4)
+            } else if arr.len() == 1 && arr[0].is_string() {
+                // Core's reader treats a lone string the same way: it is the
+                // corpus's prose (format note, section header), not a test, and
+                // it reports `Bad test` only for other short shapes
+                // (`script_tests.cpp:955-960`). There is no scriptSig,
+                // scriptPubKey, flags, or expected error to assemble.
+                counts.record_skip(
+                    "prose row (1 string element: format note or section header, no test fields)",
+                );
+                continue;
             } else {
-                counts.record_skip("malformed row (< 4 elements)");
+                counts.record_skip(&format!(
+                    "short row ({} elements): needs scriptSig, scriptPubKey, flags, expected error",
+                    arr.len()
+                ));
                 continue;
             };
 
+        // The single-leaf tree built for a row's `#SCRIPT#`/`#CONTROLBLOCK#`
+        // markers; `#TAPROOTOUTPUT#` reads the same tree for the scriptPubKey.
+        let mut placeholder_tree = None;
         let (witness, amount) = if let Some(wit_arr) = witness_raw {
             let wit = wit_arr
                 .as_array()
@@ -723,27 +841,48 @@ fn load_script_tests(counts: &mut Counts) -> Result<Vec<ScriptTestRow>, String> 
                 continue;
             };
             let amount = btc_to_sats(amount_btc);
+            // Core reads the witness element-by-element and fills the two
+            // markers in place, so the assembled stack keeps the corpus order:
+            // [..., leaf script, control block].
             let mut items = Vec::new();
-            let mut has_placeholder = false;
             for elem in &wit[..wit.len() - 1] {
-                if let Some(s) = elem.as_str() {
-                    if s.starts_with('#') {
-                        has_placeholder = true;
-                        break;
+                let Some(s) = elem.as_str() else {
+                    counts.record_skip("witness element is not a string");
+                    continue 'row;
+                };
+                if let Some(asm) = s.strip_prefix(SCRIPT_PLACEHOLDER) {
+                    // Core: `ParseScript(element.substr(SCRIPT_FLAG.size()))`.
+                    let leaf = match parse_core_asm(asm) {
+                        Ok(script) => script,
+                        Err(e) => {
+                            counts.record_skip(&format!("#SCRIPT# asm parse error: {e}"));
+                            continue 'row;
+                        }
+                    };
+                    match build_taproot_placeholder(&leaf) {
+                        Ok(tree) => {
+                            placeholder_tree = Some(tree);
+                            items.push(leaf);
+                        }
+                        Err(e) => {
+                            counts.record_skip(&format!("#CONTROLBLOCK# tree: {e}"));
+                            continue 'row;
+                        }
                     }
-                    items.push(
-                        hex_to_bytes(s)
-                            .map_err(|e| format!("row {index}: bad witness hex: {e}"))?,
-                    );
-                } else {
-                    counts.record_skip("witness element not a string");
-                    has_placeholder = true;
-                    break;
+                    continue;
                 }
-            }
-            if has_placeholder {
-                counts.record_skip("taproot script-path placeholder (#SCRIPT#/#CONTROLBLOCK#)");
-                continue;
+                if s == CONTROL_BLOCK_PLACEHOLDER {
+                    if let Some(tree) = &placeholder_tree {
+                        items.push(tree.control_block.clone());
+                    } else {
+                        counts.record_skip("#CONTROLBLOCK# with no preceding #SCRIPT# leaf");
+                        continue 'row;
+                    }
+                    continue;
+                }
+                items.push(
+                    hex_to_bytes(s).map_err(|e| format!("row {index}: bad witness hex: {e}"))?,
+                );
             }
             (items, amount)
         } else {
@@ -774,11 +913,23 @@ fn load_script_tests(counts: &mut Counts) -> Result<Vec<ScriptTestRow>, String> 
                 continue;
             }
         };
-        let script_pubkey = match parse_core_asm(script_pubkey_str) {
-            Ok(s) => s,
-            Err(e) => {
-                counts.record_skip(&format!("scriptPubKey asm parse error: {e}"));
+        let script_pubkey = if script_pubkey_str == TAPROOT_OUTPUT_ASM {
+            // Core replaces the whole string with the generated tree's program.
+            if let Some(tree) = &placeholder_tree {
+                let mut spk = vec![opcode::OP_PUSHNUM_1, 0x20];
+                spk.extend_from_slice(&tree.output_key);
+                spk
+            } else {
+                counts.record_skip("#TAPROOTOUTPUT# with no #CONTROLBLOCK# witness element");
                 continue;
+            }
+        } else {
+            match parse_core_asm(script_pubkey_str) {
+                Ok(s) => s,
+                Err(e) => {
+                    counts.record_skip(&format!("scriptPubKey asm parse error: {e}"));
+                    continue;
+                }
             }
         };
 
