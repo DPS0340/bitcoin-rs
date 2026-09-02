@@ -1121,7 +1121,7 @@ mod tests {
             result,
             Err(ConsensusError::Script {
                 input_index: 0,
-                reason: "script verification failed: missing taproot key-path signature".to_owned(),
+                reason: "script failed: WITNESS_PROGRAM_WITNESS_EMPTY".to_owned(),
             })
         );
     }
@@ -2022,12 +2022,11 @@ mod tests {
     }
 
     /// Public-seam regression: without the kernel, `verify_transaction` routes
-    /// the Taproot script-path spend to the portable interpreter, which only
-    /// implements key-path and rejects the multi-element witness with
-    /// `TaprootUnsupportedWitness` ("unsupported annex or script-path").
+    /// the Taproot script-path spend to the portable interpreter, which now
+    /// implements BIP342 script-path verification and accepts the spend.
     #[test]
     #[cfg(not(feature = "kernel"))]
-    fn verify_transaction_rejects_mainnet_taproot_scriptpath_under_portable() {
+    fn verify_transaction_accepts_mainnet_taproot_scriptpath_under_portable() {
         let fixture = load_taproot_scriptpath_fixture();
         let mut utxos = hashbrown::HashMap::new();
         for (index, prevout) in fixture.prevouts.iter().enumerate() {
@@ -2035,12 +2034,8 @@ mod tests {
         }
         let result = verify_transaction(&fixture.tx, &utxos, fixture.height, 0, fixture.flags);
         assert!(
-            matches!(
-                result,
-                Err(ConsensusError::Script { input_index: 0, ref reason })
-                    if reason.contains("unsupported annex or script-path")
-            ),
-            "expected portable TaprootUnsupportedWitness rejection, got {result:?}"
+            result.is_ok(),
+            "expected portable taproot script-path acceptance, got {result:?}"
         );
     }
 

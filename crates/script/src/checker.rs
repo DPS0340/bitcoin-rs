@@ -54,11 +54,14 @@ pub struct TxSignatureChecker<'a> {
     amount: u64,
     prevouts: &'a [TxOut],
     cache: SighashCache<'a>,
+    /// Raw taproot annex bytes, when present (BIP341). Used by
+    /// `check_schnorr_signature` to commit the annex to the sighash.
+    annex: Option<Vec<u8>>,
 }
 
 impl<'a> TxSignatureChecker<'a> {
-    /// Constructs a checker for `input_index` of `tx`, signing `amount` satoshis
-    /// with `prevouts` available for segwit/taproot sighash computation.
+    /// Builds a checker for one input of `tx`, with `prevouts` covering every
+    /// input so taproot sighashes can commit to all spent outputs.
     #[must_use]
     pub fn new(tx: &'a Tx, input_index: usize, amount: u64, prevouts: &'a [TxOut]) -> Self {
         Self {
@@ -67,7 +70,16 @@ impl<'a> TxSignatureChecker<'a> {
             amount,
             prevouts,
             cache: SighashCache::new(tx),
+            annex: None,
         }
+    }
+
+    /// Sets the taproot annex for BIP341 sighash commitment.
+    ///
+    /// The driver calls this after stripping an annex from the witness stack
+    /// so that subsequent Schnorr signature checks commit to the annex.
+    pub fn set_annex(&mut self, annex: Option<Vec<u8>>) {
+        self.annex = annex;
     }
 
     /// Verifies an ECDSA signature against the appropriate sighash.
@@ -249,7 +261,7 @@ impl<'a> TxSignatureChecker<'a> {
             .taproot_signature_hash(
                 self.input_index,
                 self.prevouts,
-                None, // annex handled by caller
+                self.annex.as_deref(),
                 leaf_codesep,
                 sighash_type,
             )

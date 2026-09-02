@@ -13,7 +13,7 @@ use bitcoin::{
     absolute, transaction,
 };
 use bitcoin_rs_primitives::{Tx, TxOut};
-use bitcoin_rs_script::{Interpreter, ScriptError, VerifyFlags};
+use bitcoin_rs_script::{Interpreter, ScriptErrCode, ScriptError, VerifyFlags};
 use proptest::prelude::*;
 
 /// Consensus-bytes round-trip from the rust-bitcoin oracle types to native types.
@@ -72,12 +72,22 @@ proptest! {
             &fixture.tx,
             0,
         );
+        // With script-path now implemented, a two-element witness with a
+        // bogus extra element is rejected. When the extra starts with 0x50
+        // (ANNEX_TAG) it is stripped as an annex, leaving a key-path spend
+        // whose signature fails verification. Otherwise it is treated as a
+        // control block and rejected for wrong size or commitment mismatch.
         prop_assert!(
             matches!(
                 ok,
-                Err(ScriptError::TaprootUnsupportedWitness { elements: 2 })
+                Err(ScriptError::Invalid {
+                    code: ScriptErrCode::TaprootWrongControlSize
+                        | ScriptErrCode::WitnessProgramMismatch
+                        | ScriptErrCode::WitnessProgramWitnessEmpty,
+                }
+                | ScriptError::Verification(_))
             ),
-            "expected TaprootUnsupportedWitness with elements=2"
+            "expected rejection, got {ok:?}"
         );
     }
 

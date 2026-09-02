@@ -3,7 +3,8 @@
 //! The driver mirrors Core's `VerifyScript`/`VerifyWitnessProgram` flow: run
 //! scriptSig then scriptPubKey through the opcode evaluator, apply P2SH
 //! redeem-script evaluation, dispatch SegWit v0 spends through their witness
-//! programs, and hand taproot key-path spends to the local BIP341 verifier.
+//! programs, and hand taproot key-path and script-path spends to the local
+//! BIP341/BIP342 verifier.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -16,6 +17,7 @@ use crate::checker::{SigVersion, TxSignatureChecker};
 use crate::eval::{self, MAX_SCRIPT_ELEMENT_SIZE};
 use crate::script::{is_p2tr, is_push_only, witness_program};
 use crate::stack::{ScriptItem, Stack};
+use crate::taproot;
 
 /// Verification flags passed to the delegated consensus script engine.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -428,8 +430,8 @@ pub enum ScriptError {
 /// Public script verifier for the portable posture.
 ///
 /// Executes legacy, `P2SH`, and segwit v0 spends through the native opcode
-/// evaluator, and taproot key-path spends via the local BIP341 path. Taproot
-/// script-path spends remain unimplemented and are rejected.
+/// evaluator, and taproot key-path and script-path spends via the local
+/// BIP341/BIP342 verifier.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Interpreter;
 
@@ -534,7 +536,14 @@ impl Interpreter {
         };
 
         if is_p2tr(script_pubkey) && flags.contains(VerifyFlags::TAPROOT) {
-            return verify_taproot_keypath(&spending, input_idx, script_pubkey, witness, prevouts);
+            return verify_taproot(
+                &spending,
+                input_idx,
+                script_pubkey,
+                witness,
+                prevouts,
+                flags,
+            );
         }
 
         let mut checker = TxSignatureChecker::new(&spending, input_idx, prevout.value, prevouts);
@@ -570,7 +579,7 @@ fn verify_script(
     let mut witness_used = false;
 
     let mut stack = Stack::new();
-    let mut weight = None;
+    let mut weight: Option<i64> = None;
     eval::eval_script(
         &mut stack,
         script_sig,
@@ -578,6 +587,7 @@ fn verify_script(
         checker,
         SigVersion::Base,
         &mut weight,
+        None,
     )?;
     // P2SH needs the scriptSig's own result, because scriptPubKey execution
     // consumes the redeem script off the top.
@@ -589,6 +599,7 @@ fn verify_script(
         checker,
         SigVersion::Base,
         &mut weight,
+        None,
     )?;
     require_true_top(&stack)?;
 
@@ -619,6 +630,7 @@ fn verify_script(
             checker,
             SigVersion::Base,
             &mut weight,
+            None,
         )?;
         require_true_top(&stack)?;
 
@@ -706,7 +718,7 @@ fn verify_witness_program(
             .map_err(|_| invalid(ScriptErrCode::StackSize))?;
     }
 
-    let mut weight = None;
+    let mut weight: Option<i64> = None;
     eval::eval_script(
         &mut witness_stack,
         &witness_script,
@@ -714,6 +726,7 @@ fn verify_witness_program(
         checker,
         SigVersion::WitnessV0,
         &mut weight,
+        None,
     )?;
 
     // Witness execution is its own stack discipline: exactly one true item,
@@ -763,17 +776,88 @@ fn require_true_top(stack: &Stack) -> Result<(), ScriptError> {
     }
 }
 
-fn verify_taproot_keypath(
+/// Unified taproot verification: key-path and script-path (BIP341/BIP342).
+///
+/// Mirrors Core's `VerifyWitnessProgram` taproot branch. Strips an optional
+/// annex, dispatches to key-path (single remaining element) or script-path
+/// (control block + leaf script), and executes tapscript through the native
+/// evaluator with `SigVersion::Tapscript`.
+fn verify_taproot(
     spending: &Tx,
     input_idx: usize,
     script_pubkey: &[u8],
     witness: &[Vec<u8>],
     prevouts: &[TxOut],
+    flags: VerifyFlags,
 ) -> Result<bool, ScriptError> {
     if prevouts.len() != spending.inputs.len() {
         return Err(ScriptError::TaprootPrevoutsUnavailable);
     }
-    let signature_bytes = taproot_keypath_signature(witness)?;
+
+    // The 32-byte output key is the witness program (bytes 2..34 of the
+    // scriptPubKey). `is_p2tr` already confirmed the shape.
+    let program = script_pubkey
+        .get(2..34)
+        .ok_or_else(|| ScriptError::Verification("taproot program is not 32 bytes".to_owned()))?;
+
+    if witness.is_empty() {
+        return Err(invalid(ScriptErrCode::WitnessProgramWitnessEmpty));
+    }
+
+    // Work on an owned copy so we can pop the annex / control / script.
+    let mut stack: Vec<Vec<u8>> = witness.to_vec();
+
+    // Strip annex: if the last element is non-empty and starts with 0x50.
+    // Core: "if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG)"
+    let annex_bytes = strip_annex(&mut stack);
+
+    if stack.len() == 1 {
+        verify_taproot_keypath(
+            spending,
+            input_idx,
+            program,
+            &stack,
+            annex_bytes.as_deref(),
+            prevouts,
+        )
+    } else {
+        verify_taproot_scriptpath(
+            spending,
+            input_idx,
+            program,
+            witness,
+            &mut stack,
+            annex_bytes,
+            prevouts,
+            flags,
+        )
+    }
+}
+
+/// Strips the annex from the witness stack when present (BIP341).
+///
+/// Mirrors Core's annex-stripping condition: when the stack has at least two
+/// elements and the last is non-empty with a leading `ANNEX_TAG` byte.
+fn strip_annex(stack: &mut Vec<Vec<u8>>) -> Option<Vec<u8>> {
+    if stack.len() < 2 {
+        return None;
+    }
+    let is_annex = stack
+        .last()
+        .is_some_and(|last| !last.is_empty() && last[0] == taproot::ANNEX_TAG);
+    if is_annex { stack.pop() } else { None }
+}
+
+/// Verifies a taproot key-path spend (BIP341).
+fn verify_taproot_keypath(
+    spending: &Tx,
+    input_idx: usize,
+    program: &[u8],
+    stack: &[Vec<u8>],
+    annex_bytes: Option<&[u8]>,
+    prevouts: &[TxOut],
+) -> Result<bool, ScriptError> {
+    let signature_bytes = &stack[0];
     let sighash_type = match signature_bytes.len() {
         64 => Sighash::Default,
         65 => Sighash::from_consensus_u8(signature_bytes[64])
@@ -784,16 +868,13 @@ fn verify_taproot_keypath(
             )));
         }
     };
-    let xonly_key = script_pubkey
-        .get(2..34)
-        .ok_or_else(|| ScriptError::Verification("taproot program is not 32 bytes".to_owned()))?;
     let signature = Signature::from_slice(signature_bytes)
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
-    let public_key = XOnlyPublicKey::from_slice(xonly_key)
+    let public_key = XOnlyPublicKey::from_slice(program)
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
     let mut cache = SighashCache::new(spending);
     let sighash = cache
-        .taproot_signature_hash(input_idx, prevouts, None, None, sighash_type)
+        .taproot_signature_hash(input_idx, prevouts, annex_bytes, None, sighash_type)
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
     let message = Message::from_digest(*sighash.as_byte_array());
     let secp = Secp256k1::verification_only();
@@ -802,15 +883,113 @@ fn verify_taproot_keypath(
         .map_err(|error| ScriptError::Verification(error.to_string()))
 }
 
-fn taproot_keypath_signature(witness: &[Vec<u8>]) -> Result<&[u8], ScriptError> {
-    match witness {
-        [signature] => Ok(signature),
-        [] => Err(ScriptError::Verification(
-            "missing taproot key-path signature".to_owned(),
-        )),
-        _ => Err(ScriptError::TaprootUnsupportedWitness {
-            elements: witness.len(),
-        }),
+/// Verifies a taproot script-path spend (BIP341/BIP342).
+fn verify_taproot_scriptpath(
+    spending: &Tx,
+    input_idx: usize,
+    program: &[u8],
+    witness: &[Vec<u8>],
+    stack: &mut Vec<Vec<u8>>,
+    annex_bytes: Option<Vec<u8>>,
+    prevouts: &[TxOut],
+    flags: VerifyFlags,
+) -> Result<bool, ScriptError> {
+    // Core: "const valtype& control = SpanPopBack(stack); const valtype& script = SpanPopBack(stack);"
+    let control = stack
+        .pop()
+        .ok_or_else(|| invalid(ScriptErrCode::WitnessProgramWitnessEmpty))?;
+    let script = stack
+        .pop()
+        .ok_or_else(|| invalid(ScriptErrCode::WitnessProgramWitnessEmpty))?;
+
+    // Core: control size validation.
+    if control.len() < taproot::TAPROOT_CONTROL_BASE_SIZE
+        || control.len() > taproot::TAPROOT_CONTROL_MAX_SIZE
+        || !(control.len() - taproot::TAPROOT_CONTROL_BASE_SIZE)
+            .is_multiple_of(taproot::TAPROOT_CONTROL_NODE_SIZE)
+    {
+        return Err(invalid(ScriptErrCode::TaprootWrongControlSize));
+    }
+
+    // Core: execdata.m_tapleaf_hash = ComputeTapleafHash(control[0] & TAPROOT_LEAF_MASK, script)
+    let leaf_version = control[0] & taproot::TAPROOT_LEAF_MASK;
+    let tapleaf = bitcoin_rs_primitives::tapleaf_hash(leaf_version, &script);
+
+    // Core: VerifyTaprootCommitment(control, program, tapleaf_hash)
+    if !taproot::verify_taproot_commitment(&control, program, &tapleaf) {
+        return Err(invalid(ScriptErrCode::WitnessProgramMismatch));
+    }
+
+    // Core: if ((control[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSCRIPT)
+    if leaf_version != taproot::TAPROOT_LEAF_TAPSCRIPT {
+        // Unknown leaf version: success by consensus, discouraged by policy.
+        if flags.contains(VerifyFlags::DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
+            return Err(invalid(ScriptErrCode::DiscourageUpgradableTaprootVersion));
+        }
+        return Ok(true);
+    }
+
+    // Build the witness stack for the evaluator: the remaining elements
+    // (after annex, control, and script were popped) are the input stack.
+    // Core: ExecuteWitnessScript checks stack.size() > MAX_STACK_SIZE
+    // for tapscript before running EvalScript.
+    if stack.len() > eval::MAX_STACK_SIZE {
+        return Err(invalid(ScriptErrCode::StackSize));
+    }
+    let mut witness_stack = Stack::new();
+    for element in &*stack {
+        if element.len() > MAX_SCRIPT_ELEMENT_SIZE {
+            return Err(invalid(ScriptErrCode::PushSize));
+        }
+        witness_stack
+            .push(ScriptItem::Bytes(element.as_slice().into()))
+            .map_err(|_| invalid(ScriptErrCode::StackSize))?;
+    }
+
+    // Core: execdata.m_validation_weight_left =
+    //   GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET
+    // `witness.stack` is the *original* full witness (including annex,
+    // control, and script). The serialization is a CompactSize count
+    // prefix followed by each element as CompactSize(len) + bytes.
+    let witness_serialized_size: usize = varint_len(witness.len())
+        + witness
+            .iter()
+            .map(|elem| varint_len(elem.len()) + elem.len())
+            .sum::<usize>();
+    let mut validation_weight_left = Some(
+        i64::try_from(witness_serialized_size).unwrap_or(i64::MAX) + eval::VALIDATION_WEIGHT_OFFSET,
+    );
+
+    let mut checker = TxSignatureChecker::new(spending, input_idx, 0, prevouts);
+    checker.set_annex(annex_bytes);
+
+    eval::eval_script(
+        &mut witness_stack,
+        &script,
+        flags,
+        &mut checker,
+        SigVersion::Tapscript,
+        &mut validation_weight_left,
+        Some(&tapleaf),
+    )?;
+
+    if witness_stack.len() != 1 {
+        return Err(invalid(ScriptErrCode::CleanStack));
+    }
+    require_true_top(&witness_stack)?;
+    Ok(true)
+}
+
+/// Returns the varint-encoded length prefix size for `data_len` bytes.
+fn varint_len(data_len: usize) -> usize {
+    if data_len < 0xfd {
+        1
+    } else if data_len <= 0xffff {
+        3
+    } else if data_len <= 0xffff_ffff {
+        5
+    } else {
+        9
     }
 }
 

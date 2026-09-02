@@ -11,6 +11,7 @@
 
 use std::borrow::Cow;
 
+use bitcoin_rs_primitives::Hash256;
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 
@@ -370,6 +371,7 @@ pub fn eval_script(
     checker: &mut TxSignatureChecker<'_>,
     sigversion: SigVersion,
     validation_weight_left: &mut Option<i64>,
+    tapleaf_hash: Option<&Hash256>,
 ) -> Result<(), ScriptError> {
     debug_assert!(
         matches!(
@@ -378,6 +380,31 @@ pub fn eval_script(
         ),
         "taproot key-path admits no script execution"
     );
+
+    // BIP342: OP_SUCCESSx opcodes make the script unconditionally valid.
+    // This scan runs before any other check (including stack element size
+    // limits) and overrides everything. Mirrors Core's ExecuteWitnessScript.
+    if sigversion == SigVersion::Tapscript {
+        for parsed in instructions(script) {
+            let op = match parsed {
+                Ok(Instruction::Op(op)) => op,
+                Ok(Instruction::PushBytes(_)) => continue,
+                Err(_) => {
+                    return Err(ScriptError::Invalid {
+                        code: ScriptErrCode::BadOpcode,
+                    });
+                }
+            };
+            if is_op_success(op) {
+                if flags.contains(VerifyFlags::DISCOURAGE_OP_SUCCESS) {
+                    return Err(ScriptError::Invalid {
+                        code: ScriptErrCode::DiscourageOpSuccess,
+                    });
+                }
+                return Ok(());
+            }
+        }
+    }
 
     if (sigversion == SigVersion::Base || sigversion == SigVersion::WitnessV0)
         && script.len() > MAX_SCRIPT_SIZE
@@ -489,6 +516,7 @@ pub fn eval_script(
                 validation_weight_left,
                 &mut codeseparator_pos,
                 instruction_start,
+                tapleaf_hash,
                 script,
             )?;
         }
@@ -578,6 +606,19 @@ const fn is_disabled(op: u8) -> bool {
     )
 }
 
+/// BIP342 `OP_SUCCESSx` opcodes (Core's `IsOpSuccess`). A script containing
+/// any of these is unconditionally valid under tapscript.
+const fn is_op_success(op: u8) -> bool {
+    op == 80
+        || op == 98
+        || (op >= 126 && op <= 129)
+        || (op >= 131 && op <= 134)
+        || (op >= 137 && op <= 138)
+        || (op >= 141 && op <= 142)
+        || (op >= 149 && op <= 153)
+        || (op >= 187 && op <= 254)
+}
+
 /// Core's `CheckMinimalPush`.
 fn check_minimal_push(data: &[u8], op: u8) -> bool {
     if data.is_empty() {
@@ -630,6 +671,7 @@ fn dispatch(
     validation_weight_left: &mut Option<i64>,
     codeseparator_pos: &mut u32,
     instruction_start: usize,
+    tapleaf_hash: Option<&Hash256>,
     script: &[u8],
 ) -> Result<(), ScriptError> {
     if !f_exec && !(OP_IF..=OP_ENDIF).contains(&op) {
@@ -1031,6 +1073,7 @@ fn dispatch(
                 checker,
                 sigversion,
                 validation_weight_left,
+                tapleaf_hash,
             )?;
             push_bytes(stack, if success { &[1] } else { &[] })?;
             if op == OP_CHECKSIGVERIFY {
@@ -1063,6 +1106,7 @@ fn dispatch(
                 checker,
                 sigversion,
                 validation_weight_left,
+                tapleaf_hash,
             )?;
             let result = value
                 .checked_add(i64::from(success))
@@ -1209,6 +1253,7 @@ fn eval_checksig(
     checker: &mut TxSignatureChecker<'_>,
     sigversion: SigVersion,
     validation_weight_left: &mut Option<i64>,
+    tapleaf_hash: Option<&Hash256>,
 ) -> Result<bool, ScriptError> {
     match sigversion {
         SigVersion::Base | SigVersion::WitnessV0 => {
@@ -1254,7 +1299,7 @@ fn eval_checksig(
                         sig,
                         pubkey,
                         sigversion,
-                        None,
+                        tapleaf_hash,
                         codeseparator_pos,
                     )?;
                 }
