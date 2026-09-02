@@ -99,7 +99,7 @@ const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 /// 16-block per-peer floor. Below this count, one healthy peer's deep
 /// sequential pipeline beats fragmented stripes on real mainnet peers; the
 /// bounded cold-front hedge handles a silent owner without under-filling.
-const MIN_PEERS_FOR_FANOUT: usize = PENDING_BUDGET / MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+pub(crate) const MIN_PEERS_FOR_FANOUT: usize = PENDING_BUDGET / MAX_BLOCKS_IN_TRANSIT_PER_PEER;
 /// Initial window-blocked stalling threshold, mirroring Bitcoin Core's
 /// `BLOCK_STALLING_TIMEOUT_DEFAULT` (2s, `net_processing.cpp`): when the
 /// window front has been in flight to one peer this long with the apply

@@ -44,11 +44,6 @@ pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 const RPC_MAX_CONNECTIONS: usize = 128;
 const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const P2P_OUTBOUND_ACTIVE_LIMIT: usize = crate::state::P2P_OUTBOUND_QUEUE_LIMIT;
-/// Target number of live outbound peers for normal operation and fan-out eligibility.
-///
-/// Must equal `sync::MIN_PEERS_FOR_FANOUT`; verified by the gate test.
-const P2P_OUTBOUND_PEER_TARGET: usize = 8;
-/// How long (in seconds) a failed dial address is suppressed from re-queueing.
 const FAILED_ADDR_BACKOFF_SECS: u64 = 60;
 /// How often the DNS peer maintenance loop wakes to check the live peer count.
 const DNS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
@@ -312,7 +307,7 @@ fn spawn_p2p_outbound_drain(
 /// Spawns a long-lived thread that continuously maintains outbound peer count under DNS mode.
 ///
 /// The thread wakes every [`DNS_MAINTENANCE_INTERVAL`] and, when the number of live outbound
-/// peers is below [`P2P_OUTBOUND_PEER_TARGET`], resolves DNS seeds and queues the deficit
+/// peers is below [`crate::sync::MIN_PEERS_FOR_FANOUT`], resolves DNS seeds and queues the deficit
 /// count of addresses into `outbound_tx`.  Addresses that recently failed are suppressed for
 /// [`FAILED_ADDR_BACKOFF_SECS`] seconds via an in-memory backoff map.
 ///
@@ -351,7 +346,7 @@ fn spawn_dns_peer_maintenance(
                         usize::try_from(duration.as_nanos()).unwrap_or(0)
                     });
 
-                // Initial bootstrap: queue up to P2P_OUTBOUND_PEER_TARGET addresses immediately.
+                // Initial bootstrap: queue up to the fan-out peer threshold immediately.
                 let queued = drain_dns_peer_deficit(
                     &resolver,
                     seeds.as_slice(),
@@ -360,7 +355,7 @@ fn spawn_dns_peer_maintenance(
                     &outbound_tx,
                     &mut failed_backoff,
                     selection_cursor,
-                    P2P_OUTBOUND_PEER_TARGET,
+                    crate::sync::MIN_PEERS_FOR_FANOUT,
                 );
                 selection_cursor = selection_cursor.wrapping_add(1);
                 tracing::info!(queued, "dns peer bootstrap queued initial addresses");
@@ -384,11 +379,11 @@ fn spawn_dns_peer_maintenance(
                     }
 
                     let live = peer_outbound.read().len();
-                    if live >= P2P_OUTBOUND_PEER_TARGET {
+                    if live >= crate::sync::MIN_PEERS_FOR_FANOUT {
                         maintenance_delay = bootstrap_refill.next_delay(live, 0);
                         continue;
                     }
-                    let deficit = P2P_OUTBOUND_PEER_TARGET - live;
+                    let deficit = crate::sync::MIN_PEERS_FOR_FANOUT - live;
                     let queued = drain_dns_peer_deficit(
                         &resolver,
                         seeds.as_slice(),
@@ -1605,20 +1600,20 @@ mod tests {
         let mut refill = DnsBootstrapRefill::default();
 
         assert_eq!(
-            refill.next_delay(0, P2P_OUTBOUND_PEER_TARGET),
+            refill.next_delay(0, crate::sync::MIN_PEERS_FOR_FANOUT),
             DNS_BOOTSTRAP_REFILL_INTERVAL
         );
         assert_eq!(
-            refill.next_delay(0, P2P_OUTBOUND_PEER_TARGET),
+            refill.next_delay(0, crate::sync::MIN_PEERS_FOR_FANOUT),
             DNS_BOOTSTRAP_REFILL_INTERVAL
         );
         assert_eq!(
-            refill.next_delay(0, P2P_OUTBOUND_PEER_TARGET),
+            refill.next_delay(0, crate::sync::MIN_PEERS_FOR_FANOUT),
             DNS_MAINTENANCE_INTERVAL
         );
         assert_eq!(refill.next_delay(1, 0), DNS_MAINTENANCE_INTERVAL);
         assert_eq!(
-            refill.next_delay(0, P2P_OUTBOUND_PEER_TARGET),
+            refill.next_delay(0, crate::sync::MIN_PEERS_FOR_FANOUT),
             DNS_BOOTSTRAP_REFILL_INTERVAL
         );
     }
@@ -1703,7 +1698,7 @@ mod tests {
         let (dial_tx, dial_rx) = crossbeam_channel::unbounded();
         let seeds = signet_seeds();
         let mut recently_queued = hashbrown::HashMap::new();
-        let needed = P2P_OUTBOUND_PEER_TARGET - peer_outbound.read().len(); // 5
+        let needed = crate::sync::MIN_PEERS_FOR_FANOUT - peer_outbound.read().len(); // 5
 
         let queued = drain_dns_peer_deficit(
             &OverlapResolver,
