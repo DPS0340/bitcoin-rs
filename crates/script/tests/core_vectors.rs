@@ -550,7 +550,7 @@ fn build_crediting_tx(script_pubkey: &[u8], amount: u64) -> Tx {
     Tx {
         version: 1,
         inputs: vec![TxIn {
-            previous_output: OutPoint::default(),
+            previous_output: OutPoint::new(Txid::default(), u32::MAX),
             script_sig: vec![opcode::OP_0, opcode::OP_0],
             sequence: SEQUENCE_FINAL,
             witness: Vec::new(),
@@ -585,32 +585,44 @@ fn build_spending_tx(script_sig: &[u8], witness: &[Vec<u8>], credit_tx: &Tx) -> 
 // Verdict model
 // ===========================================================================
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Verdict {
     Accept,
-    Reject,
+    /// Carries Core's error name when the interpreter produced one, so a
+    /// mismatch says which rule fired rather than only that something did.
+    Reject(Option<String>),
 }
 
 impl Verdict {
     fn from_interpreter(result: &Result<bool, ScriptError>) -> Self {
         match result {
             Ok(true) => Self::Accept,
-            Ok(false) | Err(_) => Self::Reject,
+            Err(ScriptError::Invalid { code }) => Self::Reject(Some(code.to_string())),
+            Ok(false) | Err(_) => Self::Reject(None),
         }
     }
 
     #[cfg(feature = "kernel")]
     fn from_kernel(result: &Result<(), bitcoin_rs_consensus::ConsensusError>) -> Self {
+        // The kernel reports a verdict, not Core's error name, so its column
+        // can prove accept-or-reject parity and nothing about error names.
         match result {
             Ok(()) => Self::Accept,
-            Err(_) => Self::Reject,
+            Err(_) => Self::Reject(None),
         }
     }
 
-    fn matches_expected(self, expected: ScriptErrCode) -> bool {
+    /// Whether the row was accepted. Rejection carries a code for triage, so
+    /// comparisons between a verdict and an expectation must go through this
+    /// rather than through equality on the payload.
+    const fn accepted(&self) -> bool {
+        matches!(self, Self::Accept)
+    }
+
+    fn matches_expected(&self, expected: ScriptErrCode) -> bool {
         match self {
             Self::Accept => expected.is_ok(),
-            Self::Reject => !expected.is_ok(),
+            Self::Reject(_) => !expected.is_ok(),
         }
     }
 }
@@ -838,8 +850,14 @@ fn run_script_tests_native(rows: &[ScriptTestRow], counts: &mut Counts) -> Vec<S
         } else {
             counts.failed += 1;
             mismatches.push(format!(
-                "row {}: expected {}, got {:?} (comment: {})",
-                row.row_index, row.expected, verdict, row.comment
+                "row {}: expected {}, got {:?} (flags {:#x}, sig {}, pubkey {}, comment: {})",
+                row.row_index,
+                row.expected,
+                verdict,
+                row.flags.bits(),
+                hex_of(&row.script_sig),
+                hex_of(&row.script_pubkey),
+                row.comment
             ));
         }
     }
@@ -864,8 +882,14 @@ fn run_script_tests_kernel(rows: &[ScriptTestRow], counts: &mut Counts) -> Vec<S
         } else {
             counts.failed += 1;
             mismatches.push(format!(
-                "row {}: expected {}, got {:?} (comment: {})",
-                row.row_index, row.expected, verdict, row.comment
+                "row {}: expected {}, got {:?} (flags {:#x}, sig {}, pubkey {}, comment: {})",
+                row.row_index,
+                row.expected,
+                verdict,
+                row.flags.bits(),
+                hex_of(&row.script_sig),
+                hex_of(&row.script_pubkey),
+                row.comment
             ));
         }
     }
@@ -939,10 +963,15 @@ fn load_tx_vectors(
             continue;
         };
 
-        let flags = match VerifyFlags::from_core_names(flags_str) {
+        // The two tx corpora read the same field in opposite directions.
+        let flags = match if expected_accept {
+            tx_valid_flags(flags_str)
+        } else {
+            tx_invalid_flags(flags_str)
+        } {
             Ok(f) => f,
             Err(e) => {
-                counts.record_skip(&format!("unknown flag: {e}"));
+                counts.record_skip(&e);
                 continue;
             }
         };
@@ -1009,7 +1038,7 @@ fn load_tx_vectors(
         let expected = if expected_accept {
             Verdict::Accept
         } else {
-            Verdict::Reject
+            Verdict::Reject(None)
         };
 
         rows.push(TxVectorRow {
@@ -1030,7 +1059,9 @@ fn run_tx_vectors_native(rows: &[TxVectorRow], counts: &mut Counts) -> Vec<Strin
     for row in rows {
         counts.executed += 1;
         let prevout_txouts: Vec<TxOut> = row.prevouts.iter().map(|(_, o)| o.clone()).collect();
-        let mut all_ok = true;
+        // The first failing input decides the row, and its error name is what
+        // a triage reader needs; a bare Reject says nothing.
+        let mut first_failure = None;
         for input_idx in 0..row.tx.inputs.len() {
             let prevout = &row.prevouts[input_idx].1;
             let input = &row.tx.inputs[input_idx];
@@ -1044,23 +1075,33 @@ fn run_tx_vectors_native(rows: &[TxVectorRow], counts: &mut Counts) -> Vec<Strin
                 input_idx,
             );
             if !matches!(result, Ok(true)) {
-                all_ok = false;
+                first_failure = Some((input_idx, Verdict::from_interpreter(&result)));
                 break;
             }
         }
 
-        let verdict = if all_ok {
-            Verdict::Accept
-        } else {
-            Verdict::Reject
+        let verdict = match &first_failure {
+            None => Verdict::Accept,
+            Some((input_idx, Verdict::Reject(code))) => Verdict::Reject(Some(format!(
+                "input {input_idx}: {}",
+                code.clone().unwrap_or_else(|| "no code".to_owned())
+            ))),
+            Some((input_idx, Verdict::Accept)) => {
+                Verdict::Reject(Some(format!("input {input_idx}: accepted-but-not-true")))
+            }
         };
 
-        let matches = verdict == row.expected;
+        let matches = verdict.accepted() == row.expected.accepted();
         if !matches {
             counts.failed += 1;
             mismatches.push(format!(
-                "row {}: expected {:?}, got {:?}",
-                row.row_index, row.expected, verdict
+                "row {}: expected {:?}, got {:?} (flags {:#x}, locktime {}, seq0 {:#x})",
+                row.row_index,
+                row.expected,
+                verdict,
+                row.flags.bits(),
+                row.tx.lock_time,
+                row.tx.inputs.first().map_or(0, |input| input.sequence)
             ));
         }
     }
@@ -1077,12 +1118,17 @@ fn run_tx_vectors_kernel(rows: &[TxVectorRow], counts: &mut Counts) -> Vec<Strin
             bitcoin_rs_consensus::kernel::verify_tx_scripts(&row.tx, &row.prevouts, row.flags);
         let verdict = Verdict::from_kernel(&result);
 
-        let matches = verdict == row.expected;
+        let matches = verdict.accepted() == row.expected.accepted();
         if !matches {
             counts.failed += 1;
             mismatches.push(format!(
-                "row {}: expected {:?}, got {:?}",
-                row.row_index, row.expected, verdict
+                "row {}: expected {:?}, got {:?} (flags {:#x}, locktime {}, seq0 {:#x})",
+                row.row_index,
+                row.expected,
+                verdict,
+                row.flags.bits(),
+                row.tx.lock_time,
+                row.tx.inputs.first().map_or(0, |input| input.sequence)
             ));
         }
     }
@@ -1208,6 +1254,54 @@ fn run_sighash_vectors(rows: &[SighashRow], counts: &mut Counts) -> Vec<String> 
 // Helpers
 // ===========================================================================
 
+/// How many mismatch lines to print per corpus.
+///
+/// Five is enough to see a pattern without burying the counts; set
+/// `SCRIPT_VECTOR_MISMATCHES` higher when triaging a specific group.
+/// Renders a script as hex so a mismatch line names the exact bytes that
+/// failed rather than a row number the reader has to resolve by hand.
+fn hex_of(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// `tx_valid.json` names the flags Core turns OFF: it verifies with the
+/// complement (`transaction_tests.cpp:224`). A row whose complement is not a
+/// filled combination is bad test data, which Core reports rather than runs.
+fn tx_valid_flags(names: &str) -> Result<VerifyFlags, String> {
+    let parsed = VerifyFlags::from_core_names(names).map_err(|e| e.to_string())?;
+    let effective = VerifyFlags::ALL.excluding(parsed);
+    if effective != effective.filled() {
+        return Err(format!(
+            "bad test flags (not a filled combination): {names}"
+        ));
+    }
+    Ok(effective)
+}
+
+/// `tx_invalid.json` names the flags Core turns ON, unfilled and unedited, so
+/// an invalid combination is detected rather than repaired
+/// (`transaction_tests.cpp:310-315`).
+fn tx_invalid_flags(names: &str) -> Result<VerifyFlags, String> {
+    let parsed = VerifyFlags::from_core_names(names).map_err(|e| e.to_string())?;
+    if parsed != parsed.filled() {
+        return Err(format!(
+            "bad test flags (not a filled combination): {names}"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn mismatch_print_limit() -> usize {
+    std::env::var("SCRIPT_VECTOR_MISMATCHES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5)
+}
+
 fn reference_path(name: &str) -> std::path::PathBuf {
     // Anchored at this crate rather than the process working directory, so the
     // corpora resolve identically from the workspace root, from a worktree at
@@ -1286,7 +1380,7 @@ fn script_tests_native_column() {
             mismatches.len(),
             counts.executed,
         );
-        for m in mismatches.iter().take(5) {
+        for m in mismatches.iter().take(mismatch_print_limit()) {
             println!("  {m}");
         }
     }
@@ -1338,7 +1432,7 @@ fn tx_valid_native_column() {
             mismatches.len(),
             counts.executed,
         );
-        for m in mismatches.iter().take(5) {
+        for m in mismatches.iter().take(mismatch_print_limit()) {
             println!("  {m}");
         }
     }
@@ -1387,7 +1481,7 @@ fn tx_invalid_native_column() {
             mismatches.len(),
             counts.executed,
         );
-        for m in mismatches.iter().take(5) {
+        for m in mismatches.iter().take(mismatch_print_limit()) {
             println!("  {m}");
         }
     }

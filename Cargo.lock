@@ -476,6 +476,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-rs-consensus",
  "bitcoin-rs-primitives",
+ "bitcoin_hashes",
  "bytemuck",
  "parking_lot",
  "proptest",

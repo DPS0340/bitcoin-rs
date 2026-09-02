@@ -1,8 +1,9 @@
 //! Script verification entry points over the native transaction type.
 //!
-//! The interpreter executes taproot key-path spends natively (BIP341 Schnorr
-//! verification against the native sighash engine); non-taproot spend classes
-//! are handled by the verification backend wired into the consensus crate.
+//! The driver mirrors Core's `VerifyScript`/`VerifyWitnessProgram` flow: run
+//! scriptSig then scriptPubKey through the opcode evaluator, apply P2SH
+//! redeem-script evaluation, dispatch SegWit v0 spends through their witness
+//! programs, and hand taproot key-path spends to the local BIP341 verifier.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -11,7 +12,10 @@ use bitcoin_rs_primitives::{Sighash, SighashCache, Tx, TxOut};
 use secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use thiserror::Error;
 
-use crate::script::is_p2tr;
+use crate::checker::{SigVersion, TxSignatureChecker};
+use crate::eval::{self, MAX_SCRIPT_ELEMENT_SIZE};
+use crate::script::{is_p2tr, is_push_only, witness_program};
+use crate::stack::{ScriptItem, Stack};
 
 /// Verification flags passed to the delegated consensus script engine.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -106,6 +110,37 @@ impl VerifyFlags {
     #[must_use]
     pub const fn kernel_bits(self) -> u32 {
         self.0 & Self::MANDATORY.0
+    }
+
+    /// Every flag bit this crate defines, the mask Core calls
+    /// `MAX_SCRIPT_VERIFY_FLAGS` minus the bits it has not assigned.
+    pub const ALL: Self =
+        Self(Self::STANDARD.0 | Self::SIGPUSHONLY.0 | Self::CONST_SCRIPTCODE.0 | Self::MINIMALIF.0);
+
+    /// Returns the bits of `self` that `other` does not set.
+    #[must_use]
+    pub const fn excluding(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Applies Core's flag implications: `CLEANSTACK` implies `WITNESS`, and
+    /// `WITNESS` implies `P2SH`.
+    ///
+    /// Core asserts these combinations in `VerifyScript` because relaxing them
+    /// would turn a soft fork into a hard one - a chain could go from
+    /// `CLEANSTACK` alone to `P2SH + CLEANSTACK` and change what validates.
+    /// A library cannot assert on its caller, so the driver normalizes instead,
+    /// which is what Core's own vector harness does through `FillFlags`.
+    #[must_use]
+    pub const fn filled(self) -> Self {
+        let mut bits = self.0;
+        if bits & Self::CLEANSTACK.0 != 0 {
+            bits |= Self::WITNESS.0;
+        }
+        if bits & Self::WITNESS.0 != 0 {
+            bits |= Self::P2SH.0;
+        }
+        Self(bits)
     }
 
     /// Returns true when all `other` bits are present.
@@ -503,32 +538,230 @@ impl Interpreter {
             return verify_taproot_keypath(&spending, input_idx, script_pubkey, witness, prevouts);
         }
 
-        verify_non_taproot_portable(input_idx, prevout, &spending, script_pubkey)
+        let mut checker = TxSignatureChecker::new(&spending, input_idx, prevout.value, prevouts);
+        verify_script(
+            script_sig,
+            script_pubkey,
+            witness,
+            flags.filled(),
+            &mut checker,
+        )?;
+        Ok(true)
     }
 }
 
-/// Portable non-taproot stub: accepts only empty `OP_TRUE` spends. All other
-/// non-taproot (and taproot script-path) classes require the kernel production path.
-fn verify_non_taproot_portable(
-    input_idx: usize,
-    _prevout: &TxOut,
-    spending: &Tx,
+fn invalid(code: ScriptErrCode) -> ScriptError {
+    ScriptError::Invalid { code }
+}
+
+/// Mirrors Core's `VerifyScript`: scriptSig, then scriptPubKey, then the P2SH
+/// and witness redirections the flags admit, then `CLEANSTACK`.
+fn verify_script(
+    script_sig: &[u8],
     script_pubkey: &[u8],
-) -> Result<bool, ScriptError> {
-    let input = spending
-        .inputs
-        .get(input_idx)
-        .ok_or(ScriptError::InputIndexOutOfRange {
-            index: input_idx,
-            inputs: spending.inputs.len(),
-        })?;
-    if script_pubkey == [0x51] && input.script_sig.is_empty() && input.witness.is_empty() {
-        return Ok(true);
+    witness: &[Vec<u8>],
+    flags: VerifyFlags,
+    checker: &mut TxSignatureChecker<'_>,
+) -> Result<(), ScriptError> {
+    if flags.contains(VerifyFlags::SIGPUSHONLY) && !is_push_only(script_sig) {
+        return Err(invalid(ScriptErrCode::SigPushonly));
+    }
+    // Witness data is only ever legitimate for a program this function
+    // reaches below; anything left unconsumed is malleation.
+    let mut witness_used = false;
+
+    let mut stack = Stack::new();
+    let mut weight = None;
+    eval::eval_script(
+        &mut stack,
+        script_sig,
+        flags,
+        checker,
+        SigVersion::Base,
+        &mut weight,
+    )?;
+    // P2SH needs the scriptSig's own result, because scriptPubKey execution
+    // consumes the redeem script off the top.
+    let redeem_stack = stack.clone();
+    eval::eval_script(
+        &mut stack,
+        script_pubkey,
+        flags,
+        checker,
+        SigVersion::Base,
+        &mut weight,
+    )?;
+    require_true_top(&stack)?;
+
+    if flags.contains(VerifyFlags::WITNESS) {
+        if let Some((version, program)) = witness_program(script_pubkey) {
+            if !script_sig.is_empty() {
+                return Err(invalid(ScriptErrCode::WitnessMalleated));
+            }
+            verify_witness_program(witness, version, program, flags, checker, &mut stack)?;
+            witness_used = true;
+        }
     }
 
-    Err(ScriptError::Verification(
-        "portable script backend cannot verify this non-taproot spend".to_owned(),
-    ))
+    let is_p2sh = flags.contains(VerifyFlags::P2SH) && crate::script::is_p2sh(script_pubkey);
+    if is_p2sh {
+        if !is_push_only(script_sig) {
+            return Err(invalid(ScriptErrCode::SigPushonly));
+        }
+        stack = redeem_stack;
+        let redeem = match stack.pop() {
+            Ok(item) => item_bytes_owned(&item),
+            Err(_) => return Err(invalid(ScriptErrCode::InvalidStackOperation)),
+        };
+        eval::eval_script(
+            &mut stack,
+            &redeem,
+            flags,
+            checker,
+            SigVersion::Base,
+            &mut weight,
+        )?;
+        require_true_top(&stack)?;
+
+        if flags.contains(VerifyFlags::WITNESS) {
+            if let Some((version, program)) = witness_program(&redeem) {
+                // The scriptSig may push exactly the redeem script and nothing
+                // else; any other shape lets a third party rewrite it.
+                if script_sig != crate::script::push_data(&redeem).as_slice() {
+                    return Err(invalid(ScriptErrCode::WitnessMalleatedP2sh));
+                }
+                verify_witness_program(witness, version, program, flags, checker, &mut stack)?;
+                witness_used = true;
+            }
+        }
+    }
+
+    if flags.contains(VerifyFlags::WITNESS) && !witness_used && !witness.is_empty() {
+        return Err(invalid(ScriptErrCode::WitnessUnexpected));
+    }
+
+    // Core's CLEANSTACK assertion is meaningful only when P2SH or WITNESS
+    // activates the corresponding stack-discipline path. Policy vectors may
+    // request CLEANSTACK alone; those legacy spends retain the normal
+    // final-top-item check.
+    if flags.contains(VerifyFlags::CLEANSTACK)
+        && (flags.contains(VerifyFlags::P2SH) || flags.contains(VerifyFlags::WITNESS))
+    {
+        if stack.len() != 1 {
+            return Err(invalid(ScriptErrCode::CleanStack));
+        }
+    }
+
+    Ok(())
+}
+
+/// Mirrors Core's `VerifyWitnessProgram` for the versions this driver serves.
+fn verify_witness_program(
+    witness: &[Vec<u8>],
+    version: u8,
+    program: &[u8],
+    flags: VerifyFlags,
+    checker: &mut TxSignatureChecker<'_>,
+    stack: &mut Stack,
+) -> Result<(), ScriptError> {
+    if version != 0 {
+        // Taproot arrives here only without the TAPROOT flag, and unknown
+        // versions stay spendable by consensus so future soft forks can define
+        // them; policy discourages relaying them.
+        if flags.contains(VerifyFlags::DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) {
+            return Err(invalid(ScriptErrCode::DiscourageUpgradableWitnessProgram));
+        }
+        stack.clear();
+        stack
+            .push(ScriptItem::Num(1))
+            .map_err(|_| invalid(ScriptErrCode::StackSize))?;
+        return Ok(());
+    }
+
+    let mut witness_stack = Stack::new();
+    let (witness_script, elements) = match program.len() {
+        32 => {
+            let Some((script, rest)) = witness.split_last() else {
+                return Err(invalid(ScriptErrCode::WitnessProgramWitnessEmpty));
+            };
+            if sha256_of(script) != program {
+                return Err(invalid(ScriptErrCode::WitnessProgramMismatch));
+            }
+            (script.clone(), rest)
+        }
+        20 => {
+            if witness.len() != 2 {
+                return Err(invalid(ScriptErrCode::WitnessProgramMismatch));
+            }
+            (p2wpkh_script_code(program), witness)
+        }
+        _ => return Err(invalid(ScriptErrCode::WitnessProgramWrongLength)),
+    };
+
+    for element in elements {
+        if element.len() > MAX_SCRIPT_ELEMENT_SIZE {
+            return Err(invalid(ScriptErrCode::PushSize));
+        }
+        witness_stack
+            .push(ScriptItem::Bytes(element.as_slice().into()))
+            .map_err(|_| invalid(ScriptErrCode::StackSize))?;
+    }
+
+    let mut weight = None;
+    eval::eval_script(
+        &mut witness_stack,
+        &witness_script,
+        flags,
+        checker,
+        SigVersion::WitnessV0,
+        &mut weight,
+    )?;
+
+    // Witness execution is its own stack discipline: exactly one true item,
+    // regardless of whether CLEANSTACK is set.
+    if witness_stack.len() != 1 {
+        return Err(invalid(ScriptErrCode::CleanStack));
+    }
+    require_true_top(&witness_stack)?;
+    *stack = witness_stack;
+    Ok(())
+}
+
+/// The implicit P2WPKH witness script: `DUP HASH160 <program> EQUALVERIFY CHECKSIG`.
+fn p2wpkh_script_code(program: &[u8]) -> Vec<u8> {
+    let mut script = Vec::with_capacity(5 + program.len());
+    script.push(0x76);
+    script.push(0xa9);
+    script.push(0x14);
+    script.extend_from_slice(program);
+    script.push(0x88);
+    script.push(0xac);
+    script
+}
+
+fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn item_bytes_owned(item: &ScriptItem) -> Vec<u8> {
+    match item {
+        ScriptItem::Num(value) => crate::script::push_int(*value),
+        ScriptItem::Bytes(bytes) => bytes.to_vec(),
+    }
+}
+
+fn require_true_top(stack: &Stack) -> Result<(), ScriptError> {
+    let top = stack
+        .peek()
+        .map_err(|_| invalid(ScriptErrCode::EvalFalse))?;
+    if eval::item_is_true(top) {
+        Ok(())
+    } else {
+        Err(invalid(ScriptErrCode::EvalFalse))
+    }
 }
 
 fn verify_taproot_keypath(
@@ -586,10 +819,10 @@ fn taproot_keypath_signature(witness: &[Vec<u8>]) -> Result<&[u8], ScriptError> 
 mod tests {
     use bitcoin_rs_primitives::{OutPoint, Tx, TxIn, TxOut, Txid};
 
-    use super::{Interpreter, ScriptError, VerifyFlags};
+    use super::{Interpreter, ScriptErrCode, ScriptError, VerifyFlags};
 
     #[test]
-    fn no_backend_accepts_only_empty_op_true_spend() {
+    fn op_true_spend_succeeds_and_a_false_stack_result_fails() {
         let interpreter = Interpreter;
         let tx = unsigned_spend();
         let prevout = TxOut {
@@ -610,9 +843,12 @@ mod tests {
             Ok(true)
         );
 
+        // OP_0 leaves one empty element, which CastToBool reads as false.
         assert!(matches!(
             interpreter.execute(&[0x00], &[], &[], VerifyFlags::MANDATORY, &prevout, &tx, 0,),
-            Err(ScriptError::Verification(_))
+            Err(ScriptError::Invalid {
+                code: ScriptErrCode::EvalFalse
+            })
         ));
     }
 
