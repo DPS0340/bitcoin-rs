@@ -1125,6 +1125,7 @@ pub struct NodeState {
     config: Config,
     data_dir: PathBuf,
     checkpoint_data_dir: cap_std::fs::Dir,
+    #[cfg(test)]
     resume_source: ResumeSource,
     storage: NodeStorage,
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
@@ -1585,6 +1586,7 @@ impl NodeState {
                 config.network,
                 config.assume_valid_height,
             )),
+            recovery_meta_path: Some(config.data_dir.join(crate::crash_recovery::META_FILENAME)),
         };
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
         let sync = Arc::new(crate::BlockSync::new(
@@ -1626,6 +1628,7 @@ impl NodeState {
             config,
             data_dir,
             checkpoint_data_dir,
+            #[cfg(test)]
             resume_source,
             storage,
             block_body_store,
@@ -1681,6 +1684,7 @@ impl NodeState {
         &self.data_dir
     }
 
+    #[cfg(test)]
     pub(crate) const fn resume_source(&self) -> ResumeSource {
         self.resume_source
     }
@@ -2067,6 +2071,7 @@ impl NodeState {
         let meta = crate::crash_recovery::Meta {
             height,
             last_committed_height: height,
+            tip_hash_hex: None,
         };
         crate::crash_recovery::write_meta(self, &meta)
     }

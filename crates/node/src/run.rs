@@ -910,9 +910,7 @@ pub(crate) fn start_node(
         // The guard was just built with `state: Some(state)` above.
         panic!("state recorded above");
     };
-    if state.resume_source() != crate::state::ResumeSource::Checkpoint {
-        crash_recovery::recover_if_needed(state)?;
-    }
+    crash_recovery::recover_if_needed(state)?;
 
     tracing::info!(
         network = ?state.config().network,
