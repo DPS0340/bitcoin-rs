@@ -1,8 +1,8 @@
 # End-to-end sync benchmarks
 
-> **Evidence status:** This page publishes completed historical runs and their raw JSON. All numbers and artifacts below reflect historical runs performed prior to the Task 16 cutover, where `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine across `bitcoin-rs-consensus`, `bitcoin-rs-node`, and `bitcoin-rs`.
+> **Evidence status:** This page publishes completed historical runs and their raw JSON. All numbers and artifacts below reflect historical runs performed prior to the Task 16 cutover, where `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine in `bitcoin-rs-consensus` and `bitcoin-rs-node`. The `bin/bitcoin-rs` binary later dropped `kernel` from its defaults (`default = ["fjall", "redb", "zmq"]`), so `cargo build -p bitcoin-rs` no longer links `bitcoinkernel`; pass `--features kernel` for the kernel consensus engine.
 >
-> The obsolete `bitcoinconsensus` backend was removed in Task 16 after fresh mainnet IBD stopped at block 938344 (exposing missing complete prevouts and unsupported Taproot script-path verification in the portable path). Default builds now require system dependencies (`cmake` and `libboost-dev`).
+> The obsolete `bitcoinconsensus` backend was removed in Task 16 after fresh mainnet IBD stopped at block 938344 (exposing missing complete prevouts and unsupported Taproot script-path verification in the portable path). Builds with `kernel` require system dependencies (`cmake` and `libboost-dev`).
 >
 > Historical `bitcoinconsensus` and early experimental `kernel` numbers published here serve as historical records and are non-comparable with kernel-default production builds. No full-tip (height 957,600+) live IBD run or G14 performance-gate pass has been completed under the landed kernel default. Final performance claims remain pending fresh measurements.
 

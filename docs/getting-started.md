@@ -6,13 +6,16 @@ verify progress before moving on.
 ## Prerequisites
 
 - A Rust toolchain for edition 2024 (MSRV 1.95.0 or newer).
-- The default build is pure Rust and requires no C++ compiler or system libraries.
+- The default binary build is pure Rust and requires no C++ compiler or system
+  libraries. It uses the portable Rust script interpreter, which verifies
+  Taproot key-path spends only and cannot validate ordinary mainnet spends
+  (see #166). For production consensus validation, enable the `kernel` feature.
 
-If you plan to compile with the optional `kernel` feature for differential
-verification against `libbitcoinkernel`, install `cmake` and `libboost-dev`:
+If you plan to compile with the `kernel` feature for production consensus
+validation via `libbitcoinkernel`, install `cmake` and `libboost-dev`:
 
 ```sh
-# Only required for the optional kernel oracle feature
+# Required for the kernel consensus engine feature
 sudo apt-get install -y cmake libboost-dev
 ```
 
@@ -25,11 +28,14 @@ cargo build --release -p bitcoin-rs
 ```
 
 This produces `./target/release/bitcoin-rs`. The default configuration includes
-the `fjall` storage backend, `redb`, and `zmq` sequence publishing. Consensus
-validation runs natively in pure Rust across all script types (Legacy, SegWit v0,
-and Taproot key-path and script-path spends).
+the `fjall` storage backend, `redb`, and `zmq` sequence publishing. The default
+binary build uses the portable Rust script interpreter, which verifies Taproot
+key-path spends only; other script classes (Legacy, SegWit v0, Taproot
+script-path) are stubbed pending a full opcode interpreter (see #166). A
+mainnet sync with this build stops at the first real spend.
 
-To compile with the optional `libbitcoinkernel` verification oracle:
+To compile with `libbitcoinkernel` as the consensus engine for full script
+validation across all script classes:
 
 ```sh
 cargo build --release -p bitcoin-rs --features kernel
@@ -78,7 +84,7 @@ Configuration defaults:
 | `--prune-target-mb` | 0 (no pruning) |
 | `--txindex` | off |
 | `--scriptindex` | off |
-| `--verify-kernel` | off (requires `--features kernel` build) |
+| `--features kernel` (build-time) | off in default binary; enables `libbitcoinkernel` consensus engine |
 
 The node logs its startup banner, effective cache allocation, and the address
 the JSON-RPC listener bound to.

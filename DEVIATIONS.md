@@ -79,7 +79,7 @@ One workspace dependency still needs host packages beyond a clean Rust toolchain
 
 | Crate | Failure mode | Root cause | Resolution |
 |---|---|---|---|
-| `bitcoinkernel` (`libbitcoinkernel-sys` 0.3.0, via `bitcoinkernel` 0.2.1) | `cmake` aborts: "Could NOT find Boost (missing: Boost_DIR)" | The crate vendors libbitcoinkernel C++ sources and builds them via CMake; **Boost development headers (`libboost-dev`) are required**. | Feature-gate behind `kernel` in `crates/consensus/Cargo.toml`. `kernel` is now a default feature (`crates/consensus/Cargo.toml` `default = ["kernel"]`), CI installs `cmake` and `libboost-dev` up front for the standard jobs, `kernel-parity` replaced the obsolete `kernel-only` and `kernel-node` jobs, and `portable-check` covers `--no-default-features`. |
+| `bitcoinkernel` (`libbitcoinkernel-sys` 0.3.0, via `bitcoinkernel` 0.2.1) | `cmake` aborts: "Could NOT find Boost (missing: Boost_DIR)" | The crate vendors libbitcoinkernel C++ sources and builds them via CMake; **Boost development headers (`libboost-dev`) are required**. | Feature-gate behind `kernel` in `crates/consensus/Cargo.toml`. `kernel` is a default feature in `crates/consensus` (`default = ["kernel"]`) and `crates/node` (`default = ["fjall", "kernel", "zmq"]`), but **not** in `bin/bitcoin-rs` (`default = ["fjall", "redb", "zmq"]`). CI installs `cmake` and `libboost-dev` for the kernel lanes, `kernel-parity` replaced the obsolete `kernel-only` and `kernel-node` jobs, and `portable-check` covers `--no-default-features`. |
 
 ### MDBX un-gated after MSRV 1.92
 
@@ -89,14 +89,14 @@ so MDBX no longer needs an elevated-toolchain CI lane.
 
 ### Resulting feature flags
 
-- `crates/consensus`: `kernel` feature enables `bitcoinkernel` dep and is the production consensus default (**Default ON** across consensus, node, and binary crates). The obsolete `bitcoinconsensus` feature chain was removed.
+- `crates/consensus`: `kernel` feature enables `bitcoinkernel` dep and is the production consensus default (**Default ON** in `crates/consensus` and `crates/node`; **Default OFF** in `bin/bitcoin-rs`). The obsolete `bitcoinconsensus` feature chain was removed. The #166 kernel flip — making `kernel` opt-in across all crates — is blocked because the portable Rust interpreter cannot validate ordinary spends (see #166 and `CONCEPTS.md` → *Rust interpreter (portable posture)*).
 - `crates/storage`: `rocksdb`, `fjall`, `redb`, `mdbx` features (all enabled by default in binary; node defaults `fjall,kernel`).
-- Default builds link `bitcoinkernel` and require system dependencies (`cmake` and `libboost-dev`).
+- `cargo build -p bitcoin-rs` (default features) does **not** link `bitcoinkernel`; `cargo build -p bitcoin-rs --features kernel` does. Builds with `kernel` require system dependencies (`cmake` and `libboost-dev`).
 - Workspace CI: `clippy`/`test` jobs build with `FULL_NODE_FEATURES: "rocksdb,fjall,redb,mdbx,kernel"` under Rust 1.95.0 with `libboost-dev` and `cmake` installed up front. The obsolete `kernel-node` job is replaced by `kernel-parity`, while `portable-check` exercises the `--no-default-features` path without C++ build dependencies.
 
 ### What this means for PLAN.md gates
 
-- **G3 (kernel parity)** is exercised on the default build via `kernel-parity`; default builds validate all script classes through bitcoinkernel.
+- **G3 (kernel parity)** is exercised on the `kernel-parity` CI lane (`--features kernel`); builds with `kernel` validate all script classes through bitcoinkernel. The default binary build (`cargo build -p bitcoin-rs`) does not include `kernel` and uses the portable interpreter (Taproot key-path only).
 - **G7 (4-backend equivalence)** runs in the default full-node CI matrix: rocksdb ↔ fjall ↔ redb ↔ mdbx.
 - All other gates (G1, G2, G4, G5, G6, G8 – G15) are unaffected.
 
@@ -451,3 +451,57 @@ derived state needs to earn its cost:
 - The `getcapabilities` pending extension row shipped; `getindexinfo` gains
   a `basicblockfilterindex` entry only while the extension runs, preserving
   the absent-filter contract recorded at removal time.
+
+## #166 — Kernel flip blocked: portable interpreter cannot validate ordinary spends
+
+The #166 kernel flip (making `libbitcoinkernel` opt-in across all crates) does
+not close this session. The flip is blocked by a capability gap in the portable
+Rust script interpreter, not by a performance gate.
+
+**Blocking evidence:**
+
+- `crates/script/src/interpreter.rs` `verify_non_taproot_portable` accepts
+  exactly one shape: `script_pubkey == [0x51]` (`OP_TRUE`) with an empty
+  `script_sig` and an empty `witness`. Every other non-Taproot spend returns
+  `Err(ScriptError::Verification(...))`.
+- Only Taproot key-path verification is implemented in full
+  (`verify_taproot_keypath` in the same file). Taproot script-path, Legacy,
+  P2SH, and SegWit v0 spends are not verified.
+- `crates/script` has no opcode interpreter at all: 1,406 lines across the
+  crate's `src/` directory (`script.rs` 559, `interpreter.rs` 452, `sigops.rs`
+  170, `stack.rs` 99, `taproot.rs` 49, `batch.rs` 43, `lib.rs` 34), with zero
+  opcode dispatch — `script.rs` lexes bytes into push/op instructions but no
+  file evaluates them against a stack.
+- `CONCEPTS.md` → *Rust interpreter (portable posture)* records the
+  consequence: "a mainnet sync stops early on the first real spend."
+
+**What was proven:**
+
+- G03 differential parity (block-parse parity over 15 mainnet blocks, script-
+  verdict parity over 6 fixtures × mutations, vector oracle parity over 121
+  tx_valid + 84 tx_invalid rows) passes under `--features kernel`. See
+  `.outline/sdd/reports/parity-harness.md`.
+- Apply-path overhead measurement (PERF-V5): native median 15.747 ms vs kernel
+  baseline 36.136 ms (2.29x). Both arithmetic gate conditions pass. However,
+  the corpus spends bare `OP_TRUE` outputs, so neither arm verifies a
+  signature; the number measures apply-path overhead, not validation cost. See
+  `docs/benchmarks/data/overhaul-native-apply-20260902.md`.
+
+**What remains:**
+
+A portable Rust opcode interpreter covering Legacy, P2SH, SegWit v0, and
+Taproot script-path verification with all sighash variants. Until that exists,
+flipping `kernel` to opt-in would ship a node that cannot validate mainnet in
+more build configurations.
+
+**Current feature defaults (unchanged):**
+
+| Crate | `kernel` in defaults? |
+|---|---|
+| `crates/consensus` | Yes (`default = ["kernel"]`) |
+| `crates/node` | Yes (`default = ["fjall", "kernel", "zmq"]`) |
+| `bin/bitcoin-rs` | No (`default = ["fjall", "redb", "zmq"]`) |
+
+`cargo tree -p bitcoin-rs` (default features) returns 0 `bitcoinkernel` lines;
+`cargo tree -p bitcoin-rs --features kernel` returns 2 (`bitcoinkernel v0.2.1`
+and `libbitcoinkernel-sys v0.3.0`).
