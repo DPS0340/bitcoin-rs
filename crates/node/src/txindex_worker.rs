@@ -1079,6 +1079,38 @@ where
     })
 }
 
+/// Exact spent-coin script anchor decoded from one block's undo record.
+///
+/// The undo restores are precisely the external coins spent by the block and
+/// carry their full `script_pubkey`. Intra-block spends are absent because
+/// those outputs never entered the committed UTXO set.
+pub(crate) struct UndoScripts {
+    scripts: hashbrown::HashMap<([u8; 32], u32), Vec<u8>>,
+}
+
+impl UndoScripts {
+    pub(crate) fn from_undo_bytes(
+        bytes: &[u8],
+        hash: Hash256,
+    ) -> Result<Self, bitcoin_rs_utxo::undo_codec::UndoCodecError> {
+        let batch = bitcoin_rs_utxo::undo_codec::decode(bytes, hash)?;
+        let mut scripts = hashbrown::HashMap::with_capacity(batch.restores().len());
+        for add in batch.restores() {
+            scripts.insert(
+                (add.outpoint.txid.to_le_bytes(), add.outpoint.vout),
+                add.txout.script_pubkey.to_bytes(),
+            );
+        }
+        Ok(Self { scripts })
+    }
+}
+
+impl bitcoin_rs_index::SpentCoinScripts for UndoScripts {
+    fn script_bytes(&self, txid: &[u8; 32], vout: u32) -> Option<&[u8]> {
+        self.scripts.get(&(*txid, vout)).map(Vec::as_slice)
+    }
+}
+
 /// Erased prepared-index writer used by the worker and stored in `NodeState`.
 pub(crate) trait TxIndexWriter: Send + Sync {
     fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError>;
@@ -1098,6 +1130,17 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         let _ = capabilities;
         self.prepare_block(height, hash, body)
     }
+    fn prepare_block_with_spent_scripts(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<PreparedBlock, IndexError> {
+        let _ = spent_scripts;
+        self.prepare_block_for(capabilities, height, hash, body)
+    }
     fn commit_forward_with_cursor(
         &self,
         fence: IndexWriteFence,
@@ -1112,6 +1155,18 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         body: &[u8],
         cursor: ConsumerCursorUpdate<'_>,
     ) -> Result<(), IndexError>;
+    fn commit_rollback_one_for_with_cursor_with_spent_scripts(
+        &self,
+        fence: IndexWriteFence,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: ConsumerCursorUpdate<'_>,
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<(), IndexError> {
+        let _ = spent_scripts;
+        self.commit_rollback_one_for_with_cursor(fence, capabilities, prev, body, cursor)
+    }
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
         let _ = capabilities;
         Err(IndexError::UnsupportedRollback)
@@ -1152,6 +1207,23 @@ where
             .prepare_block_for(capabilities, height, hash, body)
     }
 
+    fn prepare_block_with_spent_scripts(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<PreparedBlock, IndexError> {
+        self.lock().prepare_block_with_spent_scripts(
+            capabilities,
+            height,
+            hash,
+            body,
+            spent_scripts,
+        )
+    }
+
     fn commit_forward_with_cursor(
         &self,
         fence: IndexWriteFence,
@@ -1170,7 +1242,33 @@ where
         cursor: ConsumerCursorUpdate<'_>,
     ) -> Result<(), IndexError> {
         self.lock()
-            .commit_rollback_one_for_with_cursor(fence, capabilities, prev, body, cursor)
+            .commit_rollback_one_for_with_cursor(
+                fence,
+                capabilities,
+                prev,
+                body,
+                cursor,
+                &bitcoin_rs_index::NoSpentScripts,
+            )
+    }
+
+    fn commit_rollback_one_for_with_cursor_with_spent_scripts(
+        &self,
+        fence: IndexWriteFence,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: ConsumerCursorUpdate<'_>,
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<(), IndexError> {
+        self.lock().commit_rollback_one_for_with_cursor(
+            fence,
+            capabilities,
+            prev,
+            body,
+            cursor,
+            spent_scripts,
+        )
     }
 
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
@@ -1223,6 +1321,23 @@ where
             .prepare_block_for(capabilities, height, hash, body)
     }
 
+    fn prepare_block_with_spent_scripts(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<PreparedBlock, IndexError> {
+        self.read().prepare_block_with_spent_scripts(
+            capabilities,
+            height,
+            hash,
+            body,
+            spent_scripts,
+        )
+    }
+
     fn commit_forward_with_cursor(
         &self,
         fence: IndexWriteFence,
@@ -1242,7 +1357,33 @@ where
         cursor: ConsumerCursorUpdate<'_>,
     ) -> Result<(), IndexError> {
         self.write()
-            .commit_rollback_one_for_with_cursor(fence, capabilities, prev, body, cursor)
+            .commit_rollback_one_for_with_cursor(
+                fence,
+                capabilities,
+                prev,
+                body,
+                cursor,
+                &bitcoin_rs_index::NoSpentScripts,
+            )
+    }
+
+    fn commit_rollback_one_for_with_cursor_with_spent_scripts(
+        &self,
+        fence: IndexWriteFence,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: ConsumerCursorUpdate<'_>,
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<(), IndexError> {
+        self.write().commit_rollback_one_for_with_cursor(
+            fence,
+            capabilities,
+            prev,
+            body,
+            cursor,
+            spent_scripts,
+        )
     }
 
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
