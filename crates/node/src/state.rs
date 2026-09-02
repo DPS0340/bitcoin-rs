@@ -353,33 +353,28 @@ impl NodeStorage {
     fn block_body_store(
         &self,
         files: Arc<FlatFileBlockStore>,
-        data_dir: &Path,
-    ) -> Result<Arc<dyn crate::apply::PruneBodyStore>> {
+    ) -> Arc<dyn crate::apply::PruneBodyStore> {
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+            Self::RocksDb(store) => Arc::new(crate::apply::FlatFilePruneBodyStore::open(
                 Arc::clone(store),
                 files,
-                data_dir,
-            )?)),
+            )),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+            Self::Fjall(store) => Arc::new(crate::apply::FlatFilePruneBodyStore::open(
                 Arc::clone(store),
                 files,
-                data_dir,
-            )?)),
+            )),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+            Self::Redb(store) => Arc::new(crate::apply::FlatFilePruneBodyStore::open(
                 Arc::clone(store),
                 files,
-                data_dir,
-            )?)),
+            )),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+            Self::Mdbx(store) => Arc::new(crate::apply::FlatFilePruneBodyStore::open(
                 Arc::clone(store),
                 files,
-                data_dir,
-            )?)),
+            )),
         }
     }
 
@@ -910,8 +905,7 @@ impl NodeState {
         }
         let block_files =
             Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
-        let block_body_store =
-            storage.block_body_store(Arc::clone(&block_files), &config.data_dir)?;
+        let block_body_store = storage.block_body_store(Arc::clone(&block_files));
 
         let zmq_publications = config.zmq_publications();
         let active_zmq_notifications: Vec<_> = zmq_publications
@@ -1503,17 +1497,6 @@ mod tests {
         })));
     }
 
-    fn write_current_schema_marker(config: &Config) -> anyhow::Result<()> {
-        let bytes = crate::checkpoint_fs::current_schema_bytes();
-        std::fs::write(
-            config
-                .data_dir
-                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
-            bytes,
-        )?;
-        Ok(())
-    }
-
     #[test]
     fn open_constructs_empty_handles() -> anyhow::Result<()> {
         use tempfile::tempdir;
@@ -1948,38 +1931,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fjall")]
-    #[test]
-    fn legacy_block_body_datadir_is_refused() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("legacy-node");
-        config.p2p_listen.clear();
-        std::fs::create_dir_all(&config.data_dir)?;
-        write_current_schema_marker(&config)?;
-        std::fs::create_dir_all(config.data_dir.join("chainstate"))?;
-        let store = bitcoin_rs_storage::FjallStore::open(config.data_dir.join("chainstate"))?;
-        store.put(
-            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
-            &bitcoin_rs_storage::pruning::block_body_key(
-                1,
-                bitcoin_rs_primitives::Hash256::from_le_bytes(&[1_u8; 32]),
-            ),
-            b"legacy-inline-body",
-        )?;
-        drop(store);
-
-        let datadir = config.data_dir.display().to_string();
-        let Err(error) = NodeState::open(config) else {
-            anyhow::bail!("legacy inline block body unexpectedly opened");
-        };
-        let message = format!("{error:#}");
-        assert!(message.contains(&datadir));
-        assert!(message.contains("predates the flat-file block store"));
-        assert!(message.contains("must be resynced"));
-        Ok(())
-    }
-
     #[test]
     fn new_datadir_initializes_current_schema_before_storage() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2311,7 +2262,6 @@ mod tests {
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
         std::fs::create_dir_all(&config.data_dir)?;
-        write_current_schema_marker(&config)?;
         let blocks_dir = config.data_dir.join("blocks");
         std::fs::create_dir_all(&blocks_dir)?;
         let prunable_file = blocks_dir.join("blk00000.dat");
@@ -2389,7 +2339,6 @@ mod tests {
         config.prune_target_mb = 1;
 
         std::fs::create_dir_all(&config.data_dir)?;
-        write_current_schema_marker(&config)?;
 
         // Two files present before the store opens, so the earlier one is not
         // the append target and is therefore prunable. Same shape as

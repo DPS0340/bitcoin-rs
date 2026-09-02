@@ -51,6 +51,9 @@ The marker covers all persistent surfaces in the datadir:
   layout and have no historical translation layer.
 - Flat block files use the current `BRSB` record format.
 - UTXO checkpoints use only `utxo-v4.dat` and the strict v4 reader.
+- Block-body index rows must decode to 16-byte flat-file positions. That
+  validation is lazy (per read, not a boot-time column-family scan): a
+  non-decoding row is `IncompatibleData` — never a missing body.
 - Chainstate checkpoints use the current `CURRENT`, generation, manifest,
   headers, UTXO, and CoinStats artifacts. Manifest fields and component
   versions are required; absent historical fields are not defaulted.
