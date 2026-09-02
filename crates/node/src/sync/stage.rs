@@ -6,7 +6,7 @@ use std::{
 use bitcoin_rs_primitives::{Block, Hash256, consensus_bytes};
 use hashbrown::{HashMap, hash_map::Entry};
 
-use super::window::SyncBudget;
+use bitcoin_rs_p2p::SyncBudget;
 
 #[derive(Debug)]
 pub(super) struct BlockStager {
@@ -380,7 +380,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{BlockStager, block_size};
-    use crate::sync::default_sync_budget;
+    use bitcoin_rs_p2p::default_sync_budget;
 
     #[test]
     fn block_size_matches_consensus_serialized_len() {
@@ -752,9 +752,9 @@ mod tests {
             budget.max_received_bytes,
             budget
                 .max_received_blocks
-                .saturating_mul(crate::sync::PENDING_BLOCK_BYTE_ESTIMATE)
+                .saturating_mul(bitcoin_rs_p2p::download_window::PENDING_BLOCK_BYTE_ESTIMATE)
         );
-        let block = block_with_total_size(crate::sync::PENDING_BLOCK_BYTE_ESTIMATE);
+        let block = block_with_total_size(bitcoin_rs_p2p::download_window::PENDING_BLOCK_BYTE_ESTIMATE);
         let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let mut stager = BlockStager::new(budget);
         let now = Instant::now();
