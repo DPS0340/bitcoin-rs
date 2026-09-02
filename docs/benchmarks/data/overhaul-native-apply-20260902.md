@@ -45,6 +45,23 @@ Run 3 was elevated by a transient load spike (host load average 50.9 on 80 cores
 
 15.747 * 1.05 = 16.534 ms. 16.534 <= 36.136 ms. **PASS.**
 
+## Scope of this number
+
+Both arms apply the same `spend_heavy_proxy_blocks()` corpus, whose spends are
+bare `OP_TRUE` outputs (`crates/node/benches/sync_pipeline.rs`, `push_int(1)`).
+Neither arm verifies a signature. The number therefore measures apply-path
+overhead - parse, prevout resolution, state plumbing - on trivially satisfiable
+scripts. It is not evidence about signature verification cost, and it says
+nothing about the two engines on real spends.
+
 ## Verdict
 
-**FLIP-READY.** Both gate conditions pass with large margin. The native Rust apply path is 2.29x faster than the kernel apply path on the same corpus, same backend, same host, same sample count.
+**Gates pass, flip blocked.** Both arithmetic conditions hold, but they do not
+license the #166 default flip. The portable backend cannot verify ordinary
+spends: `verify_non_taproot_portable` in `crates/script/src/interpreter.rs`
+accepts exactly one shape, `script_pubkey == [0x51]` with an empty scriptSig and
+an empty witness, and errors on everything else; only taproot key-path is
+implemented in full. `CONCEPTS.md` records the consequence - a mainnet sync
+stops at the first real spend. Making `kernel` opt-in today would ship a node
+that cannot validate mainnet in more build configurations, so the flip waits on
+a portable interpreter, not on a faster measurement.
