@@ -865,12 +865,18 @@ impl NodeState {
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
         let checkpoint_data_dir = crate::checkpoint_fs::open_data_dir(&config.data_dir)
             .with_context(|| format!("open data_dir {}", config.data_dir.display()))?;
-        crate::checkpoint_fs::ensure_current_schema(&checkpoint_data_dir).with_context(|| {
-            format!(
-                "validate CURRENT_SCHEMA for datadir {}",
-                config.data_dir.display()
-            )
-        })?;
+        let datadir_identity = crate::checkpoint_fs::DatadirIdentity::for_network(
+            config.network,
+            config.p2p_magic(),
+            &config.storage_backend,
+        );
+        crate::checkpoint_fs::ensure_current_schema(&checkpoint_data_dir, &datadir_identity)
+            .with_context(|| {
+                format!(
+                    "validate CURRENT_SCHEMA for datadir {}",
+                    config.data_dir.display()
+                )
+            })?;
         let checkpoint_config = crate::checkpoint::HeaderCheckpointConfig {
             network: config.network,
             genesis: config.network.genesis_block_hash(),
@@ -1503,6 +1509,22 @@ mod tests {
         })));
     }
 
+    fn write_current_schema_marker(config: &Config) -> anyhow::Result<()> {
+        let identity = crate::checkpoint_fs::DatadirIdentity::for_network(
+            config.network,
+            config.p2p_magic(),
+            &config.storage_backend,
+        );
+        let bytes = crate::checkpoint_fs::current_schema_bytes(&identity)?;
+        std::fs::write(
+            config
+                .data_dir
+                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
+            bytes,
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn open_constructs_empty_handles() -> anyhow::Result<()> {
         use tempfile::tempdir;
@@ -1945,12 +1967,7 @@ mod tests {
         config.data_dir = dir.path().join("legacy-node");
         config.p2p_listen.clear();
         std::fs::create_dir_all(&config.data_dir)?;
-        std::fs::write(
-            config
-                .data_dir
-                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
-            b"1\n",
-        )?;
+        write_current_schema_marker(&config)?;
         std::fs::create_dir_all(config.data_dir.join("chainstate"))?;
         let store = bitcoin_rs_storage::FjallStore::open(config.data_dir.join("chainstate"))?;
         store.put(
@@ -1984,15 +2001,23 @@ mod tests {
         std::fs::write(config.data_dir.join(".CURRENT_SCHEMA.tmp"), b"partial")?;
 
         let _state = NodeState::open(config.clone())?;
+        let identity = crate::checkpoint_fs::DatadirIdentity::for_network(
+            config.network,
+            config.p2p_magic(),
+            &config.storage_backend,
+        );
         assert_eq!(
             std::fs::read(
                 config
                     .data_dir
                     .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE)
             )?,
-            b"1\n"
+            crate::checkpoint_fs::current_schema_bytes(&identity)?
         );
-        assert!(!config.data_dir.join(".CURRENT_SCHEMA.tmp").exists());
+        assert!(
+            config.data_dir.join(".CURRENT_SCHEMA.tmp").exists(),
+            "an interrupted initializer's temp is reserved residue and may be in use"
+        );
         assert!(config.data_dir.join("chainstate").exists());
         Ok(())
     }
@@ -2049,9 +2074,90 @@ mod tests {
             Err(error) => error,
         };
         let message = format!("{error:#}");
-        assert!(message.contains("current datadir schema epoch"));
+        assert!(message.contains("invalid CURRENT_SCHEMA"));
         assert!(message.contains("full resync"));
         assert!(!config.data_dir.join("chainstate").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn datadir_network_identity_is_checked_before_storage_opens() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut mainnet = crate::Config::default_for_network(crate::Network::Mainnet);
+        mainnet.data_dir = dir.path().join("shared-node");
+        mainnet.p2p_listen.clear();
+        let state = NodeState::open(mainnet.clone())?;
+        drop(state);
+
+        let mut regtest = crate::Config::default_for_network(crate::Network::Regtest);
+        regtest.data_dir = mainnet.data_dir;
+        regtest.p2p_listen.clear();
+        let error = match NodeState::open(regtest) {
+            Ok(_) => anyhow::bail!("network-switched datadir unexpectedly opened"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("datadir identity does not match"));
+        assert!(message.contains("network"));
+        assert!(!message.contains("full resync"));
+        Ok(())
+    }
+
+    #[test]
+    fn datadir_storage_backend_identity_is_checked_before_storage_opens() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut fjall = crate::Config::default_for_network(crate::Network::Regtest);
+        fjall.data_dir = dir.path().join("shared-node");
+        fjall.p2p_listen.clear();
+        let state = NodeState::open(fjall.clone())?;
+        drop(state);
+
+        let mut redb = fjall;
+        redb.storage_backend = "redb".to_owned();
+        let error = match NodeState::open(redb) {
+            Ok(_) => anyhow::bail!("backend-switched datadir unexpectedly opened"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("datadir identity does not match"));
+        assert!(message.contains("storage_backend"));
+        assert!(!message.contains("unsupported storage backend"));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_schema_initializers_publish_one_complete_marker() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("shared-node");
+        std::fs::create_dir_all(&data_dir)?;
+        let identity = crate::checkpoint_fs::DatadirIdentity::for_network(
+            crate::Network::Regtest,
+            crate::Network::Regtest.magic(),
+            "fjall",
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let data_dir = data_dir.clone();
+            let identity = identity.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || -> std::io::Result<()> {
+                barrier.wait();
+                let data = crate::checkpoint_fs::open_data_dir(&data_dir)?;
+                crate::checkpoint_fs::ensure_current_schema(&data, &identity)
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("schema initializer panicked"))??;
+        }
+
+        let marker = std::fs::read(data_dir.join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE))?;
+        assert_eq!(
+            marker,
+            crate::checkpoint_fs::current_schema_bytes(&identity)?
+        );
         Ok(())
     }
 
@@ -2313,12 +2419,7 @@ mod tests {
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
         std::fs::create_dir_all(&config.data_dir)?;
-        std::fs::write(
-            config
-                .data_dir
-                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
-            b"1\n",
-        )?;
+        write_current_schema_marker(&config)?;
         let blocks_dir = config.data_dir.join("blocks");
         std::fs::create_dir_all(&blocks_dir)?;
         let prunable_file = blocks_dir.join("blk00000.dat");
@@ -2396,12 +2497,7 @@ mod tests {
         config.prune_target_mb = 1;
 
         std::fs::create_dir_all(&config.data_dir)?;
-        std::fs::write(
-            config
-                .data_dir
-                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
-            b"1\n",
-        )?;
+        write_current_schema_marker(&config)?;
 
         // Two files present before the store opens, so the earlier one is not
         // the append target and is therefore prunable. Same shape as

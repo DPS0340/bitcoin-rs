@@ -539,12 +539,12 @@ pub(crate) enum IncompatibleCheckpoint {
         component: &'static str,
         version: u32,
     },
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum CheckpointCorruption {
     #[error(
-        "incompatible bitcoin-rs datadir: checkpoint identity is invalid: {0}; remove or replace the datadir and restart to perform a full resync"
-    )]
-    Identity(String),
-    #[error(
-        "incompatible bitcoin-rs datadir: {reason}; remove or replace the datadir and restart to perform a full resync"
+        "corrupt current-schema checkpoint: {reason}; remove or replace the datadir and restart to perform a full resync"
     )]
     Invalid { reason: String },
 }
@@ -553,6 +553,8 @@ pub(crate) enum IncompatibleCheckpoint {
 pub(crate) enum CheckpointLoadError {
     #[error(transparent)]
     Incompatible(#[from] IncompatibleCheckpoint),
+    #[error(transparent)]
+    Corrupt(#[from] CheckpointCorruption),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -669,13 +671,10 @@ pub(crate) fn load_checkpoint_from_dir(
 
     let current = match read_current(&root) {
         Ok(Some(current)) => current,
-        Ok(None) => {
-            return Err(CheckpointLoadError::Incompatible(
-                IncompatibleCheckpoint::Invalid {
-                    reason: "checkpoint root is missing CURRENT".to_owned(),
-                },
-            ));
-        }
+        // CURRENT is the publication commit point. A root without it can be
+        // leftover from a first publication that crashed before the pointer
+        // became visible; none of that generation is committed state.
+        Ok(None) => return Ok(CheckpointLoad::Cold),
         Err(error) => return Err(classify_load_error(error)),
     };
     let generation_dir = root.open_dir(&current.directory).map_err(|error| {
@@ -689,61 +688,44 @@ pub(crate) fn load_checkpoint_from_dir(
         Err(error) => return Err(classify_load_error(error)),
     };
     if manifest.headers.version != HEADER_VERSION {
-        return Err(CheckpointLoadError::Incompatible(
-            IncompatibleCheckpoint::UnsupportedVersion {
-                component: "headers",
-                version: manifest.headers.version,
-            },
-        ));
+        return Err(corrupt_checkpoint(format!(
+            "headers checkpoint version {} is not current",
+            manifest.headers.version
+        )));
     }
     if manifest.headers.codec != HEADER_CODEC {
-        return Err(CheckpointLoadError::Incompatible(
-            IncompatibleCheckpoint::Invalid {
-                reason: format!(
-                    "unexpected headers checkpoint codec {}",
-                    manifest.headers.codec
-                ),
-            },
-        ));
+        return Err(corrupt_checkpoint(format!(
+            "unexpected headers checkpoint codec {}",
+            manifest.headers.codec
+        )));
     }
 
     let restored_headers = match load_headers(&generation_dir, config, &manifest) {
         Ok(headers) => headers,
         Err(CheckpointError::Header(HeaderCheckpointError::UnsupportedVersion { actual })) => {
-            return Err(CheckpointLoadError::Incompatible(
-                IncompatibleCheckpoint::UnsupportedVersion {
-                    component: "headers",
-                    version: actual,
-                },
-            ));
+            return Err(corrupt_checkpoint(format!(
+                "headers checkpoint version {actual} is not current"
+            )));
         }
         Err(error) => return Err(classify_checkpoint_error(error)),
     };
     if manifest.utxo.version != UTXO_VERSION {
-        return Err(CheckpointLoadError::Incompatible(
-            IncompatibleCheckpoint::UnsupportedVersion {
-                component: "UTXO",
-                version: manifest.utxo.version,
-            },
-        ));
+        return Err(corrupt_checkpoint(format!(
+            "UTXO checkpoint version {} is not current",
+            manifest.utxo.version
+        )));
     }
     if manifest.coinstats.version != COINSTATS_VERSION {
-        return Err(CheckpointLoadError::Incompatible(
-            IncompatibleCheckpoint::UnsupportedVersion {
-                component: "CoinStats",
-                version: manifest.coinstats.version,
-            },
-        ));
+        return Err(corrupt_checkpoint(format!(
+            "CoinStats checkpoint version {} is not current",
+            manifest.coinstats.version
+        )));
     }
     if manifest.utxo.codec != UTXO_CODEC || manifest.coinstats.codec != COINSTATS_CODEC {
-        return Err(CheckpointLoadError::Incompatible(
-            IncompatibleCheckpoint::Invalid {
-                reason: format!(
-                    "unexpected payload codecs UTXO={} CoinStats={}",
-                    manifest.utxo.codec, manifest.coinstats.codec
-                ),
-            },
-        ));
+        return Err(corrupt_checkpoint(format!(
+            "unexpected payload codecs UTXO={} CoinStats={}",
+            manifest.utxo.codec, manifest.coinstats.codec
+        )));
     }
     match load_payloads(&generation_dir, &manifest, restored_headers) {
         Ok(restored) => Ok(CheckpointLoad::Complete(Box::new(restored))),
@@ -765,17 +747,13 @@ fn classify_checkpoint_error(error: CheckpointError) -> CheckpointLoadError {
         | CheckpointError::Storage(bitcoin_rs_storage::StorageError::Io(error)) => {
             classify_checkpoint_io(error)
         }
-        error => CheckpointLoadError::Incompatible(IncompatibleCheckpoint::Invalid {
-            reason: error.to_string(),
-        }),
+        error => corrupt_checkpoint(error.to_string()),
     }
 }
 
 fn classify_open_error(operation: &str, error: std::io::Error) -> CheckpointLoadError {
     if is_checkpoint_corruption(&error) {
-        return CheckpointLoadError::Incompatible(IncompatibleCheckpoint::Invalid {
-            reason: format!("{operation} failed: {error}"),
-        });
+        return corrupt_checkpoint(format!("{operation} failed: {error}"));
     }
     CheckpointLoadError::Io(error)
 }
@@ -789,11 +767,15 @@ fn checkpoint_file_error(name: &str, error: std::io::Error) -> CheckpointError {
 
 fn classify_checkpoint_io(error: std::io::Error) -> CheckpointLoadError {
     if is_checkpoint_corruption(&error) {
-        return CheckpointLoadError::Incompatible(IncompatibleCheckpoint::Invalid {
-            reason: error.to_string(),
-        });
+        return corrupt_checkpoint(error.to_string());
     }
     CheckpointLoadError::Io(error)
+}
+
+fn corrupt_checkpoint(reason: impl Into<String>) -> CheckpointLoadError {
+    CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid {
+        reason: reason.into(),
+    })
 }
 
 fn is_checkpoint_corruption(error: &std::io::Error) -> bool {
@@ -1253,11 +1235,10 @@ fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, LoadStageErr
     }
     let expected_directory = generation_name(current.generation);
     if current.directory != expected_directory || !valid_generation_name(&current.directory) {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::Identity(
-                "CURRENT generation directory does not match its generation".to_owned(),
-            ),
-        ));
+        return Err(CheckpointError::Invalid(
+            "CURRENT generation directory does not match its generation".to_owned(),
+        )
+        .into());
     }
     decode_hex::<32>(&current.manifest_sha256)?;
     Ok(Some(current))
@@ -1279,12 +1260,11 @@ fn read_manifest(
     let manifest: CheckpointManifestV1 =
         serde_json::from_slice(&bytes).map_err(CheckpointError::Json)?;
     if manifest.version != MANIFEST_VERSION {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::UnsupportedVersion {
-                component: "manifest",
-                version: manifest.version,
-            },
-        ));
+        return Err(CheckpointError::Invalid(format!(
+            "manifest version {} is not current",
+            manifest.version
+        ))
+        .into());
     }
     if manifest.format != MANIFEST_FORMAT {
         return Err(CheckpointError::Invalid(format!(
@@ -1294,22 +1274,20 @@ fn read_manifest(
         .into());
     }
     if manifest.generation != current.generation {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::Identity(
-                "manifest generation does not match CURRENT".to_owned(),
-            ),
-        ));
+        return Err(CheckpointError::Invalid(
+            "manifest generation does not match CURRENT".to_owned(),
+        )
+        .into());
     }
     let expected_network = network_name(config.network);
     if manifest.network != expected_network
         || manifest.network_magic != hex_encode(&config.network.magic())
         || manifest.genesis_hash != config.genesis.to_string_be()
     {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::Identity(
-                "checkpoint network, magic, or genesis does not match configuration".to_owned(),
-            ),
-        ));
+        return Err(CheckpointError::Invalid(
+            "checkpoint network, magic, or genesis does not match configuration".to_owned(),
+        )
+        .into());
     }
     Ok(manifest)
 }
@@ -1816,10 +1794,10 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CHECKPOINT_ROOT, COINSTATS_FILE, CURRENT_FILE, CheckpointFailpoint, CheckpointLoad,
-        CheckpointLoadError, CheckpointManifestV1, CheckpointWrite, CurrentV1, HEADER_PREFIX_LEN,
-        HEADERS_FILE, HeaderCheckpointConfig, HeaderCheckpointError, HeaderCheckpointPoint,
-        HeaderCheckpointTip, HeaderCheckpointWrite, IncompatibleCheckpoint, MANIFEST_FILE,
+        CHECKPOINT_ROOT, COINSTATS_FILE, CURRENT_FILE, CheckpointCorruption, CheckpointFailpoint,
+        CheckpointLoad, CheckpointLoadError, CheckpointManifestV1, CheckpointWrite, CurrentV1,
+        HEADER_PREFIX_LEN, HEADERS_FILE, HeaderCheckpointConfig, HeaderCheckpointError,
+        HeaderCheckpointPoint, HeaderCheckpointTip, HeaderCheckpointWrite, MANIFEST_FILE,
         UTXO_FILE, encode_header, load_checkpoint, read_headers, write_checkpoint_with_failpoint,
         write_headers,
     };
@@ -2223,6 +2201,57 @@ mod tests {
     }
 
     #[test]
+    fn first_publication_failures_leave_no_committed_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for failpoint in [
+            CheckpointFailpoint::HeadersWrite,
+            CheckpointFailpoint::HeadersSync,
+            CheckpointFailpoint::UtxoWrite,
+            CheckpointFailpoint::UtxoSync,
+            CheckpointFailpoint::CoinStatsWrite,
+            CheckpointFailpoint::CoinStatsSync,
+            CheckpointFailpoint::ManifestWrite,
+            CheckpointFailpoint::ManifestSync,
+            CheckpointFailpoint::StageSync,
+            CheckpointFailpoint::GenerationRename,
+            CheckpointFailpoint::GenerationRootSync,
+            CheckpointFailpoint::CurrentTempWrite,
+            CheckpointFailpoint::CurrentTempSync,
+            CheckpointFailpoint::CurrentRename,
+        ] {
+            let dir = tempfile::tempdir()?;
+            let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+            let applied_tip = tip_snapshot(&tree, applied)?;
+            let tree = RwLock::new(tree);
+            let utxo = UtxoSet::new();
+            let listener = CoinStatsListener::new(CoinStats::new());
+
+            assert!(
+                write_checkpoint_with_failpoint(
+                    dir.path(),
+                    config(),
+                    &tree,
+                    &utxo,
+                    &listener,
+                    Some(&applied_tip),
+                    failpoint,
+                )
+                .is_err(),
+                "{failpoint:?}"
+            );
+            assert!(
+                !dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE).exists(),
+                "pre-publication failure exposed CURRENT at {failpoint:?}"
+            );
+            assert!(matches!(
+                load_checkpoint(dir.path(), config()),
+                Ok(CheckpointLoad::Cold)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn no_applied_tip_skips_without_changing_current() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
@@ -2249,8 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_without_current_requires_explicit_resync()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_without_current_is_cold() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
         let applied_tip = tip_snapshot(&tree, applied)?;
@@ -2264,11 +2292,10 @@ mod tests {
         )?;
         fs::remove_file(dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE))?;
 
-        let Err(error) = load_checkpoint(dir.path(), config()) else {
-            return Err("checkpoint without CURRENT unexpectedly loaded".into());
-        };
-        assert!(error.to_string().contains("missing CURRENT"));
-        assert!(error.to_string().contains("full resync"));
+        assert!(matches!(
+            load_checkpoint(dir.path(), config()),
+            Ok(CheckpointLoad::Cold)
+        ));
         Ok(())
     }
 
@@ -2316,15 +2343,12 @@ mod tests {
             manifest.utxo.version = 3;
         })?;
 
-        let Err(CheckpointLoadError::Incompatible(IncompatibleCheckpoint::UnsupportedVersion {
-            component,
-            version,
-        })) = load_checkpoint(dir.path(), config())
+        let Err(CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid { reason })) =
+            load_checkpoint(dir.path(), config())
         else {
             return Err("unsupported UTXO snapshot unexpectedly loaded".into());
         };
-        assert_eq!(component, "UTXO");
-        assert_eq!(version, 3);
+        assert!(reason.contains("UTXO checkpoint version 3 is not current"));
         Ok(())
     }
 
@@ -2435,11 +2459,8 @@ mod tests {
 
         assert!(matches!(
             load_checkpoint(dir.path(), config()),
-            Err(super::CheckpointLoadError::Incompatible(
-                super::IncompatibleCheckpoint::UnsupportedVersion {
-                    component: "headers",
-                    version: 2
-                }
+            Err(super::CheckpointLoadError::Corrupt(
+                super::CheckpointCorruption::Invalid { .. }
             ))
         ));
         Ok(())

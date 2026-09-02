@@ -185,17 +185,23 @@ snapshot makes startup fail with an explicit datadir remove-and-resync
 instruction instead of selecting a legacy reader or a validated-headers
 fallback.
 
-### Datadir schema epoch
-The one current persistent-format marker at the datadir root, stored in
-`CURRENT_SCHEMA` as the exact bytes `1\n`. A genuinely empty directory gets the
-marker initialized and synced before any checkpoint or KV store opens. A
-missing marker on a non-empty directory, a malformed marker, or an older epoch
-is an incompatible datadir and fails before normal startup; the node never
-deletes or converts it. The `Cold` startup path therefore means only a marked
-new directory with no checkpoint root. Checkpoint format mismatches and
-structural corruption still require explicit resync, while ordinary filesystem
-I/O failures remain operational errors and are not reclassified as datadir
-incompatibility. See `docs/policies/db-migration.md`.
+### Datadir schema identity
+The one current persistent-format authority at the datadir root, stored in
+`CURRENT_SCHEMA` as a canonical epoch-and-identity record. The record binds the
+current epoch to the resolved consensus network, genesis hash, effective P2P
+magic, and storage backend, and is initialized and file-synced before any
+checkpoint or KV store opens. A missing marker on a non-empty directory, a
+malformed marker, or an older epoch is an incompatible datadir and fails before
+normal startup; an identity mismatch is a configuration error that asks for
+matching settings or another datadir. The node never deletes or converts
+state. `Cold` means there is no committed checkpoint: no checkpoint root and a
+root containing only unpublished generation/temp residue both take this path.
+If `CURRENT` exists, only its referenced generation is considered; an invalid
+referenced generation is current-state corruption and has no legacy fallback.
+Ordinary filesystem I/O failures remain operational errors and are not
+reclassified as datadir incompatibility. Directory-entry durability is
+guaranteed only on platforms that support directory syncing. See
+`docs/policies/db-migration.md`.
 
 ### Undo record
 

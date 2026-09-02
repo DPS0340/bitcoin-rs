@@ -89,8 +89,11 @@ maintainer decision and matching migration policy before adding a reader.
 ### 5.3 On-Disk Format Deprecation Policy
 - On-disk storage schemas do not maintain backward-compatibility translation shims.
 - When key-value column families, block file encodings, or checkpoint formats change, the system does not convert old databases in place.
-- Every datadir carries the current `CURRENT_SCHEMA` epoch. A missing marker
-   on a non-empty datadir, a mismatched epoch, or an incompatible checkpoint
-   fails before normal persistent-state startup and requires the operator to
-   remove/recreate the datadir and resync. `Cold` startup is reserved for a
-   genuinely new datadir; there is no `HeadersOnly` compatibility fallback.
+- Every datadir carries the current `CURRENT_SCHEMA` epoch and identity. A
+   missing marker on a non-empty datadir or a mismatched epoch fails before
+   normal persistent-state startup and requires the operator to remove/recreate
+   the datadir and resync; a network, P2P magic, or backend identity mismatch is
+   a configuration error. A checkpoint `CURRENT` is its sole commit point, so
+   unpublished generation residue yields `Cold` and a referenced invalid
+   generation is current-state corruption. There is no `HeadersOnly`
+   compatibility fallback.
