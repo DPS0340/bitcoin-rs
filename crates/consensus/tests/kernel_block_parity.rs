@@ -655,51 +655,32 @@ fn script_verdict_parity() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: the differential cannot be kernel-vs-kernel (ADV-1 pin).
+// Test 2: neither arm of the differential is constant (ADV-1 pin).
 // ---------------------------------------------------------------------------
 
-/// Proves [`script_verdict_parity`]'s Rust side is not the kernel in disguise
-/// by asserting the engines *disagree* on two inputs where they are known to
-/// differ. If anyone re-routes [`interpreter_result`] through the production
-/// `verify_transaction` (which dispatches to the kernel under this feature),
-/// both checks collapse into agreement and this test goes red.
+/// Proves [`script_verdict_parity`] compares two live engines rather than two
+/// constants.
 ///
-/// Known divergences used:
-/// 1. An `OP_TRUE` output spent with a non-empty scriptSig: the kernel
-///    executes it and accepts; the interpreter's non-taproot path in this
-///    binary (no `bitcoinconsensus`) only accepts the empty-scriptSig
-///    `OP_TRUE` form and rejects everything else.
-/// 2. The committed taproot **script-path** fixture: the kernel accepts the
-///    pristine spend; the interpreter supports only key-path witnesses and
-///    rejects script-path spends by construction.
+/// The original pin asserted the engines DISAGREE, because the Rust side then
+/// rejected every spend class the kernel executed. That premise died with the
+/// stub: the native path now verifies legacy, P2SH, segwit v0 and taproot
+/// spends, so agreement is the expected result and disagreement would be the
+/// defect.
+///
+/// What still needs proving is that each arm reads the transaction it is
+/// handed. So each engine is run twice on the committed taproot script-path
+/// fixture, once pristine and once with a tampered control block, and each
+/// must accept the first and reject the second. An arm wired to a constant
+/// verdict - or short-circuited to the other engine's answer - fails one of
+/// the four assertions.
 #[test]
 fn differential_is_non_vacuous() -> TestResult {
-    // (1) Crafted divergence, independent of the committed corpus.
-    let tx = op_true_spend_with_push_script_sig();
-    let prevouts = vec![TxOut {
-        value: 50_000,
-        script_pubkey: vec![0x51],
-    }];
-    let kernel = kernel_result(&tx, &prevouts, VerifyFlags::NONE);
-    let interpreter = interpreter_result(&tx, &prevouts, VerifyFlags::NONE);
-    assert_eq!(
-        Verdict::of(&kernel),
-        Verdict::Accept,
-        "kernel must accept OP_TRUE spent with a push-only scriptSig: {kernel:?}"
-    );
-    assert_eq!(
-        Verdict::of(&interpreter),
-        Verdict::Reject,
-        "interpreter must reject the non-empty-scriptSig OP_TRUE spend; if it \
-         accepted, the Rust side of the differential is reaching the kernel"
-    );
-
-    // (2) Fixture-grounded divergence on a real mainnet spend.
     let fixtures = load_fixtures()?;
     let script_path = fixtures
         .iter()
         .find(|fixture| fixture.class == "taproot_scriptpath")
         .ok_or("taproot_scriptpath fixture missing from the committed corpus")?;
+
     let kernel = kernel_result(&script_path.tx, &script_path.prevouts, script_path.flags);
     let interpreter = interpreter_result(&script_path.tx, &script_path.prevouts, script_path.flags);
     assert_eq!(
@@ -709,9 +690,26 @@ fn differential_is_non_vacuous() -> TestResult {
     );
     assert_eq!(
         Verdict::of(&interpreter),
+        Verdict::Accept,
+        "interpreter must accept the pristine taproot script-path fixture: {interpreter:?}"
+    );
+
+    let tampered = Mutation::TamperWitness
+        .apply(&script_path.tx)
+        .ok_or("TamperWitness must apply to a taproot script-path spend")?;
+    let kernel = kernel_result(&tampered, &script_path.prevouts, script_path.flags);
+    let interpreter = interpreter_result(&tampered, &script_path.prevouts, script_path.flags);
+    assert_eq!(
+        Verdict::of(&kernel),
         Verdict::Reject,
-        "interpreter must reject the script-path spend (key-path-only support); \
-         agreement here means the differential collapsed to kernel-vs-kernel"
+        "kernel must reject a tampered control block; a constant Accept means \
+         the kernel arm is not reading the transaction: {kernel:?}"
+    );
+    assert_eq!(
+        Verdict::of(&interpreter),
+        Verdict::Reject,
+        "interpreter must reject a tampered control block; a constant Accept \
+         means the Rust arm is not reading the transaction: {interpreter:?}"
     );
     Ok(())
 }
