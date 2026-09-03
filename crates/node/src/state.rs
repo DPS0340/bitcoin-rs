@@ -1253,6 +1253,16 @@ impl NodeState {
         // valid format/bounds, matching genesis, older writer epoch, and
         // strictly greater witness height than the restored tip.
         let genesis_hex = config.network.genesis_block_hash().to_string_be();
+        // One reporter routes every rollback fact of this process — the
+        // checkpoint fallback detected here and the index-ahead rewinds the
+        // txindex worker detects later — through the same warning store and
+        // event marker.
+        let recovery_reporter = Arc::new(crate::recovery_evidence::RecoveryReporter::new(
+            Arc::clone(&warning_store),
+            config.data_dir.clone(),
+            genesis_hex.clone(),
+            epoch,
+        ));
         let restored_height = restored_applied_tip.as_ref().map_or(0, |tip| tip.height);
         let restored_hash = restored_applied_tip
             .as_ref()
@@ -1267,17 +1277,11 @@ impl NodeState {
                 &genesis_hex,
                 restored_height,
             ) {
-                let reporter = crate::recovery_evidence::RecoveryReporter::new(
-                    Arc::clone(&warning_store),
-                    config.data_dir.clone(),
-                    genesis_hex.clone(),
-                    epoch,
-                );
                 let source = match resume_source {
                     ResumeSource::Cold => "cold",
                     ResumeSource::Checkpoint => "checkpoint",
                 };
-                reporter
+                recovery_reporter
                     .report_checkpoint_fallback(
                         witness_height,
                         restored_height,
@@ -1366,6 +1370,7 @@ impl NodeState {
                         block_source,
                         Some(body_source),
                         Arc::clone(&chain_events),
+                        Arc::clone(&recovery_reporter),
                         Arc::clone(&shutdown),
                         wake_rx,
                     )
@@ -1377,10 +1382,7 @@ impl NodeState {
         let capabilities = Arc::new(crate::capabilities::NodeCapabilities::new(
             crate::capabilities::CapabilityInputs {
                 applied_tip: Arc::clone(&applied_tip),
-                tx_query: tx_index_adapter.as_ref().map(|adapter| {
-                    let query: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = adapter.clone();
-                    query
-                }),
+                tx_lifecycle: tx_index_lifecycle.clone(),
                 tx_runtime: tx_index_runtime.clone(),
                 txindex_enabled: crate::capabilities::txindex_enabled(&config),
             },
@@ -4084,7 +4086,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn non_regular_epoch_lock_refuses_start() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

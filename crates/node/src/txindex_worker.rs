@@ -119,6 +119,33 @@ fn effective_open_timeout() -> Duration {
     TXINDEX_OPEN_TIMEOUT
 }
 
+/// Reconciliation leg the worker is executing against the applied tip.
+///
+/// Published by the worker at every leg change so operators can tell a
+/// rewind or rebuild apart from ordinary forward catch-up, whose progress is
+/// the durable watermark itself. Forward is the resting phase: an index whose
+/// watermark names the applied tip is ready; one below it is catching up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconcilePhase {
+    /// Rows extend the active chain from the durable watermark.
+    Forward,
+    /// Rows on an abandoned or ahead-of-tip branch are deleted block by
+    /// block from `from_height` down to the common ancestor `to_height`.
+    RollingBack {
+        /// Height of the watermark being rewound.
+        from_height: u32,
+        /// Height of the last block shared with the active chain.
+        to_height: u32,
+    },
+    /// The selected capabilities were reset and rebuild from genesis.
+    Rebuilding {
+        /// Whether the transaction-lookup rows are rebuilding.
+        tx_lookup: bool,
+        /// Whether the script-history rows are rebuilding.
+        script_history: bool,
+    },
+}
+
 /// Shared wake/revision/health state owned by `NodeState` and referenced by
 /// `ApplyHandles`, the worker thread, and the query engine.
 #[derive(Debug)]
@@ -128,6 +155,7 @@ pub struct TxIndexRuntime {
     failed: AtomicBool,
     wake_tx: Sender<()>,
     failure_message: RwLock<Option<CompactString>>,
+    phase: arc_swap::ArcSwap<ReconcilePhase>,
 }
 impl TxIndexRuntime {
     /// Creates a runtime attached to `wake_tx`.
@@ -139,7 +167,21 @@ impl TxIndexRuntime {
             failed: AtomicBool::new(false),
             wake_tx,
             failure_message: RwLock::new(None),
+            phase: arc_swap::ArcSwap::from_pointee(ReconcilePhase::Forward),
         }
+    }
+
+    /// Publishes the reconciliation leg the worker is executing.
+    pub fn publish_phase(&self, phase: ReconcilePhase) {
+        if **self.phase.load() != phase {
+            self.phase.store(Arc::new(phase));
+        }
+    }
+
+    /// Returns the reconciliation leg the worker last published.
+    #[must_use]
+    pub fn phase(&self) -> ReconcilePhase {
+        **self.phase.load()
     }
 
     /// Called immediately after a committed `applied_tip.store`.
@@ -223,16 +265,16 @@ impl Generation {
 
 /// One immutable lifecycle snapshot published atomically behind `ArcSwap`.
 ///
-/// Only `CatchingUp` and `Ready` carry a query payload — the complete existing
-/// `TxIndexQueryEngine`, never a raw reader. `Opening`, `Failed`, and
-/// `ShutdownAbandoned` carry no payload; the adapter returns typed
-/// `Unavailable` for them.
+/// Only `Serving` carries a query payload — the complete existing
+/// `TxIndexQueryEngine`, never a raw reader. Readiness is not a lifecycle
+/// state: the engine proves it per query from the durable watermarks
+/// (`IDX-03`), and the worker reports its reconciliation leg through
+/// `TxIndexRuntime::phase`. `Opening`, `Failed`, and `ShutdownAbandoned`
+/// carry no payload; the adapter returns typed `Unavailable` for them.
 #[derive(Clone)]
 pub(crate) enum TxIndexLifecycle {
     Opening,
-    CatchingUp(Arc<TxIndexQueryEngine>),
-    Ready(Arc<TxIndexQueryEngine>),
-    #[allow(dead_code, reason = "reason string retained for future diagnostics")]
+    Serving(Arc<TxIndexQueryEngine>),
     Failed(CompactString),
     ShutdownAbandoned,
 }
@@ -240,7 +282,7 @@ pub(crate) enum TxIndexLifecycle {
 impl TxIndexLifecycle {
     fn query_payload(&self) -> Option<&Arc<TxIndexQueryEngine>> {
         match self {
-            Self::CatchingUp(engine) | Self::Ready(engine) => Some(engine),
+            Self::Serving(engine) => Some(engine),
             _ => None,
         }
     }
@@ -250,9 +292,7 @@ impl TxIndexLifecycle {
             Self::Opening => "txindex is opening",
             Self::Failed(_) => "txindex is unavailable",
             Self::ShutdownAbandoned => "txindex was abandoned at shutdown",
-            Self::CatchingUp(_) | Self::Ready(_) => {
-                unreachable!("query_payload is Some for CatchingUp/Ready")
-            }
+            Self::Serving(_) => unreachable!("query_payload is Some for Serving"),
         }
     }
 }
@@ -506,8 +546,8 @@ pub(crate) struct TxIndexWorker {
 }
 
 impl TxIndexWorker {
-    /// Spawns a worker that owns `writer` and reconciles the durable watermark
-    /// to the applied tip stored in `handles`.
+    /// Spawns a worker over an already-open `writer`. Test seam for writer
+    /// fakes; production workers open their own store via `spawn_with_open`.
     ///
     /// `wake_rx` must be the receiver paired with the `Sender` used to construct
     /// `runtime`. `chain_events` is the publisher whose snapshot the worker
@@ -515,8 +555,8 @@ impl TxIndexWorker {
     /// same commit point as the wake, so the worker treats the wake channel as
     /// its coalesced hint stream and recovers from dropped wakes by
     /// reconciling fresh snapshots.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code, reason = "replaced by spawn_with_open")]
     pub(crate) fn spawn(
         runtime: Arc<TxIndexRuntime>,
         writer: Arc<dyn TxIndexWriter>,
@@ -526,6 +566,7 @@ impl TxIndexWorker {
         batch_limits: PreparedBatchLimits,
         enabled: IndexCapabilities,
         chain_events: Arc<crate::state::ChainEventPublisher>,
+        reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
         rollback_rebuild_cutover: u32,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
@@ -541,6 +582,7 @@ impl TxIndexWorker {
             wake_rx,
             quiet_period: REVISION_QUIET_PERIOD,
             chain_events,
+            reporter,
             batch_delay: FORWARD_BATCH_DELAY,
         };
         let runtime_for_error = Arc::clone(&runtime);
@@ -582,7 +624,8 @@ impl TxIndexWorker {
     /// constructs a stable `TxIndexQueryAdapter` over it before this call.
     /// The `generation` token makes late publication a no-op after
     /// abandonment. The `shutdown` signal is checked immediately after
-    /// backend open returns.
+    /// backend open returns. `reporter` receives the index-ahead rollback
+    /// evidence the worker detects against the restored tip.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_with_open(
         runtime: Arc<TxIndexRuntime>,
@@ -595,6 +638,7 @@ impl TxIndexWorker {
         block_source: NodeBlockSource,
         body_source: Option<Arc<dyn BlockBodySource>>,
         chain_events: Arc<crate::state::ChainEventPublisher>,
+        reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
         shutdown: Arc<AtomicBool>,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
@@ -603,7 +647,6 @@ impl TxIndexWorker {
             NamespaceRegistry::validate_child(&spec.canonical_data_root, spec.namespace).ok();
         let runtime_for_thread = Arc::clone(&runtime);
         let generation_for_thread = generation.clone();
-        let runtime_for_error = Arc::clone(&runtime);
         let join_handle = thread::Builder::new()
             .name("bitcoin-rs-txindex".to_owned())
             .spawn(move || {
@@ -613,13 +656,14 @@ impl TxIndexWorker {
                         &runtime_for_thread,
                         spec,
                         &lifecycle,
-                        generation_for_thread,
+                        &generation_for_thread,
                         applied_tip,
                         block_tree,
                         body_store,
                         block_source,
                         body_source,
                         &chain_events,
+                        reporter,
                         &shutdown,
                         &wake_rx,
                     );
@@ -633,7 +677,12 @@ impl TxIndexWorker {
                             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                             .unwrap_or("txindex worker panicked during open");
                         tracing::error!(%message, "txindex worker panicked");
-                        runtime_for_error.publish_failed(message);
+                        fail_worker(
+                            &runtime_for_thread,
+                            &lifecycle,
+                            &generation_for_thread,
+                            message,
+                        );
                     }
                 }
             })?;
@@ -737,13 +786,14 @@ fn run_worker_with_open(
     runtime: &Arc<TxIndexRuntime>,
     spec: TxIndexOpenSpec,
     lifecycle: &Arc<ArcSwap<TxIndexLifecycle>>,
-    generation: Generation,
+    generation: &Generation,
     applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
     block_tree: Arc<RwLock<BlockTree>>,
     body_store: Option<Arc<dyn PruneBodyStore>>,
     block_source: NodeBlockSource,
     body_source: Option<Arc<dyn BlockBodySource>>,
     chain_events: &Arc<crate::state::ChainEventPublisher>,
+    reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
     shutdown: &Arc<AtomicBool>,
     wake_rx: &Receiver<()>,
 ) {
@@ -751,7 +801,7 @@ fn run_worker_with_open(
         match NamespaceRegistry::validate_child(&spec.canonical_data_root, spec.namespace) {
             Ok(key) => key,
             Err(reason) => {
-                publish_failed_if_current(lifecycle, &generation, &reason);
+                fail_worker(runtime, lifecycle, generation, &reason);
                 return;
             }
         };
@@ -762,7 +812,7 @@ fn run_worker_with_open(
         } else {
             "txindex namespace is already active in this process"
         };
-        publish_failed_if_current(lifecycle, &generation, reason);
+        fail_worker(runtime, lifecycle, generation, reason);
         return;
     }
 
@@ -776,13 +826,14 @@ fn run_worker_with_open(
         runtime,
         &spec,
         lifecycle,
-        &generation,
+        generation,
         &applied_tip,
         &block_tree,
         &body_store,
         &block_source,
         &body_source,
         chain_events,
+        reporter,
         shutdown,
         wake_rx,
     );
@@ -795,18 +846,24 @@ fn run_worker_with_open(
         }
         Err(error) => {
             tracing::error!(%error, "txindex worker open or run failed");
-            publish_failed_if_current(lifecycle, &generation, &error.to_string());
+            fail_worker(runtime, lifecycle, generation, &error.to_string());
             registry.release(&namespace_key, generation.id());
         }
     }
 }
 
-/// Publishes `Failed` with a bounded reason if the generation is still current.
-fn publish_failed_if_current(
+/// Fails the worker as one unit: the runtime stops the loop and gates the
+/// query engine, and the lifecycle withdraws the query payload so the
+/// adapter answers typed `Unavailable`. The lifecycle write is skipped for a
+/// revoked generation; the runtime write is unconditional because the
+/// runtime belongs to this worker alone.
+fn fail_worker(
+    runtime: &TxIndexRuntime,
     lifecycle: &Arc<ArcSwap<TxIndexLifecycle>>,
     generation: &Generation,
     reason: &str,
 ) {
+    runtime.publish_failed(reason);
     if generation.is_revoked() {
         return;
     }
@@ -852,6 +909,7 @@ fn open_and_run(
     block_source: &NodeBlockSource,
     body_source: &Option<Arc<dyn BlockBodySource>>,
     chain_events: &Arc<crate::state::ChainEventPublisher>,
+    reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
     shutdown: &Arc<AtomicBool>,
     wake_rx: &Receiver<()>,
 ) -> Result<(), TxIndexWorkerError> {
@@ -887,11 +945,11 @@ fn open_and_run(
         body_source.clone(),
     ));
 
-    // Publish CatchingUp plus the complete engine atomically.
+    // Publish the complete engine atomically; readiness is proven per query.
     publish_lifecycle(
         lifecycle,
         generation,
-        TxIndexLifecycle::CatchingUp(Arc::clone(&query_engine)),
+        TxIndexLifecycle::Serving(query_engine),
     );
 
     // Check shutdown immediately after publication.
@@ -911,23 +969,11 @@ fn open_and_run(
         wake_rx: wake_rx.clone(),
         quiet_period: REVISION_QUIET_PERIOD,
         chain_events: Arc::clone(chain_events),
+        reporter,
         batch_delay: FORWARD_BATCH_DELAY,
     };
 
-    worker.run()?;
-
-    // Publish Ready at the exact applied-tip identity.
-    let tip = applied_tip.load_full();
-    if let Some(tip) = tip {
-        let info = query_engine.index_info().map_err(|e| {
-            TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::Backend(e.to_string()))
-        })?;
-        if info.synced && info.best_block_height == tip.height {
-            publish_lifecycle(lifecycle, generation, TxIndexLifecycle::Ready(query_engine));
-        }
-    }
-
-    Ok(())
+    worker.run()
 }
 
 /// Opens the txindex store with a bounded deadline.
@@ -1270,6 +1316,27 @@ pub(crate) fn detached_chain_publisher() -> Arc<crate::state::ChainEventPublishe
     Arc::new(crate::state::ChainEventPublisher::detached(0).0)
 }
 
+/// Reporter for test worker construction that writes rollback evidence
+/// under `data_dir` and exposes its warnings through the returned store.
+#[cfg(test)]
+pub(crate) fn test_recovery_reporter(
+    data_dir: &Path,
+) -> (
+    Arc<crate::recovery_evidence::RecoveryReporter>,
+    Arc<crate::recovery_evidence::WarningStore>,
+) {
+    let warning_store = Arc::new(crate::recovery_evidence::WarningStore::new());
+    let reporter = Arc::new(crate::recovery_evidence::RecoveryReporter::new(
+        Arc::clone(&warning_store),
+        data_dir.to_path_buf(),
+        bitcoin_rs_chain::Network::Regtest
+            .genesis_block_hash()
+            .to_string_be(),
+        1,
+    ));
+    (reporter, warning_store)
+}
+
 struct Worker {
     runtime: Arc<TxIndexRuntime>,
     writer: Arc<dyn TxIndexWriter>,
@@ -1279,6 +1346,9 @@ struct Worker {
     batch_limits: PreparedBatchLimits,
     enabled: IndexCapabilities,
     chain_events: Arc<crate::state::ChainEventPublisher>,
+    /// Sink for the index-ahead rollback evidence (`chain-rollback-event`
+    /// marker plus `getblockchaininfo` warning).
+    reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
     wake_rx: Receiver<()>,
     quiet_period: Duration,
     batch_delay: Duration,
@@ -1498,6 +1568,19 @@ impl Worker {
         &self,
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
+        let action = self.reconcile_pass(pending)?;
+        // Rollback and rebuild phases end only when every enabled capability
+        // sits at the applied tip; that is exactly what `CaughtUp` means.
+        if matches!(action, ReconcileAction::CaughtUp) {
+            self.runtime.publish_phase(ReconcilePhase::Forward);
+        }
+        Ok(action)
+    }
+
+    fn reconcile_pass(
+        &self,
+        pending: &mut Option<PendingForward>,
+    ) -> Result<ReconcileAction, TxIndexWorkerError> {
         let (target, fence, watermarks) = self.capture_target_watermarks()?;
 
         if pending.is_some() {
@@ -1506,25 +1589,18 @@ impl Worker {
 
         let mut fence = fence;
         let mut watermarks = watermarks;
-        let mut warned_ahead = false;
+        let mut reported_ahead = false;
         while let Some((capabilities, watermark)) =
             self.rollback_selection(watermarks, target.as_deref())
         {
-            // Warn once per pass: an 834k-block stale branch would otherwise
-            // warn once per rolled-back block.
+            // Report once per pass: an 834k-block stale branch would otherwise
+            // report once per rolled-back block.
             if let Some(target) = target.as_deref()
-                && !warned_ahead
+                && !reported_ahead
                 && watermark.height > target.height
             {
-                warned_ahead = true;
-                tracing::warn!(
-                    watermark_height = watermark.height,
-                    watermark_hash = %Hash256::from_le_bytes(&watermark.hash),
-                    tip_height = target.height,
-                    tip_hash = %target.hash,
-                    gap = watermark.height.saturating_sub(target.height),
-                    "index watermark is ahead of the applied tip; rolling back"
-                );
+                reported_ahead = true;
+                self.report_index_ahead(capabilities, watermark, target)?;
             }
             let depth = self.rollback_depth_for(watermark, target.as_deref());
             if depth.is_some_and(|depth| depth > self.rollback_rebuild_cutover) {
@@ -1535,17 +1611,13 @@ impl Worker {
                     script_history = capabilities.script_history,
                     "stale index watermark exceeds the rollback cutover; rebuilding selected capabilities"
                 );
-                self.writer
-                    .reset_capabilities(capabilities)
-                    .map_err(TxIndexWorkerError::Index)?;
-                let (next_fence, next_watermarks) = self
-                    .writer
-                    .fenced_watermarks()
-                    .map_err(TxIndexWorkerError::Index)?;
-                fence = next_fence;
-                watermarks = next_watermarks;
+                (fence, watermarks) = self.reset_for_rebuild(capabilities)?;
                 continue;
             }
+            self.runtime.publish_phase(ReconcilePhase::RollingBack {
+                from_height: watermark.height,
+                to_height: depth.map_or(0, |depth| watermark.height.saturating_sub(depth)),
+            });
             match self.rollback_one(fence, watermarks, capabilities, watermark) {
                 Ok(_) => {
                     let (next_fence, next_watermarks) = self
@@ -1562,15 +1634,7 @@ impl Worker {
                         script_history = capabilities.script_history,
                         "index cursor cannot be rolled back; rebuilding selected capabilities"
                     );
-                    self.writer
-                        .reset_capabilities(capabilities)
-                        .map_err(TxIndexWorkerError::Index)?;
-                    let (next_fence, next_watermarks) = self
-                        .writer
-                        .fenced_watermarks()
-                        .map_err(TxIndexWorkerError::Index)?;
-                    fence = next_fence;
-                    watermarks = next_watermarks;
+                    (fence, watermarks) = self.reset_for_rebuild(capabilities)?;
                     continue;
                 }
                 Err(TxIndexWorkerError::Index(
@@ -1581,6 +1645,11 @@ impl Worker {
                 Err(error) => return Err(error),
             }
         }
+        // A rewind ends with the rollback loop; a rebuild ends only when the
+        // reset capabilities reach the tip again.
+        if matches!(self.runtime.phase(), ReconcilePhase::RollingBack { .. }) {
+            self.runtime.publish_phase(ReconcilePhase::Forward);
+        }
 
         let Some(target) = target else {
             return Ok(ReconcileAction::CaughtUp);
@@ -1589,6 +1658,55 @@ impl Worker {
             return Ok(ReconcileAction::CaughtUp);
         };
         self.catch_up_to(&target, fence, watermarks, watermark, capabilities, pending)
+    }
+
+    /// Resets `capabilities` for a rebuild from genesis and publishes the
+    /// rebuild phase, returning the post-reset fence and watermarks.
+    fn reset_for_rebuild(
+        &self,
+        capabilities: IndexCapabilities,
+    ) -> Result<(IndexWriteFence, IndexWatermarks), TxIndexWorkerError> {
+        self.writer
+            .reset_capabilities(capabilities)
+            .map_err(TxIndexWorkerError::Index)?;
+        self.runtime.publish_phase(ReconcilePhase::Rebuilding {
+            tx_lookup: capabilities.tx_lookup,
+            script_history: capabilities.script_history,
+        });
+        self.writer
+            .fenced_watermarks()
+            .map_err(TxIndexWorkerError::Index)
+    }
+
+    /// Publishes the index-ahead rollback evidence for a watermark above the
+    /// applied tip. The marker is part of the rollback transition: a data dir
+    /// that cannot hold it fails this optional index, never the chain.
+    fn report_index_ahead(
+        &self,
+        capabilities: IndexCapabilities,
+        watermark: IndexWatermark,
+        target: &TipSnapshot,
+    ) -> Result<(), TxIndexWorkerError> {
+        let capability = match (capabilities.tx_lookup, capabilities.script_history) {
+            (true, true) => "tx_lookup,script_history",
+            (true, false) => "tx_lookup",
+            (false, true) => "script_history",
+            (false, false) => return Ok(()),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.reporter
+            .report_index_ahead(
+                capability,
+                watermark.height,
+                target.height,
+                &target.hash.to_string_be(),
+                &Hash256::from_le_bytes(&watermark.hash).to_string_be(),
+                watermark.height.saturating_sub(target.height),
+                now,
+            )
+            .map_err(TxIndexWorkerError::RollbackEvidence)
     }
 
     fn reconcile_pending(
@@ -2269,6 +2387,8 @@ enum TxIndexWorkerError {
     NoBodyStore,
     #[error("txindex worker: target chain node missing at height {height}")]
     MissingTargetChain { height: u32 },
+    #[error("txindex worker: rollback evidence marker not written: {0}")]
+    RollbackEvidence(#[source] crate::recovery_evidence::EvidenceError),
 }
 
 impl TxIndexWorkerError {
@@ -3132,6 +3252,7 @@ mod body_reader_tests {
             enabled: IndexCapabilities::ALL,
             wake_rx,
             chain_events: detached_chain_publisher(),
+            reporter: test_recovery_reporter(data_dir.path()).0,
             quiet_period: Duration::ZERO,
             batch_delay: Duration::ZERO,
             // The body-reader session test never exercises reset routing;
@@ -3170,3 +3291,8 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "txindex_worker_integration_tests.rs"]
 mod integration_tests;
+
+#[cfg(all(test, feature = "fjall"))]
+#[allow(clippy::expect_used, clippy::panic)]
+#[path = "txindex_worker_recovery_tests.rs"]
+mod recovery_tests;
