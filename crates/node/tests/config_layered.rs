@@ -188,6 +188,43 @@ fn higher_layer_replaces_zmq_endpoint_and_preserves_order_and_hwm() -> Result<()
 }
 
 #[test]
+fn lower_layer_hwm_applies_to_higher_layer_endpoint() -> Result<()> {
+    let mut lower_hwm = BTreeMap::new();
+    lower_hwm.insert(ZmqTopic::HashBlock, 42);
+    let lower = UserConfig {
+        zmq: ZmqOverrides {
+            hwm: lower_hwm,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut higher_endpoints = BTreeMap::new();
+    higher_endpoints.insert(
+        ZmqTopic::HashBlock,
+        vec!["tcp://127.0.0.1:28334".to_owned()],
+    );
+    let higher = UserConfig {
+        zmq: ZmqOverrides {
+            endpoints: higher_endpoints,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let config = resolve(&[&lower, &higher])?;
+    assert_eq!(
+        config.zmq,
+        vec![ZmqPublication {
+            topic: ZmqTopic::HashBlock,
+            endpoint: "tcp://127.0.0.1:28334".to_owned(),
+            hwm: 42,
+        }]
+    );
+    Ok(())
+}
+
+#[test]
 fn resolved_zmq_hwm_is_validated() {
     let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.zmq.push(ZmqPublication {

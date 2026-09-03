@@ -276,6 +276,34 @@ pub struct ZmqOverrides {
     pub hwm: BTreeMap<crate::zmq_publisher::ZmqTopic, u32>,
 }
 
+impl ZmqOverrides {
+    fn merge_from(&mut self, other: &Self) {
+        for (topic, endpoints) in &other.endpoints {
+            self.endpoints.insert(*topic, endpoints.clone());
+        }
+        for (topic, hwm) in &other.hwm {
+            self.hwm.insert(*topic, *hwm);
+        }
+    }
+
+    fn publications(&self) -> Vec<ZmqPublication> {
+        self.endpoints
+            .iter()
+            .flat_map(|(topic, endpoints)| {
+                let hwm = self.hwm.get(topic).copied().unwrap_or(DEFAULT_ZMQ_HWM);
+                endpoints
+                    .iter()
+                    .cloned()
+                    .map(move |endpoint| ZmqPublication {
+                        topic: *topic,
+                        endpoint,
+                        hwm,
+                    })
+            })
+            .collect()
+    }
+}
+
 /// User-supplied validation overrides.
 #[derive(Clone, Debug, Default)]
 pub struct ValidationOverrides {
@@ -535,28 +563,6 @@ impl NodeConfig {
         if let Some(value) = layer.validation.assume_valid_height {
             self.validation.assume_valid_height = value;
         }
-        for (topic, endpoints) in &layer.zmq.endpoints {
-            let hwm = layer.zmq.hwm.get(topic).copied();
-            let inherited_hwm = self
-                .zmq
-                .iter()
-                .find(|publication| publication.topic == *topic)
-                .map_or(DEFAULT_ZMQ_HWM, |publication| publication.hwm);
-            self.zmq.retain(|publication| publication.topic != *topic);
-            self.zmq
-                .extend(endpoints.iter().cloned().map(|endpoint| ZmqPublication {
-                    topic: *topic,
-                    endpoint,
-                    hwm: hwm.unwrap_or(inherited_hwm),
-                }));
-        }
-        for (topic, hwm) in &layer.zmq.hwm {
-            for publication in &mut self.zmq {
-                if publication.topic == *topic {
-                    publication.hwm = *hwm;
-                }
-            }
-        }
     }
 
     fn apply_network_selection(&mut self, selection: NetworkSelection) {
@@ -581,10 +587,12 @@ impl NodeConfig {
 /// Resolves layers from lowest to highest precedence.
 pub fn resolve(layers: &[&UserConfig]) -> Result<NodeConfig> {
     let mut config = NodeConfig::default_for_network(Network::Mainnet);
+    let mut zmq = ZmqOverrides::default();
     for layer in layers {
         config.apply_layer(layer);
+        zmq.merge_from(&layer.zmq);
     }
-    config.zmq.sort_by_key(|publication| publication.topic);
+    config.zmq = zmq.publications();
     config.validate()?;
     Ok(config)
 }
