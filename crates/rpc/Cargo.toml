@@ -23,10 +23,10 @@ bitcoin-rs-index.workspace = true
 bitcoin-rs-mempool.workspace = true
 bitcoin-rs-p2p.workspace = true
 bitcoin-rs-utxo.workspace = true
+bitcoin-rs-ext-api.workspace = true
 bitcoin-rs-mining.workspace = true
 bitcoin.workspace = true
 miniscript.workspace = true
-corepc-types.workspace = true
 sonic-rs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -37,8 +37,8 @@ compact_str.workspace = true
 hashbrown.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-bitcoin-rs-ext-api.workspace = true
 sha2.workspace = true
+corepc-types.workspace = true
 
 [dev-dependencies]
 bitcoin-rs-node = { workspace = true, features = ["fjall"] }
