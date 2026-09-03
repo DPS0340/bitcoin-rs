@@ -133,27 +133,24 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
     // Legacy/test metadata (without `tip_hash_hex`) uses
     // `last_committed_height`, which tests rewind to simulate a partial
     // commit.
-    let restored_height = state
-        .applied_tip()
-        .load()
-        .as_ref()
-        .map_or(0, |tip| tip.height);
+    let restored_height = state.applied_tip().load().as_ref().map(|tip| tip.height);
 
     let gap_base = if meta.tip_hash_hex.is_some() {
         restored_height
     } else {
-        meta.last_committed_height
+        Some(meta.last_committed_height)
     };
+    let gap_start = gap_base.map_or(0, |base| base.saturating_add(1));
 
-    if meta.height <= gap_base {
-        tracing::debug!(height = meta.height, gap_base, "no gap; recovery skipped");
+    if gap_base.is_some_and(|base| meta.height <= base) {
+        tracing::debug!(height = meta.height, ?gap_base, "no gap; recovery skipped");
         return Ok(());
     }
 
     tracing::warn!(
         height = meta.height,
-        gap_base,
-        "crash-recovery gap detected: base at {} but tip was at {}",
+        ?gap_base,
+        "crash-recovery gap detected: base at {:?} but tip was at {}",
         gap_base,
         meta.height
     );
@@ -175,7 +172,7 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
                 write_meta(state, &new_meta)?;
                 tracing::info!(
                     replayed = replayed.len(),
-                    from = gap_base + 1,
+                    from = gap_start,
                     to = meta.height,
                     "crash recovery replayed from stored bodies"
                 );
@@ -191,7 +188,7 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
     }
 
     // Fallback: record the gap in memory for the sync layer.
-    for replay in (gap_base + 1)..=meta.height {
+    for replay in gap_start..=meta.height {
         state.push_replayed(replay);
     }
     let new_meta = Meta {
