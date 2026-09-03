@@ -98,9 +98,8 @@ risk of correlated implementation failures.
 - Sharded UTXO cache: a 256-shard in-memory UTXO set (`hashbrown::HashTable` of
   compact records behind `parking_lot::RwLock`) with checkpoint-based crash
   recovery and effective `--dbcache-mb` budget allocation.
-- Asynchronous index consumers: `txindex` and BIP157/158 block filters reconcile
-  over a monotonic chain snapshot and event hint channel without blocking block
-  validation.
+- Asynchronous index consumer: `txindex` reconciles over a monotonic chain
+  snapshot and event hint channel without blocking block validation.
 - Integrated ScriptIndex and Esplora APIs: address and scripthash UTXO indexing
   and confirmed transaction history served directly over HTTP.
 - Mempool mutation gateway: centralized mutation tracking publishing ordered
@@ -170,7 +169,7 @@ methodology, hardware constraints, and artifact custody.
 ## Architecture
 
 ```
-Surfaces:      bin/bitcoin-rs, crates/rpc, crates/ext-api, crates/ext-blockfilterindex
+Surfaces:      bin/bitcoin-rs, crates/rpc
 Capabilities:  crates/index, crates/mining, crates/mempool
 Node services: crates/node, crates/p2p, crates/storage
 Core & domain: crates/consensus, crates/script, crates/utxo, crates/chain, crates/primitives
@@ -185,8 +184,8 @@ Core & domain: crates/consensus, crates/script, crates/utxo, crates/chain, crate
   never leak into node state or apply logic.
 - Storage: `crates/storage` provides backend abstraction. The active engine is
   configured at startup (`fjall`, `redb`, `rocksdb`, or `mdbx`).
-- Indexing: `txindex` and `ext-blockfilterindex` run as independent consumers
-  advancing their own cursors and rollback metadata atomically.
+- Indexing: `txindex` runs as an independent consumer, advancing its cursor and
+  rollback metadata atomically.
 
 ## Default posture
 
@@ -195,10 +194,9 @@ Core & domain: crates/consensus, crates/script, crates/utxo, crates/chain, crate
 | Storage backend | `fjall` |
 | Validation engine | `libbitcoinkernel` (with `--features kernel`); portable Rust (default binary, Taproot key-path only) |
 | Kernel feature | Off in default binary build; on in `crates/consensus` and `crates/node` library defaults |
-| Database cache | 450 MiB (`--dbcache-mb`, split 70/20/10) |
+| Database cache | 450 MiB (`--dbcache-mb`, split 80/20 when txindex is enabled) |
 | Multi-peer download | On (8 outbound peers, 128-block window) |
 | Transaction index | Off |
-| Block filters | Off |
 | Script index | Off |
 | Pruning | Off |
 

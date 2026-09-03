@@ -280,26 +280,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitcoin-rs-ext-api"
-version = "0.4.0"
-dependencies = [
- "bitcoin-rs-primitives",
- "serde",
- "sonic-rs",
-]
-
-[[package]]
-name = "bitcoin-rs-ext-blockfilterindex"
-version = "0.4.0"
-dependencies = [
- "bitcoin",
- "bitcoin-rs-ext-api",
- "bitcoin-rs-storage",
- "parking_lot",
- "thiserror",
-]
-
-[[package]]
 name = "bitcoin-rs-index"
 version = "0.4.0"
 dependencies = [
@@ -363,8 +343,6 @@ dependencies = [
  "bitcoin",
  "bitcoin-rs-chain",
  "bitcoin-rs-consensus",
- "bitcoin-rs-ext-api",
- "bitcoin-rs-ext-blockfilterindex",
  "bitcoin-rs-index",
  "bitcoin-rs-mempool",
  "bitcoin-rs-mining",
@@ -453,7 +431,6 @@ dependencies = [
  "bitcoin",
  "bitcoin-rs-chain",
  "bitcoin-rs-consensus",
- "bitcoin-rs-ext-api",
  "bitcoin-rs-index",
  "bitcoin-rs-mempool",
  "bitcoin-rs-mining",

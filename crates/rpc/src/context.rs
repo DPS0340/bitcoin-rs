@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use arc_swap::ArcSwapOption;
 
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_ext_api::CapabilityProvider;
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits, MempoolObserver, MutationResult};
 use bitcoin_rs_primitives::{
@@ -15,6 +14,7 @@ use bitcoin_rs_primitives::{
 use compact_str::CompactString;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 
@@ -880,6 +880,57 @@ pub struct TxIndexInfo {
     pub best_block_height: u32,
 }
 
+/// Lifecycle state reported for a node-owned RPC capability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CapabilityState {
+    /// The capability is current with the applied chain tip.
+    Ready,
+    /// The capability is catching up to the applied chain tip.
+    CatchingUp {
+        /// Height covered by the capability.
+        processed_height: u32,
+        /// Applied-chain height the capability is approaching.
+        target_height: u32,
+    },
+    /// The capability failed and cannot currently provide complete answers.
+    Failed {
+        /// Failure description.
+        reason: String,
+    },
+    /// The capability is not enabled for this node.
+    Disabled,
+    /// The capability is opening and cannot answer yet.
+    Opening,
+    /// The capability worker was abandoned during shutdown.
+    ShutdownAbandoned,
+}
+
+/// Status of one concrete node capability exposed through RPC.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityStatus {
+    /// Stable capability identifier.
+    pub id: String,
+    /// Whether the capability is compiled into this binary.
+    pub compiled: bool,
+    /// Whether the capability is enabled for this node.
+    pub enabled: bool,
+    /// Current lifecycle state.
+    pub state: CapabilityState,
+}
+
+/// Point-in-time status report for concrete node capabilities.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapabilitySnapshot {
+    /// Status rows in the node's stable capability order.
+    pub capabilities: Vec<CapabilityStatus>,
+}
+
+/// Read-only provider implemented by the node for the RPC capability report.
+pub trait CapabilityProvider: Send + Sync {
+    /// Captures the current capability status.
+    fn snapshot(&self) -> CapabilitySnapshot;
+}
+
 /// Failure from a complete transaction-index query.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TxQueryError {
@@ -912,33 +963,6 @@ pub trait TxIndexQuery: Send + Sync {
     }
     /// Returns the transaction index's actual durable progress.
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
-}
-
-/// Actual progress reported by the node-owned basic block-filter index.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FilterIndexInfo {
-    /// Whether the index has completely caught up to the authoritative chain tip.
-    pub synced: bool,
-    /// Height of the best block whose filter the index can serve.
-    pub best_block_height: u32,
-}
-
-/// Lockless read-only adapter for basic block-filter index queries.
-///
-/// `None` on the context means the index is not enabled; implementations
-/// return [`TxQueryError`] for blocks the index does not cover.
-pub trait FilterIndexQuery: Send + Sync {
-    /// Returns the index's actual durable progress.
-    fn filter_info(&self) -> Result<FilterIndexInfo, TxQueryError>;
-
-    /// Returns the serialized BIP158 basic filter for `block_hash`.
-    ///
-    /// `None` means complete absence: the block is known to the index and
-    /// has no filter row (only possible below the indexed prefix).
-    fn basic_filter(&self, block_hash: Hash256) -> Result<Option<Vec<u8>>, TxQueryError>;
-
-    /// Returns the BIP157 filter header for `block_hash`.
-    fn filter_header(&self, block_hash: Hash256) -> Result<Option<[u8; 32]>, TxQueryError>;
 }
 
 /// One current unspent output indexed for a script.
@@ -1046,9 +1070,7 @@ pub struct ContextHandles {
     pub network: NetworkHandles,
     /// Mining capability: the template coordinator, when one is attached.
     pub mining: MiningHandles,
-    /// Complete basic block-filter index query adapter.
-    pub filter_index: Option<Arc<dyn FilterIndexQuery>>,
-    /// Live capability report backing the `getcapabilities` extension method.
+    /// Live capability report for concrete node-owned services.
     pub capabilities: Option<Arc<dyn CapabilityProvider>>,
 }
 
@@ -1167,10 +1189,7 @@ pub struct Context {
     pub esplora_tx_index: Option<Arc<dyn TxIndexQuery>>,
     /// Optional node-owned generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
-    /// Optional node-owned complete basic block-filter index query adapter.
-    /// `None` when the filter index extension is not enabled.
-    pub filter_index: Option<Arc<dyn FilterIndexQuery>>,
-    /// Live capability report backing the `getcapabilities` extension method.
+    /// Live capability report for concrete node-owned services.
     pub capabilities: Option<Arc<dyn CapabilityProvider>>,
     /// Network counters and peers.
     pub network: Arc<RwLock<NetworkState>>,
@@ -1257,7 +1276,6 @@ impl Context {
             tx_index: None,
             esplora_tx_index: None,
             script_index: None,
-            filter_index: None,
             capabilities: None,
             prune_service: None,
             chain_control: None,
@@ -1311,7 +1329,6 @@ impl Context {
             tx_index: None,
             esplora_tx_index: None,
             script_index: None,
-            filter_index: None,
             capabilities: None,
             prune_service: None,
             chain_control: None,
@@ -1364,7 +1381,6 @@ impl Context {
                     added_nodes,
                 },
             mining: MiningHandles { mining_control },
-            filter_index,
             capabilities,
         } = handles;
         Self {
@@ -1381,7 +1397,6 @@ impl Context {
             tx_index,
             esplora_tx_index: None,
             script_index,
-            filter_index,
             capabilities,
             network,
             chain_network,
@@ -1908,7 +1923,6 @@ mod tests {
             .collect()
     }
 
-
     /// Every record at a duplicated height must be reachable by its own hash.
     ///
     /// A search that stopped at the run's first record would answer `None` for
@@ -2079,7 +2093,6 @@ mod tests {
             mining: MiningHandles {
                 mining_control: None,
             },
-            filter_index: None,
             capabilities: None,
         });
         assert!(
