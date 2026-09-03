@@ -54,7 +54,7 @@ multi-peer attempt starts from the correct design and validation plan instead of
 1. **IBD wall time is DOWNLOAD-bandwidth-bound, not apply/CPU-bound.** Apply runs ~1228 blk/s
    (early-height); single-peer high-height download is ~5-25 blk/s — apply is 50-250x faster than
    download. The UTXO set is an in-memory, sharded, arena-backed cache (`crates/utxo/src/set.rs`
-   `commit_block` -> `crates/utxo/src/shard.rs` `commit_batch`) with periodic flush, so per-block apply
+   `commit_block` -> `crates/utxo/src/shard.rs` `commit_batch`) with regular flush, so per-block apply
    hits in-memory hashtables and is **off the single-peer critical path**. Corollary: apply/UTXO/storage
    micro-optimizations (and the wire-byte reuse in commit `42aa2c7`) do **not** move end-to-end IBD,
    because download is the bottleneck. (auto memory [claude])

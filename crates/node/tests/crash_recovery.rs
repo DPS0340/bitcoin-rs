@@ -1,22 +1,8 @@
 //! Integration tests for crash recovery across all enabled storage backends.
 //!
-//! Exercises the recovery-meta sidecar protocol (`crates/node/src/crash_recovery.rs`)
-//! over every backend compiled into this test binary.  Each test loops over
-//! `available_backends()` so a single `cargo test --features rocksdb,fjall,redb`
-//! invocation exercises `RocksDB`, fjall, and redb in one run.
-//!
-//! Proof surface:
-//! - **Simulated interrupted apply**: advance `height` past
-//!   `last_committed_height`, restart, and assert the gap is replayed and the
-//!   meta converges to `last_committed == height`.
-//! - **Atomic write protocol**: after a clean commit the sidecar is readable
-//!   and no `.tmp` residue remains.
-//! - **Torn meta refusal**: a corrupt `.json` (simulating a crash that tore
-//!   the sidecar) is refused on restart — `read_meta` returns `Err`, not a
-//!   silent default.
-//! - **Stale `.tmp` tolerance**: a orphaned `.tmp` left by a crashed write
-//!   does not interfere with recovery; the valid `.json` is read and the
-//!   next `write_meta` cleans up the stale temp.
+//! The proof surface covers durability ordering, a bounded replay window from
+//! local block bodies, atomic sidecar writes, refusal of torn metadata, and
+//! tolerance of stale temporary files.
 
 #![cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
 
@@ -43,52 +29,13 @@ fn make_config(temp: &tempfile::TempDir, backend: &str) -> NodeConfig {
     config
 }
 
-/// Simulated interrupted apply: advance `height` to 10, rewind
-/// `last_committed_height` to 7, restart, and assert the gap [8, 9, 10] is
-/// replayed and the meta converges.
-#[test]
-fn recovery_replays_from_last_committed_height_to_tip() -> Result<()> {
-    for backend in available_backends() {
-        let temp = tempfile::tempdir()?;
-        let config = make_config(&temp, backend);
-
-        {
-            let state = NodeState::open(config.clone(), None)?;
-            for height in 1..=10 {
-                state.record_synthetic_block_for_recovery(height)?;
-            }
-            crash_recovery::set_last_committed_height(&state, 7)?;
-        }
-
-        let restarted = NodeState::open(config, None)?;
-        crash_recovery::recover_if_needed(&restarted)?;
-
-        let meta = crash_recovery::read_meta(&restarted)?.context("missing recovery metadata")?;
-        assert_eq!(
-            meta.height, 10,
-            "{backend}: height should be 10 after recovery"
-        );
-        assert_eq!(
-            meta.last_committed_height, 10,
-            "{backend}: last_committed_height should converge to 10"
-        );
-        assert_eq!(
-            restarted.replayed_heights(),
-            vec![8, 9, 10],
-            "{backend}: replay should cover the gap [8, 9, 10]"
-        );
-    }
-    Ok(())
-}
-
-/// Atomic write protocol: after a clean commit the sidecar is readable and
-/// no `.tmp` residue remains.
+/// Atomic write protocol: after a sidecar write it is readable, names a
+/// non-empty hash, and no temporary residue remains.
 #[test]
 fn recovery_meta_write_leaves_readable_sidecar_without_tmp() -> Result<()> {
     for backend in available_backends() {
         let temp = tempfile::tempdir()?;
         let config = make_config(&temp, backend);
-
         let meta_path = config.data_dir.join("recovery_meta.json");
         let tmp_path = config.data_dir.join("recovery_meta.json.tmp");
         {
@@ -102,9 +49,9 @@ fn recovery_meta_write_leaves_readable_sidecar_without_tmp() -> Result<()> {
         let meta: crash_recovery::Meta = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse recovery metadata {}", meta_path.display()))?;
         assert_eq!(meta.height, 3, "{backend}: height should be 3");
-        assert_eq!(
-            meta.last_committed_height, 3,
-            "{backend}: last_committed_height should be 3"
+        assert!(
+            !meta.tip_hash_hex.is_empty(),
+            "{backend}: tip_hash_hex should be non-empty"
         );
         assert!(
             !tmp_path.exists(),
@@ -114,89 +61,67 @@ fn recovery_meta_write_leaves_readable_sidecar_without_tmp() -> Result<()> {
     Ok(())
 }
 
-/// Torn meta refusal: corrupt the `.json` sidecar (simulating a crash that
-/// tore the file), reopen, and assert `read_meta` returns `Err` — the node
-/// refuses torn state rather than silently defaulting.
+/// Torn meta refusal: corrupt the `.json` sidecar and ensure recovery refuses
+/// to proceed rather than silently accepting a default or stale value.
 #[test]
 fn torn_meta_after_crash_is_refused() -> Result<()> {
     for backend in available_backends() {
         let temp = tempfile::tempdir()?;
         let config = make_config(&temp, backend);
-
-        // Establish a clean state at height 5.
         {
             let state = NodeState::open(config.clone(), None)?;
-            for height in 1..=5 {
-                state.record_synthetic_block_for_recovery(height)?;
-            }
+            state.record_synthetic_block_for_recovery(5)?;
         }
 
-        // Simulate a crash that tore the meta file — write garbage bytes
-        // directly into recovery_meta.json.  This is the failure mode the
-        // atomic-rename protocol prevents in production; the test proves the
-        // read path detects and refuses it rather than silently recovering
-        // from a default or stale value.
         let meta_path = config.data_dir.join("recovery_meta.json");
         std::fs::write(&meta_path, b"{ this is not valid json }")?;
 
         let restarted = NodeState::open(config, None)?;
-        let result = crash_recovery::read_meta(&restarted);
         assert!(
-            result.is_err(),
-            "{backend}: torn meta must be refused (returned Err), not silently accepted"
+            crash_recovery::read_meta(&restarted).is_err(),
+            "{backend}: torn meta must be refused"
         );
-
-        // recover_if_needed propagates the error — the node does not proceed.
-        let recovery_result = crash_recovery::recover_if_needed(&restarted);
         assert!(
-            recovery_result.is_err(),
+            crash_recovery::recover_if_needed(&restarted).is_err(),
             "{backend}: recover_if_needed must fail when meta is torn"
         );
     }
     Ok(())
 }
 
-/// Stale `.tmp` tolerance: a `.tmp` orphaned by a crashed write does not
-/// interfere with recovery.  The valid `.json` is read, recovery succeeds,
-/// and a subsequent `write_meta` overwrites the stale temp cleanly.
+/// A stale temporary file does not corrupt recovery.  Synthetic metadata has
+/// no matching body, so the degraded path resumes at the restored base.
 #[test]
 fn stale_tmp_after_crash_does_not_corrupt_recovery() -> Result<()> {
     for backend in available_backends() {
         let temp = tempfile::tempdir()?;
         let config = make_config(&temp, backend);
-
-        // Establish a clean state at height 8, then simulate an interrupted
-        // apply by rewinding last_committed_height to 5.
         {
             let state = NodeState::open(config.clone(), None)?;
-            for height in 1..=8 {
-                state.record_synthetic_block_for_recovery(height)?;
-            }
-            crash_recovery::set_last_committed_height(&state, 5)?;
+            state.record_synthetic_block_for_recovery(8)?;
         }
 
-        // Plant a stale .tmp from a crashed write — garbage that must never
-        // be read as the recovery meta.
         let tmp_path = config.data_dir.join("recovery_meta.json.tmp");
         std::fs::write(&tmp_path, b"garbage from a crashed write")?;
 
-        // Restart: recovery reads the valid .json and ignores the stale .tmp.
         let restarted = NodeState::open(config, None)?;
         crash_recovery::recover_if_needed(&restarted)?;
+        assert!(
+            restarted.replayed_heights().is_empty(),
+            "{backend}: missing bodies must not create fake replay heights"
+        );
+        assert_eq!(
+            restarted
+                .applied_tip()
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            0,
+            "{backend}: degraded recovery resumes at the restored base"
+        );
 
         let meta = crash_recovery::read_meta(&restarted)?.context("missing recovery metadata")?;
-        assert_eq!(meta.height, 8, "{backend}: height should be 8");
-        assert_eq!(
-            meta.last_committed_height, 8,
-            "{backend}: last_committed_height should converge to 8"
-        );
-        assert_eq!(
-            restarted.replayed_heights(),
-            vec![6, 7, 8],
-            "{backend}: replay should cover the gap [6, 7, 8]"
-        );
-
-        // A subsequent write_meta overwrites the stale .tmp cleanly.
+        assert_eq!(meta.height, 8, "{backend}: metadata must remain unchanged");
         crash_recovery::write_meta(&restarted, &meta)?;
         assert!(
             !tmp_path.exists(),
@@ -206,16 +131,8 @@ fn stale_tmp_after_crash_does_not_corrupt_recovery() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Production crash-recovery tests: apply real blocks through the production
-// apply path (which persists the recovery meta with a tip hash), simulate a
-// crash by dropping the state without a clean checkpoint, reopen, and verify
-// that `recover_if_needed` replays the gap from stored block bodies.
-// ---------------------------------------------------------------------------
-
 // Helpers for mining regtest blocks with valid PoW.
 
-/// Decodes a 256-bit compact target into little-endian bytes.
 fn compact_to_target(bits: u32) -> [u8; 32] {
     let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
     let mantissa = u64::from(bits & 0x007f_ffff);
@@ -238,7 +155,6 @@ fn compact_to_target(bits: u32) -> [u8; 32] {
     target
 }
 
-/// Returns true when `hash` is at or below the compact target.
 fn pow_met(bits: u32, hash: &bitcoin_rs_primitives::BlockHash) -> bool {
     let target = compact_to_target(bits);
     let hash_le = hash.as_bytes();
@@ -252,11 +168,25 @@ fn pow_met(bits: u32, hash: &bitcoin_rs_primitives::BlockHash) -> bool {
     true
 }
 
-/// Mines a regtest block on top of `prev_hash` with a coinbase transaction.
-///
-/// `time` must exceed the parent's median-time-past; callers should derive it
-/// from the genesis timestamp (e.g. `genesis.header.time + height`) so every
-/// block in the chain advances past the growing MTP window.
+fn script_push_int(value: i64) -> Vec<u8> {
+    match value {
+        0 => vec![0x00],
+        1..=16 => vec![0x50 + u8::try_from(value).unwrap_or_default()],
+        _ => {
+            let mut payload = Vec::new();
+            let mut magnitude = value.unsigned_abs();
+            while magnitude > 0 {
+                payload.push(u8::try_from(magnitude & 0xff).unwrap_or_default());
+                magnitude >>= 8;
+            }
+            let mut script = Vec::with_capacity(payload.len() + 1);
+            script.push(u8::try_from(payload.len()).unwrap_or_default());
+            script.extend(payload);
+            script
+        }
+    }
+}
+
 fn mine_regtest_block(
     prev_hash: bitcoin_rs_primitives::BlockHash,
     height: u32,
@@ -270,12 +200,15 @@ fn mine_regtest_block(
                 bitcoin_rs_primitives::Txid::default(),
                 u32::MAX,
             ),
-            script_sig: vec![0x51, u8::try_from(height).unwrap_or(0)],
+            script_sig: [script_push_int(i64::from(height)), script_push_int(0)].concat(),
             sequence: u32::MAX,
             witness: Vec::new(),
         }],
         outputs: vec![bitcoin_rs_primitives::TxOut {
-            value: 50 * 100_000_000,
+            value: bitcoin_rs_consensus::block_subsidy(
+                height,
+                Network::Regtest.subsidy_halving_interval(),
+            ),
             script_pubkey: vec![0x51],
         }],
     };
@@ -300,19 +233,17 @@ fn mine_regtest_block(
     Ok(block)
 }
 
-/// Production crash recovery: apply genesis, publish a checkpoint, apply
-/// three blocks, crash (drop state without clean checkpoint), reopen, and
-/// assert that `recover_if_needed` replays blocks 1–3 from stored bodies.
+/// Progress is published without a checkpoint and recovery replays the
+/// bounded remainder from local bodies, without redownloading any block.
 #[test]
-fn crash_recovery_replays_from_stored_bodies_after_crash() -> Result<()> {
+fn crash_recovery_resumes_from_local_bodies_without_checkpoint_or_redownload() -> Result<()> {
     for backend in available_backends() {
         let temp = tempfile::tempdir()?;
         let config = make_config(&temp, backend);
-
         let genesis = Network::Regtest.genesis_block();
         let genesis_hash = genesis.block_hash();
+        let block_count = crash_recovery::PROGRESS_INTERVAL_BLOCKS + 7;
 
-        // Phase 1: open, apply genesis, publish checkpoint at height 0.
         {
             let state = NodeState::open(config.clone(), None)?;
             let tip = state.apply_block(&genesis)?;
@@ -320,309 +251,67 @@ fn crash_recovery_replays_from_stored_bodies_after_crash() -> Result<()> {
             state.publish_checkpoint()?;
         }
 
-        // Phase 2: reopen, apply blocks 1–3, crash (drop without checkpoint).
-        {
+        let (published_meta, mined_hashes) = {
             let state = NodeState::open(config.clone(), None)?;
             let mut prev = genesis_hash;
-            for height in 1..=3_u32 {
+            let mut mined_hashes =
+                Vec::with_capacity(usize::try_from(block_count).context("block count overflow")?);
+            for height in 1..=block_count {
                 let block = mine_regtest_block(prev, height, genesis.header.time + height)?;
                 let tip = state.apply_block(&block)?;
                 assert_eq!(
                     tip.height, height,
                     "{backend}: block {height} should apply at height {height}"
                 );
+                mined_hashes.push(block.block_hash());
                 prev = block.block_hash();
             }
-            // Drop state without publishing a checkpoint — simulates a crash.
-        }
+            let meta = crash_recovery::read_meta(&state)?.context("missing recovery metadata")?;
+            assert!(
+                meta.height >= crash_recovery::PROGRESS_INTERVAL_BLOCKS,
+                "{backend}: progress must publish at the block cadence"
+            );
+            assert!(
+                meta.height <= block_count,
+                "{backend}: progress cannot exceed the applied tip"
+            );
+            (meta, mined_hashes)
+        };
 
-        // Phase 3: reopen — checkpoint restores to height 0, recovery meta
-        // says height 3 with a tip hash.
         let restarted = NodeState::open(config, None)?;
-        let restored_tip = restarted
+        assert_eq!(
+            restarted
+                .applied_tip()
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            0,
+            "{backend}: only the clean checkpoint restores initially"
+        );
+        crash_recovery::recover_if_needed(&restarted)?;
+
+        let recovered = restarted
             .applied_tip()
             .load()
             .as_ref()
-            .map_or(0, |t| t.height);
+            .map_or(0, |tip| tip.height);
         assert_eq!(
-            restored_tip, 0,
-            "{backend}: checkpoint should restore to height 0"
-        );
-
-        crash_recovery::recover_if_needed(&restarted)?;
-
-        let meta = crash_recovery::read_meta(&restarted)?
-            .with_context(|| format!("{backend}: missing recovery metadata after recovery"))?;
-        assert_eq!(
-            meta.height, 3,
-            "{backend}: meta height should be 3 after recovery"
-        );
-        assert_eq!(
-            meta.last_committed_height, 3,
-            "{backend}: last_committed_height should converge to 3"
+            recovered, published_meta.height,
+            "{backend}: recovered progress"
         );
         assert!(
-            meta.tip_hash_hex.is_some(),
-            "{backend}: tip_hash_hex should be present after production recovery"
+            block_count - recovered <= crash_recovery::PROGRESS_INTERVAL_BLOCKS,
+            "{backend}: replay window must remain bounded"
         );
         assert_eq!(
             restarted.replayed_heights(),
-            vec![1, 2, 3],
-            "{backend}: replay should cover the gap [1, 2, 3]"
-        );
-
-        // The replay path must actually apply the blocks, not just record
-        // the gap.  The fallback (in-memory record only) leaves the applied
-        // tip at the checkpoint height; a real replay advances it to 3.
-        let recovered_tip = restarted
-            .applied_tip()
-            .load()
-            .as_ref()
-            .map_or(0, |t| t.height);
-        assert_eq!(
-            recovered_tip, 3,
-            "{backend}: replayed blocks should advance the applied tip to height 3"
-        );
-    }
-    Ok(())
-}
-
-/// Production meta persistence: after applying a block through the
-/// production apply path, the recovery meta should contain a tip hash.
-/// This test verifies the wiring — if the apply path stops writing
-/// `tip_hash_hex`, the crash-recovery replay path cannot function.
-#[test]
-fn production_apply_writes_meta_with_tip_hash() -> Result<()> {
-    for backend in available_backends() {
-        let temp = tempfile::tempdir()?;
-        let config = make_config(&temp, backend);
-
-        let genesis = Network::Regtest.genesis_block();
-
-        {
-            let state = NodeState::open(config.clone(), None)?;
-            state.apply_block(&genesis)?;
-        }
-
-        // Reopen and check that the meta was written by the production path.
-        let state = NodeState::open(config, None)?;
-        let meta = crash_recovery::read_meta(&state)?
-            .with_context(|| format!("{backend}: recovery meta should exist after apply"))?;
-        assert_eq!(
-            meta.height, 0,
-            "{backend}: meta height should be 0 after genesis apply"
+            (1..=recovered).collect::<Vec<_>>(),
+            "{backend}: every recovered block came from local bodies"
         );
         assert_eq!(
-            meta.last_committed_height, 0,
-            "{backend}: last_committed_height should be 0 after genesis apply"
-        );
-        assert!(
-            meta.tip_hash_hex.is_some(),
-            "{backend}: production apply should write tip_hash_hex"
-        );
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Periodic checkpoint publication tests (issue #219).
-//
-// These tests prove the periodic checkpoint worker publishes a checkpoint
-// during sync without any clean shutdown, and that a killed-and-reopened
-// node resumes from the periodic checkpoint rather than the older
-// clean-shutdown one.
-// ---------------------------------------------------------------------------
-
-/// Periodic checkpoint: apply genesis (clean checkpoint at height 0), start
-/// the checkpoint worker with a 3-block cadence, apply 4 blocks, wait for
-/// the worker to publish, drop the state without a clean checkpoint, reopen,
-/// and assert the resumed tip is at height 4 (the periodic checkpoint), not
-/// height 0 (the clean-shutdown checkpoint).
-#[test]
-fn periodic_checkpoint_anchors_progress_without_clean_shutdown() -> Result<()> {
-    for backend in available_backends() {
-        let temp = tempfile::tempdir()?;
-        let config = make_config(&temp, backend);
-
-        let genesis = Network::Regtest.genesis_block();
-        let genesis_hash = genesis.block_hash();
-
-        // Phase 1: open, apply genesis, publish a clean checkpoint at height 0.
-        // This is the "old" checkpoint that must be superseded by the periodic one.
-        {
-            let state = NodeState::open(config.clone(), None)?;
-            state.apply_block(&genesis)?;
-            state.publish_checkpoint()?;
-        }
-
-        // Phase 2: reopen, start the periodic checkpoint worker with a 3-block
-        // cadence, apply 4 blocks (past the cadence), and wait for the worker
-        // to publish. Then stop the worker and drop the state WITHOUT a clean
-        // checkpoint — this simulates a crash/kill mid-sync.
-        {
-            let state = NodeState::open(config.clone(), None)?;
-
-            // Start the periodic checkpoint worker with a 3-block cadence
-            // and a 1-hour time fallback (so only the block count fires).
-            let worker = state.start_periodic_checkpoint(3, std::time::Duration::from_hours(1))?;
-
-            let mut prev = genesis_hash;
-            for height in 1..=4_u32 {
-                let block = mine_regtest_block(prev, height, genesis.header.time + height)?;
-                let tip = state.apply_block(&block)?;
-                assert_eq!(
-                    tip.height, height,
-                    "{backend}: block {height} should apply at height {height}"
-                );
-                prev = block.block_hash();
-            }
-
-            // Wait for the worker to publish. The worker polls every 5s, but
-            // the checkpoint write itself is synchronous and quick for a tiny
-            // regtest chainstate. Poll the checkpoint CURRENT file until it
-            // names a generation whose restored height exceeds 0.
-            let checkpoint_root = config.data_dir.join("chainstate-checkpoints");
-            let mut published = false;
-            for _ in 0..60 {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if let Ok(current_bytes) = std::fs::read(checkpoint_root.join("CURRENT")) {
-                    if let Ok(current) = serde_json::from_slice::<serde_json::Value>(&current_bytes)
-                    {
-                        if let Some(generation) = current
-                            .get("generation")
-                            .and_then(serde_json::Value::as_u64)
-                        {
-                            // A generation > 1 means a second checkpoint was published
-                            // (generation 1 was the clean-shutdown one at height 0).
-                            if generation > 1 {
-                                published = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            assert!(
-                published,
-                "{backend}: periodic checkpoint should have been published after 4 blocks with cadence 3"
-            );
-
-            // Stop the worker before dropping the state so it releases
-            // database locks. Then drop state without a clean checkpoint —
-            // simulates a crash.
-            state
-                .shutdown()
-                .store(true, std::sync::atomic::Ordering::Release);
-            match worker.join() {
-                Ok(()) => {}
-                Err(payload) => panic!("checkpoint worker thread panicked: {payload:?}"),
-            }
-            drop(state);
-        }
-
-        // Phase 3: reopen — the checkpoint should restore to height 4 (the
-        // periodic checkpoint), not height 0 (the clean-shutdown one).
-        let restarted = NodeState::open(config, None)?;
-        let restored_tip = restarted
-            .applied_tip()
-            .load()
-            .as_ref()
-            .map_or(0, |t| t.height);
-        assert_eq!(
-            restored_tip, 4,
-            "{backend}: periodic checkpoint should restore to height 4, not the clean-shutdown height 0"
-        );
-
-        // The recovery sidecar should also agree: after the periodic checkpoint
-        // rewrote it, the sidecar height should be 4.
-        let meta = crash_recovery::read_meta(&restarted)?.with_context(|| {
-            format!("{backend}: recovery meta should exist after periodic checkpoint")
-        })?;
-        assert_eq!(
-            meta.height, 4,
-            "{backend}: sidecar height should be 4 after periodic checkpoint publication"
-        );
-    }
-    Ok(())
-}
-
-/// Periodic checkpoint exists without shutdown: apply genesis, start the
-/// worker with a 2-block cadence, apply 3 blocks, wait for publication, and
-/// assert a checkpoint generation exists — all without ever calling
-/// `publish_checkpoint` or shutting down cleanly.
-#[test]
-fn periodic_checkpoint_published_during_sync_without_shutdown() -> Result<()> {
-    for backend in available_backends() {
-        let temp = tempfile::tempdir()?;
-        let config = make_config(&temp, backend);
-
-        let genesis = Network::Regtest.genesis_block();
-        let genesis_hash = genesis.block_hash();
-
-        // Open, apply genesis (no clean checkpoint this time — the periodic
-        // worker should be the only publisher).
-        let state = NodeState::open(config.clone(), None)?;
-        state.apply_block(&genesis)?;
-
-        // Start the periodic checkpoint worker with a 2-block cadence.
-        let worker = state.start_periodic_checkpoint(2, std::time::Duration::from_hours(1))?;
-
-        let mut prev = genesis_hash;
-        for height in 1..=3_u32 {
-            let block = mine_regtest_block(prev, height, genesis.header.time + height)?;
-            let tip = state.apply_block(&block)?;
-            assert_eq!(
-                tip.height, height,
-                "{backend}: block {height} should apply at height {height}"
-            );
-            prev = block.block_hash();
-        }
-
-        // Wait for the worker to publish a checkpoint.
-        let checkpoint_root = config.data_dir.join("chainstate-checkpoints");
-        let mut published = false;
-        for _ in 0..60 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Ok(current_bytes) = std::fs::read(checkpoint_root.join("CURRENT")) {
-                if let Ok(current) = serde_json::from_slice::<serde_json::Value>(&current_bytes) {
-                    if let Some(generation) = current
-                        .get("generation")
-                        .and_then(serde_json::Value::as_u64)
-                    {
-                        if generation >= 1 {
-                            published = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            published,
-            "{backend}: periodic checkpoint should have been published after 3 blocks with cadence 2"
-        );
-
-        // Shut down the worker by setting the shutdown flag and joining,
-        // then drop the state (no clean checkpoint publication).
-        state
-            .shutdown()
-            .store(true, std::sync::atomic::Ordering::Release);
-        match worker.join() {
-            Ok(()) => {}
-            Err(payload) => panic!("checkpoint worker thread panicked: {payload:?}"),
-        }
-        drop(state);
-
-        // Reopen and verify the checkpoint restored to height 3.
-        let restarted = NodeState::open(config, None)?;
-        let restored_tip = restarted
-            .applied_tip()
-            .load()
-            .as_ref()
-            .map_or(0, |t| t.height);
-        assert_eq!(
-            restored_tip, 3,
-            "{backend}: periodic checkpoint should restore to height 3 without any clean shutdown"
+            restarted.applied_tip().load().as_ref().map(|tip| tip.hash),
+            Some(mined_hashes[usize::try_from(recovered - 1).context("height overflow")?].into()),
+            "{backend}: recovered tip hash"
         );
     }
     Ok(())

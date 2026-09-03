@@ -620,9 +620,6 @@ pub(crate) struct NodeServices {
     outbound_worker: Option<std::thread::JoinHandle<()>>,
     /// DNS or fixed-peer bootstrap worker, absent in regtest-style configs.
     bootstrap_worker: Option<std::thread::JoinHandle<()>>,
-    /// Periodic chainstate checkpoint worker; joined before the clean
-    /// checkpoint publication so it does not race the final write.
-    checkpoint_worker: Option<std::thread::JoinHandle<()>>,
     /// Process-level SIGINT/SIGTERM forwarding handler, owned by the graph
     /// so the shared teardown — never a leak — closes and joins it.
     signal_handler: Option<crate::signal::ShutdownHandler>,
@@ -759,17 +756,6 @@ impl NodeServices {
                 set_first_error(
                     first_error,
                     anyhow::anyhow!("P2P bootstrap worker panicked"),
-                );
-            }
-        }
-        if let Some(handle) = self.checkpoint_worker.take() {
-            if matches!(handle.join(), Ok(())) {
-                tracing::info!("periodic checkpoint worker exited cleanly");
-            } else {
-                tracing::error!("periodic checkpoint worker panicked");
-                set_first_error(
-                    first_error,
-                    anyhow::anyhow!("periodic checkpoint worker panicked"),
                 );
             }
         }
@@ -1076,15 +1062,6 @@ pub(crate) fn start_node(
         spawn_fixed_peer_bootstrap(state, &shutdown)?
     };
     guard.services.bootstrap_worker = bootstrap_worker;
-    // Periodic chainstate checkpoint worker: publishes a checkpoint every
-    // CHECKPOINT_INTERVAL_BLOCKS or CHECKPOINT_INTERVAL_SECS so a node
-    // killed mid-sync restarts from a recent anchor, not the last clean
-    // shutdown. Joined before the clean-shutdown checkpoint publication.
-    let checkpoint_worker = state.start_periodic_checkpoint(
-        crate::checkpoint_worker::CHECKPOINT_INTERVAL_BLOCKS,
-        Duration::from_secs(crate::checkpoint_worker::CHECKPOINT_INTERVAL_SECS),
-    )?;
-    guard.services.checkpoint_worker = Some(checkpoint_worker);
     // The event loop runs on its own thread so both the daemon (signal wait)
     // and an embedder (typed API calls) can share the process meanwhile.
     let event_loop = std::thread::Builder::new()

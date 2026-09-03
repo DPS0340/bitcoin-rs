@@ -1459,7 +1459,11 @@ impl NodeState {
                 config.network,
                 config.assume_valid_height,
             )),
-            recovery_meta_path: Some(config.data_dir.join(crate::crash_recovery::META_FILENAME)),
+            recovery_progress: Some(Arc::new(crate::crash_recovery::ProgressPublisher::new(
+                config.data_dir.join(crate::crash_recovery::META_FILENAME),
+                Arc::clone(&block_body_store),
+                restored_height,
+            ))),
         };
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
         let sync = Arc::new(crate::BlockSync::new(
@@ -1573,60 +1577,6 @@ impl NodeState {
                 bail!("checkpoint refused: no applied tip to publish")
             }
         }
-    }
-
-    /// Creates a [`crate::checkpoint_worker::CheckpointPublisher`] from this
-    /// state's shared handles, for use by the periodic checkpoint worker.
-    ///
-    /// The publisher owns its own `Dir` handle (reopened from the data-dir
-    /// path) and cloned `Arc`s, so it can be moved into a background thread
-    /// without borrowing from `self`.
-    pub(crate) fn checkpoint_publisher(
-        &self,
-    ) -> core::result::Result<
-        crate::checkpoint_worker::CheckpointPublisher,
-        crate::checkpoint::CheckpointError,
-    > {
-        Ok(crate::checkpoint_worker::CheckpointPublisher {
-            admission: Arc::clone(&self.apply_handles.admission),
-            undo_store: Arc::clone(&self.apply_handles.undo_store),
-            block_body_store: Arc::clone(&self.block_body_store),
-            applied_tip: Arc::clone(&self.applied_tip),
-            checkpoint_data_dir: crate::checkpoint_fs::open_data_dir(&self.data_dir)
-                .map_err(crate::checkpoint::CheckpointError::Io)?,
-            network: self.config.network,
-            genesis_hash: self.config.network.genesis_block_hash(),
-            block_tree: Arc::clone(&self.block_tree),
-            utxo: Arc::clone(&self.utxo),
-            coin_stats: Arc::clone(&self.coin_stats),
-            chain_tx_count: Arc::clone(&self.chain_tx_count),
-            data_dir: self.data_dir.clone(),
-            chain_events: Arc::clone(&self.chain_events),
-            durable_tip_height: Arc::clone(&self.durable_tip_height),
-        })
-    }
-
-    /// Spawns the periodic checkpoint worker with a custom cadence.
-    ///
-    /// Production wiring goes through `start_node`, which uses
-    /// [`crate::checkpoint_worker::CHECKPOINT_INTERVAL_BLOCKS`] and
-    /// [`crate::checkpoint_worker::CHECKPOINT_INTERVAL_SECS`]. This method
-    /// is `pub` so integration tests can use a small cadence.
-    ///
-    /// Returns the worker's join handle. The worker exits when the node's
-    /// shutdown flag is set.
-    pub fn start_periodic_checkpoint(
-        &self,
-        interval_blocks: u32,
-        interval_secs: Duration,
-    ) -> Result<std::thread::JoinHandle<()>> {
-        let publisher = self.checkpoint_publisher().map_err(anyhow::Error::new)?;
-        Ok(crate::checkpoint_worker::spawn_periodic_checkpoint_worker(
-            publisher,
-            Arc::clone(&self.shutdown()),
-            interval_blocks,
-            interval_secs,
-        )?)
     }
 
     pub(crate) fn write_clean_checkpoint(
@@ -1973,15 +1923,15 @@ impl NodeState {
         self.replayed.lock().push(height);
     }
 
-    /// Test helper: writes the recovery metadata as if a block at `height`
-    /// had just been fully committed. Real block commits flow through the
-    /// `crates/utxo` listener; this helper exists so crash-recovery tests
-    /// can simulate a chain without bringing up the full subsystem stack.
+    /// Test helper: writes the sidecar as if progress at `height` had been
+    /// published; the hash is synthetic so replay cannot find a body — used
+    /// by sidecar-protocol tests only.
     pub fn record_synthetic_block_for_recovery(&self, height: u32) -> Result<()> {
+        let mut bytes = [0_u8; 32];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
         let meta = crate::crash_recovery::Meta {
             height,
-            last_committed_height: height,
-            tip_hash_hex: None,
+            tip_hash_hex: Hash256::from_le_bytes(&bytes).to_string_be(),
         };
         crate::crash_recovery::write_meta(self, &meta)
     }

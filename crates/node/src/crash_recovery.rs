@@ -1,46 +1,107 @@
-//! Startup crash-recovery: detect partial commits and replay the gap.
+//! Crash-recovery progress names a tip whose bodies are durable.
 //!
-//! The node persists `(height, last_committed_height, tip_hash)` in a small
-//! JSON sidecar file inside the data directory.  The production apply path
-//! writes the sidecar after every successful block apply, so the sidecar
-//! records the tip the node reached.  On boot, if the sidecar's `height`
-//! exceeds the restored checkpoint height, the gap is replayed from stored
-//! block bodies: the tip hash lets the recovery walk backward through
-//! `prev_blockhash` fields to collect the missing blocks, then apply them
-//! forward through the ordinary apply path.
-//!
-//! When the sidecar lacks a tip hash (legacy test metadata) or stored bodies
-//! are unavailable, recovery falls back to recording the gap in memory via
-//! [`NodeState::push_replayed`] so the sync layer can re-download the blocks.
+//! On boot, the node loads the clean-checkpoint base and replays `(base + 1)..=H`
+//! from stored bodies. The unrecovered window is bounded by
+//! [`PROGRESS_INTERVAL_BLOCKS`] and [`PROGRESS_INTERVAL`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::apply::PruneBodyStore;
 use crate::state::NodeState;
+use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_storage::StorageError;
 
 /// Filename of the recovery sidecar inside the data directory.
 pub const META_FILENAME: &str = "recovery_meta.json";
 
+/// Blocks applied between two recovery-progress publications.
+pub const PROGRESS_INTERVAL_BLOCKS: u32 = 1_000;
+/// Wall-clock bound between two recovery-progress publications.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Recovery sidecar contents.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
-    /// Tip height the node reached before the crash.
+    /// Height through which stored block bodies are durable.
     pub height: u32,
-    /// Last height whose state was fully persisted.
-    ///
-    /// On the production apply path this is advanced to `height` after every
-    /// successful block apply, because the block body — the durable artifact
-    /// needed to reconstruct the UTXO state at that height — is on disk.
-    pub last_committed_height: u32,
-    /// Big-endian hex of the tip block hash at `height`.
-    ///
-    /// Present on every meta written by the production apply path.  Absent
-    /// in legacy test metadata that predates the field; recovery falls back
-    /// to in-memory replay when it is missing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tip_hash_hex: Option<String>,
+    /// Big-endian hexadecimal hash of the durable tip.
+    pub tip_hash_hex: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProgressError {
+    #[error("body sync failed: {0}")]
+    BodySync(#[source] StorageError),
+    #[error("recovery sidecar write failed: {0}")]
+    Sidecar(#[source] anyhow::Error),
+}
+
+struct Cadence {
+    height: u32,
+    at: Instant,
+}
+
+/// Owns the crash-recovery sidecar: makes the stored block bodies durable,
+/// then names the applied tip.
+pub(crate) struct ProgressPublisher {
+    meta_path: PathBuf,
+    body_store: Arc<dyn PruneBodyStore>,
+    cadence: parking_lot::Mutex<Cadence>,
+}
+
+impl ProgressPublisher {
+    pub(crate) fn new(
+        meta_path: PathBuf,
+        body_store: Arc<dyn PruneBodyStore>,
+        base_height: u32,
+    ) -> Self {
+        Self {
+            meta_path,
+            body_store,
+            cadence: parking_lot::Mutex::new(Cadence {
+                height: base_height,
+                at: Instant::now(),
+            }),
+        }
+    }
+
+    /// Records an applied block when the progress cadence is due.
+    pub(crate) fn record_applied(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> core::result::Result<bool, ProgressError> {
+        let mut cadence = self.cadence.lock();
+        if height < cadence.height.saturating_add(PROGRESS_INTERVAL_BLOCKS)
+            && cadence.at.elapsed() < PROGRESS_INTERVAL
+        {
+            return Ok(false);
+        }
+
+        self.body_store.sync().map_err(ProgressError::BodySync)?;
+        write_meta_to_path(
+            &self.meta_path,
+            &Meta {
+                height,
+                tip_hash_hex: hash.to_string_be(),
+            },
+        )
+        .map_err(ProgressError::Sidecar)?;
+        cadence.height = height;
+        cadence.at = Instant::now();
+        Ok(true)
+    }
+
+    fn mark_published(&self, height: u32) {
+        let mut cadence = self.cadence.lock();
+        cadence.height = height;
+        cadence.at = Instant::now();
+    }
 }
 
 fn meta_path(state: &NodeState) -> PathBuf {
@@ -104,45 +165,16 @@ pub fn write_meta_to_path(path: &Path, meta: &Meta) -> Result<()> {
     Ok(())
 }
 
-/// Test helper: rewinds `last_committed_height` to simulate a partial commit.
-pub fn set_last_committed_height(state: &NodeState, height: u32) -> Result<()> {
-    let mut meta = read_meta(state)?.unwrap_or_default();
-    meta.last_committed_height = height;
-    write_meta(state, &meta)
-}
-
 /// Detects a gap between the restored checkpoint and the last applied tip,
 /// and replays it from stored block bodies.
-///
-/// When the sidecar has a tip hash and stored bodies are available, the gap
-/// is replayed by walking backward from the tip through `prev_blockhash`
-/// fields, collecting blocks, and applying them forward through the ordinary
-/// apply path.  When the tip hash is absent (legacy test metadata) or a body
-/// cannot be loaded, recovery falls back to recording the gap in memory via
-/// [`NodeState::push_replayed`].
 pub fn recover_if_needed(state: &NodeState) -> Result<()> {
     let Some(meta) = read_meta(state)? else {
         tracing::debug!("no recovery metadata; fresh node");
         return Ok(());
     };
 
-    // Determine the gap base.  Production metadata (with `tip_hash_hex`)
-    // uses the restored checkpoint height, because `last_committed_height`
-    // is always written equal to `height` on the production apply path.
-    // Legacy/test metadata (without `tip_hash_hex`) uses
-    // `last_committed_height`, which tests rewind to simulate a partial
-    // commit.
-    let restored_height = state
-        .applied_tip()
-        .load()
-        .as_ref()
-        .map_or(0, |tip| tip.height);
-
-    let gap_base = if meta.tip_hash_hex.is_some() {
-        restored_height
-    } else {
-        meta.last_committed_height
-    };
+    let restored_applied_tip = state.applied_tip().load_full();
+    let gap_base = restored_applied_tip.as_ref().map_or(0, |tip| tip.height);
 
     if meta.height <= gap_base {
         tracing::debug!(height = meta.height, gap_base, "no gap; recovery skipped");
@@ -157,56 +189,43 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
         meta.height
     );
 
-    // Try full replay from stored bodies when we have a tip hash.
-    if let Some(tip_hex) = &meta.tip_hash_hex
-        && let Some(tip_hash) = parse_hash_hex(tip_hex)
-    {
-        match replay_from_bodies(state, gap_base, meta.height, tip_hash) {
-            Ok(replayed) => {
-                for height in &replayed {
-                    state.push_replayed(*height);
-                }
-                let new_meta = Meta {
-                    height: meta.height,
-                    last_committed_height: meta.height,
-                    tip_hash_hex: meta.tip_hash_hex,
-                };
-                write_meta(state, &new_meta)?;
-                tracing::info!(
-                    replayed = replayed.len(),
-                    from = gap_base + 1,
-                    to = meta.height,
-                    "crash recovery replayed from stored bodies"
-                );
-                return Ok(());
+    let tip_hash = parse_hash_hex(&meta.tip_hash_hex)
+        .ok_or_else(|| anyhow::anyhow!("invalid recovery tip hash {}", meta.tip_hash_hex))?;
+    if let Some(progress) = &state.apply_handles().recovery_progress {
+        progress.mark_published(meta.height);
+    }
+    match replay_from_bodies(
+        state,
+        restored_applied_tip.as_deref(),
+        meta.height,
+        tip_hash,
+    ) {
+        Ok(replayed) => {
+            for height in &replayed {
+                state.push_replayed(*height);
             }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "full replay from stored bodies failed; falling back to in-memory gap record"
-                );
-            }
+            tracing::info!(
+                replayed = replayed.len(),
+                from = gap_base + 1,
+                to = meta.height,
+                "crash recovery replayed from stored bodies"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "replay from stored bodies failed; node resumes at the restored base and sync will refetch the gap"
+            );
         }
     }
-
-    // Fallback: record the gap in memory for the sync layer.
-    for replay in (gap_base + 1)..=meta.height {
-        state.push_replayed(replay);
-    }
-    let new_meta = Meta {
-        height: meta.height,
-        last_committed_height: meta.height,
-        tip_hash_hex: meta.tip_hash_hex,
-    };
-    write_meta(state, &new_meta)?;
     Ok(())
 }
 
-/// Walks backward from `(tip_height, tip_hash)` to `restored_height + 1`,
+/// Walks backward from `(tip_height, tip_hash)` to the restored tip,
 /// collecting blocks, then applies them forward through the apply path.
 fn replay_from_bodies(
     state: &NodeState,
-    restored_height: u32,
+    restored_tip: Option<&TipSnapshot>,
     tip_height: u32,
     tip_hash: bitcoin_rs_primitives::Hash256,
 ) -> Result<Vec<u32>> {
@@ -221,6 +240,7 @@ fn replay_from_bodies(
     let mut current_hash = tip_hash;
     let mut current_height = tip_height;
 
+    let restored_height = restored_tip.map_or(0, |tip| tip.height);
     while current_height > restored_height {
         let body_bytes = body_store
             .load_block_body(current_height, current_hash)
@@ -241,6 +261,15 @@ fn replay_from_bodies(
 
         current_hash = prev_hash;
         current_height = current_height.saturating_sub(1);
+    }
+    if let Some(restored_tip) = restored_tip
+        && current_hash != restored_tip.hash
+    {
+        bail!(
+            "stored bodies at height {} do not descend from the restored tip {}",
+            tip_height,
+            restored_tip.hash.to_string_be()
+        );
     }
 
     // Reverse to apply in forward order.
@@ -265,4 +294,127 @@ fn replay_from_bodies(
 /// Parses a big-endian hex string into a `Hash256`.
 fn parse_hash_hex(hex: &str) -> Option<bitcoin_rs_primitives::Hash256> {
     bitcoin_rs_primitives::Hash256::from_str_be(hex).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct MapBodyStore {
+        path: PathBuf,
+        sync_calls: AtomicUsize,
+        fail_sync: AtomicBool,
+        #[allow(clippy::option_option)]
+        sidecar_seen_at_sync: parking_lot::Mutex<Option<Option<Meta>>>,
+    }
+
+    impl MapBodyStore {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                path,
+                sync_calls: AtomicUsize::new(0),
+                fail_sync: AtomicBool::new(false),
+                sidecar_seen_at_sync: parking_lot::Mutex::new(None),
+            }
+        }
+    }
+
+    impl PruneBodyStore for MapBodyStore {
+        fn persist_block_body(
+            &self,
+            _height: u32,
+            _hash: bitcoin_rs_primitives::Hash256,
+            _body: &[u8],
+        ) -> core::result::Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn load_block_body(
+            &self,
+            _height: u32,
+            _hash: bitcoin_rs_primitives::Hash256,
+        ) -> core::result::Result<Option<Vec<u8>>, StorageError> {
+            Ok(None)
+        }
+
+        fn sync(&self) -> core::result::Result<(), StorageError> {
+            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            let current = read_meta_from_path(&self.path).unwrap_or_default();
+            *self.sidecar_seen_at_sync.lock() = Some(current);
+            if self.fail_sync.load(Ordering::Relaxed) {
+                return Err(StorageError::Backend("injected sync failure".to_owned()));
+            }
+            Ok(())
+        }
+    }
+
+    fn hash(byte: u8) -> bitcoin_rs_primitives::Hash256 {
+        bitcoin_rs_primitives::Hash256::from_le_bytes(&[byte; 32])
+    }
+
+    #[test]
+    fn progress_is_published_only_after_bodies_sync() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(META_FILENAME);
+        let store = Arc::new(MapBodyStore::new(path.clone()));
+        let publisher = ProgressPublisher::new(path.clone(), store.clone(), 0);
+
+        assert!(publisher.record_applied(PROGRESS_INTERVAL_BLOCKS, hash(1))?);
+        assert_eq!(store.sync_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*store.sidecar_seen_at_sync.lock(), Some(None));
+        assert_eq!(
+            read_meta_from_path(&path)?,
+            Some(Meta {
+                height: PROGRESS_INTERVAL_BLOCKS,
+                tip_hash_hex: hash(1).to_string_be(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sync_failure_leaves_prior_progress_in_place() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(META_FILENAME);
+        let store = Arc::new(MapBodyStore::new(path.clone()));
+        let publisher = ProgressPublisher::new(path.clone(), store.clone(), 0);
+        let first = hash(1);
+        let second = hash(2);
+        let third = hash(3);
+
+        assert!(publisher.record_applied(1_000, first)?);
+        store.fail_sync.store(true, Ordering::Relaxed);
+        assert!(publisher.record_applied(2_000, second).is_err());
+        assert_eq!(
+            read_meta_from_path(&path)?,
+            Some(Meta {
+                height: 1_000,
+                tip_hash_hex: first.to_string_be(),
+            })
+        );
+        store.fail_sync.store(false, Ordering::Relaxed);
+        assert!(publisher.record_applied(2_001, third)?);
+        assert_eq!(
+            read_meta_from_path(&path)?,
+            Some(Meta {
+                height: 2_001,
+                tip_hash_hex: third.to_string_be(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn progress_is_not_published_before_the_cadence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(META_FILENAME);
+        let store = Arc::new(MapBodyStore::new(path.clone()));
+        let publisher = ProgressPublisher::new(path.clone(), store.clone(), 0);
+
+        assert!(!publisher.record_applied(1, hash(1))?);
+        assert_eq!(store.sync_calls.load(Ordering::Relaxed), 0);
+        assert!(!path.exists());
+        Ok(())
+    }
 }

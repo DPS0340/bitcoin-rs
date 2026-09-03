@@ -22,8 +22,6 @@ pub mod block_source;
 mod capabilities;
 mod checkpoint;
 mod checkpoint_fs;
-/// Periodic chainstate checkpoint publication during sync.
-mod checkpoint_worker;
 /// Layered node configuration.
 pub mod config;
 /// Startup crash recovery.
