@@ -484,47 +484,6 @@ impl NodeConfig {
                 "blockfilterindex requires prune disabled"
             );
         }
-        ensure!(
-            self.script_index.has_live_store(),
-            "scriptindex=utxo is not yet usable: the compact live-output store it \
-             requires does not exist (#225). Only `full` and `disabled` are accepted. \
-             Blocked on #226 Q5, which selects the ScriptLive locator format."
-        );
-        let mut endpoints = HashSet::new();
-        for publication in &self.notifications.zmq {
-            ensure!(
-                !publication.endpoint.trim().is_empty(),
-                "ZMQ endpoint must not be empty"
-            );
-            ensure!(
-                !publication.topics.is_empty(),
-                "ZMQ endpoint {} must publish at least one topic",
-                publication.endpoint
-            );
-            ensure!(
-                endpoints.insert(&publication.endpoint),
-                "duplicate ZMQ endpoint {}",
-                publication.endpoint
-            );
-            let mut topics = HashSet::new();
-            for topic in &publication.topics {
-                ensure!(
-                    topics.insert(topic),
-                    "duplicate ZMQ topic {} for endpoint {}",
-                    topic.as_str(),
-                    publication.endpoint
-                );
-            }
-            if publication
-                .hwm
-                .is_some_and(|value| value > i32::MAX.cast_unsigned())
-            {
-                bail!(
-                    "ZMQ HWM for endpoint {} exceeds libzmq SNDHWM range",
-                    publication.endpoint
-                );
-            }
-        }
         Ok(())
     }
 

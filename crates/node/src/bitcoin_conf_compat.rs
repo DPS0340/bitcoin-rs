@@ -164,6 +164,9 @@ impl UserConfigMerge for UserConfig {
         if other.blockfilterindex.is_some() {
             self.blockfilterindex = other.blockfilterindex;
         }
+        if other.blockfilterindex.is_some() {
+            self.blockfilterindex = other.blockfilterindex;
+        }
         if other.dbcache_mb.is_some() {
             self.dbcache_mb = other.dbcache_mb;
         }
