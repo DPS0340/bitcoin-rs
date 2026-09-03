@@ -99,6 +99,11 @@ impl PeerTable {
         self.remove_if(addr, |_| true)
     }
 
+    /// Removes and cancels the live connection at `addr` only when its identity is `id`.
+    pub fn disconnect_connection(&self, addr: SocketAddr, id: ConnectionId) -> bool {
+        self.remove_if(addr, |current| current.connection_id() == id)
+    }
+
     fn remove_if(&self, addr: SocketAddr, matches: impl FnOnce(&PeerLease) -> bool) -> bool {
         let mut entries = self.entries.write();
         if !entries
@@ -334,6 +339,19 @@ mod tests {
         assert!(current.is_cancelled());
         assert!(table.infos().is_empty());
         assert!(table.lease(addr(1)).is_none());
+    }
+
+    #[test]
+    fn disconnect_connection_does_not_remove_replacement() {
+        let table = PeerTable::new();
+        let stale = lease();
+        let replacement = lease();
+        table.register(addr(1), stale.clone());
+        let stale_id = stale.connection_id();
+        table.register(addr(1), replacement.clone());
+        assert!(!table.disconnect_connection(addr(1), stale_id));
+        assert!(table.is_connected(addr(1)));
+        assert!(!replacement.is_cancelled());
     }
 
     #[test]

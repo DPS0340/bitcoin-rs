@@ -1470,17 +1470,19 @@ impl BlockSync {
         metrics::gauge!("node.sync.pending_bytes").set(metric_count(window.pending_bytes()));
     }
 
-    /// Selects and evicts a download-window owner without letting a
-    /// same-address registration replace the lease in the middle.
-    ///
-    /// The lock order is window, table, then pending headers.
+    /// Selects and evicts a download-window owner only when its latest
+    /// reconciled connection identity is still live.
     fn select_and_evict_window_peer(
         &self,
         select: impl FnOnce(&mut DownloadWindow) -> Option<SocketAddr>,
     ) -> Option<SocketAddr> {
         let mut window = self.download_window.lock();
         let peer_addr = select(&mut window)?;
-        if !self.peer_table.disconnect(peer_addr) {
+        let connection_id = self.known_sessions.lock().get(&peer_addr).copied()?;
+        if !self
+            .peer_table
+            .disconnect_connection(peer_addr, connection_id)
+        {
             return None;
         }
         let mut pending = self.pending_getheaders.lock();
@@ -4091,6 +4093,48 @@ mod tests {
                 assert!(window.contains_pending(&Hash256::from_le_bytes(front.as_bytes())));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stall_eviction_does_not_disconnect_replacement_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let budget = super::SyncBudget {
+            stall_timeout_initial: Duration::from_millis(100),
+            ..wedge_budget(super::PENDING_TIMEOUT)
+        };
+        let (sync, peers, _expected, _rxs, _blocks_tx) = staged_count_wedge(budget)?;
+        let staller = test_addr(9320, 0)?;
+        sync.download_window
+            .lock()
+            .seed_front_cadence_for_test(50, Instant::now());
+
+        sync.tick();
+        let applied_tip = sync
+            .handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+        let next_apply_height = applied_tip
+            .height
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("applied height overflow"))?;
+        let (replacement_tx, _replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let evicted = sync.select_and_evict_window_peer(|window| {
+            let selected = window.observe_stall(
+                next_apply_height,
+                false,
+                Instant::now() + Duration::from_millis(150),
+            );
+            peers.register(staller, replacement.clone());
+            peers.publish_info(staller, &replacement, eligible_peer(staller, 200));
+            selected
+        });
+
+        assert_eq!(evicted, None);
+        assert!(peers.is_connected(staller));
+        assert!(!replacement.is_cancelled());
         Ok(())
     }
 
