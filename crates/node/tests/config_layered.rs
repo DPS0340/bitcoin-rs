@@ -1,10 +1,9 @@
 //! Integration tests for the bitcoin-rs node.
 
 use anyhow::Result;
-use bitcoin_rs_node::{Auth, Config, Network};
+use bitcoin_rs_node::{Auth, Network, NodeConfig, ScriptIndexMode};
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 type EnvPair = (&'static str, &'static str);
 
@@ -41,7 +40,7 @@ rpc_password = "toml-pass"
         ("BITCOIN_RS_DBCACHE_MB", "1024"),
         ("BITCOIN_RS_LOG_LEVEL", "warn"),
     ];
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         Some(&toml_path),
         Some(&bitcoin_conf_path),
         env,
@@ -70,7 +69,7 @@ rpc_password = "toml-pass"
 fn cli_can_override_socket_and_vector_fields() -> Result<()> {
     let listen: SocketAddr = "127.0.0.1:18444".parse()?;
     let metrics: SocketAddr = "127.0.0.1:19090".parse()?;
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -97,7 +96,7 @@ fn cli_can_override_socket_and_vector_fields() -> Result<()> {
 #[test]
 fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
     let peer = "127.0.0.1:8333".to_owned();
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -113,7 +112,7 @@ fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
     )?;
 
     assert_eq!(config.network, Network::Mainnet);
-    assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x34]);
+    assert_eq!(config.p2p_magic, [0xec, 0xa5, 0xd4, 0x34]);
     assert_eq!(config.connect, vec![peer]);
     assert!(!config.dns_seeds_enabled);
     Ok(())
@@ -121,7 +120,7 @@ fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
 
 #[test]
 fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         None,
         None,
         [("BITCOIN_RS_NETWORK", "drynet4")],
@@ -129,7 +128,7 @@ fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
     )?;
 
     assert_eq!(config.network, Network::Mainnet);
-    assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x04]);
+    assert_eq!(config.p2p_magic, [0xec, 0xa5, 0xd4, 0x04]);
     assert_eq!(config.connect, vec!["drynet4.drivechain.dev:8533"]);
     assert!(!config.dns_seeds_enabled);
     Ok(())
@@ -137,7 +136,7 @@ fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
 
 #[test]
 fn explicit_fields_override_network_defaults_within_the_same_layer() -> Result<()> {
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         None,
         None,
         [
@@ -147,7 +146,7 @@ fn explicit_fields_override_network_defaults_within_the_same_layer() -> Result<(
         ["bitcoin-rs-node", "--p2p-magic", "01020304"],
     )?;
 
-    assert_eq!(config.p2p_magic(), [1, 2, 3, 4]);
+    assert_eq!(config.p2p_magic, [1, 2, 3, 4]);
     assert_eq!(config.connect, vec!["127.0.0.1:8333"]);
     Ok(())
 }
@@ -166,7 +165,7 @@ connect = ["127.0.0.1:18444"]
 "#,
     )?;
 
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         Some(&toml_path),
         None,
         core::iter::empty::<EnvPair>(),
@@ -189,7 +188,7 @@ connect = ["127.0.0.1:18444"]
 
 #[test]
 fn standard_network_uses_builtin_defaults() -> Result<()> {
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         None,
         None,
         [("BITCOIN_RS_NETWORK", "testnet4")],
@@ -197,7 +196,7 @@ fn standard_network_uses_builtin_defaults() -> Result<()> {
     )?;
 
     assert_eq!(config.network, Network::Testnet4);
-    assert_eq!(config.p2p_magic(), Network::Testnet4.magic());
+    assert_eq!(config.p2p_magic, Network::Testnet4.magic());
     assert!(config.connect.is_empty());
     assert!(config.dns_seeds_enabled);
     Ok(())
@@ -205,7 +204,7 @@ fn standard_network_uses_builtin_defaults() -> Result<()> {
 
 #[test]
 fn p2p_magic_override_requires_an_explicit_peer() {
-    let result = Config::from_layered_sources(
+    let result = NodeConfig::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -222,8 +221,8 @@ fn p2p_magic_override_requires_an_explicit_peer() {
 
 #[test]
 fn script_index_is_valid_without_core_txindex() -> Result<()> {
-    let mut config = Config::default_for_network(Network::Regtest);
-    config.script_index = true;
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
+    config.script_index = ScriptIndexMode::Full;
     config.txindex = false;
 
     config.validate()?;
@@ -232,20 +231,20 @@ fn script_index_is_valid_without_core_txindex() -> Result<()> {
 
 #[test]
 fn scriptindex_cli_flag_enables_the_index() -> Result<()> {
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
         ["bitcoin-rs-node", "--scriptindex"],
     )?;
 
-    assert!(config.script_index);
+    assert!(config.script_index.is_enabled());
     Ok(())
 }
 
 #[test]
 fn scriptindex_environment_enables_the_index() -> Result<()> {
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         None,
         None,
         [
@@ -256,7 +255,7 @@ fn scriptindex_environment_enables_the_index() -> Result<()> {
     )?;
 
     assert!(!config.txindex);
-    assert!(config.script_index);
+    assert!(config.script_index.is_enabled());
     Ok(())
 }
 
@@ -279,7 +278,7 @@ hwm = 5000
 "#,
     )?;
 
-    let config = Config::from_layered_sources(
+    let config = NodeConfig::from_layered_sources(
         Some(&toml_path),
         None,
         core::iter::empty::<EnvPair>(),
@@ -310,7 +309,7 @@ fn legacy_flat_zmq_toml_is_rejected() -> Result<()> {
     let toml_path = temp.path().join("node.toml");
     fs::write(&toml_path, r#"zmqpubhashblock = ["tcp://127.0.0.1:28332"]"#)?;
 
-    let error = Config::from_layered_sources(
+    let error = NodeConfig::from_layered_sources(
         Some(&toml_path),
         None,
         core::iter::empty::<EnvPair>(),
@@ -326,7 +325,7 @@ fn legacy_flat_zmq_toml_is_rejected() -> Result<()> {
 fn zmq_endpoint_groups_reject_duplicate_socket_and_topic_ownership() {
     use bitcoin_rs_node::{ZmqEndpointConfig, ZmqTopic};
 
-    let mut config = Config::default();
+    let mut config = NodeConfig::default();
     config.notifications.zmq = vec![
         ZmqEndpointConfig {
             endpoint: "tcp://127.0.0.1:28332".to_owned(),
@@ -347,129 +346,6 @@ fn zmq_endpoint_groups_reject_duplicate_socket_and_topic_ownership() {
 }
 
 #[test]
-fn g2_muhash_sample_path_layers_use_cli_env_toml_precedence() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let toml_path = temp.path().join("node.toml");
-
-    fs::write(
-        &toml_path,
-        r#"
-g2_muhash_samples = "toml.samples"
-g2_muhash_tip_height = 10000
-"#,
-    )?;
-
-    let toml_config = Config::from_layered_sources(
-        Some(&toml_path),
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node"],
-    )?;
-    assert_eq!(
-        toml_config.g2_muhash_samples,
-        Some(PathBuf::from("toml.samples"))
-    );
-    assert_eq!(toml_config.g2_muhash_tip_height, Some(10_000));
-
-    let env_config = Config::from_layered_sources(
-        Some(&toml_path),
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "env.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "20000"),
-        ],
-        ["bitcoin-rs-node"],
-    )?;
-    assert_eq!(
-        env_config.g2_muhash_samples,
-        Some(PathBuf::from("env.samples"))
-    );
-    assert_eq!(env_config.g2_muhash_tip_height, Some(20_000));
-
-    let cli_config = Config::from_layered_sources(
-        Some(&toml_path),
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "env.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "20000"),
-        ],
-        [
-            "bitcoin-rs-node",
-            "--g2-muhash-samples",
-            "cli.samples",
-            "--g2-muhash-tip-height",
-            "30000",
-        ],
-    )?;
-    assert_eq!(
-        cli_config.g2_muhash_samples,
-        Some(PathBuf::from("cli.samples"))
-    );
-    assert_eq!(cli_config.g2_muhash_tip_height, Some(30_000));
-    Ok(())
-}
-
-#[test]
-fn g2_muhash_tip_height_requires_sample_path() {
-    let result = Config::from_layered_sources(
-        None,
-        None,
-        [("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "10000")],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("tip height without sample path must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_tip_height requires g2_muhash_samples")
-    );
-}
-
-#[test]
-fn g2_muhash_sample_path_requires_tip_height() {
-    let result = Config::from_layered_sources(
-        None,
-        None,
-        [("BITCOIN_RS_G2_MUHASH_SAMPLES", "g2.samples")],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("sample path without tip height must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_samples requires g2_muhash_tip_height")
-    );
-}
-
-#[test]
-fn g2_muhash_tip_height_must_be_positive() {
-    let result = Config::from_layered_sources(
-        None,
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "g2.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "0"),
-        ],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("zero G2 tip height must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_tip_height must be greater than zero")
-    );
-}
-
-#[test]
 fn assume_valid_height_layers_use_cli_env_toml_precedence() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let toml_path = temp.path().join("node.toml");
@@ -481,7 +357,7 @@ assume_valid_height = 10000
 ",
     )?;
 
-    let toml_config = Config::from_layered_sources(
+    let toml_config = NodeConfig::from_layered_sources(
         Some(&toml_path),
         None,
         core::iter::empty::<EnvPair>(),
@@ -489,7 +365,7 @@ assume_valid_height = 10000
     )?;
     assert_eq!(toml_config.assume_valid_height, 10_000);
 
-    let env_config = Config::from_layered_sources(
+    let env_config = NodeConfig::from_layered_sources(
         Some(&toml_path),
         None,
         [("BITCOIN_RS_ASSUME_VALID_HEIGHT", "20000")],
@@ -497,7 +373,7 @@ assume_valid_height = 10000
     )?;
     assert_eq!(env_config.assume_valid_height, 20_000);
 
-    let cli_config = Config::from_layered_sources(
+    let cli_config = NodeConfig::from_layered_sources(
         Some(&toml_path),
         None,
         [("BITCOIN_RS_ASSUME_VALID_HEIGHT", "20000")],
@@ -505,7 +381,7 @@ assume_valid_height = 10000
     )?;
     assert_eq!(cli_config.assume_valid_height, 30_000);
 
-    let default_config = Config::from_layered_sources(
+    let default_config = NodeConfig::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -522,7 +398,7 @@ assume_valid_height = 10000
 
 #[test]
 fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
-    let cli_config = Config::from_layered_sources(
+    let cli_config = NodeConfig::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -534,7 +410,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
     )?;
     assert_eq!(cli_config.connect, vec!["127.0.0.1:8333", "10.0.0.2:8333"]);
 
-    let env_config = Config::from_layered_sources(
+    let env_config = NodeConfig::from_layered_sources(
         None,
         None,
         [("BITCOIN_RS_CONNECT", "192.0.2.5:8333")],
@@ -542,7 +418,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
     )?;
     assert_eq!(env_config.connect, vec!["192.0.2.5:8333"]);
 
-    let hostname_config = Config::from_layered_sources(
+    let hostname_config = NodeConfig::from_layered_sources(
         None,
         None,
         [("BITCOIN_RS_CONNECT", "localhost:18444")],
@@ -550,7 +426,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
     )?;
     assert_eq!(hostname_config.connect, vec!["localhost:18444"]);
 
-    let default_config = Config::from_layered_sources(
+    let default_config = NodeConfig::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -565,26 +441,4 @@ fn assert_auth_user(auth: &Auth, expected: &str) {
         Auth::Basic { user, .. } => assert_eq!(user, expected),
         Auth::Cookie { .. } => panic!("expected basic auth"),
     }
-}
-
-#[test]
-fn g14_utxo_commit_sample_path_requires_window_fields() {
-    let result = Config::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        [
-            "bitcoin-rs-node",
-            "--g14-utxo-commit-samples",
-            "utxo.samples.json",
-        ],
-    );
-    let Err(error) = result else {
-        panic!("g14 sample path without window fields must be rejected");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("g14_utxo_commit_samples requires")
-    );
 }

@@ -1,4 +1,3 @@
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use crossbeam_utils::CachePadded;
 use hashbrown::HashTable;
@@ -199,17 +198,14 @@ impl Shard {
         f(&table)
     }
 
-    pub(crate) fn scan_script_pubkeys(&self, scripts: &[ScriptBuf], scan: &mut UtxoScan) {
+    pub(crate) fn scan_script_pubkeys(&self, scripts: &[Vec<u8>], scan: &mut UtxoScan) {
         let table = self.inner.read();
         for record in &table.table {
             for output in record.outputs() {
                 scan.txouts = scan.txouts.saturating_add(1);
-                if scripts
-                    .iter()
-                    .any(|target| target.as_bytes() == output.script_pubkey)
-                {
+                if scripts.iter().any(|target| *target == output.script_pubkey) {
                     scan.unspents.push(ScannedUtxo {
-                        outpoint: OutPoint::new(record.txid(), output.vout),
+                        outpoint: OutPoint::new(record.txid().into(), output.vout),
                         txout: txout_from_parts(output.value, output.script_pubkey),
                         coinbase: output.coinbase,
                         height: output.height,
@@ -346,11 +342,11 @@ fn commit_single_shard_coalesced<A: UtxoAddView>(
     shard_idx: usize,
 ) -> Result<(), UtxoError> {
     let remove_spans = sorted_run_spans(removes, |remove| {
-        (UtxoKey::from_txid(&remove.txid), remove.txid)
+        (UtxoKey::from_txid(&remove.txid), remove.txid.into())
     });
     let add_spans = sorted_run_spans(adds, |add| {
         let txid = add.outpoint().txid;
-        (UtxoKey::from_txid(&txid), txid)
+        (UtxoKey::from_txid(&txid), txid.into())
     });
     if cfg!(debug_assertions) {
         for span in remove_spans.iter().chain(&add_spans) {
@@ -516,7 +512,7 @@ fn commit_single_shard_with_listener<A: UtxoAddView>(
         apply_add_payload_run_with_listener(
             table,
             key,
-            first.outpoint().txid,
+            first.outpoint().txid.into(),
             &payloads,
             listener,
         )?;
@@ -574,7 +570,7 @@ fn spend_payloads(removes: &[OutPoint]) -> Vec<SpendPayload<'_>> {
                 op,
                 key,
                 vout: op.vout,
-                txid: op.txid,
+                txid: op.txid.into(),
             }
         })
         .collect()
@@ -788,8 +784,8 @@ fn find_record(table: &ShardTable, key: UtxoKey, txid: Hash256) -> Option<&UtxoR
 fn payload_parts<'a>(payload: &BuildPayload<'a>) -> OutputParts<'a> {
     OutputParts::new(
         payload.vout,
-        payload.txout.value.to_sat(),
-        payload.txout.script_pubkey.as_bytes(),
+        payload.txout.value,
+        payload.txout.script_pubkey.as_slice(),
         payload.coinbase,
         payload.height,
     )
@@ -948,8 +944,8 @@ fn flush_inserted_coins(
 
 fn txout_from_parts(value: u64, script: &[u8]) -> TxOut {
     TxOut {
-        value: Amount::from_sat(value),
-        script_pubkey: ScriptBuf::from_bytes(script.to_vec()),
+        value,
+        script_pubkey: script.to_vec(),
     }
 }
 

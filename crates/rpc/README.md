@@ -4,6 +4,15 @@ The synchronous, Bitcoin Core-compatible JSON-RPC and REST surface of the node: 
 
 `RpcServer::bind` binds a TCP listener and `serve` (or `serve_with_shutdown` for controlled shutdown) runs the blocking accept loop, handing each connection to a bounded worker thread under a per-connection idle timeout. Each request is authenticated by `Auth`, then matched to a Core-compatible handler by `Handler::dispatch`, which reads shared node state through the dependency-injected `Context` — the boundary carrying `ChainControl` consensus-affecting operations, `PruneService`, `TxIndexQuery`, `NetworkState`, and `ZmqNotification`. Failures map to JSON-RPC error codes through `RpcError`, and Bitcoin Core-compatible REST endpoints (`rest`) are served on the same listener when enabled. RPCs that would reveal, import, create, or use private keys are not implemented and answer `method not found`, while PSBT combination and finalization remain available because they are driven by external signers without this process holding private key material.
 
+## Capability boundary
+
+`ContextHandles` groups the node-owned handles by capability — `chain`,
+`mempool`, `indexes`, `network`, `mining` — and `Context::from_handles` is the
+single composition point. RPC consumes node capabilities through these groups;
+it never names a storage backend or backend engine type, and the crate exposes
+no backend cargo feature (`g17_dependency_direction` proves both from
+`cargo metadata`).
+
 ## Interface architecture and implementation guidance
 
 ### 1. Protocol demuxing and authentication

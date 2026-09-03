@@ -9,12 +9,9 @@
 use alloc::sync::Arc;
 use std::str::FromStr;
 
-use bitcoin::block::Header;
-use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::Hash as _;
-use bitcoin::hex::DisplayHex as _;
-use bitcoin::{Block, Network, Txid};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{
+    Block, BlockHash, Hash256, Header, TxOut, Txid, consensus_bytes, deserialize,
+};
 use sonic_rs::{JsonValueTrait as _, Value, json};
 
 use crate::context::{BlockRecord, Context};
@@ -154,7 +151,7 @@ fn route_tx(ctx: &Arc<Context>, suffix: &str) -> Response {
                 if format == "hex" {
                     text_response("text/plain", format!("{hex}\n").into_bytes())
                 } else {
-                    let bytes: Vec<u8> = bitcoin::hex::FromHex::from_hex(hex).unwrap_or_default();
+                    let bytes: Vec<u8> = hex_decode(hex);
                     binary_response("application/octet-stream", &bytes)
                 }
             }
@@ -189,7 +186,7 @@ fn route_block(ctx: &Arc<Context>, suffix: &str, with_details: bool) -> Response
         "bin" => binary_response("application/octet-stream", &body),
         "hex" => text_response(
             "text/plain",
-            format!("{}\n", body.to_lower_hex_string()).into_bytes(),
+            format!("{}\n", hex_encode(&body)).into_bytes(),
         ),
         "json" => {
             let block = match deserialize::<Block>(&body) {
@@ -202,12 +199,7 @@ fn route_block(ctx: &Arc<Context>, suffix: &str, with_details: bool) -> Response
             } else {
                 BlockTxVerbosity::Ids
             };
-            let value = crate::render::block_json(
-                &block,
-                &context,
-                verbosity,
-                bitcoin_network(ctx.chain_network),
-            );
+            let value = crate::render::block_json(&block, &context, verbosity, ctx.chain_network);
             text_response("application/json", sonic_bytes(&value))
         }
         _ => format_not_found(available_formats()),
@@ -238,7 +230,7 @@ fn route_block_part(ctx: &Arc<Context>, suffix: &str) -> Response {
         "bin" => binary_response("application/octet-stream", &body),
         "hex" => text_response(
             "text/plain",
-            format!("{}\n", body.to_lower_hex_string()).into_bytes(),
+            format!("{}\n", hex_encode(&body)).into_bytes(),
         ),
         _ => format_not_found(available_formats()),
     }
@@ -399,14 +391,14 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
         "hex" => {
             let body = records
                 .iter()
-                .map(|record| serialize(&record.header).to_lower_hex_string())
+                .map(|record| hex_encode(&consensus_bytes(&record.header)))
                 .collect::<String>();
             text_response("text/plain", body.into_bytes())
         }
         "bin" => binary_response(
             "application/octet-stream",
             &records.iter().fold(Vec::new(), |mut body, record| {
-                body.extend(serialize(&record.header));
+                body.extend(consensus_bytes(&record.header));
                 body
             }),
         ),
@@ -437,11 +429,7 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     let pool = ctx.mempool.read();
     for (txid, vout) in &outpoints {
         let outpoint = bitcoin_rs_primitives::OutPoint::new(*txid, *vout);
-        let bitcoin_outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array(txid.to_le_bytes()),
-            vout: *vout,
-        };
-        let mempool_spent = check_mempool && pool.is_outpoint_spent(&bitcoin_outpoint);
+        let mempool_spent = check_mempool && pool.is_outpoint_spent(&outpoint);
         let live = if mempool_spent {
             None
         } else {
@@ -473,7 +461,7 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
                     json!({
                         "height": height,
                         "value": tx_render::btc_amount_json(txout.value),
-                        "scriptPubKey": tx_render::script_pub_key_json(&txout.script_pubkey, bitcoin_network(ctx.chain_network))
+                        "scriptPubKey": tx_render::script_pub_key_json(&txout.script_pubkey, ctx.chain_network)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -491,8 +479,12 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
             "text/plain",
             format!(
                 "{}\n",
-                serialize_getutxos_bin(active_height, active_hash, &bitmap, &outs)
-                    .to_lower_hex_string()
+                hex_encode(&serialize_getutxos_bin(
+                    active_height,
+                    active_hash,
+                    &bitmap,
+                    &outs
+                ))
             )
             .into_bytes(),
         ),
@@ -638,9 +630,10 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
 }
 
 fn truncate_at_linkage_break(mut records: Vec<HeaderRecord>) -> Vec<HeaderRecord> {
-    let Some(break_index) = records.windows(2).position(|pair| {
-        Hash256::from_le_bytes(pair[1].header.prev_blockhash.as_byte_array()) != pair[0].hash
-    }) else {
+    let Some(break_index) = records
+        .windows(2)
+        .position(|pair| pair[1].header.prev_blockhash != BlockHash::from(pair[0].hash))
+    else {
         return records;
     };
     records.truncate(break_index + 1);
@@ -682,7 +675,7 @@ fn invalid_count(value: &str) -> Response {
 // Getutxos helpers
 // ---------------------------------------------------------------------------
 
-fn parse_getutxos_outpoints(path: &str) -> Result<(bool, Vec<(Hash256, u32)>), Response> {
+fn parse_getutxos_outpoints(path: &str) -> Result<(bool, Vec<(Txid, u32)>), Response> {
     let path = path.strip_prefix('/').unwrap_or(path);
     let mut segments = path.split('/').filter(|segment| !segment.is_empty());
     let check_mempool = segments.clone().next() == Some("checkmempool");
@@ -695,7 +688,7 @@ fn parse_getutxos_outpoints(path: &str) -> Result<(bool, Vec<(Hash256, u32)>), R
         let Some((txid_text, vout_text)) = segment.split_once('-') else {
             return Err(bad_request("Parse error"));
         };
-        let Ok(txid) = Hash256::from_str(txid_text) else {
+        let Ok(txid) = Txid::from_str(txid_text) else {
             return Err(bad_request("Parse error"));
         };
         let Ok(vout) = vout_text.parse::<u32>() else {
@@ -721,7 +714,7 @@ fn serialize_getutxos_bin(
     active_height: u32,
     active_hash: Hash256,
     bitmap: &[u8],
-    outs: &[(u32, bitcoin::TxOut)],
+    outs: &[(u32, TxOut)],
 ) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&active_height.to_le_bytes());
@@ -732,7 +725,7 @@ fn serialize_getutxos_bin(
     for (height, txout) in outs {
         body.extend_from_slice(&0_u32.to_le_bytes()); // CCoin version dummy
         body.extend_from_slice(&height.to_le_bytes());
-        body.extend_from_slice(&serialize(txout));
+        body.extend_from_slice(&consensus_bytes(txout));
     }
     body
 }
@@ -777,34 +770,38 @@ fn append_compact_size(body: &mut Vec<u8>, len: usize) {
 /// header.
 fn build_chain_context(ctx: &Context, record: &BlockRecord, header: &Header) -> BlockChainContext {
     let applied_height = ctx.applied_height();
-    let on_active = ctx.active_hash_at_height(record.height) == Some(record.hash);
+    let on_active = ctx.active_hash_at_height(record.height) == Some(Hash256::from(record.hash));
     let n_tx = u32::try_from(record.tx_count).unwrap_or(u32::MAX);
     BlockChainContext {
         height: record.height,
         confirmations: crate::render::confirmations(applied_height, record.height, on_active),
-        mediantime: ctx.median_time_past_for_hash(record.hash).unwrap_or(0),
+        mediantime: ctx
+            .median_time_past_for_hash(Hash256::from(record.hash))
+            .unwrap_or(0),
         difficulty: ctx.difficulty_for_bits(header.bits),
         chainwork_hex: ctx
-            .chain_work_hex_for_hash(record.hash)
+            .chain_work_hex_for_hash(Hash256::from(record.hash))
             .unwrap_or_else(|| "00".to_owned()),
         n_tx,
         next_block_hash: ctx
             .next_block_hash_for_height(record.height)
-            .map(|hash| bitcoin::BlockHash::from_byte_array(hash.to_le_bytes())),
+            .map(BlockHash::from),
     }
 }
 
 /// Applied-chain facts for a header record, resolving the real record (and its
 /// transaction count) through the tree/log when available.
 fn header_chain_context(ctx: &Context, record: &HeaderRecord) -> BlockChainContext {
-    let real = ctx.record_for_hash(record.hash).unwrap_or(BlockRecord {
-        hash: record.hash,
-        height: record.height,
-        body_size: 0,
-        header: None,
-        tx_count: 0,
-        time: record.header.time,
-    });
+    let real = ctx
+        .record_for_hash(record.hash)
+        .unwrap_or_else(|| BlockRecord {
+            hash: BlockHash::from(record.hash),
+            height: record.height,
+            body_size: 0,
+            header: None,
+            tx_count: 0,
+            time: record.header.time,
+        });
     build_chain_context(ctx, &real, &record.header)
 }
 
@@ -843,22 +840,46 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-fn bitcoin_network(network: bitcoin_rs_primitives::Network) -> Network {
-    match network {
-        bitcoin_rs_primitives::Network::Mainnet => Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => Network::Regtest,
-    }
-}
-
 fn sonic_bytes(value: &Value) -> Vec<u8> {
     sonic_rs::to_string(value)
         .unwrap_or_else(|_| "null".to_owned())
         .into_bytes()
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn hex_decode(hex: &str) -> Vec<u8> {
+    fn nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => 0xff,
+        }
+    }
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let hi = nibble(chunk[0]);
+        let lo = nibble(chunk[1]);
+        if hi == 0xff || lo == 0xff {
+            return Vec::new();
+        }
+        out.push((hi << 4) | lo);
+    }
+    out
+}
 // ---------------------------------------------------------------------------
 // Response constructors
 // ---------------------------------------------------------------------------
@@ -949,8 +970,8 @@ fn not_found_owned(message: String) -> Response {
 mod tests {
     use super::*;
     use crate::context::BlockRecord;
-    use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Version};
     use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
+    use bitcoin_rs_primitives::{OutPoint, Tx, TxIn};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait};
 
     fn publish_active_chain(ctx: &Context, headers: &[Header]) -> Vec<Hash256> {
@@ -963,7 +984,7 @@ mod tests {
                 let id = tree
                     .insert_node(parent, *header, NodeStatus::Active)
                     .expect("active header");
-                hashes.push(Hash256::from_le_bytes(header.block_hash().as_byte_array()));
+                hashes.push(Hash256::from_le_bytes(header.compute_hash().as_bytes()));
                 ids.push(id);
                 parent = Some(id);
             }
@@ -987,7 +1008,7 @@ mod tests {
     struct PanicBlockSource;
 
     impl crate::context::BlockBodySource for PanicBlockSource {
-        fn block_body(&self, _height: u32, _hash: Hash256) -> Option<Vec<u8>> {
+        fn block_body(&self, _height: u32, _hash: BlockHash) -> Option<Vec<u8>> {
             panic!("exhausted render budget must not load a block body");
         }
     }
@@ -1015,17 +1036,17 @@ mod tests {
         let mut ctx = Context::new();
         let block = Block {
             header: Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 1,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             },
-            txdata: Vec::new(),
+            txs: Vec::new(),
         };
         let record = BlockRecord::from_block(0, &block);
-        let hash = record.hash.to_string_be();
+        let hash = record.hash.to_string();
         ctx.add_block(record);
         ctx.block_body_source = Some(Arc::new(PanicBlockSource));
         publish_active_chain(&ctx, &[block.header]);
@@ -1125,46 +1146,43 @@ mod tests {
 
     #[test]
     fn headers_json_returns_ordered_active_chain_headers() {
-        use bitcoin::hashes::Hash as _;
-        use bitcoin::{Block, BlockHash, CompactTarget, TxMerkleNode, block::Version};
-
         let ctx = Arc::new(Context::new());
-        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let bits: u32 = 0x1d00_ffff;
         let genesis_header = Header {
-            version: Version::ONE,
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::default(),
             time: 1,
             bits,
             nonce: 1,
         };
         let genesis = Block {
             header: genesis_header,
-            txdata: Vec::new(),
+            txs: Vec::new(),
         };
         let child_header = Header {
-            version: Version::ONE,
+            version: 1,
             prev_blockhash: genesis.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time: 2,
             bits,
             nonce: 2,
         };
         let child = Block {
             header: child_header,
-            txdata: Vec::new(),
+            txs: Vec::new(),
         };
         let tip_header = Header {
-            version: Version::ONE,
+            version: 1,
             prev_blockhash: child.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time: 3,
             bits,
             nonce: 3,
         };
         let tip = Block {
             header: tip_header,
-            txdata: Vec::new(),
+            txs: Vec::new(),
         };
         ctx.add_block(BlockRecord::from_block(0, &genesis));
         ctx.add_block(BlockRecord::from_block(1, &child));
@@ -1185,7 +1203,7 @@ mod tests {
         );
         let bits_text = values[0].get("bits").and_then(Value::as_str).expect("bits");
         assert_eq!(
-            CompactTarget::from_unprefixed_hex(bits_text).expect("bits round-trip"),
+            u32::from_str_radix(bits_text, 16).expect("bits round-trip"),
             bits
         );
     }
@@ -1193,27 +1211,27 @@ mod tests {
     #[test]
     fn headers_do_not_walk_past_applied_tip() {
         let ctx = Arc::new(Context::new());
-        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let bits: u32 = 0x1d00_ffff;
         let genesis = Header {
-            version: Version::ONE,
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::default(),
             time: 1,
             bits,
             nonce: 1,
         };
         let applied = Header {
-            version: Version::ONE,
-            prev_blockhash: genesis.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: genesis.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 2,
             bits,
             nonce: 2,
         };
         let header_tip = Header {
-            version: Version::ONE,
-            prev_blockhash: applied.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: applied.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 3,
             bits,
             nonce: 3,
@@ -1232,7 +1250,7 @@ mod tests {
             applied_tip
         };
         ctx.set_applied_tip(applied_tip);
-        let header_tip_hash = Hash256::from_le_bytes(header_tip.block_hash().as_byte_array());
+        let header_tip_hash = Hash256::from(header_tip.compute_hash());
 
         let response = route(
             &ctx,
@@ -1247,27 +1265,27 @@ mod tests {
     #[test]
     fn headers_json_returns_genesis_and_remaining_headers() {
         let ctx = Arc::new(Context::new());
-        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let bits: u32 = 0x1d00_ffff;
         let genesis = Header {
-            version: Version::ONE,
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::default(),
             time: 1,
             bits,
             nonce: 1,
         };
         let child = Header {
-            version: Version::ONE,
-            prev_blockhash: genesis.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: genesis.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 2,
             bits,
             nonce: 2,
         };
         let tip = Header {
-            version: Version::ONE,
-            prev_blockhash: child.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: child.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 3,
             bits,
             nonce: 3,
@@ -1276,7 +1294,7 @@ mod tests {
 
         let response = route(
             &ctx,
-            &format!("/rest/headers/{}.json", genesis.block_hash()),
+            &format!("/rest/headers/{}.json", genesis.compute_hash()),
             "count=2000",
             true,
         );
@@ -1294,35 +1312,35 @@ mod tests {
     #[test]
     fn headers_side_branch_returns_empty() {
         let ctx = Arc::new(Context::new());
-        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let bits: u32 = 0x1d00_ffff;
         let genesis = Header {
-            version: Version::ONE,
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::default(),
             time: 1,
             bits,
             nonce: 1,
         };
         let active_child = Header {
-            version: Version::ONE,
-            prev_blockhash: genesis.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: genesis.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 2,
             bits,
             nonce: 2,
         };
         let active_tip = Header {
-            version: Version::ONE,
-            prev_blockhash: active_child.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: active_child.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 3,
             bits,
             nonce: 3,
         };
         let side_child = Header {
-            version: Version::ONE,
-            prev_blockhash: genesis.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: genesis.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 4,
             bits,
             nonce: 4,
@@ -1339,7 +1357,7 @@ mod tests {
             &ctx,
             &format!(
                 "/rest/headers/{}.json",
-                Hash256::from_le_bytes(side_child.block_hash().as_byte_array())
+                Hash256::from(side_child.compute_hash())
             ),
             "count=2000",
             true,
@@ -1350,31 +1368,29 @@ mod tests {
 
     #[test]
     fn headers_truncate_when_linkage_breaks() {
-        use bitcoin::{Block, BlockHash, CompactTarget, TxMerkleNode, block::Version};
-
         let ctx = Arc::new(Context::new());
-        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let bits: u32 = 0x1d00_ffff;
         let genesis = Block {
             header: Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 1,
                 bits,
                 nonce: 1,
             },
-            txdata: Vec::new(),
+            txs: Vec::new(),
         };
         let broken_child = Block {
             header: Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 2,
                 bits,
                 nonce: 2,
             },
-            txdata: Vec::new(),
+            txs: Vec::new(),
         };
         ctx.add_block(BlockRecord::from_block(0, &genesis));
         ctx.add_block(BlockRecord::from_block(1, &broken_child));
@@ -1397,7 +1413,7 @@ mod tests {
             .node_mut(broken_id)
             .expect("broken child node")
             .header
-            .prev_blockhash = BlockHash::all_zeros();
+            .prev_blockhash = BlockHash::default();
         let tree = ctx.block_tree.read();
         let broken_node = tree.node(broken_id).expect("broken tip");
         let tip = TipSnapshot {
@@ -1421,35 +1437,35 @@ mod tests {
     #[test]
     fn headers_truncate_the_tail_after_a_middle_linkage_break() {
         let ctx = Arc::new(Context::new());
-        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let bits: u32 = 0x1d00_ffff;
         let genesis = Header {
-            version: Version::ONE,
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::default(),
             time: 1,
             bits,
             nonce: 1,
         };
         let first = Header {
-            version: Version::ONE,
-            prev_blockhash: genesis.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: genesis.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 2,
             bits,
             nonce: 2,
         };
         let middle = Header {
-            version: Version::ONE,
-            prev_blockhash: first.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: first.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 3,
             bits,
             nonce: 3,
         };
         let tail = Header {
-            version: Version::ONE,
-            prev_blockhash: middle.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: middle.compute_hash(),
+            merkle_root: Hash256::default(),
             time: 4,
             bits,
             nonce: 4,
@@ -1465,7 +1481,7 @@ mod tests {
             .node_mut(middle_id)
             .expect("middle node")
             .header
-            .prev_blockhash = BlockHash::all_zeros();
+            .prev_blockhash = BlockHash::default();
 
         let response = route(
             &ctx,
@@ -1479,6 +1495,36 @@ mod tests {
         assert_eq!(values[1].get("height").and_then(Value::as_u64), Some(1));
     }
 
+    /// Minimal native stand-in for the regtest genesis block: one coinbase
+    /// tx, with self-consistent identity via `block_hash()`.
+    fn regtest_genesis() -> Block {
+        let coinbase = Tx {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), 0xffff_ffff),
+                script_sig: vec![0x51],
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 50 * 100_000_000,
+                script_pubkey: Vec::new(),
+            }],
+            lock_time: 0,
+        };
+        Block {
+            header: Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: coinbase.txid().0,
+                time: 1_296_688_602,
+                bits: 0x207f_ffff,
+                nonce: 2,
+            },
+            txs: vec![coinbase],
+        }
+    }
+
     /// `/rest/headers/` must serve bytes identical to the block's own header.
     ///
     /// The three formats all serialize `HeaderRecord.header`, which comes from
@@ -1488,11 +1534,11 @@ mod tests {
     #[test]
     fn headers_serve_the_block_header_bytes_verbatim() {
         let ctx = Arc::new(Context::new());
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = regtest_genesis();
         ctx.add_block(BlockRecord::from_block(0, &genesis));
         let _ = publish_active_chain(&ctx, &[genesis.header]);
 
-        let expected = serialize(&genesis.header);
+        let expected = consensus_bytes(&genesis.header);
         let path = format!("/rest/headers/{}.bin", genesis.block_hash());
         let response = route(&ctx, &path, "count=1", true);
         assert_eq!(response.status, 200);
@@ -1504,7 +1550,7 @@ mod tests {
         let path = format!("/rest/headers/{}.hex", genesis.block_hash());
         let response = route(&ctx, &path, "count=1", true);
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, expected.to_lower_hex_string().into_bytes());
+        assert_eq!(response.body, hex_encode(&expected).into_bytes());
     }
 
     /// A log-only hash remains an empty success in every REST format.
@@ -1516,7 +1562,7 @@ mod tests {
     #[test]
     fn headers_for_a_record_the_tree_does_not_know_serve_nothing() {
         let ctx = Arc::new(Context::new());
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = regtest_genesis();
         ctx.add_block(BlockRecord::from_block(0, &genesis));
 
         for (format, expected) in [
@@ -1767,7 +1813,7 @@ mod tests {
         let value: Value = sonic_rs::from_slice(&response.body).expect("getutxos JSON");
         assert_eq!(value.get("bitmap").and_then(Value::as_str), Some("0"));
         let utxos = value.get("utxos").expect("utxos field");
-        assert!(utxos.as_array().is_some_and(|arr| arr.is_empty()));
+        assert!(utxos.as_array().expect("utxos array").is_empty());
     }
 
     #[test]

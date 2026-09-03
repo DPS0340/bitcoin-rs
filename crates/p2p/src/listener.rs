@@ -158,7 +158,7 @@ struct InboundSyncSinks {
 }
 
 impl InboundSyncSinks {
-    fn send_headers(&self, source: crate::PeerSource, headers: Vec<bitcoin::block::Header>) {
+    fn send_headers(&self, source: crate::PeerSource, headers: Vec<bitcoin_rs_primitives::Header>) {
         if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
             headers,
             source: Some(source),
@@ -172,7 +172,7 @@ impl InboundSyncSinks {
     fn send_block(
         &self,
         source: crate::PeerSource,
-        block: bitcoin::Block,
+        block: bitcoin_rs_primitives::Block,
         serialized: bytes::Bytes,
     ) {
         if let Err(error) = self.blocks_tx.send(crate::InboundBlock {
@@ -720,6 +720,15 @@ fn run_handshake(
     )
 }
 
+/// Runs one established connection to completion.
+///
+/// Teardown invariant (both exit paths, in this order):
+/// `remove_current_peer` → `lease.cancel()` → `stream.shutdown(Both)` →
+/// `drop(lease)` → `writer.join()`. `cancel()` raises the writer's close
+/// signal so an idle writer wakes deterministically even when foreign lease
+/// clones (registration handles, concurrent pings) are still alive; the
+/// shutdown unblocks a writer blocked mid-`write_all`. Connection threads
+/// are intentionally not joined by outer listener shutdown.
 fn run_connected_session(
     peer: &mut Peer<TcpStream>,
     peer_addr: SocketAddr,
@@ -745,6 +754,8 @@ fn run_connected_session(
             writer_stream,
             magic,
             outbound_rx,
+            lease.close_signal(),
+            lease.budget_handle(),
             peer_addr,
             lease.stats_handle(),
             shared.totals.clone(),
@@ -764,6 +775,7 @@ fn run_connected_session(
                 peer_addr,
                 &lease,
             );
+            lease.cancel();
             let _ = peer.stream.shutdown(std::net::Shutdown::Both);
             drop(lease);
             return Err(error);
@@ -812,6 +824,7 @@ fn run_connected_session(
                 .get(&peer_addr)
                 .is_none_or(|current| !current.same_connection(&lease))
     );
+    lease.cancel();
     let _ = peer.stream.shutdown(std::net::Shutdown::Both);
     drop(lease);
     let _ = writer.join();
@@ -837,6 +850,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
     const IDLE_DISCONNECT: Duration = Duration::from_mins(1);
 
     let mut last_inbound = Instant::now();
+    let budget = lease.budget_handle();
 
     loop {
         if peer.state == PeerState::Disconnecting {
@@ -874,26 +888,28 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                     command = ?std::mem::discriminant(&message),
                     "p2p message received",
                 );
-                let responses =
-                    crate::dispatch::dispatch_inbound_with_chain(peer, &message, chain_query)?;
+                crate::dispatch::dispatch_inbound_with_chain(
+                    peer,
+                    &message,
+                    chain_query,
+                    &|| budget.has_block_production_headroom(),
+                    &mut |response| {
+                        lease.send(response).map_err(|_| {
+                            crate::wire::PeerError::Protocol("outbound queue closed or saturated")
+                        })
+                    },
+                )?;
                 match message {
-                    bitcoin::p2p::message::NetworkMessage::Headers(headers) => {
+                    crate::Message::Headers(headers) => {
                         inbound_sync_sinks.send_headers(lease.source(peer_addr), headers);
                     }
-                    bitcoin::p2p::message::NetworkMessage::Block(block) => {
+                    crate::Message::Block(block) => {
                         inbound_sync_sinks.send_block(lease.source(peer_addr), block, raw);
                     }
-                    bitcoin::p2p::message::NetworkMessage::Pong(nonce) => {
+                    crate::Message::Pong(nonce) => {
                         lease.stats().complete_ping(nonce, unix_micros());
                     }
                     _ => {}
-                }
-                for response in responses {
-                    if lease.send(response).is_err() {
-                        return Err(crate::wire::PeerError::Protocol(
-                            "outbound writer disconnected",
-                        ));
-                    }
                 }
             }
             Err(crate::wire::PeerError::Io(error))
@@ -913,12 +929,15 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 /// and writes them to the peer. Decoupling writes from the blocking inbound
 /// read ensures a momentarily silent peer can never delay outbound sends (the
 /// next `getdata` during IBD). Sent bytes are accounted on the connection's
-/// telemetry and, when present, the shared aggregate totals. Exits when every
-/// sender drops or a write fails.
+/// telemetry and, when present, the shared aggregate totals. Exits on the
+/// lease close signal, when every sender drops, or on write failure. Every exit
+/// shuts down the socket so the reader half cannot outlive a failed writer.
 fn spawn_connection_writer(
     mut stream: TcpStream,
     magic: Magic,
     outbound_rx: crossbeam_channel::Receiver<crate::Message>,
+    close_rx: crossbeam_channel::Receiver<()>,
+    budget: Arc<crate::connection::OutboundBudget>,
     peer_addr: SocketAddr,
     stats: Arc<crate::PeerStats>,
     totals: Option<Arc<crate::TrafficTotals>>,
@@ -926,22 +945,63 @@ fn spawn_connection_writer(
     std::thread::Builder::new()
         .name(format!("bitcoin-rs-p2p-writer-{peer_addr}"))
         .spawn(move || {
-            while let Ok(message) = outbound_rx.recv() {
-                match crate::wire::write_message(&mut stream, magic, &message) {
+            run_writer_loop(
+                &outbound_rx,
+                close_rx,
+                &budget,
+                &mut stream,
+                magic,
+                &stats,
+                totals.as_ref(),
+            );
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        })
+}
+
+/// Writer loop body shared by the spawned writer thread and deterministic
+/// tests: receives one message or the close signal, writes it, and releases
+/// the admitted full wire byte count after a successful write. Exits on the
+/// close signal, sender drop, or write error — never by polling. On a write
+/// error the budget is deliberately not released (the connection is dying).
+fn run_writer_loop(
+    outbound_rx: &crossbeam_channel::Receiver<crate::Message>,
+    mut close_rx: crossbeam_channel::Receiver<()>,
+    budget: &Arc<crate::connection::OutboundBudget>,
+    writer: &mut dyn std::io::Write,
+    magic: Magic,
+    stats: &Arc<crate::PeerStats>,
+    totals: Option<&Arc<crate::TrafficTotals>>,
+) {
+    loop {
+        crossbeam_channel::select! {
+            recv(outbound_rx) -> message => {
+                let Ok(message) = message else { break };
+                match crate::wire::write_message(writer, magic, &message) {
                     Ok(bytes) => {
                         stats.record_sent(u64::try_from(bytes).unwrap_or(u64::MAX));
                         stats.record_msg_sent();
-                        if let Some(totals) = totals.as_ref() {
+                        if let Some(totals) = totals {
                             totals.record_sent(u64::try_from(bytes).unwrap_or(u64::MAX));
                         }
+                        budget.release(bytes);
                     }
                     Err(error) => {
-                        tracing::debug!(peer_addr = %peer_addr, %error, "p2p writer thread exiting");
+                        tracing::debug!(%error, "p2p writer thread exiting");
                         break;
                     }
                 }
             }
-        })
+            recv(close_rx) -> signal => {
+                if signal.is_ok() {
+                    break;
+                }
+                // A disconnected close channel is permanently ready. Disable
+                // that select arm so the disconnected outbound channel alone
+                // drains any messages accepted before the last lease dropped.
+                close_rx = crossbeam_channel::never();
+            }
+        }
+    }
 }
 
 fn unix_secs(now: SystemTime) -> u64 {
@@ -1150,10 +1210,14 @@ mod lease_tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], 8333));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(tx);
-        let source = lease.source(addr);
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block_bytes = bitcoin::consensus::encode::serialize(&genesis);
+        let block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
+            .map_err(|_| panic!("genesis block must decode natively"))
+            .unwrap();
+        let serialized = bytes::Bytes::from(block_bytes);
 
+        let source = lease.source(addr);
         sinks.send_headers(source, Vec::new());
         sinks.send_block(source, block, serialized.clone());
 
@@ -1460,6 +1524,7 @@ mod writer_setup_cleanup_tests {
 
         let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(outbound_tx);
+        let lease_probe = lease.clone();
         register_connection(&shared.peer_outbound, peer_addr, lease.clone());
 
         // Lease must be registered before the failure.
@@ -1489,5 +1554,392 @@ mod writer_setup_cleanup_tests {
             outbound.read().is_empty(),
             "peer_outbound must be cleaned up after writer setup failure"
         );
+        assert!(
+            lease_probe.is_cancelled(),
+            "writer setup failure must cancel the registered lease"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod writer_shutdown_tests {
+    use std::cell::Cell;
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bitcoin::p2p::Magic;
+    use parking_lot::RwLock;
+
+    use super::{
+        ConnectionShared, InboundSyncSinks, register_connection, run_connected_session,
+        run_message_loop, run_writer_loop, spawn_connection_writer,
+    };
+    use crate::connection::OutboundBudget;
+    use crate::peer::{Peer, PeerState};
+
+    const FAILSAFE: Duration = Duration::from_secs(5);
+
+    type OutboundMap = Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>;
+
+    fn loopback_pair() -> (TcpStream, TcpStream, SocketAddr) {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, peer_addr) = listener.accept().expect("accept");
+        (client, server, peer_addr)
+    }
+
+    fn ping_len() -> usize {
+        crate::wire::wire_len(&crate::Message::Ping(9)).expect("ping encodes")
+    }
+
+    /// Test-only writer that admits exactly `remaining` bytes, then blocks
+    /// on a channel signal instead of an OS socket buffer; the unblock
+    /// failure simulates what `stream.shutdown(Both)` does to a real
+    /// `write_all` mid-write.
+    struct BlockingTestWriter {
+        remaining: Cell<usize>,
+        unblock: crossbeam_channel::Receiver<()>,
+        blocked: crossbeam_channel::Sender<()>,
+    }
+
+    impl io::Write for BlockingTestWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let remaining = self.remaining.get();
+            if buf.len() <= remaining {
+                self.remaining.set(remaining - buf.len());
+                Ok(buf.len())
+            } else {
+                let _ = self.blocked.try_send(());
+                let _ = self.unblock.recv();
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "test: unblocked",
+                ))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Test-only writer that accepts everything and emits one event after
+    /// each `write` returns, so tests synchronize on writes without polling.
+    struct EventWriter {
+        events: crossbeam_channel::Sender<()>,
+    }
+
+    impl io::Write for EventWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let _ = self.events.send(());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Serves one encoded message, then keeps the reader in the poll path.
+    struct ScriptedStream {
+        script: io::Cursor<Vec<u8>>,
+    }
+
+    impl io::Read for ScriptedStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match io::Read::read(&mut self.script, buf)? {
+                0 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                read => Ok(read),
+            }
+        }
+    }
+
+    impl io::Write for ScriptedStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancel_wakes_writer_blocked_on_empty_queue_with_live_senders() {
+        let (_client, server, peer_addr) = loopback_pair();
+        let writer_stream = server.try_clone().expect("try_clone");
+        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(outbound_tx);
+        let lease_probe = lease.clone();
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let writer = spawn_connection_writer(
+            writer_stream,
+            Magic::BITCOIN,
+            outbound_rx,
+            lease.close_signal(),
+            lease.budget_handle(),
+            peer_addr,
+            lease.stats_handle(),
+            None,
+        )
+        .expect("spawn writer");
+        let waiter = std::thread::spawn(move || {
+            writer.join().expect("writer join");
+            let _ = done_tx.send(());
+        });
+
+        // The queue is idle and a foreign lease clone keeps every sender
+        // alive; only the close signal can wake the writer.
+        lease.cancel();
+        done_rx
+            .recv_timeout(FAILSAFE)
+            .expect("close signal must wake an idle writer with live senders");
+        waiter.join().expect("waiter join");
+        assert!(lease_probe.is_cancelled());
+    }
+
+    #[test]
+    fn writer_mid_write_exits_on_unblock_deterministically() {
+        let frame = ping_len();
+        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new_with_budget(
+            outbound_tx,
+            false,
+            OutboundBudget::with_block_reserve(100, 100 * frame, 0),
+        );
+
+        for _ in 0..5 {
+            lease
+                .send(crate::Message::Ping(9))
+                .expect("fresh queue admits a ping");
+        }
+        assert_eq!(lease.budget_handle().pending(), (5, 5 * frame));
+
+        let (unblock_tx, unblock_rx) = crossbeam_channel::bounded(1);
+        let (blocked_tx, blocked_rx) = crossbeam_channel::bounded(1);
+        let mut writer = BlockingTestWriter {
+            remaining: Cell::new(2 * frame),
+            unblock: unblock_rx,
+            blocked: blocked_tx,
+        };
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let budget = lease.budget_handle();
+        let close_rx = lease.close_signal();
+        let stats = lease.stats_handle();
+        let worker = std::thread::spawn(move || {
+            run_writer_loop(
+                &outbound_rx,
+                close_rx,
+                &budget,
+                &mut writer,
+                Magic::BITCOIN,
+                &stats,
+                None,
+            );
+            let _ = done_tx.send(());
+        });
+
+        // Two full frames are written and released; the third blocks the
+        // writer mid-`write_all`, exactly where `shutdown(Both)` would find
+        // it in production.
+        blocked_rx
+            .recv_timeout(FAILSAFE)
+            .expect("writer must exhaust its byte budget");
+        assert_eq!(
+            lease.budget_handle().pending(),
+            (3, 3 * frame),
+            "two written frames release; three remain charged"
+        );
+
+        // The close signal alone cannot interrupt a mid-`write_all` writer;
+        // the unblock failure simulates the stream shutdown.
+        lease.cancel();
+        let _ = unblock_tx.send(());
+        done_rx
+            .recv_timeout(FAILSAFE)
+            .expect("unblock must release the blocked writer");
+        worker.join().expect("worker join");
+
+        // The write-error path deliberately releases nothing.
+        assert_eq!(lease.budget_handle().pending(), (3, 3 * frame));
+    }
+
+    #[test]
+    fn writer_releases_budget_after_write() {
+        let frame = ping_len();
+        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new_with_budget(
+            outbound_tx,
+            false,
+            OutboundBudget::with_block_reserve(100, 100 * frame, 0),
+        );
+        lease
+            .send(crate::Message::Ping(9))
+            .expect("fresh queue admits a ping");
+        assert_eq!(lease.budget_handle().pending(), (1, frame));
+
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut writer = EventWriter { events: event_tx };
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let budget = lease.budget_handle();
+        let worker_budget = Arc::clone(&budget);
+        let close_rx = lease.close_signal();
+        let stats = lease.stats_handle();
+        let worker = std::thread::spawn(move || {
+            run_writer_loop(
+                &outbound_rx,
+                close_rx,
+                &worker_budget,
+                &mut writer,
+                Magic::BITCOIN,
+                &stats,
+                None,
+            );
+            let _ = done_tx.send(());
+        });
+
+        // Drop every sender clone (the lease holds the last one) so the
+        // writer exits on Disconnected after processing the queue.
+        drop(lease);
+
+        event_rx
+            .recv_timeout(FAILSAFE)
+            .expect("writer must emit an event after write returns");
+        done_rx
+            .recv_timeout(FAILSAFE)
+            .expect("writer must exit after senders drop");
+        worker.join().expect("worker join");
+
+        // Release was processed between the write and the next recv; the
+        // released byte count equals the admitted wire length.
+        assert_eq!(
+            budget.pending(),
+            (0, 0),
+            "written bytes must be fully released"
+        );
+    }
+
+    #[test]
+    fn writer_exit_shuts_down_the_reader_socket_clone() {
+        let (mut client, server, peer_addr) = loopback_pair();
+        let reader_stream = server.try_clone().expect("reader clone");
+        client.set_nonblocking(true).expect("nonblocking client");
+        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(outbound_tx);
+        let writer = spawn_connection_writer(
+            server,
+            Magic::BITCOIN,
+            outbound_rx,
+            lease.close_signal(),
+            lease.budget_handle(),
+            peer_addr,
+            lease.stats_handle(),
+            None,
+        )
+        .expect("spawn writer");
+
+        lease.cancel();
+        writer.join().expect("writer join");
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            io::Read::read(&mut client, &mut byte).expect("shutdown must produce EOF"),
+            0
+        );
+        drop(reader_stream);
+    }
+
+    #[test]
+    fn run_connected_session_joins_writer_with_external_lease_clone_alive() {
+        let (client, server, peer_addr) = loopback_pair();
+        // The client EOFs immediately, so the session's first read fails.
+        drop(client);
+
+        let peer_registry = Arc::new(RwLock::new(Vec::new()));
+        let outbound: OutboundMap = Arc::new(RwLock::new(hashbrown::HashMap::new()));
+        let banned = Arc::new(RwLock::new(Vec::new()));
+        let shared = ConnectionShared::from_parts(peer_registry, outbound, banned, None, None);
+
+        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(outbound_tx);
+        let lease_probe = lease.clone();
+        register_connection(&shared.peer_outbound, peer_addr, lease.clone());
+
+        let info = crate::PeerInfo {
+            addr: peer_addr,
+            version: 70_016,
+            services: 0,
+            user_agent: String::from("/test/"),
+            start_height: 0,
+            conn_time: 0,
+            inbound: false,
+        };
+        let sinks = InboundSyncSinks {
+            headers_tx: crossbeam_channel::unbounded().0,
+            blocks_tx: crossbeam_channel::unbounded().0,
+            wake_tx: None,
+        };
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let mut peer = Peer::new(server, Magic::BITCOIN);
+            let result = run_connected_session(
+                &mut peer,
+                peer_addr,
+                Magic::BITCOIN,
+                &shared,
+                &sinks,
+                lease,
+                outbound_rx,
+                info,
+            );
+            let _ = done_tx.send(result);
+        });
+
+        // The external clone keeps the queue's senders alive for the whole
+        // call; only the teardown close signal lets the writer exit, so the
+        // session must still return under the failsafe.
+        let result = done_rx
+            .recv_timeout(FAILSAFE)
+            .expect("session must return while an external lease clone is alive");
+        worker.join().expect("worker join");
+        assert!(result.is_err(), "EOF on read must end the session");
+        assert!(lease_probe.is_cancelled());
+    }
+
+    #[test]
+    fn message_loop_disconnects_saturated_peer() {
+        let (outbound_tx, _outbound_rx) = crossbeam_channel::unbounded();
+        let lease =
+            crate::PeerLease::new_with_budget(outbound_tx, false, OutboundBudget::new(0, 0));
+
+        let mut wire = Vec::new();
+        crate::wire::write_message(&mut wire, Magic::BITCOIN, &crate::Message::Ping(41))
+            .expect("ping encodes");
+        let mut peer = Peer::new(
+            ScriptedStream {
+                script: io::Cursor::new(wire),
+            },
+            Magic::BITCOIN,
+        );
+        peer.state = PeerState::Ready;
+
+        let sinks = InboundSyncSinks {
+            headers_tx: crossbeam_channel::unbounded().0,
+            blocks_tx: crossbeam_channel::unbounded().0,
+            wake_tx: None,
+        };
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_447));
+
+        // The Pong response cannot be admitted onto the zero budget, so the
+        // saturation policy cancels the lease and ends the loop.
+        let result = run_message_loop(&mut peer, addr, &lease, &sinks, None, None);
+        assert!(result.is_err(), "saturation must end the message loop");
+        assert!(lease.is_cancelled());
     }
 }

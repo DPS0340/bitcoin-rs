@@ -1,5 +1,4 @@
-/// Minimum number of blocks kept below the active tip for Core-compatible reorg safety.
-pub const CORE_REORG_SAFETY_MARGIN: u32 = 288;
+use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 

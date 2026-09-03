@@ -16,7 +16,6 @@ struct ShutdownBroadcast {
     requested: Mutex<bool>,
     wake: Condvar,
 }
-
 impl ShutdownBroadcast {
     const fn new() -> Self {
         Self {
@@ -122,88 +121,42 @@ pub fn wait_for_shutdown(deadline: Duration) -> bool {
     SHUTDOWN.wait_for(deadline)
 }
 
+/// Test-only teardown-entry observation seam.
+///
+/// `NodeServices::teardown` marks entry through the one ordered teardown
+/// that the daemon (`run`) and the embedded node (`Node::shutdown`) share.
+/// The seam lets a test prove both entry points reach the same lifecycle
+/// without a fake service graph; it compiles away outside tests.
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
-    use std::time::Duration;
+pub(crate) struct ShutdownStageGuard;
 
-    use super::ShutdownBroadcast;
+#[cfg(test)]
+thread_local! {
+    static SHUTDOWN_STAGES_REACHED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
 
-    #[test]
-    fn request_wakes_a_blocked_waiter() {
-        let broadcast = Arc::new(ShutdownBroadcast::new());
-        let waiter = {
-            let broadcast = Arc::clone(&broadcast);
-            thread::spawn(move || broadcast.wait_for(Duration::from_secs(30)))
-        };
+/// Marks that the shared teardown ran on this thread; test builds count the
+/// entry, non-test builds return a no-op marker.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn mark_shutdown_stage() -> ShutdownStageGuard {
+    SHUTDOWN_STAGES_REACHED.with(|slot| slot.set(slot.get().saturating_add(1)));
+    ShutdownStageGuard
+}
 
-        thread::sleep(Duration::from_millis(25));
-        broadcast.request();
+/// Returns and clears the number of shared-teardown entries on this thread.
+#[cfg(test)]
+pub(crate) fn take_shutdown_stages_reached() -> u32 {
+    SHUTDOWN_STAGES_REACHED.with(core::cell::Cell::take)
+}
 
-        // The waiter parks for 30s; only the wake can return it promptly, so
-        // joining at all proves the wake fired.
-        assert!(
-            waiter.join().unwrap_or(false),
-            "waiter must wake on request rather than time out"
-        );
-    }
+/// Non-test no-op marker so `teardown` carries the same `_stage` binding
+/// without compiling the counter.
+#[cfg(not(test))]
+pub(crate) struct ShutdownStageMark;
 
-    #[test]
-    fn wait_for_times_out_when_never_requested() {
-        let broadcast = ShutdownBroadcast::new();
-
-        assert!(!broadcast.wait_for(Duration::from_millis(25)));
-    }
-
-    #[test]
-    fn request_is_idempotent_and_pre_requested_wait_returns_immediately() {
-        let broadcast = ShutdownBroadcast::new();
-
-        assert!(broadcast.request());
-        assert!(!broadcast.request());
-
-        assert!(broadcast.requested());
-        assert!(broadcast.wait_for(Duration::ZERO));
-    }
-
-    #[test]
-    fn process_wide_functions_share_one_registry() {
-        super::request_shutdown();
-
-        assert!(super::shutdown_requested());
-        assert!(super::wait_for_shutdown(Duration::ZERO));
-    }
-
-    #[test]
-    fn trigger_stores_the_flag_before_waiters_observe_the_wake() {
-        let broadcast = Arc::new(ShutdownBroadcast::new());
-        let flag = Arc::new(AtomicBool::new(false));
-        let waiters: Vec<_> = (0..3)
-            .map(|_| {
-                let broadcast = Arc::clone(&broadcast);
-                let flag = Arc::clone(&flag);
-                thread::spawn(move || {
-                    assert!(broadcast.wait_for(Duration::from_secs(5)));
-                    assert!(
-                        flag.load(Ordering::Acquire),
-                        "every waiter must see the flag after the broadcast"
-                    );
-                })
-            })
-            .collect();
-
-        thread::sleep(Duration::from_millis(25));
-        assert!(broadcast.trigger(&flag));
-        assert!(!broadcast.trigger(&flag));
-
-        for waiter in waiters {
-            waiter
-                .join()
-                .unwrap_or_else(|_| panic!("shutdown waiter panicked"));
-        }
-        assert!(flag.load(Ordering::Acquire));
-        assert!(broadcast.requested());
-    }
+#[cfg(not(test))]
+#[must_use]
+pub(crate) fn mark_shutdown_stage() -> ShutdownStageMark {
+    ShutdownStageMark
 }

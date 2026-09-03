@@ -1,5 +1,7 @@
 use alloc::sync::Arc;
+use core::str::FromStr as _;
 
+use bitcoin_rs_primitives::Txid;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value};
 
 use crate::context::Context;
@@ -12,78 +14,275 @@ pub(crate) mod network;
 pub(crate) mod tx;
 pub(crate) mod util;
 
-const CORE_RPC_METHODS: &[&str] = &[
-    "getblockchaininfo",
-    "getdifficulty",
-    "getchaintips",
-    "getchaintxstats",
-    "getblockcount",
-    "getblockhash",
-    "getbestblockhash",
-    "getblock",
-    "getblockheader",
-    "getblockstats",
-    "verifychain",
-    "gettxoutsetinfo",
-    "getindexinfo",
-    "pruneblockchain",
-    "invalidateblock",
-    "scantxoutset",
-    "getrawtransaction",
-    "gettxout",
-    "gettxoutproof",
-    "verifytxoutproof",
-    "sendrawtransaction",
-    "testmempoolaccept",
-    "decoderawtransaction",
-    "createrawtransaction",
-    "combinepsbt",
-    "finalizepsbt",
-    "getmempoolinfo",
-    "getmempoolentry",
-    "getrawmempool",
-    "getmempoolancestors",
-    "getmempooldescendants",
-    "estimatesmartfee",
-    "uptime",
-    "getrpcinfo",
-    "getmemoryinfo",
-    "estimaterawfee",
-    "validateaddress",
-    "getdescriptorinfo",
-    "deriveaddresses",
-    "getnetworkinfo",
-    "getpeerinfo",
-    "ping",
-    "addnode",
-    "disconnectnode",
-    "getconnectioncount",
-    "getnettotals",
-    "getaddednodeinfo",
-    "listbanned",
-    "setban",
-    "clearbanned",
-    "setnetworkactive",
-    "getnodeaddresses",
-    "getblocktemplate",
-    "getmininginfo",
-    "submitblock",
-    "prioritisetransaction",
+use crate::manifest::{self, SurfaceKind};
+
+/// Registration consults the compatibility manifest so the declared surface
+/// and the dispatched surface cannot disagree.
+fn is_registered_method(method: &str) -> bool {
+    manifest::is_registered(SurfaceKind::Rpc, method)
+}
+
+/// Signature of one dispatch arm.
+type HandlerFn = fn(&Arc<Context>, &Value) -> Result<Value, RpcError>;
+
+/// One live registry row: a method name bound to the handler arm serving it.
+pub(crate) struct DispatchEntry {
+    name: &'static str,
+    handler: HandlerFn,
+}
+
+/// The live dispatch registry: every JSON-RPC method name this build serves,
+/// bound to its handler arm. `dispatch` routes through this table and the
+/// manifest coverage gate enumerates it, so a name can neither dispatch
+/// without a shipped manifest row nor ship a row without a live arm.
+pub(crate) const DISPATCH_TABLE: &[DispatchEntry] = &[
+    DispatchEntry {
+        name: "getblockchaininfo",
+        handler: chain::getblockchaininfo,
+    },
+    DispatchEntry {
+        name: "getdifficulty",
+        handler: chain::getdifficulty,
+    },
+    DispatchEntry {
+        name: "getchaintips",
+        handler: chain::getchaintips,
+    },
+    DispatchEntry {
+        name: "getchaintxstats",
+        handler: chain::getchaintxstats,
+    },
+    DispatchEntry {
+        name: "getblockcount",
+        handler: chain::getblockcount,
+    },
+    DispatchEntry {
+        name: "getblockhash",
+        handler: chain::getblockhash,
+    },
+    DispatchEntry {
+        name: "getbestblockhash",
+        handler: chain::getbestblockhash,
+    },
+    DispatchEntry {
+        name: "getblock",
+        handler: chain::getblock,
+    },
+    DispatchEntry {
+        name: "getblockheader",
+        handler: chain::getblockheader,
+    },
+    DispatchEntry {
+        name: "getblockstats",
+        handler: chain::getblockstats,
+    },
+    DispatchEntry {
+        name: "verifychain",
+        handler: chain::verifychain,
+    },
+    DispatchEntry {
+        name: "gettxoutsetinfo",
+        handler: chain::gettxoutsetinfo,
+    },
+    DispatchEntry {
+        name: "getindexinfo",
+        handler: chain::getindexinfo,
+    },
+    DispatchEntry {
+        name: "getblockfilter",
+        handler: chain::getblockfilter,
+    },
+    DispatchEntry {
+        name: "getcapabilities",
+        handler: chain::getcapabilities,
+    },
+    DispatchEntry {
+        name: "pruneblockchain",
+        handler: chain::pruneblockchain,
+    },
+    DispatchEntry {
+        name: "invalidateblock",
+        handler: chain::invalidateblock,
+    },
+    DispatchEntry {
+        name: "scantxoutset",
+        handler: chain::scantxoutset,
+    },
+    DispatchEntry {
+        name: "getrawtransaction",
+        handler: tx::getrawtransaction,
+    },
+    DispatchEntry {
+        name: "gettxout",
+        handler: tx::gettxout,
+    },
+    DispatchEntry {
+        name: "gettxoutproof",
+        handler: tx::gettxoutproof,
+    },
+    DispatchEntry {
+        name: "verifytxoutproof",
+        handler: tx::verifytxoutproof,
+    },
+    DispatchEntry {
+        name: "sendrawtransaction",
+        handler: tx::sendrawtransaction,
+    },
+    DispatchEntry {
+        name: "testmempoolaccept",
+        handler: tx::testmempoolaccept,
+    },
+    DispatchEntry {
+        name: "decoderawtransaction",
+        handler: tx::decoderawtransaction,
+    },
+    DispatchEntry {
+        name: "createrawtransaction",
+        handler: tx::createrawtransaction,
+    },
+    DispatchEntry {
+        name: "combinepsbt",
+        handler: tx::combinepsbt,
+    },
+    DispatchEntry {
+        name: "finalizepsbt",
+        handler: tx::finalizepsbt,
+    },
+    DispatchEntry {
+        name: "getmempoolinfo",
+        handler: mempool::getmempoolinfo,
+    },
+    DispatchEntry {
+        name: "getmempoolentry",
+        handler: mempool::getmempoolentry,
+    },
+    DispatchEntry {
+        name: "getrawmempool",
+        handler: mempool::getrawmempool,
+    },
+    DispatchEntry {
+        name: "getmempoolancestors",
+        handler: mempool::getmempoolancestors,
+    },
+    DispatchEntry {
+        name: "getmempooldescendants",
+        handler: mempool::getmempooldescendants,
+    },
+    DispatchEntry {
+        name: "estimatesmartfee",
+        handler: util::estimatesmartfee,
+    },
+    DispatchEntry {
+        name: "uptime",
+        handler: util::uptime,
+    },
+    DispatchEntry {
+        name: "getrpcinfo",
+        handler: util::getrpcinfo,
+    },
+    DispatchEntry {
+        name: "getmemoryinfo",
+        handler: util::getmemoryinfo,
+    },
+    DispatchEntry {
+        name: "estimaterawfee",
+        handler: util::estimaterawfee,
+    },
+    #[cfg(feature = "zmq")]
+    DispatchEntry {
+        name: "getzmqnotifications",
+        handler: util::getzmqnotifications,
+    },
+    DispatchEntry {
+        name: "validateaddress",
+        handler: util::validateaddress,
+    },
+    DispatchEntry {
+        name: "getdescriptorinfo",
+        handler: util::getdescriptorinfo,
+    },
+    DispatchEntry {
+        name: "deriveaddresses",
+        handler: util::deriveaddresses,
+    },
+    DispatchEntry {
+        name: "getnetworkinfo",
+        handler: network::getnetworkinfo,
+    },
+    DispatchEntry {
+        name: "getpeerinfo",
+        handler: network::getpeerinfo,
+    },
+    DispatchEntry {
+        name: "ping",
+        handler: network::ping,
+    },
+    DispatchEntry {
+        name: "addnode",
+        handler: network::addnode,
+    },
+    DispatchEntry {
+        name: "disconnectnode",
+        handler: network::disconnectnode,
+    },
+    DispatchEntry {
+        name: "getconnectioncount",
+        handler: network::getconnectioncount,
+    },
+    DispatchEntry {
+        name: "getnettotals",
+        handler: network::getnettotals,
+    },
+    DispatchEntry {
+        name: "getaddednodeinfo",
+        handler: network::getaddednodeinfo,
+    },
+    DispatchEntry {
+        name: "listbanned",
+        handler: network::listbanned,
+    },
+    DispatchEntry {
+        name: "setban",
+        handler: network::setban,
+    },
+    DispatchEntry {
+        name: "clearbanned",
+        handler: network::clearbanned,
+    },
+    DispatchEntry {
+        name: "setnetworkactive",
+        handler: network::setnetworkactive,
+    },
+    DispatchEntry {
+        name: "getnodeaddresses",
+        handler: network::getnodeaddresses,
+    },
+    DispatchEntry {
+        name: "getblocktemplate",
+        handler: mining::getblocktemplate,
+    },
+    DispatchEntry {
+        name: "getmininginfo",
+        handler: mining::getmininginfo,
+    },
+    DispatchEntry {
+        name: "submitblock",
+        handler: mining::submitblock,
+    },
+    DispatchEntry {
+        name: "prioritisetransaction",
+        handler: mining::prioritisetransaction,
+    },
 ];
 
-#[cfg(feature = "zmq")]
-const ZMQ_RPC_METHOD: &str = "getzmqnotifications";
-
-fn is_registered_method(method: &str) -> bool {
-    if CORE_RPC_METHODS.contains(&method) {
-        return true;
-    }
-    #[cfg(feature = "zmq")]
-    {
-        method == ZMQ_RPC_METHOD
-    }
-    #[cfg(not(feature = "zmq"))]
-    false
+/// Enumerates the live registry names in table order.
+///
+/// Exposed for the manifest coverage gate
+/// (`crates/rpc/tests/manifest_coverage.rs`), which asserts set equality
+/// with the shipped manifest rows in both directions. Names are gated by
+/// the same cargo features as the manifest rows.
+pub fn live_registry() -> impl Iterator<Item = &'static str> {
+    DISPATCH_TABLE.iter().map(|entry| entry.name)
 }
 
 /// JSON-RPC method dispatcher backed by shared node context.
@@ -110,67 +309,10 @@ impl Handler {
         if !is_registered_method(method) {
             return Err(RpcError::MethodNotFound(method.to_owned()));
         }
-        match method {
-            "getblockchaininfo" => chain::getblockchaininfo(&self.ctx, params),
-            "getdifficulty" => chain::getdifficulty(&self.ctx, params),
-            "getchaintips" => chain::getchaintips(&self.ctx, params),
-            "getchaintxstats" => chain::getchaintxstats(&self.ctx, params),
-            "getblockcount" => chain::getblockcount(&self.ctx, params),
-            "getblockhash" => chain::getblockhash(&self.ctx, params),
-            "getbestblockhash" => chain::getbestblockhash(&self.ctx, params),
-            "getblock" => chain::getblock(&self.ctx, params),
-            "getblockheader" => chain::getblockheader(&self.ctx, params),
-            "getblockstats" => chain::getblockstats(&self.ctx, params),
-            "verifychain" => chain::verifychain(&self.ctx, params),
-            "gettxoutsetinfo" => chain::gettxoutsetinfo(&self.ctx, params),
-            "getindexinfo" => chain::getindexinfo(&self.ctx, params),
-            "pruneblockchain" => chain::pruneblockchain(&self.ctx, params),
-            "invalidateblock" => chain::invalidateblock(&self.ctx, params),
-            "scantxoutset" => chain::scantxoutset(&self.ctx, params),
-            "getrawtransaction" => tx::getrawtransaction(&self.ctx, params),
-            "gettxout" => tx::gettxout(&self.ctx, params),
-            "gettxoutproof" => tx::gettxoutproof(&self.ctx, params),
-            "verifytxoutproof" => tx::verifytxoutproof(&self.ctx, params),
-            "sendrawtransaction" => tx::sendrawtransaction(&self.ctx, params),
-            "testmempoolaccept" => tx::testmempoolaccept(&self.ctx, params),
-            "decoderawtransaction" => tx::decoderawtransaction(&self.ctx, params),
-            "createrawtransaction" => tx::createrawtransaction(&self.ctx, params),
-            "combinepsbt" => tx::combinepsbt(&self.ctx, params),
-            "finalizepsbt" => tx::finalizepsbt(&self.ctx, params),
-            "getmempoolinfo" => mempool::getmempoolinfo(&self.ctx, params),
-            "getmempoolentry" => mempool::getmempoolentry(&self.ctx, params),
-            "getrawmempool" => mempool::getrawmempool(&self.ctx, params),
-            "getmempoolancestors" => mempool::getmempoolancestors(&self.ctx, params),
-            "getmempooldescendants" => mempool::getmempooldescendants(&self.ctx, params),
-            "estimatesmartfee" => util::estimatesmartfee(&self.ctx, params),
-            "uptime" => util::uptime(&self.ctx, params),
-            "getrpcinfo" => util::getrpcinfo(&self.ctx, params),
-            "getmemoryinfo" => util::getmemoryinfo(&self.ctx, params),
-            "estimaterawfee" => util::estimaterawfee(&self.ctx, params),
-            #[cfg(feature = "zmq")]
-            "getzmqnotifications" => util::getzmqnotifications(&self.ctx, params),
-            "validateaddress" => util::validateaddress(&self.ctx, params),
-            "getdescriptorinfo" => util::getdescriptorinfo(&self.ctx, params),
-            "deriveaddresses" => util::deriveaddresses(&self.ctx, params),
-            "getnetworkinfo" => network::getnetworkinfo(&self.ctx, params),
-            "getpeerinfo" => network::getpeerinfo(&self.ctx, params),
-            "ping" => network::ping(&self.ctx, params),
-            "addnode" => network::addnode(&self.ctx, params),
-            "disconnectnode" => network::disconnectnode(&self.ctx, params),
-            "getconnectioncount" => network::getconnectioncount(&self.ctx, params),
-            "getnettotals" => network::getnettotals(&self.ctx, params),
-            "getaddednodeinfo" => network::getaddednodeinfo(&self.ctx, params),
-            "listbanned" => network::listbanned(&self.ctx, params),
-            "setban" => network::setban(&self.ctx, params),
-            "clearbanned" => network::clearbanned(&self.ctx, params),
-            "setnetworkactive" => network::setnetworkactive(&self.ctx, params),
-            "getnodeaddresses" => network::getnodeaddresses(&self.ctx, params),
-            "getblocktemplate" => mining::getblocktemplate(&self.ctx, params),
-            "getmininginfo" => mining::getmininginfo(&self.ctx, params),
-            "submitblock" => mining::submitblock(&self.ctx, params),
-            "prioritisetransaction" => mining::prioritisetransaction(&self.ctx, params),
-            _ => unreachable!("registered RPC method missing a dispatch arm"),
-        }
+        let Some(arm) = DISPATCH_TABLE.iter().find(|entry| entry.name == method) else {
+            unreachable!("registered RPC method missing a dispatch arm: {method}");
+        };
+        (arm.handler)(&self.ctx, params)
     }
 }
 
@@ -231,20 +373,23 @@ pub(crate) fn required_u64(
         .ok_or(RpcError::InvalidParams(name))
 }
 
-pub(crate) fn serde_to_sonic(value: &serde_json::Value) -> Result<Value, RpcError> {
-    let text = serde_json::to_string(value)?;
-    Ok(sonic_rs::from_str(&text)?)
+/// Parses one 64-hex-character transaction id, rejecting anything else.
+pub(crate) fn parse_txid(value: &str) -> Result<Txid, RpcError> {
+    Txid::from_str(value).map_err(|_| RpcError::InvalidParams("txid must be 64 hex characters"))
 }
-
 #[cfg(test)]
 mod registry_tests {
+    use alloc::collections::BTreeSet;
     use alloc::sync::Arc;
 
     use sonic_rs::json;
 
-    use super::{CORE_RPC_METHODS, Handler};
+    #[cfg(feature = "zmq")]
+    use super::DISPATCH_TABLE;
+    use super::{Handler, live_registry};
     use crate::context::Context;
     use crate::error::RpcError;
+    use crate::manifest::{self, SurfaceKind};
 
     const POLICY_ABSENCES: &[&str] = &[
         "clearmempool",
@@ -256,17 +401,27 @@ mod registry_tests {
         "sethdseed",
     ];
 
+    fn shipped_rpc_rows() -> impl Iterator<Item = &'static manifest::Entry> {
+        manifest::entries_of_kind(SurfaceKind::Rpc).filter(|entry| entry.shipped())
+    }
+
     #[test]
     fn core_method_registry_has_the_expected_surface() {
-        assert_eq!(CORE_RPC_METHODS.len(), 56);
+        let live: BTreeSet<&str> = live_registry().collect();
+        let shipped: BTreeSet<&str> = shipped_rpc_rows().map(|entry| entry.name).collect();
+        assert_eq!(
+            live, shipped,
+            "live dispatch registry must equal the shipped manifest rows"
+        );
         let handler = Handler::new(Arc::new(Context::new()));
-        for method in CORE_RPC_METHODS {
+        for entry in shipped_rpc_rows() {
             assert!(
                 !matches!(
-                    handler.dispatch(method, &json!([])),
+                    handler.dispatch(entry.name, &json!([])),
                     Err(RpcError::MethodNotFound(_))
                 ),
-                "{method} is listed but not dispatchable"
+                "{} is listed but not dispatchable",
+                entry.name
             );
         }
         for method in POLICY_ABSENCES {
@@ -280,7 +435,13 @@ mod registry_tests {
     #[cfg(feature = "zmq")]
     #[test]
     fn zmq_build_adds_exactly_one_method() {
-        assert_eq!(CORE_RPC_METHODS.len() + 1, 57);
+        assert_eq!(
+            DISPATCH_TABLE
+                .iter()
+                .filter(|arm| arm.name == "getzmqnotifications")
+                .count(),
+            1
+        );
         let handler = Handler::new(Arc::new(Context::new()));
         assert!(!matches!(
             handler.dispatch("getzmqnotifications", &json!([])),
@@ -291,6 +452,7 @@ mod registry_tests {
     #[cfg(not(feature = "zmq"))]
     #[test]
     fn non_zmq_build_omits_notification_method() {
+        assert!(!live_registry().any(|name| name == "getzmqnotifications"));
         let handler = Handler::new(Arc::new(Context::new()));
         assert!(matches!(
             handler.dispatch("getzmqnotifications", &json!([])),

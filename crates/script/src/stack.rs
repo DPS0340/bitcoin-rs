@@ -51,6 +51,91 @@ impl Stack {
         self.items.last().ok_or(StackError::Underflow)
     }
 
+    /// Returns an item at `depth`, where zero is the top item.
+    pub fn peek_at(&self, depth: usize) -> Result<&ScriptItem, StackError> {
+        self.items
+            .get(
+                self.items
+                    .len()
+                    .checked_sub(depth + 1)
+                    .ok_or(StackError::Underflow)?,
+            )
+            .ok_or(StackError::Underflow)
+    }
+
+    /// Removes and returns an item at `depth`, where zero is the top item.
+    pub fn remove_at(&mut self, depth: usize) -> Result<ScriptItem, StackError> {
+        let index = self
+            .items
+            .len()
+            .checked_sub(depth + 1)
+            .ok_or(StackError::Underflow)?;
+        Ok(self.items.remove(index))
+    }
+
+    /// Inserts an item at `depth`, where zero places it on top.
+    pub fn insert_at(&mut self, depth: usize, item: ScriptItem) -> Result<(), StackError> {
+        if depth > self.items.len() {
+            return Err(StackError::Underflow);
+        }
+        if self.items.is_full() {
+            return Err(StackError::Overflow);
+        }
+        let index = self.items.len() - depth;
+        self.items.insert(index, item);
+        Ok(())
+    }
+
+    /// Swaps the top two items.
+    pub fn swap(&mut self) -> Result<(), StackError> {
+        if self.items.len() < 2 {
+            return Err(StackError::Underflow);
+        }
+        let len = self.items.len();
+        self.items.swap(len - 1, len - 2);
+        Ok(())
+    }
+
+    /// Swaps the items at the given depths (0 = top, 1 = second-from-top, …).
+    pub fn swap_at(&mut self, depth_a: usize, depth_b: usize) -> Result<(), StackError> {
+        let len = self.items.len();
+        if depth_a >= len || depth_b >= len {
+            return Err(StackError::Underflow);
+        }
+        self.items.swap(len - 1 - depth_a, len - 1 - depth_b);
+        Ok(())
+    }
+
+    /// Moves the item at `depth` to the top.
+    pub fn roll(&mut self, depth: usize) -> Result<(), StackError> {
+        let item = self.remove_at(depth)?;
+        self.push(item)
+    }
+
+    /// Removes the top `count` items, preserving their stack order.
+    pub fn drain(&mut self, count: usize) -> Result<Vec<ScriptItem>, StackError> {
+        if count > self.items.len() {
+            return Err(StackError::Underflow);
+        }
+        let start = self.items.len() - count;
+        Ok(self.items.drain(start..).collect())
+    }
+
+    /// Moves the top item to another bounded stack.
+    pub fn move_to(&mut self, destination: &mut Self) -> Result<(), StackError> {
+        let item = self.pop()?;
+        if let Err(error) = destination.push(item.clone()) {
+            self.push(item)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Moves an item from another bounded stack onto this stack.
+    pub fn move_from(&mut self, source: &mut Self) -> Result<(), StackError> {
+        source.move_to(self)
+    }
+
     /// Returns the number of stack items.
     #[must_use]
     pub fn len(&self) -> usize {

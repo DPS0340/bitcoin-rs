@@ -1,5 +1,4 @@
-use bitcoin::block::Header as BitcoinBlockHeader;
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, Header};
 use bytemuck::{Pod, Zeroable};
 use ruint::Uint;
 
@@ -7,7 +6,7 @@ use ruint::Uint;
 pub type ChainWork = Uint<256, 4>;
 
 /// Bitcoin block header type stored in block-tree nodes.
-pub type BlockHeader = BitcoinBlockHeader;
+pub type BlockHeader = Header;
 
 /// Stable slab key for a block-tree node.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, Pod)]

@@ -1,10 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bitcoin::hashes::{Hash as _, HashEngine as _, sha256d};
-use bitcoin::{ScriptBuf, Transaction, Txid, Wtxid};
 use bitcoin_rs_mempool::MempoolMiningSnapshot;
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::{Hash256, Network, Tx, Txid, Wtxid, encode::double_sha256};
 
 use crate::MiningError;
 use crate::coinbase::{WITNESS_RESERVED_VALUE, build_coinbase};
@@ -84,7 +82,7 @@ impl core::fmt::Display for TemplateId {
 #[derive(Clone, Debug)]
 pub struct CandidateTransaction {
     /// Transaction payload shared with the mempool snapshot.
-    pub tx: Arc<Transaction>,
+    pub tx: Arc<Tx>,
     /// Transaction id.
     pub txid: Txid,
     /// Witness transaction id.
@@ -135,7 +133,7 @@ pub struct Candidate {
     /// Mempool sequence captured with the snapshot.
     pub mempool_sequence: u64,
     /// Fully constructed coinbase, including the witness commitment when active.
-    pub coinbase: Transaction,
+    pub coinbase: Tx,
     /// Coinbase output value: subsidy plus actual selected fees.
     pub coinbase_value: u64,
     /// Sum of actual fees from selected non-coinbase transactions.
@@ -164,27 +162,23 @@ pub struct Candidate {
 pub fn assemble_candidate(
     context: &CandidateContext,
     snapshot: &MempoolMiningSnapshot,
-    payout: &ScriptBuf,
+    payout: &[u8],
 ) -> Result<Candidate, MiningError> {
     let dummy_commitment = Hash256::from_le_bytes(&[0_u8; 32]);
     let reservation = build_coinbase(
         context.height,
         context.network.subsidy_halving_interval(),
         0,
-        payout.clone(),
+        payout.to_vec(),
         context.segwit_active.then_some(&dummy_commitment),
     )?;
-    let reserved_weight = reservation.weight().to_wu();
+    let reserved_weight = reservation.weight();
     let reserved_size = u64::try_from(reservation.total_size()).map_err(|_| {
         MiningError::CandidateScalarOverflow {
             field: "coinbase size",
         }
     })?;
-    let reserved_sigops = u64::try_from(reservation.total_sigop_cost(|_| None)).map_err(|_| {
-        MiningError::CandidateScalarOverflow {
-            field: "coinbase sigops",
-        }
-    })?;
+    let reserved_sigops = u64::from(bitcoin_rs_script::count_tx_legacy(&reservation));
 
     let (ordered, fees, selected_weight, selected_size, selected_sigops) = select_packages(
         context,
@@ -207,13 +201,13 @@ pub fn assemble_candidate(
         context.height,
         context.network.subsidy_halving_interval(),
         fees,
-        payout.clone(),
+        payout.to_vec(),
         witness_commitment.as_ref(),
     )?;
     let coinbase_value = coinbase
-        .output
+        .outputs
         .first()
-        .map(|output| output.value.to_sat())
+        .map(|output| output.value)
         .ok_or(MiningError::CoinbaseValueOverflow)?;
     // Fees change a fixed-width amount and the witness commitment replaces a
     // fixed-width hash, so the reservation and final coinbase have the same
@@ -293,9 +287,9 @@ fn candidate_transactions(
     Ok(transactions)
 }
 
-fn depends(tx: &Transaction, tx_positions: &BTreeMap<Txid, u32>) -> Vec<u32> {
+fn depends(tx: &Tx, tx_positions: &BTreeMap<Txid, u32>) -> Vec<u32> {
     let mut depends = tx
-        .input
+        .inputs
         .iter()
         .filter_map(|input| tx_positions.get(&input.previous_output.txid).copied())
         .collect::<Vec<_>>();
@@ -304,28 +298,45 @@ fn depends(tx: &Transaction, tx_positions: &BTreeMap<Txid, u32>) -> Vec<u32> {
     depends
 }
 
+/// BIP141 witness merkle root: pairwise `SHA256d` fold duplicating the last leaf
+/// on odd levels. The coinbase contributes the all-zero wtxid leaf.
 fn witness_merkle_root(
     snapshot: &MempoolMiningSnapshot,
     ordered: &[usize],
 ) -> Result<Hash256, MiningError> {
     let mut leaves = Vec::with_capacity(ordered.len().saturating_add(1));
     // BIP141: the coinbase wtxid leaf is the all-zero hash, not the real wtxid.
-    leaves.push(Wtxid::all_zeros());
+    leaves.push([0_u8; 32]);
     for &index in ordered {
-        leaves.push(snapshot.entries[index].wtxid);
+        leaves.push(*snapshot.entries[index].wtxid.as_bytes());
     }
-    let root = bitcoin::merkle_tree::calculate_root(leaves.into_iter()).ok_or(
-        MiningError::CandidateScalarOverflow {
+
+    if leaves.is_empty() {
+        return Err(MiningError::CandidateScalarOverflow {
             field: "witness merkle root",
-        },
-    )?;
-    Ok(Hash256::from_le_bytes(root.as_byte_array()))
+        });
+    }
+
+    while leaves.len() > 1 {
+        let original_len = leaves.len();
+        let mut next = Vec::with_capacity(original_len.div_ceil(2));
+        for pos in 0..original_len.div_ceil(2) {
+            let left = leaves[2 * pos];
+            let right = leaves[(2 * pos + 1).min(original_len - 1)];
+            let mut pair = [0_u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            next.push(*double_sha256(&pair).as_byte_array());
+        }
+        leaves = next;
+    }
+
+    Ok(Hash256::from_le_bytes(&leaves[0]))
 }
 
 fn witness_commitment_hash(witness_merkle_root: &Hash256, reserved: &[u8; 32]) -> Hash256 {
-    let mut engine = sha256d::Hash::engine();
-    engine.input(witness_merkle_root.as_byte_array());
-    engine.input(reserved);
-    let hash = sha256d::Hash::from_engine(engine);
-    Hash256::from_le_bytes(hash.as_byte_array())
+    let mut pair = [0_u8; 64];
+    pair[..32].copy_from_slice(witness_merkle_root.as_byte_array());
+    pair[32..].copy_from_slice(reserved);
+    double_sha256(&pair)
 }

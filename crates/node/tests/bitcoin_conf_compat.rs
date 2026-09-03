@@ -1,7 +1,7 @@
 //! Integration tests for the bitcoin-rs node.
 
 use anyhow::Result;
-use bitcoin_rs_node::{Auth, Config, Network, bitcoin_conf_compat};
+use bitcoin_rs_node::{Auth, Network, NodeConfig, bitcoin_conf_compat};
 use std::fs;
 
 #[test]
@@ -22,7 +22,7 @@ fn bitcoin_conf_core_keys_map_into_config() -> Result<()> {
 ",
     )?;
 
-    let mut config = Config::default();
+    let mut config = NodeConfig::default();
     bitcoin_conf_compat::apply_file(&mut config, &conf_path)?;
 
     assert_eq!(config.prune_target_mb, 550);
@@ -48,7 +48,7 @@ fn bitcoin_conf_network_sections_override_globals_for_selected_network() -> Resu
 ",
     )?;
 
-    let mut config = Config::default_for_network(bitcoin_rs_node::Network::Regtest);
+    let mut config = NodeConfig::default_for_network(bitcoin_rs_node::Network::Regtest);
     bitcoin_conf_compat::apply_file(&mut config, &conf_path)?;
 
     assert_eq!(config.prune_target_mb, 900);
@@ -74,7 +74,7 @@ fn bitcoin_conf_zmq_keys_are_not_promoted_into_node_config() -> Result<()> {
 ",
     )?;
 
-    let mut config = Config::default_for_network(bitcoin_rs_node::Network::Regtest);
+    let mut config = NodeConfig::default_for_network(bitcoin_rs_node::Network::Regtest);
     bitcoin_conf_compat::apply_file(&mut config, &conf_path)?;
 
     assert!(config.notifications.zmq.is_empty());
@@ -92,7 +92,7 @@ assumevalid=0000000000000000000000000000000000000000000000000000000000000000
 ",
     )?;
 
-    let mut config = Config::default();
+    let mut config = NodeConfig::default();
     bitcoin_conf_compat::apply_file(&mut config, &conf_path)?;
 
     assert_eq!(

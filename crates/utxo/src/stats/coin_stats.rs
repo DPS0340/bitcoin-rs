@@ -95,7 +95,7 @@ impl CoinStats {
     }
 
     fn account_insert(&mut self, txout: &TxOut) {
-        self.total_amount = self.total_amount.saturating_add(txout.value.to_sat());
+        self.total_amount = self.total_amount.saturating_add(txout.value);
         self.bogo_size = self.bogo_size.saturating_add(bogo_size(txout));
         self.utxo_count = self.utxo_count.saturating_add(1);
     }
@@ -108,7 +108,7 @@ impl CoinStats {
     }
 
     fn account_remove(&mut self, txout: &TxOut) {
-        self.total_amount = self.total_amount.saturating_sub(txout.value.to_sat());
+        self.total_amount = self.total_amount.saturating_sub(txout.value);
         self.bogo_size = self.bogo_size.saturating_sub(bogo_size(txout));
         self.utxo_count = self.utxo_count.saturating_sub(1);
     }
@@ -263,7 +263,7 @@ impl EncodedPreimageArena {
     }
 
     fn push(&mut self, coin: SnapshotCoin<'_>) {
-        let op = OutPoint::new(coin.txid, coin.vout);
+        let op = OutPoint::new(coin.txid.into(), coin.vout);
         coin_hash_bytes_raw_append(
             &mut self.bytes,
             &op,
@@ -374,7 +374,7 @@ impl SnapshotCoinObserver for CoinStatsAccumulator {
         match &mut self.mode {
             MuHashMode::Disabled => {}
             MuHashMode::Serial(scratch) => {
-                let op = OutPoint::new(coin.txid, coin.vout);
+                let op = OutPoint::new(coin.txid.into(), coin.vout);
                 coin_hash_bytes_raw_into(
                     scratch,
                     &op,
@@ -390,7 +390,7 @@ impl SnapshotCoinObserver for CoinStatsAccumulator {
                 if encoded_len > PARALLEL_MUHASH_MAX_BYTES {
                     arena.flush_into(&mut self.stats.muhash);
                     let mut preimage = Vec::with_capacity(encoded_len);
-                    let op = OutPoint::new(coin.txid, coin.vout);
+                    let op = OutPoint::new(coin.txid.into(), coin.vout);
                     coin_hash_bytes_raw_append(
                         &mut preimage,
                         &op,
@@ -564,7 +564,7 @@ impl CoinStatsDelta {
     ) {
         coin_hash_bytes_into(scratch, op, txout, height, coinbase);
         self.muhash.insert(scratch.as_slice());
-        self.added_amount = self.added_amount.saturating_add(txout.value.to_sat());
+        self.added_amount = self.added_amount.saturating_add(txout.value);
         self.added_bogo_size = self.added_bogo_size.saturating_add(bogo_size(txout));
         self.added_utxos = self.added_utxos.saturating_add(1);
     }
@@ -592,7 +592,7 @@ impl CoinStatsDelta {
     ) {
         coin_hash_bytes_into(scratch, op, txout, height, coinbase);
         self.muhash.remove(scratch.as_slice());
-        self.removed_amount = self.removed_amount.saturating_add(txout.value.to_sat());
+        self.removed_amount = self.removed_amount.saturating_add(txout.value);
         self.removed_bogo_size = self.removed_bogo_size.saturating_add(bogo_size(txout));
         self.removed_utxos = self.removed_utxos.saturating_add(1);
     }
@@ -812,8 +812,8 @@ fn coin_hash_bytes_into(
     coin_hash_bytes_raw_into(
         out,
         op,
-        txout.value.to_sat(),
-        txout.script_pubkey.as_bytes(),
+        txout.value,
+        txout.script_pubkey.as_slice(),
         height,
         coinbase,
     );
@@ -848,7 +848,7 @@ fn coin_hash_bytes_raw_append(
 #[cfg(test)]
 #[inline]
 fn encode_txout_into(out: &mut Vec<u8>, txout: &TxOut) {
-    encode_value_and_script_into(out, txout.value.to_sat(), txout.script_pubkey.as_bytes());
+    encode_value_and_script_into(out, txout.value, txout.script_pubkey.as_slice());
 }
 
 #[inline]
@@ -1017,13 +1017,19 @@ mod tests {
     #[test]
     fn manual_txout_encoding_matches_consensus_boundaries() {
         for len in [0_usize, 1, 252, 253, 65_535, 65_536] {
+            let value = 50_000 + u64::try_from(len).unwrap_or(u64::MAX);
+            let script = vec![0x51; len];
             let txout = TxOut {
-                value: Amount::from_sat(50_000 + u64::try_from(len).unwrap_or(u64::MAX)),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51; len]),
+                value,
+                script_pubkey: script.clone(),
             };
             let mut manual = Vec::new();
             encode_txout_into(&mut manual, &txout);
-            let consensus = bitcoin::consensus::encode::serialize(&txout);
+            let bitcoin_txout = bitcoin::TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::from_bytes(script),
+            };
+            let consensus = bitcoin::consensus::encode::serialize(&bitcoin_txout);
             assert_eq!(manual, consensus, "script len {len}");
         }
     }
@@ -1040,14 +1046,14 @@ mod tests {
         for (i, script_len) in [0_usize, 1, 252, 253, 65_535].into_iter().enumerate() {
             let mut txid_bytes = [0_u8; 32];
             txid_bytes[0] = u8::try_from(i + 1).unwrap_or(u8::MAX);
-            let output = OutPoint::new(Hash256::from_le_bytes(&txid_bytes), u32::MAX);
+            let output = OutPoint::new(Hash256::from_le_bytes(&txid_bytes).into(), u32::MAX);
             let txout = TxOut {
-                value: Amount::from_sat(if i == 4 {
+                value: if i == 4 {
                     u64::MAX
                 } else {
                     u64::try_from(i).unwrap_or(u64::MAX).saturating_mul(100_000)
-                }),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51; script_len]),
+                },
+                script_pubkey: vec![0x51; script_len],
             };
             changes.add(UtxoAdd::new(
                 output,
