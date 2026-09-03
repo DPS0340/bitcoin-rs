@@ -845,14 +845,17 @@ fn parse_btc_amount(value: &Value) -> Result<u64, RpcError> {
 // Prevout / context resolution and frozen reason mapping.
 // ---------------------------------------------------------------------------
 
-/// Maps an [`AcceptanceRejectReason`] to the frozen RPC error code and
-/// string. `MaxFeeExceeded` is a parameter error (-32602); all others are
-/// internal errors (-32603). The string for `MinRelayFeeNotMet` uses the
-/// frozen hyphenated form `min-relay-fee-not-met`, not the mempool's Display.
+/// Maps an [`AcceptanceRejectReason`] to the Core-compatible RPC error.
+/// `MaxFeeExceeded` is a parameter error (`-32602`), pinned by the
+/// policy-contract integration test. All other admission rejections are
+/// transaction rejections (`-26`), matching Bitcoin Core's
+/// `RPC_VERIFY_REJECTED` code. The string for `MinRelayFeeNotMet` uses
+/// the frozen hyphenated form `min-relay-fee-not-met`, not the mempool's
+/// Display.
 fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
     match reason {
         AcceptanceRejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
-        other => RpcError::Internal(reject_reason_to_frozen_string(other)),
+        other => RpcError::TxRejected(reject_reason_to_frozen_string(other)),
     }
 }
 
@@ -2569,8 +2572,7 @@ mod acceptance_tests {
         assert_eq!(ctx.mempool.read().len(), 1);
     }
 
-    /// A rejection must say why. Missing inputs map to an internal error
-    /// per the frozen `reject_reason_to_rpc_error` contract.
+    /// A rejection must say why, under Core's `RPC_VERIFY_REJECTED` code.
     #[test]
     fn sendrawtransaction_rejects_a_transaction_whose_inputs_do_not_exist() {
         let ctx = Arc::new(Context::new());
@@ -2581,11 +2583,11 @@ mod acceptance_tests {
         let Err(error) = outcome else {
             panic!("a transaction with no resolvable inputs must not be accepted");
         };
-        assert_eq!(
-            error.code(),
-            RpcError::INTERNAL_ERROR,
-            "missing inputs map to internal error: {error:?}"
+        assert!(
+            matches!(error, RpcError::TxRejected(_)),
+            "expected a rejection, got {error:?}"
         );
+        assert_eq!(error.code(), RpcError::CORE_VERIFY_REJECTED);
         assert!(ctx.mempool.read().is_empty());
     }
 
