@@ -23,6 +23,10 @@ tags:
 
 # Small-window benchmarks do not predict at-scale throughput
 
+> The `mainnet_prefix_replay` executable used for the measurements below was
+> retired after the campaign. The workload-matching lesson remains current;
+> the commands are historical provenance, not supported tooling.
+
 ## Context
 
 The project's optimization roadmap rested on a measured-looking premise: bitcoin-rs beats
@@ -69,8 +73,6 @@ refresh.
    the posture in the artifact.
 Single-machine criterion trust (rebuild codegen drift, CLI baseline flags, allocator parity)
 is its own note: [criterion-bench-trust-rebuild-drift-baselines-allocator](criterion-bench-trust-rebuild-drift-baselines-allocator.md).
-Process hygiene for stale blockers is in
-[re-probe-stale-external-blockers-before-reasserting](re-probe-stale-external-blockers-before-reasserting.md).
 
 ## Why This Matters
 
@@ -92,7 +94,7 @@ entropy.
 
 - At-scale replay (repo-native, measurement-grade):
   `target/release/examples/mainnet_prefix_replay --stop-height 150000 --rest-url 127.0.0.1:8332`
-  against a `bitcoind -rest` serving a synced datadir (`crates/node/examples/mainnet_prefix_replay.rs`).
+  against a `bitcoind -rest` serving a synced datadir (the campaign executable is now retired).
 - Matched-validation Core side:
   `bitcoind -reindex-chainstate -assumevalid=0 -connect=0` (elapsed from `debug.log`
   start → `UpdateTip height=N`).
@@ -102,7 +104,3 @@ entropy.
 - [multi-peer-block-download-requires-core-stalling-disconnect](../architecture-patterns/multi-peer-block-download-requires-core-stalling-disconnect.md)
   — the download-regime analysis this learning's live-IBD numbers confirm; its points 2(b)
   and 8 are refresh candidates contradicted/superseded by this measurement.
-- [script-verification-delegated-to-core-c-no-rust-headroom](../architecture-patterns/script-verification-delegated-to-core-c-no-rust-headroom.md)
-  — why script verification itself offers no headroom vs Core.
-- [utxo-commit-borrowed-removal-win-is-off-the-coalescing-event-path](../architecture-patterns/utxo-commit-borrowed-removal-win-is-off-the-coalescing-event-path.md)
-  — the intra-crate instance of the same bench-fidelity skepticism.

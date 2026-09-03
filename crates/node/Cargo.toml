@@ -16,80 +16,53 @@ workspace = true
 # `TxIndexStorage` enums are entirely backend-cfg-gated — with zero backends the
 # `match self` arms are non-exhaustive and the crate fails to compile.  fjall
 # is the performance-oriented default backend so per-crate `cargo publish` / `cargo check`
-# works out of the box.  CI and local dev build via `bin/bitcoin-rs` with
-# `--package bitcoin-rs --no-default-features --features "rocksdb,fjall,redb,mdbx,kernel"`,
-# which propagates all four backends and the bitcoinkernel verifier through
-# `bin/bitcoin-rs`'s feature table.
+# works out of the box.  CI and local dev build via `bin/bitcoin-rs`, whose
+# default features are `fjall,redb,zmq` (pure-Rust storage; rocksdb, mdbx, and
+# kernel stay selectable but non-default). Full-matrix lanes request the other
+# backends explicitly through `bin/bitcoin-rs`'s feature table.
 # Note: `--workspace --features "..."` in a virtual workspace (no root [package])
 # does NOT forward CLI features to library crates; always use -p when features
 # must reach a specific crate.
-default = ["fjall", "kernel"]
+default = ["fjall", "kernel", "zmq"]
 rocksdb = [
     "bitcoin-rs-chain/rocksdb",
-    "bitcoin-rs-coinstats/rocksdb",
     "bitcoin-rs-consensus/rocksdb",
-    "bitcoin-rs-electrum/rocksdb",
-    "bitcoin-rs-filters/rocksdb",
     "bitcoin-rs-index/rocksdb",
     "bitcoin-rs-mempool/rocksdb",
     "bitcoin-rs-mining/rocksdb",
     "bitcoin-rs-p2p/rocksdb",
-    "bitcoin-rs-pruning/rocksdb",
-    "bitcoin-rs-rpc/rocksdb",
     "bitcoin-rs-script/rocksdb",
     "bitcoin-rs-storage/rocksdb",
-    "bitcoin-rs-utreexo/rocksdb",
     "bitcoin-rs-utxo/rocksdb",
-    "bitcoin-rs-wallet/rocksdb",
 ]
 fjall = [
     "bitcoin-rs-chain/fjall",
-    "bitcoin-rs-coinstats/fjall",
     "bitcoin-rs-consensus/fjall",
-    "bitcoin-rs-electrum/fjall",
-    "bitcoin-rs-filters/fjall",
     "bitcoin-rs-index/fjall",
     "bitcoin-rs-mempool/fjall",
     "bitcoin-rs-mining/fjall",
     "bitcoin-rs-p2p/fjall",
-    "bitcoin-rs-pruning/fjall",
-    "bitcoin-rs-rpc/fjall",
     "bitcoin-rs-script/fjall",
     "bitcoin-rs-storage/fjall",
-    "bitcoin-rs-utreexo/fjall",
     "bitcoin-rs-utxo/fjall",
-    "bitcoin-rs-wallet/fjall",
 ]
 redb = [
     "bitcoin-rs-chain/redb",
-    "bitcoin-rs-coinstats/redb",
     "bitcoin-rs-consensus/redb",
-    "bitcoin-rs-electrum/redb",
-    "bitcoin-rs-filters/redb",
     "bitcoin-rs-index/redb",
     "bitcoin-rs-mempool/redb",
     "bitcoin-rs-mining/redb",
     "bitcoin-rs-p2p/redb",
-    "bitcoin-rs-pruning/redb",
-    "bitcoin-rs-rpc/redb",
     "bitcoin-rs-script/redb",
     "bitcoin-rs-storage/redb",
-    "bitcoin-rs-utreexo/redb",
     "bitcoin-rs-utxo/redb",
-    "bitcoin-rs-wallet/redb",
 ]
 mdbx = [
-    "bitcoin-rs-filters/mdbx",
     "bitcoin-rs-index/mdbx",
     "bitcoin-rs-storage/mdbx",
 ]
 kernel = ["bitcoin-rs-consensus/kernel"]
-checksig-census = [
-    "kernel",
-    "bitcoin-rs-consensus/checksig-census",
-]
-mimalloc = ["dep:mimalloc"]
-utreexo = ["dep:bitcoin-rs-utreexo"]
+zmq = ["dep:zmq", "bitcoin-rs-rpc/zmq"]
 prometheus-http = ["metrics-exporter-prometheus/http-listener"]
 
 [dependencies]
@@ -99,21 +72,17 @@ bitcoin-rs-script.workspace = true
 bitcoin-rs-consensus.workspace = true
 bitcoin-rs-storage.workspace = true
 bitcoin-rs-utxo.workspace = true
-bitcoin-rs-utreexo = { workspace = true, optional = true }
 bitcoin-rs-chain.workspace = true
 bitcoin-rs-index.workspace = true
-bitcoin-rs-filters.workspace = true
-bitcoin-rs-coinstats.workspace = true
-bitcoin-rs-pruning.workspace = true
+
 bitcoin-rs-mempool.workspace = true
 bitcoin-rs-p2p.workspace = true
-bitcoin-rs-wallet.workspace = true
+bitcoin-rs-ext-api.workspace = true
+bitcoin-rs-ext-blockfilterindex.workspace = true
 bitcoin-rs-mining.workspace = true
 bitcoin-rs-rpc.workspace = true
-bitcoin-rs-electrum.workspace = true
 
 bitcoin.workspace = true
-mimalloc = { workspace = true, optional = true }
 bytes.workspace = true
 clap.workspace = true
 toml.workspace = true
@@ -134,7 +103,7 @@ quanta.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
-zmq.workspace = true
+zmq = { workspace = true, optional = true }
 sha2.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true
@@ -145,11 +114,8 @@ tempfile = "3"
 proptest.workspace = true
 anyhow.workspace = true
 criterion.workspace = true
+sonic-rs.workspace = true
 
 [[bench]]
 name = "sync_pipeline"
-harness = false
-
-[[bench]]
-name = "sync_apply_metrics"
 harness = false

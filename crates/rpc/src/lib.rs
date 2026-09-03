@@ -1,11 +1,10 @@
 //! Synchronous Bitcoin Core-compatible JSON-RPC surface for `bitcoin-rs`.
 //!
-//! This crate intentionally exposes only watch-only wallet behavior. RPCs that
-//! would reveal, import, create, or use private keys are disabled and return a
-//! JSON-RPC internal-error response with the message
-//! `wallet has no private keys; use external signer`. PSBT construction,
-//! combination, analysis, and finalization stay available because they can be
-//! driven by external signers without this process holding private key material.
+//! This node ships no wallet. RPCs that would fund, sign, or otherwise
+//! require private key material are not implemented and answer
+//! `method not found`. Descriptor utilities, `scantxoutset`, and PSBT
+//! combination/finalization remain for watch-only workflows driven by
+//! external signers without this process holding private key material.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -13,24 +12,32 @@ extern crate alloc;
 
 /// HTTP Basic and cookie authentication.
 pub mod auth;
+/// Bitcoin Core wire-contract boundary: versioned response types and the
+/// sanctioned native<->bitcoin conversions backing them.
+pub mod compat;
 /// Dependency-injected RPC state.
 pub mod context;
 /// JSON-RPC error mapping.
 pub mod error;
+/// Esplora-compatible HTTP endpoints backed by node-owned indexes.
+pub mod esplora;
 /// Method dispatch and Core-compatible handlers.
 pub mod handlers;
+/// Declared compatibility surface versus Bitcoin Core 31.x.
+pub mod manifest;
+/// Semantic Core projections without transport policy.
+pub mod render;
 /// Bitcoin Core-compatible REST endpoints.
 pub mod rest;
+/// Byte-level script helpers mirrored from `bitcoin-rs-script` (see module docs).
+pub mod script_util;
 /// Synchronous HTTP/1.1 JSON-RPC server.
 pub mod server;
+/// Transaction, block, and header rendering.
+pub mod tx_render;
 
 pub use auth::Auth;
-pub use context::{
-    BlockBodyMetadata, BlockBodySource, BlockLog, BlockRecord, ChainControl, ChainControlError,
-    ChainStats, Context, FoldedBlockRecords, NetworkState, PruneResult, PruneService,
-    PruneServiceError, PruneStatus, TxIndexInfo, TxIndexQuery, TxQueryError, ZmqNotification,
-    chain_stats, fold_block_records, record_at_height, record_at_height_hash,
-};
+
 pub use error::RpcError;
 pub use handlers::Handler;
 pub use server::RpcServer;

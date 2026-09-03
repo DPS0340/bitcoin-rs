@@ -1,15 +1,7 @@
 //! Index read-path resolver benchmark.
 //!
-//! Every group holds **both arms** of a refactor set over one identical
-//! fixture, so the before/after ratio comes from a single run and cannot be
-//! confounded by the rebuild and baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
-//!
-//! `before_scan` calls the naive `_scan` reference kept in the crate; `after_fast`
-//! calls whatever the production resolver currently does. Where a set has not
-//! landed yet both arms call the same function, and their spread then reports
-//! the harness noise floor. A group whose arms differ by less than the 1.05x
-//! noise band does not ship.
+//! Each group measures the current position-backed resolver over a
+//! production-shaped flat-file fixture.
 //!
 //! Blocks are served from a **real `FlatFileBlockStore`**, the same path
 //! production takes through `FlatFilePruneBodyStore`: open, `fstat`, seek, read.
@@ -29,13 +21,11 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::Hash as _;
-use bitcoin::{
-    Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Txid, Witness, absolute, block, transaction,
-};
 use bitcoin_rs_index::{BlockSource, Indexer, ScriptHash};
+use bitcoin_rs_primitives::{
+    Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+    deserialize,
+};
 use bitcoin_rs_storage::RocksDbStore;
 use bitcoin_rs_storage::block_file::{BlockFilePosition, FlatFileBlockStore};
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -115,36 +105,36 @@ fn fill_bytes(seed: u64, out: &mut [u8]) {
 
 /// Builds a 22-byte P2WPKH-shaped script so scripthash computation costs what
 /// it costs on mainnet rather than on a 2-byte toy script.
-fn witness_script(seed: u64) -> ScriptBuf {
+fn witness_script(seed: u64) -> Vec<u8> {
     let mut bytes = vec![0x00, 0x14];
     let mut program = [0_u8; 20];
     fill_bytes(seed, &mut program);
     bytes.extend_from_slice(&program);
-    ScriptBuf::from_bytes(bytes)
+    bytes
 }
 
-fn filler_tx(seed: u64) -> Transaction {
+fn filler_tx(seed: u64) -> Tx {
     let mut txid_bytes = [0_u8; 32];
     fill_bytes(seed, &mut txid_bytes);
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             previous_output: OutPoint {
-                txid: Txid::from_byte_array(txid_bytes),
+                txid: Txid(Hash256::from_le_bytes(&txid_bytes)),
                 vout: u32::try_from(seed & 0x3).unwrap_or(0),
             },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: Vec::new(),
+            sequence: u32::MAX,
+            witness: Vec::new(),
         }],
-        output: vec![
+        outputs: vec![
             TxOut {
-                value: Amount::from_sat(5_000),
+                value: 5_000,
                 script_pubkey: witness_script(seed ^ 0xa5a5_a5a5),
             },
             TxOut {
-                value: Amount::from_sat(7_000),
+                value: 7_000,
                 script_pubkey: witness_script(seed ^ 0x5a5a_5a5a),
             },
         ],
@@ -153,38 +143,38 @@ fn filler_tx(seed: u64) -> Transaction {
 
 /// The transaction the resolvers are asked to find. Pays `target_script` so it
 /// is reachable through a funding row.
-fn target_tx(height: u32, target_script: &ScriptBuf) -> Transaction {
+fn target_tx(height: u32, target_script: &[u8]) -> Tx {
     let mut txid_bytes = [0_u8; 32];
     fill_bytes(
         u64::from(height).wrapping_mul(0x9e37_79b9_7f4a_7c15),
         &mut txid_bytes,
     );
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             previous_output: OutPoint {
-                txid: Txid::from_byte_array(txid_bytes),
+                txid: Txid(Hash256::from_le_bytes(&txid_bytes)),
                 vout: 0,
             },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: Vec::new(),
+            sequence: u32::MAX,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(11_000),
-            script_pubkey: target_script.clone(),
+        outputs: vec![TxOut {
+            value: 11_000,
+            script_pubkey: target_script.to_vec(),
         }],
     }
 }
 
-fn empty_header() -> block::Header {
-    block::Header {
-        version: block::Version::ONE,
-        prev_blockhash: BlockHash::all_zeros(),
-        merkle_root: TxMerkleNode::all_zeros(),
+fn empty_header() -> Header {
+    Header {
+        version: 1,
+        prev_blockhash: BlockHash::default(),
+        merkle_root: Hash256::default(),
         time: 0,
-        bits: CompactTarget::from_consensus(0),
+        bits: 0,
         nonce: 0,
     }
 }
@@ -203,7 +193,7 @@ fn build_fixture(heights: u32, txs_per_block: usize) -> Fixture {
     let mut indexer = Indexer::new(store);
 
     let target_script = witness_script(0xdead_beef);
-    let target = ScriptHash::from_script_bytes(target_script.as_bytes());
+    let target = ScriptHash::from_script_bytes(&target_script);
 
     let mut positions = HashMap::new();
     let mut last_target = None;
@@ -212,7 +202,7 @@ fn build_fixture(heights: u32, txs_per_block: usize) -> Fixture {
     for index in 0..heights {
         let height = BASE_HEIGHT + index;
         let planted = target_tx(height, &target_script);
-        let planted_txid = planted.compute_txid();
+        let planted_txid = planted.txid();
 
         let mut txdata = Vec::with_capacity(txs_per_block + 1);
         for slot in 0..txs_per_block {
@@ -227,13 +217,13 @@ fn build_fixture(heights: u32, txs_per_block: usize) -> Fixture {
 
         let block = Block {
             header: empty_header(),
-            txdata,
+            txs: txdata,
         };
-        let bytes = serialize(&block);
+        let bytes = consensus_bytes(&block);
         indexer
             .ingest_block(&bytes, height)
             .expect("ingest fixture block");
-        let hash = block.block_hash().to_byte_array();
+        let hash = *block.block_hash().as_bytes();
         let position = files
             .persist(None, height, hash, &bytes)
             .expect("persist fixture body");
@@ -274,13 +264,7 @@ fn build_fixture(heights: u32, txs_per_block: usize) -> Fixture {
     }
 }
 
-/// Emits the paired `before`/`after` arms for one fixture.
-///
-/// The `before_*` arms call the retained `*_scan` references, which read and
-/// fully deserialize a whole block per row; the `after_*` arms call the
-/// position-backed resolvers. Same fixture, same store, one run, so the spread
-/// between them is the win rather than a comparison against a stored baseline.
-/// Repoint the `after_*` closures — never the `before_*` ones.
+/// Measures the current position-backed resolvers for one fixture.
 fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     let Fixture {
         indexer,
@@ -292,16 +276,7 @@ fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     } = fixture;
 
     let mut history = c.benchmark_group(format!("resolve_script_history/{label}"));
-    history.bench_function("before_scan", |b| {
-        b.iter(|| {
-            black_box(
-                indexer
-                    .resolve_script_history_scan(black_box(*target), source)
-                    .expect("resolve history"),
-            )
-        });
-    });
-    history.bench_function("after_fast", |b| {
+    history.bench_function("positioned", |b| {
         b.iter(|| {
             black_box(
                 indexer
@@ -313,16 +288,7 @@ fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     history.finish();
 
     let mut unspent = c.benchmark_group(format!("resolve_unspent/{label}"));
-    unspent.bench_function("before_scan", |b| {
-        b.iter(|| {
-            black_box(
-                indexer
-                    .resolve_unspent_outputs_with_height_scan(black_box(*target), source)
-                    .expect("resolve unspent"),
-            )
-        });
-    });
-    unspent.bench_function("after_fast", |b| {
+    unspent.bench_function("positioned", |b| {
         b.iter(|| {
             black_box(
                 indexer
@@ -334,16 +300,7 @@ fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     unspent.finish();
 
     let mut transaction = c.benchmark_group(format!("resolve_transaction/{label}"));
-    transaction.bench_function("before_scan", |b| {
-        b.iter(|| {
-            black_box(
-                indexer
-                    .resolve_transaction_scan(black_box(*target_txid), source)
-                    .expect("resolve transaction"),
-            )
-        });
-    });
-    transaction.bench_function("after_fast", |b| {
+    transaction.bench_function("positioned", |b| {
         b.iter(|| {
             black_box(
                 indexer
@@ -355,16 +312,7 @@ fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     transaction.finish();
 
     let mut outpoint = c.benchmark_group(format!("resolve_outpoint_value/{label}"));
-    outpoint.bench_function("before_scan", |b| {
-        b.iter(|| {
-            black_box(
-                indexer
-                    .resolve_outpoint_value(black_box(*target_outpoint), source)
-                    .expect("resolve outpoint value"),
-            )
-        });
-    });
-    outpoint.bench_function("after_fast", |b| {
+    outpoint.bench_function("positioned", |b| {
         b.iter(|| {
             black_box(
                 indexer

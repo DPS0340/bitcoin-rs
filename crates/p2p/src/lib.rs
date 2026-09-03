@@ -11,6 +11,8 @@ pub mod connection;
 pub mod counters;
 /// Inbound message dispatcher.
 pub mod dispatch;
+/// Block download window, peer-assignment, stall, and scheduling policy.
+pub mod download_window;
 /// Peer finite-state machine.
 pub mod fsm;
 /// Version/verack negotiation helpers.
@@ -32,12 +34,22 @@ pub mod wire;
 /// BIP339 wtxid-relay state.
 pub mod wtxid;
 
-pub use connection::{ConnectionId, PeerLease, PeerSource};
+pub use connection::{ConnectionId, PeerLease, PeerSource, PeerStats};
 pub use counters::{CountingStream, PeerCounters};
-pub use dispatch::{ChainQuery, InventoryResponse};
-pub use inbound::{InboundBlock, InboundHeaders};
+pub use dispatch::{ChainQuery, InventoryServing, TxInventory};
+pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use listener::spawn_outbound_connection;
-pub use peer::{DnsResolver, Peer, PeerManager, PeerState, SystemDnsResolver};
+pub use peer::{
+    AddNodeError, AddedNodeInfo, BanError, ConnectedPeer, ConnectionCounts, DnsResolver,
+    MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE_USIZE, NetworkActivity, NetworkControls,
+    NodeAddress, Peer, PeerManager, PeerState, SystemDnsResolver, TrafficTotals,
+    UPLOAD_TIMEFRAME_SECS, UploadTarget,
+};
 pub use peer_info::PeerInfo;
 pub use subnet::{BannedSubnet, IpSubnet, SubnetParseError};
 pub use wire::{Message, PeerError};
+
+pub use download_window::{
+    DownloadWindow, FanoutCandidate, SyncBudget, SyncPeer, SyncPeerSelection,
+    configure_request_mode, default_sync_budget, statically_fanout_eligible,
+};
