@@ -91,6 +91,7 @@ impl MiningControl for SmokeMiningControl {
         Ok(MiningInfo {
             blocks: 0,
             last_candidate: None,
+            bits: 0x207f_ffff,
             difficulty: 1.0,
             network_hashes_per_second: 0.0,
             pooled_transactions: 0,

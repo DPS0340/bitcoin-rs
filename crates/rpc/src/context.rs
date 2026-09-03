@@ -799,7 +799,9 @@ pub struct MiningInfo {
     pub blocks: u32,
     /// Most recently assembled candidate facts.
     pub last_candidate: Option<LastCandidateInfo>,
-    /// Difficulty of the applied tip.
+    /// Compact target bits of the applied tip.
+    pub bits: u32,
+    /// Difficulty represented by `bits`.
     pub difficulty: f64,
     /// Estimated network hashes per second.
     pub network_hashes_per_second: f64,
