@@ -292,7 +292,7 @@ fn crash_recovery_resumes_from_local_bodies_without_checkpoint_or_redownload() -
 
         let recovered = restarted
             .applied_tip()
-            .load()
+            .load_full()
             .as_ref()
             .map_or(0, |tip| tip.height);
         assert_eq!(
@@ -311,6 +311,64 @@ fn crash_recovery_resumes_from_local_bodies_without_checkpoint_or_redownload() -
         assert_eq!(
             restarted.applied_tip().load().as_ref().map(|tip| tip.hash),
             Some(mined_hashes[usize::try_from(recovered - 1).context("height overflow")?].into()),
+            "{backend}: recovered tip hash"
+        );
+    }
+    Ok(())
+}
+
+/// Cold recovery includes genesis so the first replayed block has a valid base.
+#[test]
+fn crash_recovery_resumes_before_the_first_clean_checkpoint() -> Result<()> {
+    for backend in available_backends() {
+        let temp = tempfile::tempdir()?;
+        let config = make_config(&temp, backend);
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = genesis.block_hash();
+        let block_count = crash_recovery::PROGRESS_INTERVAL_BLOCKS + 3;
+
+        let (published_meta, mined_hashes) = {
+            let state = NodeState::open(config.clone(), None)?;
+            state.apply_block(&genesis)?;
+            let mut prev = genesis_hash;
+            let mut mined_hashes = vec![genesis_hash];
+            for height in 1..=block_count {
+                let block = mine_regtest_block(prev, height, genesis.header.time + height)?;
+                state.apply_block(&block)?;
+                mined_hashes.push(block.block_hash());
+                prev = block.block_hash();
+            }
+            let meta = crash_recovery::read_meta(&state)?.context("missing recovery metadata")?;
+            assert!(
+                meta.height >= crash_recovery::PROGRESS_INTERVAL_BLOCKS,
+                "{backend}: progress must publish at the block cadence"
+            );
+            (meta, mined_hashes)
+        };
+
+        let restarted = NodeState::open(config, None)?;
+        assert!(
+            restarted.applied_tip().load().is_none(),
+            "{backend}: a cold reopen must not restore an applied tip"
+        );
+        crash_recovery::recover_if_needed(&restarted)?;
+
+        let recovered_tip = restarted
+            .applied_tip()
+            .load_full()
+            .context("cold recovery did not apply the stored tip")?;
+        assert_eq!(
+            recovered_tip.height, published_meta.height,
+            "{backend}: recovered progress"
+        );
+        assert_eq!(
+            restarted.replayed_heights(),
+            (0..=published_meta.height).collect::<Vec<_>>(),
+            "{backend}: recovery must replay genesis through the durable tip"
+        );
+        assert_eq!(
+            recovered_tip.hash,
+            mined_hashes[usize::try_from(recovered_tip.height).context("height overflow")?].into(),
             "{backend}: recovered tip hash"
         );
     }

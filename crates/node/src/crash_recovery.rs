@@ -83,6 +83,26 @@ impl ProgressPublisher {
             return Ok(false);
         }
 
+        self.publish_inner(&mut cadence, height, hash)?;
+        Ok(true)
+    }
+
+    /// Publishes the supplied tip immediately, bypassing the normal cadence.
+    pub(crate) fn publish_now(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> core::result::Result<(), ProgressError> {
+        let mut cadence = self.cadence.lock();
+        self.publish_inner(&mut cadence, height, hash)
+    }
+
+    fn publish_inner(
+        &self,
+        cadence: &mut Cadence,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> core::result::Result<(), ProgressError> {
         self.body_store.sync().map_err(ProgressError::BodySync)?;
         write_meta_to_path(
             &self.meta_path,
@@ -94,7 +114,7 @@ impl ProgressPublisher {
         .map_err(ProgressError::Sidecar)?;
         cadence.height = height;
         cadence.at = Instant::now();
-        Ok(true)
+        Ok(())
     }
 
     fn mark_published(&self, height: u32) {
@@ -204,10 +224,12 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
             for height in &replayed {
                 state.push_replayed(*height);
             }
+            let first_replayed = replayed.first().copied().unwrap_or(gap_base);
+            let last_replayed = replayed.last().copied().unwrap_or(gap_base);
             tracing::info!(
                 replayed = replayed.len(),
-                from = gap_base + 1,
-                to = meta.height,
+                from = first_replayed,
+                to = last_replayed,
                 "crash recovery replayed from stored bodies"
             );
         }
@@ -240,8 +262,11 @@ fn replay_from_bodies(
     let mut current_hash = tip_hash;
     let mut current_height = tip_height;
 
-    let restored_height = restored_tip.map_or(0, |tip| tip.height);
-    while current_height > restored_height {
+    let restored_height = restored_tip.map(|tip| tip.height);
+    loop {
+        if restored_height.is_some_and(|base| current_height <= base) {
+            break;
+        }
         let body_bytes = body_store
             .load_block_body(current_height, current_hash)
             .with_context(|| format!("load block body for replay at height {current_height}"))?
@@ -259,8 +284,11 @@ fn replay_from_bodies(
         let prev_hash = block.header.prev_blockhash.0;
         blocks.push((current_height, block));
 
+        if current_height == 0 {
+            break;
+        }
         current_hash = prev_hash;
-        current_height = current_height.saturating_sub(1);
+        current_height -= 1;
     }
     if let Some(restored_tip) = restored_tip
         && current_hash != restored_tip.hash

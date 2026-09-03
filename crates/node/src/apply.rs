@@ -850,6 +850,9 @@ pub struct ApplyHandles {
     /// Publishes crash-recovery progress after the body store is durable.
     /// `None` in test harnesses.
     pub(crate) recovery_progress: Option<Arc<crate::crash_recovery::ProgressPublisher>>,
+    /// Publishes coherent checkpoints after branch switches.
+    /// `None` in test harnesses.
+    pub(crate) checkpoint_publisher: Option<Arc<crate::checkpoint::CheckpointPublisher>>,
     /// Hash-pinned assume-valid trust gate; the height shortcut above applies only while this is trusted.
     pub assume_valid_gate: Arc<AssumeValidGate>,
 }
@@ -919,6 +922,7 @@ impl ApplyHandles {
             assume_valid_height: 0,
             assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
             recovery_progress: None,
+            checkpoint_publisher: None,
         }
     }
 

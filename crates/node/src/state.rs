@@ -835,8 +835,8 @@ pub struct NodePruneService<S: KvStore> {
     pruneheight: Mutex<Option<u32>>,
     /// Height the last clean checkpoint would restore to, 0 when none exists.
     ///
-    /// Undo pruning is bounded by this, not by the in-memory applied tip, which
-    /// can run far ahead of it.
+    /// Block-body and undo pruning are bounded by this, not by the in-memory
+    /// applied tip, which can run far ahead of it.
     durable_tip_height: Arc<AtomicU32>,
 }
 
@@ -1053,14 +1053,9 @@ fn build_tx_index_open_spec(
 
 /// Aggregate handle to a running node.
 pub struct NodeState {
-    /// Height the last clean checkpoint would restore to, 0 when none exists.
-    ///
-    /// Published by `write_clean_checkpoint` and read by the pruner, which must
-    /// not delete an undo record a crash-restore would still need.
-    durable_tip_height: Arc<AtomicU32>,
+    checkpoint_publisher: Arc<crate::checkpoint::CheckpointPublisher>,
     config: NodeConfig,
     data_dir: PathBuf,
-    checkpoint_data_dir: cap_std::fs::Dir,
     #[cfg(test)]
     resume_source: ResumeSource,
     storage: NodeStorage,
@@ -1433,6 +1428,34 @@ impl NodeState {
                 Arc::new(observer),
             )
         };
+        // A restored checkpoint is durable at its own height by definition, so
+        // start there rather than at zero, which would refuse all pruning.
+        let durable_tip_height = Arc::new(AtomicU32::new(
+            applied_tip.load().as_ref().map_or(0, |tip| tip.height),
+        ));
+        let admission = Arc::new(crate::apply::ApplyAdmission::new());
+        let recovery_progress = Arc::new(crate::crash_recovery::ProgressPublisher::new(
+            config.data_dir.join(crate::crash_recovery::META_FILENAME),
+            Arc::clone(&block_body_store),
+            restored_height,
+        ));
+        let checkpoint_publisher = Arc::new(crate::checkpoint::CheckpointPublisher {
+            admission: Arc::clone(&admission),
+            undo_store: Arc::clone(&undo_store),
+            block_body_store: Arc::clone(&block_body_store),
+            applied_tip: Arc::clone(&applied_tip),
+            checkpoint_data_dir: checkpoint_data_dir.try_clone()?,
+            network: config.network,
+            genesis_hash: config.network.genesis_block_hash(),
+            block_tree: Arc::clone(&block_tree),
+            utxo: Arc::clone(&utxo),
+            coin_stats: Arc::clone(&coin_stats),
+            chain_tx_count: Arc::clone(&chain_tx_count),
+            data_dir: config.data_dir.clone(),
+            chain_events: Arc::clone(&chain_events),
+            durable_tip_height: Arc::clone(&durable_tip_height),
+            recovery_progress: Some(Arc::clone(&recovery_progress)),
+        });
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
@@ -1450,8 +1473,8 @@ impl NodeState {
             zmq_publisher: Arc::clone(&zmq_publisher),
             chain_events: Arc::clone(&chain_events),
             block_body_store: Some(Arc::clone(&block_body_store)),
-            undo_store,
-            admission: Arc::new(crate::apply::ApplyAdmission::new()),
+            undo_store: Arc::clone(&undo_store),
+            admission,
             shutdown: Arc::clone(&shutdown),
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
             assume_valid_height: config.assume_valid_height,
@@ -1459,11 +1482,8 @@ impl NodeState {
                 config.network,
                 config.assume_valid_height,
             )),
-            recovery_progress: Some(Arc::new(crate::crash_recovery::ProgressPublisher::new(
-                config.data_dir.join(crate::crash_recovery::META_FILENAME),
-                Arc::clone(&block_body_store),
-                restored_height,
-            ))),
+            recovery_progress: Some(recovery_progress),
+            checkpoint_publisher: Some(Arc::clone(&checkpoint_publisher)),
         };
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
         let sync = Arc::new(crate::BlockSync::new(
@@ -1472,11 +1492,6 @@ impl NodeState {
             Arc::clone(&peer_outbound),
             Arc::clone(&inbound_headers_rx),
             Arc::clone(&inbound_blocks_rx),
-        ));
-        // A restored checkpoint is durable at its own height by definition, so
-        // start there rather than at zero, which would refuse all undo pruning.
-        let durable_tip_height = Arc::new(AtomicU32::new(
-            applied_tip.load().as_ref().map_or(0, |tip| tip.height),
         ));
         let prune_service = if config.prune_target_mb > 0 {
             Some(storage.prune_service(
@@ -1500,10 +1515,9 @@ impl NodeState {
         );
         let data_dir = config.data_dir.clone();
         Ok(Self {
-            durable_tip_height,
+            checkpoint_publisher,
             config,
             data_dir,
-            checkpoint_data_dir,
             #[cfg(test)]
             resume_source,
             storage,
@@ -1583,64 +1597,7 @@ impl NodeState {
         &self,
     ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
     {
-        let _exclusive_apply = self.apply_handles.admission.close();
-        if let Some(marker) = self.apply_handles.undo_store.load_disconnect_marker()?
-            && marker.phase == crate::apply::DisconnectPhase::InFlight
-        {
-            return Err(crate::checkpoint::CheckpointError::DisconnectInFlight {
-                hash: marker.hash,
-                height: marker.height,
-            });
-        }
-        // A checkpoint may name this tip only after body files then index rows sync.
-        self.block_body_store.sync()?;
-        let applied_tip = self.applied_tip.load_full();
-        let written = crate::checkpoint::write_checkpoint_from_dir(
-            &self.checkpoint_data_dir,
-            crate::checkpoint::HeaderCheckpointConfig {
-                network: self.config.network,
-                genesis: self.config.network.genesis_block_hash(),
-            },
-            &self.block_tree,
-            &self.utxo,
-            &self.coin_stats,
-            applied_tip.as_deref(),
-            self.chain_tx_count
-                .load(core::sync::atomic::Ordering::Relaxed),
-        )?;
-        // A2: Only after `CheckpointWrite::Published` and root fsync, write
-        // the applied-tip witness for the same captured tip. A witness failure
-        // is not swallowed: return a typed checkpoint error.
-        if let crate::checkpoint::CheckpointWrite::Published { .. } = written {
-            if let Some(tip) = applied_tip.as_ref() {
-                let genesis_hex = self.config.network.genesis_block_hash().to_string_be();
-                let witness = crate::recovery_evidence::AppliedTipWitness::new(
-                    genesis_hex,
-                    self.chain_events.epoch(),
-                    tip.height,
-                    tip.hash.to_string_be(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs()),
-                );
-                crate::recovery_evidence::write_witness(&self.data_dir, &witness)
-                    .map_err(|e| crate::checkpoint::CheckpointError::Invalid(e.to_string()))?;
-            }
-        }
-        // Remove the marker only after this checkpoint publishes the matching
-        // UTXO set and applied tip. TxIndex is outside the authoritative
-        // disconnect transaction and recovers from its own atomic capability watermarks.
-        self.apply_handles
-            .undo_store
-            .disarm_disconnect()
-            .map_err(crate::checkpoint::CheckpointError::from)?;
-        // Everything up to this tip is now recoverable, so undo records below it
-        // may be pruned. Published after the write, never before.
-        self.durable_tip_height.store(
-            applied_tip.as_ref().map_or(0, |tip| tip.height),
-            Ordering::Release,
-        );
-        Ok(written)
+        self.checkpoint_publisher.publish()
     }
 
     /// Returns the configured storage backend that was opened.
@@ -2782,7 +2739,10 @@ mod tests {
 
         // No checkpoint has been written, so nothing is durable above genesis.
         assert_eq!(
-            state.durable_tip_height.load(Ordering::Acquire),
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire),
             0,
             "the fixture must have no durable checkpoint, or this proves nothing"
         );
@@ -2846,6 +2806,7 @@ mod tests {
         // prune to touch anything. Without that the prune is correctly refused,
         // which the sibling test asserts.
         state
+            .checkpoint_publisher
             .durable_tip_height
             .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
 
@@ -2919,6 +2880,10 @@ mod tests {
         std::fs::write(&current_file, [])?;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+        state
+            .checkpoint_publisher
+            .durable_tip_height
+            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
 
         match &state.storage {
@@ -3586,6 +3551,76 @@ mod tests {
         assert_eq!(marker_before, marker_after);
         assert_eq!(current_before, current_after);
         assert_eq!(dirs_before, dirs_after);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_settles_rolled_back_disconnect_debt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config, None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let genesis_hash = Hash256::from(genesis.block_hash());
+        state.apply_block(&genesis)?;
+        state.publish_checkpoint()?;
+
+        let checkpoint_root = data_dir.join("chainstate-checkpoints");
+        let current_before = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            checkpoint_root.join("CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+        state
+            .apply_handles()
+            .undo_store
+            .arm_disconnect(0, genesis_hash)?;
+        state
+            .apply_handles()
+            .undo_store
+            .complete_disconnect(0, genesis_hash)?;
+
+        assert!(state.checkpoint_publisher.settle_disconnect_debt()?);
+        assert!(
+            state
+                .apply_handles()
+                .undo_store
+                .load_disconnect_marker()?
+                .is_none()
+        );
+        let current_after = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            checkpoint_root.join("CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+        assert!(current_after > current_before);
+        assert_eq!(
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire),
+            0
+        );
+        let meta = crate::crash_recovery::read_meta(&state)?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint did not publish recovery metadata"))?;
+        assert_eq!(meta.height, 0);
+        assert_eq!(meta.tip_hash_hex, genesis_hash.to_string_be());
+
+        let inflight_hash = Hash256::from_le_bytes(&[0xcd; 32]);
+        state
+            .apply_handles()
+            .undo_store
+            .arm_disconnect(0, inflight_hash)?;
+        let marker_before = state.apply_handles().undo_store.load_disconnect_marker()?;
+        assert!(!state.checkpoint_publisher.settle_disconnect_debt()?);
+        assert_eq!(
+            state.apply_handles().undo_store.load_disconnect_marker()?,
+            marker_before
+        );
         Ok(())
     }
 
