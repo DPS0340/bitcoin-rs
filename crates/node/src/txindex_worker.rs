@@ -119,15 +119,13 @@ fn effective_open_timeout() -> Duration {
     TXINDEX_OPEN_TIMEOUT
 }
 
-/// Reconciliation leg the worker is executing against the applied tip.
-///
-/// Published by the worker at every leg change so operators can tell a
-/// rewind or rebuild apart from ordinary forward catch-up, whose progress is
-/// the durable watermark itself. Forward is the resting phase: an index whose
-/// watermark names the applied tip is ready; one below it is catching up.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReconcilePhase {
+/// Reconciliation leg one capability's rows are executing against the
+/// applied tip. Forward is the resting leg: a watermark that names the
+/// applied tip is ready; one below it is catching up.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReconcileLeg {
     /// Rows extend the active chain from the durable watermark.
+    #[default]
     Forward,
     /// Rows on an abandoned or ahead-of-tip branch are deleted block by
     /// block from `from_height` down to the common ancestor `to_height`.
@@ -137,13 +135,83 @@ pub enum ReconcilePhase {
         /// Height of the last block shared with the active chain.
         to_height: u32,
     },
-    /// The selected capabilities were reset and rebuild from genesis.
-    Rebuilding {
-        /// Whether the transaction-lookup rows are rebuilding.
-        tx_lookup: bool,
-        /// Whether the script-history rows are rebuilding.
-        script_history: bool,
-    },
+    /// The rows were reset and rebuild from genesis.
+    Rebuilding,
+}
+
+/// Reconciliation legs of every capability the worker owns.
+///
+/// Capabilities carry independent watermarks, so a selective reset can leave
+/// one capability rebuilding while its sibling still rewinds. The worker
+/// publishes each leg change so operators can tell a rewind or rebuild apart
+/// from ordinary forward catch-up, whose progress is the durable watermark
+/// itself.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReconcilePhase {
+    /// Transaction-lookup leg.
+    pub tx_lookup: ReconcileLeg,
+    /// Script-history leg.
+    pub script_history: ReconcileLeg,
+}
+
+impl ReconcilePhase {
+    /// Every capability moving forward.
+    pub const FORWARD: Self = Self {
+        tx_lookup: ReconcileLeg::Forward,
+        script_history: ReconcileLeg::Forward,
+    };
+
+    /// Returns the phase with `leg` assigned to every capability in
+    /// `capabilities`.
+    #[must_use]
+    pub const fn with_leg(mut self, capabilities: IndexCapabilities, leg: ReconcileLeg) -> Self {
+        if capabilities.tx_lookup {
+            self.tx_lookup = leg;
+        }
+        if capabilities.script_history {
+            self.script_history = leg;
+        }
+        self
+    }
+
+    /// Capabilities whose rows are rebuilding from genesis.
+    #[must_use]
+    pub const fn rebuilding(self) -> IndexCapabilities {
+        IndexCapabilities {
+            tx_lookup: matches!(self.tx_lookup, ReconcileLeg::Rebuilding),
+            script_history: matches!(self.script_history, ReconcileLeg::Rebuilding),
+        }
+    }
+
+    /// Widest rollback in flight: the highest watermark being rewound and
+    /// the lowest common ancestor any capability rewinds to.
+    #[must_use]
+    pub fn rolling_back(self) -> Option<(u32, u32)> {
+        [self.tx_lookup, self.script_history]
+            .into_iter()
+            .filter_map(|leg| match leg {
+                ReconcileLeg::RollingBack {
+                    from_height,
+                    to_height,
+                } => Some((from_height, to_height)),
+                ReconcileLeg::Forward | ReconcileLeg::Rebuilding => None,
+            })
+            .reduce(|(from_a, to_a), (from_b, to_b)| (from_a.max(from_b), to_a.min(to_b)))
+    }
+
+    /// Ends every rollback leg; rebuild legs persist until their rows reach
+    /// the applied tip.
+    #[must_use]
+    fn rollbacks_finished(self) -> Self {
+        let finish = |leg| match leg {
+            ReconcileLeg::RollingBack { .. } => ReconcileLeg::Forward,
+            other => other,
+        };
+        Self {
+            tx_lookup: finish(self.tx_lookup),
+            script_history: finish(self.script_history),
+        }
+    }
 }
 
 /// Shared wake/revision/health state owned by `NodeState` and referenced by
@@ -167,18 +235,23 @@ impl TxIndexRuntime {
             failed: AtomicBool::new(false),
             wake_tx,
             failure_message: RwLock::new(None),
-            phase: arc_swap::ArcSwap::from_pointee(ReconcilePhase::Forward),
+            phase: arc_swap::ArcSwap::from_pointee(ReconcilePhase::FORWARD),
         }
     }
 
-    /// Publishes the reconciliation leg the worker is executing.
+    /// Publishes the reconciliation phase. Only the worker thread writes it.
     pub fn publish_phase(&self, phase: ReconcilePhase) {
         if **self.phase.load() != phase {
             self.phase.store(Arc::new(phase));
         }
     }
 
-    /// Returns the reconciliation leg the worker last published.
+    /// Publishes `leg` for `capabilities`, leaving the other legs as they are.
+    pub fn publish_leg(&self, capabilities: IndexCapabilities, leg: ReconcileLeg) {
+        self.publish_phase(self.phase().with_leg(capabilities, leg));
+    }
+
+    /// Returns the reconciliation phase the worker last published.
     #[must_use]
     pub fn phase(&self) -> ReconcilePhase {
         **self.phase.load()
@@ -1569,12 +1642,21 @@ impl Worker {
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
         let action = self.reconcile_pass(pending)?;
-        // Rollback and rebuild phases end only when every enabled capability
-        // sits at the applied tip; that is exactly what `CaughtUp` means.
-        if matches!(action, ReconcileAction::CaughtUp) {
-            self.runtime.publish_phase(ReconcilePhase::Forward);
+        if !matches!(action, ReconcileAction::CaughtUp) {
+            return Ok(action);
         }
-        Ok(action)
+        // A forward leg commits one capability set at a time, so its
+        // completion is only `CaughtUp` when no enabled capability still
+        // lags the tip; otherwise the pass merely progressed and the
+        // remaining legs (and their published phase) carry over.
+        let (target, _, watermarks) = self.capture_target_watermarks()?;
+        if let Some(target) = target
+            && self.forward_selection(watermarks, &target).is_some()
+        {
+            return Ok(ReconcileAction::Progressed);
+        }
+        self.runtime.publish_phase(ReconcilePhase::FORWARD);
+        Ok(ReconcileAction::CaughtUp)
     }
 
     fn reconcile_pass(
@@ -1614,10 +1696,13 @@ impl Worker {
                 (fence, watermarks) = self.reset_for_rebuild(capabilities)?;
                 continue;
             }
-            self.runtime.publish_phase(ReconcilePhase::RollingBack {
-                from_height: watermark.height,
-                to_height: depth.map_or(0, |depth| watermark.height.saturating_sub(depth)),
-            });
+            self.runtime.publish_leg(
+                capabilities,
+                ReconcileLeg::RollingBack {
+                    from_height: watermark.height,
+                    to_height: depth.map_or(0, |depth| watermark.height.saturating_sub(depth)),
+                },
+            );
             match self.rollback_one(fence, watermarks, capabilities, watermark) {
                 Ok(_) => {
                     let (next_fence, next_watermarks) = self
@@ -1647,9 +1732,8 @@ impl Worker {
         }
         // A rewind ends with the rollback loop; a rebuild ends only when the
         // reset capabilities reach the tip again.
-        if matches!(self.runtime.phase(), ReconcilePhase::RollingBack { .. }) {
-            self.runtime.publish_phase(ReconcilePhase::Forward);
-        }
+        self.runtime
+            .publish_phase(self.runtime.phase().rollbacks_finished());
 
         let Some(target) = target else {
             return Ok(ReconcileAction::CaughtUp);
@@ -1669,10 +1753,8 @@ impl Worker {
         self.writer
             .reset_capabilities(capabilities)
             .map_err(TxIndexWorkerError::Index)?;
-        self.runtime.publish_phase(ReconcilePhase::Rebuilding {
-            tx_lookup: capabilities.tx_lookup,
-            script_history: capabilities.script_history,
-        });
+        self.runtime
+            .publish_leg(capabilities, ReconcileLeg::Rebuilding);
         self.writer
             .fenced_watermarks()
             .map_err(TxIndexWorkerError::Index)
@@ -2995,7 +3077,10 @@ impl TxIndexQueryEngine {
         Ok(records)
     }
 
-    fn index_info_internal(
+    /// Watermark progress of `required` capabilities against the applied
+    /// tip: `synced` when every one names the tip, `best_block_height` the
+    /// lowest of their heights.
+    pub(crate) fn index_info_for(
         &self,
         required: IndexCapabilities,
     ) -> Result<TxIndexInfo, TxQueryError> {
@@ -3083,7 +3168,7 @@ impl TxIndexQuery for TxIndexQueryEngine {
     }
 
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
-        self.index_info_internal(IndexCapabilities::TX_LOOKUP)
+        self.index_info_for(IndexCapabilities::TX_LOOKUP)
     }
 }
 

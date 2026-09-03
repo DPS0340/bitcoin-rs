@@ -238,7 +238,7 @@ impl Harness {
             watermarks.script_history, expected,
             "script_history watermark"
         );
-        assert_eq!(self.runtime.phase(), ReconcilePhase::Forward);
+        assert_eq!(self.runtime.phase(), ReconcilePhase::FORWARD);
     }
 
     fn index_ahead_marker(&self) -> Option<RollbackEventKind> {
@@ -336,10 +336,7 @@ fn deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up() {
     assert!(!matches!(first, ReconcileAction::CaughtUp));
     assert_eq!(
         h.runtime.phase(),
-        ReconcilePhase::Rebuilding {
-            tx_lookup: true,
-            script_history: true,
-        }
+        ReconcilePhase::FORWARD.with_leg(IndexCapabilities::ALL, ReconcileLeg::Rebuilding)
     );
     let watermarks = h.watermarks();
     assert!(
@@ -370,10 +367,7 @@ fn tip_change_during_rebuild_converges_on_new_tip() {
     let b3 = f.tip(f.b[2]);
     h.set_tip(&b3);
     h.worker.reconcile_once(&mut pending).expect("reset pass");
-    assert!(matches!(
-        h.runtime.phase(),
-        ReconcilePhase::Rebuilding { .. }
-    ));
+    assert_eq!(h.runtime.phase().rebuilding(), IndexCapabilities::ALL);
 
     // Canonical chain returns to A while the rebuild toward B is underway.
     h.set_tip(&a3);
@@ -398,12 +392,50 @@ fn missing_disconnected_body_routes_rewind_to_rebuild() {
     let b2 = f.tip(f.b[1]);
     h.set_tip(&b2);
     h.worker.reconcile_once(&mut pending).expect("reset pass");
-    assert!(matches!(
-        h.runtime.phase(),
-        ReconcilePhase::Rebuilding { .. }
-    ));
+    assert_eq!(h.runtime.phase().rebuilding(), IndexCapabilities::ALL);
     h.settle(&mut pending);
     h.assert_at(&b2);
+}
+
+/// `RCV-05`: capabilities carry independent watermarks, so one may rebuild
+/// while its sibling rewinds. The rebuild leg outlives the rollback loop and
+/// is published until the reset rows reach the applied tip.
+#[test]
+fn selective_rebuild_leg_survives_sibling_rollback() {
+    let f = ForkFixture::new(3);
+    let mut h = Harness::new(&f, 1);
+    let mut pending = None;
+
+    h.worker.enabled = IndexCapabilities::SCRIPT_HISTORY;
+    h.set_tip(&f.tip(f.a[0]));
+    h.settle(&mut pending);
+    h.worker.enabled = IndexCapabilities::TX_LOOKUP;
+    let a3 = f.tip(f.a[2]);
+    h.set_tip(&a3);
+    h.settle(&mut pending);
+    let watermarks = h.watermarks();
+    assert_eq!(watermarks.tx_lookup.map(|w| w.height), Some(3));
+    assert_eq!(watermarks.script_history.map(|w| w.height), Some(1));
+
+    // tx_lookup is three blocks off B (beyond cutover 1): rebuild.
+    // script_history is one block off B (within cutover): rewind.
+    h.worker.enabled = IndexCapabilities::ALL;
+    let b3 = f.tip(f.b[2]);
+    h.set_tip(&b3);
+    let first = h.worker.reconcile_once(&mut pending).expect("reset pass");
+    assert!(!matches!(first, ReconcileAction::CaughtUp));
+    assert_eq!(
+        h.runtime.phase(),
+        ReconcilePhase::FORWARD.with_leg(IndexCapabilities::TX_LOOKUP, ReconcileLeg::Rebuilding)
+    );
+    assert_eq!(
+        h.watermarks().script_history.map(|w| w.height),
+        Some(0),
+        "rewound to genesis"
+    );
+
+    h.settle(&mut pending);
+    h.assert_at(&b3);
 }
 
 /// `RCV-02`: an absent applied tip (headers-only start) is a position the
@@ -423,5 +455,5 @@ fn absent_tip_rewinds_index_to_empty() {
     let watermarks = h.watermarks();
     assert_eq!(watermarks.tx_lookup, None);
     assert_eq!(watermarks.script_history, None);
-    assert_eq!(h.runtime.phase(), ReconcilePhase::Forward);
+    assert_eq!(h.runtime.phase(), ReconcilePhase::FORWARD);
 }

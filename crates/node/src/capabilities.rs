@@ -8,13 +8,14 @@ use std::sync::Arc;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_index::IndexCapabilities;
 use bitcoin_rs_rpc::context::{
     CapabilityProvider, CapabilitySnapshot, CapabilityState, CapabilityStatus, TxIndexQuery as _,
 };
 use parking_lot::Mutex;
 
 use crate::NodeConfig;
-use crate::txindex_worker::{ReconcilePhase, TxIndexLifecycle, TxIndexRuntime};
+use crate::txindex_worker::{TxIndexLifecycle, TxIndexRuntime};
 
 /// Stable identifier used by the RPC capability report.
 pub(crate) const TXINDEX_CAPABILITY: &str = "txindex";
@@ -87,27 +88,33 @@ impl NodeCapabilities {
             TxIndexLifecycle::Serving(engine) => engine,
         };
         let target_height = Self::applied_height(applied_tip);
-        match runtime.phase() {
-            ReconcilePhase::RollingBack {
+        let phase = runtime.phase();
+        if let Some((from_height, to_height)) = phase.rolling_back() {
+            return CapabilityState::RollingBack {
                 from_height,
                 to_height,
-            } => CapabilityState::RollingBack {
-                from_height,
-                to_height,
-            },
-            ReconcilePhase::Rebuilding { .. } => CapabilityState::Rebuilding {
-                processed_height: engine.index_info().map_or(0, |info| info.best_block_height),
-                target_height,
-            },
-            ReconcilePhase::Forward => match engine.index_info() {
-                Ok(info) if info.synced => CapabilityState::Ready,
-                Ok(info) => CapabilityState::CatchingUp {
+            };
+        }
+        let rebuilding = phase.rebuilding();
+        if rebuilding != IndexCapabilities::NONE {
+            return match engine.index_info_for(rebuilding) {
+                Ok(info) => CapabilityState::Rebuilding {
                     processed_height: info.best_block_height,
                     target_height,
                 },
                 Err(error) => CapabilityState::Failed {
                     reason: error.to_string(),
                 },
+            };
+        }
+        match engine.index_info() {
+            Ok(info) if info.synced => CapabilityState::Ready,
+            Ok(info) => CapabilityState::CatchingUp {
+                processed_height: info.best_block_height,
+                target_height,
+            },
+            Err(error) => CapabilityState::Failed {
+                reason: error.to_string(),
             },
         }
     }

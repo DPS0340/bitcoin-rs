@@ -47,16 +47,21 @@ applied tip on every pass and takes exactly one transition:
 
 ### `RCV-03`: Rewind versus rebuild
 
+- `ReconcilePhase` holds one `ReconcileLeg` per capability, because
+  capabilities carry independent watermarks and may be in different legs at
+  once (one rebuilding while its sibling rewinds).
 - A rewind removes rows block by block using exact identity-bearing rows and
   the disconnected block's body. The worker publishes
-  `ReconcilePhase::RollingBack { from_height, to_height }` for its duration.
+  `ReconcileLeg::RollingBack { from_height, to_height }` on the rewinding
+  capabilities for its duration and returns them to `Forward` when the
+  rollback loop ends.
 - When the rewind depth to the common ancestor exceeds
   `rollback_rebuild_cutover`, or when a rewind cannot be performed exactly
   (missing disconnected body, missing watermark identity), the affected
-  capabilities are reset and rebuilt from genesis (`IDX-04`). The worker
-  publishes `ReconcilePhase::Rebuilding { tx_lookup, script_history }` until
-  every reset capability is back at the applied tip; the phase returns to
-  `Forward` only when a pass reports `CaughtUp`.
+  capabilities are reset and rebuilt from genesis (`IDX-04`). Their leg is
+  `ReconcileLeg::Rebuilding` until every reset capability is back at the
+  applied tip; a rebuild leg survives sibling rollbacks and is cleared only
+  when a pass reports `CaughtUp`.
 - The applied tip may move while a rewind or rebuild is in flight. The worker
   never restarts the transition; the next pass reconciles the new tip from the
   current durable watermarks.
@@ -73,9 +78,11 @@ applied tip on every pass and takes exactly one transition:
   reporting index worker (`TxIndexWorkerError::RollbackEvidence`), never the
   chain.
 - RPC exposes `CapabilityState::{Opening, CatchingUp, RollingBack, Rebuilding,
-  Ready, Failed, Disabled, ShutdownAbandoned}` per capability; `RollingBack`
+  Ready, Failed, Disabled, ShutdownAbandoned}` for the txindex; `RollingBack`
   and `Rebuilding` come from the worker's published `ReconcilePhase`, not from
-  query results.
+  query results. `Rebuilding.processed_height` is the lowest watermark of the
+  rebuilding capabilities only (`TxIndexQueryEngine::index_info_for`), so a
+  script-only rebuild reports script progress, not the untouched tx cursor.
 
 ## Proven by
 
@@ -85,6 +92,7 @@ applied tip on every pass and takes exactly one transition:
   (`RCV-04`), `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
   (`RCV-03`), `tip_change_during_rebuild_converges_on_new_tip` (`RCV-03`),
   `missing_disconnected_body_routes_rewind_to_rebuild` (`RCV-03`),
+  `selective_rebuild_leg_survives_sibling_rollback` (`RCV-03`),
   `absent_tip_rewinds_index_to_empty` (`RCV-02`).
 - `crates/node/src/txindex_worker_lifecycle_tests.rs` and
   `crates/node/src/txindex_worker_integration_tests.rs`: open failure, open
