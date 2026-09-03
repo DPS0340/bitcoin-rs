@@ -77,8 +77,8 @@ pub struct AdmissionRequest {
     /// inputs) from the mempool and UTXO set.
     pub context: crate::standardness::PackageTxContext,
     /// Resolved prevouts for consensus verification. Empty when the caller
-    /// has not resolved them (e.g., missing inputs); verification is
-    /// skipped in that case.
+    /// has not resolved them (e.g., missing inputs); the admission path
+    /// rejects the transaction outright rather than admitting it unverified.
     pub prevouts: Vec<(
         bitcoin_rs_primitives::OutPoint,
         bitcoin_rs_primitives::TxOut,
@@ -2385,6 +2385,55 @@ mod tests {
         assert!(
             matches!(result, Err(AdmitError::Consensus)),
             "a non-coinbase tx with no prevouts must be rejected: {result:?}"
+        );
+        assert!(gateway.read().is_empty());
+    }
+    /// A transaction spending the same prevout twice must be rejected by
+    /// consensus verification. Policy does not check for duplicate inputs
+    /// and pool insertion admits the double claim, so only the step-4b
+    /// `verify_transaction_non_script` call can produce this rejection: any
+    /// other outcome fails this assertion. Observed red with the guard
+    /// neutered (the double-spend committed as `Accepted`).
+    #[test]
+    fn admit_transaction_rejects_duplicate_inputs_as_consensus() {
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                min_relay_fee_sat_per_kvb: 0,
+                ..MempoolLimits::default()
+            }))),
+            None,
+        );
+        let mut tx = standard_tx(0x45);
+        tx.inputs.push(tx.inputs[0].clone());
+        let generation = gateway.stable_generation().expect("generation is even");
+        let sequence = gateway.read().sequence_number();
+        let request = AdmissionRequest {
+            tx: Arc::new(tx.clone()),
+            context: PackageTxContext {
+                fee: 1_000,
+                vsize: 100,
+                sigop_cost: 0,
+                missing_inputs: false,
+            },
+            prevouts: vec![(
+                tx.inputs[0].previous_output,
+                TxOut {
+                    value: 11_000,
+                    script_pubkey: Vec::new(),
+                },
+            )],
+            locktime_cutoff: 0,
+            max_feerate_sat_per_kvb: None,
+            time: 1,
+            height: 1,
+            origin: AdmissionOrigin::Rpc,
+            expected_generation: generation,
+            expected_sequence: sequence,
+        };
+        let result = gateway.admit_transaction(request);
+        assert!(
+            matches!(result, Err(AdmitError::Consensus)),
+            "duplicate inputs must fail consensus verification: {result:?}"
         );
         assert!(gateway.read().is_empty());
     }
