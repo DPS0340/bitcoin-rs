@@ -17,22 +17,22 @@ through the `ZmqPublisher` trait and its `SocketZmqPublisher` / `TracingZmqPubli
 / `NoOpZmqPublisher` implementations and the `TxIndexRuntime` worker; `signal` and
 `shutdown` bridge process signals into graceful shutdown.
 
+The node crate registers only `benches/sync_pipeline.rs` as a Criterion benchmark.
+Large corpus/replay/evidence harnesses are intentionally not shipped by this
+runtime crate.
+
 ## Features
-- `default` (enables `fjall` and `kernel`): the performance-oriented fjall storage
-  backend plus the bitcoinkernel consensus verifier, so per-crate `cargo check` works
-  out of the box.
+- `default` (enables `fjall`, `kernel`, and `zmq`): the performance-oriented fjall
+  storage backend plus the bitcoinkernel consensus verifier and ZMQ notifications,
+  so per-crate `cargo check` works out of the box. The `bitcoin-rs` binary's own
+  defaults are the pure-Rust `fjall,redb,zmq`; `kernel` stays opt-in there.
 - `rocksdb`, `fjall`, `redb`: forward the named storage backend to every subsystem
   crate.
 - `mdbx`: forward the mdbx backend to the crates that provide one.
 - `kernel`: route consensus verification through bitcoinkernel
   (`bitcoin-rs-consensus/kernel`).
-- `checksig-census`: `kernel` plus the consensus crate's checksig-census
-  instrumentation.
-- `mimalloc`: pulls the optional `mimalloc` dependency; the
-  `mainnet_prefix_replay` example registers it as the global allocator.
-- `utreexo`: pull in the optional `bitcoin-rs-utreexo` crate.
 - `prometheus-http`: enables the `metrics-exporter-prometheus/http-listener` feature;
-  the in-process metrics recorder does not start an HTTP listener.
+  the production listener itself is controlled by `metrics_bind`.
 
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the
 project vocabulary.

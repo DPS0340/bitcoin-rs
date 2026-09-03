@@ -540,6 +540,7 @@ fn write_response(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicBool, Ordering};

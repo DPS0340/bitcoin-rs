@@ -13,16 +13,27 @@ This page maps it to what you might want.
   before assuming it means what it means elsewhere in Bitcoin.
 - [../README.md](../README.md) covers the defaults and the measured benchmark.
 
+## Contracts
+
+[docs/contracts/](contracts/) holds the normative behavior docs. Each one
+states what the code must keep, then names the files and tests that prove
+it. When documents disagree, the contract wins and the drift is a bug. The
+precedence rule and the index of contract pages live in
+[docs/contracts/README.md](contracts/README.md).
+
 ## Reference
 
 - [policies/](policies/) holds the rules a change has to satisfy.
   [source-compatibility.md](policies/source-compatibility.md) covers the
   toolchain and dependency rules;
   [db-migration.md](policies/db-migration.md) covers on-disk schema changes.
-- [benchmarks/](benchmarks/) holds the benchmark methodology in
-  [end-to-end-sync.md](benchmarks/end-to-end-sync.md) and the raw run data
-  under `data/`. Read the methodology before quoting any number: the results
-  depend on CPU pinning and on whether the harness competes with the node.
+- [benchmarks/](benchmarks/) holds the retained benchmark notes:
+  [end-to-end-sync.md](benchmarks/end-to-end-sync.md),
+  [index-read-path.md](benchmarks/index-read-path.md), and
+  [utxo-memory.md](benchmarks/utxo-memory.md). Read the methodology before
+  quoting any number: the results depend on CPU pinning and on whether the
+  harness competes with the node. Raw run evidence lives in the corresponding
+  PR discussions, not in the tree.
 
 ## Explanation
 
@@ -31,40 +42,27 @@ real time, and what was concluded. Five areas, `architecture-patterns`,
 `best-practices`, `logic-errors`, `performance`, and `performance-issues`.
 
 Search it before debugging a recurring problem or designing in an area someone
-has already touched. Several entries record approaches that were measured and
-rejected, which is the cheapest kind of result to reuse.
+has already touched.
 
-## Internal working notes
 
-These two are the project thinking aloud. They are kept because the reasoning
-is useful, not because they describe current behaviour. Do not treat either as
-a description of how the node works today.
-
-- [plans/](plans/) holds design blueprints for multi-step campaigns, each dated
-  and scoped to the work that prompted it, plus the historical records moved out
-  of `PLAN.md`: the
-  [2026-06-05 performance campaign ledger](plans/2026-06-05-performance-campaign-ledger.md)
-  and the [2026-05-19 Ultrareview log](plans/2026-05-19-ultrareview-log.md).
-- [brainstorms/](brainstorms/) holds exploratory requirements from before a
-  direction was settled.
 
 ## Known gaps
 
-**Do not run this on mainnet as your only node.** Sync now calls
+**Do not run this on mainnet as your only node.** Sync calls
 `switch_to_branch` when a higher-work header branch wins. It preloads the
-divergent bodies, revalidates the plan under one chain-transition guard, and
-retires staged accounting after each committed connect. A fatal partial
-transition stops the process.
+divergent bodies, revalidates the plan under one chain-transition guard,
+restores UTXO state and coinstats, re-admits disconnected non-coinbase
+transactions to the mempool in dependency order, and wakes index consumers to
+reconcile asynchronously. A fatal partial transition stops the process.
 
-Reorg handling still does not return disconnected transactions to the mempool.
-That requires one production admission pipeline shared by Esplora broadcast, P2P relay,
-and reorg handling. Production transaction relay is also incomplete. The ZMQ
-`pubsequence` stream publishes block connect/disconnect events, but intentionally
-does not emit mempool `A`/`R` events until mempool event sequencing is redesigned.
+The ZMQ `pubsequence` stream publishes block connect/disconnect events and
+mempool `A`/`R` events with per-change sequence assignment and explicit removal
+reasons.
 
-Also incomplete: metrics coverage and parts of the CLI and RPC surface.
+Still incomplete: production P2P transaction relay, broader metrics coverage,
+and parts of the CLI and RPC surface.
 
-On documentation itself: there is no API reference and no tutorial series.
-JSON-RPC uses Bitcoin Core's method names, so Core's API documentation applies
-to the shared surface; the authoritative list of what this node implements is
-the dispatch table in `crates/rpc/src/handlers.rs`.
+On documentation itself: there is no tutorial series. JSON-RPC uses Bitcoin
+Core's method names, so Core's API documentation applies to the shared surface;
+the authoritative list of what this node implements is the manifest and dispatch
+table in `crates/rpc/src/handlers.rs`.

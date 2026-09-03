@@ -65,6 +65,10 @@ Done:
   absent tip can commit the complete prepared prefix; the next pass repairs it.
 * A fatal disconnect closes apply admission and sets the process shutdown token.
   The durable marker prevents a restart on torn authoritative state.
+* Whole-UTXO RPC scans share the node's chain-transition mutex. In particular,
+  `scantxoutset` captures its UTXO view and applied-tip metadata while connects
+  and disconnects are excluded, so response height, hash, confirmations, and
+  unspents describe one authoritative state.
 
 Still open: transaction reconsideration, filter-index backfill, real crash
 replay, and the ignored live `g10_reorg_deep` gate. ZMQ now publishes block
@@ -172,16 +176,17 @@ Done:
 | Persistence | queued before the block body and UTXO commit; flushed with a clean checkpoint, not per block |
 | `disconnect_block` | restores the UTXO set, coinstats, and applied tip; then publishes a TxIndex wake |
 | TxIndex reconciliation | one node-owned worker rolls enabled capability watermarks back to the common ancestor, then assembles count-and-byte-bounded forward batches across strict descendant tip revisions. Equal cursors share one body parse and atomic commit; divergent cursors move independently. `--scriptindex` enables generic script UTXO, history, and outpoint-spender queries, while only explicit `--txindex` advertises Core txindex semantics. Each queued wake triggers reconciliation without moving the pending batch's fixed deadline. Exact capability snapshot-plus-tip gating keeps individual queries unavailable until every consumed watermark matches. Esplora additionally captures the applied-tip identity around each GET response so independently safe index reads cannot be combined across a reorg. |
-| `coin_stats` rewind | block-level fields only; the per-coin ones ride the `UtxoSet` change listener, which the undo already drives in reverse |
+| `coin_stats` rewind | block-level fields are explicitly rewound; optional listener users get per-coin inverse updates from the UTXO undo, while the default node recomputes UTXO-derived fields during checkpoint and stable reads |
 | Filter header cache | repointed at the parent; the index itself needs no rollback because its rows are hash-addressed like block bodies |
 | `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
 | `DisconnectError` | splits `Refused` (nothing touched) from `Fatal` (partly rolled back, carries hash and height), plus `MarkerStuck` (rolled back, but the interlock would not clear) |
 | Durable interlock | a phased in-flight marker in `UndoData`, armed and flushed before the UTXO mutation; startup refuses while it is set. TxIndex is outside this marker. See *Disconnect marker phase* in `CONCEPTS.md` |
-| Chain-transition serialization | `ChainTransition` proves that admission and the exclusive transition lock were acquired in that order. One witness covers authoritative replanning, all disconnects, and the available contiguous connect prefix. |
+| Chain-transition serialization | `ChainTransition` proves that admission and the exclusive transition lock were acquired in that order. One witness covers authoritative replanning, all disconnects, and the available contiguous connect prefix. `PruneGuard` wraps the same witness, reads the applied tip only after acquisition, validates the monotonic prune height against the reorg-safety margin, and remains held through storage, file, and cache deletion. |
 | Branch switching | `switch_to_branch` recomputes the complete ordered `plan_reorg` result under the transition guard and mutates only when it equals the optimistic plan. A shorter branch is eligible when its accumulated work is greater. A permanent connect failure invalidates its subtree and selects the best valid tip. |
-| Body acquisition | Each attempt loads all disconnect bodies and the contiguous connect prefix available from bounded staging, durable storage, or the applied body cache. The first missing connect body prevents mutation. A later missing body follows a coherent committed prefix. Each committed connect retires its exact staging and download-window entry; invalid subtree ownership is purged. |
+| Body acquisition | Each attempt loads all disconnect bodies and the contiguous connect prefix from bounded staging first, then the fallible `PruneBodyStore`; there is no applied-record body cache. The first missing connect body prevents mutation. A later missing body follows a coherent committed prefix. Each committed connect retires its exact staging and download-window entry; invalid subtree ownership is purged. |
 | Fatal lifecycle | `Fatal` and `MarkerStuck` close apply admission while the transition lock is held; sync sets the shared process shutdown token |
 | RPC invalidation | `invalidateblock` delegates through `ChainControl`; unknown blocks map to Core not-found, genesis is refused, required bodies are preflighted before header mutation, one transition witness spans invalidation and branch switching, and a successful active-tip rollback emits `pubsequence D` |
+| Whole-chainstate RPC reads | `scantxoutset` shares the chain-transition mutex and reads its UTXO scan plus applied-tip identity under that guard; it cannot publish metadata from the opposite side of a connect or disconnect. |
 
 Open:
 

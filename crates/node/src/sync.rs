@@ -12,130 +12,38 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 mod stage;
-mod window;
 
-use bitcoin::BlockHash;
 use bitcoin::hashes::Hash as _;
-use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin_rs_chain::{BlockTree, ChainError, NodeId, TipSnapshot, plan_reorg};
-#[cfg(test)]
-use bitcoin_rs_p2p::Message;
-use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, PeerInfo, PeerLease};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, Message, PeerInfo, PeerLease};
+use bitcoin_rs_primitives::{Block, Hash256};
 use crossbeam_channel::Receiver;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use self::stage::{BlockStager, DrainedBlock, StagedBlock};
-use self::window::DownloadWindow;
-pub use self::window::SyncBudget;
+#[allow(unused_imports)]
+use bitcoin_rs_p2p::download_window::{
+    configure_request_mode, default_sync_budget, statically_fanout_eligible, DownloadWindow,
+    FanoutCandidate, SyncPeer, SyncPeerSelection, GETDATA_BATCH_SIZE,
+    INBOUND_BLOCK_STAGE_CHUNK, MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_SERIALIZED_BLOCK_SIZE,
+    PENDING_BLOCK_BYTE_ESTIMATE, PENDING_BUDGET, PENDING_BYTE_BUDGET,
+    PENDING_TIMEOUT, PEER_INFLIGHT_BUDGET, RECEIVED_BLOCK_BUDGET, RECEIVED_BLOCK_BYTE_BUDGET,
+    RECEIVED_BLOCK_TIMEOUT, BLOCK_STALLING_TIMEOUT, BLOCK_STALLING_TIMEOUT_MAX, STALLER_COOLDOWN,
+};
+pub use bitcoin_rs_p2p::download_window::SyncBudget;
+pub(crate) use bitcoin_rs_p2p::download_window::MIN_PEERS_FOR_FANOUT;
 
 /// Maximum number of locator entries we ever send.
 const LOCATOR_MAX_ENTRIES: usize = 32;
 /// Wire protocol version we advertise on outbound `getheaders`.
 const PROTOCOL_VERSION: u32 = 70_016;
-/// Maximum number of block inventory entries we request per tick.
-///
-/// Keep the private default at the full pending window so a healthy peer can
-/// fill it in one tick; `DownloadWindow` still caps requests by pending bytes,
-/// block budget, and per-peer inflight budget.
-const GETDATA_BATCH_SIZE: usize = PENDING_BUDGET;
 /// Time after which an unanswered `getheaders` request may be retried.
 const HEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Time after which a pending getdata is considered stuck and re-requestable.
-const PENDING_TIMEOUT: Duration = Duration::from_mins(1);
-/// Maximum number of in-flight getdata requests we'll track per `BlockSync`.
-const PENDING_BUDGET: usize = 128;
-/// Time after which a received out-of-order block is discarded.
-const RECEIVED_BLOCK_TIMEOUT: Duration = Duration::from_mins(1);
-/// Maximum number of received blocks waiting for their predecessor.
-const RECEIVED_BLOCK_BUDGET: usize = 128;
-/// Mainnet-oriented block-size estimate for sizing the in-flight request window.
-const PENDING_BLOCK_BYTE_ESTIMATE: usize = 2 * 1024 * 1024;
-/// Maximum estimated bytes in the in-flight request window.
-const PENDING_BYTE_BUDGET: usize = PENDING_BUDGET * PENDING_BLOCK_BYTE_ESTIMATE;
-/// Maximum serialized bytes staged in memory while waiting for predecessors.
-///
-/// Defined as [`PENDING_BYTE_BUDGET`] so the in-flight and staged byte bounds
-/// stay one consistent pair: a full download window (`PENDING_BUDGET` blocks
-/// at the high-height `PENDING_BLOCK_BYTE_ESTIMATE`) always fits in staging
-/// without eviction. At the 150k acceptance window this bound rarely binds —
-/// blocks there are far below the per-slot estimate.
-const RECEIVED_BLOCK_BYTE_BUDGET: usize = PENDING_BYTE_BUDGET;
-/// Consensus-maximum serialized block size in bytes: a witness-serialized
-/// block cannot exceed its 4,000,000 weight, so no valid block is larger.
-const MAX_SERIALIZED_BLOCK_SIZE: usize = 4_000_000;
-// Staller-arming reachability invariant (Phase 1 of the staller arming
-// redesign): the stall episode arms on a staged-count fraction
-// (`received >= max_received_blocks / 2`, `window_blocked_on` term 3), so the
-// staged byte budget must admit at least half the staged count window even at
-// consensus-maximum block size. If a depth bump (e.g. the w256 re-attempt)
-// outgrows the byte budget, byte backpressure would silently hold the staged
-// count below the arming fraction and byte-shaped wedges would stop arming at
-// production budgets, degrading to the 60s pending-timeout fallback. Rebalance
-// both constants together; this assertion turns silent drift into a build
-// failure. (Margin today: 128 * 2 MiB >= 64 * 4 MB, ~4.6%.)
-const _: () = assert!(
-    RECEIVED_BLOCK_BYTE_BUDGET >= RECEIVED_BLOCK_BUDGET / 2 * MAX_SERIALIZED_BLOCK_SIZE,
-    "staged byte budget must admit half the staged count window at max block size"
-);
-/// Maximum decoded inbound blocks held before handing them to `BlockStager`,
-/// sized from the same byte budget that bounds retained staged blocks.
-const INBOUND_BLOCK_STAGE_CHUNK: usize =
-    at_least_one(RECEIVED_BLOCK_BYTE_BUDGET / PENDING_BLOCK_BYTE_ESTIMATE);
-/// Maximum block requests one peer may own at once outside fan-out.
-///
-/// Keep the fallback per-peer cap equal to the global cap so the bounded
-/// scheduler needs only one healthy peer to fill the whole window — this IS
-/// the shipped single-peer behavior and stays bit-identical when fewer than
-/// [`MIN_PEERS_FOR_FANOUT`] eligible peers exist.
-const PEER_INFLIGHT_BUDGET: usize = PENDING_BUDGET;
-/// Per-peer in-flight cap while fan-out is active, mirroring Bitcoin Core's
-/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (16, `net_processing.cpp`). A deep
-/// per-peer pipeline under fan-out reproduces the recorded head-of-line
-/// collapse; a shallow stripe without the fallback reproduces the early-height
-/// under-fill regression — both are pinned in
-/// `docs/solutions/architecture-patterns/multi-peer-block-download-requires-core-stalling-disconnect.md`.
-const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
-/// Minimum peer population that can fill the 128-block window at Core's
-/// 16-block per-peer floor. Below this count, one healthy peer's deep
-/// sequential pipeline beats fragmented stripes on real mainnet peers; the
-/// bounded cold-front hedge handles a silent owner without under-filling.
-const MIN_PEERS_FOR_FANOUT: usize = PENDING_BUDGET / MAX_BLOCKS_IN_TRANSIT_PER_PEER;
-/// Initial window-blocked stalling threshold, mirroring Bitcoin Core's
-/// `BLOCK_STALLING_TIMEOUT_DEFAULT` (2s, `net_processing.cpp`): when the
-/// window front has been in flight to one peer this long with the apply
-/// frontier idle and no other download progress possible, that peer is
-/// disconnected and its blocks re-queued (R8).
-const BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
-/// Adaptive ceiling for the stalling threshold, mirroring Core's
-/// `BLOCK_STALLING_TIMEOUT_MAX` (64s): the threshold doubles per staller
-/// disconnect so a sudden bandwidth drop cannot cascade into disconnecting
-/// every peer at the 2s floor, and decays by x0.85 per window-front arrival
-/// (never snapping back) so the elevation survives a peer rotation.
-const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
-/// How long a disconnected staller stays excluded from fan-out eligibility
-/// and non-last-resort block requests. Sized to the threshold ceiling: a
-/// staller flapping through reconnects can capture the window front at most
-/// once per cooldown, and the (window-global) doubled threshold bounds each
-/// capture — Core has no equivalent only because its reconnecting peer
-/// cannot re-acquire in-flight assignments this cheaply.
-const STALLER_COOLDOWN: Duration = BLOCK_STALLING_TIMEOUT_MAX;
-
-// The apply-side cache horizon (`expected_apply_horizon`) stays within the
-// inline capacity below only because the staging budget equals the in-flight
-// budget; a drift would silently spill every cached run to the heap. The
-// byte-budget pair needs no twin assertion: `RECEIVED_BLOCK_BYTE_BUDGET` is
-// `PENDING_BYTE_BUDGET` by definition.
-const _: () = assert!(PENDING_BUDGET == RECEIVED_BLOCK_BUDGET);
 
 type ExpectedBlockHashes = SmallVec<[Hash256; RECEIVED_BLOCK_BUDGET]>;
-
-const fn at_least_one(value: usize) -> usize {
-    if value == 0 { 1 } else { value }
-}
 
 /// Block download orchestrator.
 pub struct BlockSync {
@@ -150,70 +58,6 @@ pub struct BlockSync {
     expected_apply_cache: Arc<Mutex<Option<ExpectedApplyCache>>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct SyncPeer {
-    addr: SocketAddr,
-    start_height: i32,
-}
-
-#[derive(Clone, Debug, Default)]
-struct SyncPeerSelection {
-    header_peer: Option<SyncPeer>,
-    request_peers: Vec<SyncPeer>,
-    probe_peers: Vec<SyncPeer>,
-}
-
-/// A height-eligible sync candidate annotated with its fan-out eligibility
-/// (KTD6 predicate, finalized across `statically_fanout_eligible` and the
-/// window's soft-demotion check) and with whether the window currently
-/// soft-blocks it for block requests (expired pendings or staller cooldown).
-#[derive(Clone, Copy, Debug)]
-struct FanoutCandidate {
-    peer: SyncPeer,
-    fanout_eligible: bool,
-    soft_blocked: bool,
-}
-
-/// Connection-level clauses of the fan-out eligibility predicate (KTD6):
-/// outbound and witness-serving (`NODE_WITNESS`), per Bitcoin Core's
-/// block-download peer criteria in `net_processing.cpp` (Core requests blocks
-/// only from witness peers post-segwit, and inbound peers are
-/// attacker-chosen — counting them toward fan-out is the recorded under-fill
-/// regression). The height clause lives in the candidate filter and the
-/// soft-demotion clause in [`DownloadWindow::peer_has_expired_pending`].
-fn statically_fanout_eligible(peer: &PeerInfo) -> bool {
-    let witness = bitcoin::p2p::ServiceFlags::WITNESS.to_u64();
-    !peer.inbound && peer.services & witness != 0
-}
-
-fn configure_request_mode(
-    window: &mut DownloadWindow,
-    candidates: &[FanoutCandidate],
-    now: Instant,
-) -> Option<SyncPeer> {
-    let eligible = candidates
-        .iter()
-        .filter(|candidate| candidate.fanout_eligible)
-        .count();
-    let preferred_addr = window.preferred_peer();
-    let preferred_candidate = preferred_addr.and_then(|addr| {
-        candidates
-            .iter()
-            .find(|candidate| candidate.peer.addr == addr)
-    });
-    let preferred = preferred_candidate
-        .filter(|candidate| !candidate.soft_blocked)
-        .map(|candidate| candidate.peer);
-    if eligible < window.min_peers_for_fanout() && preferred_candidate.is_some() {
-        window.set_fanout_eligible_peers(0, now);
-        return preferred;
-    }
-    if preferred_addr.is_some() {
-        window.clear_preferred_peer();
-    }
-    window.set_fanout_eligible_peers(eligible, now);
-    None
-}
 
 #[derive(Clone, Copy, Debug)]
 struct PendingHeaderRequest {
@@ -321,10 +165,14 @@ impl BlockSync {
         Arc::new(move |peer_addr, lease, info| {
             let mut window = window.lock();
             let mut outbound = outbound.write();
-            let replaced = outbound.remove(&peer_addr).is_some_and(|prior| {
-                prior.cancel();
-                true
-            });
+            let replaced = match outbound.remove(&peer_addr) {
+                Some(prior) if prior.same_connection(&lease) => false,
+                Some(prior) => {
+                    prior.cancel();
+                    true
+                }
+                None => false,
+            };
             window.forget_peer(peer_addr);
             outbound.insert(peer_addr, lease);
             let mut peers = peers.write();
@@ -386,6 +234,41 @@ impl BlockSync {
         self.request_headers_from_best_peer();
         if sent_getdata {
             self.record_pending_sync_metrics();
+        }
+    }
+    /// Emits a one-line sync-progress summary at INFO level.
+    ///
+    /// Reports applied height, header (chain) height, the gap, live peer
+    /// count, and whether the node is still in initial block download. This
+    /// is the operator-facing progress signal that #223 identified as
+    /// missing during IBD — without it, `docker logs` shows no indication
+    /// that the node is alive and applying blocks.
+    pub fn emit_sync_progress(&self) {
+        let applied_tip = self.handles.applied_tip.load_full();
+        let chain_tip = self.handles.chain_tip.load_full();
+        let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
+        let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
+        let live_peers = self.peer_outbound.read().len();
+        let in_ibd = header_height > 0 && applied_height < header_height;
+        let gap = header_height.saturating_sub(applied_height);
+
+        if in_ibd {
+            tracing::info!(
+                applied_height,
+                header_height,
+                gap,
+                peers = live_peers,
+                ibd = true,
+                "sync progress"
+            );
+        } else {
+            tracing::info!(
+                applied_height,
+                header_height,
+                peers = live_peers,
+                ibd = false,
+                "sync progress"
+            );
         }
     }
     #[allow(clippy::too_many_lines)]
@@ -524,11 +407,11 @@ impl BlockSync {
         let mut blocks = Vec::with_capacity(INBOUND_BLOCK_STAGE_CHUNK);
         let mut received = 0_usize;
         let mut receiver_empty = false;
-        let mut saw_block = false;
+        let saw_block = false;
         while !receiver_empty {
             receiver_empty = self.fill_inbound_block_chunk(
                 &mut blocks,
-                &mut saw_block,
+                saw_block,
                 &mut next_expected_hash,
                 &mut apply_head_check,
             );
@@ -584,7 +467,7 @@ impl BlockSync {
     fn fill_inbound_block_chunk(
         &self,
         blocks: &mut Vec<InboundBlock>,
-        saw_block: &mut bool,
+        saw_block: bool,
         next_expected_hash: &mut Option<Hash256>,
         apply_head_check: &mut Option<Hash256>,
     ) -> bool {
@@ -593,12 +476,12 @@ impl BlockSync {
             let Ok(inbound) = receiver.try_recv() else {
                 return true;
             };
-            if !*saw_block {
+            if !saw_block {
                 *next_expected_hash = self.next_expected_block_hash();
-                *apply_head_check = next_expected_hash.as_ref().copied().filter(|hash| {
-                    *hash != Hash256::from_le_bytes(inbound.block.block_hash().as_byte_array())
-                });
-                *saw_block = true;
+                *apply_head_check = next_expected_hash
+                    .as_ref()
+                    .copied()
+                    .filter(|hash| *hash != Hash256::from(inbound.block.block_hash()));
             }
             blocks.push(inbound);
         }
@@ -628,7 +511,7 @@ impl BlockSync {
             let tree = self.handles.block_tree.read();
             let indexed_tip = Self::indexed_applied_ancestry_tip(&tree, &applied_tip);
             blocks.retain(|inbound| {
-                let hash = Hash256::from_le_bytes(inbound.block.block_hash().as_byte_array());
+                let hash = Hash256::from(inbound.block.block_hash());
                 let Some(node_id) = tree.lookup(hash) else {
                     return true;
                 };
@@ -646,7 +529,7 @@ impl BlockSync {
         {
             let mut stager = self.block_stager.lock();
             for inbound in blocks.drain(..) {
-                let hash = Hash256::from_le_bytes(inbound.block.block_hash().as_byte_array());
+                let hash = Hash256::from(inbound.block.block_hash());
                 let source = inbound.source;
                 let staged = stager.insert(
                     hash,
@@ -674,6 +557,7 @@ impl BlockSync {
                     .map(|source| source.addr);
                 match staged {
                     StagedBlock::AlreadyStaged => {
+                        metrics::counter!("node.sync.duplicate_deliveries").increment(1);
                         if let Some(source_peer) = source_peer {
                             window.credit_duplicate_delivery(hash, source_peer);
                         }
@@ -775,6 +659,17 @@ impl BlockSync {
                     "block sync: connect failed"
                 );
             }
+            Err(crate::reorg::ReorgError::DisconnectBodyLost {
+                disconnected,
+                stopped_at,
+                ..
+            }) => {
+                tracing::debug!(
+                    disconnected,
+                    stopped_at,
+                    "block sync: disconnect body unreadable mid-rollback, coherent at reached tip"
+                );
+            }
             Err(error) => {
                 tracing::warn!(%error, "block sync: branch switch failed");
             }
@@ -802,6 +697,7 @@ impl BlockSync {
         (!plan.disconnect.is_empty()).then_some(chain_tip.tip_id)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_buffered_blocks(&self, next_expected_hash: Option<Hash256>) -> (usize, usize) {
         let mut applied = 0_usize;
         let mut failed = 0_usize;
@@ -852,7 +748,7 @@ impl BlockSync {
             // Borrowed, not cloned. `DrainedBlock` owns a whole block, so
             // cloning one deep-copies every transaction and witness; doing that
             // per block per window would spend the dispatch win on memcpy.
-            let blocks: Vec<&bitcoin::Block> = chunk.iter().map(|drained| &drained.block).collect();
+            let blocks: Vec<&Block> = chunk.iter().map(|drained| &drained.block).collect();
             let bodies: Vec<bytes::Bytes> = chunk
                 .iter()
                 .map(|drained| drained.serialized.clone())
@@ -887,6 +783,29 @@ impl BlockSync {
                     self.block_stager
                         .lock()
                         .restore_many(drained[restore_from..].iter().cloned());
+                    if error.disposition == crate::apply::WindowApplyDisposition::Permanent {
+                        // The failed block's descendants can never become
+                        // valid, so they must not occupy bounded download
+                        // state or the frontier would cycle on them forever.
+                        // Purge every invalidated hash from the stager and
+                        // from the window's pending/received maps; the
+                        // expected-apply cache is dropped below because the
+                        // round failed.
+                        {
+                            let mut stager = self.block_stager.lock();
+                            for invalid_hash in &error.invalidated {
+                                stager.retire_applied(invalid_hash);
+                            }
+                        }
+                        {
+                            let mut window = self.download_window.lock();
+                            for invalid_hash in &error.invalidated {
+                                window.drop_for_retry(invalid_hash);
+                            }
+                        }
+                        metrics::counter!("node.sync.invalidated_blocks")
+                            .increment(u64::try_from(error.invalidated.len()).unwrap_or(u64::MAX));
+                    }
                     break;
                 }
             };
@@ -1215,9 +1134,13 @@ impl BlockSync {
             };
             let inventory = hashes
                 .iter()
-                .map(|hash| Inventory::WitnessBlock(BlockHash::from_byte_array(hash.to_le_bytes())))
+                .map(|hash| {
+                    Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array(
+                        *hash.as_byte_array(),
+                    ))
+                })
                 .collect();
-            if tx.send(NetworkMessage::GetData(inventory)).is_ok() {
+            if tx.send(Message::GetData(inventory)).is_ok() {
                 successful.push(peer_addr);
             }
         }
@@ -1281,9 +1204,9 @@ impl BlockSync {
         let mut expected_height = applied_tip.height.saturating_add(1);
         let mut is_contiguous = true;
         for (height, hash) in request.entries() {
-            inventory.push(Inventory::WitnessBlock(BlockHash::from_byte_array(
-                hash.to_le_bytes(),
-            )));
+            inventory.push(Inventory::WitnessBlock(
+                bitcoin::BlockHash::from_byte_array(*hash.as_byte_array()),
+            ));
             if is_contiguous && height == expected_height {
                 expected_hashes.push(hash);
                 expected_height = if let Some(next) = expected_height.checked_add(1) {
@@ -1296,7 +1219,7 @@ impl BlockSync {
                 is_contiguous = false;
             }
         }
-        let msg = NetworkMessage::GetData(inventory);
+        let msg = Message::GetData(inventory);
 
         let tx = {
             let outbound = self.peer_outbound.read();
@@ -1357,13 +1280,13 @@ impl BlockSync {
             );
             return;
         }
-        let locator_hashes: Vec<BlockHash> = locator
+        let locator_hashes: Vec<bitcoin::BlockHash> = locator
             .into_iter()
-            .map(|hash| BlockHash::from_byte_array(hash.to_le_bytes()))
+            .map(|hash| bitcoin::BlockHash::from_byte_array(*hash.as_byte_array()))
             .collect();
-        let msg = NetworkMessage::GetHeaders(GetHeadersMessage::new(
+        let msg = Message::GetHeaders(GetHeadersMessage::new(
             locator_hashes,
-            BlockHash::all_zeros(),
+            bitcoin::BlockHash::all_zeros(),
         ));
         let tx = {
             let outbound = self.peer_outbound.read();
@@ -1432,8 +1355,7 @@ impl BlockSync {
         }
 
         let had_chain_tip = self.handles.chain_tip.load_full().is_some();
-        let genesis =
-            bitcoin::blockdata::constants::genesis_block(bitcoin_network(self.handles.network));
+        let genesis = self.handles.network.genesis_block();
         match crate::apply::apply_block(&self.handles, &genesis) {
             Ok(tip) => {
                 if !had_chain_tip {
@@ -1485,8 +1407,8 @@ impl BlockSync {
                 })
                 .collect()
         };
-        let mut message = NetworkMessage::GetData(vec![Inventory::WitnessBlock(
-            BlockHash::from_byte_array(front_hash.to_le_bytes()),
+        let mut message = Message::GetData(vec![Inventory::WitnessBlock(
+            bitcoin::BlockHash::from_byte_array(*front_hash.as_byte_array()),
         )]);
         for peer_addr in candidates {
             let tx = self.peer_outbound.read().get(&peer_addr).cloned();
@@ -1592,6 +1514,15 @@ impl BlockSync {
         metrics::gauge!("node.sync.pending_bytes").set(metric_count(window.pending_bytes()));
         metrics::gauge!("node.sync.received_blocks").set(metric_count(stager.received_len()));
         metrics::gauge!("node.sync.received_bytes").set(metric_count(stager.received_bytes()));
+        let (pending_blocks_high_water, pending_bytes_high_water) = window.pending_high_water();
+        metrics::gauge!("node.sync.pending_blocks_high_water")
+            .set(metric_count(pending_blocks_high_water));
+        metrics::gauge!("node.sync.pending_bytes_high_water")
+            .set(metric_count(pending_bytes_high_water));
+        metrics::gauge!("node.sync.staged_blocks_high_water")
+            .set(metric_count(stager.received_high_water()));
+        metrics::gauge!("node.sync.staged_bytes_high_water")
+            .set(metric_count(stager.received_bytes_high_water()));
     }
 
     fn record_pending_sync_metrics(&self) {
@@ -1623,38 +1554,10 @@ impl BlockSync {
     }
 }
 
-fn bitcoin_network(network: bitcoin_rs_primitives::Network) -> bitcoin::Network {
-    match network {
-        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
-    }
-}
-
 fn metric_count(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-/// Returns the production `SyncBudget` used by `BlockSync::new`.
-pub const fn default_sync_budget() -> SyncBudget {
-    SyncBudget {
-        max_pending_blocks: PENDING_BUDGET,
-        max_pending_bytes: PENDING_BYTE_BUDGET,
-        max_received_blocks: RECEIVED_BLOCK_BUDGET,
-        max_received_bytes: RECEIVED_BLOCK_BYTE_BUDGET,
-        max_peer_inflight: PEER_INFLIGHT_BUDGET,
-        fanout_peer_inflight: MAX_BLOCKS_IN_TRANSIT_PER_PEER,
-        min_peers_for_fanout: MIN_PEERS_FOR_FANOUT,
-        getdata_batch_limit: GETDATA_BATCH_SIZE,
-        pending_timeout: PENDING_TIMEOUT,
-        received_timeout: RECEIVED_BLOCK_TIMEOUT,
-        stall_timeout_initial: BLOCK_STALLING_TIMEOUT,
-        stall_timeout_max: BLOCK_STALLING_TIMEOUT_MAX,
-        staller_cooldown: STALLER_COOLDOWN,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1663,18 +1566,17 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use arc_swap::ArcSwapOption;
+    // Wire seam: byte-array access on the retained bitcoin:: wire hash types.
     use bitcoin::hashes::Hash as _;
-    use bitcoin::{
-        Amount, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Txid, Witness,
-        block::{Header as BlockHeader, Version},
-        pow::CompactTarget,
-        script::Builder,
-    };
     use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
-    use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
     use bitcoin_rs_mempool::{Mempool, MempoolLimits};
     use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerSource};
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_primitives::encode::double_sha256;
+    use bitcoin_rs_primitives::{
+        Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxIn, TxOut, Txid,
+        consensus_bytes,
+    };
+    use bitcoin_rs_script::push_int;
     use bitcoin_rs_storage::StorageError;
     use bitcoin_rs_utxo::UtxoSet;
     use crossbeam_channel::unbounded;
@@ -1685,8 +1587,8 @@ mod tests {
     };
     use parking_lot::{Mutex, RwLock};
 
-    use super::{BlockHash, BlockSync, InboundHeaders, Inventory, Message, NetworkMessage};
-    use crate::{Network, apply::ApplyHandles};
+    use super::{BlockSync, InboundHeaders, Inventory, Message};
+    use crate::apply::ApplyHandles;
 
     #[test]
     fn tick_sends_getdata_for_headers_above_applied_tip() -> Result<(), Box<dyn std::error::Error>>
@@ -1698,12 +1600,10 @@ mod tests {
         let mut expected = Vec::new();
 
         for height in 1_u32..=3 {
-            let parent_hash = BlockHash::from_byte_array(tree.node(tip_id)?.hash.to_le_bytes());
+            let parent_hash = BlockHash::from(tree.node(tip_id)?.hash);
             let header = test_header(parent_hash, height);
             tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
-            expected.push(BlockHash::from_byte_array(
-                tree.node(tip_id)?.hash.to_le_bytes(),
-            ));
+            expected.push(BlockHash::from(tree.node(tip_id)?.hash));
         }
 
         let chain_tip = tree.tip_handle();
@@ -1739,21 +1639,24 @@ mod tests {
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let first = rx.try_recv()?;
-        let NetworkMessage::GetData(inventory) = first else {
+        let Message::GetData(inventory) = first else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(inventory.len(), 3);
         let requested = inventory
             .into_iter()
             .map(|item| match item {
-                Inventory::WitnessBlock(hash) => Ok(hash),
+                // Wire seam: Inventory payloads stay bitcoin::; convert to native.
+                Inventory::WitnessBlock(hash) => {
+                    Ok(BlockHash(Hash256::from_le_bytes(hash.as_byte_array())))
+                }
                 _ => Err(std::io::Error::other("expected witness block inventory")),
             })
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(requested, expected);
 
         let second = rx.try_recv()?;
-        if !matches!(second, NetworkMessage::GetHeaders(_)) {
+        if !matches!(second, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected getheaders").into());
         }
         Ok(())
@@ -1765,9 +1668,9 @@ mod tests {
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
 
-        let losing1 = test_header(genesis.block_hash(), 1);
+        let losing1 = test_header(genesis.compute_hash(), 1);
         let losing1_id = tree.insert_node(Some(genesis_id), losing1, NodeStatus::HeaderValid)?;
-        let losing2 = test_header(losing1.block_hash(), 2);
+        let losing2 = test_header(losing1.compute_hash(), 2);
         let losing2_id = tree.insert_node(Some(losing1_id), losing2, NodeStatus::HeaderValid)?;
         let applied = {
             let node = tree.node(losing2_id)?;
@@ -1779,16 +1682,16 @@ mod tests {
             }
         };
 
-        let winning1 = test_header(genesis.block_hash(), 101);
+        let winning1 = test_header(genesis.compute_hash(), 101);
         let winning1_id = tree.insert_node(Some(genesis_id), winning1, NodeStatus::HeaderValid)?;
-        let winning2 = test_header(winning1.block_hash(), 102);
+        let winning2 = test_header(winning1.compute_hash(), 102);
         let winning2_id = tree.insert_node(Some(winning1_id), winning2, NodeStatus::HeaderValid)?;
-        let winning3 = test_header(winning2.block_hash(), 103);
+        let winning3 = test_header(winning2.compute_hash(), 103);
         tree.insert_node(Some(winning2_id), winning3, NodeStatus::HeaderValid)?;
         let expected = vec![
-            winning1.block_hash(),
-            winning2.block_hash(),
-            winning3.block_hash(),
+            winning1.compute_hash(),
+            winning2.compute_hash(),
+            winning3.compute_hash(),
         ];
 
         let chain_tip = tree.tip_handle();
@@ -1849,9 +1752,9 @@ mod tests {
             }
         };
 
-        let losing1 = test_header(genesis.block_hash(), 1);
+        let losing1 = test_header(genesis.compute_hash(), 1);
         let losing1_id = tree.insert_node(Some(genesis_id), losing1, NodeStatus::HeaderValid)?;
-        let losing2 = test_header(losing1.block_hash(), 2);
+        let losing2 = test_header(losing1.compute_hash(), 2);
         let losing2_id = tree.insert_node(Some(losing1_id), losing2, NodeStatus::HeaderValid)?;
         let losing_tip = {
             let node = tree.node(losing2_id)?;
@@ -1862,13 +1765,13 @@ mod tests {
                 hash: node.hash,
             }
         };
-        let losing_hashes = vec![losing1.block_hash(), losing2.block_hash()];
+        let losing_hashes = vec![losing1.compute_hash(), losing2.compute_hash()];
 
-        let winning1 = test_header(genesis.block_hash(), 101);
+        let winning1 = test_header(genesis.compute_hash(), 101);
         let winning1_id = tree.insert_node(Some(genesis_id), winning1, NodeStatus::HeaderValid)?;
-        let winning2 = test_header(winning1.block_hash(), 102);
+        let winning2 = test_header(winning1.compute_hash(), 102);
         let winning2_id = tree.insert_node(Some(winning1_id), winning2, NodeStatus::HeaderValid)?;
-        let winning3 = test_header(winning2.block_hash(), 103);
+        let winning3 = test_header(winning2.compute_hash(), 103);
         let winning3_id = tree.insert_node(Some(winning2_id), winning3, NodeStatus::HeaderValid)?;
         let winning_tip = {
             let node = tree.node(winning3_id)?;
@@ -1880,9 +1783,9 @@ mod tests {
             }
         };
         let winning_hashes = vec![
-            winning1.block_hash(),
-            winning2.block_hash(),
-            winning3.block_hash(),
+            winning1.compute_hash(),
+            winning2.compute_hash(),
+            winning3.compute_hash(),
         ];
 
         let chain_tip = Arc::new(ArcSwapOption::empty());
@@ -1948,9 +1851,9 @@ mod tests {
         let genesis = genesis_header();
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let main1 = test_header(genesis.block_hash(), 1);
+        let main1 = test_header(genesis.compute_hash(), 1);
         let main1_id = tree.insert_node(Some(genesis_id), main1, NodeStatus::HeaderValid)?;
-        let main2 = test_header(main1.block_hash(), 2);
+        let main2 = test_header(main1.compute_hash(), 2);
         let main2_id = tree.insert_node(Some(main1_id), main2, NodeStatus::HeaderValid)?;
         let applied = {
             let node = tree.node(main2_id)?;
@@ -1962,10 +1865,10 @@ mod tests {
             }
         };
 
-        let mut high_work = test_header(genesis.block_hash(), 101);
-        high_work.bits = CompactTarget::from_consensus(0x2000_ffff);
+        let mut high_work = test_header(genesis.compute_hash(), 101);
+        high_work.bits = 0x2000_ffff;
         high_work.nonce = 0;
-        while !high_work.target().is_met_by(high_work.block_hash()) {
+        while !pow_met(high_work.bits, Hash256::from(high_work.compute_hash())) {
             high_work.nonce = high_work.nonce.wrapping_add(1);
         }
         let high_work_id =
@@ -1996,8 +1899,8 @@ mod tests {
         Ok(())
     }
 
-    // One no-store lifecycle must prove both accounting retirement and the
-    // cached reverse source; splitting it would stop exercising their handoff.
+    // One no-store lifecycle must prove both accounting retirement and bounded
+    // staging body resolution; splitting it would stop exercising their handoff.
     #[allow(clippy::too_many_lines)]
     #[test]
     fn branch_switch_uses_staged_bodies_without_durable_store()
@@ -2024,19 +1927,19 @@ mod tests {
             stage_body(&sync, block);
         }
 
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let genesis_id = sync
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
         let mut fork_parent = genesis_id;
         let mut fork_prev = genesis.block_hash();
         let mut fork = Vec::new();
         for height in 1..=3_u32 {
             let mut coinbase = coinbase_transaction(height);
-            coinbase.output[0].script_pubkey = Builder::new().push_int(2).into_script();
+            coinbase.outputs[0].script_pubkey = push_int(2);
             let block = mined_block_with_prev_hash(fork_prev, height, vec![coinbase]);
             fork_parent = sync.handles.block_tree.write().insert_node(
                 Some(fork_parent),
@@ -2056,10 +1959,10 @@ mod tests {
         assert_eq!(sync.block_stager.lock().received_len(), 2);
         assert_eq!(sync.download_window.lock().received_len(), 0);
 
-        let stage_received = |block: &bitcoin::Block| {
+        let stage_received = |block: &Block| {
             stage_body(&sync, block);
-            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-            let bytes = bitcoin::consensus::encode::serialize(block).len();
+            let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
+            let bytes = consensus_bytes(block).len();
             sync.download_window
                 .lock()
                 .mark_received(hash, bytes, Instant::now());
@@ -2103,27 +2006,49 @@ mod tests {
             assert_eq!(sync.download_window.lock().received_len(), 0);
         }
 
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_received_blocks: 5,
+                ..super::default_sync_budget()
+            },
+        );
+        for block in &fork {
+            stage_body(&sync, block);
+        }
+        for block in &main {
+            stage_body(&sync, block);
+        }
+        assert_eq!(
+            sync.block_stager.lock().received_len(),
+            5,
+            "bounded staging must contain every reverse-switch plan body"
+        );
+        // The reverse switch must resolve all five disconnect and connect bodies from
+        // the bounded stager, without durable storage or fixture-vector lookup.
+        let explicit_body = |hash: Hash256| sync.block_stager.lock().staged_body(hash);
         let main_target = sync
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(main[1].block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(main[1].block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing original branch tip"))?;
-        crate::reorg::switch_to_branch(
-            &sync.handles,
-            main_target,
-            |hash| sync.block_stager.lock().staged_body(hash),
-            |hash| sync.retire_applied_reorg_body(hash),
-        )?;
+        crate::reorg::switch_to_branch(&sync.handles, main_target, explicit_body, |hash| {
+            sync.retire_applied_reorg_body(hash);
+        })?;
         let restored = applied_tip
             .load_full()
             .ok_or_else(|| std::io::Error::other("reverse switch did not publish a tip"))?;
         assert_eq!(
             restored.hash,
-            Hash256::from_le_bytes(main[1].block_hash().as_byte_array()),
-            "the applied-body cache must supply disconnected fork bodies after staging retires"
+            Hash256::from_le_bytes(main[1].block_hash().as_bytes()),
+            "bounded staging must supply the reverse branch switch without durable storage"
         );
-        assert_eq!(sync.block_stager.lock().received_len(), 0);
+        assert_eq!(
+            sync.block_stager.lock().received_len(),
+            3,
+            "only connected bodies retire from bounded staging after the reverse switch"
+        );
         Ok(())
     }
 
@@ -2137,20 +2062,23 @@ mod tests {
             stage_body(&sync, block);
         }
         assert_eq!(sync.apply_buffered_blocks(None), (2, 0));
+        for block in &main {
+            stage_body(&sync, block);
+        }
 
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let genesis_id = sync
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
         let mut fork_parent = genesis_id;
         let mut fork_prev = genesis.block_hash();
         let mut fork = Vec::new();
         for height in 1..=3_u32 {
             let mut coinbase = coinbase_transaction(height);
-            coinbase.output[0].script_pubkey = Builder::new().push_int(2).into_script();
+            coinbase.outputs[0].script_pubkey = push_int(2);
             let block = mined_block_with_prev_hash(fork_prev, height, vec![coinbase]);
             fork_parent = sync.handles.block_tree.write().insert_node(
                 Some(fork_parent),
@@ -2166,11 +2094,12 @@ mod tests {
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(main[1].block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(main[1].block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing main branch tip"))?;
         let mut racing_coinbase = coinbase_transaction(3);
-        racing_coinbase.output[0].script_pubkey = Builder::new().push_int(3).into_script();
+        racing_coinbase.outputs[0].script_pubkey = push_int(3);
         let racing = mined_block_with_prev_hash(main[1].block_hash(), 3, vec![racing_coinbase]);
+        stage_body(&sync, &racing);
         sync.handles.block_tree.write().insert_node(
             Some(main_tip_id),
             racing.header,
@@ -2216,7 +2145,7 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("branch switch did not publish a tip"))?;
         assert_eq!(
             tip.hash,
-            Hash256::from_le_bytes(fork[2].block_hash().as_byte_array()),
+            Hash256::from_le_bytes(fork[2].block_hash().as_bytes()),
             "the locked replan must absorb the competing connect and still reach the target"
         );
         Ok(())
@@ -2232,19 +2161,19 @@ mod tests {
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
         stage_body(&sync, &main[0]);
 
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let genesis_id = sync
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
         let mut fork_parent = genesis_id;
         let mut fork_prev = genesis.block_hash();
         let mut fork = Vec::new();
         for height in 1..=2_u32 {
             let mut coinbase = coinbase_transaction(height);
-            coinbase.output[0].script_pubkey = Builder::new().push_int(2).into_script();
+            coinbase.outputs[0].script_pubkey = push_int(2);
             let mut block = mined_block_with_prev_hash(fork_prev, height, vec![coinbase]);
             fork_parent = sync.handles.block_tree.write().insert_node(
                 Some(fork_parent),
@@ -2253,10 +2182,10 @@ mod tests {
             )?;
             fork_prev = block.block_hash();
             if height == 2 {
-                block.txdata[0].output[0].value = Amount::from_sat(2);
+                block.txs[0].outputs[0].value = 2;
             }
-            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-            let bytes = bitcoin::consensus::encode::serialize(&block).len();
+            let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
+            let bytes = consensus_bytes(&block).len();
             stage_body(&sync, &block);
             sync.download_window
                 .lock()
@@ -2282,11 +2211,11 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("partial switch did not publish a tip"))?;
         assert_eq!(
             tip.hash,
-            Hash256::from_le_bytes(fork[0].block_hash().as_byte_array()),
+            Hash256::from_le_bytes(fork[0].block_hash().as_bytes()),
             "the valid prefix must remain committed"
         );
-        let first = Hash256::from_le_bytes(fork[0].block_hash().as_byte_array());
-        let failed = Hash256::from_le_bytes(fork[1].block_hash().as_byte_array());
+        let first = Hash256::from_le_bytes(fork[0].block_hash().as_bytes());
+        let failed = Hash256::from_le_bytes(fork[1].block_hash().as_bytes());
         assert!(!sync.block_stager.lock().contains(&first));
         assert!(sync.block_stager.lock().contains(&failed));
         assert_eq!(
@@ -2307,13 +2236,13 @@ mod tests {
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
         stage_body(&sync, &main[0]);
 
-        let main_hash = Hash256::from_le_bytes(main[0].block_hash().as_byte_array());
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let main_hash = Hash256::from_le_bytes(main[0].block_hash().as_bytes());
+        let genesis = Network::Regtest.genesis_block();
         let genesis_id = sync
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
         let invalid = mined_block_with_prev_hash(genesis.block_hash(), 1, Vec::new());
         let invalid_id = sync.handles.block_tree.write().insert_node(
@@ -2328,12 +2257,12 @@ mod tests {
             descendant.header,
             NodeStatus::HeaderValid,
         )?;
-        let invalid_hash = Hash256::from_le_bytes(invalid.block_hash().as_byte_array());
-        let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_byte_array());
+        let invalid_hash = Hash256::from_le_bytes(invalid.block_hash().as_bytes());
+        let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_bytes());
         for block in [&invalid, &descendant] {
             stage_body(&sync, block);
-            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-            let bytes = bitcoin::consensus::encode::serialize(block).len();
+            let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
+            let bytes = consensus_bytes(block).len();
             sync.download_window
                 .lock()
                 .mark_received(hash, bytes, Instant::now());
@@ -2372,15 +2301,15 @@ mod tests {
         let fail_once_store = Arc::new(FailOnceBodyStore::new(1));
         sync.handles.block_body_store = Some(fail_once_store);
 
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let genesis_id = sync
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
         let mut fork_coinbase = coinbase_transaction(1);
-        fork_coinbase.output[0].script_pubkey = Builder::new().push_int(2).into_script();
+        fork_coinbase.outputs[0].script_pubkey = push_int(2);
         let fork = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![fork_coinbase]);
         let fork_id = sync.handles.block_tree.write().insert_node(
             Some(genesis_id),
@@ -2394,12 +2323,12 @@ mod tests {
             descendant.header,
             NodeStatus::HeaderValid,
         )?;
-        let fork_hash = Hash256::from_le_bytes(fork.block_hash().as_byte_array());
-        let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_byte_array());
+        let fork_hash = Hash256::from_le_bytes(fork.block_hash().as_bytes());
+        let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_bytes());
         for block in [&fork, &descendant] {
             stage_body(&sync, block);
-            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-            let bytes = bitcoin::consensus::encode::serialize(block).len();
+            let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
+            let bytes = consensus_bytes(block).len();
             sync.download_window
                 .lock()
                 .mark_received(hash, bytes, Instant::now());
@@ -2434,15 +2363,15 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
         let utxo_len_before = sync.handles.utxo.len();
 
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let genesis_id = sync
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
         let mut target_coinbase = coinbase_transaction(1);
-        target_coinbase.output[0].script_pubkey = Builder::new().push_int(2).into_script();
+        target_coinbase.outputs[0].script_pubkey = push_int(2);
         let target = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![target_coinbase]);
         let target_id = sync.handles.block_tree.write().insert_node(
             Some(genesis_id),
@@ -2450,10 +2379,10 @@ mod tests {
             NodeStatus::HeaderValid,
         )?;
         let mut wrong_coinbase = coinbase_transaction(1);
-        wrong_coinbase.output[0].script_pubkey = Builder::new().push_int(3).into_script();
+        wrong_coinbase.outputs[0].script_pubkey = push_int(3);
         let wrong = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![wrong_coinbase]);
-        let target_hash = Hash256::from_le_bytes(target.block_hash().as_byte_array());
-        let wrong_hash = Hash256::from_le_bytes(wrong.block_hash().as_byte_array());
+        let target_hash = Hash256::from_le_bytes(target.block_hash().as_bytes());
+        let wrong_hash = Hash256::from_le_bytes(wrong.block_hash().as_bytes());
         assert_ne!(target_hash, wrong_hash);
         let connected = std::cell::Cell::new(false);
 
@@ -2466,7 +2395,7 @@ mod tests {
                 } else {
                     main[0].clone()
                 };
-                let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+                let serialized = bytes::Bytes::from(consensus_bytes(&block));
                 Some((block, serialized))
             },
             |_| connected.set(true),
@@ -2505,15 +2434,15 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
         let utxo_len_before = sync.handles.utxo.len();
 
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let genesis_id = sync
             .handles
             .block_tree
             .read()
-            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
         let mut target_coinbase = coinbase_transaction(1);
-        target_coinbase.output[0].script_pubkey = Builder::new().push_int(2).into_script();
+        target_coinbase.outputs[0].script_pubkey = push_int(2);
         let target = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![target_coinbase]);
         let target_id = sync.handles.block_tree.write().insert_node(
             Some(genesis_id),
@@ -2521,10 +2450,10 @@ mod tests {
             NodeStatus::HeaderValid,
         )?;
         let mut wrong_coinbase = coinbase_transaction(1);
-        wrong_coinbase.output[0].script_pubkey = Builder::new().push_int(3).into_script();
+        wrong_coinbase.outputs[0].script_pubkey = push_int(3);
         let wrong = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![wrong_coinbase]);
-        let target_hash = Hash256::from_le_bytes(target.block_hash().as_byte_array());
-        let wrong_bytes = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&wrong));
+        let target_hash = Hash256::from_le_bytes(target.block_hash().as_bytes());
+        let wrong_bytes = bytes::Bytes::from(consensus_bytes(&wrong));
         let connected = std::cell::Cell::new(false);
 
         let outcome = crate::reorg::switch_to_branch(
@@ -2535,7 +2464,7 @@ mod tests {
                     return Some((target.clone(), wrong_bytes.clone()));
                 }
                 let block = main[0].clone();
-                let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+                let serialized = bytes::Bytes::from(consensus_bytes(&block));
                 Some((block, serialized))
             },
             |_| connected.set(true),
@@ -2592,7 +2521,7 @@ mod tests {
         sync.tick();
 
         let first = rx.try_recv()?;
-        let NetworkMessage::GetData(inventory) = first else {
+        let Message::GetData(inventory) = first else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(witness_block_inventory(inventory)?, expected[1..]);
@@ -2621,12 +2550,12 @@ mod tests {
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let first = high_rx.try_recv()?;
-        let NetworkMessage::GetData(inventory) = first else {
+        let Message::GetData(inventory) = first else {
             return Err(std::io::Error::other("expected high peer getdata").into());
         };
         assert_eq!(witness_block_inventory(inventory)?, expected);
         let second = high_rx.try_recv()?;
-        if !matches!(second, NetworkMessage::GetHeaders(_)) {
+        if !matches!(second, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected high peer getheaders").into());
         }
         assert!(low_rx.try_recv().is_err());
@@ -2654,7 +2583,7 @@ mod tests {
 
         sync.tick();
         let first = rx.try_recv()?;
-        if !matches!(first, NetworkMessage::GetHeaders(_)) {
+        if !matches!(first, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected first getheaders").into());
         }
 
@@ -2707,18 +2636,18 @@ mod tests {
 
         sync.tick();
         let first = rx.try_recv()?;
-        if !matches!(first, NetworkMessage::GetHeaders(_)) {
+        if !matches!(first, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected first getheaders").into());
         }
 
-        let header = test_header(genesis.block_hash(), 1);
+        let header = test_header(genesis.compute_hash(), 1);
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![header],
             source: Some(current_source(&peer_outbound, addr)),
         })?;
         sync.tick();
         let second = rx.try_recv()?;
-        if !matches!(second, NetworkMessage::GetHeaders(_)) {
+        if !matches!(second, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected second getheaders after response").into());
         }
         let accepted_tip = chain_tip
@@ -2773,20 +2702,20 @@ mod tests {
 
         sync.tick();
         let first = rx.try_recv()?;
-        if !matches!(first, NetworkMessage::GetHeaders(_)) {
+        if !matches!(first, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected first getheaders").into());
         }
 
         // A syntactically valid response consumes the matching request even when
         // acceptance rejects its headers. Otherwise one bad response stalls sync.
-        let orphan_prev = BlockHash::from_byte_array([0x11; 32]);
+        let orphan_prev = BlockHash(Hash256::from_le_bytes(&[0x11; 32]));
         let orphan = test_header(orphan_prev, 5);
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![orphan],
             source: Some(current_source(&peer_outbound, addr)),
         })?;
         sync.tick();
-        assert!(matches!(rx.try_recv()?, NetworkMessage::GetHeaders(_)));
+        assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
         assert!(rx.try_recv().is_err());
         let tip = chain_tip
             .load_full()
@@ -2819,7 +2748,7 @@ mod tests {
 
         sync.tick();
         assert!(
-            matches!(invalid_rx.try_recv()?, NetworkMessage::GetHeaders(_)),
+            matches!(invalid_rx.try_recv()?, Message::GetHeaders(_)),
             "the first getheaders must target the invalid peer"
         );
         assert!(
@@ -2834,7 +2763,7 @@ mod tests {
         // tick cannot re-arm the gate against a different address: the only way
         // `pending_getheaders` ends up clear is the peer-fault cleanup.
         inbound_headers_tx.send(InboundHeaders {
-            headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
+            headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
             source: Some(current_source(&peer_outbound, invalid_peer)),
         })?;
         sync.tick();
@@ -2871,7 +2800,7 @@ mod tests {
             "the invalid peer must not receive another getheaders"
         );
         assert!(
-            matches!(other_rx.try_recv()?, NetworkMessage::GetHeaders(_)),
+            matches!(other_rx.try_recv()?, Message::GetHeaders(_)),
             "the next getheaders must rotate to the remaining peer"
         );
         Ok(())
@@ -2894,7 +2823,7 @@ mod tests {
 
         sync.tick();
         assert!(
-            matches!(old_rx.try_recv()?, NetworkMessage::GetHeaders(_)),
+            matches!(old_rx.try_recv()?, Message::GetHeaders(_)),
             "the initial getheaders request must target the old lease"
         );
         assert!(
@@ -2922,7 +2851,7 @@ mod tests {
             "the cancelled lease must not receive the next getheaders request"
         );
         assert!(
-            matches!(replacement_rx.try_recv()?, NetworkMessage::GetHeaders(_)),
+            matches!(replacement_rx.try_recv()?, Message::GetHeaders(_)),
             "the next getheaders request must route to the replacement lease"
         );
         Ok(())
@@ -2944,7 +2873,10 @@ mod tests {
             .write()
             .insert(peer_addr, bitcoin_rs_p2p::PeerLease::new(tx));
         inbound_headers_tx.send(InboundHeaders {
-            headers: vec![test_header(BlockHash::from_byte_array([0x11; 32]), 1)],
+            headers: vec![test_header(
+                BlockHash(Hash256::from_le_bytes(&[0x11; 32])),
+                1,
+            )],
             source: Some(current_source(&peer_outbound, peer_addr)),
         })?;
 
@@ -2978,7 +2910,7 @@ mod tests {
             .write()
             .insert(peer_addr, bitcoin_rs_p2p::PeerLease::new(tx));
         inbound_headers_tx.send(InboundHeaders {
-            headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
+            headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
             source: None,
         })?;
 
@@ -3022,7 +2954,7 @@ mod tests {
         sync.tick();
 
         let headers = high_rx.try_recv()?;
-        if !matches!(headers, NetworkMessage::GetHeaders(_)) {
+        if !matches!(headers, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected high peer getheaders").into());
         }
         assert!(high_rx.try_recv().is_err());
@@ -3051,12 +2983,12 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = first_rx.try_recv()? else {
+        let Message::GetData(inventory) = first_rx.try_recv()? else {
             return Err(std::io::Error::other("expected first peer getdata").into());
         };
         assert_eq!(witness_block_inventory(inventory)?, expected);
         let headers = first_rx.try_recv()?;
-        if !matches!(headers, NetworkMessage::GetHeaders(_)) {
+        if !matches!(headers, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected first peer getheaders").into());
         }
         assert!(first_rx.try_recv().is_err());
@@ -3088,12 +3020,12 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(first_inventory) = first_rx.try_recv()? else {
+        let Message::GetData(first_inventory) = first_rx.try_recv()? else {
             return Err(std::io::Error::other("expected first peer getdata").into());
         };
         assert_eq!(witness_block_inventory(first_inventory)?, expected[..2]);
         let first_headers = first_rx.try_recv()?;
-        if !matches!(first_headers, NetworkMessage::GetHeaders(_)) {
+        if !matches!(first_headers, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected first peer getheaders").into());
         }
 
@@ -3106,7 +3038,7 @@ mod tests {
 
         sync.tick();
 
-        let NetworkMessage::GetData(second_inventory) = second_rx.try_recv()? else {
+        let Message::GetData(second_inventory) = second_rx.try_recv()? else {
             return Err(std::io::Error::other("expected second peer getdata").into());
         };
         assert_eq!(witness_block_inventory(second_inventory)?, expected[2..4]);
@@ -3143,12 +3075,12 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(first_inventory) = stale_rx.try_recv()? else {
+        let Message::GetData(first_inventory) = stale_rx.try_recv()? else {
             return Err(std::io::Error::other("expected stale peer getdata").into());
         };
         assert_eq!(witness_block_inventory(first_inventory)?, expected[..2]);
         let stale_headers = stale_rx.try_recv()?;
-        if !matches!(stale_headers, NetworkMessage::GetHeaders(_)) {
+        if !matches!(stale_headers, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected stale peer getheaders").into());
         }
 
@@ -3160,13 +3092,13 @@ mod tests {
 
         sync.tick();
 
-        let NetworkMessage::GetData(retry_inventory) = healthy_rx.try_recv()? else {
+        let Message::GetData(retry_inventory) = healthy_rx.try_recv()? else {
             return Err(std::io::Error::other("expected healthy peer retry getdata").into());
         };
         assert_eq!(witness_block_inventory(retry_inventory)?, expected[..2]);
         assert!(healthy_rx.try_recv().is_err());
         while let Ok(message) = stale_rx.try_recv() {
-            if matches!(message, NetworkMessage::GetData(_)) {
+            if matches!(message, Message::GetData(_)) {
                 return Err(
                     std::io::Error::other("stale peer should not receive retry getdata").into(),
                 );
@@ -3200,18 +3132,18 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(first_inventory) = rx.try_recv()? else {
+        let Message::GetData(first_inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected first getdata").into());
         };
         assert_eq!(witness_block_inventory(first_inventory)?, expected[..2]);
         let headers = rx.try_recv()?;
-        if !matches!(headers, NetworkMessage::GetHeaders(_)) {
+        if !matches!(headers, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected getheaders").into());
         }
 
         sync.tick();
 
-        let NetworkMessage::GetData(retry_inventory) = rx.try_recv()? else {
+        let Message::GetData(retry_inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected retry getdata").into());
         };
         assert_eq!(witness_block_inventory(retry_inventory)?, expected[..2]);
@@ -3249,15 +3181,15 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(first_inventory) = first_rx.try_recv()? else {
+        let Message::GetData(first_inventory) = first_rx.try_recv()? else {
             return Err(std::io::Error::other("expected first peer getdata").into());
         };
         assert_eq!(witness_block_inventory(first_inventory)?, expected[..2]);
         let first_headers = first_rx.try_recv()?;
-        if !matches!(first_headers, NetworkMessage::GetHeaders(_)) {
+        if !matches!(first_headers, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected first peer getheaders").into());
         }
-        let NetworkMessage::GetData(second_inventory) = second_rx.try_recv()? else {
+        let Message::GetData(second_inventory) = second_rx.try_recv()? else {
             return Err(std::io::Error::other("expected second peer getdata").into());
         };
         assert_eq!(witness_block_inventory(second_inventory)?, expected[2..4]);
@@ -3267,13 +3199,13 @@ mod tests {
         sync.tick();
 
         while let Ok(message) = first_rx.try_recv() {
-            if matches!(message, NetworkMessage::GetData(_)) {
+            if matches!(message, Message::GetData(_)) {
                 return Err(
                     std::io::Error::other("first peer should not receive retry getdata").into(),
                 );
             }
         }
-        let NetworkMessage::GetData(retry_inventory) = second_rx.try_recv()? else {
+        let Message::GetData(retry_inventory) = second_rx.try_recv()? else {
             return Err(std::io::Error::other("expected retry getdata").into());
         };
         let retry_hashes = witness_block_inventory(retry_inventory)?;
@@ -3295,13 +3227,11 @@ mod tests {
         let batch_size = 16_u32;
 
         for height in 1_u32..=batch_size + 4 {
-            let parent_hash = BlockHash::from_byte_array(tree.node(tip_id)?.hash.to_le_bytes());
+            let parent_hash = BlockHash::from(tree.node(tip_id)?.hash);
             let header = test_header(parent_hash, height);
             tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
             if height <= batch_size {
-                expected.push(BlockHash::from_byte_array(
-                    tree.node(tip_id)?.hash.to_le_bytes(),
-                ));
+                expected.push(BlockHash::from(tree.node(tip_id)?.hash));
             }
         }
 
@@ -3345,13 +3275,16 @@ mod tests {
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let first = rx.try_recv()?;
-        let NetworkMessage::GetData(inventory) = first else {
+        let Message::GetData(inventory) = first else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         let requested = inventory
             .into_iter()
             .map(|item| match item {
-                Inventory::WitnessBlock(hash) => Ok(hash),
+                // Wire seam: Inventory payloads stay bitcoin::; convert to native.
+                Inventory::WitnessBlock(hash) => {
+                    Ok(BlockHash(Hash256::from_le_bytes(hash.as_byte_array())))
+                }
                 _ => Err(std::io::Error::other("expected witness block inventory")),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3368,7 +3301,7 @@ mod tests {
         let mut tip_id = genesis_id;
 
         for height in 1_u32..=3 {
-            let parent_hash = BlockHash::from_byte_array(tree.node(tip_id)?.hash.to_le_bytes());
+            let parent_hash = BlockHash::from(tree.node(tip_id)?.hash);
             let header = test_header(parent_hash, height);
             tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
         }
@@ -3406,11 +3339,11 @@ mod tests {
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let first = rx.try_recv()?;
-        if !matches!(first, NetworkMessage::GetData(_)) {
+        if !matches!(first, Message::GetData(_)) {
             return Err(std::io::Error::other("expected first tick getdata").into());
         }
         let second = rx.try_recv()?;
-        if !matches!(second, NetworkMessage::GetHeaders(_)) {
+        if !matches!(second, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected first tick getheaders").into());
         }
 
@@ -3420,10 +3353,10 @@ mod tests {
         // and already-pending blocks are not re-requested, so the second tick
         // emits no outbound messages.
         match rx.try_recv() {
-            Ok(NetworkMessage::GetData(_)) => {
+            Ok(Message::GetData(_)) => {
                 Err(std::io::Error::other("second tick re-requested pending blocks").into())
             }
-            Ok(NetworkMessage::GetHeaders(_)) => {
+            Ok(Message::GetHeaders(_)) => {
                 Err(std::io::Error::other("second tick resent in-flight getheaders").into())
             }
             Ok(_) => {
@@ -3457,7 +3390,7 @@ mod tests {
         sync.tick();
 
         let first = rx.try_recv()?;
-        let NetworkMessage::GetData(inventory) = first else {
+        let Message::GetData(inventory) = first else {
             return Err(std::io::Error::other("expected retry getdata").into());
         };
         let requested = witness_block_inventory(inventory)?;
@@ -3502,7 +3435,7 @@ mod tests {
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let first = rx.try_recv()?;
-        let NetworkMessage::GetData(inventory) = first else {
+        let Message::GetData(inventory) = first else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(witness_block_inventory(inventory)?, expected);
@@ -3510,7 +3443,7 @@ mod tests {
         let window = sync.download_window.lock();
         assert_eq!(window.pending_len(), expected.len());
         for hash in expected {
-            let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&hash.to_byte_array());
+            let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(hash.as_bytes());
             assert!(window.contains_pending(&hash));
         }
         Ok(())
@@ -3521,13 +3454,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (sync, _peers, _peer_outbound, _block_tree, _applied_tip, _expected) =
             sync_with_header_chain(1)?;
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let hash =
-            bitcoin_rs_primitives::Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let block = Network::Regtest.genesis_block();
+        let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(block.block_hash().as_bytes());
         let received_at = Instant::now()
             .checked_sub(super::RECEIVED_BLOCK_TIMEOUT + Duration::from_secs(1))
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
-        let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let staged = sync
             .block_stager
             .lock()
@@ -3549,7 +3481,7 @@ mod tests {
     #[test]
     fn unsolicited_stale_block_retries_from_resolved_header_height()
     -> Result<(), Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let block1 =
             mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
         let block2 =
@@ -3601,7 +3533,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(initial) = rx.try_recv()? else {
+        let Message::GetData(initial) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected initial getdata").into());
         };
         assert_eq!(
@@ -3611,8 +3543,8 @@ mod tests {
         let _headers = rx.try_recv()?;
         {
             let mut window = sync.download_window.lock();
-            window.mark_applied(&Hash256::from_le_bytes(block1_hash.as_byte_array()));
-            window.mark_applied(&Hash256::from_le_bytes(expected_hash.as_byte_array()));
+            window.mark_applied(&Hash256::from_le_bytes(block1_hash.as_bytes()));
+            window.mark_applied(&Hash256::from_le_bytes(expected_hash.as_bytes()));
         }
 
         inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block2))?;
@@ -3623,7 +3555,7 @@ mod tests {
 
         sync.tick();
 
-        let NetworkMessage::GetData(retry) = rx.try_recv()? else {
+        let Message::GetData(retry) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected height-2 retry getdata").into());
         };
         assert_eq!(witness_block_inventory(retry)?, alloc::vec![expected_hash]);
@@ -3651,7 +3583,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(inventory.len(), 1);
@@ -3680,7 +3612,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(inventory.len(), 2);
@@ -3723,12 +3655,12 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(first_inventory) = first_rx.try_recv()? else {
+        let Message::GetData(first_inventory) = first_rx.try_recv()? else {
             return Err(std::io::Error::other("expected first peer getdata").into());
         };
         let first_requested = witness_block_inventory(first_inventory)?;
         let _first_headers = first_rx.try_recv()?;
-        let NetworkMessage::GetData(second_inventory) = second_rx.try_recv()? else {
+        let Message::GetData(second_inventory) = second_rx.try_recv()? else {
             return Err(std::io::Error::other("expected second peer getdata").into());
         };
         let second_requested = witness_block_inventory(second_inventory)?;
@@ -3760,7 +3692,7 @@ mod tests {
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let cap = super::PENDING_BUDGET.div_ceil(super::MIN_PEERS_FOR_FANOUT);
         for (idx, rx) in rxs.iter().enumerate() {
-            let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+            let Message::GetData(inventory) = rx.try_recv()? else {
                 return Err(
                     std::io::Error::other("expected getdata for every eligible peer").into(),
                 );
@@ -3773,7 +3705,7 @@ mod tests {
                 expected[idx * cap..(idx + 1) * cap]
             );
             if idx == 0 {
-                if !matches!(rx.try_recv()?, NetworkMessage::GetHeaders(_)) {
+                if !matches!(rx.try_recv()?, Message::GetHeaders(_)) {
                     return Err(std::io::Error::other("expected getheaders for header peer").into());
                 }
             }
@@ -3805,7 +3737,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rxs[0].try_recv()? else {
+        let Message::GetData(inventory) = rxs[0].try_recv()? else {
             return Err(std::io::Error::other("expected deep getdata for highest peer").into());
         };
         // The tracked window remains single-owner. Idle eligible alternates
@@ -3977,7 +3909,7 @@ mod tests {
         } else {
             &rxs[0]
         };
-        let NetworkMessage::GetData(inventory) = deep_rx.try_recv()? else {
+        let Message::GetData(inventory) = deep_rx.try_recv()? else {
             return Err(std::io::Error::other("expected one deep fallback getdata").into());
         };
         assert_eq!(witness_block_inventory(inventory)?, expected);
@@ -4014,11 +3946,11 @@ mod tests {
         );
         sync.tick();
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(initial) = demoted_rx.try_recv()? else {
+        let Message::GetData(initial) = demoted_rx.try_recv()? else {
             return Err(std::io::Error::other("expected initial deep getdata").into());
         };
         assert_eq!(initial.len(), super::PENDING_BUDGET);
-        if !matches!(demoted_rx.try_recv()?, NetworkMessage::GetHeaders(_)) {
+        if !matches!(demoted_rx.try_recv()?, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected getheaders for lone peer").into());
         }
 
@@ -4037,7 +3969,7 @@ mod tests {
         }
         sync.tick();
 
-        let NetworkMessage::GetData(retry) = rxs[0].try_recv()? else {
+        let Message::GetData(retry) = rxs[0].try_recv()? else {
             return Err(std::io::Error::other("expected deep retry getdata").into());
         };
         assert_eq!(witness_block_inventory(retry)?, expected);
@@ -4077,11 +4009,11 @@ mod tests {
         );
         sync.tick();
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(initial) = demoted_rx.try_recv()? else {
+        let Message::GetData(initial) = demoted_rx.try_recv()? else {
             return Err(std::io::Error::other("expected initial deep getdata").into());
         };
         assert_eq!(initial.len(), super::PENDING_BUDGET);
-        if !matches!(demoted_rx.try_recv()?, NetworkMessage::GetHeaders(_)) {
+        if !matches!(demoted_rx.try_recv()?, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected getheaders for lone peer").into());
         }
 
@@ -4137,7 +4069,7 @@ mod tests {
 
         let cap = super::PENDING_BUDGET.div_ceil(super::MIN_PEERS_FOR_FANOUT);
         for (idx, rx) in rxs.iter().enumerate() {
-            let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+            let Message::GetData(inventory) = rx.try_recv()? else {
                 return Err(std::io::Error::other("expected getdata for eligible peer").into());
             };
             assert_eq!(
@@ -4148,7 +4080,7 @@ mod tests {
         }
         // The header peer (highest candidate, inbound) may still receive
         // getheaders — header sync is not block download.
-        if !matches!(inbound_rx.try_recv()?, NetworkMessage::GetHeaders(_)) {
+        if !matches!(inbound_rx.try_recv()?, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected getheaders to header peer").into());
         }
         assert!(inbound_rx.try_recv().is_err());
@@ -4184,7 +4116,7 @@ mod tests {
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let cap = super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
         for (idx, rx) in rxs[..SELECTED_PEERS].iter().enumerate() {
-            let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+            let Message::GetData(inventory) = rx.try_recv()? else {
                 return Err(std::io::Error::other("expected getdata for eligible peer").into());
             };
             assert_eq!(
@@ -4207,7 +4139,7 @@ mod tests {
         // Its in-flight blocks are released and picked up by the remaining
         // eligible peers — the saturated ones have no capacity, so the spare
         // takes the whole stripe.
-        let NetworkMessage::GetData(requeued) = spare_rx.try_recv()? else {
+        let Message::GetData(requeued) = spare_rx.try_recv()? else {
             return Err(std::io::Error::other("expected re-queued getdata for spare peer").into());
         };
         assert_eq!(witness_block_inventory(requeued)?, expected[cap..2 * cap]);
@@ -4247,12 +4179,12 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected headroom-clamped getdata").into());
         };
         // A gate-open burst must not over-request past staging headroom.
         assert_eq!(witness_block_inventory(inventory)?, expected[..1]);
-        if !matches!(rx.try_recv()?, NetworkMessage::GetHeaders(_)) {
+        if !matches!(rx.try_recv()?, Message::GetHeaders(_)) {
             return Err(std::io::Error::other("expected getheaders").into());
         }
 
@@ -4285,7 +4217,7 @@ mod tests {
             assert_eq!(window.pending_len(), 2);
             for front in &expected[..2] {
                 assert!(
-                    window.contains_pending(&Hash256::from_le_bytes(&front.to_byte_array())),
+                    window.contains_pending(&Hash256::from_le_bytes(front.as_bytes())),
                     "stalled front stripe must stay pending, not churn through retry"
                 );
             }
@@ -4303,8 +4235,7 @@ mod tests {
         let stager = sync.block_stager.lock();
         assert_eq!(stager.received_len(), 14, "no evictions may occur");
         for height in 3..=16_u32 {
-            let hash =
-                Hash256::from_le_bytes(&expected[usize::try_from(height)? - 1].to_byte_array());
+            let hash = Hash256::from_le_bytes(expected[usize::try_from(height)? - 1].as_bytes());
             assert!(
                 stager.contains(&hash),
                 "every delivered block must remain staged (height {height})"
@@ -4338,7 +4269,7 @@ mod tests {
         let mut rerequested = Vec::new();
         for rx in &rxs[1..] {
             while let Ok(message) = rx.try_recv() {
-                if let NetworkMessage::GetData(inventory) = message {
+                if let Message::GetData(inventory) = message {
                     rerequested.extend(witness_block_inventory(inventory)?);
                 }
             }
@@ -4357,7 +4288,7 @@ mod tests {
             let window = sync.download_window.lock();
             assert_eq!(window.pending_len(), 2);
             for front in &expected[..2] {
-                assert!(window.contains_pending(&Hash256::from_le_bytes(&front.to_byte_array())));
+                assert!(window.contains_pending(&Hash256::from_le_bytes(front.as_bytes())));
             }
         }
         Ok(())
@@ -4386,7 +4317,7 @@ mod tests {
         let mut hedged = Vec::new();
         for rx in &rxs[1..] {
             while let Ok(message) = rx.try_recv() {
-                if let NetworkMessage::GetData(inventory) = message {
+                if let Message::GetData(inventory) = message {
                     hedged.extend(witness_block_inventory(inventory)?);
                 }
             }
@@ -4415,16 +4346,13 @@ mod tests {
         sync.tick();
         assert_eq!(
             witness_block_inventory(next_getdata(&owner_rx)?)?,
-            blocks
-                .iter()
-                .map(bitcoin::Block::block_hash)
-                .collect::<Vec<_>>()
+            blocks.iter().map(Block::block_hash).collect::<Vec<_>>()
         );
         assert_eq!(
             witness_block_inventory(next_getdata(&alternate_rx)?)?,
             blocks[..8]
                 .iter()
-                .map(bitcoin::Block::block_hash)
+                .map(Block::block_hash)
                 .collect::<Vec<_>>()
         );
 
@@ -4448,7 +4376,7 @@ mod tests {
             witness_block_inventory(next_getdata(&alternate_rx)?)?,
             blocks[4..]
                 .iter()
-                .map(bitcoin::Block::block_hash)
+                .map(Block::block_hash)
                 .collect::<Vec<_>>()
         );
         assert!(peer_outbound.read().contains_key(&owner));
@@ -4530,7 +4458,7 @@ mod tests {
     #[test]
     fn applied_ancestry_lookup_uses_active_index_only_for_applied_prefix()
     -> Result<(), Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let main1 =
             mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
         let main2 =
@@ -4596,10 +4524,7 @@ mod tests {
         let requested = next_getdata(&rx)?;
         assert_eq!(
             witness_block_inventory(requested)?,
-            blocks
-                .iter()
-                .map(bitcoin::Block::block_hash)
-                .collect::<Vec<_>>()
+            blocks.iter().map(Block::block_hash).collect::<Vec<_>>()
         );
         for block in &blocks {
             blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))?;
@@ -4612,7 +4537,7 @@ mod tests {
                 .height,
             64
         );
-        let stale_hash = Hash256::from_le_bytes(blocks[0].block_hash().as_byte_array());
+        let stale_hash = Hash256::from_le_bytes(blocks[0].block_hash().as_bytes());
         assert!(
             !sync.download_window.lock().contains_pending(&stale_hash),
             "the replay must be unsolicited after its request was applied"
@@ -4690,7 +4615,7 @@ mod tests {
         let mut rerequested = Vec::new();
         for rx in &rxs[1..] {
             while let Ok(message) = rx.try_recv() {
-                if let NetworkMessage::GetData(inventory) = message {
+                if let Message::GetData(inventory) = message {
                     rerequested.extend(witness_block_inventory(inventory)?);
                 }
             }
@@ -4709,7 +4634,7 @@ mod tests {
             let window = sync.download_window.lock();
             assert_eq!(window.pending_len(), 2);
             for front in &expected[..2] {
-                assert!(window.contains_pending(&Hash256::from_le_bytes(&front.to_byte_array())));
+                assert!(window.contains_pending(&Hash256::from_le_bytes(front.as_bytes())));
             }
         }
         Ok(())
@@ -4749,7 +4674,7 @@ mod tests {
 
         // Tick 1: the inflated height wins the deep fallback selection.
         sync.tick();
-        let NetworkMessage::GetData(inventory) = staller_rx.try_recv()? else {
+        let Message::GetData(inventory) = staller_rx.try_recv()? else {
             return Err(std::io::Error::other("expected staller getdata").into());
         };
         assert_eq!(
@@ -4855,7 +4780,7 @@ mod tests {
                 // One initial-estimate slot (the pending front) plus the
                 // delivered successor: byte headroom is exactly zero once
                 // both are accounted.
-                max_received_bytes: 256 * 1024 + blocks[1].total_size(),
+                max_received_bytes: 256 * 1024 + consensus_bytes(&blocks[1]).len(),
                 // Phase 1: arming reads the staged-count fraction, not
                 // request capacity, so the single staged successor must be
                 // >= half the count window (2 / 2 = 1) for the episode to
@@ -4883,7 +4808,7 @@ mod tests {
             .seed_front_cadence_for_test(50, Instant::now());
 
         sync.tick();
-        let NetworkMessage::GetData(inventory) = staller_rx.try_recv()? else {
+        let Message::GetData(inventory) = staller_rx.try_recv()? else {
             return Err(std::io::Error::other("expected staller getdata").into());
         };
         assert_eq!(
@@ -4916,7 +4841,7 @@ mod tests {
             1,
             "recovery must not discard staged progress (prune-free)"
         );
-        let NetworkMessage::GetData(retry) = honest_rx.try_recv()? else {
+        let Message::GetData(retry) = honest_rx.try_recv()? else {
             return Err(std::io::Error::other("expected honest peer front retry").into());
         };
         assert_eq!(
@@ -5065,16 +4990,16 @@ mod tests {
             .seed_front_cadence_for_test(50, Instant::now());
 
         sync.tick();
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(witness_block_inventory(inventory)?, expected[..2]);
         // The successor stages; the window is otherwise fully blocked on the
         // front-holding peer.
-        let successor = Hash256::from_le_bytes(&expected[1].to_byte_array());
+        let successor = Hash256::from_le_bytes(expected[1].as_bytes());
         {
-            let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-            let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+            let block = Network::Regtest.genesis_block();
+            let serialized = bytes::Bytes::from(consensus_bytes(&block));
             sync.block_stager
                 .lock()
                 .insert(successor, None, block, serialized, Instant::now());
@@ -5085,10 +5010,10 @@ mod tests {
 
         // Apply-side backpressure: the next expected block (the frontier) is
         // itself staged but not yet drained.
-        let frontier = Hash256::from_le_bytes(&expected[0].to_byte_array());
+        let frontier = Hash256::from_le_bytes(expected[0].as_bytes());
         {
-            let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-            let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+            let block = Network::Regtest.genesis_block();
+            let serialized = bytes::Bytes::from(consensus_bytes(&block));
             sync.block_stager
                 .lock()
                 .insert(frontier, None, block, serialized, Instant::now());
@@ -5160,7 +5085,7 @@ mod tests {
         let rx = connect_peer(&peers, &peer_outbound, synthetic_peer(sole, 100));
 
         sync.tick();
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(
@@ -5295,7 +5220,7 @@ mod tests {
                 assert_eq!(stripe.len(), 3, "each peer must own a 3-block stripe");
                 stripes.push(stripe);
             }
-            let by_hash: HashMap<BlockHash, bitcoin::Block> = blocks
+            let by_hash: HashMap<BlockHash, Block> = blocks
                 .iter()
                 .map(|block| (block.block_hash(), block.clone()))
                 .collect();
@@ -5417,7 +5342,7 @@ mod tests {
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         assert!(sync.download_window.lock().fanout_active());
         for (idx, rx) in rxs.iter().enumerate() {
-            let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+            let Message::GetData(inventory) = rx.try_recv()? else {
                 return Err(std::io::Error::other("expected striped getdata").into());
             };
             assert_eq!(
@@ -5448,7 +5373,7 @@ mod tests {
         let redistributed_cap = 16_usize.div_ceil(PEER_COUNT - 1);
         for rx in &rxs[1..] {
             while let Ok(message) = rx.try_recv() {
-                if let NetworkMessage::GetData(inventory) = message {
+                if let Message::GetData(inventory) = message {
                     let hashes = witness_block_inventory(inventory)?;
                     assert!(
                         hashes.len() <= redistributed_cap,
@@ -5502,7 +5427,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(high_inventory) = high_rx.try_recv()? else {
+        let Message::GetData(high_inventory) = high_rx.try_recv()? else {
             return Err(std::io::Error::other("expected high peer getdata").into());
         };
         assert_eq!(witness_block_inventory(high_inventory)?, expected[..2]);
@@ -5535,7 +5460,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(witness_block_inventory(inventory)?, expected[..2]);
@@ -5552,7 +5477,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
             sync_with_header_chain(3)?;
-        let received_hash = Hash256::from_le_bytes(&expected[1].to_byte_array());
+        let received_hash = Hash256::from_le_bytes(expected[1].as_bytes());
         {
             let mut window = sync.download_window.lock();
             let needs_height = window.mark_received(received_hash, 80, Instant::now());
@@ -5569,7 +5494,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(
@@ -5602,7 +5527,7 @@ mod tests {
             if tick == 0 {
                 assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
             }
-            let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+            let Message::GetData(inventory) = rx.try_recv()? else {
                 return Err(std::io::Error::other("expected getdata").into());
             };
             requested.extend(witness_block_inventory(inventory)?);
@@ -5640,7 +5565,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(first) = rx.try_recv()? else {
+        let Message::GetData(first) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected first getdata").into());
         };
         assert_eq!(witness_block_inventory(first)?, expected[..2]);
@@ -5648,7 +5573,7 @@ mod tests {
 
         sync.tick();
 
-        let NetworkMessage::GetData(second) = rx.try_recv()? else {
+        let Message::GetData(second) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected retry getdata").into());
         };
         assert_eq!(witness_block_inventory(second)?, expected[..2]);
@@ -5680,18 +5605,18 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(first) = rx.try_recv()? else {
+        let Message::GetData(first) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected first getdata").into());
         };
         assert_eq!(witness_block_inventory(first)?, expected[..3]);
         let _headers = rx.try_recv()?;
         sync.download_window
             .lock()
-            .mark_applied(&Hash256::from_le_bytes(&expected[0].to_byte_array()));
+            .mark_applied(&Hash256::from_le_bytes(expected[0].as_bytes()));
 
         sync.tick();
 
-        let NetworkMessage::GetData(second) = rx.try_recv()? else {
+        let Message::GetData(second) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected mixed retry getdata").into());
         };
         assert_eq!(
@@ -5726,20 +5651,20 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(first) = rx.try_recv()? else {
+        let Message::GetData(first) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected first getdata").into());
         };
         assert_eq!(witness_block_inventory(first)?, expected[..4]);
         let _headers = rx.try_recv()?;
         {
             let mut window = sync.download_window.lock();
-            window.mark_applied(&Hash256::from_le_bytes(&expected[0].to_byte_array()));
-            window.drop_for_retry(&Hash256::from_le_bytes(&expected[1].to_byte_array()));
+            window.mark_applied(&Hash256::from_le_bytes(expected[0].as_bytes()));
+            window.drop_for_retry(&Hash256::from_le_bytes(expected[1].as_bytes()));
         }
 
         sync.tick();
 
-        let NetworkMessage::GetData(second) = rx.try_recv()? else {
+        let Message::GetData(second) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected gap-filling getdata").into());
         };
         assert_eq!(
@@ -5753,12 +5678,12 @@ mod tests {
     #[test]
     fn tick_applies_contiguous_blocks_before_requesting_more()
     -> Result<(), Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
         let child = test_header(genesis.block_hash(), 1);
         let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::HeaderValid)?;
-        let expected = BlockHash::from_byte_array(tree.node(child_id)?.hash.to_le_bytes());
+        let expected = BlockHash::from(tree.node(child_id)?.hash);
 
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
@@ -5793,7 +5718,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(witness_block_inventory(inventory)?, alloc::vec![expected]);
@@ -5811,8 +5736,8 @@ mod tests {
             ..super::default_sync_budget()
         });
         let now = Instant::now();
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
 
         let super::StagedBlock::Memory { dropped, .. } = stager.insert(
             fork_hash,
@@ -5840,7 +5765,7 @@ mod tests {
     #[test]
     fn oversized_received_block_releases_pending_budget_for_retry()
     -> Result<(), Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let block = mined_block_with_prev_hash(
             genesis.block_hash(),
             1,
@@ -5849,7 +5774,7 @@ mod tests {
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
         let block_id = tree.insert_node(Some(genesis_id), block.header, NodeStatus::HeaderValid)?;
-        let expected_hash = BlockHash::from_byte_array(tree.node(block_id)?.hash.to_le_bytes());
+        let expected_hash = BlockHash::from(tree.node(block_id)?.hash);
 
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
@@ -5892,7 +5817,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(
@@ -5913,7 +5838,7 @@ mod tests {
 
         sync.tick();
 
-        let NetworkMessage::GetData(retry) = rx.try_recv()? else {
+        let Message::GetData(retry) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected retry getdata").into());
         };
         assert_eq!(witness_block_inventory(retry)?, alloc::vec![expected_hash]);
@@ -5923,7 +5848,7 @@ mod tests {
     #[test]
     fn staging_byte_exhaustion_backpressures_requests_then_recovers()
     -> Result<(), Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let block1 =
             mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
         let block2 =
@@ -5967,7 +5892,7 @@ mod tests {
         install_budget(
             &sync,
             super::SyncBudget {
-                max_received_bytes: block2.total_size(),
+                max_received_bytes: consensus_bytes(&block2).len(),
                 getdata_batch_limit: 2,
                 ..super::default_sync_budget()
             },
@@ -5982,7 +5907,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+        let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(
@@ -5997,7 +5922,7 @@ mod tests {
         sync.drain_inbound_blocks();
         assert_eq!(
             sync.block_stager.lock().received_bytes(),
-            block2.total_size()
+            consensus_bytes(&block2).len()
         );
 
         // Exhausted staging degrades to backpressure: the next tick requests
@@ -6019,7 +5944,7 @@ mod tests {
             .height;
         assert_eq!(applied_height, 2);
         assert_eq!(sync.block_stager.lock().received_len(), 0);
-        let NetworkMessage::GetData(recovered) = rx.try_recv()? else {
+        let Message::GetData(recovered) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected recovery getdata").into());
         };
         assert_eq!(
@@ -6044,7 +5969,7 @@ mod tests {
         // neither peer is asked for anything.
         sync.tick();
         while let Ok(message) = stalled_rx.try_recv() {
-            if matches!(message, NetworkMessage::GetData(_)) {
+            if matches!(message, Message::GetData(_)) {
                 return Err(std::io::Error::other(
                     "exhausted staging must not request from the stalled peer",
                 )
@@ -6087,9 +6012,9 @@ mod tests {
             let window = sync.download_window.lock();
             assert_eq!(window.received_len(), 0);
             assert!(window.has_request_capacity());
-            assert!(window.contains_pending(&Hash256::from_le_bytes(block1_hash.as_byte_array())));
+            assert!(window.contains_pending(&Hash256::from_le_bytes(block1_hash.as_bytes())));
         }
-        let NetworkMessage::GetData(retry) = healthy_rx.try_recv()? else {
+        let Message::GetData(retry) = healthy_rx.try_recv()? else {
             return Err(std::io::Error::other("expected healthy peer retry getdata").into());
         };
         assert_eq!(
@@ -6097,7 +6022,7 @@ mod tests {
             alloc::vec![block1_hash, block2_hash]
         );
         while let Ok(message) = stalled_rx.try_recv() {
-            if matches!(message, NetworkMessage::GetData(_)) {
+            if matches!(message, Message::GetData(_)) {
                 return Err(
                     std::io::Error::other("stalled peer should not receive retry getdata").into(),
                 );
@@ -6110,12 +6035,12 @@ mod tests {
         sync: BlockSync,
         stalled_rx: crossbeam_channel::Receiver<Message>,
         healthy_rx: crossbeam_channel::Receiver<Message>,
-        block1_hash: bitcoin::BlockHash,
-        block2_hash: bitcoin::BlockHash,
+        block1_hash: BlockHash,
+        block2_hash: BlockHash,
     }
 
     fn staging_exhaustion_fixture() -> Result<ExhaustionFixture, Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let block1 =
             mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
         let block2 =
@@ -6158,7 +6083,7 @@ mod tests {
         install_budget(
             &sync,
             super::SyncBudget {
-                max_received_bytes: block2.total_size(),
+                max_received_bytes: consensus_bytes(&block2).len(),
                 getdata_batch_limit: 2,
                 pending_timeout: Duration::ZERO,
                 received_timeout: Duration::from_millis(100),
@@ -6176,7 +6101,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let NetworkMessage::GetData(inventory) = stalled_rx.try_recv()? else {
+        let Message::GetData(inventory) = stalled_rx.try_recv()? else {
             return Err(std::io::Error::other("expected getdata").into());
         };
         assert_eq!(
@@ -6217,7 +6142,7 @@ mod tests {
         block_tree: Arc<RwLock<BlockTree>>,
         inbound_blocks_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>,
         outbound_rx: crossbeam_channel::Receiver<Message>,
-        blocks: Vec<bitcoin::Block>,
+        blocks: Vec<Block>,
     }
 
     #[test]
@@ -6238,7 +6163,7 @@ mod tests {
             sync.tick();
 
             assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-            let NetworkMessage::GetData(inventory) = outbound_rx.try_recv()? else {
+            let Message::GetData(inventory) = outbound_rx.try_recv()? else {
                 return Err(std::io::Error::other("expected proxy getdata").into());
             };
             let pending_count = inventory.len();
@@ -6287,7 +6212,7 @@ mod tests {
 
     fn deterministic_proxy_fixture() -> Result<DeterministicProxyFixture, Box<dyn std::error::Error>>
     {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
         let mut tip_id = genesis_id;
@@ -6306,7 +6231,7 @@ mod tests {
         {
             let header = test_header(prev_hash, height);
             tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
-            prev_hash = header.block_hash();
+            prev_hash = header.compute_hash();
         }
 
         let chain_tip = tree.tip_handle();
@@ -6364,16 +6289,15 @@ mod tests {
     #[test]
     fn batch_drain_restores_unapplied_tail_after_mid_batch_failure()
     -> Result<(), Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let block1 =
             mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
         let block2 =
             mined_block_with_prev_hash(block1.block_hash(), 2, vec![coinbase_transaction(2)]);
         let block3 =
             mined_block_with_prev_hash(block2.block_hash(), 3, vec![coinbase_transaction(3)]);
-        let block1_hash = Hash256::from_le_bytes(block1.block_hash().as_byte_array());
-        let block2_hash = Hash256::from_le_bytes(block2.block_hash().as_byte_array());
-        let block3_hash = Hash256::from_le_bytes(block3.block_hash().as_byte_array());
+        let block2_hash = Hash256::from_le_bytes(block2.block_hash().as_bytes());
+        let block3_hash = Hash256::from_le_bytes(block3.block_hash().as_bytes());
 
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
@@ -6427,28 +6351,29 @@ mod tests {
             sync.block_stager.lock().contains(&block3_hash),
             "tail block must be restored after the mid-batch failure"
         );
+        // G5: the mid-batch failure leaves the gateway generation odd
+        // (fail-closed). Admission stays closed; a retry cannot begin a new
+        // chain change until an external recovery path resets the generation.
+        assert!(
+            sync.handles.mempool_gateway.stable_generation().is_none(),
+            "generation must be odd after mid-batch failure (G5 fail-closed)"
+        );
 
+        // Retry is blocked by the odd generation: begin_chain_change rejects
+        // an odd value, so the re-sent block 2 cannot apply.
         inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block2))?;
         sync.tick();
 
         assert_eq!(
             applied_tip.load_full().map(|tip| tip.height),
-            Some(3),
-            "retry should apply the failed block and then the restored tail in order"
+            Some(1),
+            "height must not advance while the generation is odd (G5 fail-closed)"
         );
-        assert_eq!(sync.block_stager.lock().received_len(), 0);
-        assert_eq!(sync.download_window.lock().received_len(), 0);
+        assert!(
+            sync.handles.mempool_gateway.stable_generation().is_none(),
+            "generation must remain odd after the blocked retry"
+        );
         assert!(fail_once_store.persisted_height(1));
-        assert!(fail_once_store.persisted_height(2));
-        assert!(fail_once_store.persisted_height(3));
-        assert_eq!(
-            sync.handles.applied_tip.load_full().map(|tip| tip.hash),
-            Some(block3_hash)
-        );
-        assert_eq!(
-            sync.handles.block_tree.read().height_of_hash(block1_hash),
-            Some(1)
-        );
         Ok(())
     }
 
@@ -6491,7 +6416,7 @@ mod tests {
 
     struct ApplyCacheFixture {
         sync: BlockSync,
-        blocks: Vec<bitcoin::Block>,
+        blocks: Vec<Block>,
         applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
         chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     }
@@ -6504,7 +6429,7 @@ mod tests {
         body_height: u32,
         header_only: u32,
     ) -> Result<ApplyCacheFixture, Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
         let mut tip_id = genesis_id;
@@ -6521,7 +6446,7 @@ mod tests {
         for height in body_height.saturating_add(1)..=body_height.saturating_add(header_only) {
             let header = test_header(prev_hash, height);
             tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
-            prev_hash = header.block_hash();
+            prev_hash = header.compute_hash();
         }
 
         let chain_tip = tree.tip_handle();
@@ -6559,9 +6484,9 @@ mod tests {
         })
     }
 
-    fn stage_body(sync: &BlockSync, block: &bitcoin::Block) {
-        let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-        let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(block));
+    fn stage_body(sync: &BlockSync, block: &Block) {
+        let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
+        let serialized = bytes::Bytes::from(consensus_bytes(block));
         sync.block_stager
             .lock()
             .insert(hash, None, block.clone(), serialized, Instant::now());
@@ -6614,7 +6539,7 @@ mod tests {
         assert_eq!(cache.applied_tip_height, 3);
         assert_eq!(
             cache.applied_tip_hash,
-            Hash256::from_le_bytes(fixture.blocks[2].block_hash().as_byte_array())
+            Hash256::from_le_bytes(fixture.blocks[2].block_hash().as_bytes())
         );
         assert_eq!(
             cache.chain_tip_hash,
@@ -6648,7 +6573,7 @@ mod tests {
         assert_eq!(
             cached_suffix.first().copied(),
             Some(Hash256::from_le_bytes(
-                fixture.blocks[3].block_hash().as_byte_array()
+                fixture.blocks[3].block_hash().as_bytes()
             )),
             "fourth applied block was already present in the populated horizon"
         );
@@ -6659,7 +6584,7 @@ mod tests {
     fn apply_cache_invalidated_on_failed_apply() -> Result<(), Box<dyn std::error::Error>> {
         // Fail persisting height 2 so the second apply in the batch fails after
         // the first succeeds, exercising the failed-apply invalidation branch.
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let block1 =
             mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
         let block2 =
@@ -6800,7 +6725,7 @@ mod tests {
         // apply rejects it on the merkle root. A body that changed its own hash
         // would never be drained and the window would never see it.
         let mut corrupted = fixture.blocks[1].clone();
-        corrupted.txdata.push(coinbase_transaction(99));
+        corrupted.txs.push(coinbase_transaction(99));
         assert_eq!(
             corrupted.block_hash(),
             fixture.blocks[1].block_hash(),
@@ -6824,12 +6749,15 @@ mod tests {
             "the chain stops at the last good block"
         );
 
-        // The two blocks after the failure were never attempted, so they must be
-        // back on the stager rather than silently dropped.
+        // The merkle-root rejection is a permanent consensus failure, so the
+        // window invalidated the corrupted block and its (never-attempted)
+        // descendants while the transition was held. They can never become
+        // applicable, so instead of returning to the stager they are purged
+        // from it: the frontier must not cycle on invalidated blocks.
         let restored = fixture.sync.block_stager.lock().received_len();
         assert_eq!(
-            restored, 2,
-            "suffix after the failure returns to the stager"
+            restored, 0,
+            "invalidated blocks and their descendants are purged, not restored"
         );
         Ok(())
     }
@@ -6865,11 +6793,11 @@ mod tests {
         // The cached run begins at applied_tip + 1 (height 1) and stays contiguous.
         assert_eq!(
             cache.hashes[0],
-            Hash256::from_le_bytes(fixture.blocks[0].block_hash().as_byte_array())
+            Hash256::from_le_bytes(fixture.blocks[0].block_hash().as_bytes())
         );
         assert_eq!(
             cache.hashes[cap - 1],
-            Hash256::from_le_bytes(fixture.blocks[cap - 1].block_hash().as_byte_array())
+            Hash256::from_le_bytes(fixture.blocks[cap - 1].block_hash().as_bytes())
         );
         Ok(())
     }
@@ -6902,12 +6830,10 @@ mod tests {
         let mut expected = Vec::new();
 
         for height in 1_u32..=height {
-            let parent_hash = BlockHash::from_byte_array(tree.node(tip_id)?.hash.to_le_bytes());
+            let parent_hash = BlockHash::from(tree.node(tip_id)?.hash);
             let header = test_header(parent_hash, height);
             tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
-            expected.push(BlockHash::from_byte_array(
-                tree.node(tip_id)?.hash.to_le_bytes(),
-            ));
+            expected.push(BlockHash::from(tree.node(tip_id)?.hash));
         }
 
         let chain_tip = tree.tip_handle();
@@ -6951,7 +6877,7 @@ mod tests {
         Arc<RwLock<Vec<PeerInfo>>>,
         Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
         Arc<ArcSwapOption<TipSnapshot>>,
-        Vec<bitcoin::Block>,
+        Vec<Block>,
         InboundBlockSender,
     );
 
@@ -6959,7 +6885,7 @@ mod tests {
     /// mined regtest blocks (coinbase-bearing, PoW-valid), so tests can drive
     /// real apply progress through the inbound channel.
     fn sync_with_mined_chain(count: u32) -> Result<MinedChainFixture, Box<dyn std::error::Error>> {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let mut tree = BlockTree::new();
         let mut node_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
         let mut prev_hash = genesis.block_hash();
@@ -7060,7 +6986,7 @@ mod tests {
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         for (idx, rx) in rxs.iter().enumerate() {
-            let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
+            let Message::GetData(inventory) = rx.try_recv()? else {
                 return Err(std::io::Error::other("expected a striped getdata per peer").into());
             };
             assert_eq!(
@@ -7082,7 +7008,7 @@ mod tests {
         rx: &crossbeam_channel::Receiver<Message>,
     ) -> Result<Vec<Inventory>, Box<dyn std::error::Error>> {
         while let Ok(message) = rx.try_recv() {
-            if let NetworkMessage::GetData(inventory) = message {
+            if let Message::GetData(inventory) = message {
                 return Ok(inventory);
             }
         }
@@ -7094,29 +7020,29 @@ mod tests {
         rx: &crossbeam_channel::Receiver<Message>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         while let Ok(message) = rx.try_recv() {
-            if matches!(message, NetworkMessage::GetData(_)) {
+            if matches!(message, Message::GetData(_)) {
                 return Err(std::io::Error::other("unexpected getdata").into());
             }
         }
         Ok(())
     }
 
-    /// Reconstructs the deliverable block body (header-only, empty `txdata`)
+    /// Reconstructs the deliverable block body (header-only, empty `txs`)
     /// for `height` of a [`sync_with_header_chain`] fixture: the block hash
     /// is the header hash, so the delivery matches the fixture's tree node.
     fn header_chain_block(
         expected: &[BlockHash],
         height: u32,
-    ) -> Result<bitcoin::Block, Box<dyn std::error::Error>> {
+    ) -> Result<Block, Box<dyn std::error::Error>> {
         let index = usize::try_from(height.checked_sub(1).ok_or("height must be >= 1")?)?;
         let prev_blockhash = if index == 0 {
-            genesis_header().block_hash()
+            genesis_header().compute_hash()
         } else {
             expected[index - 1]
         };
-        let block = bitcoin::Block {
+        let block = Block {
             header: test_header(prev_blockhash, height),
-            txdata: Vec::new(),
+            txs: Vec::new(),
         };
         assert_eq!(
             block.block_hash(),
@@ -7349,35 +7275,13 @@ mod tests {
         inventory
             .into_iter()
             .map(|item| match item {
-                Inventory::WitnessBlock(hash) => Ok(hash),
+                // Wire seam: Inventory payloads stay bitcoin::; convert to native.
+                Inventory::WitnessBlock(hash) => {
+                    Ok(BlockHash(Hash256::from_le_bytes(hash.as_byte_array())))
+                }
                 _ => Err(std::io::Error::other("expected witness block inventory").into()),
             })
             .collect()
-    }
-
-    struct NoopFilterIndex;
-
-    impl FilterIndexLike for NoopFilterIndex {
-        fn wants_filters(&self) -> bool {
-            false
-        }
-
-        fn put_filter(
-            &self,
-            _block_hash: Hash256,
-            _prev_header: Hash256,
-            _filter_bytes: &[u8],
-        ) -> Result<Hash256, FilterIndexError> {
-            Ok(Hash256::default())
-        }
-
-        fn filter_header(&self, _block_hash: Hash256) -> Result<Option<Hash256>, FilterIndexError> {
-            Ok(None)
-        }
-
-        fn filter(&self, _block_hash: Hash256) -> Result<Option<Vec<u8>>, FilterIndexError> {
-            Ok(None)
-        }
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -7386,27 +7290,27 @@ mod tests {
         applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
         block_tree: Arc<RwLock<BlockTree>>,
     ) -> ApplyHandles {
+        let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
+        let mempool_gateway = bitcoin_rs_mempool::MempoolGateway::shared(Arc::clone(&mempool));
+        let mining_generation = Arc::new(crate::mining::MiningGenerationSignal::new());
         ApplyHandles::new(
             Network::Regtest,
             chain_tip,
             applied_tip,
             block_tree,
             Arc::new(UtxoSet::new()),
-            Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
-                bitcoin_rs_coinstats::CoinStats::default(),
+            Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+                bitcoin_rs_utxo::stats::CoinStats::default(),
             )),
             None,
-            noop_filter_index(),
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Arc::new(RwLock::new(bitcoin_rs_rpc::BlockLog::new())),
-            Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
+            mempool,
+            mempool_gateway,
+            mining_generation,
+            Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
+            Arc::new(RwLock::new(HashMap::<Txid, Tx>::new())),
             Arc::new(crate::NoOpZmqPublisher),
+            Arc::new(crate::state::ChainEventPublisher::detached(0).0),
         )
-    }
-
-    fn noop_filter_index() -> Arc<Box<dyn FilterIndexLike>> {
-        let filter_index: Box<dyn FilterIndexLike> = Box::new(NoopFilterIndex);
-        Arc::new(filter_index)
     }
 
     /// Regtest genesis timestamp. Fixture headers must advance past it or the
@@ -7414,32 +7318,32 @@ mod tests {
     /// ancestors actually present in the tree.
     const GENESIS_TIME: u32 = 1_296_688_602;
 
-    fn test_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
+    fn test_header(prev_blockhash: BlockHash, height: u32) -> Header {
         let mut merkle = [0_u8; 32];
         merkle[..4].copy_from_slice(&height.to_le_bytes());
-        let mut header = BlockHeader {
-            version: Version::ONE,
+        let mut header = Header {
+            version: 1,
             prev_blockhash,
-            merkle_root: TxMerkleNode::from_byte_array(merkle),
+            merkle_root: Hash256::from_le_bytes(&merkle),
             time: GENESIS_TIME.saturating_add(height),
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: height,
         };
         // Mine rather than hope: the fixture previously relied on nonce=height
         // happening to satisfy regtest's easy target, so any change to another
         // header field silently broke proof-of-work validation.
-        while !header.target().is_met_by(header.block_hash()) {
+        while !pow_met(header.bits, Hash256::from(header.compute_hash())) {
             header.nonce = header.nonce.wrapping_add(1);
         }
         header
     }
 
-    fn nbits_mismatch_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
+    fn nbits_mismatch_header(prev_blockhash: BlockHash, height: u32) -> Header {
         let mut header = test_header(prev_blockhash, height);
-        header.bits = CompactTarget::from_consensus(0x207f_fffe);
+        header.bits = 0x207f_fffe;
         for nonce in 0..=u32::MAX {
             header.nonce = nonce;
-            if header.target().is_met_by(header.block_hash()) {
+            if pow_met(header.bits, Hash256::from(header.compute_hash())) {
                 return header;
             }
         }
@@ -7449,20 +7353,39 @@ mod tests {
     fn far_future_header(
         prev_blockhash: BlockHash,
         height: u32,
-    ) -> Result<BlockHeader, Box<dyn std::error::Error>> {
+    ) -> Result<Header, Box<dyn std::error::Error>> {
         let mut header = test_header(prev_blockhash, height);
         header.time = bitcoin_rs_chain::current_unix_seconds().saturating_add(3 * 60 * 60);
         for nonce in 0..=u32::MAX {
             header.nonce = nonce;
-            if header.target().is_met_by(header.block_hash()) {
+            if pow_met(header.bits, Hash256::from(header.compute_hash())) {
                 return Ok(header);
             }
         }
         Err(std::io::Error::other("exhausted future-header nonce space").into())
     }
 
+    /// Regtest-easy compact-target `PoW` check over the hash as a 256-bit
+    /// little-endian integer (mirrors `chain::pow::compact_is_met_by` for the
+    /// >3-exponent, 3-byte-mantissa forms these fixtures mine).
+    fn pow_met(bits: u32, hash: Hash256) -> bool {
+        let exponent = bits >> 24;
+        let mantissa = bits & 0x007f_ffff;
+        if exponent <= 3 || exponent > 32 || mantissa > 0x00ff_ffff {
+            return false;
+        }
+        let bytes = hash.as_byte_array();
+        let lo = usize::try_from(exponent).unwrap_or(32) - 3;
+        let window =
+            u32::from(bytes[lo]) | u32::from(bytes[lo + 1]) << 8 | u32::from(bytes[lo + 2]) << 16;
+        window <= mantissa
+            && bytes[usize::try_from(exponent).unwrap_or(32)..]
+                .iter()
+                .all(|&byte| byte == 0)
+    }
+
     struct HeaderSyncFixture {
-        genesis: BlockHeader,
+        genesis: Header,
         sync: BlockSync,
         inbound_headers_tx: crossbeam_channel::Sender<InboundHeaders>,
         peers: Arc<RwLock<Vec<PeerInfo>>>,
@@ -7507,74 +7430,97 @@ mod tests {
         })
     }
 
-    fn genesis_header() -> BlockHeader {
-        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header
+    fn genesis_header() -> Header {
+        Network::Regtest.genesis_block().header
     }
 
-    fn coinbase_transaction(height: u32) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: bitcoin::OutPoint::null(),
-                script_sig: Builder::new()
-                    .push_int(i64::from(height))
-                    .push_int(1)
-                    .into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn coinbase_transaction(height: u32) -> Tx {
+        let mut script_sig = push_int(i64::from(height));
+        script_sig.extend_from_slice(&push_int(1));
+        Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig,
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Vec::new(),
             }],
+            lock_time: 0,
         }
     }
 
-    fn transaction(seed: u8) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: bitcoin::OutPoint {
-                    txid: bitcoin::Txid::from_byte_array([seed; 32]),
-                    vout: u32::from(seed),
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn transaction(seed: u8) -> Tx {
+        Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(
+                    Txid(Hash256::from_le_bytes(&[seed; 32])),
+                    u32::from(seed),
+                ),
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Vec::new(),
             }],
+            lock_time: 0,
         }
     }
 
     fn mined_block_with_prev_hash(
         prev_blockhash: BlockHash,
         height: u32,
-        txdata: Vec<Transaction>,
-    ) -> bitcoin::Block {
-        let mut block = bitcoin::Block {
-            header: bitcoin::block::Header {
-                version: Version::ONE,
+        txdata: Vec<Tx>,
+    ) -> Block {
+        let mut block = Block {
+            header: Header {
+                version: 1,
                 prev_blockhash,
-                merkle_root: TxMerkleNode::all_zeros(),
+                merkle_root: Hash256::default(),
                 time: GENESIS_TIME.saturating_add(height),
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             },
-            txdata,
+            txs: txdata,
         };
-        block.header.merkle_root = block
-            .compute_merkle_root()
-            .unwrap_or_else(TxMerkleNode::all_zeros);
-        let target = block.header.target();
-        while block.header.validate_pow(target).is_err() {
+        block.header.merkle_root = merkle_root(&block.txs);
+        while !pow_met(block.header.bits, Hash256::from(block.block_hash())) {
             block.header.nonce = block.header.nonce.saturating_add(1);
         }
         block
+    }
+
+    /// Consensus merkle fold: pairwise double-SHA256 over little-endian txid
+    /// bytes, duplicating the last leaf on odd levels.
+    #[allow(clippy::expect_used)]
+    fn merkle_root(txs: &[Tx]) -> Hash256 {
+        let mut hashes: Vec<[u8; 32]> = txs.iter().map(|tx| *tx.txid().as_bytes()).collect();
+        if hashes.is_empty() {
+            return Hash256::default();
+        }
+        while hashes.len() > 1 {
+            if hashes.len() % 2 == 1 {
+                let last = hashes.last().expect("odd merkle level has a last leaf");
+                hashes.push(*last);
+            }
+            hashes = hashes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let mut buffer = [0_u8; 64];
+                    buffer[..32].copy_from_slice(&pair[0]);
+                    buffer[32..].copy_from_slice(&pair[1]);
+                    double_sha256(&buffer).to_le_bytes()
+                })
+                .collect();
+        }
+        let root = hashes.first().expect("merkle fold reduces to one root");
+        Hash256::from_le_bytes(root)
     }
 
     fn assert_applied_genesis(
@@ -7691,13 +7637,10 @@ mod tests {
             synthetic_peer(addr, 10),
         ));
         sync.tick();
-        assert!(matches!(
-            replacement_rx.try_recv()?,
-            NetworkMessage::GetHeaders(_)
-        ));
+        assert!(matches!(replacement_rx.try_recv()?, Message::GetHeaders(_)));
 
         inbound_headers_tx.send(InboundHeaders {
-            headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
+            headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
             source: Some(stale_source),
         })?;
         sync.drain_inbound_headers();
@@ -7718,7 +7661,7 @@ mod tests {
         );
 
         inbound_headers_tx.send(InboundHeaders {
-            headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
+            headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
             source: Some(replacement.source(addr)),
         })?;
         sync.drain_inbound_headers();
@@ -7758,16 +7701,73 @@ mod tests {
     }
 
     #[test]
+    fn peer_registration_keeps_the_pre_registered_connection_live()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
+            sync_with_header_chain(1)?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_447));
+        let (tx, rx) = unbounded::<Message>();
+        let lease = PeerLease::new(tx);
+        peer_outbound.write().insert(addr, lease.clone());
+
+        let registration = sync.peer_registration_handle();
+        assert!(!registration(addr, lease.clone(), synthetic_peer(addr, 1)));
+        assert!(
+            !lease.is_cancelled(),
+            "handshake publication must not cancel its pre-registered connection"
+        );
+        assert!(
+            peer_outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_connection(&lease))
+        );
+        lease.send(Message::Ping(7))?;
+        assert_eq!(rx.recv()?, Message::Ping(7));
+        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_publication_preserves_pre_registered_current_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
+            sync_with_header_chain(1)?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_447));
+        let (tx, _rx) = unbounded::<Message>();
+        let current = PeerLease::new(tx);
+
+        // The listener registers a connection before its handshake and then
+        // publishes metadata through this callback after the handshake.
+        peer_outbound.write().insert(addr, current.clone());
+        let registration = sync.peer_registration_handle();
+
+        assert!(!registration(
+            addr,
+            current.clone(),
+            synthetic_peer(addr, 2),
+        ));
+        assert!(!current.is_cancelled());
+        assert!(
+            peer_outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|registered| registered.same_connection(&current))
+        );
+        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
+        Ok(())
+    }
+
+    #[test]
     fn peer_registration_reconnects_after_outbound_map_removal()
     -> Result<(), Box<dyn std::error::Error>> {
         let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
             sync_with_header_chain(1)?;
         let addr = SocketAddr::from(([127, 0, 0, 1], 18_448));
         let (old_tx, _old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
         peers.write().push(synthetic_peer(addr, 1));
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(old_tx));
+        peer_outbound.write().insert(addr, old.clone());
         let now = Instant::now();
         sync.download_window
             .lock()
@@ -7781,6 +7781,8 @@ mod tests {
             replacement.clone(),
             synthetic_peer(addr, 2),
         ));
+        assert!(old.is_cancelled());
+        assert!(!replacement.is_cancelled());
         assert!(
             peer_outbound
                 .read()
@@ -7818,7 +7820,8 @@ mod tests {
 
     fn eligible_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
         PeerInfo {
-            services: bitcoin::p2p::ServiceFlags::WITNESS.to_u64() | 1,
+            // SERVICE_WITNESS (1 << 3) | NODE_NETWORK (1): native peer flags.
+            services: 0b1001,
             inbound: false,
             ..synthetic_peer(addr, start_height)
         }
@@ -7991,9 +7994,9 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("missing genesis tip"))?;
 
         sync.tick();
-        assert!(matches!(rx.try_recv()?, NetworkMessage::GetHeaders(_)));
+        assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
         inbound_headers_tx.send(InboundHeaders {
-            headers: vec![far_future_header(genesis.block_hash(), 1)?],
+            headers: vec![far_future_header(genesis.compute_hash(), 1)?],
             source: Some(current_source(&peer_outbound, peer_addr)),
         })?;
         sync.tick();
@@ -8002,7 +8005,7 @@ mod tests {
             sync.handles.chain_tip.load_full().as_deref(),
             Some(tip_before.as_ref())
         );
-        assert!(matches!(rx.try_recv()?, NetworkMessage::GetHeaders(_)));
+        assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
         assert!(rx.try_recv().is_err());
         assert!(
             !lease.is_cancelled(),
@@ -8016,6 +8019,448 @@ mod tests {
                 .lock()
                 .peer_in_staller_cooldown(peer_addr, Instant::now()),
             "local-clock rejection must not blame the peer"
+        );
+        Ok(())
+    }
+
+    /// Failure-injecting undo store: clearing the in-flight marker always
+    /// fails, which is exactly the `MarkerStuck` fatal condition. Everything
+    /// else delegates to the real store it wraps.
+    struct DisarmFailsUndoStore {
+        inner: Arc<dyn crate::apply::UndoStore>,
+    }
+
+    impl crate::apply::UndoStore for DisarmFailsUndoStore {
+        fn persist_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+            record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.persist_undo(height, hash, record)
+        }
+
+        fn load_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_undo(height, hash)
+        }
+
+        fn arm_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.arm_disconnect(height, hash)
+        }
+
+        fn complete_disconnect(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            // A completed rollback that cannot record itself is exactly the
+            // `MarkerStuck` fatal condition.
+            Err(bitcoin_rs_storage::StorageError::backend(
+                "injected marker-clear failure",
+            ))
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.disarm_disconnect()
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<bitcoin_rs_storage::DisconnectMarker>, bitcoin_rs_storage::StorageError>
+        {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    /// Mines `depth` regtest blocks on genesis and applies them. Block 1's
+    /// coinbase pays the full subsidy, and the tip block carries a matured
+    /// spend of that coin paying a fee far above min-relay, so a reorg that
+    /// disconnects the chain has a real readmission candidate. Returns the
+    /// handles, the blocks, and their serialized bodies for the reorg body
+    /// loader.
+    #[allow(clippy::type_complexity)]
+    fn matured_chain(
+        depth: u32,
+    ) -> Result<
+        (
+            ApplyHandles,
+            Vec<Block>,
+            HashMap<Hash256, (Block, bytes::Bytes)>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let genesis = Network::Regtest.genesis_block();
+        let mut tree = BlockTree::new();
+        let mut parent = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+        let subsidy = 5_000_000_000_u64;
+        let mut prev_hash = genesis.block_hash();
+        let mut blocks: Vec<Block> = Vec::new();
+        for height in 1..=depth {
+            let mut coinbase = coinbase_transaction(height);
+            if height == 1 {
+                coinbase.outputs[0].value = subsidy;
+            }
+            let mut txs = vec![coinbase];
+            if height == depth {
+                let first_txid = blocks[0].txs[0].txid();
+                txs.push(Tx {
+                    version: 2,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint::new(first_txid, 0),
+                        script_sig: push_int(1),
+                        sequence: 0xffff_ffff,
+                        witness: Vec::new(),
+                    }],
+                    outputs: vec![TxOut {
+                        value: subsidy - 100_000,
+                        script_pubkey: Vec::new(),
+                    }],
+                    lock_time: 0,
+                });
+            }
+            let block = mined_block_with_prev_hash(prev_hash, height, txs);
+            parent = tree.insert_node(Some(parent), block.header, NodeStatus::HeaderValid)?;
+            prev_hash = block.block_hash();
+            blocks.push(block);
+        }
+        let chain_tip = tree.tip_handle();
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let handles = apply_handles(chain_tip, applied_tip, Arc::new(RwLock::new(tree)));
+        crate::apply::apply_block(&handles, &genesis)?;
+        for block in &blocks {
+            crate::apply::apply_block(&handles, block)?;
+        }
+        let bodies: HashMap<Hash256, (Block, bytes::Bytes)> = blocks
+            .iter()
+            .map(|block| {
+                (
+                    Hash256::from_le_bytes(block.block_hash().as_bytes()),
+                    (block.clone(), bytes::Bytes::from(consensus_bytes(block))),
+                )
+            })
+            .collect();
+        Ok((handles, blocks, bodies))
+    }
+
+    #[test]
+    fn permanent_forward_failure_purges_invalid_blocks_without_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
+            sync_with_mined_chain(1)?;
+        sync.ensure_genesis_tip();
+        stage_body(&sync, &main[0]);
+        assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
+
+        let main_hash = main[0].block_hash();
+        let bad = mined_block_with_prev_hash(main_hash, 2, vec![coinbase_transaction(2)]);
+        // The value change alters the txid, so the staged body contradicts the
+        // header's merkle root: a permanent consensus failure.
+        let mut bad_body = bad.clone();
+        bad_body.txs[0].outputs[0].value = 2;
+        let descendant =
+            mined_block_with_prev_hash(bad.block_hash(), 3, vec![coinbase_transaction(3)]);
+        {
+            let mut tree = sync.handles.block_tree.write();
+            let main_id = tree
+                .lookup(Hash256::from_le_bytes(main_hash.as_bytes()))
+                .ok_or_else(|| std::io::Error::other("missing applied main block"))?;
+            let bad_id = tree.insert_node(Some(main_id), bad.header, NodeStatus::HeaderValid)?;
+            tree.insert_node(Some(bad_id), descendant.header, NodeStatus::HeaderValid)?;
+        }
+        stage_body(&sync, &bad_body);
+        stage_body(&sync, &descendant);
+
+        assert_eq!(
+            sync.apply_buffered_blocks(None),
+            (0, 1),
+            "the permanent failure must stop the window with nothing committed"
+        );
+        let bad_hash = Hash256::from_le_bytes(bad.block_hash().as_bytes());
+        let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_bytes());
+        assert!(!sync.block_stager.lock().contains(&bad_hash));
+        let descendant_staged = sync.block_stager.lock().contains(&descendant_hash);
+        assert!(
+            !descendant_staged,
+            "invalid descendants must be purged from bounded staging"
+        );
+        assert_eq!(
+            sync.apply_buffered_blocks(None),
+            (0, 0),
+            "the frontier must not cycle: nothing re-offers the invalidated blocks"
+        );
+        assert_eq!(applied_tip.load_full().map(|tip| tip.height), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_reorg_readmits_only_still_disconnected_transactions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handles, main, mut bodies) = matured_chain(101)?;
+        let tip = main
+            .last()
+            .ok_or_else(|| std::io::Error::other("empty chain"))?;
+        let spend_txid = tip.txs[1].txid();
+        // A competing branch rooted at block 50 with four more blocks of
+        // work: switching to it disconnects the 51-block suffix (including
+        // the matured spend) while the spent coin itself stays live below
+        // the fork point, and the 105th fork body contradicts its own
+        // header merkle root, so the connect dies permanently mid-walk.
+        let fork_root_hash = main[49].block_hash();
+        let mut tree = handles.block_tree.write();
+        let mut fork_parent = tree
+            .lookup(Hash256::from_le_bytes(fork_root_hash.as_bytes()))
+            .ok_or_else(|| std::io::Error::other("missing fork root node"))?;
+        let mut fork_prev = fork_root_hash;
+        let mut fork_blocks = Vec::new();
+        for height in 51..=105_u32 {
+            let mut coinbase = coinbase_transaction(height);
+            // Distinguish the branch: same-height coinbases on both chains
+            // must not carry identical txids, or the fork headers collide.
+            coinbase.outputs[0].script_pubkey = push_int(2);
+            let block = mined_block_with_prev_hash(fork_prev, height, vec![coinbase]);
+            fork_parent =
+                tree.insert_node(Some(fork_parent), block.header, NodeStatus::HeaderValid)?;
+            fork_prev = block.block_hash();
+            fork_blocks.push(block);
+        }
+        let fork_target = fork_parent;
+        drop(tree);
+        let mut corrupt = fork_blocks[fork_blocks.len() - 1].clone();
+        corrupt.txs[0].outputs[0].value = 2;
+        let last = fork_blocks.len() - 1;
+        fork_blocks[last] = corrupt;
+        for block in &fork_blocks {
+            bodies.insert(
+                Hash256::from_le_bytes(block.block_hash().as_bytes()),
+                (block.clone(), bytes::Bytes::from(consensus_bytes(block))),
+            );
+        }
+        let connected_count = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let counter = std::rc::Rc::clone(&connected_count);
+
+        let outcome = crate::reorg::switch_to_branch(
+            &handles,
+            fork_target,
+            |hash| bodies.get(&hash).cloned(),
+            move |_hash| counter.set(counter.get() + 1),
+        );
+
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::reorg::ReorgError::ConnectFailed {
+                    disconnected: 51,
+                    connected: 54,
+                    ..
+                })
+            ),
+            "the walk must report its exact committed prefixes, got {outcome:?}"
+        );
+        assert_eq!(
+            connected_count.get(),
+            54,
+            "only the committed connect prefix is retired to the caller"
+        );
+        let connected_tip = Hash256::from_le_bytes(fork_blocks[53].block_hash().as_bytes());
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(connected_tip),
+            "the successful connected prefix is the final active chain"
+        );
+        let mempool = handles.mempool.read();
+        assert_eq!(
+            mempool.len(),
+            1,
+            "exactly the still-off-chain tx is readmitted"
+        );
+        assert!(
+            mempool.contains_txid(&spend_txid),
+            "the disconnected matured spend stays eligible"
+        );
+        assert_eq!(
+            mempool.sequence_number(),
+            1,
+            "reconsideration runs exactly once for the partial switch"
+        );
+        let reconnected_txid = fork_blocks[0].txs[0].txid();
+        let reconnected_in_pool = mempool.contains_txid(&reconnected_txid);
+        assert!(
+            !reconnected_in_pool,
+            "reconnected-block transactions are confirmed, never readmitted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fatal_disconnect_readmits_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut handles, main, mut bodies) = matured_chain(101)?;
+        let tip = main
+            .last()
+            .ok_or_else(|| std::io::Error::other("empty chain"))?;
+        let spend_txid = tip.txs[1].txid();
+        // The in-flight marker can never be cleared, so the very first
+        // disconnect dies fatal after rolling back cleanly. The wrapper keeps
+        // the real records; only the disarm fails.
+        let real_store = Arc::clone(&handles.undo_store);
+        handles.undo_store = Arc::new(DisarmFailsUndoStore { inner: real_store });
+        let fork_root_hash = main[49].block_hash();
+        let mut tree = handles.block_tree.write();
+        let mut fork_parent = tree
+            .lookup(Hash256::from_le_bytes(fork_root_hash.as_bytes()))
+            .ok_or_else(|| std::io::Error::other("missing fork root node"))?;
+        let mut fork_prev = fork_root_hash;
+        let mut fork_blocks = Vec::new();
+        for height in 51..=52_u32 {
+            let mut coinbase = coinbase_transaction(height);
+            coinbase.outputs[0].script_pubkey = push_int(2);
+            let block = mined_block_with_prev_hash(fork_prev, height, vec![coinbase]);
+            fork_parent =
+                tree.insert_node(Some(fork_parent), block.header, NodeStatus::HeaderValid)?;
+            fork_prev = block.block_hash();
+            fork_blocks.push(block);
+        }
+        let fork_target = fork_parent;
+        drop(tree);
+        for block in &fork_blocks {
+            bodies.insert(
+                Hash256::from_le_bytes(block.block_hash().as_bytes()),
+                (block.clone(), bytes::Bytes::from(consensus_bytes(block))),
+            );
+        }
+
+        let outcome = crate::reorg::switch_to_branch(
+            &handles,
+            fork_target,
+            |hash| bodies.get(&hash).cloned(),
+            |_| {},
+        );
+
+        assert!(
+            matches!(outcome, Err(crate::reorg::ReorgError::Fatal(_))),
+            "a stuck disconnect marker is fatal, got {outcome:?}"
+        );
+        assert!(
+            handles.mempool.read().is_empty(),
+            "a fatal disconnect must never reconsider disconnected transactions"
+        );
+        assert_eq!(handles.mempool.read().sequence_number(), 0);
+        let spend_in_pool = handles.mempool.read().contains_txid(&spend_txid);
+        assert!(
+            !spend_in_pool,
+            "the off-chain matured spend must not be readmitted after a fatal disconnect"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn permanent_connect_failure_through_switch_to_branch_invalidates_subtree()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handles, main, mut bodies) = matured_chain(101)?;
+        // Build a competing fork rooted at block 50. The first fork block has a
+        // corrupted body (coinbase value changed → txid changed → merkle root
+        // mismatch), so the connect dies permanently on the very first block.
+        // A descendant header extends the invalid subtree so the test proves
+        // the whole subtree is invalidated, not just the failed block.
+        let fork_root_hash = main[49].block_hash();
+        let mut tree = handles.block_tree.write();
+        let mut fork_parent = tree
+            .lookup(Hash256::from_le_bytes(fork_root_hash.as_bytes()))
+            .ok_or_else(|| std::io::Error::other("missing fork root node"))?;
+        let mut fork_prev = fork_root_hash;
+        let mut fork_blocks = Vec::new();
+        for height in 51..=52_u32 {
+            let mut coinbase = coinbase_transaction(height);
+            coinbase.outputs[0].script_pubkey = push_int(2);
+            let block = mined_block_with_prev_hash(fork_prev, height, vec![coinbase]);
+            fork_parent =
+                tree.insert_node(Some(fork_parent), block.header, NodeStatus::HeaderValid)?;
+            fork_prev = block.block_hash();
+            fork_blocks.push(block);
+        }
+        let fork_target = fork_parent;
+        let invalid_id = tree
+            .lookup(Hash256::from_le_bytes(
+                fork_blocks[0].block_hash().as_bytes(),
+            ))
+            .ok_or_else(|| std::io::Error::other("missing invalid fork node"))?;
+        let descendant_id = tree
+            .lookup(Hash256::from_le_bytes(
+                fork_blocks[1].block_hash().as_bytes(),
+            ))
+            .ok_or_else(|| std::io::Error::other("missing descendant fork node"))?;
+        drop(tree);
+
+        // Corrupt the first fork block's body: change the coinbase value so
+        // the txid no longer matches the header's merkle root. This is a
+        // permanent consensus failure (MerkleRoot), which the classifier
+        // marks as permanent and invalidates the subtree.
+        let mut corrupt = fork_blocks[0].clone();
+        corrupt.txs[0].outputs[0].value = 2;
+        fork_blocks[0] = corrupt;
+        for block in &fork_blocks {
+            bodies.insert(
+                Hash256::from_le_bytes(block.block_hash().as_bytes()),
+                (block.clone(), bytes::Bytes::from(consensus_bytes(block))),
+            );
+        }
+
+        let outcome = crate::reorg::switch_to_branch(
+            &handles,
+            fork_target,
+            |hash| bodies.get(&hash).cloned(),
+            |_| {},
+        );
+
+        let Err(crate::reorg::ReorgError::ConnectFailed {
+            disconnected,
+            connected,
+            invalidated,
+            ..
+        }) = outcome
+        else {
+            panic!("permanent connect failure must return ConnectFailed");
+        };
+        assert_eq!(
+            disconnected, 51,
+            "the full disconnect prefix must be reported"
+        );
+        assert_eq!(
+            connected, 0,
+            "nothing connected before the permanent failure"
+        );
+        // The invalidated subtree must contain both the failed block and its
+        // descendant, so the caller can purge every bounded carrier.
+        let invalid_hash = Hash256::from_le_bytes(fork_blocks[0].block_hash().as_bytes());
+        let descendant_hash = Hash256::from_le_bytes(fork_blocks[1].block_hash().as_bytes());
+        assert!(
+            invalidated.contains(&invalid_hash),
+            "the failed block must be in the invalidated set: {invalidated:?}"
+        );
+        assert!(
+            invalidated.contains(&descendant_hash),
+            "the descendant must be in the invalidated set: {invalidated:?}"
+        );
+        // The block tree must mark the entire subtree Invalid.
+        {
+            let tree = handles.block_tree.read();
+            assert_eq!(tree.node(invalid_id)?.status, NodeStatus::Invalid);
+            assert_eq!(tree.node(descendant_id)?.status, NodeStatus::Invalid);
+        }
+        // The applied tip must be back at the fork root (block 50), the
+        // successful disconnect prefix.
+        let fork_root_id_hash = Hash256::from_le_bytes(fork_root_hash.as_bytes());
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(fork_root_id_hash),
+            "the applied tip must be the fork root after disconnecting back to it"
         );
         Ok(())
     }

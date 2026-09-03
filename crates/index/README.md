@@ -11,12 +11,13 @@ the lossy 8-byte prefix against a `BlockSource` that fetches block bytes by heig
 range. `PreparedBlock`/`PreparedBatch` under `PreparedBatchLimits` bound one atomic
 forward write by row count and encoded bytes, and `IndexWriter` is the mutation-only
 handle for durable prepared writes. `IndexWatermark` is the durable
-`(height, full block hash)` cursor — encoded `height || hash`, readable from a snapshot —
+`(height, full block hash)` cursor — encoded as `height || hash`, readable from a snapshot —
 while the `IndexReader` trait captures a point-in-time `TxIndexSnapshot` for bounded
-typed scans (`TxIndexScan`), and `IndexFormat`/`INDEX_FORMAT_VERSION` track whether row
-values carry transaction positions. Around the rows sit the stable types (`ScriptHash`,
-`HashPrefixRow`, `HeaderRow`, `TxidRow`, `SpendingPrefixRow`), `MempoolRowWriter` for
-unconfirmed rows and generic script-history resolution.
+typed scans (`TxIndexScan`). The datadir-wide `CURRENT_SCHEMA` marker owns the
+compatibility boundary for these rows; an incompatible datadir fails before the index
+store opens. Around the rows sit the stable types (`ScriptHash`, `HashPrefixRow`,
+`HeaderRow`, `TxidRow`, `SpendingPrefixRow`), `MempoolRowWriter` for unconfirmed rows
+and generic script-history resolution.
 
 ## Features
 - `rocksdb`: enables the `RocksDB` backend in `bitcoin-rs-storage`
