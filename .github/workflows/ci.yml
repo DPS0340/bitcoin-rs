@@ -99,12 +99,16 @@ jobs:
             --no-default-features --features fjall,zmq --no-fail-fast
       # Isolated so node's default `zmq` feature cannot unify this package on.
       - run: cargo test -p bitcoin-rs-rpc --no-default-features --no-fail-fast
-      # Node / binary tests run with the full-node feature set.  -p is
-      # required because `--workspace --features` silently ignores --features in
-      # a virtual workspace (no root [package] section in the top-level Cargo.toml).
+      # Node / binary tests run with the full-node backend set, minus the
+      # kernel engine: the kernel builds from C++ (cmake + libboost-dev),
+      # which this job deliberately does not install. Kernel-gated bin tests
+      # run in the main-only `full-node` lane, and the deny job still audits
+      # the full graph including kernel. -p is required because
+      # `--workspace --features` silently ignores --features in a virtual
+      # workspace (no root [package] section in the top-level Cargo.toml).
       - run: |
           cargo test -p bitcoin-rs --no-fail-fast \
-            --no-default-features --features "${FULL_NODE_FEATURES}"
+            --no-default-features --features "rocksdb,fjall,redb,mdbx"
 
   bench-smoke:
     runs-on: ubuntu-latest
