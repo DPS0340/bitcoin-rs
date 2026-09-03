@@ -2965,6 +2965,10 @@ mod tests {
 
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+        state
+            .checkpoint_publisher
+            .durable_tip_height
+            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
         let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         // The hash is not needed: this test counts bytes in files, not bodies.
         let record = BlockRecord::from_block(10, &block);
