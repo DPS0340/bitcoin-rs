@@ -374,3 +374,50 @@ fn crash_recovery_resumes_before_the_first_clean_checkpoint() -> Result<()> {
     }
     Ok(())
 }
+
+/// A progress sidecar naming only genesis must still replay genesis on a cold
+/// start, because no restored checkpoint tip exists to serve as the base.
+#[test]
+fn crash_recovery_replays_genesis_when_only_genesis_is_durable() -> Result<()> {
+    for backend in available_backends() {
+        let temp = tempfile::tempdir()?;
+        let config = make_config(&temp, backend);
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = genesis.block_hash();
+        {
+            let state = NodeState::open(config.clone(), None)?;
+            state.apply_block(&genesis)?;
+            crash_recovery::write_meta(
+                &state,
+                &crash_recovery::Meta {
+                    height: 0,
+                    tip_hash_hex: genesis_hash.0.to_string_be(),
+                },
+            )?;
+        }
+
+        let restarted = NodeState::open(config, None)?;
+        assert!(
+            restarted.applied_tip().load().is_none(),
+            "{backend}: a cold reopen must not restore an applied tip"
+        );
+        crash_recovery::recover_if_needed(&restarted)?;
+
+        let recovered_tip = restarted
+            .applied_tip()
+            .load_full()
+            .context("cold recovery did not apply genesis")?;
+        assert_eq!(recovered_tip.height, 0, "{backend}: recovered height");
+        assert_eq!(
+            recovered_tip.hash,
+            genesis_hash.into(),
+            "{backend}: recovered genesis hash"
+        );
+        assert_eq!(
+            restarted.replayed_heights(),
+            vec![0],
+            "{backend}: recovery must replay genesis"
+        );
+    }
+    Ok(())
+}

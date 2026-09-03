@@ -114,13 +114,16 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
 - `crates/node/src/state.rs`:
   `checkpoint_refuses_inflight_disconnect_and_preserves_state`,
   `checkpoint_settles_rolled_back_disconnect_debt`,
-  `publish_checkpoint_keeps_admission_open`.
+  `publish_checkpoint_keeps_admission_open`,
+  `invalidate_block_settles_disconnect_debt`,
+  `prune_request_within_safety_margin_does_not_publish_checkpoint`.
 - `crates/node/tests/crash_recovery.rs` (G11):
   `recovery_meta_write_leaves_readable_sidecar_without_tmp`,
   `torn_meta_after_crash_is_refused`,
   `stale_tmp_after_crash_does_not_corrupt_recovery`,
   `crash_recovery_resumes_from_local_bodies_without_checkpoint_or_redownload`,
-  `crash_recovery_resumes_before_the_first_clean_checkpoint`.
+  `crash_recovery_resumes_before_the_first_clean_checkpoint`,
+  `crash_recovery_replays_genesis_when_only_genesis_is_durable`.
 - `crates/node/src/recovery_evidence.rs` tests (G11):
   `witness_round_trips_and_falls_back_to_prev`,
   `foreign_genesis_current_cannot_displace_valid_prev`,

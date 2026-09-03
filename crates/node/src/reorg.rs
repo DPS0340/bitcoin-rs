@@ -19,6 +19,26 @@ use hashbrown::{HashMap, HashSet};
 use crate::apply::ApplyHandles;
 use crate::{ApplyError, DisconnectError};
 
+/// Settles a rolled-back disconnect marker once the reorg owner has released
+/// its chain-transition proof.
+pub(crate) fn settle_disconnect_debt(handles: &ApplyHandles) {
+    let Some(publisher) = &handles.checkpoint_publisher else {
+        return;
+    };
+    match publisher.settle_disconnect_debt() {
+        Ok(true) => {
+            tracing::info!("published checkpoint after branch switch");
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "disconnect left a checkpoint debt the node could not settle; a clean shutdown will"
+            );
+        }
+    }
+}
+
 /// Maximum number of disconnect-side block bodies held in memory at once
 /// during the streaming execution pass.
 ///
@@ -122,7 +142,6 @@ pub fn invalidate_block(
                     &connect[..progress.connected],
                     &mut no_staged_body,
                 );
-                let _ = proof.finish();
             }
             Err(_) => reconsider_disconnected_transactions(
                 handles,
@@ -131,6 +150,15 @@ pub fn invalidate_block(
                 &connect[..progress.connected],
                 &mut no_staged_body,
             ),
+        }
+        if matches!(&outcome, Ok(())) {
+            let _ = proof.finish();
+        } else {
+            drop(proof);
+        }
+        let settle_debt = !matches!(&outcome, Err(ReorgError::Fatal(_)));
+        if settle_debt {
+            settle_disconnect_debt(handles);
         }
         return outcome;
     }

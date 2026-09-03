@@ -195,8 +195,7 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
 
     let restored_applied_tip = state.applied_tip().load_full();
     let gap_base = restored_applied_tip.as_ref().map_or(0, |tip| tip.height);
-
-    if meta.height <= gap_base {
+    if restored_applied_tip.is_some() && meta.height <= gap_base {
         tracing::debug!(height = meta.height, gap_base, "no gap; recovery skipped");
         return Ok(());
     }

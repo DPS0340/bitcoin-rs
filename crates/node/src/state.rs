@@ -866,6 +866,7 @@ impl<S: KvStore> NodePruneService<S> {
 }
 
 impl<S: KvStore> PruneService for NodePruneService<S> {
+    #[allow(clippy::too_many_lines)]
     fn prune_to_height(
         &self,
         requested_height: u32,
@@ -880,6 +881,20 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         let pruner_tip = updated_pruneheight
             .checked_add(policy.retention_depth())
             .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
+        let live_tip = self.checkpoint_publisher.applied_tip.load_full();
+        let live_height = live_tip
+            .as_ref()
+            .map(|tip| tip.height)
+            .ok_or_else(|| PruneServiceError::failed("applied tip is unavailable"))?;
+        if is_prune_height_within_safety_margin(
+            updated_pruneheight,
+            live_height,
+            policy.retention_depth(),
+        ) {
+            return Err(PruneServiceError::failed(
+                "prune height is within reorg safety margin",
+            ));
+        }
         if self
             .checkpoint_publisher
             .durable_tip_height
@@ -898,8 +913,11 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         let applied_tip_height = authority
             .applied_tip_height()
             .ok_or_else(|| PruneServiceError::failed("applied tip is unavailable"))?;
-        let safe_prune_height = applied_tip_height.saturating_sub(policy.retention_depth());
-        if updated_pruneheight > safe_prune_height {
+        if is_prune_height_within_safety_margin(
+            updated_pruneheight,
+            applied_tip_height,
+            policy.retention_depth(),
+        ) {
             return Err(PruneServiceError::failed(
                 "prune height is within reorg safety margin",
             ));
@@ -982,6 +1000,14 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             pruneheight: *self.pruneheight.lock(),
         }
     }
+}
+
+fn is_prune_height_within_safety_margin(
+    prune_height: u32,
+    live_height: u32,
+    retention_depth: u32,
+) -> bool {
+    prune_height > live_height.saturating_sub(retention_depth)
 }
 
 const COMPILED_STORAGE_FEATURES: &[&str] = &[
@@ -2851,6 +2877,44 @@ mod tests {
     }
 
     #[test]
+    fn prune_request_within_safety_margin_does_not_publish_checkpoint() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+        let state = NodeState::open(config, None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        let block = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
+        state.apply_block(&block)?;
+
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+        let result = service.prune_to_height(1);
+        assert!(matches!(
+            result,
+            Err(PruneServiceError::Failed(message))
+                if message == "prune height is within reorg safety margin"
+        ));
+        assert_eq!(
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            !state
+                .data_dir()
+                .join("chainstate-checkpoints/CURRENT")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn prune_service_deletes_seeded_storage_rows_and_advances_pruneheight() -> anyhow::Result<()> {
         fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
             let byte = u8::try_from(height)
@@ -3751,6 +3815,58 @@ mod tests {
         assert_eq!(
             state.apply_handles().undo_store.load_disconnect_marker()?,
             marker_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_block_settles_disconnect_debt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config, None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
+        state.apply_block(&block_one)?;
+        state.publish_checkpoint()?;
+
+        let current_before = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            data_dir.join("chainstate-checkpoints/CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+        let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2)?;
+        state.apply_block(&block_two)?;
+
+        crate::reorg::invalidate_block(
+            &state.apply_handles(),
+            Hash256::from(block_two.block_hash()),
+        )?;
+
+        assert!(
+            state
+                .apply_handles()
+                .undo_store
+                .load_disconnect_marker()?
+                .is_none()
+        );
+        let current_after = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            data_dir.join("chainstate-checkpoints/CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+        assert!(current_after > current_before);
+        assert_eq!(
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire),
+            1
         );
         Ok(())
     }

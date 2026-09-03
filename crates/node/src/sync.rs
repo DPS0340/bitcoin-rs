@@ -673,22 +673,7 @@ impl BlockSync {
                 tracing::warn!(%error, "block sync: branch switch failed");
             }
         }
-        // A RolledBack marker refuses the next startup until a checkpoint
-        // captures the rolled-back state, so branch switching settles it now.
-        if let Some(publisher) = &self.handles.checkpoint_publisher {
-            match publisher.settle_disconnect_debt() {
-                Ok(true) => {
-                    tracing::info!("published checkpoint after branch switch");
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "disconnect left a checkpoint debt the node could not settle; a clean shutdown will"
-                    );
-                }
-            }
-        }
+        crate::reorg::settle_disconnect_debt(&self.handles);
     }
 
     fn retire_applied_reorg_body(&self, hash: Hash256) {
