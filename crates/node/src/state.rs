@@ -4133,18 +4133,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(not(target_vendor = "apple"))]
     fn non_regular_epoch_lock_refuses_start() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
         std::fs::create_dir_all(&data_dir)?;
         std::fs::write(data_dir.join("process-epoch"), b"7\n")?;
-        let lock_path = data_dir.join(".process-epoch.lock");
-        let lock_path = std::ffi::CString::new(lock_path.to_string_lossy().as_bytes())?;
-        // SAFETY: `lock_path` is a valid NUL-free path and the mode is standard.
-        let result = unsafe { libc::mkfifo(lock_path.as_ptr(), 0o600) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        let lock_dir = cap_std::fs::Dir::open_ambient_dir(&data_dir, cap_std::ambient_authority())?;
+        rustix::fs::mkfifoat(
+            &lock_dir,
+            ".process-epoch.lock",
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )?;
 
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();

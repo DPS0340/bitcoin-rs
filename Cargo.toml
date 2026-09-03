@@ -83,7 +83,6 @@ bitcoin_hashes = { version = "0.14", default-features = false, features = [
 ] }
 cap-std = "=4.0.2"
 cap-fs-ext = "=4.0.2"
-libc = "0.2"
 rustix = { version = "=1.1.4", features = ["fs"] }
 
 # Miniscript supplies the key-free PSBT finalizer retained by the RPC crate.
