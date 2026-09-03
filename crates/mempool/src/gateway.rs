@@ -454,7 +454,8 @@ impl MempoolGateway {
     /// `entries` must arrive in dependency order — parents before the
     /// transactions spending them — which is the order the reversed
     /// disconnect walk produces. Each candidate gets exactly one
-    /// commit-and-publish insert; a candidate the pool refuses is recorded,
+    /// commit-and-publish insert; a candidate the pool refuses (policy,
+    /// duplicate, or mempool-full after size-limit eviction) is recorded,
     /// and any later candidate spending a refused txid is withheld, so a
     /// rejected parent can never leave a partially admitted family behind.
     /// The same withholding follows a parent whose own successful insert
@@ -1699,15 +1700,14 @@ mod tests {
         assert!(!gateway.read().contains_txid(&parent_txid));
         assert!(!gateway.read().contains_txid(&child.txid()));
     }
-
     #[test]
     fn reconsider_disconnected_withholds_descendants_of_an_immediately_evicted_parent() {
         let observer = Arc::new(RecordingObserver::default());
         // A 150-byte pool already holding 100 vbytes of high-fee filler: the
-        // parent's own insert succeeds and then immediately evicts the parent
-        // as the lowest-fee package. The child pays far more than everything
-        // else, so once admitted it fits and survives — only the parent's
-        // eviction inside the parent's own MutationResult can keep it out.
+        // parent's own insert succeeds, immediately evicts the parent as the
+        // lowest-fee package, and returns Err(Full) — so nothing is committed
+        // or published. The child is withheld because the parent is in the
+        // refused set.
         let gateway = MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits {
                 min_relay_fee_sat_per_kvb: 0,
@@ -1738,19 +1738,14 @@ mod tests {
 
         assert_eq!(
             committed.len(),
-            1,
-            "only the parent's insert commits; the child is withheld"
-        );
-        assert_eq!(
-            committed[0].changes,
-            vec![
-                crate::mutation::change(&parent_txid, MutationOutcome::Accepted),
-                crate::mutation::change(&parent_txid, removed(RemovalReason::PolicyEviction)),
-            ],
-            "the parent was admitted and immediately evicted by its own insert"
+            0,
+            "the parent's insert returns Err(Full); nothing is committed"
         );
         let pool = gateway.read();
-        assert!(!pool.contains_txid(&parent_txid));
+        assert!(
+            !pool.contains_txid(&parent_txid),
+            "the parent was evicted by the size limit"
+        );
         assert!(
             !pool.contains_txid(&child_txid),
             "an evicted parent must not admit its descendant"
@@ -1759,18 +1754,15 @@ mod tests {
             pool.contains_txid(&filler_txid),
             "no orphan replaced the parent"
         );
+        // The insert bumped the sequence even though the entry was evicted.
         assert_eq!(
             pool.sequence_number(),
             3,
-            "the withheld child assigns nothing"
+            "the parent's insert advanced the sequence; the child assigns nothing"
         );
-        assert_eq!(
-            *observer.seen.lock(),
-            vec![
-                (hash(&parent_txid), MutationOutcome::Accepted),
-                (hash(&parent_txid), removed(RemovalReason::PolicyEviction)),
-            ],
-            "the parent's two changes publish once each; the child publishes nothing"
+        assert!(
+            observer.seen.lock().is_empty(),
+            "no publications: Err(Full) short-circuits before the publish queue"
         );
     }
 
