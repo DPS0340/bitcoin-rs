@@ -563,7 +563,7 @@ impl NodeStorage {
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
-        durable_tip_height: &Arc<AtomicU32>,
+        checkpoint_publisher: &Arc<crate::checkpoint::CheckpointPublisher>,
     ) -> Result<Arc<dyn PruneService>> {
         match self {
             #[cfg(feature = "rocksdb")]
@@ -574,7 +574,7 @@ impl NodeStorage {
                 blocks,
                 transactions,
                 authority,
-                Arc::clone(durable_tip_height),
+                Arc::clone(checkpoint_publisher),
             )?)),
             #[cfg(feature = "fjall")]
             Self::Fjall(store) => Ok(Arc::new(NodePruneService::new(
@@ -584,7 +584,7 @@ impl NodeStorage {
                 blocks,
                 transactions,
                 authority,
-                Arc::clone(durable_tip_height),
+                Arc::clone(checkpoint_publisher),
             )?)),
             #[cfg(feature = "redb")]
             Self::Redb(store) => Ok(Arc::new(NodePruneService::new(
@@ -594,7 +594,7 @@ impl NodeStorage {
                 blocks,
                 transactions,
                 authority,
-                Arc::clone(durable_tip_height),
+                Arc::clone(checkpoint_publisher),
             )?)),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Ok(Arc::new(NodePruneService::new(
@@ -604,7 +604,7 @@ impl NodeStorage {
                 blocks,
                 transactions,
                 authority,
-                Arc::clone(durable_tip_height),
+                Arc::clone(checkpoint_publisher),
             )?)),
             #[cfg(not(any(
                 feature = "rocksdb",
@@ -833,11 +833,11 @@ pub struct NodePruneService<S: KvStore> {
     transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
     authority: crate::apply::PruneAuthority,
     pruneheight: Mutex<Option<u32>>,
-    /// Height the last clean checkpoint would restore to, 0 when none exists.
+    /// Block-body and undo pruning are bounded by the durable checkpoint base.
     ///
-    /// Block-body and undo pruning are bounded by this, not by the in-memory
-    /// applied tip, which can run far ahead of it.
-    durable_tip_height: Arc<AtomicU32>,
+    /// A request beyond it publishes a checkpoint first, so pruning never
+    /// destroys bodies that crash recovery would replay.
+    checkpoint_publisher: Arc<crate::checkpoint::CheckpointPublisher>,
 }
 
 impl<S: KvStore> NodePruneService<S> {
@@ -849,7 +849,7 @@ impl<S: KvStore> NodePruneService<S> {
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
-        durable_tip_height: Arc<AtomicU32>,
+        checkpoint_publisher: Arc<crate::checkpoint::CheckpointPublisher>,
     ) -> Result<Self> {
         let pruneheight = load_pruneheight(&*store)?;
         Ok(Self {
@@ -860,7 +860,7 @@ impl<S: KvStore> NodePruneService<S> {
             transactions,
             authority,
             pruneheight: Mutex::new(pruneheight),
-            durable_tip_height,
+            checkpoint_publisher,
         })
     }
 }
@@ -874,6 +874,23 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             target_size_mb: 0,
             keep_below_tip: CORE_REORG_SAFETY_MARGIN,
         };
+        let mut pruneheight = self.pruneheight.lock();
+        let updated_pruneheight =
+            pruneheight.map_or(requested_height, |height| height.max(requested_height));
+        let pruner_tip = updated_pruneheight
+            .checked_add(policy.retention_depth())
+            .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
+        if self
+            .checkpoint_publisher
+            .durable_tip_height
+            .load(Ordering::Acquire)
+            < pruner_tip
+        {
+            self.checkpoint_publisher
+                .publish()
+                .map_err(|error| PruneServiceError::failed(error.to_string()))?;
+        }
+
         let authority = self
             .authority
             .begin()
@@ -881,19 +898,12 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         let applied_tip_height = authority
             .applied_tip_height()
             .ok_or_else(|| PruneServiceError::failed("applied tip is unavailable"))?;
-        let mut pruneheight = self.pruneheight.lock();
-        let updated_pruneheight =
-            pruneheight.map_or(requested_height, |height| height.max(requested_height));
         let safe_prune_height = applied_tip_height.saturating_sub(policy.retention_depth());
         if updated_pruneheight > safe_prune_height {
             return Err(PruneServiceError::failed(
                 "prune height is within reorg safety margin",
             ));
         }
-        let pruner_tip = updated_pruneheight
-            .checked_add(policy.retention_depth())
-            .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
-
         let prune_candidates: Vec<(u32, bitcoin_rs_primitives::BlockHash, usize)> = {
             let blocks = self.blocks.read();
             blocks
@@ -929,7 +939,9 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             &mut batch,
             &self.block_files,
             pruner_tip,
-            self.durable_tip_height.load(Ordering::Acquire),
+            self.checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire),
             policy,
         )
         .map_err(|err| PruneServiceError::failed(err.to_string()))?;
@@ -1500,7 +1512,7 @@ impl NodeState {
                 Arc::clone(&blocks),
                 Arc::clone(&transactions),
                 apply_handles.prune_authority(),
-                &durable_tip_height,
+                &checkpoint_publisher,
             )?)
         } else {
             None
@@ -2005,6 +2017,36 @@ mod tests {
             chainwork: bitcoin_rs_chain::node::ChainWork::ZERO,
             hash: bitcoin_rs_primitives::Hash256::from_le_bytes(&hash),
         })));
+    }
+
+    fn publish_applied_tip_with_chain(state: &NodeState, height: u32) -> anyhow::Result<()> {
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let mut tree = state.block_tree.write();
+        let mut node_id =
+            tree.insert_header(genesis.header, bitcoin_rs_chain::node::NodeStatus::Active)?;
+        for current_height in 1..=height {
+            let parent_hash = tree.node(node_id)?.hash;
+            node_id = tree.insert_header(
+                Header {
+                    version: 1,
+                    prev_blockhash: BlockHash::from(parent_hash),
+                    merkle_root: Hash256::default(),
+                    time: genesis.header.time + current_height,
+                    bits: 0x207f_ffff,
+                    nonce: current_height,
+                },
+                bitcoin_rs_chain::node::NodeStatus::Active,
+            )?;
+        }
+        let tip = tree.node(node_id)?;
+        state.applied_tip.store(Some(Arc::new(TipSnapshot {
+            tip_id: node_id,
+            height: tip.height,
+            chainwork: tip.chainwork,
+            hash: tip.hash,
+        })));
+        state.coin_stats.finish_block(height, 0);
+        Ok(())
     }
 
     #[test]
@@ -2703,7 +2745,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_pruning_keeps_records_the_durable_tip_still_needs() -> anyhow::Result<()> {
+    fn undo_pruning_follows_the_new_durable_checkpoint_base() -> anyhow::Result<()> {
         fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
             let byte = u8::try_from(height)
                 .map_err(|_| anyhow::anyhow!("test height {height} exceeds u8"))?;
@@ -2716,7 +2758,7 @@ mod tests {
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
-        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+        publish_applied_tip_with_chain(&state, 11 + CORE_REORG_SAFETY_MARGIN)?;
 
         for height in 10_u32..=12 {
             let hash = hash(height)?;
@@ -2737,14 +2779,13 @@ mod tests {
             });
         }
 
-        // No checkpoint has been written, so nothing is durable above genesis.
         assert_eq!(
             state
                 .checkpoint_publisher
                 .durable_tip_height
                 .load(Ordering::Acquire),
             0,
-            "the fixture must have no durable checkpoint, or this proves nothing"
+            "the fixture must have no durable checkpoint before pruning"
         );
 
         let Some(service) = state.prune_service() else {
@@ -2755,12 +2796,56 @@ mod tests {
             .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
 
         assert_eq!(
-            result.undo_rows_removed, 0,
-            "no undo record may go while a crash would restore below all of them"
+            result.undo_rows_removed, 1,
+            "the checkpoint published before pruning makes height 10 reclaimable"
         );
+        assert!(state.storage.stored_prune_undo(10, hash(10)?)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_request_beyond_durable_base_publishes_checkpoint_first() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+        let state = NodeState::open(config, None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+
+        let target_height = 11 + CORE_REORG_SAFETY_MARGIN + 1;
+        let mut previous = genesis.block_hash();
+        let mut applied_tip = None;
+        for height in 1..=target_height {
+            let block = mined_regtest_child_at(previous, genesis.header.time + height)?;
+            applied_tip = Some(state.apply_block(&block)?);
+            previous = block.block_hash();
+        }
+        let applied_tip =
+            applied_tip.ok_or_else(|| anyhow::anyhow!("failed to apply any child blocks"))?;
+
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+        service
+            .prune_to_height(11)
+            .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+
+        assert_eq!(
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire),
+            applied_tip.height
+        );
+        let meta = crate::crash_recovery::read_meta(&state)?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint did not publish recovery metadata"))?;
+        assert_eq!(meta.height, applied_tip.height);
         assert!(
-            state.storage.stored_prune_undo(10, hash(10)?)?.is_some(),
-            "the record a restore would need must survive"
+            dir.path()
+                .join("node/chainstate-checkpoints/CURRENT")
+                .exists()
         );
         Ok(())
     }
@@ -2879,11 +2964,7 @@ mod tests {
         std::fs::write(&prunable_file, [])?;
         std::fs::write(&current_file, [])?;
         let state = NodeState::open(config, None)?;
-        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-        state
-            .checkpoint_publisher
-            .durable_tip_height
-            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
+        publish_applied_tip_with_chain(&state, 11 + CORE_REORG_SAFETY_MARGIN)?;
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
 
         match &state.storage {
@@ -2902,6 +2983,19 @@ mod tests {
         service
             .prune_to_height(11)
             .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+        assert!(
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire)
+                >= 11 + CORE_REORG_SAFETY_MARGIN
+        );
+        assert!(
+            state
+                .data_dir()
+                .join("chainstate-checkpoints/CURRENT")
+                .exists()
+        );
 
         assert!(!prunable_file.exists());
         assert!(current_file.exists());
@@ -2964,11 +3058,7 @@ mod tests {
         std::fs::write(blocks_dir.join("blk00001.dat"), [])?;
 
         let state = NodeState::open(config, None)?;
-        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-        state
-            .checkpoint_publisher
-            .durable_tip_height
-            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
+        publish_applied_tip_with_chain(&state, 11 + CORE_REORG_SAFETY_MARGIN)?;
         let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         // The hash is not needed: this test counts bytes in files, not bodies.
         let record = BlockRecord::from_block(10, &block);
@@ -3002,6 +3092,19 @@ mod tests {
         service
             .prune_to_height(11)
             .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+        assert!(
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire)
+                >= 11 + CORE_REORG_SAFETY_MARGIN
+        );
+        assert!(
+            state
+                .data_dir()
+                .join("chainstate-checkpoints/CURRENT")
+                .exists()
+        );
 
         assert!(!prunable_file.exists(), "the fixture must actually prune");
         let Some(after) = state.block_body_store.disk_usage() else {
@@ -3034,6 +3137,10 @@ mod tests {
         config.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+        state
+            .checkpoint_publisher
+            .durable_tip_height
+            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
 
         let pruned_block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let pruned_hash = Hash256::from_le_bytes(pruned_block.block_hash().as_bytes());
@@ -3091,6 +3198,10 @@ mod tests {
         {
             let state = NodeState::open(config.clone(), None)?;
             publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
             let Some(service) = state.prune_service() else {
                 anyhow::bail!("prune service should exist when prune_target_mb > 0");
             };
@@ -3120,6 +3231,10 @@ mod tests {
         config.prune_target_mb = 1;
         let state = NodeState::open(config.clone(), None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+        state
+            .checkpoint_publisher
+            .durable_tip_height
+            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
         let Some(service) = state.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
         };
@@ -3183,6 +3298,10 @@ mod tests {
         config.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+        state
+            .checkpoint_publisher
+            .durable_tip_height
+            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
         let Some(service) = state.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
         };
@@ -3271,6 +3390,10 @@ mod tests {
         });
         let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_store.clone();
         let blocks = Arc::new(RwLock::new(BlockLog::new()));
+        authority_state
+            .checkpoint_publisher
+            .durable_tip_height
+            .store(12 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
         blocks.write().push(BlockRecord {
             hash: BlockHash::from(hash),
@@ -3287,7 +3410,7 @@ mod tests {
             Arc::clone(&blocks),
             Arc::new(RwLock::new(HashMap::new())),
             authority_state.apply_handles().prune_authority(),
-            Arc::new(AtomicU32::new(11 + CORE_REORG_SAFETY_MARGIN)),
+            Arc::clone(&authority_state.checkpoint_publisher),
         )?);
 
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -3614,6 +3737,10 @@ mod tests {
         assert_eq!(meta.height, 0);
         assert_eq!(meta.tip_hash_hex, genesis_hash.to_string_be());
 
+        let block_one = mined_regtest_child(genesis.block_hash())?;
+        let block_one_tip = state.apply_block(&block_one)?;
+        assert_eq!(block_one_tip.height, 1);
+
         let inflight_hash = Hash256::from_le_bytes(&[0xcd; 32]);
         state
             .apply_handles()
@@ -3690,6 +3817,9 @@ mod tests {
             generation > 0,
             "published checkpoint must have a positive generation"
         );
+        let block_one = mined_regtest_child(genesis.block_hash())?;
+        let block_one_tip = state.apply_block(&block_one)?;
+        assert_eq!(block_one_tip.height, 1);
         drop(state);
 
         let resumed = NodeState::open(config, None)?;
@@ -4107,12 +4237,16 @@ mod tests {
     }
 
     fn mined_regtest_child(prev_blockhash: BlockHash) -> anyhow::Result<Block> {
+        mined_regtest_child_at(prev_blockhash, 1_296_688_603)
+    }
+
+    fn mined_regtest_child_at(prev_blockhash: BlockHash, time: u32) -> anyhow::Result<Block> {
         let coinbase = Tx {
             version: 2,
             lock_time: 0,
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid::default(), u32::MAX),
-                script_sig: vec![1, 1],
+                script_sig: time.to_le_bytes().to_vec(),
                 sequence: u32::MAX,
                 witness: Vec::new(),
             }],
@@ -4126,7 +4260,7 @@ mod tests {
                 version: 1,
                 prev_blockhash,
                 merkle_root: Hash256::default(),
-                time: 1_296_688_603,
+                time,
                 bits: 0x207f_ffff,
                 nonce: 0,
             },

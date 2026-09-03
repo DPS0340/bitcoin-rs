@@ -591,7 +591,7 @@ pub(crate) struct CheckpointPublisher {
 impl CheckpointPublisher {
     /// Publishes a durable checkpoint and aligns all recovery evidence with it.
     pub(crate) fn publish(&self) -> core::result::Result<CheckpointWrite, CheckpointError> {
-        let _exclusive_apply = self.admission.close();
+        let _exclusive_apply = self.admission.pause();
         if let Some(marker) = self.undo_store.load_disconnect_marker()?
             && marker.phase == crate::apply::DisconnectPhase::InFlight
         {

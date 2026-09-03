@@ -589,6 +589,12 @@ impl ApplyAdmission {
         self.barrier.write()
     }
 
+    /// Excludes block application until the guard drops, then admission resumes.
+    /// [`Self::close`] is for shutdown; this is for a live durability barrier.
+    pub(crate) fn pause(&self) -> RwLockWriteGuard<'_, ()> {
+        self.barrier.write()
+    }
+
     /// Closes admission without taking the barrier.
     ///
     /// [`Self::close`] hands back the write guard because shutdown holds it
