@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use bitcoin::hashes::{Hash as _, sha256};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 /// RPC authentication policy.
@@ -115,7 +115,10 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn hash_password(password: &str) -> [u8; 32] {
-    *sha256::Hash::hash(password.as_bytes()).as_byte_array()
+    let digest = Sha256::digest(password.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 fn decode_base64(input: &str) -> Option<Vec<u8>> {

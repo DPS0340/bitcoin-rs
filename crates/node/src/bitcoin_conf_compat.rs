@@ -2,21 +2,21 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result};
 
-use crate::config::{Auth, Config, ConfigLayer};
+use crate::config::{Auth, NodeConfig, UserConfig};
 use bitcoin_rs_primitives::Network;
 
 /// Applies a Bitcoin Core `bitcoin.conf` file to `config`.
-pub fn apply_file(config: &mut Config, path: &Path) -> Result<()> {
+pub fn apply_file(config: &mut NodeConfig, path: &Path) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read bitcoin.conf {}", path.display()))?;
     let layer = parse_for_network(&text, config.network);
-    layer.apply_to(config);
+    layer.apply_to(config)?;
     Ok(())
 }
 
-fn parse_for_network(text: &str, network: Network) -> ConfigLayer {
-    let mut global = ConfigLayer::default();
-    let mut selected = ConfigLayer::default();
+fn parse_for_network(text: &str, network: Network) -> UserConfig {
+    let mut global = UserConfig::default();
+    let mut selected = UserConfig::default();
     let mut current_section_selected = None;
 
     for raw_line in text.lines() {
@@ -44,7 +44,7 @@ fn parse_for_network(text: &str, network: Network) -> ConfigLayer {
     global
 }
 
-fn apply_key(layer: &mut ConfigLayer, key: &str, value: &str) {
+fn apply_key(layer: &mut UserConfig, key: &str, value: &str) {
     match key {
         "prune" => {
             if let Ok(prune_target_mb) = value.parse() {
@@ -124,11 +124,11 @@ fn strip_inline_comment(line: &str) -> &str {
     }
 }
 
-trait ConfigLayerMerge {
+trait UserConfigMerge {
     fn apply_from(&mut self, other: &Self);
 }
 
-impl ConfigLayerMerge for ConfigLayer {
+impl UserConfigMerge for UserConfig {
     fn apply_from(&mut self, other: &Self) {
         if other.network.is_some() {
             self.network = other.network;
@@ -157,8 +157,11 @@ impl ConfigLayerMerge for ConfigLayer {
         if other.rpc_cookie.is_some() {
             self.rpc_cookie.clone_from(&other.rpc_cookie);
         }
+        // An unparseable value is preserved verbatim so the merge stays
+        // infallible; `NodeConfig::apply_layer` rejects it at the layer boundary
+        // where an error can be reported with the key it came from.
         if other.script_index.is_some() {
-            self.script_index = other.script_index;
+            self.script_index.clone_from(&other.script_index);
         }
         if other.p2p_listen.is_some() {
             self.p2p_listen.clone_from(&other.p2p_listen);
@@ -168,9 +171,6 @@ impl ConfigLayerMerge for ConfigLayer {
         }
         if other.prune_target_mb.is_some() {
             self.prune_target_mb = other.prune_target_mb;
-        }
-        if other.utreexo_mode.is_some() {
-            self.utreexo_mode = other.utreexo_mode;
         }
         if other.txindex.is_some() {
             self.txindex = other.txindex;

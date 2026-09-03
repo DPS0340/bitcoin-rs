@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 /// Compact encodings for UTXO record fields.
 mod compress;
 /// UTXO hash-table key.
@@ -19,19 +21,26 @@ pub mod set;
 pub mod shard;
 /// Native bitcoin-rs UTXO snapshot format.
 pub mod snapshot;
+/// Running UTXO-set statistics over the live set above.
+pub mod stats;
 /// Versioned on-disk encoding for undo records.
 pub mod undo_codec;
+/// UTXO connect accounting: block mutation, undo, and value totals.
+pub mod connect;
 
 pub use key::{UtxoBuildHasher, UtxoKey};
-pub use record::{OneUtxoOut, RecordCodec, UtxoRecord};
+pub use record::{OneUtxoOut, UtxoRecord};
 pub use set::{
-    BlockChanges, ScannedUtxo, UndoBatch, UtxoAdd, UtxoChangeListener, UtxoError, UtxoInserted,
-    UtxoMemoryReport, UtxoRemoved, UtxoScan, UtxoSet, UtxoSetView,
+    BlockChanges, ScannedUtxo, UndoBatch, UtxoAdd, UtxoChangeEvents, UtxoChangeListener,
+    UtxoCommittedEvent, UtxoError, UtxoInserted, UtxoMemoryReport, UtxoRemoved, UtxoScan, UtxoSet,
+    UtxoSetView,
 };
+pub use connect::{BlockChangeError, BlockValueTotals, SpentOutputLookup, is_coinbase_tx};
 pub use shard::{LiveOutput, LiveOutputMeta};
 pub use snapshot::{
     SnapshotCoin, SnapshotCoinObserver, SnapshotLoad, aggregate_hash, hash_serialized_3,
-    read_snapshot, read_snapshot_strict_v4_observed, write_snapshot, write_snapshot_observed,
+    read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot,
+    write_snapshot_observed,
 };
 pub use undo_codec::{
     UNDO_FORMAT_VERSION, UndoCodecError, decode as decode_undo, encode as encode_undo,

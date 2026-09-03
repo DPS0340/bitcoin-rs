@@ -8,7 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use bitcoin_rs_rpc::auth::constant_time_eq;
-use bitcoin_rs_rpc::{Auth, Context, Handler, RpcServer};
+use bitcoin_rs_rpc::context::Context;
+use bitcoin_rs_rpc::{Auth, Handler, RpcServer};
 use sonic_rs::json;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
@@ -52,7 +53,11 @@ fn legacy_error_has_core_envelope_and_http_error() -> Result<(), Box<dyn std::er
     assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
     assert!(value.get("jsonrpc").is_none());
     assert!(value.get("error").is_some());
-    assert!(value.get("result").is_some_and(|v| v.is_null()));
+    assert!(
+        value
+            .get("result")
+            .is_some_and(sonic_rs::JsonValueTrait::is_null)
+    );
     Ok(())
 }
 
@@ -112,15 +117,23 @@ fn malformed_json_uses_core_legacy_parse_error_envelope() -> Result<(), Box<dyn 
 
     assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
     assert!(value.get("jsonrpc").is_none());
-    assert!(value.get("result").is_some_and(|v| v.is_null()));
+    assert!(
+        value
+            .get("result")
+            .is_some_and(sonic_rs::JsonValueTrait::is_null)
+    );
     assert_eq!(
         value
             .get("error")
             .and_then(|error| error.get("code"))
-            .and_then(|code| code.as_i64()),
+            .and_then(sonic_rs::JsonValueTrait::as_i64),
         Some(-32_700)
     );
-    assert!(value.get("id").is_some_and(|id| id.is_null()));
+    assert!(
+        value
+            .get("id")
+            .is_some_and(sonic_rs::JsonValueTrait::is_null)
+    );
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwapOption;
 use bitcoin::blockdata::constants::genesis_block;
@@ -8,7 +8,7 @@ use bitcoin::{
 };
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_index::{ScriptHashRow, SpendingPrefixRow, TxidRow};
-use bitcoin_rs_rpc::{BlockRecord, ScriptHistoryRecord};
+use bitcoin_rs_rpc::context::{BlockRecord, ScriptHistoryRecord};
 use bitcoin_rs_storage::{ColumnFamily, PrefixScan, PrefixScanLimit};
 
 use super::*;
@@ -19,7 +19,6 @@ struct ScanResponse {
     prefix: Vec<u8>,
     scan: PrefixScan,
 }
-
 #[derive(Clone)]
 struct QuerySnapshot {
     watermark: IndexWatermark,
@@ -178,29 +177,15 @@ struct QueryFixture {
     engine: TxIndexQueryEngine,
 }
 
-struct CountingBodySource {
-    full_calls: Arc<AtomicUsize>,
-    range_calls: Arc<AtomicUsize>,
-    bytes: Vec<u8>,
+struct SingleBlockBody {
+    height: u32,
+    hash: Hash256,
+    body: Vec<u8>,
 }
 
-impl BlockBodySource for CountingBodySource {
-    fn block_body(&self, _height: u32, _hash: Hash256) -> Option<Vec<u8>> {
-        self.full_calls.fetch_add(1, Ordering::AcqRel);
-        Some(self.bytes.clone())
-    }
-
-    fn block_body_range(
-        &self,
-        _height: u32,
-        _hash: Hash256,
-        offset: u32,
-        len: u32,
-    ) -> Option<Vec<u8>> {
-        self.range_calls.fetch_add(1, Ordering::AcqRel);
-        let start = usize::try_from(offset).ok()?;
-        let end = start.checked_add(usize::try_from(len).ok()?)?;
-        Some(self.bytes.get(start..end)?.to_vec())
+impl BlockBodySource for SingleBlockBody {
+    fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        (height == self.height && hash == self.hash).then(|| self.body.clone())
     }
 }
 
@@ -260,11 +245,27 @@ impl QueryFixture {
         } else {
             Vec::new()
         };
+        let body_source = config.retain_body.then(|| {
+            let source: Arc<dyn BlockBodySource> = Arc::new(SingleBlockBody {
+                height: tip.height,
+                hash: Hash256::from_le_bytes(config.block.block_hash().as_byte_array()),
+                body: bitcoin::consensus::encode::serialize(&config.block),
+            });
+            source
+        });
         let block_source = NodeBlockSource::new(Arc::new(RwLock::new(
-            records.into_iter().collect::<bitcoin_rs_rpc::BlockLog>(),
+            records
+                .into_iter()
+                .collect::<bitcoin_rs_rpc::context::BlockLog>(),
         )));
-        let engine =
-            TxIndexQueryEngine::new(runtime, reader, block_source, tree, applied_tip, None);
+        let engine = TxIndexQueryEngine::new(
+            runtime,
+            reader,
+            block_source,
+            tree,
+            applied_tip,
+            body_source,
+        );
         Ok(Self { engine })
     }
 }
@@ -294,7 +295,6 @@ fn tx_queries_can_be_ready_while_script_history_is_backfilling()
     ));
     Ok(())
 }
-
 fn scan_response(
     cf: ColumnFamily,
     prefix: impl Into<Vec<u8>>,
@@ -308,135 +308,11 @@ fn scan_response(
     }
 }
 
-fn transaction_position(
-    block: &Block,
-    transaction_index: usize,
-) -> Result<TxPosition, Box<dyn std::error::Error>> {
-    let transaction = block
-        .txdata
-        .get(transaction_index)
-        .ok_or_else(|| std::io::Error::other("test transaction index out of bounds"))?;
-    let block_bytes = bitcoin::consensus::serialize(block);
-    let transaction_bytes = bitcoin::consensus::serialize(transaction);
-    let offset = block_bytes
-        .windows(transaction_bytes.len())
-        .position(|window| window == transaction_bytes)
-        .ok_or_else(|| std::io::Error::other("serialized block must contain its transaction"))?;
-    Ok(TxPosition::new(
-        u32::try_from(offset)?,
-        u32::try_from(transaction_bytes.len())?,
-    ))
-}
-
-#[test]
-fn exhausted_block_budget_rejects_before_body_io() -> Result<(), Box<dyn std::error::Error>> {
-    let block = genesis_block(Network::Regtest);
-    let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-    let full_calls = Arc::new(AtomicUsize::new(0));
-    let range_calls = Arc::new(AtomicUsize::new(0));
-    let mut fixture = QueryFixture::new(FixtureConfig {
-        block: block.clone(),
-        retain_body: false,
-        scans: Vec::new(),
-        aba_trigger: None,
-        watermark: None,
-    })?;
-    fixture.engine.body_source = Some(Arc::new(CountingBodySource {
-        full_calls: Arc::clone(&full_calls),
-        range_calls: Arc::clone(&range_calls),
-        bytes: bitcoin::consensus::serialize(&block),
-    }));
-    let mut budget = QueryBudget::new();
-    budget.remaining_body_reads = 0;
-
-    assert!(matches!(
-        fixture.engine.resolve_block(&mut budget, 0, hash),
-        Err(TxQueryError::Unavailable(_))
-    ));
-    assert_eq!(full_calls.load(Ordering::Acquire), 0);
-    assert_eq!(range_calls.load(Ordering::Acquire), 0);
-    Ok(())
-}
-
-#[test]
-fn transaction_uses_positioned_range_without_full_body_load()
--> Result<(), Box<dyn std::error::Error>> {
-    let block = genesis_block(Network::Regtest);
-    let txid = block.txdata[0].compute_txid();
-    let value = TxPositionValue::encode(&[transaction_position(&block, 0)?]);
-    let full_calls = Arc::new(AtomicUsize::new(0));
-    let range_calls = Arc::new(AtomicUsize::new(0));
-    let mut fixture = QueryFixture::new(FixtureConfig {
-        block: block.clone(),
-        retain_body: false,
-        scans: vec![scan_response(
-            ColumnFamily::TxConfirmed,
-            TxidRow::scan_prefix(&txid),
-            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), value)],
-            true,
-        )],
-        aba_trigger: None,
-        watermark: None,
-    })?;
-    fixture.engine.body_source = Some(Arc::new(CountingBodySource {
-        full_calls: Arc::clone(&full_calls),
-        range_calls: Arc::clone(&range_calls),
-        bytes: bitcoin::consensus::serialize(&block),
-    }));
-
-    assert_eq!(
-        fixture
-            .engine
-            .transaction(&txid)?
-            .map(|tx| tx.compute_txid()),
-        Some(txid)
-    );
-    assert_eq!(range_calls.load(Ordering::Acquire), 1);
-    assert_eq!(full_calls.load(Ordering::Acquire), 0);
-    Ok(())
-}
-
-/// `gettxoutproof` asks only where a transaction is, never what it is, so the
-/// height query must take the same positioned-read path rather than falling back
-/// to loading the whole block.
-#[test]
-fn transaction_height_uses_positioned_range_without_full_body_load()
--> Result<(), Box<dyn std::error::Error>> {
-    let block = genesis_block(Network::Regtest);
-    let txid = block.txdata[0].compute_txid();
-    let value = TxPositionValue::encode(&[transaction_position(&block, 0)?]);
-    let full_calls = Arc::new(AtomicUsize::new(0));
-    let range_calls = Arc::new(AtomicUsize::new(0));
-    let mut fixture = QueryFixture::new(FixtureConfig {
-        block: block.clone(),
-        retain_body: false,
-        scans: vec![scan_response(
-            ColumnFamily::TxConfirmed,
-            TxidRow::scan_prefix(&txid),
-            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), value)],
-            true,
-        )],
-        aba_trigger: None,
-        watermark: None,
-    })?;
-    fixture.engine.body_source = Some(Arc::new(CountingBodySource {
-        full_calls: Arc::clone(&full_calls),
-        range_calls: Arc::clone(&range_calls),
-        bytes: bitcoin::consensus::serialize(&block),
-    }));
-
-    assert_eq!(fixture.engine.transaction_height(&txid)?, Some(0));
-    assert_eq!(range_calls.load(Ordering::Acquire), 1);
-    assert_eq!(full_calls.load(Ordering::Acquire), 0);
-    Ok(())
-}
-
 /// Pins that the height query proves absence rather than guessing the tip.
 ///
 /// Without this, an implementation that answered `Some(tip.height)` for anything
-/// would satisfy the test above, and `gettxoutproof` would build its proof from
-/// the wrong block — or, having verified it, fall into the full chain scan the
-/// index path exists to avoid.
+/// would satisfy the test, and `gettxoutproof` would build its proof from the
+/// wrong block.
 #[test]
 fn transaction_height_reports_nothing_for_an_unindexed_txid()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -456,170 +332,6 @@ fn transaction_height_reports_nothing_for_an_unindexed_txid()
     })?;
 
     assert_eq!(fixture.engine.transaction_height(&txid)?, None);
-    Ok(())
-}
-
-#[test]
-fn duplicate_positions_fall_back_before_range_io() -> Result<(), Box<dyn std::error::Error>> {
-    let block = genesis_block(Network::Regtest);
-    let txid = block.txdata[0].compute_txid();
-    let position = transaction_position(&block, 0)?;
-    let value = TxPositionValue::encode(&[position, position]);
-    let full_calls = Arc::new(AtomicUsize::new(0));
-    let range_calls = Arc::new(AtomicUsize::new(0));
-    let mut fixture = QueryFixture::new(FixtureConfig {
-        block: block.clone(),
-        retain_body: false,
-        scans: vec![scan_response(
-            ColumnFamily::TxConfirmed,
-            TxidRow::scan_prefix(&txid),
-            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), value)],
-            true,
-        )],
-        aba_trigger: None,
-        watermark: None,
-    })?;
-    fixture.engine.body_source = Some(Arc::new(CountingBodySource {
-        full_calls: Arc::clone(&full_calls),
-        range_calls: Arc::clone(&range_calls),
-        bytes: bitcoin::consensus::serialize(&block),
-    }));
-
-    assert!(fixture.engine.transaction(&txid)?.is_some());
-    assert_eq!(range_calls.load(Ordering::Acquire), 0);
-    assert_eq!(full_calls.load(Ordering::Acquire), 1);
-    Ok(())
-}
-
-#[test]
-fn wrong_positioned_transaction_falls_back_to_complete_block()
--> Result<(), Box<dyn std::error::Error>> {
-    let mut block = genesis_block(Network::Regtest);
-    block.txdata.push(Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: Vec::new(),
-        output: Vec::new(),
-    });
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .ok_or_else(|| std::io::Error::other("test block must have a merkle root"))?;
-    let txid = block.txdata[0].compute_txid();
-    let value = TxPositionValue::encode(&[transaction_position(&block, 1)?]);
-    let full_calls = Arc::new(AtomicUsize::new(0));
-    let range_calls = Arc::new(AtomicUsize::new(0));
-    let mut fixture = QueryFixture::new(FixtureConfig {
-        block: block.clone(),
-        retain_body: false,
-        scans: vec![scan_response(
-            ColumnFamily::TxConfirmed,
-            TxidRow::scan_prefix(&txid),
-            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), value)],
-            true,
-        )],
-        aba_trigger: None,
-        watermark: None,
-    })?;
-    fixture.engine.body_source = Some(Arc::new(CountingBodySource {
-        full_calls: Arc::clone(&full_calls),
-        range_calls: Arc::clone(&range_calls),
-        bytes: bitcoin::consensus::serialize(&block),
-    }));
-
-    assert_eq!(
-        fixture
-            .engine
-            .transaction(&txid)?
-            .map(|tx| tx.compute_txid()),
-        Some(txid)
-    );
-    assert_eq!(range_calls.load(Ordering::Acquire), 1);
-    assert_eq!(full_calls.load(Ordering::Acquire), 1);
-    Ok(())
-}
-
-#[test]
-fn funding_history_uses_positioned_range_without_full_body_load()
--> Result<(), Box<dyn std::error::Error>> {
-    let block = genesis_block(Network::Regtest);
-    let txid = block.txdata[0].compute_txid();
-    let scripthash = ScriptHash::new(&block.txdata[0].output[0].script_pubkey);
-    let value = TxPositionValue::encode(&[transaction_position(&block, 0)?]);
-    let full_calls = Arc::new(AtomicUsize::new(0));
-    let range_calls = Arc::new(AtomicUsize::new(0));
-    let mut fixture = QueryFixture::new(FixtureConfig {
-        block: block.clone(),
-        retain_body: false,
-        scans: vec![scan_response(
-            ColumnFamily::Funding,
-            ScriptHashRow::scan_prefix(scripthash),
-            vec![(
-                ScriptHashRow::row(scripthash, 0).to_db_row().to_vec(),
-                value,
-            )],
-            true,
-        )],
-        aba_trigger: None,
-        watermark: None,
-    })?;
-    fixture.engine.body_source = Some(Arc::new(CountingBodySource {
-        full_calls: Arc::clone(&full_calls),
-        range_calls: Arc::clone(&range_calls),
-        bytes: bitcoin::consensus::serialize(&block),
-    }));
-
-    let snapshot = fixture.engine.history_snapshot(scripthash)?;
-    assert_eq!(snapshot.history.len(), 1);
-    assert_eq!(snapshot.history[0].txid, txid);
-    assert_eq!(range_calls.load(Ordering::Acquire), 1);
-    assert_eq!(full_calls.load(Ordering::Acquire), 0);
-    Ok(())
-}
-
-#[test]
-fn wrong_positioned_funding_falls_back_to_complete_block() -> Result<(), Box<dyn std::error::Error>>
-{
-    let mut block = genesis_block(Network::Regtest);
-    block.txdata.push(Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: Vec::new(),
-        output: Vec::new(),
-    });
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .ok_or_else(|| std::io::Error::other("test block must have a merkle root"))?;
-    let txid = block.txdata[0].compute_txid();
-    let scripthash = ScriptHash::new(&block.txdata[0].output[0].script_pubkey);
-    let value = TxPositionValue::encode(&[transaction_position(&block, 1)?]);
-    let full_calls = Arc::new(AtomicUsize::new(0));
-    let range_calls = Arc::new(AtomicUsize::new(0));
-    let mut fixture = QueryFixture::new(FixtureConfig {
-        block: block.clone(),
-        retain_body: false,
-        scans: vec![scan_response(
-            ColumnFamily::Funding,
-            ScriptHashRow::scan_prefix(scripthash),
-            vec![(
-                ScriptHashRow::row(scripthash, 0).to_db_row().to_vec(),
-                value,
-            )],
-            true,
-        )],
-        aba_trigger: None,
-        watermark: None,
-    })?;
-    fixture.engine.body_source = Some(Arc::new(CountingBodySource {
-        full_calls: Arc::clone(&full_calls),
-        range_calls: Arc::clone(&range_calls),
-        bytes: bitcoin::consensus::serialize(&block),
-    }));
-
-    let snapshot = fixture.engine.history_snapshot(scripthash)?;
-    assert_eq!(snapshot.history.len(), 1);
-    assert_eq!(snapshot.history[0].txid, txid);
-    assert_eq!(range_calls.load(Ordering::Acquire), 1);
-    assert_eq!(full_calls.load(Ordering::Acquire), 1);
     Ok(())
 }
 
@@ -951,48 +663,4 @@ fn confirmed_history_snapshot_retries_after_aba_on_spending_scan()
         Err(TxQueryError::Retry)
     ));
     Ok(())
-}
-
-#[test]
-fn quiet_wait_uses_authoritative_coalesced_revision() {
-    let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
-    let runtime = TxIndexRuntime::new(wake_tx);
-    runtime.wake();
-    runtime.wake();
-    runtime.wake();
-
-    assert_eq!(runtime.revision(), 3);
-    assert_eq!(
-        wait_for_revision_quiet(&runtime, &wake_rx, std::time::Duration::ZERO, 0),
-        Some(3)
-    );
-
-    runtime.request_shutdown();
-    assert_eq!(
-        wait_for_revision_quiet(&runtime, &wake_rx, std::time::Duration::ZERO, 3),
-        None
-    );
-}
-
-#[test]
-fn batch_deadline_preserves_queued_wakes_for_reconciliation() {
-    let (wake_tx, wake_rx) = crossbeam_channel::bounded(4);
-    let runtime = TxIndexRuntime::new(wake_tx);
-    runtime.wake();
-    runtime.wake();
-    let deadline = Instant::now() + std::time::Duration::from_secs(1);
-
-    assert_eq!(
-        wait_for_batch_deadline(&runtime, &wake_rx, deadline),
-        BatchWait::Woken
-    );
-    assert_eq!(
-        wait_for_batch_deadline(&runtime, &wake_rx, deadline),
-        BatchWait::Woken
-    );
-    assert!(wake_rx.is_empty());
-    assert_eq!(
-        wait_for_batch_deadline(&runtime, &wake_rx, Instant::now()),
-        BatchWait::Deadline
-    );
 }
