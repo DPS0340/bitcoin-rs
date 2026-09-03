@@ -182,4 +182,13 @@ A throughput change is measured against CPU time as well as wall time, because a
 A parallelism constant tuned while the harness competes with the node for CPU, so the optimum measures the contention. Never tune a parallelism constant against a harness sharing CPU with the node, and never on wall alone.
 
 ### CI lane parity
-A branch is green only against the commands in `.github/workflows/ci.yml`, never a local approximation: `-D warnings` on the `clippy` and `kernel-parity` lanes promotes warnings the workspace lint job merely reports; a virtual workspace drops `--workspace --features`, so the full surface is only reached through the per-crate `-p` invocations; `kernel-parity` adds `--include-ignored`. `cargo deny` failures are bug reports, not lint noise.
+A branch is green only against the commands in the workflow that validates it,
+never a local approximation. The PR gate in `.github/workflows/ci.yml` is the
+fast, pure-Rust surface: its clippy commands intentionally omit `--all-targets`,
+while the main-only `.github/workflows/main.yml` full-node lane restores
+test/example/bench-target lint coverage with `--all-targets` and its
+kernel-parity lane adds `--include-ignored`. A virtual workspace drops
+`--workspace --features`, so feature-specific coverage is reached through the
+per-crate `-p` invocations. `-D warnings` promotes warnings that a plain
+workspace lint reports, and `cargo deny` failures are bug reports, not lint
+noise.

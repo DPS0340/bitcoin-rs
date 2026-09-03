@@ -8,7 +8,12 @@ on:
     # the branch below it, and `branches: [main]` excluded those by
     # construction -- five open PRs had never been built or tested, while
     # reporting no failing checks, which reads exactly like green.
-    branches: ['**']
+    branches: ["**"]
+
+# The PR gate only needs to read repository contents. Keep the token scope
+# explicit so repository-level default permissions cannot grant more access.
+permissions:
+  contents: read
 
 # Bounded because the trigger above is wider: a superseded pull-request run is
 # cancelled when a newer commit lands on the same PR.
@@ -50,6 +55,9 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       # consensus and node default to the C++ kernel feature. Exclude them from
       # the workspace pass and lint their pure-Rust feature surfaces separately.
+      # This fast PR gate intentionally checks only the default targets. The
+      # test/example/bench target lint surface is deferred to main.yml, where
+      # the production full-node lane runs clippy with --all-targets.
       - run: |
           cargo clippy --workspace \
             --exclude bitcoin-rs --exclude bitcoin-rs-consensus \

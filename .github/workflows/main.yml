@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The deep validation lanes only need to read repository contents. Keep the
+# token scope explicit instead of inheriting repository defaults.
+permissions:
+  contents: read
+
 # Same design as ci.yml's concurrency block: one group per run, so `main`
 # pushes never queue against each other and so are never cancelled (a pending
 # run in a shared group would be cancelled by a third push and leave the
@@ -48,7 +53,9 @@ jobs:
       # Full-node feature lint surface. In a virtual workspace (no root
       # [package]), `--features` flags are not forwarded to library crates; use
       # `-p bitcoin-rs` so the binary's feature table propagates all backends
-      # and the kernel to bitcoin-rs-node and its deps.
+      # and the kernel to bitcoin-rs-node and its deps. This --all-targets
+      # coverage deliberately complements the fast PR gate's default-target
+      # clippy scope.
       - run: |
           cargo clippy -p bitcoin-rs --all-targets \
             --no-default-features --features "${FULL_NODE_FEATURES}" \
