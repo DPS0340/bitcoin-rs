@@ -19,9 +19,14 @@ Owners:
   Core-compatible transaction identifier lookup rows (`TxidRow`) and outpoint
   value positions.
 - CLI `--scriptindex` / `--script-index` (env `BITCOIN_RS_SCRIPTINDEX`,
-  configuration `scriptindex=1`) enables the `ScriptHistory` capability. This
-  builds generic scripthash funding rows (`ScriptHashRow`), spending rows
-  (`SpendingPrefixRow`), and outpoint spender records.
+  configuration `scriptindex=1`) selects `full` and enables the
+  `ScriptHistory` capability. This builds generic scripthash funding rows
+  (`ScriptHashRow`), spending rows (`SpendingPrefixRow`), and outpoint spender
+  records.
+- `scriptindex=utxo` enables only the compact `ScriptLive` view for script
+  activity; `scriptindex=full` enables both `ScriptLive` and `ScriptHistory`.
+  The historical boolean spellings (`true`, `1`, `yes`) continue to mean
+  `full`, and (`false`, `0`, `no`) mean disabled. There is no history-only mode.
 - CLI `--blockfilterindex` (env `BITCOIN_RS_BLOCKFILTERINDEX`, configuration
   `blockfilterindex=1`) enables the BIP157/158 basic block filter index extension.
   Per `crates/node/src/config.rs`, `blockfilterindex` requires `txindex` or
@@ -37,11 +42,18 @@ Owners:
 - Only explicit `--txindex` advertises the Core `txindex` capability in RPC
   `getindexinfo` and enables historical `getrawtransaction` verbose and raw
   lookups across all confirmed blocks.
-- `--scriptindex` provides generic script history, unspent output, and spender
-  queries for Esplora and RPC routes without advertising Core `txindex` unless
-  `--txindex` is also set.
+- `--scriptindex=utxo` provides only unspent-output queries; `--scriptindex`
+  with its historical boolean spelling or `full` additionally provides generic
+  script history and spender queries. These modes support Esplora and RPC
+  routes without advertising Core `txindex` unless `--txindex` is also set.
 - `getindexinfo` reports `synced: true` if and only if the advertised
   capability watermark matches the height and block hash of the active chain tip.
+
+`ScriptLive` is not a duplicate coin table. Its empty-valued key is
+`script-hash-prefix || full-outpoint`; the prefix is only a scan accelerator.
+Readers resolve each locator against the authoritative UTXO set and exact-check
+the full script. Deletes are exact point deletes, so a prefix collision cannot
+remove another script's output.
 
 ### `IDX-03`: Query gating and snapshot consistency
 
@@ -58,6 +70,10 @@ Owners:
   the query engine refuses the request with `TxQueryError::Retry` or
   `TxQueryError::Unavailable`. Stale, unconfirmed, or torn rows are never
   returned to callers.
+- `unspent_outputs` consumes the `ScriptLive` watermark only. It holds the
+  chain-transition authority while taking the index snapshot and resolving
+  every locator from one stable UTXO view. A missing locator is unavailable;
+  a compact-prefix collision is filtered by the exact script check.
 
 ### `IDX-04`: Selective reset preserves sibling readiness
 
@@ -99,6 +115,10 @@ Owners:
   - The worker loads bodies from `PruneBodyStore`, constructs bounded forward
     batches (`PreparedBatchLimits`), and commits row mutations and updated
     watermarks in a single atomic store batch per block or block chunk.
+  - Live deletes are anchored by the block's authoritative undo scripts;
+    same-block create/spend pairs cancel before the anchor is consulted.
+    Live inserts use the same admission predicate as the UTXO set, including
+    OP_RETURN, oversize-script, and genesis exclusions.
 - If a rival reorg or tip extension occurs while a forward batch is being
   prepared, the atomic commit detects the watermark divergence, discards the
   stale prepared batch, and re-plans from the new active tip on the next pass.
@@ -109,6 +129,10 @@ Owners:
   branch block pruned before rollback completed), the worker resets the
   affected capability watermark and initiates a fresh rebuild from the active
   chain.
+- When `ScriptLive` has no watermark after restoration or reset, the worker
+  rebuilds it by scanning one stable authoritative UTXO view. Rows are written
+  before the live watermark is durably stamped; without that watermark partial
+  rows are never queryable.
 - Index workers execute in supervised threads under `catch_unwind`. A fatal
   storage failure or panic marks the worker as failed (`publish_failed`) and
   stops the worker. Block validation, UTXO commits, and chainstate progress

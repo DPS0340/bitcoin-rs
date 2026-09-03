@@ -735,6 +735,22 @@ impl UtxoSetView<'_> {
         Ok(scan)
     }
 
+    /// Scans every live output in this stable view.
+    pub fn scan_all(&self) -> UtxoScan {
+        let mut scan = UtxoScan::default();
+        for shard in &self.set.shards {
+            shard.scan_all(&mut scan);
+        }
+        scan
+    }
+
+    /// Returns the full live-output entry for `op` in this stable view.
+    #[must_use]
+    pub fn get_entry(&self, op: &OutPoint) -> Option<crate::shard::LiveOutput> {
+        let key = UtxoKey::from_txid(&op.txid);
+        self.set.shards[usize::from(key.shard())].get_entry(&key, &op.txid.into(), op.vout)
+    }
+
     pub(crate) const fn shard(&self, idx: usize) -> &Shard {
         &self.set.shards[idx]
     }
@@ -819,6 +835,11 @@ impl UtxoSet {
     /// Scans a stable whole-set view for exact scriptPubKey matches.
     pub fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
         self.with_stable_view(|view| view.scan_script_pubkeys(scripts))
+    }
+
+    /// Scans every live output while commits are excluded.
+    pub fn scan_all(&self) -> UtxoScan {
+        self.with_stable_view(|view| view.scan_all())
     }
 
     /// Returns true when any output of `txid` is live in the set.

@@ -7333,6 +7333,8 @@ mod consensus_rule_tests {
             Arc::clone(&handles.block_tree),
             Arc::clone(&handles.applied_tip),
             None,
+            None,
+            None,
         );
         let query_result =
             bitcoin_rs_rpc::context::TxIndexQuery::transaction(&query, &genesis.txs[0].txid());

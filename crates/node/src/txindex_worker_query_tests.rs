@@ -266,6 +266,8 @@ impl QueryFixture {
             tree,
             applied_tip,
             body_source,
+            None,
+            None,
         );
         Ok(Self { engine })
     }

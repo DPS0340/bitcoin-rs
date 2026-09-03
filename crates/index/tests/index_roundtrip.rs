@@ -1101,7 +1101,7 @@ fn reset_claim_carries_mask_epoch_and_base_version() -> Result<(), Box<dyn std::
     let mut writer = IndexWriter::open(Arc::clone(&store), 7)?;
     let body = read_fixture(0)?;
     let hash = block_hash(&body);
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, hash, &body)?;
+    let block = writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, hash, &body)?;
     let mut prepared = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -1381,7 +1381,8 @@ fn seed_populated_store(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = IndexWriter::open(Arc::clone(store), generation)?;
     let body = read_fixture(0)?;
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, block_hash(&body), &body)?;
+    let block =
+        writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, block_hash(&body), &body)?;
     let mut prepared = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -1491,6 +1492,7 @@ const TX_LOOKUP_MASK: u8 = 0b01;
 const SCRIPT_HISTORY_MASK: u8 = 0b10;
 const TX_WATERMARK_KEY: &[u8] = &[0x00, b'T'];
 const SCRIPT_WATERMARK_KEY: &[u8] = &[0x00, b'S'];
+const LIVE_WATERMARK_KEY: &[u8] = &[0x00, b'L'];
 const CURSOR_KEY: &[u8] = &[0x00, b'C'];
 const FORMAT_KEY: &[u8] = &[0x00, b'V'];
 const FORMAT_VALUE: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
@@ -1798,7 +1800,7 @@ fn format_stays_current_after_reset_and_rebuild() -> Result<(), Box<dyn std::err
     seed_populated_store(&store, 1)?;
 
     let writer = IndexWriter::open(Arc::clone(&store), 1)?;
-    writer.reset_capabilities(IndexCapabilities::ALL)?;
+    writer.reset_capabilities(IndexCapabilities::HISTORICAL)?;
     drop(writer);
 
     // The emptied index claims the current row format before rebuilding.
@@ -2139,9 +2141,9 @@ fn double_reset_same_generation_still_rejects_stale_commit()
     let store = Arc::new(MemoryStore::default());
     seed_populated_store(&store, 1)?;
     let mut writer = IndexWriter::open(Arc::clone(&store), 4)?;
-    writer.reset_capabilities(IndexCapabilities::ALL)?;
+    writer.reset_capabilities(IndexCapabilities::HISTORICAL)?;
     let (stale_fence, _) = writer.fenced_watermarks()?;
-    writer.reset_capabilities(IndexCapabilities::ALL)?;
+    writer.reset_capabilities(IndexCapabilities::HISTORICAL)?;
     assert_eq!(stored_idle_version(&store)?, 2);
 
     // The batch is valid against the post-reset state, so only the stale
@@ -2184,7 +2186,8 @@ fn intermediate_rollback_deletes_cursor_and_survives_reopen()
     let mut writer = IndexWriter::open(Arc::clone(&store), 4)?;
     let (fence, _) = writer.fenced_watermarks()?;
     let body0 = read_fixture(0)?;
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, block_hash(&body0), &body0)?;
+    let block =
+        writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, block_hash(&body0), &body0)?;
     let mut prepared = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -2380,9 +2383,10 @@ fn populated_idle_tracking_store() -> Result<Arc<CallTrackingStore>, Box<dyn std
     seed_populated_store(&store, 1)?;
 
     let mut writer = IndexWriter::open(Arc::clone(&store), 4)?;
-    writer.reset_capabilities(IndexCapabilities::ALL)?;
+    writer.reset_capabilities(IndexCapabilities::HISTORICAL)?;
     let body = read_fixture(0)?;
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, block_hash(&body), &body)?;
+    let block =
+        writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, block_hash(&body), &body)?;
     let mut prepared = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -2490,7 +2494,7 @@ fn fenced_watermarks_prefers_reset_over_watermark_decode_error()
 }
 
 #[test]
-fn fenced_watermarks_captures_one_coherent_snapshot_across_four_reads()
+fn fenced_watermarks_captures_one_coherent_snapshot_across_five_reads()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = populated_idle_tracking_store()?;
     let mut writer = IndexWriter::open(Arc::clone(&store), 4)?;
@@ -2502,6 +2506,7 @@ fn fenced_watermarks_captures_one_coherent_snapshot_across_four_reads()
 
     assert!(watermarks.tx_lookup.is_some());
     assert!(watermarks.script_history.is_some());
+    assert!(watermarks.script_live.is_none());
     assert_eq!(
         store.snapshots.load(Ordering::Relaxed),
         snapshots_before + 1,
@@ -2510,7 +2515,7 @@ fn fenced_watermarks_captures_one_coherent_snapshot_across_four_reads()
     let captures = store.snapshot_read_order.lock().clone();
     assert_eq!(
         captures.len(),
-        4,
+        5,
         "one capture reads each fenced key exactly once: {captures:?}"
     );
     let mut captured_keys: Vec<&[u8]> = captures.iter().map(|(_cf, key)| key.as_slice()).collect();
@@ -2520,6 +2525,7 @@ fn fenced_watermarks_captures_one_coherent_snapshot_across_four_reads()
         ORDINARY_STATE_REVISION_KEY,
         TX_WATERMARK_KEY,
         SCRIPT_WATERMARK_KEY,
+        LIVE_WATERMARK_KEY,
     ];
     expected_keys.sort_unstable();
     assert_eq!(captured_keys, expected_keys);
@@ -2543,7 +2549,8 @@ fn fenced_watermarks_captures_one_coherent_snapshot_across_four_reads()
     let (fence, watermarks) = writer.fenced_watermarks()?;
     assert_eq!(watermarks, IndexWatermarks::default());
     let body = read_fixture(0)?;
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, block_hash(&body), &body)?;
+    let block =
+        writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, block_hash(&body), &body)?;
     let mut prepared = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -2635,7 +2642,8 @@ fn each_ordinary_mutator_advances_the_revision_exactly_once()
 
     // 1. forward
     let body0 = read_fixture(0)?;
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, block_hash(&body0), &body0)?;
+    let block =
+        writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, block_hash(&body0), &body0)?;
     let mut prepared = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,

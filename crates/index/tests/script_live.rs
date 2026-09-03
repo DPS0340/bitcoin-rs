@@ -24,8 +24,10 @@ use bitcoin_rs_index::{
     IndexCapabilities, IndexCapability, IndexError, IndexWatermark, IndexWriter,
     MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, ScriptHash, SpentCoinScripts,
 };
+use bitcoin_rs_primitives::{Hash256, OutPoint as NativeOutPoint, Txid as NativeTxid};
 use bitcoin_rs_storage::{
     ColumnFamily, KvIter, KvSnapshot, KvStore, PrefixScanLimit, StorageError, WriteBatch,
+    WriteCondition,
 };
 use parking_lot::RwLock;
 
@@ -75,6 +77,31 @@ impl KvStore for MemoryStore {
         }
         Ok(())
     }
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: Self::WriteBatch,
+    ) -> Result<bool, StorageError> {
+        let mut guard = self.cfs.write();
+        let matched = conditions.iter().all(|condition| {
+            let (cf, key) = condition.location();
+            condition.matches(guard[cf.index()].get(key).map(Vec::as_slice))
+        });
+        if !matched {
+            return Ok(false);
+        }
+        for (cf, key, value) in batch.ops {
+            match value {
+                Some(value) => {
+                    guard[cf.index()].insert(key, value);
+                }
+                None => {
+                    guard[cf.index()].remove(&key);
+                }
+            }
+        }
+        Ok(true)
+    }
     fn write_deferred(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
         self.write(batch)
     }
@@ -100,7 +127,9 @@ impl KvStore for MemoryStore {
         Ok(Box::new(rows.into_iter()))
     }
     fn snapshot(&self) -> Result<Box<dyn KvSnapshot + '_>, StorageError> {
-        panic!("snapshots are not exercised by these tests")
+        Ok(Box::new(MemorySnapshot {
+            cfs: self.cfs.read().clone(),
+        }))
     }
     fn scan_prefix_bounded(
         &self,
@@ -123,6 +152,29 @@ impl KvStore for MemoryStore {
             rows.push((key.clone(), value.clone()));
         }
         Ok(bitcoin_rs_storage::PrefixScan { rows, complete })
+    }
+}
+
+struct MemorySnapshot {
+    cfs: [BTreeMap<Vec<u8>, Vec<u8>>; ColumnFamily::ALL.len()],
+}
+
+impl KvSnapshot for MemorySnapshot {
+    fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.cfs[cf.index()].get(key).cloned())
+    }
+
+    fn iter_prefix<'a>(
+        &'a self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<KvIter<'a>, StorageError> {
+        let rows = self.cfs[cf.index()]
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| Ok((key.clone(), value.clone())))
+            .collect::<Vec<_>>();
+        Ok(Box::new(rows.into_iter()))
     }
 }
 
@@ -216,7 +268,7 @@ struct Chain {
 impl Chain {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryStore::default());
-        let writer = IndexWriter::open(store)?;
+        let writer = IndexWriter::open(store, 0)?;
         Ok(Self {
             writer,
             tip: [0_u8; 32],
@@ -254,8 +306,18 @@ impl Chain {
             .writer
             .indexer()
             .iter_live_outpoints(ScriptHash::from_script_bytes(script.as_bytes()))
-            .unwrap_or_else(|error| panic!("live scan failed: {error}"));
-        outpoints.sort_unstable();
+            .unwrap_or_else(|error| panic!("live scan failed: {error}"))
+            .into_iter()
+            .map(|outpoint| {
+                let txid = outpoint.txid;
+                let vout = outpoint.vout;
+                bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array(*txid.as_bytes()),
+                    vout,
+                }
+            })
+            .collect::<Vec<_>>();
+        outpoints.sort_by_key(|outpoint| (*outpoint.txid.as_byte_array(), outpoint.vout));
         outpoints
     }
 }
@@ -343,6 +405,63 @@ fn live_rows_follow_connect_spend_and_disconnect() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// A BIP30-style outpoint overwrite removes the old script row on connect and
+/// restores it from the undo anchor on disconnect.
+#[test]
+fn live_rows_restore_a_replaced_outpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let mut chain = Chain::new()?;
+    chain.connect(vec![coinbase(0)], &MapScripts::default())?;
+
+    let external = OutPoint {
+        txid: Txid::from_byte_array([0x71_u8; 32]),
+        vout: 0,
+    };
+    let old_script = script(0x72);
+    let new_script = script(0x73);
+    let mut creator = spend(&[external], std::slice::from_ref(&new_script));
+    creator.input[0].previous_output = external;
+    let creator_txid = creator.compute_txid();
+    let replaced = OutPoint {
+        txid: creator_txid,
+        vout: 0,
+    };
+    let mut anchor = MapScripts::default();
+    anchor.insert(external, &script(0x74));
+    anchor.insert(replaced, &old_script);
+
+    let (body, hash) = block_bytes(chain.tip, vec![coinbase(1), creator]);
+    let prepared = chain.writer.prepare_block_with_spent_scripts(
+        IndexCapabilities::ALL,
+        chain.height,
+        hash,
+        &body,
+        &anchor,
+    )?;
+    let mut batch = PreparedBatch::new(PreparedBatchLimits {
+        max_rows: 10_000,
+        max_bytes: 10_000_000,
+    });
+    assert!(batch.try_push(prepared).is_ok());
+    chain.writer.commit_forward(batch)?;
+
+    assert_eq!(chain.live(&old_script), Vec::<OutPoint>::new());
+    assert_eq!(chain.live(&new_script), vec![replaced]);
+
+    let prev = IndexWatermark {
+        height: 0,
+        hash: chain.tip,
+    };
+    chain.writer.commit_rollback_one_with_spent_scripts(
+        IndexCapabilities::ALL,
+        Some(prev),
+        &body,
+        &anchor,
+    )?;
+    assert_eq!(chain.live(&new_script), Vec::<OutPoint>::new());
+    assert_eq!(chain.live(&old_script), vec![replaced]);
+    Ok(())
+}
+
 /// An output created and spent inside one block never touches the live view,
 /// and needs no anchor entry -- the cancellation happens before resolution.
 #[test]
@@ -353,22 +472,41 @@ fn same_block_create_and_spend_cancels_without_an_anchor() -> Result<(), Box<dyn
     chain.connect(vec![coinbase(0)], &empty)?;
 
     let transient = script(0xdd);
+    let transient_op_return = ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x01]);
+    let transient_oversized = ScriptBuf::from_bytes(vec![0x51; MAX_LIVE_SCRIPT_SIZE + 1]);
     let survivor = script(0xee);
     let external = OutPoint {
         txid: Txid::from_byte_array([9_u8; 32]),
         vout: 3,
     };
     let creator = {
-        let mut tx = spend(&[external], std::slice::from_ref(&transient));
+        let mut tx = spend(
+            &[external],
+            &[
+                transient.clone(),
+                transient_op_return.clone(),
+                transient_oversized.clone(),
+            ],
+        );
         tx.input[0].previous_output = external;
         tx
     };
     let creator_txid = creator.compute_txid();
     let spender = spend(
-        &[OutPoint {
-            txid: creator_txid,
-            vout: 0,
-        }],
+        &[
+            OutPoint {
+                txid: creator_txid,
+                vout: 0,
+            },
+            OutPoint {
+                txid: creator_txid,
+                vout: 1,
+            },
+            OutPoint {
+                txid: creator_txid,
+                vout: 2,
+            },
+        ],
         std::slice::from_ref(&survivor),
     );
     let spender_txid = spender.compute_txid();
@@ -380,6 +518,8 @@ fn same_block_create_and_spend_cancels_without_an_anchor() -> Result<(), Box<dyn
     chain.connect(vec![coinbase(1), creator, spender], &anchor)?;
 
     assert_eq!(chain.live(&transient), Vec::<OutPoint>::new());
+    assert_eq!(chain.live(&transient_op_return), Vec::<OutPoint>::new());
+    assert_eq!(chain.live(&transient_oversized), Vec::<OutPoint>::new());
     assert_eq!(
         chain.live(&survivor),
         vec![OutPoint {
@@ -514,17 +654,14 @@ fn live_and_history_watermarks_advance_independently() -> Result<(), Box<dyn std
 #[test]
 fn seeding_stamps_once_and_refuses_a_second_pass() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
-    let mut writer = IndexWriter::open(Arc::clone(&store))?;
+    let mut writer = IndexWriter::open(Arc::clone(&store), 0)?;
 
     let wallet = script(0x44);
     let scripthash = ScriptHash::from_script_bytes(wallet.as_bytes());
     let coins = (0_u32..3)
         .map(|vout| {
             (
-                OutPoint {
-                    txid: Txid::from_byte_array([0x33_u8; 32]),
-                    vout,
-                },
+                NativeOutPoint::new(NativeTxid(Hash256::from_le_bytes(&[0x33_u8; 32])), vout),
                 scripthash,
             )
         })

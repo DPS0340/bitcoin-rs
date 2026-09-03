@@ -1,6 +1,6 @@
 use std::ops::ControlFlow;
 
-use bitcoin_rs_primitives::{Block, OutPoint, Tx, Txid, encode, varint};
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, Txid, encode, varint};
 use bitcoin_rs_storage::{
     ColumnFamily, KvSnapshot, KvStore, PrefixScanLimit, StorageError, WriteBatch, WriteCondition,
 };
@@ -49,6 +49,13 @@ pub enum IndexError {
     #[error("invalid TxIndex prefix row length {len}")]
     InvalidPrefixRowLength {
         /// Actual key length observed in storage.
+        len: usize,
+    },
+    /// A `ScriptLive` row had a non-empty value even though the row format is
+    /// key-only.
+    #[error("invalid ScriptLive row value length {len}")]
+    InvalidLiveRowValue {
+        /// Actual value length observed in storage.
         len: usize,
     },
     /// The `TxIndex` format version is not supported.
@@ -881,13 +888,13 @@ impl IndexCapabilities {
         script_history: false,
         script_live: true,
     };
-    /// Every capability.
+    /// Every index capability, including the compact live view.
     pub const ALL: Self = Self {
         tx_lookup: true,
         script_history: true,
         script_live: true,
     };
-    /// The pre-#225 pair: everything derivable from a block body alone.
+    /// Every capability derivable from a block body alone.
     ///
     /// Anchorless paths use this, because `ScriptLive` cannot be prepared
     /// without a spent-coin script source.
@@ -1238,7 +1245,7 @@ impl<S: KvStore> Indexer<S> {
             .transpose()
     }
 
-    /// Loads both independently durable capability watermarks.
+    /// Loads all independently durable capability watermarks.
     pub fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
         Ok(IndexWatermarks {
             tx_lookup: self.capability_watermark(IndexCapability::TxLookup)?,
@@ -1282,12 +1289,15 @@ impl<S: KvStore> Indexer<S> {
     pub fn iter_live_outpoints(
         &self,
         scripthash: crate::ScriptHash,
-    ) -> Result<Vec<bitcoin::OutPoint>, IndexError> {
+    ) -> Result<Vec<OutPoint>, IndexError> {
         let prefix = ScriptHashRow::scan_prefix(scripthash);
         let iter = self.store.iter_prefix(ColumnFamily::ScriptLive, &prefix)?;
         let mut outpoints = Vec::new();
         for row in iter {
-            let (key, _value) = row?;
+            let (key, value) = row?;
+            if !value.is_empty() {
+                return Err(IndexError::InvalidLiveRowValue { len: value.len() });
+            }
             let row = crate::types::ScriptLiveRow::from_db_row(&key)
                 .ok_or(IndexError::InvalidWatermark)?;
             outpoints.push(row.outpoint());
@@ -2076,14 +2086,13 @@ fn pending_rows_for_block(
     height: u32,
     txids: TxidSource<'_>,
 ) -> Result<(PendingRows, usize), IndexError> {
-    let (rows, txid_count, _) =
-        pending_rows_for_block_with_header(
-            block,
-            height,
-            txids,
-            IndexCapabilities::HISTORICAL,
-            &NoSpentScripts,
-        )?;
+    let (rows, txid_count, _) = pending_rows_for_block_with_header(
+        block,
+        height,
+        txids,
+        IndexCapabilities::HISTORICAL,
+        &NoSpentScripts,
+    )?;
     Ok((rows, txid_count))
 }
 
@@ -2096,13 +2105,11 @@ fn pending_rows_for_block(
 /// row behind.
 fn push_live_ops(
     rows: &mut PendingRows,
-    created: Vec<([u8; 32], u32, ScriptHash)>,
+    created: Vec<([u8; 32], u32, Option<ScriptHash>)>,
     spent: Vec<([u8; 32], u32)>,
     height: u32,
     spent_scripts: &dyn SpentCoinScripts,
 ) -> Result<(), IndexError> {
-    use bitcoin::hashes::Hash as _;
-
     let created_keys: hashbrown::HashSet<([u8; 32], u32)> = created
         .iter()
         .map(|(txid, vout, _)| (*txid, *vout))
@@ -2117,10 +2124,7 @@ fn push_live_ops(
         let script = spent_scripts
             .script_bytes(&txid, vout)
             .ok_or(IndexError::MissingSpentCoin { txid, vout, height })?;
-        let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array(txid),
-            vout,
-        };
+        let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&txid)), vout);
         deletes.push(LiveOp::Delete(crate::types::ScriptLiveRow::new(
             ScriptHash::from_script_bytes(script),
             &outpoint,
@@ -2130,10 +2134,21 @@ fn push_live_ops(
         if cancelled.contains(&(txid, vout)) {
             continue;
         }
-        let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array(txid),
-            vout,
+        let Some(scripthash) = scripthash else {
+            continue;
         };
+        let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&txid)), vout);
+        // At a BIP30 exception height the output outpoint can already be
+        // live. The undo record carries that replaced coin as a restore, so
+        // use the same anchor to remove its old script row before publishing
+        // the new one. The inverse operation restores the old row on rollback.
+        if let Some(old_script) = spent_scripts.script_bytes(&txid, vout) {
+            rows.live_ops
+                .push(LiveOp::Delete(crate::types::ScriptLiveRow::new(
+                    ScriptHash::from_script_bytes(old_script),
+                    &outpoint,
+                )));
+        }
         rows.live_ops
             .push(LiveOp::Insert(crate::types::ScriptLiveRow::new(
                 scripthash, &outpoint,
@@ -2478,13 +2493,16 @@ struct IndexBlockVisitor<'a> {
     /// the first point where the position exists. Outputs are therefore buffered
     /// here and drained once, in emission order.
     pending_funding: Vec<crate::types::HashPrefix>,
-    /// Live-eligible outputs of the transaction currently being parsed, as
-    /// `(vout, scripthash)` -- buffered for the same reason as
+    /// Outputs of the transaction currently being parsed, as `(vout,
+    /// optional scripthash)`. `None` means the output is not admitted to the
+    /// UTXO set (OP_RETURN or oversize), but it still participates in
+    /// same-block cancellation. Buffered for the same reason as
     /// `pending_funding`, and additionally because the txid is unknown until
     /// `visit_transaction`.
-    pending_live: Vec<(u32, ScriptHash)>,
-    /// Outputs this block created that pass UTXO admission, pre-cancellation.
-    live_created: Vec<([u8; 32], u32, ScriptHash)>,
+    pending_live: Vec<(u32, Option<ScriptHash>)>,
+    /// Outputs this block created, pre-cancellation. The option preserves
+    /// same-block cancellation for outputs that never enter UTXO state.
+    live_created: Vec<([u8; 32], u32, Option<ScriptHash>)>,
     /// Full previous outpoints this block spends, pre-cancellation.
     live_spent: Vec<([u8; 32], u32)>,
     capabilities: IndexCapabilities,
@@ -2622,12 +2640,11 @@ impl Visitor for IndexBlockVisitor<'_> {
         // authoritative lookup can resolve.
         if self.capabilities.script_live
             && self.height_bytes != [0_u8; crate::types::HEIGHT_SIZE]
-            && !is_op_return_script(script)
-            && script.len() <= MAX_LIVE_SCRIPT_SIZE
             && let Ok(vout) = u32::try_from(vout)
         {
-            self.pending_live
-                .push((vout, ScriptHash::from_script_bytes(script)));
+            let scripthash = (!is_op_return_script(script) && script.len() <= MAX_LIVE_SCRIPT_SIZE)
+                .then(|| ScriptHash::from_script_bytes(script));
+            self.pending_live.push((vout, scripthash));
         }
         ControlFlow::Continue(())
     }
@@ -2826,6 +2843,17 @@ pub struct TxIndexScan {
     pub complete: bool,
 }
 
+/// Result of one bounded `ScriptLive` prefix scan.
+#[derive(Debug)]
+pub struct ScriptLiveScan {
+    /// Parsed live-output locator rows.
+    pub rows: Vec<crate::ScriptLiveRow>,
+    /// Encoded key and value bytes returned by storage.
+    pub encoded_bytes: usize,
+    /// Whether storage returned the complete matching prefix.
+    pub complete: bool,
+}
+
 /// Point-in-time, typed view of durable `TxIndex` rows.
 pub trait TxIndexSnapshot: Send + Sync {
     /// Loads the transaction lookup watermark from this snapshot.
@@ -2856,6 +2884,15 @@ pub trait TxIndexSnapshot: Send + Sync {
         outpoint: &OutPoint,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError>;
+    /// Scans compact live-output locator rows for `scripthash`.
+    fn live_rows(
+        &self,
+        scripthash: ScriptHash,
+        limit: PrefixScanLimit,
+    ) -> Result<ScriptLiveScan, IndexError> {
+        let _ = (scripthash, limit);
+        Err(IndexError::UnsupportedRollback)
+    }
 }
 
 struct StoreTxIndexSnapshot<'a> {
@@ -2937,6 +2974,36 @@ impl TxIndexSnapshot for StoreTxIndexSnapshot<'_> {
             limit,
         )
     }
+
+    fn live_rows(
+        &self,
+        scripthash: ScriptHash,
+        limit: PrefixScanLimit,
+    ) -> Result<ScriptLiveScan, IndexError> {
+        let scan = self.snapshot.scan_prefix_bounded(
+            ColumnFamily::ScriptLive,
+            &ScriptHashRow::scan_prefix(scripthash),
+            limit,
+        )?;
+        let encoded_bytes = scan.rows.iter().fold(0_usize, |total, (key, value)| {
+            total.saturating_add(key.len()).saturating_add(value.len())
+        });
+        let mut rows = Vec::with_capacity(scan.rows.len());
+        for (key, value) in scan.rows {
+            if !value.is_empty() {
+                return Err(IndexError::InvalidLiveRowValue { len: value.len() });
+            }
+            rows.push(
+                crate::ScriptLiveRow::from_db_row(&key)
+                    .ok_or(IndexError::InvalidPrefixRowLength { len: key.len() })?,
+            );
+        }
+        Ok(ScriptLiveScan {
+            rows,
+            encoded_bytes,
+            complete: scan.complete,
+        })
+    }
 }
 
 /// Read-only `TxIndex` interface.
@@ -3010,7 +3077,7 @@ impl<S: KvStore> IndexWriter<S> {
     }
 
     /// Captures one coherent fence with the exact reset state, ordinary revision,
-    /// and both capability watermarks from a single snapshot. It returns the
+    /// and all capability watermarks from a single snapshot. It returns the
     /// fence with the watermarks it carries. A reset that
     /// begins or completes in the read window therefore returns
     /// [`IndexError::ResetInProgress`]; callers must discard derived
@@ -3050,7 +3117,7 @@ impl<S: KvStore> IndexWriter<S> {
         seed_tip: IndexWatermark,
     ) -> Result<usize, IndexError>
     where
-        I: IntoIterator<Item = (bitcoin::OutPoint, crate::ScriptHash)>,
+        I: IntoIterator<Item = (OutPoint, crate::ScriptHash)>,
     {
         const SEED_BATCH_ROWS: usize = 4_096;
         self.ensure_prepared_ready()?;
@@ -3105,7 +3172,6 @@ impl<S: KvStore> IndexWriter<S> {
             self.generation,
             capabilities.to_mask(),
         )
-        
     }
 
     /// Derives a `PreparedBlock` from a serialized body without allocating a decoded block.
@@ -3147,14 +3213,13 @@ impl<S: KvStore> IndexWriter<S> {
                 watermark: self.watermark()?,
             });
         }
-        let (mut rows, header) =
-            pending_rows_for_block_with_header(
-                body,
-                height,
-                TxidSource::Compute,
-                capabilities,
-                spent_scripts,
-            )?;
+        let (mut rows, _txid_count, header) = pending_rows_for_block_with_header(
+            body,
+            height,
+            TxidSource::Compute,
+            capabilities,
+            spent_scripts,
+        )?;
         let header = header.ok_or(IndexError::InvalidHeaderLength { len: 0 })?;
         let actual_hash = encode::double_sha256(header.as_slice()).to_le_bytes();
         if actual_hash != hash {
@@ -3288,7 +3353,6 @@ impl<S: KvStore> IndexWriter<S> {
             prev,
             body,
             ConsumerCursorUpdate::Clear,
-            &NoSpentScripts,
         )
     }
 
@@ -3310,7 +3374,6 @@ impl<S: KvStore> IndexWriter<S> {
             prev,
             body,
             ConsumerCursorUpdate::Clear,
-            &NoSpentScripts,
         )
     }
 
@@ -3325,7 +3388,7 @@ impl<S: KvStore> IndexWriter<S> {
         spent_scripts: &dyn SpentCoinScripts,
     ) -> Result<(), IndexError> {
         let (fence, _) = self.fenced_watermarks()?;
-        self.commit_rollback_one_for_with_cursor(
+        self.commit_rollback_one_for_with_cursor_with_spent_scripts(
             fence,
             capabilities,
             prev,
@@ -3338,6 +3401,29 @@ impl<S: KvStore> IndexWriter<S> {
     /// Atomically rolls back one block and applies one explicit consumer
     /// cursor disposition guarded by the captured reset-state fence.
     pub fn commit_rollback_one_for_with_cursor(
+        &mut self,
+        fence: IndexWriteFence,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<(), IndexError> {
+        if capabilities.script_live {
+            return Err(IndexError::MissingSpentScripts);
+        }
+        self.commit_rollback_one_for_with_cursor_with_spent_scripts(
+            fence,
+            capabilities,
+            prev,
+            body,
+            cursor,
+            &NoSpentScripts,
+        )
+    }
+
+    /// Atomically rolls back one block with the exact scripts of its spent
+    /// coins. This is the anchored variant used when `ScriptLive` is selected.
+    pub fn commit_rollback_one_for_with_cursor_with_spent_scripts(
         &mut self,
         fence: IndexWriteFence,
         capabilities: IndexCapabilities,
@@ -3412,6 +3498,7 @@ impl<S: KvStore> IndexWriter<S> {
                     .is_some_and(|watermark| watermark.height >= current.height))
             || (!capabilities.script_live
                 && fence
+                    .watermarks
                     .script_live
                     .is_some_and(|watermark| watermark.height >= current.height));
         delete_rows(&mut store_batch, &prepared.rows, !unselected_keeps_identity);
@@ -3452,8 +3539,8 @@ impl<S: KvStore> IndexWriter<S> {
             .get(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY)?)
     }
 
-    /// Publishes the opaque consumer cursor under four exact conditions from the
-    /// captured fence: reset state, ordinary revision, and both watermark rows.
+    /// Publishes the opaque consumer cursor under five exact conditions from the
+    /// captured fence: reset state, ordinary revision, and all watermark rows.
     /// The commit atomically advances the ordinary revision.
     ///
     /// A lost race with an unchanged reset returns

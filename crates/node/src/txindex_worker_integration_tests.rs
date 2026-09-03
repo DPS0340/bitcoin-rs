@@ -31,6 +31,8 @@ fn test_open_spec(dir: &std::path::Path, epoch: u64) -> TxIndexOpenSpec {
         enabled: IndexCapabilities::default(),
         rollback_rebuild_cutover: 0,
         canonical_data_root: dir.to_path_buf(),
+        utxo: None,
+        chain_transition: None,
     }
 }
 

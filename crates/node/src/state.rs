@@ -1008,6 +1008,8 @@ fn build_tx_index_open_spec(
         enabled,
         rollback_rebuild_cutover: config.index_rollback_rebuild_cutover,
         canonical_data_root,
+        utxo: None,
+        chain_transition: None,
     }))
 }
 
@@ -1407,10 +1409,13 @@ impl NodeState {
             ChainEventPublisher::new(epoch, initial_snapshot);
         let shutdown = Arc::new(AtomicBool::new(false));
         let chain_events = Arc::new(chain_events_raw);
+        let chain_transition = Arc::new(parking_lot::Mutex::new(()));
         let tx_index_open_spec = build_tx_index_open_spec(&config, txindex_cache_bytes, epoch)?;
         let (tx_index_runtime, tx_index_worker, tx_index_lifecycle, tx_index_adapter) =
             match tx_index_open_spec {
-                Some(spec) => {
+                Some(mut spec) => {
+                    spec.utxo = Some(Arc::clone(&utxo));
+                    spec.chain_transition = Some(Arc::clone(&chain_transition));
                     let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
                     let runtime = Arc::new(crate::txindex_worker::TxIndexRuntime::new(wake_tx));
                     let body_source: Arc<dyn bitcoin_rs_rpc::context::BlockBodySource> =
@@ -1543,7 +1548,7 @@ impl NodeState {
             undo_store,
             admission: Arc::new(crate::apply::ApplyAdmission::new()),
             shutdown: Arc::clone(&shutdown),
-            chain_transition: Arc::new(parking_lot::Mutex::new(())),
+            chain_transition,
             assume_valid_height: config.assume_valid_height,
             assume_valid_gate: Arc::new(crate::apply::AssumeValidGate::new(
                 config.network,
@@ -2359,23 +2364,16 @@ mod tests {
     /// Opens a node in each `scriptindex` mode and asserts the concrete answer
     /// for `unspent_outputs`, rather than only the `full` path.
     ///
-    /// This is the guard that would have caught advertising `utxo` before a
-    /// live store exists. Under `utxo` the node currently builds no
-    /// `Funding`/`Spending` rows and publishes no `ScriptHistory` watermark,
-    /// so every `ScriptIndexQuery` method gates on
-    /// `IndexCapabilities::SCRIPT_HISTORY` and reports `Retry` forever. The
-    /// mode is therefore rejected at config time; this test pins that the
-    /// rejection happens at `open`, and that the two accepted modes give
-    /// distinct, concrete answers instead of both degrading to `Retry`.
+    /// `utxo` must be independently usable while historical rows are absent;
+    /// this test pins that both enabled modes converge to a concrete answer.
     #[test]
     fn script_index_modes_give_concrete_unspent_outputs_answers() -> anyhow::Result<()> {
         use bitcoin_rs_index::ScriptHash;
         use bitcoin_rs_rpc::context::TxQueryError;
 
-        // Genesis is applied in each case so the index worker has at least one
-        // block to index. Without it the worker never publishes a
-        // `ScriptHistory` watermark and every mode retries forever, which would
-        // make all three cases indistinguishable.
+        // Genesis is applied in each case so the index worker has a published
+        // chain tip to anchor. The disabled case has no adapter; the enabled
+        // modes must publish their own capability watermarks independently.
         let scripthash = ScriptHash::from_script_bytes(&[0x51, 0x01]);
 
         // `disabled`: no script index at all, so no query adapter is handed
@@ -2394,25 +2392,36 @@ mod tests {
         );
         drop(state);
 
-        // `utxo`: the mode is named and parsed but has no durable live-output
-        // store, so opening must fail loudly rather than start a node that
-        // would advertise a live view nothing backs.
+        // `utxo`: the compact live-output view is independently usable while
+        // historical script rows are not maintained.
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = false;
         config.script_index = crate::config::ScriptIndexMode::Utxo;
-        let error = match NodeState::open(config, None) {
-            Ok(_) => panic!("utxo must be rejected while no live store backs it"),
-            Err(error) => error,
+        let state = NodeState::open(config, None)?;
+        let _ = state.apply_block(&crate::Network::Regtest.genesis_block())?;
+        let Some(query) = state.script_index_query() else {
+            panic!("utxo mode must hand out a script-index query adapter")
         };
-        assert!(
-            error
-                .to_string()
-                .contains("scriptindex=utxo is not yet usable"),
-            "rejection must name what is missing, got: {error}"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match query.unspent_outputs(scripthash) {
+                Ok(records) => {
+                    assert!(records.is_empty(), "an unfunded script has no outputs");
+                    break;
+                }
+                Err(TxQueryError::Retry | TxQueryError::Unavailable(_)) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "utxo mode must converge on the live view"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("unexpected script-index error: {error}"),
+            }
+        }
 
         // `full`: the accepted mode. It converges on a concrete answer — an
         // empty set for an unfunded script — rather than retrying forever.

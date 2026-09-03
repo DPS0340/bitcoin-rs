@@ -174,9 +174,7 @@ pub struct ZmqPublication {
 /// `--scriptindex=true`, and `BITCOIN_RS_SCRIPTINDEX=true` all mean
 /// [`Self::Full`], and `false` means [`Self::Disabled`].
 ///
-/// [`Self::Utxo`] is parsed and named but not yet accepted by
-/// [`NodeConfig::validate`]: the durable live-output store it describes does
-/// not exist. See [`ScriptIndexMode::has_live_store`].
+/// [`Self::Utxo`] maintains only the durable compact live-output view.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptIndexMode {
@@ -185,9 +183,7 @@ pub enum ScriptIndexMode {
     Disabled,
     /// Maintain only the compact live-output view.
     ///
-    /// Named and parsed, but **not accepted** by [`NodeConfig::validate`] until
-    /// the durable live-output store exists. See
-    /// [`ScriptIndexMode::has_live_store`].
+    /// Maintains the durable compact live-output view without historical rows.
     Utxo,
     /// Maintain both the live-output view and historical script activity.
     Full,
@@ -211,21 +207,13 @@ impl ScriptIndexMode {
 
     /// Whether this mode has a durable store backing every view it claims.
     ///
-    /// `utxo` is the one mode that does not, yet. Its whole purpose is the
-    /// compact live-output view, and that view has no on-disk representation:
-    /// #225 defers the `ScriptLive` row format to #226 Q5, which is still
-    /// choosing the locator. Until a live store exists, a node configured
-    /// `utxo` would build no `Funding`/`Spending` rows (those families are
-    /// claimed only under `script_history`), publish no `ScriptHistory`
-    /// watermark, and then have every `ScriptIndexQuery` method —
-    /// `unspent_outputs` included — gate on
-    /// `IndexCapabilities::SCRIPT_HISTORY` and report `Retry` forever. That is
-    /// an advertised capability with nothing behind it.
+    /// Every enabled mode has a durable representation: `utxo` uses the
+    /// compact `ScriptLive` column family and `full` adds historical rows.
     ///
-    /// `Disabled` trivially has every store it claims, which is none.
+    /// The `Disabled` mode claims no derived store.
     #[must_use]
     pub const fn has_live_store(self) -> bool {
-        !matches!(self, Self::Utxo)
+        true
     }
 
     /// Parses a mode from a configuration value.
@@ -524,12 +512,6 @@ impl NodeConfig {
                 "blockfilterindex requires prune disabled"
             );
         }
-        ensure!(
-            self.script_index.has_live_store(),
-            "scriptindex=utxo is not yet usable: the compact live-output store it \
-             requires does not exist (#225). Only `full` and `disabled` are accepted. \
-             Blocked on #226 Q5, which selects the ScriptLive locator format."
-        );
         for (name, hwm) in [
             ("zmqpubhashblockhwm", self.zmqpubhashblockhwm),
             ("zmqpubhashtxhwm", self.zmqpubhashtxhwm),

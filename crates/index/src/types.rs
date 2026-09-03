@@ -1,4 +1,4 @@
-use bitcoin_rs_primitives::{OutPoint, Txid};
+use bitcoin_rs_primitives::{Hash256, OutPoint, Txid};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -234,8 +234,7 @@ pub const SCRIPT_LIVE_ROW_SIZE: usize = HASH_PREFIX_LEN + 32 + 4;
 /// a **point delete collision-safe**: removing a spent output deletes one
 /// exact key and cannot touch a colliding script's rows. Prefix-range scans
 /// over this family are read-only by contract; a delete is always a whole-key
-/// point delete (#226 Q5 may later select a smaller locator, and owes an
-/// equivalent identity-safety proof if it does).
+/// point delete.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ScriptLiveRow {
     key: [u8; SCRIPT_LIVE_ROW_SIZE],
@@ -243,10 +242,10 @@ pub struct ScriptLiveRow {
 
 impl ScriptLiveRow {
     /// Builds the row for `outpoint` held by a script hashing to `scripthash`.
-    pub fn new(scripthash: ScriptHash, outpoint: &bitcoin::OutPoint) -> Self {
+    pub fn new(scripthash: ScriptHash, outpoint: &OutPoint) -> Self {
         let mut key = [0_u8; SCRIPT_LIVE_ROW_SIZE];
         key[..HASH_PREFIX_LEN].copy_from_slice(&ScriptHashRow::scan_prefix(scripthash));
-        key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + 32].copy_from_slice(outpoint.txid.as_byte_array());
+        key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + 32].copy_from_slice(outpoint.txid.as_bytes());
         key[HASH_PREFIX_LEN + 32..].copy_from_slice(&outpoint.vout.to_le_bytes());
         Self { key }
     }
@@ -264,16 +263,15 @@ impl ScriptLiveRow {
 
     /// The outpoint this row locates, for resolution against authoritative
     /// UTXO state.
-    pub fn outpoint(&self) -> bitcoin::OutPoint {
-        use bitcoin::hashes::Hash as _;
+    pub fn outpoint(&self) -> OutPoint {
         let mut txid = [0_u8; 32];
         txid.copy_from_slice(&self.key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + 32]);
         let mut vout = [0_u8; 4];
         vout.copy_from_slice(&self.key[HASH_PREFIX_LEN + 32..]);
-        bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array(txid),
-            vout: u32::from_le_bytes(vout),
-        }
+        OutPoint::new(
+            Txid(Hash256::from_le_bytes(&txid)),
+            u32::from_le_bytes(vout),
+        )
     }
 }
 

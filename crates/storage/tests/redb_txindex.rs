@@ -25,6 +25,12 @@ fn header_80(counter: u32) -> [u8; 80] {
     h
 }
 
+fn live_44(counter: u32) -> [u8; 44] {
+    let mut key = [0u8; 44];
+    key[0..4].copy_from_slice(&counter.to_le_bytes());
+    key
+}
+
 fn row_count<S: KvStore>(store: &S, cf: ColumnFamily) -> Result<usize, StorageError> {
     store
         .scan_prefix_bounded(cf, &[], MAX_SCAN)
@@ -40,7 +46,7 @@ fn assert_invalid<T>(result: Result<T, StorageError>) {
 }
 
 #[test]
-fn txindex_all_five_family_roundtrips() -> TestResult<()> {
+fn txindex_all_six_family_roundtrips() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
     let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
@@ -72,6 +78,13 @@ fn txindex_all_five_family_roundtrips() -> TestResult<()> {
         Some(Vec::new())
     );
 
+    let live = live_44(5);
+    store.put(ColumnFamily::ScriptLive, &live, b"")?;
+    assert_eq!(
+        store.get(ColumnFamily::ScriptLive, &live)?,
+        Some(Vec::new())
+    );
+
     let meta_key = b"version";
     let meta_value = b"1";
     store.put(ColumnFamily::UtxoMeta, meta_key, meta_value)?;
@@ -85,6 +98,7 @@ fn txindex_all_five_family_roundtrips() -> TestResult<()> {
     batch.delete(ColumnFamily::Funding, &funding);
     batch.delete(ColumnFamily::Spending, &spending);
     batch.delete(ColumnFamily::BlockHeaders, &header);
+    batch.delete(ColumnFamily::ScriptLive, &live);
     batch.delete(ColumnFamily::UtxoMeta, meta_key);
     store.write(batch)?;
 
@@ -93,6 +107,7 @@ fn txindex_all_five_family_roundtrips() -> TestResult<()> {
         ColumnFamily::Funding,
         ColumnFamily::Spending,
         ColumnFamily::BlockHeaders,
+        ColumnFamily::ScriptLive,
         ColumnFamily::UtxoMeta,
     ] {
         assert_eq!(row_count(&store, cf)?, 0);
@@ -395,9 +410,11 @@ fn txindex_invalid_operation_aborts_transaction() -> TestResult<()> {
     let mut batch = store.new_batch();
     batch.put(ColumnFamily::TxConfirmed, &valid, b"");
     batch.put(ColumnFamily::Spending, &key_12(2), b"non-empty");
+    batch.put(ColumnFamily::ScriptLive, &live_44(2), b"non-empty");
     assert_invalid(store.write(batch));
     assert!(store.get(ColumnFamily::TxConfirmed, &valid)?.is_none());
     assert!(store.get(ColumnFamily::Spending, &key_12(2))?.is_none());
+    assert!(store.get(ColumnFamily::ScriptLive, &live_44(2))?.is_none());
 
     // Delete with an invalid key length aborts the batch.
     let mut batch = store.new_batch();
@@ -643,6 +660,20 @@ fn txindex_write_durable_if_unit_tables() -> TestResult<()> {
         batch,
     )?);
     assert_eq!(store.get(ColumnFamily::BlockHeaders, &header)?, None);
+
+    let live = live_44(5);
+    store.put(ColumnFamily::ScriptLive, &live, b"")?;
+    let mut batch = store.new_batch();
+    batch.delete(ColumnFamily::ScriptLive, &live);
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::ScriptLive,
+            key: &live,
+            expected: b"",
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(ColumnFamily::ScriptLive, &live)?, None);
     Ok(())
 }
 
@@ -703,6 +734,14 @@ fn txindex_write_durable_if_metadata_and_widths() -> TestResult<()> {
         &[WriteCondition::Equals {
             cf: ColumnFamily::BlockHeaders,
             key: &[0u8; 79],
+            expected: b"",
+        }],
+        store.new_batch(),
+    ));
+    assert_invalid(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::ScriptLive,
+            key: &[0u8; 43],
             expected: b"",
         }],
         store.new_batch(),
