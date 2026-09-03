@@ -131,14 +131,19 @@ are **fixture-scale**, not mainnet projections.
 |---|---|---|---|---|---|---|
 | TxConfirmed | 12 | 8 | 200,000 | 4,000,000 | ~14.3 MiB | ~75 B |
 | Funding | 12 | 8 | 200,000 | 4,000,000 | ~14.3 MiB | ~75 B |
-| Spending | 12 | 8 | 200,000 | 4,000,000 | ~17.9 MiB | ~89 B |
+| Spending | 12 | 0 | 200,000 | 2,400,000 | ~17.9 MiB | ~89 B |
 | BlockHeaders | 80 | 0 | 200,000 | 16,000,000 | ~15.2 MiB | ~0 B (compressed) |
 
-**Why Spending costs more per row than Funding despite its small value:**
+The Spending row was measured before format version 4 added positions to its
+value; a current-format Spending row has the same 12 + 8n logical layout as
+Funding.
+
+**Why Spending costs more per row than Funding despite having no value:**
 fjall's per-row overhead (bloom filter, block index, key encoding) is roughly
-constant. A 12-byte key with an 8-byte value pays the same fixed overhead as
-other small index rows, but the logical payload is still small, so the
-amplification ratio is higher.
+constant. A 12-byte key with a 0-byte value pays the same overhead as a
+12-byte key with an 8-byte value, but the logical payload is smaller, so the
+amplification ratio is higher. The LZ4 compression cannot recover the
+overhead on rows with no value to compress.
 
 **Why BlockHeaders on-disk is smaller than logical:** the 80-byte headers in
 the synthetic corpus are highly repetitive (deterministic pattern), so LZ4
@@ -207,7 +212,7 @@ must sort — but the high-level resolvers already do it for them.
 |---|---|---|---|
 | TxConfirmed | 20 (12 key + 8 value) | ~75 | 3.75× |
 | Funding | 20 (12 key + 8 value) | ~75 | 3.75× |
-| Spending | 20 (12 key + 8 value) | ~89 | 7.42× |
+| Spending | 12 (12 key + 0 value) | ~89 | 7.42× |
 | BlockHeaders | 80 (80 key + 0 value) | ~0 (compressed, fixture) | <0.01× (fixture) |
 
 **Caveats:**
@@ -217,8 +222,8 @@ must sort — but the high-level resolvers already do it for them.
 - The BlockHeaders amplification is an artifact of the synthetic corpus
   (repetitive 80-byte headers compress to near-zero). On mainnet, expect
   amplification ≈ 1.0 (headers are incompressible).
-- The Spending amplification remains high because the row's fixed storage
-  overhead is large relative to its compact position payload.
+- The Spending amplification figure predates positioned Spending values
+  (format version 4) and has not been re-measured.
 
 ### Q5: Live UTXO locator — what is the baseline key shape?
 

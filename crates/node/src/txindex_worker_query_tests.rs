@@ -824,6 +824,40 @@ fn spending_position_mismatch_falls_back_to_full_block() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn spender_for_reads_every_spending_position() -> Result<(), Box<dyn std::error::Error>> {
+    let (block, outpoint, _, spend_txid) = block_with_spending_transaction()?;
+    let spending_row = SpendingPrefixRow::row(&outpoint, 0).to_db_row().to_vec();
+    let fixture = QueryFixture::new(FixtureConfig {
+        block: block.clone(),
+        retain_body: true,
+        scans: vec![scan_response(
+            ColumnFamily::Spending,
+            SpendingPrefixRow::scan_prefix(&outpoint),
+            vec![(
+                spending_row,
+                TxPositionValue::encode(&[
+                    position_of_transaction(&block, 0)?,
+                    position_of_transaction(&block, 1)?,
+                ]),
+            )],
+            true,
+        )],
+        aba_trigger: None,
+        watermark: None,
+    })?;
+
+    assert_eq!(
+        fixture
+            .engine
+            .spender(outpoint)?
+            .map(|spender| spender.txid),
+        Some(spend_txid)
+    );
+    assert_eq!(fixture.full_reads()?, 0);
+    Ok(())
+}
+
+#[test]
 fn confirmed_history_snapshot_retries_after_aba_on_spending_scan()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut block = Network::Regtest.genesis_block();

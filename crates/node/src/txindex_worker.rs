@@ -2776,14 +2776,14 @@ impl TxIndexQueryEngine {
             }
             last_height = Some(height);
             if let Some(positions) = Self::validated_positions(&row.value) {
-                if let Some(&position) = positions.first() {
-                    if let Some(transaction) =
+                for &position in positions {
+                    let Some(transaction) =
                         self.resolve_positioned_transaction(tip, budget, height, position)?
-                    {
-                        if let Some(record) = Self::spending_input(&transaction, height, outpoint)?
-                        {
-                            return Ok(Some(record));
-                        }
+                    else {
+                        break;
+                    };
+                    if let Some(record) = Self::spending_input(&transaction, height, outpoint)? {
+                        return Ok(Some(record));
                     }
                 }
             }
