@@ -1005,11 +1005,11 @@ mod tests {
     #[test]
     fn chainstate_journal_layers_precede_defaults_and_env_beats_toml() {
         let toml_layer: UserConfig = toml::from_str(
-            r#"
+            r"
             [chainstate_journal]
             enabled = true
             blocks = 100
-            "#,
+            ",
         )
         .expect("valid toml layer");
         let mut config = NodeConfig::resolve(&toml_layer).expect("toml layer resolves");
@@ -1028,10 +1028,10 @@ mod tests {
     #[test]
     fn chainstate_journal_off_is_checkpoint_only_recovery() {
         let layer: UserConfig = toml::from_str(
-            r#"
+            r"
             [chainstate_journal]
             enabled = false
-            "#,
+            ",
         )
         .expect("valid toml layer");
         let config = NodeConfig::resolve(&layer).expect("resolves");
@@ -1043,30 +1043,30 @@ mod tests {
     #[test]
     fn chainstate_journal_rejects_invalid_values() {
         let zero_blocks: UserConfig = toml::from_str(
-            r#"
+            r"
             [chainstate_journal]
             blocks = 0
-            "#,
+            ",
         )
         .expect("parses");
         assert!(NodeConfig::resolve(&zero_blocks).is_err());
 
         let lag_below_batch: UserConfig = toml::from_str(
-            r#"
+            r"
             [chainstate_journal]
             max_lag_blocks = 10
             blocks = 500
-            "#,
+            ",
         )
         .expect("parses");
         assert!(NodeConfig::resolve(&lag_below_batch).is_err());
 
         let retention_below_rotation: UserConfig = toml::from_str(
-            r#"
+            r"
             [chainstate_journal]
             rotate_mib = 512
             max_journal_mib = 256
-            "#,
+            ",
         )
         .expect("parses");
         assert!(NodeConfig::resolve(&retention_below_rotation).is_err());
