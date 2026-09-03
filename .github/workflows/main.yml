@@ -103,10 +103,10 @@ jobs:
       # Explicit host triple: some cargo-fuzz versions default to a musl
       # target that is not installed here, and only the GNU host target is
       # guaranteed on the runner.
-      - run: cargo fuzz build --target x86_64-unknown-linux-gnu
+      - run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - run: |
           for target in p2p_message block_decode tx_decode script_eval utxo_snapshot; do
-            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -runs=10000
+            cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu -- -runs=10000
           done
 
   # Main-only (issue #174): resolves every direct dependency at its oldest
