@@ -2495,7 +2495,7 @@ struct IndexBlockVisitor<'a> {
     pending_funding: Vec<crate::types::HashPrefix>,
     /// Outputs of the transaction currently being parsed, as `(vout,
     /// optional scripthash)`. `None` means the output is not admitted to the
-    /// UTXO set (OP_RETURN or oversize), but it still participates in
+    /// UTXO set (`OP_RETURN` or oversize), but it still participates in
     /// same-block cancellation. Buffered for the same reason as
     /// `pending_funding`, and additionally because the txid is unknown until
     /// `visit_transaction`.

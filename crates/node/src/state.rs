@@ -960,11 +960,10 @@ impl fmt::Display for CompiledStorageFeatures {
 
 fn tx_index_capabilities(config: &NodeConfig) -> bitcoin_rs_index::IndexCapabilities {
     bitcoin_rs_index::IndexCapabilities {
-        // ScriptIndex-backed Esplora responses need exact historical
-        // transactions to render prevouts and calculate fees. This is an
-        // internal dependency; `tx_index_query` below still exposes it to Core
-        // RPCs only for an explicit --txindex configuration.
-        tx_lookup: config.txindex || config.script_index.is_enabled(),
+        // Full ScriptIndex-backed Esplora responses need exact historical
+        // transactions to render prevouts and calculate fees. `utxo` owns
+        // only the compact live-output view and must not pay for TxLookup.
+        tx_lookup: config.txindex || config.script_index.keeps_history(),
         script_history: config.script_index.keeps_history(),
         script_live: config.script_index.is_enabled(),
     }
@@ -2047,11 +2046,45 @@ impl Drop for NodeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin_rs_index::IndexCapabilities;
     use bitcoin_rs_primitives::encode::double_sha256;
     use bitcoin_rs_primitives::{
         Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, consensus_bytes,
     };
     use bitcoin_rs_rpc::context::BlockRecord;
+
+    #[test]
+    fn script_index_capabilities_match_the_storage_contract() {
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.txindex = false;
+
+        config.script_index = crate::config::ScriptIndexMode::Disabled;
+        assert_eq!(tx_index_capabilities(&config), IndexCapabilities::NONE);
+
+        config.script_index = crate::config::ScriptIndexMode::Utxo;
+        assert_eq!(
+            tx_index_capabilities(&config),
+            IndexCapabilities::SCRIPT_LIVE,
+            "utxo mode owns only the compact live-output view"
+        );
+
+        config.script_index = crate::config::ScriptIndexMode::Full;
+        assert_eq!(tx_index_capabilities(&config), IndexCapabilities::ALL);
+
+        config.txindex = true;
+        config.script_index = crate::config::ScriptIndexMode::Disabled;
+        assert_eq!(tx_index_capabilities(&config), IndexCapabilities::TX_LOOKUP);
+
+        config.script_index = crate::config::ScriptIndexMode::Utxo;
+        assert_eq!(
+            tx_index_capabilities(&config),
+            IndexCapabilities {
+                tx_lookup: true,
+                script_history: false,
+                script_live: true,
+            }
+        );
+    }
 
     fn publish_applied_tip_height(state: &NodeState, height: u32) {
         let mut hash = [0_u8; 32];

@@ -1784,27 +1784,42 @@ impl Worker {
         let Some(chain_transition) = self.chain_transition.as_ref() else {
             return Err(TxIndexWorkerError::MissingChainTransition);
         };
-        let _transition = chain_transition.lock();
-        let current = self.applied_tip.load_full();
-        let Some(current) = current.as_deref() else {
-            return Ok(());
+        // The owned UTXO vector is the immutable seed source for `target`.
+        // Keep the transition lock only through snapshot construction; the
+        // bounded reset and all ScriptLive writes must not stall block apply.
+        let (target, coins) = {
+            let _transition = chain_transition.lock();
+            let current = self.applied_tip.load_full();
+            let Some(current) = current.as_deref() else {
+                return Ok(());
+            };
+            let target = IndexWatermark {
+                height: current.height,
+                hash: current.hash.to_le_bytes(),
+            };
+            let coins = utxo.with_stable_view(|view| {
+                view.scan_all()
+                    .unspents
+                    .into_iter()
+                    .map(|coin| {
+                        (
+                            coin.outpoint,
+                            ScriptHash::from_script_bytes(&coin.txout.script_pubkey),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            (target, coins)
         };
-        let target = IndexWatermark {
-            height: current.height,
-            hash: current.hash.to_le_bytes(),
-        };
-        let coins = utxo.with_stable_view(|view| {
-            view.scan_all()
-                .unspents
-                .into_iter()
-                .map(|coin| {
-                    (
-                        coin.outpoint,
-                        ScriptHash::from_script_bytes(&coin.txout.script_pubkey),
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
+
+        // A missing watermark is also the recovery state after a crash
+        // between deferred seed batches and the final durable watermark. The
+        // reset removes every partial row before this seed can stamp a new
+        // watermark, so an absent watermark never becomes a valid view over
+        // stale rows.
+        self.writer
+            .reset_capabilities(IndexCapabilities::SCRIPT_LIVE)
+            .map_err(TxIndexWorkerError::Index)?;
         self.writer
             .seed_script_live(coins, target)
             .map_err(TxIndexWorkerError::Index)?;

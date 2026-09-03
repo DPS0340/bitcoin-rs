@@ -654,7 +654,6 @@ mod spentby_tests {
 
     use bitcoin_rs_mempool::{Mempool, MempoolEntry};
     use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
-    use core::str::FromStr as _;
     use sonic_rs::json;
 
     use super::*;
@@ -724,7 +723,7 @@ mod spentby_tests {
     /// `child_b` spends two of the root's outputs, so a walk of the spend index
     /// reaches it twice — the case a missing dedup shows up in, and the case a
     /// fixture where every child spends one output cannot reach.
-    fn graph_ctx() -> (Arc<Context>, Txid) {
+    fn graph_ctx() -> (Arc<Context>, Txid, Vec<String>) {
         let confirmed = OutPoint::new(Txid(Hash256::from_le_bytes(&[7_u8; 32])), 0);
         let root = tx_with(&[confirmed], 3, 1);
         let root_txid = root.txid();
@@ -735,7 +734,7 @@ mod spentby_tests {
             1,
             3,
         );
-        let child_b_txid = child_b.compute_txid();
+        let child_b_txid = child_b.txid();
         let child_c = tx_with(&[OutPoint::new(child_a_txid, 0)], 1, 4);
         let loner = tx_with(
             &[OutPoint::new(Txid(Hash256::from_le_bytes(&[9_u8; 32])), 0)],

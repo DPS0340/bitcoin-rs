@@ -10,6 +10,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bitcoin_rs_chain::{ChainWork, NodeId, NodeStatus, TipSnapshot};
+use bitcoin_rs_mempool::MempoolEntry;
+use bitcoin_rs_mining::{Candidate, TemplateId};
 use bitcoin_rs_p2p::PeerInfo;
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,

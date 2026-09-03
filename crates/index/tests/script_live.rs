@@ -22,7 +22,8 @@ use bitcoin::{
 };
 use bitcoin_rs_index::{
     IndexCapabilities, IndexCapability, IndexError, IndexWatermark, IndexWriter,
-    MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, ScriptHash, SpentCoinScripts,
+    MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, ScriptHash, ScriptLiveRow,
+    SpentCoinScripts,
 };
 use bitcoin_rs_primitives::{Hash256, OutPoint as NativeOutPoint, Txid as NativeTxid};
 use bitcoin_rs_storage::{
@@ -649,15 +650,53 @@ fn live_and_history_watermarks_advance_independently() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Seeding writes rows and stamps the watermark last; a second seed over the
-/// stamped watermark is refused.
+/// Seeding writes rows and stamps the watermark last; recovery resets any
+/// partial rows before a fresh seed, and a second seed over the stamped
+/// watermark is refused.
 #[test]
-fn seeding_stamps_once_and_refuses_a_second_pass() -> Result<(), Box<dyn std::error::Error>> {
+fn seeding_resets_partial_rows_and_stamps_once() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     let mut writer = IndexWriter::open(Arc::clone(&store), 0)?;
 
     let wallet = script(0x44);
     let scripthash = ScriptHash::from_script_bytes(wallet.as_bytes());
+    let stale_script = script(0x45);
+    let stale_scripthash = ScriptHash::from_script_bytes(stale_script.as_bytes());
+    let stale_outpoint = NativeOutPoint::new(NativeTxid(Hash256::from_le_bytes(&[0x32_u8; 32])), 0);
+    let stale_row = ScriptLiveRow::new(stale_scripthash, &stale_outpoint);
+    let mut partial = store.new_batch();
+    partial.put(ColumnFamily::ScriptLive, stale_row.as_bytes(), &[]);
+    store.write(partial)?;
+    assert!(
+        writer
+            .indexer()
+            .capability_watermark(IndexCapability::ScriptLive)?
+            .is_none()
+    );
+    assert_eq!(
+        writer
+            .indexer()
+            .iter_live_outpoints(stale_scripthash)?
+            .len(),
+        1,
+        "the fixture must represent deferred rows left by an interrupted seed"
+    );
+
+    writer.reset_capabilities(IndexCapabilities::SCRIPT_LIVE)?;
+    assert!(
+        writer
+            .indexer()
+            .capability_watermark(IndexCapability::ScriptLive)?
+            .is_none()
+    );
+    assert!(
+        writer
+            .indexer()
+            .iter_live_outpoints(stale_scripthash)?
+            .is_empty(),
+        "reset must remove rows left while the live watermark was absent"
+    );
+
     let coins = (0_u32..3)
         .map(|vout| {
             (

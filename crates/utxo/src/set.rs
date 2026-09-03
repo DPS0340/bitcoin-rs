@@ -838,6 +838,10 @@ impl UtxoSet {
     }
 
     /// Scans every live output while commits are excluded.
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "the view lifetime is tied to this set's stable guard"
+    )]
     pub fn scan_all(&self) -> UtxoScan {
         self.with_stable_view(|view| view.scan_all())
     }
