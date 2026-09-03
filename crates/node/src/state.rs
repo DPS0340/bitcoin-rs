@@ -1381,7 +1381,6 @@ impl NodeState {
             };
         let capabilities = Arc::new(crate::capabilities::NodeCapabilities::new(
             crate::capabilities::CapabilityInputs {
-                applied_tip: Arc::clone(&applied_tip),
                 tx_lifecycle: tx_index_lifecycle.clone(),
                 tx_runtime: tx_index_runtime.clone(),
                 txindex_enabled: crate::capabilities::txindex_enabled(&config),

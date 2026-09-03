@@ -6,24 +6,25 @@
 
 use std::sync::Arc;
 
-use arc_swap::{ArcSwap, ArcSwapOption};
-use bitcoin_rs_chain::TipSnapshot;
+use arc_swap::ArcSwap;
 use bitcoin_rs_index::IndexCapabilities;
 use bitcoin_rs_rpc::context::{
-    CapabilityProvider, CapabilitySnapshot, CapabilityState, CapabilityStatus, TxIndexQuery as _,
+    CapabilityProvider, CapabilitySnapshot, CapabilityState, CapabilityStatus, TxQueryError,
 };
 use parking_lot::Mutex;
 
 use crate::NodeConfig;
-use crate::txindex_worker::{TxIndexLifecycle, TxIndexRuntime};
+use crate::txindex_worker::{IndexProgress, TxIndexLifecycle, TxIndexQueryEngine, TxIndexRuntime};
+
+/// Progress reads that raced a tip or revision move before the status
+/// report gives up on a coherent answer for this snapshot.
+const PROGRESS_READ_ATTEMPTS: usize = 4;
 
 /// Stable identifier used by the RPC capability report.
 pub(crate) const TXINDEX_CAPABILITY: &str = "txindex";
 
 /// Live inputs consumed by the transaction-index status provider.
 pub(crate) struct CapabilityInputs {
-    /// Applied-tip handle; its height is the catch-up target.
-    pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Worker-published lifecycle snapshot, present when the worker runs.
     pub tx_lifecycle: Option<Arc<ArcSwap<TxIndexLifecycle>>>,
     /// Transaction-index runtime handle, present when the worker runs.
@@ -44,10 +45,6 @@ impl NodeCapabilities {
         }
     }
 
-    fn applied_height(applied_tip: &ArcSwapOption<TipSnapshot>) -> u32 {
-        applied_tip.load().as_ref().map_or(0, |tip| tip.height)
-    }
-
     /// Maps the worker-owned lifecycle and reconciliation phase onto the RPC
     /// state. Health comes from the worker's own publications; the query
     /// engine is consulted only for the watermark position once the worker
@@ -55,7 +52,7 @@ impl NodeCapabilities {
     fn txindex_status(inputs: &CapabilityInputs) -> CapabilityStatus {
         let state = match (&inputs.tx_lifecycle, &inputs.tx_runtime) {
             (Some(lifecycle), Some(runtime)) if inputs.txindex_enabled => {
-                Self::worker_state(&lifecycle.load(), runtime, &inputs.applied_tip)
+                Self::worker_state(&lifecycle.load(), runtime)
             }
             _ => CapabilityState::Disabled,
         };
@@ -67,11 +64,7 @@ impl NodeCapabilities {
         }
     }
 
-    fn worker_state(
-        lifecycle: &TxIndexLifecycle,
-        runtime: &TxIndexRuntime,
-        applied_tip: &ArcSwapOption<TipSnapshot>,
-    ) -> CapabilityState {
+    fn worker_state(lifecycle: &TxIndexLifecycle, runtime: &TxIndexRuntime) -> CapabilityState {
         if let Some(message) = runtime.failure_message() {
             return CapabilityState::Failed {
                 reason: message.to_string(),
@@ -87,7 +80,6 @@ impl NodeCapabilities {
             }
             TxIndexLifecycle::Serving(engine) => engine,
         };
-        let target_height = Self::applied_height(applied_tip);
         let phase = runtime.phase();
         if let Some((from_height, to_height)) = phase.rolling_back() {
             return CapabilityState::RollingBack {
@@ -97,25 +89,42 @@ impl NodeCapabilities {
         }
         let rebuilding = phase.rebuilding();
         if rebuilding != IndexCapabilities::NONE {
-            return match engine.index_info_for(rebuilding) {
-                Ok(info) => CapabilityState::Rebuilding {
-                    processed_height: info.best_block_height,
-                    target_height,
+            return match Self::progress(engine, rebuilding) {
+                Ok(progress) => CapabilityState::Rebuilding {
+                    processed_height: progress.processed_height,
+                    target_height: progress.target_height,
                 },
                 Err(error) => CapabilityState::Failed {
                     reason: error.to_string(),
                 },
             };
         }
-        match engine.index_info() {
-            Ok(info) if info.synced => CapabilityState::Ready,
-            Ok(info) => CapabilityState::CatchingUp {
-                processed_height: info.best_block_height,
-                target_height,
+        match Self::progress(engine, IndexCapabilities::TX_LOOKUP) {
+            Ok(progress) if progress.synced => CapabilityState::Ready,
+            Ok(progress) => CapabilityState::CatchingUp {
+                processed_height: progress.processed_height,
+                target_height: progress.target_height,
             },
             Err(error) => CapabilityState::Failed {
                 reason: error.to_string(),
             },
+        }
+    }
+
+    /// One coherent progress read: the processed and target heights come
+    /// from the same applied tip, re-read a bounded number of times when
+    /// the tip or index revision moves underneath.
+    fn progress(
+        engine: &TxIndexQueryEngine,
+        required: IndexCapabilities,
+    ) -> Result<IndexProgress, TxQueryError> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match engine.index_progress_for(required) {
+                Err(TxQueryError::Retry) if attempts < PROGRESS_READ_ATTEMPTS => {}
+                result => return result,
+            }
         }
     }
 }

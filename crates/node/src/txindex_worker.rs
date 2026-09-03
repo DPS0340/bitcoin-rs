@@ -1646,12 +1646,17 @@ impl Worker {
             return Ok(action);
         }
         // A forward leg commits one capability set at a time, so its
-        // completion is only `CaughtUp` when no enabled capability still
-        // lags the tip; otherwise the pass merely progressed and the
-        // remaining legs (and their published phase) carry over.
+        // completion is only `CaughtUp` when no enabled capability needs
+        // another transition against the current tip; otherwise the pass
+        // merely progressed and the remaining legs (and their published
+        // phase) carry over.
         let (target, _, watermarks) = self.capture_target_watermarks()?;
-        if let Some(target) = target
-            && self.forward_selection(watermarks, &target).is_some()
+        if self
+            .rollback_selection(watermarks, target.as_deref())
+            .is_some()
+            || target
+                .as_deref()
+                .is_some_and(|target| self.forward_selection(watermarks, target).is_some())
         {
             return Ok(ReconcileAction::Progressed);
         }
@@ -3077,13 +3082,14 @@ impl TxIndexQueryEngine {
         Ok(records)
     }
 
-    /// Watermark progress of `required` capabilities against the applied
-    /// tip: `synced` when every one names the tip, `best_block_height` the
-    /// lowest of their heights.
-    pub(crate) fn index_info_for(
+    /// Watermark progress of `required` capabilities against one applied
+    /// tip: `synced` when every one names that tip, `processed_height` the
+    /// lowest of their heights, `target_height` the tip they were measured
+    /// against. `Retry` when the tip or revision moved during the read.
+    pub(crate) fn index_progress_for(
         &self,
         required: IndexCapabilities,
-    ) -> Result<TxIndexInfo, TxQueryError> {
+    ) -> Result<IndexProgress, TxQueryError> {
         self.query_health()?;
 
         let tip_before = self
@@ -3139,11 +3145,20 @@ impl TxIndexQueryEngine {
             return Err(TxQueryError::Retry);
         }
 
-        Ok(TxIndexInfo {
+        Ok(IndexProgress {
             synced,
-            best_block_height,
+            processed_height: best_block_height,
+            target_height: tip_before.height,
         })
     }
+}
+
+/// One coherent read of index progress against a single applied tip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IndexProgress {
+    pub synced: bool,
+    pub processed_height: u32,
+    pub target_height: u32,
 }
 
 impl TxIndexQuery for TxIndexQueryEngine {
@@ -3168,7 +3183,11 @@ impl TxIndexQuery for TxIndexQueryEngine {
     }
 
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
-        self.index_info_for(IndexCapabilities::TX_LOOKUP)
+        let progress = self.index_progress_for(IndexCapabilities::TX_LOOKUP)?;
+        Ok(TxIndexInfo {
+            synced: progress.synced,
+            best_block_height: progress.processed_height,
+        })
     }
 }
 

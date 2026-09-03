@@ -61,7 +61,9 @@ applied tip on every pass and takes exactly one transition:
   capabilities are reset and rebuilt from genesis (`IDX-04`). Their leg is
   `ReconcileLeg::Rebuilding` until every reset capability is back at the
   applied tip; a rebuild leg survives sibling rollbacks and is cleared only
-  when a pass reports `CaughtUp`.
+  when a pass reports `CaughtUp`, which `Worker::reconcile_once` grants only
+  after re-checking that no enabled capability still selects a rollback or
+  forward step against the current applied tip.
 - The applied tip may move while a rewind or rebuild is in flight. The worker
   never restarts the transition; the next pass reconciles the new tip from the
   current durable watermarks.
@@ -81,8 +83,11 @@ applied tip on every pass and takes exactly one transition:
   Ready, Failed, Disabled, ShutdownAbandoned}` for the txindex; `RollingBack`
   and `Rebuilding` come from the worker's published `ReconcilePhase`, not from
   query results. `Rebuilding.processed_height` is the lowest watermark of the
-  rebuilding capabilities only (`TxIndexQueryEngine::index_info_for`), so a
-  script-only rebuild reports script progress, not the untouched tx cursor.
+  rebuilding capabilities only (`TxIndexQueryEngine::index_progress_for`), so
+  a script-only rebuild reports script progress, not the untouched tx cursor.
+  `processed_height` and `target_height` come from the same read against one
+  applied tip; a read that raced a tip or revision move is retried, never
+  spliced with a separately loaded tip.
 
 ## Proven by
 
