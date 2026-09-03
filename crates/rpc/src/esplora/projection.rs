@@ -4,14 +4,16 @@ use core::ops::Bound;
 use core::str::FromStr as _;
 use std::sync::Arc;
 
-use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::Hash as _;
-use bitcoin::hex::DisplayHex as _;
-use bitcoin::script::Instruction;
-use bitcoin::{Block, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid};
+use crate::script_util::{
+    instructions, is_op_return, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
+};
+use bitcoin::{Address, Network as BitcoinNetwork, Script};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::ScriptHash as MempoolScriptHash;
+use bitcoin_rs_primitives::{
+    Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxOut, Txid, deserialize,
+};
 
 use super::model::{
     BlockValue, ScriptStats, TransactionInput, TransactionOutput, TransactionStatus,
@@ -25,7 +27,7 @@ use super::{
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Confirmation {
     pub height: u32,
-    pub hash: bitcoin_rs_primitives::Hash256,
+    pub hash: BlockHash,
     pub time: u32,
 }
 
@@ -34,7 +36,7 @@ impl From<Confirmation> for TransactionStatus {
         Self {
             confirmed: true,
             block_height: Some(value.height),
-            block_hash: Some(value.hash.to_string_be()),
+            block_hash: Some(value.hash.to_string()),
             block_time: Some(value.time),
         }
     }
@@ -50,7 +52,7 @@ pub(super) struct ScriptActivity {
     pub confirmed: Vec<ConfirmedActivity>,
     pub confirmed_funding: Vec<ScriptIndexRecord>,
     pub confirmed_unspent: Vec<ScriptIndexRecord>,
-    pub mempool: Vec<Arc<Transaction>>,
+    pub mempool: Vec<Arc<Tx>>,
 }
 
 impl ScriptActivity {
@@ -87,27 +89,29 @@ impl ScriptActivity {
         };
         let mut target_outputs = std::collections::BTreeMap::new();
         for output in &self.confirmed_unspent {
-            target_outputs.insert(OutPoint::new(output.txid, output.vout), output.value);
+            target_outputs.insert((output.txid, output.vout), output.value);
         }
         for transaction in &self.mempool {
-            let txid = transaction.compute_txid();
-            for (vout, output) in transaction.output.iter().enumerate() {
+            let txid = transaction.txid();
+            for (vout, output) in transaction.outputs.iter().enumerate() {
                 if ScriptHash::new(&output.script_pubkey) != script_hash {
                     continue;
                 }
                 stats.funded_txo_count = stats.funded_txo_count.saturating_add(1);
-                stats.funded_txo_sum = stats.funded_txo_sum.saturating_add(output.value.to_sat());
+                stats.funded_txo_sum = stats.funded_txo_sum.saturating_add(output.value);
                 if let Ok(vout) = u32::try_from(vout) {
-                    target_outputs.insert(OutPoint::new(txid, vout), output.value.to_sat());
+                    target_outputs.insert((txid, vout), output.value);
                 }
             }
         }
         for input in self
             .mempool
             .iter()
-            .flat_map(|transaction| &transaction.input)
+            .flat_map(|transaction| &transaction.inputs)
         {
-            if let Some(value) = target_outputs.remove(&input.previous_output) {
+            if let Some(value) =
+                target_outputs.remove(&(input.previous_output.txid, input.previous_output.vout))
+            {
                 stats.spent_txo_count = stats.spent_txo_count.saturating_add(1);
                 stats.spent_txo_sum = stats.spent_txo_sum.saturating_add(value);
             }
@@ -128,7 +132,7 @@ impl<'a> Projection<'a> {
     pub(super) fn required_transaction(
         &self,
         text_id: &str,
-    ) -> Result<(Transaction, Option<Confirmation>), Response> {
+    ) -> Result<(Tx, Option<Confirmation>), Response> {
         let txid = Txid::from_str(text_id).map_err(|_| bad("txid must be 64 hex characters"))?;
         self.transaction(&txid)?.ok_or_else(not_found)
     }
@@ -136,7 +140,7 @@ impl<'a> Projection<'a> {
     pub(super) fn transaction(
         &self,
         txid: &Txid,
-    ) -> Result<Option<(Transaction, Option<Confirmation>)>, Response> {
+    ) -> Result<Option<(Tx, Option<Confirmation>)>, Response> {
         if let Some(transaction) = self.ctx.mempool.read().transaction_by_txid(txid) {
             return Ok(Some(((*transaction).clone(), None)));
         }
@@ -161,7 +165,7 @@ impl<'a> Projection<'a> {
         })
     }
 
-    pub(super) fn confirmed_transaction(&self, txid: &Txid) -> Result<Transaction, Response> {
+    pub(super) fn confirmed_transaction(&self, txid: &Txid) -> Result<Tx, Response> {
         self.ctx
             .esplora_tx_index
             .as_ref()
@@ -222,60 +226,64 @@ impl<'a> Projection<'a> {
 
     pub(super) fn transaction_value(
         &self,
-        transaction: &Transaction,
+        transaction: &Tx,
         confirmation: Option<Confirmation>,
     ) -> Result<TransactionValue, Response> {
         let mut input_value = 0_u64;
-        let mut inputs = Vec::with_capacity(transaction.input.len());
-        for input in &transaction.input {
-            let coinbase = input.previous_output.is_null();
+        let mut inputs = Vec::with_capacity(transaction.inputs.len());
+        for input in &transaction.inputs {
+            let previous_output = input.previous_output;
+            let coinbase =
+                previous_output.txid == Txid::default() && previous_output.vout == u32::MAX;
             let previous = if coinbase {
                 None
             } else {
                 let output = self
-                    .prevout(&input.previous_output)?
+                    .prevout(&previous_output)?
                     .ok_or_else(|| unavailable("previous transaction unavailable"))?;
-                input_value = input_value.saturating_add(output.value.to_sat());
+                input_value = input_value.saturating_add(output.value);
                 Some(output)
             };
             let (redeem, witness_script) = inner_scripts(input, previous.as_ref());
             inputs.push(TransactionInput {
-                txid: input.previous_output.txid.to_string(),
-                vout: input.previous_output.vout,
+                txid: previous_output.txid.to_string(),
+                vout: previous_output.vout,
                 prevout: previous
                     .as_ref()
                     .map(|output| self.transaction_output(output)),
-                scriptsig: input.script_sig.as_bytes().to_lower_hex_string(),
-                scriptsig_asm: input.script_sig.to_asm_string(),
+                scriptsig: hex_encode(&input.script_sig),
+                scriptsig_asm: script_asm(&input.script_sig),
                 witness: (!input.witness.is_empty()).then(|| {
                     input
                         .witness
                         .iter()
-                        .map(|item| item.to_lower_hex_string())
+                        .map(Vec::as_slice)
+                        .map(hex_encode)
                         .collect()
                 }),
                 is_coinbase: coinbase,
-                sequence: input.sequence.to_consensus_u32(),
-                inner_redeemscript_asm: redeem.map(|script| script.to_asm_string()),
-                inner_witnessscript_asm: witness_script.map(|script| script.to_asm_string()),
+                sequence: input.sequence,
+                inner_redeemscript_asm: redeem.as_deref().map(script_asm),
+                inner_witnessscript_asm: witness_script.as_deref().map(script_asm),
             });
         }
         let outputs = transaction
-            .output
+            .outputs
             .iter()
             .map(|output| self.transaction_output(output))
             .collect();
-        let output_value = transaction.output.iter().fold(0_u64, |sum, output| {
-            sum.saturating_add(output.value.to_sat())
-        });
+        let output_value = transaction
+            .outputs
+            .iter()
+            .fold(0_u64, |sum, output| sum.saturating_add(output.value));
         Ok(TransactionValue {
-            txid: transaction.compute_txid().to_string(),
-            version: transaction.version.0.cast_unsigned(),
-            locktime: transaction.lock_time.to_consensus_u32(),
+            txid: transaction.txid().to_string(),
+            version: transaction.version.cast_unsigned(),
+            locktime: transaction.lock_time,
             vin: inputs,
             vout: outputs,
-            size: u32::try_from(serialize(transaction).len()).unwrap_or(u32::MAX),
-            weight: transaction.weight().to_wu(),
+            size: u32::try_from(transaction.total_size()).unwrap_or(u32::MAX),
+            weight: transaction.weight(),
             fee: input_value.saturating_sub(output_value),
             status: Self::status_value(confirmation),
         })
@@ -284,26 +292,29 @@ impl<'a> Projection<'a> {
     pub(super) fn transaction_output(&self, output: &TxOut) -> TransactionOutput {
         let script = &output.script_pubkey;
         TransactionOutput {
-            scriptpubkey: script.as_bytes().to_lower_hex_string(),
-            scriptpubkey_asm: script.to_asm_string(),
+            scriptpubkey: hex_encode(script),
+            scriptpubkey_asm: script_asm(script),
             scriptpubkey_type: script_type(script),
-            scriptpubkey_address: bitcoin::Address::from_script(script, self.bitcoin_network())
-                .ok()
-                .map(|address| address.to_string()),
-            value: output.value.to_sat(),
+            scriptpubkey_address: Address::from_script(
+                Script::from_bytes(script),
+                self.bitcoin_network(),
+            )
+            .ok()
+            .map(|address| address.to_string()),
+            value: output.value,
         }
     }
 
     pub(super) fn prevout(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, Response> {
         if let Some(transaction) = self.ctx.mempool.read().transaction_by_txid(&outpoint.txid) {
             return Ok(transaction
-                .output
+                .outputs
                 .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
                 .cloned());
         }
         if let Some(transaction) = self.ctx.transactions.read().get(&outpoint.txid) {
             return Ok(transaction
-                .output
+                .outputs
                 .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
                 .cloned());
         }
@@ -316,7 +327,7 @@ impl<'a> Projection<'a> {
             return Ok(None);
         };
         Ok(transaction
-            .output
+            .outputs
             .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
             .cloned())
     }
@@ -327,7 +338,7 @@ impl<'a> Projection<'a> {
     ) -> Result<BlockValue, Response> {
         let header = record
             .header_bytes()
-            .and_then(|bytes| deserialize::<bitcoin::block::Header>(bytes).ok())
+            .and_then(|bytes| deserialize::<Header>(bytes).ok())
             .ok_or_else(|| unavailable("block header unavailable"))?;
         let bytes = self
             .ctx
@@ -336,22 +347,22 @@ impl<'a> Projection<'a> {
         let block =
             deserialize::<Block>(&bytes).map_err(|_| internal("stored block body is corrupt"))?;
         Ok(BlockValue {
-            id: record.hash.to_string_be(),
+            id: record.hash.to_string(),
             height: record.height,
-            version: header.version.to_consensus().cast_unsigned(),
+            version: header.version.cast_unsigned(),
             timestamp: header.time,
-            tx_count: u32::try_from(block.txdata.len()).unwrap_or(u32::MAX),
+            tx_count: u32::try_from(block.txs.len()).unwrap_or(u32::MAX),
             size: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-            weight: block.weight().to_wu(),
+            weight: block_weight(&block, bytes.len()),
             merkle_root: header.merkle_root.to_string(),
-            previousblockhash: (header.prev_blockhash != bitcoin::BlockHash::all_zeros())
+            previousblockhash: (header.prev_blockhash != BlockHash::default())
                 .then(|| header.prev_blockhash.to_string()),
             mediantime: self
                 .ctx
-                .median_time_past_for_hash(record.hash)
+                .median_time_past_for_hash(Hash256::from(record.hash))
                 .unwrap_or(header.time),
             nonce: header.nonce,
-            bits: header.bits.to_consensus(),
+            bits: header.bits,
             difficulty: self.ctx.difficulty_for_bits(header.bits),
         })
     }
@@ -454,7 +465,7 @@ impl<'a> Projection<'a> {
             let Some(entry) = pool.entry(*entry_id) else {
                 continue;
             };
-            for (vout, output) in entry.tx.output.iter().enumerate() {
+            for (vout, output) in entry.tx.outputs.iter().enumerate() {
                 let Ok(vout) = u32::try_from(vout) else {
                     continue;
                 };
@@ -465,7 +476,7 @@ impl<'a> Projection<'a> {
                         txid: entry.txid.to_string(),
                         vout,
                         status: TransactionStatus::unconfirmed(),
-                        value: output.value.to_sat(),
+                        value: output.value,
                     });
                 }
             }
@@ -499,7 +510,7 @@ impl<'a> Projection<'a> {
         &self,
         script_hash: ScriptHash,
         confirmed_unspent: &[ScriptIndexRecord],
-    ) -> Vec<Arc<Transaction>> {
+    ) -> Vec<Arc<Tx>> {
         let pool = self.ctx.mempool.read();
         let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
         // Keyed by txid so a transaction reached through both the funding index
@@ -509,7 +520,7 @@ impl<'a> Projection<'a> {
         let mut selected = std::collections::BTreeMap::new();
         let mut outputs = confirmed_unspent
             .iter()
-            .map(|record| OutPoint::new(record.txid, record.vout))
+            .map(|record| (record.txid, record.vout))
             .collect::<std::collections::BTreeSet<_>>();
         for (_, entry_id) in pool.funding.range((
             Bound::Included((mempool_hash, 0)),
@@ -517,22 +528,19 @@ impl<'a> Projection<'a> {
         )) {
             if let Some(entry) = pool.entry(*entry_id) {
                 selected.insert(entry.txid, (entry.time, Arc::clone(&entry.tx)));
-                for (vout, output) in entry.tx.output.iter().enumerate() {
+                for (vout, output) in entry.tx.outputs.iter().enumerate() {
                     if MempoolScriptHash::from_script(&output.script_pubkey) == mempool_hash
                         && let Ok(vout) = u32::try_from(vout)
                     {
-                        outputs.insert(OutPoint::new(entry.txid, vout));
+                        outputs.insert((entry.txid, vout));
                     }
                 }
             }
         }
         for (_, entry) in &pool.entries {
-            if entry
-                .tx
-                .input
-                .iter()
-                .any(|input| outputs.contains(&input.previous_output))
-            {
+            if entry.tx.inputs.iter().any(|input| {
+                outputs.contains(&(input.previous_output.txid, input.previous_output.vout))
+            }) {
                 selected.insert(entry.txid, (entry.time, Arc::clone(&entry.tx)));
             }
         }
@@ -550,33 +558,69 @@ impl<'a> Projection<'a> {
             .collect()
     }
 
-    pub(super) const fn bitcoin_network(&self) -> bitcoin::Network {
+    pub(super) const fn bitcoin_network(&self) -> BitcoinNetwork {
         match self.ctx.chain_network {
-            bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-            bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-            bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-            bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-            bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
+            Network::Mainnet => BitcoinNetwork::Bitcoin,
+            Network::Testnet3 => BitcoinNetwork::Testnet,
+            Network::Testnet4 => BitcoinNetwork::Testnet4,
+            Network::Signet => BitcoinNetwork::Signet,
+            Network::Regtest => BitcoinNetwork::Regtest,
         }
     }
 }
 
-fn script_type(script: &Script) -> &'static str {
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        text.push(char::from(HEX[usize::from(byte >> 4)]));
+        text.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    text
+}
+
+fn script_asm(script: &[u8]) -> String {
+    Script::from_bytes(script).to_asm_string()
+}
+
+fn block_weight(block: &Block, total_size: usize) -> u64 {
+    let stripped_size = 80_usize
+        .saturating_add(compact_size_len(block.txs.len()))
+        .saturating_add(block.txs.iter().map(Tx::base_size).sum());
+    u64::try_from(stripped_size)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(3)
+        .saturating_add(u64::try_from(total_size).unwrap_or(u64::MAX))
+}
+
+const fn compact_size_len(value: usize) -> usize {
+    if value < 0xfd {
+        1
+    } else if value <= 0xffff {
+        3
+    } else if value <= 0xffff_ffff {
+        5
+    } else {
+        9
+    }
+}
+
+fn script_type(script: &[u8]) -> &'static str {
     if script.is_empty() {
         "empty"
-    } else if script.is_op_return() {
+    } else if is_op_return(script) {
         "op_return"
-    } else if script.is_p2pk() {
+    } else if is_p2pk(script) {
         "p2pk"
-    } else if script.is_p2pkh() {
+    } else if is_p2pkh(script) {
         "p2pkh"
-    } else if script.is_p2sh() {
+    } else if is_p2sh(script) {
         "p2sh"
-    } else if script.is_p2wpkh() {
+    } else if is_p2wpkh(script) {
         "v0_p2wpkh"
-    } else if script.is_p2wsh() {
+    } else if is_p2wsh(script) {
         "v0_p2wsh"
-    } else if script.is_p2tr() {
+    } else if is_p2tr(script) {
         "v1_p2tr"
     } else {
         "unknown"
@@ -584,22 +628,22 @@ fn script_type(script: &Script) -> &'static str {
 }
 
 fn inner_scripts(
-    input: &bitcoin::TxIn,
+    input: &bitcoin_rs_primitives::TxIn,
     prevout: Option<&TxOut>,
-) -> (Option<ScriptBuf>, Option<ScriptBuf>) {
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     let redeem = prevout
-        .filter(|output| output.script_pubkey.is_p2sh())
-        .and_then(|_| input.script_sig.instructions().last())
+        .filter(|output| is_p2sh(&output.script_pubkey))
+        .and_then(|_| instructions(&input.script_sig).last())
         .and_then(Result::ok)
         .and_then(|instruction| match instruction {
-            Instruction::PushBytes(bytes) => Some(ScriptBuf::from_bytes(bytes.as_bytes().to_vec())),
-            Instruction::Op(_) => None,
+            crate::script_util::Instruction::PushBytes(bytes) => Some(bytes.to_vec()),
+            crate::script_util::Instruction::Op(_) => None,
         });
-    let is_witness_script = prevout.is_some_and(|output| output.script_pubkey.is_p2wsh())
-        || redeem.as_ref().is_some_and(|script| script.is_p2wsh());
+    let is_witness_script = prevout.is_some_and(|output| is_p2wsh(&output.script_pubkey))
+        || redeem.as_deref().is_some_and(is_p2wsh);
     let witness_script = is_witness_script
-        .then(|| input.witness.iter().last())
+        .then(|| input.witness.last())
         .flatten()
-        .map(|bytes| ScriptBuf::from_bytes(bytes.to_vec()));
+        .cloned();
     (redeem, witness_script)
 }

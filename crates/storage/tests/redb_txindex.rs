@@ -2,7 +2,9 @@
 
 #![cfg(feature = "redb")]
 
-use bitcoin_rs_storage::{ColumnFamily, KvStore, PrefixScanLimit, StorageError, WriteBatch};
+use bitcoin_rs_storage::{
+    ColumnFamily, KvStore, PrefixScanLimit, StorageError, WriteBatch, WriteCondition,
+};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -163,8 +165,8 @@ fn txindex_position_values_follow_authoritative_rows() -> TestResult<()> {
             max_bytes: 15,
         },
     )?;
-    assert!(bounded.rows.is_empty());
-    assert!(!bounded.complete);
+    assert_eq!(bounded.rows, vec![(key_12(3).to_vec(), b"abcd".to_vec())]);
+    assert!(bounded.complete);
     Ok(())
 }
 
@@ -434,6 +436,14 @@ fn txindex_unsupported_column_families_rejected() -> TestResult<()> {
         assert_invalid(store.put(cf, b"key", b"value"));
         assert_invalid(store.iter_prefix(cf, b"key"));
         assert_invalid(store.scan_prefix_bounded(cf, b"key", MAX_SCAN));
+        assert_invalid(store.write_durable_if(
+            &[WriteCondition::Equals {
+                cf,
+                key: b"key",
+                expected: b"value",
+            }],
+            store.new_batch(),
+        ));
     }
 
     Ok(())
@@ -517,6 +527,208 @@ fn txindex_deferred_write_flush_and_reopen() -> TestResult<()> {
 
     let reopened = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
     assert!(reopened.get(ColumnFamily::Funding, &k)?.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn txindex_write_durable_if_roundtrip() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
+
+    // Paired fixed+value tables: mismatch preserves the authoritative row and
+    // its value twin, exact match removes both, repeat claims stay false.
+    let confirmed = key_12(1);
+    store.put(ColumnFamily::TxConfirmed, &confirmed, b"position")?;
+    assert!(!store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::TxConfirmed,
+            key: &confirmed,
+            expected: b"wrong",
+        }],
+        store.new_batch(),
+    )?);
+    assert_eq!(
+        store.get(ColumnFamily::TxConfirmed, &confirmed)?,
+        Some(b"position".to_vec())
+    );
+    let mut batch = store.new_batch();
+    batch.put(ColumnFamily::TxConfirmed, &key_12(99), b"swept");
+    batch.put(ColumnFamily::UtxoMeta, b"side", b"effect");
+    assert!(!store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::TxConfirmed,
+            key: &confirmed,
+            expected: b"stale-position",
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(ColumnFamily::TxConfirmed, &key_12(99))?, None);
+    assert_eq!(store.get(ColumnFamily::UtxoMeta, b"side")?, None);
+    let mut batch = store.new_batch();
+    batch.delete(ColumnFamily::TxConfirmed, &confirmed);
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::TxConfirmed,
+            key: &confirmed,
+            expected: b"position",
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(ColumnFamily::TxConfirmed, &confirmed)?, None);
+    assert!(!store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::TxConfirmed,
+            key: &confirmed,
+            expected: b"position",
+        }],
+        store.new_batch(),
+    )?);
+    Ok(())
+}
+
+#[test]
+fn txindex_write_durable_if_unit_tables() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
+
+    // Unit-valued fixed tables only ever match an empty expectation.
+    let funding = key_12(2);
+    store.put(ColumnFamily::Funding, &funding, b"")?;
+    assert!(!store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::Funding,
+            key: &funding,
+            expected: b"nonempty",
+        }],
+        store.new_batch(),
+    )?);
+    assert!(store.get(ColumnFamily::Funding, &funding)?.is_some());
+    let mut batch = store.new_batch();
+    batch.delete(ColumnFamily::Funding, &funding);
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::Funding,
+            key: &funding,
+            expected: b"",
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(ColumnFamily::Funding, &funding)?, None);
+
+    let spending = key_12(3);
+    store.put(ColumnFamily::Spending, &spending, b"")?;
+    let mut batch = store.new_batch();
+    batch.delete(ColumnFamily::Spending, &spending);
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::Spending,
+            key: &spending,
+            expected: b"",
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(ColumnFamily::Spending, &spending)?, None);
+
+    let header = header_80(4);
+    store.put(ColumnFamily::BlockHeaders, &header, b"")?;
+    let mut batch = store.new_batch();
+    batch.delete(ColumnFamily::BlockHeaders, &header);
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::BlockHeaders,
+            key: &header,
+            expected: b"",
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(ColumnFamily::BlockHeaders, &header)?, None);
+    Ok(())
+}
+
+#[test]
+fn txindex_write_durable_if_metadata_and_widths() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
+
+    // Byte-keyed metadata compares real values.
+    let meta_key = b"cursor";
+    store.put(ColumnFamily::UtxoMeta, meta_key, b"52-bytes-of-cursor")?;
+    assert!(!store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::UtxoMeta,
+            key: meta_key,
+            expected: b"different",
+        }],
+        store.new_batch(),
+    )?);
+    let mut batch = store.new_batch();
+    batch.delete(ColumnFamily::UtxoMeta, meta_key);
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::UtxoMeta,
+            key: meta_key,
+            expected: b"52-bytes-of-cursor",
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(ColumnFamily::UtxoMeta, meta_key)?, None);
+
+    // Absent claims work per family too.
+    let absent = key_12(5);
+    let mut batch = store.new_batch();
+    batch.put(ColumnFamily::TxConfirmed, &absent, b"");
+    assert!(store.write_durable_if(
+        &[WriteCondition::Absent {
+            cf: ColumnFamily::TxConfirmed,
+            key: &absent,
+        }],
+        batch,
+    )?);
+    assert_eq!(
+        store.get(ColumnFamily::TxConfirmed, &absent)?,
+        Some(Vec::new())
+    );
+
+    // Wrong-width keys are rejected before any transaction begins.
+    assert_invalid(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::Spending,
+            key: &[0u8; 11],
+            expected: b"",
+        }],
+        store.new_batch(),
+    ));
+    assert_invalid(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: ColumnFamily::BlockHeaders,
+            key: &[0u8; 79],
+            expected: b"",
+        }],
+        store.new_batch(),
+    ));
+
+    // Every condition is validated before the transaction begins, not only
+    // the first: a valid lead condition does not admit a bad-width follower,
+    // and the rejected batch touches nothing.
+    let untouched = key_12(6);
+    let mut batch = store.new_batch();
+    batch.put(ColumnFamily::TxConfirmed, &untouched, b"touched");
+    assert_invalid(store.write_durable_if(
+        &[
+            WriteCondition::Absent {
+                cf: ColumnFamily::TxConfirmed,
+                key: &untouched,
+            },
+            WriteCondition::Equals {
+                cf: ColumnFamily::Spending,
+                key: &[0u8; 11],
+                expected: b"",
+            },
+        ],
+        batch,
+    ));
+    assert_eq!(store.get(ColumnFamily::TxConfirmed, &untouched)?, None);
 
     Ok(())
 }

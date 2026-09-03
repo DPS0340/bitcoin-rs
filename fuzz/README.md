@@ -1,8 +1,11 @@
 # Fuzz Targets
 
 Five `cargo-fuzz` harnesses covering the untrusted-input surfaces of
-bitcoin-rs: P2P wire messages, block/transaction deserialization, P2TR
-key-path verification, and UTXO snapshot loading.
+bitcoin-rs: P2P wire messages, block/transaction deserialization, the
+production script interpreter, and UTXO snapshot loading. Seed corpora under
+`fuzz/corpus/` are imported from rust-bitcoin/qa-assets by
+`scripts/import-qa-assets.sh`; see `fuzz/CORPUS_PROVENANCE.md` for upstream
+commit, license, and mapping.
 
 ## Prerequisites
 
@@ -26,7 +29,7 @@ Replace `p2p_message` with any of:
 | `p2p_message`   | P2P wire message decoder (`read_message`)            |
 | `block_decode`  | Block consensus deserialization                      |
 | `tx_decode`     | Transaction consensus deserialization                |
-| `script_eval`   | Taproot key-path verifier (`Interpreter::execute` with `VerifyFlags::TAPROOT`) |
+| `script_eval`   | Production interpreter entry point (`Interpreter::execute` with fuzz-selected `VerifyFlags`) |
 | `utxo_snapshot` | UTXO snapshot deserializer (`read_snapshot_strict_v4`)     |
 
 To limit the number of iterations:
@@ -79,3 +82,15 @@ To get a full backtrace, set `RUST_BACKTRACE=1`:
 ```sh
 RUST_BACKTRACE=1 cargo +nightly fuzz run p2p_message -- fuzz/artifacts/p2p_message/crash-<hash>
 ```
+
+To refresh the seed corpora from rust-bitcoin/qa-assets (CC0), run from the
+repository root:
+
+```sh
+scripts/import-qa-assets.sh
+```
+
+The script declares and checks the clone's disk footprint, shallow-clones the
+upstream corpus repo, remaps the seeds to each harness's input framing,
+minimizes with `cargo fuzz cmin`, deletes the clone, and rewrites
+`fuzz/CORPUS_PROVENANCE.md`.

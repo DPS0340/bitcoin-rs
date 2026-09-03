@@ -11,14 +11,13 @@
 //!    from an abandoned branch be replayed against a different block at the
 //!    same height, which silently corrupts the UTXO set.
 //!
-//! Output payloads use rust-bitcoin's consensus encoding rather than a
-//! hand-rolled layout, so the format cannot drift from the encoding the rest of
-//! the node already agrees on.
+//! Output payloads use the native `bitcoin_rs_primitives` consensus encoding
+//! rather than a hand-rolled layout, so the format cannot drift from the
+//! encoding the rest of the node already agrees on.
 
 use std::collections::HashSet;
 
-use bitcoin::consensus::{Decodable, Encodable};
-use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
+use bitcoin_rs_primitives::{ConsensusDecode, ConsensusEncode, Hash256, OutPoint, TxOut};
 use thiserror::Error;
 
 use crate::set::{UndoBatch, UtxoAdd};
@@ -206,13 +205,13 @@ fn reject_duplicate(
         return Ok(());
     }
     Err(UndoCodecError::DuplicateOutpoint {
-        txid: outpoint.txid,
+        txid: outpoint.txid.into(),
         vout: outpoint.vout,
     })
 }
 
 fn put_outpoint(out: &mut Vec<u8>, outpoint: OutPoint) {
-    out.extend_from_slice(&outpoint.txid.to_le_bytes());
+    out.extend_from_slice(outpoint.txid.as_bytes());
     out.extend_from_slice(&outpoint.vout.to_le_bytes());
 }
 
@@ -276,7 +275,7 @@ impl<'a> Cursor<'a> {
     fn take_outpoint(&mut self) -> Result<OutPoint, UndoCodecError> {
         let txid = Hash256::from_le_bytes(&self.take_array::<32>()?);
         let vout = self.take_u32()?;
-        Ok(OutPoint::new(txid, vout))
+        Ok(OutPoint::new(txid.into(), vout))
     }
 
     fn take_txout(&mut self) -> Result<TxOut, UndoCodecError> {
@@ -296,8 +295,6 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::{Amount, ScriptBuf};
-
     use super::{
         COUNT_BYTES, RESTORE_COUNT_OFFSET, RESTORE_TRAILER_BYTES, UNDO_FORMAT_VERSION,
         UndoCodecError, UtxoAdd, decode, encode,
@@ -311,8 +308,8 @@ mod tests {
 
     pub(super) fn txout(sats: u64) -> TxOut {
         TxOut {
-            value: Amount::from_sat(sats),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51, byte_of(sats)]),
+            value: sats,
+            script_pubkey: vec![0x51, byte_of(sats)],
         }
     }
 
@@ -323,14 +320,19 @@ mod tests {
     fn sample() -> UndoBatch {
         let mut batch = UndoBatch::default();
         batch.restore(UtxoAdd::new(
-            OutPoint::new(hash(1), 0),
+            OutPoint::new(hash(1).into(), 0),
             txout(50_000),
             true,
             11,
         ));
-        batch.restore(UtxoAdd::new(OutPoint::new(hash(2), 7), txout(1), false, 12));
-        batch.remove(OutPoint::new(hash(3), 0));
-        batch.remove(OutPoint::new(hash(3), 1));
+        batch.restore(UtxoAdd::new(
+            OutPoint::new(hash(2).into(), 7),
+            txout(1),
+            false,
+            12,
+        ));
+        batch.remove(OutPoint::new(hash(3).into(), 0));
+        batch.remove(OutPoint::new(hash(3).into(), 1));
         batch
     }
 
@@ -414,7 +416,12 @@ mod tests {
     #[test]
     fn a_non_canonical_coinbase_flag_is_refused() {
         let mut batch = UndoBatch::default();
-        batch.restore(UtxoAdd::new(OutPoint::new(hash(1), 0), txout(10), false, 5));
+        batch.restore(UtxoAdd::new(
+            OutPoint::new(hash(1).into(), 0),
+            txout(10),
+            false,
+            5,
+        ));
         let mut bytes = encode(&batch, hash(1));
         let flag = bytes.len() - RESTORE_TRAILER_BYTES;
         bytes[flag] = 2;
@@ -427,8 +434,8 @@ mod tests {
     #[test]
     fn a_repeated_outpoint_is_refused() {
         let mut batch = UndoBatch::default();
-        batch.remove(OutPoint::new(hash(5), 0));
-        batch.remove(OutPoint::new(hash(5), 0));
+        batch.remove(OutPoint::new(hash(5).into(), 0));
+        batch.remove(OutPoint::new(hash(5).into(), 0));
         assert!(matches!(
             decode(&encode(&batch, hash(1)), hash(1)),
             Err(UndoCodecError::DuplicateOutpoint { .. })
@@ -448,7 +455,7 @@ mod cross_half_tests {
     /// both is therefore a corrupt record, not a legal one.
     #[test]
     fn an_outpoint_in_both_halves_is_refused() {
-        let shared = OutPoint::new(hash(6), 3);
+        let shared = OutPoint::new(hash(6).into(), 3);
         let mut batch = UndoBatch::default();
         batch.restore(UtxoAdd::new(shared, txout(10), false, 4));
         batch.remove(shared);

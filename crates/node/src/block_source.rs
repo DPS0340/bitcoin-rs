@@ -7,12 +7,10 @@
 
 use alloc::sync::Arc;
 
-use bitcoin::Block;
-use bitcoin::consensus::encode::deserialize;
-use bitcoin::hashes::Hash as _;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_index::BlockSource;
 use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Block, BlockHash, deserialize};
 use bitcoin_rs_rpc::context::{BlockBodySource, BlockLog, record_at_height};
 use parking_lot::RwLock;
 
@@ -68,7 +66,7 @@ impl BlockSource for NodeBlockSource {
             tree.read().active_node_at_height(height)?.hash
         } else {
             let guard = self.blocks.read();
-            record_at_height(&guard, height)?.hash
+            Hash256::from(record_at_height(&guard, height)?.hash)
         };
         self.resolve_block_by_hash(height, active_hash)
     }
@@ -79,7 +77,7 @@ impl BlockSource for NodeBlockSource {
         // `block_at_height` for the whole block.
         let source = self.block_body_source.as_ref()?;
         let hash = if let Some(tree) = &self.block_tree {
-            tree.read().active_node_at_height(height)?.hash
+            BlockHash::from(tree.read().active_node_at_height(height)?.hash)
         } else {
             let guard = self.blocks.read();
             record_at_height(&guard, height)?.hash
@@ -91,36 +89,32 @@ impl BlockSource for NodeBlockSource {
 impl NodeBlockSource {
     /// Returns serialized bytes for an exact `(height, hash)` pair from the
     /// authoritative body source.
-    pub(crate) fn block_body_bytes_for(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+    pub(crate) fn block_body_bytes_for(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
         self.block_body_source.as_ref()?.block_body(height, hash)
     }
 
     fn resolve_block_by_hash(&self, height: u32, active_hash: Hash256) -> Option<Block> {
-        let bytes = self.block_body_bytes_for(height, active_hash)?;
+        let bytes = self.block_body_bytes_for(height, BlockHash::from(active_hash))?;
         let block = deserialize::<Block>(&bytes).ok()?;
-        let decoded_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-        (decoded_hash == active_hash).then_some(block)
+        (block.block_hash() == BlockHash::from(active_hash)).then_some(block)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::Network;
-    use bitcoin::blockdata::constants::genesis_block;
-    use bitcoin::consensus::encode::serialize;
     use bitcoin_rs_chain::NodeStatus;
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_primitives::{Network, consensus_bytes};
     use bitcoin_rs_rpc::context::BlockRecord;
     use std::error::Error;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
     struct TestBodySource {
-        bodies: Vec<(u32, Hash256, Vec<u8>)>,
+        bodies: Vec<(u32, BlockHash, Vec<u8>)>,
     }
 
     impl BlockBodySource for TestBodySource {
-        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
             self.bodies
                 .iter()
                 .find(|(record_height, record_hash, _)| {
@@ -133,22 +127,22 @@ mod tests {
     /// Serves the full body but declines range reads via the trait default.
     struct FullBodyOnlySource {
         height: u32,
-        hash: Hash256,
+        hash: BlockHash,
         bytes: Vec<u8>,
     }
 
     impl BlockBodySource for FullBodyOnlySource {
-        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
             (self.height == height && self.hash == hash).then(|| self.bytes.clone())
         }
     }
 
     #[test]
     fn block_at_height_returns_some_after_record_added() {
-        let genesis = genesis_block(Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let record = BlockRecord::from_block(0, &genesis);
         let body_source = Arc::new(TestBodySource {
-            bodies: vec![(record.height, record.hash, serialize(&genesis))],
+            bodies: vec![(record.height, record.hash, consensus_bytes(&genesis))],
         });
         let blocks = Arc::new(RwLock::new(BlockLog::from_iter([record])));
         let source = NodeBlockSource::new(blocks).with_block_body_source(body_source);
@@ -161,19 +155,19 @@ mod tests {
     /// Body source that can slice, backed by one in-memory body.
     struct RangedBody {
         height: u32,
-        hash: Hash256,
+        hash: BlockHash,
         bytes: Vec<u8>,
     }
 
     impl BlockBodySource for RangedBody {
-        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
             (self.height == height && self.hash == hash).then(|| self.bytes.clone())
         }
 
         fn block_body_range(
             &self,
             height: u32,
-            hash: Hash256,
+            hash: BlockHash,
             offset: u32,
             len: u32,
         ) -> Option<Vec<u8>> {
@@ -188,8 +182,8 @@ mod tests {
 
     #[test]
     fn block_bytes_at_height_agrees_with_slicing_the_whole_block() -> TestResult {
-        let genesis = genesis_block(Network::Regtest);
-        let bytes = serialize(&genesis);
+        let genesis = Network::Regtest.genesis_block();
+        let bytes = consensus_bytes(&genesis);
         let record = BlockRecord::from_block(0, &genesis);
         let body_source = Arc::new(RangedBody {
             height: record.height,
@@ -222,12 +216,12 @@ mod tests {
 
     #[test]
     fn block_bytes_at_height_declines_when_the_source_cannot_slice() {
-        let genesis = genesis_block(Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let record = BlockRecord::from_block(0, &genesis);
         let body_source = Arc::new(FullBodyOnlySource {
             height: record.height,
             hash: record.hash,
-            bytes: serialize(&genesis),
+            bytes: consensus_bytes(&genesis),
         });
         let blocks = Arc::new(RwLock::new(BlockLog::from_iter([record])));
         let source = NodeBlockSource::new(blocks).with_block_body_source(body_source);
@@ -250,22 +244,22 @@ mod tests {
     fn block_at_height_reads_metadata_only_record_from_body_source() {
         struct SingleBlockSource {
             height: u32,
-            hash: Hash256,
+            hash: BlockHash,
             bytes: Vec<u8>,
         }
 
         impl BlockBodySource for SingleBlockSource {
-            fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
                 (self.height == height && self.hash == hash).then(|| self.bytes.clone())
             }
         }
 
-        let genesis = genesis_block(Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let record = BlockRecord::from_block(0, &genesis);
         let body_source = Arc::new(SingleBlockSource {
             height: record.height,
             hash: record.hash,
-            bytes: serialize(&genesis),
+            bytes: consensus_bytes(&genesis),
         });
         let blocks = Arc::new(RwLock::new(BlockLog::from_iter([record])));
         let source = NodeBlockSource::new(blocks).with_block_body_source(body_source);
@@ -278,7 +272,7 @@ mod tests {
 
     #[test]
     fn block_at_height_returns_first_record_for_duplicate_height() {
-        let anchor = genesis_block(Network::Regtest);
+        let anchor = Network::Regtest.genesis_block();
         let mut first = anchor.clone();
         first.header.nonce = first.header.nonce.saturating_add(1);
         let mut second = first.clone();
@@ -287,8 +281,16 @@ mod tests {
         let second_record = BlockRecord::from_block(2, &second);
         let body_source = Arc::new(TestBodySource {
             bodies: vec![
-                (first_record.height, first_record.hash, serialize(&first)),
-                (second_record.height, second_record.hash, serialize(&second)),
+                (
+                    first_record.height,
+                    first_record.hash,
+                    consensus_bytes(&first),
+                ),
+                (
+                    second_record.height,
+                    second_record.hash,
+                    consensus_bytes(&second),
+                ),
             ],
         });
         let records = vec![
@@ -309,9 +311,9 @@ mod tests {
 
     #[test]
     fn block_at_height_resolves_from_tree_with_empty_records() -> TestResult {
-        let genesis = genesis_block(Network::Regtest);
-        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
-        let body_bytes = serialize(&genesis);
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = genesis.block_hash();
+        let body_bytes = consensus_bytes(&genesis);
 
         // Seed an active tree with the genesis header.
         let mut tree = BlockTree::new();
@@ -335,11 +337,11 @@ mod tests {
 
     #[test]
     fn block_at_height_tree_rejects_stale_cache_entry() -> TestResult {
-        let genesis = genesis_block(Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let mut stale_block = genesis.clone();
         stale_block.header.nonce = stale_block.header.nonce.wrapping_add(1);
-        let stale_hash = Hash256::from_le_bytes(stale_block.block_hash().as_byte_array());
-        let correct_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let stale_hash = stale_block.block_hash();
+        let correct_hash = genesis.block_hash();
         assert_ne!(stale_hash, correct_hash);
 
         // Tree says height 0 = correct_hash.
@@ -352,7 +354,7 @@ mod tests {
         let blocks = Arc::new(RwLock::new(BlockLog::from_iter([stale_record])));
 
         let body_source = Arc::new(TestBodySource {
-            bodies: vec![(0, correct_hash, serialize(&genesis))],
+            bodies: vec![(0, correct_hash, consensus_bytes(&genesis))],
         });
 
         let source = NodeBlockSource::new(blocks)

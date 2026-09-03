@@ -13,10 +13,7 @@ workspace = true
 
 [features]
 default = []
-rocksdb = ["bitcoin-rs-utxo/rocksdb", "bitcoin-rs-storage/rocksdb", "bitcoin-rs-p2p/rocksdb"]
-fjall = ["bitcoin-rs-utxo/fjall", "bitcoin-rs-storage/fjall", "bitcoin-rs-p2p/fjall"]
-redb = ["bitcoin-rs-utxo/redb", "bitcoin-rs-storage/redb", "bitcoin-rs-p2p/redb"]
-mdbx = ["bitcoin-rs-storage/mdbx"]
+zmq = []
 
 [dependencies]
 bitcoin-rs-primitives.workspace = true
@@ -27,7 +24,6 @@ bitcoin-rs-mempool.workspace = true
 bitcoin-rs-p2p.workspace = true
 bitcoin-rs-utxo.workspace = true
 bitcoin-rs-mining.workspace = true
-bitcoin-rs-storage.workspace = true
 bitcoin.workspace = true
 miniscript.workspace = true
 corepc-types.workspace = true
@@ -41,21 +37,12 @@ compact_str.workspace = true
 hashbrown.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+bitcoin-rs-ext-api.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
+bitcoin-rs-node = { workspace = true, features = ["fjall"] }
+bitcoin-rs-mempool = { workspace = true, features = ["test-seam"] }
 proptest.workspace = true
 tempfile = "3"
-criterion.workspace = true
-
-[[bench]]
-name = "chaininfo"
-harness = false
-
-[[bench]]
-name = "blocklookup"
-harness = false
-
-[[bench]]
-name = "txoutproof"
-harness = false
-required-features = ["rocksdb"]
+rustix.workspace = true

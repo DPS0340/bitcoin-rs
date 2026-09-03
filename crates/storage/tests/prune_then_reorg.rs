@@ -11,7 +11,7 @@ use bitcoin_rs_storage::pruning::{
 };
 use bitcoin_rs_storage::{
     ColumnFamily, FlatFileBlockStore, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch,
-    block_file_max_height_key, encode_block_file_max_height,
+    WriteCondition, block_file_max_height_key, encode_block_file_max_height,
 };
 use parking_lot::RwLock;
 use tempfile::tempdir;
@@ -306,6 +306,41 @@ impl KvStore for MemoryStore {
             }
         }
         Ok(())
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: MemoryBatch,
+    ) -> Result<bool, StorageError> {
+        let mut guard = self.cfs.write();
+        for condition in conditions {
+            let (cf, key) = condition.location();
+            let current = guard[cf.index()].get(key);
+            if !condition.matches(current.map(Vec::as_slice)) {
+                return Ok(false);
+            }
+        }
+        for op in batch.ops {
+            match op {
+                MemoryOp::Put { cf, key, value } => {
+                    guard[cf.index()].insert(key, value);
+                }
+                MemoryOp::Delete { cf, key } => {
+                    guard[cf.index()].remove(&key);
+                }
+                MemoryOp::DeleteRange { cf, start, end } => {
+                    let keys = guard[cf.index()]
+                        .range(start..end)
+                        .map(|(key, _value)| key.clone())
+                        .collect::<Vec<_>>();
+                    for key in keys {
+                        guard[cf.index()].remove(&key);
+                    }
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {

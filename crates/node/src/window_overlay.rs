@@ -5,7 +5,7 @@
 //! committed UTXO set. This module supplies exactly that view and nothing else:
 //! it answers lookups and it is advanced one block at a time.
 
-use bitcoin_rs_primitives::OutPoint;
+use bitcoin_rs_primitives::{Block, OutPoint, Txid};
 use bitcoin_rs_utxo::{UtxoSet, shard::LiveOutput};
 use hashbrown::HashMap;
 
@@ -69,29 +69,27 @@ impl<'u> WindowOverlay<'u> {
     /// creations invisible and their spends unrecorded.
     pub(crate) fn advance(
         &mut self,
-        block: &bitcoin::Block,
-        txids: &[bitcoin::Txid],
+        block: &Block,
+        txids: &[Txid],
         height: u32,
         same_block_spent: &hashbrown::HashSet<OutPoint>,
     ) -> Result<(), WindowOverlayError> {
-        use bitcoin::hashes::Hash as _;
-
-        if block.txdata.len() != txids.len() {
+        if block.txs.len() != txids.len() {
             return Err(WindowOverlayError::TxidCountMismatch {
-                transactions: block.txdata.len(),
+                transactions: block.txs.len(),
                 txids: txids.len(),
             });
         }
         if height == 0 {
             return Ok(());
         }
-        for (tx, txid) in block.txdata.iter().zip(txids) {
-            let txid = bitcoin_rs_primitives::Hash256::from_le_bytes(txid.as_byte_array());
-            let coinbase = tx.is_coinbase();
-            for (vout, txout) in tx.output.iter().enumerate() {
+        for (tx, txid) in block.txs.iter().zip(txids) {
+            let txid = *txid;
+            let coinbase = is_coinbase(tx);
+            for (vout, txout) in tx.outputs.iter().enumerate() {
                 // An OP_RETURN or oversized script is provably unspendable and
                 // never enters the committed set, so it must not enter this one.
-                if txout.script_pubkey.is_op_return()
+                if is_op_return(&txout.script_pubkey)
                     || txout.script_pubkey.len() > bitcoin_rs_consensus::MAX_SCRIPT_SIZE
                 {
                     continue;
@@ -115,8 +113,8 @@ impl<'u> WindowOverlay<'u> {
             if coinbase {
                 continue;
             }
-            for input in &tx.input {
-                let spent = internal_outpoint(&input.previous_output);
+            for input in &tx.inputs {
+                let spent = input.previous_output;
                 if same_block_spent.contains(&spent) {
                     continue;
                 }
@@ -149,26 +147,24 @@ impl OutputSource for WindowOverlay<'_> {
     }
 }
 
-fn internal_outpoint(outpoint: &bitcoin::OutPoint) -> OutPoint {
-    use bitcoin::hashes::Hash as _;
+fn is_coinbase(tx: &bitcoin_rs_primitives::Tx) -> bool {
+    tx.inputs.len() == 1
+        && tx.inputs[0].previous_output.txid == Txid::default()
+        && tx.inputs[0].previous_output.vout == u32::MAX
+}
 
-    OutPoint::new(
-        bitcoin_rs_primitives::Hash256::from_le_bytes(outpoint.txid.as_byte_array()),
-        outpoint.vout,
-    )
+fn is_op_return(script: &[u8]) -> bool {
+    script.first() == Some(&0x6a)
 }
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::{
-        Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute::LockTime,
-        hashes::Hash as _, opcodes::all::OP_RETURN, script::Builder, transaction::Version,
-    };
+    use bitcoin_rs_primitives::{Block, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid};
     use bitcoin_rs_utxo::{UndoBatch, UtxoAdd, UtxoSet};
 
-    use super::{OutputSource, WindowOverlay, internal_outpoint};
+    use super::{OutputSource, WindowOverlay};
 
-    fn none() -> hashbrown::HashSet<bitcoin_rs_primitives::OutPoint> {
+    fn none() -> hashbrown::HashSet<OutPoint> {
         hashbrown::HashSet::new()
     }
 
@@ -180,20 +176,18 @@ mod tests {
         let utxo = UtxoSet::new();
         let mut overlay = WindowOverlay::new(&utxo);
         let tx = paying_tx(op_true(), 500);
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let block = block_of(vec![tx]);
 
         assert!(
-            overlay
-                .get_entry(&internal_outpoint(&outpoint_of(txid, 0)))
-                .is_none(),
+            overlay.get_entry(&OutPoint::new(txid, 0)).is_none(),
             "nothing may resolve before the block is folded in"
         );
         overlay.advance(&block, &[txid], HEIGHT, &none())?;
 
-        let found = overlay.get_entry(&internal_outpoint(&outpoint_of(txid, 0)));
+        let found = overlay.get_entry(&OutPoint::new(txid, 0));
         assert_eq!(
-            found.map(|entry| (entry.height, entry.coinbase, entry.txout.value.to_sat())),
+            found.map(|entry| (entry.height, entry.coinbase, entry.txout.value)),
             Some((HEIGHT, true, 500)),
             "the created output must carry the height and coinbase flag the committed set would record"
         );
@@ -204,16 +198,16 @@ mod tests {
     fn a_spend_tombstones_the_outpoint_rather_than_falling_through()
     -> Result<(), Box<dyn std::error::Error>> {
         let utxo = UtxoSet::new();
-        let funded = outpoint_of(txid_of(0x31), 0);
+        let funded = OutPoint::new(txid_of(0x31), 0);
         seed(&utxo, funded, 900)?;
         let mut overlay = WindowOverlay::new(&utxo);
         assert!(
-            overlay.get_entry(&internal_outpoint(&funded)).is_some(),
+            overlay.get_entry(&funded).is_some(),
             "the committed output must be visible before the spend"
         );
 
         let spend = spending_tx(funded);
-        let txid = spend.compute_txid();
+        let txid = spend.txid();
         overlay.advance(
             &block_of(vec![coinbase(), spend]),
             &[txid_of(1), txid],
@@ -222,7 +216,7 @@ mod tests {
         )?;
 
         assert!(
-            overlay.get_entry(&internal_outpoint(&funded)).is_none(),
+            overlay.get_entry(&funded).is_none(),
             "a spent outpoint must not fall through to the committed set"
         );
         Ok(())
@@ -234,12 +228,12 @@ mod tests {
         let utxo = UtxoSet::new();
         let mut overlay = WindowOverlay::new(&utxo);
         let tx = paying_tx(op_true(), 100);
-        let txid = tx.compute_txid();
-        let created = outpoint_of(txid, 0);
+        let txid = tx.txid();
+        let created = OutPoint::new(txid, 0);
 
         overlay.advance(&block_of(vec![tx.clone()]), &[txid], HEIGHT, &none())?;
         let spend = spending_tx(created);
-        let spend_txid = spend.compute_txid();
+        let spend_txid = spend.txid();
         overlay.advance(
             &block_of(vec![coinbase(), spend]),
             &[txid_of(2), spend_txid],
@@ -247,7 +241,7 @@ mod tests {
             &none(),
         )?;
         assert!(
-            overlay.get_entry(&internal_outpoint(&created)).is_none(),
+            overlay.get_entry(&created).is_none(),
             "the spend must tombstone it"
         );
 
@@ -255,9 +249,7 @@ mod tests {
         overlay.advance(&block_of(vec![tx]), &[txid], HEIGHT + 2, &none())?;
 
         assert_eq!(
-            overlay
-                .get_entry(&internal_outpoint(&created))
-                .map(|entry| entry.height),
+            overlay.get_entry(&created).map(|entry| entry.height),
             Some(HEIGHT + 2),
             "a recreated outpoint must be live again at its new height"
         );
@@ -268,16 +260,13 @@ mod tests {
     fn unspendable_outputs_never_enter_the_view() -> Result<(), Box<dyn std::error::Error>> {
         let utxo = UtxoSet::new();
         let mut overlay = WindowOverlay::new(&utxo);
-        let script = Builder::new().push_opcode(OP_RETURN).into_script();
-        let tx = paying_tx(script, 0);
-        let txid = tx.compute_txid();
+        let tx = paying_tx(vec![0x6a], 0);
+        let txid = tx.txid();
 
         overlay.advance(&block_of(vec![tx]), &[txid], HEIGHT, &none())?;
 
         assert!(
-            overlay
-                .get_entry(&internal_outpoint(&outpoint_of(txid, 0)))
-                .is_none(),
+            overlay.get_entry(&OutPoint::new(txid, 0)).is_none(),
             "an OP_RETURN output never reaches the committed set, so it must not reach this one"
         );
         Ok(())
@@ -288,16 +277,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let utxo = UtxoSet::new();
         let mut overlay = WindowOverlay::new(&utxo);
-        let accepted = paying_tx(
-            ScriptBuf::from_bytes(vec![0x51; bitcoin_rs_consensus::MAX_SCRIPT_SIZE]),
-            1,
-        );
-        let rejected = paying_tx(
-            ScriptBuf::from_bytes(vec![0x51; bitcoin_rs_consensus::MAX_SCRIPT_SIZE + 1]),
-            1,
-        );
-        let accepted_txid = accepted.compute_txid();
-        let rejected_txid = rejected.compute_txid();
+        let accepted = paying_tx(vec![0x51; bitcoin_rs_consensus::MAX_SCRIPT_SIZE], 1);
+        let rejected = paying_tx(vec![0x51; bitcoin_rs_consensus::MAX_SCRIPT_SIZE + 1], 1);
+        let accepted_txid = accepted.txid();
+        let rejected_txid = rejected.txid();
 
         overlay.advance(&block_of(vec![accepted]), &[accepted_txid], HEIGHT, &none())?;
         overlay.advance(
@@ -309,13 +292,13 @@ mod tests {
 
         assert!(
             overlay
-                .get_entry(&internal_outpoint(&outpoint_of(accepted_txid, 0)))
+                .get_entry(&OutPoint::new(accepted_txid, 0))
                 .is_some(),
             "MAX_SCRIPT_SIZE must remain spendable"
         );
         assert!(
             overlay
-                .get_entry(&internal_outpoint(&outpoint_of(rejected_txid, 0)))
+                .get_entry(&OutPoint::new(rejected_txid, 0))
                 .is_none(),
             "MAX_SCRIPT_SIZE + 1 must remain absent"
         );
@@ -327,14 +310,12 @@ mod tests {
         let utxo = UtxoSet::new();
         let mut overlay = WindowOverlay::new(&utxo);
         let tx = paying_tx(op_true(), 5_000_000_000);
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
 
         overlay.advance(&block_of(vec![tx]), &[txid], 0, &none())?;
 
         assert!(
-            overlay
-                .get_entry(&internal_outpoint(&outpoint_of(txid, 0)))
-                .is_none(),
+            overlay.get_entry(&OutPoint::new(txid, 0)).is_none(),
             "Core indexes genesis but never connects its coinbase"
         );
         Ok(())
@@ -347,7 +328,7 @@ mod tests {
     fn a_txid_list_that_misses_transactions_is_refused() {
         let utxo = UtxoSet::new();
         let mut overlay = WindowOverlay::new(&utxo);
-        let block = block_of(vec![coinbase(), spending_tx(outpoint_of(txid_of(5), 0))]);
+        let block = block_of(vec![coinbase(), spending_tx(OutPoint::new(txid_of(5), 0))]);
 
         let outcome = overlay.advance(&block, &[txid_of(6)], HEIGHT, &none());
 
@@ -370,12 +351,12 @@ mod tests {
         let utxo = UtxoSet::new();
         let mut overlay = WindowOverlay::new(&utxo);
         let tx = paying_tx(op_true(), 400);
-        let txid = tx.compute_txid();
-        let created = outpoint_of(txid, 0);
+        let txid = tx.txid();
+        let created = OutPoint::new(txid, 0);
         let spend = spending_tx(created);
-        let spend_txid = spend.compute_txid();
+        let spend_txid = spend.txid();
         let mut same_block = hashbrown::HashSet::new();
-        same_block.insert(internal_outpoint(&created));
+        same_block.insert(created);
 
         overlay.advance(
             &block_of(vec![tx, spend]),
@@ -385,7 +366,7 @@ mod tests {
         )?;
 
         assert!(
-            !overlay.changed.contains_key(&internal_outpoint(&created)),
+            !overlay.changed.contains_key(&created),
             "an output created and spent in one block never reaches the committed set, \
              so the view must record neither the creation nor the spend"
         );
@@ -394,12 +375,12 @@ mod tests {
 
     type UtxoError = bitcoin_rs_utxo::UtxoError;
 
-    fn seed(utxo: &UtxoSet, outpoint: bitcoin::OutPoint, value: u64) -> Result<(), UtxoError> {
+    fn seed(utxo: &UtxoSet, outpoint: OutPoint, value: u64) -> Result<(), UtxoError> {
         let mut batch = UndoBatch::default();
         batch.restore(UtxoAdd::new(
-            internal_outpoint(&outpoint),
+            outpoint,
             TxOut {
-                value: Amount::from_sat(value),
+                value,
                 script_pubkey: op_true(),
             },
             false,
@@ -408,73 +389,69 @@ mod tests {
         utxo.undo_block(&batch)
     }
 
-    fn op_true() -> ScriptBuf {
-        ScriptBuf::from_bytes(vec![0x51])
+    fn op_true() -> Vec<u8> {
+        vec![0x51]
     }
 
-    fn txid_of(byte: u8) -> bitcoin::Txid {
-        bitcoin::Txid::from_byte_array([byte; 32])
+    fn txid_of(byte: u8) -> Txid {
+        Txid(Hash256::from_le_bytes(&[byte; 32]))
     }
 
-    fn outpoint_of(txid: bitcoin::Txid, vout: u32) -> bitcoin::OutPoint {
-        bitcoin::OutPoint { txid, vout }
-    }
-
-    fn coinbase() -> Transaction {
-        Transaction {
-            version: Version::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: bitcoin::OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn coinbase() -> Tx {
+        Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig: vec![0x00, 0x01],
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
+            outputs: vec![TxOut {
+                value: 1,
                 script_pubkey: op_true(),
             }],
         }
     }
 
     /// A coinbase paying one output, so `advance` sees a creation.
-    fn paying_tx(script_pubkey: ScriptBuf, value: u64) -> Transaction {
+    fn paying_tx(script_pubkey: Vec<u8>, value: u64) -> Tx {
         let mut tx = coinbase();
-        tx.output = vec![TxOut {
-            value: Amount::from_sat(value),
+        tx.outputs = vec![TxOut {
+            value,
             script_pubkey,
         }];
         tx
     }
 
-    fn spending_tx(previous_output: bitcoin::OutPoint) -> Transaction {
-        Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
+    fn spending_tx(previous_output: OutPoint) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
                 previous_output,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
+            outputs: vec![TxOut {
+                value: 1,
                 script_pubkey: op_true(),
             }],
         }
     }
 
-    fn block_of(txdata: Vec<Transaction>) -> bitcoin::Block {
-        bitcoin::Block {
-            header: bitcoin::block::Header {
-                version: bitcoin::block::Version::ONE,
-                prev_blockhash: bitcoin::BlockHash::from_byte_array([0; 32]),
-                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+    fn block_of(txs: Vec<Tx>) -> Block {
+        Block {
+            header: Header {
+                version: 1,
+                prev_blockhash: bitcoin_rs_primitives::BlockHash(Hash256::from_le_bytes(&[0; 32])),
+                merkle_root: Hash256::from_le_bytes(&[0; 32]),
                 time: 0,
-                bits: bitcoin::CompactTarget::from_consensus(0x2100_ffff),
+                bits: 0x2100_ffff,
                 nonce: 0,
             },
-            txdata,
+            txs,
         }
     }
 }

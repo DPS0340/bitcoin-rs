@@ -1,8 +1,9 @@
 //! Coinstats persistence round-trip tests.
 
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
-use bitcoin_rs_storage::{ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch};
+use bitcoin_rs_storage::{
+    ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition,
+};
 use bitcoin_rs_utxo::stats::coin_stats::COIN_STATS_ENCODED_LEN;
 use bitcoin_rs_utxo::stats::{
     CoinStats, CoinStatsDecodeError, CoinStatsListener, load_coin_stats, store_coin_stats,
@@ -16,10 +17,10 @@ fn coin_stats_persist_load_roundtrips_byte_equal() -> Result<(), Box<dyn std::er
     let mut stats = CoinStats::new();
 
     for index in 0_u32..100 {
-        let outpoint = OutPoint::new(txid(index), index % 64);
+        let outpoint = OutPoint::new(txid(index).into(), index % 64);
         let txout = TxOut {
-            value: Amount::from_sat(1_000 + u64::from(index)),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51, index.to_le_bytes()[0]]),
+            value: 1_000 + u64::from(index),
+            script_pubkey: vec![0x51, index.to_le_bytes()[0]],
         };
         stats.insert_utxo(&outpoint, &txout, 42, index == 0);
     }
@@ -54,10 +55,10 @@ fn finish_block_applies_height_and_transaction_delta() {
 #[test]
 fn coin_stats_codec_is_exact_and_preserves_muhash_continuation()
 -> Result<(), Box<dyn std::error::Error>> {
-    let old_op = OutPoint::new(txid(1_000), 3);
+    let old_op = OutPoint::new(txid(1_000).into(), 3);
     let old_txout = TxOut {
-        value: Amount::from_sat(12_345),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x21]),
+        value: 12_345,
+        script_pubkey: vec![0x51, 0x21],
     };
     let mut original = CoinStats::new();
     original.insert_utxo(&old_op, &old_txout, 100, true);
@@ -79,10 +80,10 @@ fn coin_stats_codec_is_exact_and_preserves_muhash_continuation()
         Err(CoinStatsDecodeError::TrailingBytes)
     ));
 
-    let new_op = OutPoint::new(txid(1_001), 4);
+    let new_op = OutPoint::new(txid(1_001).into(), 4);
     let new_txout = TxOut {
-        value: Amount::from_sat(54_321),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x22]),
+        value: 54_321,
+        script_pubkey: vec![0x51, 0x22],
     };
     original.remove_utxo(&old_op, &old_txout, 100, true);
     restored.remove_utxo(&old_op, &old_txout, 100, true);
@@ -142,31 +143,31 @@ impl KvStore for MemoryStore {
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
         let mut rows = self.rows.write();
-        for op in batch.ops {
-            match op {
-                MemoryOp::Put(cf, key, value) => {
-                    if let Some((_row, existing_value)) = rows
-                        .iter_mut()
-                        .find(|((row_cf, row_key), _value)| *row_cf == cf && row_key == &key)
-                    {
-                        *existing_value = value;
-                    } else {
-                        rows.push(((cf, key), value));
-                    }
-                }
-                MemoryOp::Delete(cf, key) => {
-                    rows.retain(|((row_cf, row_key), _value)| *row_cf != cf || row_key != &key);
-                }
-                MemoryOp::DeleteRange(cf, start, end) => {
-                    rows.retain(|((row_cf, key), _value)| {
-                        *row_cf != cf
-                            || key.as_slice() < start.as_slice()
-                            || key.as_slice() >= end.as_slice()
-                    });
-                }
-            }
-        }
+        apply_ops(&mut rows, batch.ops.into_iter());
         Ok(())
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: Self::WriteBatch,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.rows.write();
+        // Every condition observes pre-batch state; the batch may mutate a
+        // condition key itself.
+        let matched = conditions.iter().all(|condition| {
+            let (cf, key) = condition.location();
+            condition.matches(
+                rows.iter()
+                    .find(|((row_cf, row_key), _value)| *row_cf == cf && row_key == key)
+                    .map(|(_row, value)| value.as_slice()),
+            )
+        });
+        if !matched {
+            return Ok(false);
+        }
+        apply_ops(&mut rows, batch.ops.into_iter());
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
@@ -204,5 +205,33 @@ impl WriteBatch for MemoryBatch {
     fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
         self.ops
             .push(MemoryOp::DeleteRange(cf, start.to_vec(), end.to_vec()));
+    }
+}
+
+/// Folds one batch's operations into the row list, in order.
+fn apply_ops(rows: &mut Vec<Row>, ops: std::vec::IntoIter<MemoryOp>) {
+    for op in ops {
+        match op {
+            MemoryOp::Put(cf, key, value) => {
+                if let Some((_row, existing_value)) = rows
+                    .iter_mut()
+                    .find(|((row_cf, row_key), _value)| *row_cf == cf && row_key == &key)
+                {
+                    *existing_value = value;
+                } else {
+                    rows.push(((cf, key), value));
+                }
+            }
+            MemoryOp::Delete(cf, key) => {
+                rows.retain(|((row_cf, row_key), _value)| *row_cf != cf || row_key != &key);
+            }
+            MemoryOp::DeleteRange(cf, start, end) => {
+                rows.retain(|((row_cf, key), _value)| {
+                    *row_cf != cf
+                        || key.as_slice() < start.as_slice()
+                        || key.as_slice() >= end.as_slice()
+                });
+            }
+        }
     }
 }

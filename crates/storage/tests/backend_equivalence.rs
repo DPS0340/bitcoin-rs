@@ -1,8 +1,13 @@
 //! Cross-backend equivalence tests for the storage abstraction.
 
-use bitcoin_rs_storage::{ColumnFamily, KvIter, KvPair, KvStore, StorageError, WriteBatch};
+use bitcoin_rs_storage::{
+    ColumnFamily, KvIter, KvPair, KvStore, StorageError, WriteBatch, WriteCondition,
+};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+#[cfg(feature = "mdbx")]
+use std::{path::PathBuf, process::Command};
 
 const ROWS: u32 = 10_000;
 const DELETE_ROWS: u32 = 1_000;
@@ -366,5 +371,387 @@ fn portable_backends_have_identical_aggregate_hashes() -> TestResult<()> {
     assert_eq!(rocksdb, redb);
     #[cfg(feature = "mdbx")]
     assert_eq!(rocksdb, mdbx);
+    Ok(())
+}
+
+fn run_single_key_condition_laws<S: KvStore>(store: &S) -> Result<(), StorageError> {
+    const CF: ColumnFamily = ColumnFamily::BlockBodies;
+    let key = b"write-condition".as_slice();
+    let unrelated = b"write-condition-unrelated".as_slice();
+
+    // Absent claim on a missing key: the whole batch applies.
+    let mut batch = store.new_batch();
+    batch.put(CF, key, b"v1");
+    batch.put(CF, unrelated, b"u1");
+    assert!(store.write_durable_if(&[WriteCondition::Absent { cf: CF, key }], batch)?);
+    assert_eq!(store.get(CF, key)?, Some(b"v1".to_vec()));
+    assert_eq!(store.get(CF, unrelated)?, Some(b"u1".to_vec()));
+
+    // Absent claim on a present key: mismatch, and no batch operation —
+    // including the unrelated one — is applied.
+    let mut batch = store.new_batch();
+    batch.put(CF, unrelated, b"u2");
+    batch.delete(CF, key);
+    assert!(!store.write_durable_if(&[WriteCondition::Absent { cf: CF, key }], batch)?);
+    assert_eq!(store.get(CF, key)?, Some(b"v1".to_vec()));
+    assert_eq!(store.get(CF, unrelated)?, Some(b"u1".to_vec()));
+
+    // Exact match: durable replace, and the batch may mutate the condition key.
+    let mut batch = store.new_batch();
+    batch.put(CF, key, b"v2");
+    batch.put(CF, unrelated, b"u2");
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: CF,
+            key,
+            expected: b"v1"
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, key)?, Some(b"v2".to_vec()));
+    assert_eq!(store.get(CF, unrelated)?, Some(b"u2".to_vec()));
+
+    // Stale expectation after the replace: mismatch preserves everything.
+    let mut batch = store.new_batch();
+    batch.delete(CF, key);
+    batch.delete(CF, unrelated);
+    assert!(!store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: CF,
+            key,
+            expected: b"v1"
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, key)?, Some(b"v2".to_vec()));
+    assert_eq!(store.get(CF, unrelated)?, Some(b"u2".to_vec()));
+
+    // Exact match: durable delete of the condition key inside the batch.
+    let mut batch = store.new_batch();
+    batch.delete(CF, key);
+    batch.put(CF, unrelated, b"u3");
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: CF,
+            key,
+            expected: b"v2"
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, key)?, None);
+    assert_eq!(store.get(CF, unrelated)?, Some(b"u3".to_vec()));
+    store.flush()?;
+
+    // Repeat against the now-absent key: mismatch applies nothing again.
+    let mut batch = store.new_batch();
+    batch.put(CF, unrelated, b"u4");
+    assert!(!store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: CF,
+            key,
+            expected: b"v2"
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, unrelated)?, Some(b"u3".to_vec()));
+
+    // Ordered batch operations touching the condition key apply in order.
+    store.put(CF, key, b"v3")?;
+    let mut batch = store.new_batch();
+    batch.put(CF, key, b"v4");
+    batch.delete(CF, key);
+    batch.put(CF, key, b"v5");
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: CF,
+            key,
+            expected: b"v3"
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, key)?, Some(b"v5".to_vec()));
+
+    Ok(())
+}
+
+fn run_conjunction_condition_laws<S: KvStore>(store: &S) -> Result<(), StorageError> {
+    const CF: ColumnFamily = ColumnFamily::BlockBodies;
+    let first = b"conjunction-first".as_slice();
+    let second = b"conjunction-second".as_slice();
+    let third = b"conjunction-third".as_slice();
+
+    // Multi-key conjunction: the batch lands only when every condition
+    // matches, across different keys and condition kinds.
+    let mut batch = store.new_batch();
+    batch.put(CF, first, b"c1");
+    batch.put(CF, second, b"c2");
+    assert!(store.write_durable_if(
+        &[
+            WriteCondition::Absent { cf: CF, key: first },
+            WriteCondition::Absent {
+                cf: CF,
+                key: second
+            },
+        ],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, first)?, Some(b"c1".to_vec()));
+    assert_eq!(store.get(CF, second)?, Some(b"c2".to_vec()));
+
+    // One differing condition rejects the whole conjunction: nothing in the
+    // batch — including writes to keys no condition mentions — is applied.
+    let mut batch = store.new_batch();
+    batch.put(CF, third, b"c3");
+    batch.put(CF, first, b"overwritten");
+    assert!(!store.write_durable_if(
+        &[
+            WriteCondition::Equals {
+                cf: CF,
+                key: first,
+                expected: b"c1"
+            },
+            WriteCondition::Equals {
+                cf: CF,
+                key: second,
+                expected: b"stale"
+            },
+        ],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, third)?, None);
+    assert_eq!(store.get(CF, first)?, Some(b"c1".to_vec()));
+    assert_eq!(store.get(CF, second)?, Some(b"c2".to_vec()));
+
+    // The empty slice is an all-true conjunction: the batch commits
+    // unconditionally.
+    let mut batch = store.new_batch();
+    batch.put(CF, third, b"c3");
+    assert!(store.write_durable_if(&[], batch)?);
+    assert_eq!(store.get(CF, third)?, Some(b"c3".to_vec()));
+
+    // Conditions observe the pre-batch state even when two of them name the
+    // same key: both members see the same pre-image.
+    assert!(!store.write_durable_if(
+        &[
+            WriteCondition::Equals {
+                cf: CF,
+                key: first,
+                expected: b"c1"
+            },
+            WriteCondition::Equals {
+                cf: CF,
+                key: first,
+                expected: b"never"
+            },
+        ],
+        store.new_batch(),
+    )?);
+    assert_eq!(store.get(CF, first)?, Some(b"c1".to_vec()));
+
+    Ok(())
+}
+
+fn run_write_condition_laws<S: KvStore>(store: &S) -> Result<(), StorageError> {
+    run_single_key_condition_laws(store)?;
+    run_conjunction_condition_laws(store)?;
+    store.flush()?;
+    Ok(())
+}
+
+/// Competing writers holding the same pre-image: exactly one claim wins, the
+/// loser's batch never lands, and the winner's bytes are the final state.
+fn run_competing_writer_laws<S: KvStore>(store: &S) -> Result<(), StorageError> {
+    const CF: ColumnFamily = ColumnFamily::BlockBodies;
+    let key = b"write-condition-race".as_slice();
+    store.put(CF, key, b"claim")?;
+    store.flush()?;
+
+    let results: Vec<Result<bool, StorageError>> = std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        [b"first".as_slice(), b"second".as_slice()]
+            .map(|tag| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let mut batch = store.new_batch();
+                    batch.put(CF, key, tag);
+                    barrier.wait();
+                    store.write_durable_if(
+                        &[WriteCondition::Equals {
+                            cf: CF,
+                            key,
+                            expected: b"claim",
+                        }],
+                        batch,
+                    )
+                })
+            })
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            })
+            .collect()
+    });
+    let winners = results
+        .iter()
+        .filter(|result| matches!(result, Ok(true)))
+        .count();
+    assert_eq!(
+        winners, 1,
+        "exactly one competing writer may win: {results:?}"
+    );
+    assert!(results.iter().all(Result::is_ok));
+    let winner_tag = if matches!(results[0], Ok(true)) {
+        b"first".as_slice()
+    } else {
+        b"second".as_slice()
+    };
+    assert_eq!(store.get(CF, key)?, Some(winner_tag.to_vec()));
+    Ok(())
+}
+
+/// `write_durable_if` success is durable on its own: a reopened store sees the
+/// committed bytes without any caller flush.
+fn run_reopen_durability_law<S, Reopen>(reopen: Reopen) -> Result<(), StorageError>
+where
+    S: KvStore,
+    Reopen: Fn() -> Result<S, StorageError>,
+{
+    const CF: ColumnFamily = ColumnFamily::BlockBodies;
+    let key = b"write-condition-durability".as_slice();
+    {
+        let store = reopen()?;
+        let mut batch = store.new_batch();
+        batch.put(CF, key, b"durable");
+        assert!(store.write_durable_if(&[WriteCondition::Absent { cf: CF, key }], batch)?);
+    }
+    let store = reopen()?;
+    assert_eq!(store.get(CF, key)?, Some(b"durable".to_vec()));
+    Ok(())
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn rocksdb_write_durable_if_laws() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::RocksDbStore::open(temp.path())?;
+    run_write_condition_laws(&store)?;
+    run_competing_writer_laws(&store)?;
+    drop(store);
+    run_reopen_durability_law(|| bitcoin_rs_storage::RocksDbStore::open(temp.path()))?;
+    Ok(())
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_write_durable_if_laws() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::FjallStore::open(temp.path())?;
+    run_write_condition_laws(&store)?;
+    run_competing_writer_laws(&store)?;
+    drop(store);
+    run_reopen_durability_law(|| bitcoin_rs_storage::FjallStore::open(temp.path()))?;
+    Ok(())
+}
+
+#[cfg(feature = "redb")]
+#[test]
+fn redb_write_durable_if_laws() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::RedbStore::open(temp.path())?;
+    run_write_condition_laws(&store)?;
+    run_competing_writer_laws(&store)?;
+    drop(store);
+    run_reopen_durability_law(|| bitcoin_rs_storage::RedbStore::open(temp.path()))?;
+    Ok(())
+}
+
+#[cfg(feature = "mdbx")]
+#[test]
+fn mdbx_write_durable_if_laws() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::MdbxStore::open(temp.path())?;
+    run_write_condition_laws(&store)?;
+    run_competing_writer_laws(&store)?;
+    drop(store);
+    run_reopen_durability_law(|| bitcoin_rs_storage::MdbxStore::open(temp.path()))?;
+    Ok(())
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn rocksdb_rejects_second_writable_primary_open_on_same_path() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let first = bitcoin_rs_storage::RocksDbStore::open(temp.path())?;
+    let second = bitcoin_rs_storage::RocksDbStore::open(temp.path());
+    assert!(
+        second.is_err(),
+        "a second writable primary open must fail while the first store owns the database"
+    );
+    drop(first);
+    Ok(())
+}
+
+#[cfg(feature = "mdbx")]
+#[test]
+fn mdbx_write_durable_if_spans_processes() -> TestResult<()> {
+    const CF: ColumnFamily = ColumnFamily::BlockBodies;
+    const CHILD_DATA_DIR: &str = "BITCOIN_RS_MDBX_CONDITIONAL_WRITE_CHILD";
+    let key = b"mdbx-cross-process".as_slice();
+    if let Some(path) = std::env::var_os(CHILD_DATA_DIR) {
+        // Child mode: claim the parent's pre-image through the conditional
+        // primitive; MDBX's cross-process write lock serializes the boundary.
+        let store = bitcoin_rs_storage::MdbxStore::open(PathBuf::from(path))?;
+        let mut batch = store.new_batch();
+        batch.put(CF, key, b"newer");
+        assert!(store.write_durable_if(
+            &[WriteCondition::Equals {
+                cf: CF,
+                key,
+                expected: b"older"
+            }],
+            batch,
+        )?);
+        return Ok(());
+    }
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::MdbxStore::open(temp.path())?;
+    store.put(CF, key, b"older")?;
+    let status = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("mdbx_write_durable_if_spans_processes")
+        .arg("--nocapture")
+        .env(CHILD_DATA_DIR, temp.path())
+        .status()?;
+    assert!(status.success(), "MDBX writer child failed: {status}");
+
+    // The child consumed the pre-image across processes: the stale claim
+    // misses, and its unrelated write never lands either.
+    let stale_key = b"mdbx-unrelated".as_slice();
+    let mut batch = store.new_batch();
+    batch.put(CF, stale_key, b"stale");
+    assert!(!store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: CF,
+            key,
+            expected: b"older"
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, key)?, Some(b"newer".to_vec()));
+    assert_eq!(store.get(CF, stale_key)?, None);
+
+    // The cross-process value satisfies a fresh claim.
+    let mut batch = store.new_batch();
+    batch.delete(CF, key);
+    assert!(store.write_durable_if(
+        &[WriteCondition::Equals {
+            cf: CF,
+            key,
+            expected: b"newer"
+        }],
+        batch,
+    )?);
+    assert_eq!(store.get(CF, key)?, None);
     Ok(())
 }
