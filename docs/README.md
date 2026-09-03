@@ -56,8 +56,8 @@ transactions to the mempool in dependency order, and wakes index consumers to
 reconcile asynchronously. A fatal partial transition stops the process.
 
 The ZMQ `pubsequence` stream publishes block connect/disconnect events and
-mempool `A`/`R` events with per-change sequence assignment and explicit removal
-reasons.
+mempool `A`/`R` events with per-change sequence assignment and reason-carrying
+removals.
 
 Still incomplete: production P2P transaction relay, broader metrics coverage,
 and parts of the CLI and RPC surface.

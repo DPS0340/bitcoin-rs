@@ -63,7 +63,7 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
   order. Each change carries the txid and a `MutationOutcome`:
   `Accepted`, or `Removed(RemovalReason)`.
 - `RemovalReason` is one of `BlockInclusion`, `Conflict`, `Replaced`,
-  `Descendant`, `PolicyEviction`, `Expiry`, `Explicit`, `Clear`, `Reorg`.
+  `Descendant`, `PolicyEviction`, `Expiry`, `Clear`, `Reorg`.
 - `Mempool::sequence_number` advances exactly once per emitted change while
   the write lock is held. A failed insert, a no-op removal, and a clear of
   an empty pool assign nothing.
@@ -127,7 +127,7 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
   admission retry rebuilds context after a transient rejection.
 - `crates/node/src/mempool_observer.rs`:
   `admission_publishes_one_a_frame_with_core_payload_bytes`,
-  `explicit_removal_publishes_r_frames_in_commit_order`,
+  `policy_eviction_publishes_r_frames_in_commit_order`,
   `block_inclusion_suppresses_r_frames`,
   `policy_eviction_publishes_r_frames_with_contiguous_sequences`.
 - `crates/node/src/zmq_publisher.rs`:

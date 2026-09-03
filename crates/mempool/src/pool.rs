@@ -824,17 +824,8 @@ impl Mempool {
         Ok(())
     }
 
-    /// Removes an entry and all descendants that spend its outputs. The
-    /// parent commits before its descendants; each removed entry emits one
-    /// `Removed(Explicit)` change.
-    pub fn remove_entry_and_descendants(&mut self, id: EntryId) -> MutationResult {
-        let mut changes = Vec::new();
-        self.remove_entry_and_descendants_into(id, RemovalReason::Explicit, &mut changes);
-        self.finish_mutation(changes)
-    }
-
-    /// Reason-carrying core of [`Mempool::remove_entry_and_descendants`] for
-    /// composite mutations that must tag the removal with their own reason.
+    /// Reason-carrying core for composite mutations that remove an entry and
+    /// all descendants that spend its outputs.
     pub(crate) fn remove_entry_and_descendants_into(
         &mut self,
         id: EntryId,
@@ -849,18 +840,8 @@ impl Mempool {
         self.remove_entries_with_reasons(&removals, changes);
     }
 
-    /// Removes the entry for `txid` along with all descendants that spend
-    /// its outputs, each as one `Removed(Explicit)` change in parent-before-
-    /// descendants order.
-    ///
-    /// Returns an empty result when the txid is not present in the pool.
-    pub fn remove_by_txid(&mut self, txid: &Txid) -> MutationResult {
-        let mut changes = Vec::new();
-        self.remove_by_txid_into(txid, RemovalReason::Explicit, &mut changes);
-        self.finish_mutation(changes)
-    }
-
-    /// Reason-carrying core of [`Mempool::remove_by_txid`].
+    /// Removes the entry identified by `txid` and its descendants with the
+    /// supplied reason.
     fn remove_by_txid_into(
         &mut self,
         txid: &Txid,
@@ -880,14 +861,16 @@ impl Mempool {
     /// committing parent before descendants.
     ///
     /// For each block transaction, this mirrors Bitcoin Core's
-    /// `removeForBlock`: the entry and its descendants leave the pool, other
-    /// entries spending the same inputs — double spends the block just
-    /// settled — leave with their descendants, and the overlay stored for the
-    /// txid is erased whether or not the transaction was ever admitted (a
-    /// pre-admission delta for a directly mined transaction must not survive
-    /// into a later re-admission). Entries removed only because a parent or
-    /// conflict was mined were not confirmed themselves: they keep their
-    /// overlay and are recorded as departures, not confirmations.
+    /// `removeForBlock`: the mined entry leaves the pool, while its unmined
+    /// descendants stay there with refreshed ancestor metadata because they
+    /// now spend confirmed coins. Other entries spending the same inputs
+    /// — double spends the block just settled — leave with their descendants,
+    /// and the overlay stored for the txid is erased whether or not the
+    /// transaction was ever admitted (a pre-admission delta for a directly
+    /// mined transaction must not survive into a later re-admission). Entries
+    /// removed only because a conflict was mined were not confirmed
+    /// themselves: they keep their overlay and are recorded as departures,
+    /// not confirmations.
     ///
     /// `block_txids` contains the validated txid for each transaction in
     /// `block_txs`, in the same order. `height` is the connected block's
@@ -911,7 +894,12 @@ impl Mempool {
 
         let mut changes = Vec::new();
         for (tx, txid) in block_txs.iter().zip(block_txids) {
-            self.remove_by_txid_into(txid, RemovalReason::BlockInclusion, &mut changes);
+            if let Some(id) = self.by_txid.get(txid).copied() {
+                self.remove_entries_with_reasons(
+                    &[(id, RemovalReason::BlockInclusion)],
+                    &mut changes,
+                );
+            }
             for conflict in self.conflicts_for(tx) {
                 self.remove_entry_and_descendants_into(
                     conflict,
@@ -1679,10 +1667,14 @@ mod tests {
             7,
         ))?;
         pool.insert_entry(MempoolEntry::new(Arc::new(prioritised), 100, 100, 2, 7))?;
-        pool.insert_entry(MempoolEntry::new(Arc::new(removed), 100, 50, 3, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(removed.clone()), 100, 50, 3, 7))?;
 
         assert_eq!(pool.aggregate_fees(), u64::MAX);
-        assert!(!pool.remove_by_txid(&removed_txid).is_empty());
+        assert!(
+            !pool
+                .remove_for_block(&[&removed], &[removed_txid], 8)
+                .is_empty()
+        );
         assert_eq!(pool.aggregate_fees(), u64::MAX);
         pool.prioritise(prioritised_txid, -100)
             .expect("overlay delta applies");
@@ -1912,7 +1904,13 @@ mod tests {
 
         let low_a_tx = tx(2, Vec::new());
         let low_a_txid = low_a_tx.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(low_a_tx), 1_000, 1_500, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(
+            Arc::new(low_a_tx.clone()),
+            1_000,
+            1_500,
+            1,
+            7,
+        ))?;
         assert_floor(&pool, Some(1_500), "insert lower rate");
 
         let low_b_tx = tx(3, Vec::new());
@@ -1920,9 +1918,9 @@ mod tests {
         pool.insert_entry(MempoolEntry::new(Arc::new(low_b_tx), 1_000, 1_500, 1, 7))?;
         assert_floor(&pool, Some(1_500), "duplicate min rate");
 
-        let removed = pool.remove_by_txid(&low_a_txid);
+        let removed = pool.remove_for_block(&[&low_a_tx], &[low_a_txid], 8);
         assert_eq!(removed.len(), 1);
-        assert_floor(&pool, Some(1_500), "explicit remove of one duplicate min");
+        assert_floor(&pool, Some(1_500), "block inclusion of one duplicate min");
 
         let evicted = pool.evict_below_fee_rate(2_000);
         assert_eq!(change_txids(&evicted), vec![hash_of(&low_b_txid)]);
@@ -2342,36 +2340,38 @@ mod tests {
     }
 
     #[test]
-    fn remove_by_txid_returns_empty_for_unknown_txid() {
+    fn block_inclusion_keeps_unmined_descendants() -> Result<(), MempoolError> {
         let mut pool = Mempool::new(MempoolLimits::default());
+        let parent = tx(13, Vec::new());
+        let parent_txid = parent.txid();
+        let child = tx(14, vec![OutPoint::new(parent_txid, 0)]);
+        let child_txid = child.txid();
+        pool.insert_entry(MempoolEntry::new(
+            Arc::new(parent.clone()),
+            100,
+            1_000,
+            1,
+            7,
+        ))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 2, 7))?;
+        let child_id = pool
+            .entry_id_by_txid(&child_txid)
+            .expect("child id resolves");
 
-        let removed = pool.remove_by_txid(&txid_of([0_u8; 32]));
+        let removed = pool.remove_for_block(&[&parent], &[parent_txid], 8);
 
-        assert!(removed.is_empty());
-        assert_eq!(pool.len(), 0);
-    }
-
-    #[test]
-    fn remove_by_txid_removes_entry_and_descendants_when_present() -> Result<(), MempoolError> {
-        let mut pool = Mempool::new(MempoolLimits::default());
-        let tx = Tx {
-            version: 2,
-            lock_time: 0,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-        };
-        let txid = tx.txid();
-        let entry = MempoolEntry::new(Arc::new(tx), 123, 4_567, 0, 0);
-        pool.insert_entry(entry)?;
-
-        let removed = pool.remove_by_txid(&txid);
-
-        assert_eq!(removed.len(), 1);
         assert_eq!(
-            removed.changes.first().map(|change| change.txid),
-            Some(hash_of(&txid))
+            removed.changes,
+            vec![MutationChange {
+                txid: hash_of(&parent_txid),
+                outcome: MutationOutcome::Removed(RemovalReason::BlockInclusion),
+            }]
         );
-        assert_eq!(pool.len(), 0);
+        assert!(pool.contains_txid(&child_txid));
+        assert!(pool.ancestor_ids_for_entry(child_id).is_empty());
+        let incremental = totals(&pool);
+        pool.recompute_all_metadata();
+        assert_eq!(incremental, totals(&pool));
         Ok(())
     }
 
@@ -2592,7 +2592,7 @@ mod tests {
         pool.insert_entry(MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7))?;
         pool.prioritise(txid, 700).expect("delta applies");
 
-        assert!(!pool.remove_by_txid(&txid).is_empty());
+        assert!(!pool.evict_below_fee_rate(10_001).is_empty());
 
         pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7))?;
         let Some(entry) = pool.entry_by_txid(&txid) else {
@@ -2617,7 +2617,7 @@ mod tests {
         ))?;
         let child = tx(11, vec![OutPoint::new(parent_txid, 0)]);
         let child_txid = child.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(child.clone()), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 1, 7))?;
         // A delta stored for a transaction that never reached the pool.
         let stranger = tx(12, Vec::new());
         let stranger_txid = stranger.txid();
@@ -2632,21 +2632,24 @@ mod tests {
         let removed =
             pool.remove_for_block(&[&parent, &stranger], &[parent_txid, stranger_txid], 8);
 
-        assert_eq!(removed.len(), 2, "the parent leaves with its descendant");
+        assert_eq!(removed.len(), 1, "only the mined parent leaves");
+        assert_eq!(
+            removed.changes,
+            vec![MutationChange {
+                txid: hash_of(&parent_txid),
+                outcome: MutationOutcome::Removed(RemovalReason::BlockInclusion),
+            }]
+        );
         assert!(!pool.fee_deltas.contains_key(&parent_txid));
         assert!(!pool.fee_deltas.contains_key(&stranger_txid));
         assert_eq!(
             pool.fee_deltas.get(&child_txid).copied(),
             Some(200),
-            "a descendant removed for a mined parent was not confirmed itself"
+            "the unmined child keeps its overlay"
         );
+        assert!(pool.contains_txid(&child_txid));
 
         // Readmission answers from the surviving state alone.
-        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 1, 7))?;
-        assert_eq!(
-            pool.entry_by_txid(&child_txid).map(|entry| entry.fee_delta),
-            Some(200)
-        );
         pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 1, 7))?;
         assert_eq!(
             pool.entry_by_txid(&parent_txid)
@@ -3037,7 +3040,12 @@ mod tests {
     {
         for victim in 0..6_u32 {
             let (mut pool, _outs) = graph_pool()?;
-            let removed = pool.remove_entry_and_descendants(victim);
+            let Some(entry) = pool.entry(victim) else {
+                panic!("entry {victim} must be present in the fixture");
+            };
+            let tx = entry.tx.clone();
+            let txid = entry.txid;
+            let removed = pool.remove_for_block(&[&tx], &[txid], 8);
             assert!(
                 !removed.is_empty(),
                 "entry {victim} must be present in the fixture"
@@ -3169,13 +3177,21 @@ mod tests {
             .expect("prioritise down must apply");
         check(&pool, "a negative fee delta");
 
-        // `mid`: removing it takes the rest of the chain with it and leaves
-        // both a surviving parent and an unrelated entry behind.
+        // `mid`: only the mined entry leaves; its descendants stay, while
+        // both a surviving parent and an unrelated entry remain behind.
         let Some(victim_txid) = outs.get(1).map(|out| out.txid) else {
             panic!("fixture must hold a second entry");
         };
-        let removed = pool.remove_by_txid(&victim_txid);
+        let Some(victim) = pool.entry_by_txid(&victim_txid) else {
+            panic!("fixture must hold the victim entry");
+        };
+        let victim_tx = victim.tx.clone();
+        let removed = pool.remove_for_block(&[&victim_tx], &[victim_txid], 8);
         assert!(!removed.is_empty(), "the victim must actually be removed");
+        assert!(
+            outs.get(2).is_some_and(|out| pool.contains_txid(&out.txid)),
+            "the chain below the victim remains in the pool"
+        );
         check(&pool, "a removal");
 
         pool.clear();
@@ -3436,15 +3452,19 @@ mod spend_index_tests {
     }
 
     #[test]
-    fn spender_txids_is_empty_once_the_spenders_are_gone() {
+    fn block_inclusion_removes_root_but_leaves_descendants() {
         let (mut pool, root_txid) = graph_pool();
-        let Some(root_id) = pool.entry_id_by_txid(&root_txid) else {
+        let Some(root) = pool.entry_by_txid(&root_txid) else {
             panic!("root missing from the fixture pool");
         };
-        let removed = pool.remove_entry_and_descendants(root_id);
+        let root_tx = root.tx.clone();
+        let before = pool.len();
+        let removed = pool.remove_for_block(&[&root_tx], &[root_txid], 8);
         assert!(!removed.is_empty());
-        // The root left with its descendants, so nothing is left to spend it.
+        // The root left, while its descendants remain as transactions that
+        // now spend confirmed outputs.
         assert!(pool.entry_id_by_txid(&root_txid).is_none());
-        assert!(pool.is_empty(), "the fixture is a single connected package");
+        assert_eq!(pool.len(), before - 1);
+        assert!(!pool.is_empty());
     }
 }
