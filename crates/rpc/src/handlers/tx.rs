@@ -836,10 +836,16 @@ fn optional_max_feerate(params: &Value, index: usize) -> Result<Option<u64>, Rpc
     if btc_per_kvb == 0.0 {
         return Ok(None);
     }
-    Ok(Some(sats_from_btc(
-        btc_per_kvb,
-        "maxfeerate is out of range",
-    )?))
+    let sats = sats_from_btc(btc_per_kvb, "maxfeerate is out of range")?;
+    // Core's `ParseFeeRate` refuses rates at or above 1 BTC/kvB, so the
+    // ceiling is enforced on the integer domain to keep the parameter
+    // contract identical.
+    if sats >= 100_000_000 {
+        return Err(RpcError::InvalidParams(
+            "Fee rates larger than or equal to 1BTC/kvB are not accepted",
+        ));
+    }
+    Ok(Some(sats))
 }
 
 fn parse_btc_amount(value: &Value) -> Result<u64, RpcError> {
@@ -2576,17 +2582,20 @@ mod acceptance_tests {
         assert_eq!(ctx.mempool.read().len(), 1);
     }
 
-    /// A ceiling of one whole coin per kvB is a high but valid rate.
+    /// Core's `ParseFeeRate` refuses ceilings at or above one whole coin per
+    /// kvB, so the parameter itself is invalid no matter how small the fee.
     #[test]
-    fn sendrawtransaction_accepts_a_fee_rate_of_a_whole_coin() {
+    fn sendrawtransaction_rejects_a_fee_rate_of_a_whole_coin() {
         let ctx = Arc::new(Context::new());
         seed_utxo(&ctx, 11, 100_000);
         let tx = spending_tx(11, 90_000);
 
-        let sent = sendrawtransaction(&ctx, &json!([hex_of(&tx), 1.0]));
+        let error = sendrawtransaction(&ctx, &json!([hex_of(&tx), 1.0]))
+            .err()
+            .unwrap_or_else(|| panic!("1 BTC/kvB is not an accepted ceiling"));
 
-        assert!(sent.is_ok(), "1 BTC/kvB is a valid ceiling: {sent:?}");
-        assert_eq!(ctx.mempool.read().len(), 1);
+        assert_eq!(error.code(), RpcError::INVALID_PARAMS, "{error:?}");
+        assert_eq!(ctx.mempool.read().len(), 0, "nothing admitted: {error:?}");
     }
 
     /// A rejection must say why, under Core's `RPC_VERIFY_REJECTED` code.
