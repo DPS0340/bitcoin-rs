@@ -26,12 +26,9 @@ use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use crossbeam_channel::unbounded;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
+type PeerMap = Arc<RwLock<HashMap<SocketAddr, PeerLease>>>;
 
-fn make_sync() -> (
-    BlockSync,
-    Arc<RwLock<Vec<PeerInfo>>>,
-    Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
-) {
+fn make_sync() -> (BlockSync, Arc<RwLock<Vec<PeerInfo>>>, PeerMap) {
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
     let chain_tip = block_tree.read().tip_handle();
     let applied_tip: Arc<ArcSwapOption<bitcoin_rs_chain::TipSnapshot>> =
@@ -47,10 +44,9 @@ fn make_sync() -> (
     let utxo = Arc::new(utxo);
 
     let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-    let mempool_gateway = Arc::new(MempoolGateway::shared(Arc::clone(&mempool)));
+    let mempool_gateway = MempoolGateway::shared(Arc::clone(&mempool));
     let mining_generation = Arc::new(bitcoin_rs_node::mining::MiningGenerationSignal::new());
-    let (chain_events, _chain_events_rx) =
-        bitcoin_rs_node::state::ChainEventPublisher::detached(0);
+    let (chain_events, _chain_events_rx) = bitcoin_rs_node::state::ChainEventPublisher::detached(0);
 
     let handles = ApplyHandles::new(
         Network::Regtest,
@@ -64,7 +60,10 @@ fn make_sync() -> (
         mempool_gateway,
         mining_generation,
         Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
-        Arc::new(RwLock::new(HashMap::<bitcoin::Txid, bitcoin::Transaction>::new())),
+        Arc::new(RwLock::new(HashMap::<
+            bitcoin_rs_primitives::Txid,
+            bitcoin_rs_primitives::Tx,
+        >::new())),
         Arc::new(NoOpZmqPublisher),
         Arc::new(chain_events),
     );
@@ -97,6 +96,10 @@ fn synthetic_peer(addr: SocketAddr, inbound: bool) -> PeerInfo {
 /// callback must detect that the prior entry is the same connection
 /// (`same_connection`) and must NOT cancel it.
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "test: channel send/recv must succeed or test is broken"
+)]
 fn pre_registered_lease_survives_publication_callback() {
     let (sync, peers, peer_outbound) = make_sync();
     let addr = SocketAddr::from(([127, 0, 0, 1], 18_447));
@@ -140,14 +143,18 @@ fn pre_registered_lease_survives_publication_callback() {
     assert_eq!(&*peers.read(), &[synthetic_peer(addr, true)]);
 
     // The lease must still be usable — a message sent through it must arrive.
-    lease.send(Message::Ping(42)).unwrap();
-    assert_eq!(rx.recv().unwrap(), Message::Ping(42));
+    lease.send(Message::Ping(42)).expect("send must succeed");
+    assert_eq!(rx.recv().expect("recv must succeed"), Message::Ping(42));
 }
 
 /// A genuinely different predecessor at the same address MUST be cancelled.
 /// This verifies the callback still protects against stale connections — the
 /// fix only spares the *current* connection, not a real predecessor.
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "test: channel send/recv must succeed or test is broken"
+)]
 fn predecessor_lease_is_cancelled_by_publication_callback() {
     let (sync, peers, peer_outbound) = make_sync();
     let addr = SocketAddr::from(([127, 0, 0, 1], 18_448));
@@ -173,10 +180,7 @@ fn predecessor_lease_is_cancelled_by_publication_callback() {
         old_lease.is_cancelled(),
         "predecessor lease must be cancelled"
     );
-    assert!(
-        !new_lease.is_cancelled(),
-        "new lease must not be cancelled"
-    );
+    assert!(!new_lease.is_cancelled(), "new lease must not be cancelled");
 
     // The new lease must be in the map and usable.
     assert!(
@@ -186,7 +190,9 @@ fn predecessor_lease_is_cancelled_by_publication_callback() {
             .is_some_and(|current| current.same_connection(&new_lease)),
         "outbound map must hold the new connection"
     );
-    new_lease.send(Message::Ping(99)).unwrap();
-    assert_eq!(new_rx.recv().unwrap(), Message::Ping(99));
+    new_lease
+        .send(Message::Ping(99))
+        .expect("send must succeed");
+    assert_eq!(new_rx.recv().expect("recv must succeed"), Message::Ping(99));
     assert_eq!(&*peers.read(), &[synthetic_peer(addr, false)]);
 }

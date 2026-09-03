@@ -1,8 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-/// Block download window, peer-assignment, stall, and scheduling policy.
-pub mod download_window;
 /// BIP155 addrv2 address helpers.
 pub mod addrv2;
 /// Peer banning and persistence.
@@ -11,6 +9,8 @@ pub mod banlist;
 pub mod connection;
 /// Inbound message dispatcher.
 pub mod dispatch;
+/// Block download window, peer-assignment, stall, and scheduling policy.
+pub mod download_window;
 /// Peer finite-state machine.
 pub mod fsm;
 /// Version/verack negotiation helpers.
@@ -47,6 +47,6 @@ pub use subnet::{BannedSubnet, IpSubnet, SubnetParseError};
 pub use wire::{Message, PeerError};
 
 pub use download_window::{
-    configure_request_mode, default_sync_budget, statically_fanout_eligible, DownloadWindow,
-    FanoutCandidate, SyncBudget, SyncPeer, SyncPeerSelection,
+    DownloadWindow, FanoutCandidate, SyncBudget, SyncPeer, SyncPeerSelection,
+    configure_request_mode, default_sync_budget, statically_fanout_eligible,
 };
