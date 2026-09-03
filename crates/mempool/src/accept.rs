@@ -439,6 +439,7 @@ fn count_accurate(script: &[u8]) -> u32 {
     count
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::MempoolLimits;
@@ -835,7 +836,7 @@ mod tests {
             input.script_sig = script_sig.clone();
         }
 
-        let blind = u32::try_from(count_tx_legacy(&tx).saturating_mul(4)).unwrap_or(u32::MAX);
+        let blind = count_tx_legacy(&tx).saturating_mul(4);
         assert!(
             blind <= MAX_STANDARD_TX_SIGOPS_COST,
             "counting blind must stay under the limit ({blind}), or the \

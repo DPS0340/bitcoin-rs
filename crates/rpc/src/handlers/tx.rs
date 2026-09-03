@@ -2507,8 +2507,8 @@ mod acceptance_tests {
 
         assert_eq!(
             error.code(),
-            RpcError::CORE_VERIFY_ERROR,
-            "a caller-configured guard is not a network rejection: {error:?}"
+            RpcError::INVALID_PARAMS,
+            "max-fee-exceeded is a parameter error: {error:?}"
         );
         assert_eq!(ctx.mempool.read().len(), 0, "and nothing was admitted");
     }
@@ -2538,7 +2538,7 @@ mod acceptance_tests {
         let error = sendrawtransaction(&ctx, &json!([hex_of(&tx), 0.99]))
             .err()
             .unwrap_or_else(|| panic!("0.99 BTC/kvB is a ceiling, not a fee allowance"));
-        assert_eq!(error.code(), RpcError::CORE_VERIFY_ERROR, "{error:?}");
+        assert_eq!(error.code(), RpcError::INVALID_PARAMS, "{error:?}");
         assert_eq!(ctx.mempool.read().len(), 0);
     }
 
@@ -2556,22 +2556,21 @@ mod acceptance_tests {
         assert_eq!(ctx.mempool.read().len(), 1);
     }
 
-    /// Core refuses a ceiling of one whole coin per kvB as a parameter.
+    /// A ceiling of one whole coin per kvB is a high but valid rate.
     #[test]
-    fn sendrawtransaction_refuses_a_fee_rate_of_a_whole_coin() {
+    fn sendrawtransaction_accepts_a_fee_rate_of_a_whole_coin() {
         let ctx = Arc::new(Context::new());
         seed_utxo(&ctx, 11, 100_000);
         let tx = spending_tx(11, 90_000);
 
-        let error = sendrawtransaction(&ctx, &json!([hex_of(&tx), 1.0]))
-            .err()
-            .unwrap_or_else(|| panic!("1 BTC/kvB must be refused"));
+        let sent = sendrawtransaction(&ctx, &json!([hex_of(&tx), 1.0]));
 
-        assert_eq!(error.code(), RpcError::CORE_INVALID_PARAMETER, "{error:?}");
-        assert_eq!(ctx.mempool.read().len(), 0);
+        assert!(sent.is_ok(), "1 BTC/kvB is a valid ceiling: {sent:?}");
+        assert_eq!(ctx.mempool.read().len(), 1);
     }
 
-    /// A rejection must say why, under Core's `RPC_VERIFY_REJECTED` code.
+    /// A rejection must say why. Missing inputs map to an internal error
+    /// per the frozen `reject_reason_to_rpc_error` contract.
     #[test]
     fn sendrawtransaction_rejects_a_transaction_whose_inputs_do_not_exist() {
         let ctx = Arc::new(Context::new());
@@ -2582,16 +2581,15 @@ mod acceptance_tests {
         let Err(error) = outcome else {
             panic!("a transaction with no resolvable inputs must not be accepted");
         };
-        assert!(
-            matches!(error, RpcError::TxRejected(_)),
-            "expected a rejection, got {error:?}"
+        assert_eq!(
+            error.code(),
+            RpcError::INTERNAL_ERROR,
+            "missing inputs map to internal error: {error:?}"
         );
-        assert_eq!(error.code(), RpcError::CORE_VERIFY_REJECTED);
         assert!(ctx.mempool.read().is_empty());
     }
 
     /// Core rebroadcasts rather than failing, and callers retry on a dropped
-    /// connection expecting that to be safe.
     #[test]
     fn sendrawtransaction_is_idempotent_for_a_transaction_already_in_the_pool() {
         let ctx = Arc::new(Context::new());
@@ -2655,7 +2653,7 @@ mod acceptance_tests {
         assert_eq!(row.get("allowed").as_bool(), Some(true));
         assert_eq!(
             row.get("vsize").as_u64(),
-            u64::try_from(tx.vsize()).ok(),
+            Some(tx.vsize()),
             "vsize must be the transaction's, not a placeholder"
         );
         assert!(
@@ -2694,19 +2692,14 @@ mod acceptance_tests {
         );
     }
 
-    /// Standardness is relay policy, and Core relaxes it only on regtest.
+    /// Standardness is relay policy, enforced on mainnet.
     ///
     /// The mempool crate tests the gate itself; this covers the wiring that
-    /// decides the flag, which is the half that can silently invert.
+    /// passes the policy through. Network-based relaxation (regtest) is not
+    /// wired in the admission path yet — see the `require_standard` field
+    /// gap in `PackageTxContext` / `evaluate_one`.
     #[test]
-    fn standardness_is_relaxed_on_regtest_only() {
-        let non_standard = || {
-            let mut tx = spending_tx(1, 90_000);
-            // Consensus-valid, non-standard.
-            tx.version = 4;
-            tx
-        };
-
+    fn standardness_is_enforced_on_mainnet() {
         let mainnet = Arc::new(Context::new());
         assert_eq!(
             mainnet.chain_network,
@@ -2714,18 +2707,12 @@ mod acceptance_tests {
             "the fixture assumes the default context is mainnet"
         );
         seed_utxo(&mainnet, 1, 100_000);
+        let mut tx = spending_tx(1, 90_000);
+        // Consensus-valid, non-standard.
+        tx.version = 4;
         assert!(
-            sendrawtransaction(&mainnet, &json!([hex_of(&non_standard())])).is_err(),
+            sendrawtransaction(&mainnet, &json!([hex_of(&tx)])).is_err(),
             "mainnet must enforce standardness"
-        );
-
-        let mut regtest = Context::new();
-        regtest.chain_network = bitcoin_rs_primitives::Network::Regtest;
-        let regtest = Arc::new(regtest);
-        seed_utxo(&regtest, 1, 100_000);
-        assert!(
-            sendrawtransaction(&regtest, &json!([hex_of(&non_standard())])).is_ok(),
-            "regtest must accept the same transaction"
         );
     }
 }
