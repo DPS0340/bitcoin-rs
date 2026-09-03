@@ -1,6 +1,8 @@
-//! Golden block fixture tests for primitive block and transaction hashing.
-use bitcoin_rs_primitives::{Block as PrimitiveBlock, Hash256, Tx};
+//! Golden block fixture tests: native decode, block hash, and txids against
+//! blockstream-recorded values.
+use std::str::FromStr;
 
+use bitcoin_rs_primitives::{Block as PrimitiveBlock, BlockHash, Txid, deserialize};
 const HEIGHTS: &[(u32, &str)] = &[
     (
         0,
@@ -70,9 +72,8 @@ fn golden_blocks_decode_and_hash_to_blockstream_txids() -> Result<(), Box<dyn st
         let block_bytes = read_fixture(*height, "bin")?;
         let txid_text = String::from_utf8(read_fixture(*height, "txids.txt")?)?;
         let expected_txids = parse_txids(&txid_text)?;
-        let bitcoin_block: bitcoin::Block = bitcoin::consensus::deserialize(&block_bytes)?;
-        let block = PrimitiveBlock(bitcoin_block);
-        let expected_block_hash = Hash256::from_str_be(expected_hash)?;
+        let block = deserialize::<PrimitiveBlock>(&block_bytes)?;
+        let expected_block_hash = expected_hash.parse::<BlockHash>()?;
 
         assert_eq!(
             block.block_hash(),
@@ -80,20 +81,24 @@ fn golden_blocks_decode_and_hash_to_blockstream_txids() -> Result<(), Box<dyn st
             "height {height} block hash"
         );
         assert_eq!(
-            block.0.txdata.len(),
+            block.txs.len(),
             expected_txids.len(),
             "height {height} tx count"
         );
 
-        for (index, (tx, expected_txid)) in
-            block.0.txdata.iter().zip(expected_txids.iter()).enumerate()
+        for (index, (tx, expected_txid)) in block.txs.iter().zip(expected_txids.iter()).enumerate()
         {
             assert_eq!(
-                Tx(tx.clone()).txid(),
+                tx.txid(),
                 *expected_txid,
                 "height {height} tx index {index}"
             );
         }
+        assert_eq!(
+            bitcoin_rs_primitives::consensus_bytes(&block),
+            block_bytes,
+            "height {height} re-encode"
+        );
     }
     Ok(())
 }
@@ -109,6 +114,10 @@ fn read_fixture(height: u32, extension: &str) -> Result<Vec<u8>, Box<dyn std::er
     }
 }
 
-fn parse_txids(txid_text: &str) -> Result<Vec<Hash256>, bitcoin_rs_primitives::HashError> {
-    txid_text.lines().map(Hash256::from_str_be).collect()
+fn parse_txids(txid_text: &str) -> Result<Vec<Txid>, bitcoin_rs_primitives::HashError> {
+    txid_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(Txid::from_str)
+        .collect()
 }

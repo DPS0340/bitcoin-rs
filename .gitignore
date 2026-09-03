@@ -7,6 +7,9 @@ Cargo.lock.bak
 .vscode/
 *.profraw
 *.profdata
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/.tmp*/
 perf.data
 perf.data.old
 flamegraph.svg
@@ -17,10 +20,10 @@ core.*
 /data/
 .env
 
-# Re-include project plan tracked in-repo (global ~/.gitignore drops PLAN.md).
-!PLAN.md
-!DEVIATIONS.md
+# Agent task scratch is temporary; acceptance criteria belong in issues/PRs.
 .antigravitycli/
+.agent-tasks/
 
 # lean-ctx local tooling cache
 .lean-ctx/
+.cargo-tmp/

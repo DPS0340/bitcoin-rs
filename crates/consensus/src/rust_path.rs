@@ -1,4 +1,4 @@
-use bitcoin::{BlockHash, OutPoint, TxOut};
+use bitcoin_rs_primitives::{BlockHash, OutPoint, TxOut};
 
 /// Minimal UTXO lookup contract used by the portable validator.
 pub trait UtxoView {
@@ -12,12 +12,6 @@ where
 {
     fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
         (*self).lookup(outpoint)
-    }
-}
-
-impl UtxoView for std::collections::BTreeMap<OutPoint, TxOut> {
-    fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
-        self.get(outpoint).cloned()
     }
 }
 

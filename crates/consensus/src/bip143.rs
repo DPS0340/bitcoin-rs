@@ -20,39 +20,35 @@ pub fn check_bip143(
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute,
-        transaction,
-    };
-    use bitcoin_rs_primitives::{Sighash, Tx};
+    use bitcoin_rs_primitives::{OutPoint, Sighash, Tx, TxIn, TxOut};
 
     use super::check_bip143;
 
     #[test]
     fn valid_input_index_computes() {
-        let tx = Tx(transaction());
+        let tx = transaction();
         assert_eq!(check_bip143(&tx, 0, &[0x51], 1, Sighash::All), Ok(()));
     }
 
     #[test]
     fn out_of_range_input_fails() {
-        let tx = Tx(transaction());
+        let tx = transaction();
         assert!(check_bip143(&tx, 1, &[0x51], 1, Sighash::All).is_err());
     }
 
-    fn transaction() -> Transaction {
-        Transaction {
-            version: transaction::Version(2),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn transaction() -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Vec::new(),
             }],
         }
     }

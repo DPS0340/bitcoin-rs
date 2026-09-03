@@ -1,5 +1,4 @@
 //! Snapshot trailer integration tests for coinstats.
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_utxo::{
@@ -15,7 +14,7 @@ fn snapshot_trailer_uses_listener_muhash() -> Result<(), Box<dyn std::error::Err
 
     let mut changes = BlockChanges::default();
     for index in 0_u32..3 {
-        let outpoint = OutPoint::new(txid(index), index);
+        let outpoint = OutPoint::new(txid(index).into(), index);
         changes.add(UtxoAdd::new(outpoint, txout(index), index == 0, 7));
     }
 
@@ -37,8 +36,8 @@ fn snapshot_trailer_tracks_listener_after_removal() -> Result<(), Box<dyn std::e
     let mut set = UtxoSet::new();
     set.set_listener(Box::new(listener.clone()));
 
-    let removed_outpoint = OutPoint::new(txid(1), 0);
-    let kept_outpoint = OutPoint::new(txid(2), 1);
+    let removed_outpoint = OutPoint::new(txid(1).into(), 0);
+    let kept_outpoint = OutPoint::new(txid(2).into(), 1);
     let removed_txout = txout(1);
     let kept_txout = txout(2);
 
@@ -69,7 +68,7 @@ fn snapshot_trailer_tracks_listener_after_removal() -> Result<(), Box<dyn std::e
         before_removal.muhash.finalize()
     );
     assert_eq!(after_removal.utxo_count, 1);
-    assert_eq!(after_removal.total_amount, kept_txout.value.to_sat());
+    assert_eq!(after_removal.total_amount, kept_txout.value);
 
     let mut snapshot = Vec::new();
     let trailer = write_snapshot(&set, &txid(101), 8, &mut snapshot)?;
@@ -86,7 +85,7 @@ fn listener_tracks_duplicate_txid_overwrite() -> Result<(), Box<dyn std::error::
     let mut set = UtxoSet::new();
     set.set_listener(Box::new(listener.clone()));
 
-    let outpoint = OutPoint::new(txid(30), 0);
+    let outpoint = OutPoint::new(txid(30).into(), 0);
     let original = txout(30);
     let replacement = txout(31);
 
@@ -107,7 +106,7 @@ fn listener_tracks_duplicate_txid_overwrite() -> Result<(), Box<dyn std::error::
     assert_eq!(set.get(&outpoint), Some(replacement.clone()));
     assert_eq!(after_overwrite, expected);
     assert_eq!(after_overwrite.utxo_count, 1);
-    assert_eq!(after_overwrite.total_amount, replacement.value.to_sat());
+    assert_eq!(after_overwrite.total_amount, replacement.value);
     Ok(())
 }
 
@@ -123,7 +122,7 @@ fn listener_coalesced_parallel_path_preserves_overwrite_boundary()
 
     for shard in 0_u8..20 {
         let index = u32::from(shard);
-        let outpoint = OutPoint::new(txid_in_shard(shard, 1_100 + u64::from(shard)), index);
+        let outpoint = OutPoint::new(txid_in_shard(shard, 1_100 + u64::from(shard)).into(), index);
         let original = txout(1_100 + index);
         assert_eq!(UtxoKey::from_txid(&outpoint.txid).shard(), shard);
         expected.insert_utxo(&outpoint, &original, 110, shard % 2 == 0);
@@ -168,7 +167,7 @@ fn listener_parallel_shard_delta_matches_serial_stats() -> Result<(), Box<dyn st
 
     for shard in 0_u8..20 {
         let index = u32::from(shard);
-        let outpoint = OutPoint::new(txid_in_shard(shard, 700 + u64::from(shard)), index);
+        let outpoint = OutPoint::new(txid_in_shard(shard, 700 + u64::from(shard)).into(), index);
         let txout = txout(700 + index);
         assert_eq!(UtxoKey::from_txid(&outpoint.txid).shard(), shard);
         expected.insert_utxo(&outpoint, &txout, 70, shard % 2 == 0);
@@ -180,7 +179,10 @@ fn listener_parallel_shard_delta_matches_serial_stats() -> Result<(), Box<dyn st
     let mut mixed = BlockChanges::default();
     for shard in (0_u8..20).rev() {
         let index = u32::from(shard);
-        let replacement = OutPoint::new(txid_in_shard(shard, 900 + u64::from(shard)), 100 + index);
+        let replacement = OutPoint::new(
+            txid_in_shard(shard, 900 + u64::from(shard)).into(),
+            100 + index,
+        );
         let replacement_txout = txout(900 + index);
         let removed_txout = txout(700 + index);
         expected.remove_utxo(
@@ -229,7 +231,7 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
 
     for index in 0_u32..ENTRIES {
         let shard = u8::try_from(index % 2)?;
-        let outpoint = OutPoint::new(txid_in_shard(shard, 3_000 + u64::from(index)), 0);
+        let outpoint = OutPoint::new(txid_in_shard(shard, 3_000 + u64::from(index)).into(), 0);
         let txout = txout(3_000 + index);
         let coinbase = index % 2 == 0;
         assert_eq!(UtxoKey::from_txid(&outpoint.txid).shard(), shard);
@@ -248,7 +250,7 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
     let mut replacements = Vec::with_capacity(usize::try_from(ENTRIES)?);
     for index in 0_u32..ENTRIES {
         let shard = u8::try_from(index % 2)?;
-        let replacement = OutPoint::new(txid_in_shard(shard, 6_000 + u64::from(index)), 0);
+        let replacement = OutPoint::new(txid_in_shard(shard, 6_000 + u64::from(index)).into(), 0);
         let replacement_txout = txout(6_000 + index);
         assert_eq!(UtxoKey::from_txid(&replacement.txid).shard(), shard);
         expected.insert_utxo(&replacement, &replacement_txout, 201, false);
@@ -284,7 +286,7 @@ fn listener_parallel_direct_coin_batches_match_serial_stats()
     let mut removals = Vec::with_capacity(usize::try_from(ENTRIES)?);
 
     for index in 0_u32..ENTRIES {
-        let outpoint = OutPoint::new(txid(index), index);
+        let outpoint = OutPoint::new(txid(index).into(), index);
         let txout = txout(index);
         let coinbase = index % 2 == 0;
         expected.insert_utxo(&outpoint, &txout, 300, coinbase);
@@ -318,11 +320,11 @@ fn listener_parallel_direct_coin_batches_match_serial_stats()
 #[test]
 fn listener_undo_restores_muhash_and_accounting() -> Result<(), Box<dyn std::error::Error>> {
     let (full, full_listener) = listener_set();
-    let coinbase_outpoint = OutPoint::new(txid(40), 0);
+    let coinbase_outpoint = OutPoint::new(txid(40).into(), 0);
     let coinbase_txout = txout(40);
-    let kept_outpoint = OutPoint::new(txid(41), 0);
+    let kept_outpoint = OutPoint::new(txid(41).into(), 0);
     let kept_txout = txout(41);
-    let replacement_outpoint = OutPoint::new(txid(42), 0);
+    let replacement_outpoint = OutPoint::new(txid(42).into(), 0);
     let replacement_txout = txout(42);
 
     let first = first_undo_test_block(
@@ -396,8 +398,8 @@ fn first_undo_test_block(
 
 fn txout(index: u32) -> TxOut {
     TxOut {
-        value: Amount::from_sat(50_000 + u64::from(index)),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51, index.to_le_bytes()[0]]),
+        value: 50_000 + u64::from(index),
+        script_pubkey: vec![0x51, index.to_le_bytes()[0]],
     }
 }
 

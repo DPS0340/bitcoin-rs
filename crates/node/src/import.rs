@@ -6,10 +6,7 @@
 //! file declares the contract those commits fill in.
 
 use anyhow::{Context as _, Result};
-use bitcoin::Block;
-use bitcoin::consensus::Decodable as _;
-use bitcoin::hashes::Hash as _;
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Block, Hash256};
 
 use crate::state::NodeState;
 
@@ -32,12 +29,10 @@ pub struct ImportOutcome {
 /// V1 contract: synthetically apply after decode. Returns an error if the bytes
 /// are malformed or the block cannot connect to the current synthetic tip.
 pub fn import_block(state: &NodeState, block_bytes: &[u8]) -> Result<ImportOutcome> {
-    let mut cursor = std::io::Cursor::new(block_bytes);
-    let block = Block::consensus_decode(&mut cursor)
+    let block = Block::consensus_decode(block_bytes)
         .with_context(|| format!("decode block ({} bytes)", block_bytes.len()))?;
-    let block_hash = block.block_hash();
-    let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-    let tx_count = block.txdata.len();
+    let hash = block.block_hash().0;
+    let tx_count = block.txs.len();
     let _tip = state.apply_block(&block).context("apply_block")?;
     Ok(ImportOutcome {
         hash,
@@ -49,7 +44,10 @@ pub fn import_block(state: &NodeState, block_bytes: &[u8]) -> Result<ImportOutco
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::consensus::Encodable as _;
+    use bitcoin_rs_primitives::encode::double_sha256;
+    use bitcoin_rs_primitives::{
+        Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+    };
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
@@ -58,16 +56,15 @@ mod tests {
     #[test]
     fn import_decodes_a_well_formed_block() -> Result<()> {
         let bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(bytes.as_slice());
-        let block = Block::consensus_decode(&mut cursor)?;
-        let genesis_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let block = Block::consensus_decode(&bytes)?;
+        let genesis_hash = block.block_hash().0;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = true;
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let outcome = import_block(&state, &bytes)?;
 
         assert_eq!(outcome.tx_count, 1, "genesis has one transaction");
@@ -92,10 +89,10 @@ mod tests {
             "confirmed transaction cache must stay empty"
         );
         let coinbase = block
-            .txdata
+            .txs
             .first()
             .ok_or_else(|| anyhow::anyhow!("genesis block has no transactions"))?;
-        let txid = coinbase.compute_txid();
+        let txid = coinbase.txid();
         let tx_index = state
             .tx_index_query()
             .ok_or_else(|| anyhow::anyhow!("txindex missing after enabled open"))?;
@@ -117,7 +114,7 @@ mod tests {
         }
         let resolved = tx_index.transaction(&txid)?;
         assert_eq!(
-            resolved.as_ref().map(bitcoin::Transaction::compute_txid),
+            resolved.as_ref().map(Tx::txid),
             Some(txid),
             "genesis coinbase must resolve through txindex"
         );
@@ -128,23 +125,116 @@ mod tests {
         Ok(())
     }
 
+    fn compute_merkle_root(block: &Block) -> Option<Hash256> {
+        let mut leaves: Vec<[u8; 32]> = block.txs.iter().map(|tx| *tx.txid().as_bytes()).collect();
+        if leaves.is_empty() {
+            return None;
+        }
+        while leaves.len() > 1 {
+            let original_len = leaves.len();
+            let mut next = Vec::with_capacity(original_len.div_ceil(2));
+            for pos in 0..original_len.div_ceil(2) {
+                let left = leaves[2 * pos];
+                let right = leaves[(2 * pos + 1).min(original_len - 1)];
+                let mut pair = [0_u8; 64];
+                pair[..32].copy_from_slice(&left);
+                pair[32..].copy_from_slice(&right);
+                next.push(double_sha256(&pair).to_le_bytes());
+            }
+            leaves = next;
+        }
+        Some(Hash256::from_le_bytes(&leaves[0]))
+    }
+
+    fn pow_met(bits: u32, hash: Hash256) -> bool {
+        // Interpret the hash as a little-endian 256-bit integer and compare it
+        // against the decoded compact target. Regtest bits 0x207f_ffff is the
+        // easiest target (about half of all hashes pass); lower targets reject
+        // more. Both arrays are reversed into big-endian order so `[u8; 32]`
+        // ordering is numeric ordering.
+        let target = uint_be(&compact_to_target(bits));
+        if target == [0_u8; 32] {
+            return false;
+        }
+        uint_be(&hash.to_le_bytes()) <= target
+    }
+
+    fn compact_to_target(bits: u32) -> [u8; 32] {
+        let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
+        let mantissa = u64::from(bits & 0x007f_ffff);
+        let mut target = [0_u8; 32];
+        if exponent <= 3 {
+            let val = mantissa >> (8 * (3 - exponent));
+            target[..8].copy_from_slice(&val.to_le_bytes());
+        } else {
+            let shift = 8 * (exponent - 3);
+            if shift < 256 {
+                let byte_shift = shift / 8;
+                for (offset, &byte) in mantissa.to_le_bytes().iter().enumerate() {
+                    let position = byte_shift + offset;
+                    if position < 32 {
+                        target[position] = byte;
+                    }
+                }
+            }
+        }
+        if mantissa != 0 && bits & 0x0080_0000 != 0 {
+            return [0_u8; 32];
+        }
+        if mantissa != 0
+            && (exponent > 34
+                || (mantissa > 0xff && exponent > 33)
+                || (mantissa > 0xffff && exponent > 32))
+        {
+            return [0_u8; 32];
+        }
+        target
+    }
+
+    /// Reverses a 32-byte little-endian integer so array ordering is numeric.
+    fn uint_be(bytes: &[u8; 32]) -> [u8; 32] {
+        let mut arr = [0_u8; 32];
+        arr.copy_from_slice(bytes);
+        arr.reverse();
+        arr
+    }
+
+    fn mine_header_to_declared_target(header: &mut Header) -> Result<()> {
+        while !pow_met(header.bits, header.compute_hash().0) {
+            header.nonce = header
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("exhausted nonce while mining test header"))?;
+        }
+        Ok(())
+    }
+
+    fn mine_block_to_declared_target(block: &mut Block) -> Result<()> {
+        while !pow_met(block.header.bits, block.block_hash().0) {
+            block.header.nonce = block
+                .header
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("exhausted nonce while mining test block"))?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn import_rejects_block_whose_hash_exceeds_declared_target() -> Result<()> {
         let genesis_bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
-        let mut block = Block::consensus_decode(&mut cursor)?;
+        let mut block = Block::consensus_decode(&genesis_bytes)?;
         block.header.prev_blockhash = block.block_hash();
         block.header.time = block.header.time.saturating_add(1);
-        block.header.bits = bitcoin::CompactTarget::from_consensus(0x0010_0001);
+        block.header.bits = 0x0010_0001;
 
-        let mut block_bytes = Vec::new();
-        block.consensus_encode(&mut block_bytes)?;
+        let block_bytes = consensus_bytes(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -175,24 +265,23 @@ mod tests {
 
     #[test]
     fn import_rejects_block_with_target_above_network_limit() -> Result<()> {
-        let genesis_block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
-        let genesis_bytes = encode_block(&genesis_block)?;
+        let genesis_block = crate::Network::Mainnet.genesis_block();
+        let genesis_bytes = encode_block(&genesis_block);
         let mut block = genesis_block.clone();
         block.header.prev_blockhash = genesis_block.block_hash();
         block.header.time = block.header.time.saturating_add(1);
-        block.header.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
-        block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
-        block.header.merkle_root = block
-            .compute_merkle_root()
+        block.header.bits = 0x207f_ffff;
+        block.txs[0].inputs[0].script_sig = vec![1, 1];
+        block.header.merkle_root = compute_merkle_root(&block)
             .ok_or_else(|| anyhow::anyhow!("mutated block should have merkle root"))?;
         mine_block_to_declared_target(&mut block)?;
-        let block_bytes = encode_block(&block)?;
+        let block_bytes = encode_block(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Mainnet);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Mainnet);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -223,23 +312,21 @@ mod tests {
     #[test]
     fn import_rejects_non_retarget_child_with_changed_nbits() -> Result<()> {
         let genesis_bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
-        let mut block = Block::consensus_decode(&mut cursor)?;
+        let mut block = Block::consensus_decode(&genesis_bytes)?;
         block.header.prev_blockhash = block.block_hash();
         block.header.time = block.header.time.saturating_add(1);
-        block.header.bits = bitcoin::CompactTarget::from_consensus(0x207e_ffff);
-        block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
-        block.header.merkle_root = block
-            .compute_merkle_root()
+        block.header.bits = 0x207e_ffff;
+        block.txs[0].inputs[0].script_sig = vec![1, 1];
+        block.header.merkle_root = compute_merkle_root(&block)
             .ok_or_else(|| anyhow::anyhow!("mutated block should have merkle root"))?;
         mine_block_to_declared_target(&mut block)?;
-        let block_bytes = encode_block(&block)?;
+        let block_bytes = encode_block(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -274,24 +361,21 @@ mod tests {
     #[test]
     fn import_two_blocks_in_sequence_advances_height_to_one() -> Result<()> {
         let genesis_bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
-        let mut follow_up = Block::consensus_decode(&mut cursor)?;
+        let mut follow_up = Block::consensus_decode(&genesis_bytes)?;
         follow_up.header.prev_blockhash = follow_up.block_hash();
         follow_up.header.time = follow_up.header.time.saturating_add(1);
-        follow_up.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
-        follow_up.header.merkle_root = follow_up
-            .compute_merkle_root()
+        follow_up.txs[0].inputs[0].script_sig = vec![1, 1];
+        follow_up.header.merkle_root = compute_merkle_root(&follow_up)
             .ok_or_else(|| anyhow::anyhow!("follow-up block should have merkle root"))?;
         mine_block_to_declared_target(&mut follow_up)?;
 
-        let mut follow_up_bytes = Vec::new();
-        follow_up.consensus_encode(&mut follow_up_bytes)?;
+        let follow_up_bytes = consensus_bytes(&follow_up);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
         let _follow_up = import_block(&state, &follow_up_bytes)?;
@@ -307,24 +391,21 @@ mod tests {
     #[test]
     fn two_block_import_grows_block_tree_to_two_headers() -> Result<()> {
         let genesis_bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
-        let mut follow_up = Block::consensus_decode(&mut cursor)?;
+        let mut follow_up = Block::consensus_decode(&genesis_bytes)?;
         follow_up.header.prev_blockhash = follow_up.block_hash();
         follow_up.header.time = follow_up.header.time.saturating_add(1);
-        follow_up.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
-        follow_up.header.merkle_root = follow_up
-            .compute_merkle_root()
+        follow_up.txs[0].inputs[0].script_sig = vec![1, 1];
+        follow_up.header.merkle_root = compute_merkle_root(&follow_up)
             .ok_or_else(|| anyhow::anyhow!("follow-up block should have merkle root"))?;
         mine_block_to_declared_target(&mut follow_up)?;
 
-        let mut follow_up_bytes = Vec::new();
-        follow_up.consensus_encode(&mut follow_up_bytes)?;
+        let follow_up_bytes = consensus_bytes(&follow_up);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
         let _follow_up = import_block(&state, &follow_up_bytes)?;
@@ -336,41 +417,35 @@ mod tests {
     #[test]
     fn import_rejects_block_with_unspendable_input_tx() -> Result<()> {
         let genesis_bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
-        let mut block = Block::consensus_decode(&mut cursor)?;
+        let mut block = Block::consensus_decode(&genesis_bytes)?;
         block.header.prev_blockhash = block.block_hash();
         block.header.time = block.header.time.saturating_add(1);
-        block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
-        block.txdata.push(bitcoin::Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint {
-                    txid: bitcoin::Txid::from_byte_array([0_u8; 32]),
-                    vout: 0,
-                },
-                script_sig: bitcoin::ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::new(),
+        block.txs[0].inputs[0].script_sig = vec![1, 1];
+        block.txs.push(Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[0_u8; 32])), 0),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(1),
-                script_pubkey: bitcoin::ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Vec::new(),
             }],
+            lock_time: 0,
         });
-        block.header.merkle_root = block
-            .compute_merkle_root()
+        block.header.merkle_root = compute_merkle_root(&block)
             .ok_or_else(|| anyhow::anyhow!("mutated block should have merkle root"))?;
         mine_block_to_declared_target(&mut block)?;
 
-        let mut block_bytes = Vec::new();
-        block.consensus_encode(&mut block_bytes)?;
+        let block_bytes = consensus_bytes(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -398,48 +473,43 @@ mod tests {
     #[test]
     fn import_rejects_premature_coinbase_spend() -> Result<()> {
         let genesis_bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
-        let genesis_block = Block::consensus_decode(&mut cursor)?;
+        let genesis_block = Block::consensus_decode(&genesis_bytes)?;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let mut coinbase_block = genesis_block.clone();
         coinbase_block.header.prev_blockhash = genesis_block.block_hash();
         coinbase_block.header.time = coinbase_block.header.time.saturating_add(1);
-        coinbase_block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
-        coinbase_block.header.merkle_root = coinbase_block
-            .compute_merkle_root()
+        coinbase_block.txs[0].inputs[0].script_sig = vec![1, 1];
+        coinbase_block.header.merkle_root = compute_merkle_root(&coinbase_block)
             .ok_or_else(|| anyhow::anyhow!("height-1 block should have merkle root"))?;
         mine_block_to_declared_target(&mut coinbase_block)?;
-        let coinbase_bytes = encode_block(&coinbase_block)?;
+        let coinbase_bytes = encode_block(&coinbase_block);
         let _coinbase = import_block(&state, &coinbase_bytes)?;
-        let immature_coinbase_txid = coinbase_block.txdata[0].compute_txid();
+        let immature_coinbase_txid = coinbase_block.txs[0].txid();
 
         let mut block = coinbase_block;
         block.header.prev_blockhash = block.block_hash();
         block.header.time = block.header.time.saturating_add(1);
-        block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 2]);
-        block.txdata.push(bitcoin::Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint {
-                    txid: immature_coinbase_txid,
-                    vout: 0,
-                },
-                script_sig: bitcoin::ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::new(),
+        block.txs[0].inputs[0].script_sig = vec![1, 2];
+        block.txs.push(Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(immature_coinbase_txid, 0),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(1),
-                script_pubkey: bitcoin::ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Vec::new(),
             }],
+            lock_time: 0,
         });
 
         let Err(error) = state.check_coinbase_maturity(&block, 2) else {
@@ -471,28 +541,23 @@ mod tests {
     #[test]
     fn import_rejects_block_with_no_coinbase() -> Result<()> {
         let genesis_bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
-        let mut block = Block::consensus_decode(&mut cursor)?;
+        let mut block = Block::consensus_decode(&genesis_bytes)?;
         block.header.prev_blockhash = block.block_hash();
         block.header.time = block.header.time.saturating_add(1);
-        block.txdata[0].input[0].previous_output = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array([1_u8; 32]),
-            vout: 0,
-        };
-        let merkle_root = block
-            .compute_merkle_root()
+        block.txs[0].inputs[0].previous_output =
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[1_u8; 32])), 0);
+        let merkle_root = compute_merkle_root(&block)
             .ok_or_else(|| anyhow::anyhow!("mutated block should have merkle root"))?;
         block.header.merkle_root = merkle_root;
         mine_block_to_declared_target(&mut block)?;
 
-        let mut block_bytes = Vec::new();
-        block.consensus_encode(&mut block_bytes)?;
+        let block_bytes = consensus_bytes(&block);
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
         let Err(error) = import_block(&state, &block_bytes) else {
@@ -521,26 +586,22 @@ mod tests {
     #[test]
     fn import_rejects_post_bip34_block_with_no_height_in_coinbase() -> Result<()> {
         let genesis_bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-        let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
-        let mut block = Block::consensus_decode(&mut cursor)?;
+        let mut block = Block::consensus_decode(&genesis_bytes)?;
 
         let dir = tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        let state = NodeState::open(config)?;
+        let state = NodeState::open(config, None)?;
         let synthetic_tip = seed_synthetic_header_tip(&state, 499)?;
 
-        block.header.prev_blockhash =
-            bitcoin::BlockHash::from_byte_array(synthetic_tip.hash.to_le_bytes());
-        block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::new();
-        block.header.merkle_root = block
-            .compute_merkle_root()
+        block.header.prev_blockhash = BlockHash(synthetic_tip.hash);
+        block.txs[0].inputs[0].script_sig = Vec::new();
+        block.header.merkle_root = compute_merkle_root(&block)
             .ok_or_else(|| anyhow::anyhow!("mutated block should have merkle root"))?;
         mine_block_to_declared_target(&mut block)?;
 
-        let mut block_bytes = Vec::new();
-        block.consensus_encode(&mut block_bytes)?;
+        let block_bytes = consensus_bytes(&block);
 
         let Err(error) = import_block(&state, &block_bytes) else {
             anyhow::bail!("post-BIP34 block without height should be rejected");
@@ -564,10 +625,8 @@ mod tests {
         Ok(())
     }
 
-    fn encode_block(block: &Block) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        block.consensus_encode(&mut bytes)?;
-        Ok(bytes)
+    fn encode_block(block: &Block) -> Vec<u8> {
+        consensus_bytes(block)
     }
 
     fn seed_synthetic_header_tip(
@@ -576,18 +635,18 @@ mod tests {
     ) -> Result<bitcoin_rs_chain::TipSnapshot> {
         let block_tree = state.block_tree();
         let mut tree = block_tree.write();
-        let bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+        let bits = 0x207f_ffff;
         let mut parent = None;
-        let mut prev_blockhash = bitcoin::BlockHash::all_zeros();
+        let mut prev_blockhash = BlockHash(Hash256::from_le_bytes(&[0_u8; 32]));
         let mut tip = None;
 
         for current_height in 0..=height {
             let mut merkle = [0_u8; 32];
             merkle[..4].copy_from_slice(&current_height.to_le_bytes());
-            let mut header = bitcoin::block::Header {
-                version: bitcoin::block::Version::ONE,
+            let mut header = Header {
+                version: 1,
                 prev_blockhash,
-                merkle_root: bitcoin::TxMerkleNode::from_byte_array(merkle),
+                merkle_root: Hash256::from_le_bytes(&merkle),
                 time: current_height,
                 bits,
                 nonce: 0,
@@ -602,7 +661,7 @@ mod tests {
                 chainwork: node.chainwork,
                 hash: node.hash,
             };
-            prev_blockhash = header.block_hash();
+            prev_blockhash = header.compute_hash();
             parent = Some(node_id);
             tip = Some(snapshot);
         }
@@ -617,27 +676,6 @@ mod tests {
             .applied_tip()
             .store(Some(std::sync::Arc::new(tip.clone())));
         Ok(tip)
-    }
-
-    fn mine_header_to_declared_target(header: &mut bitcoin::block::Header) -> Result<()> {
-        while header.validate_pow(header.target()).is_err() {
-            header.nonce = header
-                .nonce
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("exhausted nonce while mining test header"))?;
-        }
-        Ok(())
-    }
-
-    fn mine_block_to_declared_target(block: &mut Block) -> Result<()> {
-        while block.header.validate_pow(block.header.target()).is_err() {
-            block.header.nonce = block
-                .header
-                .nonce
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("exhausted nonce while mining test block"))?;
-        }
-        Ok(())
     }
 
     fn hex_decode(hex: &str) -> Result<Vec<u8>> {

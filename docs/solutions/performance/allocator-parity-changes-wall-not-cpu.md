@@ -85,5 +85,5 @@ allocator arms still match each other on both commitments.
 5. The fjall panel now beats Core on both required axes. RocksDB and redb remain
    separate final gates; this result does not stand in for them.
 
-The machine-readable source of record is
-[`allocator-custody-v1.json`](../../benchmarks/data/end-to-end-sync/allocator-custody-v1.json).
+The machine-readable source of record is the `allocator-custody-v1` custody
+packet in PR #29.

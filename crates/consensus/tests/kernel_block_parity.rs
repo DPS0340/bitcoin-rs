@@ -76,9 +76,8 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use bitcoin::consensus::encode;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Witness};
 use bitcoin_rs_consensus::ConsensusError;
+use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, consensus_bytes, deserialize};
 use bitcoin_rs_script::{Interpreter, VerifyFlags};
 use serde::Deserialize;
 
@@ -120,13 +119,9 @@ impl Verdict {
 
 /// Kernel verdict for every input of `tx`, through the same free function the
 /// production `verify_transaction` dispatches to under `feature = "kernel"`.
-fn kernel_result(
-    tx: &Transaction,
-    prevouts: &[TxOut],
-    flags: VerifyFlags,
-) -> Result<(), ConsensusError> {
+fn kernel_result(tx: &Tx, prevouts: &[TxOut], flags: VerifyFlags) -> Result<(), ConsensusError> {
     let spent: Vec<(OutPoint, TxOut)> = tx
-        .input
+        .inputs
         .iter()
         .zip(prevouts)
         .map(|(input, prevout)| (input.previous_output, prevout.clone()))
@@ -140,17 +135,13 @@ fn kernel_result(
 /// verdicts into the kernel (see module docs, ADV-1), which
 /// would make the differential kernel-vs-kernel. Returns the first failing
 /// input's error, `Ok` when all inputs pass.
-fn interpreter_result(
-    tx: &Transaction,
-    prevouts: &[TxOut],
-    flags: VerifyFlags,
-) -> Result<(), String> {
-    for (input_index, (input, prevout)) in tx.input.iter().zip(prevouts).enumerate() {
-        let witness = input.witness.to_vec();
+fn interpreter_result(tx: &Tx, prevouts: &[TxOut], flags: VerifyFlags) -> Result<(), String> {
+    for (input_index, (input, prevout)) in tx.inputs.iter().zip(prevouts).enumerate() {
+        let witness = input.witness.clone();
         Interpreter
             .execute(
-                prevout.script_pubkey.as_bytes(),
-                input.script_sig.as_bytes(),
+                &prevout.script_pubkey,
+                &input.script_sig,
                 &witness,
                 flags,
                 prevout,
@@ -216,7 +207,7 @@ impl Mutation {
     /// Applies the mutation to a clone of `tx`. Returns `None` when the
     /// mutation does not apply (e.g. witness tampering on a legacy spend) so
     /// the caller skips it rather than asserting on a no-op.
-    fn apply(self, tx: &Transaction) -> Option<Transaction> {
+    fn apply(self, tx: &Tx) -> Option<Tx> {
         let mut tx = tx.clone();
         let applied = match self {
             Self::Pristine => true,
@@ -283,20 +274,20 @@ fn is_signature_element(element: &[u8]) -> bool {
     looks_like_der_sig(element) || matches!(element.len(), 64 | 65)
 }
 
-fn flip_signature_bit(tx: &mut Transaction) -> bool {
-    for input in &mut tx.input {
-        let mut bytes = input.script_sig.to_bytes();
+fn flip_signature_bit(tx: &mut Tx) -> bool {
+    for input in &mut tx.inputs {
+        let mut bytes = input.script_sig.clone();
         if let Some((start, len)) = der_sig_range(&bytes)
             && let Some(mid) = start.checked_add(len / 2)
             && let Some(byte) = bytes.get_mut(mid)
         {
             *byte ^= 0x01;
-            input.script_sig = ScriptBuf::from_bytes(bytes);
+            input.script_sig = bytes;
             return true;
         }
     }
-    for input in &mut tx.input {
-        let mut elements = input.witness.to_vec();
+    for input in &mut tx.inputs {
+        let mut elements = input.witness.clone();
         if let Some(element) = elements
             .iter_mut()
             .find(|element| is_signature_element(element))
@@ -304,7 +295,7 @@ fn flip_signature_bit(tx: &mut Transaction) -> bool {
             let mid = element.len() / 2;
             if let Some(byte) = element.get_mut(mid) {
                 *byte ^= 0x01;
-                input.witness = Witness::from_slice(&elements);
+                input.witness = elements;
                 return true;
             }
         }
@@ -312,20 +303,20 @@ fn flip_signature_bit(tx: &mut Transaction) -> bool {
     false
 }
 
-fn truncate_script_sig(tx: &mut Transaction) -> bool {
-    for input in &mut tx.input {
-        let mut bytes = input.script_sig.to_bytes();
+fn truncate_script_sig(tx: &mut Tx) -> bool {
+    for input in &mut tx.inputs {
+        let mut bytes = input.script_sig.clone();
         if bytes.pop().is_some() {
-            input.script_sig = ScriptBuf::from_bytes(bytes);
+            input.script_sig = bytes;
             return true;
         }
     }
     false
 }
 
-fn wrong_sighash_type_byte(tx: &mut Transaction) -> bool {
-    for input in &mut tx.input {
-        let mut bytes = input.script_sig.to_bytes();
+fn wrong_sighash_type_byte(tx: &mut Tx) -> bool {
+    for input in &mut tx.inputs {
+        let mut bytes = input.script_sig.clone();
         if let Some((start, len)) = der_sig_range(&bytes)
             && let Some(last) = start.checked_add(len.saturating_sub(1))
             && let Some(byte) = bytes.get_mut(last)
@@ -334,12 +325,12 @@ fn wrong_sighash_type_byte(tx: &mut Transaction) -> bool {
             // always a different byte, so the signature's committed hash no
             // longer matches what the verifier computes.
             *byte ^= 0x02;
-            input.script_sig = ScriptBuf::from_bytes(bytes);
+            input.script_sig = bytes;
             return true;
         }
     }
-    for input in &mut tx.input {
-        let mut elements = input.witness.to_vec();
+    for input in &mut tx.inputs {
+        let mut elements = input.witness.clone();
         let mut mutated = false;
         for element in &mut elements {
             if looks_like_der_sig(element) || element.len() == 65 {
@@ -359,23 +350,23 @@ fn wrong_sighash_type_byte(tx: &mut Transaction) -> bool {
             }
         }
         if mutated {
-            input.witness = Witness::from_slice(&elements);
+            input.witness = elements;
             return true;
         }
     }
     false
 }
 
-fn tamper_witness(tx: &mut Transaction) -> bool {
-    for input in &mut tx.input {
-        let mut elements = input.witness.to_vec();
+fn tamper_witness(tx: &mut Tx) -> bool {
+    for input in &mut tx.inputs {
+        let mut elements = input.witness.clone();
         if let Some(last) = elements.last_mut()
             && !last.is_empty()
         {
             let mid = last.len() / 2;
             if let Some(byte) = last.get_mut(mid) {
                 *byte ^= 0x01;
-                input.witness = Witness::from_slice(&elements);
+                input.witness = elements;
                 return true;
             }
         }
@@ -383,11 +374,11 @@ fn tamper_witness(tx: &mut Transaction) -> bool {
     false
 }
 
-fn truncate_witness(tx: &mut Transaction) -> bool {
-    for input in &mut tx.input {
-        let mut elements = input.witness.to_vec();
+fn truncate_witness(tx: &mut Tx) -> bool {
+    for input in &mut tx.inputs {
+        let mut elements = input.witness.clone();
         if elements.pop().is_some() {
-            input.witness = Witness::from_slice(&elements);
+            input.witness = elements;
             return true;
         }
     }
@@ -451,7 +442,7 @@ struct Fixture {
     /// Whether interpreter-vs-kernel parity is asserted for this fixture.
     interpreter_parity: bool,
     /// The decoded pristine transaction.
-    tx: Transaction,
+    tx: Tx,
     /// Every input's prevout, in input order.
     prevouts: Vec<TxOut>,
     /// Parsed verify flags active at `height`.
@@ -486,9 +477,9 @@ fn load_fixtures() -> Result<Vec<Fixture>, Box<dyn Error>> {
 }
 
 fn validate_fixture(file: FixtureFile, path: &Path) -> Result<Fixture, Box<dyn Error>> {
-    let tx: Transaction = encode::deserialize(&decode_hex(&file.tx_hex)?)
+    let tx: Tx = deserialize(&decode_hex(&file.tx_hex)?)
         .map_err(|error| format!("{}: tx hex does not decode: {error}", path.display()))?;
-    let computed_txid = tx.compute_txid().to_string();
+    let computed_txid = tx.txid().to_string();
     if computed_txid != file.txid {
         return Err(format!(
             "{}: txid mismatch: manifest says {} but tx hex hashes to {computed_txid}",
@@ -497,7 +488,7 @@ fn validate_fixture(file: FixtureFile, path: &Path) -> Result<Fixture, Box<dyn E
         )
         .into());
     }
-    let computed_wtxid = tx.compute_wtxid().to_string();
+    let computed_wtxid = tx.wtxid().to_string();
     if computed_wtxid != file.wtxid {
         return Err(format!(
             "{}: wtxid mismatch: manifest says {} but tx hex hashes to {computed_wtxid} \
@@ -507,13 +498,13 @@ fn validate_fixture(file: FixtureFile, path: &Path) -> Result<Fixture, Box<dyn E
         )
         .into());
     }
-    if file.prevouts.len() != tx.input.len() {
+    if file.prevouts.len() != tx.inputs.len() {
         return Err(format!(
             "{}: {} prevouts for {} inputs; every input needs its prevout \
              (the kernel taproot path requires all of them)",
             path.display(),
             file.prevouts.len(),
-            tx.input.len()
+            tx.inputs.len()
         )
         .into());
     }
@@ -524,8 +515,8 @@ fn validate_fixture(file: FixtureFile, path: &Path) -> Result<Fixture, Box<dyn E
         .iter()
         .map(|prevout| {
             Ok(TxOut {
-                value: Amount::from_sat(prevout.amount_sat),
-                script_pubkey: ScriptBuf::from_bytes(decode_hex(&prevout.script_hex)?),
+                value: prevout.amount_sat,
+                script_pubkey: decode_hex(&prevout.script_hex)?,
             })
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
@@ -587,7 +578,7 @@ fn script_verdict_parity() -> TestResult {
 
     let mut interpreter_scoped = 0usize;
     for fixture in &fixtures {
-        let pristine_bytes = encode::serialize(&fixture.tx);
+        let pristine_bytes = consensus_bytes(&fixture.tx);
         let mut reject_mutations = 0usize;
 
         for mutation in Mutation::ALL {
@@ -596,7 +587,7 @@ fn script_verdict_parity() -> TestResult {
             };
             if mutation != Mutation::Pristine {
                 assert_ne!(
-                    encode::serialize(&tx),
+                    consensus_bytes(&tx),
                     pristine_bytes,
                     "mutation {mutation:?} must change tx bytes: fixture={}",
                     fixture.name,
@@ -664,51 +655,32 @@ fn script_verdict_parity() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: the differential cannot be kernel-vs-kernel (ADV-1 pin).
+// Test 2: neither arm of the differential is constant (ADV-1 pin).
 // ---------------------------------------------------------------------------
 
-/// Proves [`script_verdict_parity`]'s Rust side is not the kernel in disguise
-/// by asserting the engines *disagree* on two inputs where they are known to
-/// differ. If anyone re-routes [`interpreter_result`] through the production
-/// `verify_transaction` (which dispatches to the kernel under this feature),
-/// both checks collapse into agreement and this test goes red.
+/// Proves [`script_verdict_parity`] compares two live engines rather than two
+/// constants.
 ///
-/// Known divergences used:
-/// 1. An `OP_TRUE` output spent with a non-empty scriptSig: the kernel
-///    executes it and accepts; the interpreter's non-taproot path in this
-///    binary (no `bitcoinconsensus`) only accepts the empty-scriptSig
-///    `OP_TRUE` form and rejects everything else.
-/// 2. The committed taproot **script-path** fixture: the kernel accepts the
-///    pristine spend; the interpreter supports only key-path witnesses and
-///    rejects script-path spends by construction.
+/// The original pin asserted the engines DISAGREE, because the Rust side then
+/// rejected every spend class the kernel executed. That premise died with the
+/// stub: the native path now verifies legacy, P2SH, segwit v0 and taproot
+/// spends, so agreement is the expected result and disagreement would be the
+/// defect.
+///
+/// What still needs proving is that each arm reads the transaction it is
+/// handed. So each engine is run twice on the committed taproot script-path
+/// fixture, once pristine and once with a tampered control block, and each
+/// must accept the first and reject the second. An arm wired to a constant
+/// verdict - or short-circuited to the other engine's answer - fails one of
+/// the four assertions.
 #[test]
 fn differential_is_non_vacuous() -> TestResult {
-    // (1) Crafted divergence, independent of the committed corpus.
-    let tx = op_true_spend_with_push_script_sig();
-    let prevouts = vec![TxOut {
-        value: Amount::from_sat(50_000),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-    }];
-    let kernel = kernel_result(&tx, &prevouts, VerifyFlags::NONE);
-    let interpreter = interpreter_result(&tx, &prevouts, VerifyFlags::NONE);
-    assert_eq!(
-        Verdict::of(&kernel),
-        Verdict::Accept,
-        "kernel must accept OP_TRUE spent with a push-only scriptSig: {kernel:?}"
-    );
-    assert_eq!(
-        Verdict::of(&interpreter),
-        Verdict::Reject,
-        "interpreter must reject the non-empty-scriptSig OP_TRUE spend; if it \
-         accepted, the Rust side of the differential is reaching the kernel"
-    );
-
-    // (2) Fixture-grounded divergence on a real mainnet spend.
     let fixtures = load_fixtures()?;
     let script_path = fixtures
         .iter()
         .find(|fixture| fixture.class == "taproot_scriptpath")
         .ok_or("taproot_scriptpath fixture missing from the committed corpus")?;
+
     let kernel = kernel_result(&script_path.tx, &script_path.prevouts, script_path.flags);
     let interpreter = interpreter_result(&script_path.tx, &script_path.prevouts, script_path.flags);
     assert_eq!(
@@ -718,9 +690,26 @@ fn differential_is_non_vacuous() -> TestResult {
     );
     assert_eq!(
         Verdict::of(&interpreter),
+        Verdict::Accept,
+        "interpreter must accept the pristine taproot script-path fixture: {interpreter:?}"
+    );
+
+    let tampered = Mutation::TamperWitness
+        .apply(&script_path.tx)
+        .ok_or("TamperWitness must apply to a taproot script-path spend")?;
+    let kernel = kernel_result(&tampered, &script_path.prevouts, script_path.flags);
+    let interpreter = interpreter_result(&tampered, &script_path.prevouts, script_path.flags);
+    assert_eq!(
+        Verdict::of(&kernel),
         Verdict::Reject,
-        "interpreter must reject the script-path spend (key-path-only support); \
-         agreement here means the differential collapsed to kernel-vs-kernel"
+        "kernel must reject a tampered control block; a constant Accept means \
+         the kernel arm is not reading the transaction: {kernel:?}"
+    );
+    assert_eq!(
+        Verdict::of(&interpreter),
+        Verdict::Reject,
+        "interpreter must reject a tampered control block; a constant Accept \
+         means the Rust arm is not reading the transaction: {interpreter:?}"
     );
     Ok(())
 }
@@ -728,21 +717,21 @@ fn differential_is_non_vacuous() -> TestResult {
 /// A minimal transaction spending an `OP_TRUE` output with `scriptSig =
 /// OP_PUSHNUM_1`. Not consensus-valid as a chain transaction (null prevout);
 /// it only needs to drive per-input script verification.
-fn op_true_spend_with_push_script_sig() -> Transaction {
-    use bitcoin::{Sequence, TxIn, absolute, transaction};
+fn op_true_spend_with_push_script_sig() -> Tx {
+    use bitcoin_rs_primitives::TxIn;
 
-    Transaction {
-        version: transaction::Version(1),
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::from_bytes(vec![0x51]),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+    Tx {
+        version: 1,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::default(),
+            script_sig: vec![0x51],
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(40_000),
-            script_pubkey: ScriptBuf::new(),
+        outputs: vec![TxOut {
+            value: 40_000,
+            script_pubkey: Vec::new(),
         }],
     }
 }
@@ -757,13 +746,13 @@ fn op_true_spend_with_push_script_sig() -> Transaction {
 #[test]
 fn pristine_mutation_is_identity() -> TestResult {
     let tx = op_true_spend_with_push_script_sig();
-    let before = encode::serialize(&tx);
+    let before = consensus_bytes(&tx);
     let after_tx = Mutation::Pristine
         .apply(&tx)
         .ok_or("Pristine must always apply")?;
     assert_eq!(
         before,
-        encode::serialize(&after_tx),
+        consensus_bytes(&after_tx),
         "Pristine mutation must be a byte-exact identity"
     );
 
