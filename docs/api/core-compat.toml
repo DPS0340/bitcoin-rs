@@ -4,11 +4,12 @@
 # method, REST route and ZMQ topic this node exposes, each with the status it is
 # claimed at and what has actually checked that claim.
 #
-# THIS FILE IS ENFORCED, NOT DESCRIBED. `crates/rpc/src/compat.rs` embeds it at
-# compile time and cross-checks it against the dispatcher, the REST router, the
-# ZMQ topic table and `Cargo.lock`. Adding a method without an entry here fails
-# the test suite; so does an entry for a method that does not dispatch, and so
-# does bumping the kernel crate without revisiting the pinned reference below.
+# THIS FILE IS ENFORCED, NOT DESCRIBED. `crates/rpc/src/compat_manifest.rs`
+# embeds it at compile time and cross-checks it against the dispatcher, the
+# REST router, the ZMQ topic table and `Cargo.lock`. Adding a method without
+# an entry here fails the test suite; so does an entry for a method that does
+# not dispatch, and so does bumping the kernel crate without revisiting the
+# pinned reference below.
 #
 # Anything absent from this file is `not_implemented` and answers JSON-RPC
 # -32601. That is asserted rather than assumed -- see
@@ -56,8 +57,15 @@ differential_harness = false
 #                          "treating a Core method name as proof of behavioral
 #                          compatibility" as a non-goal -- so the manifest
 #                          refuses to call these supported.
-#   disabled               refused by product policy with a stable error. This
-#                          node holds no private keys.
+#   extension              bitcoin-rs-specific surface with no Core
+#                          counterpart. Not a compatibility claim against
+#                          the pinned reference; recorded so the manifest
+#                          names every method the dispatcher answers.
+#   disabled               refused by product policy with a stable error at
+#                          the parameter level (e.g. `deriveaddresses` refuses
+#                          ranged descriptors). No whole method is disabled;
+#                          methods this node does not expose are simply absent
+#                          from this file and answer -32601.
 #   not_implemented        not dispatched; answers -32601.
 #
 # Entries may also carry a field-level record of how the result shape differs
@@ -227,11 +235,6 @@ group = "mempool"
 status = "implemented_unverified"
 
 [[rpc]]
-method = "clearmempool"
-group = "mempool"
-status = "implemented_unverified"
-
-[[rpc]]
 method = "getmempoolancestors"
 group = "mempool"
 status = "implemented_unverified"
@@ -378,16 +381,6 @@ group = "wallet"
 status = "implemented_unverified"
 
 [[rpc]]
-method = "walletcreatefundedpsbt"
-group = "wallet"
-status = "implemented_unverified"
-
-[[rpc]]
-method = "walletprocesspsbt"
-group = "wallet"
-status = "implemented_unverified"
-
-[[rpc]]
 method = "finalizepsbt"
 group = "wallet"
 status = "implemented_unverified"
@@ -398,81 +391,19 @@ group = "wallet"
 status = "implemented_unverified"
 
 [[rpc]]
-method = "bumpfee"
-group = "wallet"
+method = "createrawtransaction"
+group = "rawtransactions"
 status = "implemented_unverified"
 
 [[rpc]]
-method = "signrawtransactionwithkey"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
+method = "getcapabilities"
+group = "blockchain"
+status = "extension"
 
 [[rpc]]
-method = "signrawtransactionwithwallet"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "dumpprivkey"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "dumpwallet"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "importprivkey"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "importwallet"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "importmulti"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "importdescriptors"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "sethdseed"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "walletpassphrase"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "walletpassphrasechange"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
-
-[[rpc]]
-method = "encryptwallet"
-group = "wallet"
-status = "disabled"
-deviation = "This node holds no private keys. The method is refused with a stable error rather than partially imitated, so a caller learns the capability is absent instead of receiving a half-signed result."
+method = "getnodeaddresses"
+group = "network"
+status = "implemented_unverified"
 
 # ---------------------------------------------------------------------------
 # REST

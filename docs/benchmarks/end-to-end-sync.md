@@ -1,8 +1,8 @@
 # End-to-end sync benchmarks
 
-> **Evidence status:** This page publishes completed historical runs and their raw JSON. All numbers and artifacts below reflect historical runs performed prior to the Task 16 cutover, where `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine across `bitcoin-rs-consensus`, `bitcoin-rs-node`, and `bitcoin-rs`.
+> **Evidence status:** This page publishes completed historical runs and their raw JSON. All numbers and artifacts below reflect historical runs performed prior to the Task 16 cutover, where `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine in `bitcoin-rs-consensus` and `bitcoin-rs-node`. The `bin/bitcoin-rs` binary later dropped `kernel` from its defaults (`default = ["fjall", "redb", "zmq"]`), so `cargo build -p bitcoin-rs` no longer links `bitcoinkernel`; pass `--features kernel` for the kernel consensus engine.
 >
-> The obsolete `bitcoinconsensus` backend was removed in Task 16 after fresh mainnet IBD stopped at block 938344 (exposing missing complete prevouts and unsupported Taproot script-path verification in the portable path). Default builds now require system dependencies (`cmake` and `libboost-dev`).
+> The obsolete `bitcoinconsensus` backend was removed in Task 16 after fresh mainnet IBD stopped at block 938344 (exposing missing complete prevouts and unsupported Taproot script-path verification in the portable path). Builds with `kernel` require system dependencies (`cmake` and `libboost-dev`).
 >
 > Historical `bitcoinconsensus` and early experimental `kernel` numbers published here serve as historical records and are non-comparable with kernel-default production builds. No full-tip (height 957,600+) live IBD run or G14 performance-gate pass has been completed under the landed kernel default. Final performance claims remain pending fresh measurements.
 
@@ -12,11 +12,11 @@ The machine-readable attachments preserve every recorded field and stage timer. 
 
 | Run | Range | Validation | Block source | Commit | Elapsed | Throughput | Peak RSS | Raw artifact |
 |---|---:|---|---|---|---:|---:|---:|---|
-| Current-campaign control, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 88.667s | 1,691.726 blocks/s | 301.6 MiB | [`rs-parprep-current-control-r1.json`](data/end-to-end-sync/rs-parprep-current-control-r1.json) |
-| Current-campaign candidate, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 96.732s | 1,550.684 blocks/s | 308.2 MiB | [`rs-parprep-current-candidate-r2.json`](data/end-to-end-sync/rs-parprep-current-candidate-r2.json) |
-| Long local replay, 0–642,000 | 0–642,000 | Assume-valid through 642,000 | `legacy-fjall-chainstate` | `9ce0727` | 2h 43m 58.256s | 65.256 blocks/s | 6.827 GiB | [`rs-spendable-local-nobody-a014.json`](data/end-to-end-sync/rs-spendable-local-nobody-a014.json) |
-| Inferred `parverify` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `3023eb0` | 296.211s | 506.399 blocks/s | 2.210 GiB | [`rs-replay-150k-parverify.json`](data/end-to-end-sync/rs-replay-150k-parverify.json) |
-| Inferred `kernel` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `fb2227e` | 232.208s | 645.977 blocks/s | 2.219 GiB | [`rs-replay-150k-kernel.json`](data/end-to-end-sync/rs-replay-150k-kernel.json) |
+| Current-campaign control, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 88.667s | 1,691.726 blocks/s | 301.6 MiB | rs-parprep-current-control-r1 (retired) |
+| Current-campaign candidate, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 96.732s | 1,550.684 blocks/s | 308.2 MiB | rs-parprep-current-candidate-r2 (retired) |
+| Long local replay, 0–642,000 | 0–642,000 | Assume-valid through 642,000 | `legacy-fjall-chainstate` | `9ce0727` | 2h 43m 58.256s | 65.256 blocks/s | 6.827 GiB | rs-spendable-local-nobody-a014 (retired) |
+| Inferred `parverify` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `3023eb0` | 296.211s | 506.399 blocks/s | 2.210 GiB | rs-replay-150k-parverify (retired) |
+| Inferred `kernel` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `fb2227e` | 232.208s | 645.977 blocks/s | 2.219 GiB | rs-replay-150k-kernel (retired) |
 
 All five artifacts pass these structural checks: schema `mainnet-prefix-replay-v1`, genesis start hash, positive elapsed time and throughput, non-empty stage list, and `block_count = stop_height - start_height + 1`.
 
@@ -59,16 +59,15 @@ The live runs were sequential single samples. Peer conditions and validation pos
 
 Later code changed both failed bitcoin-rs paths, but no completed rerun is attached. This report does not infer results from those fixes.
 
-## G14 gate status
+## Historical performance evidence
 
 | Budget | Required evidence | Status in this publication |
 |---|---|---|
 | IBD throughput | bitcoin-rs faster than Bitcoin Core on one identical window | Bounded 0–150,000 one-peer daemon IBD: Core median 73.459s vs bitcoin-rs 89.576s; Core delivered 1.219× bitcoin-rs throughput; gate and 2× target failed |
 | UTXO commit p95 | ≤50ms for serialized blocks ≥1MB | Not captured |
-| Electrum history p95 | ≤30ms over 10,000 non-empty calls | Bounded 0–150,000 p95: 1.213ms; current-tip evidence not captured |
-| Tip RSS | ≤16GiB with fjall, txindex, and blockfilterindex | Bounded txindex-only RSS: 313.1MB; completed current-tip evidence with both indexes not captured |
+| Tip RSS | ≤16GiB with fjall and txindex | Bounded txindex-only RSS: 313.1MB; completed current-tip evidence not captured |
 
-The ignored `g14_perf_budgets` gate must remain unclaimed.
+These historical measurements do not establish a current performance claim.
 
 ## Bounded current evidence
 
@@ -89,26 +88,18 @@ validation, persistence, crash recovery, or reorg-availability semantics to clai
 
 The transaction-index comparison is not workload parity. Bitcoin Core stores
 transaction lookup positions. bitcoin-rs also stores confirmed headers, funding,
-spending, and script-history rows for RPC and Electrum queries. A nine-run bitcoin-rs
+spending, and script-history rows for RPC and ScriptIndex queries. A nine-run bitcoin-rs
 row-limit sweep retained the 1,000,000-row limit. The 250,000-, 500,000-, 2,000,000-,
 and 4,000,000-row candidates, plus the Fjall `bytes_1` feature-only and
 `bytes_1`-plus-owned-value candidates, failed the required 1.05× throughput gate.
 Every bitcoin-rs TxIndex run produced the same logical digest.
 
-On the same bounded tip, setting `TCP_NODELAY` on every accepted Electrum socket
-reduced `blockchain.scripthash.get_history` p95 from 42.749ms to a three-run median
-of 1.213ms over 10,000 non-empty calls, a 35.237× speedup. This clears the latency
-budget on the bounded corpus. It does not replace current-tip evidence.
-
 The full corpus, treatment, binary, timing, memory, free-space, restore, and rejected
 candidate custody is in
-[`bounded-performance-custody-v1.json`](data/end-to-end-sync/bounded-performance-custody-v1.json).
-The Electrum treatment, raw artifact hashes, tests, and mutation proof are in
-[`electrum-nodelay-custody-v1.json`](data/end-to-end-sync/electrum-nodelay-custody-v1.json).
+bounded-performance-custody-v1 (retired).
 The campaign retained one bounded corpus root with one canonical archive per
 implementation and deleted each disposable fixture before the next run. These bounded
-results do not satisfy the live-IBD, current-tip RSS, or current-tip Electrum-history
-gates above.
+results do not satisfy the live-IBD or current-tip RSS gates above.
 
 ## Bounded daemon IBD comparison
 
@@ -136,7 +127,7 @@ Every run reached the exact height 150,000 endpoint (block hash `0000000000000a3
 - The PGO (`w128`) candidate measured 89.266232737s (1.003470356× wall ratio vs the 89.576018374s baseline) and was rejected below the 1.05× continuation threshold.
 - The eight-proxy same-seed run measured 115.429379346s (28.861922467% slower than the one-peer median) and was rejected as topology reconnaissance only.
 
-The complete machine-readable custody is in [`daemon-ibd-custody-v1.json`](data/end-to-end-sync/daemon-ibd-custody-v1.json).
+The complete machine-readable custody is in daemon-ibd-custody-v1 (retired).
 
 ## Raw artifact integrity
 
@@ -148,14 +139,13 @@ The complete machine-readable custody is in [`daemon-ibd-custody-v1.json`](data/
 | `rs-replay-150k-parverify.json` | `f1704f895a958afcf5fcce2f829954056e9864af87bf4f0483c29af36599ac29` |
 | `rs-replay-150k-kernel.json` | `d722ab149c39c5f13e18c6358ab999f4c1f44ce46b37a9d0eb87bfd45e0b91a9` |
 | `bounded-performance-custody-v1.json` | `ce3e561dbd2119579f359b7cf55f8b84211c4c1eec3953cf40762f07faabb3cf` |
-| `electrum-nodelay-custody-v1.json` | `b57087cf368d3e56da75c543c6ba780115a7a6684db03a11e2692d6648b29abf` |
 | `daemon-ibd-custody-v1.json` | `3eb68821cb2e389be5ed5391f5671fae527212a0e2129fcb85fe9676e4d396c8` |
 
 ## Full recorded stage timers
 
 ### Current-campaign control, 0–150,000
 
-Artifact: [`rs-parprep-current-control-r1.json`](data/end-to-end-sync/rs-parprep-current-control-r1.json). Stage timers are nested and are not additive.
+Artifact: rs-parprep-current-control-r1 (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -185,7 +175,7 @@ Artifact: [`rs-parprep-current-control-r1.json`](data/end-to-end-sync/rs-parprep
 
 ### Current-campaign candidate, 0–150,000
 
-Artifact: [`rs-parprep-current-candidate-r2.json`](data/end-to-end-sync/rs-parprep-current-candidate-r2.json). Stage timers are nested and are not additive.
+Artifact: rs-parprep-current-candidate-r2 (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -215,7 +205,7 @@ Artifact: [`rs-parprep-current-candidate-r2.json`](data/end-to-end-sync/rs-parpr
 
 ### Long local replay, 0–642,000
 
-Artifact: [`rs-spendable-local-nobody-a014.json`](data/end-to-end-sync/rs-spendable-local-nobody-a014.json). Stage timers are nested and are not additive.
+Artifact: rs-spendable-local-nobody-a014 (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -242,7 +232,7 @@ Artifact: [`rs-spendable-local-nobody-a014.json`](data/end-to-end-sync/rs-spenda
 
 ### Portable full-validation replay, 0–150,000
 
-Artifact: [`rs-replay-150k-parverify.json`](data/end-to-end-sync/rs-replay-150k-parverify.json). Stage timers are nested and are not additive.
+Artifact: rs-replay-150k-parverify (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -269,7 +259,7 @@ Artifact: [`rs-replay-150k-parverify.json`](data/end-to-end-sync/rs-replay-150k-
 
 ### Kernel full-validation replay, 0–150,000
 
-Artifact: [`rs-replay-150k-kernel.json`](data/end-to-end-sync/rs-replay-150k-kernel.json). Stage timers are nested and are not additive.
+Artifact: rs-replay-150k-kernel (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -296,4 +286,4 @@ Artifact: [`rs-replay-150k-kernel.json`](data/end-to-end-sync/rs-replay-150k-ker
 
 ## Harness
 
-The attached JSON was emitted by `crates/node/examples/mainnet_prefix_replay.rs`. The artifacts record the range, boundary hashes, backend, index flags, source kind, data directory, elapsed/fetch/decode time, block and transaction counts, peak RSS, commit, and stage timers. They do not capture enough launch or host state to reconstruct the exact original command. A future publishable G14 run must use the repository G14 daemon adapters and evidence manifest instead of reconstructing missing provenance from these files.
+The attached JSON was emitted by the former `mainnet_prefix_replay` campaign executable. The artifacts record the range, boundary hashes, backend, index flags, source kind, data directory, elapsed/fetch/decode time, block and transaction counts, peak RSS, commit, and stage timers. They do not capture enough launch or host state to reconstruct the exact original command. The replay executable and G14 artifact adapters have been retired; these files are historical evidence, not inputs to a supported runner.

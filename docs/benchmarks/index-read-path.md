@@ -1,22 +1,17 @@
 # Index read-path benchmarks
 
-Baseline for the Electrum/index read path, captured before any optimization.
+Baseline for the ScriptIndex resolver read path, captured before any optimization.
 Prior performance campaigns covered the sync and apply path only; `crates/index`
-and `crates/electrum` had no benchmarks at all, so no number existed for the
-G14 Electrum `get_history` p95 <= 30 ms budget.
+had no benchmarks for this resolver, so no read-path number existed.
 
-Harness: `crates/index/benches/history_resolve.rs` and
-`crates/electrum/benches/electrum_methods.rs`. Both are Criterion, both hold the
-`before_scan` and `after_fast` arms of a refactor set in one group over one
-fixture. At the **baseline** commit both arms called the same code, which is
-what the noise-floor section below measures; both harnesses now run genuinely
-different paths in each arm.
+Harness: `crates/index/benches/history_resolve.rs`. It is Criterion and measures
+only the retained current position-backed resolver over a production-shaped
+flat-file fixture. The `before_scan` and `after_fast` arms described below are
+historical evidence from the retired refactor harness; they are not current
+targets.
 
-In `history_resolve.rs` the arms call different functions — the retained `*_scan`
-reference against the position-backed resolver. In `electrum_methods.rs` both
-arms enter the same `dispatch`, and the arms are separated by giving each its own
-`IndexHandle` over a block source that either serves ranged reads or declines
-them. Same rows, same block files, same request.
+The historical arms called different functions — the former `*_scan` reference
+against the position-backed resolver — over the same rows and block files.
 
 > **Harness correction, 2026-08-13 (second).** Between the resolver rewrite
 > landing and this revision, the two `electrum_methods.rs` arms were *literally
@@ -75,8 +70,7 @@ flat-file store moved 64 heights from 65.21 ms to 65.644 ms.
 | 64 heights, 250 KB | 65.21 ms | 136.50 ms | 0.92 ms | 0.91 ms |
 | 8 heights, 1 MB | 33.52 ms | 82.04 ms | 4.48 ms | 3.75 ms |
 
-**The cost is O(funding rows x block size).**
-`resolve_script_history` goes 1.02 -> 9.33 -> 65.21 ms
+**The cost is O(funding rows × block size).** `resolve_script_history` goes 1.02 -> 9.33 -> 65.21 ms
 across 1 -> 8 -> 64 heights: a 63.9x rise for a 64x rise in rows. Holding rows at
 8 and taking block size from 250 KB to 1 MB moves it 9.33 -> 33.52 ms, a 3.6x
 rise for 4x the bytes. Both terms are linear and they multiply, because the
@@ -94,7 +88,11 @@ a txid only for transactions that matched. That is a double-SHA256 over every
 full transaction serialization in the block, per row, thrown away for all but
 one transaction.
 
-## Electrum dispatch
+## Historical Electrum dispatch evidence
+
+> This protocol-level measurement is retained only as provenance for the resolver
+> campaign. The Electrum server was removed; current consumers are `ScriptIndex`
+> and Esplora.
 
 End-to-end through `dispatch`, including JSON parameter parsing and rendering.
 Medians, `before_scan` arm, pre-optimization, on the in-memory harness. The
@@ -114,9 +112,8 @@ precise number.
 250 KB blocks.** Since the index bench shows the cost is linear in block size,
 the same address over tip-sized blocks projects several times higher again.
 This is a synthetic fixture on a laptop and is **not** the G14 gate — that
-remains `scripts/measure-g14-electrum-rss.sh` against a mainnet-tip node over a
-real 10,000-scripthash corpus, and it remains unclaimed. What the number
-establishes is direction and shape, not a gate result.
+historical gate remains unclaimed after the campaign tooling was retired. What
+the number establishes is direction and shape, not a gate result.
 
 `subscribe` runs the same resolution and then hashes the status. An Electrum
 wallet issues one per address on connect, so it is the highest-volume caller of
@@ -148,11 +145,9 @@ throttle mid-group.
 `get_balance` at 64 heights could not — a win claimed there would have needed a
 quiet host, more samples, or both.
 
-That constraint is no longer binding. The `after` arm now runs in under a
-millisecond, so those groups finish before throttling starts. The measured
-ratios there are 71.6x and 76.5x — three orders of magnitude past a noise floor
-that was never worse than 2.4x, so the conclusion does not depend on the floor
-having improved.
+That constraint is no longer binding: the `after` arm now runs in under a
+millisecond. The measured 71.6x and 76.5x ratios are about 30x the largest
+observed 2.4x spread, so the conclusion does not depend on the spread improving.
 
 ## Landed: lazy txid in the unspent-output resolvers
 
@@ -163,16 +158,17 @@ most once per matching transaction, via `Option::get_or_insert_with`.
 `resolve_unspent_outputs` no longer duplicates the walk at all — it delegates and
 drops the height. Pure code motion; no behavioural change.
 
-**Equivalence.** `crates/index/tests/resolver_equivalence.rs`, 8 tests against
-the naive `resolve_unspent_outputs*_scan` references retained in the crate:
-single funding output, one transaction paying the target twice (the lazy txid
-must be computed once and reused by both entries), two transactions paying the
-target in one block (ingest collapses these into a single row), multiple
-heights, an unresolvable height, an `OP_RETURN` target that ingest never indexed,
-a never-indexed scripthash, and a `proptest` over random block/transaction/output
-shapes. Equality is over the full result vector, not a spot check.
+**Historical equivalence (retired).** The former `resolver_equivalence`
+integration tests compared the unspent-output resolvers with naive scan-only
+references over single and multiple heights, duplicate matches, unresolvable
+heights, never-indexed scripts, and random block/transaction/output shapes.
+The tests and public scan-only oracle methods were retired with the A/B
+harness. Current resolver behavior is covered by the Indexer unit tests and
+the transaction-position contract tests; the private full-scan helpers remain
+the live fallback path.
 
-**Speed**, paired arms in one run, `crates/index/benches/history_resolve.rs`.
+**Historical speed**, paired arms in one run, from the retired
+`crates/index/benches/history_resolve.rs` harness.
 In-memory harness, and unaffected by that: both arms here are scan-path variants,
 so both are CPU-bound and I/O cancels out of the ratio.
 
@@ -195,13 +191,9 @@ because it agrees with the paired result: `get_balance` and `listunspent` each
 fell about 50% at 1 and 8 heights. The 64-height groups are excluded per the
 noise floor above; on this run their identical arms disagreed by 1.7x.
 
-**Reference retention.** The public unspent-output `_scan` functions stay in the
-crate as the equivalence oracle and the `before` arm. They deliberately keep the
-eager txid: an oracle that shares an optimization with the implementation it
-checks cannot catch a fault in that optimization. These two public entry points
-are not the production fallback paths; the optimized resolvers use private
-whole-block fallbacks for legacy rows and failed position resolution. See the
-position-rewrite section below.
+**Reference retirement.** The scan-only oracle and benchmark `before` arm were
+removed after the comparison was completed. The historical numbers above remain
+evidence for the lazy-txid change, not a current test or runtime contract.
 
 ## Landed: transaction byte positions in row values
 
@@ -238,38 +230,20 @@ correct and costs one scan per 2^64 pairs. The residual risk this accepts is a
 stale offset landing exactly on a transaction boundary *and* that transaction
 matching, while another transaction in the same block also matches.
 
-**Equivalence.** `crates/index/tests/tx_positions.rs`, 8 tests. The load-bearing
-one is `both_ingest_paths_write_identical_row_values`: the zero-copy path
-measures each range directly from the block slice, the decoded path derives it
-arithmetically from `Transaction::total_size()`, and nothing but a test keeps two
-different computations of the same number equal. Fixtures mix legacy and segwit
-transactions, and a separate case crosses the 253-transaction varint boundary.
-
-**Mutation-verified.** Both arithmetic terms were mutated and the suite caught
-each:
-
-| Mutation | Result |
-|---|---|
-| `VarInt::from(len).size()` -> literal `1` | caught by the varint-boundary test only |
-| `total_size()` -> `base_size()` (drops witness bytes) | caught by 3 tests |
-
-The varint mutation initially survived: every fixture had fewer than 253
-transactions, so a hardcoded 1 was correct for all of them, and the proptest's
-doc comment claimed a boundary coverage it did not have. The boundary test exists
-because of that miss. Mainnet blocks carry thousands of transactions, so the
-untested branch was the only one that matters in production.
+**Position values.** `crates/index/tests/tx_positions.rs` covers the persisted
+position encoding, exact transaction boundaries, and the independent row-value
+contract. It intentionally does
+not retain equivalence coverage for a second ingest implementation; the index
+has one supported serialized-block ingest path.
 
 ## Landed: resolvers read only the transactions their positions name
 
 **Change.** `resolve_script_history`, `resolve_unspent_outputs{,_with_height}`
 and `resolve_transaction` now read each row's `TxPosition` list, fetch only
 those byte ranges through `BlockSource::block_bytes_at_height`, and decode only
-those transactions. The naive whole-block scan survives in the public `*_scan`
-functions as the oracle and benchmark `before` arm. All three resolver families
-also retain private production fallbacks for rows without usable positions:
-`resolve_script_history` calls `scan_height_history`,
-`resolve_unspent_outputs{,_with_height}` calls `scan_height_unspent_outputs`,
-and `resolve_transaction` scans the named block inline.
+those transactions. Production resolvers use private per-height full-scan
+helpers when positioned resolution fails; the former public scan-only oracle
+methods were retired with the comparison harness.
 
 **The all-or-scan rule is what makes this safe.** A resolver falls back to a full
 block scan the moment any single position fails to resolve; it never skips a
@@ -337,48 +311,16 @@ The 64-height `subscribe` and `get_balance` groups, previously unusable at
 2.0-2.4x identical-arm spread, are now stable: the `after` arm got cheap enough
 that host thermal noise no longer dominates the group.
 
-**Equivalence.** `crates/index/tests/resolver_equivalence.rs`, 12 tests. Every
-assertion runs **twice** — once against a source that can serve ranges and once
-against one that declines — so the position path and the scan fallback are both
-checked against the same `_scan` oracle.
+**Current contract coverage.** The resolver unit tests retain ordinary indexed
+resolution and one deterministic fixture for an eight-byte prefix collision.
+Rows whose positions are stale, malformed, or blank are outside the valid
+watermark-backed index-state contract described in `CONCEPTS.md`, so they are
+not promoted to permanent fallback contracts here. The private all-or-scan
+fallback remains a defensive production path.
 
-**One of the twelve tests the read shape, not the result**, and it exists because
-the other eleven cannot catch the most likely regression. Equivalence is measured
-*against scanning*, so deleting the position path entirely leaves all eleven
-green. `the_position_path_reads_ranges_and_never_whole_blocks` counts the calls
-its source serves and asserts that the position path loads zero whole blocks and
-at least one range, and that a source declining ranges is the mirror image.
-Raised in review of PR #80.
-
-Beyond the shared fixtures:
-
-- `stale_positions_from_a_superseded_block_fall_back_to_scanning` indexes block
-  A and serves block B at the same height.
-- `a_stale_position_that_decodes_but_does_not_match_still_forces_a_scan` does the
-  same with both blocks holding equally sized transactions, so A's offset lands
-  exactly on a transaction boundary in B and yields a **valid** transaction that
-  funds something else.
-- `rows_without_positions_fall_back_to_scanning` blanks every row value to
-  reproduce a database written before this format.
-
-**Mutation-verified.**
-
-| Mutation | Result |
-|---|---|
-| `positioned_history`: skip a non-matching position instead of scanning | caught by the decodes-but-does-not-match test only |
-| `positioned_unspent_outputs`: same skip | caught by the same test only |
-| `TxPosition::cmp`: revert to derived lexicographic ordering | caught by the random-blocks proptest |
-
-The first two mutations initially **survived**. The original stale-position test
-only produced undecodable bytes, so any implementation bailed for the wrong
-reason; the decodes-but-does-not-match case had to be constructed deliberately,
-by making both blocks lay transactions at identical offsets. The all-or-scan rule
-is the one invariant standing between this design and silently short history, and
-it was untested until that fixture existed.
-
-The third mutation is why `TxPosition` implements `Ord` by hand: deriving it
-compares little-endian byte arrays lexicographically, so offset 256 would sort
-before offset 1, and stored positions would not be in block order. Emission order
+`TxPosition` implements `Ord` by hand: deriving it compares little-endian byte
+arrays lexicographically, so offset 256 would sort before offset 1, and stored
+positions would not be in block order. Emission order
 is contractual — Electrum clients hash the sequence to derive a status.
 
 ## Rejected: decoded-block cache
@@ -451,8 +393,7 @@ On an x86 host *with* SHA-NI that 634 µs would fall by roughly 3-5x, taking the
 `before` arm to somewhere near 520 µs and the ratio at that fixture from ~490x
 to ~250x. Two things keep this from undermining the result: it is still two and
 a half orders of magnitude, and the project's own reference host is a **Xeon
-Gold 6138, which `processing-bound-sync-performance-evolution.md` records as
-having no SHA-NI** — the same scalar regime measured here.
+Gold 6138, which has no SHA-NI** — the same scalar regime measured here.
 
 **The file-I/O gap is closed.** An earlier revision of this section flagged that
 the harness served ranges from memory. It now uses a real `FlatFileBlockStore`,
@@ -488,11 +429,10 @@ with block size. That is a complexity change, and no amount of hardware moves
 `resolve_script_history` at 8 heights off 106 µs whether the blocks are 250 KB or
 1 MB.
 
-## G14 Electrum gate: still unclaimed, and why
+## Historical protocol gate: still unclaimed
 
-Everything above is in-tree signal. The gate of record is
-`scripts/measure-g14-electrum-rss.sh` against a mainnet-tip node, and it has
-**not** been run. Three independent blockers, none of them code:
+Everything above is in-tree resolver evidence. The retired protocol gate was
+never run against a mainnet-tip node.
 
 1. **The script needs Python 3.10+.** It annotates with PEP 604 unions
    (`dict[str, str | bool]`) that are evaluated at runtime. On a host with
@@ -504,22 +444,22 @@ Everything above is in-tree signal. The gate of record is
 2. **The script is Linux-only.** Eight reads of `/proc` — `/proc/{pid}/exe` for
    the process-identity check, and the network tables for the
    accepted-connection proof. There is no macOS path.
-3. **It needs a synced mainnet-tip node** with Electrum enabled and a corpus of
+3. **It needed a synced mainnet-tip node** with the retired server enabled and a corpus of
    real 64-hex scripthashes, one per line, with at least 10,000 non-empty
    histories.
 
-The invocation, for whoever has that host:
+The retired invocation is not a current reproduction command:
 
 ```
-scripts/measure-g14-electrum-rss.sh \
+# retired command; retained arguments are historical only
   --output <measurement.json> --host <host> --port <port> \
   --pid <bitcoin-rs-pid> --tip-height <height> --tip-hash <64-hex> \
   --scripthashes <corpus-path> --sample-size 10000
 ```
 
-Defaults are `--sample-size 10000 --seed g14-electrum-rss-v1
+Defaults were `--sample-size 10000 --seed g14-electrum-rss-v1
 --timeout-seconds 30`; the emitted JSON carries schema
-`g14-electrum-rss-measurement-v1` and feeds the evidence-manifest flow.
+`g14-electrum-rss-measurement-v1`; the retired script is not a current command.
 
 **Do not claim the gate from the numbers on this page.** They come from
 synthetic fixtures on a laptop. What they establish is that the resolver's cost
@@ -530,7 +470,6 @@ direction and the shape, not the gate result.
 
 ```
 cargo bench -p bitcoin-rs-index    --bench history_resolve   --features rocksdb
-cargo bench -p bitcoin-rs-electrum --bench electrum_methods  --features rocksdb
 ```
 
 Both fixtures assert they resolve the expected entry count before benchmarking.

@@ -1,4 +1,3 @@
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use crossbeam_utils::CachePadded;
 use hashbrown::HashTable;
@@ -106,24 +105,18 @@ impl Shard {
         &self,
         adds: &[(UtxoKey, Hash256, BuildPayload<'_>)],
         removes: &[SpendPayload<'_>],
-        listener: Option<&(dyn UtxoChangeListener + Send + Sync)>,
     ) -> Result<(), UtxoError> {
         let mut table = self.inner.write();
-        if let Some(listener) = listener {
-            commit_batch_with_listener(&mut table, adds, removes, listener)
-        } else {
-            commit_batch_coalesced(&mut table, adds, removes)
-        }
+        commit_batch_coalesced(&mut table, adds, removes)
     }
 
     pub(crate) fn commit_batch_collect_events<'a>(
         &self,
         adds: &'a [(UtxoKey, Hash256, BuildPayload<'a>)],
         removes: &[SpendPayload<'_>],
-        coalesce_events: bool,
     ) -> (UtxoChangeEvents<'a>, Result<(), UtxoError>) {
         let mut table = self.inner.write();
-        commit_batch_collect_events(&mut table, adds, removes, coalesce_events)
+        commit_batch_collect_events(&mut table, adds, removes)
     }
 
     pub(crate) fn commit_single_shard_batch<A: UtxoAddView>(
@@ -205,17 +198,14 @@ impl Shard {
         f(&table)
     }
 
-    pub(crate) fn scan_script_pubkeys(&self, scripts: &[ScriptBuf], scan: &mut UtxoScan) {
+    pub(crate) fn scan_script_pubkeys(&self, scripts: &[Vec<u8>], scan: &mut UtxoScan) {
         let table = self.inner.read();
         for record in &table.table {
             for output in record.outputs() {
                 scan.txouts = scan.txouts.saturating_add(1);
-                if scripts
-                    .iter()
-                    .any(|target| target.as_bytes() == output.script_pubkey)
-                {
+                if scripts.iter().any(|target| *target == output.script_pubkey) {
                     scan.unspents.push(ScannedUtxo {
-                        outpoint: OutPoint::new(record.txid(), output.vout),
+                        outpoint: OutPoint::new(record.txid().into(), output.vout),
                         txout: txout_from_parts(output.value, output.script_pubkey),
                         coinbase: output.coinbase,
                         height: output.height,
@@ -285,54 +275,12 @@ struct StagedRemove {
     removed: Vec<Option<OwnedUtxoOut>>,
 }
 
-fn commit_batch_with_listener(
-    table: &mut ShardTable,
-    adds: &[(UtxoKey, Hash256, BuildPayload<'_>)],
-    removes: &[SpendPayload<'_>],
-    listener: &(dyn UtxoChangeListener + Send + Sync),
-) -> Result<(), UtxoError> {
-    let mut remaining_removes = removes;
-    while let Some((first, rest)) = remaining_removes.split_first() {
-        let run_len = rest
-            .iter()
-            .take_while(|remove| remove.key == first.key && remove.txid == first.txid)
-            .count()
-            .saturating_add(1);
-        apply_remove_run_with_listener(table, &remaining_removes[..run_len], listener)?;
-        remaining_removes = &remaining_removes[run_len..];
-    }
-
-    reserve_add_runs(table, coalesced_add_run_count(adds));
-    let mut remaining_adds = adds;
-    while let Some((first, rest)) = remaining_adds.split_first() {
-        let run_len = rest
-            .iter()
-            .take_while(|(key, txid, _payload)| *key == first.0 && *txid == first.1)
-            .count()
-            .saturating_add(1);
-        apply_add_run_with_listener(
-            table,
-            first.0,
-            first.1,
-            &remaining_adds[..run_len],
-            listener,
-        )?;
-        remaining_adds = &remaining_adds[run_len..];
-    }
-    Ok(())
-}
-
 fn commit_batch_collect_events<'a>(
     table: &mut ShardTable,
     adds: &'a [(UtxoKey, Hash256, BuildPayload<'a>)],
     removes: &[SpendPayload<'_>],
-    coalesce_events: bool,
 ) -> (UtxoChangeEvents<'a>, Result<(), UtxoError>) {
-    let mut events = if coalesce_events {
-        UtxoChangeEvents::with_coalesced_capacity(adds.len(), removes.len())
-    } else {
-        UtxoChangeEvents::default()
-    };
+    let mut events = UtxoChangeEvents::with_capacity_hint(adds.len(), removes.len());
 
     let mut remaining_removes = removes;
     while let Some((first, rest)) = remaining_removes.split_first() {
@@ -341,12 +289,9 @@ fn commit_batch_collect_events<'a>(
             .take_while(|remove| remove.key == first.key && remove.txid == first.txid)
             .count()
             .saturating_add(1);
-        if let Err(error) = apply_remove_run_collect_events(
-            table,
-            &remaining_removes[..run_len],
-            &mut events,
-            coalesce_events,
-        ) {
+        if let Err(error) =
+            apply_remove_run_collect_events(table, &remaining_removes[..run_len], &mut events)
+        {
             return (events, Err(error));
         }
         remaining_removes = &remaining_removes[run_len..];
@@ -366,7 +311,6 @@ fn commit_batch_collect_events<'a>(
             first.1,
             &remaining_adds[..run_len],
             &mut events,
-            coalesce_events,
         ) {
             return (events, Err(error));
         }
@@ -398,11 +342,11 @@ fn commit_single_shard_coalesced<A: UtxoAddView>(
     shard_idx: usize,
 ) -> Result<(), UtxoError> {
     let remove_spans = sorted_run_spans(removes, |remove| {
-        (UtxoKey::from_txid(&remove.txid), remove.txid)
+        (UtxoKey::from_txid(&remove.txid), remove.txid.into())
     });
     let add_spans = sorted_run_spans(adds, |add| {
         let txid = add.outpoint().txid;
-        (UtxoKey::from_txid(&txid), txid)
+        (UtxoKey::from_txid(&txid), txid.into())
     });
     if cfg!(debug_assertions) {
         for span in remove_spans.iter().chain(&add_spans) {
@@ -568,7 +512,7 @@ fn commit_single_shard_with_listener<A: UtxoAddView>(
         apply_add_payload_run_with_listener(
             table,
             key,
-            first.outpoint().txid,
+            first.outpoint().txid.into(),
             &payloads,
             listener,
         )?;
@@ -626,7 +570,7 @@ fn spend_payloads(removes: &[OutPoint]) -> Vec<SpendPayload<'_>> {
                 op,
                 key,
                 vout: op.vout,
-                txid: op.txid,
+                txid: op.txid.into(),
             }
         })
         .collect()
@@ -675,7 +619,6 @@ fn apply_remove_run_collect_events(
     table: &mut ShardTable,
     removes: &[SpendPayload<'_>],
     events: &mut UtxoChangeEvents<'_>,
-    coalesce_events: bool,
 ) -> Result<(), UtxoError> {
     let Some(first) = removes.first() else {
         return Ok(());
@@ -684,11 +627,7 @@ fn apply_remove_run_collect_events(
     let removed = removed_events(removes, staged.removed);
     apply_record_mutation(table, first.key, first.txid, staged.mutation);
     if staged.found_record {
-        if coalesce_events {
-            events.push_remove_batch_coalesced(removed);
-        } else {
-            events.push_remove_batch(removed);
-        }
+        events.push_remove_batch(removed);
     }
     Ok(())
 }
@@ -745,18 +684,6 @@ fn parts_are_increasing_unique(record: Option<&UtxoRecord>, parts: &[OutputParts
     true
 }
 
-fn apply_add_run_with_listener(
-    table: &mut ShardTable,
-    key: UtxoKey,
-    txid: Hash256,
-    adds: &[(UtxoKey, Hash256, BuildPayload<'_>)],
-    listener: &(dyn UtxoChangeListener + Send + Sync),
-) -> Result<(), UtxoError> {
-    let payloads: Vec<BuildPayload<'_>> =
-        adds.iter().map(|(_key, _txid, payload)| *payload).collect();
-    apply_add_payload_run_with_listener(table, key, txid, &payloads, listener)
-}
-
 fn apply_add_payload_run_with_listener(
     table: &mut ShardTable,
     key: UtxoKey,
@@ -780,7 +707,6 @@ fn apply_add_run_collect_events<'add>(
     txid: Hash256,
     adds: &'add [(UtxoKey, Hash256, BuildPayload<'add>)],
     events: &mut UtxoChangeEvents<'add>,
-    coalesce_events: bool,
 ) -> Result<(), UtxoError> {
     let payloads: Vec<BuildPayload<'add>> =
         adds.iter().map(|(_key, _txid, payload)| *payload).collect();
@@ -790,7 +716,7 @@ fn apply_add_run_collect_events<'add>(
         add_unique,
     } = stage_add_run(table, key, txid, &payloads)?;
     replace_record(table, key, txid, replacement);
-    collect_add_events(events, &payloads, &overwritten, add_unique, coalesce_events);
+    collect_add_events(events, &payloads, &overwritten, add_unique);
     Ok(())
 }
 
@@ -858,8 +784,8 @@ fn find_record(table: &ShardTable, key: UtxoKey, txid: Hash256) -> Option<&UtxoR
 fn payload_parts<'a>(payload: &BuildPayload<'a>) -> OutputParts<'a> {
     OutputParts::new(
         payload.vout,
-        payload.txout.value.to_sat(),
-        payload.txout.script_pubkey.as_bytes(),
+        payload.txout.value,
+        payload.txout.script_pubkey.as_slice(),
         payload.coinbase,
         payload.height,
     )
@@ -940,8 +866,13 @@ fn replay_add_listener(
     for (payload, overwritten) in payloads.iter().zip(overwritten) {
         if let Some(output) = overwritten {
             flush_inserted_coins(listener, &mut inserted);
-            let txout = txout_from_parts(output.value, &output.script_pubkey);
-            listener.on_remove_coin(payload.outpoint, &txout, output.height, output.coinbase);
+            let removal = UtxoRemoved::new(
+                *payload.outpoint,
+                txout_from_parts(output.value, &output.script_pubkey),
+                output.height,
+                output.coinbase,
+            );
+            listener.on_remove_coins(core::slice::from_ref(&removal));
         }
         inserted.push(UtxoInserted::new(
             payload.outpoint,
@@ -958,11 +889,10 @@ fn collect_add_events<'a>(
     payloads: &[BuildPayload<'a>],
     overwritten: &[Option<OwnedUtxoOut>],
     add_unique: bool,
-    coalesce_events: bool,
 ) {
-    if add_unique && coalesce_events {
+    if add_unique {
         for payload in payloads {
-            events.push_insert_coin_coalesced(UtxoInserted::new(
+            events.push_insert_coin(UtxoInserted::new(
                 payload.outpoint,
                 payload.txout,
                 payload.height,
@@ -975,7 +905,7 @@ fn collect_add_events<'a>(
     let mut inserted = SmallVec::<[UtxoInserted<'a>; 8]>::with_capacity(payloads.len());
     for (payload, overwritten) in payloads.iter().zip(overwritten) {
         if let Some(output) = overwritten {
-            flush_inserted_events(events, &mut inserted, coalesce_events);
+            flush_inserted_events(events, &mut inserted);
             events.push_remove_coin(UtxoRemoved::new(
                 *payload.outpoint,
                 txout_from_parts(output.value, &output.script_pubkey),
@@ -990,20 +920,14 @@ fn collect_add_events<'a>(
             payload.coinbase,
         ));
     }
-    flush_inserted_events(events, &mut inserted, coalesce_events);
+    flush_inserted_events(events, &mut inserted);
 }
 
 fn flush_inserted_events<'add>(
     events: &mut UtxoChangeEvents<'add>,
     inserted: &mut SmallVec<[UtxoInserted<'add>; 8]>,
-    coalesce_events: bool,
 ) {
-    if inserted.is_empty() {
-        return;
-    }
-    if coalesce_events {
-        events.push_insert_batch_coalesced(core::mem::take(inserted));
-    } else {
+    if !inserted.is_empty() {
         events.push_insert_batch(core::mem::take(inserted));
     }
 }
@@ -1020,8 +944,8 @@ fn flush_inserted_coins(
 
 fn txout_from_parts(value: u64, script: &[u8]) -> TxOut {
     TxOut {
-        value: Amount::from_sat(value),
-        script_pubkey: ScriptBuf::from_bytes(script.to_vec()),
+        value,
+        script_pubkey: script.to_vec(),
     }
 }
 

@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn compared_methods_differ_from_core_exactly_as_declared() {
         let schemas = load_schemas();
-        let manifest: toml::Table = toml::from_str(super::super::MANIFEST_TOML)
+        let manifest: toml::Table = toml::from_str(crate::compat_manifest::MANIFEST_TOML)
             .unwrap_or_else(|err| panic!("the compatibility manifest must parse: {err}"));
         let handler = crate::Handler::new(Arc::new(Context::new()));
 

@@ -14,8 +14,8 @@ use std::process::ExitCode;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
-    match bitcoin_rs_node::Config::load_from_args(std::env::args_os())
-        .and_then(bitcoin_rs_node::run)
+    match bitcoin_rs_node::NodeConfig::load_from_args(std::env::args_os())
+        .and_then(|config| bitcoin_rs_node::run(config, bitcoin_rs_node::RuntimeInputs::default()))
     {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
