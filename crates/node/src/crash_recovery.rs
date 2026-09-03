@@ -6,8 +6,8 @@
 //! records the tip the node reached.  On boot, if the sidecar's `height`
 //! exceeds the restored checkpoint height, the gap is replayed from stored
 //! block bodies: the tip hash lets the recovery walk backward through
-//! `prev_blockhash` fields to collect the missing blocks, then apply them
-//! forward through the ordinary apply path.
+//! `prev_blockhash` fields to identify the missing blocks, then apply them
+//! forward as locally validated replay without re-executing scripts.
 //!
 //! When the sidecar lacks a tip hash (legacy test metadata) or stored bodies
 //! are unavailable, recovery falls back to recording the gap in memory via
@@ -116,9 +116,10 @@ pub fn set_last_committed_height(state: &NodeState, height: u32) -> Result<()> {
 ///
 /// When the sidecar has a tip hash and stored bodies are available, the gap
 /// is replayed by walking backward from the tip through `prev_blockhash`
-/// fields, collecting blocks, and applying them forward through the ordinary
-/// apply path.  When the tip hash is absent (legacy test metadata) or a body
-/// cannot be loaded, recovery falls back to recording the gap in memory via
+/// fields, retaining only block identities, and applying bodies forward as
+/// locally validated replay. The walk must land on the restored base tip.
+/// When the tip hash is absent (legacy test metadata) or a body cannot be
+/// loaded, recovery falls back to recording the gap in memory via
 /// [`NodeState::push_replayed`].
 pub fn recover_if_needed(state: &NodeState) -> Result<()> {
     let Some(meta) = read_meta(state)? else {
@@ -203,7 +204,9 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
 }
 
 /// Walks backward from `(tip_height, tip_hash)` to `restored_height + 1`,
-/// collecting blocks, then applies them forward through the apply path.
+/// retaining only block identities while reading headers, then loads and
+/// replays one complete body at a time as locally validated input. The walk
+/// must land on the restored base tip before any body is replayed.
 fn replay_from_bodies(
     state: &NodeState,
     restored_height: u32,
@@ -216,41 +219,79 @@ fn replay_from_bodies(
         .as_ref()
         .context("no block body store available for crash recovery replay")?;
 
-    // Walk backward from the tip, collecting (height, block) pairs.
-    let mut blocks: Vec<(u32, bitcoin_rs_primitives::Block)> = Vec::new();
+    // Walk backward from the tip, retaining only identities. A ranged header
+    // read keeps the walk bounded by the largest body when the store supports
+    // slicing; stores without that capability fall back to one full body.
+    let mut identities: Vec<(u32, bitcoin_rs_primitives::Hash256)> = Vec::new();
     let mut current_hash = tip_hash;
     let mut current_height = tip_height;
 
     while current_height > restored_height {
-        let body_bytes = body_store
-            .load_block_body(current_height, current_hash)
-            .with_context(|| format!("load block body for replay at height {current_height}"))?
-            .with_context(|| {
-                format!(
-                    "block body missing for replay at height {current_height}; \
-                     it may have been pruned or not yet flushed to disk"
-                )
-            })?;
+        let header_bytes = match body_store
+            .load_block_body_range(current_height, current_hash, 0, 80)
+            .with_context(|| format!("load block header for replay at height {current_height}"))?
+        {
+            Some(bytes) => bytes,
+            None => body_store
+                .load_block_body(current_height, current_hash)
+                .with_context(|| format!("load block body for replay at height {current_height}"))?
+                .with_context(|| {
+                    format!(
+                        "block body missing for replay at height {current_height}; \
+                         it may have been pruned or not yet flushed to disk"
+                    )
+                })?,
+        };
 
-        let block: bitcoin_rs_primitives::Block =
-            bitcoin_rs_primitives::encode::deserialize(&body_bytes)
-                .with_context(|| format!("deserialize block body at height {current_height}"))?;
+        let header: bitcoin_rs_primitives::Header =
+            bitcoin_rs_primitives::encode::deserialize(&header_bytes)
+                .with_context(|| format!("deserialize block header at height {current_height}"))?;
 
-        let prev_hash = block.header.prev_blockhash.0;
-        blocks.push((current_height, block));
-
-        current_hash = prev_hash;
+        identities.push((current_height, current_hash));
+        current_hash = header.prev_blockhash.0;
         current_height = current_height.saturating_sub(1);
     }
 
-    // Reverse to apply in forward order.
-    blocks.reverse();
+    let restored_hash = state
+        .applied_tip()
+        .load()
+        .as_ref()
+        .map(|tip| tip.hash)
+        .or_else(|| (restored_height == 0).then(|| handles.network.genesis_block_hash()))
+        .with_context(|| {
+            format!("missing restored tip at height {restored_height} for crash recovery")
+        })?;
+    if current_hash != restored_hash {
+        anyhow::bail!(
+            "crash-recovery walk landed on {} at restored height {}, expected {}",
+            current_hash.to_string_be(),
+            restored_height,
+            restored_hash.to_string_be()
+        );
+    }
 
-    let mut replayed = Vec::with_capacity(blocks.len());
-    for (height, block) in blocks {
-        let tip = state
-            .apply_block(&block)
-            .map_err(|error| anyhow::anyhow!("replay apply failed at height {height}: {error}"))?;
+    // Reverse to apply in forward order, loading one body at a time.
+    identities.reverse();
+
+    let mut replayed = Vec::with_capacity(identities.len());
+    for (height, hash) in identities {
+        let body_bytes = body_store
+            .load_block_body(height, hash)
+            .with_context(|| format!("load block body for replay at height {height}"))?
+            .with_context(|| {
+                format!(
+                    "block body missing for replay at height {height}; \
+                     it may have been pruned or not yet flushed to disk"
+                )
+            })?;
+        let block: bitcoin_rs_primitives::Block =
+            bitcoin_rs_primitives::encode::deserialize(&body_bytes)
+                .with_context(|| format!("deserialize block body at height {height}"))?;
+        let tip =
+            crate::apply::replay_local_block(&handles, &block, bytes::Bytes::from(body_bytes))
+                .map_err(|error| {
+                    anyhow::anyhow!("replay apply failed at height {height}: {error}")
+                })?;
         tracing::debug!(
             height,
             hash = %tip.hash.to_string_be(),

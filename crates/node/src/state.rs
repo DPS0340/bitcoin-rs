@@ -1051,6 +1051,14 @@ fn build_tx_index_open_spec(
     }))
 }
 
+struct TxIndexSpawn {
+    spec: crate::txindex_worker::TxIndexOpenSpec,
+    generation: crate::txindex_worker::Generation,
+    block_source: crate::NodeBlockSource,
+    body_source: Arc<dyn BlockBodySource>,
+    wake_rx: Receiver<()>,
+}
+
 /// Aggregate handle to a running node.
 pub struct NodeState {
     /// Height the last clean checkpoint would restore to, 0 when none exists.
@@ -1068,6 +1076,7 @@ pub struct NodeState {
     utxo: Arc<UtxoSet>,
     coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
+    tx_index_spawn: Option<TxIndexSpawn>,
     tx_index_worker: Option<crate::txindex_worker::TxIndexWorker>,
     tx_index_lifecycle: Option<Arc<arc_swap::ArcSwap<crate::txindex_worker::TxIndexLifecycle>>>,
     /// Stable query adapter for txindex/script-index, constructed before open.
@@ -1337,7 +1346,7 @@ impl NodeState {
         let shutdown = Arc::new(AtomicBool::new(false));
         let chain_events = Arc::new(chain_events_raw);
         let tx_index_open_spec = build_tx_index_open_spec(&config, txindex_cache_bytes, epoch)?;
-        let (tx_index_runtime, tx_index_worker, tx_index_lifecycle, tx_index_adapter) =
+        let (tx_index_runtime, tx_index_spawn, tx_index_lifecycle, tx_index_adapter) =
             match tx_index_open_spec {
                 Some(spec) => {
                     let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
@@ -1355,22 +1364,18 @@ impl NodeState {
                         Arc::clone(&lifecycle),
                     ));
                     let generation = crate::txindex_worker::Generation::new(spec.epoch);
-                    let worker = crate::txindex_worker::TxIndexWorker::spawn_with_open(
-                        Arc::clone(&runtime),
-                        spec,
-                        Arc::clone(&lifecycle),
-                        generation,
-                        Arc::clone(&applied_tip),
-                        Arc::clone(&block_tree),
-                        Some(Arc::clone(&block_body_store)),
-                        block_source,
-                        Some(body_source),
-                        Arc::clone(&chain_events),
-                        Arc::clone(&shutdown),
-                        wake_rx,
+                    (
+                        Some(runtime),
+                        Some(TxIndexSpawn {
+                            spec,
+                            generation,
+                            block_source,
+                            body_source,
+                            wake_rx,
+                        }),
+                        Some(lifecycle),
+                        Some(adapter),
                     )
-                    .context("spawn txindex worker")?;
-                    (Some(runtime), Some(worker), Some(lifecycle), Some(adapter))
                 }
                 None => (None, None, None, None),
             };
@@ -1507,7 +1512,8 @@ impl NodeState {
             utxo,
             coin_stats,
             tx_index_runtime,
-            tx_index_worker,
+            tx_index_spawn,
+            tx_index_worker: None,
             tx_index_lifecycle,
             tx_index_adapter,
             capabilities,
@@ -1745,6 +1751,40 @@ impl NodeState {
             let q: Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery> = adapter.clone();
             q
         })
+    }
+
+    /// Starts the derived-index workers. Call only once the applied tip is
+    /// authoritative — after crash recovery — so the index reconciles against
+    /// the real chainstate and never mistakes a recovered gap for a stale branch.
+    pub fn start_index_workers(&mut self) -> anyhow::Result<()> {
+        let Some(spawn) = self.tx_index_spawn.take() else {
+            return Ok(());
+        };
+        let runtime = self
+            .tx_index_runtime
+            .as_ref()
+            .context("txindex runtime missing for a pending worker spawn")?;
+        let lifecycle = self
+            .tx_index_lifecycle
+            .as_ref()
+            .context("txindex lifecycle missing for a pending worker spawn")?;
+        let worker = crate::txindex_worker::TxIndexWorker::spawn_with_open(
+            Arc::clone(runtime),
+            spawn.spec,
+            Arc::clone(lifecycle),
+            spawn.generation,
+            Arc::clone(&self.applied_tip),
+            Arc::clone(&self.block_tree),
+            Some(Arc::clone(&self.block_body_store)),
+            spawn.block_source,
+            Some(spawn.body_source),
+            Arc::clone(&self.chain_events),
+            Arc::clone(&self.apply_handles.shutdown),
+            spawn.wake_rx,
+        )
+        .context("spawn txindex worker")?;
+        self.tx_index_worker = Some(worker);
+        Ok(())
     }
 
     /// Returns the live capability report provider for `getcapabilities`.
@@ -2183,7 +2223,8 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = true;
-        let state = NodeState::open(config, None)?;
+        let mut state = NodeState::open(config, None)?;
+        state.start_index_workers()?;
         let (Some(a), Some(b)) = (state.tx_index_query(), state.tx_index_query()) else {
             panic!("txindex query engine missing when enabled");
         };
@@ -2202,6 +2243,41 @@ mod tests {
     }
 
     #[test]
+    fn index_workers_start_only_when_asked() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.txindex = true;
+        let mut state = NodeState::open(config, None)?;
+
+        assert!(state.tx_index_lifecycle.as_ref().is_some_and(|lifecycle| {
+            matches!(
+                lifecycle.load().as_ref(),
+                crate::txindex_worker::TxIndexLifecycle::Opening
+            )
+        }));
+        assert!(state.tx_index_worker.is_none());
+
+        state.start_index_workers()?;
+        assert!(state.tx_index_worker.is_some());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while state.tx_index_lifecycle.as_ref().is_some_and(|lifecycle| {
+            matches!(
+                lifecycle.load().as_ref(),
+                crate::txindex_worker::TxIndexLifecycle::Opening
+            )
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "txindex lifecycle remained Opening"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn script_index_builds_without_advertising_core_txindex() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
@@ -2210,7 +2286,8 @@ mod tests {
         config.txindex = false;
         config.script_index = crate::config::ScriptIndexMode::Full;
 
-        let state = NodeState::open(config, None)?;
+        let mut state = NodeState::open(config, None)?;
+        state.start_index_workers()?;
 
         assert!(state.apply_handles().tx_index_runtime.is_some());
         assert!(state.tx_index_query().is_none());
@@ -2295,7 +2372,8 @@ mod tests {
         config.p2p_listen.clear();
         config.txindex = false;
         config.script_index = crate::config::ScriptIndexMode::Full;
-        let state = NodeState::open(config, None)?;
+        let mut state = NodeState::open(config, None)?;
+        state.start_index_workers()?;
         let _ = state.apply_block(&crate::Network::Regtest.genesis_block())?;
         let Some(query) = state.script_index_query() else {
             panic!("full mode must hand out a script-index query adapter")
@@ -2335,7 +2413,8 @@ mod tests {
         config.txindex = true;
 
         {
-            let state = NodeState::open(config.clone(), None)?;
+            let mut state = NodeState::open(config.clone(), None)?;
+            state.start_index_workers()?;
             assert!(state.tx_index_query().is_some());
         }
 
