@@ -1,6 +1,6 @@
 use core::hash::{BuildHasher, BuildHasherDefault};
 
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::Txid;
 use nohash_hasher::NoHashHasher;
 
 /// Identity build-hasher for the already-uniform 8-byte UTXO key prefix.
@@ -21,8 +21,10 @@ impl UtxoKey {
     /// Builds a key from the first eight little-endian txid bytes.
     #[must_use]
     #[inline]
-    pub fn from_txid(txid: &Hash256) -> Self {
-        Self(txid.prefix8())
+    pub fn from_txid(txid: &Txid) -> Self {
+        let mut prefix = [0_u8; 8];
+        prefix.copy_from_slice(&txid.as_bytes()[..8]);
+        Self(prefix)
     }
 
     /// Builds a key from a serialized snapshot prefix.

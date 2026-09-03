@@ -4,7 +4,6 @@ use anyhow::Result;
 use bitcoin_rs_node::{Auth, Config, Network};
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 type EnvPair = (&'static str, &'static str);
 
@@ -36,10 +35,9 @@ rpc_password = "toml-pass"
 ",
     )?;
 
-    let env: [EnvPair; 4] = [
+    let env: [EnvPair; 3] = [
         ("BITCOIN_RS_STORAGE_BACKEND", "redb"),
         ("BITCOIN_RS_DBCACHE_MB", "1024"),
-        ("BITCOIN_RS_BLOCKFILTERINDEX", "true"),
         ("BITCOIN_RS_LOG_LEVEL", "warn"),
     ];
     let config = Config::from_layered_sources(
@@ -63,7 +61,6 @@ rpc_password = "toml-pass"
     assert_eq!(config.dbcache_mb, 2048);
     assert_eq!(config.log_level, "trace");
     assert!(config.txindex);
-    assert!(config.blockfilterindex);
     assert_auth_user(&config.rpc_auth, "toml-user");
     Ok(())
 }
@@ -223,9 +220,9 @@ fn p2p_magic_override_requires_an_explicit_peer() {
 }
 
 #[test]
-fn electrum_bind_implicitly_enables_internal_tx_lookup() -> Result<()> {
+fn script_index_is_valid_without_core_txindex() -> Result<()> {
     let mut config = Config::default_for_network(Network::Regtest);
-    config.electrum_bind = Some("127.0.0.1:50001".parse()?);
+    config.script_index = true;
     config.txindex = false;
 
     config.validate()?;
@@ -233,33 +230,32 @@ fn electrum_bind_implicitly_enables_internal_tx_lookup() -> Result<()> {
 }
 
 #[test]
-fn electrum_cli_flag_sets_the_service_address() -> Result<()> {
-    let address: SocketAddr = "127.0.0.1:50001".parse()?;
+fn scriptindex_cli_flag_enables_the_index() -> Result<()> {
     let config = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node", "--electrum", "127.0.0.1:50001"],
+        ["bitcoin-rs-node", "--scriptindex"],
     )?;
 
-    assert_eq!(config.electrum_bind, Some(address));
+    assert!(config.script_index);
     Ok(())
 }
 
 #[test]
-fn empty_electrum_bind_disables_the_optional_service() -> Result<()> {
+fn scriptindex_environment_enables_the_index() -> Result<()> {
     let config = Config::from_layered_sources(
         None,
         None,
         [
             ("BITCOIN_RS_TXINDEX", "false"),
-            ("BITCOIN_RS_ELECTRUM_BIND", ""),
+            ("BITCOIN_RS_SCRIPTINDEX", "true"),
         ],
         ["bitcoin-rs-node"],
     )?;
 
     assert!(!config.txindex);
-    assert_eq!(config.electrum_bind, None);
+    assert!(config.script_index);
     Ok(())
 }
 
@@ -342,129 +338,6 @@ zmqpubsequencehwm = 13
     );
     assert_eq!(hwms, [9, 9, 1_000, 12, 14]);
     Ok(())
-}
-
-#[test]
-fn g2_muhash_sample_path_layers_use_cli_env_toml_precedence() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let toml_path = temp.path().join("node.toml");
-
-    fs::write(
-        &toml_path,
-        r#"
-g2_muhash_samples = "toml.samples"
-g2_muhash_tip_height = 10000
-"#,
-    )?;
-
-    let toml_config = Config::from_layered_sources(
-        Some(&toml_path),
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node"],
-    )?;
-    assert_eq!(
-        toml_config.g2_muhash_samples,
-        Some(PathBuf::from("toml.samples"))
-    );
-    assert_eq!(toml_config.g2_muhash_tip_height, Some(10_000));
-
-    let env_config = Config::from_layered_sources(
-        Some(&toml_path),
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "env.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "20000"),
-        ],
-        ["bitcoin-rs-node"],
-    )?;
-    assert_eq!(
-        env_config.g2_muhash_samples,
-        Some(PathBuf::from("env.samples"))
-    );
-    assert_eq!(env_config.g2_muhash_tip_height, Some(20_000));
-
-    let cli_config = Config::from_layered_sources(
-        Some(&toml_path),
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "env.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "20000"),
-        ],
-        [
-            "bitcoin-rs-node",
-            "--g2-muhash-samples",
-            "cli.samples",
-            "--g2-muhash-tip-height",
-            "30000",
-        ],
-    )?;
-    assert_eq!(
-        cli_config.g2_muhash_samples,
-        Some(PathBuf::from("cli.samples"))
-    );
-    assert_eq!(cli_config.g2_muhash_tip_height, Some(30_000));
-    Ok(())
-}
-
-#[test]
-fn g2_muhash_tip_height_requires_sample_path() {
-    let result = Config::from_layered_sources(
-        None,
-        None,
-        [("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "10000")],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("tip height without sample path must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_tip_height requires g2_muhash_samples")
-    );
-}
-
-#[test]
-fn g2_muhash_sample_path_requires_tip_height() {
-    let result = Config::from_layered_sources(
-        None,
-        None,
-        [("BITCOIN_RS_G2_MUHASH_SAMPLES", "g2.samples")],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("sample path without tip height must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_samples requires g2_muhash_tip_height")
-    );
-}
-
-#[test]
-fn g2_muhash_tip_height_must_be_positive() {
-    let result = Config::from_layered_sources(
-        None,
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "g2.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "0"),
-        ],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("zero G2 tip height must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_tip_height must be greater than zero")
-    );
 }
 
 #[test]
@@ -563,26 +436,4 @@ fn assert_auth_user(auth: &Auth, expected: &str) {
         Auth::Basic { user, .. } => assert_eq!(user, expected),
         Auth::Cookie { .. } => panic!("expected basic auth"),
     }
-}
-
-#[test]
-fn g14_utxo_commit_sample_path_requires_window_fields() {
-    let result = Config::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        [
-            "bitcoin-rs-node",
-            "--g14-utxo-commit-samples",
-            "utxo.samples.json",
-        ],
-    );
-    let Err(error) = result else {
-        panic!("g14 sample path without window fields must be rejected");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("g14_utxo_commit_samples requires")
-    );
 }

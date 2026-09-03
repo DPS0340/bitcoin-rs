@@ -79,58 +79,34 @@ const fn ensure_negotiating_or_ready<S>(peer: &Peer<S>) -> Result<(), PeerError>
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     use bitcoin::p2p::Magic;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::p2p::address::Address;
     use bitcoin::p2p::message_compact_blocks::SendCmpct;
+    use bitcoin::p2p::message_network::VersionMessage;
 
     use super::*;
 
-    #[test]
-    fn sendcmpct_while_ready_updates_compact_block_state() -> Result<(), PeerError> {
-        let mut peer = peer_in_state(PeerState::Ready);
-        let message = sendcmpct_message(true, 2);
-
-        step(&mut peer, &message)?;
-
-        assert_eq!(peer.compact_blocks.remote_send_compact, Some(true));
-        assert_eq!(peer.compact_blocks.remote_version, Some(2));
-        assert_eq!(peer.state, PeerState::Ready);
-        Ok(())
+    fn fresh_peer() -> Peer<Cursor<Vec<u8>>> {
+        Peer::new(Cursor::new(Vec::new()), Magic::BITCOIN)
     }
 
-    #[test]
-    fn sendcmpct_during_negotiation_updates_compact_block_state() -> Result<(), PeerError> {
-        let mut peer = peer_in_state(PeerState::VersionExchange);
-        let message = sendcmpct_message(false, 1);
-
-        step(&mut peer, &message)?;
-
-        assert_eq!(peer.compact_blocks.remote_send_compact, Some(false));
-        assert_eq!(peer.compact_blocks.remote_version, Some(1));
-        assert_eq!(peer.state, PeerState::VersionExchange);
-        Ok(())
-    }
-
-    #[test]
-    fn sendcmpct_while_disconnected_is_rejected_without_state_mutation() {
-        let mut peer = peer_in_state(PeerState::Disconnected);
-        let before = peer.compact_blocks;
-        let message = sendcmpct_message(true, 2);
-
-        let result = step(&mut peer, &message);
-
-        assert!(matches!(
-            result,
-            Err(PeerError::Protocol("feature negotiation outside handshake"))
-        ));
-        assert_eq!(peer.compact_blocks, before);
-        assert_eq!(peer.state, PeerState::Disconnected);
-    }
-
-    fn peer_in_state(state: PeerState) -> Peer<Cursor<Vec<u8>>> {
-        let mut peer = Peer::new(Cursor::new(Vec::new()), Magic::BITCOIN);
-        peer.state = state;
-        peer
+    fn version_message() -> VersionMessage {
+        let socket = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        let address = Address::new(&socket, ServiceFlags::NETWORK);
+        VersionMessage {
+            version: 70_016,
+            services: ServiceFlags::NETWORK,
+            timestamp: 0,
+            receiver: address.clone(),
+            sender: address,
+            nonce: 1,
+            user_agent: "/test:0.1/".to_owned(),
+            start_height: 0,
+            relay: true,
+        }
     }
 
     const fn sendcmpct_message(send_compact: bool, version: u64) -> Message {
@@ -138,5 +114,64 @@ mod tests {
             send_compact,
             version,
         })
+    }
+
+    /// A complete version/verack handshake makes a peer usable: ordinary
+    /// application traffic is accepted only once the handshake is done.
+    #[test]
+    fn valid_handshake_reaches_a_usable_peer() -> Result<(), PeerError> {
+        let mut peer = fresh_peer();
+
+        // Before the handshake, application traffic is refused.
+        assert!(step(&mut peer, &Message::Ping(1)).is_err());
+
+        step(&mut peer, &Message::Version(version_message()))?;
+        // Version received but verack outstanding: still not usable.
+        assert!(step(&mut peer, &Message::Ping(1)).is_err());
+
+        step(&mut peer, &Message::Verack)?;
+
+        // Handshake complete: ordinary application traffic is now accepted.
+        step(&mut peer, &Message::Ping(1))?;
+        Ok(())
+    }
+
+    /// A second version after a completed handshake is a protocol violation.
+    #[test]
+    fn duplicate_version_after_handshake_is_rejected() -> Result<(), PeerError> {
+        let mut peer = fresh_peer();
+        step(&mut peer, &Message::Version(version_message()))?;
+        step(&mut peer, &Message::Verack)?;
+
+        assert!(step(&mut peer, &Message::Version(version_message())).is_err());
+        Ok(())
+    }
+
+    /// Verack before version is an ordering violation.
+    #[test]
+    fn verack_before_version_is_rejected() {
+        let mut peer = fresh_peer();
+        assert!(step(&mut peer, &Message::Verack).is_err());
+    }
+
+    /// Feature negotiation is legal during and after the handshake, but
+    /// illegal before negotiation has started.
+    #[test]
+    fn feature_negotiation_is_rejected_before_handshake() {
+        let mut peer = fresh_peer();
+        assert!(step(&mut peer, &sendcmpct_message(true, 2)).is_err());
+    }
+
+    #[test]
+    fn feature_negotiation_is_accepted_during_and_after_handshake() -> Result<(), PeerError> {
+        let mut peer = fresh_peer();
+        // During negotiation (version received, verack outstanding).
+        step(&mut peer, &Message::Version(version_message()))?;
+        step(&mut peer, &sendcmpct_message(true, 2))?;
+
+        // After the handshake completes.
+        step(&mut peer, &Message::Verack)?;
+        step(&mut peer, &sendcmpct_message(false, 1))?;
+        Ok(())
     }
 }

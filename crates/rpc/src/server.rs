@@ -154,12 +154,20 @@ fn serve_connection(
         let keep_alive = request.keep_alive;
 
         if request.method == "GET" {
-            let response = if request.path.starts_with("/rest/") {
-                let (path, query) = split_path_query(&request.path);
+            let (path, query) = split_path_query(&request.path);
+            let response = if path.starts_with("/rest/") {
                 crate::rest::route(handler.context(), path, query, rest_enabled)
             } else {
-                crate::rest::not_found_response()
+                crate::esplora::route(handler, path, query)
             };
+            write_response(reader.get_mut(), &response, keep_alive)?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        }
+
+        if let Some(response) = crate::esplora::route_post(handler, &request.path, &request.body) {
             write_response(reader.get_mut(), &response, keep_alive)?;
             if !keep_alive {
                 return Ok(());
@@ -532,6 +540,7 @@ fn write_response(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicBool, Ordering};

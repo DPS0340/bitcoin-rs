@@ -21,7 +21,7 @@ mdbx = ["bitcoin-rs-storage/mdbx"]
 [dependencies]
 bitcoin-rs-primitives.workspace = true
 bitcoin-rs-storage = { workspace = true, default-features = false }
-bitcoin.workspace = true
+sha2.workspace = true
 bitcoin_slices.workspace = true
 hashbrown.workspace = true
 zerocopy.workspace = true

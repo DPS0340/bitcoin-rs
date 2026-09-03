@@ -12,10 +12,13 @@ const STATS_INTERVAL: u64 = 1024;
 const MEMPOOL_TICK: Duration = Duration::from_secs(1);
 const METRICS_TICK: Duration = Duration::from_secs(10);
 const SYNC_TICK: Duration = Duration::from_secs(1);
+/// How often (in sync ticks) the event loop emits a sync-progress summary.
+/// At the 1-second sync tick this is once per minute during IBD.
+const SYNC_PROGRESS_INTERVAL: u64 = 60;
 
 /// Central v1 event loop for process-level tick coordination.
 ///
-/// The p2p, JSON-RPC, and Electrum subsystems still own their connection
+/// The p2p, JSON-RPC, and `ScriptIndex` subsystems still own their connection
 /// channels and worker threads. This loop coordinates the shared tick-style
 /// work that must stop cleanly with the process.
 pub struct EventLoop {
@@ -91,6 +94,9 @@ impl EventLoop {
                     if ticked.is_ok() {
                         sync_ticks += 1;
                         self.on_sync_tick();
+                        if sync_ticks.is_multiple_of(SYNC_PROGRESS_INTERVAL) {
+                            self.sync.emit_sync_progress();
+                        }
                     }
                 }
                 recv(self.sync_wake) -> woke => {

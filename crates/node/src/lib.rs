@@ -20,24 +20,37 @@ pub mod bitcoin_conf_compat;
 pub mod block_source;
 mod checkpoint;
 mod checkpoint_fs;
+/// Periodic chainstate checkpoint publication during sync.
+mod checkpoint_worker;
 /// Layered node configuration.
 pub mod config;
-/// Block corpus manifest for contiguous archive integrity.
-pub mod corpus;
 /// Startup crash recovery.
 pub mod crash_recovery;
+/// Typed in-process node lifecycle: the embedding surface over the same
+/// service graph the daemon wires.
+pub mod embed;
 /// Central synchronous event loop.
 pub mod event_loop;
-mod g14_utxo_commit;
-mod g2_muhash;
+/// Extension registry: descriptors, validation, capability report.
+pub mod extensions;
+/// BIP157/158 filter index reconciliation worker and query engine.
+mod filterindex_worker;
 /// Block import pipeline.
 pub mod import;
 /// Tracing initialization.
 pub mod logging;
+/// Mempool mutation observer publishing `A`/`R` sequence events.
+pub mod mempool_observer;
 /// Metrics instrumentation and optional exposition.
 pub mod metrics;
+/// Node-owned mining candidate lifecycle coordinator.
+pub mod mining;
 /// Node-side active-chain view for server-side P2P responders.
 pub mod p2p_chain;
+/// Chain-event reconciliation seam for index consumers.
+pub mod reconcile;
+/// Durable rollback evidence: witness and marker file protocol, warning snapshot.
+mod recovery_evidence;
 
 /// Switching the applied chain from one branch to another.
 pub mod reorg;
@@ -51,6 +64,13 @@ pub mod signal;
 pub mod state;
 /// Block download orchestrator.
 pub mod sync;
+/// Inbound P2P transaction admission policy: orphan map and recent-rejects.
+pub mod tx_admission;
+/// P2P transaction ingress consumer.
+pub mod tx_ingress;
+/// Outbound transaction relay worker: announce accepted txs to peers
+/// excluding the source connection.
+pub mod tx_relay;
 mod txindex_worker;
 /// UTXO view adapter for consensus transaction checks.
 pub mod utxo_view;
@@ -59,16 +79,17 @@ mod window_overlay;
 /// ZMQ publisher trait + implementations for the notification subsystem.
 pub mod zmq_publisher;
 
-pub use bip9_context::BlockTreeContext;
 pub use bitcoin_rs_primitives::Network;
 pub use block_source::NodeBlockSource;
-pub use config::{Auth, Config};
+pub use config::{Auth, NodeConfig, RuntimeInputs, ScriptIndexMode, UserConfig};
+pub use embed::{Node, NodeError, SyncProgress};
+pub use mining::{GenerationKey, MiningCoordinator};
 pub use p2p_chain::NodeP2pChainQuery;
 pub use run::run;
 pub use state::{ApplyError, DisconnectError};
 pub use sync::BlockSync;
 pub use txindex_worker::TxIndexRuntime;
 pub use utxo_view::UtxoSetView;
-pub use zmq_publisher::{
-    NoOpZmqPublisher, SequenceEvent, SocketZmqPublisher, TracingZmqPublisher, ZmqPublisher,
-};
+#[cfg(feature = "zmq")]
+pub use zmq_publisher::SocketZmqPublisher;
+pub use zmq_publisher::{NoOpZmqPublisher, SequenceEvent, TracingZmqPublisher, ZmqPublisher};

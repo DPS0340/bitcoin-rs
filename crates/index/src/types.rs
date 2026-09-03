@@ -1,5 +1,6 @@
-use bitcoin::hashes::{Hash as _, sha256};
+use bitcoin_rs_primitives::{OutPoint, Txid};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Number of bytes retained from hashes in electrs index rows.
@@ -61,7 +62,7 @@ impl HashPrefixRow {
     }
 }
 
-/// Electrum protocol scripthash, defined as SHA256(scriptPubKey bytes).
+/// Protocol-neutral SHA256 identifier for a scriptPubKey.
 #[derive(
     Copy,
     Clone,
@@ -84,15 +85,15 @@ pub struct ScriptHash {
 }
 
 impl ScriptHash {
-    /// Hashes a Bitcoin script into its Electrum scripthash.
-    pub fn new(script: &bitcoin::Script) -> Self {
-        Self::from_script_bytes(script.as_bytes())
+    /// Hashes a Bitcoin script into its script-index identifier.
+    pub fn new(script: &[u8]) -> Self {
+        Self::from_script_bytes(script)
     }
 
-    /// Hashes raw script bytes into their Electrum scripthash.
+    /// Hashes raw script bytes into their script-index identifier.
     pub fn from_script_bytes(script: &[u8]) -> Self {
         Self {
-            bytes: sha256::Hash::hash(script).to_byte_array(),
+            bytes: Sha256::digest(script).into(),
         }
     }
 
@@ -106,7 +107,7 @@ impl ScriptHash {
         self.bytes
     }
 
-    /// Returns the electrs scan prefix.
+    /// Returns the compact index scan prefix.
     pub const fn prefix(self) -> HashPrefix {
         let bytes = self.bytes;
         [
@@ -135,12 +136,12 @@ pub struct SpendingPrefixRow;
 
 impl SpendingPrefixRow {
     /// Returns the prefix used to scan rows for a previous outpoint.
-    pub fn scan_prefix(outpoint: &bitcoin::OutPoint) -> HashPrefix {
-        spending_prefix(outpoint.txid.as_ref(), outpoint.vout)
+    pub fn scan_prefix(outpoint: &OutPoint) -> HashPrefix {
+        spending_prefix(outpoint.txid.as_bytes(), outpoint.vout)
     }
 
     /// Builds a database row for a spending occurrence at `height`.
-    pub fn row(outpoint: &bitcoin::OutPoint, height: u32) -> HashPrefixRow {
+    pub fn row(outpoint: &OutPoint, height: u32) -> HashPrefixRow {
         HashPrefixRow::new(Self::scan_prefix(outpoint), height)
     }
 
@@ -162,12 +163,12 @@ pub struct TxidRow;
 
 impl TxidRow {
     /// Returns the prefix used to scan rows for a transaction id.
-    pub fn scan_prefix(txid: &bitcoin::Txid) -> HashPrefix {
-        txid_prefix(txid.as_ref())
+    pub fn scan_prefix(txid: &Txid) -> HashPrefix {
+        txid_prefix(txid.as_bytes())
     }
 
     /// Builds a database row for a transaction occurrence at `height`.
-    pub fn row(txid: &bitcoin::Txid, height: u32) -> HashPrefixRow {
+    pub fn row(txid: &Txid, height: u32) -> HashPrefixRow {
         HashPrefixRow::new(Self::scan_prefix(txid), height)
     }
 
@@ -332,8 +333,8 @@ impl TxPositionValue {
 
     /// Decodes a row value into its positions.
     ///
-    /// Returns `None` for an empty value (a row predating this format) and for a
-    /// malformed one, which mean the same thing to a reader.
+    /// Returns `None` for an empty or malformed value. The resolver treats an
+    /// unavailable position list as a signal to use its all-or-scan safety path.
     #[must_use]
     pub fn decode(value: &[u8]) -> Option<&[TxPosition]> {
         if value.is_empty() {
@@ -358,8 +359,9 @@ fn spending_prefix(txid_bytes: &[u8], vout: u32) -> HashPrefix {
 
 #[cfg(test)]
 mod tests {
+    use bitcoin_rs_primitives::{Hash256, OutPoint, Txid};
+
     use super::{HashPrefixRow, ScriptHash, ScriptHashRow, SpendingPrefixRow, TxidRow};
-    use bitcoin::hashes::Hash as _;
 
     #[test]
     fn hash_prefix_row_uses_electrs_layout() {
@@ -375,11 +377,12 @@ mod tests {
 
     #[test]
     fn spending_prefix_matches_electrs_wrapping_prefix() {
-        let txid = bitcoin::Txid::from_byte_array([
+        let bytes = [
             31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10,
             9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
-        ]);
-        let outpoint = bitcoin::OutPoint { txid, vout: 255 };
+        ];
+        let txid = Txid::from(Hash256::from_le_bytes(&bytes));
+        let outpoint = OutPoint::new(txid, 255);
         assert_eq!(
             SpendingPrefixRow::scan_prefix(&outpoint),
             [31, 30, 29, 28, 27, 26, 26, 23]
@@ -389,7 +392,7 @@ mod tests {
     #[test]
     fn row_builders_use_hash_prefixes() {
         let scripthash = ScriptHash::from_byte_array([7_u8; 32]);
-        let txid = bitcoin::Txid::from_byte_array([9_u8; 32]);
+        let txid = Txid::from(Hash256::from_le_bytes(&[9_u8; 32]));
         assert_eq!(ScriptHashRow::row(scripthash, 5).prefix, [7_u8; 8]);
         assert_eq!(TxidRow::row(&txid, 6).prefix, [9_u8; 8]);
     }
