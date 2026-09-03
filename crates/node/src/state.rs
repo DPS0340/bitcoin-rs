@@ -3834,6 +3834,23 @@ mod tests {
     }
 
     #[test]
+    fn publish_checkpoint_keeps_admission_open() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        let state = NodeState::open(config, None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        state.publish_checkpoint()?;
+
+        let block = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
+        let tip = state.apply_block(&block)?;
+        assert_eq!(tip.height, 1);
+        Ok(())
+    }
+
+    #[test]
     fn process_epoch_is_strictly_monotonic_across_restart() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
