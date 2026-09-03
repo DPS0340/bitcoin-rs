@@ -44,6 +44,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     use bitcoin_rs_node::{Auth, Network, ScriptIndexMode};
 
@@ -192,5 +194,38 @@ mod tests {
         );
         let debug = format!("{config:?}");
         assert!(!debug.contains("/secret/.cookie"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_non_utf8_environment_value_is_ignored() {
+        let config = super::load(
+            ["bitcoin-rs"],
+            std::iter::once((OsString::from("UNRELATED"), OsString::from_vec(vec![0xff]))),
+        )
+        .unwrap_or_else(|error| panic!("unrelated environment variable: {error}"));
+
+        assert_eq!(config.network, Network::Mainnet);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_non_utf8_environment_value_is_rejected() {
+        let error = match super::load(
+            ["bitcoin-rs"],
+            std::iter::once((
+                OsString::from("BITCOIN_RS_DATA_DIR"),
+                OsString::from_vec(vec![0xff]),
+            )),
+        ) {
+            Ok(_) => panic!("known environment variable must be valid UTF-8"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("environment variable BITCOIN_RS_DATA_DIR is not valid UTF-8")
+        );
     }
 }

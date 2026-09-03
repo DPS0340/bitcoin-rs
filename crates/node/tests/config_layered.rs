@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use bitcoin_rs_node::zmq_publisher::ZmqTopic;
 use bitcoin_rs_node::{
-    NetworkSelection, P2pOverrides, ScriptIndexMode, UserConfig, ValidationOverrides, ZmqOverrides,
-    resolve,
+    NetworkSelection, NodeConfig, P2pOverrides, ScriptIndexMode, UserConfig, ValidationOverrides,
+    ZmqOverrides, ZmqPublication, resolve,
 };
 use bitcoin_rs_primitives::Network;
 
@@ -135,6 +135,71 @@ fn zmq_endpoints_expand_in_topic_order_with_hwm() -> Result<()> {
         [9, 9, 1_000]
     );
     Ok(())
+}
+
+#[test]
+fn higher_layer_replaces_zmq_endpoint_and_preserves_order_and_hwm() -> Result<()> {
+    let mut lower_endpoints = BTreeMap::new();
+    lower_endpoints.insert(
+        ZmqTopic::HashBlock,
+        vec!["tcp://127.0.0.1:28332".to_owned()],
+    );
+    lower_endpoints.insert(ZmqTopic::RawTx, vec!["tcp://127.0.0.1:28333".to_owned()]);
+    let mut lower_hwm = BTreeMap::new();
+    lower_hwm.insert(ZmqTopic::HashBlock, 42);
+    let lower = UserConfig {
+        zmq: ZmqOverrides {
+            endpoints: lower_endpoints,
+            hwm: lower_hwm,
+        },
+        ..Default::default()
+    };
+
+    let mut higher_endpoints = BTreeMap::new();
+    higher_endpoints.insert(
+        ZmqTopic::HashBlock,
+        vec!["tcp://127.0.0.1:28334".to_owned()],
+    );
+    let higher = UserConfig {
+        zmq: ZmqOverrides {
+            endpoints: higher_endpoints,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let config = resolve(&[&lower, &higher])?;
+    assert_eq!(
+        config.zmq,
+        vec![
+            ZmqPublication {
+                topic: ZmqTopic::HashBlock,
+                endpoint: "tcp://127.0.0.1:28334".to_owned(),
+                hwm: 42,
+            },
+            ZmqPublication {
+                topic: ZmqTopic::RawTx,
+                endpoint: "tcp://127.0.0.1:28333".to_owned(),
+                hwm: 1_000,
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn resolved_zmq_hwm_is_validated() {
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
+    config.zmq.push(ZmqPublication {
+        topic: ZmqTopic::HashBlock,
+        endpoint: "tcp://127.0.0.1:28332".to_owned(),
+        hwm: 2_147_483_648,
+    });
+    let error = match config.validate() {
+        Ok(()) => panic!("out-of-range resolved ZMQ HWM must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("pubhashblockhwm"));
 }
 
 #[test]

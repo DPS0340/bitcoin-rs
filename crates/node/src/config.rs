@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_storage::StorageBackend;
 use crossbeam_channel::Receiver;
@@ -464,10 +464,17 @@ impl NodeConfig {
              requires does not exist (#225). Only `full` and `disabled` are accepted. \
              Blocked on #226 Q5, which selects the ScriptLive locator format."
         );
+        for publication in &self.zmq {
+            ensure!(
+                publication.hwm <= 2_147_483_647,
+                "{}hwm exceeds libzmq SNDHWM range",
+                publication.topic.notifier_type()
+            );
+        }
         Ok(())
     }
 
-    fn apply_layer(&mut self, layer: &UserConfig) -> Result<()> {
+    fn apply_layer(&mut self, layer: &UserConfig) {
         if let Some(network) = layer.network {
             self.apply_network_selection(network);
         }
@@ -550,17 +557,6 @@ impl NodeConfig {
                 }
             }
         }
-        Self::validate_hwm_options(&layer.zmq.hwm)?;
-        Ok(())
-    }
-
-    fn validate_hwm_options(hwm: &BTreeMap<crate::zmq_publisher::ZmqTopic, u32>) -> Result<()> {
-        for (topic, value) in hwm {
-            if *value > 2_147_483_647 {
-                bail!("{}hwm exceeds libzmq SNDHWM range", topic.notifier_type());
-            }
-        }
-        Ok(())
     }
 
     fn apply_network_selection(&mut self, selection: NetworkSelection) {
@@ -586,8 +582,9 @@ impl NodeConfig {
 pub fn resolve(layers: &[&UserConfig]) -> Result<NodeConfig> {
     let mut config = NodeConfig::default_for_network(Network::Mainnet);
     for layer in layers {
-        config.apply_layer(layer)?;
+        config.apply_layer(layer);
     }
+    config.zmq.sort_by_key(|publication| publication.topic);
     config.validate()?;
     Ok(config)
 }
