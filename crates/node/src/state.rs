@@ -4084,7 +4084,8 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    // `rustix::fs::mkfifoat` is unavailable on Apple targets.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn non_regular_epoch_lock_refuses_start() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
