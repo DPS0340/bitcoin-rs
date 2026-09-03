@@ -546,6 +546,13 @@ impl NodeStorage {
                 let _ = store;
                 "mdbx"
             }
+            #[cfg(not(any(
+                feature = "rocksdb",
+                feature = "fjall",
+                feature = "redb",
+                feature = "mdbx"
+            )))]
+            _ => match *self {},
         }
     }
 
@@ -599,6 +606,13 @@ impl NodeStorage {
                 authority,
                 Arc::clone(durable_tip_height),
             )?)),
+            #[cfg(not(any(
+                feature = "rocksdb",
+                feature = "fjall",
+                feature = "redb",
+                feature = "mdbx"
+            )))]
+            _ => match *self {},
         }
     }
 
@@ -627,6 +641,13 @@ impl NodeStorage {
                 Arc::clone(store),
                 files,
             )),
+            #[cfg(not(any(
+                feature = "rocksdb",
+                feature = "fjall",
+                feature = "redb",
+                feature = "mdbx"
+            )))]
+            _ => match *self {},
         }
     }
 
@@ -645,6 +666,13 @@ impl NodeStorage {
             Self::Redb(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
+            #[cfg(not(any(
+                feature = "rocksdb",
+                feature = "fjall",
+                feature = "redb",
+                feature = "mdbx"
+            )))]
+            _ => match *self {},
         }
     }
 
@@ -666,6 +694,13 @@ impl NodeStorage {
             Self::Redb(store) => Ok(store.get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Ok(store.get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?),
+            #[cfg(not(any(
+                feature = "rocksdb",
+                feature = "fjall",
+                feature = "redb",
+                feature = "mdbx"
+            )))]
+            _ => match *self {},
         }
     }
 
@@ -685,6 +720,13 @@ impl NodeStorage {
             Self::Redb(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
+            #[cfg(not(any(
+                feature = "rocksdb",
+                feature = "fjall",
+                feature = "redb",
+                feature = "mdbx"
+            )))]
+            _ => match *self {},
         }
     }
 }
