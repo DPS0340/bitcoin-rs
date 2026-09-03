@@ -488,11 +488,14 @@ pub(crate) fn admit_transaction(
 
         // Without a pool guard: resolve UTXO data and combine with the
         // mempool-dependent prevouts captured above.
-        let context = resolve_full_context(ctx, &tx, &mempool_prevouts);
+        let (context, prevouts) = resolve_full_context(ctx, &tx, &mempool_prevouts);
+        let locktime_cutoff = ctx.median_time_past_for_hash(ctx.best_hash()).unwrap_or(0);
 
         let request = AdmissionRequest {
             tx: Arc::new(tx.clone()),
             context,
+            prevouts,
+            locktime_cutoff,
             max_feerate_sat_per_kvb,
             time: unix_time_secs(),
             height: ctx.applied_height(),
@@ -515,6 +518,9 @@ pub(crate) fn admit_transaction(
             Err(AdmitError::GenerationChanged | AdmitError::MempoolChanged) => continue,
             Err(AdmitError::Policy(reason)) => {
                 return Err(reason.to_string());
+            }
+            Err(AdmitError::Consensus) => {
+                return Err("consensus-verification-failed".to_owned());
             }
         }
     }
@@ -569,11 +575,14 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
 
         // Without a pool guard: resolve UTXO data and combine with the
         // mempool-dependent prevouts captured above.
-        let context = resolve_full_context(ctx, &tx, &mempool_prevouts);
+        let (context, prevouts) = resolve_full_context(ctx, &tx, &mempool_prevouts);
+        let locktime_cutoff = ctx.median_time_past_for_hash(ctx.best_hash()).unwrap_or(0);
 
         let request = AdmissionRequest {
             tx: Arc::new(tx.clone()),
             context,
+            prevouts,
+            locktime_cutoff,
             max_feerate_sat_per_kvb: max_feerate,
             time: unix_time_secs(),
             height: ctx.applied_height(),
@@ -596,6 +605,11 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
             Err(AdmitError::GenerationChanged | AdmitError::MempoolChanged) => continue,
             Err(AdmitError::Policy(reason)) => {
                 return Err(reject_reason_to_rpc_error(reason));
+            }
+            Err(AdmitError::Consensus) => {
+                return Err(RpcError::TxRejected(
+                    "consensus-verification-failed".to_owned(),
+                ));
             }
         }
     }
@@ -899,7 +913,7 @@ fn resolve_full_context(
     ctx: &Context,
     tx: &Tx,
     mempool_prevouts: &HashMap<OutPoint, TxOut>,
-) -> MempoolPackageTxContext {
+) -> (MempoolPackageTxContext, Vec<(OutPoint, TxOut)>) {
     let mut missing_inputs = false;
     let mut input_value = 0_u64;
     let mut prevouts: Vec<(OutPoint, TxOut)> = Vec::new();
@@ -930,12 +944,15 @@ fn resolve_full_context(
     let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
     let sigop_cost = u32::try_from(total_sigop_cost(tx, &prevouts)).unwrap_or(u32::MAX);
 
-    MempoolPackageTxContext {
-        fee,
-        vsize,
-        sigop_cost,
-        missing_inputs,
-    }
+    (
+        MempoolPackageTxContext {
+            fee,
+            vsize,
+            sigop_cost,
+            missing_inputs,
+        },
+        prevouts,
+    )
 }
 
 fn package_contexts(
@@ -2588,6 +2605,48 @@ mod acceptance_tests {
             "expected a rejection, got {error:?}"
         );
         assert_eq!(error.code(), RpcError::CORE_VERIFY_REJECTED);
+        assert!(ctx.mempool.read().is_empty());
+    }
+
+    /// A transaction with duplicate inputs must be rejected by consensus
+    /// verification, not admitted to the mempool.
+    #[test]
+    fn sendrawtransaction_rejects_a_transaction_with_duplicate_inputs() {
+        let ctx = Arc::new(Context::new());
+        seed_utxo(&ctx, 1, 100_000);
+        let prev = spent_outpoint(1);
+        let tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![
+                TxIn {
+                    previous_output: prev,
+                    script_sig: Vec::new(),
+                    sequence: 0xffff_ffff,
+                    witness: Vec::new(),
+                },
+                TxIn {
+                    previous_output: prev,
+                    script_sig: Vec::new(),
+                    sequence: 0xffff_ffff,
+                    witness: Vec::new(),
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: vec![0x51],
+            }],
+        };
+
+        let outcome = sendrawtransaction(&ctx, &json!([hex_of(&tx)]));
+
+        let Err(error) = outcome else {
+            panic!("a transaction with duplicate inputs must not be accepted");
+        };
+        assert!(
+            matches!(error, RpcError::TxRejected(_)),
+            "expected a rejection, got {error:?}"
+        );
         assert!(ctx.mempool.read().is_empty());
     }
 

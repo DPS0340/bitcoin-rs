@@ -18,11 +18,26 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use bitcoin_rs_primitives::{Tx, Txid};
+use bitcoin_rs_consensus::UtxoView;
+use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Adapter that lets the consensus verifier look up prevouts from a
+/// resolved `(OutPoint, TxOut)` slice, layered under the mempool by
+/// `MempoolUtxoView`.
+struct PrevoutMap<'a>(&'a [(OutPoint, TxOut)]);
+
+impl UtxoView for PrevoutMap<'_> {
+    fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
+        self.0
+            .iter()
+            .find(|(op, _)| op == outpoint)
+            .map(|(_, txout)| txout.clone())
+    }
+}
 
 /// Why a chain-change reservation or finish failed.
 ///
@@ -61,6 +76,16 @@ pub struct AdmissionRequest {
     /// Resolved per-transaction context (fee, vsize, sigop cost, missing
     /// inputs) from the mempool and UTXO set.
     pub context: crate::standardness::PackageTxContext,
+    /// Resolved prevouts for consensus verification. Empty when the caller
+    /// has not resolved them (e.g., missing inputs); verification is
+    /// skipped in that case.
+    pub prevouts: Vec<(
+        bitcoin_rs_primitives::OutPoint,
+        bitcoin_rs_primitives::TxOut,
+    )>,
+    /// Median-time-past of the chain tip for BIP113 finality checks.
+    /// Zero disables the locktime cutoff (pre-genesis).
+    pub locktime_cutoff: u32,
     /// Caller-supplied maximum fee rate in sat/kvB; `None` means no cap.
     pub max_feerate_sat_per_kvb: Option<u64>,
     /// Wall-clock seconds for the mempool entry timestamp.
@@ -100,6 +125,11 @@ pub enum AdmitError {
     /// The transaction was rejected by policy. The reason is mempool-owned.
     #[error(transparent)]
     Policy(#[from] crate::standardness::AcceptanceRejectReason),
+    /// The transaction failed consensus verification (finality, duplicate
+    /// inputs, overspend, sigop limits). Script verification is deferred
+    /// to block connection under the assume-valid policy.
+    #[error("consensus verification failed")]
+    Consensus,
 }
 
 /// Interns one [`MempoolGateway`] per pool `Arc` identity.
@@ -584,6 +614,24 @@ impl MempoolGateway {
             return Err(AdmitError::Policy(reason));
         }
 
+        // 4b. Consensus verification (finality, duplicate inputs, overspend,
+        //     sigop limits) over the resolved prevouts layered with the
+        //     mempool. Skipped when prevouts are empty (missing inputs were
+        //     already caught by policy in step 4). Script verification is
+        //     deferred to block connection under the assume-valid policy.
+        if !request.prevouts.is_empty() {
+            let chain_view = PrevoutMap(&request.prevouts);
+            let view = crate::accept::MempoolUtxoView::new(&pool, &chain_view);
+            if let Err(_err) = bitcoin_rs_consensus::verify_transaction_non_script(
+                &request.tx,
+                &view,
+                request.height,
+                request.locktime_cutoff,
+            ) {
+                return Err(AdmitError::Consensus);
+            }
+        }
+
         // 5. Mutate under the same write guard via `replace_transaction`,
         //    which handles BIP125 replacement, package limits, and insert.
         let candidate = ReplacementCandidate::new(
@@ -1011,6 +1059,8 @@ mod tests {
                 sigop_cost: 0,
                 missing_inputs: false,
             },
+            prevouts: Vec::new(),
+            locktime_cutoff: 0,
             max_feerate_sat_per_kvb: None,
             time: 1,
             height: 1,
@@ -1935,6 +1985,8 @@ mod tests {
                 sigop_cost: 0,
                 missing_inputs: false,
             },
+            prevouts: Vec::new(),
+            locktime_cutoff: 0,
             max_feerate_sat_per_kvb: None,
             time: 1,
             height: 1,

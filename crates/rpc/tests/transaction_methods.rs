@@ -136,7 +136,7 @@ fn sendrawtransaction_rejects_missing_inputs() {
     let err = handler
         .dispatch("sendrawtransaction", &json!([raw.as_str()]))
         .expect_err("missing-inputs tx should be rejected");
-    assert_eq!(err.code(), RpcError::INTERNAL_ERROR);
+    assert_eq!(err.code(), RpcError::CORE_VERIFY_REJECTED);
 }
 
 #[test]
