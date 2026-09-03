@@ -9,8 +9,9 @@ use hashbrown::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-
 use bitcoin_rs_chain::{ChainWork, NodeId, NodeStatus, TipSnapshot};
+use bitcoin_rs_mempool::MempoolEntry;
+use bitcoin_rs_mining::{Candidate, TemplateId};
 use bitcoin_rs_p2p::PeerInfo;
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
@@ -397,44 +398,18 @@ fn getindexinfo_named_request_returns_only_that_index() -> Result<(), Box<dyn st
             best_block_height: 7,
         },
     }));
-    ctx.filter_index = Some(Arc::new(FakeFilterIndex {
-        info: bitcoin_rs_rpc::context::FilterIndexInfo {
-            synced: false,
-            best_block_height: 5,
-        },
-    }));
     let handler = Handler::new(Arc::new(ctx));
 
     let txindex = handler.dispatch("getindexinfo", &json!(["txindex"]))?;
     assert!(txindex.get("txindex").is_some(), "txindex must be present");
-    assert!(
-        txindex.get("basicblockfilterindex").is_none(),
-        "named request must exclude the filter index"
-    );
-
-    let filter = handler.dispatch("getindexinfo", &json!(["basicblockfilterindex"]))?;
-    assert!(
-        filter.get("basicblockfilterindex").is_some(),
-        "filter index must be present"
-    );
-    assert!(
-        filter.get("txindex").is_none(),
-        "named request must exclude txindex"
-    );
-
     let all = handler.dispatch("getindexinfo", &json!([]))?;
     assert!(
         all.get("txindex").is_some(),
         "no-param request includes txindex"
     );
-    assert!(
-        all.get("basicblockfilterindex").is_some(),
-        "no-param request includes the filter index"
-    );
-
     let unknown = handler.dispatch("getindexinfo", &json!(["unknown"]))?;
     assert!(
-        unknown.get("txindex").is_none() && unknown.get("basicblockfilterindex").is_none(),
+        unknown.get("txindex").is_none(),
         "unknown index name yields an empty object"
     );
     Ok(())
@@ -618,33 +593,6 @@ impl bitcoin_rs_rpc::context::TxIndexQuery for FakeTxIndex {
         &self,
     ) -> Result<bitcoin_rs_rpc::context::TxIndexInfo, bitcoin_rs_rpc::context::TxQueryError> {
         Ok(self.info)
-    }
-}
-
-struct FakeFilterIndex {
-    info: bitcoin_rs_rpc::context::FilterIndexInfo,
-}
-
-impl bitcoin_rs_rpc::context::FilterIndexQuery for FakeFilterIndex {
-    fn filter_info(
-        &self,
-    ) -> Result<bitcoin_rs_rpc::context::FilterIndexInfo, bitcoin_rs_rpc::context::TxQueryError>
-    {
-        Ok(self.info)
-    }
-
-    fn basic_filter(
-        &self,
-        _block_hash: Hash256,
-    ) -> Result<Option<Vec<u8>>, bitcoin_rs_rpc::context::TxQueryError> {
-        Ok(None)
-    }
-
-    fn filter_header(
-        &self,
-        _block_hash: Hash256,
-    ) -> Result<Option<[u8; 32]>, bitcoin_rs_rpc::context::TxQueryError> {
-        Ok(None)
     }
 }
 

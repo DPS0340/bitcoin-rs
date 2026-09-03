@@ -134,7 +134,6 @@ impl ServerHarness {
             mining: bitcoin_rs_rpc::context::MiningHandles {
                 mining_control: None,
             },
-            filter_index: state.filter_index_query(),
             capabilities: Some(state.capability_provider()),
         });
         let handler = Arc::new(Handler::new(Arc::new(ctx)));

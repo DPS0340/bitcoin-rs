@@ -14,8 +14,9 @@ use bitcoin_rs_primitives::{
 };
 use bitcoin_rs_rpc::context::{BlockLog, BlockRecord};
 use bitcoin_rs_utxo::{
-    LiveOutput, LiveOutputMeta, UtxoSet, is_coinbase_tx,
+    LiveOutput, LiveOutputMeta, UtxoSet,
     connect::{BlockChangeError, SpentOutputLookup, build_block_changes},
+    is_coinbase_tx,
 };
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -2352,7 +2353,7 @@ fn apply_block_admitted<'b>(
             .then(|| handles.utxo.as_ref()),
         MAX_SCRIPT_SIZE,
     )
-    .map_err(map_block_change_error)?;
+    .map_err(|e| map_block_change_error(&e))?;
     let utxo_changes_dur = utxo_changes_started.elapsed();
     metrics::histogram!("node.apply_block.utxo_changes_seconds")
         .record(utxo_changes_dur.as_secs_f64());
@@ -2454,8 +2455,6 @@ fn apply_block_admitted<'b>(
     metrics::histogram!("node.apply_block.utxo_commit_seconds")
         .record(utxo_commit_dur.as_secs_f64());
     utxo_commit_result.map_err(ApplyError::UtxoCommit)?;
-
-
 
     // Everything past the UTXO commit publishes values prepared above and
     // cannot fail: the tip snapshot was resolved from the tree before the
@@ -2932,7 +2931,6 @@ impl UtxoView for ResolvedUtxoView {
         self.lookup(outpoint)
     }
 }
-
 
 impl SpentOutputLookup for ResolvedUtxoView {
     fn entry(&self, outpoint: &OutPoint) -> Option<&LiveOutput> {
@@ -3528,13 +3526,14 @@ fn apply_nbits_error(error: bitcoin_rs_chain::ChainError) -> ApplyError {
 }
 
 /// Converts UTXO connect accounting errors into apply errors.
-fn map_block_change_error(error: BlockChangeError) -> ApplyError {
+fn map_block_change_error(error: &BlockChangeError) -> ApplyError {
     match error {
         BlockChangeError::BlockValueOverflow => ApplyError::BlockValueOverflow,
-        BlockChangeError::HeightOverflow(height) => ApplyError::HeightOverflow(height),
-        BlockChangeError::UndoPrevoutMissing { txid, vout } => {
-            ApplyError::UndoPrevoutMissing { txid, vout }
-        }
+        BlockChangeError::HeightOverflow(height) => ApplyError::HeightOverflow(*height),
+        BlockChangeError::UndoPrevoutMissing { txid, vout } => ApplyError::UndoPrevoutMissing {
+            txid: *txid,
+            vout: *vout,
+        },
     }
 }
 
@@ -3586,9 +3585,6 @@ mod consensus_rule_tests {
     use bitcoin_rs_script::script::{push_data, push_int};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
     use hashbrown::HashMap;
-    use metrics::{
-        Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
-    };
     use parking_lot::{Mutex, RwLock};
 
     use super::*;
@@ -3598,40 +3594,6 @@ mod consensus_rule_tests {
     const MAINNET_POW_LIMIT_BITS: u32 = 0x1d00_ffff;
     const MAINNET_POW_LIMIT_DIV_4_BITS: u32 = 0x1c3f_ffc0;
     const DAA_ANCHOR_TIME: u32 = 1_600_000_000;
-
-    #[derive(Clone, Copy, Debug, Default)]
-    struct TestRecorder;
-
-    impl Recorder for TestRecorder {
-        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
-        }
-
-        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
-
-        fn describe_histogram(
-            &self,
-            _key: KeyName,
-            _unit: Option<Unit>,
-            _description: SharedString,
-        ) {
-        }
-
-        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
-            Counter::noop()
-        }
-
-        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-            Gauge::noop()
-        }
-
-        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-            Histogram::noop()
-        }
-    }
-
-    fn test_recorder() -> TestRecorder {
-        TestRecorder
-    }
 
     /// Parses `block` the way production does, so tests exercise the real
     /// one-shot kernel parse rather than a stand-in.

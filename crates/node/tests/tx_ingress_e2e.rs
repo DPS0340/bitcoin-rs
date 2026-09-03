@@ -147,18 +147,21 @@ impl MiningControl for RecordingMining {
         &self,
         _request: BlockTemplateRequest,
     ) -> Result<BlockTemplateResult, MiningControlError> {
-        Err(MiningControlError::Failed("not implemented".to_owned().into()))
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
     }
 
     fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
-        Err(MiningControlError::Failed("not implemented".to_owned().into()))
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
     }
 
-    fn submit_block(
-        &self,
-        _block: Block,
-    ) -> Result<BlockValidationResult, MiningControlError> {
-        Err(MiningControlError::Failed("not implemented".to_owned().into()))
+    fn submit_block(&self, _block: Block) -> Result<BlockValidationResult, MiningControlError> {
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
     }
 
     fn publish_generation(&self) {
@@ -289,9 +292,9 @@ fn serve_connection(
                     continue;
                 }
                 let mut send = |response: Message| {
-                    lease.send(response).map_err(|_| {
-                        PeerError::Protocol("outbound lease closed or saturated")
-                    })
+                    lease
+                        .send(response)
+                        .map_err(|_| PeerError::Protocol("outbound lease closed or saturated"))
                 };
                 let _ = dispatch_inbound_full(
                     &mut peer,

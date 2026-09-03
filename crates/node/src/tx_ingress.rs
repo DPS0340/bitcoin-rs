@@ -1,7 +1,7 @@
-//! P2P transaction ingress consumer: the single node-side owner that drains
-//! the bounded [`InboundTx`](bitcoin_rs_p2p::InboundTx) channel, evaluates
-//! each transaction through the mempool's standardness + acceptance policy,
-//! and admits accepted transactions through the one
+//! P2P transaction ingress consumer for the node.
+//!
+//! Each transaction is evaluated through the mempool's standardness +
+//! acceptance policy, and admitted through the one
 //! [`MempoolGateway`](bitcoin_rs_mempool::MempoolGateway).
 //!
 //! # Ordering and side effects
@@ -239,7 +239,7 @@ impl TxIngressConsumer {
         txs: &[Tx],
     ) -> Vec<PackageTxContext> {
         use bitcoin_rs_primitives::OutPoint;
-        use std::collections::HashMap;
+        use hashbrown::HashMap;
 
         let mut package_outputs: HashMap<(Txid, u32), u64> = HashMap::new();
         let mut contexts = Vec::with_capacity(txs.len());
@@ -299,6 +299,7 @@ impl TxIngressConsumer {
 
     /// Returns the current applied tip height.
     fn applied_height(&self) -> u32 {
+        let _ = self;
         // The admission height is used for mempool entry ancestor
         // accounting. The apply path corrects it on block connect.
         0
@@ -308,8 +309,7 @@ impl TxIngressConsumer {
 fn unix_time_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -386,7 +386,7 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: OutPoint::default(),
                 script_sig: vec![0x51],
-                sequence: 0xFFFFFFFF,
+                sequence: 0xFFFF_FFFF,
                 witness: Vec::new(),
             }],
             outputs: vec![TxOut {
@@ -408,7 +408,7 @@ mod tests {
                     vout: 0,
                 },
                 script_sig: vec![0x52, 0x02, 0xAA, 0xBB],
-                sequence: 0xFFFFFFFF,
+                sequence: 0xFFFF_FFFF,
                 witness: Vec::new(),
             }],
             outputs: vec![TxOut {
@@ -419,10 +419,10 @@ mod tests {
         }
     }
 
-    /// Creates a consumer with a pre-funded UTXO so spending_tx passes
-    /// standardness (missing-inputs) checks.
+    /// Creates a consumer with a pre-funded UTXO so `spending_tx` passes
+    /// standardness (`missing-inputs`) checks.
     fn make_consumer_with_utxo(
-        gateway: Arc<MempoolGateway>,
+        gateway: &Arc<MempoolGateway>,
         mining: Arc<RecordingMining>,
     ) -> TxIngressConsumer {
         use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
@@ -448,14 +448,14 @@ mod tests {
         TxIngressConsumer {
             utxo,
             transactions,
-            mempool_gateway: Arc::clone(&gateway),
+            mempool_gateway: Arc::clone(gateway),
             mining_control: mining,
             relay,
-            tx_admission: Arc::new(TxAdmission::new(Arc::clone(&gateway))),
+            tx_admission: Arc::new(TxAdmission::new(Arc::clone(gateway))),
         }
     }
 
-    /// Builds a PeerSource for testing.
+    /// Builds a `PeerSource` for testing.
     fn test_source() -> bitcoin_rs_p2p::PeerSource {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_333);
         let lease = bitcoin_rs_p2p::PeerLease::new(
@@ -466,7 +466,7 @@ mod tests {
 
     /// Creates a minimal consumer for testing.
     fn make_consumer(
-        gateway: Arc<MempoolGateway>,
+        gateway: &Arc<MempoolGateway>,
         mining: Arc<RecordingMining>,
     ) -> TxIngressConsumer {
         let utxo = Arc::new(UtxoSet::new());
@@ -475,24 +475,18 @@ mod tests {
         TxIngressConsumer {
             utxo,
             transactions,
-            mempool_gateway: Arc::clone(&gateway),
+            mempool_gateway: Arc::clone(gateway),
             mining_control: mining,
             relay,
-            tx_admission: Arc::new(TxAdmission::new(Arc::clone(&gateway))),
+            tx_admission: Arc::new(TxAdmission::new(Arc::clone(gateway))),
         }
     }
 
-    /// Test: the consumer carries the exact originating ConnectionId through
+    /// Test: the consumer carries the exact originating `ConnectionId` through
     /// to the admission gateway. A mutation admitted from a peer must carry
-    /// the PeerToken with the correct connection_id.
+    /// the `PeerToken` with the correct `connection_id`.
     #[test]
     fn consumer_preserves_exact_connection_id() {
-        let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits {
-            min_relay_fee_sat_per_kvb: 0,
-            ..MempoolLimits::default()
-        })));
-
-        let recorded_origin = Arc::new(Mutex::new(None));
         struct OriginRecorder {
             captured: Arc<Mutex<Option<bitcoin_rs_mempool::AdmissionOrigin>>>,
         }
@@ -508,6 +502,12 @@ mod tests {
                 }
             }
         }
+        let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        })));
+
+        let recorded_origin = Arc::new(Mutex::new(None));
         let gateway = MempoolGateway::shared_with(
             Arc::clone(&pool),
             Arc::new(OriginRecorder {
@@ -522,7 +522,7 @@ mod tests {
         let inbound = bitcoin_rs_p2p::InboundTx::new(tx, source);
 
         let mining = Arc::new(RecordingMining::new());
-        let consumer = make_consumer_with_utxo(Arc::clone(&gateway), mining);
+        let consumer = make_consumer_with_utxo(&gateway, mining);
 
         consumer.process_one(inbound);
 
@@ -556,7 +556,7 @@ mod tests {
         let inbound = bitcoin_rs_p2p::InboundTx::new(tx, source);
 
         let mining = Arc::new(RecordingMining::new());
-        let consumer = make_consumer(Arc::clone(&gateway), Arc::clone(&mining));
+        let consumer = make_consumer(&gateway, Arc::clone(&mining));
 
         consumer.process_one(inbound);
 
@@ -586,7 +586,7 @@ mod tests {
         let inbound = bitcoin_rs_p2p::InboundTx::new(tx, source);
 
         let mining = Arc::new(RecordingMining::new());
-        let consumer = make_consumer(Arc::clone(&gateway), Arc::clone(&mining));
+        let consumer = make_consumer(&gateway, Arc::clone(&mining));
 
         consumer.process_one(inbound);
 
@@ -615,7 +615,7 @@ mod tests {
         let inbound = bitcoin_rs_p2p::InboundTx::new(tx, source);
 
         let mining = Arc::new(RecordingMining::new());
-        let consumer = make_consumer_with_utxo(Arc::clone(&gateway), Arc::clone(&mining));
+        let consumer = make_consumer_with_utxo(&gateway, Arc::clone(&mining));
 
         consumer.process_one(inbound);
 
