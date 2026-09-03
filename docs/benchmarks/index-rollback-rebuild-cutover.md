@@ -69,7 +69,6 @@ Status: COMPLETED — three runs, medians of medians, spread recorded.
 
 ## Notes
 
-- Filterindex needs no cutover: its rewind is pointer/cursor-only O(1).
 - No bitcoin_conf_compat alias: this is not a Core knob and that file is
   outside this leaf.
 - `cutover = 0` means every resolvable stale watermark rebuilds (legal

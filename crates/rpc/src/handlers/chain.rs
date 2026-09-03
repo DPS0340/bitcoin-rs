@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use bitcoin::hex::DisplayHex as _;
 use core::str::FromStr as _;
 use core::{fmt, fmt::Write as _};
 
@@ -957,22 +956,9 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         synced: info.synced,
         best_block_height: info.best_block_height,
     });
-    let filter_entry = ctx
-        .filter_index
-        .as_ref()
-        .map(|filter_index| filter_index.filter_info())
-        .transpose()?;
-    let filter_entry = filter_entry.map(|info| v31::GetIndexInfoName {
-        synced: info.synced,
-        best_block_height: info.best_block_height,
-    });
-
     let mut indexes = alloc::collections::BTreeMap::new();
     if let Some(entry) = txindex_entry {
         indexes.insert("txindex".to_owned(), entry);
-    }
-    if let Some(entry) = filter_entry {
-        indexes.insert("basicblockfilterindex".to_owned(), entry);
     }
     // Core answers a named request with only that index; an unknown name
     // yields an empty object, as does a name for a disabled index.
@@ -987,33 +973,6 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         }
     };
     typed_to_sonic(&v31::GetIndexInfo(selected))
-}
-
-/// Bitcoin Core `getblockfilter`.
-///
-/// Serves the BIP158 basic filter for one block from the filter index
-/// extension. Without `--blockfilterindex` the method is registered but
-/// answers the Core-shaped "Index is not enabled" parameter error, matching
-/// Core behavior without the index.
-pub(crate) fn getblockfilter(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
-    let Some(filter_index) = ctx.filter_index.as_ref() else {
-        return Err(RpcError::InvalidParams("Index is not enabled"));
-    };
-    let block_hash_text = required_str(params, 0, "block hash is required")?;
-    let block_hash = Hash256::from_str_be(block_hash_text)
-        .map_err(|_| RpcError::InvalidParams("block hash must be a 64-character hex string"))?;
-    let filter_type = required_str(params, 1, "filter type is required")?;
-    if filter_type != "basic" {
-        return Err(RpcError::InvalidParams("unknown filtertype"));
-    }
-
-    let filter = filter_index
-        .basic_filter(block_hash)
-        .map_err(TxQueryError::into_rpc_error)?
-        .ok_or(RpcError::NotFound(
-            "Block not available (not fully indexed)",
-        ))?;
-    Ok(json!({ "hex": filter.to_lower_hex_string() }))
 }
 
 /// bitcoin-rs extension `getcapabilities`.

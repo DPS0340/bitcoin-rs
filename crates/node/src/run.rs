@@ -910,7 +910,6 @@ pub(crate) fn start_node(
     cap_global_thread_pool();
 
     let injected_shutdown = runtime.shutdown;
-    crate::extensions::validate_extensions(&config)?;
     let state = NodeState::open(config, runtime.mempool_observer.as_ref())?;
     let mut guard = StartupGuard {
         state: Some(state),
@@ -1009,7 +1008,6 @@ pub(crate) fn start_node(
             mining: bitcoin_rs_rpc::context::MiningHandles {
                 mining_control: Some(Arc::clone(&mining_control)),
             },
-            filter_index: state.filter_index_query(),
             capabilities: Some(state.capability_provider()),
         })
         .with_esplora_tx_index(state.esplora_tx_index_query());
