@@ -288,11 +288,9 @@ pub struct NodeConfig {
     pub prune_target_mb: u64,
     /// Whether the transaction index is enabled.
     pub txindex: bool,
-    /// Whether the BIP157/158 basic block filter index extension is enabled.
-    pub blockfilterindex: bool,
-    /// Database cache budget in MiB, divided across the persistent storage
-    /// namespaces (chainstate 70%, txindex 20%, filters 10%; shares of
-    /// disabled namespaces redistribute to chainstate).
+    /// Database cache budget in MiB, divided across the chainstate and
+    /// transaction-index namespaces (shares of disabled namespaces redistribute
+    /// to chainstate).
     ///
     /// Bounds: values are clamped to the byte range
     /// `[16 MiB, 1 TiB]` — a zero or tiny value clamps up to the 16 MiB floor
@@ -362,7 +360,6 @@ impl fmt::Debug for NodeConfig {
             .field("connect", &self.connect)
             .field("prune_target_mb", &self.prune_target_mb)
             .field("txindex", &self.txindex)
-            .field("blockfilterindex", &self.blockfilterindex)
             .field("dbcache_mb", &self.dbcache_mb)
             .field(
                 "index_rollback_rebuild_cutover",
@@ -417,7 +414,6 @@ impl NodeConfig {
             connect: Vec::new(),
             prune_target_mb: 0,
             txindex: false,
-            blockfilterindex: false,
             dbcache_mb: DEFAULT_DBCACHE_MB,
             index_rollback_rebuild_cutover: DEFAULT_INDEX_ROLLBACK_REBUILD_CUTOVER,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
@@ -513,16 +509,6 @@ impl NodeConfig {
         match self.storage_backend.as_str() {
             "rocksdb" | "fjall" | "redb" | "mdbx" => {}
             other => bail!("unsupported storage backend {other}"),
-        }
-        if self.blockfilterindex {
-            ensure!(
-                self.txindex || self.script_index.is_enabled(),
-                "blockfilterindex requires txindex"
-            );
-            ensure!(
-                self.prune_target_mb == 0,
-                "blockfilterindex requires prune disabled"
-            );
         }
         ensure!(
             self.script_index.has_live_store(),
@@ -665,9 +651,6 @@ impl NodeConfig {
         }
         if let Some(txindex) = layer.txindex {
             self.txindex = txindex;
-        }
-        if let Some(blockfilterindex) = layer.blockfilterindex {
-            self.blockfilterindex = blockfilterindex;
         }
         if let Some(dbcache_mb) = layer.dbcache_mb {
             self.dbcache_mb = dbcache_mb;
@@ -831,12 +814,6 @@ pub struct UserConfig {
     pub(crate) prune_target_mb: Option<u64>,
     #[arg(long)]
     pub(crate) txindex: Option<bool>,
-    #[arg(
-        long = "blockfilterindex",
-        num_args = 0..=1,
-        default_missing_value = "true"
-    )]
-    pub(crate) blockfilterindex: Option<bool>,
     #[arg(long = "dbcache-mb")]
     pub(crate) dbcache_mb: Option<u64>,
     #[arg(long = "index-rollback-rebuild-cutover")]
@@ -904,7 +881,6 @@ impl UserConfig {
                 "BITCOIN_RS_CONNECT" => layer.connect = Some(parse_connect_list(value)?),
                 "BITCOIN_RS_PRUNE_TARGET_MB" => layer.prune_target_mb = Some(value.parse()?),
                 "BITCOIN_RS_TXINDEX" => layer.txindex = Some(parse_bool(value)?),
-                "BITCOIN_RS_BLOCKFILTERINDEX" => layer.blockfilterindex = Some(parse_bool(value)?),
                 "BITCOIN_RS_DBCACHE_MB" => layer.dbcache_mb = Some(value.parse()?),
                 "BITCOIN_RS_INDEX_ROLLBACK_REBUILD_CUTOVER" => {
                     layer.index_rollback_rebuild_cutover = Some(value.parse()?);
