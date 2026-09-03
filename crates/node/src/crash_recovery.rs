@@ -162,7 +162,7 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
     if let Some(tip_hex) = &meta.tip_hash_hex
         && let Some(tip_hash) = parse_hash_hex(tip_hex)
     {
-        match replay_from_bodies(state, gap_base, meta.height, tip_hash) {
+        match replay_from_bodies(state, meta.height, tip_hash) {
             Ok(replayed) => {
                 for height in &replayed {
                     state.push_replayed(*height);
@@ -203,13 +203,13 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
     Ok(())
 }
 
-/// Walks backward from `(tip_height, tip_hash)` to `restored_height + 1`,
-/// retaining only block identities while reading headers, then loads and
-/// replays one complete body at a time as locally validated input. The walk
-/// must land on the restored base tip before any body is replayed.
+/// Walks backward from `(tip_height, tip_hash)` to the restored tip, or
+/// through genesis when nothing is restored, retaining only block identities
+/// while reading headers. It then loads and replays one complete body at a
+/// time as locally validated input. The walk must land on the restored base
+/// tip before any body is replayed.
 fn replay_from_bodies(
     state: &NodeState,
-    restored_height: u32,
     tip_height: u32,
     tip_hash: bitcoin_rs_primitives::Hash256,
 ) -> Result<Vec<u32>> {
@@ -219,6 +219,13 @@ fn replay_from_bodies(
         .as_ref()
         .context("no block body store available for crash recovery replay")?;
 
+    let base = state
+        .applied_tip()
+        .load()
+        .as_deref()
+        .map(|tip| (tip.height, tip.hash));
+    let genesis_hash = handles.network.genesis_block_hash();
+
     // Walk backward from the tip, retaining only identities. A ranged header
     // read keeps the walk bounded by the largest body when the store supports
     // slicing; stores without that capability fall back to one full body.
@@ -226,7 +233,11 @@ fn replay_from_bodies(
     let mut current_hash = tip_hash;
     let mut current_height = tip_height;
 
-    while current_height > restored_height {
+    loop {
+        if base.is_some_and(|(base_height, _)| current_height <= base_height) {
+            break;
+        }
+
         let header_bytes = match body_store
             .load_block_body_range(current_height, current_hash, 0, 80)
             .with_context(|| format!("load block header for replay at height {current_height}"))?
@@ -243,30 +254,34 @@ fn replay_from_bodies(
                 })?,
         };
 
+        let header_prefix = header_bytes
+            .get(..80)
+            .context("stored block body is shorter than its header")?;
         let header: bitcoin_rs_primitives::Header =
-            bitcoin_rs_primitives::encode::deserialize(&header_bytes)
+            bitcoin_rs_primitives::encode::deserialize(header_prefix)
                 .with_context(|| format!("deserialize block header at height {current_height}"))?;
 
         identities.push((current_height, current_hash));
+        if current_height == 0 {
+            anyhow::ensure!(
+                current_hash == genesis_hash,
+                "crash-recovery walk reached height 0 at {} but genesis is {}",
+                current_hash.to_string_be(),
+                genesis_hash.to_string_be()
+            );
+            break;
+        }
         current_hash = header.prev_blockhash.0;
-        current_height = current_height.saturating_sub(1);
+        current_height -= 1;
     }
 
-    let restored_hash = state
-        .applied_tip()
-        .load()
-        .as_ref()
-        .map(|tip| tip.hash)
-        .or_else(|| (restored_height == 0).then(|| handles.network.genesis_block_hash()))
-        .with_context(|| {
-            format!("missing restored tip at height {restored_height} for crash recovery")
-        })?;
-    if current_hash != restored_hash {
-        anyhow::bail!(
+    if let Some((base_height, base_hash)) = base {
+        anyhow::ensure!(
+            current_hash == base_hash,
             "crash-recovery walk landed on {} at restored height {}, expected {}",
             current_hash.to_string_be(),
-            restored_height,
-            restored_hash.to_string_be()
+            base_height,
+            base_hash.to_string_be()
         );
     }
 
