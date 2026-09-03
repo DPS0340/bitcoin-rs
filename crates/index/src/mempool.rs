@@ -1,3 +1,4 @@
+use bitcoin_rs_primitives::{OutPoint, Tx};
 use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch as _};
 
 use crate::{
@@ -38,10 +39,7 @@ impl<S: KvStore> MempoolRowWriter<S> {
     }
 
     /// Writes unconfirmed rows for a transaction into [`ColumnFamily::TxMempool`].
-    pub fn insert_transaction(
-        &self,
-        tx: &bitcoin::Transaction,
-    ) -> Result<MempoolRowCounts, IndexError> {
+    pub fn insert_transaction(&self, tx: &Tx) -> Result<MempoolRowCounts, IndexError> {
         let rows = MempoolRows::from_transaction(tx);
         let counts = rows.counts();
         let mut batch = self.store.new_batch();
@@ -59,10 +57,7 @@ impl<S: KvStore> MempoolRowWriter<S> {
     }
 
     /// Removes unconfirmed rows for a transaction from [`ColumnFamily::TxMempool`].
-    pub fn remove_transaction(
-        &self,
-        tx: &bitcoin::Transaction,
-    ) -> Result<MempoolRowCounts, IndexError> {
+    pub fn remove_transaction(&self, tx: &Tx) -> Result<MempoolRowCounts, IndexError> {
         let rows = MempoolRows::from_transaction(tx);
         let counts = rows.counts();
         let mut batch = self.store.new_batch();
@@ -87,25 +82,25 @@ struct MempoolRows {
 }
 
 impl MempoolRows {
-    fn from_transaction(tx: &bitcoin::Transaction) -> Self {
-        let txid = tx.compute_txid();
+    fn from_transaction(tx: &Tx) -> Self {
+        let txid = tx.txid();
         let mut rows = Self {
             txid_rows: vec![tagged_row(
                 MEMPOOL_TXID_TAG,
                 TxidRow::row(&txid, MEMPOOL_HEIGHT).to_db_row(),
             )],
-            funding_rows: Vec::with_capacity(tx.output.len()),
-            spending_rows: Vec::with_capacity(tx.input.len()),
+            funding_rows: Vec::with_capacity(tx.outputs.len()),
+            spending_rows: Vec::with_capacity(tx.inputs.len()),
         };
-        for output in &tx.output {
+        for output in &tx.outputs {
             rows.funding_rows.push(tagged_row(
                 MEMPOOL_FUNDING_TAG,
                 ScriptHashRow::row(ScriptHash::new(&output.script_pubkey), MEMPOOL_HEIGHT)
                     .to_db_row(),
             ));
         }
-        for input in &tx.input {
-            if !input.previous_output.is_null() {
+        for input in &tx.inputs {
+            if !is_null_outpoint(&input.previous_output) {
                 rows.spending_rows.push(tagged_row(
                     MEMPOOL_SPENDING_TAG,
                     SpendingPrefixRow::row(&input.previous_output, MEMPOOL_HEIGHT).to_db_row(),
@@ -138,4 +133,9 @@ fn tagged_row(
     tagged[0] = tag;
     tagged[1..].copy_from_slice(&row);
     tagged
+}
+
+/// Coinbase/null previous outpoints have an all-zero txid and `u32::MAX` vout.
+fn is_null_outpoint(outpoint: &OutPoint) -> bool {
+    outpoint.vout == u32::MAX && outpoint.txid.as_bytes() == &[0_u8; 32]
 }

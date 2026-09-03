@@ -1,5 +1,4 @@
 //! Undo coverage for deterministic block disconnects.
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{BlockChanges, UndoBatch, UtxoAdd, UtxoSet, aggregate_hash};
 
@@ -17,8 +16,8 @@ fn txout(seed: u64) -> TxOut {
     script.extend_from_slice(&[0x00, 0x08]);
     script.extend_from_slice(&seed.to_le_bytes());
     TxOut {
-        value: Amount::from_sat(50_000 + seed),
-        script_pubkey: ScriptBuf::from_bytes(script),
+        value: 50_000 + seed,
+        script_pubkey: script,
     }
 }
 
@@ -39,7 +38,7 @@ fn build_blocks() -> Result<Vec<(BlockChanges, UndoBatch)>, Box<dyn std::error::
 
         for n in 0_u64..100 {
             let seed = u64::from(height) * 1_000 + n;
-            let outpoint = OutPoint::new(txid(seed), u32::try_from(n % 3)?);
+            let outpoint = OutPoint::new(txid(seed).into(), u32::try_from(n % 3)?);
             let txout = txout(seed);
             let add = UtxoAdd::new(outpoint, txout, height == 1, height);
             live.push(add.clone());

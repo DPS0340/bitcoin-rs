@@ -4,7 +4,7 @@ This document defines the toolchain requirements, dependency management rules, s
 
 ## 1. Scope and Authority
 
-This policy applies to all 18 crates in the `bitcoin-rs` workspace (`crates/*`) and the node binary (`bin/bitcoin-rs`).
+This policy applies to every crate in the `bitcoin-rs` workspace (`crates/*`) and the node binary (`bin/bitcoin-rs`).
 
 ## 2. Toolchain and Language Edition
 
@@ -33,7 +33,7 @@ Language and toolchain settings are locked centrally in `rust-toolchain.toml` an
 - `[dev-dependencies]` are exempt. They do not reach the shipped binary, so a version skew between two crates' test harnesses cannot produce a runtime conflict, and centralizing them buys nothing. Twelve member manifests declare `tempfile = "3"` directly under `[dev-dependencies]` and there is no workspace entry for it; that is intended, not drift.
 - Centralize a dev-dependency anyway when two crates must agree on a type that crosses between them in tests.
 - Do not add dependencies for functionality available in the Rust standard library or existing workspace crates.
-- Prohibited dependencies: `tokio`, `async-std`, or any async runtime. The node architecture uses a synchronous crossbeam-channel event loop (`PLAN.md`).
+- Prohibited dependencies: `tokio`, `async-std`, or any async runtime. The node architecture uses a synchronous crossbeam-channel event loop.
 
 ### 3.2 Major Version Bumps
 - Upgrading a workspace dependency to a new major version requires:
@@ -50,17 +50,12 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 | `bitcoin-rs-primitives` | `crates/primitives` | Core types and byte primitives |
 | `bitcoin-rs-consensus` | `crates/consensus` | Block and transaction verification |
 | `bitcoin-rs-script` | `crates/script` | Script execution and evaluation |
-| `bitcoin-rs-storage` | `crates/storage` | Key-value store abstraction and implementations |
-| `bitcoin-rs-utxo` | `crates/utxo` | In-memory UTXO set management and snapshots |
-| `bitcoin-rs-utreexo` | `crates/utreexo` | Utreexo accumulator implementation |
+| `bitcoin-rs-storage` | `crates/storage` | Key-value store abstraction, implementations, and block/undo pruning |
+| `bitcoin-rs-utxo` | `crates/utxo` | In-memory UTXO set management, snapshots, and UTXO statistics / MuHash |
 | `bitcoin-rs-chain` | `crates/chain` | Block tree and chain index tracking |
 | `bitcoin-rs-index` | `crates/index` | Transaction and address indexing |
-| `bitcoin-rs-filters` | `crates/filters` | BIP157/158 compact block filters |
-| `bitcoin-rs-coinstats` | `crates/coinstats` | UTXO statistics and MuHash computation |
-| `bitcoin-rs-pruning` | `crates/pruning` | Block file and state pruning logic |
 | `bitcoin-rs-mempool` | `crates/mempool` | Memory pool transaction storage |
 | `bitcoin-rs-p2p` | `crates/p2p` | Peer-to-peer network protocol |
-| `bitcoin-rs-wallet` | `crates/wallet` | Watch-only descriptor tracking, coin selection, PSBT construction, fee bumping |
 | `bitcoin-rs-mining` | `crates/mining` | Block template construction |
 | `bitcoin-rs-rpc` | `crates/rpc` | JSON-RPC HTTP server |
 | `bitcoin-rs-node` | `crates/node` | Full node state machine and event loop |
@@ -73,21 +68,18 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 ## 5. Anti-Shim Principle and Deprecation Policy
 
 ### 5.1 The Anti-Shim Principle
-`bitcoin-rs` operates on a strict **clean cutover** principle (`PLAN.md`). The project rejects:
+`bitcoin-rs` operates on a strict **clean cutover** principle. The project rejects:
 - Backward-compatibility shims.
 - Deprecated wrapper functions or type aliases.
 - Transitional configuration flags or legacy fallback paths.
 
 When a feature, algorithm, interface, or data layout changes, maintainers must remove the old code path completely in the same change-set.
 
-**One exception, and it is not a shim.** A reader that still accepts an older
-on-disk format is permitted where refusing it would destroy data the node
-cannot rebuild. `read_snapshot` accepts UTXO snapshot versions 2, 3 and 4 for
-that reason. The distinction is direction: reading an old format to recover
-state is recovery, while writing one, or translating in place to keep an old
-consumer working, is a shim and is prohibited. A retained reader must be
-write-only-forward — the node writes the current version and never the old one
-— and `docs/policies/db-migration.md` governs when one may be retained at all.
+The UTXO snapshot reader is a clean-cutover boundary: `read_snapshot_strict_v4`
+accepts only complete version-4 snapshots and rejects versions 2 and 3. The
+node can rebuild or resynchronize chainstate, so no legacy reader is retained
+for this format. A future recovery exception would require an explicit
+maintainer decision and matching migration policy before adding a reader.
 
 ### 5.2 RPC Deprecation Policy
 - `bitcoin-rs-rpc` does not provide deprecation windows or compatibility shims for RPC endpoints.
@@ -97,4 +89,14 @@ write-only-forward — the node writes the current version and never the old one
 ### 5.3 On-Disk Format Deprecation Policy
 - On-disk storage schemas do not maintain backward-compatibility translation shims.
 - When key-value column families, block file encodings, or checkpoint formats change, the system does not convert old databases in place.
-- Incompatible CHECKPOINT formats trigger automatic fallback to `HeadersOnly` or `Cold` start resync (`crates/node/src/checkpoint.rs`), requiring the node to rebuild state cleanly. Key-value column families and flat block files carry no version metadata, so nothing detects an incompatible one and no fallback fires; changing either requires the operator to wipe the datadir, which is why `docs/policies/db-migration.md` makes that step the safeguard rather than the version bump.
+- Every datadir carries the current `CURRENT_SCHEMA` epoch. An unmarked
+   non-empty datadir is implicitly epoch `0`: it is adopted and marked while
+   epoch `0` is current, but requires removal/recreation and resync after the
+   epoch advances. A mismatched marker fails before normal persistent-state
+   startup and requires the operator to remove/recreate the datadir and resync.
+   Network/backend datadir ownership and multi-process locking are separate
+   configuration and lifecycle concerns, not persistent schema compatibility
+   ([issue #242](https://github.com/gosuda/bitcoin-rs/issues/242)).
+   A checkpoint `CURRENT` is its sole commit point, so unpublished generation
+   residue yields `Cold` and a referenced invalid generation is current-state
+   corruption. There is no `HeadersOnly` compatibility fallback.

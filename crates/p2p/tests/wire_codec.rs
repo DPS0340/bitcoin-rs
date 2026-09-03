@@ -14,7 +14,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
-use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
 use bitcoin::pow::CompactTarget;
@@ -22,21 +21,21 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, W
 use bitcoin_rs_p2p::handshake::version_message;
 use bitcoin_rs_p2p::inv::MAX_INV_PER_MSG;
 use bitcoin_rs_p2p::wire::{
-    MAX_ADDR_MESSAGE_COUNT, MAX_LOCATOR_HASHES, PeerError, read_message, write_message,
+    MAX_ADDR_MESSAGE_COUNT, MAX_LOCATOR_HASHES, Message, PeerError, read_message, write_message,
 };
 use sha2::{Digest, Sha256};
 
 #[test]
 fn round_trips_ping_pong_version_verack_inv_getheaders() -> Result<(), PeerError> {
     let messages = vec![
-        NetworkMessage::Ping(42),
-        NetworkMessage::Pong(42),
-        NetworkMessage::Version(version_message(99, 123)),
-        NetworkMessage::Verack,
-        NetworkMessage::Inv(vec![Inventory::Transaction(Txid::from_byte_array(
+        Message::Ping(42),
+        Message::Pong(42),
+        Message::Version(version_message(99, 123)),
+        Message::Verack,
+        Message::Inv(vec![Inventory::Transaction(Txid::from_byte_array(
             [7u8; 32],
         ))]),
-        NetworkMessage::GetHeaders(GetHeadersMessage::new(
+        Message::GetHeaders(GetHeadersMessage::new(
             vec![BlockHash::all_zeros()],
             BlockHash::all_zeros(),
         )),
@@ -111,9 +110,7 @@ fn accepts_inv_message_with_max_vectors() -> Result<(), PeerError> {
 
     let (decoded, _) = read_message(&mut cursor, Magic::BITCOIN)?;
 
-    assert!(
-        matches!(decoded, NetworkMessage::Inv(inventory) if inventory.len() == MAX_INV_PER_MSG)
-    );
+    assert!(matches!(decoded, Message::Inv(inventory) if inventory.len() == MAX_INV_PER_MSG));
     Ok(())
 }
 
@@ -124,9 +121,7 @@ fn accepts_getdata_message_with_max_vectors() -> Result<(), PeerError> {
 
     let (decoded, _) = read_message(&mut cursor, Magic::BITCOIN)?;
 
-    assert!(
-        matches!(decoded, NetworkMessage::GetData(inventory) if inventory.len() == MAX_INV_PER_MSG)
-    );
+    assert!(matches!(decoded, Message::GetData(inventory) if inventory.len() == MAX_INV_PER_MSG));
     Ok(())
 }
 
@@ -137,9 +132,7 @@ fn accepts_notfound_message_with_max_vectors() -> Result<(), PeerError> {
 
     let (decoded, _) = read_message(&mut cursor, Magic::BITCOIN)?;
 
-    assert!(
-        matches!(decoded, NetworkMessage::NotFound(inventory) if inventory.len() == MAX_INV_PER_MSG)
-    );
+    assert!(matches!(decoded, Message::NotFound(inventory) if inventory.len() == MAX_INV_PER_MSG));
     Ok(())
 }
 
@@ -165,7 +158,7 @@ fn accepts_addr_message_with_max_addresses() -> Result<(), PeerError> {
     let (decoded, _) = read_message(&mut cursor, Magic::BITCOIN)?;
 
     assert!(
-        matches!(decoded, NetworkMessage::Addr(addresses) if addresses.len() == MAX_ADDR_MESSAGE_COUNT)
+        matches!(decoded, Message::Addr(addresses) if addresses.len() == MAX_ADDR_MESSAGE_COUNT)
     );
     Ok(())
 }
@@ -195,7 +188,7 @@ fn accepts_addrv2_message_with_max_addresses() -> Result<(), PeerError> {
     let (decoded, _) = read_message(&mut cursor, Magic::BITCOIN)?;
 
     assert!(
-        matches!(decoded, NetworkMessage::AddrV2(addresses) if addresses.len() == MAX_ADDR_MESSAGE_COUNT)
+        matches!(decoded, Message::AddrV2(addresses) if addresses.len() == MAX_ADDR_MESSAGE_COUNT)
     );
     Ok(())
 }
@@ -242,7 +235,7 @@ fn accepts_getheaders_message_with_max_locator_hashes() -> Result<(), PeerError>
     let (decoded, _) = read_message(&mut cursor, Magic::BITCOIN)?;
 
     assert!(
-        matches!(decoded, NetworkMessage::GetHeaders(request) if request.locator_hashes.len() == MAX_LOCATOR_HASHES)
+        matches!(decoded, Message::GetHeaders(request) if request.locator_hashes.len() == MAX_LOCATOR_HASHES)
     );
     Ok(())
 }
@@ -255,7 +248,7 @@ fn accepts_getblocks_message_with_max_locator_hashes() -> Result<(), PeerError> 
     let (decoded, _) = read_message(&mut cursor, Magic::BITCOIN)?;
 
     assert!(
-        matches!(decoded, NetworkMessage::GetBlocks(request) if request.locator_hashes.len() == MAX_LOCATOR_HASHES)
+        matches!(decoded, Message::GetBlocks(request) if request.locator_hashes.len() == MAX_LOCATOR_HASHES)
     );
     Ok(())
 }
@@ -284,7 +277,7 @@ fn accepts_headers_message_with_2000_headers() -> Result<(), PeerError> {
 
     let (decoded, _) = read_message(&mut cursor, Magic::BITCOIN)?;
 
-    assert!(matches!(decoded, NetworkMessage::Headers(headers) if headers.len() == 2_000));
+    assert!(matches!(decoded, Message::Headers(headers) if headers.len() == 2_000));
     Ok(())
 }
 
@@ -293,15 +286,15 @@ fn round_trips_compact_block_messages() -> Result<(), PeerError> {
     let block_hash = BlockHash::from_byte_array([3u8; 32]);
     let transaction = compact_block_transaction();
     let messages = vec![
-        NetworkMessage::SendCmpct(SendCmpct {
+        Message::SendCmpct(SendCmpct {
             send_compact: false,
             version: 1,
         }),
-        NetworkMessage::SendCmpct(SendCmpct {
+        Message::SendCmpct(SendCmpct {
             send_compact: true,
             version: 2,
         }),
-        NetworkMessage::CmpctBlock(CmpctBlock {
+        Message::CmpctBlock(CmpctBlock {
             compact_block: HeaderAndShortIds {
                 header: compact_block_header(),
                 nonce: 99,
@@ -312,13 +305,13 @@ fn round_trips_compact_block_messages() -> Result<(), PeerError> {
                 }],
             },
         }),
-        NetworkMessage::GetBlockTxn(GetBlockTxn {
+        Message::GetBlockTxn(GetBlockTxn {
             txs_request: BlockTransactionsRequest {
                 block_hash,
                 indexes: vec![1, 3],
             },
         }),
-        NetworkMessage::BlockTxn(BlockTxn {
+        Message::BlockTxn(BlockTxn {
             transactions: BlockTransactions {
                 block_hash,
                 transactions: vec![transaction],
