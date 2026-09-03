@@ -341,12 +341,12 @@ impl BlockSync {
         let chain_tip = self.handles.chain_tip.load_full();
         let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
         let mut header_peer: Option<SyncPeer> = None;
-        self.peer_table.for_each_info(|peer| {
+        for peer in self.peer_table.infos() {
             let Ok(height) = u32::try_from(peer.start_height) else {
-                return;
+                continue;
             };
             if height <= applied_height {
-                return;
+                continue;
             }
             let candidate = SyncPeer {
                 addr: peer.addr,
@@ -355,7 +355,7 @@ impl BlockSync {
             if header_peer.is_none_or(|current| current.start_height < candidate.start_height) {
                 header_peer = Some(candidate);
             }
-        });
+        }
         if let Some(peer) = header_peer {
             let peer_best_height = u32::try_from(peer.start_height).unwrap_or(0);
             if peer_best_height > header_height {
@@ -5189,11 +5189,8 @@ mod tests {
             assert!(window.has_request_capacity());
             assert!(window.contains_pending(&Hash256::from_le_bytes(block1_hash.as_bytes())));
         }
-        let retry = loop {
-            let message = healthy_rx.try_recv()?;
-            if let Message::GetData(retry) = message {
-                break retry;
-            }
+        let Message::GetData(retry) = healthy_rx.try_recv()? else {
+            return Err(std::io::Error::other("expected healthy peer retry getdata").into());
         };
         assert_eq!(
             witness_block_inventory(retry)?,

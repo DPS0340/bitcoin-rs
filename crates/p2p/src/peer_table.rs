@@ -206,16 +206,6 @@ impl PeerTable {
         }
     }
 
-    /// Calls `f` with the metadata of every handshake-complete connection
-    /// under the table's read lock.
-    pub fn for_each_info(&self, mut f: impl FnMut(&PeerInfo)) {
-        for entry in self.entries.read().values() {
-            if let Some(info) = &entry.info {
-                f(info);
-            }
-        }
-    }
-
     /// Metadata of every handshake-complete connection, ordered by connection
     /// identity (connection order).
     #[must_use]

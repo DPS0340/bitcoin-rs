@@ -775,10 +775,10 @@ impl NetworkControls {
     /// plane into the durable address book without replacing prior entries.
     fn ingest_known_address_facts(&self, now: SystemTime) {
         let mut infos = hashbrown::HashMap::new();
-        self.peer_table.for_each_info(|info| {
+        for info in self.peer_table.infos() {
             infos.insert(info.addr, info.services);
             self.observe_address(info.addr, info.services, now);
-        });
+        }
         for addr in self.peer_table.addrs() {
             let services = infos.get(&addr).copied().unwrap_or(0);
             self.observe_address(addr, services, now);
