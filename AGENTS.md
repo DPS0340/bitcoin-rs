@@ -1,16 +1,40 @@
 # AGENTS.md
 
-- Before debugging a recurring issue or designing in an already-touched area,
-  search `docs/solutions/` and `CONCEPTS.md` for existing decisions and terms;
-  otherwise work can repeat settled failures or contradict project knowledge.
-- Before adding or changing durable project knowledge, update any overlapping
-  `docs/solutions/` learning and reconcile each affected project-specific term in
-  `CONCEPTS.md`; otherwise diagnoses and shared vocabulary drift independently.
-- During benchmark campaigns, retain one canonical corpus and at most one disposable
-  run fixture. Before every corpus build, clone, or run, declare its worst-case
-  additional disk footprint, reserve threshold, and free-space check cadence; refuse
-  to start unless free space covers both the footprint and reserve. During long runs,
-  recheck at that cadence and stop the run and delete its disposable fixture if free
-  space reaches the reserve. Record compact results and delete the disposable fixture
-  before starting the next run, because accumulated benchmark copies have exhausted
-  the workstation's home dataset.
+Keep this file behavioral. Put architecture, implementation details, vocabulary,
+and rationale in `CONCEPTS.md`, policies, or subsystem documentation.
+
+## Rules
+
+- Before changing a settled area, identify its current contract and owner. Read
+  relevant concepts, subsystem docs, source, policies, tests, and issue or PR
+  before adding another representation of the same knowledge.
+- Give each invariant, state transition, validation rule, default, and durable
+  representation one owner. Prefer single ownership, serialization, or an
+  explicit commit boundary; preserve complete ownership units when moving
+  responsibility. Avoid parallel state, shadow models, duplicate
+  implementations, broad wrappers, and speculative abstractions. Add
+  indirection only for a real boundary or current consumer.
+- Remove superseded paths, interfaces, compatibility scaffolding, and temporary
+  state when a replacement becomes authoritative, unless compatibility requires
+  them.
+- For persistence changes, review affected readers and writers together. Make
+  ownership, commit point, durability, recovery, and failure classification
+  explicit.
+- For every TLS path, use Rustls with default features disabled and a reviewed
+  non-C crypto provider, and keep the native-TLS/C-provider family in `deny.toml`
+  complete, because Rustls and adapter feature defaults can reintroduce AWS-LC,
+  ring, OpenSSL, or platform TLS transitively.
+
+## Verification
+
+- Verify protocol and compatibility changes against independent specifications,
+  reference implementations, vectors, or observable behavior. Use independent
+  external authorities for durable compatibility tests; previous bitcoin-rs code
+  is a temporary comparison control only.
+- Keep permanent tests and fixtures only for named current contracts. Discard
+  old implementations, harnesses, corpora, outputs, and other development
+  evidence unless they independently protect a current contract.
+- Judge performance end-to-end across elapsed time, CPU, memory, and I/O, using
+  matched workloads, validation, data sources, hardware, and resource limits.
+- Put acceptance criteria in the issue or PR and execution proof in CI artifacts
+  or the PR discussion. Keep local plans and scratch outside the repository.

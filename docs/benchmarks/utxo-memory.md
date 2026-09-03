@@ -11,14 +11,10 @@ ever attributed that figure. The record constants predict roughly 5 GB at that
 height, leaving ~9 GiB unexplained, and the plan named allocator fragmentation
 across tens of millions of small allocations as the leading suspect.
 
-Harness: `crates/utxo/examples/utxo_memory_attribution.rs`, backed by
-`UtxoSetView::memory_report()`. Synthetic set with a mainnet-shaped script mix
-(P2WPKH 22 B, P2PKH 25 B, P2SH 23 B, P2TR 34 B) and 1.5 live outputs per record.
-System allocator, Apple Silicon.
-
-```
-cargo run -p bitcoin-rs-utxo --example utxo_memory_attribution --release -- [records] [churn_rounds]
-```
+The retired `utxo_memory_attribution` example used
+`UtxoSetView::memory_report()` over a synthetic set with a mainnet-shaped script
+mix and 1.5 live outputs per record. The measurements below are retained as
+historical evidence; the one-off executable is no longer supported.
 
 ## What a UTXO costs
 
@@ -71,12 +67,14 @@ handles well. **The hypothesis is refuted at this scale on this allocator** —
 with two caveats worth keeping: production links mimalloc rather than the system
 allocator, and 645,804 blocks is far more churn than twenty rounds.
 
-## Measured on a real chainstate
+## Historical full-node measurement
 
 A pruned mainnet sync to **height 412,732** (38,145,360 outputs across
-10,519,335 records) settled the assumptions above. Taken from the checkpoint
-path, so sync has stopped and the subsystems have drained — in-flight samples
-swing between 1.1 and 3.2 GB and measure block staging, not the set.
+10,519,335 records) settled the assumptions above. The figures below are
+historical evidence collected by the former checkpoint RSS-attribution hook;
+that hook is no longer part of the node runtime. Current full-node RSS evidence
+must use an external process monitor. The former `snapshot_memory` helper was
+also retired with the completed memory campaign.
 
 | Layer | Bytes/output | Total |
 |---|---:|---:|
@@ -90,11 +88,12 @@ suggested. The remaining 0.64 GiB is fjall, CoinStats, the block-record log and
 the runtime.
 
 An earlier revision attributed 450 MB of that residual to the configured
-`dbcache`. That was wrong: `Config::dbcache_mb` is parsed but **never reaches a
-backend constructor** — `NodeStorage::open` does not pass it, fjall takes builder
-defaults and RocksDB a fixed 256 MiB block cache. Issue #51 tracks it. The
-residual is therefore not a configured, bounded component the way that claim
-implied, and it has not been attributed.
+`dbcache`. That was wrong at the time: `Config::dbcache_mb` was parsed but never
+reached a backend constructor. **Update:** the budget is now real —
+`dbcache_mb` divides across namespaces and every backend takes its share
+through `open_with_cache` (issue #51). The attribution numbers in this
+document predate that change and a fresh RSS decomposition is needed before
+any residual claim is re-earned.
 
 **The synthetic harness is validated.** Re-run at the measured 3.626 outputs per
 record it predicts 54.6 B/output of payload against 55.1 measured (0.9% apart)
@@ -125,7 +124,7 @@ txids may break. Core-style script compression, the other 3 B/output, is
 untouched.
 
 At 83% of budget on the UTXO path alone — before `txindex` and
-`blockfilterindex`, which the G14 budget requires — that 12-point margin is
+the remaining derived indexes, which the G14 budget requires — that 12-point margin is
 worth having, but it does not by itself settle the gate.
 
 **Step 2.2 is justified and done. Step 2.4 is not**: fragmentation measured 5%
@@ -144,9 +143,10 @@ measured. The 13.83 GiB figure everything here is projected from comes from
 *excluded* evidence at height 645,804, on a run that never made the tip.
 
 **If G14 tip RSS measures well under budget — say below 10 GiB — this
-complexity is not earning its keep and reverting is the right call.** v4 is
-retained in the tree as the equivalence oracle and the benchmark's `before`
-arm, so a revert is a revert rather than a rewrite.
+complexity is not earning its keep and reverting is the right call.** The
+historical v4 implementation and its comparison harness have since been
+retired; the measurements below remain evidence for that decision, not a
+current compatibility or benchmark contract.
 
 The second thing that would change the answer is outputs per record. The
 projection holds it at 3.626; it has not converged (2.296 at height 183k, 4.056
@@ -174,7 +174,7 @@ Everything above about size came from a synthetic fixture. The same 2.03 GiB
 `utxo-v4.dat` a real pruned sync produced at height 412,732 — 10,519,335 records
 and **38,145,360 outputs** — was then loaded by a v4 build and a v5 build.
 Same file, same machine, only the codec differs
-(`crates/utxo/examples/snapshot_memory.rs`).
+using the now-retired `snapshot_memory` campaign helper.
 
 | Layer | v4 | v5 | Saved |
 |---|---:|---:|---:|
@@ -201,12 +201,7 @@ instead of 433 fixture ones.
 
 What this does **not** measure is full-node tip RSS: it loads the UTXO set alone,
 with no fjall, CoinStats, block-record log or runtime alongside it. The G14 gate
-still needs a synced tip node with `txindex` and `blockfilterindex`.
-
-```
-cargo run -p bitcoin-rs-utxo --example snapshot_memory --release -- \
-    <datadir>/chainstate-checkpoints/gen-*/utxo-v4.dat [manifest-trailer-sha256]
-```
+still needs a synced tip node with `txindex` and the remaining derived indexes.
 
 ### Where the two layouts cross over
 
@@ -248,7 +243,7 @@ conservative number** and the one quoted above.
 v5 keeps v4's record header and replaces the per-output layout:
 
 ```
-txid(32) || output_count(4) || legacy_inline_len(1) || widths(1)
+txid(32) || output_count(4) || inline_len(1) || widths(1)
 || vout_dir  : one fixed-width little-endian entry per output
 || len_dir   : one fixed-width payload length per output
 || payloads  : varint(amount) [|| raw amount] || varint(height << 1 | coinbase) || script
@@ -345,33 +340,18 @@ per entry.
 
 ### How it is checked
 
-- `crates/utxo/tests/record_codec_equivalence.rs`, 7 tests. v4 is retained as
-  the oracle and both codecs run over the same inputs; equality is **per field**
-  over every decoded `OneUtxoOut`, in order, because comparing encoded bytes
-  would be meaningless when the layouts are supposed to differ. Size is asserted
-  as a property, not a spot check.
-- `non_canonical_v5_spellings_are_rejected` covers what the variable-length and
-  fixed-width layouts each introduced: a non-minimal varint, the amount escape
-  used for a value the compact form already covers, and a directory wider than
-  the record needs. `UtxoRecord` compares by bytes, so a second spelling of one
-  record is a correctness bug.
-- `find_output_decompresses_at_most_the_amount_it_returns` asserts the *work*,
-  not the time: one amount decompression for a hit, none for a miss, none for
-  `max_vout`, no matter how many outputs the record holds. A wall-clock
-  assertion in a test suite is a flake generator; counting the expensive
-  operation is the same claim made deterministically.
+The former `record_codec_equivalence` integration test and `record_codec`
+benchmark were retired with the A/B harness. Historical v4/v5 equivalence and
+size checks remain on this page as evidence; current record correctness is
+covered by the unit tests in `crates/utxo/src/record.rs` and the snapshot and
+commit integration tests. The deterministic `find_output` work-count test
+remains because it protects the lookup algorithm without asserting wall time.
 
-Reproduce:
+Reproduce the retained production-shaped benchmark:
 
 ```
-cargo bench -p bitcoin-rs-utxo --bench record_codec
-cargo bench -p bitcoin-rs-utxo --bench utxo_commit -- "lookup|spend_fanout_64"
+cargo bench -p bitcoin-rs-utxo --bench utxo_commit
 ```
-
-The `utxo_commit` arms cannot be paired in one run — only one codec is compiled
-in — so the v4 comparison was taken A-B-A across a stash, with the two v5 runs
-agreeing to 0.1-2.9%. That drift bounds the rebuild effect well below every
-ratio quoted above.
 
 ## Superseded: the pre-measurement sizing
 
@@ -417,6 +397,6 @@ first.
   encoding table above is used to make a decision.
 - The script mix is representative, not measured from chainstate.
 - System allocator, not the mimalloc production links.
-- Whether the 13.83 GiB run had `txindex` and `blockfilterindex` enabled is not
+- Whether the 13.83 GiB run had `txindex` and all remaining derived indexes enabled is not
   recorded, so the ~7 GiB residual cannot yet be split between index structures
   and everything else.

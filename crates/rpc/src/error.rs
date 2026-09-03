@@ -1,6 +1,7 @@
 use core::fmt;
 use std::io;
 
+use bitcoin_rs_primitives::{DecodeError, HashError};
 use thiserror::Error;
 
 /// JSON-RPC 2.0 and Bitcoin Core-compatible RPC errors.
@@ -69,7 +70,7 @@ impl RpcError {
     /// Bitcoin Core general submission-error code, `RPC_VERIFY_ERROR`.
     pub const CORE_VERIFY_ERROR: i64 = -25;
 
-    /// Builds the no-private-keys policy error used by signing RPCs.
+    /// Builds the policy-disabled error for methods unavailable by configuration.
     #[must_use]
     pub const fn method_disabled(message: &'static str) -> Self {
         Self::MethodDisabled(message)
@@ -111,14 +112,14 @@ impl From<io::Error> for RpcError {
     }
 }
 
-impl From<bitcoin::consensus::encode::Error> for RpcError {
-    fn from(_error: bitcoin::consensus::encode::Error) -> Self {
+impl From<DecodeError> for RpcError {
+    fn from(_error: DecodeError) -> Self {
         Self::InvalidParams("consensus decoding failed")
     }
 }
 
-impl From<bitcoin::hex::HexToBytesError> for RpcError {
-    fn from(_error: bitcoin::hex::HexToBytesError) -> Self {
+impl From<HashError> for RpcError {
+    fn from(_error: HashError) -> Self {
         Self::InvalidParams("hex string is invalid")
     }
 }

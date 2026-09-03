@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 //! Subnet primitive coverage: parsing, normalization, expiry, and matching.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -85,6 +86,50 @@ fn zero_prefix_matches_entire_same_family_only() {
     assert_eq!(v6_subnet.to_string(), "::/0");
     assert!(v6_subnet.contains(v6([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1])));
     assert!(!v6_subnet.contains(v4(203, 0, 113, 1)));
+}
+
+#[test]
+fn ipv4_mapped_ipv6_base_canonicalizes_to_ipv4_subnet() {
+    let subnet = parse_subnet("::ffff:192.0.2.7");
+
+    assert_eq!(subnet.to_string(), "192.0.2.7/32");
+    assert!(subnet.contains(v4(192, 0, 2, 7)));
+    assert!(
+        subnet.contains(
+            "::ffff:192.0.2.7"
+                .parse::<std::net::IpAddr>()
+                .expect("mapped v6 literal parses")
+        )
+    );
+    assert!(!subnet.contains(v4(192, 0, 2, 8)));
+}
+
+#[test]
+fn ipv4_mapped_ipv6_prefix_validates_against_canonical_family() {
+    assert_eq!(
+        "::ffff:192.0.2.0/24"
+            .parse::<IpSubnet>()
+            .expect("mapped subnet with v4-width prefix parses")
+            .to_string(),
+        "192.0.2.0/24"
+    );
+    assert_eq!(
+        "::ffff:192.0.2.0/120".parse::<IpSubnet>(),
+        Err(SubnetParseError::PrefixTooLarge {
+            width: 32,
+            prefix: 120,
+        })
+    );
+}
+
+#[test]
+fn mapped_v4_query_matches_plain_v4_subnet() {
+    let subnet = parse_subnet("192.0.2.0/24");
+    let mapped: std::net::IpAddr = "::ffff:192.0.2.9"
+        .parse()
+        .expect("mapped v6 literal parses");
+
+    assert!(subnet.contains(mapped));
 }
 
 #[test]

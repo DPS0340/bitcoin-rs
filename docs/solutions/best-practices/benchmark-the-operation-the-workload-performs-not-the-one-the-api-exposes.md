@@ -111,5 +111,3 @@ mainnet average is 3.626 outputs per record, where v5 is slower.
   — why both arms belong in one group in one run.
 - `docs/benchmarks/utxo-memory.md` — the campaign this came from, including the
   correction notice.
-- The *Directory-layout record* and *Work-count assertion* entries in
-  `CONCEPTS.md`.

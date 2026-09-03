@@ -20,10 +20,12 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 use bitcoin_rs_consensus::rust_path::UtxoView;
-use bitcoin_rs_consensus::{ConsensusError, verify_transaction_borrowed_with_mtp};
+use bitcoin_rs_consensus::{ConsensusError, verify_transaction};
+use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid};
 use bitcoin_rs_script::VerifyFlags;
+use bitcoin_rs_script::script::{Instruction, instructions, is_p2sh, is_witness_program, opcode};
+use bitcoin_rs_script::sigops::{count_segwit, count_tx_legacy};
 use thiserror::Error;
 
 use crate::rbf::{RbfError, ReplacementCandidate};
@@ -190,7 +192,7 @@ where
     fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
         if let Some(entry) = self.pool.entry_by_txid(&outpoint.txid) {
             let vout = usize::try_from(outpoint.vout).ok()?;
-            return entry.tx.output.get(vout).cloned();
+            return entry.tx.outputs.get(vout).cloned();
         }
         self.chain.lookup(outpoint)
     }
@@ -209,18 +211,18 @@ where
 /// outpoints so the caller can route the transaction to an orphan pool.
 pub fn check_acceptance<V>(
     pool: &Mempool,
-    tx: &Arc<Transaction>,
+    tx: &Arc<Tx>,
     chain: &V,
     ctx: &AcceptContext,
 ) -> Result<AcceptChecks, AcceptError>
 where
     V: UtxoView,
 {
-    let txid = tx.compute_txid();
+    let txid = tx.txid();
     if pool.contains_txid(&txid) {
         return Err(AcceptError::AlreadyInPool);
     }
-    if tx.is_coinbase() {
+    if is_coinbase(tx) {
         return Err(AcceptError::Coinbase);
     }
     if ctx.require_standard {
@@ -231,12 +233,14 @@ where
 
     let mut missing = Vec::new();
     let mut value_in = 0_u64;
-    for input in &tx.input {
+    let mut prevouts = Vec::with_capacity(tx.inputs.len());
+    for input in &tx.inputs {
         match view.lookup(&input.previous_output) {
             Some(prevout) => {
                 value_in = value_in
-                    .checked_add(prevout.value.to_sat())
+                    .checked_add(prevout.value)
                     .ok_or(AcceptError::InputValueOverflow)?;
+                prevouts.push((input.previous_output, prevout));
             }
             None => missing.push(input.previous_output),
         }
@@ -249,8 +253,7 @@ where
     // counts it in `PreChecks` rather than in `PolicyScriptChecks`: the sigop
     // limit is a cheap rejection and there is no sense running scripts for a
     // transaction that cannot be relayed anyway.
-    let sigop_cost =
-        u32::try_from(tx.total_sigop_cost(|outpoint| view.lookup(outpoint))).unwrap_or(u32::MAX);
+    let sigop_cost = u32::try_from(total_sigop_cost(tx, &prevouts)).unwrap_or(u32::MAX);
     if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
         return Err(AcceptError::TooManySigops {
             cost: sigop_cost,
@@ -261,7 +264,7 @@ where
     // Full verification, scripts included, under relay flags. Core runs policy
     // flags in the mempool and consensus flags in a block, so a transaction
     // rejected here may still be valid in a block someone else mines.
-    verify_transaction_borrowed_with_mtp(
+    verify_transaction(
         tx,
         &view,
         ctx.height,
@@ -270,9 +273,9 @@ where
     )?;
 
     let mut value_out = 0_u64;
-    for output in &tx.output {
+    for output in &tx.outputs {
         value_out = value_out
-            .checked_add(output.value.to_sat())
+            .checked_add(output.value)
             .ok_or(AcceptError::OutputValueOverflow)?;
     }
     // Verification already rejected `value_out > value_in`; saturating rather
@@ -285,7 +288,7 @@ where
         .check_replacement(&candidate)?
         .evicted
         .iter()
-        .filter_map(|id| pool.entry(*id).map(|entry| entry.tx.compute_txid()))
+        .filter_map(|id| pool.entry(*id).map(|entry| entry.txid))
         .collect::<Vec<_>>();
 
     Ok(AcceptChecks {
@@ -308,7 +311,7 @@ where
 /// policy limit that only applies once the entry is placed.
 pub fn accept_to_mempool<V>(
     pool: &mut Mempool,
-    tx: Transaction,
+    tx: Tx,
     chain: &V,
     ctx: &AcceptContext,
 ) -> Result<AcceptResult, AcceptError>
@@ -333,8 +336,7 @@ where
     // `replace_transaction` re-runs `check_replacement` internally. Paying for
     // one extra walk of the conflict set keeps BIP125 eviction implemented in
     // exactly one place; inlining it here would be a second copy to drift.
-    let id = pool
-        .replace_transaction(candidate, ctx.time, ctx.height)
+    pool.replace_transaction(candidate, ctx.time, ctx.height, checks.sigop_cost)
         .map_err(|error| match error {
             // `replace_transaction` reports every failure as an `RbfError`,
             // including the plain insertion limits, which have nothing to do
@@ -344,12 +346,15 @@ where
             RbfError::Mempool(mempool) => AcceptError::Mempool(mempool),
             rbf => AcceptError::Rbf(rbf),
         })?;
+    let id = pool
+        .entry_id_by_txid(&checks.txid)
+        .ok_or(AcceptError::Mempool(MempoolError::TooManyEntries))?;
     Ok(AcceptResult { id, checks })
 }
 
 fn replacement_candidate(
     pool: &Mempool,
-    tx: &Arc<Transaction>,
+    tx: &Arc<Tx>,
     vsize: u32,
     fee: u64,
     sigop_cost: u32,
@@ -358,69 +363,179 @@ fn replacement_candidate(
         .with_sigop_cost(sigop_cost)
 }
 
-#[cfg(test)]
+/// Returns true if `tx` is a coinbase: exactly one input with the null outpoint.
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1
+        && tx.inputs[0].previous_output.txid == Txid::default()
+        && tx.inputs[0].previous_output.vout == u32::MAX
+}
+
+/// Computes the total sigop cost for a transaction given resolved prevouts.
+///
+/// Mirrors the consensus `total_sigop_cost` using public script-crate counters:
+/// legacy sigops × 4, plus P2SH redeem-script accurate sigops × 4, plus
+/// segwit witness-program sigops.
+fn total_sigop_cost(tx: &Tx, prevouts: &[(OutPoint, TxOut)]) -> u64 {
+    let mut cost = u64::from(count_tx_legacy(tx)).saturating_mul(4);
+    for input in &tx.inputs {
+        let prevout = prevouts
+            .iter()
+            .find(|(op, _)| *op == input.previous_output)
+            .map(|(_, txout)| txout);
+        let Some(prevout) = prevout else {
+            continue;
+        };
+        let redeem_script = last_push(&input.script_sig);
+        if is_p2sh(&prevout.script_pubkey) {
+            if let Some(redeem) = redeem_script {
+                cost = cost.saturating_add(u64::from(count_accurate(redeem)).saturating_mul(4));
+            }
+        }
+        let witness_program = if is_witness_program(&prevout.script_pubkey) {
+            Some(prevout.script_pubkey.as_slice())
+        } else {
+            redeem_script.filter(|script| is_witness_program(script))
+        };
+        if let Some(program) = witness_program {
+            cost = cost.saturating_add(u64::from(count_segwit(program, &input.witness)));
+        }
+    }
+    cost
+}
+
+/// Returns the last data push from a script, or `None`.
+fn last_push(script: &[u8]) -> Option<&[u8]> {
+    let mut last = None;
+    for instruction in instructions(script) {
+        match instruction.ok()? {
+            Instruction::PushBytes(bytes) => last = Some(bytes),
+            Instruction::Op(_) => last = None,
+        }
+    }
+    last
+}
+
+/// Counts sigops accurately (multisig uses the preceding pushnum value).
+fn count_accurate(script: &[u8]) -> u32 {
+    let mut count = 0_u32;
+    let mut pushed_number = None;
+    for instruction in instructions(script) {
+        match instruction {
+            Ok(Instruction::Op(op)) => match op {
+                opcode::OP_CHECKSIG | opcode::OP_CHECKSIGVERIFY => {
+                    count = count.saturating_add(1);
+                    pushed_number = None;
+                }
+                opcode::OP_CHECKMULTISIG | opcode::OP_CHECKMULTISIGVERIFY => {
+                    count = count.saturating_add(u32::from(pushed_number.unwrap_or(20)));
+                    pushed_number = None;
+                }
+                other => pushed_number = opcode::decode_pushnum(other),
+            },
+            Ok(Instruction::PushBytes(_)) => pushed_number = None,
+            Err(_) => break,
+        }
+    }
+    count
+}
+
 mod tests {
     use super::*;
     use crate::MempoolLimits;
     use alloc::collections::BTreeMap;
     use alloc::vec;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::script::Builder;
-    use bitcoin::transaction::Version;
-    use bitcoin::{Amount, FeeRate, PubkeyHash, ScriptBuf, Sequence, TxIn, TxOut, Txid, Witness};
+    use bitcoin_rs_primitives::{Hash256, TxIn};
+    use bitcoin_rs_script::script::{opcode, push_data, push_int};
+    use bitcoin_rs_script::sigops::count_tx_legacy;
+
+    /// A local `UtxoView` over a map. The trait is only implemented for
+    /// `hashbrown::HashMap` upstream, and `OutPoint` has no `Ord`, so the
+    /// fixtures key the map by the outpoint's wire bytes instead.
+    struct ChainView(BTreeMap<[u8; 36], TxOut>);
+
+    impl UtxoView for ChainView {
+        fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
+            self.0.get(&outpoint_key(outpoint)).cloned()
+        }
+    }
+
+    fn outpoint_key(outpoint: &OutPoint) -> [u8; 36] {
+        let mut key = [0_u8; 36];
+        key[..32].copy_from_slice(outpoint.txid.as_bytes());
+        key[32..].copy_from_slice(&outpoint.vout.to_le_bytes());
+        key
+    }
 
     /// A prevout script anyone can spend with an empty scriptSig.
     ///
     /// Keeps these tests about acceptance. Producing real signatures would
     /// turn every fixture into a signing exercise, and a prevout's own script
     /// is not what standardness looks at.
-    fn anyone_can_spend() -> ScriptBuf {
-        ScriptBuf::from_bytes(vec![0x51])
+    fn anyone_can_spend() -> Vec<u8> {
+        vec![0x51]
     }
 
-    fn p2pkh(tag: u8) -> ScriptBuf {
-        ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([tag; 20]))
+    fn p2pkh(tag: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(25);
+        out.push(opcode::OP_DUP);
+        out.push(opcode::OP_HASH160);
+        out.push(0x14);
+        out.extend_from_slice(&[tag; 20]);
+        out.push(opcode::OP_EQUALVERIFY);
+        out.push(opcode::OP_CHECKSIG);
+        out
+    }
+
+    /// Builds a P2SH scriptPubKey from a 20-byte redeem-script hash.
+    fn p2sh_script_pubkey(redeem_hash: &[u8; 20]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(23);
+        out.push(opcode::OP_HASH160);
+        out.push(0x14);
+        out.extend_from_slice(redeem_hash);
+        out.push(opcode::OP_EQUAL);
+        out
     }
 
     fn outpoint(tag: u8, vout: u32) -> OutPoint {
-        OutPoint::new(Txid::from_byte_array([tag; 32]), vout)
+        OutPoint::new(Txid(Hash256::from_le_bytes(&[tag; 32])), vout)
     }
 
     /// Spends `inputs` and pays `output_value` to a standard P2PKH script.
-    fn spending_tx(inputs: &[OutPoint], output_value: u64, tag: u8) -> Transaction {
-        Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: inputs
+    fn spending_tx(inputs: &[OutPoint], output_value: u64, tag: u8) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: inputs
                 .iter()
                 .map(|previous_output| TxIn {
                     previous_output: *previous_output,
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::MAX,
-                    witness: Witness::new(),
+                    script_sig: Vec::new(),
+                    sequence: 0xffff_ffff,
+                    witness: Vec::new(),
                 })
                 .collect(),
-            output: vec![TxOut {
-                value: Amount::from_sat(output_value),
+            outputs: vec![TxOut {
+                value: output_value,
                 script_pubkey: p2pkh(tag),
             }],
         }
     }
 
-    fn chain_with(entries: &[(OutPoint, u64)]) -> BTreeMap<OutPoint, TxOut> {
-        entries
-            .iter()
-            .map(|(outpoint, value)| {
-                (
-                    *outpoint,
-                    TxOut {
-                        value: Amount::from_sat(*value),
-                        script_pubkey: anyone_can_spend(),
-                    },
-                )
-            })
-            .collect()
+    fn chain_with(entries: &[(OutPoint, u64)]) -> ChainView {
+        ChainView(
+            entries
+                .iter()
+                .map(|(outpoint, value)| {
+                    (
+                        outpoint_key(outpoint),
+                        TxOut {
+                            value: *value,
+                            script_pubkey: anyone_can_spend(),
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 
     fn context() -> AcceptContext {
@@ -429,7 +544,7 @@ mod tests {
             locktime_cutoff: 1_700_000_000,
             time: 42,
             standardness: StandardnessPolicy {
-                dust_relay_fee: FeeRate::DUST,
+                dust_relay_fee: 3_000,
                 max_datacarrier_bytes: Some(83),
             },
             require_standard: true,
@@ -503,8 +618,8 @@ mod tests {
             ..context()
         };
         let mut parent = spending_tx(&[outpoint(1, 0)], 90_000, 7);
-        parent.output[0].script_pubkey = anyone_can_spend();
-        let parent_txid = parent.compute_txid();
+        parent.outputs[0].script_pubkey = anyone_can_spend();
+        let parent_txid = parent.txid();
         let Ok(_parent) = accept_to_mempool(&mut pool, parent, &chain, &relaxed) else {
             panic!("parent must be accepted or the child case is untested");
         };
@@ -541,9 +656,9 @@ mod tests {
     fn rejects_a_coinbase() {
         let mut pool = pool();
         let chain = chain_with(&[]);
-        let mut tx = spending_tx(&[OutPoint::null()], 90_000, 7);
-        tx.input[0].script_sig = Builder::new().push_int(800_001).into_script();
-        assert!(tx.is_coinbase(), "the fixture must be a coinbase");
+        let mut tx = spending_tx(&[OutPoint::new(Txid::default(), u32::MAX)], 90_000, 7);
+        tx.inputs[0].script_sig = push_int(800_001);
+        assert!(is_coinbase(&tx), "the fixture must be a coinbase");
 
         assert_eq!(
             accept_to_mempool(&mut pool, tx, &chain, &context()),
@@ -558,7 +673,7 @@ mod tests {
         let chain = chain_with(&[(outpoint(1, 0), 100_000)]);
         let mut tx = spending_tx(&[outpoint(1, 0)], 90_000, 7);
         // Version 4 is consensus-valid and non-standard.
-        tx.version = Version(4);
+        tx.version = 4;
 
         let mut strict = pool();
         assert_eq!(
@@ -617,15 +732,15 @@ mod tests {
         let mut pool = pool();
         let chain = chain_with(&[(outpoint(1, 0), 100_000)]);
         let mut original = spending_tx(&[outpoint(1, 0)], 90_000, 7);
-        original.input[0].sequence = Sequence::from_consensus(0xffff_fffd);
-        let original_txid = original.compute_txid();
+        original.inputs[0].sequence = 0xffff_fffd;
+        let original_txid = original.txid();
         let Ok(_first) = accept_to_mempool(&mut pool, original, &chain, &context()) else {
             panic!("the original must be accepted");
         };
 
         // Same input, higher fee, different output so it is a distinct txid.
         let mut replacement = spending_tx(&[outpoint(1, 0)], 50_000, 8);
-        replacement.input[0].sequence = Sequence::from_consensus(0xffff_fffd);
+        replacement.inputs[0].sequence = 0xffff_fffd;
         let Ok(result) = accept_to_mempool(&mut pool, replacement, &chain, &context()) else {
             panic!("a higher-feerate replacement must be accepted");
         };
@@ -684,41 +799,43 @@ mod tests {
     /// and the test runs on both script backends.
     #[test]
     fn sigop_cost_is_counted_against_the_resolved_prevouts() {
-        use bitcoin::opcodes::all::OP_CHECKMULTISIG;
-
         // Twenty sigops: `GetSigOpCount` charges the maximum for a
         // `CHECKMULTISIG` that is not preceded by a literal key count.
-        let redeem = Builder::new().push_opcode(OP_CHECKMULTISIG).into_script();
-        let Ok(redeem_push) = <&bitcoin::script::PushBytes>::try_from(redeem.as_bytes()) else {
-            panic!("a one-byte redeem script must be pushable");
-        };
-        let script_sig = Builder::new().push_slice(redeem_push).into_script();
-        let script_pubkey = ScriptBuf::new_p2sh(&redeem.script_hash());
+        let redeem = vec![opcode::OP_CHECKMULTISIG];
+        let script_sig = push_data(&redeem);
+
+        // P2SH scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL.
+        // The hash need not be the actual HASH160 of the redeem script —
+        // `is_p2sh` only checks the 23-byte shape, and the sigop counter
+        // reads the redeem script from the scriptSig, not from this hash.
+        let script_pubkey = p2sh_script_pubkey(&[0x42; 20]);
 
         // 200 inputs * 20 sigops * 4 = 16 000, one past the limit once the
         // output's own legacy sigop is scaled in.
         let inputs = (0..200_u32)
             .map(|vout| outpoint(3, vout))
             .collect::<Vec<_>>();
-        let chain = inputs
-            .iter()
-            .map(|outpoint| {
-                (
-                    *outpoint,
-                    TxOut {
-                        value: Amount::from_sat(1_000),
-                        script_pubkey: script_pubkey.clone(),
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let chain = ChainView(
+            inputs
+                .iter()
+                .map(|outpoint| {
+                    (
+                        outpoint_key(outpoint),
+                        TxOut {
+                            value: 1_000,
+                            script_pubkey: script_pubkey.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
 
         let mut tx = spending_tx(&inputs, 190_000, 7);
-        for input in &mut tx.input {
+        for input in &mut tx.inputs {
             input.script_sig = script_sig.clone();
         }
 
-        let blind = u32::try_from(tx.total_sigop_cost(|_outpoint| None)).unwrap_or(u32::MAX);
+        let blind = u32::try_from(count_tx_legacy(&tx).saturating_mul(4)).unwrap_or(u32::MAX);
         assert!(
             blind <= MAX_STANDARD_TX_SIGOPS_COST,
             "counting blind must stay under the limit ({blind}), or the \

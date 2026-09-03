@@ -1,75 +1,105 @@
 use alloc::sync::Arc;
-use core::fmt;
-
-use arc_swap::{ArcSwap, ArcSwapOption};
-use bitcoin::consensus::encode::serialize;
-use bitcoin::hashes::Hash as _;
-use bitcoin::hex::{DisplayHex, FromHex as _};
-use bitcoin::{Block, FeeRate, OutPoint, Transaction, TxOut, Txid};
+use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_consensus::rust_path::UtxoView;
+use bitcoin_rs_ext_api::CapabilityProvider;
 use bitcoin_rs_index::ScriptHash;
-use bitcoin_rs_mempool::{
-    AcceptChecks, AcceptContext, AcceptError, AcceptResult, Mempool, MempoolLimits,
-    StandardnessPolicy, accept_to_mempool, check_acceptance,
+use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits, MempoolObserver, MutationResult};
+use bitcoin_rs_primitives::{
+    Block, BlockHash, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
 };
-use bitcoin_rs_primitives::{Hash256, Network, OutPoint as InternalOutPoint};
 use compact_str::CompactString;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::path::PathBuf;
 
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 
-/// Number of blocks in a median-time-past window (BIP113).
-const MEDIAN_TIME_SPAN: usize = 11;
-
-/// Aggregate nulldata bytes relay policy allows in one transaction.
-///
-/// Bitcoin Core's `MAX_OP_RETURN_RELAY`, defined as
-/// `MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR`. The historical 83-byte
-/// limit is gone; using it here would reject transactions Core relays.
-const MAX_OP_RETURN_RELAY: usize = 400_000 / 4;
-
-/// The confirmed UTXO set, as the consensus crate's lookup contract.
-///
-/// Named to avoid colliding with the two other `UtxoSetView` types in the
-/// workspace: `bitcoin_rs_utxo`'s borrowed view and the node's apply-path
-/// adapter.
-struct ChainUtxoView {
-    set: Arc<bitcoin_rs_utxo::UtxoSet>,
-}
-
-impl ChainUtxoView {
-    const fn new(set: Arc<bitcoin_rs_utxo::UtxoSet>) -> Self {
-        Self { set }
-    }
-}
-
-impl UtxoView for ChainUtxoView {
-    fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
-        let internal = InternalOutPoint::new(
-            Hash256::from_le_bytes(outpoint.txid.as_byte_array()),
-            outpoint.vout,
-        );
-        self.set.get(&internal)
-    }
-}
 /// How stale the applied tip may be while the node still counts as synced.
 ///
 /// Bitcoin Core's `DEFAULT_MAX_TIP_AGE`, 24 hours. Core exposes it as
 /// `-maxtipage`; this node has no such option yet, so the default stands.
 const MAX_TIP_AGE_SECONDS: u64 = 24 * 60 * 60;
 
-/// Block data made available to RPC handlers without forcing storage I/O.
+/// Core `sendrawtransaction` default `maxfeerate`: 0.1 BTC/kvB in sat/kvB.
+///
+/// The node applies the identical cap to every admission surface, including
+/// the embedded [`bitcoin_rs_node::Node::broadcast`], via
+/// [`Context::admit_transaction`].
+pub const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
+
+/// Full-block REST responses materialize the block and a response buffer.
+/// Bound concurrent materializations independently of socket connections.
+const MAX_CONCURRENT_REST_BLOCK_RENDERS: usize = 2;
+
+/// Encodes `bytes` as lowercase hexadecimal.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+#[derive(Debug)]
+struct RestRenderBudget {
+    in_flight: AtomicUsize,
+}
+
+impl RestRenderBudget {
+    const fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<RestRenderPermit> {
+        let mut in_flight = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if in_flight >= MAX_CONCURRENT_REST_BLOCK_RENDERS {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                in_flight,
+                in_flight + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(RestRenderPermit {
+                        budget: Arc::clone(self),
+                    });
+                }
+                Err(actual) => in_flight = actual,
+            }
+        }
+    }
+}
+
+pub(crate) struct RestRenderPermit {
+    budget: Arc<RestRenderBudget>,
+}
+
+impl Drop for RestRenderPermit {
+    fn drop(&mut self) {
+        let previous = self.budget.in_flight.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous > 0, "REST render permit count underflowed");
+    }
+}
+
+/// Block metadata made available to RPC handlers without forcing storage I/O.
+///
+/// The serialized block body lives in durable storage behind
+/// [`BlockBodySource`]; records carry only identity and size facts.
 #[derive(Clone, Debug)]
 pub struct BlockRecord {
     /// Block hash in conventional big-endian hex order.
-    pub hash: Hash256,
+    pub hash: BlockHash,
     /// Height in the active chain.
     pub height: u32,
-    /// Serialized block bytes as lowercase hex.
-    pub block_hex: String,
     /// Serialized block byte length.
     pub body_size: usize,
     /// Serialized block header bytes, when the record carries a header.
@@ -180,16 +210,6 @@ impl BlockLog {
         self.cumulative_tx_count.reserve(additional);
     }
 
-    /// Mutable access to the records, for fields the running sums do not cover.
-    ///
-    /// Pruning uses this to release cached block bodies. `body_size` and
-    /// `tx_count` describe the block and do not change when its body is dropped,
-    /// so the sums stay correct — and `debug_assert`s in [`Self::size_on_disk`]
-    /// and [`Self::tx_count_before`] fail loudly if a caller ever changes them.
-    pub fn records_mut(&mut self) -> impl Iterator<Item = &mut BlockRecord> {
-        self.records.iter_mut()
-    }
-
     /// Sum of every record's serialized block length, in bytes.
     ///
     /// This is `getblockchaininfo`'s `size_on_disk`. It counts the block sizes
@@ -283,8 +303,9 @@ impl FromIterator<BlockRecord> for BlockLog {
 /// answer it. The window is the caller's `nblocks` (~4,320 by default), not the
 /// chain.
 ///
-/// [`fold_block_records`] is the implementation this replaced, kept as
-/// the oracle `chain_stats_matches_the_fold_it_replaced` compares against.
+/// The equivalence oracle this was checked against has since been deleted;
+/// direct expected-value tests in `handlers::chain::tests` pin every figure
+/// against hand-computed values instead.
 #[must_use]
 pub fn chain_stats(log: &BlockLog, applied_height: u32, lowest_window_height: u64) -> ChainStats {
     let blocks: &[BlockRecord] = log;
@@ -333,71 +354,6 @@ pub struct ChainStats {
     pub tip_time: Option<u32>,
     /// Lowest timestamp inside the requested window.
     pub earliest_window_time: Option<u32>,
-}
-
-/// What a whole-log fold produced for the chain-info RPCs.
-///
-/// See [`fold_block_records`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct FoldedBlockRecords {
-    /// Sum of `body_size` over every record.
-    pub size_on_disk: u64,
-    /// Sum of `tx_count` over records at or below the applied tip.
-    pub total_tx_count: u64,
-    /// Sum of `tx_count` over records inside the requested window.
-    pub window_tx_count: u64,
-    /// Timestamp of the first record at the applied height.
-    pub tip_time: Option<u32>,
-    /// Lowest timestamp inside the requested window.
-    pub earliest_window_time: Option<u32>,
-}
-
-/// The whole-log fold `getblockchaininfo` and `getchaintxstats` used to run.
-///
-/// Retained deliberately, not left behind. It is the oracle the equivalence
-/// tests compare [`BlockLog`]'s running sums and the windowed search against,
-/// and the `before` arm of `benches/chaininfo.rs` — both arms have to run in one
-/// process over one fixture for the ratio to mean anything, which they cannot do
-/// if this is deleted.
-///
-/// Nothing in the node calls it. It walks every record the node holds, which is
-/// the entire reason it was replaced.
-///
-/// It makes no assumption about the log's ordering, which is the point: the
-/// replacement binary-searches, and an oracle that shared that assumption could
-/// not catch it being wrong.
-#[must_use]
-pub fn fold_block_records(
-    blocks: &[BlockRecord],
-    applied_height: u32,
-    lowest_window_height: Option<u64>,
-) -> FoldedBlockRecords {
-    let mut stats = FoldedBlockRecords::default();
-    for record in blocks {
-        stats.size_on_disk = stats
-            .size_on_disk
-            .saturating_add(u64::try_from(record.body_size).unwrap_or(u64::MAX));
-        if record.height > applied_height {
-            continue;
-        }
-        stats.total_tx_count = stats
-            .total_tx_count
-            .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-        if record.height == applied_height && stats.tip_time.is_none() {
-            stats.tip_time = Some(record.time);
-        }
-        if lowest_window_height.is_some_and(|lowest| u64::from(record.height) >= lowest) {
-            stats.window_tx_count = stats
-                .window_tx_count
-                .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-            stats.earliest_window_time = Some(
-                stats
-                    .earliest_window_time
-                    .map_or(record.time, |earliest| earliest.min(record.time)),
-            );
-        }
-    }
-    stats
 }
 
 /// Finds the record at `height`, or `None` when the log holds no such height.
@@ -453,7 +409,7 @@ pub fn record_at_height_hash(
         index = index.saturating_sub(1);
     }
     while index < records.len() && records[index].height == height {
-        if records[index].hash == hash {
+        if Hash256::from(records[index].hash) == hash {
             return Some(&records[index]);
         }
         index += 1;
@@ -472,11 +428,11 @@ pub struct BlockBodyMetadata {
 /// Storage-backed block body reader used when block records keep only metadata.
 pub trait BlockBodySource: Send + Sync {
     /// Returns serialized block bytes for `height` and `hash`, if available.
-    fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>>;
+    fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>>;
 
     /// Returns indexed body facts. Implementations that cannot answer without
     /// I/O may leave this absent; header-only callers then remain header-only.
-    fn block_body_metadata(&self, _height: u32, _hash: Hash256) -> Option<BlockBodyMetadata> {
+    fn block_body_metadata(&self, _height: u32, _hash: BlockHash) -> Option<BlockBodyMetadata> {
         None
     }
 
@@ -508,7 +464,7 @@ pub trait BlockBodySource: Send + Sync {
     fn block_body_range(
         &self,
         _height: u32,
-        _hash: Hash256,
+        _hash: BlockHash,
         _offset: u32,
         _len: u32,
     ) -> Option<Vec<u8>> {
@@ -516,67 +472,41 @@ pub trait BlockBodySource: Send + Sync {
     }
 }
 
+/// Read-only source of rollback-evidence warnings for `getblockchaininfo`.
+///
+/// Implemented by the node crate's `WarningStore`. Each call loads one
+/// immutable snapshot; the handler copies rendered strings into the
+/// existing `warnings` field without reading disk or reparsing markers.
+pub trait RollbackWarningSource: Send + Sync {
+    /// Returns rendered warnings in deterministic order.
+    fn rollback_warnings(&self) -> Vec<String>;
+}
+
 impl BlockRecord {
     /// Builds a record from a decoded Bitcoin block.
+    ///
+    /// The record is metadata only: `body_size` is the native consensus-encoded length.
     #[must_use]
     pub fn from_block(height: u32, block: &Block) -> Self {
-        let block_bytes = serialize(block);
-        Self::from_block_bytes(height, block, &block_bytes)
-    }
-
-    /// Builds a record from a decoded Bitcoin block and its serialized bytes.
-    ///
-    /// Callers on hot paths can pass bytes already produced for persistence or
-    /// indexes instead of serializing the full block a second time.
-    #[must_use]
-    pub fn from_block_bytes(height: u32, block: &Block, block_bytes: &[u8]) -> Self {
-        let block_hash = block.block_hash();
-        let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-        let block_hex = block_bytes.to_lower_hex_string();
+        let hash = block.block_hash();
         Self {
             hash,
             height,
-            block_hex,
-            body_size: block_bytes.len(),
+            body_size: consensus_bytes(block).len(),
             // Not stored: the block tree holds this block's header, and
             // `Context::header_record` supplies it on the way out.
             header: None,
-            tx_count: block.txdata.len(),
-            time: block.header.time,
-        }
-    }
-
-    /// Builds a metadata-only record for nodes that serve block bodies from storage.
-    #[must_use]
-    pub fn from_block_metadata(height: u32, block: &Block) -> Self {
-        let block_bytes = serialize(block);
-        Self::from_block_metadata_bytes(height, block, &block_bytes)
-    }
-
-    /// Builds a metadata-only record from bytes already serialized by the caller.
-    #[must_use]
-    pub fn from_block_metadata_bytes(height: u32, block: &Block, block_bytes: &[u8]) -> Self {
-        let block_hash = block.block_hash();
-        let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-        Self {
-            hash,
-            height,
-            block_hex: String::new(),
-            body_size: block_bytes.len(),
-            // See `from_block_bytes`.
-            header: None,
-            tx_count: block.txdata.len(),
+            tx_count: block.txs.len(),
             time: block.header.time,
         }
     }
 
     /// Builds a synthetic record used by tests and empty-state scaffolds.
     #[must_use]
-    pub fn synthetic(height: u32, hash: Hash256) -> Self {
+    pub fn synthetic(height: u32, hash: BlockHash) -> Self {
         Self {
             hash,
             height,
-            block_hex: String::new(),
             body_size: 0,
             header: None,
             tx_count: 0,
@@ -603,7 +533,7 @@ impl BlockRecord {
     pub fn header_hex(&self) -> String {
         self.header
             .as_ref()
-            .map_or_else(String::new, |bytes| bytes.to_lower_hex_string())
+            .map_or_else(String::new, |bytes| hex_encode(bytes.as_slice()))
     }
 }
 
@@ -718,37 +648,225 @@ pub enum ChainControlError {
     #[error("{0}")]
     Failed(String),
 }
-#[derive(Debug, Default)]
-struct NoopFilterIndex;
 
-impl bitcoin_rs_filters::FilterIndexLike for NoopFilterIndex {
-    fn put_filter(
-        &self,
-        _block_hash: bitcoin_rs_primitives::Hash256,
-        _prev_header: bitcoin_rs_primitives::Hash256,
-        _filter_bytes: &[u8],
-    ) -> Result<bitcoin_rs_primitives::Hash256, bitcoin_rs_filters::FilterIndexError> {
-        Ok(bitcoin_rs_primitives::Hash256::default())
+/// One capability advertised by a `getblocktemplate` caller.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MiningCapability(CompactString);
+
+impl MiningCapability {
+    /// Preserves a BIP22/BIP23 capability name without coupling it to JSON.
+    #[must_use]
+    pub fn new(name: impl Into<CompactString>) -> Self {
+        Self(name.into())
     }
 
-    fn filter_header(
-        &self,
-        _block_hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<Option<bitcoin_rs_primitives::Hash256>, bitcoin_rs_filters::FilterIndexError> {
-        Ok(None)
-    }
-
-    fn filter(
-        &self,
-        _block_hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<Option<Vec<u8>>, bitcoin_rs_filters::FilterIndexError> {
-        Ok(None)
+    /// Returns the capability name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
-fn noop_filter_index() -> Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>> {
-    let filter_index: Box<dyn bitcoin_rs_filters::FilterIndexLike> = Box::new(NoopFilterIndex);
-    Arc::new(filter_index)
+/// One versionbits rule named by a template request or response.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MiningRule(CompactString);
+
+impl MiningRule {
+    /// Preserves a deployment rule name without coupling it to its wire encoding.
+    #[must_use]
+    pub fn new(name: impl Into<CompactString>) -> Self {
+        Self(name.into())
+    }
+
+    /// Returns the deployment rule name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// Operation selected by a BIP22/BIP23 block-template request.
+#[derive(Clone, Debug)]
+pub enum BlockTemplateMode {
+    /// Assemble or wait for a mining candidate.
+    Template,
+    /// Dry-run validation of a caller-provided block.
+    Proposal(Block),
+}
+
+/// Transport-neutral input to [`MiningControl::get_block_template`].
+#[derive(Clone, Debug)]
+pub struct BlockTemplateRequest {
+    /// Template assembly or proposal validation.
+    pub mode: BlockTemplateMode,
+    /// Advisory BIP22/BIP23 capabilities advertised by the caller.
+    pub capabilities: Vec<MiningCapability>,
+    /// Versionbits rules the caller can enforce.
+    pub rules: Vec<MiningRule>,
+    /// Opaque BIP22/BIP23 generation to wait beyond in template mode.
+    pub long_poll_id: Option<CompactString>,
+}
+
+/// One versionbits deployment available for caller negotiation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvailableMiningRule {
+    /// Deployment rule name.
+    pub rule: MiningRule,
+    /// Header-version bit assigned to the deployment.
+    pub bit: u8,
+}
+
+/// Candidate fields a template consumer may change before solving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TemplateMutation {
+    /// Header time may advance within the consensus bounds.
+    Time,
+    /// Transactions may be added, removed, or reordered consistently.
+    Transactions,
+    /// The previous-block field may be replaced after a tip change.
+    PreviousBlock,
+}
+
+/// Semantic template assembled by the node-owned mining coordinator.
+#[derive(Clone, Debug)]
+pub struct BlockTemplate {
+    /// Immutable candidate generation and transaction facts.
+    pub candidate: Arc<bitcoin_rs_mining::Candidate>,
+    /// Active rules a solver must enforce.
+    pub rules: Vec<MiningRule>,
+    /// Optional deployments available for versionbits negotiation.
+    pub version_bits_available: Vec<AvailableMiningRule>,
+    /// Header-version bits the solver must preserve.
+    pub version_bits_required: u32,
+    /// Capabilities implemented by this template producer.
+    pub capabilities: Vec<MiningCapability>,
+    /// Candidate fields the solver may mutate.
+    pub mutable: Vec<TemplateMutation>,
+    /// Whether work derived from the request's prior generation remains valid.
+    pub submit_old: Option<bool>,
+    /// Opaque server work identity when the producer requires one on submission.
+    pub work_id: Option<CompactString>,
+}
+
+/// BIP22 validation vocabulary shared by proposal and solved-block submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockValidationResult {
+    /// The block is valid and, for submission, was synchronously applied.
+    Accepted,
+    /// The block was already accepted.
+    Duplicate,
+    /// The block duplicates one already known to be invalid.
+    DuplicateInvalid,
+    /// The block duplicates one whose validity is not yet conclusive.
+    DuplicateInconclusive,
+    /// Validation could not reach a conclusive result.
+    Inconclusive,
+    /// Consensus or contextual validation rejected the block.
+    Rejected(CompactString),
+}
+
+/// Semantic result of template assembly or proposal validation.
+#[derive(Clone, Debug)]
+pub enum BlockTemplateResult {
+    /// A candidate ready for projection into a BIP22 template.
+    Template(BlockTemplate),
+    /// Dry-run proposal validation, with no chain or mempool mutation.
+    Proposal(BlockValidationResult),
+}
+
+/// Facts from the most recently assembled candidate, when one exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LastCandidateInfo {
+    /// Total candidate weight.
+    pub weight: u64,
+    /// Number of transactions including the coinbase.
+    pub transactions: u64,
+}
+
+/// Signet-specific mining configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignetMiningInfo {
+    /// Consensus signet challenge script.
+    pub challenge: Vec<u8>,
+}
+
+/// Authoritative semantic state returned by [`MiningControl::mining_info`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct MiningInfo {
+    /// Current applied-chain height.
+    pub blocks: u32,
+    /// Most recently assembled candidate facts.
+    pub last_candidate: Option<LastCandidateInfo>,
+    /// Difficulty of the applied tip.
+    pub difficulty: f64,
+    /// Estimated network hashes per second.
+    pub network_hashes_per_second: f64,
+    /// Transactions currently available in the mempool.
+    pub pooled_transactions: u64,
+    /// Active consensus network.
+    pub network: Network,
+    /// Compact target bits for the next candidate.
+    pub next_bits: u32,
+    /// Difficulty represented by `next_bits`.
+    pub next_difficulty: f64,
+    /// Configured minimum mining feerate in satoshis per kvB.
+    pub minimum_fee_rate: u64,
+    /// Signet mining data, absent on other networks.
+    pub signet: Option<SignetMiningInfo>,
+    /// Active node warnings.
+    pub warnings: Vec<CompactString>,
+}
+
+/// Failure to execute a node-owned mining operation.
+#[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum MiningControlError {
+    /// The semantic request is internally inconsistent or unsupported.
+    #[error("{0}")]
+    InvalidRequest(CompactString),
+    /// Authoritative mining state is not currently available.
+    #[error("{0}")]
+    Unavailable(CompactString),
+    /// Candidate construction, validation, or application failed operationally.
+    #[error("{0}")]
+    Failed(CompactString),
+}
+
+/// Node-owned control plane for candidate lifecycle and solved-block submission.
+pub trait MiningControl: Send + Sync {
+    /// Assembles or long-polls a template, or dry-validates a proposal.
+    fn get_block_template(
+        &self,
+        request: BlockTemplateRequest,
+    ) -> Result<BlockTemplateResult, MiningControlError>;
+
+    /// Captures one coherent mining-state report.
+    fn mining_info(&self) -> Result<MiningInfo, MiningControlError>;
+
+    /// Synchronously validates and applies a solved block.
+    fn submit_block(&self, block: Block) -> Result<BlockValidationResult, MiningControlError>;
+
+    /// Publishes a completed authoritative mutation to template waiters.
+    fn publish_generation(&self);
+}
+
+/// Returns the f64 difficulty for `bits` using Bitcoin Core's calculation.
+#[must_use]
+pub fn difficulty_for_bits(consensus_bits: u32) -> f64 {
+    let mantissa = consensus_bits & 0x00ff_ffff;
+    if mantissa == 0 {
+        return 0.0;
+    }
+    let mut shift = (consensus_bits >> 24) & 0xff;
+    let mut difficulty = f64::from(0x0000_ffff_u32) / f64::from(mantissa);
+    while shift < 29 {
+        difficulty *= 256.0;
+        shift += 1;
+    }
+    while shift > 29 {
+        difficulty /= 256.0;
+        shift -= 1;
+    }
+    difficulty
 }
 
 /// Actual progress reported by the node-owned transaction index.
@@ -777,7 +895,7 @@ pub enum TxQueryError {
 /// Lockless read-only adapter for complete transaction-index queries.
 pub trait TxIndexQuery: Send + Sync {
     /// Resolves a confirmed transaction, returning `None` only after complete absence is proven.
-    fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError>;
+    fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError>;
     /// Resolves a confirmed prevout value, returning `None` only after complete absence is proven.
     fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError>;
     /// Resolves the height of the block confirming `txid`, without materializing the transaction.
@@ -792,6 +910,33 @@ pub trait TxIndexQuery: Send + Sync {
     }
     /// Returns the transaction index's actual durable progress.
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
+}
+
+/// Actual progress reported by the node-owned basic block-filter index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilterIndexInfo {
+    /// Whether the index has completely caught up to the authoritative chain tip.
+    pub synced: bool,
+    /// Height of the best block whose filter the index can serve.
+    pub best_block_height: u32,
+}
+
+/// Lockless read-only adapter for basic block-filter index queries.
+///
+/// `None` on the context means the index is not enabled; implementations
+/// return [`TxQueryError`] for blocks the index does not cover.
+pub trait FilterIndexQuery: Send + Sync {
+    /// Returns the index's actual durable progress.
+    fn filter_info(&self) -> Result<FilterIndexInfo, TxQueryError>;
+
+    /// Returns the serialized BIP158 basic filter for `block_hash`.
+    ///
+    /// `None` means complete absence: the block is known to the index and
+    /// has no filter row (only possible below the indexed prefix).
+    fn basic_filter(&self, block_hash: Hash256) -> Result<Option<Vec<u8>>, TxQueryError>;
+
+    /// Returns the BIP157 filter header for `block_hash`.
+    fn filter_header(&self, block_hash: Hash256) -> Result<Option<[u8; 32]>, TxQueryError>;
 }
 
 /// One current unspent output indexed for a script.
@@ -880,12 +1025,102 @@ impl TxQueryError {
     }
 }
 
+/// Handles owned by the node and observed by the RPC context, grouped by
+/// node capability: chain, mempool, indexes, network, and mining.
+///
+/// A struct-of-structs grouping, not a trait layer. `Context::from_handles`
+/// consumes one `ContextHandles` value and the handler surface reads only
+/// these capability groups — RPC consumes node capabilities and never names a
+/// storage backend or backend engine type.
+#[derive(Clone)]
+pub struct ContextHandles {
+    /// Chain capability: tips, block log, UTXO set, and block tree.
+    pub chain: ChainHandles,
+    /// Mempool capability: the in-memory transaction pool.
+    pub mempool: MempoolHandles,
+    /// Index capability: transaction and script index query adapters.
+    pub indexes: IndexHandles,
+    /// Network capability: peer registry, reachability, and connection control.
+    pub network: NetworkHandles,
+    /// Mining capability: the template coordinator, when one is attached.
+    pub mining: MiningHandles,
+    /// Complete basic block-filter index query adapter.
+    pub filter_index: Option<Arc<dyn FilterIndexQuery>>,
+    /// Live capability report backing the `getcapabilities` extension method.
+    pub capabilities: Option<Arc<dyn CapabilityProvider>>,
+}
+
+/// Chain capability handles.
+#[derive(Clone)]
+pub struct ChainHandles {
+    /// Best header-chain tip.
+    pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Best fully-applied block tip.
+    pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Applied block metadata log.
+    pub blocks: Arc<RwLock<BlockLog>>,
+    /// Transactions retained for direct RPC lookup.
+    pub transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
+    /// Authoritative UTXO set.
+    pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
+    /// Incremental UTXO statistics.
+    pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
+    /// Shared block tree.
+    pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
+    /// Consensus network.
+    pub chain_network: Network,
+}
+
+/// Mempool capability handles.
+#[derive(Clone)]
+pub struct MempoolHandles {
+    /// The process-wide mutation gateway in front of the in-memory pool.
+    pub mempool: Arc<MempoolGateway>,
+}
+
+/// Index capability handles.
+#[derive(Clone)]
+pub struct IndexHandles {
+    /// Complete transaction-index query adapter.
+    pub tx_index: Option<Arc<dyn TxIndexQuery>>,
+    /// Generic script-index query adapter.
+    pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
+}
+
+/// Network capability handles.
+#[derive(Clone)]
+pub struct NetworkHandles {
+    /// Network state.
+    pub network: Arc<RwLock<NetworkState>>,
+    /// Whether the node accepts or starts P2P connections.
+    pub network_active: Arc<core::sync::atomic::AtomicBool>,
+    /// Connected peer registry.
+    pub peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
+    /// Live per-peer outbound control handles.
+    pub peer_outbound: Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
+    /// Channel that requests outbound P2P connections.
+    pub p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
+    /// Manual IP/CIDR bans.
+    pub banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
+    /// Persisted `addnode add` entries.
+    pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
+}
+
+/// Mining capability handles.
+#[derive(Clone)]
+pub struct MiningHandles {
+    /// Node-owned mining coordinator. `None` when mining is not wired.
+    pub mining_control: Option<Arc<dyn MiningControl>>,
+}
+
 /// Shared state consumed by JSON-RPC handlers.
 pub struct Context {
     /// Best-chain tip snapshot published by chain validation.
     pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Best-applied-block tip snapshot published after block application.
     pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Serializes whole-chainstate RPC reads with node-owned connect/disconnect transitions.
+    chain_transition: Arc<Mutex<()>>,
     /// Cumulative transaction count of the applied chain, `0` when unknown.
     ///
     /// Maintained by block application and restored from the chainstate
@@ -903,22 +1138,23 @@ pub struct Context {
     /// longer than the tip-age window would announce that it is back in initial
     /// sync, and callers treat that as "do not trust this node's data yet".
     left_initial_block_download: Arc<core::sync::atomic::AtomicBool>,
-    /// In-memory mempool handle.
-    pub mempool: Arc<RwLock<Mempool>>,
+    /// Mempool mutation gateway: the only production route that takes the
+    /// pool write lock, publishing ordered mutation events to observers.
+    pub mempool: Arc<MempoolGateway>,
     /// Block records already available without blocking storage readers.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Raw transactions indexed by txid for Core transaction RPCs.
-    pub transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+    pub transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
     /// UTXO set snapshot handle used by chain metadata RPCs.
     pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
     /// Incremental UTXO-set statistics.
-    pub coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
-    /// BIP157/158 compact-filter index used by filter RPCs.
-    pub filter_index: Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>,
+    pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     /// Optional storage pruning mutator.
     pub prune_service: Option<Arc<dyn PruneService>>,
     /// Optional node-owned chain mutation service.
     pub chain_control: Option<Arc<dyn ChainControl>>,
+    /// Optional node-owned mining coordinator.
+    pub mining_control: Option<Arc<dyn MiningControl>>,
     /// Optional node-owned complete transaction-index query adapter.
     /// `None` when transaction indexing is disabled.
     pub tx_index: Option<Arc<dyn TxIndexQuery>>,
@@ -929,25 +1165,26 @@ pub struct Context {
     pub esplora_tx_index: Option<Arc<dyn TxIndexQuery>>,
     /// Optional node-owned generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
+    /// Optional node-owned complete basic block-filter index query adapter.
+    /// `None` when the filter index extension is not enabled.
+    pub filter_index: Option<Arc<dyn FilterIndexQuery>>,
+    /// Live capability report backing the `getcapabilities` extension method.
+    pub capabilities: Option<Arc<dyn CapabilityProvider>>,
     /// Network counters and peers.
     pub network: Arc<RwLock<NetworkState>>,
     /// Network selector used by handlers needing consensus parameters (e.g.
     /// difficulty calculation).
     pub chain_network: Network,
+    /// Live per-peer outbound control handles.
+    pub peer_outbound: Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
+    /// Whether outbound and inbound network activity is enabled through RPC.
+    pub network_active: Arc<core::sync::atomic::AtomicBool>,
     /// Shared registry of currently-handshook peers.
     pub peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
     /// Shared in-memory block tree.
     pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
     /// Optional durable block body reader for metadata-only block records.
     pub block_body_source: Option<Arc<dyn BlockBodySource>>,
-    /// Current getblocktemplate long-poll id.
-    pub mining_template_id: Arc<ArcSwap<CompactString>>,
-    /// Receiver notified when mining template inputs change.
-    pub mining_notifications: Receiver<()>,
-    /// Optional outbound channel that submits decoded blocks back to the node's
-    /// `BlockSync::tick` for the canonical apply path. `None` when no node is
-    /// wired (tests, embedded callers).
-    pub inbound_blocks_sender: Option<crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>>,
     /// Optional outbound channel for `addnode` to request new P2P connections.
     /// `None` for embedded/test callers without a live P2P listener.
     pub p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
@@ -957,7 +1194,15 @@ pub struct Context {
     pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
     /// Active ZMQ PUB notifications.
     pub zmq_notifications: Arc<[ZmqNotification]>,
-    mining_sender: Sender<()>,
+    /// Configured node debug-log path for `getrpcinfo`.
+    pub debug_log_path: Option<PathBuf>,
+    /// Limits concurrent full-block REST response materializations.
+    rest_render_budget: Arc<RestRenderBudget>,
+    /// Rollback-evidence warning source for `getblockchaininfo`.
+    ///
+    /// `None` in test contexts; populated by `NodeState` with the process-wide
+    /// `WarningStore`. Each request loads one immutable snapshot.
+    pub rollback_warnings: Option<Arc<dyn RollbackWarningSource>>,
 }
 // SAFETY: `Context` is shared by RPC worker threads. Each mutable subsystem
 // handle behind it uses atomics, channels, or locks for interior mutation.
@@ -987,77 +1232,143 @@ impl Context {
     #[must_use]
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
-        let (mining_sender, mining_notifications) = unbounded();
-        let coin_stats_listener = bitcoin_rs_coinstats::CoinStatsListener::new(
-            bitcoin_rs_coinstats::CoinStats::default(),
+        let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
         );
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
         utxo.set_listener(Box::new(coin_stats_listener.clone()));
         let coin_stats = Arc::new(coin_stats_listener);
+        let mempool = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))));
         Self {
             chain_tip: Arc::new(ArcSwapOption::empty()),
             applied_tip: Arc::new(ArcSwapOption::empty()),
+            chain_transition: Arc::new(Mutex::new(())),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
-            mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            mempool,
             blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::new(utxo),
             coin_stats,
-            filter_index: noop_filter_index(),
             tx_index: None,
             esplora_tx_index: None,
             script_index: None,
+            filter_index: None,
+            capabilities: None,
             prune_service: None,
             chain_control: None,
+            peer_outbound: Arc::new(RwLock::new(HashMap::new())),
+            network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+            mining_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
             chain_network: Network::Mainnet,
             peers: Arc::new(RwLock::new(Vec::new())),
             block_tree: Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
             block_body_source: None,
-            mining_template_id: Arc::new(ArcSwap::from_pointee(CompactString::new("0"))),
-            mining_notifications,
-            inbound_blocks_sender: None,
             p2p_outbound_sender: None,
-            banned: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            banned: Arc::new(RwLock::new(Vec::new())),
+            added_nodes: Arc::new(RwLock::new(Vec::new())),
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
-            mining_sender,
+            debug_log_path: None,
+            rest_render_budget: Arc::new(RestRenderBudget::new()),
+            rollback_warnings: None,
         }
     }
-    /// Builds a context that shares pre-existing handles owned elsewhere
-    /// (typically by `bitcoin-rs-node::state::NodeState`).
+
+    /// Builds an empty context whose mempool gateway carries `observer`.
     ///
-    /// This is the wiring path for the integration layer: subsystem owners
-    /// pass in their authoritative Arc handles, and RPC handlers observe
-    /// the same state.
+    /// Like [`Self::new`] but the gateway is constructed with the supplied
+    /// observer instead of `None`. Test-only: production wiring constructs
+    /// the gateway through `NodeState::open`.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_handles(
-        chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
-        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-        mempool: Arc<RwLock<Mempool>>,
-        blocks: Arc<RwLock<BlockLog>>,
-        transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
-        utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
-        coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
-        filter_index: Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>,
-        network: Arc<RwLock<NetworkState>>,
-        mining_template_id: Arc<ArcSwap<CompactString>>,
-        peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
-        block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
-        chain_network: Network,
-        inbound_blocks_sender: Option<crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>>,
-        p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
-        banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
-        added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
-        tx_index: Option<Arc<dyn TxIndexQuery>>,
-        script_index: Option<Arc<dyn ScriptIndexQuery>>,
-    ) -> Self {
-        let (mining_sender, mining_notifications) = unbounded();
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn new_with_mempool_observer(observer: Arc<dyn MempoolObserver>) -> Self {
+        let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
+        );
+        let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
+        utxo.set_listener(Box::new(coin_stats_listener.clone()));
+        let coin_stats = Arc::new(coin_stats_listener);
+        let mempool = MempoolGateway::shared_with(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            observer,
+        );
+        Self {
+            chain_tip: Arc::new(ArcSwapOption::empty()),
+            applied_tip: Arc::new(ArcSwapOption::empty()),
+            chain_transition: Arc::new(Mutex::new(())),
+            chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
+            left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            mempool,
+            blocks: Arc::new(RwLock::new(BlockLog::new())),
+            transactions: Arc::new(RwLock::new(HashMap::new())),
+            utxo: Arc::new(utxo),
+            coin_stats,
+            tx_index: None,
+            esplora_tx_index: None,
+            script_index: None,
+            filter_index: None,
+            capabilities: None,
+            prune_service: None,
+            chain_control: None,
+            peer_outbound: Arc::new(RwLock::new(HashMap::new())),
+            network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+            mining_control: None,
+            network: Arc::new(RwLock::new(NetworkState::default())),
+            chain_network: Network::Mainnet,
+            peers: Arc::new(RwLock::new(Vec::new())),
+            block_tree: Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
+            block_body_source: None,
+            p2p_outbound_sender: None,
+            banned: Arc::new(RwLock::new(Vec::new())),
+            added_nodes: Arc::new(RwLock::new(Vec::new())),
+            zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
+            debug_log_path: None,
+            rest_render_budget: Arc::new(RestRenderBudget::new()),
+            rollback_warnings: None,
+        }
+    }
+    /// Builds a context that shares pre-existing handles owned elsewhere.
+    #[must_use]
+    pub fn from_handles(handles: ContextHandles) -> Self {
+        let ContextHandles {
+            chain:
+                ChainHandles {
+                    chain_tip,
+                    applied_tip,
+                    blocks,
+                    transactions,
+                    utxo,
+                    coin_stats,
+                    block_tree,
+                    chain_network,
+                },
+            mempool: MempoolHandles { mempool },
+            indexes:
+                IndexHandles {
+                    tx_index,
+                    script_index,
+                },
+            network:
+                NetworkHandles {
+                    network,
+                    network_active,
+                    peers,
+                    peer_outbound,
+                    p2p_outbound_sender,
+                    banned,
+                    added_nodes,
+                },
+            mining: MiningHandles { mining_control },
+            filter_index,
+            capabilities,
+        } = handles;
         Self {
             chain_tip,
             applied_tip,
+            chain_transition: Arc::new(Mutex::new(())),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool,
@@ -1065,25 +1376,28 @@ impl Context {
             transactions,
             utxo,
             coin_stats,
-            filter_index,
             tx_index,
             esplora_tx_index: None,
             script_index,
+            filter_index,
+            capabilities,
             network,
             chain_network,
             peers,
+            peer_outbound,
+            network_active,
             block_tree,
             block_body_source: None,
-            mining_template_id,
-            mining_notifications,
-            inbound_blocks_sender,
             p2p_outbound_sender,
             banned,
             added_nodes,
             prune_service: None,
             chain_control: None,
+            mining_control,
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
-            mining_sender,
+            debug_log_path: None,
+            rest_render_budget: Arc::new(RestRenderBudget::new()),
+            rollback_warnings: None,
         }
     }
 
@@ -1102,10 +1416,26 @@ impl Context {
         self
     }
 
+    /// Attaches the rollback-evidence warning source for `getblockchaininfo`.
+    #[must_use]
+    pub fn with_rollback_warnings(mut self, source: Arc<dyn RollbackWarningSource>) -> Self {
+        self.rollback_warnings = Some(source);
+        self
+    }
+
     /// Attaches the node-owned pruning mutator used by `pruneblockchain`.
     #[must_use]
     pub fn with_prune_service(mut self, prune_service: Arc<dyn PruneService>) -> Self {
         self.prune_service = Some(prune_service);
+        self
+    }
+
+    /// Attaches the node-owned mining coordinator to a context built without
+    /// handles (`Context::new`). Production wiring passes the coordinator
+    /// through `ContextHandles::mining` instead.
+    #[must_use]
+    pub fn with_mining_control(mut self, mining_control: Arc<dyn MiningControl>) -> Self {
+        self.mining_control = Some(mining_control);
         self
     }
 
@@ -1116,11 +1446,36 @@ impl Context {
         self
     }
 
+    /// Shares the node's authoritative connect/disconnect lock with RPC readers.
+    #[must_use]
+    pub fn with_chain_transition(mut self, chain_transition: Arc<Mutex<()>>) -> Self {
+        self.chain_transition = chain_transition;
+        self
+    }
+
+    /// Runs a read while authoritative UTXO and applied-tip transitions are excluded.
+    pub fn with_stable_chainstate<R>(&self, read: impl FnOnce() -> R) -> R {
+        let _transition = self.chain_transition.lock();
+        read()
+    }
+
     /// Attaches active ZMQ notification metadata reported by `getzmqnotifications`.
     #[must_use]
     pub fn with_zmq_notifications(mut self, notifications: Vec<ZmqNotification>) -> Self {
         self.zmq_notifications = Arc::from(notifications);
         self
+    }
+
+    /// Attaches the configured node debug-log path.
+    #[must_use]
+    pub fn with_debug_log_path(mut self, path: PathBuf) -> Self {
+        self.debug_log_path = Some(path);
+        self
+    }
+
+    /// Acquires a bounded full-block REST render slot, if one is available.
+    pub(crate) fn try_acquire_rest_render(&self) -> Option<RestRenderPermit> {
+        self.rest_render_budget.try_acquire()
     }
 
     /// Returns active ZMQ notification metadata.
@@ -1143,13 +1498,12 @@ impl Context {
     /// changing the repeated 256 scaling into an equivalent exponentiation can
     /// change the final floating-point bit.
     #[must_use]
-    pub fn difficulty_for_bits(&self, bits: bitcoin::CompactTarget) -> f64 {
-        let consensus_bits = bits.to_consensus();
-        let mantissa = consensus_bits & 0x00ff_ffff;
+    pub fn difficulty_for_bits(&self, bits: u32) -> f64 {
+        let mantissa = bits & 0x00ff_ffff;
         if mantissa == 0 {
             return 0.0;
         }
-        let mut shift = (consensus_bits >> 24) & 0xff;
+        let mut shift = (bits >> 24) & 0xff;
         let mut difficulty = f64::from(0x0000_ffff_u32) / f64::from(mantissa);
         while shift < 29 {
             difficulty *= 256.0;
@@ -1162,12 +1516,9 @@ impl Context {
         difficulty
     }
 
-    /// Publishes a new best-chain tip and wakes getblocktemplate long polls.
+    /// Publishes a new best-chain tip.
     pub fn set_chain_tip(&self, tip: TipSnapshot) {
-        self.mining_template_id
-            .store(Arc::new(CompactString::from(tip.hash.to_string_be())));
         self.chain_tip.store(Some(Arc::new(tip)));
-        let _ignored = self.mining_sender.send(());
     }
 
     /// Publishes a new best-applied-block tip.
@@ -1181,78 +1532,44 @@ impl Context {
     }
 
     /// Stores a decoded transaction for transaction lookup RPCs.
-    pub fn add_transaction(&self, tx: Transaction) -> Txid {
-        let txid = tx.compute_txid();
+    pub fn add_transaction(&self, tx: Tx) -> Txid {
+        let txid = tx.txid();
         self.transactions.write().insert(txid, tx);
         txid
     }
 
-    /// Validates `tx` and admits it to the mempool.
+    /// Admits one transaction through the full policy stack, then mutates
+    /// the mempool only through the node's one [`MempoolGateway`].
     ///
-    /// `now` is the acceptance timestamp in seconds; it is a parameter rather
-    /// than a clock read so tests can pin it.
+    /// This is the shared typed admission operation: `sendrawtransaction`
+    /// and the embedded `Node::broadcast` both run it. The gateway's
+    /// [`MempoolGateway::admit_transaction`] holds the pool write lock
+    /// across the entire mempool-dependent policy evaluation — the
+    /// already-known check, prevout-resolved fee/vsize/sigop context,
+    /// standardness policy, the live min-relay / mempool-min floor, the
+    /// caller's max-feerate cap, BIP125 replacement analysis, and package
+    /// limits — and commits the authorized
+    /// [`MempoolGateway::replace_transaction`] inside that same lock
+    /// interval, so no concurrent admission can invalidate the verdict
+    /// before it lands.
     ///
-    /// # Errors
+    /// The pool and transaction-cache fast paths here remain best-effort
+    /// pre-checks for the "already known" no-op; the authoritative
+    /// already-known re-check runs inside the locked evaluation.
     ///
-    /// Returns the first check that rejected the transaction.
-    pub fn accept_transaction(
-        &self,
-        tx: Transaction,
-        now: u64,
-        max_fee: Option<u64>,
-    ) -> Result<AcceptResult, AcceptError> {
-        let chain = ChainUtxoView::new(Arc::clone(&self.utxo));
-        let accept_ctx = self.accept_context(now, max_fee);
-        let result = {
-            let mut pool = self.mempool.write();
-            accept_to_mempool(&mut pool, tx, &chain, &accept_ctx)?
-        };
-        // A new mempool transaction changes what the next block template would
-        // contain, so long polls waiting on it should wake.
-        let _ignored = self.mining_sender.send(());
-        Ok(result)
-    }
-
-    /// Runs every acceptance check without admitting the transaction.
+    /// `max_feerate_sat_per_kvb` of `None` disables the max-fee cap,
+    /// matching `sendrawtransaction`'s `maxfeerate=0` behavior.
     ///
     /// # Errors
     ///
-    /// Returns the first check that rejected the transaction.
-    pub fn check_transaction(
+    /// Returns the policy rejection verbatim (Core rejection strings) or
+    /// the failure verbatim; nothing is inserted when this fails.
+    pub fn admit_transaction(
         &self,
-        tx: &Arc<Transaction>,
-        now: u64,
-    ) -> Result<AcceptChecks, AcceptError> {
-        let chain = ChainUtxoView::new(Arc::clone(&self.utxo));
-        // No ceiling: this reports what acceptance would decide, and a fee the
-        // submitter would have capped is still a fee the network would accept.
-        let accept_ctx = self.accept_context(now, None);
-        let pool = self.mempool.read();
-        check_acceptance(&pool, tx, &chain, &accept_ctx)
-    }
-
-    fn accept_context(&self, now: u64, max_fee: Option<u64>) -> AcceptContext {
-        AcceptContext {
-            // The next block's height: a transaction entering the mempool is a
-            // candidate for the block being built, not for the tip.
-            height: self.applied_height().saturating_add(1),
-            locktime_cutoff: self.tip_median_time_past().unwrap_or(0),
-            time: now,
-            standardness: StandardnessPolicy {
-                dust_relay_fee: FeeRate::DUST,
-                max_datacarrier_bytes: Some(MAX_OP_RETURN_RELAY),
-            },
-            // Core's `-acceptnonstdtxn`, which it permits only on regtest.
-            require_standard: self.chain_network != Network::Regtest,
-            max_fee,
-        }
-    }
-
-    fn tip_median_time_past(&self) -> Option<u32> {
-        let tip = self.applied_tip.load_full()?;
-        self.block_tree
-            .read()
-            .median_time_past_at(tip.tip_id, MEDIAN_TIME_SPAN)
+        tx: Tx,
+        max_feerate_sat_per_kvb: Option<u64>,
+    ) -> Result<MutationResult, String> {
+        crate::handlers::tx::admit_transaction(self, tx, max_feerate_sat_per_kvb)
     }
 
     /// Returns the current tip height, or zero before initial sync publishes one.
@@ -1402,14 +1719,13 @@ impl Context {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
         Some(BlockRecord {
-            hash,
+            hash: BlockHash::from(hash),
             height: node.height,
-            block_hex: String::new(),
             body_size: 0,
             // The one place a header is produced. Every constructor leaves the
             // field empty, so the tree node reached here is the single source of
             // truth for what a block's header is.
-            header: serialize(&node.header).try_into().ok().map(Box::new),
+            header: consensus_bytes(&node.header).try_into().ok().map(Box::new),
             tx_count: 0,
             time: node.header.time,
         })
@@ -1417,24 +1733,20 @@ impl Context {
 
     /// Resolves a block record for `hash`.
     ///
-    /// The restored header tree is the identity authority: when it knows the
-    /// hash its `(hash, height)` pair wins, and the session vector contributes
-    /// only a matching payload cache or durable body metadata. When the tree
-    /// has no node for `hash` (cache-only fixtures, or a block seen before a
-    /// checkpoint restore) the vector supplies a record by exact hash as a
-    /// legacy fallback. A stale cached height can therefore never override an
-    /// active-tree identity.
+    /// The restored header tree is the only identity authority. A hash it does
+    /// not know resolves to `None`, even when the block log carries a record for
+    /// it. For a tree-resolved `(height, hash)` pair, the log may contribute
+    /// matching durable body metadata.
     #[must_use]
     pub fn record_for_hash(&self, hash: Hash256) -> Option<BlockRecord> {
-        // 1. Tree authority. When the restored header index knows this hash its
-        //    identity wins; enrich with a height-matched cached payload, else
-        //    with durable body metadata.
+        // Tree authority resolves identity first; the exact `(height, hash)`
+        // record may then enrich its payload fields.
         if let Some(mut record) = self.header_record(hash) {
             // The tree already gave us the height, so this is a binary search
             // over a height-ordered log rather than a walk of every record on
             // the chain. `getblock` and `getblockheader` both land here.
             if let Some(cached) = record_at_height_hash(&self.blocks.read(), record.height, hash) {
-                // The cached record supplies the payload facts — body hex, size,
+                // The cached record supplies the payload facts — size and
                 // transaction count — and the tree supplies the header, because
                 // the log does not store one. Returning the cached record as it
                 // stands would answer with no header at all.
@@ -1449,25 +1761,14 @@ impl Context {
             if let Some(metadata) = self
                 .block_body_source
                 .as_ref()
-                .and_then(|source| source.block_body_metadata(record.height, hash))
+                .and_then(|source| source.block_body_metadata(record.height, BlockHash::from(hash)))
             {
                 record.body_size = metadata.body_size;
                 record.tx_count = metadata.tx_count;
             }
             return Some(record);
         }
-        // 2. Legacy/cache-only fallback. The tree cannot resolve this identity,
-        //    so accept a vector record by exact hash. Metadata-only records and
-        //    pruned-body payloads pass through unchanged via their own fields.
-        //
-        //    This one stays linear on purpose: without the tree there is no
-        //    height to search on, and a hash-keyed index would have to be kept
-        //    for every block to serve a path that only legacy state reaches.
-        self.blocks
-            .read()
-            .iter()
-            .find(|candidate| candidate.hash == hash)
-            .cloned()
+        None
     }
 
     /// Returns the block hash for an applied height.
@@ -1482,13 +1783,9 @@ impl Context {
             return self.hash_at_height_from_tip(&tip, height);
         }
         if height == 0 {
-            return Some(Hash256::from_le_bytes(
-                bitcoin::blockdata::constants::genesis_block(bitcoin_network(self.chain_network))
-                    .block_hash()
-                    .as_byte_array(),
-            ));
+            return Some(self.chain_network.genesis_block_hash());
         }
-        record_at_height(&self.blocks.read(), height).map(|candidate| candidate.hash)
+        record_at_height(&self.blocks.read(), height).map(|candidate| Hash256::from(candidate.hash))
     }
 
     /// Returns a known block by hash.
@@ -1510,12 +1807,9 @@ impl Context {
         record_at_height(&self.blocks.read(), height).cloned()
     }
 
-    /// Returns serialized block bytes from the record or durable storage.
+    /// Returns serialized block bytes from durable body storage.
     #[must_use]
     pub fn block_body_bytes(&self, record: &BlockRecord) -> Option<Vec<u8>> {
-        if !record.block_hex.is_empty() {
-            return Vec::<u8>::from_hex(&record.block_hex).ok();
-        }
         self.block_body_source
             .as_ref()?
             .block_body(record.height, record.hash)
@@ -1529,13 +1823,10 @@ impl Context {
         self.block_body_source.as_ref()?.disk_usage()
     }
 
-    /// Returns lowercase serialized block hex from the record or durable storage.
+    /// Returns lowercase serialized block hex from durable body storage.
     #[must_use]
     pub fn block_body_hex(&self, record: &BlockRecord) -> Option<String> {
-        if !record.block_hex.is_empty() {
-            return Some(record.block_hex.clone());
-        }
-        Some(self.block_body_bytes(record)?.to_lower_hex_string())
+        Some(hex_encode(&self.block_body_bytes(record)?))
     }
 
     /// Returns the median-time-past at the block with `hash`, or `None` if the
@@ -1562,7 +1853,7 @@ impl Context {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
         let bytes: [u8; 32] = node.chainwork.to_be_bytes();
-        Some(bytes.to_lower_hex_string())
+        Some(hex_encode(&bytes))
     }
 
     /// Returns the hash of the block at `height + 1` on the active chain.
@@ -1580,17 +1871,8 @@ impl Context {
     }
 }
 
-fn bitcoin_network(network: Network) -> bitcoin::Network {
-    match network {
-        Network::Mainnet => bitcoin::Network::Bitcoin,
-        Network::Testnet3 => bitcoin::Network::Testnet,
-        Network::Testnet4 => bitcoin::Network::Testnet4,
-        Network::Signet => bitcoin::Network::Signet,
-        Network::Regtest => bitcoin::Network::Regtest,
-    }
-}
-
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1616,56 +1898,12 @@ mod tests {
                 // Distinct per record, not per height: the duplicates have to be
                 // distinguishable by hash or the walk has nothing to walk.
                 hash[0] = u8::try_from(index).unwrap_or(0);
-                let mut record = BlockRecord::synthetic(height, Hash256::from_le_bytes(&hash));
+                let mut record =
+                    BlockRecord::synthetic(height, BlockHash::from(Hash256::from_le_bytes(&hash)));
                 record.time = 1_000 + u32::try_from(index).unwrap_or(0);
                 record
             })
             .collect()
-    }
-
-    /// The search must land on exactly what the scan it replaced found.
-    ///
-    /// `record_for_hash` had the height from the block tree and scanned the log
-    /// for the matching pair anyway. The scan made no assumption about ordering;
-    /// the search assumes the log is non-decreasing by height. This holds the
-    /// search to the scan over every height in and around the fixture, and over
-    /// every hash in it — including hashes at the wrong height, which must find
-    /// nothing.
-    ///
-    /// A sweep rather than a chosen pair: a search is wrong at its boundaries,
-    /// and a test that picks one pair picks whether it visits them.
-    #[test]
-    fn record_at_height_hash_matches_the_scan_it_replaced() {
-        let records = shaped_records();
-        let hashes = records.iter().map(|record| record.hash).collect::<Vec<_>>();
-
-        for height in 0_u32..12 {
-            for hash in &hashes {
-                let scanned = records
-                    .iter()
-                    .find(|candidate| candidate.hash == *hash && candidate.height == height);
-                assert_eq!(
-                    record_at_height_hash(&records, height, *hash).map(|r| r.time),
-                    scanned.map(|r| r.time),
-                    "search and scan disagree at height {height}"
-                );
-            }
-        }
-    }
-
-    /// The same for the height-only lookup, which has to return the *first*
-    /// record at a duplicated height because that is what the scan returned.
-    #[test]
-    fn record_at_height_matches_the_scan_it_replaced() {
-        let records = shaped_records();
-        for height in 0_u32..12 {
-            let scanned = records.iter().find(|candidate| candidate.height == height);
-            assert_eq!(
-                record_at_height(&records, height).map(|r| r.time),
-                scanned.map(|r| r.time),
-                "search and scan disagree at height {height}"
-            );
-        }
     }
 
     /// Every record at a duplicated height must be reachable by its own hash.
@@ -1684,7 +1922,7 @@ mod tests {
 
         for (hash, time) in duplicates {
             assert_eq!(
-                record_at_height_hash(&records, 3, hash).map(|r| r.time),
+                record_at_height_hash(&records, 3, Hash256::from(hash)).map(|r| r.time),
                 Some(time),
                 "a record at a duplicated height was not reachable by its hash"
             );
@@ -1728,19 +1966,19 @@ mod tests {
         let first = Hash256::from_le_bytes(&[0x11_u8; 32]);
         let second = Hash256::from_le_bytes(&[0x22_u8; 32]);
         let records = vec![
-            BlockRecord::synthetic(0, Hash256::from_le_bytes(&[0x00_u8; 32])),
-            BlockRecord::synthetic(1, first),
-            BlockRecord::synthetic(1, second),
-            BlockRecord::synthetic(2, Hash256::from_le_bytes(&[0x33_u8; 32])),
+            BlockRecord::synthetic(0, BlockHash::from(Hash256::from_le_bytes(&[0x00_u8; 32]))),
+            BlockRecord::synthetic(1, BlockHash::from(first)),
+            BlockRecord::synthetic(1, BlockHash::from(second)),
+            BlockRecord::synthetic(2, BlockHash::from(Hash256::from_le_bytes(&[0x33_u8; 32]))),
         ];
 
         assert_eq!(
-            record_at_height_hash(&records, 1, second).map(|record| record.hash),
+            record_at_height_hash(&records, 1, second).map(|record| Hash256::from(record.hash)),
             Some(second),
             "the second record at the height must be reachable, not just the first"
         );
         assert_eq!(
-            record_at_height_hash(&records, 1, first).map(|record| record.hash),
+            record_at_height_hash(&records, 1, first).map(|record| Hash256::from(record.hash)),
             Some(first)
         );
         assert!(
@@ -1759,13 +1997,13 @@ mod tests {
     fn record_at_height_returns_the_first_record_of_a_duplicate_height() {
         let first = Hash256::from_le_bytes(&[0x11_u8; 32]);
         let records = vec![
-            BlockRecord::synthetic(1, first),
-            BlockRecord::synthetic(1, Hash256::from_le_bytes(&[0x22_u8; 32])),
-            BlockRecord::synthetic(2, Hash256::from_le_bytes(&[0x33_u8; 32])),
+            BlockRecord::synthetic(1, BlockHash::from(first)),
+            BlockRecord::synthetic(1, BlockHash::from(Hash256::from_le_bytes(&[0x22_u8; 32]))),
+            BlockRecord::synthetic(2, BlockHash::from(Hash256::from_le_bytes(&[0x33_u8; 32]))),
         ];
 
         assert_eq!(
-            record_at_height(&records, 1).map(|record| record.hash),
+            record_at_height(&records, 1).map(|record| Hash256::from(record.hash)),
             Some(first),
             "the dense index lands on the second duplicate; the first must win"
         );
@@ -1779,13 +2017,13 @@ mod tests {
     fn record_at_height_does_not_trust_the_index_on_a_sparse_log() {
         let wanted = Hash256::from_le_bytes(&[0x44_u8; 32]);
         let records = vec![
-            BlockRecord::synthetic(10, Hash256::from_le_bytes(&[0x0a_u8; 32])),
-            BlockRecord::synthetic(11, wanted),
-            BlockRecord::synthetic(12, Hash256::from_le_bytes(&[0x0c_u8; 32])),
+            BlockRecord::synthetic(10, BlockHash::from(Hash256::from_le_bytes(&[0x0a_u8; 32]))),
+            BlockRecord::synthetic(11, BlockHash::from(wanted)),
+            BlockRecord::synthetic(12, BlockHash::from(Hash256::from_le_bytes(&[0x0c_u8; 32]))),
         ];
 
         assert_eq!(
-            record_at_height(&records, 11).map(|record| record.hash),
+            record_at_height(&records, 11).map(|record| Hash256::from(record.hash)),
             Some(wanted),
             "a log that does not start at zero must still resolve by search"
         );
@@ -1799,34 +2037,48 @@ mod tests {
         let chain_tip = Arc::new(ArcSwapOption::empty());
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let utxo = Arc::new(bitcoin_rs_utxo::UtxoSet::new());
-        let coin_stats = Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
-            bitcoin_rs_coinstats::CoinStats::default(),
+        let coin_stats = Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
         ));
-        let filter_index = noop_filter_index();
         let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
         let banned = Arc::new(RwLock::new(Vec::<bitcoin_rs_p2p::BannedSubnet>::new()));
         let added_nodes = Arc::new(RwLock::new(Vec::new()));
-        let ctx = Context::from_handles(
-            Arc::clone(&chain_tip),
-            Arc::clone(&applied_tip),
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Arc::new(RwLock::new(BlockLog::new())),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::clone(&utxo),
-            Arc::clone(&coin_stats),
-            Arc::clone(&filter_index),
-            Arc::new(RwLock::new(NetworkState::default())),
-            Arc::new(ArcSwap::from_pointee(CompactString::new("0"))),
-            Arc::new(RwLock::new(Vec::new())),
-            Arc::clone(&block_tree),
-            Network::Mainnet,
-            None,
-            None,
-            Arc::clone(&banned),
-            Arc::clone(&added_nodes),
-            None,
-            None,
-        );
+        let network_active = Arc::new(core::sync::atomic::AtomicBool::new(true));
+        let ctx = Context::from_handles(ContextHandles {
+            chain: ChainHandles {
+                chain_tip: Arc::clone(&chain_tip),
+                applied_tip: Arc::clone(&applied_tip),
+                blocks: Arc::new(RwLock::new(BlockLog::new())),
+                transactions: Arc::new(RwLock::new(HashMap::new())),
+                utxo: Arc::clone(&utxo),
+                coin_stats: Arc::clone(&coin_stats),
+                block_tree: Arc::clone(&block_tree),
+                chain_network: Network::Mainnet,
+            },
+            mempool: MempoolHandles {
+                mempool: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+                    MempoolLimits::default(),
+                )))),
+            },
+            indexes: IndexHandles {
+                tx_index: None,
+                script_index: None,
+            },
+            network: NetworkHandles {
+                network: Arc::new(RwLock::new(NetworkState::default())),
+                network_active: Arc::clone(&network_active),
+                peers: Arc::new(RwLock::new(Vec::new())),
+                peer_outbound: Arc::new(RwLock::new(HashMap::new())),
+                p2p_outbound_sender: None,
+                banned: Arc::clone(&banned),
+                added_nodes: Arc::clone(&added_nodes),
+            },
+            mining: MiningHandles {
+                mining_control: None,
+            },
+            filter_index: None,
+            capabilities: None,
+        });
         assert!(
             Arc::ptr_eq(&ctx.chain_tip, &chain_tip),
             "chain_tip must be shared with caller"
@@ -1844,12 +2096,12 @@ mod tests {
             "coin_stats must be shared with caller"
         );
         assert!(
-            Arc::ptr_eq(&ctx.filter_index, &filter_index),
-            "filter_index must be shared with caller"
-        );
-        assert!(
             Arc::ptr_eq(&ctx.block_tree, &block_tree),
             "block_tree must be shared with caller"
+        );
+        assert!(
+            Arc::ptr_eq(&ctx.network_active, &network_active),
+            "network activity must be shared with caller"
         );
         assert!(
             Arc::ptr_eq(&ctx.banned, &banned),
@@ -1862,16 +2114,26 @@ mod tests {
     }
 
     #[test]
+    fn rest_render_budget_releases_dropped_permits() {
+        let ctx = Context::new();
+        let first = ctx.try_acquire_rest_render().expect("first permit");
+        let second = ctx.try_acquire_rest_render().expect("second permit");
+        assert!(ctx.try_acquire_rest_render().is_none());
+        drop(first);
+        assert!(ctx.try_acquire_rest_render().is_some());
+        drop(second);
+    }
+
+    #[test]
     fn new_context_wires_utxo_commits_to_coin_stats() {
-        use bitcoin::{Amount, ScriptBuf};
-        use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
+        use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid};
         use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 
         let ctx = Context::new();
-        let outpoint = OutPoint::new(Hash256::from_le_bytes(&[1_u8; 32]), 0);
+        let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&[1_u8; 32])), 0);
         let txout = TxOut {
-            value: Amount::from_sat(125_000),
-            script_pubkey: ScriptBuf::new(),
+            value: 125_000,
+            script_pubkey: Vec::new(),
         };
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(outpoint, txout, true, 7));
@@ -1886,39 +2148,35 @@ mod tests {
     }
 
     #[test]
-    fn block_record_from_block_bytes_matches_from_block() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let block_bytes = serialize(&block);
+    fn block_record_from_block_is_metadata_only() {
+        let block = Network::Regtest.genesis_block();
+        let record = BlockRecord::from_block(0, &block);
 
-        let from_block = BlockRecord::from_block(0, &block);
-        let from_bytes = BlockRecord::from_block_bytes(0, &block, &block_bytes);
-
-        assert_eq!(from_bytes.hash, from_block.hash);
-        assert_eq!(from_bytes.height, from_block.height);
-        assert_eq!(from_bytes.block_hex, from_block.block_hex);
-        assert_eq!(from_bytes.body_size, from_block.body_size);
-        assert_eq!(from_bytes.header, from_block.header);
-        assert_eq!(from_bytes.tx_count, from_block.tx_count);
-        assert_eq!(from_bytes.time, from_block.time);
+        assert_eq!(record.hash, block.block_hash());
+        assert_eq!(record.height, 0);
+        assert_eq!(record.body_size, consensus_bytes(&block).len());
+        assert_eq!(record.header, None);
+        assert_eq!(record.tx_count, block.txs.len());
+        assert_eq!(record.time, block.header.time);
     }
 
     #[test]
     fn context_reads_metadata_only_block_record_from_body_source() {
         struct SingleBlockSource {
             height: u32,
-            hash: Hash256,
+            hash: BlockHash,
             body: Vec<u8>,
         }
 
         impl BlockBodySource for SingleBlockSource {
-            fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
                 (height == self.height && hash == self.hash).then(|| self.body.clone())
             }
         }
 
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let body = serialize(&block);
-        let record = BlockRecord::from_block_metadata(0, &block);
+        let block = Network::Regtest.genesis_block();
+        let body = consensus_bytes(&block);
+        let record = BlockRecord::from_block(0, &block);
         let source = Arc::new(SingleBlockSource {
             height: 0,
             hash: record.hash,
@@ -1927,13 +2185,12 @@ mod tests {
         let ctx = Context::new().with_block_body_source(source);
         ctx.add_block(record.clone());
 
-        assert!(record.block_hex.is_empty());
-        assert_eq!(record.body_size, body.len());
+        assert_eq!(record.body_size, consensus_bytes(&block).len());
         assert_eq!(
             ctx.block_body_bytes(&record).as_deref(),
             Some(body.as_slice())
         );
-        let expected_hex = body.to_lower_hex_string();
+        let expected_hex = hex_encode(&body);
         assert_eq!(
             ctx.block_body_hex(&record).as_deref(),
             Some(expected_hex.as_str())
@@ -1947,27 +2204,26 @@ mod tests {
     ///
     /// The field was 104 bytes inline plus a 160-byte heap `String` of hex —
     /// 264 bytes and an allocation per block. Storing the raw header inline took
-    /// that to 168 with no allocation. Not storing it at all takes it to **88**:
-    /// a further **80 bytes per block**, about **73.5 MiB** at a mainnet-sized
-    /// chain, on top of the 88 MiB the inline change saved.
+    /// that to 168 with no allocation. Not storing it at all takes it to **64**:
+    /// a further **24 bytes per block**, about **23.1 MiB** at a mainnet-sized
+    /// chain, on top of the 73.5 MiB the boxed header saved.
     ///
     /// The boxing is what buys those 80 bytes and is easy to undo by accident.
     /// An `Option<[u8; 80]>` costs its full width in every record even when it
     /// is `None`, so emptying the log's records would have saved nothing at all.
     /// This test is here so that reverting the box fails loudly.
     #[test]
-    fn a_record_costs_88_bytes_and_carries_no_header() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    fn a_record_costs_64_bytes_and_carries_no_header() {
+        let block = Network::Regtest.genesis_block();
 
         assert_eq!(
             core::mem::size_of::<BlockRecord>(),
-            88,
+            64,
             "BlockRecord footprint changed; re-measure the per-block saving"
         );
         for record in [
             BlockRecord::from_block(0, &block),
-            BlockRecord::from_block_metadata(0, &block),
-            BlockRecord::synthetic(0, Hash256::default()),
+            BlockRecord::synthetic(0, BlockHash::default()),
         ] {
             assert!(
                 record.header_bytes().is_none(),
@@ -1985,42 +2241,43 @@ mod tests {
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn header_hex_is_unchanged_by_sourcing_the_header_from_the_tree() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = Network::Regtest.genesis_block();
         let ctx = Arc::new(Context::new());
         {
             let mut tree = ctx.block_tree.write();
             let _ = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active);
         }
-        let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let hash = Hash256::from(block.block_hash());
         let Some(record) = ctx.record_for_hash(hash) else {
             panic!("the tree knows this hash");
         };
 
         assert_eq!(
             record.header_hex(),
-            serialize(&block.header).to_lower_hex_string()
+            hex_encode(&consensus_bytes(&block.header))
         );
         assert_eq!(record.header_hex().len(), SERIALIZED_BLOCK_HEADER_LEN * 2);
     }
 
     /// The tree's header must reach a caller even when the log has the block.
     ///
-    /// `record_for_hash` returns the cached record for its payload facts — body
-    /// hex, size, transaction count — and that record has no header. Returning
+    /// `record_for_hash` returns the cached record for its payload facts — size,
+    /// transaction count — and that record has no header. Returning
     /// it unchanged would answer with none, which is what an earlier revision of
     /// this change did until this test caught it.
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn record_for_hash_answers_with_the_tree_header_for_a_cached_record() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = Network::Regtest.genesis_block();
         let ctx = Arc::new(Context::new());
         {
             let mut tree = ctx.block_tree.write();
             let _ = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active);
         }
         let cached = BlockRecord::from_block(0, &block);
-        let hash = cached.hash;
-        let expected_body = cached.block_hex.clone();
+        let hash = Hash256::from(cached.hash);
+        let expected_body_size = cached.body_size;
+        let expected_tx_count = cached.tx_count;
         assert!(cached.header_bytes().is_none(), "the log stores no header");
         ctx.add_block(cached);
 
@@ -2029,13 +2286,31 @@ mod tests {
         };
         assert_eq!(
             record.header_bytes().map(<[u8; 80]>::as_slice),
-            Some(serialize(&block.header).as_slice()),
+            Some(consensus_bytes(&block.header).as_slice()),
             "the resolved record must carry the tree's header"
         );
         assert_eq!(
-            record.block_hex, expected_body,
-            "the cached payload must survive the header splice"
+            record.body_size, expected_body_size,
+            "the cached body size must survive the header splice"
         );
+        assert_eq!(
+            record.tx_count, expected_tx_count,
+            "the cached transaction count must survive the header splice"
+        );
+    }
+    /// A log-only hash must not make a block identity visible.
+    ///
+    /// The old tree-miss fallback scanned every log record and accepted the
+    /// matching hash, making unknown-hash RPC cost linear in chain length and
+    /// allowing fixture-only state to masquerade as a real node identity.
+    #[test]
+    fn block_by_hash_ignores_log_records_the_tree_does_not_know() {
+        let ctx = Context::new();
+        let hash = Hash256::from_le_bytes(&[3_u8; 32]);
+        ctx.add_block(BlockRecord::synthetic(3, BlockHash::from(hash)));
+
+        assert!(ctx.record_for_hash(hash).is_none());
+        assert!(ctx.block_by_hash(hash).is_none());
     }
 
     /// A record with no header must render as the empty string, the way an empty
@@ -2043,7 +2318,8 @@ mod tests {
     /// what they saw.
     #[test]
     fn synthetic_record_has_no_header_and_renders_empty_hex() {
-        let record = BlockRecord::synthetic(7, Hash256::from_le_bytes(&[3_u8; 32]));
+        let record =
+            BlockRecord::synthetic(7, BlockHash::from(Hash256::from_le_bytes(&[3_u8; 32])));
 
         assert!(record.header_bytes().is_none());
         assert!(record.header_hex().is_empty());
@@ -2057,18 +2333,16 @@ mod tests {
     /// dropped the header from this path failed no test before this one existed.
     #[test]
     fn tree_derived_record_carries_the_header() {
-        use bitcoin::block::Version;
-        use bitcoin::hashes::Hash as _;
-        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
         use bitcoin_rs_chain::NodeStatus;
+        use bitcoin_rs_primitives::Header;
 
         let ctx = Context::new();
-        let header = bitcoin::block::Header {
-            version: Version::ONE,
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
+        let header = Header {
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::default(),
             time: 1_000_000,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 7,
         };
         let hash = {
@@ -2084,27 +2358,11 @@ mod tests {
         let record = ctx.record_for_hash(hash).expect("tree resolves the hash");
 
         assert_eq!(
-            record.header_bytes().map(|bytes| bytes.as_slice()),
-            Some(serialize(&header).as_slice()),
+            record.header_bytes().map(|bytes| &bytes[..]),
+            Some(consensus_bytes(&header).as_slice()),
             "the tree-derived record must carry the header the tree holds"
         );
-        assert_eq!(
-            record.header_hex(),
-            serialize(&header).to_lower_hex_string()
-        );
-    }
-    #[test]
-    fn block_by_height_returns_record_after_add_block() {
-        use bitcoin_rs_primitives::Hash256;
-
-        let ctx = Context::new();
-        let record = BlockRecord::synthetic(42, Hash256::default());
-        ctx.add_block(record);
-
-        let Some(found) = ctx.block_by_height(42) else {
-            panic!("expected record at height 42");
-        };
-        assert_eq!(found.height, 42);
+        assert_eq!(record.header_hex(), hex_encode(&consensus_bytes(&header)));
     }
 
     #[test]
@@ -2117,29 +2375,27 @@ mod tests {
     #[test]
     fn block_by_height_prefers_tree_identity_over_stale_cache()
     -> Result<(), Box<dyn std::error::Error>> {
-        use bitcoin::block::Version;
-        use bitcoin::hashes::Hash as _;
-        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
         use bitcoin_rs_chain::NodeStatus;
+        use bitcoin_rs_primitives::Header;
 
         let ctx = Context::new();
         let (child_hash, stale_hash) = {
             let mut tree = ctx.block_tree.write();
-            let genesis = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let genesis = Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 1_000_000,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             };
             let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-            let mut child = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: genesis.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let mut child = Header {
+                version: 1,
+                prev_blockhash: genesis.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_000_900,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             };
             child.nonce = 1;
@@ -2152,7 +2408,7 @@ mod tests {
             // Stale cache entry at the SAME height as the tree child but with a
             // different hash. The active-tree identity must win over this cache.
             let stale_hash = Hash256::from_le_bytes(&[0xa5_u8; 32]);
-            ctx.add_block(BlockRecord::synthetic(1, stale_hash));
+            ctx.add_block(BlockRecord::synthetic(1, BlockHash::from(stale_hash)));
             (child_hash, stale_hash)
         };
 
@@ -2161,7 +2417,8 @@ mod tests {
             .block_by_height(1)
             .ok_or_else(|| std::io::Error::other("tree child missing at height 1"))?;
         assert_eq!(
-            found.hash, child_hash,
+            found.hash,
+            BlockHash::from(child_hash),
             "active-tree identity must win over a stale cached hash"
         );
         assert_eq!(found.height, 1);
@@ -2171,29 +2428,27 @@ mod tests {
     #[test]
     fn height_lookups_follow_applied_tip_when_header_fork_leads()
     -> Result<(), Box<dyn std::error::Error>> {
-        use bitcoin::block::Version;
-        use bitcoin::hashes::Hash as _;
-        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
         use bitcoin_rs_chain::NodeStatus;
+        use bitcoin_rs_primitives::Header;
 
         let ctx = Context::new();
         let (applied_tip, header_tip) = {
             let mut tree = ctx.block_tree.write();
-            let genesis = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let genesis = Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 1_000_000,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             };
             let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-            let applied = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: genesis.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let applied = Header {
+                version: 1,
+                prev_blockhash: genesis.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_000_900,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 1,
             };
             let applied_id = tree.insert_node(Some(genesis_id), applied, NodeStatus::Active)?;
@@ -2202,21 +2457,21 @@ mod tests {
                 .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
             assert_eq!(applied_tip.tip_id, applied_id);
 
-            let fork = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: genesis.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let fork = Header {
+                version: 1,
+                prev_blockhash: genesis.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_000_901,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 2,
             };
             let fork_id = tree.insert_node(Some(genesis_id), fork, NodeStatus::HeaderValid)?;
-            let fork_tip = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: fork.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let fork_tip = Header {
+                version: 1,
+                prev_blockhash: fork.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_001_800,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 3,
             };
             let header_tip_id =
@@ -2230,7 +2485,7 @@ mod tests {
 
         ctx.set_applied_tip((*applied_tip).clone());
         ctx.set_chain_tip((*header_tip).clone());
-        ctx.add_block(BlockRecord::synthetic(2, header_tip.hash));
+        ctx.add_block(BlockRecord::synthetic(2, BlockHash::from(header_tip.hash)));
 
         assert_eq!(
             ctx.active_hash_at_height(1),
@@ -2239,7 +2494,8 @@ mod tests {
         );
         assert_eq!(ctx.block_hash_at_height(1), Some(applied_tip.hash));
         assert_eq!(
-            ctx.block_by_height(1).map(|record| record.hash),
+            ctx.block_by_height(1)
+                .map(|record| Hash256::from(record.hash)),
             Some(applied_tip.hash)
         );
         assert!(ctx.block_hash_at_height(2).is_none());

@@ -13,20 +13,12 @@ workspace = true
 
 [features]
 default = []
-# Bench-only A/B allocator toggle (measurement experiment). The `mimalloc`
-# dev-dependency compiles for every test/bench build of this crate regardless
-# of this flag (cargo cannot prune a dev-dep by feature); the flag only gates
-# the `#[global_allocator]` registration in `benches/utxo_commit.rs`. Default
-# OFF. Dev-deps cannot be optional, so this feature pulls nothing (`dep:` would
-# require an optional dep, which cargo rejects for dev-dependencies).
-bench-mimalloc = []
 rocksdb = ["bitcoin-rs-storage/rocksdb"]
 fjall = ["bitcoin-rs-storage/fjall"]
 redb = ["bitcoin-rs-storage/redb"]
 mdbx = ["bitcoin-rs-storage/mdbx"]
 
 [dependencies]
-bitcoin.workspace = true
 bitcoin-rs-primitives.workspace = true
 bitcoin-rs-storage = { workspace = true, default-features = false }
 hashbrown.workspace = true
@@ -36,6 +28,7 @@ nohash-hasher.workspace = true
 rayon.workspace = true
 bytemuck.workspace = true
 zerocopy.workspace = true
+ruint.workspace = true
 tinyvec.workspace = true
 smallvec.workspace = true
 lz4_flex.workspace = true
@@ -49,15 +42,11 @@ proptest.workspace = true
 proptest-derive.workspace = true
 criterion.workspace = true
 tempfile = "3"
-# Plain (non-optional) dev-dep: cargo forbids optional dev-dependencies, so the
-# `bench-mimalloc` feature gates only the `#[global_allocator]` static, not this
-# compilation. Inherits `default-features = false`, matching `bin/bitcoin-rs`.
+# The benchmark uses the same allocator as the production binary. Inherits
+# `default-features = false`, matching `bin/bitcoin-rs`.
 mimalloc.workspace = true
+bitcoin.workspace = true
 
 [[bench]]
 name = "utxo_commit"
-harness = false
-
-[[bench]]
-name = "record_codec"
 harness = false

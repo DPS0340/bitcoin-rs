@@ -9,7 +9,7 @@
 
 use alloc::vec::Vec;
 
-use bitcoin::Txid;
+use bitcoin_rs_primitives::Txid;
 use hashbrown::HashMap;
 
 /// Bucket fee-rate growth numerator: each bucket's lower bound is 5% above
@@ -55,6 +55,7 @@ impl FeeRate {
 }
 
 /// Per-bucket confirmation statistics.
+#[derive(Debug)]
 struct Bucket {
     /// Lower-bound fee rate for this bucket (sat/kvB).
     fee_rate_sat_per_kvb: u64,
@@ -90,6 +91,7 @@ impl Bucket {
 }
 
 /// Metadata for a pending (unconfirmed) transaction.
+#[derive(Debug)]
 struct PendingEntry {
     /// Index into `buckets`.
     bucket_index: usize,
@@ -110,6 +112,7 @@ struct PendingEntry {
 /// and [`FeeEstimator::block_connected`] for each connected block. Then use
 /// [`FeeEstimator::estimate`] to obtain a fee-rate estimate for a given
 /// confirmation target.
+#[derive(Debug)]
 pub struct FeeEstimator {
     buckets: Vec<Bucket>,
     /// Height whose decay has already been applied, so a repeated
@@ -272,6 +275,15 @@ impl FeeEstimator {
         result
     }
 
+    /// Returns the last height whose decay was applied, or `None` before the
+    /// first `block_connected` call. A connected block ages the estimator even
+    /// when it confirms nothing the pool tracked, so this is the observable
+    /// proof that `block_connected` fired.
+    #[must_use]
+    pub fn last_decayed_height(&self) -> Option<u32> {
+        self.last_decayed_height
+    }
+
     /// Returns the bucket index for a fee rate: the highest bucket whose
     /// lower bound is <= the given rate. Rates below the first bucket clamp
     /// to index 0.
@@ -363,21 +375,22 @@ fn build_buckets() -> Vec<Bucket> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::Hash as _;
+    use bitcoin_rs_primitives::Hash256;
 
     fn test_txid(n: u8) -> Txid {
         let mut bytes = [0u8; 32];
         bytes[0] = n;
-        Txid::from_byte_array(bytes)
+        Txid(Hash256::from_le_bytes(&bytes))
     }
 
     /// A txid spread over more than 256 values, for the capacity test.
     fn wide_txid(n: u32) -> Txid {
         let mut bytes = [0_u8; 32];
         bytes[..4].copy_from_slice(&n.to_le_bytes());
-        Txid::from_byte_array(bytes)
+        Txid(Hash256::from_le_bytes(&bytes))
     }
 
     fn assert_estimator_state_eq(left: &FeeEstimator, right: &FeeEstimator) {
