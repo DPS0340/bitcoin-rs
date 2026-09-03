@@ -1,33 +1,73 @@
 use alloc::sync::Arc;
 use core::str::FromStr as _;
-use std::collections::HashSet;
+use hashbrown::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::Hash as _;
-use bitcoin::hex::{DisplayHex as _, FromHex as _};
-use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::script::PushBytesBuf;
-use bitcoin::{
-    Amount, Denomination, FeeRate, OutPoint as BitcoinOutPoint, ScriptBuf, Sequence, Transaction,
-    TxIn, TxOut, Txid, Witness, absolute, transaction,
+use crate::script_util::{
+    Instruction, count_segwit, count_tx_legacy, instructions, is_p2sh, is_witness_program, opcode,
+    push_data,
 };
-use bitcoin_rs_mempool::MempoolEntry;
-use bitcoin_rs_mempool::standardness::{StandardnessError, StandardnessPolicy, is_standard_tx};
-use bitcoin_rs_primitives::{Hash256, OutPoint};
-use hashbrown::HashMap;
+use bitcoin::consensus::encode::serialize as bitcoin_serialize;
+use bitcoin::hashes::Hash as _;
+use bitcoin::merkle_tree::MerkleBlock;
+use bitcoin_rs_mempool::standardness::{
+    AcceptanceRejectReason, PackageTxContext as MempoolPackageTxContext,
+    evaluate_package_acceptance_all,
+};
+use bitcoin_rs_mempool::{
+    AdmissionOrigin, AdmissionRequest, AdmitError, AdmitOutcome, MutationResult,
+};
+use bitcoin_rs_primitives::{
+    Block as NativeBlock, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+    deserialize as native_deserialize,
+};
 use miniscript::psbt::PsbtExt as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
+use crate::compat::convert::{
+    self, VerboseTxChain, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
+};
 use crate::context::{BlockRecord, Context};
 use crate::error::RpcError;
-use crate::handlers::{optional_bool, params_array, required_str, required_u64};
-use crate::tx_render::{self, TransactionChainContext};
+use crate::handlers::{optional_bool, params_array, parse_txid, required_str, required_u64};
+use corepc_types::v31;
 
-/// Bitcoin Core incremental relay fee default: 1000 sat/kvB.
-const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 1_000;
-/// Bitcoin Core `DEFAULT_MAX_RAW_TX_FEE_RATE` = 0.10 BTC/kvB.
 const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
+
+/// Encodes `bytes` as lowercase hexadecimal.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+/// Decodes a lowercase or uppercase hexadecimal string into bytes.
+fn hex_decode(hex: &str) -> Result<Vec<u8>, RpcError> {
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(RpcError::InvalidParams("hex string must have even length"));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks(2) {
+        let hi = decode_nibble(chunk[0]).ok_or(RpcError::InvalidParams("invalid hex character"))?;
+        let lo = decode_nibble(chunk[1]).ok_or(RpcError::InvalidParams("invalid hex character"))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+const fn decode_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
 
 pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let txid = parse_txid(required_str(params, 0, "txid is required")?)?;
@@ -52,22 +92,17 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
             .ok_or(RpcError::NotFound("block not found"))?;
         let block = load_block(ctx, &record)?;
         let tx = block
-            .txdata
+            .txs
             .iter()
-            .find(|tx| tx.compute_txid() == txid)
+            .find(|tx| tx.txid() == txid)
             .ok_or(RpcError::NotFound("transaction not in specified block"))?;
-        return Ok(render_raw_transaction(ctx, tx, verbose, Some(&record)));
+        return render_raw_transaction(ctx, tx, verbose, Some(&record));
     }
 
     {
         let pool = ctx.mempool.read();
         if let Some(entry) = pool.entry_by_txid(&txid) {
-            return Ok(render_raw_transaction(
-                ctx,
-                entry.tx.as_ref(),
-                verbose,
-                None,
-            ));
+            return render_raw_transaction(ctx, entry.tx.as_ref(), verbose, None);
         }
     }
     if let Some(tx_index) = ctx.tx_index.as_ref() {
@@ -77,13 +112,13 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
                 .transaction_height(&txid)
                 .map_err(RpcError::from)?
                 .and_then(|height| ctx.block_by_height(height));
-            return Ok(render_raw_transaction(ctx, &tx, verbose, record.as_ref()));
+            return render_raw_transaction(ctx, &tx, verbose, record.as_ref());
         }
     }
 
     // Compatibility cache used by tests and early wiring; not confirmation proof.
     if let Some(tx) = ctx.transactions.read().get(&txid) {
-        return Ok(render_raw_transaction(ctx, tx, verbose, None));
+        return render_raw_transaction(ctx, tx, verbose, None);
     }
 
     Err(RpcError::NotFound("transaction not found"))
@@ -109,34 +144,38 @@ fn raw_transaction_verbosity(params: &Value) -> Result<bool, RpcError> {
     }
 }
 
-fn load_block(ctx: &Context, record: &BlockRecord) -> Result<bitcoin::Block, RpcError> {
+fn load_block(ctx: &Context, record: &BlockRecord) -> Result<NativeBlock, RpcError> {
     let bytes = ctx
         .block_body_bytes(record)
         .ok_or(RpcError::NotFound("block data pruned"))?;
-    deserialize(&bytes)
+    native_deserialize(&bytes)
         .map_err(|_| RpcError::Internal("stored block bytes failed decode".to_owned()))
 }
 
 fn render_raw_transaction(
     ctx: &Context,
-    tx: &Transaction,
+    tx: &Tx,
     verbose: bool,
     record: Option<&BlockRecord>,
-) -> Value {
+) -> Result<Value, RpcError> {
     if !verbose {
-        return json!(serialize(tx).to_lower_hex_string());
+        return typed_to_sonic(&v31::GetRawTransaction(hex_encode(&consensus_bytes(tx))));
     }
-    let chain = record.map(|record| TransactionChainContext {
-        block_hash: bitcoin::BlockHash::from_byte_array(record.hash.to_le_bytes()),
-        confirmations: i64::from(
+    let chain = record.map(|record| VerboseTxChain {
+        block_hash: record.hash.to_string(),
+        confirmations: u64::from(
             ctx.applied_height()
                 .saturating_sub(record.height)
                 .saturating_add(1),
         ),
-        block_time: u64::from(record.time),
+        time: u64::from(record.time),
         in_active_chain: Some(true),
     });
-    tx_render::transaction_json(tx, bitcoin_network(ctx.chain_network), chain)
+    typed_to_sonic(&convert::raw_transaction_verbose(
+        tx,
+        ctx.chain_network,
+        chain,
+    )?)
 }
 
 pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -144,26 +183,23 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
     let vout = required_u64(params, 1, "vout is required")?;
     let vout_u32 = u32::try_from(vout).map_err(|_| RpcError::InvalidParams("vout exceeds u32"))?;
     let include_mempool = optional_bool(params, 2, true)?;
-    let bitcoin_outpoint = BitcoinOutPoint {
-        txid,
-        vout: vout_u32,
-    };
-    let utxo_outpoint = OutPoint::new(Hash256::from_le_bytes(txid.as_byte_array()), vout_u32);
+
+    let outpoint = OutPoint::new(txid, vout_u32);
 
     if include_mempool {
         let pool = ctx.mempool.read();
-        if pool.is_outpoint_spent(&bitcoin_outpoint) {
+        if pool.is_outpoint_spent(&outpoint) {
             return Ok(Value::new_null());
         }
         if let Some(entry) = pool.entry_by_txid(&txid)
             && let Ok(vout) = usize::try_from(vout_u32)
-            && let Some(output) = entry.tx.output.get(vout)
+            && let Some(output) = entry.tx.outputs.get(vout)
         {
-            return Ok(txout_json(ctx, output, 0, false));
+            return txout_typed(ctx, output, 0, false);
         }
     }
 
-    let Some(live) = ctx.utxo.get_entry(&utxo_outpoint) else {
+    let Some(live) = ctx.utxo.get_entry(&outpoint) else {
         // Spent or never existed: Core-spec returns JSON null.
         return Ok(Value::new_null());
     };
@@ -171,19 +207,21 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
         .applied_height()
         .saturating_sub(live.height)
         .saturating_add(1);
-    Ok(txout_json(ctx, &live.txout, confirmations, live.coinbase))
+    txout_typed(ctx, &live.txout, confirmations, live.coinbase)
 }
 
-fn txout_json(ctx: &Context, output: &TxOut, confirmations: u32, coinbase: bool) -> Value {
-    json!({
-        "bestblock": ctx.best_hash().to_string_be(),
-        "confirmations": confirmations,
-        "value": tx_render::btc_amount_json(output.value),
-        "scriptPubKey": tx_render::script_pub_key_json(
-            &output.script_pubkey,
-            bitcoin_network(ctx.chain_network),
-        ),
-        "coinbase": coinbase
+fn txout_typed(
+    ctx: &Context,
+    output: &TxOut,
+    confirmations: u32,
+    coinbase: bool,
+) -> Result<Value, RpcError> {
+    typed_to_sonic(&v31::GetTxOut {
+        best_block: ctx.best_hash().to_string(),
+        confirmations,
+        value: sat_to_btc(output.value),
+        script_pubkey: convert::script_pub_key_typed(&output.script_pubkey, ctx.chain_network)?,
+        coinbase,
     })
 }
 
@@ -343,26 +381,36 @@ fn proof_from_record(
 /// Builds the merkle proof for `wanted` from one serialized block, or `None`
 /// when it does not decode or does not hold every wanted txid.
 fn proof_from_body(bytes: &[u8], wanted: &hashbrown::HashSet<Txid>) -> Option<Value> {
-    let block = deserialize::<bitcoin::Block>(bytes).ok()?;
+    let block = native_deserialize::<NativeBlock>(bytes).ok()?;
     let block_txids = block
-        .txdata
+        .txs
         .iter()
-        .map(bitcoin::Transaction::compute_txid)
+        .map(Tx::txid)
         .collect::<hashbrown::HashSet<Txid>>();
     if !wanted.iter().all(|txid| block_txids.contains(txid)) {
         return None;
     }
 
-    let merkle_block = MerkleBlock::from_block_with_predicate(&block, |txid| wanted.contains(txid));
-    Some(json!(serialize(&merkle_block).to_lower_hex_string()))
+    // MerkleBlock construction requires bitcoin::Block (sanctioned seam).
+    let bitcoin_block = bitcoin::consensus::encode::deserialize::<bitcoin::Block>(bytes).ok()?;
+    // WHY `Hash`: `from_byte_array` comes from the rust-bitcoin `Hash` trait
+    // here; the wire txids ride the sanctioned MerkleBlock seam in native LE bytes.
+    let bitcoin_wanted: hashbrown::HashSet<bitcoin::Txid> = wanted
+        .iter()
+        .map(|txid| bitcoin::Txid::from_byte_array(*txid.as_bytes()))
+        .collect();
+    let merkle_block = MerkleBlock::from_block_with_predicate(&bitcoin_block, |txid| {
+        bitcoin_wanted.contains(txid)
+    });
+    Some(json!(hex_encode(&bitcoin_serialize(&merkle_block))))
 }
 
 pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let proof_hex = required_str(params, 0, "proof is required")?;
-    let bytes = Vec::<u8>::from_hex(proof_hex)
-        .map_err(|_| RpcError::InvalidParams("proof must be valid hex"))?;
-    let Ok(merkle_block) = deserialize::<MerkleBlock>(&bytes) else {
-        return Ok(json!([]));
+
+    let bytes = hex_decode(proof_hex)?;
+    let Ok(merkle_block) = bitcoin::consensus::encode::deserialize::<MerkleBlock>(&bytes) else {
+        return typed_to_sonic(&v31::VerifyTxOutProof(Vec::new()));
     };
 
     let mut matched_txids = Vec::new();
@@ -371,60 +419,185 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
         .extract_matches(&mut matched_txids, &mut indexes)
         .is_err()
     {
-        return Ok(json!([]));
+        return typed_to_sonic(&v31::VerifyTxOutProof(Vec::new()));
     }
 
     let result = matched_txids
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    Ok(json!(result))
+    typed_to_sonic(&v31::VerifyTxOutProof(result))
+}
+
+/// Admits one transaction through the R4 generation-revalidated gateway.
+///
+/// This is the shared typed admission operation: `sendrawtransaction` and
+/// the embedded `Node::broadcast` both run it. Each attempt reads a fresh
+/// stable generation, captures the exact mempool sequence under a read
+/// guard, resolves UTXO data without the guard, then calls
+/// [`MempoolGateway::admit_transaction`] with both tokens. A chain change
+/// or mempool mutation between capture and commit returns a transient
+/// error and the loop retries with fresh facts.
+///
+/// An already-known transaction succeeds with an empty [`MutationResult`],
+/// matching Core's `sendrawtransaction` already-known success.
+///
+/// `max_feerate_sat_per_kvb` of `None` disables the max-fee cap, matching
+/// `sendrawtransaction`'s `maxfeerate=0` behavior.
+///
+/// # Errors
+///
+/// Returns the policy rejection string (Core rejection strings) or the
+/// failure verbatim; nothing is inserted when this fails.
+pub(crate) fn admit_transaction(
+    ctx: &Context,
+    tx: Tx,
+    max_feerate_sat_per_kvb: Option<u64>,
+) -> Result<MutationResult, String> {
+    let txid = tx.txid();
+
+    // A tx already confirmed in the chain is always "known" — no
+    // generation or mempool guard needed.
+    if ctx.transactions.read().contains_key(&txid) {
+        return Ok(MutationResult::empty());
+    }
+
+    // Bounded retry: each attempt reads a fresh stable generation, captures
+    // the exact mempool sequence under a read guard, resolves UTXO data
+    // without the guard, then calls admit_transaction with both tokens. A
+    // chain change or mempool mutation between capture and commit returns a
+    // transient error and the loop retries with fresh facts — it never
+    // re-uses a captured even generation.
+    #[allow(clippy::items_after_statements)]
+    const MAX_ADMISSION_RETRIES: usize = 4;
+    for _ in 0..MAX_ADMISSION_RETRIES {
+        let Some(generation) = ctx.mempool.stable_generation() else {
+            continue; // chain change active or failed — retry
+        };
+
+        // Under one gateway read guard: already-known lookup, capture exact
+        // sequence, snapshot policy, resolve mempool-dependent context.
+        let (sequence, _policy, mempool_prevouts) = {
+            let pool = ctx.mempool.read();
+            if pool.contains_txid(&txid) {
+                return Ok(MutationResult::empty());
+            }
+            let sequence = pool.sequence_number();
+            let policy = pool.policy_snapshot();
+            let mempool_prevouts = resolve_mempool_prevouts(&pool, &tx);
+            (sequence, policy, mempool_prevouts)
+        };
+
+        // Without a pool guard: resolve UTXO data and combine with the
+        // mempool-dependent prevouts captured above.
+        let context = resolve_full_context(ctx, &tx, &mempool_prevouts);
+
+        let request = AdmissionRequest {
+            tx: Arc::new(tx.clone()),
+            context,
+            max_feerate_sat_per_kvb,
+            time: unix_time_secs(),
+            height: ctx.applied_height(),
+            origin: AdmissionOrigin::Rpc,
+            expected_generation: generation,
+            expected_sequence: sequence,
+        };
+
+        match ctx.mempool.admit_transaction(request) {
+            Ok(AdmitOutcome::Committed(result)) => {
+                let _ = ctx.add_transaction(tx);
+                return Ok(result);
+            }
+            Ok(AdmitOutcome::AlreadyKnown) => {
+                // The exact transaction was added between our read-guard
+                // check and the write-guard commit. Return normal success
+                // without a second add_transaction.
+                return Ok(MutationResult::empty());
+            }
+            Err(AdmitError::GenerationChanged | AdmitError::MempoolChanged) => continue,
+            Err(AdmitError::Policy(reason)) => {
+                return Err(reason.to_string());
+            }
+        }
+    }
+
+    Err("admission retry exhausted: chain or mempool changed during submission".to_owned())
 }
 
 pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let raw = required_str(params, 0, "raw transaction is required")?;
     let max_feerate = optional_max_feerate(params, 1)?;
     let tx = decode_tx(raw)?;
-    let txid = tx.compute_txid();
+    let txid = tx.txid();
 
-    // Already-known submissions remain successful.
-    {
-        let pool = ctx.mempool.read();
-        if pool.contains_txid(&txid) {
-            return Ok(json!(txid.to_string()));
+    // A tx already confirmed in the chain is always "known" — no
+    // generation or mempool guard needed.
+    if ctx.transactions.read().contains_key(&txid) {
+        return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
+    }
+
+    // Bounded retry: each attempt reads a fresh stable generation, captures
+    // the exact mempool sequence under a read guard, resolves UTXO data
+    // without the guard, then calls admit_transaction with both tokens. A
+    // chain change or mempool mutation between capture and commit returns a
+    // transient error and the loop retries with fresh facts — it never
+    // re-uses a captured even generation.
+    #[allow(clippy::items_after_statements)]
+    const MAX_ADMISSION_RETRIES: usize = 4;
+    for _ in 0..MAX_ADMISSION_RETRIES {
+        let Some(generation) = ctx.mempool.stable_generation() else {
+            continue; // chain change active or failed — retry
+        };
+
+        // Under one gateway read guard: already-known lookup, capture exact
+        // sequence, snapshot policy, resolve mempool-dependent context.
+        let (sequence, _policy, mempool_prevouts) = {
+            let pool = ctx.mempool.read();
+            if pool.contains_txid(&txid) {
+                return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
+            }
+            let sequence = pool.sequence_number();
+            let policy = pool.policy_snapshot();
+            let mempool_prevouts = resolve_mempool_prevouts(&pool, &tx);
+            (sequence, policy, mempool_prevouts)
+        };
+
+        // Without a pool guard: resolve UTXO data and combine with the
+        // mempool-dependent prevouts captured above.
+        let context = resolve_full_context(ctx, &tx, &mempool_prevouts);
+
+        let request = AdmissionRequest {
+            tx: Arc::new(tx.clone()),
+            context,
+            max_feerate_sat_per_kvb: max_feerate,
+            time: unix_time_secs(),
+            height: ctx.applied_height(),
+            origin: AdmissionOrigin::Rpc,
+            expected_generation: generation,
+            expected_sequence: sequence,
+        };
+
+        match ctx.mempool.admit_transaction(request) {
+            Ok(AdmitOutcome::Committed(_)) => {
+                let _ = ctx.add_transaction(tx);
+                return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
+            }
+            Ok(AdmitOutcome::AlreadyKnown) => {
+                // The exact transaction was added between our read-guard
+                // check and the write-guard commit. Return normal txid
+                // success without a second add_transaction.
+                return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
+            }
+            Err(AdmitError::GenerationChanged | AdmitError::MempoolChanged) => continue,
+            Err(AdmitError::Policy(reason)) => {
+                return Err(reject_reason_to_rpc_error(reason));
+            }
         }
     }
-    if ctx.transactions.read().contains_key(&txid) {
-        return Ok(json!(txid.to_string()));
-    }
 
-    let fact = {
-        let pool = ctx.mempool.read();
-        let contexts = package_contexts(ctx, &pool, std::slice::from_ref(&tx));
-        evaluate_package_acceptance(&pool, std::slice::from_ref(&tx), &contexts, max_feerate)
-            .into_iter()
-            .next()
-            .ok_or_else(|| RpcError::Internal("package acceptance returned no rows".to_owned()))?
-    };
-
-    if let Some(reason) = fact.reject_reason {
-        return Err(reject_to_rpc_error(&reason));
-    }
-
-    let entry = MempoolEntry::new(
-        Arc::new(tx.clone()),
-        fact.vsize,
-        fact.base_fee.unwrap_or(0),
-        unix_time_secs(),
-        ctx.applied_height(),
-    )
-    .with_sigop_cost(fact.sigop_cost);
-    ctx.mempool
-        .write()
-        .insert_entry(entry)
-        .map_err(|error| RpcError::Internal(error.to_string()))?;
-    let _ = ctx.add_transaction(tx);
-    Ok(json!(txid.to_string()))
+    Err(RpcError::Internal(
+        "admission retry exhausted: chain or mempool changed during submission".to_owned(),
+    ))
 }
 
 pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -444,40 +617,44 @@ pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Va
     }
 
     let pool = ctx.mempool.read();
+    let policy = pool.policy_snapshot();
     let contexts = package_contexts(ctx, &pool, &txs);
-    let facts = evaluate_package_acceptance(&pool, &txs, &contexts, max_feerate);
+    let facts = evaluate_package_acceptance_all(
+        &pool,
+        &policy.standardness,
+        &txs,
+        &contexts,
+        max_feerate,
+        policy.incremental_relay_fee_sat_per_kvb,
+    );
 
-    let mut rows = Vec::with_capacity(facts.len());
-    for fact in facts {
-        let mut row = json!({
-            "txid": fact.txid.to_string(),
-            "wtxid": fact.wtxid.to_string(),
-            "allowed": fact.allowed,
-            "vsize": fact.vsize,
-            "weight": fact.weight
+    let mut rows = Vec::with_capacity(facts.results.len());
+    for fact in &facts.results {
+        let fees = fact.base_fee.map(|fee| v31::MempoolAcceptanceFees {
+            base: sat_to_btc(fee),
+            effective_fee_rate: None,
+            effective_includes: Vec::new(),
         });
-        if let Some(fee) = fact.base_fee {
-            let _ = row.insert(
-                "fees",
-                json!({ "base": tx_render::btc_amount_json(Amount::from_sat(fee)) }),
-            );
-        }
-        if let Some(reason) = fact.reject_reason {
-            let _ = row.insert("reject-reason", json!(reason.to_string()));
-        }
-        rows.push(row);
+        rows.push(v31::MempoolAcceptance {
+            txid: fact.txid.to_string(),
+            wtxid: fact.wtxid.to_string(),
+            allowed: fact.allowed.unwrap_or(false),
+            vsize: fact.allowed.unwrap_or(false).then(|| i64::from(fact.vsize)),
+            fees,
+            reject_reason: fact.reject_reason.map(reject_reason_to_frozen_string),
+            reject_details: None,
+        });
     }
-    Ok(json!(rows))
+    typed_to_sonic_omitting_nulls(&v31::TestMempoolAccept(rows))
 }
 
 pub(crate) fn decoderawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let raw = required_str(params, 0, "raw transaction is required")?;
     let tx = decode_tx(raw)?;
-    Ok(tx_render::transaction_json(
+    typed_to_sonic(&v31::DecodeRawTransaction(convert::raw_transaction(
         &tx,
-        bitcoin_network(ctx.chain_network),
-        None,
-    ))
+        ctx.chain_network,
+    )?))
 }
 
 pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -501,10 +678,12 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
         }
     };
     let replaceable = optional_bool(params, 3, false)?;
-    let default_sequence = if replaceable {
-        Sequence::ENABLE_RBF_NO_LOCKTIME
+
+    // BIP125 opt-in sequence; 0xFFFFFFFF = final (no RBF, no locktime).
+    let default_sequence: u32 = if replaceable {
+        0xFFFF_FFFD
     } else {
-        Sequence::MAX
+        0xFFFF_FFFF
     };
 
     let mut tx_inputs = Vec::with_capacity(inputs.len());
@@ -533,34 +712,32 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
                 let sequence = value
                     .as_u64()
                     .ok_or(RpcError::InvalidType("sequence must be an integer"))?;
-                Sequence::from_consensus(
-                    u32::try_from(sequence)
-                        .map_err(|_| RpcError::InvalidParams("sequence exceeds u32"))?,
-                )
+                u32::try_from(sequence)
+                    .map_err(|_| RpcError::InvalidParams("sequence exceeds u32"))?
             }
         };
         tx_inputs.push(TxIn {
-            previous_output: BitcoinOutPoint { txid, vout },
-            script_sig: ScriptBuf::new(),
+            previous_output: OutPoint::new(txid, vout),
+            script_sig: Vec::new(),
             sequence,
-            witness: Witness::default(),
+            witness: Vec::new(),
         });
     }
 
-    let network = bitcoin_network(ctx.chain_network);
+    // Address parsing requires bitcoin::Network (sanctioned seam).
+    let network = convert::bitcoin_network(ctx.chain_network);
     let mut tx_outputs = Vec::with_capacity(outputs.len());
     for (key, value) in outputs {
         if key == "data" {
             let data_hex = value
                 .as_str()
                 .ok_or(RpcError::InvalidType("data output must be a hex string"))?;
-            let data = Vec::<u8>::from_hex(data_hex)
-                .map_err(|_| RpcError::InvalidParams("data output must be valid hex"))?;
-            let data = PushBytesBuf::try_from(data)
-                .map_err(|_| RpcError::InvalidParams("data output exceeds maximum push size"))?;
+            let data = hex_decode(data_hex)?;
+            let mut script = vec![opcode::OP_RETURN];
+            script.extend_from_slice(&push_data(&data));
             tx_outputs.push(TxOut {
-                value: Amount::ZERO,
-                script_pubkey: ScriptBuf::new_op_return(data),
+                value: 0,
+                script_pubkey: script,
             });
             continue;
         }
@@ -571,49 +748,52 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
             .map_err(|_| RpcError::InvalidParams("invalid Bitcoin address"))?;
         tx_outputs.push(TxOut {
             value: parse_btc_amount(value)?,
-            script_pubkey: address.script_pubkey(),
+            script_pubkey: address.script_pubkey().as_bytes().to_vec(),
         });
     }
 
-    let tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::from_consensus(locktime),
-        input: tx_inputs,
-        output: tx_outputs,
+    let tx = Tx {
+        version: 2,
+        lock_time: locktime,
+        inputs: tx_inputs,
+        outputs: tx_outputs,
     };
-    Ok(json!(serialize(&tx).to_lower_hex_string()))
+    typed_to_sonic(&v31::CreateRawTransaction(hex_encode(&consensus_bytes(
+        &tx,
+    ))))
 }
 
-fn decode_tx(raw: &str) -> Result<Transaction, RpcError> {
-    let bytes = Vec::<u8>::from_hex(raw)?;
-    deserialize(&bytes).map_err(|_| RpcError::InvalidParams("transaction decode failed"))
-}
-
-fn parse_txid(value: &str) -> Result<Txid, RpcError> {
-    Txid::from_str(value).map_err(|_| RpcError::InvalidParams("txid must be 64 hex characters"))
-}
-
-fn standardness_policy() -> StandardnessPolicy {
-    StandardnessPolicy {
-        dust_relay_fee: FeeRate::DUST,
-        max_datacarrier_bytes: Some(83),
-    }
-}
-
-const fn bitcoin_network(chain_network: bitcoin_rs_primitives::Network) -> bitcoin::Network {
-    match chain_network {
-        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
-    }
+fn decode_tx(raw: &str) -> Result<Tx, RpcError> {
+    let bytes = hex_decode(raw)?;
+    native_deserialize(&bytes).map_err(|_| RpcError::InvalidParams("transaction decode failed"))
 }
 
 fn unix_time_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+/// f64 nearest to 2^64 — the value `u64::MAX` rounds to as a float, and the
+/// first `f64` that no longer fits `u64` satoshis. A literal because
+/// `as_conversions` bans the cast that would compute it.
+const U64_MAX_F64: f64 = 18_446_744_073_709_551_616.0;
+
+/// Converts a BTC-denominated float to satoshis, rejecting non-finite,
+/// negative, and overflow values with `message`.
+///
+/// The final step is a scoped `as`: std offers no `TryFrom<f64> for u64`, and
+/// the range check above already bounds `raw` to `[0, 2^64)`, so the cast
+/// only truncates fractional satoshi dust, matching the historical behavior.
+fn sats_from_btc(btc: f64, message: &'static str) -> Result<u64, RpcError> {
+    let raw = btc * 100_000_000.0;
+    if !raw.is_finite() || !(0.0..U64_MAX_F64).contains(&raw) {
+        return Err(RpcError::InvalidParams(message));
+    }
+    #[allow(clippy::as_conversions)] // see fn doc: no TryFrom<f64> for u64 in std
+    #[allow(clippy::cast_possible_truncation)] // fractional dust, per fn doc
+    #[allow(clippy::cast_sign_loss)] // raw >= 0.0 checked above
+    Ok(raw as u64)
 }
 
 fn optional_max_feerate(params: &Value, index: usize) -> Result<Option<u64>, RpcError> {
@@ -637,146 +817,182 @@ fn optional_max_feerate(params: &Value, index: usize) -> Result<Option<u64>, Rpc
     if btc_per_kvb == 0.0 {
         return Ok(None);
     }
-    let sats = Amount::from_btc(btc_per_kvb)
-        .map_err(|_| RpcError::InvalidParams("maxfeerate is out of range"))?
-        .to_sat();
-    Ok(Some(sats))
+    Ok(Some(sats_from_btc(
+        btc_per_kvb,
+        "maxfeerate is out of range",
+    )?))
 }
 
-fn parse_btc_amount(value: &Value) -> Result<Amount, RpcError> {
+fn parse_btc_amount(value: &Value) -> Result<u64, RpcError> {
     if let Some(number) = value.as_f64() {
-        return Amount::from_btc(number).map_err(|_| RpcError::InvalidParams("Invalid amount"));
+        return sats_from_btc(number, "Invalid amount");
     }
     if let Some(text) = value.as_str() {
-        return Amount::from_str_in(text, Denomination::Bitcoin)
-            .map_err(|_| RpcError::InvalidParams("Invalid amount"));
+        let number: f64 = text
+            .parse()
+            .map_err(|_| RpcError::InvalidParams("Invalid amount"))?;
+        return sats_from_btc(number, "Invalid amount");
     }
     Err(RpcError::InvalidType("amount must be a number or string"))
 }
 
 // ---------------------------------------------------------------------------
-// Package acceptance — adapted from R2 to current Mempool/standardness APIs.
+// Prevout / context resolution and frozen reason mapping.
 // ---------------------------------------------------------------------------
 
-/// Per-transaction context computed from UTXO and mempool state.
-struct PackageTxContext {
-    fee: u64,
-    vsize: u32,
-    sigop_cost: u32,
-    missing_inputs: bool,
-}
-
-/// Per-transaction acceptance result.
-struct AcceptanceFact {
-    txid: Txid,
-    wtxid: bitcoin::Wtxid,
-    allowed: bool,
-    vsize: u32,
-    weight: u64,
-    base_fee: Option<u64>,
-    sigop_cost: u32,
-    reject_reason: Option<RejectReason>,
-}
-
-/// Reason a transaction was rejected from mempool acceptance.
-enum RejectReason {
-    AlreadyInMempool,
-    MissingInputs,
-    NonStandard(StandardnessError),
-    MaxFeeExceeded,
-    MinRelayFeeNotMet,
-}
-
-impl core::fmt::Display for RejectReason {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::AlreadyInMempool => write!(f, "txn-already-in-mempool"),
-            Self::MissingInputs => write!(f, "missing-inputs"),
-            Self::NonStandard(error) => write!(f, "{error}"),
-            Self::MaxFeeExceeded => write!(f, "max-fee-exceeded"),
-            Self::MinRelayFeeNotMet => write!(f, "min-relay-fee-not-met"),
-        }
+/// Maps an [`AcceptanceRejectReason`] to the frozen RPC error code and
+/// string. `MaxFeeExceeded` is a parameter error (-32602); all others are
+/// internal errors (-32603). The string for `MinRelayFeeNotMet` uses the
+/// frozen hyphenated form `min-relay-fee-not-met`, not the mempool's Display.
+fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
+    match reason {
+        AcceptanceRejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
+        other => RpcError::Internal(reject_reason_to_frozen_string(other)),
     }
 }
 
-fn reject_to_rpc_error(reason: &RejectReason) -> RpcError {
+/// Maps an [`AcceptanceRejectReason`] to the frozen RPC reject-reason string.
+/// Every variant matches the mempool's `Display` except `MinRelayFeeNotMet`,
+/// which uses the frozen hyphenated form.
+fn reject_reason_to_frozen_string(reason: AcceptanceRejectReason) -> String {
     match reason {
-        RejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
-        RejectReason::AlreadyInMempool
-        | RejectReason::MissingInputs
-        | RejectReason::MinRelayFeeNotMet
-        | RejectReason::NonStandard(_) => RpcError::Internal(reason.to_string()),
+        AcceptanceRejectReason::MinRelayFeeNotMet => "min-relay-fee-not-met".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolves mempool-dependent prevouts for a single tx under a read guard.
+/// Returns `(txid, vout, value, script_pubkey)` tuples for inputs whose
+/// prevout is a mempool parent transaction.
+fn resolve_mempool_prevouts(
+    pool: &bitcoin_rs_mempool::Mempool,
+    tx: &Tx,
+) -> HashMap<OutPoint, TxOut> {
+    let mut prevouts = HashMap::new();
+    for input in &tx.inputs {
+        if input.previous_output == OutPoint::default() {
+            continue;
+        }
+        if let Some(parent) = pool.transaction_by_txid(&input.previous_output.txid)
+            && let Ok(vout) = usize::try_from(input.previous_output.vout)
+            && let Some(output) = parent.outputs.get(vout)
+        {
+            prevouts.insert(input.previous_output, output.clone());
+        }
+    }
+    prevouts
+}
+
+/// Combines mempool-dependent prevouts (captured under a read guard) with
+/// UTXO-set prevouts (resolved without a pool guard) to build the full
+/// per-transaction context. Inputs found in neither source are marked
+/// missing.
+fn resolve_full_context(
+    ctx: &Context,
+    tx: &Tx,
+    mempool_prevouts: &HashMap<OutPoint, TxOut>,
+) -> MempoolPackageTxContext {
+    let mut missing_inputs = false;
+    let mut input_value = 0_u64;
+    let mut prevouts: Vec<(OutPoint, TxOut)> = Vec::new();
+
+    for input in &tx.inputs {
+        if input.previous_output == OutPoint::default() {
+            missing_inputs = true;
+            continue;
+        }
+        if let Some(output) = mempool_prevouts.get(&input.previous_output) {
+            input_value = input_value.saturating_add(output.value);
+            prevouts.push((input.previous_output, output.clone()));
+            continue;
+        }
+        if let Some(live) = ctx.utxo.get_entry(&input.previous_output) {
+            input_value = input_value.saturating_add(live.txout.value);
+            prevouts.push((input.previous_output, live.txout.clone()));
+            continue;
+        }
+        missing_inputs = true;
+    }
+
+    let output_value = tx
+        .outputs
+        .iter()
+        .fold(0_u64, |sum, output| sum.saturating_add(output.value));
+    let fee = input_value.saturating_sub(output_value);
+    let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
+    let sigop_cost = u32::try_from(total_sigop_cost(tx, &prevouts)).unwrap_or(u32::MAX);
+
+    MempoolPackageTxContext {
+        fee,
+        vsize,
+        sigop_cost,
+        missing_inputs,
     }
 }
 
 fn package_contexts(
     ctx: &Context,
     pool: &bitcoin_rs_mempool::Mempool,
-    txs: &[Transaction],
-) -> Vec<PackageTxContext> {
-    let mut package_outputs: HashMap<(Txid, u32), Amount> = HashMap::new();
+    txs: &[Tx],
+) -> Vec<MempoolPackageTxContext> {
+    let mut package_outputs: HashMap<(Txid, u32), u64> = HashMap::new();
     let mut contexts = Vec::with_capacity(txs.len());
 
     for tx in txs {
         let mut missing_inputs = false;
         let mut input_value = 0_u64;
-        let mut prevouts: HashMap<BitcoinOutPoint, TxOut> = HashMap::new();
+        let mut prevouts: Vec<(OutPoint, TxOut)> = Vec::new();
 
-        for input in &tx.input {
-            if input.previous_output.is_null() {
+        for input in &tx.inputs {
+            if input.previous_output == OutPoint::default() {
                 missing_inputs = true;
                 continue;
             }
             let key = (input.previous_output.txid, input.previous_output.vout);
             if let Some(value) = package_outputs.get(&key) {
-                input_value = input_value.saturating_add(value.to_sat());
-                prevouts.insert(
+                input_value = input_value.saturating_add(*value);
+                prevouts.push((
                     input.previous_output,
                     TxOut {
                         value: *value,
-                        script_pubkey: ScriptBuf::new(),
+                        script_pubkey: Vec::new(),
                     },
-                );
+                ));
                 continue;
             }
             if let Some(parent) = pool.transaction_by_txid(&input.previous_output.txid)
                 && let Ok(vout) = usize::try_from(input.previous_output.vout)
-                && let Some(output) = parent.output.get(vout)
+                && let Some(output) = parent.outputs.get(vout)
             {
-                input_value = input_value.saturating_add(output.value.to_sat());
-                prevouts.insert(input.previous_output, output.clone());
+                input_value = input_value.saturating_add(output.value);
+                prevouts.push((input.previous_output, output.clone()));
                 continue;
             }
-            let utxo_outpoint = OutPoint::new(
-                Hash256::from_le_bytes(input.previous_output.txid.as_byte_array()),
-                input.previous_output.vout,
-            );
-            if let Some(live) = ctx.utxo.get_entry(&utxo_outpoint) {
-                input_value = input_value.saturating_add(live.txout.value.to_sat());
-                prevouts.insert(input.previous_output, live.txout.clone());
+            if let Some(live) = ctx.utxo.get_entry(&input.previous_output) {
+                input_value = input_value.saturating_add(live.txout.value);
+                prevouts.push((input.previous_output, live.txout.clone()));
                 continue;
             }
             missing_inputs = true;
         }
 
-        let output_value = tx.output.iter().fold(0_u64, |sum, output| {
-            sum.saturating_add(output.value.to_sat())
-        });
+        let output_value = tx
+            .outputs
+            .iter()
+            .fold(0_u64, |sum, output| sum.saturating_add(output.value));
         let fee = input_value.saturating_sub(output_value);
         let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
-        let sigop_cost =
-            u32::try_from(tx.total_sigop_cost(|outpoint| prevouts.get(outpoint).cloned()))
-                .unwrap_or(u32::MAX);
+        let sigop_cost = u32::try_from(total_sigop_cost(tx, &prevouts)).unwrap_or(u32::MAX);
 
-        contexts.push(PackageTxContext {
+        contexts.push(MempoolPackageTxContext {
             fee,
             vsize,
             sigop_cost,
             missing_inputs,
         });
 
-        let txid = tx.compute_txid();
-        for (vout, output) in tx.output.iter().enumerate() {
+        let txid = tx.txid();
+        for (vout, output) in tx.outputs.iter().enumerate() {
             let vout = u32::try_from(vout).unwrap_or(u32::MAX);
             package_outputs.insert((txid, vout), output.value);
         }
@@ -785,67 +1001,73 @@ fn package_contexts(
     contexts
 }
 
-fn evaluate_package_acceptance(
-    pool: &bitcoin_rs_mempool::Mempool,
-    txs: &[Transaction],
-    contexts: &[PackageTxContext],
-    max_feerate: Option<u64>,
-) -> Vec<AcceptanceFact> {
-    let policy = standardness_policy();
-    let mut facts = Vec::with_capacity(txs.len());
-
-    for (tx, ctx) in txs.iter().zip(contexts) {
-        let txid = tx.compute_txid();
-        let wtxid = tx.compute_wtxid();
-        let vsize = ctx.vsize;
-        let weight = tx.weight().to_wu();
-        let base_fee = if ctx.missing_inputs {
-            None
-        } else {
-            Some(ctx.fee)
+/// Computes the total sigop cost for a transaction given resolved prevouts.
+///
+/// Mirrors the consensus `total_sigop_cost` using public script-crate counters:
+/// legacy sigops × 4, plus P2SH redeem-script accurate sigops × 4, plus
+/// segwit witness-program sigops.
+fn total_sigop_cost(tx: &Tx, prevouts: &[(OutPoint, TxOut)]) -> u64 {
+    let mut cost = u64::from(count_tx_legacy(tx)).saturating_mul(4);
+    for input in &tx.inputs {
+        let prevout = prevouts
+            .iter()
+            .find(|(op, _)| *op == input.previous_output)
+            .map(|(_, txout)| txout);
+        let Some(prevout) = prevout else {
+            continue;
         };
-
-        let reject_reason = if pool.contains_txid(&txid) {
-            Some(RejectReason::AlreadyInMempool)
-        } else if ctx.missing_inputs {
-            Some(RejectReason::MissingInputs)
-        } else {
-            match is_standard_tx(tx, &policy) {
-                Ok(()) => {
-                    // Fee rate checks.
-                    let fee_rate = if ctx.vsize > 0 {
-                        ctx.fee * 1_000 / u64::from(ctx.vsize)
-                    } else {
-                        0
-                    };
-                    if let Some(max_rate) = max_feerate
-                        && fee_rate > max_rate
-                    {
-                        Some(RejectReason::MaxFeeExceeded)
-                    } else if fee_rate < DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB {
-                        Some(RejectReason::MinRelayFeeNotMet)
-                    } else {
-                        None
-                    }
-                }
-                Err(error) => Some(RejectReason::NonStandard(error)),
+        let redeem_script = last_push(&input.script_sig);
+        if is_p2sh(&prevout.script_pubkey) {
+            if let Some(redeem) = redeem_script {
+                cost = cost.saturating_add(u64::from(count_accurate(redeem)).saturating_mul(4));
             }
+        }
+        let witness_program = if is_witness_program(&prevout.script_pubkey) {
+            Some(prevout.script_pubkey.as_slice())
+        } else {
+            redeem_script.filter(|script| is_witness_program(script))
         };
-
-        let allowed = reject_reason.is_none();
-        facts.push(AcceptanceFact {
-            txid,
-            wtxid,
-            allowed,
-            vsize,
-            weight,
-            base_fee,
-            sigop_cost: ctx.sigop_cost,
-            reject_reason,
-        });
+        if let Some(program) = witness_program {
+            cost = cost.saturating_add(u64::from(count_segwit(program, &input.witness)));
+        }
     }
+    cost
+}
 
-    facts
+/// Returns the last data push from a script, or `None`.
+fn last_push(script: &[u8]) -> Option<&[u8]> {
+    let mut last = None;
+    for instruction in instructions(script) {
+        match instruction.ok()? {
+            Instruction::PushBytes(bytes) => last = Some(bytes),
+            Instruction::Op(_) => last = None,
+        }
+    }
+    last
+}
+
+/// Counts sigops accurately (multisig uses the preceding pushnum value).
+fn count_accurate(script: &[u8]) -> u32 {
+    let mut count = 0_u32;
+    let mut pushed_number = None;
+    for instruction in instructions(script) {
+        match instruction {
+            Ok(Instruction::Op(op)) => match op {
+                opcode::OP_CHECKSIG | opcode::OP_CHECKSIGVERIFY => {
+                    count = count.saturating_add(1);
+                    pushed_number = None;
+                }
+                opcode::OP_CHECKMULTISIG | opcode::OP_CHECKMULTISIGVERIFY => {
+                    count = count.saturating_add(u32::from(pushed_number.unwrap_or(20)));
+                    pushed_number = None;
+                }
+                other => pushed_number = opcode::decode_pushnum(other),
+            },
+            Ok(Instruction::PushBytes(_)) => pushed_number = None,
+            Err(_) => break,
+        }
+    }
+    count
 }
 
 pub(crate) fn finalizepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -866,17 +1088,19 @@ pub(crate) fn finalizepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value,
     };
     let complete = finalized_tx.is_some();
     if extract && let Some(tx) = finalized_tx {
-        let hex = bitcoin::consensus::encode::serialize(&tx).to_lower_hex_string();
-        Ok(json!({
-            "hex": hex,
-            "complete": true,
-        }))
+        let hex = hex_encode(&bitcoin_serialize(&tx));
+        typed_to_sonic(&v31::FinalizePsbt {
+            psbt: None,
+            hex: Some(hex),
+            complete: true,
+        })
     } else {
         let serialized = encode_base64(&psbt.serialize());
-        Ok(json!({
-            "psbt": serialized,
-            "complete": complete,
-        }))
+        typed_to_sonic(&v31::FinalizePsbt {
+            psbt: Some(serialized),
+            hex: None,
+            complete,
+        })
     }
 }
 
@@ -909,7 +1133,7 @@ pub(crate) fn combinepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             .map_err(|err| RpcError::Internal(format!("combine failed: {err}")))?;
     }
 
-    Ok(json!(encode_base64(&psbt.serialize())))
+    typed_to_sonic(&v31::CombinePsbt(encode_base64(&psbt.serialize())))
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -1005,40 +1229,100 @@ fn encode_base64(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
 
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::hex::DisplayHex as _;
-    use bitcoin::{OutPoint, Txid};
     use bitcoin_rs_chain::NodeStatus;
-    use bitcoin_rs_mempool::MempoolEntry;
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_mempool::{
+        AdmissionOrigin, MempoolEntry, arm_admission_park, reset_admission_park,
+    };
+    use bitcoin_rs_primitives::{
+        Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+        encode::double_sha256,
+    };
+    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
+    use std::sync::mpsc;
+    use std::thread;
 
     use super::getrawtransaction;
+    use super::hex_encode;
     use crate::Handler;
     use crate::context::{BlockRecord, Context, TxIndexQuery, TxQueryError};
     use crate::error::RpcError;
 
-    fn genesis_block(network: bitcoin::Network) -> bitcoin::Block {
-        bitcoin::blockdata::constants::genesis_block(network)
+    /// Minimal one-coinbase-tx fixture block standing in for the chain genesis.
+    ///
+    /// Identity is self-consistent via `block_hash()`; with a single transaction
+    /// the merkle root is its txid, matching consensus layering.
+    fn fixture_genesis() -> Block {
+        let coinbase = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig: vec![0x51; 4],
+                sequence: u32::MAX,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: vec![0x51],
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            txs: vec![coinbase],
+        };
+        block.header.merkle_root = merkle_root_for(&block.txs);
+        block
+    }
+
+    /// Test-local merkle root over fixture txids: a single tx contributes its
+    /// txid, pairs fold with `double_sha256` over the concatenated 64 bytes,
+    /// duplicating the last hash for odd counts, matching consensus.
+    fn merkle_root_for(txs: &[Tx]) -> Hash256 {
+        let mut layer: Vec<Hash256> = txs.iter().map(|tx| tx.txid().0).collect();
+        while layer.len() > 1 {
+            if layer.len() % 2 == 1
+                && let Some(last) = layer.last().copied()
+            {
+                layer.push(last);
+            }
+            layer = layer
+                .chunks(2)
+                .map(|pair| {
+                    let mut concat = [0_u8; 64];
+                    concat[..32].copy_from_slice(pair[0].as_byte_array());
+                    concat[32..].copy_from_slice(pair[1].as_byte_array());
+                    double_sha256(&concat)
+                })
+                .collect();
+        }
+        layer.first().copied().unwrap_or_default()
     }
 
     #[test]
     fn getrawtransaction_falls_back_to_mempool_for_unconfirmed()
     -> Result<(), Box<dyn std::error::Error>> {
         let ctx = Arc::new(Context::new());
-        let genesis = genesis_block(bitcoin::Network::Regtest);
+        let genesis = fixture_genesis();
         let coinbase = genesis
-            .txdata
+            .txs
             .first()
             .ok_or_else(|| RpcError::Internal("genesis has no transactions".to_owned()))?
             .clone();
-        let txid = coinbase.compute_txid();
+        let txid = coinbase.txid();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             let vsize = u32::try_from(coinbase.vsize())?;
             let entry =
                 MempoolEntry::new(Arc::new(coinbase.clone()), vsize, u64::from(vsize), 0, 0);
@@ -1047,7 +1331,7 @@ mod tests {
 
         let result = getrawtransaction(&ctx, &json!([txid.to_string()]))?;
 
-        let expected = serialize(&coinbase).to_lower_hex_string();
+        let expected = hex_encode(&consensus_bytes(&coinbase));
         assert_eq!(result.as_str(), Some(expected.as_str()));
         Ok(())
     }
@@ -1058,10 +1342,7 @@ mod tests {
         struct FailingQuery;
 
         impl TxIndexQuery for FailingQuery {
-            fn transaction(
-                &self,
-                _txid: &Txid,
-            ) -> Result<Option<bitcoin::Transaction>, TxQueryError> {
+            fn transaction(&self, _txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
                 Err(TxQueryError::Storage("disk full".into()))
             }
 
@@ -1080,15 +1361,15 @@ mod tests {
         let mut ctx = Context::new();
         ctx.tx_index = Some(Arc::new(FailingQuery));
         let ctx = Arc::new(ctx);
-        let genesis = genesis_block(bitcoin::Network::Regtest);
+        let genesis = fixture_genesis();
         let coinbase = genesis
-            .txdata
+            .txs
             .first()
             .ok_or_else(|| RpcError::Internal("genesis has no transactions".to_owned()))?
             .clone();
-        let txid = coinbase.compute_txid();
+        let txid = coinbase.txid();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             let vsize = u32::try_from(coinbase.vsize())?;
             let entry =
                 MempoolEntry::new(Arc::new(coinbase.clone()), vsize, u64::from(vsize), 0, 0);
@@ -1097,20 +1378,19 @@ mod tests {
 
         let result = getrawtransaction(&ctx, &json!([txid.to_string()]))?;
 
-        let expected = serialize(&coinbase).to_lower_hex_string();
+        let expected = hex_encode(&consensus_bytes(&coinbase));
         assert_eq!(result.as_str(), Some(expected.as_str()));
         Ok(())
     }
 
     #[test]
     fn getrawtransaction_with_blockhash_finds_tx_in_specific_block() {
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first() else {
             panic!("genesis has no transactions");
         };
-        let txid = coinbase.compute_txid();
-        let block_hash =
-            bitcoin_rs_primitives::Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let txid = coinbase.txid();
+        let block_hash = genesis.block_hash();
         let mut ctx = Context::new();
         attach_body_for_block(&mut ctx, &genesis, 0);
         ctx.block_tree
@@ -1123,7 +1403,7 @@ mod tests {
         let result = handler
             .dispatch(
                 "getrawtransaction",
-                &json!([txid.to_string(), false, block_hash.to_string_be()]),
+                &json!([txid.to_string(), false, block_hash.to_string()]),
             )
             .unwrap_or_else(|err| panic!("getrawtransaction with blockhash: {err}"));
         assert!(result.is_str(), "expected hex string, got {result:?}");
@@ -1132,15 +1412,12 @@ mod tests {
     #[test]
     fn getrawtransaction_resolves_confirmed_transaction_from_txindex_without_cache() {
         struct StaticQuery {
-            tx: bitcoin::Transaction,
+            tx: Tx,
         }
 
         impl TxIndexQuery for StaticQuery {
-            fn transaction(
-                &self,
-                txid: &Txid,
-            ) -> Result<Option<bitcoin::Transaction>, TxQueryError> {
-                Ok((self.tx.compute_txid() == *txid).then(|| self.tx.clone()))
+            fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
+                Ok((self.tx.txid() == *txid).then(|| self.tx.clone()))
             }
 
             fn outpoint_value(&self, _outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
@@ -1155,11 +1432,11 @@ mod tests {
             }
         }
 
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first().cloned() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first().cloned() else {
             panic!("genesis has no transactions");
         };
-        let txid = coinbase.compute_txid();
+        let txid = coinbase.txid();
         let mut ctx = Context::new();
         ctx.tx_index = Some(Arc::new(StaticQuery {
             tx: coinbase.clone(),
@@ -1173,18 +1450,18 @@ mod tests {
         let result = getrawtransaction(&ctx, &json!([txid.to_string()]))
             .unwrap_or_else(|err| panic!("txindex lookup failed: {err}"));
 
-        let expected = serialize(&coinbase).to_lower_hex_string();
+        let expected = hex_encode(&consensus_bytes(&coinbase));
         assert_eq!(result.as_str(), Some(expected.as_str()));
     }
 
     #[test]
     fn getrawtransaction_with_blockhash_reports_pruned_block_body() {
         let ctx = Arc::new(Context::new());
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first() else {
             panic!("genesis has no transactions");
         };
-        let txid = coinbase.compute_txid();
+        let txid = coinbase.txid();
         let record = BlockRecord::from_block(0, &genesis);
         let block_hash = record.hash;
         ctx.block_tree
@@ -1195,7 +1472,7 @@ mod tests {
 
         let result = getrawtransaction(
             &ctx,
-            &json!([txid.to_string(), false, block_hash.to_string_be()]),
+            &json!([txid.to_string(), false, block_hash.to_string()]),
         );
 
         assert!(matches!(
@@ -1207,11 +1484,11 @@ mod tests {
     #[test]
     fn getrawtransaction_with_blockhash_reports_pruned_body_for_a_header_only_block() {
         let ctx = Arc::new(Context::new());
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first() else {
             panic!("genesis has no transactions");
         };
-        let block_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let block_hash = genesis.block_hash();
         ctx.block_tree
             .write()
             .insert_node(None, genesis.header, NodeStatus::HeaderValid)
@@ -1219,11 +1496,7 @@ mod tests {
 
         let result = getrawtransaction(
             &ctx,
-            &json!([
-                coinbase.compute_txid().to_string(),
-                false,
-                block_hash.to_string_be()
-            ]),
+            &json!([coinbase.txid().to_string(), false, block_hash.to_string()]),
         );
 
         assert!(matches!(
@@ -1250,12 +1523,12 @@ mod tests {
 
     #[test]
     fn gettxoutproof_finds_genesis_coinbase() {
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first() else {
             panic!("genesis has no transactions");
         };
-        let txid = coinbase.compute_txid();
-        let ctx = context_with_blocks(&[genesis.clone()]);
+        let txid = coinbase.txid();
+        let ctx = context_with_blocks(std::slice::from_ref(&genesis));
         let handler = Handler::new(Arc::clone(&ctx));
         let result = handler
             .dispatch("gettxoutproof", &json!([[txid.to_string()]]))
@@ -1275,16 +1548,16 @@ mod tests {
 
     #[test]
     fn gettxoutproof_skips_pruned_blocks_before_matching_block() {
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first() else {
             panic!("genesis has no transactions");
         };
-        let txid = coinbase.compute_txid();
+        let txid = coinbase.txid();
         let mut ctx = Context::new();
         ctx.block_body_source = Some(Arc::new(ScriptedBodySource {
-            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+            responses: parking_lot::Mutex::new(std::collections::VecDeque::from([
                 None,
-                Some(serialize(&genesis)),
+                Some(consensus_bytes(&genesis)),
             ])),
         }));
         ctx.add_block(BlockRecord::from_block(0, &genesis));
@@ -1305,22 +1578,22 @@ mod tests {
         struct PanicBodySource;
 
         impl crate::context::BlockBodySource for PanicBodySource {
-            fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
                 panic!("specified blockhash proof should not load unrelated body {height}:{hash}");
             }
         }
 
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first() else {
             panic!("genesis has no transactions");
         };
-        let txid = coinbase.compute_txid();
-        let unrelated_hash = Hash256::from_le_bytes(&[7_u8; 32]);
+        let txid = coinbase.txid();
+        let unrelated_hash = BlockHash::from(Hash256::from_le_bytes(&[7_u8; 32]));
         let record = BlockRecord::from_block(0, &genesis);
         let block_hash = record.hash;
         let mut ctx = Context::new().with_block_body_source(Arc::new(PanicBodySource));
         ctx.block_body_source = Some(Arc::new(SeededBodySource {
-            bodies: vec![(0, record.hash, serialize(&genesis))],
+            bodies: vec![(0, record.hash, consensus_bytes(&genesis))],
         }));
         ctx.block_tree
             .write()
@@ -1333,7 +1606,7 @@ mod tests {
 
         let result = handler.dispatch(
             "gettxoutproof",
-            &json!([[txid.to_string()], block_hash.to_string_be()]),
+            &json!([[txid.to_string()], block_hash.to_string()]),
         );
 
         assert!(
@@ -1345,11 +1618,11 @@ mod tests {
     #[test]
     fn gettxoutproof_with_blockhash_reports_pruned_block_body() {
         let ctx = Arc::new(Context::new());
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first() else {
             panic!("genesis has no transactions");
         };
-        let txid = coinbase.compute_txid();
+        let txid = coinbase.txid();
         let record = BlockRecord::from_block(0, &genesis);
         ctx.block_tree
             .write()
@@ -1361,7 +1634,7 @@ mod tests {
 
         let result = handler.dispatch(
             "gettxoutproof",
-            &json!([[txid.to_string()], block_hash.to_string_be()]),
+            &json!([[txid.to_string()], block_hash.to_string()]),
         );
 
         assert!(matches!(
@@ -1373,11 +1646,11 @@ mod tests {
     #[test]
     fn gettxoutproof_with_blockhash_reports_pruned_body_for_a_header_only_block() {
         let ctx = Arc::new(Context::new());
-        let genesis = genesis_block(bitcoin::Network::Regtest);
-        let Some(coinbase) = genesis.txdata.first() else {
+        let genesis = fixture_genesis();
+        let Some(coinbase) = genesis.txs.first() else {
             panic!("genesis has no transactions");
         };
-        let block_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let block_hash = genesis.block_hash();
         ctx.block_tree
             .write()
             .insert_node(None, genesis.header, NodeStatus::HeaderValid)
@@ -1386,10 +1659,7 @@ mod tests {
 
         let result = handler.dispatch(
             "gettxoutproof",
-            &json!([
-                [coinbase.compute_txid().to_string()],
-                block_hash.to_string_be()
-            ]),
+            &json!([[coinbase.txid().to_string()], block_hash.to_string()]),
         );
 
         assert!(matches!(
@@ -1401,35 +1671,37 @@ mod tests {
     /// Builds a block distinguishable from the blocks of other markers: the
     /// coinbase script makes the txid differ, and the merkle root is recomputed
     /// so `verifytxoutproof` can still extract matches from a proof over it.
-    fn distinct_block(marker: u8) -> bitcoin::Block {
-        let mut block = genesis_block(bitcoin::Network::Regtest);
-        if let Some(tx) = block.txdata.first_mut()
-            && let Some(input) = tx.input.first_mut()
-        {
-            input.script_sig = bitcoin::ScriptBuf::from_bytes(vec![marker; 4]);
+    fn distinct_block(marker: u8) -> Block {
+        let mut block = fixture_genesis();
+        if let Some(input) = block.txs.first_mut().and_then(|tx| tx.inputs.first_mut()) {
+            input.script_sig = vec![marker; 4];
         }
-        if let Some(root) = block.compute_merkle_root() {
-            block.header.merkle_root = root;
-        }
+        block.header.merkle_root = merkle_root_for(&block.txs);
         block
     }
 
     /// Adds a second transaction so one block can hold two wanted txids.
-    fn block_with_two_txs(marker: u8) -> bitcoin::Block {
+    fn block_with_two_txs(marker: u8) -> Block {
         let mut block = distinct_block(marker);
-        let extra = bitcoin::Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(1_000 + u64::from(marker)),
-                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+        // The extra tx must carry at least one input: the gettxoutproof path
+        // round-trips block bytes through the sanctioned rust-bitcoin
+        // MerkleBlock seam, whose decoder rejects input-less transactions.
+        let extra = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[marker; 32])), 0),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 1_000 + u64::from(marker),
+                script_pubkey: vec![0x51],
             }],
         };
-        block.txdata.push(extra);
-        if let Some(root) = block.compute_merkle_root() {
-            block.header.merkle_root = root;
-        }
+        block.txs.push(extra);
+        block.header.merkle_root = merkle_root_for(&block.txs);
         block
     }
 
@@ -1445,7 +1717,7 @@ mod tests {
     where
         F: Fn(&Txid) -> Result<Option<u32>, TxQueryError> + Send + Sync,
     {
-        fn transaction(&self, _txid: &Txid) -> Result<Option<bitcoin::Transaction>, TxQueryError> {
+        fn transaction(&self, _txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
             Ok(None)
         }
 
@@ -1479,12 +1751,12 @@ mod tests {
 
     struct PanicUnlessBodySource {
         height: u32,
-        hash: Hash256,
+        hash: BlockHash,
         body: Vec<u8>,
     }
 
     impl crate::context::BlockBodySource for PanicUnlessBodySource {
-        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
             if height == self.height && hash == self.hash {
                 Some(self.body.clone())
             } else {
@@ -1494,11 +1766,11 @@ mod tests {
     }
 
     struct SeededBodySource {
-        bodies: Vec<(u32, Hash256, Vec<u8>)>,
+        bodies: Vec<(u32, BlockHash, Vec<u8>)>,
     }
 
     impl crate::context::BlockBodySource for SeededBodySource {
-        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
             self.bodies
                 .iter()
                 .find(|(h, k, _)| *h == height && *k == hash)
@@ -1508,20 +1780,16 @@ mod tests {
 
     #[derive(Default)]
     struct ScriptedBodySource {
-        responses: std::sync::Mutex<std::collections::VecDeque<Option<Vec<u8>>>>,
+        responses: parking_lot::Mutex<std::collections::VecDeque<Option<Vec<u8>>>>,
     }
 
     impl crate::context::BlockBodySource for ScriptedBodySource {
-        fn block_body(&self, _height: u32, _hash: Hash256) -> Option<Vec<u8>> {
-            self.responses
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pop_front()
-                .flatten()
+        fn block_body(&self, _height: u32, _hash: BlockHash) -> Option<Vec<u8>> {
+            self.responses.lock().pop_front().flatten()
         }
     }
 
-    fn install_blocks(ctx: &mut Context, blocks: &[bitcoin::Block]) {
+    fn install_blocks(ctx: &mut Context, blocks: &[Block]) {
         let mut records = Vec::with_capacity(blocks.len());
         let mut bodies = Vec::with_capacity(blocks.len());
         for (height, block) in blocks.iter().enumerate() {
@@ -1529,7 +1797,7 @@ mod tests {
                 u32::try_from(height).unwrap_or_else(|err| panic!("height: {err}")),
                 block,
             );
-            bodies.push((record.height, record.hash, serialize(block)));
+            bodies.push((record.height, record.hash, consensus_bytes(block)));
             records.push(record);
         }
         ctx.block_body_source = Some(Arc::new(SeededBodySource { bodies }));
@@ -1538,16 +1806,16 @@ mod tests {
         }
     }
 
-    fn context_with_blocks(blocks: &[bitcoin::Block]) -> Arc<Context> {
+    fn context_with_blocks(blocks: &[Block]) -> Arc<Context> {
         let mut ctx = Context::new();
         install_blocks(&mut ctx, blocks);
         Arc::new(ctx)
     }
 
-    fn attach_body_for_block(ctx: &mut Context, block: &bitcoin::Block, height: u32) {
+    fn attach_body_for_block(ctx: &mut Context, block: &Block, height: u32) {
         let record = BlockRecord::from_block(height, block);
         ctx.block_body_source = Some(Arc::new(SeededBodySource {
-            bodies: vec![(record.height, record.hash, serialize(block))],
+            bodies: vec![(record.height, record.hash, consensus_bytes(block))],
         }));
     }
 
@@ -1557,11 +1825,12 @@ mod tests {
     }
 
     #[test]
+
     fn gettxoutproof_index_path_does_not_read_unrelated_block_bodies() {
         // Records without a body force a `BlockBodySource` read, so a scan over
         // them panics; only skipping them entirely keeps this test green.
         let block = distinct_block(3);
-        let Some(wanted) = block.txdata.first().map(bitcoin::Transaction::compute_txid) else {
+        let Some(wanted) = block.txs.first().map(Tx::txid) else {
             panic!("block has no transactions");
         };
         let indexed = BlockRecord::from_block(2, &block);
@@ -1570,15 +1839,15 @@ mod tests {
         ctx.block_body_source = Some(Arc::new(PanicUnlessBodySource {
             height: indexed.height,
             hash: indexed.hash,
-            body: serialize(&block),
+            body: consensus_bytes(&block),
         }));
         ctx.add_block(BlockRecord::synthetic(
             0,
-            Hash256::from_le_bytes(&[7_u8; 32]),
+            BlockHash::from(Hash256::from_le_bytes(&[7_u8; 32])),
         ));
         ctx.add_block(BlockRecord::synthetic(
             1,
-            Hash256::from_le_bytes(&[8_u8; 32]),
+            BlockHash::from(Hash256::from_le_bytes(&[8_u8; 32])),
         ));
         ctx.add_block(indexed);
         let ctx = Arc::new(ctx);
@@ -1594,11 +1863,7 @@ mod tests {
     #[test]
     fn gettxoutproof_falls_back_to_the_scan_when_the_index_cannot_answer() {
         let blocks = [distinct_block(1), distinct_block(2)];
-        let Some(wanted) = blocks[1]
-            .txdata
-            .first()
-            .map(bitcoin::Transaction::compute_txid)
-        else {
+        let Some(wanted) = blocks[1].txs.first().map(Tx::txid) else {
             panic!("block has no transactions");
         };
 
@@ -1621,11 +1886,7 @@ mod tests {
         // so pointing the index at the wrong one must still produce the proof.
         let both = block_with_two_txs(9);
         let blocks = [distinct_block(1), both.clone()];
-        let wanted = both
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let wanted = both.txs.iter().map(Tx::txid).collect::<Vec<_>>();
 
         let scan_ctx = context_with_blocks(&blocks);
         let scanned =
@@ -1650,7 +1911,7 @@ mod tests {
         let blocks = [distinct_block(1), distinct_block(2)];
         let wanted = blocks
             .iter()
-            .filter_map(|block| block.txdata.first().map(bitcoin::Transaction::compute_txid))
+            .filter_map(|block| block.txs.first().map(Tx::txid))
             .collect::<Vec<_>>();
 
         let mut index_ctx = Context::new();
@@ -1672,11 +1933,7 @@ mod tests {
     #[test]
     fn gettxoutproof_index_path_answers_for_several_txids_in_one_block() {
         let block = block_with_two_txs(11);
-        let wanted = block
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let wanted = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
         let resolvable = wanted.iter().map(|txid| (*txid, 1)).collect::<Vec<_>>();
 
         let mut ctx = Context::new();
@@ -1685,11 +1942,11 @@ mod tests {
         ctx.block_body_source = Some(Arc::new(PanicUnlessBodySource {
             height: indexed.height,
             hash: indexed.hash,
-            body: serialize(&block),
+            body: consensus_bytes(&block),
         }));
         ctx.add_block(BlockRecord::synthetic(
             0,
-            Hash256::from_le_bytes(&[5_u8; 32]),
+            BlockHash::from(Hash256::from_le_bytes(&[5_u8; 32])),
         ));
         ctx.add_block(indexed);
         let ctx = Arc::new(ctx);
@@ -1709,11 +1966,7 @@ mod tests {
         // an unresolvable probe does not by itself drop the call into the scan —
         // the scan here would panic.
         let block = block_with_two_txs(12);
-        let wanted = block
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let wanted = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
         let Some(only_one) = wanted.last().copied() else {
             panic!("block has no transactions");
         };
@@ -1724,11 +1977,11 @@ mod tests {
         ctx.block_body_source = Some(Arc::new(PanicUnlessBodySource {
             height: indexed.height,
             hash: indexed.hash,
-            body: serialize(&block),
+            body: consensus_bytes(&block),
         }));
         ctx.add_block(BlockRecord::synthetic(
             0,
-            Hash256::from_le_bytes(&[6_u8; 32]),
+            BlockHash::from(Hash256::from_le_bytes(&[6_u8; 32])),
         ));
         ctx.add_block(indexed);
         let ctx = Arc::new(ctx);
@@ -1757,11 +2010,7 @@ mod tests {
             TxQueryError::Storage("disk full".into()),
         ] {
             let blocks = [distinct_block(1), distinct_block(2)];
-            let Some(wanted) = blocks[1]
-                .txdata
-                .first()
-                .map(bitcoin::Transaction::compute_txid)
-            else {
+            let Some(wanted) = blocks[1].txs.first().map(Tx::txid) else {
                 panic!("block has no transactions");
             };
 
@@ -1794,7 +2043,7 @@ mod tests {
         // The explicit-blockhash path is unchanged by this work, and an index
         // that panics on use proves it stays that way.
         let block = distinct_block(4);
-        let Some(wanted) = block.txdata.first().map(bitcoin::Transaction::compute_txid) else {
+        let Some(wanted) = block.txs.first().map(Tx::txid) else {
             panic!("block has no transactions");
         };
         let record = BlockRecord::from_block(0, &block);
@@ -1813,10 +2062,8 @@ mod tests {
         ctx.add_block(record);
         let ctx = Arc::new(ctx);
 
-        let result = super::gettxoutproof(
-            &ctx,
-            &json!([[wanted.to_string()], block_hash.to_string_be()]),
-        );
+        let result =
+            super::gettxoutproof(&ctx, &json!([[wanted.to_string()], block_hash.to_string()]));
 
         assert!(
             result.as_ref().is_ok_and(|value| value.as_str().is_some()),
@@ -1833,11 +2080,7 @@ mod tests {
     #[test]
     fn gettxoutproof_asks_the_index_about_every_wanted_txid() {
         let block = block_with_two_txs(13);
-        let wanted = block
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let wanted = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
         let probes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
 
         let counter = Arc::clone(&probes);
@@ -1874,11 +2117,7 @@ mod tests {
     #[test]
     fn gettxoutproof_keeps_probing_after_a_candidate_block_fails_verification() {
         let block = block_with_two_txs(14);
-        let wanted = block
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let wanted = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
         let probes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
 
         let counter = Arc::clone(&probes);
@@ -1889,7 +2128,7 @@ mod tests {
             counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             Ok(Some(0))
         })));
-        install_blocks(&mut ctx, &[distinct_block(15), block.clone()]);
+        install_blocks(&mut ctx, &[distinct_block(15), block]);
         let ctx = Arc::new(ctx);
 
         let result = proof_for(&ctx, &wanted);
@@ -1921,7 +2160,7 @@ mod tests {
         }
 
         impl crate::context::BlockBodySource for LockProbeSource {
-            fn block_body(&self, height: u32, _hash: Hash256) -> Option<Vec<u8>> {
+            fn block_body(&self, height: u32, _hash: BlockHash) -> Option<Vec<u8>> {
                 assert!(
                     self.blocks.try_write().is_some(),
                     "the block-record lock must not be held across a body load"
@@ -1934,11 +2173,7 @@ mod tests {
         }
 
         let blocks = [distinct_block(21), distinct_block(22), distinct_block(23)];
-        let Some(wanted) = blocks[2]
-            .txdata
-            .first()
-            .map(bitcoin::Transaction::compute_txid)
-        else {
+        let Some(wanted) = blocks[2].txs.first().map(Tx::txid) else {
             panic!("block has no transactions");
         };
 
@@ -1949,7 +2184,7 @@ mod tests {
             .enumerate()
             .map(|(height, block)| {
                 let height = u32::try_from(height).unwrap_or_else(|err| panic!("height: {err}"));
-                (height, serialize(block))
+                (height, consensus_bytes(block))
             })
             .collect::<Vec<_>>();
         let ctx = Arc::new(ctx.with_block_body_source(Arc::new(LockProbeSource {
@@ -1960,7 +2195,7 @@ mod tests {
         // Body-less records, so every body must come from the source above.
         for (height, block) in blocks.iter().enumerate() {
             let height = u32::try_from(height).unwrap_or_else(|err| panic!("height: {err}"));
-            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            let hash = block.block_hash();
             ctx.add_block(BlockRecord::synthetic(height, hash));
         }
 
@@ -1969,6 +2204,154 @@ mod tests {
         assert!(
             result.as_ref().is_ok_and(|value| value.as_str().is_some()),
             "the scan should answer from the body source: {result:?}"
+        );
+    }
+
+    /// P2WPKH script: `OP_0` + push-20 + fixed 20-byte key hash.
+    fn retry_p2wpkh() -> Vec<u8> {
+        [vec![0x00, 0x14], vec![0x11; 20]].concat()
+    }
+
+    /// Funds a UTXO in the context's UTXO set and returns the outpoint.
+    fn retry_fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
+            TxOut {
+                value,
+                script_pubkey: retry_p2wpkh(),
+            },
+            false,
+            1,
+        ));
+        ctx.utxo
+            .commit_block(&changes, &Hash256::from_le_bytes(&[0xaa; 32]))
+            .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
+        OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0)
+    }
+
+    /// One-input one-output tx spending `prevout` with `output_value` sats.
+    fn retry_tx(prevout: OutPoint, output_value: u64) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: prevout,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: output_value,
+                script_pubkey: retry_p2wpkh(),
+            }],
+        }
+    }
+
+    /// Consensus hex for RPC submission.
+    fn retry_raw_hex(tx: &Tx) -> String {
+        hex_encode(&consensus_bytes(tx))
+    }
+
+    /// Proves `sendrawtransaction` rebuilds admission context on retry: the
+    /// first attempt captures context from a mempool state where the child's
+    /// parent is absent (missing inputs), parks at the gateway seam, the test
+    /// changes the chain generation (forcing `GenerationChanged`) and admits
+    /// the parent, then releases the park. The retried attempt must observe
+    /// the FRESH mempool state — the parent now provides the child's prevout —
+    /// and succeed. If the context were reused from the first attempt (the
+    /// r4c3 mutation), the stale `missing_inputs` flag would reject the child.
+    #[test]
+    fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection() {
+        let ctx = Arc::new(Context::new());
+        reset_admission_park();
+
+        // Parent spends a confirmed UTXO; child spends the parent's output.
+        // The parent output is NOT in the UTXO set, so the child's prevout is
+        // only available while the parent is in the mempool.
+        let parent_prevout = retry_fund_utxo(&ctx, 0x70, 100_000);
+        let parent = retry_tx(parent_prevout, 90_000);
+        let parent_txid = parent.txid();
+        let child_prevout = OutPoint::new(parent_txid, 0);
+        let child = retry_tx(child_prevout, 80_000);
+        let child_txid = child.txid();
+        let child_hex = retry_raw_hex(&child);
+
+        // Arm the admission park gate: the first `admit_transaction` on this
+        // gateway will block before the write lock, signal `parked`, and wait
+        // for `release`.
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let target = Arc::as_ptr(&ctx.mempool).expose_provenance();
+        arm_admission_park(target, parked_tx, release_rx);
+
+        let ctx_clone = Arc::clone(&ctx);
+        let handler = Handler::new(Arc::clone(&ctx));
+        let admission =
+            thread::spawn(move || handler.dispatch("sendrawtransaction", &json!([child_hex])));
+
+        // Wait for the first attempt to park at the gateway seam.
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("first admission parked at the gateway seam");
+
+        // While the first attempt is parked (before the write lock, holding
+        // no guard), change the chain generation so the first attempt's
+        // captured generation token is stale, and admit the parent so the
+        // mempool sequence bumps and the parent's output is available.
+        let guard = ctx_clone
+            .mempool
+            .begin_chain_change()
+            .expect("begin chain change on even generation");
+        guard
+            .finish()
+            .expect("finish chain change to next even generation");
+
+        let parent_vsize = u32::try_from(parent.vsize()).unwrap_or(u32::MAX);
+        ctx_clone
+            .mempool
+            .insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(parent), parent_vsize, 10_000, 0, 1),
+            )
+            .expect("parent admitted to the mempool");
+
+        // Release the park: the first attempt proceeds, sees the stale
+        // generation token, and returns `GenerationChanged` — retrying with
+        // fresh facts.
+        release_tx.send(()).expect("release the parked admission");
+
+        let result = admission.join().expect("admission thread did not panic");
+
+        reset_admission_park();
+
+        // The retried admission must succeed: the parent is now in the
+        // mempool, the child's prevout is available, and the context was
+        // rebuilt from the fresh mempool state.
+        let txid_str = result
+            .as_ref()
+            .map_err(|err| format!("sendrawtransaction failed: {err}"))
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| format!("expected txid string, got {value:?}"))
+            });
+        assert_eq!(
+            txid_str.expect("child admitted on retry"),
+            child_txid.to_string(),
+            "the retried admission must observe the fresh mempool state"
+        );
+
+        // The child must be in the mempool.
+        assert!(
+            ctx.mempool.read().contains_txid(&child_txid),
+            "the child must be pooled after successful retry"
+        );
+        // The parent must still be in the mempool.
+        assert!(
+            ctx.mempool.read().contains_txid(&parent_txid),
+            "the parent must remain pooled"
         );
     }
 }
@@ -1992,13 +2375,13 @@ mod gettxout_via_utxo_tests {
     #[test]
     fn gettxout_returns_null_for_transaction_output_absent_from_utxo() {
         let ctx = Arc::new(Context::new());
-        let tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(50_000),
-                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+        let tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 50_000,
+                script_pubkey: vec![0x51],
             }],
         };
         let txid = ctx.add_transaction(tx);
@@ -2084,7 +2467,7 @@ mod finalizepsbt_tests {
             panic!("complete missing: {result:?}");
         };
         assert!(!complete);
-        assert!(result.get("hex").is_none());
+        assert!(result.get("hex").is_none_or(Value::is_null));
         assert!(result.get("psbt").and_then(Value::as_str).is_some());
     }
 
@@ -2150,7 +2533,7 @@ mod finalizepsbt_tests {
         let result = finalizepsbt(&ctx, &json!([combined, false]))
             .unwrap_or_else(|err| panic!("finalizepsbt failed: {err}"));
         assert_eq!(result.get("complete").and_then(Value::as_bool), Some(true));
-        assert!(result.get("hex").is_none());
+        assert!(result.get("hex").is_none_or(Value::is_null));
         assert!(result.get("psbt").and_then(Value::as_str).is_some());
     }
 
@@ -2166,7 +2549,7 @@ mod finalizepsbt_tests {
         let result = finalizepsbt(&ctx, &json!([combined]))
             .unwrap_or_else(|err| panic!("finalizepsbt failed: {err}"));
         assert_eq!(result.get("complete").and_then(Value::as_bool), Some(true));
-        assert!(result.get("psbt").is_none());
+        assert!(result.get("psbt").is_none_or(Value::is_null));
         assert!(result.get("hex").and_then(Value::as_str).is_some());
     }
 }

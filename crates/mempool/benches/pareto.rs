@@ -1,9 +1,9 @@
 //! Production-path mempool priority-index benchmark.
 //!
-//! The benchmark drives `Mempool::insert_entry` at realistic pool sizes. This
-//! is the path used for transaction admission and mining priority maintenance;
-//! implementation-only `ParetoFront` filling is intentionally left to tests.
-// PERF: Criterion emits public harness items whose docs are irrelevant to the benchmark report.
+//! `mempool_insert_entry` is the end-to-end path an attacker actually drives:
+//! `Mempool::insert_entry` calls `recompute_all_metadata`, which rebuilds the
+//! whole priority index for every accepted transaction.
+// PERF: Criterion emits public harness items whose docs are irrelevant here.
 #![allow(missing_docs)]
 // A fixture that fails to build has no meaningful degraded mode: a fill that
 // silently indexed nothing would be timed as a win.
@@ -12,12 +12,8 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bitcoin::hashes::Hash as _;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-    transaction,
-};
 use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits};
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 /// Pool sizes large enough to cover admission from a small node to a mature
@@ -30,22 +26,23 @@ fn spread_fee(seed: u64) -> u64 {
     (seed.wrapping_mul(2_654_435_761) % 100_000).saturating_add(1)
 }
 
-fn distinct_tx(seed: u64) -> Transaction {
+fn distinct_tx(seed: u64) -> Tx {
     let mut previous = [0_u8; 32];
     previous[..8].copy_from_slice(&seed.to_le_bytes());
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            // Distinct prevouts keep every entry on the accepted admission path.
-            previous_output: OutPoint::new(Txid::from_byte_array(previous), 0),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            // Distinct prevouts: entries that conflict would be rejected rather
+            // than accepted, and the fill would measure the rejection path.
+            previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&previous)), 0),
+            script_sig: Vec::new(),
+            sequence: 0xFFFF_FFFF,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(10_000),
-            script_pubkey: ScriptBuf::from_bytes(seed.to_le_bytes().to_vec()),
+        outputs: vec![TxOut {
+            value: 10_000,
+            script_pubkey: seed.to_le_bytes().to_vec(),
         }],
     }
 }

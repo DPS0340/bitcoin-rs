@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 use bytes::Bytes;
@@ -6,11 +7,20 @@ use signet_libmdbx::{
     tx::aliases::{RoTxSync, RwTxSync},
 };
 
-use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
+use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
 
 const MIB: usize = 1024 * 1024;
 const GIB: usize = 1024 * MIB;
 const TIB: usize = 1024 * GIB;
+
+/// MDBX's default page size, used to turn cache bytes into page counts.
+const MDBX_PAGE_BYTES: u64 = 4 * 1024;
+/// MDBX's default dirty-page reserve for unbudgeted opens.
+const MDBX_DEFAULT_DIRTY_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+/// Engine ceiling for the reserved dirty-page pool (MDBX caps at 32-bit).
+const MDBX_MAX_RESERVE_PAGES: u64 = 1 << 20;
+/// Engine ceiling for the loose-page reuse pool.
+const MDBX_MAX_LOOSE_PAGES: u64 = 255;
 
 /// MDBX-backed key-value store.
 pub struct MdbxStore {
@@ -21,9 +31,35 @@ pub struct MdbxStore {
 impl MdbxStore {
     /// Opens or creates an MDBX store at `path` with one named database per column family.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_cache(path, MDBX_DEFAULT_DIRTY_RESERVE_BYTES)
+    }
+
+    /// Opens or creates an MDBX store with an explicit write-cache capacity.
+    ///
+    /// MDBX reads through the OS page cache over its memory map, which no
+    /// in-process knob bounds; the budget therefore applies to the write side:
+    /// the reserved dirty-page pool (`dp_reserve_limit`, pages) and the
+    /// loose-page reuse pool (`loose_limit`, pages) are derived from
+    /// `cache_bytes` at MDBX's 4 KiB default page size and clamped to their
+    /// engine ceilings. `cache_bytes` itself is configured exactly: a budgeted
+    /// share is never raised above its allocation. Zero selects the engine
+    /// default for unbudgeted opens. Reads stay OS-cached regardless of the
+    /// budget.
+    pub fn open_with_cache(path: impl AsRef<Path>, cache_bytes: u64) -> Result<Self, StorageError> {
+        let cache_bytes = if cache_bytes == 0 {
+            MDBX_DEFAULT_DIRTY_RESERVE_BYTES
+        } else {
+            cache_bytes
+        };
+        let reserve_pages = (cache_bytes / MDBX_PAGE_BYTES).min(MDBX_MAX_RESERVE_PAGES);
+        let loose_pages = (cache_bytes / MDBX_PAGE_BYTES / 4).clamp(16, MDBX_MAX_LOOSE_PAGES);
+        metrics::gauge!("storage.cache_capacity_bytes", "backend" => "mdbx")
+            .set(crate::metric_f64(cache_bytes));
         std::fs::create_dir_all(path.as_ref())?;
         let env = Environment::builder()
             .set_max_dbs(ColumnFamily::ALL.len())
+            .set_dp_reserve_limit(reserve_pages)
+            .set_loose_limit(loose_pages)
             .set_geometry(Geometry {
                 size: Some(GIB..TIB),
                 ..Default::default()
@@ -48,6 +84,19 @@ impl MdbxStore {
             .get(cf.index())
             .copied()
             .ok_or(StorageError::UnknownColumnFamily(cf))
+    }
+
+    /// Applies one batch as a single logical write with the given durability
+    /// label, so each write is counted exactly once.
+    fn write_with_durability(
+        &self,
+        batch: MdbxWriteBatch,
+        durability: &'static str,
+    ) -> Result<(), StorageError> {
+        count_write(durability, batch.encoded_bytes);
+        let txn = self.env.begin_rw_sync().map_err(StorageError::backend)?;
+        apply_mdbx_ops(self, &txn, batch)?;
+        txn.commit().map_err(StorageError::backend)
     }
 }
 
@@ -92,43 +141,40 @@ impl KvStore for MdbxStore {
     }
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
-        let txn = self.env.begin_rw_sync().map_err(StorageError::backend)?;
-        let mut databases = [None; ColumnFamily::ALL.len()];
-        for op in batch.ops {
-            match op {
-                BatchOp::Put { cf, key, value } => {
-                    txn.put(
-                        cached_database(self, &mut databases, cf)?,
-                        key,
-                        value,
-                        WriteFlags::empty(),
-                    )
-                    .map_err(StorageError::backend)?;
-                }
-                BatchOp::Delete { cf, key } => {
-                    txn.del(cached_database(self, &mut databases, cf)?, key, None)
-                        .map_err(StorageError::backend)?;
-                }
-                BatchOp::DeleteRange { cf, start, end } => {
-                    let database = cached_database(self, &mut databases, cf)?;
-                    let keys = collect_range_keys(&txn, database, &start, &end)?;
-                    for key in keys {
-                        txn.del(database, key, None)
-                            .map_err(StorageError::backend)?;
-                    }
-                }
-            }
-        }
-        txn.commit().map_err(StorageError::backend)
+        self.write_with_durability(batch, "default")
     }
 
     fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
         // MDBX environments are opened with default durable sync flags, so a normal
         // synchronous write transaction already returns after the data is fsynced.
-        self.write(batch)
+        self.write_with_durability(batch, "durable")
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: MdbxWriteBatch,
+    ) -> Result<bool, StorageError> {
+        let encoded_bytes = batch.encoded_bytes;
+        let txn = self.env.begin_rw_sync().map_err(StorageError::backend)?;
+        for condition in conditions {
+            let (cf, key) = condition.location();
+            let current: Option<Cow<'_, [u8]>> = txn
+                .get(self.database(cf)?.dbi(), key)
+                .map_err(StorageError::backend)?;
+            if !condition.matches(current.as_deref()) {
+                // Dropping the transaction aborts it, so no batch operation is applied.
+                return Ok(false);
+            }
+        }
+        apply_mdbx_ops(self, &txn, batch)?;
+        txn.commit().map_err(StorageError::backend)?;
+        count_write("durable", encoded_bytes);
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
+        metrics::counter!("storage.flushes_total", "backend" => "mdbx").increment(1);
         self.env
             .sync(true)
             .map(|_| ())
@@ -141,6 +187,48 @@ impl KvStore for MdbxStore {
             databases: self.databases.clone(),
         }))
     }
+}
+
+/// Records one backend-neutral write-path metric sample.
+fn count_write(durability: &'static str, encoded_bytes: usize) {
+    metrics::counter!("storage.writes_total", "backend" => "mdbx", "durability" => durability)
+        .increment(1);
+    metrics::histogram!("storage.write_bytes", "backend" => "mdbx")
+        .record(crate::metric_f64_from_usize(encoded_bytes));
+}
+
+/// Applies every ordered batch operation inside one open write transaction.
+fn apply_mdbx_ops(
+    store: &MdbxStore,
+    txn: &RwTxSync,
+    batch: MdbxWriteBatch,
+) -> Result<(), StorageError> {
+    let mut databases = [None; ColumnFamily::ALL.len()];
+    for op in batch.ops {
+        match op {
+            BatchOp::Put { cf, key, value } => {
+                txn.put(
+                    cached_database(store, &mut databases, cf)?,
+                    &key,
+                    &value,
+                    WriteFlags::empty(),
+                )
+                .map_err(StorageError::backend)?;
+            }
+            BatchOp::Delete { cf, key } => {
+                txn.del(cached_database(store, &mut databases, cf)?, &key, None)
+                    .map_err(StorageError::backend)?;
+            }
+            BatchOp::DeleteRange { cf, start, end } => {
+                let database = cached_database(store, &mut databases, cf)?;
+                for key in collect_range_keys(txn, database, &start, &end)? {
+                    txn.del(database, &key, None)
+                        .map_err(StorageError::backend)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cached_database(
@@ -161,6 +249,8 @@ fn cached_database(
 #[derive(Default)]
 pub struct MdbxWriteBatch {
     ops: Vec<BatchOp>,
+    /// Sum of key and value lengths across ops, for write-path metrics.
+    encoded_bytes: usize,
 }
 
 impl WriteBatch for MdbxWriteBatch {
@@ -169,6 +259,7 @@ impl WriteBatch for MdbxWriteBatch {
     }
 
     fn put_value(&mut self, cf: ColumnFamily, key: &[u8], value: Bytes) {
+        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len() + value.len());
         self.ops.push(BatchOp::Put {
             cf,
             key: key.to_vec(),
@@ -177,6 +268,7 @@ impl WriteBatch for MdbxWriteBatch {
     }
 
     fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
+        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len());
         self.ops.push(BatchOp::Delete {
             cf,
             key: key.to_vec(),

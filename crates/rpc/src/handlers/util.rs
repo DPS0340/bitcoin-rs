@@ -4,18 +4,40 @@ use core::str::FromStr as _;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use bitcoin::Amount;
 use sonic_rs::{JsonValueTrait, Value, json};
 
+use corepc_types::v31;
+
+use crate::compat::convert::{self, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls};
 use crate::context::Context;
 use crate::error::RpcError;
-use crate::handlers::{params_array, required_str, required_u64, serde_to_sonic};
-use crate::tx_render::btc_amount_json;
+use crate::handlers::{params_array, required_str, required_u64};
 
 static SERVER_START: OnceLock<Instant> = OnceLock::new();
 
 fn conf_target_blocks(conf_target: u64) -> u32 {
     u32::try_from(conf_target).unwrap_or(u32::MAX)
+}
+
+fn to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn btc_amount_json(satoshis: u64) -> Value {
+    let whole = satoshis / 100_000_000;
+    let fractional = satoshis % 100_000_000;
+    let text = format!("{whole}.{fractional:08}");
+    let mut deserializer = sonic_rs::Deserializer::from_str(&text).use_rawnumber();
+    match sonic_rs::Deserialize::deserialize(&mut deserializer) {
+        Ok(value) => value,
+        Err(error) => panic!("formatted unsigned BTC amount was invalid JSON: {error}"),
+    }
 }
 
 pub(crate) fn uptime(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -31,10 +53,10 @@ pub(crate) fn getrpcinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, Rp
         .debug_log_path
         .as_ref()
         .ok_or_else(|| RpcError::Internal("debug log path is not configured".to_owned()))?;
-    Ok(json!({
-        "active_commands": Vec::<String>::new(),
-        "logpath": path
-    }))
+    typed_to_sonic(&v31::GetRpcInfo {
+        active_commands: Vec::new(),
+        log_path: path.to_string_lossy().into_owned(),
+    })
 }
 
 pub(crate) fn getmemoryinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -53,16 +75,19 @@ pub(crate) fn getmemoryinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value
     // Bitcoin Core reports locked-pool allocator stats. This implementation
     // exposes resident set size from Linux /proc as the available v1 proxy.
     let rss_bytes = read_linux_rss_bytes().unwrap_or(0);
-    Ok(json!({
-        "locked": {
-            "used": rss_bytes,
-            "free": 0_u64,
-            "total": rss_bytes,
-            "locked": 0_u64,
-            "chunks_used": 0_u64,
-            "chunks_free": 0_u64
-        }
-    }))
+    let mut locked = alloc::collections::BTreeMap::new();
+    locked.insert(
+        "locked".to_owned(),
+        v31::Locked {
+            used: rss_bytes,
+            free: 0,
+            total: rss_bytes,
+            locked: 0,
+            chunks_used: 0,
+            chunks_free: 0,
+        },
+    );
+    typed_to_sonic(&v31::GetMemoryInfoStats(locked))
 }
 
 fn read_linux_rss_bytes() -> Option<u64> {
@@ -80,47 +105,48 @@ fn read_linux_rss_bytes() -> Option<u64> {
 #[cfg(feature = "zmq")]
 pub(crate) fn getzmqnotifications(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
-    let notifications: Vec<_> = ctx
+    let notifications = ctx
         .zmq_notifications()
         .iter()
-        .map(|notification| {
-            json!({
-                "type": notification.notification_type.as_str(),
-                "address": notification.address.as_str(),
-                "hwm": notification.hwm
-            })
+        .map(|notification| v31::GetZmqNotifications {
+            type_: notification.notification_type.to_string(),
+            address: notification.address.clone(),
+            hwm: u64::from(notification.hwm),
         })
-        .collect();
-    Ok(json!(notifications))
+        .collect::<Vec<_>>();
+    typed_to_sonic(&notifications)
 }
 
 pub(crate) fn estimatesmartfee(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let conf_target = required_u64(params, 0, "conf_target is required")?;
+    let blocks = conf_target_blocks(conf_target);
     let pool = ctx.mempool.read();
-    match pool.estimate_fee_rate(conf_target_blocks(conf_target)) {
-        Some(rate) => {
-            let mut object = sonic_rs::Object::new();
-            let _ = object.insert(
-                "feerate",
-                btc_amount_json(Amount::from_sat(rate.as_sat_per_kvb())),
-            );
-            let _ = object.insert("blocks", json!(conf_target));
-            Ok(Value::from(object))
-        }
-        None => Ok(json!({
-            "errors": ["Insufficient data or no feerate found"],
-            "blocks": conf_target
-        })),
+    match pool.estimate_fee_rate(blocks) {
+        Some(rate) => typed_to_sonic_omitting_nulls(&v31::EstimateSmartFee {
+            fee_rate: Some(sat_to_btc(rate.as_sat_per_kvb())),
+            errors: None,
+            blocks,
+        }),
+        None => typed_to_sonic_omitting_nulls(&v31::EstimateSmartFee {
+            fee_rate: None,
+            errors: Some(alloc::vec![
+                "Insufficient data or no feerate found".to_owned()
+            ]),
+            blocks,
+        }),
     }
 }
 
+/// Local response shape: the fee estimator does not expose Core's
+/// `decay`/`scale` internals, so `{short,medium,long}` carry `feerate` only
+/// and the no-estimate branch stays `{}` (see the manifest row note).
 pub(crate) fn estimaterawfee(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let conf_target = required_u64(params, 0, "conf_target is required")?;
     let pool = ctx.mempool.read();
     let Some(rate) = pool.estimate_fee_rate(conf_target_blocks(conf_target)) else {
         return Ok(json!({}));
     };
-    let feerate = btc_amount_json(Amount::from_sat(rate.as_sat_per_kvb()));
+    let feerate = btc_amount_json(rate.as_sat_per_kvb());
     let mut short = sonic_rs::Object::new();
     let _ = short.insert("feerate", feerate.clone());
     let mut medium = sonic_rs::Object::new();
@@ -134,63 +160,43 @@ pub(crate) fn estimaterawfee(ctx: &Arc<Context>, params: &Value) -> Result<Value
     Ok(Value::from(object))
 }
 
+/// Local response shape: an invalid address (malformed or wrong network)
+/// answers Core's sparse `{"isvalid": false}` object only, which the pinned
+/// corepc type cannot represent because its valid-address fields are
+/// required; that branch is hand-built (see the manifest row note).
 pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     use core::str::FromStr as _;
 
-    use bitcoin::hex::DisplayHex as _;
-
     let address_str = required_str(params, 0, "address is required")?;
-    let network = match ctx.chain_network {
-        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
-    };
-    let Ok(unchecked) = bitcoin::Address::from_str(address_str) else {
-        return Ok(json!({ "isvalid": false }));
-    };
-    let Ok(address) = unchecked.require_network(network) else {
-        return Ok(json!({ "isvalid": false }));
+    let network = convert::bitcoin_network(ctx.chain_network);
+    let Some(address) = bitcoin::Address::from_str(address_str)
+        .ok()
+        .and_then(|address| address.require_network(network).ok())
+    else {
+        // Core answers a malformed or wrong-network address with the sparse
+        // `{"isvalid": false}` object alone: no address, scriptPubKey,
+        // isscript, iswitness, or witness fields. `v31::ValidateAddress`
+        // models the valid-address fields as required and cannot represent
+        // that wire shape, so this branch is hand-built (local_shape
+        // exception; see the manifest row note).
+        return Ok(json!({"isvalid": false}));
     };
 
     let script = address.script_pubkey();
-    let script_hex = script.as_bytes().to_lower_hex_string();
-    let address_canon = address.to_string();
-    let mut response = serde_json::Map::new();
-    response.insert("isvalid".to_owned(), serde_json::Value::Bool(true));
-    response.insert(
-        "address".to_owned(),
-        serde_json::Value::String(address_canon),
-    );
-    response.insert(
-        "scriptPubKey".to_owned(),
-        serde_json::Value::String(script_hex),
-    );
-    response.insert(
-        "isscript".to_owned(),
-        serde_json::Value::Bool(script.is_p2sh() || script.is_p2wsh()),
-    );
-    response.insert(
-        "iswitness".to_owned(),
-        serde_json::Value::Bool(script.is_witness_program()),
-    );
-    if let Some(version) = script.witness_version() {
-        response.insert(
-            "witness_version".to_owned(),
-            serde_json::Value::Number(i64::from(version.to_num()).into()),
-        );
-        // Witness program is the bytes after the 1-byte version prefix and 1-byte push opcode.
-        let bytes = script.as_bytes();
-        if bytes.len() >= 2 {
-            response.insert(
-                "witness_program".to_owned(),
-                serde_json::Value::String(bytes[2..].to_lower_hex_string()),
-            );
-        }
-    }
-
-    serde_to_sonic(&serde_json::Value::Object(response))
+    let script_hex = to_lower_hex(script.as_bytes());
+    let witness_version = script.witness_version();
+    let witness_program = witness_version
+        .filter(|_| script.as_bytes().len() >= 2)
+        .map(|_| to_lower_hex(&script.as_bytes()[2..]));
+    typed_to_sonic(&v31::ValidateAddress {
+        is_valid: true,
+        address: address.to_string(),
+        script_pubkey: script_hex,
+        is_script: script.is_p2sh() || script.is_p2wsh(),
+        is_witness: script.is_witness_program(),
+        witness_version: witness_version.map(|version| i64::from(version.to_num())),
+        witness_program,
+    })
 }
 
 pub(crate) fn getdescriptorinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -204,13 +210,14 @@ pub(crate) fn getdescriptorinfo(_ctx: &Arc<Context>, params: &Value) -> Result<V
     let checksum = descriptor_checksum(payload).ok_or(RpcError::InvalidParams(
         "descriptor contains invalid characters",
     ))?;
-    Ok(json!({
-        "descriptor": format!("{payload}#{checksum}"),
-        "checksum": checksum,
-        "isrange": payload.contains('*'),
-        "issolvable": false,
-        "hasprivatekeys": false
-    }))
+    typed_to_sonic(&v31::GetDescriptorInfo {
+        descriptor: format!("{payload}#{checksum}"),
+        multipath_expansion: None,
+        checksum,
+        is_range: payload.contains('*'),
+        is_solvable: false,
+        has_private_keys: false,
+    })
 }
 
 pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -226,9 +233,9 @@ pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         let address = bitcoin::Address::from_str(inner)
             .map_err(|_| RpcError::InvalidParams("addr() contains an invalid address"))?;
         let address = address
-            .require_network(bitcoin_network(ctx.chain_network))
+            .require_network(convert::bitcoin_network(ctx.chain_network))
             .map_err(|_| RpcError::InvalidParams("addr() address is for the wrong network"))?;
-        return Ok(json!([address.to_string()]));
+        return typed_to_sonic(&v31::DeriveAddresses(alloc::vec![address.to_string()]));
     }
     Err(RpcError::MethodDisabled(
         "only addr() descriptors are available without a wallet",
@@ -246,16 +253,6 @@ fn required_checked_descriptor_payload(descriptor: &str) -> Result<&str, RpcErro
         Ok(body)
     } else {
         Err(RpcError::InvalidParams("descriptor checksum mismatch"))
-    }
-}
-
-const fn bitcoin_network(network: bitcoin_rs_primitives::Network) -> bitcoin::Network {
-    match network {
-        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
     }
 }
 
@@ -405,8 +402,8 @@ mod tests {
         assert!(
             result
                 .get("active_commands")
-                .and_then(|value| value.as_array())
-                .is_some_and(|commands| commands.is_empty())
+                .and_then(Value::as_array)
+                .is_some_and(sonic_rs::Array::is_empty)
         );
         assert_eq!(
             result.get("logpath").and_then(|value| value.as_str()),
@@ -482,13 +479,15 @@ mod tests {
 mod validateaddress_tests {
     use super::*;
     use alloc::sync::Arc;
-    use sonic_rs::JsonValueTrait;
+    use sonic_rs::{JsonContainerTrait as _, JsonValueTrait};
 
-    #[test]
-    fn validateaddress_returns_isvalid_false_for_garbage() {
-        let ctx = Arc::new(Context::new());
-        let result = validateaddress(&ctx, &json!(["not a real address"]))
-            .unwrap_or_else(|err| panic!("validateaddress failed: {err}"));
+    /// Both invalid classes must answer exactly `{"isvalid": false}`: the
+    /// valid-only fields are absent, never default-valued.
+    fn assert_sparse_invalid(result: &Value) {
+        let object = result
+            .as_object()
+            .unwrap_or_else(|| panic!("not an object: {result:?}"));
+        assert_eq!(object.len(), 1, "expected exactly one key: {result:?}");
         let Some(isvalid) = result
             .get("isvalid")
             .and_then(sonic_rs::JsonValueTrait::as_bool)
@@ -496,6 +495,37 @@ mod validateaddress_tests {
             panic!("isvalid missing: {result:?}");
         };
         assert!(!isvalid);
+        for field in [
+            "address",
+            "scriptPubKey",
+            "isscript",
+            "iswitness",
+            "witness_version",
+            "witness_program",
+        ] {
+            assert!(
+                result.get(field).is_none(),
+                "{field} must be absent: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validateaddress_returns_sparse_object_for_garbage() {
+        let ctx = Arc::new(Context::new());
+        let result = validateaddress(&ctx, &json!(["not a real address"]))
+            .unwrap_or_else(|err| panic!("validateaddress failed: {err}"));
+        assert_sparse_invalid(&result);
+    }
+
+    #[test]
+    fn validateaddress_returns_sparse_object_for_wrong_network() {
+        // ctx defaults to the Mainnet selector; this testnet address parses
+        // but fails require_network, and Core answers it sparsely too.
+        let ctx = Arc::new(Context::new());
+        let result = validateaddress(&ctx, &json!(["tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"]))
+            .unwrap_or_else(|err| panic!("validateaddress failed: {err}"));
+        assert_sparse_invalid(&result);
     }
 
     #[test]

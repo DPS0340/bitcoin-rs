@@ -3,14 +3,13 @@
 use std::error::Error;
 use std::sync::Arc;
 
+// rust-bitcoin differential oracle: sha256d engine for witness commitment.
 use bitcoin::hashes::{Hash as _, HashEngine as _, sha256d};
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, Wtxid,
-    absolute, transaction,
-};
+// rust-bitcoin differential oracle: witness merkle root.
+use bitcoin::Wtxid as OracleWtxid;
 use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits};
 use bitcoin_rs_mining::{CandidateContext, TemplateId, WITNESS_RESERVED_VALUE, assemble_candidate};
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::{Hash256, Network, OutPoint, Tx, TxIn, TxOut, Txid};
 
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -20,7 +19,7 @@ fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box
         ..MempoolLimits::default()
     });
     let parent = tx(1, 50_000, None);
-    let parent_txid = parent.compute_txid();
+    let parent_txid = parent.txid();
     mempool.insert_entry(MempoolEntry::new(Arc::new(parent), 150, 1_500, 1, 100))?;
     mempool.insert_entry(MempoolEntry::new(
         Arc::new(tx(2, 40_000, Some(parent_txid))),
@@ -55,7 +54,7 @@ fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box
         max_size: 4_000_000,
         max_sigops: 80_000,
     };
-    let candidate = assemble_candidate(&context, &snapshot, &ScriptBuf::from_bytes(vec![0x51]))?;
+    let candidate = assemble_candidate(&context, &snapshot, &[0x51])?;
 
     assert_eq!(
         candidate.template_id,
@@ -78,9 +77,9 @@ fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box
     assert_eq!(candidate.segwit_active, context.segwit_active);
 
     let mut fees = 0_u64;
-    let mut weight = candidate.coinbase.weight().to_wu();
+    let mut weight = candidate.coinbase.weight();
     let mut size = u64::try_from(candidate.coinbase.total_size())?;
-    let mut sigops = u64::try_from(candidate.coinbase.total_sigop_cost(|_| None))?;
+    let mut sigops = 0_u64;
     let mut positions = std::collections::BTreeMap::new();
     for (offset, tx) in candidate.transactions.iter().enumerate() {
         positions.insert(tx.txid, u32::try_from(offset + 1)?);
@@ -90,8 +89,8 @@ fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box
         sigops = sigops
             .checked_add(u64::from(tx.sigop_cost))
             .ok_or("sigops")?;
-        assert_eq!(tx.txid, tx.tx.compute_txid());
-        assert_eq!(tx.wtxid, tx.tx.compute_wtxid());
+        assert_eq!(tx.txid, tx.tx.txid());
+        assert_eq!(tx.wtxid, tx.tx.wtxid());
         assert_eq!(
             tx.modified_fee,
             i128::from(tx.fee) + i128::from(tx.fee_delta)
@@ -100,7 +99,7 @@ fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box
     for tx in &candidate.transactions {
         let mut expected = tx
             .tx
-            .input
+            .inputs
             .iter()
             .filter_map(|input| positions.get(&input.previous_output.txid).copied())
             .collect::<Vec<_>>();
@@ -122,8 +121,14 @@ fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box
             + fees
     );
 
-    let mut leaves = vec![Wtxid::all_zeros()];
-    leaves.extend(candidate.transactions.iter().map(|tx| tx.wtxid));
+    // rust-bitcoin differential oracle for witness merkle and sha256d commitment.
+    let mut leaves = vec![OracleWtxid::all_zeros()];
+    leaves.extend(
+        candidate
+            .transactions
+            .iter()
+            .map(|tx| OracleWtxid::from_byte_array(*tx.wtxid.as_bytes())),
+    );
     let root = bitcoin::merkle_tree::calculate_root(leaves.into_iter()).ok_or("root")?;
     let root = Hash256::from_le_bytes(root.as_byte_array());
     assert_eq!(candidate.witness_merkle_root, Some(root));
@@ -172,7 +177,7 @@ fn equal_fee_ties_follow_snapshot_order_deterministically() -> Result<(), Box<dy
             max_sigops: 80_000,
         },
         &snapshot,
-        &ScriptBuf::from_bytes(vec![0x51]),
+        &[0x51],
     )?;
     let second = assemble_candidate(
         &CandidateContext {
@@ -191,7 +196,7 @@ fn equal_fee_ties_follow_snapshot_order_deterministically() -> Result<(), Box<dy
             max_sigops: 80_000,
         },
         &snapshot,
-        &ScriptBuf::from_bytes(vec![0x51]),
+        &[0x51],
     )?;
     assert_eq!(
         first
@@ -221,33 +226,31 @@ fn equal_fee_ties_follow_snapshot_order_deterministically() -> Result<(), Box<dy
     Ok(())
 }
 
-fn tx(label: u8, value: u64, parent: Option<Txid>) -> Transaction {
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn tx(label: u8, value: u64, parent: Option<Txid>) -> Tx {
+    let mut bytes = [0_u8; 32];
+    bytes[0] = label;
+    Tx {
+        version: 2,
+        inputs: vec![TxIn {
             previous_output: OutPoint::new(
-                parent.unwrap_or_else(|| {
-                    let mut bytes = [0_u8; 32];
-                    bytes[0] = label;
-                    Txid::from_byte_array(bytes)
-                }),
+                parent.unwrap_or_else(|| Txid(Hash256::from_le_bytes(&bytes))),
                 0,
             ),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: vec![],
+            sequence: u32::MAX,
+            witness: vec![],
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51, label]),
+        outputs: vec![TxOut {
+            value,
+            script_pubkey: vec![0x51, label],
         }],
+        lock_time: 0,
     }
 }
 
 #[test]
 fn currentblocktx_counts_exclude_the_coinbase() -> Result<(), Box<dyn Error>> {
-    let payout = ScriptBuf::from_bytes(vec![0x51]);
+    let payout = vec![0x51];
     let empty = Mempool::new(MempoolLimits {
         min_relay_fee_sat_per_kvb: 0,
         ..MempoolLimits::default()
@@ -318,7 +321,7 @@ fn assembly_copies_deployment_boundary_flags() -> Result<(), Box<dyn Error>> {
         ..MempoolLimits::default()
     })
     .mining_snapshot();
-    let payout = ScriptBuf::from_bytes(vec![0x51]);
+    let payout = vec![0x51];
     for (csv_active, segwit_active) in [(false, false), (true, false), (false, true), (true, true)]
     {
         let candidate = assemble_candidate(

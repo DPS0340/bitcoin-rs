@@ -16,17 +16,24 @@ default = []
 rocksdb = []
 fjall = []
 redb = []
+kernel = ["bitcoin-rs-consensus/kernel"]
+
 
 [dependencies]
 bitcoin-rs-primitives.workspace = true
-bitcoin.workspace = true
 secp256k1.workspace = true
 sha2.workspace = true
+bitcoin_hashes.workspace = true
+rayon.workspace = true
+tinyvec.workspace = true
+smallvec.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+bitcoin.workspace = true
 serde_json.workspace = true
 proptest.workspace = true
+bitcoin-rs-consensus = { workspace = true }

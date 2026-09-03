@@ -203,6 +203,17 @@ pub(super) struct DownloadWindow {
     peer_inflight: HashMap<SocketAddr, PeerInflight>,
     pending_bytes: usize,
     received_bytes: usize,
+    /// Highest `pending` population observed; feeds the high-water gauge.
+    pending_blocks_high_water: usize,
+    /// Highest `pending_bytes` observed; feeds the high-water gauge.
+    pending_bytes_high_water: usize,
+    /// Start of the current apply-idle interval: no staged work while the
+    /// window still owes downloads. `None` while apply has work.
+    apply_idle_since: Option<Instant>,
+    /// Start of the current download-blocked-by-apply interval: blocks are
+    /// staged (apply owns the frontier) while the window front stays in
+    /// flight. `None` while apply is not the gate.
+    download_blocked_by_apply_since: Option<Instant>,
     ewma_block_bytes: usize,
     next_request_height: u32,
     request_tip: Option<(Hash256, u32)>,
@@ -288,6 +299,10 @@ impl DownloadWindow {
             ),
             pending_bytes: 0,
             received_bytes: 0,
+            pending_blocks_high_water: 0,
+            pending_bytes_high_water: 0,
+            apply_idle_since: None,
+            download_blocked_by_apply_since: None,
             ewma_block_bytes: 256 * 1024,
             next_request_height: 1,
             request_tip: None,
@@ -621,6 +636,27 @@ impl DownloadWindow {
         apply_side_busy: bool,
         now: Instant,
     ) -> Option<SocketAddr> {
+        // Measurement only (issue #51): interval bookkeeping ahead of the
+        // stall state machine, which these observations never feed.
+        // - download-blocked-by-apply: apply owns the frontier while requests
+        //   are in flight — download progress gated by apply speed.
+        // - apply-idle: requests in flight, nothing staged — apply starved
+        //   by the network.
+        if apply_side_busy {
+            if self.pending.is_empty() {
+                self.close_download_blocked_by_apply(now);
+            } else if self.download_blocked_by_apply_since.is_none() {
+                self.download_blocked_by_apply_since = Some(now);
+            }
+            self.close_apply_idle(now);
+        } else {
+            self.close_download_blocked_by_apply(now);
+            if self.pending.is_empty() {
+                self.close_apply_idle(now);
+            } else if self.apply_idle_since.is_none() {
+                self.apply_idle_since = Some(now);
+            }
+        }
         if apply_side_busy {
             if self.stall.take().is_some() {
                 count_stall_episode_cleared("apply_busy");
@@ -700,6 +736,31 @@ impl DownloadWindow {
             .min(self.budget.stall_timeout_max);
         self.mark_peer_unresponsive(peer_addr, now);
         Some(peer_addr)
+    }
+
+    /// Closes an open apply-idle interval, recording its duration.
+    fn close_apply_idle(&mut self, now: Instant) {
+        if let Some(since) = self.apply_idle_since.take() {
+            metrics::histogram!("node.sync.apply_idle_seconds")
+                .record(now.duration_since(since).as_secs_f64());
+        }
+    }
+
+    /// Closes an open download-blocked-by-apply interval, recording its
+    /// duration.
+    fn close_download_blocked_by_apply(&mut self, now: Instant) {
+        if let Some(since) = self.download_blocked_by_apply_since.take() {
+            metrics::histogram!("node.sync.download_blocked_by_apply_seconds")
+                .record(now.duration_since(since).as_secs_f64());
+        }
+    }
+
+    /// Exposes the pending high-water marks for the metrics gauges.
+    pub(super) const fn pending_high_water(&self) -> (usize, usize) {
+        (
+            self.pending_blocks_high_water,
+            self.pending_bytes_high_water,
+        )
     }
 
     /// Lower bound for the adaptive threshold's x0.85 decay (and for the
@@ -1483,6 +1544,8 @@ impl DownloadWindow {
             self.pending_bytes = self.pending_bytes.saturating_add(estimated_bytes);
             inflight.blocks = inflight.blocks.saturating_add(1);
         }
+        self.pending_blocks_high_water = self.pending_blocks_high_water.max(self.pending.len());
+        self.pending_bytes_high_water = self.pending_bytes_high_water.max(self.pending_bytes);
         if !request.entries.is_empty() {
             self.record_pending_deadline(now);
         }

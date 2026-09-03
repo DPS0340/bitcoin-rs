@@ -1,8 +1,8 @@
 # End-to-end sync benchmarks
 
-> **Evidence status:** This page publishes completed historical runs and their raw JSON. All numbers and artifacts below reflect historical runs performed prior to the Task 16 cutover, where `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine across `bitcoin-rs-consensus`, `bitcoin-rs-node`, and `bitcoin-rs`.
+> **Evidence status:** This page publishes completed historical runs and their raw JSON. All numbers and artifacts below reflect historical runs performed prior to the Task 16 cutover, where `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine in `bitcoin-rs-consensus` and `bitcoin-rs-node`. The `bin/bitcoin-rs` binary later dropped `kernel` from its defaults (`default = ["fjall", "redb", "zmq"]`), so `cargo build -p bitcoin-rs` no longer links `bitcoinkernel`; pass `--features kernel` for the kernel consensus engine.
 >
-> The obsolete `bitcoinconsensus` backend was removed in Task 16 after fresh mainnet IBD stopped at block 938344 (exposing missing complete prevouts and unsupported Taproot script-path verification in the portable path). Default builds now require system dependencies (`cmake` and `libboost-dev`).
+> The obsolete `bitcoinconsensus` backend was removed in Task 16 after fresh mainnet IBD stopped at block 938344 (exposing missing complete prevouts and unsupported Taproot script-path verification in the portable path). Builds with `kernel` require system dependencies (`cmake` and `libboost-dev`).
 >
 > Historical `bitcoinconsensus` and early experimental `kernel` numbers published here serve as historical records and are non-comparable with kernel-default production builds. No full-tip (height 957,600+) live IBD run or G14 performance-gate pass has been completed under the landed kernel default. Final performance claims remain pending fresh measurements.
 
@@ -12,11 +12,11 @@ The machine-readable attachments preserve every recorded field and stage timer. 
 
 | Run | Range | Validation | Block source | Commit | Elapsed | Throughput | Peak RSS | Raw artifact |
 |---|---:|---|---|---|---:|---:|---:|---|
-| Current-campaign control, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 88.667s | 1,691.726 blocks/s | 301.6 MiB | [`rs-parprep-current-control-r1.json`](data/end-to-end-sync/rs-parprep-current-control-r1.json) |
-| Current-campaign candidate, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 96.732s | 1,550.684 blocks/s | 308.2 MiB | [`rs-parprep-current-candidate-r2.json`](data/end-to-end-sync/rs-parprep-current-candidate-r2.json) |
-| Long local replay, 0–642,000 | 0–642,000 | Assume-valid through 642,000 | `legacy-fjall-chainstate` | `9ce0727` | 2h 43m 58.256s | 65.256 blocks/s | 6.827 GiB | [`rs-spendable-local-nobody-a014.json`](data/end-to-end-sync/rs-spendable-local-nobody-a014.json) |
-| Inferred `parverify` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `3023eb0` | 296.211s | 506.399 blocks/s | 2.210 GiB | [`rs-replay-150k-parverify.json`](data/end-to-end-sync/rs-replay-150k-parverify.json) |
-| Inferred `kernel` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `fb2227e` | 232.208s | 645.977 blocks/s | 2.219 GiB | [`rs-replay-150k-kernel.json`](data/end-to-end-sync/rs-replay-150k-kernel.json) |
+| Current-campaign control, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 88.667s | 1,691.726 blocks/s | 301.6 MiB | rs-parprep-current-control-r1 (retired) |
+| Current-campaign candidate, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 96.732s | 1,550.684 blocks/s | 308.2 MiB | rs-parprep-current-candidate-r2 (retired) |
+| Long local replay, 0–642,000 | 0–642,000 | Assume-valid through 642,000 | `legacy-fjall-chainstate` | `9ce0727` | 2h 43m 58.256s | 65.256 blocks/s | 6.827 GiB | rs-spendable-local-nobody-a014 (retired) |
+| Inferred `parverify` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `3023eb0` | 296.211s | 506.399 blocks/s | 2.210 GiB | rs-replay-150k-parverify (retired) |
+| Inferred `kernel` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `fb2227e` | 232.208s | 645.977 blocks/s | 2.219 GiB | rs-replay-150k-kernel (retired) |
 
 All five artifacts pass these structural checks: schema `mainnet-prefix-replay-v1`, genesis start hash, positive elapsed time and throughput, non-empty stage list, and `block_count = stop_height - start_height + 1`.
 
@@ -96,7 +96,7 @@ Every bitcoin-rs TxIndex run produced the same logical digest.
 
 The full corpus, treatment, binary, timing, memory, free-space, restore, and rejected
 candidate custody is in
-[`bounded-performance-custody-v1.json`](data/end-to-end-sync/bounded-performance-custody-v1.json).
+bounded-performance-custody-v1 (retired).
 The campaign retained one bounded corpus root with one canonical archive per
 implementation and deleted each disposable fixture before the next run. These bounded
 results do not satisfy the live-IBD or current-tip RSS gates above.
@@ -127,7 +127,7 @@ Every run reached the exact height 150,000 endpoint (block hash `0000000000000a3
 - The PGO (`w128`) candidate measured 89.266232737s (1.003470356× wall ratio vs the 89.576018374s baseline) and was rejected below the 1.05× continuation threshold.
 - The eight-proxy same-seed run measured 115.429379346s (28.861922467% slower than the one-peer median) and was rejected as topology reconnaissance only.
 
-The complete machine-readable custody is in [`daemon-ibd-custody-v1.json`](data/end-to-end-sync/daemon-ibd-custody-v1.json).
+The complete machine-readable custody is in daemon-ibd-custody-v1 (retired).
 
 ## Raw artifact integrity
 
@@ -145,7 +145,7 @@ The complete machine-readable custody is in [`daemon-ibd-custody-v1.json`](data/
 
 ### Current-campaign control, 0–150,000
 
-Artifact: [`rs-parprep-current-control-r1.json`](data/end-to-end-sync/rs-parprep-current-control-r1.json). Stage timers are nested and are not additive.
+Artifact: rs-parprep-current-control-r1 (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -175,7 +175,7 @@ Artifact: [`rs-parprep-current-control-r1.json`](data/end-to-end-sync/rs-parprep
 
 ### Current-campaign candidate, 0–150,000
 
-Artifact: [`rs-parprep-current-candidate-r2.json`](data/end-to-end-sync/rs-parprep-current-candidate-r2.json). Stage timers are nested and are not additive.
+Artifact: rs-parprep-current-candidate-r2 (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -205,7 +205,7 @@ Artifact: [`rs-parprep-current-candidate-r2.json`](data/end-to-end-sync/rs-parpr
 
 ### Long local replay, 0–642,000
 
-Artifact: [`rs-spendable-local-nobody-a014.json`](data/end-to-end-sync/rs-spendable-local-nobody-a014.json). Stage timers are nested and are not additive.
+Artifact: rs-spendable-local-nobody-a014 (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -232,7 +232,7 @@ Artifact: [`rs-spendable-local-nobody-a014.json`](data/end-to-end-sync/rs-spenda
 
 ### Portable full-validation replay, 0–150,000
 
-Artifact: [`rs-replay-150k-parverify.json`](data/end-to-end-sync/rs-replay-150k-parverify.json). Stage timers are nested and are not additive.
+Artifact: rs-replay-150k-parverify (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|
@@ -259,7 +259,7 @@ Artifact: [`rs-replay-150k-parverify.json`](data/end-to-end-sync/rs-replay-150k-
 
 ### Kernel full-validation replay, 0–150,000
 
-Artifact: [`rs-replay-150k-kernel.json`](data/end-to-end-sync/rs-replay-150k-kernel.json). Stage timers are nested and are not additive.
+Artifact: rs-replay-150k-kernel (retired). Stage timers are nested and are not additive.
 
 | Stage | Samples | Sum (seconds) |
 |---|---:|---:|

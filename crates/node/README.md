@@ -22,9 +22,10 @@ Large corpus/replay/evidence harnesses are intentionally not shipped by this
 runtime crate.
 
 ## Features
-- `default` (enables `fjall` and `kernel`): the performance-oriented fjall storage
-  backend plus the bitcoinkernel consensus verifier, so per-crate `cargo check` works
-  out of the box.
+- `default` (enables `fjall`, `kernel`, and `zmq`): the performance-oriented fjall
+  storage backend plus the bitcoinkernel consensus verifier and ZMQ notifications,
+  so per-crate `cargo check` works out of the box. The `bitcoin-rs` binary's own
+  defaults are the pure-Rust `fjall,redb,zmq`; `kernel` stays opt-in there.
 - `rocksdb`, `fjall`, `redb`: forward the named storage backend to every subsystem
   crate.
 - `mdbx`: forward the mdbx backend to the crates that provide one.

@@ -20,6 +20,10 @@ and rationale in `CONCEPTS.md`, policies, or subsystem documentation.
 - For persistence changes, review affected readers and writers together. Make
   ownership, commit point, durability, recovery, and failure classification
   explicit.
+- For every TLS path, use Rustls with default features disabled and a reviewed
+  non-C crypto provider, and keep the native-TLS/C-provider family in `deny.toml`
+  complete, because Rustls and adapter feature defaults can reintroduce AWS-LC,
+  ring, OpenSSL, or platform TLS transitively.
 
 ## Verification
 

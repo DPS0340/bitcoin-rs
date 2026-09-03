@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 
 use bytes;
 
-use bitcoin::consensus::encode::{self, Decodable, Encodable};
+use bitcoin::consensus::encode::{self, Decodable};
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::address::AddrV2Message;
 use bitcoin::p2p::message::{CommandString, NetworkMessage};
@@ -13,6 +13,7 @@ use bitcoin::p2p::message_filter::{
     CFCheckpt, CFHeaders, CFilter, GetCFCheckpt, GetCFHeaders, GetCFilters,
 };
 use bitcoin::p2p::message_network::{Reject, VersionMessage};
+use bitcoin_rs_primitives::{Block, ConsensusDecode, ConsensusEncode, Header, Tx, deserialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -32,8 +33,186 @@ pub const MAX_ADDR_MESSAGE_COUNT: usize = 1_000;
 pub(crate) const HEADER_LEN: usize = 24;
 const COMMAND_LEN: usize = 12;
 
-/// Bitcoin P2P message payload type.
-pub type Message = NetworkMessage;
+/// Bitcoin P2P message payload.
+///
+/// Identical to the retained `bitcoin::p2p::NetworkMessage` envelope except
+/// `tx`, `block`, and `headers` payloads use the native consensus types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Message {
+    /// `version`
+    Version(VersionMessage),
+    /// `verack`
+    Verack,
+    /// `addr`
+    Addr(Vec<(u32, bitcoin::p2p::Address)>),
+    /// `inv`
+    Inv(Vec<Inventory>),
+    /// `getdata`
+    GetData(Vec<Inventory>),
+    /// `notfound`
+    NotFound(Vec<Inventory>),
+    /// `getblocks`
+    GetBlocks(GetBlocksMessage),
+    /// `getheaders`
+    GetHeaders(GetHeadersMessage),
+    /// `mempool`
+    MemPool,
+    /// `tx`
+    Tx(Tx),
+    /// `block`
+    Block(Block),
+    /// `headers`
+    Headers(Vec<Header>),
+    /// `sendheaders`
+    SendHeaders,
+    /// `getaddr`
+    GetAddr,
+    /// `ping`
+    Ping(u64),
+    /// `pong`
+    Pong(u64),
+    /// `merkleblock`
+    MerkleBlock(bitcoin::merkle_tree::MerkleBlock),
+    /// BIP 37 `filterload`
+    FilterLoad(FilterLoad),
+    /// BIP 37 `filteradd`
+    FilterAdd(FilterAdd),
+    /// BIP 37 `filterclear`
+    FilterClear,
+    /// BIP157 getcfilters
+    GetCFilters(GetCFilters),
+    /// BIP157 cfilter
+    CFilter(CFilter),
+    /// BIP157 getcfheaders
+    GetCFHeaders(GetCFHeaders),
+    /// BIP157 cfheaders
+    CFHeaders(CFHeaders),
+    /// BIP157 getcfcheckpt
+    GetCFCheckpt(GetCFCheckpt),
+    /// BIP157 cfcheckpt
+    CFCheckpt(CFCheckpt),
+    /// BIP152 sendcmpct
+    SendCmpct(SendCmpct),
+    /// BIP152 cmpctblock
+    CmpctBlock(CmpctBlock),
+    /// BIP152 getblocktxn
+    GetBlockTxn(GetBlockTxn),
+    /// BIP152 blocktxn
+    BlockTxn(BlockTxn),
+    /// `alert`
+    Alert(Vec<u8>),
+    /// `reject`
+    Reject(Reject),
+    /// `feefilter`
+    FeeFilter(i64),
+    /// `wtxidrelay`
+    WtxidRelay,
+    /// `addrv2`
+    AddrV2(Vec<AddrV2Message>),
+    /// `sendaddrv2`
+    SendAddrV2,
+    /// Any other message.
+    Unknown {
+        /// The command of this message.
+        command: CommandString,
+        /// The payload of this message.
+        payload: Vec<u8>,
+    },
+}
+
+impl Message {
+    /// Returns the message command for the wire header.
+    pub fn command(&self) -> CommandString {
+        let name = match self {
+            Self::Version(_) => "version",
+            Self::Verack => "verack",
+            Self::Addr(_) => "addr",
+            Self::Inv(_) => "inv",
+            Self::GetData(_) => "getdata",
+            Self::NotFound(_) => "notfound",
+            Self::GetBlocks(_) => "getblocks",
+            Self::GetHeaders(_) => "getheaders",
+            Self::MemPool => "mempool",
+            Self::Tx(_) => "tx",
+            Self::Block(_) => "block",
+            Self::Headers(_) => "headers",
+            Self::SendHeaders => "sendheaders",
+            Self::GetAddr => "getaddr",
+            Self::Ping(_) => "ping",
+            Self::Pong(_) => "pong",
+            Self::MerkleBlock(_) => "merkleblock",
+            Self::FilterLoad(_) => "filterload",
+            Self::FilterAdd(_) => "filteradd",
+            Self::FilterClear => "filterclear",
+            Self::GetCFilters(_) => "getcfilters",
+            Self::CFilter(_) => "cfilter",
+            Self::GetCFHeaders(_) => "getcfheaders",
+            Self::CFHeaders(_) => "cfheaders",
+            Self::GetCFCheckpt(_) => "getcfcheckpt",
+            Self::CFCheckpt(_) => "cfcheckpt",
+            Self::SendCmpct(_) => "sendcmpct",
+            Self::CmpctBlock(_) => "cmpctblock",
+            Self::GetBlockTxn(_) => "getblocktxn",
+            Self::BlockTxn(_) => "blocktxn",
+            Self::Alert(_) => "alert",
+            Self::Reject(_) => "reject",
+            Self::FeeFilter(_) => "feefilter",
+            Self::WtxidRelay => "wtxidrelay",
+            Self::AddrV2(_) => "addrv2",
+            Self::SendAddrV2 => "sendaddrv2",
+            Self::Unknown { command, .. } => return command.clone(),
+        };
+        #[allow(clippy::expect_used)]
+        CommandString::try_from_static(name).expect("static P2P command")
+    }
+}
+
+impl Message {
+    fn envelope(&self) -> NetworkMessage {
+        match self {
+            Self::Version(message) => NetworkMessage::Version(message.clone()),
+            Self::Verack => NetworkMessage::Verack,
+            Self::Addr(addresses) => NetworkMessage::Addr(addresses.clone()),
+            Self::Inv(inventory) => NetworkMessage::Inv(inventory.clone()),
+            Self::GetData(inventory) => NetworkMessage::GetData(inventory.clone()),
+            Self::NotFound(inventory) => NetworkMessage::NotFound(inventory.clone()),
+            Self::GetBlocks(message) => NetworkMessage::GetBlocks(message.clone()),
+            Self::GetHeaders(message) => NetworkMessage::GetHeaders(message.clone()),
+            Self::MemPool => NetworkMessage::MemPool,
+            Self::Tx(_) | Self::Block(_) | Self::Headers(_) => {
+                unreachable!("native payloads are encoded directly")
+            }
+            Self::SendHeaders => NetworkMessage::SendHeaders,
+            Self::GetAddr => NetworkMessage::GetAddr,
+            Self::Ping(nonce) => NetworkMessage::Ping(*nonce),
+            Self::Pong(nonce) => NetworkMessage::Pong(*nonce),
+            Self::MerkleBlock(block) => NetworkMessage::MerkleBlock(block.clone()),
+            Self::FilterLoad(filter) => NetworkMessage::FilterLoad(filter.clone()),
+            Self::FilterAdd(filter) => NetworkMessage::FilterAdd(filter.clone()),
+            Self::FilterClear => NetworkMessage::FilterClear,
+            Self::GetCFilters(message) => NetworkMessage::GetCFilters(message.clone()),
+            Self::CFilter(message) => NetworkMessage::CFilter(message.clone()),
+            Self::GetCFHeaders(message) => NetworkMessage::GetCFHeaders(message.clone()),
+            Self::CFHeaders(message) => NetworkMessage::CFHeaders(message.clone()),
+            Self::GetCFCheckpt(message) => NetworkMessage::GetCFCheckpt(message.clone()),
+            Self::CFCheckpt(message) => NetworkMessage::CFCheckpt(message.clone()),
+            Self::SendCmpct(message) => NetworkMessage::SendCmpct(*message),
+            Self::CmpctBlock(message) => NetworkMessage::CmpctBlock(message.clone()),
+            Self::GetBlockTxn(message) => NetworkMessage::GetBlockTxn(message.clone()),
+            Self::BlockTxn(message) => NetworkMessage::BlockTxn(message.clone()),
+            Self::Alert(payload) => NetworkMessage::Alert(payload.clone()),
+            Self::Reject(message) => NetworkMessage::Reject(message.clone()),
+            Self::FeeFilter(rate) => NetworkMessage::FeeFilter(*rate),
+            Self::WtxidRelay => NetworkMessage::WtxidRelay,
+            Self::AddrV2(addresses) => NetworkMessage::AddrV2(addresses.clone()),
+            Self::SendAddrV2 => NetworkMessage::SendAddrV2,
+            Self::Unknown { command, payload } => NetworkMessage::Unknown {
+                command: command.clone(),
+                payload: payload.clone(),
+            },
+        }
+    }
+}
 
 /// Wire and peer protocol errors.
 #[derive(Debug, Error)]
@@ -44,6 +223,12 @@ pub enum PeerError {
     /// Consensus payload encoding or decoding failed.
     #[error("bitcoin consensus encoding error: {0}")]
     Encode(#[from] encode::Error),
+    /// Native varint decoding failed.
+    #[error("varint decode error: {0}")]
+    Varint(#[from] bitcoin_rs_primitives::varint::VarintError),
+    /// Native consensus payload decoding failed.
+    #[error("native consensus decode error: {0}")]
+    NativeDecode(#[from] bitcoin_rs_primitives::DecodeError),
     /// Command name is not valid for a v1 P2P header.
     #[error("invalid command `{0}`")]
     InvalidCommand(String),
@@ -76,7 +261,7 @@ pub enum PeerError {
 ///
 /// Returns the number of bytes written to the wire (header plus payload) so
 /// callers can account per-connection and aggregate traffic.
-pub fn write_message<W: Write>(
+pub fn write_message<W: Write + ?Sized>(
     writer: &mut W,
     magic: Magic,
     message: &Message,
@@ -135,13 +320,37 @@ pub fn read_message<R: Read>(
     Ok((message, bytes::Bytes::from(payload)))
 }
 
+/// Returns the full encoded wire size of `message`: the 24-byte framing
+/// header plus the encoded payload length.
+///
+/// Admission accounts this exact count and `write_message` returns it for
+/// release, so budget accounting and wire emission charge identical bytes.
+pub fn wire_len(message: &Message) -> Result<usize, PeerError> {
+    Ok(HEADER_LEN + encode_payload(message)?.len())
+}
+
 /// Encode only a message payload.
 pub fn encode_payload(message: &Message) -> Result<Vec<u8>, PeerError> {
     let mut payload = Vec::new();
-    message
-        .consensus_encode(&mut payload)
-        .map_err(|error| PeerError::Io(std::io::Error::other(error.to_string())))?;
+    match message {
+        Message::Tx(tx) => tx.consensus_encode(&mut payload)?,
+        Message::Block(block) => block.consensus_encode(&mut payload)?,
+        Message::Headers(headers) => {
+            let count = u64::try_from(headers.len())
+                .map_err(|_| PeerError::PayloadTooLarge(headers.len()))?;
+            encode_varint(&mut payload, count);
+            for header in headers {
+                header.consensus_encode(&mut payload)?;
+                payload.push(0);
+            }
+        }
+        other => payload.extend_from_slice(&encode::serialize(&other.envelope())),
+    }
     Ok(payload)
+}
+
+fn encode_varint(payload: &mut Vec<u8>, value: u64) {
+    payload.extend_from_slice(&bitcoin_rs_primitives::varint::encode(value));
 }
 
 fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, PeerError> {
@@ -155,8 +364,8 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, PeerError> {
         "getblocks" => Message::GetBlocks(decode_getblocks(payload)?),
         "getheaders" => Message::GetHeaders(decode_getheaders(payload)?),
         "mempool" => empty_payload(payload, Message::MemPool)?,
-        "tx" => Message::Tx(encode::deserialize::<bitcoin::Transaction>(payload)?),
-        "block" => Message::Block(encode::deserialize::<bitcoin::Block>(payload)?),
+        "tx" => Message::Tx(deserialize::<Tx>(payload)?),
+        "block" => Message::Block(deserialize::<Block>(payload)?),
         "headers" => Message::Headers(decode_headers(payload)?),
         "sendheaders" => empty_payload(payload, Message::SendHeaders)?,
         "getaddr" => empty_payload(payload, Message::GetAddr)?,
@@ -297,17 +506,19 @@ fn decode_locator_payload(
     Ok((version, locator_hashes, stop_hash))
 }
 
-fn decode_headers(payload: &[u8]) -> Result<Vec<bitcoin::block::Header>, PeerError> {
+fn decode_headers(payload: &[u8]) -> Result<Vec<Header>, PeerError> {
     let mut reader = payload;
-    let count = bitcoin::consensus::encode::VarInt::consensus_decode(&mut reader)?.0;
+    let (count, consumed) = bitcoin_rs_primitives::varint::decode(reader)?;
+    reader = &reader[consumed..];
     let capacity = usize::try_from(count).map_err(|_| PeerError::PayloadTooLarge(usize::MAX))?;
     if capacity > MAX_HEADERS_MESSAGE_COUNT {
         return Err(PeerError::Protocol("headers count too large"));
     }
     let mut headers = Vec::with_capacity(capacity);
     for _ in 0..count {
-        headers.push(bitcoin::block::Header::consensus_decode(&mut reader)?);
-        let tx_count = u8::consensus_decode(&mut reader)?;
+        headers.push(<Header as ConsensusDecode>::consensus_decode(&mut reader)?);
+        let (tx_count, consumed) = bitcoin_rs_primitives::varint::decode(reader)?;
+        reader = &reader[consumed..];
         if tx_count != 0 {
             return Err(PeerError::Protocol("headers entry carried transactions"));
         }
@@ -322,11 +533,14 @@ fn empty_payload(payload: &[u8], message: Message) -> Result<Message, PeerError>
     if payload.is_empty() {
         Ok(message)
     } else {
-        Err(PeerError::Protocol("non-empty payload for empty message"))
+        Err(PeerError::Protocol("expected empty payload"))
     }
 }
 
-fn write_command<W: Write>(writer: &mut W, command: &CommandString) -> Result<(), PeerError> {
+fn write_command<W: Write + ?Sized>(
+    writer: &mut W,
+    command: &CommandString,
+) -> Result<(), PeerError> {
     let command = command.as_ref().as_bytes();
     if command.len() > COMMAND_LEN || command.contains(&0) {
         return Err(PeerError::InvalidCommand(
@@ -368,11 +582,12 @@ mod tests {
     use std::io::{Cursor, Read};
 
     use bitcoin::consensus::encode::serialize;
+    use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::Magic;
-    use bitcoin::p2p::message::NetworkMessage;
 
     use super::{
-        HEADER_LEN, MAX_MESSAGE_PAYLOAD, PeerError, encode_payload, read_message, write_message,
+        HEADER_LEN, MAX_MESSAGE_PAYLOAD, PeerError, encode_payload, read_message, wire_len,
+        write_message,
     };
 
     /// Serves exactly one v1 wire header and fails on any read beyond it.
@@ -411,7 +626,10 @@ mod tests {
     #[test]
     fn block_message_roundtrip_preserves_wire_payload() -> Result<(), super::PeerError> {
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let message = NetworkMessage::Block(block.clone());
+        let block_bytes = serialize(&block);
+        let native_block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
+            .map_err(super::PeerError::NativeDecode)?;
+        let message = super::Message::Block(native_block);
         let payload = encode_payload(&message)?;
         let expected_hash = block.block_hash();
 
@@ -421,15 +639,19 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let (decoded, raw) = read_message(&mut cursor, Magic::REGTEST)?;
 
-        let NetworkMessage::Block(decoded_block) = decoded else {
+        let super::Message::Block(decoded_block) = decoded else {
             return Err(super::PeerError::Protocol(
                 "expected block message in roundtrip test",
             ));
         };
 
-        assert_eq!(raw.as_ref(), serialize(&decoded_block).as_slice());
+        // Native re-encoding must be byte-identical to the original wire bytes.
+        let reencoded = bitcoin_rs_primitives::consensus_bytes(&decoded_block);
+        assert_eq!(raw.as_ref(), reencoded.as_slice());
         assert_eq!(raw.as_ref(), payload.as_slice());
-        assert_eq!(decoded_block.block_hash(), expected_hash);
+        // Native block hash must match bitcoin's block hash.
+        let native_hash = decoded_block.header.compute_hash();
+        assert_eq!(native_hash.as_bytes(), &expected_hash.to_byte_array());
 
         Ok(())
     }
@@ -481,7 +703,7 @@ mod tests {
     #[test]
     fn write_message_rejects_payload_exceeding_cap() -> Result<(), PeerError> {
         let oversize = MAX_MESSAGE_PAYLOAD + 1;
-        let message = NetworkMessage::Unknown {
+        let message = super::Message::Unknown {
             command: super::command_string("huge")?,
             payload: vec![0u8; oversize],
         };
@@ -497,5 +719,27 @@ mod tests {
                 "expected PayloadTooLarge from encode path",
             )),
         }
+    }
+
+    #[test]
+    fn wire_len_matches_write_message_for_representative_messages() -> Result<(), PeerError> {
+        let messages = vec![
+            super::Message::Ping(0x1234_5678_9abc_def0),
+            super::Message::Verack,
+            super::Message::Headers(vec![bitcoin_rs_primitives::Header::default(); 2_000]),
+            super::Message::Block(bitcoin_rs_primitives::Block::default()),
+            super::Message::Unknown {
+                command: super::command_string("unknown")?,
+                payload: vec![7; 61],
+            },
+        ];
+
+        for message in &messages {
+            let mut buffer = Vec::new();
+            let written = write_message(&mut buffer, Magic::BITCOIN, message)?;
+            assert_eq!(wire_len(message)?, written);
+            assert_eq!(written, buffer.len());
+        }
+        Ok(())
     }
 }

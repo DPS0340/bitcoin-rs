@@ -20,8 +20,15 @@ mimalloc.workspace = true
 anyhow.workspace = true
 bitcoin-rs-node.workspace = true
 
+[dev-dependencies]
+parking_lot.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile = "3"
+bitcoin-rs-consensus.workspace = true
+bitcoin-rs-primitives.workspace = true
 [features]
-default = ["rocksdb", "fjall", "redb", "mdbx", "kernel", "zmq"]
+default = ["fjall", "redb", "zmq"]
 rocksdb = ["bitcoin-rs-node/rocksdb"]
 fjall = ["bitcoin-rs-node/fjall"]
 redb = ["bitcoin-rs-node/redb"]
@@ -29,3 +36,9 @@ mdbx = ["bitcoin-rs-node/mdbx"]
 kernel = ["bitcoin-rs-node/kernel"]
 zmq = ["bitcoin-rs-node/zmq"]
 
+[[test]]
+name = "g17_dependency_direction"
+path = "tests/gates/g17_dependency_direction.rs"
+[[test]]
+name = "g16_extension_model"
+path = "tests/gates/g16_extension_model.rs"

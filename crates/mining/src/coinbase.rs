@@ -1,8 +1,5 @@
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute,
-    script::Builder, transaction,
-};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
+use bitcoin_rs_script::push_int;
 use thiserror::Error;
 
 const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
@@ -62,58 +59,55 @@ pub(crate) fn build_coinbase(
     height: u32,
     subsidy_halving_interval: u32,
     fees: u64,
-    payout: ScriptBuf,
+    payout: Vec<u8>,
     witness_commitment: Option<&Hash256>,
-) -> Result<Transaction, MiningError> {
+) -> Result<Tx, MiningError> {
     let value = bitcoin_rs_consensus::block_subsidy(height, subsidy_halving_interval)
         .checked_add(fees)
         .ok_or(MiningError::CoinbaseValueOverflow)?;
 
-    let mut witness = Witness::new();
-    let mut output = vec![TxOut {
-        value: Amount::from_sat(value),
+    let mut witness = Vec::new();
+    let mut outputs = vec![TxOut {
+        value,
         script_pubkey: payout,
     }];
 
     if let Some(commitment) = witness_commitment {
-        witness.push(WITNESS_RESERVED_VALUE);
-        output.push(TxOut {
-            value: Amount::ZERO,
+        witness.push(WITNESS_RESERVED_VALUE.to_vec());
+        outputs.push(TxOut {
+            value: 0,
             script_pubkey: witness_commitment_script(commitment),
         });
     }
 
-    Ok(Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::null(),
+    Ok(Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[0; 32])), 0xffff_ffff),
             script_sig: coinbase_script_sig(height)?,
-            sequence: Sequence::MAX,
+            sequence: 0xffff_ffff,
             witness,
         }],
-        output,
+        outputs,
+        lock_time: 0,
     })
 }
 
 /// Builds the BIP141 `OP_RETURN` witness-commitment script (`6a24aa21a9ed || commitment`).
-pub fn witness_commitment_script(commitment: &Hash256) -> ScriptBuf {
+pub fn witness_commitment_script(commitment: &Hash256) -> Vec<u8> {
     let mut script = Vec::with_capacity(38);
-    script.push(0x6a);
-    script.push(36);
+    script.push(0x6a); // OP_RETURN
+    script.push(36); // PUSH36
     script.extend_from_slice(&WITNESS_COMMITMENT_TAG);
     script.extend_from_slice(commitment.as_byte_array());
-    ScriptBuf::from_bytes(script)
+    script
 }
 
-fn coinbase_script_sig(height: u32) -> Result<ScriptBuf, MiningError> {
+fn coinbase_script_sig(height: u32) -> Result<Vec<u8>, MiningError> {
     // BIP34 requires the minimal `CScriptNum` encoding. Heights 1..=16 therefore
-    // use OP_1..OP_16 rather than a data push — `Builder::push_int` matches
-    // consensus `check_bip34`.
-    let mut script = Builder::new()
-        .push_int(i64::from(height))
-        .into_script()
-        .into_bytes();
+    // use OP_1..OP_16 rather than a data push — `push_int` matches consensus
+    // `check_bip34`.
+    let mut script = push_int(i64::from(height));
     // Consensus rejects coinbase scriptSigs shorter than two bytes
     // (`bad-cb-length`). Heights whose BIP34 prefix is a single opcode need a
     // trailing OP_0, matching Bitcoin Core's `CreateNewBlock`.
@@ -126,5 +120,5 @@ fn coinbase_script_sig(height: u32) -> Result<ScriptBuf, MiningError> {
             max: MAX_COINBASE_SCRIPT_SIG_LEN,
         });
     }
-    Ok(ScriptBuf::from_bytes(script))
+    Ok(script)
 }

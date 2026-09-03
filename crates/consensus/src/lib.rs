@@ -1,11 +1,16 @@
 //! Consensus validation surfaces for bitcoin-rs.
 //!
-//! The `kernel` feature is the production default: it routes every script class
-//! through bitcoinkernel (Bitcoin Core's native consensus engine). With the
-//! feature off, the crate builds a portable Rust validation path that delegates
-//! taproot key-path script execution to `bitcoin-rs-script` and keeps
-//! consensus-facing rule checks in small, testable modules. The portable path
-//! is retained for differential tests and builds without a native backend.
+//! The `kernel` feature is the production default in this crate and in
+//! `bitcoin-rs-node`: it routes every script class through bitcoinkernel
+//! (Bitcoin Core's native consensus engine). The `bin/bitcoin-rs` binary
+//! defaults to `["fjall", "redb", "zmq"]` (no `kernel`), so `cargo build
+//! -p bitcoin-rs` uses the portable path. With the feature off, the crate
+//! builds a portable Rust validation path that delegates taproot key-path
+//! script execution to `bitcoin-rs-script` and keeps consensus-facing rule
+//! checks in small, testable modules. The portable path's non-Taproot arm
+//! is a stub that accepts only bare `OP_TRUE` spends; it cannot validate
+//! ordinary mainnet spends (see #166). It is retained for differential
+//! tests and builds without a native backend.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -36,6 +41,8 @@ pub mod bip66;
 pub mod bip68;
 /// BIP9 versionbits checks.
 pub mod bip9;
+/// Parse-once block state shared by the native apply path.
+pub mod block_view;
 /// Feature-gated bitcoinkernel wrapper.
 pub mod kernel;
 /// Portable Rust validator.
@@ -48,6 +55,7 @@ pub mod verify_block;
 pub mod verify_tx;
 
 pub use bip9::{DeploymentContext, DeploymentParams, DeploymentState, compute_state};
+pub use block_view::BlockView;
 pub use rust_path::{TipState, UtxoView};
 pub use verify_block::{
     BlockRuleContext, verify_block_rules, verify_block_rules_precomputed,

@@ -8,10 +8,7 @@
 use crate::config::ZmqPublication;
 #[cfg(feature = "zmq")]
 use anyhow::{Context as _, Result, bail};
-use bitcoin::Txid;
-#[cfg(any(feature = "zmq", test))]
-use bitcoin::hashes::Hash as _;
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, Txid};
 #[cfg(feature = "zmq")]
 use core::fmt;
 #[cfg(feature = "zmq")]
@@ -80,19 +77,23 @@ pub enum SequenceEvent {
     Connected(Hash256),
     /// A block was disconnected.
     Disconnected(Hash256),
+    /// A transaction was admitted to the mempool, with the mempool sequence
+    /// assigned to the admission.
+    Added(Txid, u64),
+    /// A transaction left the mempool, with the mempool sequence assigned to
+    /// the removal. Block-inclusion removals never publish this event: Core
+    /// suppresses `R` when the block's own `C` event already covers the
+    /// departure.
+    Removed(Txid, u64),
 }
 
 impl SequenceEvent {
-    fn hash(self) -> Hash256 {
-        match self {
-            Self::Connected(hash) | Self::Disconnected(hash) => hash,
-        }
-    }
-
     const fn label(self) -> u8 {
         match self {
             Self::Connected(_) => b'C',
             Self::Disconnected(_) => b'D',
+            Self::Added(..) => b'A',
+            Self::Removed(..) => b'R',
         }
     }
 }
@@ -243,11 +244,17 @@ impl ZmqPublisher for TracingZmqPublisher {
     }
 
     fn publish_sequence(&self, event: SequenceEvent) {
+        let subject = match event {
+            SequenceEvent::Connected(hash) | SequenceEvent::Disconnected(hash) => {
+                hash.to_string_be()
+            }
+            SequenceEvent::Added(txid, _) | SequenceEvent::Removed(txid, _) => txid.to_string(),
+        };
         tracing::info!(
             target: "bitcoin_rs_node::zmq",
             topic = "sequence",
-            hash = %event.hash().to_string_be(),
-            label = event.label(),
+            hash = %subject,
+            label = char::from(event.label()).to_string(),
         );
     }
 }
@@ -461,17 +468,33 @@ pub(crate) fn hash_body_from_hash(hash: Hash256) -> [u8; 32] {
     body
 }
 
+/// Body frame for a `sequence` topic event: the reversed hash/txid bytes and
+/// the label byte, plus — for mempool `A`/`R` events — the mempool sequence
+/// as a little-endian u64. The transport's own 4-byte counter stays in its
+/// separate trailing frame.
 #[cfg(any(feature = "zmq", test))]
-pub(crate) fn sequence_payload(event: SequenceEvent) -> [u8; 33] {
-    let mut body = [0_u8; 33];
-    body[..32].copy_from_slice(&hash_body_from_hash(event.hash()));
-    body[32] = event.label();
-    body
+pub(crate) fn sequence_payload(event: SequenceEvent) -> Vec<u8> {
+    match event {
+        SequenceEvent::Added(txid, mempool_sequence)
+        | SequenceEvent::Removed(txid, mempool_sequence) => {
+            let mut body = Vec::with_capacity(41);
+            body.extend_from_slice(&hash_body_from_txid(txid));
+            body.push(event.label());
+            body.extend_from_slice(&mempool_sequence.to_le_bytes());
+            body
+        }
+        SequenceEvent::Connected(hash) | SequenceEvent::Disconnected(hash) => {
+            let mut body = Vec::with_capacity(33);
+            body.extend_from_slice(&hash_body_from_hash(hash));
+            body.push(event.label());
+            body
+        }
+    }
 }
 
-#[cfg(feature = "zmq")]
+#[cfg(any(feature = "zmq", test))]
 pub(crate) fn hash_body_from_txid(txid: Txid) -> [u8; 32] {
-    let mut body = *txid.as_byte_array();
+    let mut body = *txid.as_bytes();
     body.reverse();
     body
 }
@@ -507,7 +530,7 @@ mod tests {
         assert!(!publisher.wants_rawtx());
         assert!(!publisher.wants_rawblock());
         publisher.publish_hashblock(Hash256::default());
-        publisher.publish_hashtx(bitcoin::Txid::from_byte_array([0; 32]));
+        publisher.publish_hashtx(Txid(Hash256::from_le_bytes(&[0; 32])));
         publisher.publish_rawblock(&[]);
         publisher.publish_rawtx(&[]);
         publisher.publish_sequence(SequenceEvent::Connected(Hash256::default()));
@@ -520,7 +543,7 @@ mod tests {
         assert!(publisher.wants_rawtx());
         assert!(publisher.wants_rawblock());
         publisher.publish_hashblock(Hash256::default());
-        publisher.publish_hashtx(bitcoin::Txid::from_byte_array([0; 32]));
+        publisher.publish_hashtx(Txid(Hash256::from_le_bytes(&[0; 32])));
         publisher.publish_rawblock(&[1, 2, 3]);
         publisher.publish_rawtx(&[4, 5, 6]);
         publisher.publish_sequence(SequenceEvent::Disconnected(Hash256::default()));
@@ -558,6 +581,31 @@ mod tests {
                 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, b'D'
             ]
         );
+    }
+
+    #[test]
+    fn mempool_event_payloads_carry_reversed_txid_label_and_le_sequence() {
+        let txid = Txid(Hash256::from_le_bytes(&[
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31,
+        ]));
+        let mut reversed = *txid.as_bytes();
+        reversed.reverse();
+
+        let added = sequence_payload(SequenceEvent::Added(txid, 1));
+        assert_eq!(added.len(), 41);
+        assert_eq!(added[..32], reversed);
+        assert_eq!(added[32], b'A');
+        assert_eq!(added[33..], 0x0000_0000_0000_0001_u64.to_le_bytes());
+
+        let removed = sequence_payload(SequenceEvent::Removed(txid, 0xFF00_0000_0000_0042));
+        assert_eq!(removed.len(), 41);
+        assert_eq!(removed[..32], reversed);
+        assert_eq!(removed[32], b'R');
+        assert_eq!(removed[33..], 0xFF00_0000_0000_0042_u64.to_le_bytes());
+
+        // A hash256 conversion round-trips through the observer's mapping.
+        assert_eq!(Txid(Hash256::from_le_bytes(txid.as_bytes())), txid);
     }
 
     #[test]

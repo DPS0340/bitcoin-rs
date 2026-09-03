@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 
-use bitcoin::{Transaction, Txid, Wtxid};
+use bitcoin_rs_primitives::{Tx, Txid, Wtxid};
+use bitcoin_rs_script::count_tx_legacy;
 
 /// Stable mempool entry identifier.
 pub type EntryId = u32;
@@ -9,7 +10,7 @@ pub type EntryId = u32;
 #[derive(Clone, Debug)]
 pub struct MempoolEntry {
     /// Transaction payload shared with downstream consumers.
-    pub tx: Arc<Transaction>,
+    pub tx: Arc<Tx>,
     /// Transaction id, hashed once at construction.
     pub txid: Txid,
     /// Witness transaction id, hashed once at construction.
@@ -55,14 +56,14 @@ impl MempoolEntry {
     /// resolved prevouts must replace it with [`Self::with_sigop_cost`] so P2SH
     /// and witness sigops are included.
     #[must_use]
-    pub fn new(tx: Arc<Transaction>, vsize: u32, fee: u64, time: u64, height: u32) -> Self {
+    pub fn new(tx: Arc<Tx>, vsize: u32, fee: u64, time: u64, height: u32) -> Self {
         let own_size = u64::from(vsize);
-        let txid = tx.compute_txid();
-        let wtxid = tx.compute_wtxid();
+        let txid = tx.txid();
+        let wtxid = tx.wtxid();
         let bip141_vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
         let size = u32::try_from(tx.total_size()).unwrap_or(u32::MAX);
-        let weight = tx.weight().to_wu();
-        let sigop_cost = u32::try_from(tx.total_sigop_cost(|_| None)).unwrap_or(u32::MAX);
+        let weight = tx.weight();
+        let sigop_cost = count_tx_legacy(&tx);
         Self {
             tx,
             txid,
@@ -131,9 +132,9 @@ impl MempoolEntry {
     pub fn is_replaceable(&self) -> bool {
         const RBF_FLAG_THRESHOLD: u32 = 0xFFFF_FFFE;
         self.tx
-            .input
+            .inputs
             .iter()
-            .any(|input| input.sequence.0 < RBF_FLAG_THRESHOLD)
+            .any(|input| input.sequence < RBF_FLAG_THRESHOLD)
     }
 }
 
@@ -153,19 +154,20 @@ fn signed_fee_rate(fee: i128, vsize: u64) -> i128 {
 #[cfg(test)]
 mod is_replaceable_tests {
     use super::*;
+    use bitcoin_rs_primitives::{OutPoint, Tx, TxIn};
     use std::sync::Arc;
 
     fn entry_with_sequence(sequence: u32) -> MempoolEntry {
-        let tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: bitcoin::ScriptBuf::new(),
-                sequence: bitcoin::Sequence(sequence),
-                witness: bitcoin::Witness::new(),
+        let tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: Vec::new(),
+                sequence,
+                witness: Vec::new(),
             }],
-            output: vec![],
+            outputs: vec![],
         };
         MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7)
     }
@@ -190,11 +192,11 @@ mod is_replaceable_tests {
 
     #[test]
     fn is_replaceable_false_for_no_inputs() {
-        let tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![],
-            output: vec![],
+        let tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![],
+            outputs: vec![],
         };
         let entry = MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7);
         assert!(!entry.is_replaceable());
@@ -204,14 +206,15 @@ mod is_replaceable_tests {
 #[cfg(test)]
 mod mining_metadata_tests {
     use super::*;
+    use bitcoin_rs_primitives::{Tx, TxOut};
     use std::sync::Arc;
 
     fn bare_entry() -> MempoolEntry {
-        let tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![],
-            output: vec![],
+        let tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![],
+            outputs: vec![],
         };
         MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7)
     }
@@ -224,21 +227,18 @@ mod mining_metadata_tests {
         let entry = bare_entry().with_sigop_cost(20_000);
         assert_eq!(entry.sigop_cost, 20_000);
 
-        let mut tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![],
-            output: vec![],
+        let mut tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![],
+            outputs: vec![],
         };
-        tx.output.push(bitcoin::TxOut {
-            value: bitcoin::Amount::from_sat(1_000),
-            script_pubkey: bitcoin::ScriptBuf::from_bytes(alloc::vec![0xac]),
+        tx.outputs.push(TxOut {
+            value: 1_000,
+            script_pubkey: alloc::vec![0xac],
         });
         let counted = MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7);
-        assert_eq!(
-            counted.sigop_cost,
-            u32::try_from(counted.tx.total_sigop_cost(|_| None)).unwrap_or(u32::MAX)
-        );
+        assert_eq!(counted.sigop_cost, count_tx_legacy(&counted.tx));
         assert!(counted.sigop_cost > 0, "an OP_CHECKSIG output costs sigops");
     }
 

@@ -37,3 +37,4 @@ sha2.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile = "3"
+serde_json.workspace = true

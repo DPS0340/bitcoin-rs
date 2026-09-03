@@ -2,7 +2,6 @@
 
 use std::io::{Cursor, Seek};
 
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{
     BlockChanges, SnapshotCoin, SnapshotCoinObserver, UtxoAdd, UtxoChangeEvents,
@@ -23,8 +22,8 @@ fn txid(seed: u64) -> Hash256 {
 
 fn txout(seed: u64) -> TxOut {
     TxOut {
-        value: Amount::from_sat(2_000 + seed),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51, u8::try_from(seed % 256).unwrap_or(0)]),
+        value: 2_000 + seed,
+        script_pubkey: vec![0x51, u8::try_from(seed % 256).unwrap_or(0)],
     }
 }
 
@@ -33,14 +32,14 @@ fn snapshot_roundtrip_preserves_vout_and_metadata_boundaries()
 -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let live_txid = txid(42_000);
-    let low = OutPoint::new(live_txid, 63);
-    let high = OutPoint::new(live_txid, 64);
-    let max = OutPoint::new(live_txid, u32::MAX);
+    let low = OutPoint::new(live_txid.into(), 63);
+    let high = OutPoint::new(live_txid.into(), 64);
+    let max = OutPoint::new(live_txid.into(), u32::MAX);
     let low_txout = txout(42_001);
     let high_txout = txout(42_002);
     let max_txout = TxOut {
-        value: Amount::from_sat(42_003),
-        script_pubkey: ScriptBuf::new(),
+        value: 42_003,
+        script_pubkey: Vec::new(),
     };
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(low, low_txout.clone(), false, 400));
@@ -147,24 +146,24 @@ fn observed_snapshot_traversal_matches_the_current_reader() -> Result<(), Box<dy
     let second_txid = txid(200_001);
     let first = txout(200_010);
     let second = TxOut {
-        value: Amount::from_sat(200_011),
-        script_pubkey: ScriptBuf::new(),
+        value: 200_011,
+        script_pubkey: Vec::new(),
     };
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(
-        OutPoint::new(first_txid, 0),
+        OutPoint::new(first_txid.into(), 0),
         first.clone(),
         false,
         2000,
     ));
     changes.add(UtxoAdd::new(
-        OutPoint::new(first_txid, 9),
+        OutPoint::new(first_txid.into(), 9),
         second.clone(),
         true,
         2001,
     ));
     changes.add(UtxoAdd::new(
-        OutPoint::new(second_txid, 2),
+        OutPoint::new(second_txid.into(), 2),
         txout(200_012),
         false,
         2002,
@@ -214,7 +213,7 @@ fn snapshot_trailer_round_trips_through_listener() -> Result<(), Box<dyn std::er
     let mut set = UtxoSet::new();
     set.set_listener(Box::new(StaticTrailer { trailer }));
 
-    let op = OutPoint::new(txid(130_000), 0);
+    let op = OutPoint::new(txid(130_000).into(), 0);
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(op, txout(130_001), false, 900));
     set.commit_block(&changes, &txid(130_099))?;
@@ -278,7 +277,7 @@ fn snapshot_read_rejects_unsupported_version() {
 #[test]
 fn snapshot_read_rejects_duplicate_vouts_in_a_v4_record() {
     let record_txid = txid(160_010);
-    let key = UtxoKey::from_txid(&record_txid);
+    let key = UtxoKey::from_txid(&record_txid.into());
     let mut bytes = v4_header(txid(160_011), 1601, 1);
     bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 4));
     for vout in [9, 1, 9, 1] {
@@ -298,7 +297,7 @@ fn snapshot_read_rejects_duplicate_vouts_in_a_v4_record() {
 #[test]
 fn snapshot_read_rejects_a_record_count_mismatch() {
     let record_txid = txid(170_000);
-    let key = UtxoKey::from_txid(&record_txid);
+    let key = UtxoKey::from_txid(&record_txid.into());
     let mut bytes = v4_header(txid(170_001), 1700, 1);
     bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 0));
     bytes.extend_from_slice(&[0_u8; 384]);
@@ -337,7 +336,7 @@ fn strict_v4_observer_is_dropped_on_error() {
     }
 
     let record_txid = txid(180_000);
-    let key = UtxoKey::from_txid(&record_txid);
+    let key = UtxoKey::from_txid(&record_txid.into());
     let mut bytes = v4_header(txid(180_001), 1800, 2);
     for vout in 0..2 {
         bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 1));

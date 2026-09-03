@@ -3,10 +3,7 @@
 //! Callers supply applied-chain facts. This module never queries node state and
 //! does not choose JSON-RPC versus REST transport policy.
 
-use bitcoin::block::Header;
-use bitcoin::consensus::encode::serialize;
-use bitcoin::hex::DisplayHex as _;
-use bitcoin::{Block, BlockHash, Network};
+use bitcoin_rs_primitives::{Block, Header, Network, Tx, consensus_bytes};
 use sonic_rs::{Value, json};
 
 use crate::tx_render::transaction_json;
@@ -28,7 +25,7 @@ pub struct BlockChainContext {
     /// Transaction count reported by Core for header and block responses.
     pub n_tx: u32,
     /// Hash of the next applied-chain block, when one exists.
-    pub next_block_hash: Option<BlockHash>,
+    pub next_block_hash: Option<bitcoin_rs_primitives::BlockHash>,
 }
 
 /// Transaction array shape for `getblock` verbosity levels.
@@ -56,8 +53,8 @@ pub fn block_json(
 ) -> Value {
     let header = &block.header;
     let mut value = header_common_json(header, chain);
-    let size = block.total_size();
-    let weight = block.weight().to_wu();
+    let size = consensus_bytes(block).len();
+    let weight = block_weight(block);
     let stripped_size = stripped_size(block);
 
     let _ = value.insert("strippedsize", json!(stripped_size));
@@ -65,12 +62,12 @@ pub fn block_json(
     let _ = value.insert("weight", json!(weight));
     let tx_array = match tx_verbosity {
         BlockTxVerbosity::Ids => block
-            .txdata
+            .txs
             .iter()
-            .map(|tx| json!(tx.compute_txid().to_string()))
+            .map(|tx| json!(tx.txid().to_string()))
             .collect::<Vec<_>>(),
         BlockTxVerbosity::Full => block
-            .txdata
+            .txs
             .iter()
             .map(|tx| transaction_json(tx, network, None))
             .collect::<Vec<_>>(),
@@ -82,13 +79,13 @@ pub fn block_json(
 /// Hex-encode a header using consensus serialization.
 #[must_use]
 pub fn header_hex(header: &Header) -> String {
-    serialize(header).to_lower_hex_string()
+    hex_encode(&consensus_bytes(header))
 }
 
 /// Hex-encode a block using consensus serialization.
 #[must_use]
 pub fn block_hex(block: &Block) -> String {
-    serialize(block).to_lower_hex_string()
+    hex_encode(&consensus_bytes(block))
 }
 
 /// Compute Bitcoin Core confirmations from applied-chain membership facts.
@@ -106,16 +103,15 @@ pub fn confirmations(applied_height: u32, block_height: u32, on_active_chain: bo
 }
 
 fn header_common_json(header: &Header, chain: &BlockChainContext) -> Value {
-    let version = header.version.to_consensus();
-    let version_hex = u32::from_le_bytes(version.to_le_bytes());
-    let bits = header.bits.to_consensus();
+    let version = header.version;
+    let bits = header.bits;
     let mut value = json!({
-        "hash": header.block_hash().to_string(),
+        "hash": header.compute_hash().to_string(),
         "confirmations": chain.confirmations,
         "height": chain.height,
         "version": i64::from(version),
-        "versionHex": format!("{version_hex:08x}"),
-        "merkleroot": header.merkle_root.to_string(),
+        "versionHex": format!("{version:08x}"),
+        "merkleroot": header.merkle_root.to_string_be(),
         "time": header.time,
         "mediantime": chain.mediantime,
         "nonce": header.nonce,
@@ -131,11 +127,42 @@ fn header_common_json(header: &Header, chain: &BlockChainContext) -> Value {
     value
 }
 
-fn stripped_size(block: &Block) -> usize {
-    // weight = base_size * 3 + total_size, and strippedsize is base_size.
-    let weight = usize::try_from(block.weight().to_wu()).unwrap_or(usize::MAX);
-    weight
-        .saturating_sub(block.total_size())
-        .checked_div(3)
-        .unwrap_or(0)
+/// BIP141 block weight: `stripped size * 3 + total size`, matching Core's
+/// `GetBlockWeight` (both sizes include the 80-byte header and the tx-count
+/// compact size; `stripped` excludes only the segwit marker/flag/witness).
+pub(crate) fn block_weight(block: &Block) -> u64 {
+    let size = u64::try_from(consensus_bytes(block).len()).unwrap_or(u64::MAX);
+    u64::try_from(stripped_size(block))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(3)
+        .saturating_add(size)
+}
+
+/// Stripped size: the full serialization without segwit witness sections.
+pub(crate) fn stripped_size(block: &Block) -> usize {
+    80_usize
+        .saturating_add(compact_size_len(block.txs.len()))
+        .saturating_add(block.txs.iter().map(Tx::base_size).sum())
+}
+
+const fn compact_size_len(value: usize) -> usize {
+    if value < 0xfd {
+        1
+    } else if value <= 0xffff {
+        3
+    } else if value <= 0xffff_ffff {
+        5
+    } else {
+        9
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }

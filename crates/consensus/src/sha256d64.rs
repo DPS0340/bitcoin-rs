@@ -3,6 +3,7 @@
 //! The algorithm and lane contract follow Bitcoin Core v31.0
 //! `src/crypto/sha256_avx2.cpp`. This module keeps runtime dispatch and the
 //! target-feature boundary private. The general Merkle path remains scalar.
+#![cfg(test)]
 
 /// Proof that the current x86-64 process can execute AVX2 instructions.
 pub(crate) struct Avx2Sha256d64(());

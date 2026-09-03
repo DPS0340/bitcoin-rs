@@ -1,8 +1,8 @@
 use std::ops::ControlFlow;
 
-use bitcoin::hashes::Hash as _;
+use bitcoin_rs_primitives::{Block, OutPoint, Tx, Txid, encode, varint};
 use bitcoin_rs_storage::{
-    ColumnFamily, KvSnapshot, KvStore, PrefixScanLimit, StorageError, WriteBatch,
+    ColumnFamily, KvSnapshot, KvStore, PrefixScanLimit, StorageError, WriteBatch, WriteCondition,
 };
 use bitcoin_slices::{Visit as _, Visitor, bsl};
 use thiserror::Error;
@@ -33,6 +33,7 @@ pub enum IndexError {
     },
     /// A transaction's byte range in the block does not fit the `u32` that
     /// [`crate::types::TxPosition`] stores.
+    ///
     /// Unreachable for any consensus-valid block — a block is capped far below
     /// 4 GiB — but the arithmetic is checked rather than wrapped, and the
     /// failure is an addressing limit, not a malformed header.
@@ -49,6 +50,12 @@ pub enum IndexError {
     InvalidPrefixRowLength {
         /// Actual key length observed in storage.
         len: usize,
+    },
+    /// The `TxIndex` format version is not supported.
+    #[error("unsupported TxIndex format version {version}")]
+    UnsupportedTxIndexFormatVersion {
+        /// Format version value found in the store.
+        version: u32,
     },
     /// A serialized block header does not hash to the expected identity.
     #[error(
@@ -87,24 +94,666 @@ pub enum IndexError {
         /// Watermark found in the store.
         actual: Option<IndexWatermark>,
     },
-    /// A prepared transition cannot mix with buffered rows.
-    #[error("cannot write prepared TxIndex mutations with buffered rows")]
-    PendingBufferedRows,
+    /// A prepared transition cannot mix with legacy buffered rows.
+    #[error("cannot write prepared TxIndex mutations with buffered legacy rows")]
+    PendingLegacyRows,
+    /// `TxIndex` tables exist but the format-version key is missing.
+    #[error("TxIndex tables are present without a versioned watermark")]
+    LegacyCursorlessIndex,
     /// A crash-recovery marker for a capability rebuild was malformed.
     #[error("invalid TxIndex capability reset marker")]
     InvalidResetMarker,
+    /// A durable capability reset rejected state derived before the reset.
+    #[error("capability reset in progress; discard prepared state and re-derive")]
+    ResetInProgress,
+    /// The durable reset version exhausted `u64` and can no longer advance.
+    #[error("capability reset version exhausted")]
+    ResetVersionOverflow,
+    /// Storage returned an empty but incomplete reset scan, which no
+    /// conforming backend produces when row capacity is positive.
+    #[error("capability reset scan returned an empty incomplete result")]
+    ResetScanIncomplete,
+    /// Durable ordinary-state revision bytes were not exactly one little-endian `u64`.
+    #[error("invalid TxIndex ordinary-state revision encoding")]
+    InvalidStateRevision,
+    /// The ordinary-state revision exhausted `u64` and can no longer advance.
+    #[error("TxIndex ordinary-state revision exhausted")]
+    StateRevisionOverflow,
+    /// Another ordinary writer committed after this state was captured.
+    #[error("TxIndex state changed; discard derived state and re-derive")]
+    StaleIndexState,
 }
 
 // Reserved metadata keys in `ColumnFamily::UtxoMeta`. The 0x00 prefix is reserved for
 // TxIndex metadata; data row keys begin with ASCII letters only and can never collide.
+const FORMAT_VERSION_KEY: &[u8] = &[0x00, b'V'];
+const FORMAT_VERSION_VALUE: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 const TX_LOOKUP_WATERMARK_KEY: &[u8] = &[0x00, b'T'];
 const SCRIPT_HISTORY_WATERMARK_KEY: &[u8] = &[0x00, b'S'];
+/// Monotonic revision shared by every ordinary index mutation.
+const ORDINARY_STATE_REVISION_KEY: &[u8] = &[0x00, b'O'];
+/// Permanent versioned capability-reset state (`0x00, b'R'`). Absent only
+/// before the first reset; afterwards the key always exists, either as
+/// `Idle = [0xFF, version(u64 LE)]` (9 bytes) or as a claim
+/// `[mask, process_epoch(u64 LE), base_version(u64 LE)]` (17 bytes).
+/// The process epoch records provenance only; any process can complete the
+/// exact claim. Interrupted 1-byte (`[mask]`) and 9-byte
+/// (`[mask, process_epoch(u64 LE)]`) claims from earlier binaries are adopted
+/// with a base version of zero; every other shape is a typed error. Completion
+/// never deletes the key: it CASes the exact claim to
+/// `Idle(base_version + 1)`, which makes stale fences un-reusable (no ABA)
+/// across repeated resets.
 const RESET_CAPABILITIES_KEY: &[u8] = &[0x00, b'R'];
+/// Consumer cursor slot (`0x00, b'C'`). Opaque bytes owned by the node-side
+/// reconciliation consumer; data row keys begin with ASCII letters only and
+/// can never collide with the reserved `0x00` prefix.
+const CONSUMER_CURSOR_KEY: &[u8] = &[0x00, b'C'];
 const WATERMARK_LEN: usize = crate::types::HEIGHT_SIZE + 32;
 const RESET_SCAN_LIMIT: PrefixScanLimit = PrefixScanLimit {
     max_rows: 1_000,
     max_bytes: 256 * 1024,
 };
+const RESET_IDLE_TAG: u8 = 0xFF;
+const RESET_IDLE_LEN: usize = 1 + size_of::<u64>();
+const RESET_CLAIM_LEN: usize = 1 + 2 * size_of::<u64>();
+
+/// Decoded durable capability-reset state.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ResetState {
+    /// No reset is owed; `version` advances once per completed reset.
+    Idle { version: u64 },
+    /// A reset obligation derived on top of `base_version`. `process_epoch`
+    /// records where the claim originated; it does not grant exclusive rights.
+    Claim {
+        mask: u8,
+        process_epoch: u64,
+        base_version: u64,
+    },
+}
+
+/// Exact reset-state observation fencing one derived index write.
+///
+/// Captured before any store-dependent derivation, carried by value into the
+/// matching commit, and re-checked as a conditional write on the exact bytes:
+/// an ordinary commit only lands while the reset state is byte-identical to
+/// the observation, so a reset that completed in between (idle version
+/// advanced, or state moved Absent -> Idle) rejects the stale write instead
+/// of silently re-adopting it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IndexWriteFence {
+    state: IndexWriteFenceState,
+    revision: Option<u64>,
+    watermarks: IndexWatermarks,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexWriteFenceState {
+    /// No reset state existed; the commit requires the key to stay absent.
+    Absent,
+    /// Exact `Idle` bytes observed; the commit requires the same bytes.
+    Idle([u8; RESET_IDLE_LEN]),
+}
+
+/// Atomic disposition of the reconciliation consumer cursor inside one
+/// committed index transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsumerCursorUpdate<'a> {
+    /// Preserve the currently stored cursor.
+    Keep,
+    /// Replace the cursor with these opaque consumer bytes.
+    Set(&'a [u8]),
+    /// Delete the cursor atomically with the row mutation.
+    Clear,
+}
+
+fn encode_idle(version: u64) -> [u8; RESET_IDLE_LEN] {
+    let mut value = [0_u8; RESET_IDLE_LEN];
+    value[0] = RESET_IDLE_TAG;
+    value[1..].copy_from_slice(&version.to_le_bytes());
+    value
+}
+
+fn encode_claim(mask: u8, process_epoch: u64, base_version: u64) -> [u8; RESET_CLAIM_LEN] {
+    let mut value = [0_u8; RESET_CLAIM_LEN];
+    value[0] = mask;
+    value[1..9].copy_from_slice(&process_epoch.to_le_bytes());
+    value[9..].copy_from_slice(&base_version.to_le_bytes());
+    value
+}
+
+fn valid_reset_mask(mask: u8) -> bool {
+    mask != 0 && IndexCapabilities::from_mask(mask).is_ok()
+}
+
+/// Decodes exactly `size_of::<u64>()` bytes as little-endian; any other
+/// length is a malformed reset marker.
+fn decode_le_u64(bytes: &[u8]) -> Result<u64, IndexError> {
+    let raw: [u8; size_of::<u64>()] = bytes
+        .try_into()
+        .map_err(|_| IndexError::InvalidResetMarker)?;
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn decode_state_revision(bytes: &[u8]) -> Result<u64, IndexError> {
+    let raw: [u8; size_of::<u64>()] = bytes
+        .try_into()
+        .map_err(|_| IndexError::InvalidStateRevision)?;
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn parse_reset_state(bytes: &[u8]) -> Result<ResetState, IndexError> {
+    match bytes {
+        [mask] if valid_reset_mask(*mask) => Ok(ResetState::Claim {
+            mask: *mask,
+            process_epoch: 0,
+            base_version: 0,
+        }),
+        [RESET_IDLE_TAG, version @ ..] if version.len() == size_of::<u64>() => {
+            Ok(ResetState::Idle {
+                version: decode_le_u64(version)?,
+            })
+        }
+        [mask, process_epoch_bytes @ ..]
+            if process_epoch_bytes.len() == size_of::<u64>() && valid_reset_mask(*mask) =>
+        {
+            Ok(ResetState::Claim {
+                mask: *mask,
+                process_epoch: decode_le_u64(process_epoch_bytes)?,
+                base_version: 0,
+            })
+        }
+        [mask, process_epoch_and_base @ ..]
+            if process_epoch_and_base.len() == 2 * size_of::<u64>() && valid_reset_mask(*mask) =>
+        {
+            Ok(ResetState::Claim {
+                mask: *mask,
+                process_epoch: decode_le_u64(&process_epoch_and_base[..8])?,
+                base_version: decode_le_u64(&process_epoch_and_base[8..])?,
+            })
+        }
+        _ => Err(IndexError::InvalidResetMarker),
+    }
+}
+
+/// Captures the reset state, ordinary revision, and both watermarks from one
+/// point-in-time snapshot. Pending reset claims are cooperatively completed
+/// only after the snapshot has been released.
+fn capture_write_fence<S: KvStore>(
+    store: &S,
+    generation: u64,
+) -> Result<IndexWriteFence, IndexError> {
+    let snapshot = store.snapshot()?;
+    let observed_reset = snapshot.get(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY)?;
+    let observed_revision = snapshot.get(ColumnFamily::UtxoMeta, ORDINARY_STATE_REVISION_KEY)?;
+    let observed_tx_lookup = snapshot.get(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY)?;
+    let observed_script_history =
+        snapshot.get(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY)?;
+    drop(snapshot);
+
+    let state = match observed_reset.as_deref() {
+        None => IndexWriteFenceState::Absent,
+        Some(bytes) => match parse_reset_state(bytes) {
+            Ok(ResetState::Idle { .. }) => IndexWriteFenceState::Idle(
+                bytes
+                    .try_into()
+                    .map_err(|_| IndexError::InvalidResetMarker)?,
+            ),
+            Ok(ResetState::Claim { process_epoch, .. }) => {
+                debug!(
+                    process_epoch,
+                    generation, "cooperatively completing pending capability reset claim"
+                );
+                resume_capability_reset(store, generation, 0)?;
+                return Err(IndexError::ResetInProgress);
+            }
+            Err(error) => {
+                ensure_raw_reset_live(store, generation, Some(bytes))?;
+                return Err(error);
+            }
+        },
+    };
+
+    let decoded: Result<(Option<u64>, IndexWatermarks), IndexError> = (|| {
+        let revision = observed_revision
+            .as_deref()
+            .map(decode_state_revision)
+            .transpose()?;
+        let watermarks = IndexWatermarks {
+            tx_lookup: observed_tx_lookup
+                .as_deref()
+                .map(IndexWatermark::from_bytes)
+                .transpose()?,
+            script_history: observed_script_history
+                .as_deref()
+                .map(IndexWatermark::from_bytes)
+                .transpose()?,
+        };
+        Ok((revision, watermarks))
+    })();
+    ensure_reset_live(store, generation, &state)?;
+    let (revision, watermarks) = decoded?;
+
+    Ok(IndexWriteFence {
+        state,
+        revision,
+        watermarks,
+    })
+}
+
+fn reset_condition(state: &IndexWriteFenceState) -> WriteCondition<'_> {
+    match state {
+        IndexWriteFenceState::Absent => WriteCondition::Absent {
+            cf: ColumnFamily::UtxoMeta,
+            key: RESET_CAPABILITIES_KEY,
+        },
+        IndexWriteFenceState::Idle(expected) => WriteCondition::Equals {
+            cf: ColumnFamily::UtxoMeta,
+            key: RESET_CAPABILITIES_KEY,
+            expected,
+        },
+    }
+}
+
+fn ensure_reset_live<S: KvStore>(
+    store: &S,
+    generation: u64,
+    state: &IndexWriteFenceState,
+) -> Result<(), IndexError> {
+    let current = store.get(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY)?;
+    let live = match (state, current.as_deref()) {
+        (IndexWriteFenceState::Absent, None) => true,
+        (IndexWriteFenceState::Idle(expected), Some(bytes)) => bytes == expected.as_slice(),
+        _ => false,
+    };
+    if live {
+        return Ok(());
+    }
+    resume_capability_reset(store, generation, 0)?;
+    Err(IndexError::ResetInProgress)
+}
+
+fn ensure_raw_reset_live<S: KvStore>(
+    store: &S,
+    generation: u64,
+    observed: Option<&[u8]>,
+) -> Result<(), IndexError> {
+    if store
+        .get(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY)?
+        .as_deref()
+        == observed
+    {
+        return Ok(());
+    }
+    resume_capability_reset(store, generation, 0)?;
+    Err(IndexError::ResetInProgress)
+}
+
+#[derive(Clone, Copy)]
+struct ExactResetClaim {
+    bytes: [u8; RESET_CLAIM_LEN],
+    len: usize,
+}
+
+impl ExactResetClaim {
+    fn from_observed(observed: &[u8]) -> Self {
+        let mut bytes = [0_u8; RESET_CLAIM_LEN];
+        bytes[..observed.len()].copy_from_slice(observed);
+        Self {
+            bytes,
+            len: observed.len(),
+        }
+    }
+
+    fn full(bytes: [u8; RESET_CLAIM_LEN]) -> Self {
+        Self {
+            bytes,
+            len: RESET_CLAIM_LEN,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn with_mask(mut self, mask: u8) -> Self {
+        self.bytes[0] = mask;
+        self
+    }
+
+    fn condition(&self) -> WriteCondition<'_> {
+        WriteCondition::Equals {
+            cf: ColumnFamily::UtxoMeta,
+            key: RESET_CAPABILITIES_KEY,
+            expected: self.as_slice(),
+        }
+    }
+}
+
+/// A cooperative reset obligation. The process epoch is provenance only; any
+/// process can complete the exact raw claim. Same-mask adoption preserves its
+/// 1/9/17-byte encoding.
+struct ResetWork {
+    mask: u8,
+    claim: ExactResetClaim,
+    revision: Option<u64>,
+    next_reset: [u8; RESET_IDLE_LEN],
+    next_revision: [u8; size_of::<u64>()],
+}
+
+fn prepare_reset_work(
+    mask: u8,
+    claim: ExactResetClaim,
+    base_version: u64,
+    revision: Option<u64>,
+) -> Result<ResetWork, IndexError> {
+    let next_reset_version = base_version
+        .checked_add(1)
+        .ok_or(IndexError::ResetVersionOverflow)?;
+    let next_revision = revision
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(IndexError::StateRevisionOverflow)?;
+    Ok(ResetWork {
+        mask,
+        claim,
+        revision,
+        next_reset: encode_idle(next_reset_version),
+        next_revision: next_revision.to_le_bytes(),
+    })
+}
+
+fn revision_condition(
+    revision: Option<u64>,
+    encoded: &[u8; size_of::<u64>()],
+) -> WriteCondition<'_> {
+    match revision {
+        Some(_) => WriteCondition::Equals {
+            cf: ColumnFamily::UtxoMeta,
+            key: ORDINARY_STATE_REVISION_KEY,
+            expected: encoded,
+        },
+        None => WriteCondition::Absent {
+            cf: ColumnFamily::UtxoMeta,
+            key: ORDINARY_STATE_REVISION_KEY,
+        },
+    }
+}
+
+fn watermark_condition<'a>(
+    encoded: Option<&'a [u8; WATERMARK_LEN]>,
+    key: &'static [u8],
+) -> WriteCondition<'a> {
+    match encoded {
+        Some(expected) => WriteCondition::Equals {
+            cf: ColumnFamily::UtxoMeta,
+            key,
+            expected,
+        },
+        None => WriteCondition::Absent {
+            cf: ColumnFamily::UtxoMeta,
+            key,
+        },
+    }
+}
+
+/// Applies one ordinary batch under the coherent fence. Four exact conditions
+/// fence the batch: reset state, ordinary revision, and both watermark rows.
+/// The commit also inserts the next revision. A lost race with an unchanged
+/// reset returns [`IndexError::StaleIndexState`]. A moved reset cooperatively
+/// completes the pending exact claim and returns [`IndexError::ResetInProgress`].
+fn commit_ordinary<S: KvStore>(
+    store: &S,
+    generation: u64,
+    fence: &IndexWriteFence,
+    mut batch: S::WriteBatch,
+) -> Result<(), IndexError> {
+    let next_revision = fence
+        .revision
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(IndexError::StateRevisionOverflow)?;
+    batch.put(
+        ColumnFamily::UtxoMeta,
+        ORDINARY_STATE_REVISION_KEY,
+        &next_revision.to_le_bytes(),
+    );
+    let revision_bytes = fence.revision.unwrap_or(0).to_le_bytes();
+    let tx_lookup = fence
+        .watermarks
+        .tx_lookup
+        .map(|watermark| watermark.to_bytes());
+    let script_history = fence
+        .watermarks
+        .script_history
+        .map(|watermark| watermark.to_bytes());
+    let conditions = [
+        reset_condition(&fence.state),
+        revision_condition(fence.revision, &revision_bytes),
+        watermark_condition(tx_lookup.as_ref(), TX_LOOKUP_WATERMARK_KEY),
+        watermark_condition(script_history.as_ref(), SCRIPT_HISTORY_WATERMARK_KEY),
+    ];
+    if store.write_durable_if(&conditions, batch)? {
+        return Ok(());
+    }
+    ensure_reset_live(store, generation, &fence.state)?;
+    Err(IndexError::StaleIndexState)
+}
+
+/// Rechecks the exact reset state and ordinary revision captured by `fence`.
+/// A moved reset adopts or completes the pending claim first; an unchanged
+/// reset with a moved revision reports the derived state as stale.
+fn ensure_fence_live<S: KvStore>(
+    store: &S,
+    generation: u64,
+    fence: &IndexWriteFence,
+) -> Result<(), IndexError> {
+    let snapshot = store.snapshot()?;
+    let current_reset = snapshot.get(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY)?;
+    let current_revision = snapshot.get(ColumnFamily::UtxoMeta, ORDINARY_STATE_REVISION_KEY)?;
+    drop(snapshot);
+
+    let reset_live = match (&fence.state, current_reset.as_deref()) {
+        (IndexWriteFenceState::Absent, None) => true,
+        (IndexWriteFenceState::Idle(expected), Some(bytes)) => bytes == expected.as_slice(),
+        _ => false,
+    };
+    if !reset_live {
+        resume_capability_reset(store, generation, 0)?;
+        return Err(IndexError::ResetInProgress);
+    }
+    let revision_bytes = fence.revision.unwrap_or(0).to_le_bytes();
+    let expected_revision: Option<&[u8]> = fence.revision.map(|_| revision_bytes.as_slice());
+    if current_revision.as_deref() == expected_revision {
+        return Ok(());
+    }
+    Err(IndexError::StaleIndexState)
+}
+
+/// Publishes or adopts a reset claim. Same-mask adoption writes nothing; mask
+/// growth changes only byte zero of the exact observed claim.
+fn acquire_capability_reset<S: KvStore>(
+    store: &S,
+    requested_mask: u8,
+    generation: u64,
+) -> Result<Option<ResetWork>, IndexError> {
+    loop {
+        let snapshot = store.snapshot()?;
+        let observed = snapshot.get(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY)?;
+        let observed_revision =
+            snapshot.get(ColumnFamily::UtxoMeta, ORDINARY_STATE_REVISION_KEY)?;
+        drop(snapshot);
+
+        let revision = match observed_revision
+            .as_deref()
+            .map(decode_state_revision)
+            .transpose()
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                ensure_raw_reset_live(store, generation, observed.as_deref())?;
+                return Err(error);
+            }
+        };
+        let revision_bytes = revision.unwrap_or(0).to_le_bytes();
+
+        let (current_mask, base_version, observed_claim) = match observed.as_deref() {
+            Some(bytes) => match parse_reset_state(bytes) {
+                Ok(ResetState::Idle { .. }) if requested_mask == 0 => return Ok(None),
+                Ok(ResetState::Idle { version }) => (0, version, None),
+                Ok(ResetState::Claim {
+                    mask, base_version, ..
+                }) => (
+                    mask,
+                    base_version,
+                    Some(ExactResetClaim::from_observed(bytes)),
+                ),
+                Err(error) => {
+                    ensure_raw_reset_live(store, generation, Some(bytes))?;
+                    return Err(error);
+                }
+            },
+            None if requested_mask == 0 => return Ok(None),
+            None => (0, 0, None),
+        };
+        let mask = current_mask | requested_mask;
+        if !valid_reset_mask(mask) {
+            return Err(IndexError::InvalidResetMarker);
+        }
+
+        if let Some(claim) = observed_claim {
+            if mask == current_mask {
+                return prepare_reset_work(mask, claim, base_version, revision).map(Some);
+            }
+        }
+
+        let claim = match observed_claim {
+            Some(claim) => claim.with_mask(mask),
+            None => ExactResetClaim::full(encode_claim(mask, generation, base_version)),
+        };
+        let work = prepare_reset_work(mask, claim, base_version, revision)?;
+        let observed_reset_condition = match observed.as_deref() {
+            Some(expected) => WriteCondition::Equals {
+                cf: ColumnFamily::UtxoMeta,
+                key: RESET_CAPABILITIES_KEY,
+                expected,
+            },
+            None => WriteCondition::Absent {
+                cf: ColumnFamily::UtxoMeta,
+                key: RESET_CAPABILITIES_KEY,
+            },
+        };
+        let conditions = [
+            observed_reset_condition,
+            revision_condition(revision, &revision_bytes),
+        ];
+        let mut batch = store.new_batch();
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            RESET_CAPABILITIES_KEY,
+            work.claim.as_slice(),
+        );
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            FORMAT_VERSION_KEY,
+            &FORMAT_VERSION_VALUE,
+        );
+        let capabilities = IndexCapabilities::from_mask(mask)?;
+        if capabilities.tx_lookup {
+            batch.delete(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY);
+        }
+        if capabilities.script_history {
+            batch.delete(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY);
+        }
+        batch.delete(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY);
+        if store.write_durable_if(&conditions, batch)? {
+            return Ok(Some(work));
+        }
+    }
+}
+
+/// Drives an exact reset claim to completion in bounded, revision-fenced
+/// batches, or cooperatively adopts any pending claim when the request is empty.
+fn resume_capability_reset<S: KvStore>(
+    store: &S,
+    generation: u64,
+    requested_mask: u8,
+) -> Result<(), IndexError> {
+    let mut requested_mask = requested_mask;
+    loop {
+        let Some(work) = acquire_capability_reset(store, requested_mask, generation)? else {
+            return Ok(());
+        };
+        requested_mask = 0;
+
+        let capabilities = IndexCapabilities::from_mask(work.mask)?;
+        let mut column_families = Vec::with_capacity(4);
+        if capabilities.tx_lookup {
+            column_families.push(ColumnFamily::TxConfirmed);
+        }
+        if capabilities.script_history {
+            column_families.push(ColumnFamily::Funding);
+            column_families.push(ColumnFamily::Spending);
+        }
+        let unselected_cursor_remains = (!capabilities.tx_lookup
+            && store
+                .get(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY)?
+                .is_some())
+            || (!capabilities.script_history
+                && store
+                    .get(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY)?
+                    .is_some());
+        if !unselected_cursor_remains {
+            column_families.push(ColumnFamily::BlockHeaders);
+        }
+
+        let revision_bytes = work.revision.unwrap_or(0).to_le_bytes();
+        let conditions = [
+            work.claim.condition(),
+            revision_condition(work.revision, &revision_bytes),
+        ];
+        let mut claim_changed = false;
+        'families: for cf in column_families {
+            loop {
+                let scan = store.scan_prefix_bounded(cf, &[], RESET_SCAN_LIMIT)?;
+                if scan.rows.is_empty() {
+                    if scan.complete {
+                        break;
+                    }
+                    return Err(IndexError::ResetScanIncomplete);
+                }
+                let mut batch = store.new_batch();
+                for (key, _) in scan.rows {
+                    batch.delete(cf, &key);
+                }
+                if !store.write_durable_if(&conditions, batch)? {
+                    claim_changed = true;
+                    break 'families;
+                }
+                if scan.complete {
+                    break;
+                }
+            }
+        }
+        if claim_changed {
+            continue;
+        }
+
+        let mut completion = store.new_batch();
+        completion.put(
+            ColumnFamily::UtxoMeta,
+            RESET_CAPABILITIES_KEY,
+            &work.next_reset,
+        );
+        completion.put(
+            ColumnFamily::UtxoMeta,
+            ORDINARY_STATE_REVISION_KEY,
+            &work.next_revision,
+        );
+        if store.write_durable_if(&conditions, completion)? {
+            return Ok(());
+        }
+    }
+}
 
 const fn watermark_key(capability: IndexCapability) -> &'static [u8] {
     match capability {
@@ -126,14 +775,14 @@ pub struct IndexWatermark {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ScriptHistoryEntry {
     /// Transaction identifier.
-    pub txid: bitcoin::Txid,
+    pub txid: Txid,
     /// Confirming block height.
     pub height: u32,
 }
 
 impl ScriptHistoryEntry {
     /// Creates a confirmed script-history entry.
-    pub const fn confirmed(txid: bitcoin::Txid, height: u32) -> Self {
+    pub const fn confirmed(txid: Txid, height: u32) -> Self {
         Self { txid, height }
     }
 }
@@ -388,7 +1037,8 @@ impl PreparedBatch {
         self.blocks
     }
 
-    const fn capabilities(&self) -> Option<IndexCapabilities> {
+    /// Returns the row families represented by the admitted blocks.
+    pub const fn capabilities(&self) -> Option<IndexCapabilities> {
         self.capabilities
     }
 }
@@ -412,6 +1062,11 @@ pub struct Indexer<S: KvStore> {
     last_counts: IndexRowCounts,
     pending_rows: PendingRows,
     batch_depth: u32,
+    /// Reset-state observation covering every buffered row, captured before
+    /// the first store read that produced them and held until they flush.
+    fence: Option<IndexWriteFence>,
+    /// Process generation fencing this indexer's reset adoption work.
+    generation: u64,
 }
 
 impl<S: KvStore> Indexer<S> {
@@ -422,6 +1077,8 @@ impl<S: KvStore> Indexer<S> {
             last_counts: IndexRowCounts::default(),
             pending_rows: PendingRows::default(),
             batch_depth: 0,
+            fence: None,
+            generation: 0,
         }
     }
 
@@ -465,13 +1122,13 @@ impl<S: KvStore> Indexer<S> {
     ///
     /// Returns every `HashPrefixRow` whose 8-byte prefix matches the scripthash's
     /// scan prefix, decoded from `ColumnFamily::Funding`. Rows are returned in
-    /// the iteration order of the underlying store: byte-lexicographic over
-    /// `prefix || height`, where the height is **little-endian** -- so within
-    /// one prefix this is NOT numeric height order (height 256, `[0,1,0,0]`,
-    /// sorts before height 1, `[1,0,0,0]`). Callers that need chronological
-    /// order must sort; every production consumer does, and bounded scans that
-    /// truncate fail closed instead of serving a byte-order prefix of the rows.
-    /// Pinned by `funding_row_iteration_order_is_not_numeric_height_order`.
+    /// the iteration order of the underlying store (lexicographic by key bytes).
+    ///
+    /// **Height ordering caveat:** the 4-byte height suffix is little-endian,
+    /// so lexicographic byte order does **not** match numeric height order
+    /// within one prefix. For example, height 256 (`00 01 00 00`) sorts before
+    /// height 1 (`01 00 00 00`). Callers that need chronological order must
+    /// sort the returned rows by numeric height after exact-resolving them.
     ///
     /// The 8-byte prefix is lossy: callers MUST resolve heights back to full
     /// transactions via block storage to confirm scripthash identity.
@@ -491,10 +1148,12 @@ impl<S: KvStore> Indexer<S> {
     /// `ScriptHistoryEntry::confirmed` for every transaction in that block that has
     /// at least one output matching `scripthash` exactly.
     ///
-    /// Entries are returned in storage iteration order, which is not numeric
-    /// height order (heights are little-endian in the key -- see
-    /// [`Self::iter_funding_rows`]). Callers that present history
-    /// chronologically must sort above this layer, and do.
+    /// Entries are returned sorted by numeric height (ascending). The underlying
+    /// store iterates rows in lexicographic key-byte order, and because the
+    /// 4-byte height suffix is little-endian, that order does **not** match
+    /// numeric height order within one prefix (height 256 sorts before height
+    /// 1). This method sorts the final entry list by numeric height so callers
+    /// receive chronological order regardless of the on-disk key encoding.
     /// Heights not resolvable by `source` are skipped.
     ///
     /// The lossy 8-byte prefix is exact-resolved here: only transactions whose
@@ -513,6 +1172,52 @@ impl<S: KvStore> Indexer<S> {
                 None => scan_height_history(scripthash, height, source, &mut entries),
             }
         }
+        entries.sort_by_key(|entry| entry.height);
+        Ok(entries)
+    }
+
+    /// Naive reference implementation of [`Self::resolve_script_history`].
+    ///
+    /// Loads and fully decodes the block once per funding row, then hashes every
+    /// output script in it. Retained as the correctness oracle for the resolver
+    /// equivalence tests, as the `before` arm of the `resolve_script_history`
+    /// benchmark group, and as the live fallback for rows written before row
+    /// values carried transaction positions.
+    ///
+    /// Like [`Self::resolve_script_history`], this sorts the final entry list by
+    /// numeric height so the reference and the optimized resolver agree on order.
+    pub fn resolve_script_history_scan<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+    ) -> Result<Vec<crate::ScriptHistoryEntry>, IndexError> {
+        let rows = self.iter_funding_rows(scripthash)?;
+        let mut entries = Vec::new();
+        let mut last_height: Option<u32> = None;
+        let mut cached_block: Option<Block> = None;
+        for row in &rows {
+            let height = row.height();
+            if last_height != Some(height) {
+                cached_block = source.block_at_height(height);
+                last_height = Some(height);
+            }
+            let Some(block) = cached_block.as_ref() else {
+                continue;
+            };
+            for tx in &block.txs {
+                let mut matched = false;
+                for output in &tx.outputs {
+                    if crate::ScriptHash::from_script_bytes(&output.script_pubkey) == scripthash {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    entries.push(crate::ScriptHistoryEntry::confirmed(tx.txid(), height));
+                }
+            }
+        }
+        entries.sort_by_key(|entry| entry.height);
         Ok(entries)
     }
 
@@ -532,7 +1237,7 @@ impl<S: KvStore> Indexer<S> {
     /// Iterates confirmed transaction-id rows for `txid` with their row values.
     fn iter_txid_rows_with_values(
         &self,
-        txid: &bitcoin::Txid,
+        txid: &Txid,
     ) -> Result<Vec<(crate::HashPrefixRow, Vec<u8>)>, IndexError> {
         let prefix = TxidRow::scan_prefix(txid);
         let iter = self.store.iter_prefix(ColumnFamily::TxConfirmed, &prefix)?;
@@ -551,7 +1256,7 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
-    ) -> Result<Vec<(bitcoin::Txid, u32, u64)>, IndexError> {
+    ) -> Result<Vec<(Txid, u32, u64)>, IndexError> {
         Ok(self
             .resolve_unspent_outputs_with_height(scripthash, source)?
             .into_iter()
@@ -559,16 +1264,39 @@ impl<S: KvStore> Indexer<S> {
             .collect())
     }
 
+    /// Naive reference implementation of [`Self::resolve_unspent_outputs`].
+    ///
+    /// Retained as the correctness oracle for the resolver equivalence tests and
+    /// as the `before` arm of the `resolve_unspent` benchmark group. Deliberately
+    /// carries no optimization: an oracle that shares an optimization with the
+    /// implementation it checks cannot catch a fault in that optimization.
+    ///
+    /// Not a fallback path — [`Self::resolve_unspent_outputs`] is always correct
+    /// and always faster. Call that one.
+    pub fn resolve_unspent_outputs_scan<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+    ) -> Result<Vec<(Txid, u32, u64)>, IndexError> {
+        Ok(self
+            .resolve_unspent_outputs_with_height_scan(scripthash, source)?
+            .into_iter()
+            .map(|(txid, vout, value, _height)| (txid, vout, value))
+            .collect())
+    }
+
     /// Same as `resolve_unspent_outputs` but each tuple carries the funding height.
     ///
-    /// Returns `(txid, vout, value_sats, funding_height)` quadruples. Use this
-    /// when callers need the confirmation height (e.g. `ScriptIndex` `listunspent`
-    /// emits the height for each unspent output).
+    /// Returns `(txid, vout, value_sats, funding_height)` quadruples sorted by
+    /// funding height (ascending). Use this when callers need the confirmation
+    /// height (e.g. `ScriptIndex` `listunspent` emits the height for each
+    /// unspent output). The sort mirrors [`Self::resolve_script_history`]:
+    /// store iteration order is LE byte order, not numeric height order.
     pub fn resolve_unspent_outputs_with_height<B: BlockSource>(
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
-    ) -> Result<Vec<(bitcoin::Txid, u32, u64, u32)>, IndexError> {
+    ) -> Result<Vec<(Txid, u32, u64, u32)>, IndexError> {
         let rows = self.iter_funding_rows_with_values(scripthash)?;
         let mut outputs = Vec::new();
         for (row, value) in &rows {
@@ -578,6 +1306,53 @@ impl<S: KvStore> Indexer<S> {
                 None => scan_height_unspent_outputs(scripthash, height, source, &mut outputs),
             }
         }
+        outputs.sort_by_key(|&(_, _, _, height)| height);
+        Ok(outputs)
+    }
+
+    /// Naive reference implementation of [`Self::resolve_unspent_outputs_with_height`].
+    ///
+    /// Computes every transaction's txid before testing any output script, which
+    /// is the shape this resolver had before the lazy-txid change. Retained as
+    /// the correctness oracle for the resolver equivalence tests and as the
+    /// `before` arm of the `resolve_unspent` benchmark group.
+    ///
+    /// Not a fallback path — [`Self::resolve_unspent_outputs_with_height`] is
+    /// always correct and always faster. Call that one. Like the fast path,
+    /// this sorts by funding height so the reference and the optimized resolver
+    /// agree on order.
+    pub fn resolve_unspent_outputs_with_height_scan<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+    ) -> Result<Vec<(Txid, u32, u64, u32)>, IndexError> {
+        let rows = self.iter_funding_rows(scripthash)?;
+        let mut outputs = Vec::new();
+        let mut last_height: Option<u32> = None;
+        let mut cached_block: Option<Block> = None;
+        for row in &rows {
+            let height = row.height();
+            if last_height != Some(height) {
+                cached_block = source.block_at_height(height);
+                last_height = Some(height);
+            }
+            let Some(block) = cached_block.as_ref() else {
+                continue;
+            };
+            for tx in &block.txs {
+                let txid = tx.txid();
+                for (vout_idx, output) in tx.outputs.iter().enumerate() {
+                    if crate::ScriptHash::from_script_bytes(&output.script_pubkey) != scripthash {
+                        continue;
+                    }
+                    let Ok(vout) = u32::try_from(vout_idx) else {
+                        continue;
+                    };
+                    outputs.push((txid, vout, output.value, height));
+                }
+            }
+        }
+        outputs.sort_by_key(|&(_, _, _, height)| height);
         Ok(outputs)
     }
 
@@ -586,9 +1361,15 @@ impl<S: KvStore> Indexer<S> {
     /// Returns every `HashPrefixRow` whose 8-byte prefix matches the outpoint's
     /// spending scan prefix, decoded from `ColumnFamily::Spending`. The 8-byte
     /// prefix is lossy as above.
+    ///
+    /// **Height ordering caveat:** same as [`Self::iter_funding_rows`]: the
+    /// 4-byte height suffix is little-endian, so lexicographic byte order does
+    /// **not** match numeric height order within one prefix. Callers needing
+    /// chronological order must sort by numeric height after exact-resolving
+    /// rows.
     pub fn iter_spending_rows(
         &self,
-        outpoint: &bitcoin::OutPoint,
+        outpoint: &OutPoint,
     ) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
         let prefix = SpendingPrefixRow::scan_prefix(outpoint);
         let iter = self.store.iter_prefix(ColumnFamily::Spending, &prefix)?;
@@ -600,10 +1381,13 @@ impl<S: KvStore> Indexer<S> {
     /// Returns every `HashPrefixRow` whose 8-byte prefix matches the txid's scan
     /// prefix, decoded from `ColumnFamily::TxConfirmed`. The 8-byte prefix is
     /// lossy; multiple txids can share a prefix.
-    pub fn iter_txid_rows(
-        &self,
-        txid: &bitcoin::Txid,
-    ) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
+    ///
+    /// **Height ordering caveat:** same as [`Self::iter_funding_rows`]: the
+    /// 4-byte height suffix is little-endian, so lexicographic byte order does
+    /// **not** match numeric height order within one prefix. Callers needing
+    /// chronological order must sort by numeric height after exact-resolving
+    /// rows.
+    pub fn iter_txid_rows(&self, txid: &Txid) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
         let prefix = TxidRow::scan_prefix(txid);
         let iter = self.store.iter_prefix(ColumnFamily::TxConfirmed, &prefix)?;
         collect_prefix_rows(iter)
@@ -620,9 +1404,9 @@ impl<S: KvStore> Indexer<S> {
     /// the full 32-byte txid before returning.
     pub fn resolve_transaction<B: BlockSource + ?Sized>(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &B,
-    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
+    ) -> Result<Option<Tx>, IndexError> {
         let rows = self.iter_txid_rows_with_values(&txid)?;
         for (row, value) in &rows {
             let height = row.height();
@@ -630,7 +1414,7 @@ impl<S: KvStore> Indexer<S> {
                 let found = positions
                     .iter()
                     .filter_map(|position| transaction_at(height, *position, source))
-                    .find(|tx| tx.compute_txid() == txid);
+                    .find(|tx| tx.txid() == txid);
                 if let Some(tx) = found {
                     return Ok(Some(tx));
                 }
@@ -640,10 +1424,41 @@ impl<S: KvStore> Indexer<S> {
             // both are answered correctly by scanning; "not found" is never
             // reported on the strength of positions alone.
             if let Some(block) = source.block_at_height(height) {
-                for tx in &block.txdata {
-                    if tx.compute_txid() == txid {
+                for tx in &block.txs {
+                    if tx.txid() == txid {
                         return Ok(Some(tx.clone()));
                     }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Naive reference implementation of [`Self::resolve_transaction`].
+    ///
+    /// Loads and fully decodes the block for each candidate row, then computes
+    /// every transaction's txid until one matches. Retained as the correctness
+    /// oracle and the `before` arm of the `resolve_transaction` benchmark group.
+    pub fn resolve_transaction_scan<B: BlockSource + ?Sized>(
+        &self,
+        txid: Txid,
+        source: &B,
+    ) -> Result<Option<Tx>, IndexError> {
+        let rows = self.iter_txid_rows(&txid)?;
+        let mut last_height: Option<u32> = None;
+        let mut cached_block: Option<Block> = None;
+        for row in &rows {
+            let height = row.height();
+            if last_height != Some(height) {
+                cached_block = source.block_at_height(height);
+                last_height = Some(height);
+            }
+            let Some(block) = cached_block.as_ref() else {
+                continue;
+            };
+            for tx in &block.txs {
+                if tx.txid() == txid {
+                    return Ok(Some(tx.clone()));
                 }
             }
         }
@@ -659,7 +1474,7 @@ impl<S: KvStore> Indexer<S> {
     /// in transaction-broadcast and prevout-value lookups.
     pub fn resolve_outpoint_value<B: BlockSource + ?Sized>(
         &self,
-        outpoint: bitcoin::OutPoint,
+        outpoint: OutPoint,
         source: &B,
     ) -> Result<Option<u64>, IndexError> {
         let Some(tx) = self.resolve_transaction(outpoint.txid, source)? else {
@@ -668,7 +1483,7 @@ impl<S: KvStore> Indexer<S> {
         let Ok(vout_idx) = usize::try_from(outpoint.vout) else {
             return Ok(None);
         };
-        Ok(tx.output.get(vout_idx).map(|output| output.value.to_sat()))
+        Ok(tx.outputs.get(vout_idx).map(|output| output.value))
     }
 
     /// Resolves a transaction by txid and returns it alongside the block
@@ -683,12 +1498,12 @@ impl<S: KvStore> Indexer<S> {
     /// fetch cost per candidate height.
     pub fn resolve_tx_with_height<B: BlockSource + ?Sized>(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &B,
-    ) -> Result<Option<(bitcoin::Transaction, u32)>, IndexError> {
+    ) -> Result<Option<(Tx, u32)>, IndexError> {
         let rows = self.iter_txid_rows(&txid)?;
         let mut last_height: Option<u32> = None;
-        let mut cached_block: Option<bitcoin::Block> = None;
+        let mut cached_block: Option<Block> = None;
         for row in &rows {
             let height = row.height();
             if last_height != Some(height) {
@@ -698,13 +1513,81 @@ impl<S: KvStore> Indexer<S> {
             let Some(block) = cached_block.as_ref() else {
                 continue;
             };
-            for tx in &block.txdata {
-                if tx.compute_txid() == txid {
+            for tx in &block.txs {
+                if tx.txid() == txid {
                     return Ok(Some((tx.clone(), height)));
                 }
             }
         }
         Ok(None)
+    }
+
+    /// Reports whether this index's rows carry transaction positions, adopting
+    /// the current format when the index is empty.
+    ///
+    /// Reading is always correct either way — a row without positions takes the
+    /// scan fallback — so this exists to tell an operator which path their node
+    /// is on, not to gate correctness. The difference is three orders of
+    /// magnitude on history resolution, which is worth a startup line.
+    ///
+    /// An index with rows but no version marker predates the format and is
+    /// reported as [`IndexFormat::Legacy`]. The marker is written only for an
+    /// empty index, because that is the only case where every row that will ever
+    /// exist is going to be written with positions. Writing it for a populated
+    /// legacy index would claim positions that are not there.
+    pub fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
+        match self.read_format_version()? {
+            Some(FormatMarker::Version(found)) => {
+                return Ok(if found == INDEX_FORMAT_VERSION {
+                    IndexFormat::Current
+                } else {
+                    IndexFormat::Legacy { found: Some(found) }
+                });
+            }
+            Some(FormatMarker::Unreadable { len }) => {
+                return Ok(IndexFormat::UnreadableMarker { len });
+            }
+            None => {}
+        }
+        if self.has_any_header()? {
+            return Ok(IndexFormat::Legacy { found: None });
+        }
+        let mut batch = self.store.new_batch();
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            INDEX_FORMAT_VERSION_KEY,
+            &INDEX_FORMAT_VERSION.to_le_bytes(),
+        );
+        self.store.write(batch)?;
+        Ok(IndexFormat::Current)
+    }
+
+    fn read_format_version(&self) -> Result<Option<FormatMarker>, IndexError> {
+        let Some(bytes) = self
+            .store
+            .get(ColumnFamily::UtxoMeta, INDEX_FORMAT_VERSION_KEY)?
+        else {
+            return Ok(None);
+        };
+        let Ok(encoded) = <[u8; 4]>::try_from(bytes.as_slice()) else {
+            // Reported as its own outcome rather than folded into version 0: an
+            // operator told "your index is at version 0" deletes and re-syncs,
+            // which is the wrong response to bytes that should be a `u32` and
+            // are not.
+            return Ok(Some(FormatMarker::Unreadable { len: bytes.len() }));
+        };
+        Ok(Some(FormatMarker::Version(u32::from_le_bytes(encoded))))
+    }
+
+    /// True when the header column family holds at least one row.
+    ///
+    /// Deliberately not `header_count`: a legacy index takes this branch on
+    /// every single start, and counting reads every row in the column family
+    /// and allocates an 80-byte array per row — roughly a million of each at
+    /// mainnet height — to answer a question that is only ever yes or no.
+    fn has_any_header(&self) -> Result<bool, IndexError> {
+        let mut rows = self.store.iter_prefix(ColumnFamily::BlockHeaders, &[])?;
+        Ok(rows.next().transpose()?.is_some())
     }
 
     const FLUSH_THRESHOLD_ROWS: usize = 500_000;
@@ -715,16 +1598,71 @@ impl<S: KvStore> Indexer<S> {
         block: &[u8],
         height: u32,
     ) -> Result<IndexRowCounts, IndexError> {
-        let rows = pending_rows_for_block(block, height)?;
+        let (rows, _txid_count) = pending_rows_for_block(block, height, TxidSource::Compute)?;
+        self.ingest_rows(rows)
+    }
+
+    /// Walks one serialized block and reuses caller-supplied transaction IDs after validation.
+    ///
+    /// Falls back to hashing transactions from `block` for any missing or mismatched entry,
+    /// preserving `ingest_block` semantics for mismatched input.
+    pub fn ingest_block_with_txids(
+        &mut self,
+        block: &[u8],
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let (rows, txid_count) =
+            pending_rows_for_block(block, height, TxidSource::Validate(txids))?;
+        if txids.len() != txid_count {
+            return self.ingest_block(block, height);
+        }
+        self.ingest_rows(rows)
+    }
+
+    /// Walks one serialized block using caller-verified transaction IDs.
+    ///
+    /// This preserves [`Self::ingest_block_with_txids`] for untrusted callers while allowing
+    /// block-apply code to avoid hashing transactions a second time after it has already built
+    /// txids from the same block.
+    pub fn ingest_block_with_verified_txids(
+        &mut self,
+        block: &[u8],
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let (rows, txid_count) = pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
+        if txids.len() != txid_count {
+            return self.ingest_block(block, height);
+        }
+        self.ingest_rows(rows)
+    }
+
+    /// Walks one decoded block using caller-verified transaction IDs.
+    ///
+    /// The serialized block is retained only as the safe fallback path when the caller-provided
+    /// transaction-id count does not match the decoded block. Normal callers must pass the
+    /// consensus serialization of `block` as `serialized_block`.
+    pub fn ingest_decoded_block_with_verified_txids(
+        &mut self,
+        block: &Block,
+        serialized_block: &[u8],
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        if txids.len() != block.txs.len() {
+            return self.ingest_block_with_verified_txids(serialized_block, height, txids);
+        }
+        let rows = pending_rows_for_decoded_block(block, height, txids)?;
         self.ingest_rows(rows)
     }
 
     /// Deletes every index row that ingesting `block` at `height` would have written.
     ///
     /// Derives the same txid, funding, spending, and header row keys as
-    /// the block ingest path by reusing the shared row-construction code, then
-    /// issues all deletions in a single atomic [`KvStore::write`] batch. Either
-    /// the entire block's rows are removed or
+    /// [`Self::ingest_decoded_block_with_verified_txids`] by reusing the shared
+    /// row-construction code, then issues all deletions in a single atomic
+    /// [`KvStore::write`] batch. Either the entire block's rows are removed or
     /// the method returns `Err` having deleted nothing observable.
     ///
     /// Deleting a row that is already absent is not an error: the indexer may
@@ -741,25 +1679,44 @@ impl<S: KvStore> Indexer<S> {
     /// deleted.
     pub fn rollback_block(
         &mut self,
-        block: &bitcoin::Block,
+        block: &Block,
         height: u32,
     ) -> Result<IndexRowCounts, IndexError> {
         // Buffered rows must reach the store before the deletes, or a later
         // end_batch would write back the block being disconnected.
         self.flush()?;
-        let txids: Vec<bitcoin::Txid> = block
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect();
-        self.rollback_block_inner(block, height, &txids)
+        let fence = capture_write_fence(self.store.as_ref(), self.generation)?;
+        let txids: Vec<Txid> = block.txs.iter().map(Tx::txid).collect();
+        self.rollback_block_inner(block, height, &txids, &fence)
+    }
+
+    /// Same as [`Self::rollback_block`] but reuses caller-verified transaction
+    /// IDs, avoiding a second pass of `compute_txid` when the caller has
+    /// already computed them for merkle verification.
+    ///
+    /// Falls back to [`Self::rollback_block`] when the supplied txid count
+    /// does not match the block's transaction count, preserving semantics for
+    /// mismatched input.
+    pub fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &Block,
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.flush()?;
+        if txids.len() != block.txs.len() {
+            return self.rollback_block(block, height);
+        }
+        let fence = capture_write_fence(self.store.as_ref(), self.generation)?;
+        self.rollback_block_inner(block, height, txids, &fence)
     }
 
     fn rollback_block_inner(
         &self,
-        block: &bitcoin::Block,
+        block: &Block,
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
+        fence: &IndexWriteFence,
     ) -> Result<IndexRowCounts, IndexError> {
         let mut rows = pending_rows_for_decoded_block(block, height, txids)?;
         rows.sort();
@@ -792,6 +1749,9 @@ impl<S: KvStore> Indexer<S> {
             None => false,
         };
         if !identity_present {
+            ensure_fence_live(self.store.as_ref(), self.generation, fence)?;
+        }
+        if !identity_present {
             debug!(
                 height,
                 "rollback skipped: block header row absent, rows belong to another block"
@@ -814,7 +1774,7 @@ impl<S: KvStore> Indexer<S> {
         for row in &rows.header_rows {
             batch.delete(ColumnFamily::BlockHeaders, row);
         }
-        self.store.write(batch)?;
+        commit_ordinary(self.store.as_ref(), self.generation, fence, batch)?;
         debug!(
             txids = counts.txids,
             funding = counts.funding,
@@ -829,6 +1789,9 @@ impl<S: KvStore> Indexer<S> {
         // Dedup before counting: a block can generate the same funding or
         // spending row twice, and only one copy is ever written. Counting the
         // raw rows would report more rows than the store receives.
+        if self.fence.is_none() {
+            self.fence = Some(capture_write_fence(self.store.as_ref(), self.generation)?);
+        }
         rows.sort();
         let block_counts = rows.counts();
         self.pending_rows.append(rows);
@@ -844,6 +1807,10 @@ impl<S: KvStore> Indexer<S> {
         if counts.txids + counts.funding + counts.spending + counts.headers == 0 {
             return Ok(counts);
         }
+        let fence = match self.fence.take() {
+            Some(fence) => fence,
+            None => capture_write_fence(self.store.as_ref(), self.generation)?,
+        };
         let mut batch = self.store.new_batch();
         for_each_row_group(&self.pending_rows.txid_rows, |row, positions| {
             batch.put(
@@ -865,7 +1832,15 @@ impl<S: KvStore> Indexer<S> {
         for row in &self.pending_rows.header_rows {
             batch.put(ColumnFamily::BlockHeaders, row, &[]);
         }
-        self.store.write(batch)?;
+        if let Err(error) = commit_ordinary(self.store.as_ref(), self.generation, &fence, batch) {
+            if matches!(
+                error,
+                IndexError::ResetInProgress | IndexError::StaleIndexState
+            ) {
+                self.pending_rows = PendingRows::default();
+            }
+            return Err(error);
+        }
         self.last_counts = counts;
         self.pending_rows = PendingRows::default();
         debug!(
@@ -896,43 +1871,61 @@ impl<S: KvStore> Indexer<S> {
 fn pending_rows_for_block_with_header(
     block: &[u8],
     height: u32,
+    txids: TxidSource<'_>,
     capabilities: IndexCapabilities,
-) -> Result<(PendingRows, Option<[u8; crate::types::HEADER_ROW_SIZE]>), IndexError> {
+) -> Result<
+    (
+        PendingRows,
+        usize,
+        Option<[u8; crate::types::HEADER_ROW_SIZE]>,
+    ),
+    IndexError,
+> {
     let mut rows = PendingRows::default();
     let mut header = None;
-    let mut visitor = IndexBlockVisitor {
-        rows: &mut rows,
-        header: &mut header,
-        height_bytes: height.to_le_bytes(),
-        invalid_header_len: None,
-        block,
-        pending_funding: Vec::new(),
-        capabilities,
-    };
-    match bsl::Block::visit(block, &mut visitor) {
-        Ok(_) => Ok((rows, header)),
-        Err(bitcoin_slices::Error::VisitBreak) => {
-            if let Some(len) = visitor.invalid_header_len {
-                return Err(IndexError::InvalidHeaderLength { len });
+    let txid_count = {
+        let mut visitor = IndexBlockVisitor {
+            rows: &mut rows,
+            header: &mut header,
+            height_bytes: height.to_le_bytes(),
+            txids,
+            txid_count: 0,
+            invalid_header_len: None,
+            block,
+            pending_funding: Vec::new(),
+            capabilities,
+        };
+        match bsl::Block::visit(block, &mut visitor) {
+            Ok(_) => visitor.txid_count,
+            Err(bitcoin_slices::Error::VisitBreak) => {
+                if let Some(len) = visitor.invalid_header_len {
+                    return Err(IndexError::InvalidHeaderLength { len });
+                }
+                return Err(IndexError::BlockParse(bitcoin_slices::Error::VisitBreak));
             }
-            Err(IndexError::BlockParse(bitcoin_slices::Error::VisitBreak))
+            Err(error) => return Err(IndexError::BlockParse(error)),
         }
-        Err(error) => Err(IndexError::BlockParse(error)),
-    }
+    };
+    Ok((rows, txid_count, header))
 }
 
-fn pending_rows_for_block(block: &[u8], height: u32) -> Result<PendingRows, IndexError> {
-    let (rows, _) = pending_rows_for_block_with_header(block, height, IndexCapabilities::ALL)?;
-    Ok(rows)
+fn pending_rows_for_block(
+    block: &[u8],
+    height: u32,
+    txids: TxidSource<'_>,
+) -> Result<(PendingRows, usize), IndexError> {
+    let (rows, txid_count, _) =
+        pending_rows_for_block_with_header(block, height, txids, IndexCapabilities::ALL)?;
+    Ok((rows, txid_count))
 }
 
 fn pending_rows_for_decoded_block(
-    block: &bitcoin::Block,
+    block: &Block,
     height: u32,
-    txids: &[bitcoin::Txid],
+    txids: &[Txid],
 ) -> Result<PendingRows, IndexError> {
     let mut rows = PendingRows::default();
-    let header_bytes = bitcoin::consensus::encode::serialize(&block.header);
+    let header_bytes = encode::consensus_bytes(&block.header);
     let Some(header) = HeaderRow::from_header_bytes(&header_bytes) else {
         return Err(IndexError::InvalidHeaderLength {
             len: header_bytes.len(),
@@ -943,14 +1936,15 @@ fn pending_rows_for_decoded_block(
     // Byte offsets are derived arithmetically rather than by re-serializing: a
     // serialized block is `header || varint(tx_count) || tx...`, so the first
     // transaction starts after the header and the count, and each subsequent one
-    // starts a `total_size()` further on. The resulting ranges are the same
-    // serialized transaction boundaries used by the resolver's fast path.
-    let prologue = crate::types::HEADER_ROW_SIZE + bitcoin::VarInt::from(block.txdata.len()).size();
+    // starts a `total_size()` further on. `both_ingest_paths_write_identical_row_values`
+    // pins this against the byte offsets the zero-copy path measures directly.
+    let prologue = crate::types::HEADER_ROW_SIZE
+        + varint::encode(u64::try_from(block.txs.len()).unwrap_or(u64::MAX)).len();
     let mut offset = u32::try_from(prologue).map_err(|_| IndexError::UnaddressablePosition {
         offset: u64::try_from(prologue).unwrap_or(u64::MAX),
     })?;
 
-    for (tx, txid) in block.txdata.iter().zip(txids) {
+    for (tx, txid) in block.txs.iter().zip(txids) {
         let byte_len =
             u32::try_from(tx.total_size()).map_err(|_| IndexError::UnaddressablePosition {
                 offset: u64::from(offset),
@@ -966,14 +1960,14 @@ fn pending_rows_for_decoded_block(
             row: TxidRow::row(txid, height),
             position,
         });
-        for tx_in in &tx.input {
-            if !tx_in.previous_output.is_null() {
+        for tx_in in &tx.inputs {
+            if !is_null_outpoint(&tx_in.previous_output) {
                 rows.spending_rows
                     .push(SpendingPrefixRow::row(&tx_in.previous_output, height));
             }
         }
-        for tx_out in &tx.output {
-            if !is_op_return_script(tx_out.script_pubkey.as_bytes()) {
+        for tx_out in &tx.outputs {
+            if !is_op_return_script(&tx_out.script_pubkey) {
                 let scripthash = ScriptHash::new(&tx_out.script_pubkey);
                 rows.funding_rows.push(PositionedRow {
                     row: ScriptHashRow::row(scripthash, height),
@@ -1186,6 +2180,8 @@ struct IndexBlockVisitor<'a> {
     rows: &'a mut PendingRows,
     header: &'a mut Option<[u8; crate::types::HEADER_ROW_SIZE]>,
     height_bytes: [u8; crate::types::HEIGHT_SIZE],
+    txids: TxidSource<'a>,
+    txid_count: usize,
     invalid_header_len: Option<usize>,
     /// The serialized block being visited, used as the base for byte offsets.
     block: &'a [u8],
@@ -1253,10 +2249,39 @@ impl Visitor for IndexBlockVisitor<'_> {
             });
         }
         if !self.capabilities.tx_lookup {
+            self.txid_count += 1;
             return ControlFlow::Continue(());
         }
-        let txid = tx.txid_sha2();
-        self.push_txid_row(txid.as_slice(), position);
+        match self.txids {
+            TxidSource::Compute => {
+                let txid = tx.txid_sha2();
+                self.push_txid_row(txid.as_slice(), position);
+            }
+            TxidSource::Validate(txids) => {
+                if let Some(txid) = txids.get(self.txid_count) {
+                    let computed = tx.txid_sha2();
+                    let txid_bytes: &[u8] = txid.as_bytes();
+                    if txid_bytes == computed.as_slice() {
+                        self.push_txid_row(txid_bytes, position);
+                    } else {
+                        self.push_txid_row(computed.as_slice(), position);
+                    }
+                } else {
+                    let txid = tx.txid_sha2();
+                    self.push_txid_row(txid.as_slice(), position);
+                }
+            }
+            TxidSource::Trusted(txids) => {
+                if let Some(txid) = txids.get(self.txid_count) {
+                    let txid_bytes: &[u8] = txid.as_bytes();
+                    self.push_txid_row(txid_bytes, position);
+                } else {
+                    let txid = tx.txid_sha2();
+                    self.push_txid_row(txid.as_slice(), position);
+                }
+            }
+        }
+        self.txid_count += 1;
         ControlFlow::Continue(())
     }
 
@@ -1292,9 +2317,20 @@ fn is_null_prevout(prevout: &bsl::OutPoint<'_>) -> bool {
     prevout.vout() == u32::MAX && prevout.txid().iter().all(|byte| *byte == 0)
 }
 
+fn is_null_outpoint(outpoint: &OutPoint) -> bool {
+    outpoint.vout == u32::MAX && outpoint.txid.as_bytes().iter().all(|&byte| byte == 0)
+}
+
 #[inline]
 fn is_op_return_script(script: &[u8]) -> bool {
     matches!(script.first(), Some(0x6a))
+}
+
+#[derive(Clone, Copy)]
+enum TxidSource<'a> {
+    Compute,
+    Validate(&'a [Txid]),
+    Trusted(&'a [Txid]),
 }
 
 /// Reads and decodes the single transaction a position names.
@@ -1307,9 +2343,9 @@ fn transaction_at<B: BlockSource + ?Sized>(
     height: u32,
     position: crate::types::TxPosition,
     source: &B,
-) -> Option<bitcoin::Transaction> {
+) -> Option<Tx> {
     let bytes = source.block_bytes_at_height(height, position.offset(), position.byte_len())?;
-    bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(&bytes).ok()
+    Tx::consensus_decode(&bytes).ok()
 }
 
 /// Resolves one funding row's history entries from its positions.
@@ -1331,10 +2367,7 @@ fn positioned_history<B: BlockSource + ?Sized>(
         if !funds_scripthash(&tx, scripthash) {
             return None;
         }
-        entries.push(crate::ScriptHistoryEntry::confirmed(
-            tx.compute_txid(),
-            height,
-        ));
+        entries.push(crate::ScriptHistoryEntry::confirmed(tx.txid(), height));
     }
     Some(entries)
 }
@@ -1349,12 +2382,9 @@ fn scan_height_history<B: BlockSource + ?Sized>(
     let Some(block) = source.block_at_height(height) else {
         return;
     };
-    for tx in &block.txdata {
+    for tx in &block.txs {
         if funds_scripthash(tx, scripthash) {
-            entries.push(crate::ScriptHistoryEntry::confirmed(
-                tx.compute_txid(),
-                height,
-            ));
+            entries.push(crate::ScriptHistoryEntry::confirmed(tx.txid(), height));
         }
     }
 }
@@ -1367,7 +2397,7 @@ fn positioned_unspent_outputs<B: BlockSource + ?Sized>(
     height: u32,
     value: &[u8],
     source: &B,
-) -> Option<Vec<(bitcoin::Txid, u32, u64, u32)>> {
+) -> Option<Vec<(Txid, u32, u64, u32)>> {
     let positions = crate::types::TxPositionValue::decode(value)?;
     let mut outputs = Vec::new();
     for position in positions {
@@ -1386,12 +2416,12 @@ fn scan_height_unspent_outputs<B: BlockSource + ?Sized>(
     scripthash: crate::ScriptHash,
     height: u32,
     source: &B,
-    outputs: &mut Vec<(bitcoin::Txid, u32, u64, u32)>,
+    outputs: &mut Vec<(Txid, u32, u64, u32)>,
 ) {
     let Some(block) = source.block_at_height(height) else {
         return;
     };
-    for tx in &block.txdata {
+    for tx in &block.txs {
         append_matching_outputs(tx, scripthash, height, outputs);
     }
 }
@@ -1399,28 +2429,28 @@ fn scan_height_unspent_outputs<B: BlockSource + ?Sized>(
 /// Appends `(txid, vout, value, height)` for every output of `tx` matching
 /// `scripthash`, computing the txid only once a match is found.
 fn append_matching_outputs(
-    tx: &bitcoin::Transaction,
+    tx: &Tx,
     scripthash: crate::ScriptHash,
     height: u32,
-    outputs: &mut Vec<(bitcoin::Txid, u32, u64, u32)>,
+    outputs: &mut Vec<(Txid, u32, u64, u32)>,
 ) {
-    let mut computed_txid: Option<bitcoin::Txid> = None;
-    for (vout_idx, output) in tx.output.iter().enumerate() {
-        if crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes()) != scripthash {
+    let mut computed_txid: Option<Txid> = None;
+    for (vout_idx, output) in tx.outputs.iter().enumerate() {
+        if crate::ScriptHash::from_script_bytes(&output.script_pubkey) != scripthash {
             continue;
         }
         let Ok(vout) = u32::try_from(vout_idx) else {
             continue;
         };
-        let txid = *computed_txid.get_or_insert_with(|| tx.compute_txid());
-        outputs.push((txid, vout, output.value.to_sat(), height));
+        let txid = *computed_txid.get_or_insert_with(|| tx.txid());
+        outputs.push((txid, vout, output.value, height));
     }
 }
 
-fn funds_scripthash(tx: &bitcoin::Transaction, scripthash: crate::ScriptHash) -> bool {
-    tx.output.iter().any(|output| {
-        crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes()) == scripthash
-    })
+fn funds_scripthash(tx: &Tx, scripthash: crate::ScriptHash) -> bool {
+    tx.outputs
+        .iter()
+        .any(|output| crate::ScriptHash::from_script_bytes(&output.script_pubkey) == scripthash)
 }
 
 fn collect_prefix_rows_with_values(
@@ -1491,7 +2521,7 @@ pub trait TxIndexSnapshot: Send + Sync {
     /// Scans confirmed-transaction rows for `txid`.
     fn transaction_rows(
         &self,
-        txid: &bitcoin::Txid,
+        txid: &Txid,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError>;
     /// Scans funding rows for `scripthash`.
@@ -1503,7 +2533,7 @@ pub trait TxIndexSnapshot: Send + Sync {
     /// Scans spending rows for `outpoint`.
     fn spending_rows(
         &self,
-        outpoint: &bitcoin::OutPoint,
+        outpoint: &OutPoint,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError>;
 }
@@ -1554,7 +2584,7 @@ impl TxIndexSnapshot for StoreTxIndexSnapshot<'_> {
 
     fn transaction_rows(
         &self,
-        txid: &bitcoin::Txid,
+        txid: &Txid,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError> {
         self.scan(
@@ -1578,7 +2608,7 @@ impl TxIndexSnapshot for StoreTxIndexSnapshot<'_> {
 
     fn spending_rows(
         &self,
-        outpoint: &bitcoin::OutPoint,
+        outpoint: &OutPoint,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError> {
         self.scan(
@@ -1606,14 +2636,42 @@ impl<S: KvStore> IndexReader for Indexer<S> {
 /// Mutation-only handle for durable prepared `TxIndex` writes.
 pub struct IndexWriter<S: KvStore> {
     indexer: Indexer<S>,
+    /// Durable process epoch fencing this writer's reset work. Adoption of
+    /// an interrupted reset re-fences the marker to this generation before
+    /// any row deletion, and only this generation may clear the marker.
+    generation: u64,
 }
 
 impl<S: KvStore> IndexWriter<S> {
-    /// Opens a writer over the current datadir's index store.
-    pub fn open(store: std::sync::Arc<S>) -> Result<Self, IndexError> {
+    /// Opens a writer over `store`, rejecting unversioned index tables.
+    pub fn open(store: std::sync::Arc<S>, generation: u64) -> Result<Self, IndexError> {
         let indexer = Indexer::new(store);
-        Self::resume_capability_reset(indexer.store.as_ref())?;
-        Ok(Self { indexer })
+        match indexer
+            .store
+            .get(ColumnFamily::UtxoMeta, FORMAT_VERSION_KEY)?
+        {
+            Some(value) => {
+                if value.as_slice() != FORMAT_VERSION_VALUE {
+                    let version = value
+                        .get(..4)
+                        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                        .map_or(0, u32::from_le_bytes);
+                    return Err(IndexError::UnsupportedTxIndexFormatVersion { version });
+                }
+            }
+            None => {
+                if has_any_index_row(&*indexer.store)? {
+                    return Err(IndexError::LegacyCursorlessIndex);
+                }
+            }
+        }
+        // A plain open adopts any outstanding obligation (requested mask 0)
+        // without publishing a claim of its own.
+        resume_capability_reset(indexer.store.as_ref(), generation, 0)?;
+        Ok(Self {
+            indexer,
+            generation,
+        })
     }
 
     /// Loads the exact durable watermark.
@@ -1626,80 +2684,42 @@ impl<S: KvStore> IndexWriter<S> {
         self.indexer.watermarks()
     }
 
-    /// Marks selected derived rows unavailable, deletes them in bounded batches,
-    /// and leaves their durable cursors empty so the worker can rebuild from genesis.
+    /// Captures one coherent fence with the exact reset state, ordinary revision,
+    /// and both capability watermarks from a single snapshot. It returns the
+    /// fence with the watermarks it carries. A reset that
+    /// begins or completes in the read window therefore returns
+    /// [`IndexError::ResetInProgress`]; callers must discard derived
+    /// state and re-capture.
+    pub fn fenced_watermarks(&mut self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError> {
+        let fence = capture_write_fence(self.indexer.store.as_ref(), self.generation)?;
+        Ok((fence, fence.watermarks))
+    }
+
+    /// Resets every derived capability through the durable exact-claim fence.
     ///
-    /// The reset marker and cursor deletion land atomically before row deletion.
+    /// A pre-existing selective reset is merged into the all-capability
+    /// obligation before any row is deleted.
+    pub fn reset_index(store: &S, generation: u64) -> Result<(), IndexError> {
+        resume_capability_reset(store, generation, IndexCapabilities::ALL.to_mask())
+    }
+
+    /// Marks selected derived rows unavailable, deletes them in bounded
+    /// batches, and leaves their durable cursors empty so the worker can
+    /// rebuild from genesis.
+    ///
+    /// The claim and cursor deletion land atomically before row deletion, and
+    /// completion CASes the exact claim to the next idle version.
     /// `open` resumes an interrupted reset before exposing the writer again.
     pub fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
         self.ensure_prepared_ready()?;
         if capabilities.is_empty() {
             return Err(IndexError::InvalidResetMarker);
         }
-        let mut batch = self.indexer.store.new_batch();
-        batch.put(
-            ColumnFamily::UtxoMeta,
-            RESET_CAPABILITIES_KEY,
-            &[capabilities.to_mask()],
-        );
-        if capabilities.tx_lookup {
-            batch.delete(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY);
-        }
-        if capabilities.script_history {
-            batch.delete(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY);
-        }
-        self.indexer.store.write_durable(batch)?;
-        Self::resume_capability_reset(self.indexer.store.as_ref())
-    }
-
-    fn resume_capability_reset(store: &S) -> Result<(), IndexError> {
-        let Some(marker) = store.get(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY)? else {
-            return Ok(());
-        };
-        let [mask] = marker.as_slice() else {
-            return Err(IndexError::InvalidResetMarker);
-        };
-        let capabilities = IndexCapabilities::from_mask(*mask)?;
-        let mut column_families = Vec::with_capacity(4);
-        if capabilities.tx_lookup {
-            column_families.push(ColumnFamily::TxConfirmed);
-        }
-        if capabilities.script_history {
-            column_families.push(ColumnFamily::Funding);
-            column_families.push(ColumnFamily::Spending);
-        }
-        let unselected_cursor_remains = (!capabilities.tx_lookup
-            && store
-                .get(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY)?
-                .is_some())
-            || (!capabilities.script_history
-                && store
-                    .get(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY)?
-                    .is_some());
-        if !unselected_cursor_remains {
-            column_families.push(ColumnFamily::BlockHeaders);
-        }
-        for cf in column_families {
-            loop {
-                let scan = store.scan_prefix_bounded(cf, &[], RESET_SCAN_LIMIT)?;
-                if scan.rows.is_empty() {
-                    break;
-                }
-                let mut batch = store.new_batch();
-                for (key, _) in scan.rows {
-                    batch.delete(cf, &key);
-                }
-                store.write_deferred(batch)?;
-                if scan.complete {
-                    break;
-                }
-            }
-        }
-        store.flush()?;
-        let mut batch = store.new_batch();
-        batch.delete(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY);
-        store.write_durable(batch)?;
-        Ok(())
+        resume_capability_reset(
+            self.indexer.store.as_ref(),
+            self.generation,
+            capabilities.to_mask(),
+        )
     }
 
     /// Derives a `PreparedBlock` from a serialized body without allocating a decoded block.
@@ -1725,9 +2745,10 @@ impl<S: KvStore> IndexWriter<S> {
                 watermark: self.watermark()?,
             });
         }
-        let (mut rows, header) = pending_rows_for_block_with_header(body, height, capabilities)?;
+        let (mut rows, _txid_count, header) =
+            pending_rows_for_block_with_header(body, height, TxidSource::Compute, capabilities)?;
         let header = header.ok_or(IndexError::InvalidHeaderLength { len: 0 })?;
-        let actual_hash = bitcoin::BlockHash::hash(header.as_slice()).to_byte_array();
+        let actual_hash = encode::double_sha256(header.as_slice()).to_le_bytes();
         if actual_hash != hash {
             return Err(IndexError::BlockIdentityMismatch {
                 height,
@@ -1752,20 +2773,34 @@ impl<S: KvStore> IndexWriter<S> {
     }
 
     /// Atomically connects a bounded batch and advances the durable watermark.
+    ///
+    /// Captures its own fence before any store-dependent derivation and keeps
+    /// the consumer cursor untouched.
     pub fn commit_forward(&mut self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError> {
+        let (fence, _) = self.fenced_watermarks()?;
+        self.commit_forward_with_cursor(fence, batch, ConsumerCursorUpdate::Keep)
+    }
+
+    /// Atomically connects a bounded batch and applies one explicit consumer
+    /// cursor disposition guarded by the captured reset-state fence.
+    pub fn commit_forward_with_cursor(
+        &mut self,
+        fence: IndexWriteFence,
+        batch: PreparedBatch,
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<IndexWatermark, IndexError> {
         self.ensure_prepared_ready()?;
         if batch.is_empty() {
             return Err(IndexError::NonContiguousPrepared {
-                watermark: self.watermark()?,
+                watermark: fence.watermarks.tx_lookup,
             });
         }
         let capabilities = batch
             .capabilities()
             .ok_or(IndexError::NonContiguousPrepared {
-                watermark: self.watermark()?,
+                watermark: fence.watermarks.tx_lookup,
             })?;
-        let watermarks = self.watermarks()?;
-        let current = selected_watermark(watermarks, capabilities)?;
+        let current = selected_watermark(fence.watermarks, capabilities)?;
         let mut expected_height = match current {
             None => 0,
             Some(w) => w
@@ -1803,31 +2838,81 @@ impl<S: KvStore> IndexWriter<S> {
             last.ok_or(IndexError::NonContiguousPrepared { watermark: current })?;
         let mut store_batch = self.indexer.store.new_batch();
         put_rows(&mut store_batch, &merged);
+        store_batch.put(
+            ColumnFamily::UtxoMeta,
+            FORMAT_VERSION_KEY,
+            &FORMAT_VERSION_VALUE,
+        );
         put_selected_watermarks(&mut store_batch, capabilities, Some(final_watermark));
-        self.indexer.store.write_durable(store_batch)?;
+        match cursor {
+            ConsumerCursorUpdate::Keep => {}
+            ConsumerCursorUpdate::Set(bytes) => {
+                store_batch.put(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY, bytes);
+            }
+            ConsumerCursorUpdate::Clear => {
+                store_batch.delete(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY);
+            }
+        }
+        commit_ordinary(
+            self.indexer.store.as_ref(),
+            self.generation,
+            &fence,
+            store_batch,
+        )?;
         self.indexer.last_counts = merged.counts();
         Ok(final_watermark)
     }
 
     /// Atomically rolls back one tip block and writes the parent watermark.
+    ///
+    /// Captures its own fence before any store-dependent derivation and
+    /// clears the consumer cursor atomically: without a valid replacement
+    /// block the cursor names rows that no longer exist.
     pub fn commit_rollback_one(
         &mut self,
         prev: Option<IndexWatermark>,
         body: &[u8],
     ) -> Result<(), IndexError> {
-        self.commit_rollback_one_for(IndexCapabilities::ALL, prev, body)
+        let (fence, _) = self.fenced_watermarks()?;
+        self.commit_rollback_one_for_with_cursor(
+            fence,
+            IndexCapabilities::ALL,
+            prev,
+            body,
+            ConsumerCursorUpdate::Clear,
+        )
     }
 
-    /// Atomically rolls back one block for the selected capabilities.
+    /// Atomically rolls back one block for the selected capabilities,
+    /// capturing its own fence and clearing the consumer cursor.
     pub fn commit_rollback_one_for(
         &mut self,
         capabilities: IndexCapabilities,
         prev: Option<IndexWatermark>,
         body: &[u8],
     ) -> Result<(), IndexError> {
+        let (fence, _) = self.fenced_watermarks()?;
+        self.commit_rollback_one_for_with_cursor(
+            fence,
+            capabilities,
+            prev,
+            body,
+            ConsumerCursorUpdate::Clear,
+        )
+    }
+
+    /// Atomically rolls back one block and applies one explicit consumer
+    /// cursor disposition guarded by the captured reset-state fence.
+    pub fn commit_rollback_one_for_with_cursor(
+        &mut self,
+        fence: IndexWriteFence,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<(), IndexError> {
         self.ensure_prepared_ready()?;
-        let watermarks = self.watermarks()?;
-        let current = selected_watermark(watermarks, capabilities)?
+        let current = selected_watermark(fence.watermarks, capabilities)?
             .ok_or(IndexError::NonContiguousPrepared { watermark: None })?;
         let prepared = self.prepare_block_for(capabilities, current.height, current.hash, body)?;
         if let Some(prev) = &prev {
@@ -1858,12 +2943,13 @@ impl<S: KvStore> IndexWriter<S> {
                     height: current.height,
                     hash: current.hash,
                 })?;
-        if self
+        let header_present = self
             .indexer
             .store
             .get(ColumnFamily::BlockHeaders, header)?
-            .is_none()
-        {
+            .is_some();
+        ensure_fence_live(self.indexer.store.as_ref(), self.generation, &fence)?;
+        if !header_present {
             return Err(IndexError::MissingWatermarkIdentity {
                 height: current.height,
                 hash: current.hash,
@@ -1874,19 +2960,74 @@ impl<S: KvStore> IndexWriter<S> {
         // disconnected prefix. Retain every ancestor identity it may need to
         // reconcile when it is enabled again.
         let unselected_keeps_identity = (!capabilities.tx_lookup
-            && watermarks
+            && fence
+                .watermarks
                 .tx_lookup
                 .is_some_and(|watermark| watermark.height >= current.height))
             || (!capabilities.script_history
-                && watermarks
+                && fence
+                    .watermarks
                     .script_history
                     .is_some_and(|watermark| watermark.height >= current.height));
         delete_rows(&mut store_batch, &prepared.rows, !unselected_keeps_identity);
+        store_batch.put(
+            ColumnFamily::UtxoMeta,
+            FORMAT_VERSION_KEY,
+            &FORMAT_VERSION_VALUE,
+        );
         put_selected_watermarks(&mut store_batch, capabilities, prev);
-        self.indexer.store.write_deferred(store_batch)?;
-        self.indexer.store.flush()?;
+        match cursor {
+            ConsumerCursorUpdate::Keep => {}
+            ConsumerCursorUpdate::Set(bytes) => {
+                store_batch.put(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY, bytes);
+            }
+            ConsumerCursorUpdate::Clear => {
+                store_batch.delete(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY);
+            }
+        }
+        commit_ordinary(
+            self.indexer.store.as_ref(),
+            self.generation,
+            &fence,
+            store_batch,
+        )?;
         self.indexer.last_counts = prepared.rows.counts();
         Ok(())
+    }
+
+    /// Loads the opaque consumer cursor bytes, or `None` when none is stored.
+    ///
+    /// The cursor is opaque to this crate: the owning consumer defines the
+    /// encoding and writes it only after its rows reached the position it
+    /// names, so a present cursor always describes committed rows.
+    pub fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, IndexError> {
+        Ok(self
+            .indexer
+            .store
+            .get(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY)?)
+    }
+
+    /// Publishes the opaque consumer cursor under four exact conditions from the
+    /// captured fence: reset state, ordinary revision, and both watermark rows.
+    /// The commit atomically advances the ordinary revision.
+    ///
+    /// A lost race with an unchanged reset returns
+    /// [`IndexError::StaleIndexState`]. A moved reset cooperatively completes
+    /// the pending exact claim and returns [`IndexError::ResetInProgress`].
+    pub fn commit_consumer_cursor(
+        &mut self,
+        fence: IndexWriteFence,
+        cursor: &[u8],
+    ) -> Result<(), IndexError> {
+        self.ensure_prepared_ready()?;
+        let mut store_batch = self.indexer.store.new_batch();
+        store_batch.put(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY, cursor);
+        commit_ordinary(
+            self.indexer.store.as_ref(),
+            self.generation,
+            &fence,
+            store_batch,
+        )
     }
 
     /// Forces all completed writes to durable storage.
@@ -1896,7 +3037,7 @@ impl<S: KvStore> IndexWriter<S> {
 
     fn ensure_prepared_ready(&self) -> Result<(), IndexError> {
         if self.indexer.batch_depth != 0 || !self.indexer.pending_rows.is_empty() {
-            return Err(IndexError::PendingBufferedRows);
+            return Err(IndexError::PendingLegacyRows);
         }
         Ok(())
     }
@@ -1910,6 +3051,22 @@ impl<S: KvStore> IndexReader for IndexWriter<S> {
     }
 }
 
+fn has_any_index_row<S: KvStore>(store: &S) -> Result<bool, IndexError> {
+    for cf in [
+        ColumnFamily::TxConfirmed,
+        ColumnFamily::Funding,
+        ColumnFamily::Spending,
+        ColumnFamily::BlockHeaders,
+    ] {
+        let mut iter = store.iter_prefix(cf, &[])?;
+        if let Some(entry) = iter.next() {
+            let _ = entry?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Storage-agnostic block-ingest interface.
 ///
 /// Use this trait when consumers must hold the indexer behind a trait
@@ -1917,6 +3074,59 @@ impl<S: KvStore> IndexReader for IndexWriter<S> {
 pub trait IndexerLike: Send + Sync {
     /// Walks `block` once and writes index rows. See `Indexer::ingest_block`.
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError>;
+
+    /// Reports the row-value format. See [`Indexer::ensure_format_version`].
+    ///
+    /// Defaults to [`IndexFormat::Current`] for the in-memory and stub indexers
+    /// used in tests, which have no persisted rows and therefore no legacy ones.
+    /// A store-backed implementation must override this.
+    fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
+        Ok(IndexFormat::Current)
+    }
+
+    /// Walks `block` once and writes index rows, reusing precomputed transaction IDs when supported.
+    ///
+    /// The default implementation preserves existing implementations by ignoring `txids` and
+    /// delegating to [`IndexerLike::ingest_block`].
+    fn ingest_block_with_txids(
+        &mut self,
+        block: &[u8],
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = txids;
+        self.ingest_block(block, height)
+    }
+
+    /// Walks `block` once and writes index rows, trusting caller-verified transaction IDs when
+    /// supported.
+    ///
+    /// The default implementation preserves existing implementations by validating through
+    /// [`IndexerLike::ingest_block_with_txids`].
+    fn ingest_block_with_verified_txids(
+        &mut self,
+        block: &[u8],
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.ingest_block_with_txids(block, height, txids)
+    }
+
+    /// Walks a decoded block and writes rows, trusting caller-verified transaction IDs when
+    /// supported.
+    ///
+    /// The default implementation preserves existing implementations by validating through
+    /// [`IndexerLike::ingest_block_with_verified_txids`].
+    fn ingest_decoded_block_with_verified_txids(
+        &mut self,
+        block: &Block,
+        serialized_block: &[u8],
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = block;
+        self.ingest_block_with_verified_txids(serialized_block, height, txids)
+    }
 
     /// Deletes every index row that ingesting `block` at `height` would have written.
     ///
@@ -1927,13 +3137,24 @@ pub trait IndexerLike: Send + Sync {
     /// is consistent, and `ScriptIndex` queries would then serve transactions
     /// that are no longer in the chain. Failing loudly is the only safe
     /// default. Concrete indexers that persist rows override this.
-    fn rollback_block(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-    ) -> Result<IndexRowCounts, IndexError> {
+    fn rollback_block(&mut self, block: &Block, height: u32) -> Result<IndexRowCounts, IndexError> {
         let _ = (block, height);
         Err(IndexError::UnsupportedRollback)
+    }
+
+    /// Same as [`IndexerLike::rollback_block`] but reuses caller-verified
+    /// transaction IDs when supported.
+    ///
+    /// The default implementation preserves existing implementations by
+    /// ignoring `txids` and delegating to [`IndexerLike::rollback_block`].
+    fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &Block,
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = txids;
+        self.rollback_block(block, height)
     }
 
     /// Begins a batch of block ingests; rows are not flushed until [`IndexerLike::end_batch`].
@@ -1950,9 +3171,9 @@ pub trait IndexerLike: Send + Sync {
     /// does not support transaction lookup.
     fn resolve_transaction(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &dyn BlockSource,
-    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
+    ) -> Result<Option<Tx>, IndexError> {
         let _ = (txid, source);
         Ok(None)
     }
@@ -1966,9 +3187,51 @@ pub trait IndexerLike: Send + Sync {
     /// in transaction-broadcast and prevout-value lookups.
     fn resolve_outpoint_value(
         &self,
-        outpoint: bitcoin::OutPoint,
+        outpoint: OutPoint,
         source: &dyn BlockSource,
     ) -> Result<Option<u64>, IndexError>;
+}
+
+/// Metadata key marking which row-value format an index was written with.
+const INDEX_FORMAT_VERSION_KEY: &[u8] = b"index:format_version";
+
+/// Current row-value format. Version 1 added transaction byte positions to
+/// funding and txid row values; version 0 (unmarked) has empty values.
+pub const INDEX_FORMAT_VERSION: u32 = 1;
+
+/// Which row-value format an opened index carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexFormat {
+    /// Rows carry transaction positions; resolvers take the fast path.
+    Current,
+    /// Rows predate transaction positions; resolvers scan whole blocks.
+    ///
+    /// Correct but far slower. Clearing the index directory and re-syncing
+    /// rebuilds it in the current format.
+    Legacy {
+        /// The version marker found, or `None` when the index carries none.
+        found: Option<u32>,
+    },
+    /// A version marker exists but is not the 4 little-endian bytes of a `u32`.
+    ///
+    /// Resolvers scan, exactly as for [`Self::Legacy`], but the operator
+    /// response differs: this is damaged metadata, not an old index, and
+    /// deleting the directory would discard the evidence of whatever wrote it.
+    UnreadableMarker {
+        /// Byte length of the marker value that failed to decode.
+        len: usize,
+    },
+}
+
+/// What the format-version marker key holds, when it is present at all.
+enum FormatMarker {
+    /// Four little-endian bytes that decoded to this version.
+    Version(u32),
+    /// Present, but not a 4-byte little-endian `u32`.
+    Unreadable {
+        /// Byte length of the value found.
+        len: usize,
+    },
 }
 
 /// Provides block lookups for resolving lossy index prefixes to full identities.
@@ -1980,7 +3243,7 @@ pub trait IndexerLike: Send + Sync {
 /// database, peer fetch).
 pub trait BlockSource {
     /// Returns the Bitcoin block at `height` on the active chain, if known.
-    fn block_at_height(&self, height: u32) -> Option<bitcoin::Block>;
+    fn block_at_height(&self, height: u32) -> Option<Block>;
 
     /// Returns `len` serialized bytes starting `offset` bytes into the active
     /// block at `height`, without materializing or decoding the whole body.
@@ -2002,12 +3265,49 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         Self::ingest_block(self, block, height)
     }
 
-    fn rollback_block(
+    fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
+        Self::ensure_format_version(self)
+    }
+
+    fn ingest_block_with_txids(
         &mut self,
-        block: &bitcoin::Block,
+        block: &[u8],
         height: u32,
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
+        Self::ingest_block_with_txids(self, block, height, txids)
+    }
+
+    fn ingest_block_with_verified_txids(
+        &mut self,
+        block: &[u8],
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::ingest_block_with_verified_txids(self, block, height, txids)
+    }
+
+    fn ingest_decoded_block_with_verified_txids(
+        &mut self,
+        block: &Block,
+        serialized_block: &[u8],
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::ingest_decoded_block_with_verified_txids(self, block, serialized_block, height, txids)
+    }
+
+    fn rollback_block(&mut self, block: &Block, height: u32) -> Result<IndexRowCounts, IndexError> {
         Self::rollback_block(self, block, height)
+    }
+
+    fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &Block,
+        height: u32,
+        txids: &[Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::rollback_block_with_verified_txids(self, block, height, txids)
     }
 
     fn begin_batch(&mut self) {
@@ -2020,15 +3320,15 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
 
     fn resolve_transaction(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &dyn BlockSource,
-    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
+    ) -> Result<Option<Tx>, IndexError> {
         Self::resolve_transaction(self, txid, source)
     }
 
     fn resolve_outpoint_value(
         &self,
-        outpoint: bitcoin::OutPoint,
+        outpoint: OutPoint,
         source: &dyn BlockSource,
     ) -> Result<Option<u64>, IndexError> {
         Self::resolve_outpoint_value(self, outpoint, source)
@@ -2039,11 +3339,9 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
 mod tests {
     use std::sync::Arc;
 
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{
-        Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-        TxMerkleNode, TxOut, Txid, Witness, absolute, block, transaction,
+    use bitcoin_rs_primitives::{
+        Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxIn, TxOut, Txid,
+        consensus_bytes,
     };
     use bitcoin_rs_storage::{ColumnFamily, KvStore, RocksDbStore};
 
@@ -2063,13 +3361,13 @@ mod tests {
 
     #[test]
     fn iter_funding_rows_returns_indexed_rows() -> Result<(), Box<dyn std::error::Error>> {
-        let script = ScriptBuf::from_bytes(vec![0x51, 0x01]);
+        let script = vec![0x51, 0x01];
         let tx = tx(spent_outpoint(1, 0), script.clone());
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block(vec![tx])), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx])), HEIGHT)?;
 
-        let scripthash = ScriptHash::from_script_bytes(script.as_bytes());
+        let scripthash = ScriptHash::from_script_bytes(&script);
         assert_eq!(
             indexer.iter_funding_rows(scripthash)?,
             vec![ScriptHashRow::row(scripthash, HEIGHT)]
@@ -2077,44 +3375,49 @@ mod tests {
         Ok(())
     }
 
-    /// The stored iteration order is byte order, not height order.
+    /// Proves that lexicographic key byte order does **not** match numeric
+    /// height order within one prefix, because the height suffix is
+    /// little-endian. Height 256 is `[0x00, 0x01, 0x00, 0x00]`, height 1 is
+    /// `[0x01, 0x00, 0x00, 0x00]`, so byte order puts 256 before 1.
     ///
-    /// Heights are little-endian in the key, so 256 (`[0,1,0,0]`) sorts before
-    /// 1 (`[1,0,0,0]`) within one prefix. #226's audit found the previous doc
-    /// contract claiming "(prefix, height) ascending", which this order
-    /// falsifies; no production reader relies on it -- the Esplora and worker
-    /// paths sort in memory, and truncated bounded scans fail closed -- but
-    /// nothing pinned that fact, so a reader could have started relying on the
-    /// documented order and been wrong only at heights past 255. This test is
-    /// that pin: if the height encoding ever becomes sortable (#226 Q3), the
-    /// expectation below flips and the doc contract must flip with it.
+    /// This pins the corrected doc contract on `iter_funding_rows`: callers
+    /// needing chronological order must sort by numeric height after
+    /// exact-resolving rows, never rely on store iteration order.
     #[test]
-    fn funding_row_iteration_order_is_not_numeric_height_order()
+    fn iter_funding_rows_height_order_is_le_byte_order_not_numeric()
     -> Result<(), Box<dyn std::error::Error>> {
-        let script = ScriptBuf::from_bytes(vec![0x51, 0x03]);
+        let script = vec![0x51, 0x01];
+        let scripthash = ScriptHash::from_script_bytes(&script);
         let (_dir, mut indexer) = indexer()?;
 
-        // Same script funded at numeric heights 1 and 256, ingested in
-        // numeric order.
-        indexer.ingest_block(
-            &serialize(&block(vec![tx(spent_outpoint(3, 0), script.clone())])),
-            1,
-        )?;
-        indexer.ingest_block(
-            &serialize(&block(vec![tx(spent_outpoint(4, 0), script.clone())])),
-            256,
-        )?;
+        let tx_at_1 = tx(spent_outpoint(1, 0), script.clone());
+        let tx_at_256 = tx(spent_outpoint(2, 0), script);
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx_at_1])), 1)?;
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx_at_256])), 256)?;
+        indexer.flush()?;
 
-        let scripthash = ScriptHash::from_script_bytes(script.as_bytes());
         let rows = indexer.iter_funding_rows(scripthash)?;
-        let heights: Vec<u32> = rows.iter().map(|row| row.height()).collect();
+        assert_eq!(rows.len(), 2, "two heights funded the same script");
 
+        // Store iteration order is LE byte order, so 256 precedes 1.
         assert_eq!(
-            heights,
-            vec![256, 1],
-            "little-endian heights iterate in byte order, not numeric order; \
-             if this starts returning [1, 256] the encoding became sortable and \
-             every ordering doc contract in this file must be revisited"
+            rows[0].height(),
+            256,
+            "LE byte order puts height 256 before height 1, not numeric order"
+        );
+        assert_eq!(rows[1].height(), 1);
+
+        // The corollary: numeric sort produces the opposite order, so no
+        // caller may treat raw iteration order as chronological.
+        let mut numeric = rows.clone();
+        numeric.sort_by_key(|row| row.height());
+        assert_eq!(
+            numeric.iter().map(|row| row.height()).collect::<Vec<_>>(),
+            vec![1, 256]
+        );
+        assert_ne!(
+            rows, numeric,
+            "store iteration order must differ from numeric height order"
         );
         Ok(())
     }
@@ -2122,10 +3425,10 @@ mod tests {
     #[test]
     fn iter_spending_rows_returns_indexed_rows() -> Result<(), Box<dyn std::error::Error>> {
         let outpoint = spent_outpoint(2, 3);
-        let tx = tx(outpoint, ScriptBuf::from_bytes(vec![0x51, 0x02]));
+        let tx = tx(outpoint, vec![0x51, 0x02]);
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block(vec![tx])), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx])), HEIGHT)?;
 
         assert_eq!(
             indexer.iter_spending_rows(&outpoint)?,
@@ -2136,14 +3439,11 @@ mod tests {
 
     #[test]
     fn iter_txid_rows_returns_indexed_rows() -> Result<(), Box<dyn std::error::Error>> {
-        let tx = tx(
-            spent_outpoint(4, 5),
-            ScriptBuf::from_bytes(vec![0x51, 0x03]),
-        );
-        let txid = tx.compute_txid();
+        let tx = tx(spent_outpoint(4, 5), vec![0x51, 0x03]);
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block(vec![tx])), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx])), HEIGHT)?;
 
         let rows = indexer.iter_txid_rows(&txid)?;
         assert!(rows.contains(&TxidRow::row(&txid, HEIGHT)));
@@ -2151,20 +3451,98 @@ mod tests {
     }
 
     #[test]
+    fn decoded_verified_txid_ingest_matches_serialized_ingest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let coinbase = tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51, 0x04]);
+        let spender = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: spent_outpoint(9, 1),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 5_000,
+                    script_pubkey: vec![0x51, 0x05],
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: vec![0x6a, 0x01, 0x00],
+                },
+            ],
+        };
+        let block = block(vec![coinbase, spender]);
+        let block_bytes = consensus_bytes(&block);
+        let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
+        let (_serialized_dir, mut serialized_indexer) = indexer()?;
+        let (_decoded_dir, mut decoded_indexer) = indexer()?;
+
+        let serialized_counts =
+            serialized_indexer.ingest_block_with_verified_txids(&block_bytes, HEIGHT, &txids)?;
+        let decoded_counts = decoded_indexer.ingest_decoded_block_with_verified_txids(
+            &block,
+            &block_bytes,
+            HEIGHT,
+            &txids,
+        )?;
+
+        assert_eq!(decoded_counts, serialized_counts);
+        assert_eq!(
+            stored_rows(&decoded_indexer)?,
+            stored_rows(&serialized_indexer)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_verified_txid_ingest_mismatch_falls_back_to_serialized_ingest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decoded_block = block(vec![tx(
+            OutPoint::new(Txid::default(), u32::MAX),
+            vec![0x51, 0x08],
+        )]);
+        let serialized_block = block(vec![
+            tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51, 0x06]),
+            tx(spent_outpoint(10, 0), vec![0x51, 0x07]),
+        ]);
+        let serialized_block_bytes = consensus_bytes(&serialized_block);
+        let (_serialized_dir, mut serialized_indexer) = indexer()?;
+        let (_decoded_dir, mut decoded_indexer) = indexer()?;
+
+        let serialized_counts = serialized_indexer.ingest_block(&serialized_block_bytes, HEIGHT)?;
+        let decoded_counts = decoded_indexer.ingest_decoded_block_with_verified_txids(
+            &decoded_block,
+            &serialized_block_bytes,
+            HEIGHT,
+            &[],
+        )?;
+
+        assert_eq!(decoded_counts, serialized_counts);
+        assert_eq!(
+            stored_rows(&decoded_indexer)?,
+            stored_rows(&serialized_indexer)?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolve_script_history_returns_entries_for_funded_scripthash()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let Some(output) = tx.output.first() else {
+        let Some(output) = tx.outputs.first() else {
             return Err(std::io::Error::other("genesis transaction has no outputs").into());
         };
-        let scripthash = ScriptHash::from_script_bytes(output.script_pubkey.as_bytes());
-        let txid = tx.compute_txid();
+        let scripthash = ScriptHash::from_script_bytes(&output.script_pubkey);
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2178,19 +3556,19 @@ mod tests {
     #[test]
     fn resolve_unspent_outputs_returns_txid_vout_value_for_funded_scripthash()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let Some(output) = tx.output.first() else {
+        let Some(output) = tx.outputs.first() else {
             return Err(std::io::Error::other("genesis transaction has no outputs").into());
         };
-        let scripthash = ScriptHash::from_script_bytes(output.script_pubkey.as_bytes());
-        let txid = tx.compute_txid();
-        let value = output.value.to_sat();
+        let scripthash = ScriptHash::from_script_bytes(&output.script_pubkey);
+        let txid = tx.txid();
+        let value = output.value;
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2205,15 +3583,15 @@ mod tests {
     #[test]
     fn resolve_transaction_returns_coinbase_for_genesis_block_indexed_at_height_zero()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
         let coinbase = tx.clone();
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2228,14 +3606,14 @@ mod tests {
     #[test]
     fn resolve_transaction_returns_none_when_indexed_height_is_not_visible()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2250,15 +3628,15 @@ mod tests {
     #[test]
     fn resolve_tx_with_height_returns_genesis_coinbase_at_height_zero()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
         let coinbase = tx.clone();
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2274,9 +3652,9 @@ mod tests {
     fn resolve_tx_with_height_returns_none_for_unknown_txid()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, indexer) = indexer()?;
-        let txid = bitcoin::Txid::from_byte_array([0xff; 32]);
+        let txid = Txid(Hash256::from_le_bytes(&[0xff; 32]));
         let source = FakeSource {
-            block: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest),
+            block: Network::Regtest.genesis_block(),
             target_height: 0,
         };
 
@@ -2287,20 +3665,20 @@ mod tests {
     #[test]
     fn resolve_outpoint_value_returns_genesis_coinbase_subsidy()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
             target_height: 0,
         };
-        let outpoint = bitcoin::OutPoint { txid, vout: 0 };
+        let outpoint = OutPoint { txid, vout: 0 };
         let value = indexer.resolve_outpoint_value(outpoint, &source)?;
 
         assert_eq!(value, Some(5_000_000_000));
@@ -2310,14 +3688,14 @@ mod tests {
     #[test]
     fn resolve_outpoint_value_via_indexerlike_dyn_source() -> Result<(), Box<dyn std::error::Error>>
     {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2325,7 +3703,7 @@ mod tests {
         };
         let dyn_indexer: &dyn super::IndexerLike = &indexer;
         let dyn_source: &dyn super::BlockSource = &source;
-        let outpoint = bitcoin::OutPoint { txid, vout: 0 };
+        let outpoint = OutPoint { txid, vout: 0 };
         let value = dyn_indexer.resolve_outpoint_value(outpoint, dyn_source)?;
 
         assert_eq!(value, Some(5_000_000_000));
@@ -2335,20 +3713,20 @@ mod tests {
     #[test]
     fn resolve_outpoint_value_returns_none_for_vout_out_of_range()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
             target_height: 0,
         };
-        let outpoint = bitcoin::OutPoint { txid, vout: 99 };
+        let outpoint = OutPoint { txid, vout: 99 };
 
         assert_eq!(indexer.resolve_outpoint_value(outpoint, &source)?, None);
         Ok(())
@@ -2358,12 +3736,12 @@ mod tests {
     fn resolve_outpoint_value_returns_none_for_unknown_txid()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, indexer) = indexer()?;
-        let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array([0xff; 32]),
+        let outpoint = OutPoint {
+            txid: Txid(Hash256::from_le_bytes(&[0xff; 32])),
             vout: 0,
         };
         let source = FakeSource {
-            block: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest),
+            block: Network::Regtest.genesis_block(),
             target_height: 0,
         };
 
@@ -2374,19 +3752,19 @@ mod tests {
     #[test]
     fn resolve_unspent_outputs_with_height_returns_funding_height()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let Some(output) = tx.output.first() else {
+        let Some(output) = tx.outputs.first() else {
             return Err(std::io::Error::other("genesis transaction has no outputs").into());
         };
-        let scripthash = ScriptHash::from_script_bytes(output.script_pubkey.as_bytes());
-        let txid = tx.compute_txid();
-        let value = output.value.to_sat();
+        let scripthash = ScriptHash::from_script_bytes(&output.script_pubkey);
+        let txid = tx.txid();
+        let value = output.value;
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2416,14 +3794,8 @@ mod tests {
     /// spend, so funding and spending rows both exist alongside txid and header
     /// rows.
     fn rollback_fixture_block() -> Block {
-        let funded = tx(
-            OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
-            ScriptBuf::from_bytes(vec![0x51]),
-        );
-        let spender = tx(
-            OutPoint::new(funded.compute_txid(), 0),
-            ScriptBuf::from_bytes(vec![0x52]),
-        );
+        let funded = tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51]);
+        let spender = tx(OutPoint::new(funded.txid(), 0), vec![0x52]);
         block(vec![funded, spender])
     }
 
@@ -2434,7 +3806,7 @@ mod tests {
         let candidate = rollback_fixture_block();
         let before = stored_rows(&indexer)?;
 
-        let written = indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        let written = indexer.ingest_block(&consensus_bytes(&candidate), HEIGHT)?;
         let after_ingest = stored_rows(&indexer)?;
         assert!(
             after_ingest.len() > before.len(),
@@ -2470,22 +3842,16 @@ mod tests {
     fn last_counts_remains_ingest_after_rollback() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut indexer) = indexer()?;
         let old = rollback_fixture_block();
-        let old_written = indexer.ingest_block(&serialize(&old), HEIGHT)?;
+        let old_written = indexer.ingest_block(&consensus_bytes(&old), HEIGHT)?;
         let _ = indexer.rollback_block(&old, HEIGHT)?;
 
         // A replacement at the same height with a different shape so its
         // ingest counts differ from the old block's rollback counts.
         let replacement = block(vec![
-            tx(
-                OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
-                ScriptBuf::from_bytes(vec![0x51]),
-            ),
-            tx(
-                OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
-                ScriptBuf::from_bytes(vec![0x52]),
-            ),
+            tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51]),
+            tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x52]),
         ]);
-        let replacement_written = indexer.ingest_block(&serialize(&replacement), HEIGHT)?;
+        let replacement_written = indexer.ingest_block(&consensus_bytes(&replacement), HEIGHT)?;
         assert_ne!(
             replacement_written, old_written,
             "replacement counts must differ from the old block's counts"
@@ -2519,7 +3885,7 @@ mod tests {
     fn repeated_rollback_is_not_an_error() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut indexer) = indexer()?;
         let candidate = rollback_fixture_block();
-        indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&candidate), HEIGHT)?;
 
         indexer.rollback_block(&candidate, HEIGHT)?;
         let after_first = stored_rows(&indexer)?;
@@ -2542,7 +3908,7 @@ mod tests {
         let candidate = rollback_fixture_block();
 
         indexer.begin_batch();
-        indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&candidate), HEIGHT)?;
         indexer.rollback_block(&candidate, HEIGHT)?;
         indexer.end_batch()?;
 
@@ -2553,9 +3919,9 @@ mod tests {
         Ok(())
     }
 
-    /// Delegates every operation to a real store but fails `write`, so the
-    /// all-or-nothing claim on `rollback_block` can be exercised rather than
-    /// merely asserted in a doc comment.
+    /// Delegates reads to a real store but fails every write API, so the
+    /// all-or-nothing claim on `rollback_block` is exercised through its
+    /// current conditional durable path.
     struct FailingWriteStore(RocksDbStore);
 
     impl bitcoin_rs_storage::KvStore for FailingWriteStore {
@@ -2587,6 +3953,16 @@ mod tests {
             ))
         }
 
+        fn write_durable_if(
+            &self,
+            _conditions: &[bitcoin_rs_storage::WriteCondition<'_>],
+            _batch: Self::WriteBatch,
+        ) -> Result<bool, bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected write failure".to_owned(),
+            ))
+        }
+
         fn flush(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
             self.0.flush()
         }
@@ -2609,7 +3985,7 @@ mod tests {
         {
             let store = Arc::new(RocksDbStore::open(dir.path())?);
             let mut indexer = Indexer::new(store);
-            indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+            indexer.ingest_block(&consensus_bytes(&candidate), HEIGHT)?;
         }
         let store = Arc::new(RocksDbStore::open(dir.path())?);
         let before = stored_rows(&Indexer::new(Arc::clone(&store)))?;
@@ -2650,7 +4026,7 @@ mod tests {
             &self,
             _txid: Txid,
             _source: &dyn BlockSource,
-        ) -> Result<Option<Transaction>, super::IndexError> {
+        ) -> Result<Option<Tx>, super::IndexError> {
             Ok(None)
         }
 
@@ -2684,31 +4060,31 @@ mod tests {
     fn a_repeated_rollback_leaves_a_replacement_blocks_rows_alone()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut indexer) = indexer()?;
-        let shared_script = ScriptBuf::from_bytes(vec![0x51]);
+        let shared_script = vec![0x51];
 
         // Two different blocks at the same height that both pay the same
         // script, so their funding rows collide.
         // The shared `block` fixture pins a zero merkle root, so the nonce is
         // what distinguishes these two headers.
         let mut old_block = block(vec![tx(
-            OutPoint::new(Txid::from_byte_array([0xa1; 32]), 0),
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[0xa1; 32])), 0),
             shared_script.clone(),
         )]);
         old_block.header.nonce = 1;
         let mut replacement = block(vec![tx(
-            OutPoint::new(Txid::from_byte_array([0xb2; 32]), 0),
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[0xb2; 32])), 0),
             shared_script,
         )]);
         replacement.header.nonce = 2;
         assert_ne!(
-            old_block.header.block_hash(),
-            replacement.header.block_hash(),
+            old_block.block_hash(),
+            replacement.block_hash(),
             "the two blocks must differ, or there is nothing to confuse"
         );
 
-        indexer.ingest_block(&serialize(&old_block), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&old_block), HEIGHT)?;
         indexer.rollback_block(&old_block, HEIGHT)?;
-        indexer.ingest_block(&serialize(&replacement), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&replacement), HEIGHT)?;
         indexer.flush()?;
         let after_replacement = stored_rows(&indexer)?;
         assert!(
@@ -2756,41 +4132,38 @@ mod tests {
         Ok(rows)
     }
 
-    fn block(txdata: Vec<Transaction>) -> Block {
+    fn block(txs: Vec<Tx>) -> Block {
         Block {
-            header: block::Header {
-                version: block::Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            header: Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 0,
-                bits: CompactTarget::from_consensus(0),
+                bits: 0,
                 nonce: 0,
             },
-            txdata,
+            txs,
         }
     }
 
-    fn tx(previous_output: OutPoint, script_pubkey: ScriptBuf) -> Transaction {
-        Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
+    fn tx(previous_output: OutPoint, script_pubkey: Vec<u8>) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
                 previous_output,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(5_000),
+            outputs: vec![TxOut {
+                value: 5_000,
                 script_pubkey,
             }],
         }
     }
 
     fn spent_outpoint(label: u8, vout: u32) -> OutPoint {
-        OutPoint {
-            txid: Txid::from_byte_array([label; 32]),
-            vout,
-        }
+        OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), vout)
     }
 }

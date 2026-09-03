@@ -11,14 +11,12 @@ mod common;
 
 use std::sync::Arc;
 
-use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::Hash as _;
-use bitcoin::{
-    Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Txid, Witness, absolute, block, transaction,
-};
 use bitcoin_rs_index::types::{TxPosition, TxPositionValue};
 use bitcoin_rs_index::{Indexer, ScriptHash};
+use bitcoin_rs_primitives::{
+    Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+    deserialize,
+};
 use bitcoin_rs_storage::{ColumnFamily, KvStore};
 use proptest::prelude::*;
 
@@ -26,50 +24,50 @@ use common::MemoryStore;
 
 const HEIGHT: u32 = 321;
 
-fn header() -> block::Header {
-    block::Header {
-        version: block::Version::ONE,
-        prev_blockhash: BlockHash::all_zeros(),
-        merkle_root: TxMerkleNode::all_zeros(),
+fn header() -> Header {
+    Header {
+        version: 1,
+        prev_blockhash: BlockHash::default(),
+        merkle_root: Hash256::default(),
         time: 7,
-        bits: CompactTarget::from_consensus(0),
+        bits: 0,
         nonce: 42,
     }
 }
 
-fn script(tag: u8) -> ScriptBuf {
+fn script(tag: u8) -> Vec<u8> {
     let mut bytes = vec![0x00, 0x14];
     bytes.extend_from_slice(&[tag; 20]);
-    ScriptBuf::from_bytes(bytes)
+    bytes
 }
 
-fn tx(seed: u8, outputs: Vec<TxOut>, witness: bool) -> Transaction {
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn tx(seed: u8, outputs: Vec<TxOut>, witness: bool) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             previous_output: OutPoint {
-                txid: Txid::from_byte_array([seed; 32]),
+                txid: Txid(Hash256::from_le_bytes(&[seed; 32])),
                 vout: u32::from(seed),
             },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
+            script_sig: Vec::new(),
+            sequence: u32::MAX,
             // A segwit transaction serializes with a marker, a flag and a
             // witness. If `total_size()` and the zero-copy measurement disagree
             // anywhere, it is here.
             witness: if witness {
-                Witness::from_slice(&[vec![0xab; 71], vec![0xcd; 33]])
+                vec![vec![0xab; 71], vec![0xcd; 33]]
             } else {
-                Witness::new()
+                Vec::new()
             },
         }],
-        output: outputs,
+        outputs,
     }
 }
 
-fn out(script_pubkey: ScriptBuf, sats: u64) -> TxOut {
+fn out(script_pubkey: Vec<u8>, sats: u64) -> TxOut {
     TxOut {
-        value: Amount::from_sat(sats),
+        value: sats,
         script_pubkey,
     }
 }
@@ -79,7 +77,7 @@ fn out(script_pubkey: ScriptBuf, sats: u64) -> TxOut {
 fn mixed_block() -> Block {
     Block {
         header: header(),
-        txdata: vec![
+        txs: vec![
             tx(1, vec![out(script(0x11), 1_000)], false),
             tx(
                 2,
@@ -89,10 +87,7 @@ fn mixed_block() -> Block {
             tx(3, vec![out(script(0x33), 4_000)], true),
             tx(
                 4,
-                vec![
-                    out(script(0x44), 5_000),
-                    out(ScriptBuf::from_bytes(vec![0x6a, 0x01]), 0),
-                ],
+                vec![out(script(0x44), 5_000), out(vec![0x6a, 0x01], 0)],
                 false,
             ),
         ],
@@ -108,9 +103,10 @@ fn rows_with_values(store: &MemoryStore, cf: ColumnFamily) -> Vec<(Vec<u8>, Vec<
 }
 
 #[test]
+
 fn funding_positions_address_the_transactions_that_funded_the_script() {
     let block = mixed_block();
-    let bytes = serialize(&block);
+    let bytes = consensus_bytes(&block);
 
     let store = Arc::new(MemoryStore::default());
     Indexer::new(Arc::clone(&store))
@@ -119,7 +115,7 @@ fn funding_positions_address_the_transactions_that_funded_the_script() {
 
     // Script 0x11 is funded by transaction 0 and again by transaction 1, which
     // collapse into a single row: one key, two positions.
-    let target = ScriptHash::from_script_bytes(script(0x11).as_bytes());
+    let target = ScriptHash::from_script_bytes(&script(0x11));
 
     let rows = rows_with_values(&store, ColumnFamily::Funding);
     let (_key, value) = rows
@@ -133,13 +129,13 @@ fn funding_positions_address_the_transactions_that_funded_the_script() {
     for position in positions {
         let start = usize::try_from(position.offset()).expect("offset fits usize");
         let end = usize::try_from(position.end().expect("end fits u32")).expect("end fits usize");
-        let decoded: Transaction =
+        let decoded: Tx =
             deserialize(&bytes[start..end]).expect("position slices a whole transaction");
         assert!(
             decoded
-                .output
+                .outputs
                 .iter()
-                .any(|o| ScriptHash::from_script_bytes(o.script_pubkey.as_bytes()) == target),
+                .any(|o| ScriptHash::from_script_bytes(&o.script_pubkey) == target),
             "position must address a transaction that funded the script"
         );
     }
@@ -148,7 +144,7 @@ fn funding_positions_address_the_transactions_that_funded_the_script() {
 #[test]
 fn txid_positions_address_their_own_transaction() {
     let block = mixed_block();
-    let bytes = serialize(&block);
+    let bytes = consensus_bytes(&block);
 
     let store = Arc::new(MemoryStore::default());
     Indexer::new(Arc::clone(&store))
@@ -156,7 +152,7 @@ fn txid_positions_address_their_own_transaction() {
         .expect("ingest");
 
     let rows = rows_with_values(&store, ColumnFamily::TxConfirmed);
-    assert_eq!(rows.len(), block.txdata.len());
+    assert_eq!(rows.len(), block.txs.len());
 
     for (_key, value) in &rows {
         let positions = TxPositionValue::decode(value).expect("row value decodes");
@@ -164,15 +160,16 @@ fn txid_positions_address_their_own_transaction() {
             let start = usize::try_from(position.offset()).expect("offset fits usize");
             let end =
                 usize::try_from(position.end().expect("end fits u32")).expect("end fits usize");
-            let decoded: Transaction =
+            let decoded: Tx =
                 deserialize(&bytes[start..end]).expect("position slices a whole transaction");
             assert!(
-                block.txdata.contains(&decoded),
+                block.txs.contains(&decoded),
                 "position must address a transaction of this block"
             );
         }
     }
 }
+
 
 #[test]
 fn a_partial_position_decodes_to_none() {
@@ -202,5 +199,6 @@ proptest! {
         let decoded = TxPositionValue::decode(&encoded).expect("decodes");
         prop_assert_eq!(decoded, positions.as_slice());
     }
+
 
 }

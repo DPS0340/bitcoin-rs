@@ -13,11 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwapOption;
-use bitcoin::ScriptBuf;
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mining::{Candidate, CandidateContext, TemplateId, assemble_candidate};
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::{Block, Hash256, Network};
 use bitcoin_rs_rpc::context::{
     AvailableMiningRule, BlockTemplate, BlockTemplateMode, BlockTemplateRequest,
     BlockTemplateResult, BlockValidationResult, LastCandidateInfo, MiningCapability, MiningControl,
@@ -125,6 +124,93 @@ impl CoordinatorState {
         }
     }
 }
+/// Mempool-sequence wake that avoids the mempool read lock.
+///
+/// The mempool observer fires under the gateway's publish mutex; taking the
+/// pool read lock from that path can deadlock or contend with an in-flight
+/// writer. Implementations build the generation key from `applied_tip` plus
+/// the caller-supplied sequence instead.
+pub trait MempoolSequenceWake: Send + Sync {
+    /// Publishes a generation key built from `applied_tip` and `sequence`
+    /// without taking the mempool read lock, then wakes all waiters.
+    fn publish_generation_from(&self, sequence: u64);
+}
+
+ /// Wake seam between authoritative mutations and the template coordinator.
+ ///
+ /// [`MiningCoordinator::publish_generation`] documents that every long-poll
+ /// waiter must observe each authoritative applied-tip or mempool mutation,
+ /// but the coordinator is built after node state, so it cannot be referenced
+ /// from the apply path or the mempool gateway directly. This signal is
+ /// created with the node state, wired into the gateway's mutation observer
+ /// and the apply-path tip publication points, and the coordinator attaches
+ /// itself at startup: [`Self::publish_generation`] then forwards to the live
+ /// coordinator. With nothing attached it is a no-op — there is no waiter to
+ /// wake before the coordinator exists.
+ #[derive(Default)]
+ pub struct MiningGenerationSignal {
+     coordinator: RwLock<Option<std::sync::Weak<dyn MiningControl>>>,
+     /// Lock-free mempool-sequence wake; set by [`Self::attach_sequence_wake`].
+    sequence_wake: RwLock<Option<std::sync::Weak<dyn MempoolSequenceWake>>>,
+ }
+ 
+ impl MiningGenerationSignal {
+     /// Creates a detached signal.
+     #[must_use]
+     pub fn new() -> Self {
+         Self::default()
+     }
+ 
+     /// Points the signal at `coordinator` without extending its ownership.
+     ///
+     /// The RPC context owns the coordinator; this wake seam must not create
+     /// an ownership cycle through `MiningCoordinator::apply_handles`, which
+     /// carries the same signal back. A weak reference keeps the seam
+     /// observational: the coordinator's lifetime is the context's, and a
+     /// wake against a torn-down coordinator is a no-op.
+     pub fn attach(&self, coordinator: &Arc<dyn MiningControl>) {
+         *self.coordinator.write() = Some(Arc::downgrade(coordinator));
+     }
+ 
+    /// Points the signal at a lock-free mempool-sequence wake.
+    ///
+    /// When attached, [`Self::publish_generation_from`] forwards to `wake`
+    /// without taking the mempool read lock. Without it, that method falls
+    /// back to [`Self::publish_generation`].
+    pub fn attach_sequence_wake(&self, wake: &Arc<dyn MempoolSequenceWake>) {
+        *self.sequence_wake.write() = Some(Arc::downgrade(wake));
+    }
+
+     /// Forwards one authoritative-mutation wake to the attached coordinator.
+     pub fn publish_generation(&self) {
+         if let Some(coordinator) = self
+             .coordinator
+             .read()
+             .as_ref()
+             .and_then(std::sync::Weak::upgrade)
+         {
+             coordinator.publish_generation();
+         }
+     }
+
+    /// Forwards one mempool-sequence wake to the attached coordinator.
+    ///
+    /// Uses the lock-free [`MempoolSequenceWake`] path when attached;
+    /// otherwise falls back to [`Self::publish_generation`].
+    pub fn publish_generation_from(&self, sequence: u64) {
+        if let Some(wake) = self
+            .sequence_wake
+            .read()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            wake.publish_generation_from(sequence);
+        } else {
+            self.publish_generation();
+        }
+    }
+ }
+
 /// Production mining coordinator owned by the node process.
 ///
 /// `coinbase_script` is immutable coordinator configuration captured at
@@ -138,7 +224,7 @@ pub struct MiningCoordinator {
     block_tree: Arc<RwLock<BlockTree>>,
     mempool: Arc<RwLock<Mempool>>,
     apply_handles: ApplyHandles,
-    coinbase_script: ScriptBuf,
+    coinbase_script: Vec<u8>,
     shutdown: Arc<AtomicBool>,
     /// Wall clock used for long-poll cooldowns.
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -152,7 +238,7 @@ impl MiningCoordinator {
     /// Builds a coordinator over the shared applied-chain and mempool handles.
     ///
     /// `coinbase_script` is required and stored immutably. Pass
-    /// [`ScriptBuf::new`] for transport-only template assembly when the node
+    /// `Vec::new()` for transport-only template assembly when the node
     /// does not own a miner payout script.
     #[must_use]
     pub fn new(
@@ -161,7 +247,7 @@ impl MiningCoordinator {
         block_tree: Arc<RwLock<BlockTree>>,
         mempool: Arc<RwLock<Mempool>>,
         apply_handles: ApplyHandles,
-        coinbase_script: ScriptBuf,
+        coinbase_script: Vec<u8>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -200,6 +286,33 @@ impl MiningCoordinator {
     /// captured from live applied-tip / mempool state under the coordinator lock.
     pub fn publish_generation(&self) {
         let key = self.live_generation_key();
+        let mut state = self.state.lock();
+        if let Some(previous) = state.published
+            && previous != key
+        {
+            state.invalidate_key(previous);
+        }
+        state.published = Some(key);
+        self.wake.notify_all();
+    }
+
+    /// Publishes a generation key built from `applied_tip` and `sequence`
+    /// without taking the mempool read lock, then wakes all waiters.
+    ///
+    /// The mempool observer calls this with the sequence the mutation already
+    /// produced, avoiding a reentrant pool read that can deadlock under the
+    /// gateway's publish mutex. Tip-move callers should use
+    /// [`Self::publish_generation`] instead, which captures the live sequence
+    /// safely (no write lock is held on that path).
+    pub fn publish_generation_from(&self, sequence: u64) {
+        let tip_hash = self
+            .applied_tip
+            .load_full()
+            .map_or_else(|| self.network.genesis_block_hash(), |tip| tip.hash);
+        let key = GenerationKey {
+            tip_hash,
+            mempool_sequence: sequence,
+        };
         let mut state = self.state.lock();
         if let Some(previous) = state.published
             && previous != key
@@ -256,7 +369,6 @@ impl MiningCoordinator {
         &self,
         waited: GenerationKey,
     ) -> Result<GenerationKey, MiningControlError> {
-        let started = (self.clock)();
         let mut state = self.state.lock();
         loop {
             if self.shutdown.load(Ordering::Acquire) {
@@ -266,16 +378,7 @@ impl MiningCoordinator {
             }
             let live = self.ensure_published(&mut state);
             if live != waited {
-                if live.tip_hash != waited.tip_hash {
-                    return Ok(live);
-                }
-                if started.elapsed() >= self.mempool_update_wait {
-                    return Ok(live);
-                }
-                let remaining = self.mempool_update_wait.saturating_sub(started.elapsed());
-                let wait = remaining.min(LONG_POLL_SLICE);
-                let _ = self.wake.wait_for(&mut state, wait);
-                continue;
+                return Ok(live);
             }
             let _ = self.wake.wait_for(&mut state, LONG_POLL_SLICE);
         }
@@ -400,7 +503,7 @@ impl MiningCoordinator {
             previous_block_hash: chain.previous_block_hash,
             height: chain.height,
             version: chain.version,
-            bits: chain.bits.to_consensus(),
+            bits: chain.bits,
             min_time: chain.min_time,
             current_time: current_time.max(chain.min_time),
             locktime_cutoff: chain.locktime_cutoff(current_time.max(chain.min_time)),
@@ -461,17 +564,15 @@ impl MiningCoordinator {
         }
     }
 
-    fn propose(&self, block: &bitcoin::Block) -> BlockValidationResult {
+    fn propose(&self, block: &Block) -> BlockValidationResult {
         match apply::validate_block(&self.apply_handles, block) {
             Ok(()) => BlockValidationResult::Accepted,
             Err(error) => map_apply_error(error),
         }
     }
 
-    fn submit(&self, block: &bitcoin::Block) -> Result<BlockValidationResult, MiningControlError> {
-        use bitcoin::hashes::Hash as _;
-
-        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    fn submit(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
+        let block_hash: Hash256 = block.block_hash().into();
         {
             let tree = self.block_tree.read();
             if let Some(node_id) = tree.lookup(block_hash) {
@@ -530,7 +631,7 @@ impl MiningCoordinator {
                         })?;
                 (
                     difficulty_for_bits(tip_bits),
-                    next.bits.to_consensus(),
+                    next.bits,
                     difficulty_for_bits(next.bits),
                 )
             }
@@ -605,15 +706,18 @@ impl MiningControl for MiningCoordinator {
         self.mining_info_snapshot()
     }
 
-    fn submit_block(
-        &self,
-        block: bitcoin::Block,
-    ) -> Result<BlockValidationResult, MiningControlError> {
+    fn submit_block(&self, block: Block) -> Result<BlockValidationResult, MiningControlError> {
         self.submit(&block)
     }
 
     fn publish_generation(&self) {
         Self::publish_generation(self);
+    }
+}
+
+impl MempoolSequenceWake for MiningCoordinator {
+    fn publish_generation_from(&self, sequence: u64) {
+        Self::publish_generation_from(self, sequence);
     }
 }
 
@@ -701,11 +805,34 @@ fn signet_info(network: Network) -> Option<SignetMiningInfo> {
     if network != Network::Signet {
         return None;
     }
-    let challenge = match ScriptBuf::from_hex(DEFAULT_SIGNET_CHALLENGE) {
-        Ok(challenge) => challenge,
-        Err(error) => panic!("Bitcoin Core's default Signet challenge is invalid: {error}"),
-    };
+    let challenge = hex_decode(DEFAULT_SIGNET_CHALLENGE)
+        .unwrap_or_else(|| panic!("Bitcoin Core's default Signet challenge is invalid hex"));
     Some(SignetMiningInfo { challenge })
+}
+
+/// Decodes a lowercase hex string to bytes. Returns `None` on invalid input.
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.as_bytes().iter();
+    while let Some(&hi) = chars.next() {
+        let &lo = chars.next()?;
+        let high = decode_nibble(hi)?;
+        let low = decode_nibble(lo)?;
+        bytes.push((high << 4) | low);
+    }
+    Some(bytes)
+}
+
+fn decode_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -713,7 +840,7 @@ mod generation_key_tests {
     use super::{GenerationKey, parse_long_poll_id};
     use alloc::sync::Arc;
     use bitcoin_rs_mining::{Candidate, TemplateId};
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_primitives::{Hash256, Tx, TxOut};
 
     #[test]
     fn long_poll_round_trips_template_id() {
@@ -754,17 +881,16 @@ mod generation_key_tests {
     #[test]
     fn candidate_cache_evicts_the_oldest_entry_at_the_bound() {
         use alloc::sync::Arc;
-        use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
         use bitcoin_rs_mining::Candidate;
 
         let mut state = super::CoordinatorState::new();
-        let coinbase = Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+        let coinbase = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         };
         let mut first_id = None;
@@ -812,7 +938,6 @@ mod generation_key_tests {
     }
 
     fn sample_candidate(previous: Hash256, csv_active: bool, segwit_active: bool) -> Candidate {
-        use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
         Candidate {
             template_id: TemplateId::new(&previous, 1),
             previous_block_hash: previous,
@@ -827,13 +952,13 @@ mod generation_key_tests {
             max_size: 4_000_000,
             max_sigops: 80_000,
             mempool_sequence: 1,
-            coinbase: Transaction {
-                version: bitcoin::transaction::Version::TWO,
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: Vec::new(),
-                output: vec![TxOut {
-                    value: Amount::from_sat(50),
-                    script_pubkey: ScriptBuf::new(),
+            coinbase: Tx {
+                version: 2,
+                lock_time: 0,
+                inputs: Vec::new(),
+                outputs: vec![TxOut {
+                    value: 50,
+                    script_pubkey: Vec::new(),
                 }],
             },
             coinbase_value: 50,
@@ -925,5 +1050,128 @@ mod generation_key_tests {
                 expected
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_signal_tests {
+    use super::{MiningGenerationSignal, MempoolSequenceWake};
+    use bitcoin_rs_primitives::Block;
+    use bitcoin_rs_rpc::context::{
+        BlockTemplateRequest, BlockTemplateResult, MiningControl, MiningControlError,
+    };
+    use compact_str::CompactString;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// Records `publish_generation` and `publish_generation_from` calls; every
+    /// other control operation is unsupported in these tests.
+    #[derive(Default)]
+    struct RecordingControl {
+        published: Mutex<usize>,
+        published_from: Mutex<Vec<u64>>,
+    }
+
+    fn unavailable() -> MiningControlError {
+        MiningControlError::Unavailable(CompactString::from("not wired in this test"))
+    }
+
+    impl MiningControl for RecordingControl {
+        fn get_block_template(
+            &self,
+            _request: BlockTemplateRequest,
+        ) -> Result<BlockTemplateResult, MiningControlError> {
+            Err(unavailable())
+        }
+
+        fn mining_info(&self) -> Result<bitcoin_rs_rpc::context::MiningInfo, MiningControlError> {
+            Err(unavailable())
+        }
+
+        fn submit_block(
+            &self,
+            _block: Block,
+        ) -> Result<bitcoin_rs_rpc::context::BlockValidationResult, MiningControlError> {
+            Err(unavailable())
+        }
+
+        fn publish_generation(&self) {
+            *self.published.lock() += 1;
+        }
+    }
+
+    impl MempoolSequenceWake for RecordingControl {
+        fn publish_generation_from(&self, sequence: u64) {
+            self.published_from.lock().push(sequence);
+        }
+    }
+
+    #[test]
+    fn detached_signal_is_a_noop() {
+        let signal = MiningGenerationSignal::new();
+        // No coordinator attached: nothing to wake, nothing panics.
+        signal.publish_generation();
+        signal.publish_generation();
+        signal.publish_generation_from(1);
+    }
+
+    #[test]
+    fn attached_signal_forwards_every_generation_publication() {
+        let signal = MiningGenerationSignal::new();
+        let control = Arc::new(RecordingControl::default());
+        let control_dyn: Arc<dyn MiningControl> = control.clone();
+        signal.attach(&control_dyn);
+
+        assert_eq!(*control.published.lock(), 0);
+        signal.publish_generation();
+        signal.publish_generation();
+        assert_eq!(
+            *control.published.lock(),
+            2,
+            "every authoritative-mutation wake must reach the coordinator"
+        );
+    }
+
+    #[test]
+    fn attached_signal_forwards_sequence_wake_without_mempool_lock() {
+        let signal = MiningGenerationSignal::new();
+        let control = Arc::new(RecordingControl::default());
+        let control_dyn: Arc<dyn MiningControl> = control.clone();
+        let wake_dyn: Arc<dyn MempoolSequenceWake> = control.clone();
+        signal.attach(&control_dyn);
+        signal.attach_sequence_wake(&wake_dyn);
+
+        assert!(control.published_from.lock().is_empty());
+        signal.publish_generation_from(7);
+        signal.publish_generation_from(8);
+        assert_eq!(
+            *control.published_from.lock(),
+            vec![7, 8],
+            "sequence wakes must reach the lock-free path"
+        );
+        assert_eq!(
+            *control.published.lock(),
+            0,
+            "sequence wakes must not fall back to publish_generation"
+        );
+    }
+
+    #[test]
+    fn sequence_wake_falls_back_when_not_attached() {
+        let signal = MiningGenerationSignal::new();
+        let control = Arc::new(RecordingControl::default());
+        let control_dyn: Arc<dyn MiningControl> = control.clone();
+        signal.attach(&control_dyn);
+
+        signal.publish_generation_from(1);
+        assert_eq!(
+            *control.published.lock(),
+            1,
+            "without attach_sequence_wake, publish_generation_from falls back"
+        );
+        assert!(
+            control.published_from.lock().is_empty(),
+            "the lock-free path is not taken without attach_sequence_wake"
+        );
     }
 }

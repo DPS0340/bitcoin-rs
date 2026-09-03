@@ -1,9 +1,8 @@
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use bitcoin::block::Header;
-use bitcoin::consensus::{Encodable, encode::deserialize};
 use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot, accept_headers};
+use bitcoin_rs_primitives::{ConsensusEncode, Header, deserialize};
 use bitcoin_rs_primitives::{Hash256, Network};
 use bitcoin_rs_utxo::stats::{
     CoinStats, CoinStatsAccumulator, CoinStatsListener, coin_stats::COIN_STATS_ENCODED_LEN,
@@ -417,10 +416,10 @@ fn tip_from_node(
 fn encode_header(header: &Header) -> Result<[u8; HEADER_LEN], HeaderCheckpointError> {
     let mut encoded = [0_u8; HEADER_LEN];
     let mut cursor = &mut encoded[..];
-    let written = header
+    header
         .consensus_encode(&mut cursor)
         .map_err(|error| HeaderCheckpointError::Codec(error.to_string()))?;
-    if written != HEADER_LEN || !cursor.is_empty() {
+    if !cursor.is_empty() {
         return Err(HeaderCheckpointError::Codec(
             "Bitcoin header did not encode to 80 bytes".to_owned(),
         ));
@@ -1740,12 +1739,10 @@ mod tests {
     use std::io::Cursor;
     use std::path::Path;
 
-    use bitcoin::block::{Header, Version};
-    use bitcoin::consensus::encode::deserialize;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{Amount, BlockHash, CompactTarget, ScriptBuf, TxMerkleNode, TxOut};
-    use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot, accept_headers};
-    use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
+    use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot, accept_headers};
+    use bitcoin_rs_primitives::{
+        BlockHash, Hash256, Header, Network, OutPoint, TxOut, Txid, deserialize,
+    };
     use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener, scan_coin_stats};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
     use parking_lot::RwLock;
@@ -1880,7 +1877,7 @@ mod tests {
         let mut bad_pow = bytes.clone();
         let header_offset = HEADER_PREFIX_LEN + 80;
         let mut invalid = header_from_row(&bad_pow[header_offset..header_offset + 80])?;
-        while invalid.validate_pow(invalid.target()).is_ok() {
+        while pow_meets_target(invalid.bits, invalid.compute_hash().0) {
             invalid.nonce = invalid.nonce.checked_add(1).ok_or("nonce exhausted")?;
         }
         bad_pow[header_offset..header_offset + 80].copy_from_slice(&encode_header(&invalid)?);
@@ -1889,7 +1886,7 @@ mod tests {
         let mut bad_nbits = bytes;
         let previous = header_from_row(&bad_nbits[header_offset..header_offset + 80])?;
         let mut nbits_mismatch = Header {
-            bits: CompactTarget::from_consensus(0x207f_fffe),
+            bits: 0x207f_fffe,
             ..previous
         };
         mine_header_to_declared_target(&mut nbits_mismatch)?;
@@ -1950,7 +1947,7 @@ mod tests {
         let (mut tree, best_tip_id, _) = chain_with_applied_height(3, 1)?;
         let genesis_hash = tree.node(NodeId::new(0))?.hash;
         let mut fork = next_header(
-            BlockHash::from_byte_array(genesis_hash.to_le_bytes()),
+            BlockHash(genesis_hash),
             u32::from(NETWORK.genesis_block_hash().to_le_bytes()[0]) + 1,
         );
         mine_header_to_declared_target(&mut fork)?;
@@ -2016,7 +2013,7 @@ mod tests {
         let main_best_hash = tree.node(main_best_id)?.hash;
 
         let genesis_hash = tree.node(NodeId::new(0))?.hash;
-        let mut prev = BlockHash::from_byte_array(genesis_hash.to_le_bytes());
+        let mut prev = BlockHash(genesis_hash);
         let mut fork_best_id = NodeId::new(0);
         for height in 1..=4 {
             let mut header = next_header(prev, height);
@@ -2028,7 +2025,7 @@ mod tests {
                 NETWORK,
                 bitcoin_rs_chain::current_unix_seconds(),
             )?[0];
-            prev = BlockHash::from_byte_array(tree.node(fork_best_id)?.hash.to_le_bytes());
+            prev = BlockHash(tree.node(fork_best_id)?.hash);
         }
         let fork_best_hash = tree.node(fork_best_id)?.hash;
         assert_eq!(tree.tip().map(|tip| tip.tip_id), Some(fork_best_id));
@@ -2520,14 +2517,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
         let applied_tip = tip_snapshot(&tree, applied)?;
-        let record_txid = Hash256::from_le_bytes(&[0x44; 32]);
+        let record_txid = Txid(Hash256::from_le_bytes(&[0x44; 32]));
         let mut changes = BlockChanges::default();
         for vout in 0..OUTPUT_COUNT {
             changes.add(UtxoAdd::new(
                 OutPoint::new(record_txid, vout),
                 TxOut {
-                    value: Amount::from_sat(u64::from(vout) + 1),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    value: u64::from(vout) + 1,
+                    script_pubkey: vec![0x51],
                 },
                 false,
                 0,
@@ -2593,10 +2590,10 @@ mod tests {
         restored.utxo.set_listener(Box::new(listener.clone()));
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
-            OutPoint::new(Hash256::from_le_bytes(&[0x5a; 32]), 42),
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[0x5a; 32])), 42),
             TxOut {
-                value: Amount::from_sat(123_456),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0xac]),
+                value: 123_456,
+                script_pubkey: vec![0x51, 0xac],
             },
             false,
             restored.applied_tip.height,
@@ -2786,8 +2783,7 @@ mod tests {
         best_height: u32,
         applied_height: u32,
     ) -> Result<(BlockTree, NodeId, HeaderCheckpointPoint), HeaderCheckpointError> {
-        let genesis =
-            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let genesis = NETWORK.genesis_block().header;
         let mut tree = BlockTree::new();
         let mut current = accept_headers(
             &mut tree,
@@ -2796,7 +2792,7 @@ mod tests {
             bitcoin_rs_chain::current_unix_seconds(),
         )?[0];
         for height in 1..=best_height {
-            let prev = BlockHash::from_byte_array(tree.node(current)?.hash.to_le_bytes());
+            let prev = BlockHash(tree.node(current)?.hash);
             let mut header = next_header(prev, height);
             mine_header_to_declared_target(&mut header)?;
             current = accept_headers(
@@ -2817,23 +2813,52 @@ mod tests {
 
     fn next_header(prev_blockhash: BlockHash, height: u32) -> Header {
         Header {
-            version: Version::ONE,
+            version: 1,
             prev_blockhash,
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time: 1_296_688_602_u32.saturating_add(height),
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         }
     }
 
     fn mine_header_to_declared_target(header: &mut Header) -> Result<(), HeaderCheckpointError> {
-        while header.validate_pow(header.target()).is_err() {
+        while !pow_meets_target(header.bits, header.compute_hash().0) {
             header.nonce = header
                 .nonce
                 .checked_add(1)
                 .ok_or_else(|| HeaderCheckpointError::Codec("exhausted test nonce".to_owned()))?;
         }
         Ok(())
+    }
+
+    /// Decodes a compact target and checks whether `hash` meets it, mirroring
+    /// the chain crate's private `compact_is_met_by`.
+    fn pow_meets_target(bits: u32, hash: Hash256) -> bool {
+        let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
+        let mantissa = u64::from(bits & 0x007f_ffff);
+        let negative = mantissa != 0 && bits & 0x0080_0000 != 0;
+        let overflow = mantissa != 0
+            && (exponent > 34
+                || (mantissa > 0xff && exponent > 33)
+                || (mantissa > 0xffff && exponent > 32));
+        if negative || overflow {
+            return false;
+        }
+        let target = if exponent <= 3 {
+            ChainWork::from(mantissa >> (8 * (3 - exponent)))
+        } else {
+            let shift = 8 * (exponent - 3);
+            if shift < 256 {
+                ChainWork::from(mantissa) << shift
+            } else {
+                return false;
+            }
+        };
+        if target == ChainWork::ZERO {
+            return false;
+        }
+        ChainWork::from_le_bytes(hash.to_le_bytes()) <= target
     }
 
     fn header_from_row(row: &[u8]) -> Result<Header, HeaderCheckpointError> {
@@ -2843,10 +2868,10 @@ mod tests {
     fn populated_utxo() -> Result<UtxoSet, bitcoin_rs_utxo::UtxoError> {
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
-            OutPoint::new(Hash256::from_le_bytes(&[7_u8; 32]), 3),
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[7_u8; 32])), 3),
             TxOut {
-                value: Amount::from_sat(50_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x21]),
+                value: 50_000,
+                script_pubkey: vec![0x51, 0x21],
             },
             true,
             0,

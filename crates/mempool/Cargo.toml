@@ -16,15 +16,17 @@ default = []
 rocksdb = []
 fjall = []
 redb = []
+test-seam = []
 
 [dependencies]
 bitcoin-rs-primitives.workspace = true
 bitcoin-rs-consensus.workspace = true
 bitcoin-rs-script.workspace = true
-bitcoin.workspace = true
+sha2.workspace = true
 hashbrown.workspace = true
 smallvec.workspace = true
 parking_lot.workspace = true
+metrics.workspace = true
 arc-swap.workspace = true
 slab.workspace = true
 bytemuck.workspace = true

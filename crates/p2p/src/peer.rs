@@ -64,6 +64,8 @@ pub struct Peer<S> {
     /// Current protocol state.
     pub state: PeerState,
     /// Outbound message sender for event-loop integration.
+    // Vestigial queue: drained only by handshake tests (~6 messages per
+    // connection lifetime); production traffic uses the PeerLease channel.
     pub sender: Sender<Message>,
     /// Receiver paired with `sender` for tests and simple loops.
     pub receiver: Receiver<Message>,
@@ -85,23 +87,6 @@ impl<S> Peer<S> {
     /// Create a peer using an in-process outbound queue.
     pub fn new(stream: S, magic: Magic) -> Self {
         let (sender, receiver) = unbounded();
-        Self {
-            stream,
-            state: PeerState::Disconnected,
-            sender,
-            receiver,
-            magic,
-            remote_version: None,
-            received_verack: false,
-            capabilities: PeerCapabilities::default(),
-            compact_blocks: CompactBlockNegotiation::default(),
-            wtxid_relay: WtxidRelayState::default(),
-        }
-    }
-
-    /// Create a peer using an externally managed outbound sender.
-    pub fn with_sender(stream: S, magic: Magic, sender: Sender<Message>) -> Self {
-        let (_unused_sender, receiver) = unbounded();
         Self {
             stream,
             state: PeerState::Disconnected,
@@ -236,6 +221,12 @@ pub const UPLOAD_TIMEFRAME_SECS: u64 = 86_400;
 /// Consensus maximum serialized block size, the per-10-minute relay buffer
 /// unit in Core's historical-block serving rule.
 pub const MAX_BLOCK_SERIALIZED_SIZE: u64 = 4_000_000;
+/// Same consensus limit as [`MAX_BLOCK_SERIALIZED_SIZE`] in `usize` form,
+/// for wire-buffer arithmetic. Defined beside the `u64` original so `peer`
+/// is the single authority for both forms.
+pub const MAX_BLOCK_SERIALIZED_SIZE_USIZE: usize = 4_000_000;
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+const _: () = assert!(MAX_BLOCK_SERIALIZED_SIZE_USIZE as u64 == MAX_BLOCK_SERIALIZED_SIZE);
 
 /// Aggregate traffic totals and upload-target accounting behind `getnettotals`.
 ///
@@ -603,7 +594,10 @@ impl NetworkControls {
     }
 
     /// Queues one ping toward every live connection and returns the number of
-    /// pings successfully queued (Core `PeerManager::SendPings`).
+    /// pings successfully queued (Core `PeerManager::SendPings`). Pings
+    /// inherit the saturation-disconnect policy from `PeerLease::send`: a
+    /// saturated lease refuses the ping, is not counted, and is cancelled so
+    /// the peer disconnects.
     pub fn send_pings(&self, now_us: u64) -> usize {
         let mut scheduled = 0;
         for lease in self.peer_outbound.read().values() {
@@ -1095,6 +1089,24 @@ mod tests {
         assert_eq!(controls.send_pings(10_000), 1);
         assert!(matches!(rx.try_recv(), Ok(Message::Ping(_))));
         assert!(lease.stats().ping_wait(10_500).is_some());
+    }
+
+    #[test]
+    fn send_pings_skips_and_disconnects_saturated_peer() {
+        let controls = controls_with_no_peers();
+        let addr = SocketAddr::from(([127, 0, 0, 1], 6));
+        let (tx, _undrained_rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new_with_budget(
+            tx,
+            false,
+            crate::connection::OutboundBudget::new(0, 0),
+        );
+        controls.peer_outbound().write().insert(addr, lease.clone());
+
+        // The zero budget refuses the ping; it is not counted and the
+        // saturation policy cancels the lease so the peer disconnects.
+        assert_eq!(controls.send_pings(10_000), 0);
+        assert!(lease.is_cancelled());
     }
 
     #[test]

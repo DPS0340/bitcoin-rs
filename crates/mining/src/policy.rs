@@ -3,6 +3,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use bitcoin_rs_mempool::{MempoolMiningSnapshot, SnapshotEntry};
+use bitcoin_rs_primitives::Tx;
 
 use crate::MiningError;
 use crate::template::CandidateContext;
@@ -11,6 +12,12 @@ use crate::template::CandidateContext;
 thread_local! {
     static RESIDUAL_PACKAGE_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
 }
+
+/// BIP113 locktime threshold: values below this are height-based, at or above
+/// are timestamp-based.
+const LOCKTIME_THRESHOLD: u32 = 500_000_000;
+/// Sequence value that marks an input as final (disables locktime).
+const SEQUENCE_FINAL: u32 = 0xffff_ffff;
 
 /// One dependency-closed package selected for a candidate.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,24 +216,47 @@ fn package_is_final(
 ) -> bool {
     package.indices.iter().all(|&index| {
         let entry = &snapshot.entries[index];
-        bitcoin_rs_consensus::is_final_tx(&entry.tx, context.height, context.locktime_cutoff)
+        is_final_tx(&entry.tx, context.height, context.locktime_cutoff)
             && next_block_sequence_locks_final(context, snapshot, &entry.tx)
     })
+}
+
+/// Inlined BIP113/BIP68 finality check matching consensus `is_final_tx`.
+///
+/// - locktime == 0: always final.
+/// - locktime < `LOCKTIME_THRESHOLD`: height-based; final iff locktime < `block_height`.
+/// - locktime >= `LOCKTIME_THRESHOLD`: timestamp-based; final iff locktime < `locktime_cutoff`.
+/// - all inputs sequence == `SEQUENCE_FINAL`: final regardless of locktime.
+fn is_final_tx(tx: &Tx, block_height: u32, locktime_cutoff: u32) -> bool {
+    if tx.lock_time == 0 {
+        return true;
+    }
+    let threshold = if tx.lock_time < LOCKTIME_THRESHOLD {
+        block_height
+    } else {
+        locktime_cutoff
+    };
+    if tx.lock_time < threshold {
+        return true;
+    }
+    tx.inputs
+        .iter()
+        .all(|input| input.sequence == SEQUENCE_FINAL)
 }
 
 fn next_block_sequence_locks_final(
     context: &CandidateContext,
     snapshot: &MempoolMiningSnapshot,
-    tx: &bitcoin::Transaction,
+    tx: &Tx,
 ) -> bool {
     if !context.csv_active {
         return true;
     }
-    if tx.version.0 < 2 {
+    if tx.version < 2 {
         return true;
     }
-    tx.input.iter().all(|input| {
-        let sequence = input.sequence.to_consensus_u32();
+    tx.inputs.iter().all(|input| {
+        let sequence = input.sequence;
         let parent_unconfirmed = snapshot
             .entries
             .iter()
@@ -235,7 +265,7 @@ fn next_block_sequence_locks_final(
             return true;
         }
         bitcoin_rs_consensus::bip68::sequence_lock_satisfied(
-            tx.version.0,
+            tx.version,
             sequence,
             context.height,
             context.locktime_cutoff,
@@ -257,13 +287,8 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Arc;
 
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-        transaction,
-    };
     use bitcoin_rs_mempool::{MempoolMiningSnapshot, SnapshotEntry};
-    use bitcoin_rs_primitives::{Hash256, Network};
+    use bitcoin_rs_primitives::{Hash256, Network, OutPoint, Tx, TxIn, TxOut, Txid};
 
     use super::{RESIDUAL_PACKAGE_CONSTRUCTIONS, select_packages};
     use crate::template::CandidateContext;
@@ -323,17 +348,11 @@ mod tests {
         }
     }
 
-    fn snapshot_entry(
-        tx: Transaction,
-        fee: u64,
-        weight: u64,
-        size: u32,
-        sigop_cost: u32,
-    ) -> SnapshotEntry {
+    fn snapshot_entry(tx: Tx, fee: u64, weight: u64, size: u32, sigop_cost: u32) -> SnapshotEntry {
         let tx = Arc::new(tx);
         SnapshotEntry {
-            txid: tx.compute_txid(),
-            wtxid: tx.compute_wtxid(),
+            txid: tx.txid(),
+            wtxid: tx.wtxid(),
             vsize: size.max(1),
             bip141_vsize: size.max(1),
             size,
@@ -351,20 +370,22 @@ mod tests {
         }
     }
 
-    fn independent_tx(label: u8) -> Transaction {
-        Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([label; 32]), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn independent_tx(label: u8) -> Tx {
+        let mut bytes = [0_u8; 32];
+        bytes[0] = label;
+        Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from(Hash256::from_le_bytes(&bytes)), 0),
+                script_sig: vec![],
+                sequence: u32::MAX,
+                witness: vec![],
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, label]),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51, label],
             }],
+            lock_time: 0,
         }
     }
 }

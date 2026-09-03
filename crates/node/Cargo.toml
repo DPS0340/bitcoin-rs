@@ -16,10 +16,10 @@ workspace = true
 # `TxIndexStorage` enums are entirely backend-cfg-gated — with zero backends the
 # `match self` arms are non-exhaustive and the crate fails to compile.  fjall
 # is the performance-oriented default backend so per-crate `cargo publish` / `cargo check`
-# works out of the box.  CI and local dev build via `bin/bitcoin-rs` with
-# `--package bitcoin-rs --no-default-features --features "rocksdb,fjall,redb,mdbx,kernel"`,
-# which propagates all four backends and the bitcoinkernel verifier through
-# `bin/bitcoin-rs`'s feature table.
+# works out of the box.  CI and local dev build via `bin/bitcoin-rs`, whose
+# default features are `fjall,redb,zmq` (pure-Rust storage; rocksdb, mdbx, and
+# kernel stay selectable but non-default). Full-matrix lanes request the other
+# backends explicitly through `bin/bitcoin-rs`'s feature table.
 # Note: `--workspace --features "..."` in a virtual workspace (no root [package])
 # does NOT forward CLI features to library crates; always use -p when features
 # must reach a specific crate.
@@ -31,7 +31,6 @@ rocksdb = [
     "bitcoin-rs-mempool/rocksdb",
     "bitcoin-rs-mining/rocksdb",
     "bitcoin-rs-p2p/rocksdb",
-    "bitcoin-rs-rpc/rocksdb",
     "bitcoin-rs-script/rocksdb",
     "bitcoin-rs-storage/rocksdb",
     "bitcoin-rs-utxo/rocksdb",
@@ -43,7 +42,6 @@ fjall = [
     "bitcoin-rs-mempool/fjall",
     "bitcoin-rs-mining/fjall",
     "bitcoin-rs-p2p/fjall",
-    "bitcoin-rs-rpc/fjall",
     "bitcoin-rs-script/fjall",
     "bitcoin-rs-storage/fjall",
     "bitcoin-rs-utxo/fjall",
@@ -55,7 +53,6 @@ redb = [
     "bitcoin-rs-mempool/redb",
     "bitcoin-rs-mining/redb",
     "bitcoin-rs-p2p/redb",
-    "bitcoin-rs-rpc/redb",
     "bitcoin-rs-script/redb",
     "bitcoin-rs-storage/redb",
     "bitcoin-rs-utxo/redb",
@@ -80,6 +77,8 @@ bitcoin-rs-index.workspace = true
 
 bitcoin-rs-mempool.workspace = true
 bitcoin-rs-p2p.workspace = true
+bitcoin-rs-ext-api.workspace = true
+bitcoin-rs-ext-blockfilterindex.workspace = true
 bitcoin-rs-mining.workspace = true
 bitcoin-rs-rpc.workspace = true
 
@@ -115,6 +114,7 @@ tempfile = "3"
 proptest.workspace = true
 anyhow.workspace = true
 criterion.workspace = true
+sonic-rs.workspace = true
 
 [[bench]]
 name = "sync_pipeline"

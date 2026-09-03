@@ -25,6 +25,8 @@ pub mod snapshot;
 pub mod stats;
 /// Versioned on-disk encoding for undo records.
 pub mod undo_codec;
+/// UTXO connect accounting: block mutation, undo, and value totals.
+pub mod connect;
 
 pub use key::{UtxoBuildHasher, UtxoKey};
 pub use record::{OneUtxoOut, UtxoRecord};
@@ -33,6 +35,7 @@ pub use set::{
     UtxoCommittedEvent, UtxoError, UtxoInserted, UtxoMemoryReport, UtxoRemoved, UtxoScan, UtxoSet,
     UtxoSetView,
 };
+pub use connect::{BlockChangeError, BlockValueTotals, SpentOutputLookup, is_coinbase_tx};
 pub use shard::{LiveOutput, LiveOutputMeta};
 pub use snapshot::{
     SnapshotCoin, SnapshotCoinObserver, SnapshotLoad, aggregate_hash, hash_serialized_3,

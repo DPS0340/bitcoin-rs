@@ -34,6 +34,15 @@ counter. Reorg disconnects are emitted tip-first before connects on the
 replacement branch. Mempool `A`/`R` events are deliberately omitted until the
 mempool has per-transaction sequence assignment and explicit removal reasons.
 
+### Embedded node
+The typed in-process surface (`bitcoin_rs_node::Node`) over the same
+lifecycle the daemon runs: start against a data dir on the caller's
+Tokio runtime, typed snapshot/progress/capability reads, mempool
+statistics, fee estimates, gateway-routed broadcast, and a consuming
+shutdown that publishes the clean checkpoint. No second lifecycle exists —
+the daemon's `run()` is a signal wrapper around the identical start and
+shutdown path (see `docs/contracts/embedding.md`).
+
 ## Initial Block Download
 
 ### Initial Block Download (IBD)
@@ -63,11 +72,16 @@ The default mainnet configuration: `fjall` backend, multi-peer download (outboun
 ### Sync regimes (download-bound vs processing-bound)
 The two cost regimes a sync measurement must name before its numbers mean anything. **Download-bound:** wall is decided by the network path — live IBD. **Processing-bound:** blocks are local and wall is decided by validation plus storage commit — reindex and replay. A node can rank differently in the two, so a faster-than-X claim needs the regime and validation posture stated.
 
+All benchmark campaign evidence and tooling is retired by #224. The seven
+retained Criterion benchmark targets are compiled in the `bench-smoke` CI lane
+(`bitcoin-rs-consensus --bench merkle`, `bitcoin-rs-consensus --bench verify_tx`,
+`bitcoin-rs-storage --bench kvstore_backends`, `bitcoin-rs-utxo --bench record_codec`,
+`bitcoin-rs-utxo --bench utxo_commit`, `bitcoin-rs-mining --bench candidate`,
+`bitcoin-rs-node --bench sync_pipeline`).
 ## Consensus validation
 
 ### bitcoinkernel
 Bitcoin Core's C++ consensus engine (`libbitcoinkernel`), the production consensus default. It is both the input-script verifier for every script class and the block **parser** on the apply path (*One-shot kernel block parse*). Rust performs the surrounding non-script transaction and block checks. Default builds need `cmake` and `libboost-dev`.
-
 ### Rust interpreter (portable posture)
 The pure-Rust script path under `--no-default-features`. It fully verifies the Taproot key path; its non-Taproot path is a stub accepting only a bare `OP_TRUE` spend, and it has no Taproot script-path support. Retained for differential testing and lightweight non-production environments; a mainnet sync stops at the first real spend.
 
@@ -92,7 +106,6 @@ means preserving value and operation order, not forcing JSON text to match. See
 Outputs the UTXO set never admits: a `scriptPubKey` starting with `OP_RETURN`, or longer than `MAX_SCRIPT_SIZE`. Excluding them changes no consensus outcome, so the snapshot codec carries the version tag `bitcoin-rs-utxo-spendable-v1`; a change to admission semantics is a codec change. See `docs/solutions/logic-errors/exclude-provably-unspendable-utxos.md`.
 
 ## Block apply
-
 ### Window script batching
 Verifying the ordered transaction unit of several consecutive blocks in one parallel dispatch. The window prepares each block against an ordered overlay, dispatches once, and issues a private, single-use `BlockValidationProof` that owns the `PreparedApply` it certifies and binds block hash, predecessor, height, flags, and locktime cutoff. Blocks then commit one at a time, in order; commit re-derives all five fields and on mismatch discards proof and prepared state and rebuilds from the live UTXO set. The proof bypasses only the transaction-validation slot: block rules and BIP30 stay before it, coinbase maturity and BIP68 after. Assume-valid produces a distinct `AssumeValidSkipped` state that never takes the bypass. See `docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
 
@@ -107,6 +120,38 @@ Whether a fan-out pays is decided by per-item work against dispatch cost, not by
 
 ### Global rayon pool cap
 The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` by `cap_global_thread_pool` (`crates/node/src/run.rs`). It runs only short coarse jobs while `SCRIPT_VERIFY_POOL` separately holds up to 32 threads; uncapped, its unnamed workers oversubscribe a many-core host and spin, costing CPU without showing in wall time.
+
+### Chain generation
+The even/odd atomic counter on `MempoolGateway` that fences admission
+against chain changes (`crates/mempool/src/gateway.rs`). Even values mean
+the chain is stable and admission is open; odd values mean a connect,
+disconnect, or reorg is in progress and admission is closed.
+`stable_generation` returns `Some(even)` when stable, `None` when a chain
+change is active. `begin_chain_change` takes the pool write lock, stores the
+next odd value, and returns a `ChainChangeGuard` that owns the reservation.
+Only `finish` may compare-exchange the odd value to the reserved even value,
+reopening admission. A failed chain change leaves the generation odd —
+admission stays closed until the operator restarts or the chain change
+completes.
+
+### Admission origin
+The `AdmissionOrigin` enum on `MutationEnvelope` that identifies how a
+transaction entered the node (`crates/mempool/src/mutation.rs`): `Rpc`
+(submitted through `sendrawtransaction`), `Peer` (relayed from a network
+peer, carrying a `PeerToken`), `Reorg` (re-admitted by a disconnect walk via
+`reconsider_disconnected`), or `Block` (confirmed by block application). The
+observer receives the origin alongside the committed `MutationResult` so
+downstream consumers (ZMQ publisher, metrics) can distinguish relay from
+reorg re-admission without inspecting call sites.
+
+### Chain-change proof
+The type-level binding of a `ChainTransition` to the `ChainChangeGuard` that
+reserved the active odd generation (`crates/node/src/apply.rs`). Apply-path
+functions accept `&ChainChangeProof`, not independent `&ChainTransition` and
+`&ChainChangeGuard` arguments, so a call without an active odd generation
+cannot compile. The proof's `odd_generation` returns the exact reserved
+value, letting admission checks compare against a specific generation rather
+than a snapshot that may have moved.
 
 ### Count-and-byte bound
 A window sized by whichever of a count cap and a byte cap binds first, because item size varies by orders of magnitude across the chain. The script window uses it; the sync staging budget owes the same shape. One item larger than the whole byte cap still goes through alone.
@@ -162,6 +207,25 @@ The node accepts only complete native version-4 snapshots: exact magic and versi
 ### Canonical record spelling
 One logical record has exactly one byte string; `UtxoRecord` compares and hashes by bytes. v5 enforces it with three rules: minimal varints, narrowest directory width, and compact/escape amount forms that are exact complements. The last is a safety rule: `decompress_amount` multiplies by up to a billion, so an unbounded input panics in debug and wraps in release. `decompress_accepts_exactly_the_encoder_image` states the whole rule as one property.
 
+### Work-count assertion
+Asserting how much of an expensive operation a code path performs, instead of how long it takes. A wall-clock assertion in a test suite is a flake generator, and an assertion that a function merely returns something passes for a stub. `find_output_decompresses_at_most_the_amount_it_returns` counts `decompress_amount` calls behind a `cfg(test)` thread-local and requires one for a hit, none for a miss and none for `max_vout`, at any record size — which is the algorithmic claim the layout rests on, stated deterministically. The counterpart is the case a count cannot make: where the claim really is about elapsed time, the assertion belongs in a paired-arm benchmark, not a test.
+### Chain snapshot
+The coherent, non-torn view of the applied tip the chain-event publisher keeps in one `RwLock`ed cell: `{ epoch, sequence, tip_hash, tip_height }` (`crates/node/src/state.rs`). The single writer replaces the whole cell per commit, so a reader never mixes two commit points. `epoch` is a persisted, strictly monotonic per-data-dir counter that makes an old run's cursors stale; `sequence` advances once per committed connect or disconnect and starts at 1. The snapshot is live state, never persisted per-event; readers take `NodeState::active_chain_snapshot`.
+
+### Chain-event hint
+The bounded-channel wake-up `ChainEventPublisher::record` emits after replacing the snapshot cell: `{ kind, height, hash, epoch, sequence }`, one per committed connect or disconnect. Hints carry no payload to apply and a full channel drops them without blocking the commit path; recovery is always positional re-planning over the chain itself. Hints are not a recovery log.
+
+### Reconciliation consumer
+An index that mirrors the applied chain by re-planning positionally against a fresh chain snapshot instead of receiving inline writes from the apply path. The txindex worker is the reference consumer; the BIP157/158 filter index is the second (`crates/node/src/filterindex_worker.rs`), which is what makes the seam real rather than a naming convention. A consumer owns its rows, its cursor, and its batch atomicity, and a failure or lag in it can never stall block application.
+
+### Consumer cursor
+The durable 52-byte record `{ epoch, sequence, height, hash }` naming the exact chain state a consumer's rows already mirror (`crates/node/src/reconcile.rs`). Position (`height`, `hash`) anchors row truth; `epoch` and `sequence` are advisory identity that a restart or epoch bump invalidates without invalidating rows. It is written only when the publisher snapshot provably names the tip the rows reached, and always in the same atomic batch as the row mutations it describes.
+
+### Extension capability
+The named, compiled-in service unit the extension registry reports and validates: an `ExtensionDescriptor` carries the id, namespace directory, schema version, and required/incompatible capability ids, and exists even when the runtime toggle is off. Enabled instances live or fail independently of core (`docs/contracts/extensions.md`); `getcapabilities` reports the live `CapabilitySnapshot` with compiled/enabled/state per capability.
+
+### Filter-header pointer
+The namespace-owned `(height, hash)` marker for the newest block whose BIP157 filter header the consumer's header chain provably ends at (`crates/ext-blockfilterindex`). Because filter and header rows are hash-addressed, a reorg rewinds only this pointer and the consumer cursor — rows are retained and re-derived rows are idempotent overwrites — which is the disconnect contract that lets the filter consumer share the txindex reconciliation shape without row deletion.
 ## Mempool
 
 ### Resolution-time sampling
