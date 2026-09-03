@@ -616,20 +616,25 @@ impl MempoolGateway {
 
         // 4b. Consensus verification (finality, duplicate inputs, overspend,
         //     sigop limits) over the resolved prevouts layered with the
-        //     mempool. Skipped when prevouts are empty (missing inputs were
-        //     already caught by policy in step 4). Script verification is
+        //     mempool. A non-coinbase transaction with no resolved prevouts
+        //     must be rejected outright — policy may not have caught it if
+        //     the caller set missing_inputs=false. Script verification is
         //     deferred to block connection under the assume-valid policy.
-        if !request.prevouts.is_empty() {
-            let chain_view = PrevoutMap(&request.prevouts);
-            let view = crate::accept::MempoolUtxoView::new(&pool, &chain_view);
-            if let Err(_err) = bitcoin_rs_consensus::verify_transaction_non_script(
-                &request.tx,
-                &view,
-                request.height,
-                request.locktime_cutoff,
-            ) {
-                return Err(AdmitError::Consensus);
-            }
+        if request.prevouts.is_empty() {
+            // Coinbase transactions are never admitted via the gateway.
+            // Empty prevouts on a non-coinbase tx means the caller did not
+            // resolve inputs — reject rather than admit unverified.
+            return Err(AdmitError::Consensus);
+        }
+        let chain_view = PrevoutMap(&request.prevouts);
+        let view = crate::accept::MempoolUtxoView::new(&pool, &chain_view);
+        if let Err(_err) = bitcoin_rs_consensus::verify_transaction_non_script(
+            &request.tx,
+            &view,
+            request.height,
+            request.locktime_cutoff,
+        ) {
+            return Err(AdmitError::Consensus);
         }
 
         // 5. Mutate under the same write guard via `replace_transaction`,
@@ -1059,7 +1064,13 @@ mod tests {
                 sigop_cost: 0,
                 missing_inputs: false,
             },
-            prevouts: Vec::new(),
+            prevouts: vec![(
+                tx.inputs[0].previous_output,
+                TxOut {
+                    value: 11_000,
+                    script_pubkey: Vec::new(),
+                },
+            )],
             locktime_cutoff: 0,
             max_feerate_sat_per_kvb: None,
             time: 1,
@@ -1985,7 +1996,13 @@ mod tests {
                 sigop_cost: 0,
                 missing_inputs: false,
             },
-            prevouts: Vec::new(),
+            prevouts: vec![(
+                replacement.inputs[0].previous_output,
+                TxOut {
+                    value: 10_000,
+                    script_pubkey: Vec::new(),
+                },
+            )],
             locktime_cutoff: 0,
             max_feerate_sat_per_kvb: None,
             time: 1,
@@ -2327,5 +2344,48 @@ mod tests {
             ],
             "mined is BlockInclusion, conflict and descendant are Conflict, in deterministic order"
         );
+    }
+
+    /// A non-coinbase transaction with no resolved prevouts must be rejected
+    /// by consensus verification, not admitted to the mempool.
+    #[test]
+    fn admit_transaction_rejects_a_transaction_with_no_prevouts() {
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                min_relay_fee_sat_per_kvb: 0,
+                ..MempoolLimits::default()
+            }))),
+            None,
+        );
+        // A standard transaction with one input, but the caller passes empty
+        // prevouts — simulating a caller that did not resolve inputs. Policy
+        // passes (missing_inputs=false, standard output, fee>0), but the
+        // consensus gate rejects because prevouts are empty.
+        let tx = standard_tx(0x44);
+        let generation = gateway.stable_generation().expect("generation is even");
+        let sequence = gateway.read().sequence_number();
+        let request = AdmissionRequest {
+            tx: Arc::new(tx),
+            context: PackageTxContext {
+                fee: 1_000,
+                vsize: 100,
+                sigop_cost: 0,
+                missing_inputs: false,
+            },
+            prevouts: Vec::new(),
+            locktime_cutoff: 0,
+            max_feerate_sat_per_kvb: None,
+            time: 1,
+            height: 1,
+            origin: AdmissionOrigin::Rpc,
+            expected_generation: generation,
+            expected_sequence: sequence,
+        };
+        let result = gateway.admit_transaction(request);
+        assert!(
+            matches!(result, Err(AdmitError::Consensus)),
+            "a non-coinbase tx with no prevouts must be rejected: {result:?}"
+        );
+        assert!(gateway.read().is_empty());
     }
 }
