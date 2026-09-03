@@ -75,6 +75,6 @@ The matched replay kept the same start and stop hashes. Redb improved from 405.4
 ## Related
 
 - `docs/benchmarks/end-to-end-sync.md`
-- `crates/node/examples/mainnet_prefix_replay.rs`
+- historical `mainnet_prefix_replay` campaign executable (retired)
 - `crates/node/src/apply.rs`
 - `crates/storage/src/redb_impl.rs`

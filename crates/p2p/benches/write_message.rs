@@ -8,17 +8,17 @@
 //! wide-area links are not visible here; this bench primarily captures
 //! syscall and serialization overhead.
 
+use bitcoin::Network;
+use bitcoin::blockdata::constants::genesis_block;
+use bitcoin::consensus::encode::serialize;
+use bitcoin::p2p::Magic;
+use bitcoin_rs_primitives::Block;
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::thread::JoinHandle;
 
-use bitcoin::Network;
-use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::p2p::Magic;
-use bitcoin::p2p::message::NetworkMessage;
-use criterion::{Criterion, criterion_group, criterion_main};
-
-use bitcoin_rs_p2p::wire::write_message;
+use bitcoin_rs_p2p::wire::{Message, write_message};
 
 /// Open a connected loopback pair and drain the read side on a thread so the
 /// writer never blocks on a full socket buffer.
@@ -38,8 +38,14 @@ fn connected_pair() -> (TcpStream, JoinHandle<()>) {
 fn bench_write_message(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_message");
 
-    let ping = NetworkMessage::Ping(42);
-    let block = NetworkMessage::Block(genesis_block(Network::Regtest));
+    let ping = Message::Ping(42);
+
+    // Build a native `Block` from the regtest genesis so the benchmark
+    // exercises the same consensus-encode path as real block relay.
+    let genesis = genesis_block(Network::Regtest);
+    let genesis_bytes = serialize(&genesis);
+    let native_block = Block::consensus_decode(&genesis_bytes).expect("decode genesis block");
+    let block = Message::Block(native_block);
 
     group.bench_function("ping_8B_payload", |b| {
         let (mut stream, _drain) = connected_pair();

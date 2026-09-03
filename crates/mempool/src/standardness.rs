@@ -4,10 +4,19 @@
 //! that fails these checks may still be valid; it simply will not be accepted
 //! to the mempool or relayed by default.
 
-use bitcoin::blockdata::script::Instruction;
-use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHNUM_16, OP_PUSHNUM_NEG1};
-use bitcoin::{FeeRate, Script, Transaction, TxOut, VarInt};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use hashbrown::HashSet;
+
+use bitcoin_rs_primitives::{Tx, TxOut, Txid, Wtxid};
+use bitcoin_rs_script::{
+    Instruction, is_multisig, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh,
+    is_p2wsh, is_push_only, minimal_non_dust, opcode, script::instructions,
+};
 use thiserror::Error;
+
+use crate::{EntryId, Mempool, PolicyError, RbfError, ReplacementCandidate};
 
 /// Maximum weight of a standard transaction (400 000 weight units).
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
@@ -18,10 +27,22 @@ const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 /// Standard relay policy values that are configurable by the node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StandardnessPolicy {
-    /// Fee rate used to classify outputs as dust.
-    pub dust_relay_fee: FeeRate,
+    /// Fee rate used to classify outputs as dust, in sat/kvB.
+    pub dust_relay_fee: u64,
     /// Maximum aggregate serialized nulldata script bytes, or `None` to disable nulldata.
     pub max_datacarrier_bytes: Option<usize>,
+}
+
+impl Default for StandardnessPolicy {
+    /// The enforced defaults: Core's dust-relay rate (3 000 sat/kvB) and an
+    /// 83-byte aggregate nulldata budget. Admission consumes these through
+    /// [`crate::Mempool::policy_snapshot`]; `getmempoolinfo` projects them.
+    fn default() -> Self {
+        Self {
+            dust_relay_fee: 3_000,
+            max_datacarrier_bytes: Some(83),
+        }
+    }
 }
 
 /// Minimum transaction version considered standard.
@@ -87,10 +108,7 @@ pub enum StandardnessError {
 ///
 /// Returns `Ok(())` if the transaction is standard, or the first
 /// `StandardnessError` encountered.
-pub fn is_standard_tx(
-    tx: &Transaction,
-    policy: &StandardnessPolicy,
-) -> Result<(), StandardnessError> {
+pub fn is_standard_tx(tx: &Tx, policy: &StandardnessPolicy) -> Result<(), StandardnessError> {
     check_version(tx)?;
     check_weight(tx)?;
     check_script_sigs(tx)?;
@@ -102,6 +120,284 @@ pub fn is_standard_tx(
     Ok(())
 }
 
+/// Bitcoin Core `MAX_PACKAGE_COUNT` for package acceptance / `testmempoolaccept`.
+pub const MAX_PACKAGE_COUNT: usize = 25;
+
+/// Caller-resolved fee and prevout context for one package transaction.
+///
+/// Prevout lookup and fee accounting live outside this module. The acceptance
+/// seam records the already-computed prevout-aware `sigop_cost` so RPC and
+/// admission can project it without recomputing script costs here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackageTxContext {
+    /// Actual fee in satoshis.
+    pub fee: u64,
+    /// Policy virtual size in vbytes.
+    pub vsize: u32,
+    /// Prevout-aware sigop cost.
+    pub sigop_cost: u32,
+    /// At least one input is neither confirmed nor satisfied by the mempool /
+    /// earlier package transactions.
+    pub missing_inputs: bool,
+}
+
+/// Per-transaction package acceptance fact for RPC / admission consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TxAcceptanceFact {
+    /// Transaction id.
+    pub txid: Txid,
+    /// Witness transaction id.
+    pub wtxid: Wtxid,
+    /// Whether the transaction was accepted or rejected. `None` means package
+    /// evaluation stopped before this row was validated.
+    pub allowed: Option<bool>,
+    /// Policy virtual size in vbytes.
+    pub vsize: u32,
+    /// Consensus weight.
+    pub weight: u64,
+    /// Prevout-aware sigop cost supplied by the caller.
+    pub sigop_cost: u32,
+    /// Base fee when acceptance accounting succeeded far enough to know it.
+    pub base_fee: Option<u64>,
+    /// Rejection reason when `allowed` is false.
+    pub reject_reason: Option<AcceptanceRejectReason>,
+}
+
+/// Package-level acceptance facts: optional package error plus per-tx rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageAcceptanceFacts {
+    /// Package-wide failure (for example package count bounds).
+    pub package_error: Option<AcceptanceRejectReason>,
+    /// One row per submitted transaction, in input order.
+    pub results: Vec<TxAcceptanceFact>,
+}
+
+/// Policy rejection reason for dry-run package acceptance.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum AcceptanceRejectReason {
+    /// Package length is outside `1..=MAX_PACKAGE_COUNT`.
+    #[error("package-too-large")]
+    PackageTooLarge,
+    /// Transaction is already present in the mempool.
+    #[error("txn-already-in-mempool")]
+    AlreadyInMempool,
+    /// One or more inputs are unavailable.
+    #[error("missing-inputs")]
+    MissingInputs,
+    /// Fee rate is below the live min-relay / mempool-min floor.
+    #[error("min relay fee not met")]
+    MinRelayFeeNotMet,
+    /// Fee rate exceeds the caller-supplied maximum.
+    #[error("max-fee-exceeded")]
+    MaxFeeExceeded,
+    /// Transaction fails standardness policy.
+    #[error(transparent)]
+    NonStandard(#[from] StandardnessError),
+    /// Conflicting replacement fails BIP125.
+    #[error(transparent)]
+    Replacement(#[from] RbfError),
+    /// Transaction exceeds ancestor or descendant package limits.
+    #[error(transparent)]
+    PackageLimit(#[from] PolicyError),
+    /// Next-block BIP68 relative sequence locks are unmet.
+    #[error("non-BIP68-final")]
+    NonBip68Final,
+    /// Consensus script verification failed.
+    #[error("script-verify-flag-failed")]
+    ScriptVerify,
+}
+
+/// Mempool-owned seam behind `testmempoolaccept`.
+///
+/// It composes standardness, presence, missing-input, min-relay / max-fee,
+/// and BIP125 replacement checks against the live pool without inserting
+/// anything. Consensus script verification remains outside this module.
+/// `contexts` must have the same length as `txs`. `incremental_relay_fee_sat_per_kvb`
+/// feeds the size-pressure mempool-min floor and BIP125 rule 4.
+#[must_use]
+pub fn evaluate_package_acceptance(
+    pool: &Mempool,
+    policy: &StandardnessPolicy,
+    txs: &[Tx],
+    contexts: &[PackageTxContext],
+    max_feerate_sat_per_kvb: Option<u64>,
+    incremental_relay_fee_sat_per_kvb: u64,
+) -> PackageAcceptanceFacts {
+    assert_eq!(
+        txs.len(),
+        contexts.len(),
+        "package txs and contexts must align"
+    );
+
+    if txs.is_empty() || txs.len() > MAX_PACKAGE_COUNT {
+        return PackageAcceptanceFacts {
+            package_error: Some(AcceptanceRejectReason::PackageTooLarge),
+            results: Vec::new(),
+        };
+    }
+
+    let mempool_min_fee =
+        crate::eviction::mempool_min_fee_sat_per_kvb(pool, incremental_relay_fee_sat_per_kvb);
+
+    let mut results = Vec::with_capacity(txs.len());
+    let mut package_failed = false;
+
+    for (tx, context) in txs.iter().zip(contexts.iter()) {
+        if package_failed {
+            results.push(TxAcceptanceFact {
+                txid: tx.txid(),
+                wtxid: tx.wtxid(),
+                allowed: None,
+                vsize: context.vsize,
+                weight: tx.weight(),
+                sigop_cost: context.sigop_cost,
+                base_fee: None,
+                reject_reason: None,
+            });
+            continue;
+        }
+
+        let fact = evaluate_one(
+            pool,
+            policy,
+            tx,
+            *context,
+            max_feerate_sat_per_kvb,
+            mempool_min_fee,
+            incremental_relay_fee_sat_per_kvb,
+        );
+        if fact.allowed == Some(false) {
+            package_failed = true;
+        }
+        results.push(fact);
+    }
+
+    PackageAcceptanceFacts {
+        package_error: None,
+        results,
+    }
+}
+
+/// Evaluates all transactions in a package without stopping after the first
+/// rejection. Each row gets its own independent verdict.
+///
+/// This is the `testmempoolaccept` form: it reports every row's acceptance
+/// status, including rows after an earlier rejected row.
+#[must_use]
+pub fn evaluate_package_acceptance_all(
+    pool: &Mempool,
+    policy: &StandardnessPolicy,
+    txs: &[Tx],
+    contexts: &[PackageTxContext],
+    max_feerate_sat_per_kvb: Option<u64>,
+    incremental_relay_fee_sat_per_kvb: u64,
+) -> PackageAcceptanceFacts {
+    assert_eq!(
+        txs.len(),
+        contexts.len(),
+        "package txs and contexts must align"
+    );
+
+    if txs.is_empty() || txs.len() > MAX_PACKAGE_COUNT {
+        return PackageAcceptanceFacts {
+            package_error: Some(AcceptanceRejectReason::PackageTooLarge),
+            results: Vec::new(),
+        };
+    }
+
+    let mempool_min_fee =
+        crate::eviction::mempool_min_fee_sat_per_kvb(pool, incremental_relay_fee_sat_per_kvb);
+
+    let results = txs
+        .iter()
+        .zip(contexts.iter())
+        .map(|(tx, context)| {
+            evaluate_one(
+                pool,
+                policy,
+                tx,
+                *context,
+                max_feerate_sat_per_kvb,
+                mempool_min_fee,
+                incremental_relay_fee_sat_per_kvb,
+            )
+        })
+        .collect();
+
+    PackageAcceptanceFacts {
+        package_error: None,
+        results,
+    }
+}
+
+pub(crate) fn evaluate_one(
+    pool: &Mempool,
+    policy: &StandardnessPolicy,
+    tx: &Tx,
+    context: PackageTxContext,
+    max_feerate_sat_per_kvb: Option<u64>,
+    mempool_min_fee_sat_per_kvb: u64,
+    incremental_relay_fee_sat_per_kvb: u64,
+) -> TxAcceptanceFact {
+    let txid = tx.txid();
+    let wtxid = tx.wtxid();
+    let weight = tx.weight();
+    let vsize = context.vsize;
+    let fee_rate = if vsize == 0 {
+        0
+    } else {
+        context.fee.saturating_mul(1_000) / u64::from(vsize)
+    };
+
+    let reject = if pool.contains_txid(&txid) {
+        Some(AcceptanceRejectReason::AlreadyInMempool)
+    } else if is_coinbase(tx) || context.missing_inputs {
+        Some(AcceptanceRejectReason::MissingInputs)
+    } else if let Err(err) = is_standard_tx(tx, policy) {
+        Some(AcceptanceRejectReason::NonStandard(err))
+    } else if fee_rate < mempool_min_fee_sat_per_kvb {
+        Some(AcceptanceRejectReason::MinRelayFeeNotMet)
+    } else if max_feerate_sat_per_kvb.is_some_and(|max| fee_rate > max) {
+        Some(AcceptanceRejectReason::MaxFeeExceeded)
+    } else {
+        let candidate = ReplacementCandidate::new(
+            Arc::new(tx.clone()),
+            vsize,
+            context.fee,
+            incremental_relay_fee_sat_per_kvb,
+        );
+        match pool.check_replacement(&candidate) {
+            Err(err) => Some(AcceptanceRejectReason::Replacement(err)),
+            Ok(plan) => {
+                let excluded: HashSet<EntryId> = plan.evicted.iter().copied().collect();
+                match pool.check_package_limits(tx, vsize, &excluded) {
+                    Err(err) => Some(AcceptanceRejectReason::PackageLimit(err)),
+                    Ok(()) => None,
+                }
+            }
+        }
+    };
+
+    TxAcceptanceFact {
+        txid,
+        wtxid,
+        allowed: Some(reject.is_none()),
+        vsize,
+        weight,
+        sigop_cost: context.sigop_cost,
+        base_fee: Some(context.fee),
+        reject_reason: reject,
+    }
+}
+
+/// Returns true if `tx` is a coinbase transaction: exactly one input whose
+/// previous output is the null outpoint (zero txid, `vout == u32::MAX`).
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1
+        && tx.inputs[0].previous_output.txid == Txid::default()
+        && tx.inputs[0].previous_output.vout == u32::MAX
+}
+
 /// Minimum non-witness serialization Core relays, `tx-size-small`.
 ///
 /// The bound is on the stripped size. A one-input `SegWit` spend with an empty
@@ -110,34 +406,33 @@ pub fn is_standard_tx(
 /// alone lets it through.
 const MIN_NON_WITNESS_TX_SIZE: usize = 65;
 
-fn check_min_size(tx: &Transaction) -> Result<(), StandardnessError> {
+fn check_min_size(tx: &Tx) -> Result<(), StandardnessError> {
     if tx.base_size() < MIN_NON_WITNESS_TX_SIZE {
         return Err(StandardnessError::TransactionTooSmall);
     }
     Ok(())
 }
 
-fn check_version(tx: &Transaction) -> Result<(), StandardnessError> {
-    let v = tx.version.0;
-    if (TX_VERSION_MIN..=TX_VERSION_MAX).contains(&v) {
+fn check_version(tx: &Tx) -> Result<(), StandardnessError> {
+    if (TX_VERSION_MIN..=TX_VERSION_MAX).contains(&tx.version) {
         Ok(())
     } else {
         Err(StandardnessError::Version)
     }
 }
 
-fn check_weight(tx: &Transaction) -> Result<(), StandardnessError> {
-    if tx.weight().to_wu() > MAX_STANDARD_TX_WEIGHT {
+fn check_weight(tx: &Tx) -> Result<(), StandardnessError> {
+    if tx.weight() > MAX_STANDARD_TX_WEIGHT {
         Err(StandardnessError::Weight)
     } else {
         Ok(())
     }
 }
 
-fn check_script_sigs(tx: &Transaction) -> Result<(), StandardnessError> {
-    for input in &tx.input {
+fn check_script_sigs(tx: &Tx) -> Result<(), StandardnessError> {
+    for input in &tx.inputs {
         let script_sig = &input.script_sig;
-        if !script_sig.is_push_only() {
+        if !is_push_only(script_sig) {
             return Err(StandardnessError::ScriptSigNotPushOnly);
         }
         if script_sig.len() > MAX_STANDARD_SCRIPTSIG_SIZE {
@@ -147,19 +442,18 @@ fn check_script_sigs(tx: &Transaction) -> Result<(), StandardnessError> {
     Ok(())
 }
 
-fn check_outputs(tx: &Transaction, policy: &StandardnessPolicy) -> Result<(), StandardnessError> {
+fn check_outputs(tx: &Tx, policy: &StandardnessPolicy) -> Result<(), StandardnessError> {
     let mut datacarrier_bytes = 0_usize;
-    for output in &tx.output {
+    for output in &tx.outputs {
         let script = &output.script_pubkey;
-        if script.is_op_return() {
+        if is_op_return(script) {
             if !is_standard_nulldata(script) {
                 return Err(StandardnessError::NonStandardOutput);
             }
             let Some(limit) = policy.max_datacarrier_bytes else {
                 return Err(StandardnessError::DataCarrierDisabled);
             };
-            let serialized_script_bytes = VarInt::from(script.len())
-                .size()
+            let serialized_script_bytes = compact_size_len(script.len())
                 .checked_add(script.len())
                 .ok_or(StandardnessError::DataCarrierSizeOverflow)?;
             datacarrier_bytes = datacarrier_bytes
@@ -184,36 +478,22 @@ fn check_outputs(tx: &Transaction, policy: &StandardnessPolicy) -> Result<(), St
 ///
 /// Standard types: P2PKH, P2SH, P2PK, P2WPKH, P2WSH, P2TR, bare multisig
 /// (up to 3 keys), and `OP_RETURN` (checked separately by the caller).
-fn is_standard_output_script(script: &Script) -> bool {
-    script.is_p2pkh()
-        || script.is_p2sh()
-        || script.is_p2pk()
-        || script.is_p2wpkh()
-        || script.is_p2wsh()
-        || script.is_p2tr()
+fn is_standard_output_script(script: &[u8]) -> bool {
+    is_p2pkh(script)
+        || is_p2sh(script)
+        || is_p2pk(script)
+        || is_p2wpkh(script)
+        || is_p2wsh(script)
+        || is_p2tr(script)
         || is_p2a(script)
         || is_standard_multisig(script)
-}
-
-/// Returns `true` for the pay-to-anchor output template.
-///
-/// `OP_1` followed by a two-byte push of `0x4e73`. Core treats this distinct
-/// short witness program as standard under TRUC and ephemeral-anchor policy,
-/// and none of the predicates above match it: `is_p2tr` wants a 32-byte
-/// version-1 program. Its dust and package restrictions live at the policy
-/// layer that owns them, not here.
-fn is_p2a(script: &Script) -> bool {
-    script.as_bytes() == [0x51, 0x02, 0x4e, 0x73]
 }
 
 /// Returns `true` if `script` is a bare multisig with at most 3 pubkeys.
 ///
 /// Bitcoin Core's `IsStandard` allows bare multisig with up to 3 keys.
-fn is_standard_multisig(script: &Script) -> bool {
-    if !script.is_multisig() {
-        return false;
-    }
-    multisig_key_count(script).is_some_and(|n| n <= 3)
+fn is_standard_multisig(script: &[u8]) -> bool {
+    is_multisig(script) && multisig_key_count(script).is_some_and(|n| n <= 3)
 }
 
 /// Counts the pubkeys in a bare multisig script, or `None` if any push in it
@@ -226,9 +506,9 @@ fn is_standard_multisig(script: &Script) -> bool {
 /// `OP_1 <4 bytes> OP_1 OP_CHECKMULTISIG` passes it. That is the gap, and this
 /// closes exactly that; duplicating the rest would be checks that can never
 /// fire.
-fn multisig_key_count(script: &Script) -> Option<u8> {
+fn multisig_key_count(script: &[u8]) -> Option<u8> {
     let mut count: u8 = 0;
-    for inst in script.instructions() {
+    for inst in instructions(script) {
         match inst {
             // 33 bytes compressed, 65 uncompressed. Anything else is not a key.
             Ok(Instruction::PushBytes(bytes)) => {
@@ -245,12 +525,21 @@ fn multisig_key_count(script: &Script) -> Option<u8> {
 }
 
 /// Returns `true` if a non-`OP_RETURN` output is dust.
-fn is_dust(output: &TxOut, dust_relay_fee: FeeRate) -> bool {
-    output.value.to_sat()
-        < output
-            .script_pubkey
-            .minimal_non_dust_custom(dust_relay_fee)
-            .to_sat()
+fn is_dust(output: &TxOut, dust_relay_fee: u64) -> bool {
+    output.value < minimal_non_dust(&output.script_pubkey, dust_relay_fee)
+}
+
+#[inline]
+const fn compact_size_len(len: usize) -> usize {
+    if len < 0xfd {
+        1
+    } else if len <= 0xffff {
+        3
+    } else if len <= 0xffff_ffff {
+        5
+    } else {
+        9
+    }
 }
 
 /// Extracts the payload length from an `OP_RETURN` script.
@@ -265,8 +554,8 @@ fn is_dust(output: &TxOut, dust_relay_fee: FeeRate) -> bool {
 /// that fails to parse partway, is not standard — and the old code accepted
 /// both, because it ignored opcodes and treated a parse error as the end of
 /// the payload.
-fn is_standard_nulldata(script: &Script) -> bool {
-    let mut instructions = script.instructions();
+fn is_standard_nulldata(script: &[u8]) -> bool {
+    let mut instructions = instructions(script);
     // The leading OP_RETURN itself, already established by `is_op_return`.
     if instructions.next().is_none() {
         return false;
@@ -278,63 +567,73 @@ fn is_standard_nulldata(script: &Script) -> bool {
         // push-only nulldata rule accepts every push opcode, so rejecting
         // `OP_RETURN OP_1` would call a standard output non-standard.
         Ok(Instruction::Op(op)) => {
-            op == OP_PUSHNUM_NEG1
-                || (OP_PUSHNUM_1.to_u8()..=OP_PUSHNUM_16.to_u8()).contains(&op.to_u8())
+            op == opcode::OP_1NEGATE || (opcode::OP_PUSHNUM_1..=opcode::OP_PUSHNUM_16).contains(&op)
         }
         Err(_) => false,
     })
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::opcodes::all::OP_RETURN;
-    use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1, OP_PUSHNUM_3, OP_PUSHNUM_4};
-    use bitcoin::script::{Builder, PushBytesBuf};
-    use bitcoin::transaction::Version;
-    use bitcoin::{Amount, PubkeyHash, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+    use alloc::sync::Arc;
+    use bitcoin_rs_primitives::{OutPoint, Tx, TxIn, TxOut, Txid};
+    use bitcoin_rs_script::{is_multisig, minimal_non_dust, opcode, push_data};
 
-    fn standard_tx(version: Version) -> Transaction {
-        Transaction {
+    const DUST_RELAY_FEE_SAT_PER_KVB: u64 = 3_000;
+    const BROADCAST_MIN_FEE_SAT_PER_KVB: u64 = 1_000;
+
+    fn p2pkh(hash20: &[u8; 20]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(25);
+        out.push(opcode::OP_DUP);
+        out.push(opcode::OP_HASH160);
+        out.push(0x14);
+        out.extend_from_slice(hash20);
+        out.push(opcode::OP_EQUALVERIFY);
+        out.push(opcode::OP_CHECKSIG);
+        out
+    }
+
+    fn standard_tx(version: i32) -> Tx {
+        Tx {
             version,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::default(),
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(100_000),
-                script_pubkey: ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([7_u8; 20])),
+            outputs: vec![TxOut {
+                value: 100_000,
+                script_pubkey: p2pkh(&[7_u8; 20]),
             }],
         }
     }
 
     fn policy() -> StandardnessPolicy {
         StandardnessPolicy {
-            dust_relay_fee: FeeRate::DUST,
+            dust_relay_fee: DUST_RELAY_FEE_SAT_PER_KVB,
             max_datacarrier_bytes: Some(83),
         }
     }
 
     #[test]
     fn accepts_standard_version_one() {
-        let tx = standard_tx(Version::ONE);
+        let tx = standard_tx(1);
         assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     #[test]
     fn accepts_standard_version_two() {
-        let tx = standard_tx(Version::TWO);
+        let tx = standard_tx(2);
         assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     #[test]
     fn rejects_version_zero() {
-        let tx = standard_tx(Version(0));
+        let tx = standard_tx(0);
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::Version)
@@ -346,7 +645,7 @@ mod tests {
     /// the "here".
     #[test]
     fn rejects_version_three_while_truc_policy_is_absent() {
-        let tx = standard_tx(Version(3));
+        let tx = standard_tx(3);
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::Version)
@@ -355,7 +654,7 @@ mod tests {
 
     #[test]
     fn rejects_version_four() {
-        let tx = standard_tx(Version(4));
+        let tx = standard_tx(4);
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::Version)
@@ -364,21 +663,18 @@ mod tests {
 
     /// Numeric push opcodes are pushes, and standard nulldata accepts them.
     ///
-    /// rust-bitcoin reports `OP_1` through `OP_16` as `Op` rather than
-    /// `PushBytes`, so a naive push-only check calls `OP_RETURN OP_1`
+    /// The native script iterator reports `OP_1` through `OP_16` as `Op` rather
+    /// than `PushBytes`, so a naive push-only check calls `OP_RETURN OP_1`
     /// non-standard when Core relays it.
     #[test]
     fn accepts_op_return_followed_by_a_numeric_push() {
-        let mut tx = standard_tx(Version::ONE);
-        tx.output[0].value = Amount::ZERO;
-        tx.output[0].script_pubkey = Builder::new()
-            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
-            .push_opcode(OP_PUSHNUM_1)
-            .into_script();
+        let mut tx = standard_tx(1);
+        tx.outputs[0].value = 0;
+        tx.outputs[0].script_pubkey = vec![opcode::OP_RETURN, opcode::OP_PUSHNUM_1];
         // Padded to clear the relay minimum, which is a different rule.
-        tx.output.push(TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([9_u8; 20])),
+        tx.outputs.push(TxOut {
+            value: 50_000,
+            script_pubkey: p2pkh(&[9_u8; 20]),
         });
         assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
@@ -386,19 +682,16 @@ mod tests {
     /// `OP_RETURN` followed by a non-push opcode is not standard nulldata.
     #[test]
     fn rejects_op_return_followed_by_an_opcode() {
-        let mut tx = standard_tx(Version::ONE);
-        tx.output[0].value = Amount::ZERO;
-        tx.output[0].script_pubkey = Builder::new()
-            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
-            .push_opcode(bitcoin::opcodes::all::OP_DUP)
-            .into_script();
+        let mut tx = standard_tx(1);
+        tx.outputs[0].value = 0;
+        tx.outputs[0].script_pubkey = vec![opcode::OP_RETURN, opcode::OP_DUP];
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::NonStandardOutput)
         );
     }
 
-    /// A push that is not a pubkey length still passes `Script::is_multisig`.
+    /// A push that is not a pubkey length still passes `is_multisig`.
     ///
     /// That predicate was measured against this surface: it already rejects a
     /// declared count that disagrees with the keys present, an `m` greater than
@@ -406,19 +699,16 @@ mod tests {
     /// check, so it is the only thing worth checking here.
     #[test]
     fn rejects_bare_multisig_whose_key_is_not_a_pubkey() {
-        let script = Builder::new()
-            .push_opcode(OP_PUSHNUM_1)
-            .push_slice([0_u8; 4])
-            .push_opcode(OP_PUSHNUM_1)
-            .push_opcode(OP_CHECKMULTISIG)
-            .into_script();
+        let mut script = vec![opcode::OP_PUSHNUM_1];
+        script.extend(push_data(&[0_u8; 4]));
+        script.extend([opcode::OP_PUSHNUM_1, opcode::OP_CHECKMULTISIG]);
         assert!(
-            script.is_multisig(),
+            is_multisig(&script),
             "the shape check must accept this, or the length check is never reached"
         );
 
-        let mut tx = standard_tx(Version::ONE);
-        tx.output[0].script_pubkey = script;
+        let mut tx = standard_tx(1);
+        tx.outputs[0].script_pubkey = script;
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::NonStandardOutput)
@@ -429,49 +719,46 @@ mod tests {
     #[test]
     fn accepts_a_well_formed_bare_multisig() {
         let key = [0x02_u8; 33];
-        let Ok(pushable) = <&bitcoin::script::PushBytes>::try_from(key.as_slice()) else {
-            panic!("33 bytes must be pushable");
-        };
-        let mut tx = standard_tx(Version::ONE);
-        tx.output[0].script_pubkey = Builder::new()
-            .push_opcode(OP_PUSHNUM_1)
-            .push_slice(pushable)
-            .push_opcode(OP_PUSHNUM_1)
-            .push_opcode(OP_CHECKMULTISIG)
-            .into_script();
+        let mut script = vec![opcode::OP_PUSHNUM_1];
+        script.extend(push_data(&key));
+        script.extend([opcode::OP_PUSHNUM_1, opcode::OP_CHECKMULTISIG]);
+
+        let mut tx = standard_tx(1);
+        tx.outputs[0].script_pubkey = script;
         assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     #[test]
     fn accepts_three_of_three_bare_multisig() {
         let key = [0x02_u8; 33];
-        let mut tx = standard_tx(Version::ONE);
-        tx.output[0].script_pubkey = Builder::new()
-            .push_opcode(OP_PUSHNUM_3)
-            .push_slice(key)
-            .push_slice(key)
-            .push_slice(key)
-            .push_opcode(OP_PUSHNUM_3)
-            .push_opcode(OP_CHECKMULTISIG)
-            .into_script();
+        let mut script = vec![opcode::OP_PUSHNUM_1 + 2 /* OP_PUSHNUM_3 */];
+        for _ in 0..3 {
+            script.extend(push_data(&key));
+        }
+        script.extend([
+            opcode::OP_PUSHNUM_1 + 2, /* OP_PUSHNUM_3 */
+            opcode::OP_CHECKMULTISIG,
+        ]);
 
+        let mut tx = standard_tx(1);
+        tx.outputs[0].script_pubkey = script;
         assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     #[test]
     fn rejects_one_of_four_bare_multisig() {
         let key = [0x02_u8; 33];
-        let mut tx = standard_tx(Version::ONE);
-        tx.output[0].script_pubkey = Builder::new()
-            .push_opcode(OP_PUSHNUM_1)
-            .push_slice(key)
-            .push_slice(key)
-            .push_slice(key)
-            .push_slice(key)
-            .push_opcode(OP_PUSHNUM_4)
-            .push_opcode(OP_CHECKMULTISIG)
-            .into_script();
+        let mut script = vec![opcode::OP_PUSHNUM_1];
+        for _ in 0..4 {
+            script.extend(push_data(&key));
+        }
+        script.extend([
+            opcode::OP_PUSHNUM_1 + 3, /* OP_PUSHNUM_4 */
+            opcode::OP_CHECKMULTISIG,
+        ]);
 
+        let mut tx = standard_tx(1);
+        tx.outputs[0].script_pubkey = script;
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::NonStandardOutput)
@@ -485,10 +772,10 @@ mod tests {
     /// script being recognised, not about that.
     #[test]
     fn accepts_a_pay_to_anchor_output() {
-        let mut tx = standard_tx(Version::ONE);
-        tx.output.push(TxOut {
-            value: Amount::from_sat(240),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]),
+        let mut tx = standard_tx(1);
+        tx.outputs.push(TxOut {
+            value: 240,
+            script_pubkey: vec![0x51, 0x02, 0x4e, 0x73],
         });
         assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
@@ -498,11 +785,11 @@ mod tests {
     /// cannot see.
     #[test]
     fn rejects_a_transaction_below_the_non_witness_minimum() {
-        let mut tx = standard_tx(Version::ONE);
-        tx.output[0].value = Amount::ZERO;
-        tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
+        let mut tx = standard_tx(1);
+        tx.outputs[0].value = 0;
+        tx.outputs[0].script_pubkey = vec![opcode::OP_RETURN];
         assert!(
-            tx.base_size() < MIN_NON_WITNESS_TX_SIZE,
+            tx.base_size() < super::MIN_NON_WITNESS_TX_SIZE,
             "the fixture must be undersized or this test proves nothing"
         );
         assert_eq!(
@@ -513,11 +800,9 @@ mod tests {
 
     #[test]
     fn rejects_non_pushonly_scriptsig() {
-        let mut tx = standard_tx(Version::ONE);
+        let mut tx = standard_tx(1);
         // OP_DUP is not a push opcode.
-        tx.input[0].script_sig = Builder::new()
-            .push_opcode(bitcoin::opcodes::all::OP_DUP)
-            .into_script();
+        tx.inputs[0].script_sig = vec![opcode::OP_DUP];
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::ScriptSigNotPushOnly)
@@ -526,11 +811,10 @@ mod tests {
 
     #[test]
     fn rejects_oversized_scriptsig() {
-        let mut tx = standard_tx(Version::ONE);
+        let mut tx = standard_tx(1);
         // Build a push-only scriptSig that exceeds 1650 bytes.
-        let big_data = PushBytesBuf::try_from(vec![0_u8; MAX_STANDARD_SCRIPTSIG_SIZE])
-            .expect("push payload fits");
-        tx.input[0].script_sig = Builder::new().push_slice(big_data).into_script();
+        let big = vec![0_u8; super::MAX_STANDARD_SCRIPTSIG_SIZE];
+        tx.inputs[0].script_sig = push_data(&big);
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::ScriptSigTooLarge)
@@ -539,27 +823,21 @@ mod tests {
 
     #[test]
     fn accepts_two_nulldata_outputs_within_the_aggregate_limit() {
-        let mut tx = standard_tx(Version::ONE);
-        let first = Builder::new()
-            .push_opcode(OP_RETURN)
-            .push_slice(b"first")
-            .into_script();
-        let second = Builder::new()
-            .push_opcode(OP_RETURN)
-            .push_slice(b"second")
-            .into_script();
+        let mut tx = standard_tx(1);
+        let first = [vec![opcode::OP_RETURN], push_data(b"first")].concat();
+        let second = [vec![opcode::OP_RETURN], push_data(b"second")].concat();
         let limit = [&first, &second]
             .into_iter()
             .fold(0_usize, |total, script| {
-                total + VarInt::from(script.len()).size() + script.len()
+                total + super::compact_size_len(script.len()) + script.len()
             });
-        tx.output = vec![
+        tx.outputs = vec![
             TxOut {
-                value: Amount::ZERO,
+                value: 0,
                 script_pubkey: first,
             },
             TxOut {
-                value: Amount::ZERO,
+                value: 0,
                 script_pubkey: second,
             },
         ];
@@ -589,18 +867,16 @@ mod tests {
 
     #[test]
     fn dust_relay_fee_changes_the_boundary() {
-        let mut tx = standard_tx(Version::ONE);
-        let threshold = tx.output[0]
-            .script_pubkey
-            .minimal_non_dust_custom(FeeRate::DUST);
-        tx.output[0].value = threshold - Amount::ONE_SAT;
+        let mut tx = standard_tx(1);
+        let threshold = minimal_non_dust(&tx.outputs[0].script_pubkey, DUST_RELAY_FEE_SAT_PER_KVB);
+        tx.outputs[0].value = threshold - 1;
 
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::DustOutput)
         );
         let lower_fee = StandardnessPolicy {
-            dust_relay_fee: FeeRate::BROADCAST_MIN,
+            dust_relay_fee: BROADCAST_MIN_FEE_SAT_PER_KVB,
             ..policy()
         };
         assert_eq!(is_standard_tx(&tx, &lower_fee), Ok(()));
@@ -608,13 +884,10 @@ mod tests {
 
     #[test]
     fn accepts_single_op_return_within_limit() {
-        let mut tx = standard_tx(Version::ONE);
-        let script = Builder::new()
-            .push_opcode(OP_RETURN)
-            .push_slice(b"ok")
-            .into_script();
-        tx.output.push(TxOut {
-            value: Amount::ZERO,
+        let mut tx = standard_tx(1);
+        let script = [vec![opcode::OP_RETURN], push_data(b"ok")].concat();
+        tx.outputs.push(TxOut {
+            value: 0,
             script_pubkey: script,
         });
         assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
@@ -622,9 +895,9 @@ mod tests {
 
     #[test]
     fn rejects_dust_output() {
-        let mut tx = standard_tx(Version::ONE);
+        let mut tx = standard_tx(1);
         // 1 sat to a P2PKH output is dust.
-        tx.output[0].value = Amount::from_sat(1);
+        tx.outputs[0].value = 1;
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::DustOutput)
@@ -633,14 +906,195 @@ mod tests {
 
     #[test]
     fn rejects_non_standard_output_script() {
-        let mut tx = standard_tx(Version::ONE);
+        let mut tx = standard_tx(1);
         // A random non-standard script.
-        tx.output[0].script_pubkey = Builder::new()
-            .push_opcode(bitcoin::opcodes::all::OP_DEPTH)
-            .into_script();
+        tx.outputs[0].script_pubkey = vec![0x74]; // OP_DEPTH
         assert_eq!(
             is_standard_tx(&tx, &policy()),
             Err(StandardnessError::NonStandardOutput)
         );
+    }
+
+    fn ctx(fee: u64, vsize: u32, missing_inputs: bool) -> PackageTxContext {
+        PackageTxContext {
+            fee,
+            vsize,
+            sigop_cost: 2,
+            missing_inputs,
+        }
+    }
+
+    #[test]
+    fn package_acceptance_rejects_empty_and_oversized_packages() {
+        let pool = crate::Mempool::new(crate::MempoolLimits::default());
+        let empty = evaluate_package_acceptance(&pool, &policy(), &[], &[], None, 1_000);
+        assert_eq!(
+            empty.package_error,
+            Some(AcceptanceRejectReason::PackageTooLarge)
+        );
+
+        let txs: Vec<Tx> = (0..=MAX_PACKAGE_COUNT)
+            .map(|i| {
+                let mut tx = standard_tx(1);
+                tx.outputs[0].script_pubkey =
+                    vec![0x51, u8::try_from(i).expect("package index fits u8")];
+                tx
+            })
+            .collect();
+        let contexts: Vec<PackageTxContext> = txs.iter().map(|_| ctx(1_000, 100, false)).collect();
+        let oversized = evaluate_package_acceptance(&pool, &policy(), &txs, &contexts, None, 1_000);
+        assert_eq!(
+            oversized.package_error,
+            Some(AcceptanceRejectReason::PackageTooLarge)
+        );
+        assert!(oversized.results.is_empty());
+    }
+
+    #[test]
+    fn package_acceptance_allows_standard_tx_and_records_sigop_cost() {
+        let pool = crate::Mempool::new(crate::MempoolLimits {
+            min_relay_fee_sat_per_kvb: 1_000,
+            ..crate::MempoolLimits::default()
+        });
+        let tx = standard_tx(1);
+        let facts = evaluate_package_acceptance(
+            &pool,
+            &policy(),
+            std::slice::from_ref(&tx),
+            &[ctx(1_000, 100, false)],
+            None,
+            1_000,
+        );
+        assert!(facts.package_error.is_none());
+        let row = &facts.results[0];
+        assert_eq!(row.allowed, Some(true));
+        assert_eq!(row.sigop_cost, 2);
+        assert_eq!(row.base_fee, Some(1_000));
+        assert_eq!(row.txid, tx.txid());
+        assert_eq!(row.wtxid, tx.wtxid());
+    }
+
+    #[test]
+    fn package_acceptance_rejects_missing_inputs_and_stops_later_rows() {
+        let pool = crate::Mempool::new(crate::MempoolLimits::default());
+        let first = standard_tx(1);
+        let mut second = standard_tx(1);
+        second.outputs[0].script_pubkey = vec![0x51, 0x99];
+        let facts = evaluate_package_acceptance(
+            &pool,
+            &policy(),
+            &[first, second.clone()],
+            &[ctx(1_000, 100, true), ctx(1_000, 100, false)],
+            None,
+            1_000,
+        );
+        assert_eq!(
+            facts.results[0].reject_reason,
+            Some(AcceptanceRejectReason::MissingInputs)
+        );
+        assert_eq!(facts.results[0].allowed, Some(false));
+        assert_eq!(facts.results[1].allowed, None);
+        assert_eq!(facts.results[1].reject_reason, None);
+        assert_eq!(facts.results[1].base_fee, None);
+    }
+
+    #[test]
+    fn package_acceptance_rejects_max_feerate_and_already_in_mempool() {
+        let mut pool = crate::Mempool::new(crate::MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            ..crate::MempoolLimits::default()
+        });
+        let tx = standard_tx(1);
+        let over = evaluate_package_acceptance(
+            &pool,
+            &policy(),
+            std::slice::from_ref(&tx),
+            &[ctx(10_000, 100, false)],
+            Some(50_000),
+            1_000,
+        );
+        // fee_rate = 100_000 sat/kvB > 50_000
+        assert_eq!(
+            over.results[0].reject_reason,
+            Some(AcceptanceRejectReason::MaxFeeExceeded)
+        );
+
+        pool.insert_entry(crate::MempoolEntry::new(
+            Arc::new(tx.clone()),
+            100,
+            1_000,
+            1,
+            1,
+        ))
+        .expect("insert");
+        let dup = evaluate_package_acceptance(
+            &pool,
+            &policy(),
+            &[tx],
+            &[ctx(1_000, 100, false)],
+            None,
+            1_000,
+        );
+        assert_eq!(
+            dup.results[0].reject_reason,
+            Some(AcceptanceRejectReason::AlreadyInMempool)
+        );
+    }
+
+    #[test]
+    fn coinbase_requires_null_prevout() {
+        let pool = crate::Mempool::new(crate::MempoolLimits::default());
+        let coinbase = Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig: vec![0x51],
+                sequence: u32::MAX,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 50 * 100_000_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+        };
+        let facts = evaluate_package_acceptance(
+            &pool,
+            &policy(),
+            std::slice::from_ref(&coinbase),
+            &[ctx(0, 100, false)],
+            None,
+            1_000,
+        );
+        assert_eq!(
+            facts.results[0].reject_reason,
+            Some(AcceptanceRejectReason::MissingInputs),
+            "coinbase maps to MissingInputs"
+        );
+    }
+
+    #[test]
+    fn package_acceptance_all_evaluates_after_rejection() {
+        let pool = crate::Mempool::new(crate::MempoolLimits::default());
+        let first = standard_tx(1);
+        let second = standard_tx(2);
+        let facts = evaluate_package_acceptance_all(
+            &pool,
+            &policy(),
+            &[first, second.clone()],
+            &[ctx(1_000, 100, true), ctx(1_000, 100, false)],
+            None,
+            1_000,
+        );
+        assert_eq!(
+            facts.results[0].reject_reason,
+            Some(AcceptanceRejectReason::MissingInputs)
+        );
+        assert_eq!(
+            facts.results[1].allowed,
+            Some(true),
+            "evaluate-all must still evaluate the second row after the first rejects"
+        );
+        assert_eq!(facts.results[1].txid, second.txid());
     }
 }

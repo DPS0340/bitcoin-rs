@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use bitcoin_rs_storage::{ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch};
+use bitcoin_rs_storage::{
+    ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition,
+};
 use parking_lot::RwLock;
 
 #[derive(Default)]
@@ -44,29 +46,27 @@ impl KvStore for MemoryStore {
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
         let mut guard = self.cfs.write();
-        for op in batch.ops {
-            match op {
-                MemoryOp::Put { cf, key, value } => {
-                    guard[cf.index()].insert(key, value);
-                }
-                MemoryOp::Delete { cf, key } => {
-                    guard[cf.index()].remove(&key);
-                }
-                MemoryOp::DeleteRange { cf, start, end } => {
-                    let keys = guard[cf.index()]
-                        .keys()
-                        .filter(|key| {
-                            key.as_slice() >= start.as_slice() && key.as_slice() < end.as_slice()
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for key in keys {
-                        guard[cf.index()].remove(&key);
-                    }
-                }
-            }
-        }
+        apply_ops(&mut guard, batch.ops.into_iter());
         Ok(())
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: Self::WriteBatch,
+    ) -> Result<bool, StorageError> {
+        let mut guard = self.cfs.write();
+        // Every condition observes pre-batch state; the batch is allowed to
+        // put or delete a condition key itself.
+        let matched = conditions.iter().all(|condition| {
+            let (cf, key) = condition.location();
+            condition.matches(guard[cf.index()].get(key).map(Vec::as_slice))
+        });
+        if !matched {
+            return Ok(false);
+        }
+        apply_ops(&mut guard, batch.ops.into_iter());
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
@@ -147,5 +147,34 @@ impl KvSnapshot for MemorySnapshot {
             .map(|(key, value)| Ok((key.clone(), value.clone())))
             .collect::<Vec<_>>();
         Ok(Box::new(rows.into_iter()))
+    }
+}
+
+/// Folds one batch's operations into the column families, in order.
+fn apply_ops(
+    cfs: &mut [BTreeMap<Vec<u8>, Vec<u8>>; ColumnFamily::ALL.len()],
+    ops: std::vec::IntoIter<MemoryOp>,
+) {
+    for op in ops {
+        match op {
+            MemoryOp::Put { cf, key, value } => {
+                cfs[cf.index()].insert(key, value);
+            }
+            MemoryOp::Delete { cf, key } => {
+                cfs[cf.index()].remove(&key);
+            }
+            MemoryOp::DeleteRange { cf, start, end } => {
+                let keys = cfs[cf.index()]
+                    .keys()
+                    .filter(|key| {
+                        key.as_slice() >= start.as_slice() && key.as_slice() < end.as_slice()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    cfs[cf.index()].remove(&key);
+                }
+            }
+        }
     }
 }

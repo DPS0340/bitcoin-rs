@@ -1,7 +1,6 @@
 use std::{io, time::Instant};
 
-use bitcoin::ScriptBuf;
-use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
+use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use rayon::prelude::*;
 use smallvec::SmallVec;
@@ -22,12 +21,6 @@ const TXID_RUN_GROUPING_MAX_SHARDS: usize = 8;
 /// Errors returned by UTXO mutation and snapshot operations.
 #[derive(Debug, Error)]
 pub enum UtxoError {
-    /// A legacy snapshot v2 bitmap only represents vouts `0..64`.
-    #[error("snapshot v2 vout {vout} exceeds bitmap range 0..64")]
-    VoutOutOfRange {
-        /// Invalid vout.
-        vout: u32,
-    },
     /// A script does not fit the snapshot and record `u16` length field.
     #[error("script_pubkey is too large for a u16 length: {len} bytes")]
     ScriptTooLarge {
@@ -77,22 +70,6 @@ pub enum UtxoError {
     SnapshotOutputCountTooLarge {
         /// Live output count in one transaction-level record.
         count: usize,
-    },
-    /// Snapshot vout count does not match the bitmap.
-    #[error("snapshot record vout count {vout_count} does not match bitmap {bitmap:#018x}")]
-    SnapshotVoutCountMismatch {
-        /// Vout bitmap from the record.
-        bitmap: u64,
-        /// Vout count from the record.
-        vout_count: u8,
-    },
-    /// Snapshot vout is not present in the legacy record bitmap.
-    #[error("snapshot v2 vout {vout} is not present in bitmap {bitmap:#018x}")]
-    SnapshotVoutBitmapMismatch {
-        /// Vout bitmap from the record.
-        bitmap: u64,
-        /// Output index from the record body.
-        vout: u32,
     },
     /// Snapshot record serialized the same vout more than once.
     #[error("snapshot record duplicates vout {vout}")]
@@ -750,7 +727,7 @@ impl UtxoSetView<'_> {
     }
 
     /// Scans every live output for exact scriptPubKey matches.
-    pub fn scan_script_pubkeys(&self, scripts: &[ScriptBuf]) -> Result<UtxoScan, UtxoError> {
+    pub fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
         let mut scan = UtxoScan::default();
         for shard in &self.set.shards {
             shard.scan_script_pubkeys(scripts, &mut scan);
@@ -821,7 +798,7 @@ impl UtxoSet {
     #[must_use]
     pub fn get(&self, op: &OutPoint) -> Option<TxOut> {
         let key = UtxoKey::from_txid(&op.txid);
-        self.shards[usize::from(key.shard())].get(&key, &op.txid, op.vout)
+        self.shards[usize::from(key.shard())].get(&key, &op.txid.into(), op.vout)
     }
 
     /// Returns the full live-output entry (txout + coinbase + height)
@@ -829,18 +806,18 @@ impl UtxoSet {
     #[must_use]
     pub fn get_entry(&self, op: &OutPoint) -> Option<crate::shard::LiveOutput> {
         let key = UtxoKey::from_txid(&op.txid);
-        self.shards[usize::from(key.shard())].get_entry(&key, &op.txid, op.vout)
+        self.shards[usize::from(key.shard())].get_entry(&key, &op.txid.into(), op.vout)
     }
 
     /// Returns live-output metadata without materializing script bytes.
     #[must_use]
     pub fn get_meta(&self, op: &OutPoint) -> Option<crate::shard::LiveOutputMeta> {
         let key = UtxoKey::from_txid(&op.txid);
-        self.shards[usize::from(key.shard())].get_meta(&key, &op.txid, op.vout)
+        self.shards[usize::from(key.shard())].get_meta(&key, &op.txid.into(), op.vout)
     }
 
     /// Scans a stable whole-set view for exact scriptPubKey matches.
-    pub fn scan_script_pubkeys(&self, scripts: &[ScriptBuf]) -> Result<UtxoScan, UtxoError> {
+    pub fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
         self.with_stable_view(|view| view.scan_script_pubkeys(scripts))
     }
 
@@ -850,7 +827,7 @@ impl UtxoSet {
     /// forbidden while any earlier output for that txid remains unspent.
     #[must_use]
     pub fn has_live_outputs_for_txid(&self, txid: &Hash256) -> bool {
-        let key = UtxoKey::from_txid(txid);
+        let key = UtxoKey::from_txid(&Txid::from(*txid));
         self.shards[usize::from(key.shard())].has_live_outputs_for_txid(&key, txid)
     }
 
@@ -1069,7 +1046,7 @@ impl Default for UtxoSet {
 }
 
 fn validate_add(add: &impl UtxoAddView) -> Result<(), UtxoError> {
-    let script_len = add.txout().script_pubkey.as_bytes().len();
+    let script_len = add.txout().script_pubkey.len();
     let _fits =
         u16::try_from(script_len).map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
     Ok(())
@@ -1251,7 +1228,7 @@ fn direct_adds<A: UtxoAddView>(adds: &[A], shard_idx: usize) -> Vec<AddPayload<'
     for add in adds {
         let key = UtxoKey::from_txid(&add.outpoint().txid);
         debug_assert_eq!(usize::from(key.shard()), shard_idx);
-        payloads.push((key, add.outpoint().txid, add.payload()));
+        payloads.push((key, add.outpoint().txid.into(), add.payload()));
     }
     payloads
 }
@@ -1278,7 +1255,7 @@ fn scattered_adds<'a, A: UtxoAddView>(
         let key = UtxoKey::from_txid(&add.outpoint().txid);
         let shard_idx = usize::from(key.shard());
         let cursor = &mut cursors[shard_idx];
-        slots[*cursor] = Some((key, add.outpoint().txid, add.payload()));
+        slots[*cursor] = Some((key, add.outpoint().txid.into(), add.payload()));
         *cursor = cursor.saturating_add(1);
     }
     debug_assert_eq!(cursors, range_ends(&ranges));
@@ -1312,7 +1289,7 @@ fn spend_payload(remove: &OutPoint, key: UtxoKey) -> SpendPayload<'_> {
         op: remove,
         key,
         vout: remove.vout,
-        txid: remove.txid,
+        txid: remove.txid.into(),
     }
 }
 

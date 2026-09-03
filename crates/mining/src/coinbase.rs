@@ -1,20 +1,21 @@
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute, transaction,
-};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
+use bitcoin_rs_script::push_int;
 use thiserror::Error;
 
-const HALVING_INTERVAL: u32 = 210_000;
 const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
+const MIN_COINBASE_SCRIPT_SIG_LEN: usize = 2;
 const WITNESS_COMMITMENT_TAG: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 
-/// Mining crate error type.
+/// Consensus witness reserved value used when constructing a BIP141 commitment.
+pub const WITNESS_RESERVED_VALUE: [u8; 32] = [0; 32];
+
+/// Candidate assembly failure.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MiningError {
-    /// Coinbase subsidy plus fees exceeded Bitcoin's money range.
+    /// Coinbase subsidy plus fees exceeded the satoshi range.
     #[error("coinbase value overflows satoshi range")]
     CoinbaseValueOverflow,
-    /// The generated coinbase scriptSig exceeded the consensus script size bound.
+    /// A generated coinbase scriptSig exceeded the consensus bound.
     #[error("coinbase scriptSig length {len} exceeds {max}")]
     CoinbaseScriptTooLarge {
         /// Generated scriptSig byte length.
@@ -22,150 +23,102 @@ pub enum MiningError {
         /// Maximum consensus scriptSig byte length.
         max: usize,
     },
-    /// A selected mempool entry disappeared before template assembly completed.
-    #[error("selected mempool entry {0} is missing")]
-    MissingMempoolEntry(u32),
-    /// A transaction weight did not fit into the template field width.
-    #[error("transaction weight does not fit in u32")]
-    TransactionWeightOverflow,
+    /// The immutable snapshot contains an invalid ancestor position.
+    #[error("snapshot entry {entry} names missing ancestor {ancestor}")]
+    MissingAncestor {
+        /// Snapshot position of the entry.
+        entry: usize,
+        /// Invalid ancestor position.
+        ancestor: u32,
+    },
+    /// The immutable snapshot's dependency graph contains a cycle.
+    #[error("snapshot dependency graph contains a cycle at entry {entry}")]
+    DependencyCycle {
+        /// Snapshot position at which the cycle was detected.
+        entry: usize,
+    },
+    /// A selected fee sum exceeded the satoshi range.
+    #[error("selected transaction fees overflow the satoshi range")]
+    FeeOverflow,
+    /// Candidate scalar arithmetic exceeded its supported width.
+    #[error("candidate {field} overflows its supported width")]
+    CandidateScalarOverflow {
+        /// Scalar that overflowed.
+        field: &'static str,
+    },
+    /// Coinbase reservation already exhausts a configured block limit.
+    #[error("coinbase reservation exhausts the {field} limit")]
+    CapacityExhausted {
+        /// Limit that the coinbase alone exhausted.
+        field: &'static str,
+    },
 }
 
-/// Coinbase construction parameters that are stable across template requests.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CoinbaseTemplateConfig {
-    /// Script receiving the subsidy plus selected transaction fees.
-    pub miner_script_pubkey: ScriptBuf,
-}
-
-impl CoinbaseTemplateConfig {
-    /// Creates a coinbase configuration paying the supplied miner script.
-    #[must_use]
-    pub const fn new(miner_script_pubkey: ScriptBuf) -> Self {
-        Self {
-            miner_script_pubkey,
-        }
-    }
-
-    /// Builds a coinbase transaction with the configured miner payout script.
-    pub fn build_coinbase_template(
-        &self,
-        height: u32,
-        fees: u64,
-        witness_commitment: &Hash256,
-        extranonce_reserve: usize,
-    ) -> Result<Transaction, MiningError> {
-        let script_sig = coinbase_script_sig(height, extranonce_reserve)?;
-        let coinbase_value = block_subsidy(height)
-            .checked_add(fees)
-            .ok_or(MiningError::CoinbaseValueOverflow)?;
-
-        Ok(Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig,
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![
-                TxOut {
-                    value: Amount::from_sat(coinbase_value),
-                    script_pubkey: self.miner_script_pubkey.clone(),
-                },
-                TxOut {
-                    value: Amount::from_sat(0),
-                    script_pubkey: witness_commitment_script(witness_commitment),
-                },
-            ],
-        })
-    }
-}
-
-impl Default for CoinbaseTemplateConfig {
-    fn default() -> Self {
-        Self {
-            miner_script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }
-    }
-}
-
-/// Builds a coinbase template using the default miner payout script.
-pub fn build_coinbase_template(
+/// Builds the coinbase paying `payout`, optionally committing to `SegWit`.
+pub(crate) fn build_coinbase(
     height: u32,
+    subsidy_halving_interval: u32,
     fees: u64,
-    witness_commitment: &Hash256,
-    extranonce_reserve: usize,
-) -> Result<Transaction, MiningError> {
-    CoinbaseTemplateConfig::default().build_coinbase_template(
-        height,
-        fees,
-        witness_commitment,
-        extranonce_reserve,
-    )
-}
+    payout: Vec<u8>,
+    witness_commitment: Option<&Hash256>,
+) -> Result<Tx, MiningError> {
+    let value = bitcoin_rs_consensus::block_subsidy(height, subsidy_halving_interval)
+        .checked_add(fees)
+        .ok_or(MiningError::CoinbaseValueOverflow)?;
 
-/// Returns the block subsidy for a height in satoshis.
-#[must_use]
-pub const fn block_subsidy(height: u32) -> u64 {
-    // Delegates so the subsidy has one implementation. It is a consensus
-    // quantity, and a template that computed it differently from the validator
-    // would propose blocks the node then rejects.
-    //
-    // The mainnet interval is passed because this entry point has no network.
-    // A regtest template therefore still over-states the subsidy; that is
-    // pre-existing and belongs with making `BlockTemplateParams` carry the
-    // network, not with the validation rule.
-    bitcoin_rs_consensus::block_subsidy(height, HALVING_INTERVAL)
-}
+    let mut witness = Vec::new();
+    let mut outputs = vec![TxOut {
+        value,
+        script_pubkey: payout,
+    }];
 
-/// Builds the BIP141 witness commitment output script.
-#[must_use]
-pub fn witness_commitment_script(witness_commitment: &Hash256) -> ScriptBuf {
-    let mut script = Vec::with_capacity(38);
-    script.push(0x6a);
-    script.push(36);
-    script.extend_from_slice(&WITNESS_COMMITMENT_TAG);
-    script.extend_from_slice(witness_commitment.as_byte_array());
-    ScriptBuf::from_bytes(script)
-}
-
-fn coinbase_script_sig(height: u32, extranonce_reserve: usize) -> Result<ScriptBuf, MiningError> {
-    let encoded_height = encode_script_number(u64::from(height));
-    let len = encoded_height
-        .len()
-        .saturating_add(1)
-        .saturating_add(extranonce_reserve);
-    if len > MAX_COINBASE_SCRIPT_SIG_LEN {
-        return Err(MiningError::CoinbaseScriptTooLarge {
-            len,
-            max: MAX_COINBASE_SCRIPT_SIG_LEN,
+    if let Some(commitment) = witness_commitment {
+        witness.push(WITNESS_RESERVED_VALUE.to_vec());
+        outputs.push(TxOut {
+            value: 0,
+            script_pubkey: witness_commitment_script(commitment),
         });
     }
 
-    let mut script = Vec::with_capacity(len);
-    script.push(
-        u8::try_from(encoded_height.len())
-            .unwrap_or_else(|_| unreachable!("u32 height script number fits in u8")),
-    );
-    script.extend_from_slice(&encoded_height);
-    script.resize(len, 0);
-    Ok(ScriptBuf::from_bytes(script))
+    Ok(Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[0; 32])), 0xffff_ffff),
+            script_sig: coinbase_script_sig(height)?,
+            sequence: 0xffff_ffff,
+            witness,
+        }],
+        outputs,
+        lock_time: 0,
+    })
 }
 
-fn encode_script_number(value: u64) -> Vec<u8> {
-    if value == 0 {
-        return Vec::new();
-    }
+/// Builds the BIP141 `OP_RETURN` witness-commitment script (`6a24aa21a9ed || commitment`).
+pub fn witness_commitment_script(commitment: &Hash256) -> Vec<u8> {
+    let mut script = Vec::with_capacity(38);
+    script.push(0x6a); // OP_RETURN
+    script.push(36); // PUSH36
+    script.extend_from_slice(&WITNESS_COMMITMENT_TAG);
+    script.extend_from_slice(commitment.as_byte_array());
+    script
+}
 
-    let mut remaining = value;
-    let mut result = Vec::new();
-    while remaining > 0 {
-        result.push(remaining.to_le_bytes()[0]);
-        remaining >>= 8;
+fn coinbase_script_sig(height: u32) -> Result<Vec<u8>, MiningError> {
+    // BIP34 requires the minimal `CScriptNum` encoding. Heights 1..=16 therefore
+    // use OP_1..OP_16 rather than a data push — `push_int` matches consensus
+    // `check_bip34`.
+    let mut script = push_int(i64::from(height));
+    // Consensus rejects coinbase scriptSigs shorter than two bytes
+    // (`bad-cb-length`). Heights whose BIP34 prefix is a single opcode need a
+    // trailing OP_0, matching Bitcoin Core's `CreateNewBlock`.
+    if script.len() < MIN_COINBASE_SCRIPT_SIG_LEN {
+        script.push(0x00);
     }
-    if result.last().is_some_and(|last| *last & 0x80 != 0) {
-        result.push(0);
+    if script.len() > MAX_COINBASE_SCRIPT_SIG_LEN {
+        return Err(MiningError::CoinbaseScriptTooLarge {
+            len: script.len(),
+            max: MAX_COINBASE_SCRIPT_SIG_LEN,
+        });
     }
-    result
+    Ok(script)
 }

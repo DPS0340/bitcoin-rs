@@ -3,14 +3,14 @@ use secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
 
 /// Verifies Schnorr signatures in parallel.
 ///
-/// secp256k1 0.31 exposes per-signature Schnorr verification but not public
-/// batch verification. This v1 batch path preserves the public shape while using
+/// secp256k1 exposes per-signature Schnorr verification but no public batch
+/// verification. This v1 batch path preserves the public shape while using
 /// Rayon to verify independent items concurrently.
 #[must_use]
 pub fn verify_schnorr_batch(items: &[(Signature, Message, XOnlyPublicKey)]) -> bool {
     items.par_iter().all(|(signature, message, public_key)| {
         secp256k1::SECP256K1
-            .verify_schnorr(signature, message.as_ref(), public_key)
+            .verify_schnorr(signature, message, public_key)
             .is_ok()
     })
 }
@@ -24,7 +24,7 @@ mod tests {
     #[test]
     fn batch_verify_is_conjunction_of_individual_verification() {
         let secp = Secp256k1::new();
-        let secret = match SecretKey::from_byte_array([3; 32]) {
+        let secret = match SecretKey::from_slice(&[3u8; 32]) {
             Ok(secret) => secret,
             Err(error) => panic!("fixed secret key should be valid: {error}"),
         };
@@ -33,7 +33,7 @@ mod tests {
         let items: Vec<_> = (0u8..20)
             .map(|byte| {
                 let message = Message::from_digest([byte; 32]);
-                let signature = secp.sign_schnorr(message.as_ref(), &keypair);
+                let signature = secp.sign_schnorr(&message, &keypair);
                 (signature, message, public_key)
             })
             .collect();

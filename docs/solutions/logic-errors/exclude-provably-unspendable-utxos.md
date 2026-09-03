@@ -54,7 +54,7 @@ Keep the strict boundary explicit in tests:
 - A 10,000-byte script is retained.
 - A 10,001-byte script is excluded.
 
-Rename the checkpoint UTXO codec to `bitcoin-rs-utxo-spendable-v1`. A checkpoint carrying the previous codec now falls back to `CheckpointLoad::HeadersOnly` instead of restoring chainstate with obsolete admission semantics.
+Rename the checkpoint UTXO codec to `bitcoin-rs-utxo-spendable-v1`. A checkpoint carrying the previous codec now fails startup with an explicit datadir remove-and-resync instruction instead of restoring chainstate with obsolete admission semantics or retaining a validated-headers fallback.
 
 ## Why This Works
 
@@ -65,5 +65,6 @@ The codec name binds persisted data to that semantic contract. Snapshot bytes wr
 ## Prevention
 
 - Test both sides of every consensus-size boundary, including the exact accepted maximum.
-- Treat a change to UTXO admission semantics as a checkpoint codec change.
+- Treat a change to UTXO admission semantics as a checkpoint codec change and
+  require an explicit datadir resync when that codec is encountered.
 - Keep the spendability filter in the block-to-UTXO change boundary so every storage and snapshot path sees the same set.

@@ -53,20 +53,31 @@ fn assert_limit_semantics<S: KvStore>(store: &S) -> Result<(), StorageError> {
     assert_eq!(scan.rows[1].0, vec![0x00, 0x01]);
     assert!(scan.complete);
 
-    for limit in [
+    // max_rows = 0 always yields an empty, incomplete scan.
+    let scan = store.scan_prefix_bounded(
+        ColumnFamily::TxConfirmed,
+        &[0x00],
         PrefixScanLimit {
             max_rows: 0,
             max_bytes: usize::MAX,
         },
+    )?;
+    assert!(scan.rows.is_empty());
+    assert!(!scan.complete);
+
+    // max_bytes = 0 with max_rows > 0 still admits the first row (soft limit),
+    // then stops because every subsequent row exceeds the hard byte budget.
+    let scan = store.scan_prefix_bounded(
+        ColumnFamily::TxConfirmed,
+        &[0x00],
         PrefixScanLimit {
             max_rows: usize::MAX,
             max_bytes: 0,
         },
-    ] {
-        let scan = store.scan_prefix_bounded(ColumnFamily::TxConfirmed, &[0x00], limit)?;
-        assert!(scan.rows.is_empty());
-        assert!(!scan.complete);
-    }
+    )?;
+    assert_eq!(scan.rows.len(), 1);
+    assert_eq!(scan.rows[0].0, vec![0x00]);
+    assert!(!scan.complete);
     Ok(())
 }
 
@@ -125,11 +136,57 @@ fn assert_snapshot_isolation<S: KvStore>(store: &S) -> Result<(), StorageError> 
     Ok(())
 }
 
+fn assert_oversized_first_row<S: KvStore>(store: &S) -> Result<(), StorageError> {
+    // Seed a prefix range where the first row is larger than max_bytes.
+    let mut batch = store.new_batch();
+    batch.put(ColumnFamily::Spending, &[0x10], &[0u8; 200]);
+    batch.put(ColumnFamily::Spending, &[0x10, 0x01], b"small");
+    store.write(batch)?;
+
+    // The first row is admitted even though it alone exceeds max_bytes.
+    let scan = store.scan_prefix_bounded(
+        ColumnFamily::Spending,
+        &[0x10],
+        PrefixScanLimit {
+            max_rows: 10,
+            max_bytes: 10,
+        },
+    )?;
+    assert_eq!(scan.rows.len(), 1);
+    assert_eq!(scan.rows[0].0, vec![0x10]);
+    assert!(!scan.complete);
+
+    // After deleting the oversized row, scanning progresses to the next row.
+    let mut batch = store.new_batch();
+    batch.delete(ColumnFamily::Spending, &[0x10]);
+    store.write(batch)?;
+
+    let scan = store.scan_prefix_bounded(
+        ColumnFamily::Spending,
+        &[0x10],
+        PrefixScanLimit {
+            max_rows: 10,
+            max_bytes: 10,
+        },
+    )?;
+    assert_eq!(scan.rows.len(), 1);
+    assert_eq!(scan.rows[0].0, vec![0x10, 0x01]);
+    assert!(scan.complete);
+
+    // Cleanup so the store is reusable.
+    let mut batch = store.new_batch();
+    batch.delete(ColumnFamily::Spending, &[0x10, 0x01]);
+    store.write(batch)?;
+
+    Ok(())
+}
+
 fn run_bounded_scan_suite<S: KvStore>(store: &S) -> Result<(), StorageError> {
     seed_rows(store)?;
     assert_limit_semantics(store)?;
     assert_prefix_boundaries(store)?;
-    assert_snapshot_isolation(store)
+    assert_snapshot_isolation(store)?;
+    assert_oversized_first_row(store)
 }
 
 #[cfg(feature = "fjall")]

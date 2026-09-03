@@ -9,11 +9,8 @@ use crate::{UtxoError, UtxoKey};
 
 const TXID_LEN: usize = 32;
 const OUTPUT_COUNT_OFFSET: usize = TXID_LEN;
-const LEGACY_INLINE_LEN_OFFSET: usize = OUTPUT_COUNT_OFFSET + core::mem::size_of::<u32>();
-const RECORD_HEADER_LEN: usize = LEGACY_INLINE_LEN_OFFSET + core::mem::size_of::<u8>();
-/// Fixed per-output metadata width of the retained v4 layout:
-/// `vout(4) || value(8) || height(4) || coinbase(1) || script_len(2)`.
-const OUTPUT_METADATA_LEN_V4: usize = 19;
+const INLINE_LEN_OFFSET: usize = OUTPUT_COUNT_OFFSET + core::mem::size_of::<u32>();
+const RECORD_HEADER_LEN: usize = INLINE_LEN_OFFSET + core::mem::size_of::<u8>();
 /// Largest v5 payload prologue, for the encoder's stack buffer: 10 bytes for
 /// the amount varint (or the escape sentinel), 8 for a raw escaped amount, and
 /// 5 for the packed height. The script needs none — it is the rest.
@@ -128,23 +125,25 @@ fn pack_widths(vout_width: usize, len_width: usize) -> Result<u8, UtxoError> {
     let len = u8::try_from(len_width).map_err(|_| UtxoError::CorruptRecord)?;
     Ok((len << 4) | vout)
 }
-const LEGACY_INLINE_CAPACITY: usize = 8;
+/// Number of outputs kept in the inline partition before overflow outputs are
+/// appended to the directory-addressed region.
+const INLINE_CAPACITY: usize = 8;
 
 /// Sentinel amount varint meaning "the next 8 bytes are a raw little-endian
 /// value".
 ///
 /// [`compress_amount`] maps the whole money supply below 2^54, so `u64::MAX` is
 /// unreachable as a compressed amount and is free as an escape. No
-/// consensus-valid output can need it — but `Amount` is a plain `u64`, v4
-/// stored one losslessly, and a codec that started rejecting values its
-/// predecessor accepted would not be an equivalent replacement.
+/// consensus-valid output can need it — but `Amount` is a plain `u64`, so the
+/// record codec preserves every representable value for lossless round trips.
 const AMOUNT_ESCAPE: u64 = u64::MAX;
 
 /// Packs the two per-output facts that always travel together into one varint.
 ///
 /// `coinbase` occupies the low bit, so a height under 2^20 — every height
-/// Bitcoin will reach for centuries — costs 3 bytes for both fields where v4
-/// spent 5. Kept per-output rather than hoisted into the record header, which
+/// Bitcoin will reach for centuries — costs 3 bytes for both fields instead of
+/// separate fixed-width fields. Kept per-output rather than hoisted into the
+/// record header, which
 /// would save 3 more: hoisting needs "every output of a record shares one
 /// height" to hold, and BIP30's duplicate coinbase txids are exactly the case
 /// where it might not.
@@ -169,10 +168,11 @@ pub struct OneUtxoOut<'a> {
 
 /// Transaction-level UTXO record encoded in one owned byte allocation.
 ///
-/// The payload is `txid || output_count || legacy_inline_len || outputs`, where
-/// every output is `vout || value || height || coinbase || script_len || script`
-/// in little-endian canonical form. The record owns exactly one pointer-sized
-/// [`ThinRecordBuf`]; output views borrow directly from its payload.
+/// The payload is `txid || output_count || inline_len || widths || vout_dir ||
+/// len_dir || payloads`. Each output payload contains its value, height,
+/// coinbase bit, and script in little-endian canonical form. The record owns
+/// exactly one pointer-sized [`ThinRecordBuf`]; output views borrow directly
+/// from its payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct UtxoRecord {
@@ -448,7 +448,7 @@ impl<'a> RecordWriter<'a> {
 struct RecordHeader {
     txid: Hash256,
     output_count: usize,
-    legacy_inline_len: usize,
+    inline_len: usize,
 }
 
 /// Iterator over checked output views from one validated record.
@@ -511,7 +511,7 @@ impl UtxoRecord {
         txid: Hash256,
         outputs: &[OwnedUtxoOut],
     ) -> Result<Self, UtxoError> {
-        Self::from_owned_parts(txid, outputs.len().min(LEGACY_INLINE_CAPACITY), outputs)
+        Self::from_owned_parts(txid, outputs.len().min(INLINE_CAPACITY), outputs)
     }
 
     pub(crate) fn key(&self) -> UtxoKey {
@@ -534,7 +534,7 @@ impl UtxoRecord {
         self.header().output_count
     }
 
-    /// Returns checked, zero-copy output views in the legacy snapshot order.
+    /// Returns checked, zero-copy output views in the canonical snapshot order.
     ///
     /// `UtxoRecord` is validated at construction and its `bytes` field is
     /// private and immutable afterward, so the encoded payload cannot corrupt
@@ -616,15 +616,9 @@ impl UtxoRecord {
             }
         }
         let mut parts = self.output_parts();
-        let mut legacy_inline_len = self.header().legacy_inline_len;
-        apply_additions(
-            &mut parts,
-            &mut legacy_inline_len,
-            additions,
-            add_unique,
-            None,
-        );
-        Self::from_output_parts(self.txid(), legacy_inline_len, &parts)
+        let mut inline_len = self.header().inline_len;
+        apply_additions(&mut parts, &mut inline_len, additions, add_unique, None);
+        Self::from_output_parts(self.txid(), inline_len, &parts)
     }
 
     /// Add-run replacement that also materializes the overwritten outputs (owned,
@@ -640,16 +634,16 @@ impl UtxoRecord {
             return Ok((record, vec![None; additions.len()]));
         }
         let mut parts = self.output_parts();
-        let mut legacy_inline_len = self.header().legacy_inline_len;
+        let mut inline_len = self.header().inline_len;
         let mut overwritten = Vec::with_capacity(additions.len());
         apply_additions(
             &mut parts,
-            &mut legacy_inline_len,
+            &mut inline_len,
             additions,
             false,
             Some(&mut overwritten),
         );
-        let record = Self::from_output_parts(self.txid(), legacy_inline_len, &parts)?;
+        let record = Self::from_output_parts(self.txid(), inline_len, &parts)?;
         Ok((record, overwritten))
     }
 
@@ -663,13 +657,13 @@ impl UtxoRecord {
         if add_unique {
             // Unique adds on an empty record encode in slice order with the
             // inline partition filled to capacity; no dedup pass is needed.
-            let legacy_inline_len = additions.len().min(LEGACY_INLINE_CAPACITY);
-            return Self::from_output_parts(txid, legacy_inline_len, additions);
+            let inline_len = additions.len().min(INLINE_CAPACITY);
+            return Self::from_output_parts(txid, inline_len, additions);
         }
         let mut parts = Vec::with_capacity(additions.len());
-        let mut legacy_inline_len = 0;
-        apply_additions(&mut parts, &mut legacy_inline_len, additions, false, None);
-        Self::from_output_parts(txid, legacy_inline_len, &parts)
+        let mut inline_len = 0;
+        apply_additions(&mut parts, &mut inline_len, additions, false, None);
+        Self::from_output_parts(txid, inline_len, &parts)
     }
 
     pub(crate) fn new_add_replacement_tracked(
@@ -678,26 +672,26 @@ impl UtxoRecord {
         add_unique: bool,
     ) -> Result<(Self, Vec<Option<OwnedUtxoOut>>), UtxoError> {
         if add_unique {
-            let legacy_inline_len = additions.len().min(LEGACY_INLINE_CAPACITY);
-            let record = Self::from_output_parts(txid, legacy_inline_len, additions)?;
+            let inline_len = additions.len().min(INLINE_CAPACITY);
+            let record = Self::from_output_parts(txid, inline_len, additions)?;
             return Ok((record, vec![None; additions.len()]));
         }
         let mut parts = Vec::with_capacity(additions.len());
-        let mut legacy_inline_len = 0;
+        let mut inline_len = 0;
         let mut overwritten = Vec::with_capacity(additions.len());
         apply_additions(
             &mut parts,
-            &mut legacy_inline_len,
+            &mut inline_len,
             additions,
             false,
             Some(&mut overwritten),
         );
-        let record = Self::from_output_parts(txid, legacy_inline_len, &parts)?;
+        let record = Self::from_output_parts(txid, inline_len, &parts)?;
         Ok((record, overwritten))
     }
 
     /// Increasing-unique append-copy fast path. Returns `None` when appending
-    /// would reorder the legacy partition bytes, or when the directories would
+    /// would reorder the inline partition bytes, or when the directories would
     /// have to widen, so the caller must rebuild.
     ///
     /// Appending is a splice of three regions rather than one, because the
@@ -708,8 +702,8 @@ impl UtxoRecord {
     /// copy would otherwise preserve.
     fn append_unique_run(&self, additions: &[OutputParts<'_>]) -> Result<Option<Self>, UtxoError> {
         let header = self.header();
-        let appends_at_end = header.output_count == header.legacy_inline_len
-            || header.legacy_inline_len == LEGACY_INLINE_CAPACITY;
+        let appends_at_end =
+            header.output_count == header.inline_len || header.inline_len == INLINE_CAPACITY;
         if !appends_at_end {
             return Ok(None);
         }
@@ -725,10 +719,8 @@ impl UtxoRecord {
                 })?;
         let output_count =
             u32::try_from(new_count).map_err(|_| UtxoError::RecordTooLarge { len: new_count })?;
-        let legacy_inline_len =
-            (header.legacy_inline_len + additions.len()).min(LEGACY_INLINE_CAPACITY);
-        let legacy_inline_len_u8 =
-            u8::try_from(legacy_inline_len).map_err(|_| UtxoError::CorruptRecord)?;
+        let inline_len = (header.inline_len + additions.len()).min(INLINE_CAPACITY);
+        let inline_len_u8 = u8::try_from(inline_len).map_err(|_| UtxoError::CorruptRecord)?;
 
         // Widths must stay exactly as they are: narrower would be non-minimal
         // for the outputs already encoded, wider would mean rewriting every
@@ -766,7 +758,7 @@ impl UtxoRecord {
         let mut writer = RecordWriter::new(&mut buf);
         writer.push(&header.txid.to_le_bytes())?;
         writer.push(&output_count.to_le_bytes())?;
-        writer.push(&[legacy_inline_len_u8])?;
+        writer.push(&[inline_len_u8])?;
         writer.push(&[pack_widths(old.vout_width, old.len_width)?])?;
 
         writer.push(region(old.vout_dir, old.len_dir)?)?;
@@ -798,14 +790,14 @@ impl UtxoRecord {
         vouts: &[u32],
     ) -> Result<(Option<Self>, Vec<Option<OwnedUtxoOut>>), UtxoError> {
         let mut parts = self.output_parts();
-        let mut legacy_inline_len = self.header().legacy_inline_len;
+        let mut inline_len = self.header().inline_len;
         let mut removed = Vec::with_capacity(vouts.len());
 
         for &vout in vouts {
             let output = parts
                 .iter()
                 .position(|part| part.vout == vout)
-                .map(|index| remove_part_at(&mut parts, &mut legacy_inline_len, index));
+                .map(|index| remove_part_at(&mut parts, &mut inline_len, index));
             removed.push(output.map(OutputParts::into_owned));
         }
 
@@ -813,7 +805,7 @@ impl UtxoRecord {
             return Ok((None, removed));
         }
 
-        let replacement = Self::from_output_parts(self.txid(), legacy_inline_len, &parts)?;
+        let replacement = Self::from_output_parts(self.txid(), inline_len, &parts)?;
         Ok((Some(replacement), removed))
     }
 
@@ -825,11 +817,11 @@ impl UtxoRecord {
             return Ok(RemovedRecord::Emptied);
         }
         let mut parts = self.output_parts();
-        let mut legacy_inline_len = self.header().legacy_inline_len;
+        let mut inline_len = self.header().inline_len;
         let mut any_removed = false;
         for &vout in vouts {
             if let Some(index) = parts.iter().position(|part| part.vout == vout) {
-                remove_part_at(&mut parts, &mut legacy_inline_len, index);
+                remove_part_at(&mut parts, &mut inline_len, index);
                 any_removed = true;
             }
         }
@@ -839,13 +831,13 @@ impl UtxoRecord {
         if parts.is_empty() {
             return Ok(RemovedRecord::Emptied);
         }
-        let replacement = Self::from_output_parts(self.txid(), legacy_inline_len, &parts)?;
+        let replacement = Self::from_output_parts(self.txid(), inline_len, &parts)?;
         Ok(RemovedRecord::Replaced(replacement))
     }
 
     /// Builds the replacement for a coalesced remove run followed by a
     /// coalesced add run on this record, in one borrowed descriptor pass with a
-    /// single encode. Removes model legacy-partition removal in `vouts` request
+    /// single encode. Removes model inline-partition removal in `vouts` request
     /// order; the adds then overwrite or append in `additions` payload order.
     /// Used by the no-listener commit path when one record identity is both
     /// spent and rebuilt in the same batch; no removed or overwritten output is
@@ -871,7 +863,7 @@ impl UtxoRecord {
             return Ok(RemovedRecord::Replaced(record));
         }
         let mut parts = self.output_parts();
-        let mut legacy_inline_len = self.header().legacy_inline_len;
+        let mut inline_len = self.header().inline_len;
         // `add_unique` is the strictly-increasing fast path. `parts` are the
         // pre-removal live outputs, so their max is exactly the record's
         // pre-removal `max_vout`; computing it here from the already-built
@@ -880,20 +872,14 @@ impl UtxoRecord {
             additions_are_strictly_increasing(parts.iter().map(|part| part.vout).max(), additions);
         for &vout in vouts {
             if let Some(index) = parts.iter().position(|part| part.vout == vout) {
-                remove_part_at(&mut parts, &mut legacy_inline_len, index);
+                remove_part_at(&mut parts, &mut inline_len, index);
             }
         }
-        apply_additions(
-            &mut parts,
-            &mut legacy_inline_len,
-            additions,
-            add_unique,
-            None,
-        );
+        apply_additions(&mut parts, &mut inline_len, additions, add_unique, None);
         if parts.is_empty() {
             return Ok(RemovedRecord::Emptied);
         }
-        let replacement = Self::from_output_parts(self.txid(), legacy_inline_len, &parts)?;
+        let replacement = Self::from_output_parts(self.txid(), inline_len, &parts)?;
         Ok(RemovedRecord::Replaced(replacement))
     }
 
@@ -969,10 +955,10 @@ impl UtxoRecord {
     /// [`Self::from_encoded`].
     fn from_owned_parts(
         txid: Hash256,
-        legacy_inline_len: usize,
+        inline_len: usize,
         outputs: &[OwnedUtxoOut],
     ) -> Result<Self, UtxoError> {
-        let buf = encode_record(txid, legacy_inline_len, &owned_parts(outputs))?;
+        let buf = encode_record(txid, inline_len, &owned_parts(outputs))?;
         Self::from_encoded(buf)
     }
 
@@ -981,10 +967,10 @@ impl UtxoRecord {
     /// encoded payload is canonical by construction and needs no re-decode.
     fn from_output_parts(
         txid: Hash256,
-        legacy_inline_len: usize,
+        inline_len: usize,
         outputs: &[OutputParts<'_>],
     ) -> Result<Self, UtxoError> {
-        let buf = encode_record(txid, legacy_inline_len, outputs)?;
+        let buf = encode_record(txid, inline_len, outputs)?;
         Ok(Self { buf })
     }
 }
@@ -1075,15 +1061,6 @@ impl<'a> OutputParts<'a> {
             .checked_add(script_len)
             .ok_or(UtxoError::RecordTooLarge { len: script_len })
     }
-
-    /// Validated v4 encoded size (19-byte metadata + script). Oracle only.
-    fn encoded_len_v4(&self) -> Result<usize, UtxoError> {
-        let script_len = self.script.len();
-        u16::try_from(script_len).map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
-        OUTPUT_METADATA_LEN_V4
-            .checked_add(script_len)
-            .ok_or(UtxoError::RecordTooLarge { len: script_len })
-    }
 }
 
 /// Outcome of staging a coalesced remove run without materializing removals.
@@ -1101,11 +1078,11 @@ fn owned_parts(outputs: &[OwnedUtxoOut]) -> Vec<OutputParts<'_>> {
 }
 
 /// Applies a coalesced add run to `parts` with overwrite semantics, preserving
-/// the legacy inline/overflow partition order. When `overwritten` is supplied,
+/// the inline/overflow partition order. When `overwritten` is supplied,
 /// each displaced output is cloned owned into it in addition order.
 fn apply_additions<'a>(
     parts: &mut Vec<OutputParts<'a>>,
-    legacy_inline_len: &mut usize,
+    inline_len: &mut usize,
     additions: &[OutputParts<'a>],
     add_unique: bool,
     mut overwritten: Option<&mut Vec<Option<OwnedUtxoOut>>>,
@@ -1118,23 +1095,19 @@ fn apply_additions<'a>(
             parts
                 .iter()
                 .position(|part| part.vout == addition.vout)
-                .map(|index| remove_part_at(parts, legacy_inline_len, index))
+                .map(|index| remove_part_at(parts, inline_len, index))
         };
-        push_part(parts, legacy_inline_len, addition);
+        push_part(parts, inline_len, addition);
         if let Some(sink) = overwritten.as_deref_mut() {
             sink.push(old.map(OutputParts::into_owned));
         }
     }
 }
 
-fn push_part<'a>(
-    parts: &mut Vec<OutputParts<'a>>,
-    legacy_inline_len: &mut usize,
-    part: OutputParts<'a>,
-) {
-    if *legacy_inline_len < LEGACY_INLINE_CAPACITY {
-        parts.insert(*legacy_inline_len, part);
-        *legacy_inline_len += 1;
+fn push_part<'a>(parts: &mut Vec<OutputParts<'a>>, inline_len: &mut usize, part: OutputParts<'a>) {
+    if *inline_len < INLINE_CAPACITY {
+        parts.insert(*inline_len, part);
+        *inline_len += 1;
     } else {
         parts.push(part);
     }
@@ -1142,13 +1115,13 @@ fn push_part<'a>(
 
 fn remove_part_at<'a>(
     parts: &mut Vec<OutputParts<'a>>,
-    legacy_inline_len: &mut usize,
+    inline_len: &mut usize,
     index: usize,
 ) -> OutputParts<'a> {
-    if index < *legacy_inline_len {
-        let last_inline = *legacy_inline_len - 1;
+    if index < *inline_len {
+        let last_inline = *inline_len - 1;
         parts.swap(index, last_inline);
-        *legacy_inline_len -= 1;
+        *inline_len -= 1;
         parts.remove(last_inline)
     } else {
         parts.swap_remove(index)
@@ -1190,12 +1163,12 @@ fn push_dir_entry(
 /// of walking output frames.
 fn encode_record(
     txid: Hash256,
-    legacy_inline_len: usize,
+    inline_len: usize,
     outputs: &[OutputParts<'_>],
 ) -> Result<ThinRecordBuf, UtxoError> {
     let output_count = u32::try_from(outputs.len())
         .map_err(|_| UtxoError::RecordTooLarge { len: outputs.len() })?;
-    if legacy_inline_len > LEGACY_INLINE_CAPACITY || legacy_inline_len > outputs.len() {
+    if inline_len > INLINE_CAPACITY || inline_len > outputs.len() {
         return Err(UtxoError::CorruptRecord);
     }
 
@@ -1226,19 +1199,15 @@ fn encode_record(
         return Err(UtxoError::RecordTooLarge { len: payload_len });
     }
 
-    let legacy_inline_len_u8 =
-        u8::try_from(legacy_inline_len).map_err(|_| UtxoError::CorruptRecord)?;
+    let inline_len_u8 = u8::try_from(inline_len).map_err(|_| UtxoError::CorruptRecord)?;
     let mut buf = ThinRecordBuf::with_capacity(payload_len)?;
     let mut writer = RecordWriter::new(&mut buf);
     writer.push(&txid.to_le_bytes())?;
     writer.push(&output_count.to_le_bytes())?;
-    writer.push(&[legacy_inline_len_u8])?;
+    writer.push(&[inline_len_u8])?;
     writer.push(&[pack_widths(vout_width, len_width)?])?;
-    // One `push` per directory entry. Staging both directories in a
-    // `SmallVec` scratch and copying once was tried and measured *slower* —
-    // 505.7ns against 428.5ns to encode a 16-output record — because setting up
-    // the scratch costs more than the bounds checks it saves at one or two
-    // bytes per entry.
+    // One `push` per directory entry is cheaper than staging both directories
+    // in a scratch buffer: the entries are only one or two bytes each.
     for output in outputs {
         push_dir_entry(&mut writer, u64::from(output.vout), vout_width)?;
     }
@@ -1247,44 +1216,6 @@ fn encode_record(
     }
     for output in outputs {
         write_payload(&mut writer, output)?;
-    }
-    writer.finish()?;
-    debug_assert_eq!(buf.as_bytes().len(), payload_len);
-    Ok(buf)
-}
-
-/// [`encode_record`] against the retained v4 output layout. Oracle and
-/// benchmark arm only; nothing in the crate encodes v4 any more.
-fn encode_record_v4(
-    txid: Hash256,
-    legacy_inline_len: usize,
-    outputs: &[OutputParts<'_>],
-) -> Result<ThinRecordBuf, UtxoError> {
-    let output_count = u32::try_from(outputs.len())
-        .map_err(|_| UtxoError::RecordTooLarge { len: outputs.len() })?;
-    if legacy_inline_len > LEGACY_INLINE_CAPACITY || legacy_inline_len > outputs.len() {
-        return Err(UtxoError::CorruptRecord);
-    }
-
-    let mut payload_len = RECORD_HEADER_LEN;
-    for output in outputs {
-        payload_len = payload_len
-            .checked_add(output.encoded_len_v4()?)
-            .ok_or(UtxoError::RecordTooLarge { len: payload_len })?;
-    }
-    if payload_len > usize::try_from(isize::MAX).unwrap_or(usize::MAX) {
-        return Err(UtxoError::RecordTooLarge { len: payload_len });
-    }
-
-    let legacy_inline_len_u8 =
-        u8::try_from(legacy_inline_len).map_err(|_| UtxoError::CorruptRecord)?;
-    let mut buf = ThinRecordBuf::with_capacity(payload_len)?;
-    let mut writer = RecordWriter::new(&mut buf);
-    writer.push(&txid.to_le_bytes())?;
-    writer.push(&output_count.to_le_bytes())?;
-    writer.push(&[legacy_inline_len_u8])?;
-    for output in outputs {
-        write_output_v4(&mut writer, output)?;
     }
     writer.finish()?;
     debug_assert_eq!(buf.as_bytes().len(), payload_len);
@@ -1305,9 +1236,8 @@ fn amount_parts(value: u64) -> (u64, bool) {
 /// `vout` and the payload length live in the directories, and the script length
 /// is not stored at all — the script is the remainder of the payload.
 ///
-/// The `u16` script-length ceiling is kept from v4, so both codecs accept
-/// exactly the same set of outputs and the equivalence between them is
-/// unconditional.
+/// The `u16` script-length ceiling bounds the remainder of the payload and
+/// keeps record sizes representable by the directory.
 fn write_payload(writer: &mut RecordWriter<'_>, output: &OutputParts<'_>) -> Result<(), UtxoError> {
     use crate::compress::write_varint_at;
 
@@ -1315,9 +1245,8 @@ fn write_payload(writer: &mut RecordWriter<'_>, output: &OutputParts<'_>) -> Res
     u16::try_from(script_len).map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
     let (amount, escaped) = amount_parts(output.value);
 
-    // Laid into one stack buffer and copied once, mirroring v4. Issuing a
-    // bounds-checked `push` per field instead measured 3.2x slower to encode a
-    // 16-output record — the varints are cheap, the per-push overhead was not.
+    // Lay the variable-length prologue into one stack buffer and copy it once.
+    // Issuing a bounds-checked `push` per field adds overhead to every output.
     let mut prologue = [0_u8; PAYLOAD_PROLOGUE_MAX_LEN];
     let mut at = write_varint_at(amount, &mut prologue, 0).ok_or(UtxoError::CorruptRecord)?;
     if escaped {
@@ -1338,33 +1267,6 @@ fn write_payload(writer: &mut RecordWriter<'_>, output: &OutputParts<'_>) -> Res
     .ok_or(UtxoError::CorruptRecord)?;
 
     writer.push(prologue.get(..at).ok_or(UtxoError::CorruptRecord)?)?;
-    writer.push(output.script)?;
-    Ok(())
-}
-
-/// Appends one output in the retained v4 layout: a fixed 19-byte metadata block
-/// plus the script.
-///
-/// Not reachable from any live path — [`encode_record`] writes v5. It is the
-/// equivalence oracle and the benchmark's `before` arm, and it is what proves
-/// the replacement is both smaller and lossless.
-fn write_output_v4(
-    writer: &mut RecordWriter<'_>,
-    output: &OutputParts<'_>,
-) -> Result<(), UtxoError> {
-    let script_len = u16::try_from(output.script.len()).map_err(|_| UtxoError::ScriptTooLarge {
-        len: output.script.len(),
-    })?;
-    // Pack the canonical 19-byte metadata header (`vout || value || height ||
-    // coinbase || script_len`, all little-endian) into one stack array, then
-    // emit it followed by the script in a single two-push sequence.
-    let mut meta = [0_u8; OUTPUT_METADATA_LEN_V4];
-    meta[0..4].copy_from_slice(&output.vout.to_le_bytes());
-    meta[4..12].copy_from_slice(&output.value.to_le_bytes());
-    meta[12..16].copy_from_slice(&output.height.to_le_bytes());
-    meta[16] = u8::from(output.coinbase);
-    meta[17..19].copy_from_slice(&script_len.to_le_bytes());
-    writer.push(&meta)?;
     writer.push(output.script)?;
     Ok(())
 }
@@ -1403,18 +1305,18 @@ fn decode_header(bytes: &[u8]) -> Result<RecordHeader, UtxoError> {
     let output_count =
         usize::try_from(read_u32(bytes, OUTPUT_COUNT_OFFSET).ok_or(UtxoError::CorruptRecord)?)
             .map_err(|_| UtxoError::RecordTooLarge { len: usize::MAX })?;
-    let legacy_inline_len = usize::from(
+    let inline_len = usize::from(
         *bytes
-            .get(LEGACY_INLINE_LEN_OFFSET)
+            .get(INLINE_LEN_OFFSET)
             .ok_or(UtxoError::CorruptRecord)?,
     );
-    if legacy_inline_len > LEGACY_INLINE_CAPACITY || legacy_inline_len > output_count {
+    if inline_len > INLINE_CAPACITY || inline_len > output_count {
         return Err(UtxoError::CorruptRecord);
     }
     Ok(RecordHeader {
         txid: Hash256::from_le_bytes(&txid),
         output_count,
-        legacy_inline_len,
+        inline_len,
     })
 }
 
@@ -1441,8 +1343,8 @@ fn payload_offset(bytes: &[u8], layout: &V5Layout, index: usize) -> Result<usize
 /// walk never re-sums the length directory.
 ///
 /// Every rejection here exists to keep the encoding canonical, so that equal
-/// records are byte-equal — a property v4's fixed-width fields gave for free
-/// and one that `UtxoRecord`'s byte-wise `PartialEq` depends on.
+/// records are byte-equal, which `UtxoRecord`'s byte-wise `PartialEq` depends
+/// on.
 fn decode_output_at<'a>(
     bytes: &'a [u8],
     layout: &V5Layout,
@@ -1483,8 +1385,7 @@ fn decode_output_at<'a>(
     let coinbase = packed & 1 == 1;
 
     // Whatever is left of the payload is the script, so no length is stored.
-    // The v4 ceiling is still enforced: a record a v4 build could not have
-    // written must not decode here either.
+    // Keep the script length within the representable record bound.
     let script_pubkey = body.get(cursor..).ok_or(UtxoError::CorruptRecord)?;
     u16::try_from(script_pubkey.len()).map_err(|_| UtxoError::CorruptRecord)?;
 
@@ -1500,179 +1401,10 @@ fn decode_output_at<'a>(
     ))
 }
 
-/// Decodes one output in the retained v4 layout. Oracle and benchmark arm only;
-/// see [`write_output_v4`].
-fn decode_output_v4(bytes: &[u8], offset: usize) -> Result<(OneUtxoOut<'_>, usize), UtxoError> {
-    let metadata_end = offset
-        .checked_add(OUTPUT_METADATA_LEN_V4)
-        .ok_or(UtxoError::CorruptRecord)?;
-    let metadata = bytes
-        .get(offset..metadata_end)
-        .ok_or(UtxoError::CorruptRecord)?;
-    let vout = read_u32(metadata, 0).ok_or(UtxoError::CorruptRecord)?;
-    let value = read_u64(metadata, 4).ok_or(UtxoError::CorruptRecord)?;
-    let height = read_u32(metadata, 12).ok_or(UtxoError::CorruptRecord)?;
-    let coinbase = match metadata[16] {
-        0 => false,
-        1 => true,
-        _ => return Err(UtxoError::CorruptRecord),
-    };
-    let script_len = usize::from(read_u16(metadata, 17).ok_or(UtxoError::CorruptRecord)?);
-    let next = metadata_end
-        .checked_add(script_len)
-        .ok_or(UtxoError::CorruptRecord)?;
-    let script_pubkey = bytes
-        .get(metadata_end..next)
-        .ok_or(UtxoError::CorruptRecord)?;
-    Ok((
-        OneUtxoOut {
-            vout,
-            value,
-            script_pubkey,
-            coinbase,
-            height,
-        },
-        next,
-    ))
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    let end = offset.checked_add(core::mem::size_of::<u16>())?;
-    let bytes = bytes.get(offset..end)?;
-    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let end = offset.checked_add(core::mem::size_of::<u32>())?;
     let bytes = bytes.get(offset..end)?;
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    let end = offset.checked_add(core::mem::size_of::<u64>())?;
-    let bytes = bytes.get(offset..end)?;
-    Some(u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]))
-}
-
-/// Both record payload codecs, side by side, for the equivalence test and the
-/// paired benchmark.
-///
-/// The codec itself is `pub(crate)` and stays that way; this is the smallest
-/// surface that lets an out-of-crate test drive v4 and v5 over identical inputs
-/// and compare bytes as well as fields. Inputs and outputs are
-/// [`OneUtxoOut`], which is the type the rest of the crate reads records
-/// through, so nothing here is a test-only shape.
-#[doc(hidden)]
-pub struct RecordCodec;
-
-#[doc(hidden)]
-impl RecordCodec {
-    /// Encodes a whole record payload with the current v5 output layout.
-    pub fn encode_v5(txid: Hash256, outputs: &[OneUtxoOut<'_>]) -> Result<Vec<u8>, UtxoError> {
-        let parts = view_parts(outputs);
-        let inline = parts.len().min(LEGACY_INLINE_CAPACITY);
-        Ok(encode_record(txid, inline, &parts)?.as_bytes().to_vec())
-    }
-
-    /// Encodes the same payload with the retained v4 output layout.
-    pub fn encode_v4(txid: Hash256, outputs: &[OneUtxoOut<'_>]) -> Result<Vec<u8>, UtxoError> {
-        let parts = view_parts(outputs);
-        let inline = parts.len().min(LEGACY_INLINE_CAPACITY);
-        Ok(encode_record_v4(txid, inline, &parts)?.as_bytes().to_vec())
-    }
-
-    /// Decodes every output of a v5 payload, borrowing scripts from `bytes`.
-    pub fn decode_v5(bytes: &[u8]) -> Result<Vec<OneUtxoOut<'_>>, UtxoError> {
-        let header = decode_header(bytes)?;
-        let layout = V5Layout::read(bytes, header.output_count)?;
-        let mut outputs = Vec::with_capacity(layout.count);
-        let mut payload = layout.payloads;
-        for index in 0..layout.count {
-            let (output, next) = decode_output_at(bytes, &layout, index, payload)?;
-            outputs.push(output);
-            payload = next;
-        }
-        if payload != bytes.len() {
-            return Err(UtxoError::CorruptRecord);
-        }
-        Ok(outputs)
-    }
-
-    /// Decodes every output of a v4 payload, borrowing scripts from `bytes`.
-    pub fn decode_v4(bytes: &[u8]) -> Result<Vec<OneUtxoOut<'_>>, UtxoError> {
-        let header = decode_header(bytes)?;
-        let mut outputs = Vec::with_capacity(header.output_count);
-        let mut cursor = RECORD_HEADER_LEN;
-        for _ in 0..header.output_count {
-            let (output, next) = decode_output_v4(bytes, cursor)?;
-            outputs.push(output);
-            cursor = next;
-        }
-        if cursor != bytes.len() {
-            return Err(UtxoError::CorruptRecord);
-        }
-        Ok(outputs)
-    }
-
-    /// Finds one output in a v5 payload by `vout`, decoding only the match.
-    ///
-    /// The hot read: `Shard::get`, `get_entry` and `get_meta` all resolve a
-    /// spent input through this shape, so it is the operation a codec change
-    /// has to be judged on. Mirrors [`UtxoRecord::find_output`] exactly.
-    pub fn find_v5(bytes: &[u8], vout: u32) -> Result<Option<OneUtxoOut<'_>>, UtxoError> {
-        let header = decode_header(bytes)?;
-        let layout = V5Layout::read(bytes, header.output_count)?;
-        for index in 0..layout.count {
-            if layout.vout_at(bytes, index)? == vout {
-                let payload = payload_offset(bytes, &layout, index)?;
-                return decode_output_at(bytes, &layout, index, payload)
-                    .map(|(output, _)| Some(output));
-            }
-        }
-        Ok(None)
-    }
-
-    /// The same search over a v4 payload.
-    ///
-    /// Written as the naive full decode, because that is what the shipped code
-    /// did — and it is nonetheless the arm to beat. Every v4 field sits at a
-    /// constant offset, so when only `vout` is read the optimizer deletes the
-    /// loads for the rest: v4 gets lazy skipping for free from LLVM, without
-    /// anyone designing it. v5 cannot be given the same treatment, because each
-    /// varint's length is what locates the next field, so the reads are a
-    /// serial dependency chain that no optimizer can remove.
-    ///
-    /// That asymmetry is the real cost of the variable-length layout, and it
-    /// only shows up in a benchmark shaped like the hot path.
-    pub fn find_v4(bytes: &[u8], vout: u32) -> Result<Option<OneUtxoOut<'_>>, UtxoError> {
-        let header = decode_header(bytes)?;
-        let mut cursor = RECORD_HEADER_LEN;
-        for _ in 0..header.output_count {
-            let (output, next) = decode_output_v4(bytes, cursor)?;
-            if output.vout == vout {
-                return Ok(Some(output));
-            }
-            cursor = next;
-        }
-        Ok(None)
-    }
-}
-
-fn view_parts<'a>(outputs: &[OneUtxoOut<'a>]) -> Vec<OutputParts<'a>> {
-    outputs
-        .iter()
-        .map(|output| {
-            OutputParts::new(
-                output.vout,
-                output.value,
-                output.script_pubkey,
-                output.coinbase,
-                output.height,
-            )
-        })
-        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1708,150 +1440,6 @@ mod tests {
 
     fn output(vout: u32, script: &[u8], value: u64) -> OwnedUtxoOut {
         OwnedUtxoOut::new(vout, value, script.to_vec(), false, 1)
-    }
-
-    const MODEL_INLINE_CAPACITY: usize = 8;
-
-    struct LegacyArrayVecModel {
-        inline: Vec<OwnedUtxoOut>,
-        overflow: Vec<OwnedUtxoOut>,
-    }
-
-    impl LegacyArrayVecModel {
-        fn from_outputs(outputs: &[OwnedUtxoOut]) -> Self {
-            let inline_len = outputs.len().min(MODEL_INLINE_CAPACITY);
-            Self {
-                inline: outputs[..inline_len].to_vec(),
-                overflow: outputs[inline_len..].to_vec(),
-            }
-        }
-
-        fn output_count(&self) -> usize {
-            self.inline.len() + self.overflow.len()
-        }
-
-        fn outputs(&self) -> impl Iterator<Item = &OwnedUtxoOut> {
-            self.inline.iter().chain(self.overflow.iter())
-        }
-
-        fn add_run(
-            &mut self,
-            additions: Vec<OwnedUtxoOut>,
-            add_unique: bool,
-        ) -> Vec<Option<OwnedUtxoOut>> {
-            let mut overwritten = Vec::with_capacity(additions.len());
-            for addition in additions {
-                let old = if add_unique {
-                    None
-                } else {
-                    self.remove(addition.vout)
-                };
-                self.push(addition);
-                overwritten.push(old);
-            }
-            overwritten
-        }
-
-        fn remove_run(&mut self, vouts: &[u32]) -> Vec<Option<OwnedUtxoOut>> {
-            vouts.iter().map(|&vout| self.remove(vout)).collect()
-        }
-
-        fn push(&mut self, output: OwnedUtxoOut) {
-            if self.inline.len() < MODEL_INLINE_CAPACITY {
-                self.inline.push(output);
-            } else {
-                self.overflow.push(output);
-            }
-        }
-
-        fn remove(&mut self, vout: u32) -> Option<OwnedUtxoOut> {
-            if let Some(index) = self.inline.iter().position(|output| output.vout == vout) {
-                return Some(self.inline.swap_remove(index));
-            }
-            self.overflow
-                .iter()
-                .position(|output| output.vout == vout)
-                .map(|index| self.overflow.swap_remove(index))
-        }
-
-        fn encode(&self, txid: Hash256) -> Result<Vec<u8>, UtxoError> {
-            if self.inline.len() > MODEL_INLINE_CAPACITY {
-                return Err(UtxoError::CorruptRecord);
-            }
-
-            let output_count =
-                u32::try_from(self.output_count()).map_err(|_| UtxoError::RecordTooLarge {
-                    len: self.output_count(),
-                })?;
-            let inline_len =
-                u8::try_from(self.inline.len()).map_err(|_| UtxoError::CorruptRecord)?;
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&txid.to_le_bytes());
-            bytes.extend_from_slice(&output_count.to_le_bytes());
-            bytes.push(inline_len);
-            for output in self.outputs() {
-                let script_len = u16::try_from(output.script_pubkey.len()).map_err(|_| {
-                    UtxoError::ScriptTooLarge {
-                        len: output.script_pubkey.len(),
-                    }
-                })?;
-                bytes.extend_from_slice(&output.vout.to_le_bytes());
-                bytes.extend_from_slice(&output.value.to_le_bytes());
-                bytes.extend_from_slice(&output.height.to_le_bytes());
-                bytes.push(u8::from(output.coinbase));
-                bytes.extend_from_slice(&script_len.to_le_bytes());
-                bytes.extend_from_slice(&output.script_pubkey);
-            }
-            Ok(bytes)
-        }
-    }
-
-    enum EditorOperation {
-        Add {
-            additions: Vec<OwnedUtxoOut>,
-            add_unique: bool,
-        },
-        Remove {
-            vouts: Vec<u32>,
-        },
-    }
-
-    fn assert_record_matches_model(
-        record: &UtxoRecord,
-        txid: Hash256,
-        model: &LegacyArrayVecModel,
-    ) -> Result<(), UtxoError> {
-        assert_eq!(record.output_count(), model.output_count());
-
-        // The model serializes v4 independently of the crate's codec, which is
-        // what makes it an oracle for ordering and for the inline/overflow
-        // partition. The record is v5, so the comparison runs the record's own
-        // descriptors — and its own inline length, which is not always
-        // `min(count, 8)` — back through the retained v4 encoder. Byte
-        // equality then still means "same outputs, same order, same partition"
-        // without the test having to reimplement the varint layout.
-        let expected_bytes = model.encode(txid)?;
-        let actual_v4 = encode_record_v4(
-            txid,
-            record.header().legacy_inline_len,
-            &record.output_parts(),
-        )?;
-        assert_eq!(actual_v4.as_bytes(), expected_bytes.as_slice());
-
-        let actual_outputs = record
-            .outputs()
-            .map(|output| {
-                OwnedUtxoOut::new(
-                    output.vout,
-                    output.value,
-                    output.script_pubkey.to_vec(),
-                    output.coinbase,
-                    output.height,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(actual_outputs, model.outputs().cloned().collect::<Vec<_>>());
-        Ok(())
     }
 
     #[test]
@@ -1891,19 +1479,15 @@ mod tests {
                 u32::MAX,
             )],
         )?;
-        // Deliberately the worst case for v5: `u32::MAX` in both the vout and
-        // the height costs 5 varint bytes each, where a real output pays 1 and
-        // 3. Even here v5 is 15 metadata+script bytes against v4's 21.
+        // Deliberately maxes both directory widths: `u32::MAX` in the vout and
+        // height costs 5 varint bytes each, where a real output pays 1 and
+        // 3. Even here the output representation is 15 metadata+script bytes.
         //   varint(u32::MAX) = 5, varint(compress(42)) = 2,
         //   varint(u32::MAX << 1 | 1) = 5, varint(2) = 1, script = 2
         assert_eq!(
             record.encoded_bytes().len(),
             RECORD_HEADER_LEN + 15,
             "v5 output layout changed"
-        );
-        assert!(
-            record.encoded_bytes().len() < RECORD_HEADER_LEN + OUTPUT_METADATA_LEN_V4 + 2,
-            "v5 must not be larger than v4 even on its worst-case input"
         );
         let output = record.outputs().next().ok_or(UtxoError::CorruptRecord)?;
         assert_eq!(output.vout, u32::MAX);
@@ -1925,8 +1509,7 @@ mod tests {
             OwnedUtxoOut::new(1, 1, vec![0x51], false, 1),
             OwnedUtxoOut::new(127, 100_000_000, vec![0x00; 22], true, 840_000),
             OwnedUtxoOut::new(128, 2_099_999_999_999_999, script.clone(), false, 1_048_576),
-            // Above the money supply: takes the escape, which is the only case
-            // where v5 is larger than v4.
+            // Above the money supply: takes the raw amount escape.
             OwnedUtxoOut::new(u32::MAX, u64::MAX, script, true, u32::MAX),
         ];
         for case in cases {
@@ -1948,7 +1531,7 @@ mod tests {
     }
 
     /// An amount above the money supply cannot occur in a consensus-valid
-    /// block, but v4 stored one losslessly and so must v5.
+    /// block, but the record representation still preserves it losslessly.
     #[test]
     fn an_amount_above_the_money_supply_survives_the_escape() -> Result<(), UtxoError> {
         for value in [
@@ -2005,7 +1588,7 @@ mod tests {
 
         let mut count_mismatch = encoded.to_vec();
         let count = count_mismatch
-            .get_mut(OUTPUT_COUNT_OFFSET..LEGACY_INLINE_LEN_OFFSET)
+            .get_mut(OUTPUT_COUNT_OFFSET..INLINE_LEN_OFFSET)
             .ok_or(UtxoError::CorruptRecord)?;
         count.copy_from_slice(&2_u32.to_le_bytes());
         assert!(matches!(
@@ -2103,107 +1686,13 @@ mod tests {
             );
         }
 
-        // A script longer than the `u16` ceiling v4 could express.
+        // A script longer than the `u16` payload ceiling.
         let mut oversize = vec![0x01, 0x02];
         oversize.extend_from_slice(&vec![0x51; 65_536]);
         assert!(matches!(
             UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&record(1, 4, 0, &oversize))?),
             Err(UtxoError::CorruptRecord)
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn editor_matches_legacy_arrayvec_partition_reference_model() -> Result<(), UtxoError> {
-        let txid = Hash256::from_le_bytes(&[0xA5; TXID_LEN]);
-        let initial = vec![
-            OwnedUtxoOut::new(0, 100, vec![], false, 0),
-            OwnedUtxoOut::new(1, 101, vec![0x51], true, 1),
-            OwnedUtxoOut::new(2, 102, vec![0x51, 0xAC], false, u32::MAX),
-            OwnedUtxoOut::new(3, 103, vec![0x6A, 0x01, 0x03], true, 3),
-            OwnedUtxoOut::new(4, 104, vec![0x00, 0x04], false, 4),
-            OwnedUtxoOut::new(5, 105, vec![0x51, 0x51, 0x05], true, 5),
-            OwnedUtxoOut::new(6, 106, vec![0xAC], false, 6),
-        ];
-        let mut model = LegacyArrayVecModel::from_outputs(&initial);
-        let mut record = UtxoRecord::from_owned_outputs(txid, &initial)?;
-        assert_record_matches_model(&record, txid, &model)?;
-
-        let operations = vec![
-            EditorOperation::Add {
-                additions: vec![OwnedUtxoOut::new(63, 163, vec![0x63, 0x00], true, u32::MAX)],
-                add_unique: true,
-            },
-            EditorOperation::Add {
-                additions: vec![OwnedUtxoOut::new(
-                    64,
-                    164,
-                    vec![0x64, 0x01, 0x00],
-                    false,
-                    64,
-                )],
-                add_unique: true,
-            },
-            EditorOperation::Add {
-                additions: vec![OwnedUtxoOut::new(
-                    u32::MAX,
-                    1_000,
-                    vec![0xFF, 0x00, 0xFE, 0x01],
-                    true,
-                    u32::MAX,
-                )],
-                add_unique: true,
-            },
-            EditorOperation::Remove { vouts: vec![0] },
-            EditorOperation::Add {
-                additions: vec![OwnedUtxoOut::new(0, 200, vec![0x00, 0x51], false, 200)],
-                add_unique: true,
-            },
-            EditorOperation::Remove { vouts: vec![64] },
-            EditorOperation::Add {
-                additions: vec![OwnedUtxoOut::new(64, 264, vec![0x64], true, 264)],
-                add_unique: true,
-            },
-            EditorOperation::Add {
-                additions: vec![
-                    OwnedUtxoOut::new(63, 263, vec![0x63, 0x01], false, 263),
-                    OwnedUtxoOut::new(63, 363, vec![0x63, 0x02, 0x03], true, 363),
-                ],
-                add_unique: false,
-            },
-            EditorOperation::Remove {
-                vouts: vec![63, 63, u32::MAX, u32::MAX],
-            },
-            EditorOperation::Remove {
-                vouts: vec![63, u32::MAX],
-            },
-        ];
-
-        for operation in operations {
-            match operation {
-                EditorOperation::Add {
-                    additions,
-                    add_unique,
-                } => {
-                    let expected_overwritten = model.add_run(additions.clone(), add_unique);
-                    let (replacement, overwritten) =
-                        record.stage_add_run(&additions, add_unique)?;
-                    assert_eq!(overwritten, expected_overwritten);
-                    record = replacement;
-                }
-                EditorOperation::Remove { vouts } => {
-                    let expected_removed = model.remove_run(&vouts);
-                    let (replacement, removed) = record.stage_remove_run(&vouts)?;
-                    assert_eq!(removed, expected_removed);
-                    if expected_removed.iter().any(Option::is_some) {
-                        record = replacement.ok_or(UtxoError::CorruptRecord)?;
-                    } else {
-                        assert!(replacement.is_none());
-                    }
-                }
-            }
-            assert_record_matches_model(&record, txid, &model)?;
-        }
         Ok(())
     }
 
@@ -2217,68 +1706,6 @@ mod tests {
             Err(UtxoError::ScriptTooLarge { .. })
         ));
         assert_eq!(record, original);
-        Ok(())
-    }
-
-    /// The speed half of this refactor set, asserted deterministically.
-    ///
-    /// `find_output` is the hot read — every spent input lands there — and what
-    /// made the first v5 draft slower than v4 was decoding every output it
-    /// rejected. Timing that in a test would flake; counting the expensive
-    /// operation does not. One decompression for a hit, none for a miss, no
-    /// matter how many outputs the record holds.
-    #[test]
-    fn find_output_decompresses_at_most_the_amount_it_returns() -> Result<(), UtxoError> {
-        let outputs: Vec<OwnedUtxoOut> = (0..24_u32)
-            .map(|index| {
-                OwnedUtxoOut::new(
-                    index,
-                    u64::from(index + 1) * 10_000_000,
-                    vec![0x51; 22],
-                    false,
-                    800_000 + index,
-                )
-            })
-            .collect();
-        let record = UtxoRecord::from_owned_outputs(Hash256::default(), &outputs)?;
-
-        let calls = |f: &dyn Fn()| {
-            crate::compress::DECOMPRESS_CALLS.with(|c| c.set(0));
-            f();
-            crate::compress::DECOMPRESS_CALLS.with(core::cell::Cell::get)
-        };
-
-        // The last output: the whole record is walked before it matches.
-        assert_eq!(
-            calls(&|| {
-                assert!(record.find_output(23).is_some());
-            }),
-            1,
-            "a hit must decompress only the amount it returns"
-        );
-        // A miss walks every output and must decompress none of them.
-        assert_eq!(
-            calls(&|| {
-                assert!(record.find_output(999).is_none());
-            }),
-            0,
-            "a miss must not decompress anything"
-        );
-        // `max_vout` reads only vouts.
-        assert_eq!(
-            calls(&|| {
-                assert_eq!(record.max_vout(), Some(23));
-            }),
-            0,
-            "max_vout must not decompress anything"
-        );
-        // The full scan is the one read that legitimately pays per output.
-        assert_eq!(
-            calls(&|| {
-                assert_eq!(record.outputs().count(), 24);
-            }),
-            24
-        );
         Ok(())
     }
 

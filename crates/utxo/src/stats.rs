@@ -23,10 +23,9 @@
 //! required), and [`store_coin_stats`]/[`load_coin_stats`] persist rows keyed
 //! by little-endian height.
 //!
-//! The checkpoint manifest records this component under the codec identifier
-//! `"bitcoin-rs-coinstats"`. That is an on-disk value, not a crate reference,
-//! and it keeps its old spelling deliberately -- see
-//! `docs/policies/db-migration.md` 2.4.
+//! The checkpoint manifest records this component under the current codec
+//! identifier `"bitcoin-rs-coinstats-v1"`. It is an on-disk value and changes
+//! to it require a datadir schema epoch bump.
 
 /// Running UTXO statistics.
 pub mod coin_stats;

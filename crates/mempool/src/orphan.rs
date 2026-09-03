@@ -13,7 +13,7 @@
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use bitcoin::{Transaction, Txid};
+use bitcoin_rs_primitives::{Tx, Txid};
 use hashbrown::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -55,7 +55,7 @@ pub enum OrphanError {
 #[derive(Clone, Debug)]
 struct OrphanEntry {
     /// The orphan transaction payload.
-    tx: Transaction,
+    tx: Tx,
     /// Txids of the missing prevout transactions that caused orphaning.
     /// Deduplicated on insertion.  When this list becomes empty the orphan is
     /// ready for re-evaluation.
@@ -148,7 +148,7 @@ impl OrphanPool {
     /// Returns the txid of the inserted orphan on success.
     pub fn add(
         &mut self,
-        tx: Transaction,
+        tx: Tx,
         missing_parents: Vec<Txid>,
         peer: SocketAddr,
         now: Instant,
@@ -160,12 +160,12 @@ impl OrphanPool {
             return Err(OrphanError::PoolDisabled);
         }
 
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         if self.orphans.contains_key(&txid) {
             return Err(OrphanError::DuplicateOrphan);
         }
 
-        let weight = tx.weight().to_wu();
+        let weight = tx.weight();
         if weight > self.max_weight {
             return Err(OrphanError::TransactionTooLarge {
                 weight,
@@ -215,7 +215,7 @@ impl OrphanPool {
     /// Accepting a parent must release exactly the children it unblocked: an
     /// orphan with two missing parents is only returned when the *second*
     /// parent arrives.
-    pub fn take_ready(&mut self, parent_txid: Txid) -> Vec<Transaction> {
+    pub fn take_ready(&mut self, parent_txid: Txid) -> Vec<Tx> {
         // Take ownership of the list of orphans waiting on this parent.
         let Some(waiting) = self.by_parent.remove(&parent_txid) else {
             return Vec::new();
@@ -253,7 +253,7 @@ impl OrphanPool {
     }
 
     /// Removes a single orphan by txid, returning the transaction if present.
-    pub fn remove(&mut self, txid: Txid) -> Option<Transaction> {
+    pub fn remove(&mut self, txid: Txid) -> Option<Tx> {
         let entry = self.orphans.remove(&txid)?;
         self.total_weight = self.total_weight.saturating_sub(entry.weight);
 
@@ -275,7 +275,7 @@ impl OrphanPool {
     /// transactions.
     ///
     /// `now` is injected by the caller — no internal clock read.
-    pub fn expire(&mut self, now: Instant) -> Vec<Transaction> {
+    pub fn expire(&mut self, now: Instant) -> Vec<Tx> {
         let timeout = self.timeout;
         let expired_txids: Vec<Txid> = self
             .orphans
@@ -297,7 +297,7 @@ impl OrphanPool {
     }
 
     /// Removes all orphans sent by `peer`, returning the removed transactions.
-    pub fn evict_by_peer(&mut self, peer: SocketAddr) -> Vec<Transaction> {
+    pub fn evict_by_peer(&mut self, peer: SocketAddr) -> Vec<Tx> {
         let Some(txids) = self.by_peer.remove(&peer) else {
             return Vec::new();
         };
@@ -352,11 +352,11 @@ impl OrphanPool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use alloc::vec::Vec;
 
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+    use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::{Duration, Instant};
 
@@ -374,7 +374,10 @@ mod tests {
     #[test]
     fn a_zero_count_limit_admits_no_orphans() {
         let mut pool = OrphanPool::with_limits(0, 10_000_000, Duration::from_mins(1));
-        let tx = orphan_tx(1, vec![OutPoint::new(Txid::from_byte_array([9_u8; 32]), 0)]);
+        let tx = orphan_tx(
+            1,
+            vec![OutPoint::new(Txid(Hash256::from_le_bytes(&[9_u8; 32])), 0)],
+        );
         let outcome = pool.add(tx, Vec::new(), peer(1), Instant::now());
 
         assert!(
@@ -391,9 +394,9 @@ mod tests {
     #[test]
     fn duplicate_parents_collapse_and_keep_their_order() {
         let mut pool = OrphanPool::with_limits(8, 10_000_000, Duration::from_mins(1));
-        let a = Txid::from_byte_array([0xa1; 32]);
-        let b = Txid::from_byte_array([0xb2; 32]);
-        let c = Txid::from_byte_array([0xc3; 32]);
+        let a = Txid(Hash256::from_le_bytes(&[0xa1; 32]));
+        let b = Txid(Hash256::from_le_bytes(&[0xb2; 32]));
+        let c = Txid(Hash256::from_le_bytes(&[0xc3; 32]));
         let tx = orphan_tx(2, vec![OutPoint::new(a, 0)]);
 
         let Ok(txid) = pool.add(tx, vec![c, a, b, a, c, b], peer(2), Instant::now()) else {
@@ -410,47 +413,47 @@ mod tests {
     }
 
     /// Builds a transaction with the given label and prevout outpoints.
-    fn orphan_tx(label: u8, prevouts: Vec<OutPoint>) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: prevouts
+    fn orphan_tx(label: u8, prevouts: Vec<OutPoint>) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: prevouts
                 .into_iter()
                 .map(|previous_output| TxIn {
                     previous_output,
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::MAX,
-                    witness: Witness::new(),
+                    script_sig: Vec::new(),
+                    sequence: 0xFFFF_FFFF,
+                    witness: Vec::new(),
                 })
                 .collect(),
-            output: vec![TxOut {
-                value: Amount::from_sat(5_000 + u64::from(label)),
-                script_pubkey: ScriptBuf::from_bytes(vec![label]),
+            outputs: vec![TxOut {
+                value: 5_000 + u64::from(label),
+                script_pubkey: vec![label],
             }],
         }
     }
 
     /// Builds a large transaction (many outputs) to exceed weight limits.
-    fn large_tx(label: u8) -> Transaction {
+    fn large_tx(label: u8) -> Tx {
         let output = TxOut {
-            value: Amount::from_sat(1_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 200]),
+            value: 1_000,
+            script_pubkey: vec![0x51; 200],
         };
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([label; 32]), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFF,
+                witness: Vec::new(),
             }],
-            output: vec![output; 50],
+            outputs: vec![output; 50],
         }
     }
 
     fn dummy_txid(byte: u8) -> Txid {
-        Txid::from_byte_array([byte; 32])
+        Txid(Hash256::from_le_bytes(&[byte; 32]))
     }
 
     #[test]
@@ -461,7 +464,7 @@ mod tests {
         let outpoint = OutPoint::new(parent, 0);
 
         let orphan = orphan_tx(1, vec![outpoint]);
-        let orphan_txid = orphan.compute_txid();
+        let orphan_txid = orphan.txid();
 
         pool.add(orphan, vec![parent], peer(1), now)
             .expect("add orphan");
@@ -470,7 +473,7 @@ mod tests {
         // Parent arrives — orphan should be released.
         let ready = pool.take_ready(parent);
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].compute_txid(), orphan_txid);
+        assert_eq!(ready[0].txid(), orphan_txid);
 
         // Second call returns nothing — orphan already taken.
         let ready2 = pool.take_ready(parent);
@@ -489,7 +492,7 @@ mod tests {
             1,
             vec![OutPoint::new(parent_a, 0), OutPoint::new(parent_b, 0)],
         );
-        let orphan_txid = orphan.compute_txid();
+        let orphan_txid = orphan.txid();
 
         pool.add(orphan, vec![parent_a, parent_b], peer(1), now)
             .expect("add orphan");
@@ -503,7 +506,7 @@ mod tests {
         // Second parent arrives — orphan is now ready.
         let ready_b = pool.take_ready(parent_b);
         assert_eq!(ready_b.len(), 1);
-        assert_eq!(ready_b[0].compute_txid(), orphan_txid);
+        assert_eq!(ready_b[0].txid(), orphan_txid);
         assert!(pool.is_empty());
     }
 
@@ -516,19 +519,19 @@ mod tests {
 
         let parent_a = dummy_txid(0xA1);
         let tx1 = orphan_tx(1, vec![OutPoint::new(parent_a, 0)]);
-        let tx1_id = tx1.compute_txid();
+        let tx1_id = tx1.txid();
         pool.add(tx1, vec![parent_a], peer(1), t0).expect("add 1");
 
         let parent_b = dummy_txid(0xB1);
         let tx2 = orphan_tx(2, vec![OutPoint::new(parent_b, 0)]);
-        let tx2_id = tx2.compute_txid();
+        let tx2_id = tx2.txid();
         pool.add(tx2, vec![parent_b], peer(2), t1).expect("add 2");
 
         // Pool is at capacity (max_count=2).  Adding a third should evict the
         // oldest (tx1).
         let parent_c = dummy_txid(0xC1);
         let tx3 = orphan_tx(3, vec![OutPoint::new(parent_c, 0)]);
-        let tx3_id = tx3.compute_txid();
+        let tx3_id = tx3.txid();
         pool.add(tx3, vec![parent_c], peer(3), t2).expect("add 3");
 
         assert_eq!(pool.len(), 2);
@@ -543,7 +546,7 @@ mod tests {
     fn weight_based_eviction() {
         // Set a small weight limit so two large transactions cannot coexist.
         let large = large_tx(1);
-        let large_weight = large.weight().to_wu();
+        let large_weight = large.weight();
         let max_weight = large_weight; // only room for one large tx
 
         let mut pool = OrphanPool::with_limits(100, max_weight, Duration::from_mins(2));
@@ -552,12 +555,12 @@ mod tests {
 
         let parent_a = dummy_txid(0xA1);
         let tx1 = large_tx(1);
-        let tx1_id = tx1.compute_txid();
+        let tx1_id = tx1.txid();
         pool.add(tx1, vec![parent_a], peer(1), t0).expect("add 1");
 
         let parent_b = dummy_txid(0xB1);
         let tx2 = large_tx(2);
-        let tx2_id = tx2.compute_txid();
+        let tx2_id = tx2.txid();
         pool.add(tx2, vec![parent_b], peer(2), t1).expect("add 2");
 
         // tx1 (oldest) should have been evicted to make weight room for tx2.
@@ -601,17 +604,17 @@ mod tests {
 
         let parent_a = dummy_txid(0xAA);
         let tx1 = orphan_tx(1, vec![OutPoint::new(parent_a, 0)]);
-        let tx1_id = tx1.compute_txid();
+        let tx1_id = tx1.txid();
         pool.add(tx1, vec![parent_a], peer(1), now).expect("add 1");
 
         let parent_b = dummy_txid(0xBB);
         let tx2 = orphan_tx(2, vec![OutPoint::new(parent_b, 0)]);
-        let tx2_id = tx2.compute_txid();
+        let tx2_id = tx2.txid();
         pool.add(tx2, vec![parent_b], peer(2), now).expect("add 2");
 
         let parent_c = dummy_txid(0xCC);
         let tx3 = orphan_tx(3, vec![OutPoint::new(parent_c, 0)]);
-        let tx3_id = tx3.compute_txid();
+        let tx3_id = tx3.txid();
         pool.add(tx3, vec![parent_c], peer(1), now).expect("add 3");
 
         assert_eq!(pool.len(), 3);
@@ -632,7 +635,7 @@ mod tests {
         // A transaction whose weight alone exceeds the pool's weight limit must
         // be rejected, not inserted and then evicted in a loop.
         let large = large_tx(1);
-        let large_weight = large.weight().to_wu();
+        let large_weight = large.weight();
         let max_weight = large_weight / 2;
 
         let mut pool = OrphanPool::with_limits(100, max_weight, Duration::from_mins(2));
@@ -641,7 +644,7 @@ mod tests {
         // First, add a small orphan so the pool is non-empty.
         let parent_a = dummy_txid(0xAA);
         let small = orphan_tx(1, vec![OutPoint::new(parent_a, 0)]);
-        let small_id = small.compute_txid();
+        let small_id = small.txid();
         pool.add(small, vec![parent_a], peer(1), now)
             .expect("small orphan should fit");
         assert_eq!(pool.len(), 1);
@@ -726,7 +729,7 @@ mod tests {
         let p4 = dummy_txid(0xC4);
 
         let tx3 = orphan_tx(3, vec![OutPoint::new(p1, 0)]);
-        let tx3_id = tx3.compute_txid();
+        let tx3_id = tx3.txid();
         pool.add(tx3, vec![p1], peer(1), t0).expect("add 3");
         let tx4 = orphan_tx(4, vec![OutPoint::new(p2, 0)]);
         pool.add(tx4, vec![p2], peer(2), t1).expect("add 4");
