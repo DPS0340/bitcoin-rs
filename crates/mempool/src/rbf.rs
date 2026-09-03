@@ -1,9 +1,11 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use bitcoin::Transaction;
+use bitcoin_rs_primitives::Tx;
+use hashbrown::HashSet;
 use thiserror::Error;
 
+use crate::mutation::{MutationResult, RemovalReason};
 use crate::pool::tx_fee_rate;
 use crate::{EntryId, Mempool, MempoolEntry, MempoolError};
 
@@ -11,7 +13,7 @@ use crate::{EntryId, Mempool, MempoolEntry, MempoolError};
 #[derive(Clone, Debug)]
 pub struct ReplacementCandidate {
     /// Replacement transaction.
-    pub tx: Arc<Transaction>,
+    pub tx: Arc<Tx>,
     /// Replacement virtual size in vbytes.
     pub vsize: u32,
     /// Replacement fee in satoshis.
@@ -23,7 +25,7 @@ pub struct ReplacementCandidate {
 impl ReplacementCandidate {
     /// Builds a replacement candidate.
     #[must_use]
-    pub const fn new(tx: Arc<Transaction>, vsize: u32, fee: u64, min_relay_fee_rate: u64) -> Self {
+    pub const fn new(tx: Arc<Tx>, vsize: u32, fee: u64, min_relay_fee_rate: u64) -> Self {
         Self {
             tx,
             vsize,
@@ -67,7 +69,7 @@ pub enum RbfError {
     /// Replacement fee rate does not improve on directly conflicting transactions.
     #[error("BIP125 rule 6: replacement fee rate is not higher than originals")]
     Rule6InsufficientFeeRate,
-    /// A validated replacement failed insertion after evicting conflicts.
+    /// Rejected by pool insertion constraints before any eviction.
     #[error(transparent)]
     Mempool(#[from] MempoolError),
 }
@@ -92,14 +94,20 @@ impl Mempool {
             return Err(RbfError::Rule1NoOptIn);
         }
 
-        let original_spends = direct_conflicts
+        let original_parent_txids = direct_conflicts
             .iter()
             .filter_map(|id| self.entry(*id))
-            .flat_map(|entry| entry.tx.input.iter().map(|input| input.previous_output))
-            .collect::<Vec<_>>();
-        for input in &candidate.tx.input {
+            .flat_map(|entry| {
+                entry
+                    .tx
+                    .inputs
+                    .iter()
+                    .map(|input| input.previous_output.txid)
+            })
+            .collect::<HashSet<_>>();
+        for input in &candidate.tx.inputs {
             if self.is_unconfirmed_outpoint(input.previous_output)
-                && !original_spends.contains(&input.previous_output)
+                && !original_parent_txids.contains(&input.previous_output.txid)
             {
                 return Err(RbfError::Rule2NewUnconfirmedInput);
             }
@@ -135,18 +143,47 @@ impl Mempool {
         Ok(ReplacementPlan { evicted })
     }
 
-    /// Applies a BIP125 replacement after validation and returns the new entry id.
+    /// Applies a BIP125 replacement after validation and reports the
+    /// committed mutation: each direct conflict commits as
+    /// `Removed(Replaced)`, each descendant swept with a conflict as
+    /// `Removed(Descendant)` (parents before descendants), then the
+    /// replacement's `Accepted` and any post-insert policy evictions. The
+    /// replacement's entry id resolves from the `Accepted` change via
+    /// `entry_id_by_txid`.
+    ///
+    /// Re-runs conflict checks under the caller's exclusive access so a plan
+    /// computed earlier cannot silently race with concurrent admissions.
+    /// Non-conflicting candidates take the same path with an empty eviction
+    /// set.
     pub fn replace_transaction(
         &mut self,
         candidate: ReplacementCandidate,
         time: u64,
         height: u32,
-    ) -> Result<EntryId, RbfError> {
+        sigop_cost: u32,
+    ) -> Result<MutationResult, RbfError> {
         let plan = self.check_replacement(&candidate)?;
-        for id in plan.evicted {
-            let _ = self.remove_entry_and_descendants(id);
-        }
-        let entry = MempoolEntry::new(candidate.tx, candidate.vsize, candidate.fee, time, height);
-        self.insert_entry(entry).map_err(RbfError::from)
+        let direct: HashSet<EntryId> = self.conflicts_for(&candidate.tx).into_iter().collect();
+        let entry = MempoolEntry::new(candidate.tx, candidate.vsize, candidate.fee, time, height)
+            .with_sigop_cost(sigop_cost);
+        let excluded: HashSet<EntryId> = plan.evicted.iter().copied().collect();
+        let prepared = self.validate_insert(entry, &excluded)?;
+        let mut changes = Vec::new();
+        let removals = plan
+            .evicted
+            .into_iter()
+            .map(|id| {
+                let reason = if direct.contains(&id) {
+                    RemovalReason::Replaced
+                } else {
+                    RemovalReason::Descendant
+                };
+                (id, reason)
+            })
+            .collect::<Vec<_>>();
+        self.remove_entries_with_reasons(&removals, &mut changes);
+        let replacement = self.commit_insert(prepared);
+        changes.extend(replacement.changes);
+        Ok(self.finish_mutation(changes))
     }
 }

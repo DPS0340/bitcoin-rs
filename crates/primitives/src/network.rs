@@ -473,6 +473,65 @@ impl Network {
             Err(error) => panic!("invalid compiled-in genesis hash: {error}"),
         }
     }
+
+    /// Returns the network's genesis block.
+    ///
+    /// Decoded from the fixed consensus serialization copied from Bitcoin Core's
+    /// `chainparams.cpp` genesis (the same bytes `CreateGenesisBlock` produces);
+    /// [`Self::genesis_block_hash`] is asserted in debug builds and pinned by the
+    /// crate's differential tests.
+    #[must_use]
+    pub fn genesis_block(self) -> crate::Block {
+        let hex = match self {
+            Self::Mainnet => MAINNET_GENESIS_HEX,
+            Self::Testnet3 => TESTNET3_GENESIS_HEX,
+            Self::Testnet4 => TESTNET4_GENESIS_HEX,
+            Self::Signet => SIGNET_GENESIS_HEX,
+            Self::Regtest => REGTEST_GENESIS_HEX,
+        };
+        let bytes = decode_compiled_hex(hex);
+        let block = crate::Block::consensus_decode(&bytes)
+            .unwrap_or_else(|error| panic!("compiled-in genesis must decode: {error}"));
+        debug_assert_eq!(
+            crate::Hash256::from_le_bytes(block.block_hash().as_bytes()),
+            self.genesis_block_hash(),
+            "compiled-in genesis bytes must hash to the compiled-in genesis hash"
+        );
+        block
+    }
+}
+/// Bitcoin Core testnet3 genesis serialization.
+const TESTNET3_GENESIS_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff001d1aa4ae180101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+/// Bitcoin Core mainnet genesis serialization.
+const MAINNET_GENESIS_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c0101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+
+/// Bitcoin Core 27.0+ testnet4 genesis serialization.
+const TESTNET4_GENESIS_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000004e7b2b9128fe0291db0693af2ae418b767e657cd407e80cb1434221eaea7a07a046f3566ffff001dbb0c78170101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff5504ffff001d01044c4c30332f4d61792f323032342030303030303030303030303030303030303030303165626435386332343439373062336161396437383362623030313031316662653865613865393865303065ffffffff0100f2052a010000002321000000000000000000000000000000000000000000000000000000000000000000ac00000000";
+
+/// Bitcoin Core default-signet genesis serialization.
+const SIGNET_GENESIS_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a008f4d5fae77031e8ad222030101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+
+/// Bitcoin Core regtest genesis serialization.
+const REGTEST_GENESIS_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f20020000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+
+/// Decodes a lowercase hex literal; compiled-in constants must be valid.
+fn decode_compiled_hex(hex: &str) -> Vec<u8> {
+    fn nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => unreachable!("compiled-in hex constant is lowercase hex"),
+        }
+    }
+    let bytes = hex.as_bytes();
+    assert!(
+        bytes.len().is_multiple_of(2),
+        "compiled-in hex constant has even length"
+    );
+    bytes
+        .chunks_exact(2)
+        .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+        .collect()
 }
 
 #[cfg(test)]

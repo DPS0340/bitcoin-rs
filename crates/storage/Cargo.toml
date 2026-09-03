@@ -19,9 +19,12 @@ redb = ["dep:redb"]
 mdbx = ["dep:signet-libmdbx"]
 
 [dependencies]
+bitcoin-rs-primitives.workspace = true
 bytemuck.workspace = true
 bytes.workspace = true
 crossbeam-channel.workspace = true
+hashbrown.workspace = true
+metrics.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -33,11 +36,5 @@ redb = { workspace = true, optional = true }
 signet-libmdbx = { workspace = true, optional = true }
 
 [dev-dependencies]
-criterion.workspace = true
-rayon.workspace = true
 sha2.workspace = true
 tempfile = "3"
-
-[[bench]]
-name = "kvstore_backends"
-harness = false

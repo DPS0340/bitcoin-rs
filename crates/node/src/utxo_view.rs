@@ -1,15 +1,14 @@
 //! `UtxoView` adapter over the in-memory `UtxoSet`.
 //!
-//! Converts `bitcoin::OutPoint` lookups (the consensus crate's contract)
-//! into `bitcoin_rs_primitives::OutPoint` lookups (the UTXO crate's
-//! internal layout). Used by `NodeState::apply_block` to run per-tx
-//! script verification against the committed UTXO set.
+//! Answers native `bitcoin_rs_primitives::OutPoint` lookups (the consensus
+//! crate's contract) directly against the UTXO crate's internal layout. Used by
+//! `NodeState::apply_block` to run per-tx script verification against the
+//! committed UTXO set.
 
 use std::sync::Arc;
 
-use bitcoin::hashes::Hash as _;
 use bitcoin_rs_consensus::rust_path::UtxoView;
-use bitcoin_rs_primitives::{Hash256, OutPoint as InternalOutPoint};
+use bitcoin_rs_primitives::OutPoint;
 use bitcoin_rs_utxo::UtxoSet;
 
 /// Thin lookup adapter around a shared `UtxoSet` handle.
@@ -26,11 +25,7 @@ impl UtxoSetView {
 }
 
 impl UtxoView for UtxoSetView {
-    fn lookup(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
-        let internal = InternalOutPoint::new(
-            Hash256::from_le_bytes(outpoint.txid.as_byte_array()),
-            outpoint.vout,
-        );
-        self.set.get(&internal)
+    fn lookup(&self, outpoint: &OutPoint) -> Option<bitcoin_rs_primitives::TxOut> {
+        self.set.get(outpoint)
     }
 }

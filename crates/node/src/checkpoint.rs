@@ -1,18 +1,13 @@
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use bitcoin::block::Header;
-use bitcoin::consensus::{Encodable, encode::deserialize};
 use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot, accept_headers};
-use bitcoin_rs_coinstats::{
-    CoinStats, CoinStatsAccumulator, CoinStatsListener, scan_coin_stats,
-    stats::COIN_STATS_ENCODED_LEN,
-};
+use bitcoin_rs_primitives::{ConsensusEncode, Header, deserialize};
 use bitcoin_rs_primitives::{Hash256, Network};
-use bitcoin_rs_utxo::{
-    UtxoSet, read_snapshot_strict_v4_observed, snapshot::read_snapshot_strict_v4,
-    write_snapshot_observed,
+use bitcoin_rs_utxo::stats::{
+    CoinStats, CoinStatsAccumulator, CoinStatsListener, coin_stats::COIN_STATS_ENCODED_LEN,
 };
+use bitcoin_rs_utxo::{UtxoSet, read_snapshot_strict_v4_observed, write_snapshot_observed};
 use cap_std::fs::{Dir, File};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -42,7 +37,9 @@ const CURRENT_FORMAT: &str = "bitcoin-rs-chainstate-current";
 const MANIFEST_FORMAT: &str = "bitcoin-rs-chainstate-checkpoint";
 const HEADER_CODEC: &str = "bitcoin-rs-canonical-headers";
 const UTXO_CODEC: &str = "bitcoin-rs-utxo-spendable-v1";
-const COINSTATS_CODEC: &str = "bitcoin-rs-coinstats";
+// This identifier is written into `manifest-v1.json` and matched on load. It
+// is an on-disk value; changing it requires a schema epoch bump and resync.
+const COINSTATS_CODEC: &str = "bitcoin-rs-coinstats-v1";
 const CURRENT_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
 const UTXO_VERSION: u32 = 4;
@@ -419,10 +416,10 @@ fn tip_from_node(
 fn encode_header(header: &Header) -> Result<[u8; HEADER_LEN], HeaderCheckpointError> {
     let mut encoded = [0_u8; HEADER_LEN];
     let mut cursor = &mut encoded[..];
-    let written = header
+    header
         .consensus_encode(&mut cursor)
         .map_err(|error| HeaderCheckpointError::Codec(error.to_string()))?;
-    if written != HEADER_LEN || !cursor.is_empty() {
+    if !cursor.is_empty() {
         return Err(HeaderCheckpointError::Codec(
             "Bitcoin header did not encode to 80 bytes".to_owned(),
         ));
@@ -448,16 +445,8 @@ struct CheckpointTipV1 {
     chainwork: String,
     /// Cumulative transaction count of the chain through this tip.
     ///
-    /// `#[serde(default)]` so a manifest written before this field existed
-    /// still parses, restoring as `0` — Bitcoin Core's own "unset" encoding for
-    /// `m_chain_tx_count`. Those chains cannot recover the number without
-    /// re-reading every block body, and this project does not do in-place
-    /// migrations (see `docs/policies/db-migration.md`), so they stay unknown
-    /// until the node is resynced.
-    ///
     /// Only meaningful for the applied tip; the best-header tip records `0`,
     /// since headers carry no transactions.
-    #[serde(default)]
     chain_tx_count: u64,
 }
 
@@ -485,15 +474,6 @@ struct UtxoArtifactV1 {
     record_count: u64,
     output_count: u64,
     muhash_trailer_sha256: String,
-    trailer_kind: TrailerKindV1,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum TrailerKindV1 {
-    Rolling,
-    Scanned,
-    Zero,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -529,8 +509,7 @@ struct CheckpointManifestV1 {
 }
 
 pub(crate) enum CheckpointLoad {
-    Cold { reason: Option<String> },
-    HeadersOnly { tree: BlockTree, reason: String },
+    Cold,
     Complete(Box<RestoredChainstate>),
 }
 
@@ -551,14 +530,19 @@ pub(crate) enum CheckpointWrite {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum IncompatibleCheckpoint {
-    #[error("unsupported chainstate checkpoint {component} version {version}")]
-    UnsupportedVersion {
-        component: &'static str,
-        version: u32,
-    },
-    #[error("incompatible chainstate checkpoint identity: {0}")]
-    Identity(String),
+pub(crate) enum CheckpointCorruption {
+    #[error(
+        "corrupt current-schema checkpoint: {reason}; remove or replace the datadir and restart to perform a full resync"
+    )]
+    Invalid { reason: String },
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum CheckpointLoadError {
+    #[error(transparent)]
+    Corrupt(#[from] CheckpointCorruption),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, Error)]
@@ -572,7 +556,7 @@ pub(crate) enum CheckpointError {
     #[error("UTXO checkpoint failed: {0}")]
     Utxo(#[from] bitcoin_rs_utxo::UtxoError),
     #[error("CoinStats checkpoint decode failed: {0}")]
-    CoinStats(#[from] bitcoin_rs_coinstats::CoinStatsDecodeError),
+    CoinStats(#[from] bitcoin_rs_utxo::stats::CoinStatsDecodeError),
     #[error("checkpoint JSON failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("checkpoint invariant failed: {0}")]
@@ -603,6 +587,12 @@ pub(crate) enum CheckpointFailpoint {
 }
 
 struct GenerationPaths {
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     staging: String,
     final_dir: String,
     current_temp: String,
@@ -658,120 +648,133 @@ impl Write for HashingWriter<'_> {
 pub(crate) fn load_checkpoint_from_dir(
     data_dir: &Dir,
     config: HeaderCheckpointConfig,
-) -> Result<CheckpointLoad, IncompatibleCheckpoint> {
+) -> Result<CheckpointLoad, CheckpointLoadError> {
     let root = match CheckpointRoot::open_existing(data_dir, CHECKPOINT_ROOT) {
         Ok(Some(root)) => root,
-        Ok(None) => return Ok(CheckpointLoad::Cold { reason: None }),
-        Err(error) => {
-            return Ok(CheckpointLoad::Cold {
-                reason: Some(error.to_string()),
-            });
-        }
+        Ok(None) => return Ok(CheckpointLoad::Cold),
+        Err(error) => return Err(classify_open_error("open checkpoint root", error)),
     };
 
     let current = match read_current(&root) {
         Ok(Some(current)) => current,
-        Ok(None) => return Ok(CheckpointLoad::Cold { reason: None }),
-        Err(LoadStageError::Incompatible(error)) => return Err(error),
-        Err(LoadStageError::Candidate(error)) => {
-            return Ok(CheckpointLoad::Cold {
-                reason: Some(error.to_string()),
-            });
-        }
+        // CURRENT is the publication commit point. A root without it can be
+        // leftover from a first publication that crashed before the pointer
+        // became visible; none of that generation is committed state.
+        Ok(None) => return Ok(CheckpointLoad::Cold),
+        Err(error) => return Err(classify_checkpoint_error(error)),
     };
-    let generation_dir = match root.open_dir(&current.directory) {
-        Ok(dir) => dir,
-        Err(error) => {
-            return Ok(CheckpointLoad::Cold {
-                reason: Some(error.to_string()),
-            });
-        }
-    };
+    let generation_dir = root.open_dir(&current.directory).map_err(|error| {
+        classify_open_error(
+            &format!("open checkpoint generation {}", current.directory),
+            error,
+        )
+    })?;
     let manifest = match read_manifest(&generation_dir, &current, config) {
         Ok(manifest) => manifest,
-        Err(LoadStageError::Incompatible(error)) => return Err(error),
-        Err(LoadStageError::Candidate(error)) => {
-            return Ok(CheckpointLoad::Cold {
-                reason: Some(error.to_string()),
-            });
-        }
+        Err(error) => return Err(classify_checkpoint_error(error)),
     };
     if manifest.headers.version != HEADER_VERSION {
-        return Err(IncompatibleCheckpoint::UnsupportedVersion {
-            component: "headers",
-            version: manifest.headers.version,
-        });
+        return Err(corrupt_checkpoint(format!(
+            "headers checkpoint version {} is not current",
+            manifest.headers.version
+        )));
     }
     if manifest.headers.codec != HEADER_CODEC {
-        return Ok(CheckpointLoad::Cold {
-            reason: Some(format!(
-                "unexpected headers checkpoint codec {}",
-                manifest.headers.codec
-            )),
-        });
+        return Err(corrupt_checkpoint(format!(
+            "unexpected headers checkpoint codec {}",
+            manifest.headers.codec
+        )));
     }
 
     let restored_headers = match load_headers(&generation_dir, config, &manifest) {
         Ok(headers) => headers,
         Err(CheckpointError::Header(HeaderCheckpointError::UnsupportedVersion { actual })) => {
-            return Err(IncompatibleCheckpoint::UnsupportedVersion {
-                component: "headers",
-                version: actual,
-            });
+            return Err(corrupt_checkpoint(format!(
+                "headers checkpoint version {actual} is not current"
+            )));
         }
-        Err(error) => {
-            return Ok(CheckpointLoad::Cold {
-                reason: Some(error.to_string()),
-            });
-        }
+        Err(error) => return Err(classify_checkpoint_error(error)),
     };
     if manifest.utxo.version != UTXO_VERSION {
-        return Ok(CheckpointLoad::HeadersOnly {
-            tree: restored_headers.tree,
-            reason: format!(
-                "unsupported UTXO checkpoint version {}",
-                manifest.utxo.version
-            ),
-        });
+        return Err(corrupt_checkpoint(format!(
+            "UTXO checkpoint version {} is not current",
+            manifest.utxo.version
+        )));
     }
     if manifest.coinstats.version != COINSTATS_VERSION {
-        return Err(IncompatibleCheckpoint::UnsupportedVersion {
-            component: "CoinStats",
-            version: manifest.coinstats.version,
-        });
+        return Err(corrupt_checkpoint(format!(
+            "CoinStats checkpoint version {} is not current",
+            manifest.coinstats.version
+        )));
     }
     if manifest.utxo.codec != UTXO_CODEC || manifest.coinstats.codec != COINSTATS_CODEC {
-        return Ok(CheckpointLoad::HeadersOnly {
-            tree: restored_headers.tree,
-            reason: format!(
-                "unexpected payload codecs UTXO={} CoinStats={}",
-                manifest.utxo.codec, manifest.coinstats.codec
-            ),
-        });
+        return Err(corrupt_checkpoint(format!(
+            "unexpected payload codecs UTXO={} CoinStats={}",
+            manifest.utxo.codec, manifest.coinstats.codec
+        )));
     }
     match load_payloads(&generation_dir, &manifest, restored_headers) {
         Ok(restored) => Ok(CheckpointLoad::Complete(Box::new(restored))),
-        Err(error) => {
-            let (tree, error) = *error;
-            Ok(CheckpointLoad::HeadersOnly {
-                tree,
-                reason: error.to_string(),
-            })
-        }
+        Err(error) => Err(classify_checkpoint_error(error)),
     }
+}
+
+fn classify_checkpoint_error(error: CheckpointError) -> CheckpointLoadError {
+    match error {
+        CheckpointError::Io(error)
+        | CheckpointError::Utxo(bitcoin_rs_utxo::UtxoError::Io(error))
+        | CheckpointError::Storage(bitcoin_rs_storage::StorageError::Io(error)) => {
+            classify_checkpoint_io(error)
+        }
+        error => corrupt_checkpoint(error.to_string()),
+    }
+}
+
+fn classify_open_error(operation: &str, error: std::io::Error) -> CheckpointLoadError {
+    if is_checkpoint_corruption(&error) {
+        return corrupt_checkpoint(format!("{operation} failed: {error}"));
+    }
+    CheckpointLoadError::Io(error)
+}
+
+fn checkpoint_file_error(name: &str, error: std::io::Error) -> CheckpointError {
+    if is_checkpoint_corruption(&error) {
+        return CheckpointError::Invalid(format!("checkpoint file {name:?} failed: {error}"));
+    }
+    CheckpointError::Io(error)
+}
+
+fn classify_checkpoint_io(error: std::io::Error) -> CheckpointLoadError {
+    if is_checkpoint_corruption(&error) {
+        return corrupt_checkpoint(error.to_string());
+    }
+    CheckpointLoadError::Io(error)
+}
+
+fn corrupt_checkpoint(reason: impl Into<String>) -> CheckpointLoadError {
+    CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid {
+        reason: reason.into(),
+    })
+}
+
+fn is_checkpoint_corruption(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::IsADirectory
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 #[cfg(test)]
 fn load_checkpoint(
     data_dir: &Path,
     config: HeaderCheckpointConfig,
-) -> Result<CheckpointLoad, IncompatibleCheckpoint> {
+) -> Result<CheckpointLoad, CheckpointLoadError> {
     let data_dir = match open_data_dir(data_dir) {
         Ok(data_dir) => data_dir,
-        Err(error) => {
-            return Ok(CheckpointLoad::Cold {
-                reason: Some(error.to_string()),
-            });
-        }
+        Err(_) => return Ok(CheckpointLoad::Cold),
     };
     load_checkpoint_from_dir(&data_dir, config)
 }
@@ -784,7 +787,6 @@ pub(crate) fn write_checkpoint_from_dir(
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
     chain_tx_count: u64,
-    rolling_stats: bool,
 ) -> Result<CheckpointWrite, CheckpointError> {
     write_checkpoint_inner(
         data_dir,
@@ -794,7 +796,6 @@ pub(crate) fn write_checkpoint_from_dir(
         coin_stats,
         applied_tip,
         chain_tx_count,
-        rolling_stats,
         test_failpoint(),
     )
 }
@@ -806,7 +807,6 @@ fn write_checkpoint(
     utxo: &UtxoSet,
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
-    rolling_stats: bool,
 ) -> Result<CheckpointWrite, CheckpointError> {
     let data_dir = open_data_dir(data_dir)?;
     write_checkpoint_from_dir(
@@ -817,7 +817,6 @@ fn write_checkpoint(
         coin_stats,
         applied_tip,
         0,
-        rolling_stats,
     )
 }
 
@@ -837,72 +836,6 @@ fn checkpoint_best_tip_id(
     Ok(applied_id)
 }
 
-/// Logs and gauges what the UTXO set holds in memory, against process RSS.
-///
-/// Runs on the checkpoint path because a checkpoint already walks every record
-/// to serialize the snapshot, so a second pointer-only walk is cheap beside it,
-/// and because a checkpoint is the only moment the set is guaranteed stable.
-///
-/// The residual between `accounted` and RSS is the point: the set can only
-/// account for its own allocations, while the G14 budget is written against the
-/// process. See `docs/benchmarks/utxo-memory.md`.
-fn report_utxo_memory(utxo: &UtxoSet, height: u32) {
-    // Clippy suggests a method reference here; it does not compile, because
-    // `with_stable_view` needs a closure general over the view's lifetime.
-    #[allow(clippy::redundant_closure_for_method_calls)]
-    let report = utxo.with_stable_view(|view| view.memory_report());
-    let accounted = report.accounted_bytes();
-    let rss = crate::metrics::process_rss_bytes();
-
-    metrics::gauge!("node.utxo.records").set(metric_count(report.records));
-    metrics::gauge!("node.utxo.outputs").set(metric_count(report.outputs));
-    metrics::gauge!("node.utxo.record_payload_bytes")
-        .set(metric_count(report.record_payload_bytes));
-    metrics::gauge!("node.utxo.record_allocation_bytes")
-        .set(metric_count(report.record_allocation_bytes));
-    metrics::gauge!("node.utxo.table_bytes").set(metric_count(report.table_bytes));
-    metrics::gauge!("node.utxo.accounted_bytes").set(metric_count(accounted));
-    if let Some(rss) = rss {
-        metrics::gauge!("node.process.rss_bytes").set(metric_count_u64(rss));
-    }
-
-    tracing::info!(
-        height,
-        records = report.records,
-        outputs = report.outputs,
-        record_payload_bytes = report.record_payload_bytes,
-        record_allocation_bytes = report.record_allocation_bytes,
-        table_bytes = report.table_bytes,
-        accounted_bytes = accounted,
-        // Plain numbers, not `?rss`: Debug on an `Option` emits "Some(123)",
-        // which every downstream parser then has to strip.
-        rss_bytes = rss.unwrap_or_default(),
-        rss_known = rss.is_some(),
-        unaccounted_bytes = rss
-            .map(|rss| rss.saturating_sub(accounted.try_into().unwrap_or(u64::MAX)))
-            .unwrap_or_default(),
-        "utxo memory attribution"
-    );
-}
-
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    reason = "gauge values are f64 by the metrics crate's contract"
-)]
-fn metric_count(value: usize) -> f64 {
-    value as f64
-}
-
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    reason = "gauge values are f64 by the metrics crate's contract"
-)]
-fn metric_count_u64(value: u64) -> f64 {
-    value as f64
-}
-
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_checkpoint_inner(
     data_dir: &Dir,
@@ -912,7 +845,6 @@ fn write_checkpoint_inner(
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
     chain_tx_count: u64,
-    rolling_stats: bool,
     #[cfg_attr(not(test), allow(unused_variables))] failpoint: Option<CheckpointFailpoint>,
 ) -> Result<CheckpointWrite, CheckpointError> {
     let Some(applied_tip) = applied_tip else {
@@ -922,10 +854,7 @@ fn write_checkpoint_inner(
     let current_generation = match read_current(&root) {
         Ok(Some(current)) => current.generation,
         Ok(None) => 0,
-        Err(LoadStageError::Candidate(error)) => return Err(error),
-        Err(LoadStageError::Incompatible(error)) => {
-            return Err(CheckpointError::Invalid(error.to_string()));
-        }
+        Err(error) => return Err(error),
     };
     let (generation, paths, staging) = allocate_generation(&root, current_generation)?;
 
@@ -962,8 +891,6 @@ fn write_checkpoint_inner(
     let (utxo_bytes, utxo_sha256) = utxo_writer.finish()?;
     sync_file(&utxo_file, failpoint, CheckpointFailpoint::UtxoSync)?;
 
-    report_utxo_memory(utxo, applied_tip.height);
-
     let listener_stats = coin_stats.snapshot();
     if listener_stats.height != applied_tip.height {
         return Err(CheckpointError::Invalid(format!(
@@ -974,31 +901,12 @@ fn write_checkpoint_inner(
     let mut fused_stats = accumulator.into_stats();
     fused_stats.tx_count = listener_stats.tx_count;
     let record_count = utxo.record_count();
-    let trailer_kind = if rolling_stats {
-        if listener_stats != fused_stats {
-            return Err(CheckpointError::Invalid(
-                "rolling CoinStats does not match the quiesced UTXO traversal".to_owned(),
-            ));
-        }
-        if trailer != listener_stats.muhash.finalize() {
-            return Err(CheckpointError::Invalid(
-                "rolling UTXO trailer does not match CoinStats MuHash".to_owned(),
-            ));
-        }
-        TrailerKindV1::Rolling
-    } else {
-        if trailer == [0_u8; 384] {
-            return Err(CheckpointError::Invalid(
-                "scanned UTXO snapshot has a zero MuHash trailer".to_owned(),
-            ));
-        }
-        TrailerKindV1::Scanned
-    };
-    let persisted_stats = if rolling_stats {
-        listener_stats
-    } else {
-        fused_stats
-    };
+    if trailer == [0_u8; 384] {
+        return Err(CheckpointError::Invalid(
+            "scanned UTXO snapshot has a zero MuHash trailer".to_owned(),
+        ));
+    }
+    let persisted_stats = fused_stats;
 
     let mut coinstats_file = create_file(&staging, COINSTATS_FILE)?;
     let mut coinstats_writer = HashingWriter::new(
@@ -1060,7 +968,6 @@ fn write_checkpoint_inner(
             record_count,
             output_count: persisted_stats.utxo_count,
             muhash_trailer_sha256: hex_encode(&Sha256::digest(trailer)),
-            trailer_kind,
         },
         coinstats: CoinStatsArtifactV1 {
             file: COINSTATS_FILE.to_owned(),
@@ -1154,7 +1061,6 @@ pub(crate) fn write_checkpoint_with_failpoint(
     utxo: &UtxoSet,
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
-    rolling_stats: bool,
     failpoint: CheckpointFailpoint,
 ) -> Result<CheckpointWrite, CheckpointError> {
     let data_dir = open_data_dir(data_dir)?;
@@ -1166,7 +1072,6 @@ pub(crate) fn write_checkpoint_with_failpoint(
         coin_stats,
         applied_tip,
         0,
-        rolling_stats,
         Some(failpoint),
     )
 }
@@ -1271,45 +1176,29 @@ fn rename_current(
     Ok(())
 }
 
-enum LoadStageError {
-    Incompatible(IncompatibleCheckpoint),
-    Candidate(CheckpointError),
-}
-
-impl From<CheckpointError> for LoadStageError {
-    fn from(error: CheckpointError) -> Self {
-        Self::Candidate(error)
-    }
-}
-
-fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, LoadStageError> {
+fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, CheckpointError> {
     let bytes = match read_file(root.dir(), CURRENT_FILE, MAX_CHECKPOINT_METADATA_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(CheckpointError::Io(error).into()),
+        Err(error) => return Err(checkpoint_file_error(CURRENT_FILE, error)),
     };
     let current: CurrentV1 = serde_json::from_slice(&bytes).map_err(CheckpointError::Json)?;
     if current.version != CURRENT_VERSION {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::UnsupportedVersion {
-                component: "CURRENT",
-                version: current.version,
-            },
-        ));
+        return Err(CheckpointError::Invalid(format!(
+            "CURRENT checkpoint version {} is not current",
+            current.version
+        )));
     }
     if current.format != CURRENT_FORMAT {
         return Err(CheckpointError::Invalid(format!(
             "unexpected CURRENT format {}",
             current.format
-        ))
-        .into());
+        )));
     }
     let expected_directory = generation_name(current.generation);
     if current.directory != expected_directory || !valid_generation_name(&current.directory) {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::Identity(
-                "CURRENT generation directory does not match its generation".to_owned(),
-            ),
+        return Err(CheckpointError::Invalid(
+            "CURRENT generation directory does not match its generation".to_owned(),
         ));
     }
     decode_hex::<32>(&current.manifest_sha256)?;
@@ -1320,37 +1209,32 @@ fn read_manifest(
     generation_dir: &Dir,
     current: &CurrentV1,
     config: HeaderCheckpointConfig,
-) -> Result<CheckpointManifestV1, LoadStageError> {
+) -> Result<CheckpointManifestV1, CheckpointError> {
     let bytes = read_file(generation_dir, MANIFEST_FILE, MAX_CHECKPOINT_METADATA_BYTES)
-        .map_err(CheckpointError::Io)?;
+        .map_err(|error| checkpoint_file_error(MANIFEST_FILE, error))?;
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if digest != decode_hex::<32>(&current.manifest_sha256)? {
-        return Err(
-            CheckpointError::Invalid("manifest SHA256 does not match CURRENT".to_owned()).into(),
-        );
+        return Err(CheckpointError::Invalid(
+            "manifest SHA256 does not match CURRENT".to_owned(),
+        ));
     }
     let manifest: CheckpointManifestV1 =
         serde_json::from_slice(&bytes).map_err(CheckpointError::Json)?;
     if manifest.version != MANIFEST_VERSION {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::UnsupportedVersion {
-                component: "manifest",
-                version: manifest.version,
-            },
-        ));
+        return Err(CheckpointError::Invalid(format!(
+            "manifest version {} is not current",
+            manifest.version
+        )));
     }
     if manifest.format != MANIFEST_FORMAT {
         return Err(CheckpointError::Invalid(format!(
             "unexpected manifest format {}",
             manifest.format
-        ))
-        .into());
+        )));
     }
     if manifest.generation != current.generation {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::Identity(
-                "manifest generation does not match CURRENT".to_owned(),
-            ),
+        return Err(CheckpointError::Invalid(
+            "manifest generation does not match CURRENT".to_owned(),
         ));
     }
     let expected_network = network_name(config.network);
@@ -1358,10 +1242,8 @@ fn read_manifest(
         || manifest.network_magic != hex_encode(&config.network.magic())
         || manifest.genesis_hash != config.genesis.to_string_be()
     {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::Identity(
-                "checkpoint network, magic, or genesis does not match configuration".to_owned(),
-            ),
+        return Err(CheckpointError::Invalid(
+            "checkpoint network, magic, or genesis does not match configuration".to_owned(),
         ));
     }
     Ok(manifest)
@@ -1393,35 +1275,26 @@ fn load_payloads(
     generation_dir: &Dir,
     manifest: &CheckpointManifestV1,
     headers: RestoredHeaders,
-) -> Result<RestoredChainstate, Box<(BlockTree, CheckpointError)>> {
+) -> Result<RestoredChainstate, CheckpointError> {
     let chain_tx_count = manifest.applied_tip.chain_tx_count;
-    match load_payloads_inner(generation_dir, manifest, &headers) {
-        Ok((utxo, coin_stats)) => {
-            let applied_node = match headers.tree.node(headers.applied_tip_id) {
-                Ok(node) => node,
-                Err(error) => {
-                    return Err(Box::new((
-                        headers.tree,
-                        CheckpointError::Header(error.into()),
-                    )));
-                }
-            };
-            let applied_tip = TipSnapshot {
-                tip_id: headers.applied_tip_id,
-                height: applied_node.height,
-                chainwork: applied_node.chainwork,
-                hash: applied_node.hash,
-            };
-            Ok(RestoredChainstate {
-                tree: headers.tree,
-                utxo,
-                coin_stats,
-                applied_tip,
-                chain_tx_count,
-            })
-        }
-        Err(error) => Err(Box::new((headers.tree, error))),
-    }
+    let (utxo, coin_stats) = load_payloads_inner(generation_dir, manifest, &headers)?;
+    let applied_node = headers
+        .tree
+        .node(headers.applied_tip_id)
+        .map_err(|error| CheckpointError::Header(error.into()))?;
+    let applied_tip = TipSnapshot {
+        tip_id: headers.applied_tip_id,
+        height: applied_node.height,
+        chainwork: applied_node.chainwork,
+        hash: applied_node.hash,
+    };
+    Ok(RestoredChainstate {
+        tree: headers.tree,
+        utxo,
+        coin_stats,
+        applied_tip,
+        chain_tx_count,
+    })
 }
 
 fn load_payloads_inner(
@@ -1450,12 +1323,8 @@ fn load_payloads_inner(
     )?;
     let expected_applied = parse_tip(&manifest.applied_tip)?;
 
-    let (snapshot, fused_stats) = read_checkpoint_snapshot(
-        utxo_file,
-        manifest.utxo.bytes,
-        manifest.utxo.trailer_kind,
-        expected_applied.height,
-    )?;
+    let (snapshot, mut derived) =
+        read_checkpoint_snapshot(utxo_file, manifest.utxo.bytes, expected_applied.height)?;
     let snapshot_tip = (snapshot.height, snapshot.tip_hash);
     let expected_tip = (expected_applied.height, expected_applied.hash);
     if snapshot_tip != expected_tip {
@@ -1479,15 +1348,11 @@ fn load_payloads_inner(
     }
 
     let mut coinstats_bytes = Vec::with_capacity(COIN_STATS_ENCODED_LEN + 16);
-    coinstats_file.read_to_end(&mut coinstats_bytes)?;
+    coinstats_file
+        .read_to_end(&mut coinstats_bytes)
+        .map_err(|error| checkpoint_file_error(COINSTATS_FILE, error))?;
     let coin_stats = decode_coinstats_artifact(&coinstats_bytes)?;
     validate_coinstats_manifest(&coin_stats, &manifest.coinstats)?;
-    let mut derived = match fused_stats {
-        Some(stats) => stats,
-        None => snapshot
-            .set
-            .with_stable_view(|view| scan_coin_stats(view, snapshot.height, true))?,
-    };
     // Transaction count is chain metadata and cannot be derived from live coins.
     derived.tx_count = coin_stats.tx_count;
     if derived != coin_stats {
@@ -1500,20 +1365,10 @@ fn load_payloads_inner(
             "UTXO output count does not match manifest".to_owned(),
         ));
     }
-    match manifest.utxo.trailer_kind {
-        TrailerKindV1::Rolling | TrailerKindV1::Scanned
-            if snapshot.muhash_trailer != coin_stats.muhash.finalize() =>
-        {
-            return Err(CheckpointError::Invalid(
-                "UTXO trailer does not match restored CoinStats".to_owned(),
-            ));
-        }
-        TrailerKindV1::Zero if snapshot.muhash_trailer != [0_u8; 384] => {
-            return Err(CheckpointError::Invalid(
-                "zero UTXO trailer kind contains nonzero bytes".to_owned(),
-            ));
-        }
-        TrailerKindV1::Rolling | TrailerKindV1::Scanned | TrailerKindV1::Zero => {}
+    if snapshot.muhash_trailer != coin_stats.muhash.finalize() {
+        return Err(CheckpointError::Invalid(
+            "UTXO trailer does not match restored CoinStats".to_owned(),
+        ));
     }
     let applied = headers.tree.node(headers.applied_tip_id)?;
     let applied_tip = (applied.height, applied.hash);
@@ -1528,24 +1383,18 @@ fn load_payloads_inner(
 fn read_checkpoint_snapshot(
     utxo_file: File,
     encoded_len: u64,
-    trailer_kind: TrailerKindV1,
     height: u32,
-) -> Result<(bitcoin_rs_utxo::SnapshotLoad, Option<CoinStats>), CheckpointError> {
+) -> Result<(bitcoin_rs_utxo::SnapshotLoad, CoinStats), CheckpointError> {
     let mut limited = BufReader::new(utxo_file).take(
         encoded_len
             .checked_add(1)
             .ok_or_else(|| CheckpointError::Invalid("UTXO byte length overflow".to_owned()))?,
     );
-    match trailer_kind {
-        TrailerKindV1::Rolling | TrailerKindV1::Scanned => {
-            let (snapshot, accumulator) = read_snapshot_strict_v4_observed(
-                &mut limited,
-                CoinStatsAccumulator::with_parallel_muhash(height),
-            )?;
-            Ok((snapshot, Some(accumulator.into_stats())))
-        }
-        TrailerKindV1::Zero => Ok((read_snapshot_strict_v4(&mut limited)?, None)),
-    }
+    let (snapshot, accumulator) = read_snapshot_strict_v4_observed(
+        &mut limited,
+        CoinStatsAccumulator::with_parallel_muhash(height),
+    )?;
+    Ok((snapshot, accumulator.into_stats()))
 }
 
 fn validate_coinstats_manifest(
@@ -1616,6 +1465,12 @@ fn allocate_generation(
 fn generation_paths(generation: u64) -> GenerationPaths {
     let directory = generation_name(generation);
     GenerationPaths {
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        ))]
         staging: format!(".{directory}.tmp"),
         final_dir: directory.clone(),
         current_temp: format!(".CURRENT-{generation:020}.tmp"),
@@ -1650,8 +1505,11 @@ fn valid_current_temp_name(name: &str) -> bool {
 }
 
 fn open_regular_file(dir: &Dir, name: &str, expected_len: u64) -> Result<File, CheckpointError> {
-    let file = open_file(dir, name)?;
-    let actual_len = file.metadata()?.len();
+    let file = open_file(dir, name).map_err(|error| checkpoint_file_error(name, error))?;
+    let actual_len = file
+        .metadata()
+        .map_err(|error| checkpoint_file_error(name, error))?
+        .len();
     if actual_len != expected_len {
         return Err(CheckpointError::Invalid(format!(
             "checkpoint artifact {name:?} has {actual_len} bytes, expected {expected_len}"
@@ -1676,7 +1534,9 @@ fn verify_artifact(
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut bytes = 0_u64;
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| checkpoint_file_error(name, error))?;
         if read == 0 {
             break;
         }
@@ -1691,7 +1551,8 @@ fn verify_artifact(
             "checkpoint artifact {name:?} length or SHA256 mismatch"
         )));
     }
-    file.seek(SeekFrom::Start(0))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| checkpoint_file_error(name, error))?;
     Ok(file)
 }
 
@@ -1854,51 +1715,68 @@ fn decode_nibble(byte: u8) -> u8 {
 #[cfg(test)]
 mod tests {
 
-    /// The migration guarantee. `docs/policies/db-migration.md` rules out
-    /// in-place migrations, so a field added to the manifest has to be readable
-    /// as absent — otherwise every existing datadir fails to load and resyncs
-    /// from genesis for the sake of one number.
+    /// The checkpoint manifest's codec identifiers are on-disk values.
+    ///
+    /// Pinned as literals rather than through the constants, because comparing a
+    /// constant to itself proves nothing: the writer and the reader use the same
+    /// three names, so renaming one keeps a single binary perfectly
+    /// self-consistent while every checkpoint already on disk stops loading and
+    /// requires an explicit full resync (`docs/policies/db-migration.md`). That
+    /// failure is invisible to a round-trip test and expensive in production.
+    ///
+    /// These identifiers are the current schema's on-disk codec names. Changing
+    /// one requires a schema epoch bump and an explicit resync.
     #[test]
-    fn a_manifest_tip_written_before_the_count_existed_reads_as_unknown() {
-        let without = r#"{"height":7,"hash":"00","chainwork":"01"}"#;
-        let Ok(parsed) = serde_json::from_str::<super::CheckpointTipV1>(without) else {
-            panic!("a pre-existing manifest tip must still parse");
-        };
-        assert_eq!(
-            parsed.chain_tx_count, 0,
-            "absent must decode as Core's unset encoding, not as a wrong total"
-        );
-
-        let with = r#"{"height":7,"hash":"00","chainwork":"01","chain_tx_count":42}"#;
-        let Ok(parsed) = serde_json::from_str::<super::CheckpointTipV1>(with) else {
-            panic!("a manifest tip carrying the count must parse");
-        };
-        assert_eq!(parsed.chain_tx_count, 42);
+    fn manifest_codec_identifiers_are_current_and_frozen() {
+        assert_eq!(super::HEADER_CODEC, "bitcoin-rs-canonical-headers");
+        assert_eq!(super::UTXO_CODEC, "bitcoin-rs-utxo-spendable-v1");
+        assert_eq!(super::COINSTATS_CODEC, "bitcoin-rs-coinstats-v1");
+        assert_eq!(super::CURRENT_FORMAT, "bitcoin-rs-chainstate-current");
+        assert_eq!(super::MANIFEST_FORMAT, "bitcoin-rs-chainstate-checkpoint");
     }
+
     use std::fs;
     use std::io::Cursor;
     use std::path::Path;
 
-    use bitcoin::block::{Header, Version};
-    use bitcoin::consensus::encode::deserialize;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{Amount, BlockHash, CompactTarget, ScriptBuf, TxMerkleNode, TxOut};
-    use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot, accept_headers};
-    use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener, scan_coin_stats};
-    use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
+    use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot, accept_headers};
+    use bitcoin_rs_primitives::{
+        BlockHash, Hash256, Header, Network, OutPoint, TxOut, Txid, deserialize,
+    };
+    use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener, scan_coin_stats};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
     use parking_lot::RwLock;
     use sha2::{Digest, Sha256};
 
     use super::{
-        CHECKPOINT_ROOT, COINSTATS_FILE, CURRENT_FILE, CheckpointFailpoint, CheckpointLoad,
-        CheckpointManifestV1, CheckpointWrite, CurrentV1, HEADER_PREFIX_LEN, HEADERS_FILE,
-        HeaderCheckpointConfig, HeaderCheckpointError, HeaderCheckpointPoint, HeaderCheckpointTip,
-        HeaderCheckpointWrite, MANIFEST_FILE, UTXO_FILE, encode_header, load_checkpoint,
-        read_headers, write_checkpoint_with_failpoint, write_headers,
+        CHECKPOINT_ROOT, COINSTATS_FILE, CURRENT_FILE, CheckpointCorruption, CheckpointFailpoint,
+        CheckpointLoad, CheckpointLoadError, CheckpointManifestV1, CheckpointWrite, CurrentV1,
+        HEADER_PREFIX_LEN, HEADERS_FILE, HeaderCheckpointConfig, HeaderCheckpointError,
+        HeaderCheckpointPoint, HeaderCheckpointTip, HeaderCheckpointWrite, MANIFEST_FILE,
+        UTXO_FILE, encode_header, load_checkpoint, read_headers, write_checkpoint_with_failpoint,
+        write_headers,
     };
 
     const NETWORK: Network = Network::Regtest;
+
+    #[test]
+    fn transient_checkpoint_io_is_not_classified_as_incompatible() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "checkpoint locked");
+        let classified = super::classify_checkpoint_error(super::CheckpointError::Io(error));
+        let CheckpointLoadError::Io(error) = classified else {
+            panic!("transient checkpoint I/O was classified as datadir incompatibility");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "checkpoint locked");
+
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
+        let classified = super::classify_open_error("open checkpoint root", error);
+        let CheckpointLoadError::Io(error) = classified else {
+            panic!("transient checkpoint-open I/O was classified as datadir incompatibility");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "root locked");
+    }
 
     #[test]
     fn round_trip_replays_consensus_validated_active_chain()
@@ -1999,7 +1877,7 @@ mod tests {
         let mut bad_pow = bytes.clone();
         let header_offset = HEADER_PREFIX_LEN + 80;
         let mut invalid = header_from_row(&bad_pow[header_offset..header_offset + 80])?;
-        while invalid.validate_pow(invalid.target()).is_ok() {
+        while pow_meets_target(invalid.bits, invalid.compute_hash().0) {
             invalid.nonce = invalid.nonce.checked_add(1).ok_or("nonce exhausted")?;
         }
         bad_pow[header_offset..header_offset + 80].copy_from_slice(&encode_header(&invalid)?);
@@ -2008,7 +1886,7 @@ mod tests {
         let mut bad_nbits = bytes;
         let previous = header_from_row(&bad_nbits[header_offset..header_offset + 80])?;
         let mut nbits_mismatch = Header {
-            bits: CompactTarget::from_consensus(0x207f_fffe),
+            bits: 0x207f_fffe,
             ..previous
         };
         mine_header_to_declared_target(&mut nbits_mismatch)?;
@@ -2069,7 +1947,7 @@ mod tests {
         let (mut tree, best_tip_id, _) = chain_with_applied_height(3, 1)?;
         let genesis_hash = tree.node(NodeId::new(0))?.hash;
         let mut fork = next_header(
-            BlockHash::from_byte_array(genesis_hash.to_le_bytes()),
+            BlockHash(genesis_hash),
             u32::from(NETWORK.genesis_block_hash().to_le_bytes()[0]) + 1,
         );
         mine_header_to_declared_target(&mut fork)?;
@@ -2112,7 +1990,6 @@ mod tests {
                 &utxo,
                 &listener,
                 Some(&applied_tip),
-                false,
             )?,
             CheckpointWrite::Published { .. }
         ));
@@ -2136,7 +2013,7 @@ mod tests {
         let main_best_hash = tree.node(main_best_id)?.hash;
 
         let genesis_hash = tree.node(NodeId::new(0))?.hash;
-        let mut prev = BlockHash::from_byte_array(genesis_hash.to_le_bytes());
+        let mut prev = BlockHash(genesis_hash);
         let mut fork_best_id = NodeId::new(0);
         for height in 1..=4 {
             let mut header = next_header(prev, height);
@@ -2148,7 +2025,7 @@ mod tests {
                 NETWORK,
                 bitcoin_rs_chain::current_unix_seconds(),
             )?[0];
-            prev = BlockHash::from_byte_array(tree.node(fork_best_id)?.hash.to_le_bytes());
+            prev = BlockHash(tree.node(fork_best_id)?.hash);
         }
         let fork_best_hash = tree.node(fork_best_id)?.hash;
         assert_eq!(tree.tip().map(|tip| tip.tip_id), Some(fork_best_id));
@@ -2173,7 +2050,6 @@ mod tests {
                 &utxo,
                 &listener,
                 Some(&applied_tip),
-                false,
             )?,
             CheckpointWrite::Published { .. }
         ));
@@ -2217,7 +2093,6 @@ mod tests {
             &utxo,
             &listener,
             Some(&applied_tip),
-            false,
         )?;
 
         for failpoint in [
@@ -2246,7 +2121,6 @@ mod tests {
                     &utxo,
                     &listener,
                     Some(&applied_tip),
-                    false,
                     failpoint,
                 )
                 .is_err(),
@@ -2270,7 +2144,6 @@ mod tests {
                 &utxo,
                 &listener,
                 Some(&applied_tip),
-                false,
                 CheckpointFailpoint::CurrentRootSync,
             )
             .is_err()
@@ -2279,6 +2152,57 @@ mod tests {
             load_checkpoint(dir.path(), config())?,
             CheckpointLoad::Complete(_)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn first_publication_failures_leave_no_committed_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for failpoint in [
+            CheckpointFailpoint::HeadersWrite,
+            CheckpointFailpoint::HeadersSync,
+            CheckpointFailpoint::UtxoWrite,
+            CheckpointFailpoint::UtxoSync,
+            CheckpointFailpoint::CoinStatsWrite,
+            CheckpointFailpoint::CoinStatsSync,
+            CheckpointFailpoint::ManifestWrite,
+            CheckpointFailpoint::ManifestSync,
+            CheckpointFailpoint::StageSync,
+            CheckpointFailpoint::GenerationRename,
+            CheckpointFailpoint::GenerationRootSync,
+            CheckpointFailpoint::CurrentTempWrite,
+            CheckpointFailpoint::CurrentTempSync,
+            CheckpointFailpoint::CurrentRename,
+        ] {
+            let dir = tempfile::tempdir()?;
+            let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+            let applied_tip = tip_snapshot(&tree, applied)?;
+            let tree = RwLock::new(tree);
+            let utxo = UtxoSet::new();
+            let listener = CoinStatsListener::new(CoinStats::new());
+
+            assert!(
+                write_checkpoint_with_failpoint(
+                    dir.path(),
+                    config(),
+                    &tree,
+                    &utxo,
+                    &listener,
+                    Some(&applied_tip),
+                    failpoint,
+                )
+                .is_err(),
+                "{failpoint:?}"
+            );
+            assert!(
+                !dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE).exists(),
+                "pre-publication failure exposed CURRENT at {failpoint:?}"
+            );
+            assert!(matches!(
+                load_checkpoint(dir.path(), config()),
+                Ok(CheckpointLoad::Cold)
+            ));
+        }
         Ok(())
     }
 
@@ -2297,12 +2221,11 @@ mod tests {
             &utxo,
             &listener,
             Some(&applied_tip),
-            false,
         )?;
         let current_path = dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE);
         let before = fs::read(&current_path)?;
         assert_eq!(
-            super::write_checkpoint(dir.path(), config(), &tree, &utxo, &listener, None, false,)?,
+            super::write_checkpoint(dir.path(), config(), &tree, &utxo, &listener, None)?,
             CheckpointWrite::SkippedNoAppliedTip
         );
         assert_eq!(fs::read(current_path)?, before);
@@ -2310,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_utxo_semantics_keep_headers_only() -> Result<(), Box<dyn std::error::Error>> {
+    fn checkpoint_without_current_is_cold() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
         let applied_tip = tip_snapshot(&tree, applied)?;
@@ -2321,22 +2244,45 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
+        )?;
+        fs::remove_file(dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE))?;
+
+        assert!(matches!(
+            load_checkpoint(dir.path(), config()),
+            Ok(CheckpointLoad::Cold)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_utxo_codec_requires_explicit_resync() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &RwLock::new(tree),
+            &UtxoSet::new(),
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
         )?;
         mutate_authenticated_manifest(dir.path(), |manifest| {
             manifest.utxo.codec = "bitcoin-rs-utxo".to_owned();
         })?;
 
-        let CheckpointLoad::HeadersOnly { reason, .. } = load_checkpoint(dir.path(), config())?
-        else {
-            return Err("legacy UTXO semantics did not keep headers only".into());
+        let Err(error) = load_checkpoint(dir.path(), config()) else {
+            return Err("unsupported UTXO codec unexpectedly loaded".into());
         };
-        assert!(reason.contains("unexpected payload codecs"));
+        let message = error.to_string();
+        assert!(message.contains("unexpected payload codecs"));
+        assert!(message.contains("full resync"));
         Ok(())
     }
 
     #[test]
-    fn legacy_utxo_snapshot_version_keeps_headers_only() -> Result<(), Box<dyn std::error::Error>> {
+    fn unsupported_utxo_snapshot_version_requires_explicit_resync()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(1, 0)?;
         let applied_tip = tip_snapshot(&tree, applied)?;
@@ -2347,23 +2293,23 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         mutate_authenticated_manifest(dir.path(), |manifest| {
             manifest.utxo.version = 3;
         })?;
 
-        let CheckpointLoad::HeadersOnly { tree, reason } = load_checkpoint(dir.path(), config())?
+        let Err(CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid { reason })) =
+            load_checkpoint(dir.path(), config())
         else {
-            return Err("legacy UTXO snapshot did not keep headers only".into());
+            return Err("unsupported UTXO snapshot unexpectedly loaded".into());
         };
-        assert_eq!(tree.tip().map(|tip| tip.height), Some(1));
-        assert!(reason.contains("unsupported UTXO checkpoint version 3"));
+        assert!(reason.contains("UTXO checkpoint version 3 is not current"));
         Ok(())
     }
 
     #[test]
-    fn unsupported_current_version_is_fatal() -> Result<(), Box<dyn std::error::Error>> {
+    fn unsupported_current_version_is_current_checkpoint_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
         let applied_tip = tip_snapshot(&tree, applied)?;
@@ -2375,18 +2321,23 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         let current_path = dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE);
         let mut current: CurrentV1 = serde_json::from_slice(&fs::read(&current_path)?)?;
         current.version = current.version.saturating_add(1);
         fs::write(current_path, serde_json::to_vec(&current)?)?;
-        assert!(load_checkpoint(dir.path(), config()).is_err());
+        let Err(CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid { reason })) =
+            load_checkpoint(dir.path(), config())
+        else {
+            return Err("unsupported CURRENT version was not reported as corruption".into());
+        };
+        assert!(reason.contains("CURRENT checkpoint version"));
+        assert!(!reason.contains("incompatible bitcoin-rs datadir"));
         Ok(())
     }
 
     #[test]
-    fn semantic_utxo_trailing_byte_with_rebound_hashes_keeps_headers_only()
+    fn semantic_utxo_trailing_byte_with_rebound_hashes_requires_resync()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(1, 0)?;
@@ -2401,7 +2352,6 @@ mod tests {
             &utxo,
             &listener,
             Some(&applied_tip),
-            false,
         )?;
 
         let root = dir.path().join(CHECKPOINT_ROOT);
@@ -2422,11 +2372,10 @@ mod tests {
         current.manifest_sha256 = super::hex_encode(&Sha256::digest(&manifest_bytes));
         fs::write(&current_path, serde_json::to_vec(&current)?)?;
 
-        let CheckpointLoad::HeadersOnly { tree, .. } = load_checkpoint(dir.path(), config())?
-        else {
-            return Err("semantic UTXO corruption did not choose header-only fallback".into());
+        let Err(error) = load_checkpoint(dir.path(), config()) else {
+            return Err("semantic UTXO corruption unexpectedly loaded".into());
         };
-        assert_eq!(tree.tip().map(|tip| tip.height), Some(1));
+        assert!(error.to_string().contains("full resync"));
         Ok(())
     }
 
@@ -2443,7 +2392,6 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         let wrong = HeaderCheckpointConfig {
             network: Network::Testnet3,
@@ -2466,7 +2414,6 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         mutate_authenticated_artifact(dir.path(), HEADERS_FILE, |bytes| {
             bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
@@ -2474,17 +2421,15 @@ mod tests {
 
         assert!(matches!(
             load_checkpoint(dir.path(), config()),
-            Err(super::IncompatibleCheckpoint::UnsupportedVersion {
-                component: "headers",
-                version: 2
-            })
+            Err(super::CheckpointLoadError::Corrupt(
+                super::CheckpointCorruption::Invalid { .. }
+            ))
         ));
         Ok(())
     }
 
     #[test]
-    fn authenticated_header_semantics_choose_cold_fallback()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn authenticated_header_semantics_require_resync() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(2, 0)?;
         let applied_tip = tip_snapshot(&tree, applied)?;
@@ -2496,20 +2441,19 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         mutate_authenticated_artifact(dir.path(), HEADERS_FILE, |bytes| {
             bytes[HEADER_PREFIX_LEN + 80 + 4] ^= 1;
         })?;
 
-        assert!(matches!(
-            load_checkpoint(dir.path(), config())?,
-            CheckpointLoad::Cold { .. }
-        ));
+        let Err(error) = load_checkpoint(dir.path(), config()) else {
+            return Err("corrupt header checkpoint unexpectedly loaded".into());
+        };
+        assert!(error.to_string().contains("full resync"));
         Ok(())
     }
     #[test]
-    fn authenticated_header_tip_and_commitment_mutations_choose_cold()
+    fn authenticated_header_tip_and_commitment_mutations_require_resync()
     -> Result<(), Box<dyn std::error::Error>> {
         for case in 0..4 {
             let dir = tempfile::tempdir()?;
@@ -2523,7 +2467,6 @@ mod tests {
                 &UtxoSet::new(),
                 &CoinStatsListener::new(CoinStats::new()),
                 Some(&applied_tip),
-                false,
             )?;
             mutate_authenticated_manifest(dir.path(), |manifest| match case {
                 0 => manifest.best_header_tip.hash = "00".repeat(32),
@@ -2531,17 +2474,17 @@ mod tests {
                 2 => manifest.headers.best_chain_sha256 = "00".repeat(32),
                 _ => manifest.headers.applied_chain_sha256 = "00".repeat(32),
             })?;
-            assert!(matches!(
-                load_checkpoint(dir.path(), config())?,
-                CheckpointLoad::Cold { .. }
-            ));
+            let Err(error) = load_checkpoint(dir.path(), config()) else {
+                return Err("corrupt checkpoint unexpectedly loaded".into());
+            };
+            assert!(error.to_string().contains("full resync"));
         }
         Ok(())
     }
 
     #[test]
-    fn authenticated_coinstats_semantics_choose_headers_only()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn authenticated_coinstats_semantics_require_resync() -> Result<(), Box<dyn std::error::Error>>
+    {
         for offset in [16, 16 + 768, 16 + 772, 16 + 780, 16 + 788, 16 + 796] {
             let dir = tempfile::tempdir()?;
             let (tree, _, applied) = chain_with_applied_height(0, 0)?;
@@ -2554,42 +2497,16 @@ mod tests {
                 &UtxoSet::new(),
                 &CoinStatsListener::new(CoinStats::new()),
                 Some(&applied_tip),
-                false,
             )?;
             mutate_authenticated_artifact(dir.path(), COINSTATS_FILE, |bytes| {
                 bytes[offset] ^= 1;
             })?;
 
-            assert!(matches!(
-                load_checkpoint(dir.path(), config())?,
-                CheckpointLoad::HeadersOnly { .. }
-            ));
+            let Err(error) = load_checkpoint(dir.path(), config()) else {
+                return Err("corrupt CoinStats checkpoint unexpectedly loaded".into());
+            };
+            assert!(error.to_string().contains("full resync"));
         }
-        Ok(())
-    }
-
-    #[test]
-    fn rolling_trailer_restores_full_coinstats_state() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
-        let applied_tip = tip_snapshot(&tree, applied)?;
-        let tree = RwLock::new(tree);
-        let listener = CoinStatsListener::new(CoinStats::new());
-        let mut utxo = UtxoSet::new();
-        utxo.set_listener(Box::new(listener.clone()));
-        super::write_checkpoint(
-            dir.path(),
-            config(),
-            &tree,
-            &utxo,
-            &listener,
-            Some(&applied_tip),
-            true,
-        )?;
-        let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
-            return Err("rolling generation did not restore".into());
-        };
-        assert_eq!(restored.coin_stats, listener.snapshot());
         Ok(())
     }
 
@@ -2600,14 +2517,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
         let applied_tip = tip_snapshot(&tree, applied)?;
-        let record_txid = Hash256::from_le_bytes(&[0x44; 32]);
+        let record_txid = Txid(Hash256::from_le_bytes(&[0x44; 32]));
         let mut changes = BlockChanges::default();
         for vout in 0..OUTPUT_COUNT {
             changes.add(UtxoAdd::new(
                 OutPoint::new(record_txid, vout),
                 TxOut {
-                    value: Amount::from_sat(u64::from(vout) + 1),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    value: u64::from(vout) + 1,
+                    script_pubkey: vec![0x51],
                 },
                 false,
                 0,
@@ -2623,7 +2540,6 @@ mod tests {
             &utxo,
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
             return Err("multi-output checkpoint did not restore".into());
@@ -2655,15 +2571,11 @@ mod tests {
             &utxo,
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
 
         let root = dir.path().join(CHECKPOINT_ROOT);
         let current: CurrentV1 = serde_json::from_slice(&fs::read(root.join(CURRENT_FILE))?)?;
         let generation = root.join(current.directory);
-        let manifest: CheckpointManifestV1 =
-            serde_json::from_slice(&fs::read(generation.join(MANIFEST_FILE))?)?;
-        assert_eq!(manifest.utxo.trailer_kind, super::TrailerKindV1::Scanned);
         let mut reader = std::io::BufReader::new(std::fs::File::open(generation.join(UTXO_FILE))?);
         let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut reader)?;
         assert_ne!(snapshot.muhash_trailer, [0_u8; 384]);
@@ -2678,10 +2590,10 @@ mod tests {
         restored.utxo.set_listener(Box::new(listener.clone()));
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
-            OutPoint::new(Hash256::from_le_bytes(&[0x5a; 32]), 42),
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[0x5a; 32])), 42),
             TxOut {
-                value: Amount::from_sat(123_456),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0xac]),
+                value: 123_456,
+                script_pubkey: vec![0x51, 0xac],
             },
             false,
             restored.applied_tip.height,
@@ -2697,8 +2609,8 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_utxo_value_mutation_keeps_headers_only()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn authenticated_utxo_value_mutation_requires_resync() -> Result<(), Box<dyn std::error::Error>>
+    {
         const FIRST_VALUE_OFFSET: usize = 52 + 45 + 4;
 
         let dir = tempfile::tempdir()?;
@@ -2711,50 +2623,15 @@ mod tests {
             &populated_utxo()?,
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
 
         mutate_authenticated_artifact(dir.path(), UTXO_FILE, |bytes| {
             bytes[FIRST_VALUE_OFFSET] ^= 1;
         })?;
-        assert!(matches!(
-            load_checkpoint(dir.path(), config())?,
-            CheckpointLoad::HeadersOnly { .. }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_zero_trailer_generation_still_loads() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
-        let applied_tip = tip_snapshot(&tree, applied)?;
-        let utxo = populated_utxo()?;
-        let expected = utxo.with_stable_view(|view| scan_coin_stats(view, 0, true))?;
-        super::write_checkpoint(
-            dir.path(),
-            config(),
-            &RwLock::new(tree),
-            &utxo,
-            &CoinStatsListener::new(CoinStats::new()),
-            Some(&applied_tip),
-            false,
-        )?;
-        mutate_authenticated_artifact(dir.path(), UTXO_FILE, |bytes| {
-            let trailer = bytes.len() - 384;
-            bytes[trailer..].fill(0);
-        })?;
-        mutate_authenticated_manifest(dir.path(), |manifest| {
-            manifest.utxo.trailer_kind = super::TrailerKindV1::Zero;
-            manifest.utxo.muhash_trailer_sha256 = super::hex_encode(&Sha256::digest([0_u8; 384]));
-        })?;
-
-        let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
-            return Err(
-                std::io::Error::other("legacy zero-trailer generation did not restore").into(),
-            );
+        let Err(error) = load_checkpoint(dir.path(), config()) else {
+            return Err("corrupt UTXO checkpoint unexpectedly loaded".into());
         };
-        assert_eq!(restored.coin_stats, expected);
+        assert!(error.to_string().contains("full resync"));
         Ok(())
     }
 
@@ -2776,7 +2653,6 @@ mod tests {
             &utxo,
             &listener,
             Some(&applied_tip),
-            false,
         )?;
         let root = dir.path().join(CHECKPOINT_ROOT);
         let unknown = root.join("operator-note");
@@ -2798,7 +2674,6 @@ mod tests {
                 &utxo,
                 &listener,
                 Some(&applied_tip),
-                false,
             )?,
             CheckpointWrite::Published { generation: 2 }
         );
@@ -2908,8 +2783,7 @@ mod tests {
         best_height: u32,
         applied_height: u32,
     ) -> Result<(BlockTree, NodeId, HeaderCheckpointPoint), HeaderCheckpointError> {
-        let genesis =
-            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let genesis = NETWORK.genesis_block().header;
         let mut tree = BlockTree::new();
         let mut current = accept_headers(
             &mut tree,
@@ -2918,7 +2792,7 @@ mod tests {
             bitcoin_rs_chain::current_unix_seconds(),
         )?[0];
         for height in 1..=best_height {
-            let prev = BlockHash::from_byte_array(tree.node(current)?.hash.to_le_bytes());
+            let prev = BlockHash(tree.node(current)?.hash);
             let mut header = next_header(prev, height);
             mine_header_to_declared_target(&mut header)?;
             current = accept_headers(
@@ -2939,23 +2813,52 @@ mod tests {
 
     fn next_header(prev_blockhash: BlockHash, height: u32) -> Header {
         Header {
-            version: Version::ONE,
+            version: 1,
             prev_blockhash,
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time: 1_296_688_602_u32.saturating_add(height),
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         }
     }
 
     fn mine_header_to_declared_target(header: &mut Header) -> Result<(), HeaderCheckpointError> {
-        while header.validate_pow(header.target()).is_err() {
+        while !pow_meets_target(header.bits, header.compute_hash().0) {
             header.nonce = header
                 .nonce
                 .checked_add(1)
                 .ok_or_else(|| HeaderCheckpointError::Codec("exhausted test nonce".to_owned()))?;
         }
         Ok(())
+    }
+
+    /// Decodes a compact target and checks whether `hash` meets it, mirroring
+    /// the chain crate's private `compact_is_met_by`.
+    fn pow_meets_target(bits: u32, hash: Hash256) -> bool {
+        let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
+        let mantissa = u64::from(bits & 0x007f_ffff);
+        let negative = mantissa != 0 && bits & 0x0080_0000 != 0;
+        let overflow = mantissa != 0
+            && (exponent > 34
+                || (mantissa > 0xff && exponent > 33)
+                || (mantissa > 0xffff && exponent > 32));
+        if negative || overflow {
+            return false;
+        }
+        let target = if exponent <= 3 {
+            ChainWork::from(mantissa >> (8 * (3 - exponent)))
+        } else {
+            let shift = 8 * (exponent - 3);
+            if shift < 256 {
+                ChainWork::from(mantissa) << shift
+            } else {
+                return false;
+            }
+        };
+        if target == ChainWork::ZERO {
+            return false;
+        }
+        ChainWork::from_le_bytes(hash.to_le_bytes()) <= target
     }
 
     fn header_from_row(row: &[u8]) -> Result<Header, HeaderCheckpointError> {
@@ -2965,10 +2868,10 @@ mod tests {
     fn populated_utxo() -> Result<UtxoSet, bitcoin_rs_utxo::UtxoError> {
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
-            OutPoint::new(Hash256::from_le_bytes(&[7_u8; 32]), 3),
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[7_u8; 32])), 3),
             TxOut {
-                value: Amount::from_sat(50_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x21]),
+                value: 50_000,
+                script_pubkey: vec![0x51, 0x21],
             },
             true,
             0,
