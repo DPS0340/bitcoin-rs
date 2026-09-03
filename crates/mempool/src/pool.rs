@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
-use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, Txid, Wtxid};
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid, Wtxid};
 use hashbrown::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use slab::Slab;
@@ -3565,10 +3565,7 @@ mod dynamic_memory_usage_tests {
             version: 2,
             lock_time: 0,
             inputs: alloc::vec![TxIn {
-                previous_output: OutPoint::new(
-                    Txid::from(Hash256::from_le_bytes(&[tag; 32])),
-                    0,
-                ),
+                previous_output: OutPoint::new(Txid::from(Hash256::from_le_bytes(&[tag; 32])), 0,),
                 script_sig: Vec::new(),
                 sequence: u32::MAX,
                 witness: Vec::new(),

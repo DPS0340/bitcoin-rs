@@ -199,7 +199,6 @@ fn i64_to_f64(value: i64) -> f64 {
     if value < 0 { -magnitude } else { magnitude }
 }
 
-
 fn chainwork_hex(tip: &TipSnapshot) -> String {
     let bytes: [u8; 32] = tip.chainwork.to_be_bytes();
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -4601,18 +4600,13 @@ mod stripped_size_tests {
         Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
     };
 
-    use super::*;
-
     /// A block whose single transaction carries a witness stack.
     fn witness_block() -> Block {
         let tx = Tx {
             version: 2,
             lock_time: 0,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(
-                    Txid::from(Hash256::from_le_bytes(&[0_u8; 32])),
-                    0,
-                ),
+                previous_output: OutPoint::new(Txid::from(Hash256::from_le_bytes(&[0_u8; 32])), 0),
                 script_sig: Vec::new(),
                 sequence: u32::MAX,
                 witness: vec![vec![0x21_u8; 64], vec![0x03_u8; 33]],
@@ -4641,10 +4635,7 @@ mod stripped_size_tests {
             version: 2,
             lock_time: 0,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(
-                    Txid::from(Hash256::from_le_bytes(&[0_u8; 32])),
-                    0,
-                ),
+                previous_output: OutPoint::new(Txid::from(Hash256::from_le_bytes(&[0_u8; 32])), 0),
                 script_sig: Vec::new(),
                 sequence: u32::MAX,
                 witness: Vec::new(),
