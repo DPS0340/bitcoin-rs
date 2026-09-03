@@ -3004,6 +3004,89 @@ mod tests {
         );
     }
 
+    /// A replacement the size limit sheds must not report success.
+    ///
+    /// `replace_transaction` evicts conflicting entries, inserts the
+    /// replacement, and then trims. If the replacement itself is the
+    /// worst-paying entry, the trim takes it — but the caller would
+    /// receive `Ok` for a transaction that is no longer in the pool.
+    /// The post-insert survival check returns `Err(Full)` instead,
+    /// matching `insert_entry`.
+    #[test]
+    fn a_replacement_the_size_limit_sheds_is_not_accepted() {
+        let limits = MempoolLimits {
+            max_total_bytes: 1_000,
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+
+        // Shared prevout so the replacement directly conflicts with the
+        // original — both spend the same outpoint.
+        let prev = OutPoint {
+            txid: txid_of([0x11; 32]),
+            vout: 0,
+        };
+
+        // Original: 100 vbytes, low fee rate (100 sat/vbyte).
+        let original = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: prev,
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFD,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51],
+            }],
+        };
+        let seated = pool.insert_entry(MempoolEntry::new(Arc::new(original), 100, 10_000, 1, 7));
+        assert!(seated.is_ok(), "original must fit: {seated:?}");
+
+        // Bystander: 850 vbytes, high fee rate (10_000 sat/vbyte), fills pool.
+        let bystander = tx(8, Vec::new());
+        let seated_by =
+            pool.insert_entry(MempoolEntry::new(Arc::new(bystander), 850, 8_500_000, 1, 7));
+        assert!(seated_by.is_ok(), "bystander must fit: {seated_by:?}");
+        assert_eq!(pool.len(), 2);
+
+        // Replacement: conflicts with the original (same prevout), higher
+        // absolute fee (BIP125 rule 3: 15_000 > 10_000), higher fee rate
+        // than the original (BIP125 rule 6: 150 > 100 sat/vbyte), but
+        // 900 vbytes at a far lower fee rate than the bystander
+        // (166 vs 10_000). After evicting the original (100 vbytes freed),
+        // the pool has 850 + 900 = 1750 > 1000, so the trim evicts the
+        // lowest-fee-rate entry — the replacement itself.
+        let replacement = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: prev,
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFD,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 100,
+                script_pubkey: vec![0x52],
+            }],
+        };
+        let result = pool.replace_transaction(
+            crate::ReplacementCandidate::new(Arc::new(replacement), 900, 100_000, 1),
+            2,
+            7,
+            4,
+        );
+        assert_eq!(
+            result,
+            Err(crate::rbf::RbfError::Mempool(MempoolError::Full)),
+            "a replacement evicted by the trim must report Full, not success: {result:?}"
+        );
+    }
+
     /// Every entry's four package totals, in entry-id order.
     fn totals(pool: &Mempool) -> Vec<(usize, u64, u64, u64, u64)> {
         let mut all = pool

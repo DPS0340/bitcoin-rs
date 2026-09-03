@@ -181,6 +181,7 @@ impl Mempool {
         height: u32,
         sigop_cost: u32,
     ) -> Result<MutationResult, RbfError> {
+        let candidate_txid = candidate.tx.txid();
         let plan = self.check_replacement(&candidate)?;
         let direct: HashSet<EntryId> = self.conflicts_for(&candidate.tx).into_iter().collect();
         let entry = MempoolEntry::new(candidate.tx, candidate.vsize, candidate.fee, time, height)
@@ -203,6 +204,14 @@ impl Mempool {
         self.remove_entries_with_reasons(&removals, &mut changes);
         let replacement = self.commit_insert(prepared);
         changes.extend(replacement.changes);
+        // The trim evicts the worst-paying entries, and the replacement can be
+        // one of them. Reporting success hands the caller a receipt for a
+        // transaction that is not in the pool — `sendrawtransaction` turns
+        // that into a success the sender acts on. Same check as
+        // `insert_entry`.
+        if !self.contains_txid(&candidate_txid) {
+            return Err(RbfError::Mempool(MempoolError::Full));
+        }
         Ok(self.finish_mutation(changes))
     }
 }
