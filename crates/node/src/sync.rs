@@ -626,7 +626,6 @@ impl BlockSync {
                     %error,
                     "block sync: chainstate torn by a failed disconnect, shutting down"
                 );
-                return;
             }
             Err(crate::reorg::ReorgError::ConnectFailed {
                 hash, invalidated, ..
@@ -673,7 +672,6 @@ impl BlockSync {
                 tracing::warn!(%error, "block sync: branch switch failed");
             }
         }
-        crate::reorg::settle_disconnect_debt(&self.handles);
     }
 
     fn retire_applied_reorg_body(&self, hash: Hash256) {

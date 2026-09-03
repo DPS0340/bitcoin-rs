@@ -21,7 +21,7 @@ use crate::{ApplyError, DisconnectError};
 
 /// Settles a rolled-back disconnect marker once the reorg owner has released
 /// its chain-transition proof.
-pub(crate) fn settle_disconnect_debt(handles: &ApplyHandles) {
+fn settle_disconnect_debt(handles: &ApplyHandles) {
     let Some(publisher) = &handles.checkpoint_publisher else {
         return;
     };
@@ -418,8 +418,15 @@ where
         for body in &connect[..progress.connected] {
             connected_body(body.hash);
         }
+        if matches!(&outcome, Ok(())) {
+            let _ = proof.finish();
+        } else {
+            drop(proof);
+        }
+        if !matches!(&outcome, Err(ReorgError::Fatal(_))) {
+            settle_disconnect_debt(handles);
+        }
         outcome?;
-        let _ = proof.finish();
         if let Some((hash, height)) = missing_connect {
             return Err(ReorgError::MissingBody { hash, height });
         }

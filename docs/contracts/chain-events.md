@@ -116,7 +116,8 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `checkpoint_settles_rolled_back_disconnect_debt`,
   `publish_checkpoint_keeps_admission_open`,
   `invalidate_block_settles_disconnect_debt`,
-  `prune_request_within_safety_margin_does_not_publish_checkpoint`.
+  `prune_request_within_safety_margin_does_not_publish_checkpoint`,
+  `switch_to_branch_settles_disconnect_debt`.
 - `crates/node/tests/crash_recovery.rs` (G11):
   `recovery_meta_write_leaves_readable_sidecar_without_tmp`,
   `torn_meta_after_crash_is_refused`,

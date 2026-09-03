@@ -3872,6 +3872,82 @@ mod tests {
     }
 
     #[test]
+    fn switch_to_branch_settles_disconnect_debt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config, None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
+        state.apply_block(&block_one)?;
+        state.publish_checkpoint()?;
+
+        let current_before = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            data_dir.join("chainstate-checkpoints/CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+
+        let genesis_id = state
+            .block_tree
+            .read()
+            .lookup(Hash256::from(genesis.block_hash()))
+            .ok_or_else(|| anyhow::anyhow!("missing genesis node"))?;
+        let mut parent = genesis_id;
+        let mut previous_hash = genesis.block_hash();
+        let mut fork_bodies = HashMap::new();
+        for height in 1..=2 {
+            let block = mined_regtest_child_at(previous_hash, genesis.header.time + 10 + height)?;
+            let node_id = state.block_tree.write().insert_node(
+                Some(parent),
+                block.header,
+                bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+            )?;
+            fork_bodies.insert(
+                Hash256::from(block.block_hash()),
+                (block.clone(), bytes::Bytes::from(consensus_bytes(&block))),
+            );
+            parent = node_id;
+            previous_hash = block.block_hash();
+        }
+
+        let handles = state.apply_handles();
+        crate::reorg::switch_to_branch(
+            &handles,
+            parent,
+            |hash| fork_bodies.get(&hash).cloned(),
+            |_| {},
+        )?;
+
+        assert!(
+            state
+                .apply_handles()
+                .undo_store
+                .load_disconnect_marker()?
+                .is_none()
+        );
+        let current_after = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            data_dir.join("chainstate-checkpoints/CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+        assert!(current_after > current_before);
+        assert_eq!(
+            state
+                .checkpoint_publisher
+                .durable_tip_height
+                .load(Ordering::Acquire),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
     fn torn_disconnect_refusal_names_authoritative_stores_to_remove() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
