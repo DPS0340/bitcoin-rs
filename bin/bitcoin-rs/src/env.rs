@@ -3,12 +3,38 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use bitcoin_rs_node::zmq_publisher::ZmqTopic;
-use bitcoin_rs_node::{NetworkSelection, ScriptIndexMode, UserConfig, ZmqOverrides};
+use bitcoin_rs_node::{NetworkSelection, ScriptIndexMode, UserConfig};
 use bitcoin_rs_storage::StorageBackend;
 
 use crate::cli::{
     parse_bool, parse_connect_list, parse_p2p_magic, parse_socket_list, parse_string_list,
 };
+
+#[derive(Copy, Clone)]
+enum EnvSetting {
+    Network,
+    P2pMagic,
+    DataDir,
+    StorageBackend,
+    RpcBind,
+    Rest,
+    RpcUser,
+    RpcPassword,
+    RpcCookie,
+    ScriptIndex,
+    P2pListen,
+    DnsSeedsEnabled,
+    Connect,
+    PruneTargetMb,
+    TxIndex,
+    DbcacheMb,
+    IndexRollbackRebuildCutover,
+    LogLevel,
+    MetricsBind,
+    AssumeValidHeight,
+    ZmqEndpoints(ZmqTopic),
+    ZmqHwm(ZmqTopic),
+}
 
 pub(crate) fn user_config_from_env(
     vars: impl Iterator<Item = (OsString, OsString)>,
@@ -18,105 +44,49 @@ pub(crate) fn user_config_from_env(
         let Some(key) = key.to_str() else {
             continue;
         };
-        if is_zmq_env_key(key) {
-            let value = environment_value(&value, key)?;
-            apply_zmq_env(&mut layer.zmq, key, value)?;
-        } else if is_general_env_key(key) {
-            apply_general_env(&mut layer, key, &value)?;
-        }
+        let Some(setting) = env_setting(key) else {
+            continue;
+        };
+        let value = environment_value(&value, key)?;
+        apply(&mut layer, setting, value)?;
     }
     Ok(layer)
 }
 
-fn is_zmq_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        "BITCOIN_RS_ZMQPUBHASHBLOCK"
-            | "BITCOIN_RS_ZMQPUBHASHTX"
-            | "BITCOIN_RS_ZMQPUBRAWBLOCK"
-            | "BITCOIN_RS_ZMQPUBRAWTX"
-            | "BITCOIN_RS_ZMQPUBSEQUENCE"
-            | "BITCOIN_RS_ZMQPUBHASHBLOCKHWM"
-            | "BITCOIN_RS_ZMQPUBHASHTXHWM"
-            | "BITCOIN_RS_ZMQPUBRAWBLOCKHWM"
-            | "BITCOIN_RS_ZMQPUBRAWTXHWM"
-            | "BITCOIN_RS_ZMQPUBSEQUENCEHWM"
-    )
-}
-
-fn is_general_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        "BITCOIN_RS_NETWORK"
-            | "BITCOIN_RS_P2P_MAGIC"
-            | "BITCOIN_RS_DATA_DIR"
-            | "BITCOIN_RS_STORAGE_BACKEND"
-            | "BITCOIN_RS_RPC_BIND"
-            | "BITCOIN_RS_REST"
-            | "BITCOIN_RS_RPC_USER"
-            | "BITCOIN_RS_RPC_PASSWORD"
-            | "BITCOIN_RS_RPC_COOKIE"
-            | "BITCOIN_RS_SCRIPTINDEX"
-            | "BITCOIN_RS_P2P_LISTEN"
-            | "BITCOIN_RS_DNS_SEEDS_ENABLED"
-            | "BITCOIN_RS_CONNECT"
-            | "BITCOIN_RS_PRUNE_TARGET_MB"
-            | "BITCOIN_RS_TXINDEX"
-            | "BITCOIN_RS_DBCACHE_MB"
-            | "BITCOIN_RS_INDEX_ROLLBACK_REBUILD_CUTOVER"
-            | "BITCOIN_RS_LOG_LEVEL"
-            | "BITCOIN_RS_METRICS_BIND"
-            | "BITCOIN_RS_ASSUME_VALID_HEIGHT"
-    )
-}
-
-fn apply_general_env(layer: &mut UserConfig, key: &str, value: &OsString) -> Result<()> {
-    let value = environment_value(value, key)?;
-    match key {
-        "BITCOIN_RS_NETWORK" => {
-            layer.network = Some(
-                value
-                    .parse::<NetworkSelection>()
-                    .map_err(anyhow::Error::msg)?,
-            );
-        }
-        "BITCOIN_RS_P2P_MAGIC" => layer.p2p.magic = Some(parse_p2p_magic(value)?),
-        "BITCOIN_RS_DATA_DIR" => layer.data_dir = Some(PathBuf::from(value)),
-        "BITCOIN_RS_STORAGE_BACKEND" => {
-            layer.storage.backend = Some(
-                value
-                    .parse::<StorageBackend>()
-                    .map_err(anyhow::Error::msg)?,
-            );
-        }
-        "BITCOIN_RS_RPC_BIND" => layer.rpc.bind = Some(value.parse()?),
-        "BITCOIN_RS_REST" => layer.rpc.rest = Some(parse_bool(value)?),
-        "BITCOIN_RS_RPC_USER" => layer.rpc.user = Some(value.to_owned()),
-        "BITCOIN_RS_RPC_PASSWORD" => layer.rpc.password = Some(value.to_owned()),
-        "BITCOIN_RS_RPC_COOKIE" => layer.rpc.cookie = Some(PathBuf::from(value)),
-        "BITCOIN_RS_SCRIPTINDEX" => {
-            layer.indexes.script_index = Some(
-                ScriptIndexMode::parse(value)
-                    .ok_or_else(|| anyhow::anyhow!("invalid scriptindex value `{value}`"))?,
-            );
-        }
-        "BITCOIN_RS_P2P_LISTEN" => layer.p2p.listen = Some(parse_socket_list(value)?),
-        "BITCOIN_RS_DNS_SEEDS_ENABLED" => layer.p2p.dns_seeds = Some(parse_bool(value)?),
-        "BITCOIN_RS_CONNECT" => layer.p2p.connect = Some(parse_connect_list(value)?),
-        "BITCOIN_RS_PRUNE_TARGET_MB" => layer.storage.prune_target_mb = Some(value.parse()?),
-        "BITCOIN_RS_TXINDEX" => layer.indexes.txindex = Some(parse_bool(value)?),
-        "BITCOIN_RS_DBCACHE_MB" => layer.storage.dbcache_mb = Some(value.parse()?),
-        "BITCOIN_RS_INDEX_ROLLBACK_REBUILD_CUTOVER" => {
-            layer.indexes.rollback_rebuild_cutover = Some(value.parse()?);
-        }
-        "BITCOIN_RS_LOG_LEVEL" => layer.observability.log_level = Some(value.to_owned()),
-        "BITCOIN_RS_METRICS_BIND" => layer.observability.metrics_bind = Some(value.parse()?),
-        "BITCOIN_RS_ASSUME_VALID_HEIGHT" => {
-            layer.validation.assume_valid_height = Some(value.parse()?);
-        }
-        _ => {}
-    }
-    Ok(())
+fn env_setting(key: &str) -> Option<EnvSetting> {
+    Some(match key {
+        "BITCOIN_RS_NETWORK" => EnvSetting::Network,
+        "BITCOIN_RS_P2P_MAGIC" => EnvSetting::P2pMagic,
+        "BITCOIN_RS_DATA_DIR" => EnvSetting::DataDir,
+        "BITCOIN_RS_STORAGE_BACKEND" => EnvSetting::StorageBackend,
+        "BITCOIN_RS_RPC_BIND" => EnvSetting::RpcBind,
+        "BITCOIN_RS_REST" => EnvSetting::Rest,
+        "BITCOIN_RS_RPC_USER" => EnvSetting::RpcUser,
+        "BITCOIN_RS_RPC_PASSWORD" => EnvSetting::RpcPassword,
+        "BITCOIN_RS_RPC_COOKIE" => EnvSetting::RpcCookie,
+        "BITCOIN_RS_SCRIPTINDEX" => EnvSetting::ScriptIndex,
+        "BITCOIN_RS_P2P_LISTEN" => EnvSetting::P2pListen,
+        "BITCOIN_RS_DNS_SEEDS_ENABLED" => EnvSetting::DnsSeedsEnabled,
+        "BITCOIN_RS_CONNECT" => EnvSetting::Connect,
+        "BITCOIN_RS_PRUNE_TARGET_MB" => EnvSetting::PruneTargetMb,
+        "BITCOIN_RS_TXINDEX" => EnvSetting::TxIndex,
+        "BITCOIN_RS_DBCACHE_MB" => EnvSetting::DbcacheMb,
+        "BITCOIN_RS_INDEX_ROLLBACK_REBUILD_CUTOVER" => EnvSetting::IndexRollbackRebuildCutover,
+        "BITCOIN_RS_LOG_LEVEL" => EnvSetting::LogLevel,
+        "BITCOIN_RS_METRICS_BIND" => EnvSetting::MetricsBind,
+        "BITCOIN_RS_ASSUME_VALID_HEIGHT" => EnvSetting::AssumeValidHeight,
+        "BITCOIN_RS_ZMQPUBHASHBLOCK" => EnvSetting::ZmqEndpoints(ZmqTopic::HashBlock),
+        "BITCOIN_RS_ZMQPUBHASHTX" => EnvSetting::ZmqEndpoints(ZmqTopic::HashTx),
+        "BITCOIN_RS_ZMQPUBRAWBLOCK" => EnvSetting::ZmqEndpoints(ZmqTopic::RawBlock),
+        "BITCOIN_RS_ZMQPUBRAWTX" => EnvSetting::ZmqEndpoints(ZmqTopic::RawTx),
+        "BITCOIN_RS_ZMQPUBSEQUENCE" => EnvSetting::ZmqEndpoints(ZmqTopic::Sequence),
+        "BITCOIN_RS_ZMQPUBHASHBLOCKHWM" => EnvSetting::ZmqHwm(ZmqTopic::HashBlock),
+        "BITCOIN_RS_ZMQPUBHASHTXHWM" => EnvSetting::ZmqHwm(ZmqTopic::HashTx),
+        "BITCOIN_RS_ZMQPUBRAWBLOCKHWM" => EnvSetting::ZmqHwm(ZmqTopic::RawBlock),
+        "BITCOIN_RS_ZMQPUBRAWTXHWM" => EnvSetting::ZmqHwm(ZmqTopic::RawTx),
+        "BITCOIN_RS_ZMQPUBSEQUENCEHWM" => EnvSetting::ZmqHwm(ZmqTopic::Sequence),
+        _ => return None,
+    })
 }
 
 fn environment_value<'a>(value: &'a OsString, key: &str) -> Result<&'a str> {
@@ -125,32 +95,55 @@ fn environment_value<'a>(value: &'a OsString, key: &str) -> Result<&'a str> {
         .with_context(|| format!("environment variable {key} is not valid UTF-8"))
 }
 
-fn apply_zmq_env(layer: &mut ZmqOverrides, key: &str, value: &str) -> Result<()> {
-    let endpoint_topic = match key {
-        "BITCOIN_RS_ZMQPUBHASHBLOCK" => Some(ZmqTopic::HashBlock),
-        "BITCOIN_RS_ZMQPUBHASHTX" => Some(ZmqTopic::HashTx),
-        "BITCOIN_RS_ZMQPUBRAWBLOCK" => Some(ZmqTopic::RawBlock),
-        "BITCOIN_RS_ZMQPUBRAWTX" => Some(ZmqTopic::RawTx),
-        "BITCOIN_RS_ZMQPUBSEQUENCE" => Some(ZmqTopic::Sequence),
-        _ => None,
-    };
-    if let Some(topic) = endpoint_topic {
-        layer.endpoints.insert(topic, parse_string_list(value));
-        return Ok(());
+fn apply(layer: &mut UserConfig, setting: EnvSetting, value: &str) -> Result<()> {
+    match setting {
+        EnvSetting::Network => {
+            layer.network = Some(
+                value
+                    .parse::<NetworkSelection>()
+                    .map_err(anyhow::Error::msg)?,
+            );
+        }
+        EnvSetting::P2pMagic => layer.p2p.magic = Some(parse_p2p_magic(value)?),
+        EnvSetting::DataDir => layer.data_dir = Some(PathBuf::from(value)),
+        EnvSetting::StorageBackend => {
+            layer.storage.backend = Some(
+                value
+                    .parse::<StorageBackend>()
+                    .map_err(anyhow::Error::msg)?,
+            );
+        }
+        EnvSetting::RpcBind => layer.rpc.bind = Some(value.parse()?),
+        EnvSetting::Rest => layer.rpc.rest = Some(parse_bool(value)?),
+        EnvSetting::RpcUser => layer.rpc.user = Some(value.to_owned()),
+        EnvSetting::RpcPassword => layer.rpc.password = Some(value.to_owned()),
+        EnvSetting::RpcCookie => layer.rpc.cookie = Some(PathBuf::from(value)),
+        EnvSetting::ScriptIndex => {
+            layer.indexes.script_index = Some(
+                ScriptIndexMode::parse(value)
+                    .ok_or_else(|| anyhow::anyhow!("invalid scriptindex value `{value}`"))?,
+            );
+        }
+        EnvSetting::P2pListen => layer.p2p.listen = Some(parse_socket_list(value)?),
+        EnvSetting::DnsSeedsEnabled => layer.p2p.dns_seeds = Some(parse_bool(value)?),
+        EnvSetting::Connect => layer.p2p.connect = Some(parse_connect_list(value)?),
+        EnvSetting::PruneTargetMb => layer.storage.prune_target_mb = Some(value.parse()?),
+        EnvSetting::TxIndex => layer.indexes.txindex = Some(parse_bool(value)?),
+        EnvSetting::DbcacheMb => layer.storage.dbcache_mb = Some(value.parse()?),
+        EnvSetting::IndexRollbackRebuildCutover => {
+            layer.indexes.rollback_rebuild_cutover = Some(value.parse()?);
+        }
+        EnvSetting::LogLevel => layer.observability.log_level = Some(value.to_owned()),
+        EnvSetting::MetricsBind => layer.observability.metrics_bind = Some(value.parse()?),
+        EnvSetting::AssumeValidHeight => {
+            layer.validation.assume_valid_height = Some(value.parse()?);
+        }
+        EnvSetting::ZmqEndpoints(topic) => {
+            layer.zmq.endpoints.insert(topic, parse_string_list(value));
+        }
+        EnvSetting::ZmqHwm(topic) => {
+            layer.zmq.hwm.insert(topic, value.parse()?);
+        }
     }
-
-    let hwm_topic = match key {
-        "BITCOIN_RS_ZMQPUBHASHBLOCKHWM" => Some(ZmqTopic::HashBlock),
-        "BITCOIN_RS_ZMQPUBHASHTXHWM" => Some(ZmqTopic::HashTx),
-        "BITCOIN_RS_ZMQPUBRAWBLOCKHWM" => Some(ZmqTopic::RawBlock),
-        "BITCOIN_RS_ZMQPUBRAWTXHWM" => Some(ZmqTopic::RawTx),
-        "BITCOIN_RS_ZMQPUBSEQUENCEHWM" => Some(ZmqTopic::Sequence),
-        _ => None,
-    };
-    if let Some(topic) = hwm_topic {
-        layer.hwm.insert(topic, value.parse()?);
-        return Ok(());
-    }
-
-    unreachable!("only known ZMQ environment keys are dispatched")
+    Ok(())
 }
