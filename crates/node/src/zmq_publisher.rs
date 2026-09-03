@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// ZMQ PUB notification topic.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum ZmqTopic {
     /// Block hash notification.
     HashBlock,

@@ -69,8 +69,6 @@ Status: COMPLETED — three runs, medians of medians, spread recorded.
 
 ## Notes
 
-- No bitcoin_conf_compat alias: this is not a Core knob and that file is
-  outside this leaf.
 - `cutover = 0` means every resolvable stale watermark rebuilds (legal
   operator choice, documented in `Config` rustdoc); `u32::MAX` restores the
   pre-cutover rewind-at-any-depth behavior.

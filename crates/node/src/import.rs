@@ -62,8 +62,8 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = true;
+        config.p2p.listen.clear();
+        config.indexes.txindex = true;
         let state = NodeState::open(config, None)?;
         let outcome = import_block(&state, &bytes)?;
 
@@ -233,7 +233,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
@@ -280,7 +280,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Mainnet);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
@@ -325,7 +325,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
@@ -374,7 +374,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
@@ -404,7 +404,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
@@ -444,7 +444,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
 
         let _genesis = import_block(&state, &genesis_bytes)?;
@@ -478,7 +478,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
@@ -556,7 +556,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let _genesis = import_block(&state, &genesis_bytes)?;
 
@@ -591,7 +591,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let synthetic_tip = seed_synthetic_header_tip(&state, 499)?;
 

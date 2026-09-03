@@ -462,7 +462,7 @@ impl Heartbeat {
 pub(crate) struct TxIndexOpenSpec {
     pub(crate) data_dir: PathBuf,
     pub(crate) namespace: &'static str,
-    pub(crate) storage_backend: String,
+    pub(crate) storage_backend: bitcoin_rs_storage::StorageBackend,
     pub(crate) cache_bytes: u64,
     #[allow(dead_code)]
     pub(crate) batch_limits: PreparedBatchLimits,
@@ -769,7 +769,7 @@ fn run_worker_with_open(
     let heartbeat = Heartbeat::start(
         "txindex",
         spec.namespace.to_owned(),
-        spec.storage_backend.clone(),
+        spec.storage_backend.to_string(),
     );
 
     let worker_result = open_and_run(
@@ -863,7 +863,7 @@ fn open_and_run(
         .map_err(|e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::Io(e)))?;
 
     let open: OpenTxIndex = open_tx_index_with_timeout(
-        &spec.storage_backend,
+        spec.storage_backend,
         &txindex_dir,
         spec.cache_bytes,
         spec.batch_limits,
@@ -940,7 +940,7 @@ fn open_and_run(
 /// kill a thread) and `OpenTimeout` is returned so the worker publishes
 /// `Failed` and the node stays operable without the index.
 fn open_tx_index_with_timeout(
-    storage_backend: &str,
+    storage_backend: bitcoin_rs_storage::StorageBackend,
     txindex_dir: &Path,
     cache_bytes: u64,
     batch_limits: PreparedBatchLimits,
@@ -948,12 +948,12 @@ fn open_tx_index_with_timeout(
     shutdown: &Arc<AtomicBool>,
 ) -> Result<OpenTxIndex, TxIndexWorkerError> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let backend = storage_backend.to_owned();
+    let backend = storage_backend;
     let dir = txindex_dir.to_path_buf();
     let _join = thread::Builder::new()
         .name("bitcoin-rs-txindex-open".to_owned())
         .spawn(move || {
-            let result = open_tx_index_on_worker(&backend, &dir, cache_bytes, batch_limits, epoch);
+            let result = open_tx_index_on_worker(backend, &dir, cache_bytes, batch_limits, epoch);
             let _ = tx.send(result);
         })
         .map_err(|e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::Io(e)))?;
@@ -970,7 +970,7 @@ fn open_tx_index_with_timeout(
         if remaining.is_zero() {
             tracing::error!(
                 timeout_secs = timeout.as_secs(),
-                backend = storage_backend,
+                backend = %storage_backend,
                 dir = %txindex_dir.display(),
                 "txindex store open timed out — the storage engine recovery \
                  appears stuck; detaching the open thread and publishing Failed"
@@ -1001,7 +1001,7 @@ static OPEN_DELAY_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// Opens the txindex store on the worker thread, preserving all backend
 /// constructors, cache paths, and batch limits.
 fn open_tx_index_on_worker(
-    storage_backend: &str,
+    storage_backend: bitcoin_rs_storage::StorageBackend,
     txindex_dir: &Path,
     cache_bytes: u64,
     batch_limits: PreparedBatchLimits,
@@ -1016,7 +1016,7 @@ fn open_tx_index_on_worker(
     }
     match storage_backend {
         #[cfg(feature = "rocksdb")]
-        "rocksdb" => {
+        bitcoin_rs_storage::StorageBackend::RocksDb => {
             let store = Arc::new(
                 bitcoin_rs_storage::RocksDbStore::open_with_cache(txindex_dir, cache_bytes)
                     .map_err(|e| {
@@ -1026,7 +1026,7 @@ fn open_tx_index_on_worker(
             open_tx_index_store_on_worker(store, batch_limits, epoch)
         }
         #[cfg(feature = "fjall")]
-        "fjall" => {
+        bitcoin_rs_storage::StorageBackend::Fjall => {
             let store = Arc::new(
                 bitcoin_rs_storage::FjallStore::open_with_cache(txindex_dir, cache_bytes).map_err(
                     |e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(e)),
@@ -1035,7 +1035,7 @@ fn open_tx_index_on_worker(
             open_tx_index_store_on_worker(store, batch_limits, epoch)
         }
         #[cfg(feature = "redb")]
-        "redb" => {
+        bitcoin_rs_storage::StorageBackend::Redb => {
             let store = Arc::new(
                 bitcoin_rs_storage::open_redb_tx_index_store_with_cache(txindex_dir, cache_bytes)
                     .map_err(|e| {
@@ -1045,7 +1045,7 @@ fn open_tx_index_on_worker(
             open_tx_index_store_on_worker(store, batch_limits, epoch)
         }
         #[cfg(feature = "mdbx")]
-        "mdbx" => {
+        bitcoin_rs_storage::StorageBackend::Mdbx => {
             let store = Arc::new(
                 bitcoin_rs_storage::MdbxStore::open_with_cache(txindex_dir, cache_bytes).map_err(
                     |e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(e)),
@@ -1053,6 +1053,12 @@ fn open_tx_index_on_worker(
             );
             open_tx_index_store_on_worker(store, batch_limits, epoch)
         }
+        #[cfg(any(
+            not(feature = "rocksdb"),
+            not(feature = "fjall"),
+            not(feature = "redb"),
+            not(feature = "mdbx")
+        ))]
         other => Err(TxIndexWorkerError::Storage(
             bitcoin_rs_storage::StorageError::Backend(format!(
                 "unsupported storage backend for txindex: {other}"

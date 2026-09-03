@@ -18,7 +18,9 @@ workspace = true
 [dependencies]
 mimalloc.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 bitcoin-rs-node.workspace = true
+bitcoin-rs-storage.workspace = true
 
 [dev-dependencies]
 parking_lot.workspace = true

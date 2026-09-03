@@ -81,9 +81,8 @@ bitcoin-rs-mining.workspace = true
 bitcoin-rs-rpc.workspace = true
 
 bitcoin.workspace = true
+libc.workspace = true
 bytes.workspace = true
-clap.workspace = true
-toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 crossbeam-channel.workspace = true

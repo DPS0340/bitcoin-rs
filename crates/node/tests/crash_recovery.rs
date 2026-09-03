@@ -38,8 +38,11 @@ fn available_backends() -> Vec<&'static str> {
 fn make_config(temp: &tempfile::TempDir, backend: &str) -> NodeConfig {
     let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join(format!("node-{backend}"));
-    backend.clone_into(&mut config.storage_backend);
-    config.p2p_listen.clear();
+    config.storage.backend = match backend.parse() {
+        Ok(backend) => backend,
+        Err(error) => panic!("known backend: {error}"),
+    };
+    config.p2p.listen.clear();
     config
 }
 

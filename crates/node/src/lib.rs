@@ -12,8 +12,6 @@ extern crate alloc;
 pub mod apply;
 /// BIP9 deployment-state adapter over `BlockTree`.
 pub mod bip9_context;
-/// Bitcoin Core configuration compatibility.
-pub mod bitcoin_conf_compat;
 /// Adapter.
 ///
 /// Bridges in-memory block records to the index crate's BlockSource trait.
@@ -79,7 +77,12 @@ pub mod zmq_publisher;
 
 pub use bitcoin_rs_primitives::Network;
 pub use block_source::NodeBlockSource;
-pub use config::{Auth, NodeConfig, RuntimeInputs, ScriptIndexMode, UserConfig};
+pub use config::{
+    Auth, IndexConfig, IndexOverrides, NetworkSelection, NodeConfig, ObservabilityConfig,
+    ObservabilityOverrides, P2pConfig, P2pOverrides, RpcConfig, RpcOverrides, RuntimeInputs,
+    ScriptIndexMode, StorageConfig, StorageOverrides, UserConfig, ValidationConfig,
+    ValidationOverrides, ZmqOverrides, ZmqPublication, resolve,
+};
 pub use embed::{Node, NodeError, SyncProgress};
 pub use mining::{GenerationKey, MiningCoordinator};
 pub use p2p_chain::NodeP2pChainQuery;
