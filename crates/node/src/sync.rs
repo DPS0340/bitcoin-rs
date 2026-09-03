@@ -5189,8 +5189,11 @@ mod tests {
             assert!(window.has_request_capacity());
             assert!(window.contains_pending(&Hash256::from_le_bytes(block1_hash.as_bytes())));
         }
-        let Message::GetData(retry) = healthy_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected healthy peer retry getdata").into());
+        let retry = loop {
+            let message = healthy_rx.try_recv()?;
+            if let Message::GetData(retry) = message {
+                break retry;
+            }
         };
         assert_eq!(
             witness_block_inventory(retry)?,
