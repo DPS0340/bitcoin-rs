@@ -1137,7 +1137,10 @@ mod writer_shutdown_tests {
     use std::cell::Cell;
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     use bitcoin::p2p::Magic;
@@ -1162,6 +1165,183 @@ mod writer_shutdown_tests {
 
     fn ping_len() -> usize {
         crate::wire::wire_len(&crate::Message::Ping(9)).expect("ping encodes")
+    }
+
+    fn peer_info(addr: SocketAddr, start_height: i32) -> crate::PeerInfo {
+        crate::PeerInfo {
+            addr,
+            version: 70_016,
+            services: 1,
+            user_agent: String::from("/test/"),
+            start_height,
+            conn_time: 0,
+            inbound: false,
+        }
+    }
+
+    #[test]
+    fn sinks_stamp_exact_connection_source() -> Result<(), Box<dyn std::error::Error>> {
+        let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let (blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
+        let sinks = InboundSyncSinks {
+            headers_tx,
+            blocks_tx,
+            wake_tx: None,
+        };
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_443));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block_bytes = bitcoin::consensus::encode::serialize(&genesis);
+        let block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
+            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
+        let serialized = bytes::Bytes::from(block_bytes);
+        let source = lease.source(addr);
+
+        sinks.send_headers(source, Vec::new());
+        sinks.send_block(source, block, serialized.clone());
+
+        assert_eq!(headers_rx.try_recv()?.source, Some(source));
+        let received = blocks_rx.try_recv()?;
+        assert_eq!(received.source, Some(source));
+        assert_eq!(received.serialized, serialized);
+        Ok(())
+    }
+
+    #[test]
+    fn message_loop_exits_before_read_when_cancelled() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_444));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        lease.cancel();
+        let mut peer = Peer::new(
+            ScriptedStream {
+                script: io::Cursor::new(Vec::new()),
+            },
+            Magic::BITCOIN,
+        );
+        peer.state = PeerState::Ready;
+
+        let sinks = InboundSyncSinks {
+            headers_tx: crossbeam_channel::unbounded().0,
+            blocks_tx: crossbeam_channel::unbounded().0,
+            wake_tx: None,
+        };
+        assert!(run_message_loop(&mut peer, addr, &lease, &sinks, None, None).is_ok());
+    }
+
+    #[test]
+    fn message_loop_exits_after_replacement_during_read() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_445));
+        let table = crate::PeerTable::new();
+        let (old_tx, _old_rx) = crossbeam_channel::unbounded();
+        let old = crate::PeerLease::new(old_tx);
+        table.register(addr, old.clone());
+        let (replacement_tx, _replacement_rx) = crossbeam_channel::unbounded();
+        let replacement = crate::PeerLease::new(replacement_tx);
+        table.register(addr, replacement.clone());
+
+        let mut wire = Vec::new();
+        crate::wire::write_message(
+            &mut wire,
+            Magic::BITCOIN,
+            &crate::Message::Headers(Vec::new()),
+        )
+        .expect("headers encodes");
+        let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let sinks = InboundSyncSinks {
+            headers_tx,
+            blocks_tx: crossbeam_channel::unbounded().0,
+            wake_tx: None,
+        };
+        let mut peer = Peer::new(
+            ScriptedStream {
+                script: io::Cursor::new(wire),
+            },
+            Magic::BITCOIN,
+        );
+        peer.state = PeerState::Ready;
+
+        assert!(run_message_loop(&mut peer, addr, &old, &sinks, None, None).is_ok());
+        assert!(headers_rx.try_recv().is_err());
+        assert!(old.is_cancelled());
+        assert!(table.is_current(replacement.source(addr)));
+    }
+
+    struct ContinuingStream(Arc<AtomicUsize>);
+
+    impl io::Read for ContinuingStream {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Err(io::ErrorKind::UnexpectedEof.into())
+            }
+        }
+    }
+
+    impl io::Write for ContinuingStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn message_loop_keeps_current_lease_running() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_446));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        let mut peer = Peer::new(ContinuingStream(Arc::clone(&reads)), Magic::BITCOIN);
+        peer.state = PeerState::Ready;
+        let sinks = InboundSyncSinks {
+            headers_tx: crossbeam_channel::unbounded().0,
+            blocks_tx: crossbeam_channel::unbounded().0,
+            wake_tx: None,
+        };
+
+        assert!(run_message_loop(&mut peer, addr, &lease, &sinks, None, None).is_err());
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn registration_cancels_replaced_lease() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_447));
+        let table = crate::PeerTable::new();
+        let (old_tx, _old_rx) = crossbeam_channel::unbounded();
+        let old = crate::PeerLease::new(old_tx);
+        table.register(addr, old.clone());
+        let (replacement_tx, _replacement_rx) = crossbeam_channel::unbounded();
+        let replacement = crate::PeerLease::new(replacement_tx);
+
+        assert!(table.register(addr, replacement.clone()));
+        table.publish_info(addr, &replacement, peer_info(addr, 2));
+        assert!(old.is_cancelled());
+        assert!(table.is_current(replacement.source(addr)));
+        assert_eq!(table.infos(), vec![peer_info(addr, 2)]);
+    }
+
+    #[test]
+    fn stale_release_preserves_replacement_and_current_release_removes_it() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_448));
+        let table = crate::PeerTable::new();
+        let (stale_tx, _stale_rx) = crossbeam_channel::unbounded();
+        let stale = crate::PeerLease::new(stale_tx);
+        let (current_tx, _current_rx) = crossbeam_channel::unbounded();
+        let current = crate::PeerLease::new(current_tx);
+        table.register(addr, current.clone());
+        table.publish_info(addr, &current, peer_info(addr, 2));
+
+        assert!(!table.remove_current(addr, &stale));
+        assert!(!current.is_cancelled());
+        assert!(table.is_current(current.source(addr)));
+        assert!(table.remove_current(addr, &current));
+        assert!(current.is_cancelled());
+        assert!(table.is_empty());
     }
 
     /// Test-only writer that admits exactly `remaining` bytes, then blocks

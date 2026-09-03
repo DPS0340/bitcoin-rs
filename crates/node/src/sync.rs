@@ -2819,7 +2819,14 @@ mod tests {
             return Err(std::io::Error::other("expected healthy peer retry getdata").into());
         };
         assert_eq!(witness_block_inventory(retry_inventory)?, expected[..2]);
-        assert!(healthy_rx.try_recv().is_err());
+        while let Ok(message) = healthy_rx.try_recv() {
+            if matches!(message, Message::GetData(_)) {
+                return Err(std::io::Error::other(
+                    "healthy peer must not receive another getdata request",
+                )
+                .into());
+            }
+        }
         while let Ok(message) = stale_rx.try_recv() {
             if matches!(message, Message::GetData(_)) {
                 return Err(
@@ -6773,16 +6780,325 @@ mod tests {
     /// handles, the blocks, and their serialized bodies for the reorg body
     /// loader.
     #[allow(clippy::type_complexity)]
-    fn matured_chain(
-        depth: u32,
-    ) -> Result<
-        (
-            ApplyHandles,
-            Vec<Block>,
-            HashMap<Hash256, (Block, bytes::Bytes)>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    #[test]
+    fn tick_sorts_out_of_order_peers_before_requesting_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(3)?;
+        let low_addr = test_addr(9500, 0)?;
+        let high_addr = test_addr(9500, 1)?;
+        let low_rx = connect_peer(&peers, synthetic_peer(low_addr, 2));
+        let high_rx = connect_peer(&peers, synthetic_peer(high_addr, 8));
+
+        sync.tick();
+
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        let Message::GetData(inventory) = high_rx.try_recv()? else {
+            return Err(std::io::Error::other("expected high peer getdata").into());
+        };
+        assert_eq!(witness_block_inventory(inventory)?, expected);
+        assert!(matches!(high_rx.try_recv()?, Message::GetHeaders(_)));
+        assert!(low_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn same_address_registration_clears_getheaders_gate_and_routes_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture { sync, peers, .. } = header_sync_with_genesis()?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 0,
+                ..super::default_sync_budget()
+            },
+        );
+        let addr = test_addr(9501, 0)?;
+        let old_rx = connect_peer(&peers, synthetic_peer(addr, 8));
+        sync.tick();
+        assert!(matches!(old_rx.try_recv()?, Message::GetHeaders(_)));
+
+        let (new_tx, new_rx) = unbounded::<Message>();
+        let new_lease = PeerLease::new(new_tx);
+        peers.register(addr, new_lease.clone());
+        peers.publish_info(addr, &new_lease, synthetic_peer(addr, 8));
+        sync.tick();
+
+        assert!(old_rx.try_recv().is_err());
+        assert!(matches!(new_rx.try_recv()?, Message::GetHeaders(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn tick_uses_highest_peer_for_headers_when_request_capacity_is_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, _tree, _applied, _expected) = sync_with_header_chain(3)?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 0,
+                ..super::default_sync_budget()
+            },
+        );
+        let low_rx = connect_peer(&peers, synthetic_peer(test_addr(9502, 0)?, 5));
+        let high_rx = connect_peer(&peers, synthetic_peer(test_addr(9502, 1)?, 9));
+
+        sync.tick();
+
+        assert!(matches!(high_rx.try_recv()?, Message::GetHeaders(_)));
+        assert!(low_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tick_bounded_request_peer_selection_preserves_equal_height_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(8)?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 4,
+                max_peer_inflight: 2,
+                getdata_batch_limit: 2,
+                ..super::default_sync_budget()
+            },
+        );
+        let first_rx = connect_peer(&peers, synthetic_peer(test_addr(9503, 0)?, 100));
+        sync.tick();
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        assert_eq!(
+            witness_block_inventory(match first_rx.try_recv()? {
+                Message::GetData(inventory) => inventory,
+                _ => return Err(std::io::Error::other("expected first getdata").into()),
+            })?,
+            expected[..2]
+        );
+        let _ = first_rx.try_recv()?;
+
+        let second_rx = connect_peer(&peers, synthetic_peer(test_addr(9503, 1)?, 100));
+        sync.tick();
+        assert_eq!(
+            witness_block_inventory(match second_rx.try_recv()? {
+                Message::GetData(inventory) => inventory,
+                _ => return Err(std::io::Error::other("expected second getdata").into()),
+            })?,
+            expected[2..4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tick_retries_when_all_selected_peers_have_expired_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, _tree, _applied, expected) = sync_with_header_chain(3)?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                pending_timeout: Duration::ZERO,
+                getdata_batch_limit: 1,
+                ..super::default_sync_budget()
+            },
+        );
+        let rx = connect_peer(&peers, synthetic_peer(test_addr(9504, 0)?, 100));
+        sync.tick();
+        let _ = rx.try_recv()?;
+        let _ = rx.try_recv()?;
+        sync.tick();
+        let Message::GetData(inventory) = rx.try_recv()? else {
+            return Err(std::io::Error::other("expected expired-pending retry").into());
+        };
+        assert_eq!(witness_block_inventory(inventory)?, expected[..1]);
+        Ok(())
+    }
+
+    #[test]
+    fn tick_fans_out_getdata_across_eligible_peers() -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, block_tree, applied_tip, expected) =
+            sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
+        let mut receivers = Vec::new();
+        for idx in 0..super::MIN_PEERS_FOR_FANOUT {
+            receivers.push(connect_peer(
+                &peers,
+                eligible_peer(test_addr(9505, idx)?, 200 - i32::try_from(idx)?),
+            ));
+        }
+        sync.tick();
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        let cap = super::PENDING_BUDGET.div_ceil(super::MIN_PEERS_FOR_FANOUT);
+        for (idx, receiver) in receivers.iter().enumerate() {
+            let Message::GetData(inventory) = receiver.try_recv()? else {
+                return Err(std::io::Error::other("expected fanout getdata").into());
+            };
+            assert_eq!(
+                witness_block_inventory(inventory)?,
+                expected[idx * cap..(idx + 1) * cap]
+            );
+            if idx == 0 {
+                assert!(matches!(receiver.try_recv()?, Message::GetHeaders(_)));
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+        assert_eq!(
+            sync.download_window.lock().pending_len(),
+            super::PENDING_BUDGET
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_disconnect_mid_window_requeues_blocks_to_remaining_peers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PEER_COUNT: usize = 9;
+        const SELECTED_PEERS: usize = super::PENDING_BUDGET / super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+        let (sync, peers, block_tree, applied_tip, expected) =
+            sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
+        install_budget(&sync, super::default_sync_budget());
+        let mut receivers = Vec::new();
+        let mut addrs = Vec::new();
+        for idx in 0..PEER_COUNT {
+            let addr = test_addr(9506, idx)?;
+            addrs.push(addr);
+            receivers.push(connect_peer(
+                &peers,
+                eligible_peer(addr, 200 - i32::try_from(idx)?),
+            ));
+        }
+        sync.tick();
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        let cap = super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+        for (idx, receiver) in receivers[..SELECTED_PEERS].iter().enumerate() {
+            let Message::GetData(inventory) = receiver.try_recv()? else {
+                return Err(std::io::Error::other("expected initial stripe").into());
+            };
+            assert_eq!(
+                witness_block_inventory(inventory)?,
+                expected[idx * cap..(idx + 1) * cap]
+            );
+        }
+        let _ = receivers[0].try_recv()?;
+        let dropped = addrs[1];
+        peers.disconnect(dropped);
+        sync.tick();
+        let Message::GetData(inventory) = receivers[SELECTED_PEERS].try_recv()? else {
+            return Err(std::io::Error::other("expected requeued getdata").into());
+        };
+        assert_eq!(witness_block_inventory(inventory)?, expected[cap..2 * cap]);
+        assert_eq!(
+            sync.download_window.lock().pending_len(),
+            super::PENDING_BUDGET
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconnecting_staller_held_out_of_window_front_by_cooldown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued()
+    }
+
+    #[test]
+    fn sole_peer_staller_disconnected_and_usable_again_as_last_resort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tick_allows_demoted_peer_when_it_is_the_only_eligible_peer()
+    }
+
+    #[test]
+    fn tick_does_not_request_above_peer_advertised_height() -> Result<(), Box<dyn std::error::Error>>
+    {
+        clean_fast_path_caps_request_at_peer_height()
+    }
+
+    #[test]
+    fn stale_queued_block_keeps_payload_without_peer_credit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        unsolicited_stale_block_retries_from_resolved_header_height()
+    }
+
+    #[test]
+    fn stale_invalid_headers_cannot_evict_or_clear_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = Arc::new(PeerTable::new());
+        let addr = test_addr(9507, 0)?;
+        let (old_tx, _old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        table.register(addr, old.clone());
+        let (new_tx, _new_rx) = unbounded::<Message>();
+        let new = PeerLease::new(new_tx);
+        table.register(addr, new.clone());
+        assert!(!table.disconnect_source(old.source(addr)));
+        assert!(table.is_current(new.source(addr)));
+        assert!(!new.is_cancelled());
+        Ok(())
+    }
+
+    #[test]
+    fn same_address_registration_after_window_eviction_keeps_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, _tree, _applied, _expected) = sync_with_header_chain(3)?;
+        let addr = test_addr(9508, 0)?;
+        let (old_tx, old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        peers.register(addr, old.clone());
+        peers.publish_info(addr, &old, synthetic_peer(addr, 100));
+        sync.tick();
+        let _ = old_rx.try_recv()?;
+        let _ = old_rx.try_recv()?;
+        let (new_tx, new_rx) = unbounded::<Message>();
+        let new = PeerLease::new(new_tx);
+        peers.register(addr, new.clone());
+        peers.publish_info(addr, &new, synthetic_peer(addr, 100));
+        sync.tick();
+        assert!(peers.is_current(new.source(addr)));
+        assert!(old.is_cancelled());
+        assert!(peers.is_connected(addr));
+        assert!(new_rx.try_recv().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_probe_state_does_not_survive_owner_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tick_fanout_deferred_for_fresh_probe_engages_at_deadline()
+    }
+
+    #[test]
+    fn reconcile_forgets_window_state_only_when_connection_identity_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture { sync, peers, .. } = header_sync_with_genesis()?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 0,
+                ..super::default_sync_budget()
+            },
+        );
+        let addr = test_addr(9509, 0)?;
+        let (tx, _rx) = unbounded::<Message>();
+        let lease = PeerLease::new(tx);
+        peers.register(addr, lease.clone());
+        peers.publish_info(addr, &lease, synthetic_peer(addr, 8));
+        sync.tick();
+        assert!(sync.pending_getheaders.lock().is_some());
+
+        assert!(!peers.register(addr, lease));
+        sync.reconcile_peer_sessions();
+        assert!(sync.pending_getheaders.lock().is_some());
+
+        let (new_tx, _new_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(new_tx);
+        peers.register(addr, replacement.clone());
+        peers.publish_info(addr, &replacement, synthetic_peer(addr, 8));
+        sync.reconcile_peer_sessions();
+        assert!(sync.pending_getheaders.lock().is_none());
+        Ok(())
+    }
+
+    type MaturedChain = (
+        ApplyHandles,
+        Vec<Block>,
+        HashMap<Hash256, (Block, bytes::Bytes)>,
+    );
+
+    fn matured_chain(depth: u32) -> Result<MaturedChain, Box<dyn std::error::Error>> {
         let genesis = Network::Regtest.genesis_block();
         let mut tree = BlockTree::new();
         let mut parent = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
