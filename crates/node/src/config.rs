@@ -473,15 +473,28 @@ impl NodeConfig {
             "rocksdb" | "fjall" | "redb" | "mdbx" => {}
             other => bail!("unsupported storage backend {other}"),
         }
-        if self.blockfilterindex {
+        ensure!(
+            self.script_index.has_live_store(),
+            "scriptindex=utxo is not yet usable: the compact live-output store it \
+             requires does not exist (#225). Only `full` and `disabled` are accepted."
+        );
+
+        let mut endpoints = HashSet::new();
+        for group in &self.notifications.zmq {
             ensure!(
-                self.txindex || self.script_index.is_enabled(),
-                "blockfilterindex requires txindex"
+                endpoints.insert(&group.endpoint),
+                "duplicate ZMQ endpoint: {}",
+                group.endpoint
             );
             ensure!(
-                self.prune_target_mb == 0,
-                "blockfilterindex requires prune disabled"
+                group.effective_hwm() <= i32::MAX as u32,
+                "ZMQ HWM exceeds libzmq's signed SNDHWM range: {}",
+                group.effective_hwm()
             );
+            let mut topics = HashSet::new();
+            for topic in &group.topics {
+                ensure!(topics.insert(topic), "duplicate ZMQ topic on endpoint: {}", group.endpoint);
+            }
         }
         ensure!(
             self.script_index.has_live_store(),
