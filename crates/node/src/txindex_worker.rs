@@ -1979,7 +1979,7 @@ impl Worker {
             let coins = utxo.with_stable_view(|view| {
                 let mut coins = Vec::new();
                 view.for_each_all(|outpoint, script| {
-                    coins.push((outpoint.clone(), ScriptHash::from_script_bytes(script)));
+                    coins.push((*outpoint, ScriptHash::from_script_bytes(script)));
                 });
                 coins
             });
