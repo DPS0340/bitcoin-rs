@@ -674,13 +674,12 @@ fn seeding_resets_partial_rows_and_stamps_once() -> Result<(), Box<dyn std::erro
             .capability_watermark(IndexCapability::ScriptLive)?
             .is_none()
     );
-    assert_eq!(
+    assert!(
         writer
             .indexer()
             .iter_live_outpoints(stale_scripthash)?
-            .len(),
-        1,
-        "the fixture must represent deferred rows left by an interrupted seed"
+            .is_empty(),
+        "partial rows must remain unavailable until the live watermark is stamped"
     );
 
     writer.reset_capabilities(IndexCapabilities::SCRIPT_LIVE)?;
