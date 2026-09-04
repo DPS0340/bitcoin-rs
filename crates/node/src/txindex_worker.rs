@@ -2253,7 +2253,18 @@ impl Worker {
         let anchors = if capabilities.script_live {
             let mut anchors = Vec::with_capacity(sub_chunk.len());
             for identity in sub_chunk {
-                anchors.push(self.live_anchor(identity.height, identity.hash)?);
+                match self.live_anchor(identity.height, identity.hash) {
+                    Ok(anchor) => anchors.push(anchor),
+                    Err(error @ TxIndexWorkerError::UndoUnavailable { .. }) => {
+                        *pending = None;
+                        self.writer
+                            .reset_capabilities(IndexCapabilities::SCRIPT_LIVE)
+                            .map_err(TxIndexWorkerError::Index)?;
+                        tracing::warn!(error = %error, "rebuilding ScriptLive after pruned undo");
+                        return Ok(ChunkAction::Stalled);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Some(anchors)
         } else {
