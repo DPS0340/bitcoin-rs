@@ -32,7 +32,7 @@ pub(crate) struct CapabilityInputs {
     /// Whether the Core `--txindex` surface or its script-index dependency is enabled.
     pub txindex_enabled: bool,
     /// Exact index families this node maintains. Progress and Ready use this
-    /// set so `scriptindex=utxo` is not judged against a missing TxLookup watermark.
+    /// set so `scriptindex=utxo` is not judged against a missing `TxLookup` watermark.
     pub index_capabilities: IndexCapabilities,
 }
 

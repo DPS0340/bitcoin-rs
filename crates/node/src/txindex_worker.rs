@@ -3581,19 +3581,17 @@ impl TxIndexQueryEngine {
             && (!required.script_live || at_tip(script_live));
         let watermark_height =
             |watermark: Option<IndexWatermark>| watermark.map_or(0, |watermark| watermark.height);
-        let mut processed = None;
-        if required.tx_lookup {
-            processed = Some(watermark_height(tx));
-        }
-        if required.script_history {
-            let height = watermark_height(script_index);
-            processed = Some(processed.map_or(height, |current| current.min(height)));
-        }
-        if required.script_live {
-            let height = watermark_height(script_live);
-            processed = Some(processed.map_or(height, |current| current.min(height)));
-        }
-        let best_block_height = processed.unwrap_or(0);
+        let best_block_height = [
+            required.tx_lookup.then(|| watermark_height(tx)),
+            required
+                .script_history
+                .then(|| watermark_height(script_index)),
+            required.script_live.then(|| watermark_height(script_live)),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0);
 
         self.query_health()?;
         let tip_after = self.applied_tip.load();

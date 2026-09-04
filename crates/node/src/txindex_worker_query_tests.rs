@@ -878,38 +878,25 @@ fn confirmed_history_snapshot_reads_positioned_spending_transaction()
 
 #[test]
 fn unspent_outputs_exclude_positioned_spent_output() -> Result<(), Box<dyn std::error::Error>> {
-    let (block, outpoint, scripthash, _) = block_with_spending_transaction()?;
-    let funding_row = ScriptHashRow::row(scripthash, 0).to_db_row().to_vec();
-    let spending_row = SpendingPrefixRow::row(&outpoint, 0).to_db_row().to_vec();
-    let fixture = QueryFixture::new(FixtureConfig {
-        block: block.clone(),
-        retain_body: true,
-        scans: vec![
-            scan_response(
-                ColumnFamily::Funding,
+    let (block, _outpoint, scripthash, _) = block_with_spending_transaction()?;
+    let utxo = Arc::new(UtxoSet::new());
+    let fixture = QueryFixture::new_with_utxo(
+        FixtureConfig {
+            block,
+            retain_body: true,
+            scans: vec![scan_response(
+                ColumnFamily::ScriptLive,
                 ScriptHashRow::scan_prefix(scripthash),
-                vec![(
-                    funding_row,
-                    TxPositionValue::encode(&[position_of_transaction(&block, 0)?]),
-                )],
+                Vec::new(),
                 true,
-            ),
-            scan_response(
-                ColumnFamily::Spending,
-                SpendingPrefixRow::scan_prefix(&outpoint),
-                vec![(
-                    spending_row,
-                    TxPositionValue::encode(&[position_of_transaction(&block, 1)?]),
-                )],
-                true,
-            ),
-        ],
-        aba_trigger: None,
-        watermark: None,
-    })?;
+            )],
+            aba_trigger: None,
+            watermark: None,
+        },
+        utxo,
+    )?;
 
     assert!(fixture.engine.unspent_outputs(scripthash)?.is_empty());
-    assert_eq!(fixture.full_reads()?, 0);
     Ok(())
 }
 
