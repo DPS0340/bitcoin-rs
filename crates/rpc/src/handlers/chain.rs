@@ -295,6 +295,7 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
 }
 
 pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    ctx.with_stable_chainstate(|| {
     // Bitcoin Core's default: one month of ten-minute blocks.
     const DEFAULT_WINDOW: u64 = 30 * 24 * 6; // ~1 month of 10-min blocks
 
@@ -311,7 +312,7 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
                 return Err(RpcError::NotFound("block not found"));
             };
             if ctx.block_hash_at_height(height) != Some(hash) {
-                return Err(RpcError::InvalidParams("Block is not in main chain"));
+                return Err(RpcError::InvalidParameter("Block is not in main chain".to_owned()));
             }
             hash
         }
@@ -319,7 +320,7 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     let tip_height = ctx
         .height_for_hash(tip_hash)
         .unwrap_or_else(|| ctx.applied_height());
-    let default_window = DEFAULT_WINDOW.min(u64::from(tip_height));
+    let default_window = DEFAULT_WINDOW.min(u64::from(tip_height.saturating_sub(1)));
     let window_block_count = match array.first().filter(|value| !value.is_null()) {
         None => default_window,
         Some(value) => {
@@ -327,8 +328,8 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
                 .as_u64()
                 .ok_or(RpcError::InvalidType("nblocks must be a number"))?;
             if nblocks > 0 && nblocks >= u64::from(tip_height) {
-                return Err(RpcError::InvalidParams(
-                    "Invalid block count: should be between 0 and the block's height - 1",
+                return Err(RpcError::InvalidParameter(
+                    "Invalid block count: should be between 0 and the block's height - 1".to_owned(),
                 ));
             }
             nblocks
@@ -385,7 +386,7 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     } else {
         None
     };
-    typed_to_sonic(&v31::GetChainTxStats {
+    let mut result = typed_to_sonic_omitting_nulls(&v31::GetChainTxStats {
         time: i64::from(tip_time),
         tx_count: i64_saturated(total_tx_count),
         window_final_block_hash: tip_hash_hex,
@@ -394,6 +395,11 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         window_tx_count: window_open.then(|| i64_saturated(window_tx_count)),
         window_interval: window_open.then(|| i64_saturated(window_interval)),
         tx_rate,
+    })?;
+    if total_tx_count == 0 {
+        result.remove("txcount");
+    }
+    Ok(result)
     })
 }
 
