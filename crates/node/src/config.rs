@@ -175,8 +175,9 @@ pub struct ZmqPublication {
 /// [`Self::Full`], and `false` means [`Self::Disabled`].
 ///
 /// [`Self::Utxo`] is parsed and named but not yet accepted by
-/// [`NodeConfig::validate`]: the durable live-output store it describes does
-/// not exist. See [`ScriptIndexMode::has_live_store`].
+/// [`NodeConfig::validate`]: the `ScriptLive` row format was selected in #226
+/// (see `ScriptLiveRow`), but the live-output worker that populates it is still
+/// pending in #225. See [`ScriptIndexMode::has_live_store`].
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptIndexMode {
@@ -185,9 +186,9 @@ pub enum ScriptIndexMode {
     Disabled,
     /// Maintain only the compact live-output view.
     ///
-    /// Named and parsed, but **not accepted** by [`NodeConfig::validate`] until
-    /// the durable live-output store exists. See
-    /// [`ScriptIndexMode::has_live_store`].
+    /// Named and parsed, but **not accepted** by [`NodeConfig::validate`]
+    /// until the live-output worker that writes `ScriptLive` rows is wired in
+    /// #225. See [`ScriptIndexMode::has_live_store`].
     Utxo,
     /// Maintain both the live-output view and historical script activity.
     Full,
@@ -212,13 +213,14 @@ impl ScriptIndexMode {
     /// Whether this mode has a durable store backing every view it claims.
     ///
     /// `utxo` is the one mode that does not, yet. Its whole purpose is the
-    /// compact live-output view, and that view has no on-disk representation:
-    /// #225 defers the `ScriptLive` row format to #226 Q5, which is still
-    /// choosing the locator. Until a live store exists, a node configured
-    /// `utxo` would build no `Funding`/`Spending` rows (those families are
-    /// claimed only under `script_history`), publish no `ScriptHistory`
-    /// watermark, and then have every `ScriptIndexQuery` method —
-    /// `unspent_outputs` included — gate on
+    /// compact live-output view. The `ScriptLive` locator format was selected
+    /// in #226 Q5 (see `ScriptLiveRow` in `crates/index/src/types.rs`), so the
+    /// durable row shape now exists in the storage layer; this mode remains
+    /// disabled until #225 wires the worker that actually populates those rows.
+    /// Until then, a node configured `utxo` would build no `Funding`/`Spending`
+    /// rows (those families are claimed only under `script_history`), publish
+    /// no `ScriptHistory` watermark, and then have every `ScriptIndexQuery`
+    /// method — `unspent_outputs` included — gate on
     /// `IndexCapabilities::SCRIPT_HISTORY` and report `Retry` forever. That is
     /// an advertised capability with nothing behind it.
     ///
@@ -512,9 +514,9 @@ impl NodeConfig {
         }
         ensure!(
             self.script_index.has_live_store(),
-            "scriptindex=utxo is not yet usable: the compact live-output store it \
-             requires does not exist (#225). Only `full` and `disabled` are accepted. \
-             Blocked on #226 Q5, which selects the ScriptLive locator format."
+            "scriptindex=utxo is not yet usable: the ScriptLive locator format was \
+             selected in #226 Q5, but the live-output store is not yet populated \
+             by a worker (#225). Only `full` and `disabled` are accepted."
         );
         for (name, hwm) in [
             ("zmqpubhashblockhwm", self.zmqpubhashblockhwm),
