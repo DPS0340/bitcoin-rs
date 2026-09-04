@@ -66,9 +66,12 @@ remove another script's output.
   `TxQueryError::Unavailable`. Stale, unconfirmed, or torn rows are never
   returned to callers.
 - `unspent_outputs` consumes the `ScriptLive` watermark only. It holds the
-  chain-transition authority while taking the index snapshot and resolving
-  every locator from one stable UTXO view. A missing locator is unavailable;
-  a compact-prefix collision is filtered by the exact script check.
+  chain-transition authority while taking the index snapshot and checking the
+  live watermark against the applied tip. Locator resolution uses one stable
+  UTXO view after that lock is released; a tip or revision change during
+  resolution is `Retry`. A missing locator after an unchanged tip is
+  unavailable; a compact-prefix collision is filtered by the exact script
+  check.
 
 ### `IDX-04`: Selective reset preserves sibling readiness
 

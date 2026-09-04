@@ -10,7 +10,8 @@ use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCo
 type ByteTable = TableDefinition<'static, &'static [u8], &'static [u8]>;
 type FixedTable<const N: usize> = TableDefinition<'static, &'static [u8; N], ()>;
 type TxIndexValueTable = TableDefinition<'static, &'static [u8; 12], &'static [u8]>;
-const SCRIPT_LIVE_KEY_SIZE: usize = 44;
+/// `ScriptLive` key width: `prefix(8) || txid(32) || vout(4)`.
+const SCRIPT_LIVE_KEY_LEN: usize = 44;
 
 const TXINDEX_TX_CONFIRMED: FixedTable<12> = TableDefinition::new("txindex_v1_tx_confirmed");
 const TXINDEX_TX_CONFIRMED_VALUES: TxIndexValueTable =
@@ -19,7 +20,7 @@ const TXINDEX_FUNDING: FixedTable<12> = TableDefinition::new("txindex_v1_funding
 const TXINDEX_FUNDING_VALUES: TxIndexValueTable = TableDefinition::new("txindex_v1_funding_values");
 const TXINDEX_SPENDING: FixedTable<12> = TableDefinition::new("txindex_v1_spending");
 const TXINDEX_BLOCK_HEADERS: FixedTable<80> = TableDefinition::new("txindex_v1_block_headers");
-const TXINDEX_SCRIPT_LIVE: FixedTable<SCRIPT_LIVE_KEY_SIZE> =
+const TXINDEX_SCRIPT_LIVE: FixedTable<SCRIPT_LIVE_KEY_LEN> =
     TableDefinition::new("txindex_v1_script_live");
 const TXINDEX_META: ByteTable = TableDefinition::new("txindex_v1_meta");
 
@@ -74,6 +75,7 @@ impl RedbStore {
         batch: RedbWriteBatch,
         durability: Durability,
     ) -> Result<(), StorageError> {
+        validate_redb_store_batch(&batch)?;
         let durability_label = match durability {
             Durability::Immediate => "durable",
             Durability::None => "deferred",
@@ -131,6 +133,9 @@ impl KvStore for RedbStore {
     }
 
     fn put(&self, cf: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        if cf == ColumnFamily::ScriptLive {
+            validate_script_live_put(key, value)?;
+        }
         let write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         {
             let mut table = write_txn
@@ -158,6 +163,7 @@ impl KvStore for RedbStore {
         conditions: &[WriteCondition<'_>],
         batch: RedbWriteBatch,
     ) -> Result<bool, StorageError> {
+        validate_redb_store_batch(&batch)?;
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         write_txn
             .set_durability(Durability::Immediate)
@@ -405,9 +411,9 @@ impl KvStore for RedbTxIndexStore {
 ///
 /// The concrete store type is an implementation detail. The store serves
 /// [`ColumnFamily::TxConfirmed`], [`ColumnFamily::Funding`],
-/// [`ColumnFamily::Spending`], [`ColumnFamily::BlockHeaders`], and
-/// [`ColumnFamily::ScriptLive`], and [`ColumnFamily::UtxoMeta`]; every other family returns
-/// [`StorageError::InvalidOperation`].
+/// [`ColumnFamily::Spending`], [`ColumnFamily::BlockHeaders`],
+/// [`ColumnFamily::ScriptLive`], and [`ColumnFamily::UtxoMeta`]; every other
+/// family returns [`StorageError::InvalidOperation`].
 pub fn open_redb_tx_index_store(path: &Path) -> Result<impl KvStore, StorageError> {
     RedbTxIndexStore::open(path)
 }
@@ -500,10 +506,15 @@ fn apply_redb_batch_op(
     op: BatchOp,
 ) -> Result<(), StorageError> {
     match op {
-        BatchOp::Put { key, value, .. } => table
-            .insert(key.as_slice(), value.as_ref())
-            .map(|_| ())
-            .map_err(StorageError::backend),
+        BatchOp::Put { cf, key, value } => {
+            if cf == ColumnFamily::ScriptLive {
+                validate_script_live_put(&key, &value)?;
+            }
+            table
+                .insert(key.as_slice(), value.as_ref())
+                .map(|_| ())
+                .map_err(StorageError::backend)
+        }
         BatchOp::Delete { key, .. } => table
             .remove(key.as_slice())
             .map(|_| ())
@@ -759,6 +770,31 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Rejects a `ScriptLive` write that is not a 44-byte key with an empty value.
+///
+/// The dedicated txindex store enforces this with a fixed-width table. The
+/// generic [`RedbStore`] path uses variable-width tables, so the same
+/// `ScriptLiveRow` contract is checked here before any write is persisted.
+fn validate_script_live_put(key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+    fixed_key::<SCRIPT_LIVE_KEY_LEN>(key).map(|_| ())?;
+    if !value.is_empty() {
+        return Err(fixed_value_error());
+    }
+    Ok(())
+}
+
+/// Validates `ScriptLive` puts in a generic [`RedbStore`] batch before a
+/// transaction begins, matching the dedicated txindex store's reject-first
+/// contract.
+fn validate_redb_store_batch(batch: &RedbWriteBatch) -> Result<(), StorageError> {
+    batch.ops.iter().try_for_each(|op| match op {
+        BatchOp::Put { cf, key, value } if *cf == ColumnFamily::ScriptLive => {
+            validate_script_live_put(key, value)
+        }
+        _ => Ok(()),
+    })
+}
+
 fn invalid_txindex_cf() -> StorageError {
     StorageError::InvalidOperation("column family not supported by RedbTxIndexStore")
 }
@@ -985,7 +1021,7 @@ fn collect_txindex_prefix(
             fixed_prefix_collect::<80>(read_txn, TXINDEX_BLOCK_HEADERS, prefix)
         }
         ColumnFamily::ScriptLive => {
-            fixed_prefix_collect::<SCRIPT_LIVE_KEY_SIZE>(read_txn, TXINDEX_SCRIPT_LIVE, prefix)
+            fixed_prefix_collect::<SCRIPT_LIVE_KEY_LEN>(read_txn, TXINDEX_SCRIPT_LIVE, prefix)
         }
         ColumnFamily::UtxoMeta => collect_prefix(read_txn, TXINDEX_META, prefix),
         _ => Err(invalid_txindex_cf()),
@@ -1020,7 +1056,7 @@ fn scan_txindex_prefix(
             fixed_prefix_scan::<80>(read_txn, TXINDEX_BLOCK_HEADERS, prefix, limit)
         }
         ColumnFamily::ScriptLive => {
-            fixed_prefix_scan::<SCRIPT_LIVE_KEY_SIZE>(read_txn, TXINDEX_SCRIPT_LIVE, prefix, limit)
+            fixed_prefix_scan::<SCRIPT_LIVE_KEY_LEN>(read_txn, TXINDEX_SCRIPT_LIVE, prefix, limit)
         }
         ColumnFamily::UtxoMeta => scan_prefix(read_txn, TXINDEX_META, prefix, limit),
         _ => Err(invalid_txindex_cf()),
@@ -1183,7 +1219,7 @@ fn validate_txindex_key(cf: ColumnFamily, key: &[u8]) -> Result<(), StorageError
             fixed_key::<12>(key).map(|_| ())
         }
         ColumnFamily::BlockHeaders => fixed_key::<80>(key).map(|_| ()),
-        ColumnFamily::ScriptLive => fixed_key::<SCRIPT_LIVE_KEY_SIZE>(key).map(|_| ()),
+        ColumnFamily::ScriptLive => fixed_key::<SCRIPT_LIVE_KEY_LEN>(key).map(|_| ()),
         ColumnFamily::UtxoMeta => Ok(()),
         _ => Err(invalid_txindex_cf()),
     }

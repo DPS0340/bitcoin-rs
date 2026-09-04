@@ -1245,6 +1245,10 @@ impl bitcoin_rs_index::SpentCoinScripts for UndoScripts {
     }
 }
 
+/// Object-safe `ScriptLive` seed producer used by [`TxIndexWriter`].
+type ScriptLiveSeedProduce<'a> = dyn FnMut(&mut dyn FnMut(OutPoint, ScriptHash) -> Result<(), IndexError>) -> Result<(), IndexError>
+    + 'a;
+
 /// Erased prepared-index writer used by the worker and stored in `NodeState`.
 pub(crate) trait TxIndexWriter: Send + Sync {
     fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError>;
@@ -1275,12 +1279,12 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         let _ = spent_scripts;
         self.prepare_block_for(capabilities, height, hash, body)
     }
-    fn seed_script_live(
+    fn seed_script_live_stream(
         &self,
-        coins: Vec<(OutPoint, ScriptHash)>,
+        produce: &mut ScriptLiveSeedProduce<'_>,
         tip: IndexWatermark,
     ) -> Result<usize, IndexError> {
-        let _ = (coins, tip);
+        let _ = (produce, tip);
         Err(IndexError::UnsupportedRollback)
     }
     fn commit_forward_with_cursor(
@@ -1376,12 +1380,12 @@ where
         self.lock().commit_forward_with_cursor(fence, batch, cursor)
     }
 
-    fn seed_script_live(
+    fn seed_script_live_stream(
         &self,
-        coins: Vec<(OutPoint, ScriptHash)>,
+        produce: &mut ScriptLiveSeedProduce<'_>,
         tip: IndexWatermark,
     ) -> Result<usize, IndexError> {
-        self.lock().seed_script_live(coins, tip)
+        self.lock().seed_script_live_stream(produce, tip)
     }
 
     fn commit_rollback_one_for_with_cursor(
@@ -1493,12 +1497,12 @@ where
             .commit_forward_with_cursor(fence, batch, cursor)
     }
 
-    fn seed_script_live(
+    fn seed_script_live_stream(
         &self,
-        coins: Vec<(OutPoint, ScriptHash)>,
+        produce: &mut ScriptLiveSeedProduce<'_>,
         tip: IndexWatermark,
     ) -> Result<usize, IndexError> {
-        self.write().seed_script_live(coins, tip)
+        self.write().seed_script_live_stream(produce, tip)
     }
 
     fn commit_rollback_one_for_with_cursor(
@@ -1946,11 +1950,11 @@ impl Worker {
             return Err(TxIndexWorkerError::MissingChainTransition);
         };
         // Hold chain-transition until the stable UTXO view is acquired so
-        // `target` names the exact state we traverse. Collect compact
-        // locators under that view, then release both guards before reset
-        // and persistence so block apply is not blocked for the write phase.
-        // Lock order matches apply: chain_transition, then stable-view read.
-        let (target, coins) = {
+        // `target` names the exact state we traverse. Release the transition
+        // before persistence; the view guard keeps the scan consistent while
+        // rows stream in bounded batches. Lock order matches apply:
+        // chain_transition, then stable-view read.
+        let (target, view) = {
             let _transition = chain_transition.lock();
             let current = self.applied_tip.load_full();
             let Some(current) = current.as_deref() else {
@@ -1960,14 +1964,7 @@ impl Worker {
                 height: current.height,
                 hash: current.hash.to_le_bytes(),
             };
-            let coins = utxo.with_stable_view(|view| {
-                let mut coins = Vec::new();
-                view.for_each_all(|outpoint, script| {
-                    coins.push((*outpoint, ScriptHash::from_script_bytes(script)));
-                });
-                coins
-            });
-            (target, coins)
+            (target, utxo.lock_stable_view())
         };
 
         // A missing watermark is also the recovery state after a crash
@@ -1980,7 +1977,21 @@ impl Worker {
             .map_err(TxIndexWorkerError::Index)?;
         let written = self
             .writer
-            .seed_script_live(coins, target)
+            .seed_script_live_stream(
+                &mut |emit| {
+                    let mut result = Ok(());
+                    view.for_each_all(|outpoint, script| {
+                        if result.is_err() {
+                            return;
+                        }
+                        if let Err(error) = emit(*outpoint, ScriptHash::from_script_bytes(script)) {
+                            result = Err(error);
+                        }
+                    });
+                    result
+                },
+                target,
+            )
             .map_err(TxIndexWorkerError::Index)?;
         tracing::info!(
             height = target.height,
@@ -2967,53 +2978,54 @@ impl TxIndexQueryEngine {
     {
         self.query_health()?;
 
-        // Live locator resolution must observe one chain transition: the
-        // applied tip and the UTXO set change together. History and tx
-        // lookup already gate on snapshot, watermark, tip, and revision, so
-        // they must not hold apply while scanning blocks.
-        let _chain_transition = if required.script_live {
-            self.chain_transition
-                .as_ref()
-                .map(|transition| transition.lock())
-        } else {
-            None
-        };
-
-        let tip_before = self
-            .applied_tip
-            .load()
-            .as_ref()
-            .cloned()
-            .ok_or(TxQueryError::Retry)?;
-        let revision_before = self.runtime.revision();
-
-        let reader: &dyn IndexReader = self.reader.as_ref();
-        let snapshot = reader
-            .snapshot()
-            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-
-        // Ensure the index watermark is exactly at the applied tip we are
-        // answering for, otherwise the snapshot is stale.
-        for capability in [
-            IndexCapability::TxLookup,
-            IndexCapability::ScriptHistory,
-            IndexCapability::ScriptLive,
-        ] {
-            if !required.contains(capability) {
-                continue;
-            }
-            let watermark = snapshot
-                .capability_watermark(capability)
-                .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-            let Some(watermark) = watermark else {
-                return Err(TxQueryError::Retry);
+        // Live queries hold chain-transition only long enough to pin the
+        // applied tip and take a watermark-checked index snapshot. History
+        // and tx lookup never take it. Locator resolution and block reads
+        // run after the lock is released; a moved tip or revision is Retry.
+        let (tip_before, revision_before, snapshot) = {
+            let _chain_transition = if required.script_live {
+                self.chain_transition
+                    .as_ref()
+                    .map(|transition| transition.lock())
+            } else {
+                None
             };
-            if watermark.height != tip_before.height
-                || watermark.hash != *tip_before.hash.as_byte_array()
-            {
-                return Err(TxQueryError::Retry);
+
+            let tip_before = self
+                .applied_tip
+                .load()
+                .as_ref()
+                .cloned()
+                .ok_or(TxQueryError::Retry)?;
+            let revision_before = self.runtime.revision();
+
+            let reader: &dyn IndexReader = self.reader.as_ref();
+            let snapshot = reader
+                .snapshot()
+                .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
+
+            for capability in [
+                IndexCapability::TxLookup,
+                IndexCapability::ScriptHistory,
+                IndexCapability::ScriptLive,
+            ] {
+                if !required.contains(capability) {
+                    continue;
+                }
+                let watermark = snapshot
+                    .capability_watermark(capability)
+                    .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
+                let Some(watermark) = watermark else {
+                    return Err(TxQueryError::Retry);
+                };
+                if watermark.height != tip_before.height
+                    || watermark.hash != *tip_before.hash.as_byte_array()
+                {
+                    return Err(TxQueryError::Retry);
+                }
             }
-        }
+            (tip_before, revision_before, snapshot)
+        };
 
         let mut budget = QueryBudget::new();
         let result = f(snapshot.as_ref(), &tip_before, &mut budget);

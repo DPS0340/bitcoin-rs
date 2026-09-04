@@ -25,10 +25,11 @@ fn header_80(counter: u32) -> [u8; 80] {
     h
 }
 
-fn live_44(counter: u32) -> [u8; 44] {
-    let mut key = [0u8; 44];
-    key[0..4].copy_from_slice(&counter.to_le_bytes());
-    key
+fn script_live_44(counter: u32) -> [u8; 44] {
+    let mut k = [0u8; 44];
+    k[0..4].copy_from_slice(&counter.to_le_bytes());
+    k[40..].copy_from_slice(&counter.to_le_bytes());
+    k
 }
 
 fn row_count<S: KvStore>(store: &S, cf: ColumnFamily) -> Result<usize, StorageError> {
@@ -78,7 +79,7 @@ fn txindex_all_six_family_roundtrips() -> TestResult<()> {
         Some(Vec::new())
     );
 
-    let live = live_44(5);
+    let live = script_live_44(5);
     store.put(ColumnFamily::ScriptLive, &live, b"")?;
     assert_eq!(
         store.get(ColumnFamily::ScriptLive, &live)?,
@@ -112,6 +113,55 @@ fn txindex_all_six_family_roundtrips() -> TestResult<()> {
     ] {
         assert_eq!(row_count(&store, cf)?, 0);
     }
+    Ok(())
+}
+
+#[test]
+fn txindex_script_live_roundtrips_with_empty_value() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
+
+    let live = script_live_44(1);
+    store.put(ColumnFamily::ScriptLive, &live, b"")?;
+    assert_eq!(
+        store.get(ColumnFamily::ScriptLive, &live)?,
+        Some(Vec::new())
+    );
+
+    // Non-empty values are rejected for the fixed-width ScriptLive table.
+    assert_invalid(store.put(ColumnFamily::ScriptLive, &script_live_44(2), b"value"));
+
+    // Wrong key length is rejected before touching the database.
+    assert_invalid(store.put(ColumnFamily::ScriptLive, &live[..12], b""));
+
+    Ok(())
+}
+
+#[test]
+fn generic_redb_store_enforces_script_live_row_contract() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::RedbStore::open(temp.path())?;
+
+    let live = script_live_44(1);
+    store.put(ColumnFamily::ScriptLive, &live, b"")?;
+    assert_eq!(
+        store.get(ColumnFamily::ScriptLive, &live)?,
+        Some(Vec::new())
+    );
+
+    // The generic store must reject the same invalid ScriptLive rows as the
+    // dedicated txindex store: non-empty values and wrong-width keys.
+    assert_invalid(store.put(ColumnFamily::ScriptLive, &script_live_44(2), b"value"));
+    assert_invalid(store.put(ColumnFamily::ScriptLive, &live[..12], b""));
+
+    let mut batch = store.new_batch();
+    batch.put(ColumnFamily::ScriptLive, &script_live_44(3), b"value");
+    assert_invalid(store.write(batch));
+    assert_eq!(
+        store.get(ColumnFamily::ScriptLive, &script_live_44(3))?,
+        None
+    );
+
     Ok(())
 }
 
@@ -410,11 +460,15 @@ fn txindex_invalid_operation_aborts_transaction() -> TestResult<()> {
     let mut batch = store.new_batch();
     batch.put(ColumnFamily::TxConfirmed, &valid, b"");
     batch.put(ColumnFamily::Spending, &key_12(2), b"non-empty");
-    batch.put(ColumnFamily::ScriptLive, &live_44(2), b"non-empty");
+    batch.put(ColumnFamily::ScriptLive, &script_live_44(2), b"non-empty");
     assert_invalid(store.write(batch));
     assert!(store.get(ColumnFamily::TxConfirmed, &valid)?.is_none());
     assert!(store.get(ColumnFamily::Spending, &key_12(2))?.is_none());
-    assert!(store.get(ColumnFamily::ScriptLive, &live_44(2))?.is_none());
+    assert!(
+        store
+            .get(ColumnFamily::ScriptLive, &script_live_44(2))?
+            .is_none()
+    );
 
     // Delete with an invalid key length aborts the batch.
     let mut batch = store.new_batch();
@@ -661,7 +715,7 @@ fn txindex_write_durable_if_unit_tables() -> TestResult<()> {
     )?);
     assert_eq!(store.get(ColumnFamily::BlockHeaders, &header)?, None);
 
-    let live = live_44(5);
+    let live = script_live_44(5);
     store.put(ColumnFamily::ScriptLive, &live, b"")?;
     let mut batch = store.new_batch();
     batch.delete(ColumnFamily::ScriptLive, &live);

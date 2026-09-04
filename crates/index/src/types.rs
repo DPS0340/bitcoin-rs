@@ -236,6 +236,7 @@ pub const SCRIPT_LIVE_ROW_SIZE: usize = HASH_PREFIX_LEN + 32 + 4;
 /// over this family are read-only by contract; a delete is always a whole-key
 /// point delete.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(C)]
 pub struct ScriptLiveRow {
     key: [u8; SCRIPT_LIVE_ROW_SIZE],
 }
@@ -416,7 +417,10 @@ fn spending_prefix(txid_bytes: &[u8], vout: u32) -> HashPrefix {
 mod tests {
     use bitcoin_rs_primitives::{Hash256, OutPoint, Txid};
 
-    use super::{HashPrefixRow, ScriptHash, ScriptHashRow, SpendingPrefixRow, TxidRow};
+    use super::{
+        HASH_PREFIX_LEN, HashPrefixRow, ScriptHash, ScriptHashRow, ScriptLiveRow,
+        SpendingPrefixRow, TxidRow,
+    };
 
     #[test]
     fn hash_prefix_row_uses_electrs_layout() {
@@ -450,5 +454,35 @@ mod tests {
         let txid = Txid::from(Hash256::from_le_bytes(&[9_u8; 32]));
         assert_eq!(ScriptHashRow::row(scripthash, 5).prefix, [7_u8; 8]);
         assert_eq!(TxidRow::row(&txid, 6).prefix, [9_u8; 8]);
+    }
+
+    #[test]
+    fn script_live_row_roundtrips_outpoint() {
+        let scripthash = ScriptHash::from_byte_array([7_u8; 32]);
+        // Nonuniform so a reversed-endian writer cannot satisfy the stored-byte
+        // assertion; a palindrome such as `[9; 32]` would.
+        let txid_le = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        let txid = Txid::from(Hash256::from_le_bytes(&txid_le));
+        let outpoint = OutPoint::new(txid, 0x0a0b_0c0d);
+        let row = ScriptLiveRow::new(scripthash, &outpoint);
+
+        assert_eq!(&row.as_bytes()[..HASH_PREFIX_LEN], &[7_u8; 8]);
+        assert_eq!(
+            &row.as_bytes()[HASH_PREFIX_LEN..HASH_PREFIX_LEN + 32],
+            &txid_le
+        );
+        assert_eq!(
+            &row.as_bytes()[HASH_PREFIX_LEN + 32..],
+            &[0x0d, 0x0c, 0x0b, 0x0a]
+        );
+        assert_eq!(row.outpoint(), outpoint);
+        assert_eq!(
+            ScriptLiveRow::from_db_row(row.as_bytes().as_slice()),
+            Some(row)
+        );
     }
 }

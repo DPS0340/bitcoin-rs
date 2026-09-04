@@ -570,6 +570,18 @@ impl<'a> BorrowedBlockChanges<'a> {
     pub const fn remove_count(&self) -> usize {
         self.removes.len()
     }
+
+    /// Iterates the borrowed add operations in commit order.
+    #[must_use]
+    pub fn adds(&self) -> &[BorrowedUtxoAdd<'a>] {
+        &self.adds
+    }
+
+    /// Iterates the spent outpoints in commit order (one per non-netted spend).
+    #[must_use]
+    pub fn spent_outpoints(&self) -> &[OutPoint] {
+        &self.removes
+    }
 }
 
 /// Inverse mutations needed to disconnect one block.
@@ -788,12 +800,19 @@ impl UtxoSet {
 
     /// Runs `read` while commits are blocked, yielding a stable whole-set view.
     pub fn with_stable_view<R>(&self, read: impl FnOnce(&UtxoSetView<'_>) -> R) -> R {
-        let guard = self.stable_view_lock.read();
-        let view = UtxoSetView {
+        read(&self.lock_stable_view())
+    }
+
+    /// Locks a stable whole-set view until the returned guard is dropped.
+    ///
+    /// Commits take the matching write lock. Acquire any chain-transition
+    /// authority first when both are needed, matching block apply.
+    #[must_use]
+    pub fn lock_stable_view(&self) -> UtxoSetView<'_> {
+        UtxoSetView {
             set: self,
-            _guard: guard,
-        };
-        read(&view)
+            _guard: self.stable_view_lock.read(),
+        }
     }
 
     /// Applies all UTXO changes for a connected block.

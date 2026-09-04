@@ -3102,20 +3102,15 @@ impl<S: KvStore> IndexWriter<S> {
         resume_capability_reset(store, generation, IndexCapabilities::ALL.to_mask())
     }
 
-    /// Seeds the live view from a scan of the authoritative UTXO set.
+    /// Seeds the live view from a producer of compact locators.
     ///
-    /// `produce` emits every live `(outpoint, scripthash)` at `seed_tip`, in
-    /// any order. Rows are written in bounded deferred batches, and the
-    /// watermark is stamped **once, durably, after the last row** -- so a
-    /// crash mid-seed leaves the capability without a watermark, which is
-    /// exactly "not ready": partial rows are never queryable, and the
-    /// recovery is a capability reset followed by a fresh seed (#225).
+    /// `produce` emits every live `(outpoint, scripthash)` at `seed_tip`.
+    /// Rows are written in bounded deferred batches. A storage write failure
+    /// is [`IndexError::Storage`] and is retryable only after the caller
+    /// resets this capability; this method does not recover itself. See
+    /// `IDX-07` in `docs/contracts/indexing.md`.
     ///
-    /// A deferred-batch failure stops the seed and is returned before the
-    /// format or live watermark is published. Refuses to run over an
-    /// existing live watermark. Seeding is for a fresh or reset capability;
-    /// re-seeding a live view in place would have to reconcile stale rows,
-    /// which is the reset path's job.
+    /// Refuses to run over an existing live watermark.
     pub fn seed_script_live_stream<F>(
         &mut self,
         mut produce: F,
