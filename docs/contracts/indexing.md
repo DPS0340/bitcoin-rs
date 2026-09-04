@@ -77,10 +77,11 @@ Owners:
     forward.
   - If the watermark is on an abandoned branch, the worker rolls back to the
     common ancestor and connects forward to the active tip.
-- Startup crash recovery (`crates/node/src/crash_recovery.rs`) runs and completes
-  replaying the gap up to the sidecar tip before `NodeState::start_index_workers()`
-  spawns worker threads (`crates/node/src/run.rs`), ensuring index workers reconcile
-  against a fully restored active chainstate.
+- `NodeState::open` restores the authenticated checkpoint and, when enabled,
+  replays the journal's committed suffix (`docs/chainstate-recovery.md`) before
+  `NodeState::start_index_workers()` spawns worker threads
+  (`crates/node/src/run.rs`), so index workers reconcile against a restored
+  active chainstate.
 
 ### `IDX-06`: Reorganization rollback and forward reconciliation
 
