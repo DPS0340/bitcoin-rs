@@ -1290,6 +1290,12 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
     ) -> Result<Vec<OutPoint>, IndexError> {
+        if self
+            .capability_watermark(IndexCapability::ScriptLive)?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
         let prefix = ScriptHashRow::scan_prefix(scripthash);
         let iter = self.store.iter_prefix(ColumnFamily::ScriptLive, &prefix)?;
         let mut outpoints = Vec::new();
@@ -3130,6 +3136,12 @@ impl<S: KvStore> IndexWriter<S> {
         }
         let mut written = 0_usize;
         let mut batch = self.indexer.store.new_batch();
+        // Version the store before publishing deferred seed rows.
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            FORMAT_VERSION_KEY,
+            &FORMAT_VERSION_VALUE,
+        );
         let mut in_batch = 0_usize;
         for (outpoint, scripthash) in coins {
             let row = crate::types::ScriptLiveRow::new(scripthash, &outpoint);
