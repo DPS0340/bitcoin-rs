@@ -17,8 +17,9 @@ ledger. This page adds nothing normative; it places the policy under the
 - **Scope**: admission checks in `crates/mempool/src/standardness.rs`,
   `policy.rs`, `rbf.rs`, `eviction.rs`, `accept.rs`, `gateway.rs`, and the RPC surface
   `sendrawtransaction` / `testmempoolaccept` in `crates/rpc/src/handlers/tx.rs`.
-- Standardness rules, BIP125 RBF rules 1–6, package limits, policy script
-  checks (`STANDARD_SCRIPT_VERIFY_FLAGS`), and eviction ranking follow the
+- Standardness rules, BIP125 RBF rules 1–6, package limits, gateway policy
+  script checks (`STANDARD_SCRIPT_VERIFY_FLAGS` at admission; not the
+  `testmempoolaccept` preview evaluator), and eviction ranking follow the
   policy document.
 
 ## Proven by

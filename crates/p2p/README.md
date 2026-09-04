@@ -20,7 +20,10 @@ download scheduler, outbound transaction relay, and RPC methods (`getpeerinfo`,
 `getnetworkinfo`, `disconnectnode`) — observe and mutate live connections exclusively
 through `PeerTable`.
 
-`PeerManager` coordinates peer lifecycle state; a connection is identified by a
+`PeerManager` owns DNS resolver and seed configuration and bootstraps outbound
+addresses. Live session registration, replacement, metadata publication, and
+identity-checked removal go through `PeerTable`, used by the inbound TCP
+`listener` and connection-session paths. A connection is identified by a
 `ConnectionId`, cleaned up through a `PeerLease`, and opened outbound through
 `spawn_outbound_connection`, while the `listener` module accepts inbound TCP connections
 with graceful shutdown. A connection negotiates version/verack in `handshake`, then runs
