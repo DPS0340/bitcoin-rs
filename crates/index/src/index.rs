@@ -3126,6 +3126,7 @@ impl<S: KvStore> IndexWriter<S> {
             &mut dyn FnMut(OutPoint, crate::ScriptHash) -> Result<(), IndexError>,
         ) -> Result<(), IndexError>,
     {
+        const SEED_BATCH_ROWS: usize = 4_096;
         self.ensure_prepared_ready()?;
         if self
             .indexer
@@ -3134,7 +3135,6 @@ impl<S: KvStore> IndexWriter<S> {
         {
             return Err(IndexError::LiveAlreadySeeded);
         }
-        const SEED_BATCH_ROWS: usize = 4_096;
         let mut written = 0;
         let mut batch = self.indexer.store.new_batch();
         // Version the store before publishing deferred seed rows.

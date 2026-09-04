@@ -235,7 +235,7 @@ impl Shard {
         for record in &table.table {
             for output in record.outputs() {
                 let outpoint = OutPoint::new(record.txid().into(), output.vout);
-                f(&outpoint, &output.script_pubkey);
+                f(&outpoint, output.script_pubkey);
             }
         }
     }

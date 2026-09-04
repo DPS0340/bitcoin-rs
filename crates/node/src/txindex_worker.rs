@@ -110,25 +110,6 @@ const FORWARD_BATCH_DELAY: Duration = Duration::from_millis(100);
 /// makes a slow open observable to an operator watching logs.
 const TXINDEX_OPEN_TIMEOUT: Duration = Duration::from_mins(30);
 
-/// Test-only override for the open timeout, in seconds. When non-zero it
-/// replaces [`TXINDEX_OPEN_TIMEOUT`] so tests can exercise the timeout path
-/// without waiting the production backstop.
-#[cfg(test)]
-static OPEN_TIMEOUT_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Returns the effective open timeout, honoring the test-only override.
-fn effective_open_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        let override_secs = OPEN_TIMEOUT_OVERRIDE_SECS.load(Ordering::Relaxed);
-        if override_secs > 0 {
-            return Duration::from_secs(override_secs);
-        }
-    }
-    TXINDEX_OPEN_TIMEOUT
-}
-
 /// Reconciliation leg one capability's rows are executing against the
 /// applied tip. Forward is the resting leg: a watermark that names the
 /// applied tip is ready; one below it is catching up.
@@ -1024,6 +1005,8 @@ fn open_and_run(
         spec.cache_bytes,
         spec.batch_limits,
         spec.epoch,
+        Duration::ZERO,
+        TXINDEX_OPEN_TIMEOUT,
         shutdown,
     )?;
 
@@ -1093,6 +1076,8 @@ fn open_tx_index_with_timeout(
     cache_bytes: u64,
     batch_limits: PreparedBatchLimits,
     epoch: u64,
+    open_delay: Duration,
+    open_timeout: Duration,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<OpenTxIndex, TxIndexWorkerError> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1101,14 +1086,21 @@ fn open_tx_index_with_timeout(
     let _join = thread::Builder::new()
         .name("bitcoin-rs-txindex-open".to_owned())
         .spawn(move || {
-            let result = open_tx_index_on_worker(&backend, &dir, cache_bytes, batch_limits, epoch);
+            let result = open_tx_index_on_worker(
+                &backend,
+                &dir,
+                cache_bytes,
+                batch_limits,
+                epoch,
+                open_delay,
+            );
             let _ = tx.send(result);
         })
         .map_err(|e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::Io(e)))?;
 
     // Poll in short slices so a shutdown during the open deadline
     // exits promptly instead of waiting the full timeout.
-    let timeout = effective_open_timeout();
+    let timeout = open_timeout;
     let deadline = Instant::now() + timeout;
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -1141,11 +1133,6 @@ fn open_tx_index_with_timeout(
     }
 }
 
-/// Test-only: when non-zero, `open_tx_index_on_worker` sleeps this many
-/// seconds before proceeding, simulating a stuck storage-engine recovery.
-#[cfg(test)]
-static OPEN_DELAY_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Opens the txindex store on the worker thread, preserving all backend
 /// constructors, cache paths, and batch limits.
 fn open_tx_index_on_worker(
@@ -1154,13 +1141,10 @@ fn open_tx_index_on_worker(
     cache_bytes: u64,
     batch_limits: PreparedBatchLimits,
     epoch: u64,
+    open_delay: Duration,
 ) -> Result<OpenTxIndex, TxIndexWorkerError> {
-    #[cfg(test)]
-    {
-        let delay = OPEN_DELAY_SECS.load(Ordering::Relaxed);
-        if delay > 0 {
-            std::thread::sleep(Duration::from_secs(delay));
-        }
+    if !open_delay.is_zero() {
+        std::thread::sleep(open_delay);
     }
     match storage_backend {
         #[cfg(feature = "rocksdb")]
@@ -1977,11 +1961,16 @@ impl Worker {
                 hash: current.hash.to_le_bytes(),
             };
             let coins = utxo.with_stable_view(|view| {
-                let mut coins = Vec::new();
-                view.for_each_all(|outpoint, script| {
-                    coins.push((outpoint.clone(), ScriptHash::from_script_bytes(script)));
-                });
-                coins
+                view.scan_all()
+                    .unspents
+                    .into_iter()
+                    .map(|coin| {
+                        (
+                            coin.outpoint,
+                            ScriptHash::from_script_bytes(&coin.txout.script_pubkey),
+                        )
+                    })
+                    .collect::<Vec<_>>()
             });
             (target, coins)
         };
