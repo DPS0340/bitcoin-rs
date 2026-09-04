@@ -75,7 +75,10 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `RolledBack` means the in-memory UTXO set and applied tip moved together
   and still need one clean checkpoint. Startup refuses either phase and names
   the directories to remove. Only the checkpoint that publishes the
-  rolled-back authoritative state may remove the marker.
+  rolled-back authoritative state may remove the marker. The reorg owner
+  (`invalidate_block`, `switch_to_branch`) settles this debt before reporting
+  success; a checkpoint publication failure is `ReorgError::CheckpointSettlement`
+  and leaves the marker in place.
 - `ChainChangeProof` binds a `ChainTransition` to the `ChainChangeGuard`
   that reserved the active odd generation. Apply-path functions accept
   `&ChainChangeProof`, not independent `&ChainTransition` and
@@ -119,7 +122,10 @@ fallback, and reorg is owned by [recovery.md](recovery.md).
   `stable_generation_is_even_before_and_after_connect`,
   `stable_generation_is_even_after_disconnect`.
 - `crates/node/src/state.rs`:
-  `checkpoint_refuses_inflight_disconnect_and_preserves_state`.
+  `checkpoint_refuses_inflight_disconnect_and_preserves_state`,
+  `invalidate_block_settles_disconnect_debt`,
+  `invalidate_block_settlement_failure_is_not_success`,
+  `switch_to_branch_settles_disconnect_debt`.
 - `crates/node/src/recovery_evidence.rs` tests (G11):
   `witness_round_trips_and_falls_back_to_prev`,
   `foreign_genesis_current_cannot_displace_valid_prev`,
