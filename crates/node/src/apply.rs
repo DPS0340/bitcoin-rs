@@ -789,6 +789,17 @@ impl AssumeValidGate {
     }
 }
 
+/// Where a block being applied came from. Decides whether its scripts execute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockProvenance {
+    /// Untrusted input (peer delivery, submitblock, file import): scripts run
+    /// unless the assume-valid gate covers the height.
+    Network,
+    /// A body this node validated and persisted under its recovery marker
+    /// before the crash; its scripts already ran here.
+    LocalReplay,
+}
+
 /// Owned shared handle set needed by `apply_block` to perform a block apply.
 #[derive(Clone)]
 pub struct ApplyHandles {
@@ -864,6 +875,21 @@ pub struct ApplyHandles {
 }
 
 impl ApplyHandles {
+    pub(crate) fn scripts_verified_upstream(
+        &self,
+        provenance: BlockProvenance,
+        height: u32,
+    ) -> bool {
+        match provenance {
+            BlockProvenance::LocalReplay => true,
+            BlockProvenance::Network => {
+                self.assume_valid_height > 0
+                    && height <= self.assume_valid_height
+                    && self.assume_valid_gate.trusted()
+            }
+        }
+    }
+
     pub(crate) fn prune_authority(&self) -> PruneAuthority {
         PruneAuthority {
             admission: Arc::clone(&self.admission),
@@ -1341,7 +1367,7 @@ pub fn apply_block(
     handles: &ApplyHandles,
     block: &Block,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
-    apply_block_inner(handles, block, None)
+    apply_block_inner(handles, block, None, BlockProvenance::Network)
 }
 
 /// Returns after consensus gates that precede the first write, without
@@ -1363,7 +1389,7 @@ pub fn apply_block_with_serialized(
     block: &Block,
     serialized: bytes::Bytes,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
-    apply_block_inner(handles, block, Some(serialized))
+    apply_block_inner(handles, block, Some(serialized), BlockProvenance::Network)
 }
 
 /// Applies one serialized block while the caller holds admission and `chain_transition`.
@@ -1375,7 +1401,28 @@ pub(crate) fn apply_block_with_serialized_admitted(
     serialized: bytes::Bytes,
     proof: &ChainChangeProof<'_>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
-    apply_block_admitted(handles, block, Some(serialized), None, proof)
+    apply_block_admitted(
+        handles,
+        block,
+        Some(serialized),
+        None,
+        BlockProvenance::Network,
+        proof,
+    )
+}
+
+/// Re-applies a body this node already validated and persisted before a crash.
+pub fn replay_local_block(
+    handles: &ApplyHandles,
+    block: &Block,
+    serialized: bytes::Bytes,
+) -> core::result::Result<TipSnapshot, ApplyError> {
+    apply_block_inner(
+        handles,
+        block,
+        Some(serialized),
+        BlockProvenance::LocalReplay,
+    )
 }
 
 /// How many consecutive blocks share one script-verification dispatch.
@@ -1512,22 +1559,28 @@ pub fn apply_window(
     let mut proven = prove_window(handles, blocks, serialized).into_iter();
     let mut applied = 0_usize;
     for (block, raw) in blocks.iter().zip(serialized) {
-        apply_block_admitted(handles, block, Some(raw.clone()), proven.next(), &proof).map_err(
-            |source| {
-                let disposition = if is_permanent_apply_error(&source) {
-                    WindowApplyDisposition::Permanent
-                } else {
-                    WindowApplyDisposition::Operational
-                };
-                let invalidated = invalidate_failed_subtree(handles, block, &source);
-                WindowApplyError {
-                    applied,
-                    source,
-                    disposition,
-                    invalidated,
-                }
-            },
-        )?;
+        apply_block_admitted(
+            handles,
+            block,
+            Some(raw.clone()),
+            proven.next(),
+            BlockProvenance::Network,
+            &proof,
+        )
+        .map_err(|source| {
+            let disposition = if is_permanent_apply_error(&source) {
+                WindowApplyDisposition::Permanent
+            } else {
+                WindowApplyDisposition::Operational
+            };
+            let invalidated = invalidate_failed_subtree(handles, block, &source);
+            WindowApplyError {
+                applied,
+                source,
+                disposition,
+                invalidated,
+            }
+        })?;
         applied = applied.saturating_add(1);
     }
     // G5: finish only on success. An error after begin leaves the generation
@@ -1841,10 +1894,7 @@ fn prove_window<'a>(
             // window. Without it the batch prepared and executed every unit
             // before the per-block decision was ever reached, so assume-valid
             // did nothing at all on the windowed path.
-            if handles.assume_valid_height > 0
-                && context.height <= handles.assume_valid_height
-                && handles.assume_valid_gate.trusted()
-            {
+            if handles.scripts_verified_upstream(BlockProvenance::Network, context.height) {
                 skipped[index] = true;
                 continue;
             }
@@ -2117,6 +2167,7 @@ fn apply_block_inner(
     handles: &ApplyHandles,
     block: &Block,
     provided_serialized: Option<bytes::Bytes>,
+    provenance: BlockProvenance,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let transition = handles.begin_chain_transition()?;
     let guard = handles
@@ -2124,7 +2175,14 @@ fn apply_block_inner(
         .begin_chain_change()
         .map_err(|_| ApplyError::Shutdown)?;
     let proof = ChainChangeProof::new(transition, guard);
-    let result = apply_block_admitted(handles, block, provided_serialized, None, &proof);
+    let result = apply_block_admitted(
+        handles,
+        block,
+        provided_serialized,
+        None,
+        provenance,
+        &proof,
+    );
     if result.is_ok() {
         let _ = proof.finish();
     }
@@ -2148,6 +2206,7 @@ fn apply_block_admitted<'b>(
     block: &'b Block,
     provided_serialized: Option<bytes::Bytes>,
     proven: Option<ProvenApply<'b>>,
+    provenance: BlockProvenance,
     _proof: &ChainChangeProof<'_>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let total_started = quanta::Instant::now();
@@ -2286,6 +2345,7 @@ fn apply_block_admitted<'b>(
             &tx_plan,
             Arc::clone(&resolved),
             &validation_context,
+            provenance,
             &kernel_block,
         )
     };
@@ -3001,7 +3061,7 @@ fn resolve_block_prevouts(
     clippy::cast_possible_truncation
 )]
 /// Runs every non-script transaction check for a block whose scripts are
-/// skipped by the live assume-valid gate.
+/// verified upstream: assume-valid or local replay.
 fn run_non_script_checks_only(
     block: &Block,
     tx_plan: &BlockTxPlan,
@@ -3063,6 +3123,7 @@ fn verify_block_transactions(
     tx_plan: &BlockTxPlan,
     resolved: Arc<ResolvedUtxoView>,
     context: &BlockValidationContext,
+    provenance: BlockProvenance,
     kernel_block: &bitcoin_rs_consensus::kernel::KernelBlock,
 ) -> core::result::Result<(), ApplyError> {
     debug_assert_eq!(block.txs.len(), view.txids().len());
@@ -3072,11 +3133,9 @@ fn verify_block_transactions(
         }
         return Ok(());
     }
-    // Assume-valid: skip kernel / portable script execution only, and only while the
-    // hash-pinned trust gate holds (always trusted when no pin is configured).
-    let skip_scripts = handles.assume_valid_height > 0
-        && context.height <= handles.assume_valid_height
-        && handles.assume_valid_gate.trusted();
+    // The decision is owned by `scripts_verified_upstream`, which covers the
+    // live assume-valid gate and locally validated crash-recovery replay.
+    let skip_scripts = handles.scripts_verified_upstream(provenance, context.height);
     if skip_scripts {
         return run_non_script_checks_only(
             block,
@@ -3747,6 +3806,7 @@ mod consensus_rule_tests {
                 &tx_plan(&block),
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::NONE),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         )?;
         Ok(())
@@ -3873,6 +3933,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail under the kernel build"),
@@ -3931,6 +3992,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad same-block spend must fail under the kernel build"),
@@ -4007,6 +4069,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("earlier tx bad script must reject the block"),
@@ -4047,6 +4110,7 @@ mod consensus_rule_tests {
                 &tx_plan(&block),
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::NONE),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("cross-transaction duplicate spend must fail script verification"),
@@ -4080,6 +4144,7 @@ mod consensus_rule_tests {
                 &tx_plan(&block),
             )),
             &validation_context(&block, 1, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad coinbase scriptSig length must fail transaction verification"),
@@ -4118,6 +4183,19 @@ mod consensus_rule_tests {
 
         let unanchored = AssumeValidGate::with_anchor(None);
         assert!(unanchored.trusted(), "no anchor means always trusted");
+    }
+
+    #[test]
+    fn scripts_verified_upstream_follows_provenance() {
+        let mut handles = empty_apply_handles();
+        assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 1));
+        assert!(handles.scripts_verified_upstream(BlockProvenance::LocalReplay, 1));
+
+        handles.assume_valid_height = 10;
+        handles.assume_valid_gate = Arc::new(AssumeValidGate::with_anchor(None));
+        assert!(handles.scripts_verified_upstream(BlockProvenance::Network, 10));
+        assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 11));
+        assert!(handles.scripts_verified_upstream(BlockProvenance::LocalReplay, 11));
     }
 
     #[test]
@@ -4187,6 +4265,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::NONE),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail when assume_valid_height is zero"),
@@ -4219,6 +4298,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::NONE),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail even under assume_valid_height"),
@@ -4251,6 +4331,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 3, 0, bitcoin_rs_script::VerifyFlags::NONE),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail above assume_valid_height"),
@@ -4283,6 +4364,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         )?;
         Ok(())
@@ -4305,6 +4387,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail when assume_valid_height is zero"),
@@ -4338,6 +4421,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 3, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail above assume_valid_height"),
@@ -4374,6 +4458,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("outputs exceeding inputs must fail even under assume_valid_height"),
@@ -4411,6 +4496,7 @@ mod consensus_rule_tests {
                 &tx_plan(&block),
             )),
             &validation_context(&block, 1, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad coinbase scriptSig length must fail under assume_valid_height"),
@@ -4606,6 +4692,7 @@ mod consensus_rule_tests {
                     &tx_plan(&block)
                 )),
                 &validation_context(&block, 1, 0, bitcoin_rs_script::VerifyFlags::NONE),
+                BlockProvenance::Network,
                 &kernel_block_of(&block),
             )
             .is_ok()
@@ -6035,6 +6122,7 @@ mod consensus_rule_tests {
                 &block,
                 Some(raw),
                 Some(ProvenApply::Proven(proof)),
+                BlockProvenance::Network,
                 &chain_proof,
             ) else {
                 panic!("a mismatched proof must re-read the now-missing live prevout");
@@ -6206,7 +6294,14 @@ mod consensus_rule_tests {
         let transition = handles.begin_chain_transition()?;
         let guard = handles.mempool_gateway.begin_chain_change()?;
         let proof = ChainChangeProof::new(transition, guard);
-        let outcome = apply_block_admitted(&handles, &block, Some(raw), Some(skipped), &proof);
+        let outcome = apply_block_admitted(
+            &handles,
+            &block,
+            Some(raw),
+            Some(skipped),
+            BlockProvenance::Network,
+            &proof,
+        );
         assert!(
             matches!(
                 outcome,
@@ -7205,6 +7300,7 @@ mod consensus_rule_tests {
         handles.tx_index_runtime = Some(Arc::clone(&runtime));
         let index: Arc<FailAfterStartupTxIndex> = Arc::new(FailAfterStartupTxIndex::new()?);
         let writer: Arc<dyn crate::txindex_worker::TxIndexWriter> = index.clone();
+        let evidence_dir = tempfile::tempdir()?;
         let _worker = crate::txindex_worker::TxIndexWorker::spawn(
             Arc::clone(&runtime),
             writer,
@@ -7214,6 +7310,7 @@ mod consensus_rule_tests {
             crate::txindex_worker::DEFAULT_BATCH_LIMITS,
             bitcoin_rs_index::IndexCapabilities::ALL,
             Arc::new(crate::state::ChainEventPublisher::detached(0).0),
+            crate::txindex_worker::test_recovery_reporter(evidence_dir.path()).0,
             u32::MAX,
             wake_rx,
         )?;
@@ -8218,6 +8315,7 @@ mod consensus_rule_tests {
                 &plan,
             )),
             &validation_context(&block, 170_060, 0, exc_flags),
+            BlockProvenance::Network,
             &kernel_block_of(&block),
         )?;
 
@@ -8235,6 +8333,7 @@ mod consensus_rule_tests {
                 &plan2,
             )),
             &validation_context(&block2, 170_060, 0, normal_flags),
+            BlockProvenance::Network,
             &kernel_block_of(&block2),
         ) {
             Ok(()) => {
