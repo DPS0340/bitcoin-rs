@@ -451,7 +451,7 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
 /// failure verbatim; nothing is inserted when this fails.
 pub(crate) fn admit_transaction(
     ctx: &Context,
-    tx: Tx,
+    tx: &Tx,
     max_feerate_sat_per_kvb: Option<u64>,
 ) -> Result<MutationResult, String> {
     let txid = tx.txid();
@@ -478,13 +478,13 @@ pub(crate) fn admit_transaction(
             }
             let sequence = pool.sequence_number();
             let policy = pool.policy_snapshot();
-            let mempool_prevouts = resolve_mempool_prevouts(&pool, &tx);
+            let mempool_prevouts = resolve_mempool_prevouts(&pool, tx);
             (sequence, policy, mempool_prevouts)
         };
 
         // Without a pool guard: resolve UTXO data and combine with the
         // mempool-dependent prevouts captured above.
-        let (context, prevouts) = resolve_full_context(ctx, &tx, &mempool_prevouts);
+        let (context, prevouts) = resolve_full_context(ctx, tx, &mempool_prevouts);
         let locktime_cutoff = ctx
             .median_time_past_for_hash(ctx.applied_hash())
             .unwrap_or(0);
@@ -584,12 +584,7 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
         };
 
         match ctx.mempool.admit_transaction(request) {
-            Ok(AdmitOutcome::Committed(_)) => {
-                return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
-            }
-            Ok(AdmitOutcome::AlreadyKnown) => {
-                // The exact transaction was added between our read-guard
-                // check and the write-guard commit.
+            Ok(AdmitOutcome::Committed(_) | AdmitOutcome::AlreadyKnown) => {
                 return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
             }
             Err(AdmitError::GenerationChanged | AdmitError::MempoolChanged) => continue,

@@ -307,7 +307,7 @@ impl Node {
         // the embedded surface admits under the identical cap.
         let max_feerate = Some(bitcoin_rs_rpc::context::DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB);
         self.context
-            .admit_transaction(tx, max_feerate)
+            .admit_transaction(&tx, max_feerate)
             .map_err(NodeError::Broadcast)
     }
 

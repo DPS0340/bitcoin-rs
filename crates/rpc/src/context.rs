@@ -1575,7 +1575,7 @@ impl Context {
     /// the failure verbatim; nothing is inserted when this fails.
     pub fn admit_transaction(
         &self,
-        tx: Tx,
+        tx: &Tx,
         max_feerate_sat_per_kvb: Option<u64>,
     ) -> Result<MutationResult, String> {
         crate::handlers::tx::admit_transaction(self, tx, max_feerate_sat_per_kvb)
