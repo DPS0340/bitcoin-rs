@@ -4071,10 +4071,13 @@ mod tests {
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
+        // Journal rewind disarms disconnect markers itself. These tests own the
+        // checkpoint-settlement path that remains when the journal cannot.
+        config.chainstate_journal.enabled = false;
         let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
-        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1, 1)?;
         state.apply_block(&block_one)?;
         state.publish_checkpoint()?;
 
@@ -4084,7 +4087,7 @@ mod tests {
         .get("generation")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
-        let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2)?;
+        let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2, 2)?;
         state.apply_block(&block_two)?;
 
         crate::reorg::invalidate_block(
@@ -4115,16 +4118,17 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.data_dir = data_dir.clone();
+        config.data_dir = data_dir;
         config.p2p_listen.clear();
+        config.chainstate_journal.enabled = false;
         let state = NodeState::open(config.clone(), None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
-        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1, 1)?;
         state.apply_block(&block_one)?;
         state.publish_checkpoint()?;
 
-        let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2)?;
+        let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2, 2)?;
         state.apply_block(&block_two)?;
 
         crate::checkpoint::inject_next_checkpoint_failpoint(
@@ -4169,10 +4173,11 @@ mod tests {
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
+        config.chainstate_journal.enabled = false;
         let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
-        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1, 1)?;
         state.apply_block(&block_one)?;
         state.publish_checkpoint()?;
 
@@ -4192,7 +4197,8 @@ mod tests {
         let mut previous_hash = genesis.block_hash();
         let mut fork_bodies = HashMap::new();
         for height in 1..=2 {
-            let block = mined_regtest_child_at(previous_hash, genesis.header.time + 10 + height)?;
+            let block =
+                mined_regtest_child_at(previous_hash, genesis.header.time + 10 + height, height)?;
             let node_id = state.block_tree.write().insert_node(
                 Some(parent),
                 block.header,
@@ -4681,16 +4687,23 @@ mod tests {
     }
 
     fn mined_regtest_child(prev_blockhash: BlockHash) -> anyhow::Result<Block> {
-        mined_regtest_child_at(prev_blockhash, 1_296_688_603)
+        mined_regtest_child_at(prev_blockhash, 1_296_688_603, 1)
     }
 
-    fn mined_regtest_child_at(prev_blockhash: BlockHash, time: u32) -> anyhow::Result<Block> {
+    fn mined_regtest_child_at(
+        prev_blockhash: BlockHash,
+        time: u32,
+        height: u32,
+    ) -> anyhow::Result<Block> {
+        let mut script_sig = vec![8];
+        script_sig.extend_from_slice(&height.to_le_bytes());
+        script_sig.extend_from_slice(&time.to_le_bytes());
         let coinbase = Tx {
             version: 2,
             lock_time: 0,
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid::default(), u32::MAX),
-                script_sig: vec![1, 1],
+                script_sig,
                 sequence: u32::MAX,
                 witness: Vec::new(),
             }],

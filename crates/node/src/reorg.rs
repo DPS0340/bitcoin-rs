@@ -21,6 +21,9 @@ use crate::{ApplyError, DisconnectError};
 
 /// Settles a rolled-back disconnect marker once the reorg owner has released
 /// its chain-transition proof.
+///
+/// A successful chainstate-journal rewind already disarms the marker, in which
+/// case this is a no-op. Publication runs only when `RolledBack` debt remains.
 fn settle_disconnect_debt(handles: &ApplyHandles) -> core::result::Result<(), ReorgError> {
     let Some(publisher) = &handles.checkpoint_publisher else {
         return Ok(());
