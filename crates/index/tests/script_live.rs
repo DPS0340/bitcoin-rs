@@ -651,7 +651,7 @@ fn live_and_history_watermarks_advance_independently() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Seeding writes rows and stamps the watermark last; recovery resets any
+/// CONTRACT: IDX-07. Seeding writes rows and stamps the watermark last; recovery resets any
 /// partial rows before a fresh seed, and a second seed over the stamped
 /// watermark is refused.
 #[test]
