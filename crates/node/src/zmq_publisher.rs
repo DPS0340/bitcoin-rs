@@ -583,6 +583,7 @@ mod tests {
     #[cfg(feature = "zmq")]
     use std::time::{Duration, Instant};
 
+    #[cfg(feature = "zmq")]
     fn endpoint(endpoint: impl Into<String>, topics: Vec<ZmqTopic>, hwm: u32) -> ZmqEndpointConfig {
         ZmqEndpointConfig {
             endpoint: endpoint.into(),
