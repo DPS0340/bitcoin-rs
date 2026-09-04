@@ -454,11 +454,13 @@ pub(crate) fn admit_transaction(
 ) -> Result<MutationResult, String> {
     let txid = tx.txid();
 
-    // A tx already confirmed in the chain is always "known" — no
-    // generation or mempool guard needed.
-    if ctx.transactions.read().contains_key(&txid) {
-        return Ok(MutationResult::empty());
-    }
+    // `ctx.transactions` is not consulted here. Block application never
+    // writes it; its only production writer is this path, after admission.
+    // Treating it as "already confirmed" made a transaction the mempool later
+    // evicted unrepeatable: every resubmission short-circuited to success
+    // while the transaction was in neither the pool nor the chain. A
+    // transaction that really is in the chain has its prevouts spent, so
+    // admission below rejects it with missing inputs.
 
     // Bounded retry: each attempt reads a fresh stable generation, captures
     // the exact mempool sequence under a read guard, resolves UTXO data
@@ -543,11 +545,8 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
     let tx = decode_tx(raw)?;
     let txid = tx.txid();
 
-    // A tx already confirmed in the chain is always "known" — no
-    // generation or mempool guard needed.
-    if ctx.transactions.read().contains_key(&txid) {
-        return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
-    }
+    // No `ctx.transactions` short-circuit here either; see `admit_transaction`
+    // for why that cache is not a confirmation record.
 
     // Bounded retry: each attempt reads a fresh stable generation, captures
     // the exact mempool sequence under a read guard, resolves UTXO data
