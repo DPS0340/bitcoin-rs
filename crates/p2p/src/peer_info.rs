@@ -41,6 +41,12 @@ pub struct PeerInfo {
 }
 
 impl PeerInfo {
+    fn time_offset(version: &VersionMessage, version_received_time: u64) -> i64 {
+        version
+            .timestamp
+            .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX))
+    }
+
     /// Constructs a `PeerInfo` for an inbound peer from the captured remote `VersionMessage`.
     #[must_use]
     pub fn inbound_from_version(
@@ -64,9 +70,7 @@ impl PeerInfo {
             // the difference against local time at that moment and never
             // revisits it, so a long-lived connection reports the offset as it
             // was at handshake.
-            time_offset: version
-                .timestamp
-                .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX)),
+            time_offset: Self::time_offset(version, version_received_time),
             counters,
         }
     }
@@ -94,9 +98,7 @@ impl PeerInfo {
             // the difference against local time at that moment and never
             // revisits it, so a long-lived connection reports the offset as it
             // was at handshake.
-            time_offset: version
-                .timestamp
-                .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX)),
+            time_offset: Self::time_offset(version, version_received_time),
             counters,
         }
     }
@@ -191,12 +193,12 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let mut version = fake_version();
         version.timestamp = 1_700_000_120;
-        let info = PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, 0, counters());
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, 1_700_000_000, counters());
         assert_eq!(info.time_offset, 120);
 
         version.timestamp = 1_699_999_940;
         let behind =
-            PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, 0, counters());
+            PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, 1_700_000_000, counters());
         assert_eq!(behind.time_offset, -60);
     }
 

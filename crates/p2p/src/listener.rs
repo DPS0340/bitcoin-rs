@@ -669,6 +669,12 @@ fn run_handshake(
         .set_write_timeout(Some(HANDSHAKE_READ_TIMEOUT))
         .map_err(crate::wire::PeerError::Io)?;
 
+    // Wrapped before the handshake, so the bytes it spends are counted too.
+    let counters = std::sync::Arc::new(crate::PeerCounters::default());
+    let stream = crate::CountingStream::new(stream, counters);
+    let addr_bind = stream.local_addr().map_err(crate::wire::PeerError::Io)?;
+    let counters = std::sync::Arc::clone(stream.counters());
+
     // Register the connection before the handshake so live-connection
     // accounting covers handshaking peers exactly like Core's connman.
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::Message>();
@@ -676,11 +682,6 @@ fn run_handshake(
     register_connection(&shared.peer_outbound, peer_addr, lease.clone());
 
     let nonce = generate_nonce(peer_addr);
-    // Wrapped before the handshake, so the bytes it spends are counted too.
-    let counters = std::sync::Arc::new(crate::PeerCounters::default());
-    let stream = crate::CountingStream::new(stream, counters);
-    let addr_bind = stream.local_addr().map_err(crate::wire::PeerError::Io)?;
-    let counters = std::sync::Arc::clone(stream.counters());
     let mut peer = Peer::new(stream, magic);
     let handshake_deadline = Instant::now() + HANDSHAKE_READ_TIMEOUT;
     if let Err(error) = run_inbound_handshake(
