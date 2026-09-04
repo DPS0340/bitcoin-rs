@@ -169,14 +169,13 @@ pub(crate) fn read_handshake_message<S: Read>(
                     totals.record_recv(wire_len);
                 }
                 if matches!(message, Message::Version(_)) {
-                        peer.version_received_time = Some(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|duration| duration.as_secs())
-                                .unwrap_or(0),
-                        );
-                    }
-                    return Ok((message, raw));
+                    peer.version_received_time = Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0, |duration| duration.as_secs()),
+                    );
+                }
+                return Ok((message, raw));
             }
             Err(PeerError::Io(error))
                 if matches!(

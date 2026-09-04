@@ -193,12 +193,25 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let mut version = fake_version();
         version.timestamp = 1_700_000_120;
-        let info = PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, 1_700_000_000, counters());
+        let info = PeerInfo::inbound_from_version(
+            addr,
+            addr,
+            &version,
+            1_700_000_000,
+            1_700_000_000,
+            counters(),
+        );
         assert_eq!(info.time_offset, 120);
 
         version.timestamp = 1_699_999_940;
-        let behind =
-            PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, 1_700_000_000, counters());
+        let behind = PeerInfo::inbound_from_version(
+            addr,
+            addr,
+            &version,
+            1_700_000_000,
+            1_700_000_000,
+            counters(),
+        );
         assert_eq!(behind.time_offset, -60);
     }
 

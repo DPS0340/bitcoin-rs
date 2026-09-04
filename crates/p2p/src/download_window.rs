@@ -4,7 +4,6 @@
 //! request from which peers, how to detect and recover from stalls, and how
 //! to manage the in-flight window budget. The sync *coordinator* (`BlockSync`
 //! in the node crate) drives these policy types but does not own them.
-
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -68,36 +67,46 @@ pub const INBOUND_BLOCK_STAGE_CHUNK: usize =
 /// the shipped single-peer behavior and stays bit-identical when fewer than
 /// [`MIN_PEERS_FOR_FANOUT`] eligible peers exist.
 pub const PEER_INFLIGHT_BUDGET: usize = PENDING_BUDGET;
-/// Per-peer in-flight cap while fan-out is active, mirroring Bitcoin Core's
-/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (16, `net_processing.cpp`). A deep
-/// per-peer pipeline under fan-out reproduces the recorded head-of-line
-/// collapse; a shallow stripe without the fallback reproduces the early-height
-/// under-fill regression — both were established by a live-tested and reverted
-/// attempt (commit 5608279, recoverable from git history).
+/// Per-peer in-flight cap while fan-out is active.
+///
+/// Mirrors Bitcoin Core's `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (16,
+/// `net_processing.cpp`). A deep per-peer pipeline under fan-out reproduces
+/// the recorded head-of-line collapse; a shallow stripe without the fallback
+/// reproduces the early-height under-fill regression — both were established
+/// by a live-tested and reverted attempt (commit 5608279, recoverable from
+/// git history).
 pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 /// Minimum peer population that can fill the 128-block window at Core's
-/// 16-block per-peer floor. Below this count, one healthy peer's deep
-/// sequential pipeline beats fragmented stripes on real mainnet peers; the
-/// bounded cold-front hedge handles a silent owner without under-filling.
+/// 16-block per-peer floor.
+///
+/// Below this count, one healthy peer's deep sequential pipeline beats
+/// fragmented stripes on real mainnet peers; the bounded cold-front hedge
+/// handles a silent owner without under-filling.
 pub const MIN_PEERS_FOR_FANOUT: usize = PENDING_BUDGET / MAX_BLOCKS_IN_TRANSIT_PER_PEER;
-/// Initial window-blocked stalling threshold, mirroring Bitcoin Core's
-/// `BLOCK_STALLING_TIMEOUT_DEFAULT` (2s, `net_processing.cpp`): when the
-/// window front has been in flight to one peer this long with the apply
-/// frontier idle and no other download progress possible, that peer is
-/// disconnected and its blocks re-queued (R8).
+/// Initial window-blocked stalling threshold.
+///
+/// Mirrors Bitcoin Core's `BLOCK_STALLING_TIMEOUT_DEFAULT` (2s,
+/// `net_processing.cpp`): when the window front has been in flight to one
+/// peer this long with the apply frontier idle and no other download
+/// progress possible, that peer is disconnected and its blocks re-queued
+/// (R8).
 pub const BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
-/// Adaptive ceiling for the stalling threshold, mirroring Core's
-/// `BLOCK_STALLING_TIMEOUT_MAX` (64s): the threshold doubles per staller
-/// disconnect so a sudden bandwidth drop cannot cascade into disconnecting
-/// every peer at the 2s floor, and decays by x0.85 per window-front arrival
-/// (never snapping back) so the elevation survives a peer rotation.
+/// Adaptive ceiling for the stalling threshold.
+///
+/// Mirrors Core's `BLOCK_STALLING_TIMEOUT_MAX` (64s): the threshold doubles
+/// per staller disconnect so a sudden bandwidth drop cannot cascade into
+/// disconnecting every peer at the 2s floor, and decays by x0.85 per
+/// window-front arrival (never snapping back) so the elevation survives a
+/// peer rotation.
 pub const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 /// How long a disconnected staller stays excluded from fan-out eligibility
-/// and non-last-resort block requests. Sized to the threshold ceiling: a
-/// staller flapping through reconnects can capture the window front at most
-/// once per cooldown, and the (window-global) doubled threshold bounds each
-/// capture — Core has no equivalent only because its reconnecting peer
-/// cannot re-acquire in-flight assignments this cheaply.
+/// and non-last-resort block requests.
+///
+/// Sized to the threshold ceiling: a staller flapping through reconnects can
+/// capture the window front at most once per cooldown, and the
+/// (window-global) doubled threshold bounds each capture — Core has no
+/// equivalent only because its reconnecting peer cannot re-acquire in-flight
+/// assignments this cheaply.
 pub const STALLER_COOLDOWN: Duration = BLOCK_STALLING_TIMEOUT_MAX;
 
 // The apply-side cache horizon (`expected_apply_horizon`) stays within the
@@ -114,6 +123,7 @@ const _: () = assert!(PENDING_BUDGET == RECEIVED_BLOCK_BUDGET);
 /// block budget, and per-peer inflight budget.
 pub const GETDATA_BATCH_SIZE: usize = PENDING_BUDGET;
 
+/// Clamp a `usize` to at least 1, preventing zero-sized budgets.
 pub const fn at_least_one(value: usize) -> usize {
     if value == 0 { 1 } else { value }
 }
@@ -122,32 +132,46 @@ pub const fn at_least_one(value: usize) -> usize {
 // Peer-assignment policy types
 // ---------------------------------------------------------------------------
 
+/// A peer selected for block-header or block-body synchronization.
 #[derive(Clone, Copy, Debug)]
 pub struct SyncPeer {
+    /// Peer network address.
     pub addr: SocketAddr,
+    /// Best known block height the peer advertises.
     pub start_height: i32,
 }
 
+/// The set of peers chosen for the current sync cycle.
 #[derive(Clone, Debug, Default)]
 pub struct SyncPeerSelection {
+    /// Peer used for header-first sync.
     pub header_peer: Option<SyncPeer>,
+    /// Peers used for block-body requests.
     pub request_peers: Vec<SyncPeer>,
+    /// Peers used for cold-front prefix probes.
     pub probe_peers: Vec<SyncPeer>,
 }
 
 /// A height-eligible sync candidate annotated with its fan-out eligibility
-/// (KTD6 predicate, finalized across `statically_fanout_eligible` and the
-/// window's soft-demotion check) and with whether the window currently
-/// soft-blocks it for block requests (expired pendings or staller cooldown).
+/// and soft-block status.
+///
+/// The fan-out eligibility is the KTD6 predicate, finalized across
+/// `statically_fanout_eligible` and the window's soft-demotion check; the
+/// soft-block flag indicates whether the window currently soft-blocks the
+/// candidate for block requests (expired pendings or staller cooldown).
 #[derive(Clone, Copy, Debug)]
 pub struct FanoutCandidate {
+    /// The peer this candidate refers to.
     pub peer: SyncPeer,
+    /// Whether the peer satisfies the KTD6 fan-out eligibility predicate.
     pub fanout_eligible: bool,
+    /// Whether the window currently soft-blocks this peer for requests.
     pub soft_blocked: bool,
 }
 
-/// Connection-level clauses of the fan-out eligibility predicate (KTD6):
-/// outbound and witness-serving (`NODE_WITNESS`), per Bitcoin Core's
+/// Connection-level clauses of the fan-out eligibility predicate (KTD6).
+///
+/// Outbound and witness-serving (`NODE_WITNESS`), per Bitcoin Core's
 /// block-download peer criteria in `net_processing.cpp` (Core requests blocks
 /// only from witness peers post-segwit, and inbound peers are
 /// attacker-chosen — counting them toward fan-out is the recorded under-fill
@@ -158,6 +182,7 @@ pub fn statically_fanout_eligible(peer: &PeerInfo) -> bool {
     !peer.inbound && peer.services & witness != 0
 }
 
+/// Set the fan-out/request mode on the window from the current candidate set.
 pub fn configure_request_mode(
     window: &mut DownloadWindow,
     candidates: &[FanoutCandidate],
@@ -228,6 +253,7 @@ pub struct SyncBudget {
     pub staller_cooldown: Duration,
 }
 
+/// A batch of block requests prepared for a single peer.
 #[derive(Clone, Debug)]
 pub struct PeerRequest {
     peer_addr: SocketAddr,
@@ -236,16 +262,24 @@ pub struct PeerRequest {
 }
 
 impl PeerRequest {
+    /// Returns the peer address this request is directed to.
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
 
+    /// Iterates over the `(height, hash)` pairs in this request.
     pub fn entries(&self) -> impl Iterator<Item = (u32, Hash256)> + '_ {
         self.entries.iter().map(|entry| (entry.height, entry.hash))
     }
 
+    /// Returns the number of block entries in this request.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Returns `true` if the request contains no block entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -399,6 +433,8 @@ fn count_stall_episode_cleared(reason: &'static str) {
     metrics::counter!("node.sync.stall_episodes_cleared", "reason" => reason).increment(1);
 }
 
+/// Block download window: tracks pending, received, and in-flight block
+/// requests with stall detection, cold-front hedging, and fan-out policy.
 #[derive(Debug)]
 pub struct DownloadWindow {
     budget: SyncBudget,
@@ -493,6 +529,7 @@ struct ReceivedBlock {
 }
 
 impl DownloadWindow {
+    /// Creates a new download window with the given budget.
     pub fn new(budget: SyncBudget) -> Self {
         Self {
             budget,
@@ -597,6 +634,7 @@ impl DownloadWindow {
             .min(self.budget.max_peer_inflight)
     }
 
+    /// Returns the number of blocks currently pending (requested, not yet received).
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
@@ -610,10 +648,12 @@ impl DownloadWindow {
         self.budget.max_pending_blocks
     }
 
+    /// Returns the total estimated bytes of pending blocks.
     pub const fn pending_bytes(&self) -> usize {
         self.pending_bytes
     }
 
+    /// Returns `true` if the window can accept new block requests.
     pub fn has_request_capacity(&self) -> bool {
         self.pending.len() < self.budget.max_pending_blocks
             && self.pending_bytes.saturating_add(self.ewma_block_bytes)
@@ -698,6 +738,7 @@ impl DownloadWindow {
             .saturating_sub(self.pending.len().saturating_sub(expired_pending_blocks))
     }
 
+    /// Maximum number of blocks to request from one peer this tick.
     pub fn request_peer_scan_limit(&self, now: Instant) -> usize {
         if self.staged_bytes_exhausted() {
             return 0;
@@ -1240,7 +1281,6 @@ impl DownloadWindow {
     }
 
     /// Current adaptive stalling threshold (2s doubling to 64s).
-    #[cfg(test)]
     pub const fn stall_timeout(&self) -> Duration {
         self.stall_timeout
     }
@@ -1264,17 +1304,17 @@ impl DownloadWindow {
             .is_some_and(|fired_at| now.duration_since(*fired_at) < self.budget.staller_cooldown)
     }
 
-    #[cfg(test)]
+    /// Returns the number of received (staged) blocks. Test-only accessor.
     pub fn received_len(&self) -> usize {
         self.received.len()
     }
 
-    #[cfg(test)]
+    /// Returns `true` if `hash` is currently pending. Test-only accessor.
     pub fn contains_pending(&self, hash: &Hash256) -> bool {
         self.pending.contains_key(hash)
     }
 
-    #[cfg(test)]
+    /// Returns the start time of the active prefix probe, if any. Test-only.
     pub fn active_prefix_probe_started_at(&self) -> Option<Instant> {
         self.prefix_probe.as_ref().map(|probe| probe.started_at)
     }
@@ -1303,6 +1343,8 @@ impl DownloadWindow {
             .min();
     }
 
+    /// Releases all state for peers that are no longer live, re-queuing their
+    /// pending and in-flight blocks for retry.
     pub fn release_disconnected_peers(&mut self, is_live_peer: impl Fn(&SocketAddr) -> bool) {
         let cold_front_live = match self.cold_front {
             Some(ColdFrontState::Waiting { owner, .. }) => is_live_peer(&owner),
@@ -1394,6 +1436,8 @@ impl DownloadWindow {
         self.next_request_height = retry_height;
     }
 
+    /// Builds the next batch of block requests for `peer_addr`, or `None` if
+    /// no blocks are available to request.
     pub fn next_peer_request(
         &mut self,
         peer_addr: SocketAddr,
@@ -1723,6 +1767,8 @@ impl DownloadWindow {
         }
     }
 
+    /// Records that `request` has been sent to its peer, moving entries to
+    /// pending. Returns `true` if the window still has request capacity.
     pub fn mark_requested(&mut self, request: &PeerRequest, now: Instant) -> bool {
         if self.pending.is_empty() && !request.entries.is_empty() {
             self.prefix_probe_attempted_owner = None;
@@ -1754,6 +1800,9 @@ impl DownloadWindow {
         self.has_request_capacity()
     }
 
+    /// Records that block `hash` was received from `source_peer`, moving it
+    /// from pending to received (staged). Returns `true` if the window still
+    /// has request capacity.
     pub fn mark_received_from(
         &mut self,
         hash: Hash256,
@@ -1795,7 +1844,6 @@ impl DownloadWindow {
     }
 
     /// Test-only shorthand for delivery by the pending owner.
-    #[cfg(test)]
     pub fn mark_received(&mut self, hash: Hash256, bytes: usize, now: Instant) -> bool {
         let source_peer = self.pending.get(&hash).map(|pending| pending.peer_addr);
         self.mark_received_from(hash, bytes, source_peer, now)
@@ -1883,7 +1931,6 @@ impl DownloadWindow {
     }
 
     /// Current inter-front-advance EWMA in milliseconds, if seeded.
-    #[cfg(test)]
     pub const fn front_interval_ewma_ms(&self) -> Option<u64> {
         self.front_interval_ewma_ms
     }
@@ -1894,34 +1941,37 @@ impl DownloadWindow {
     /// (the recorded wedge constructions) use this instead of replaying two
     /// real front deliveries; the real sampling path is pinned by the window
     /// tests.
-    #[cfg(test)]
     pub const fn seed_front_cadence_for_test(&mut self, ewma_ms: u64, now: Instant) {
         self.front_interval_ewma_ms = Some(ewma_ms);
         self.last_front_advance = Some(now);
     }
 
+    /// Updates the height of a received block after a tree re-evaluation.
     pub fn update_received_height(&mut self, hash: &Hash256, height: u32) {
         if let Some(received) = self.received.get_mut(hash) {
             received.height = height;
         }
     }
 
-    #[cfg(test)]
+    /// Marks a block as applied and removes it from pending. Test-only.
     pub fn mark_applied(&mut self, hash: &Hash256) {
         self.mark_received_applied(hash);
         self.remove_pending(hash);
     }
 
+    /// Marks a received block as applied, removing it from the staging set.
     pub fn mark_received_applied(&mut self, hash: &Hash256) {
         self.remove_received(hash);
     }
 
+    /// Drops a received (staged) block, re-queuing it for re-download.
     pub fn drop_received_for_retry(&mut self, hash: &Hash256) {
         if let Some(received) = self.remove_received(hash) {
             self.next_request_height = self.next_request_height.min(received.height);
         }
     }
 
+    /// Drops a block from both received and pending, re-queuing it for retry.
     pub fn drop_for_retry(&mut self, hash: &Hash256) {
         self.drop_received_for_retry(hash);
         if let Some(pending) = self.remove_pending(hash) {
