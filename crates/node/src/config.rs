@@ -39,9 +39,6 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_RPC_USER: &str = "bitcoin-rs";
 const DEFAULT_RPC_PASSWORD: &str = "bitcoin-rs";
 const DEFAULT_DBCACHE_MB: u64 = 450;
-/// Fork depth (blocks) at which a stale txindex watermark stops the
-/// per-block rewind and routes to a selective reset + rebuild instead.
-const DEFAULT_INDEX_ROLLBACK_REBUILD_CUTOVER: u32 = 100_000;
 const DEFAULT_ZMQ_HWM: u32 = 1_000;
 const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
 const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
@@ -166,30 +163,21 @@ pub struct ZmqPublication {
 /// How much of the derived `ScriptIndex` a node maintains.
 ///
 /// `ScriptIndex` is rebuildable derived state, so the mode is a capability
-/// selection rather than a storage compatibility question: `utxo` maintains
-/// only the compact live-output view, `full` adds historical funding/spending
-/// rows.
+/// selection rather than a storage compatibility question: `full` adds
+/// historical funding/spending rows while still maintaining the live-output
+/// view.
 ///
 /// The boolean spellings remain behaviorally compatible: `--scriptindex`,
 /// `--scriptindex=true`, and `BITCOIN_RS_SCRIPTINDEX=true` all mean
 /// [`Self::Full`], and `false` means [`Self::Disabled`].
-///
-/// [`Self::Utxo`] is parsed and named but not yet accepted by
-/// [`NodeConfig::validate`]: the `ScriptLive` row format was selected in #226
-/// (see `ScriptLiveRow`), but the live-output worker that populates it is still
-/// pending in #225. See [`ScriptIndexMode::has_live_store`].
+
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptIndexMode {
     /// No `ScriptIndex` capability is maintained.
     #[default]
     Disabled,
-    /// Maintain only the compact live-output view.
-    ///
-    /// Named and parsed, but **not accepted** by [`NodeConfig::validate`]
-    /// until the live-output worker that writes `ScriptLive` rows is wired in
-    /// #225. See [`ScriptIndexMode::has_live_store`].
-    Utxo,
+
     /// Maintain both the live-output view and historical script activity.
     Full,
 }
@@ -202,41 +190,16 @@ impl ScriptIndexMode {
     }
 
     /// Whether historical funding/spending rows are maintained.
-    ///
-    /// Only `full` keeps history; `utxo` deliberately avoids paying the
-    /// storage cost of full historical script indexing.
     #[must_use]
     pub const fn keeps_history(self) -> bool {
         matches!(self, Self::Full)
     }
-
-    /// Whether this mode has a durable store backing every view it claims.
-    ///
-    /// `utxo` is the one mode that does not, yet. Its whole purpose is the
-    /// compact live-output view. The `ScriptLive` locator format was selected
-    /// in #226 Q5 (see `ScriptLiveRow` in `crates/index/src/types.rs`), so the
-    /// durable row shape now exists in the storage layer; this mode remains
-    /// disabled until #225 wires the worker that actually populates those rows.
-    /// Until then, a node configured `utxo` would build no `Funding`/`Spending`
-    /// rows (those families are claimed only under `script_history`), publish
-    /// no `ScriptHistory` watermark, and then have every `ScriptIndexQuery`
-    /// method — `unspent_outputs` included — gate on
-    /// `IndexCapabilities::SCRIPT_HISTORY` and report `Retry` forever. That is
-    /// an advertised capability with nothing behind it.
-    ///
-    /// `Disabled` trivially has every store it claims, which is none.
-    #[must_use]
-    pub const fn has_live_store(self) -> bool {
-        !matches!(self, Self::Utxo)
-    }
-
     /// Parses a mode from a configuration value.
     ///
     /// Accepts the historical boolean spellings for compatibility: `true`
     /// means `full` and `false` means disabled. Parsing is case-insensitive.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "utxo" => Some(Self::Utxo),
             // `true` is the historical boolean spelling and must keep meaning
             // `full`; it is a separate pattern for that readability, not a
             // distinct outcome.
@@ -300,15 +263,6 @@ pub struct NodeConfig {
     /// down so share arithmetic stays exact. Effective per-namespace
     /// capacities are logged at startup (`opened storage backend`).
     pub dbcache_mb: u64,
-    /// Fork depth at which a stale txindex watermark routes to a selective
-    /// reset and rebuild instead of a per-block rewind.
-    ///
-    /// Grounded in three measured runs of per-block forward-ingest versus
-    /// rollback cost (see `docs/benchmarks/index-rollback-rebuild-cutover.md`):
-    /// the default routes the 834k-block stale-branch incident shape to a
-    /// rebuild while organic reorgs (tens of blocks) keep rewinding block by
-    /// block.
-    pub index_rollback_rebuild_cutover: u32,
     /// Tracing filter level used when `RUST_LOG` is unset.
     pub log_level: String,
     /// Optional Prometheus metrics bind address. `None` disables metrics.
@@ -363,10 +317,6 @@ impl fmt::Debug for NodeConfig {
             .field("prune_target_mb", &self.prune_target_mb)
             .field("txindex", &self.txindex)
             .field("dbcache_mb", &self.dbcache_mb)
-            .field(
-                "index_rollback_rebuild_cutover",
-                &self.index_rollback_rebuild_cutover,
-            )
             .field("log_level", &self.log_level)
             .field("metrics_bind", &self.metrics_bind)
             .field("zmqpubhashblock", &self.zmqpubhashblock)
@@ -417,7 +367,6 @@ impl NodeConfig {
             prune_target_mb: 0,
             txindex: false,
             dbcache_mb: DEFAULT_DBCACHE_MB,
-            index_rollback_rebuild_cutover: DEFAULT_INDEX_ROLLBACK_REBUILD_CUTOVER,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             metrics_bind: None,
             zmqpubhashblock: Vec::new(),
@@ -512,12 +461,7 @@ impl NodeConfig {
             "rocksdb" | "fjall" | "redb" | "mdbx" => {}
             other => bail!("unsupported storage backend {other}"),
         }
-        ensure!(
-            self.script_index.has_live_store(),
-            "scriptindex=utxo is not yet usable: the ScriptLive locator format was \
-             selected in #226 Q5, but the live-output store is not yet populated \
-             by a worker (#225). Only `full` and `disabled` are accepted."
-        );
+
         for (name, hwm) in [
             ("zmqpubhashblockhwm", self.zmqpubhashblockhwm),
             ("zmqpubhashtxhwm", self.zmqpubhashtxhwm),
@@ -635,7 +579,7 @@ impl NodeConfig {
         if let Some(script_index) = &layer.script_index {
             self.script_index = ScriptIndexMode::parse(script_index).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "invalid scriptindex value `{script_index}`: expected `utxo`, `full`, or a boolean"
+                    "invalid scriptindex value `{script_index}`: expected `full` or a boolean"
                 )
             })?;
         }
@@ -657,17 +601,11 @@ impl NodeConfig {
         if let Some(dbcache_mb) = layer.dbcache_mb {
             self.dbcache_mb = dbcache_mb;
         }
-        if let Some(cutover) = layer.index_rollback_rebuild_cutover {
-            self.index_rollback_rebuild_cutover = cutover;
-        }
         if let Some(log_level) = &layer.log_level {
             self.log_level.clone_from(log_level);
         }
         if let Some(metrics_bind) = layer.metrics_bind {
             self.metrics_bind = Some(metrics_bind);
-        }
-        if layer.clear_metrics_bind {
-            self.metrics_bind = None;
         }
         if let Some(endpoints) = &layer.zmqpubhashblock {
             self.zmqpubhashblock.clone_from(endpoints);
@@ -818,14 +756,10 @@ pub struct UserConfig {
     pub(crate) txindex: Option<bool>,
     #[arg(long = "dbcache-mb")]
     pub(crate) dbcache_mb: Option<u64>,
-    #[arg(long = "index-rollback-rebuild-cutover")]
-    pub(crate) index_rollback_rebuild_cutover: Option<u32>,
     #[arg(long = "log-level")]
     pub(crate) log_level: Option<String>,
     #[arg(long = "metrics-bind")]
     pub(crate) metrics_bind: Option<SocketAddr>,
-    #[arg(skip)]
-    pub(crate) clear_metrics_bind: bool,
     #[arg(long = "zmqpubhashblock", value_delimiter = ',')]
     pub(crate) zmqpubhashblock: Option<Vec<String>>,
     #[arg(long = "zmqpubhashtx", value_delimiter = ',')]
@@ -884,9 +818,6 @@ impl UserConfig {
                 "BITCOIN_RS_PRUNE_TARGET_MB" => layer.prune_target_mb = Some(value.parse()?),
                 "BITCOIN_RS_TXINDEX" => layer.txindex = Some(parse_bool(value)?),
                 "BITCOIN_RS_DBCACHE_MB" => layer.dbcache_mb = Some(value.parse()?),
-                "BITCOIN_RS_INDEX_ROLLBACK_REBUILD_CUTOVER" => {
-                    layer.index_rollback_rebuild_cutover = Some(value.parse()?);
-                }
                 "BITCOIN_RS_LOG_LEVEL" => layer.log_level = Some(value.to_owned()),
                 "BITCOIN_RS_METRICS_BIND" => layer.metrics_bind = Some(value.parse()?),
                 "BITCOIN_RS_ZMQPUBHASHBLOCK" => {
