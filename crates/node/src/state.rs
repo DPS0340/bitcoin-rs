@@ -13,6 +13,12 @@ use bitcoin_rs_rpc::context::{
     BlockBodyMetadata, BlockBodySource, BlockLog, NetworkState, PruneResult, PruneService,
     PruneServiceError, PruneStatus, ZmqNotification,
 };
+#[cfg(any(
+    not(feature = "rocksdb"),
+    not(feature = "fjall"),
+    not(feature = "redb"),
+    not(feature = "mdbx")
+))]
 use core::fmt;
 use core::mem::size_of;
 use crossbeam_channel::{Receiver, Sender};
@@ -29,7 +35,7 @@ use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
 use bitcoin_rs_storage::pruning::{
     PrunePolicy, reclaim_staged_flat_block_files, stage_block_and_undo_prune,
 };
-use bitcoin_rs_storage::{ColumnFamily, FlatFileBlockStore, KvStore, WriteBatch};
+use bitcoin_rs_storage::{ColumnFamily, FlatFileBlockStore, KvStore, StorageBackend, WriteBatch};
 use bitcoin_rs_utxo::UtxoSet;
 use parking_lot::{Mutex, RwLock};
 
@@ -491,9 +497,9 @@ impl NodeStorage {
         std::fs::create_dir_all(&chainstate_dir)
             .with_context(|| format!("create chainstate_dir {}", chainstate_dir.display()))?;
 
-        match config.storage_backend.as_str() {
+        match config.storage.backend {
             #[cfg(feature = "rocksdb")]
-            "rocksdb" => Ok(Self::RocksDb(Arc::new(
+            StorageBackend::RocksDb => Ok(Self::RocksDb(Arc::new(
                 bitcoin_rs_storage::RocksDbStore::open_with_cache(
                     &chainstate_dir,
                     chainstate_cache_bytes,
@@ -501,7 +507,7 @@ impl NodeStorage {
                 .map_err(anyhow::Error::new)?,
             ))),
             #[cfg(feature = "fjall")]
-            "fjall" => Ok(Self::Fjall(Arc::new(
+            StorageBackend::Fjall => Ok(Self::Fjall(Arc::new(
                 bitcoin_rs_storage::FjallStore::open_with_cache(
                     &chainstate_dir,
                     chainstate_cache_bytes,
@@ -509,7 +515,7 @@ impl NodeStorage {
                 .map_err(anyhow::Error::new)?,
             ))),
             #[cfg(feature = "redb")]
-            "redb" => Ok(Self::Redb(Arc::new(
+            StorageBackend::Redb => Ok(Self::Redb(Arc::new(
                 bitcoin_rs_storage::RedbStore::open_with_cache(
                     &chainstate_dir,
                     chainstate_cache_bytes,
@@ -517,13 +523,19 @@ impl NodeStorage {
                 .map_err(anyhow::Error::new)?,
             ))),
             #[cfg(feature = "mdbx")]
-            "mdbx" => Ok(Self::Mdbx(Arc::new(
+            StorageBackend::Mdbx => Ok(Self::Mdbx(Arc::new(
                 bitcoin_rs_storage::MdbxStore::open_with_cache(
                     &chainstate_dir,
                     chainstate_cache_bytes,
                 )
                 .map_err(anyhow::Error::new)?,
             ))),
+            #[cfg(any(
+                not(feature = "rocksdb"),
+                not(feature = "fjall"),
+                not(feature = "redb"),
+                not(feature = "mdbx")
+            ))]
             other => bail!(
                 "unsupported storage backend: {other} (compiled features = {CompiledStorageFeatures})"
             ),
@@ -1292,6 +1304,12 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
     }
 }
 
+#[cfg(any(
+    not(feature = "rocksdb"),
+    not(feature = "fjall"),
+    not(feature = "redb"),
+    not(feature = "mdbx")
+))]
 const COMPILED_STORAGE_FEATURES: &[&str] = &[
     #[cfg(feature = "rocksdb")]
     "rocksdb",
@@ -1303,8 +1321,20 @@ const COMPILED_STORAGE_FEATURES: &[&str] = &[
     "mdbx",
 ];
 
+#[cfg(any(
+    not(feature = "rocksdb"),
+    not(feature = "fjall"),
+    not(feature = "redb"),
+    not(feature = "mdbx")
+))]
 struct CompiledStorageFeatures;
 
+#[cfg(any(
+    not(feature = "rocksdb"),
+    not(feature = "fjall"),
+    not(feature = "redb"),
+    not(feature = "mdbx")
+))]
 impl fmt::Display for CompiledStorageFeatures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Some((first, rest)) = COMPILED_STORAGE_FEATURES.split_first() else {
@@ -1325,9 +1355,11 @@ fn tx_index_capabilities(config: &NodeConfig) -> bitcoin_rs_index::IndexCapabili
         // Full ScriptIndex-backed Esplora responses need exact historical
         // transactions to render prevouts and calculate fees. `utxo` owns
         // only the compact live-output view and must not pay for TxLookup.
-        tx_lookup: config.txindex || config.script_index.keeps_history(),
-        script_history: config.script_index.keeps_history(),
-        script_live: config.script_index.is_enabled(),
+        // `tx_index_query` still exposes TxLookup to Core RPCs only for an
+        // explicit --txindex configuration.
+        tx_lookup: config.indexes.txindex || config.indexes.script_index.keeps_history(),
+        script_history: config.indexes.script_index.keeps_history(),
+        script_live: config.indexes.script_index.is_enabled(),
     }
 }
 
@@ -1340,18 +1372,24 @@ fn build_tx_index_open_spec(
     if enabled.is_empty() {
         return Ok(None);
     }
-    if config.prune_target_mb > 0 {
+    if config.storage.prune_target_mb > 0 {
         bail!("transaction and script indexing are not compatible with -prune");
     }
-    let batch_limits = match config.storage_backend.as_str() {
+    let batch_limits = match config.storage.backend {
         #[cfg(feature = "rocksdb")]
-        "rocksdb" => crate::txindex_worker::ROCKSDB_BATCH_LIMITS,
+        StorageBackend::RocksDb => crate::txindex_worker::ROCKSDB_BATCH_LIMITS,
         #[cfg(feature = "fjall")]
-        "fjall" => crate::txindex_worker::DEFAULT_BATCH_LIMITS,
+        StorageBackend::Fjall => crate::txindex_worker::DEFAULT_BATCH_LIMITS,
         #[cfg(feature = "redb")]
-        "redb" => crate::txindex_worker::REDB_BATCH_LIMITS,
+        StorageBackend::Redb => crate::txindex_worker::REDB_BATCH_LIMITS,
         #[cfg(feature = "mdbx")]
-        "mdbx" => crate::txindex_worker::DEFAULT_BATCH_LIMITS,
+        StorageBackend::Mdbx => crate::txindex_worker::DEFAULT_BATCH_LIMITS,
+        #[cfg(any(
+            not(feature = "rocksdb"),
+            not(feature = "fjall"),
+            not(feature = "redb"),
+            not(feature = "mdbx")
+        ))]
         other => bail!("unsupported storage backend for txindex: {other}"),
     };
     let canonical_data_root = config
@@ -1361,7 +1399,7 @@ fn build_tx_index_open_spec(
     Ok(Some(crate::txindex_worker::TxIndexOpenSpec {
         data_dir: config.data_dir.clone(),
         namespace: "txindex",
-        storage_backend: config.storage_backend.clone(),
+        storage_backend: config.storage.backend,
         cache_bytes: txindex_cache_bytes,
         batch_limits,
         epoch,
@@ -1476,7 +1514,7 @@ impl NodeState {
         // Divide the process cache budget across the persistent namespaces
         // that exist in this deployment. A disabled txindex share redistributes
         // to chainstate.
-        let cache_budget = bitcoin_rs_storage::clamp_dbcache_bytes(config.dbcache_mb);
+        let cache_budget = bitcoin_rs_storage::clamp_dbcache_bytes(config.storage.dbcache_mb);
         let cache_shares = bitcoin_rs_storage::split_cache_budget(
             cache_budget,
             !tx_index_capabilities(&config).is_empty(),
@@ -1723,6 +1761,7 @@ impl NodeState {
                 tx_lifecycle: tx_index_lifecycle.clone(),
                 tx_runtime: tx_index_runtime.clone(),
                 txindex_enabled: crate::capabilities::txindex_enabled(&config),
+                index_capabilities: tx_index_capabilities(&config),
             },
         ));
         let network = Arc::new(RwLock::new(NetworkState::default()));
@@ -1793,10 +1832,10 @@ impl NodeState {
             admission: Arc::new(crate::apply::ApplyAdmission::new()),
             shutdown: Arc::clone(&shutdown),
             chain_transition,
-            assume_valid_height: config.assume_valid_height,
+            assume_valid_height: config.validation.assume_valid_height,
             assume_valid_gate: Arc::new(crate::apply::AssumeValidGate::new(
                 config.network,
-                config.assume_valid_height,
+                config.validation.assume_valid_height,
             )),
             journal,
         };
@@ -1812,7 +1851,7 @@ impl NodeState {
         let durable_tip_height = Arc::new(AtomicU32::new(
             applied_tip.load().as_ref().map_or(0, |tip| tip.height),
         ));
-        let prune_service = if config.prune_target_mb > 0 {
+        let prune_service = if config.storage.prune_target_mb > 0 {
             Some(storage.prune_service(
                 &block_files,
                 &block_body_store,
@@ -1994,7 +2033,7 @@ impl NodeState {
     /// Returns the node-owned complete transaction-index query adapter.
     #[must_use]
     pub fn tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery>> {
-        if !self.config.txindex {
+        if !self.config.indexes.txindex {
             return None;
         }
         self.tx_index_adapter.as_ref().map(|adapter| {
@@ -2018,7 +2057,7 @@ impl NodeState {
     /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
     pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
-        if !self.config.script_index.is_enabled() {
+        if !self.config.indexes.script_index.is_enabled() {
             return None;
         }
         self.tx_index_adapter.as_ref().map(|adapter| {
@@ -2387,26 +2426,26 @@ mod tests {
     #[test]
     fn script_index_capabilities_match_the_storage_contract() {
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.txindex = false;
+        config.indexes.txindex = false;
 
-        config.script_index = crate::config::ScriptIndexMode::Disabled;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Disabled;
         assert_eq!(tx_index_capabilities(&config), IndexCapabilities::NONE);
 
-        config.script_index = crate::config::ScriptIndexMode::Utxo;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Utxo;
         assert_eq!(
             tx_index_capabilities(&config),
             IndexCapabilities::SCRIPT_LIVE,
             "utxo mode owns only the compact live-output view"
         );
 
-        config.script_index = crate::config::ScriptIndexMode::Full;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Full;
         assert_eq!(tx_index_capabilities(&config), IndexCapabilities::ALL);
 
-        config.txindex = true;
-        config.script_index = crate::config::ScriptIndexMode::Disabled;
+        config.indexes.txindex = true;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Disabled;
         assert_eq!(tx_index_capabilities(&config), IndexCapabilities::TX_LOOKUP);
 
-        config.script_index = crate::config::ScriptIndexMode::Utxo;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Utxo;
         assert_eq!(
             tx_index_capabilities(&config),
             IndexCapabilities {
@@ -2450,7 +2489,7 @@ mod tests {
         let dir = tempdir()?;
         let config = crate::NodeConfig {
             data_dir: dir.path().join("node"),
-            ..crate::NodeConfig::default()
+            ..crate::NodeConfig::default_for_network(crate::Network::Regtest)
         };
 
         let state = NodeState::open(config, None)?;
@@ -2474,7 +2513,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let tree = state.block_tree();
 
@@ -2490,7 +2529,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let snapshot = state.coin_stats().snapshot();
         assert_eq!(
@@ -2505,7 +2544,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
 
         assert!(
@@ -2524,8 +2563,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = true;
+        config.p2p.listen.clear();
+        config.indexes.txindex = true;
         let mut state = NodeState::open(config, None)?;
         state.start_index_workers()?;
         let (Some(a), Some(b)) = (state.tx_index_query(), state.tx_index_query()) else {
@@ -2550,8 +2589,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = true;
+        config.p2p.listen.clear();
+        config.indexes.txindex = true;
         let mut state = NodeState::open(config, None)?;
 
         assert!(state.tx_index_lifecycle.as_ref().is_some_and(|lifecycle| {
@@ -2585,9 +2624,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = false;
-        config.script_index = crate::config::ScriptIndexMode::Full;
+        config.p2p.listen.clear();
+        config.indexes.txindex = false;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Full;
 
         let mut state = NodeState::open(config, None)?;
         state.start_index_workers()?;
@@ -2629,9 +2668,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = false;
-        config.script_index = crate::config::ScriptIndexMode::Disabled;
+        config.p2p.listen.clear();
+        config.indexes.txindex = false;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Disabled;
         let state = NodeState::open(config, None)?;
         let _ = state.apply_block(&crate::Network::Regtest.genesis_block())?;
         assert!(
@@ -2645,9 +2684,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = false;
-        config.script_index = crate::config::ScriptIndexMode::Utxo;
+        config.p2p.listen.clear();
+        config.indexes.txindex = false;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Utxo;
         let mut state = NodeState::open(config, None)?;
         state.start_index_workers()?;
         let _ = state.apply_block(&crate::Network::Regtest.genesis_block())?;
@@ -2677,9 +2716,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = false;
-        config.script_index = crate::config::ScriptIndexMode::Full;
+        config.p2p.listen.clear();
+        config.indexes.txindex = false;
+        config.indexes.script_index = crate::config::ScriptIndexMode::Full;
         let mut state = NodeState::open(config, None)?;
         state.start_index_workers()?;
         let _ = state.apply_block(&crate::Network::Regtest.genesis_block())?;
@@ -2717,8 +2756,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = true;
+        config.p2p.listen.clear();
+        config.indexes.txindex = true;
 
         {
             let mut state = NodeState::open(config.clone(), None)?;
@@ -2736,9 +2775,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = true;
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.indexes.txindex = true;
+        config.storage.prune_target_mb = 1;
 
         let error = match NodeState::open(config, None) {
             Ok(_) => anyhow::bail!("txindex with pruning must be rejected"),
@@ -2758,7 +2797,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let sync_a = state.sync();
         let sync_b = state.sync();
@@ -2774,7 +2813,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
 
         assert!(
@@ -2791,7 +2830,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
 
         assert!(
@@ -2808,7 +2847,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
 
         assert!(state.peer_table().is_empty());
@@ -2820,7 +2859,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let publisher = state.zmq_publisher();
         // No-op publisher accepts publish calls silently.
@@ -2833,7 +2872,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         config.notifications.zmq = vec![
             crate::zmq_publisher::ZmqEndpointConfig {
                 endpoint: "inproc://state-zmq-block".to_owned(),
@@ -2876,7 +2915,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let tx1 = state.inbound_headers_sender();
         let tx2 = state.inbound_headers_sender();
@@ -2898,7 +2937,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let _tx1 = state.inbound_blocks_sender();
         let _tx2 = state.inbound_blocks_sender();
@@ -2910,7 +2949,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let tx = state.inbound_blocks_sender();
         let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
@@ -2936,7 +2975,7 @@ mod tests {
         let dir = tempdir()?;
         let config = crate::NodeConfig {
             data_dir: dir.path().join("node"),
-            ..crate::NodeConfig::default()
+            ..crate::NodeConfig::default_for_network(crate::Network::Regtest)
         };
 
         let state = NodeState::open(config, None)?;
@@ -2961,15 +3000,15 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("without-txindex");
-        config.p2p_listen.clear();
-        config.txindex = false;
+        config.p2p.listen.clear();
+        config.indexes.txindex = false;
         let state = NodeState::open(config, None)?;
         assert!(state.apply_handles().tx_index_runtime.is_none());
 
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("with-txindex");
-        config.p2p_listen.clear();
-        config.txindex = true;
+        config.p2p.listen.clear();
+        config.indexes.txindex = true;
         let state = NodeState::open(config, None)?;
         assert!(state.apply_handles().tx_index_runtime.is_some());
         Ok(())
@@ -2980,8 +3019,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 0;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 0;
 
         let state = NodeState::open(config, None)?;
 
@@ -2994,8 +3033,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 0;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 0;
         let state = NodeState::open(config, None)?;
         let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
@@ -3019,7 +3058,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[7_u8; 32]);
         let body = b"idempotent block body";
@@ -3043,7 +3082,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::write(config.data_dir.join(".CURRENT_SCHEMA.tmp"), b"partial")?;
 
@@ -3063,7 +3102,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("legacy-node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::write(config.data_dir.join("legacy-state"), b"old")?;
 
@@ -3085,7 +3124,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("old-node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::write(
             config
@@ -3114,16 +3153,16 @@ mod tests {
         let dir_a = tempfile::tempdir()?;
         let mut config_a = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config_a.data_dir = dir_a.path().join("node-a");
-        config_a.p2p_listen.clear();
-        config_a.prune_target_mb = 0;
+        config_a.p2p.listen.clear();
+        config_a.storage.prune_target_mb = 0;
         let state_a = NodeState::open(config_a, None)?;
         state_a.apply_block(&block)?;
 
         let dir_b = tempfile::tempdir()?;
         let mut config_b = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config_b.data_dir = dir_b.path().join("node-b");
-        config_b.p2p_listen.clear();
-        config_b.prune_target_mb = 0;
+        config_b.p2p.listen.clear();
+        config_b.storage.prune_target_mb = 0;
         let state_b = NodeState::open(config_b, None)?;
         crate::apply::apply_block_with_serialized(&state_b.apply_handles(), &block, serialized)?;
 
@@ -3152,7 +3191,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let expected = {
             let state = NodeState::open(config.clone(), None)?;
@@ -3203,8 +3242,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
@@ -3263,8 +3302,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
@@ -3355,8 +3394,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 1;
         std::fs::create_dir_all(&config.data_dir)?;
         let blocks_dir = config.data_dir.join("blocks");
         std::fs::create_dir_all(&blocks_dir)?;
@@ -3429,8 +3468,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 1;
 
         std::fs::create_dir_all(&config.data_dir)?;
 
@@ -3508,8 +3547,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
@@ -3563,8 +3602,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 1;
 
         {
             let state = NodeState::open(config.clone(), None)?;
@@ -3594,8 +3633,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 1;
         let state = NodeState::open(config.clone(), None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let Some(service) = state.prune_service() else {
@@ -3657,8 +3696,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
+        config.p2p.listen.clear();
+        config.storage.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let Some(service) = state.prune_service() else {
@@ -3732,7 +3771,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut authority_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         authority_config.data_dir = dir.path().join("authority");
-        authority_config.p2p_listen.clear();
+        authority_config.p2p.listen.clear();
         let authority_state = NodeState::open(authority_config, None)?;
         publish_applied_tip_height(&authority_state, 12 + CORE_REORG_SAFETY_MARGIN);
         let data_dir = dir.path().join("node");
@@ -3825,7 +3864,7 @@ mod tests {
         let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let genesis_tip = state.apply_block(&genesis)?;
@@ -3839,7 +3878,7 @@ mod tests {
 
         let mut reopen_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         reopen_config.data_dir = data_dir.clone();
-        reopen_config.p2p_listen.clear();
+        reopen_config.p2p.listen.clear();
         let resumed = NodeState::open(reopen_config.clone(), None)?;
         assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
         let applied = resumed
@@ -3916,8 +3955,8 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
             config.data_dir = dir.path().join(backend);
-            config.storage_backend = backend.to_owned();
-            config.p2p_listen.clear();
+            config.storage.backend = backend.parse().map_err(anyhow::Error::msg)?;
+            config.p2p.listen.clear();
             let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
             let state = NodeState::open(config.clone(), None)?;
             state.apply_block(&genesis)?;
@@ -3937,7 +3976,7 @@ mod tests {
         let data_dir = dir.path().join("node-g2");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
@@ -3947,7 +3986,7 @@ mod tests {
 
         let mut reopen_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         reopen_config.data_dir = data_dir;
-        reopen_config.p2p_listen.clear();
+        reopen_config.p2p.listen.clear();
         let resumed = NodeState::open(reopen_config, None)?;
         assert_eq!(resumed.coin_stats().snapshot(), before);
         resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
@@ -3978,7 +4017,7 @@ mod tests {
         let data_dir = dir.path().join("journal-resume");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir;
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         config.chainstate_journal.blocks = 1;
 
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
@@ -4019,7 +4058,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         assert!(Arc::ptr_eq(
             &state.shutdown(),
@@ -4034,7 +4073,7 @@ mod tests {
         let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
@@ -4090,7 +4129,7 @@ mod tests {
         let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config.clone(), None)?;
         state.apply_handles().undo_store.arm_disconnect(
             10,
@@ -4119,7 +4158,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config, None)?;
         let Err(error) = state.publish_checkpoint() else {
             anyhow::bail!("checkpoint publication succeeded without an applied tip");
@@ -4137,7 +4176,7 @@ mod tests {
         let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir;
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
         let state = NodeState::open(config.clone(), None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let tip = state.apply_block(&genesis)?;
@@ -4164,7 +4203,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let first = NodeState::open(config.clone(), None)?
             .active_chain_snapshot()
@@ -4190,7 +4229,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let state = NodeState::open(config.clone(), None)?;
         let epoch = state.chain_event_publisher().epoch();
@@ -4212,7 +4251,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let (tip, first_epoch) = {
             let state = NodeState::open(config.clone(), None)?;
@@ -4248,7 +4287,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let state = NodeState::open(config, None)?;
         let publisher = state.chain_event_publisher();
@@ -4310,7 +4349,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let state = NodeState::open(config, None)?;
         let publisher = state.chain_event_publisher();
@@ -4377,7 +4416,7 @@ mod tests {
 
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir;
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let Err(error) = NodeState::open(config, None) else {
             anyhow::bail!("a corrupt process-epoch file must refuse startup");
@@ -4512,7 +4551,7 @@ mod tests {
 
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let Err(error) = NodeState::open(config, None) else {
             anyhow::bail!("a symlinked epoch lock must refuse startup");
@@ -4531,6 +4570,7 @@ mod tests {
 
     #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
+    #[cfg(not(target_vendor = "apple"))]
     fn non_regular_epoch_lock_refuses_start() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
@@ -4545,7 +4585,7 @@ mod tests {
 
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let Err(error) = NodeState::open(config, None) else {
             anyhow::bail!("a non-regular epoch lock must refuse startup");
@@ -4651,7 +4691,7 @@ mod tests {
         let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
+        config.p2p.listen.clear();
 
         let state = NodeState::open(config.clone(), None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
@@ -4678,7 +4718,7 @@ mod tests {
         let data_dir2 = dir2.path().join("node");
         let mut config2 = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config2.data_dir = data_dir2.clone();
-        config2.p2p_listen.clear();
+        config2.p2p.listen.clear();
 
         let state2 = NodeState::open(config2.clone(), None)?;
         let genesis2 = bitcoin_rs_primitives::Network::Regtest.genesis_block();
@@ -4712,8 +4752,8 @@ mod tests {
         let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
-        config.script_index = crate::config::ScriptIndexMode::Disabled;
+        config.p2p.listen.clear();
+        config.indexes.script_index = crate::config::ScriptIndexMode::Disabled;
 
         // Apply genesis and publish a checkpoint at height 0.
         let state = NodeState::open(config.clone(), None)?;

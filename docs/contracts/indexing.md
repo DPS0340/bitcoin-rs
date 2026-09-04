@@ -124,6 +124,9 @@ remove another script's output.
   branch block pruned before rollback completed), the worker resets the
   affected capability watermark and initiates a fresh rebuild from the active
   chain.
+- A missing or unreadable undo record is fatal only for `ScriptLive`. The
+  worker resets that capability and reseeds from the authoritative UTXO view;
+  `TxLookup` and `ScriptHistory` continue their body-only rollback.
 - When `ScriptLive` has no watermark after restoration or reset, the worker
   rebuilds it by scanning one stable authoritative UTXO view. Rows are written
   before the live watermark is durably stamped; without that watermark partial
