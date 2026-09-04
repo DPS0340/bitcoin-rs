@@ -3923,6 +3923,58 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_block_settlement_failure_is_not_success() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config.clone(), None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
+        state.apply_block(&block_one)?;
+        state.publish_checkpoint()?;
+
+        let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2)?;
+        state.apply_block(&block_two)?;
+
+        crate::checkpoint::inject_next_checkpoint_failpoint(
+            crate::checkpoint::CheckpointFailpoint::ManifestWrite,
+        );
+        let result = crate::reorg::invalidate_block(
+            &state.apply_handles(),
+            Hash256::from(block_two.block_hash()),
+        );
+        let Err(crate::reorg::ReorgError::CheckpointSettlement(_)) = result else {
+            anyhow::bail!("expected CheckpointSettlement, got {result:?}");
+        };
+
+        let marker = state
+            .apply_handles()
+            .undo_store
+            .load_disconnect_marker()?
+            .ok_or_else(|| anyhow::anyhow!("settlement failure cleared the disconnect marker"))?;
+        assert_eq!(
+            marker.phase,
+            bitcoin_rs_storage::DisconnectPhase::RolledBack
+        );
+
+        drop(state);
+        let error = match NodeState::open(config, None) {
+            Ok(_) => anyhow::bail!("node reopened with unsettled RolledBack debt"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("did not reach a clean checkpoint"),
+            "startup refusal omitted the checkpoint debt: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn switch_to_branch_settles_disconnect_debt() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");

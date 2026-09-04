@@ -71,12 +71,20 @@ impl ProgressPublisher {
     }
 
     /// Records an applied block when the progress cadence is due.
+    ///
+    /// Never publishes a height at or below the last named durable height.
+    /// Recovery replay and a later time-cadence tick therefore cannot overwrite
+    /// the sidecar with a lower height; [`Self::publish_now`] is the explicit
+    /// rollback path after a checkpoint or reorg.
     pub(crate) fn record_applied(
         &self,
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> core::result::Result<bool, ProgressError> {
         let mut cadence = self.cadence.lock();
+        if height <= cadence.height {
+            return Ok(false);
+        }
         if height < cadence.height.saturating_add(PROGRESS_INTERVAL_BLOCKS)
             && cadence.at.elapsed() < PROGRESS_INTERVAL
         {
@@ -117,16 +125,18 @@ impl ProgressPublisher {
         Ok(())
     }
 
-    fn mark_published(&self, height: u32) {
+    fn set_cadence(&self, height: u32) {
         let mut cadence = self.cadence.lock();
         cadence.height = height;
         cadence.at = Instant::now();
     }
 
-    fn reset_cadence(&self, height: u32) {
+    #[cfg(test)]
+    fn expire_cadence(&self) {
         let mut cadence = self.cadence.lock();
-        cadence.height = height;
-        cadence.at = Instant::now();
+        cadence.at = Instant::now()
+            .checked_sub(PROGRESS_INTERVAL)
+            .unwrap_or(cadence.at);
     }
 }
 
@@ -216,6 +226,13 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
 
     let tip_hash = parse_hash_hex(&meta.tip_hash_hex)
         .ok_or_else(|| anyhow::anyhow!("invalid recovery tip hash {}", meta.tip_hash_hex))?;
+    // Adopt the sidecar's named height before replay so `record_applied` cannot
+    // publish a lower height once the time cadence elapses. If replay fails,
+    // withdraw that high-water mark to the restored base so a refetch can
+    // republish after `PROGRESS_INTERVAL_BLOCKS`.
+    if let Some(progress) = &state.apply_handles().recovery_progress {
+        progress.set_cadence(meta.height);
+    }
     match replay_from_bodies(
         state,
         restored_applied_tip.as_deref(),
@@ -225,9 +242,6 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
         Ok(replayed) => {
             for height in &replayed {
                 state.push_replayed(*height);
-            }
-            if let Some(progress) = &state.apply_handles().recovery_progress {
-                progress.mark_published(meta.height);
             }
             let first_replayed = replayed.first().copied().unwrap_or(gap_base);
             let last_replayed = replayed.last().copied().unwrap_or(gap_base);
@@ -239,11 +253,8 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
             );
         }
         Err(error) => {
-            // Replay may have failed after a previous recovery attempt advanced
-            // the cadence. Keep refetched blocks eligible for the normal
-            // block-count trigger from the restored base.
             if let Some(progress) = &state.apply_handles().recovery_progress {
-                progress.reset_cadence(gap_base);
+                progress.set_cadence(gap_base);
             }
             tracing::warn!(
                 %error,
@@ -454,6 +465,52 @@ mod tests {
         assert!(!publisher.record_applied(1, hash(1))?);
         assert_eq!(store.sync_calls.load(Ordering::Relaxed), 0);
         assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn record_applied_does_not_regress_published_height_after_cadence_elapses() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(META_FILENAME);
+        let store = Arc::new(MapBodyStore::new(path.clone()));
+        let publisher = ProgressPublisher::new(path.clone(), store.clone(), 0);
+        let first = hash(1);
+        let lower = hash(2);
+
+        assert!(publisher.record_applied(11_000, first)?);
+        publisher.expire_cadence();
+        assert!(!publisher.record_applied(10_001, lower)?);
+        assert_eq!(
+            read_meta_from_path(&path)?,
+            Some(Meta {
+                height: 11_000,
+                tip_hash_hex: first.to_string_be(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_replay_cadence_allows_block_count_republication() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(META_FILENAME);
+        let store = Arc::new(MapBodyStore::new(path.clone()));
+        let publisher = ProgressPublisher::new(path.clone(), store.clone(), 0);
+        let recovered = hash(1);
+        let refetched = hash(2);
+
+        publisher.set_cadence(11_000);
+        publisher.expire_cadence();
+        assert!(!publisher.record_applied(10_001, recovered)?);
+        publisher.set_cadence(0);
+        assert!(publisher.record_applied(PROGRESS_INTERVAL_BLOCKS, refetched)?);
+        assert_eq!(
+            read_meta_from_path(&path)?,
+            Some(Meta {
+                height: PROGRESS_INTERVAL_BLOCKS,
+                tip_hash_hex: refetched.to_string_be(),
+            })
+        );
         Ok(())
     }
 }

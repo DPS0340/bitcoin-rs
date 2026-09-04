@@ -21,21 +21,17 @@ use crate::{ApplyError, DisconnectError};
 
 /// Settles a rolled-back disconnect marker once the reorg owner has released
 /// its chain-transition proof.
-fn settle_disconnect_debt(handles: &ApplyHandles) {
+fn settle_disconnect_debt(handles: &ApplyHandles) -> core::result::Result<(), ReorgError> {
     let Some(publisher) = &handles.checkpoint_publisher else {
-        return;
+        return Ok(());
     };
     match publisher.settle_disconnect_debt() {
         Ok(true) => {
             tracing::info!("published checkpoint after branch switch");
+            Ok(())
         }
-        Ok(false) => {}
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "disconnect left a checkpoint debt the node could not settle; a clean shutdown will"
-            );
-        }
+        Ok(false) => Ok(()),
+        Err(error) => Err(ReorgError::CheckpointSettlement(anyhow::Error::new(error))),
     }
 }
 
@@ -158,7 +154,10 @@ pub fn invalidate_block(
         }
         let settle_debt = !matches!(&outcome, Err(ReorgError::Fatal(_)));
         if settle_debt {
-            settle_disconnect_debt(handles);
+            if let Err(settlement) = settle_disconnect_debt(handles) {
+                outcome?;
+                return Err(settlement);
+            }
         }
         return outcome;
     }
@@ -327,6 +326,12 @@ pub enum ReorgError {
     /// refuses rather than serving it.
     #[error("reorg left the chainstate inconsistent: {0}")]
     Fatal(#[source] Box<DisconnectError>),
+    /// A nonfatal reorg completed, but the rolled-back state could not be
+    /// checkpointed. The chain is coherent at the reached tip and the
+    /// disconnect marker remains `RolledBack`; a restart will refuse the data
+    /// directory until a later checkpoint publishes this state.
+    #[error("disconnect left a checkpoint debt the node could not settle: {0}")]
+    CheckpointSettlement(#[source] anyhow::Error),
 }
 
 /// Switches the applied chain to `target`.
@@ -424,7 +429,10 @@ where
             drop(proof);
         }
         if !matches!(&outcome, Err(ReorgError::Fatal(_))) {
-            settle_disconnect_debt(handles);
+            if let Err(settlement) = settle_disconnect_debt(handles) {
+                outcome?;
+                return Err(settlement);
+            }
         }
         outcome?;
         if let Some((hash, height)) = missing_connect {
