@@ -130,10 +130,10 @@ mod tests {
         assert!(!live.is_empty(), "the live registry must not be empty");
 
         let table = manifest();
-        let listed: BTreeSet<String> = entries(&table, "rpc")
-            .iter()
-            .map(|entry| field(entry, "method"))
-            .collect();
+        let rpc_entries = entries(&table, "rpc");
+        let rpc_names: Vec<String> = rpc_entries.iter().map(|entry| field(entry, "method")).collect();
+        let listed: BTreeSet<String> = rpc_names.iter().cloned().collect();
+        assert_eq!(listed.len(), rpc_names.len(), "the manifest must not duplicate RPC methods");
 
         let missing: Vec<&String> = live.difference(&listed).collect();
         assert!(
@@ -353,6 +353,9 @@ mod tests {
             .map(|entry| field(entry, "path"))
             .collect();
         assert!(!listed.is_empty(), "the manifest must list the REST routes");
+          let listed_prefixes: BTreeSet<String> = listed.iter().map(|path| path.strip_suffix(".json").unwrap_or(path).to_owned()).collect();
+          let registered: BTreeSet<String> = crate::rest::REGISTRATIONS.iter().map(|path| (*path).to_owned()).collect();
+          assert_eq!(listed_prefixes, registered, "REST manifest and router registrations must agree");
 
         // The manifest writes the header route with its parameters spelled out,
         // which is what a reader needs and not what the router takes.
@@ -368,7 +371,7 @@ mod tests {
             );
         }
 
-        let unlisted = crate::rest::route(&ctx, "/rest/tx/deadbeef.json", "", true);
+        let unlisted = crate::rest::route(&ctx, "/rest/not-a-registered-route", "", true);
         assert_eq!(
             unlisted.status, 404,
             "an unlisted REST path must be a miss, not a partial imitation"
