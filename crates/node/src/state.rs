@@ -1197,26 +1197,28 @@ impl NodeState {
             Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
         let block_body_store = storage.block_body_store(Arc::clone(&block_files));
 
-        let zmq_publications = config.zmq_publications();
-        let active_zmq_notifications: Vec<_> = zmq_publications
+        let zmq_endpoints = config.zmq_endpoints();
+        let active_zmq_notifications: Vec<_> = zmq_endpoints
             .iter()
-            .map(|publication| {
-                ZmqNotification::new(
-                    publication.topic.notifier_type(),
-                    publication.endpoint.clone(),
-                    publication.hwm,
-                )
+            .flat_map(|endpoint| {
+                endpoint.topics.iter().map(|topic| {
+                    ZmqNotification::new(
+                        topic.notifier_type(),
+                        endpoint.endpoint.clone(),
+                        endpoint.effective_hwm(),
+                    )
+                })
             })
             .collect();
         #[cfg(feature = "zmq")]
-        let zmq_publisher: Arc<dyn crate::ZmqPublisher> = if zmq_publications.is_empty() {
+        let zmq_publisher: Arc<dyn crate::ZmqPublisher> = if zmq_endpoints.is_empty() {
             Arc::new(crate::NoOpZmqPublisher)
         } else {
-            Arc::new(crate::SocketZmqPublisher::bind(&zmq_publications)?)
+            Arc::new(crate::SocketZmqPublisher::bind(zmq_endpoints)?)
         };
         #[cfg(not(feature = "zmq"))]
         let zmq_publisher: Arc<dyn crate::ZmqPublisher> = {
-            let _ = &zmq_publications;
+            let _ = &zmq_endpoints;
             Arc::new(crate::NoOpZmqPublisher)
         };
         let (
@@ -2483,14 +2485,24 @@ mod tests {
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        config.zmqpubhashblock = vec!["inproc://state-zmq-pubhashblock".to_owned()];
-        config.zmqpubhashtx = vec!["inproc://state-zmq-pubhashtx".to_owned()];
-        config.zmqpubrawblock = vec!["inproc://state-zmq-pubrawblock".to_owned()];
-        config.zmqpubrawtx = vec!["inproc://state-zmq-pubrawtx".to_owned()];
-        config.zmqpubhashblockhwm = Some(17);
-        config.zmqpubhashtxhwm = Some(18);
-        config.zmqpubrawblockhwm = Some(19);
-        config.zmqpubrawtxhwm = Some(20);
+        config.notifications.zmq = vec![
+            crate::zmq_publisher::ZmqEndpointConfig {
+                endpoint: "inproc://state-zmq-block".to_owned(),
+                topics: vec![
+                    crate::zmq_publisher::ZmqTopic::HashBlock,
+                    crate::zmq_publisher::ZmqTopic::RawBlock,
+                ],
+                hwm: Some(17),
+            },
+            crate::zmq_publisher::ZmqEndpointConfig {
+                endpoint: "inproc://state-zmq-tx".to_owned(),
+                topics: vec![
+                    crate::zmq_publisher::ZmqTopic::HashTx,
+                    crate::zmq_publisher::ZmqTopic::RawTx,
+                ],
+                hwm: Some(20),
+            },
+        ];
         let state = NodeState::open(config, None)?;
 
         let notifications = state.active_zmq_notifications();
@@ -2504,9 +2516,9 @@ mod tests {
             .collect();
         assert_eq!(
             notification_types,
-            ["pubhashblock", "pubhashtx", "pubrawblock", "pubrawtx"]
+            ["pubhashblock", "pubrawblock", "pubhashtx", "pubrawtx"]
         );
-        assert_eq!(hwms, [17, 18, 19, 20]);
+        assert_eq!(hwms, [17, 17, 20, 20]);
         Ok(())
     }
 
