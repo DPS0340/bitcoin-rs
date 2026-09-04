@@ -3102,37 +3102,47 @@ impl<S: KvStore> IndexWriter<S> {
         resume_capability_reset(store, generation, IndexCapabilities::ALL.to_mask())
     }
 
-    /// Marks selected derived rows unavailable, deletes them in bounded
-    /// batches, and leaves their durable cursors empty so the worker can
-    /// rebuild from genesis.
-    ///
     /// Seeds the live view from a scan of the authoritative UTXO set.
     ///
-    /// `coins` is every live `(outpoint, scripthash)` at `seed_tip`, in any
-    /// order. Rows are written in bounded deferred batches, and the watermark
-    /// is stamped **once, durably, after the last row** -- so a crash mid-seed
-    /// leaves the capability without a watermark, which is exactly "not
-    /// ready": partial rows are never queryable, and the recovery is a
-    /// capability reset followed by a fresh seed (#225).
+    /// `produce` emits every live `(outpoint, scripthash)` at `seed_tip`, in
+    /// any order. Rows are written in bounded deferred batches, and the
+    /// watermark is stamped **once, durably, after the last row** -- so a
+    /// crash mid-seed leaves the capability without a watermark, which is
+    /// exactly "not ready": partial rows are never queryable, and the
+    /// recovery is a capability reset followed by a fresh seed (#225).
     ///
-    /// Refuses to run over an existing live watermark. Seeding is for a fresh
-    /// or reset capability; re-seeding a live view in place would have to
-    /// reconcile stale rows, which is the reset path's job.
+    /// A deferred-batch failure stops the seed and is returned before the
+    /// format or live watermark is published. Refuses to run over an
+    /// existing live watermark. Seeding is for a fresh or reset capability;
+    /// re-seeding a live view in place would have to reconcile stale rows,
+    /// which is the reset path's job.
     pub fn seed_script_live_stream<F>(
         &mut self,
         mut produce: F,
         seed_tip: IndexWatermark,
     ) -> Result<usize, IndexError>
     where
-        F: FnMut(&mut dyn FnMut(OutPoint, crate::ScriptHash)),
+        F: FnMut(
+            &mut dyn FnMut(OutPoint, crate::ScriptHash) -> Result<(), IndexError>,
+        ) -> Result<(), IndexError>,
     {
         self.ensure_prepared_ready()?;
-        if self.indexer.capability_watermark(IndexCapability::ScriptLive)?.is_some() {
+        if self
+            .indexer
+            .capability_watermark(IndexCapability::ScriptLive)?
+            .is_some()
+        {
             return Err(IndexError::LiveAlreadySeeded);
         }
         const SEED_BATCH_ROWS: usize = 4_096;
         let mut written = 0;
         let mut batch = self.indexer.store.new_batch();
+        // Version the store before publishing deferred seed rows.
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            FORMAT_VERSION_KEY,
+            &FORMAT_VERSION_VALUE,
+        );
         let mut in_batch = 0;
         let mut add = |outpoint, scripthash| -> Result<(), IndexError> {
             let row = crate::types::ScriptLiveRow::new(scripthash, &outpoint);
@@ -3147,50 +3157,7 @@ impl<S: KvStore> IndexWriter<S> {
             }
             Ok(())
         };
-        produce(&mut |op, hash| { let _ = add(op, hash); });
-        batch.put(ColumnFamily::UtxoMeta, FORMAT_VERSION_KEY, &FORMAT_VERSION_VALUE);
-        batch.put(ColumnFamily::UtxoMeta, SCRIPT_LIVE_WATERMARK_KEY, &seed_tip.to_bytes());
-        self.indexer.store.write_durable(batch)?;
-        Ok(written)
-    }
-
-    pub fn seed_script_live<I>(
-        &mut self,
-        coins: I,
-        seed_tip: IndexWatermark,
-    ) -> Result<usize, IndexError>
-    where
-        I: IntoIterator<Item = (OutPoint, crate::ScriptHash)>,
-    {
-        const SEED_BATCH_ROWS: usize = 4_096;
-        self.ensure_prepared_ready()?;
-        if self
-            .indexer
-            .capability_watermark(IndexCapability::ScriptLive)?
-            .is_some()
-        {
-            return Err(IndexError::LiveAlreadySeeded);
-        }
-        let mut written = 0_usize;
-        let mut batch = self.indexer.store.new_batch();
-        // Version the store before publishing deferred seed rows.
-        batch.put(
-            ColumnFamily::UtxoMeta,
-            FORMAT_VERSION_KEY,
-            &FORMAT_VERSION_VALUE,
-        );
-        let mut in_batch = 0_usize;
-        for (outpoint, scripthash) in coins {
-            let row = crate::types::ScriptLiveRow::new(scripthash, &outpoint);
-            batch.put(ColumnFamily::ScriptLive, row.as_bytes(), &[]);
-            written = written.saturating_add(1);
-            in_batch += 1;
-            if in_batch >= SEED_BATCH_ROWS {
-                self.indexer.store.write_deferred(batch)?;
-                batch = self.indexer.store.new_batch();
-                in_batch = 0;
-            }
-        }
+        produce(&mut add)?;
         batch.put(
             ColumnFamily::UtxoMeta,
             FORMAT_VERSION_KEY,
@@ -3203,6 +3170,26 @@ impl<S: KvStore> IndexWriter<S> {
         );
         self.indexer.store.write_durable(batch)?;
         Ok(written)
+    }
+
+    pub fn seed_script_live<I>(
+        &mut self,
+        coins: I,
+        seed_tip: IndexWatermark,
+    ) -> Result<usize, IndexError>
+    where
+        I: IntoIterator<Item = (OutPoint, crate::ScriptHash)>,
+    {
+        let mut coins = coins.into_iter();
+        self.seed_script_live_stream(
+            |emit| {
+                for (outpoint, scripthash) in coins.by_ref() {
+                    emit(outpoint, scripthash)?;
+                }
+                Ok(())
+            },
+            seed_tip,
+        )
     }
 
     /// Marks selected derived rows unavailable, deletes them in bounded batches,

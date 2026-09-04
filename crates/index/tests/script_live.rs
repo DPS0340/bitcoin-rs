@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{self, Header};
@@ -37,6 +38,7 @@ use parking_lot::RwLock;
 #[derive(Default)]
 struct MemoryStore {
     cfs: RwLock<[BTreeMap<Vec<u8>, Vec<u8>>; ColumnFamily::ALL.len()]>,
+    fail_next_deferred: AtomicBool,
 }
 
 struct MemoryBatch {
@@ -104,6 +106,11 @@ impl KvStore for MemoryStore {
         Ok(true)
     }
     fn write_deferred(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        if self.fail_next_deferred.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::Backend(
+                "injected deferred write failure".into(),
+            ));
+        }
         self.write(batch)
     }
     fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
@@ -727,6 +734,49 @@ fn seeding_resets_partial_rows_and_stamps_once() -> Result<(), Box<dyn std::erro
     assert!(
         matches!(again, Err(IndexError::LiveAlreadySeeded)),
         "re-seeding over a stamped watermark must be refused: {again:?}"
+    );
+    Ok(())
+}
+
+/// CONTRACT: IDX-07. A deferred seed-batch failure must not publish the live
+/// watermark over an incomplete view.
+#[test]
+fn seed_stream_deferred_write_failure_does_not_publish_watermark()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(MemoryStore {
+        fail_next_deferred: AtomicBool::new(true),
+        ..MemoryStore::default()
+    });
+    let mut writer = IndexWriter::open(Arc::clone(&store), 0)?;
+    let scripthash = ScriptHash::from_script_bytes(script(0x46).as_bytes());
+    let coins = (0_u32..4_096)
+        .map(|vout| {
+            (
+                NativeOutPoint::new(NativeTxid(Hash256::from_le_bytes(&[0x34_u8; 32])), vout),
+                scripthash,
+            )
+        })
+        .collect::<Vec<_>>();
+    let seed_tip = IndexWatermark {
+        height: 7,
+        hash: [0x07_u8; 32],
+    };
+
+    let result = writer.seed_script_live(coins, seed_tip);
+    assert!(
+        matches!(result, Err(IndexError::Storage(_))),
+        "a deferred batch failure must surface: {result:?}"
+    );
+    assert!(
+        writer
+            .indexer()
+            .capability_watermark(IndexCapability::ScriptLive)?
+            .is_none(),
+        "the live watermark must stay unpublished after a seed write failure"
+    );
+    assert!(
+        writer.indexer().iter_live_outpoints(scripthash)?.is_empty(),
+        "partial seed rows must remain unavailable without a live watermark"
     );
     Ok(())
 }

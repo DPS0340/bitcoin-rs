@@ -240,16 +240,6 @@ impl Shard {
         }
     }
 
-    pub(crate) fn for_each_all(&self, mut f: impl FnMut(&OutPoint, &[u8])) {
-        let table = self.inner.read();
-        for record in &table.table {
-            for output in record.outputs() {
-                let outpoint = OutPoint::new(record.txid().into(), output.vout);
-                f(&outpoint, &output.script_pubkey);
-            }
-        }
-    }
-
     pub(crate) fn record_count(&self) -> usize {
         let table = self.inner.read();
         table.record_count()
