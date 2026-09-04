@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
-use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, Txid, Wtxid};
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid, Wtxid};
 use hashbrown::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use slab::Slab;
@@ -604,6 +604,80 @@ impl Mempool {
             bytes,
             total_fee,
         }
+    }
+
+    /// Estimates the heap this pool occupies, in bytes.
+    ///
+    /// This is `getmempoolinfo`'s `usage`, and it is a different quantity from
+    /// `bytes`: `bytes` is the sum of virtual sizes, a consensus-facing measure
+    /// of the transactions, while this is how much memory holding them costs.
+    /// The two differ by a large constant factor — per-entry accounting, four
+    /// indexes, and the allocations inside each transaction.
+    ///
+    /// An estimate, as it is in Bitcoin Core, whose own `DynamicMemoryUsage`
+    /// carries the comment "Estimate the overhead of mapTx to be 9 pointers …
+    /// as no exact formula for `boost::multi_index_container` is implemented".
+    /// The figure is Core's *shape*, not Core's number: it counts this node's
+    /// structures, which are not Core's.
+    ///
+    /// Counted here: the entry arena and the txid map at their **allocated
+    /// capacity**, each live transaction's own heap, and the indexes keyed off
+    /// those entries -- with the priority index answering for itself, because
+    /// it stores every entry twice.
+    ///
+    /// Capacity rather than length for the two that retain it. Neither the slab
+    /// nor the hash map hands its allocation back on removal or on `clear`, so
+    /// a pool that peaked and then drained is still holding the memory, and a
+    /// figure read off `len()` answers "nothing" at exactly the moment someone
+    /// is asking where it went.
+    #[must_use]
+    pub fn dynamic_memory_usage(&self) -> u64 {
+        use core::mem::size_of;
+
+        // The arena is charged at **capacity**, not at length. `slab::Slab`
+        // keeps its backing allocation across removals and across `clear`, so a
+        // pool that grew to a million entries and then emptied still holds the
+        // arena -- and charging `len()` reported that retained memory as zero,
+        // which is exactly the moment an operator looks at `usage` to find out
+        // where it went. Core charges its own pool the same way: `mapTx`'s
+        // allocator does not return nodes to the OS either.
+        //
+        // Everything below stays keyed to live entries. They are payload terms
+        // -- the transactions and the index keys -- and a removed entry's
+        // payload really is gone.
+        let arena = u64::try_from(self.entries.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<MempoolEntry>()).unwrap_or(0));
+
+        let transactions = self
+            .entries
+            .iter()
+            .map(|(_index, entry)| transaction_heap_usage(&entry.tx))
+            .fold(0_u64, u64::saturating_add);
+
+        // `by_txid` is a hash map, so it carries slack; the other three are
+        // B-tree sets of fixed-size keys.
+        let by_txid = u64::try_from(self.by_txid.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<(Txid, EntryId)>()).unwrap_or(0));
+        let funding = u64::try_from(self.funding.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<(ScriptHash, EntryId)>()).unwrap_or(0));
+        let spending = u64::try_from(self.spending.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<(SpendingKey, EntryId)>()).unwrap_or(0));
+        // The priority index stores every entry twice -- once ordered by
+        // priority, once keyed by id so a removal need not search for what to
+        // remove -- so it answers for itself rather than being charged one
+        // `EntryId` per transaction here.
+        let pareto = self.pareto.dynamic_memory_usage();
+
+        arena
+            .saturating_add(transactions)
+            .saturating_add(by_txid)
+            .saturating_add(funding)
+            .saturating_add(spending)
+            .saturating_add(pareto)
     }
 
     /// Estimates the fee rate that historically confirmed within
@@ -1546,6 +1620,35 @@ impl From<OutPoint> for SpendingKey {
         key[32..].copy_from_slice(&outpoint.vout.to_le_bytes());
         Self(key)
     }
+}
+
+/// Heap a single transaction owns, beyond the `Tx` struct itself.
+///
+/// The input and output vectors, and the script and witness bytes inside them.
+/// Counted from the structures rather than from the serialized length, because
+/// a `Vec` costs its capacity and a serialized form costs neither the vector
+/// headers nor the per-field overhead.
+fn transaction_heap_usage(tx: &Tx) -> u64 {
+    use core::mem::size_of;
+
+    let mut total = u64::try_from(size_of::<Tx>()).unwrap_or(0);
+    total = total.saturating_add(
+        u64::try_from(tx.inputs.capacity().saturating_mul(size_of::<TxIn>())).unwrap_or(u64::MAX),
+    );
+    total = total.saturating_add(
+        u64::try_from(tx.outputs.capacity().saturating_mul(size_of::<TxOut>())).unwrap_or(u64::MAX),
+    );
+    for input in &tx.inputs {
+        total = total.saturating_add(u64::try_from(input.script_sig.len()).unwrap_or(u64::MAX));
+        total = total.saturating_add(
+            u64::try_from(input.witness.iter().map(|item| item.len()).sum::<usize>())
+                .unwrap_or(u64::MAX),
+        );
+    }
+    for output in &tx.outputs {
+        total = total.saturating_add(u64::try_from(output.script_pubkey.len()).unwrap_or(u64::MAX));
+    }
+    total
 }
 
 fn outpoint_range(outpoint: OutPoint) -> RangeInclusive<(SpendingKey, EntryId)> {
@@ -3634,5 +3737,242 @@ mod spend_index_tests {
         // The root left with its descendants, so nothing is left to spend it.
         assert!(pool.entry_id_by_txid(&root_txid).is_none());
         assert!(pool.is_empty(), "the fixture is a single connected package");
+    }
+}
+
+#[cfg(test)]
+mod dynamic_memory_usage_tests {
+    use alloc::sync::Arc;
+
+    use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut};
+
+    use super::*;
+
+    fn tx_with(script_len: usize, tag: u8) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: alloc::vec![TxIn {
+                previous_output: OutPoint::new(Txid::from(Hash256::from_le_bytes(&[tag; 32])), 0,),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
+            }],
+            outputs: alloc::vec![TxOut {
+                value: 10_000,
+                script_pubkey: alloc::vec![0x51; script_len],
+            }],
+        }
+    }
+
+    fn pool_with(count: u8, script_len: usize) -> Mempool {
+        let mut pool = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            ..MempoolLimits::default()
+        });
+        for tag in 0..count {
+            let entry = MempoolEntry::new(Arc::new(tx_with(script_len, tag)), 100, 10_000, 1, 7);
+            let Ok(_id) = pool.insert_entry(entry) else {
+                panic!("fixture insert failed");
+            };
+        }
+        pool
+    }
+
+    #[test]
+    fn an_empty_pool_reports_no_transaction_memory() {
+        let pool = Mempool::new(MempoolLimits::default());
+        // Only whatever the empty containers hold, which for unallocated ones is
+        // nothing. The point is that it does not report a phantom footprint.
+        assert_eq!(pool.dynamic_memory_usage(), 0);
+    }
+
+    #[test]
+    fn usage_is_a_different_quantity_from_the_vsize_sum() {
+        let pool = pool_with(4, 64);
+        let stats = pool.stats();
+        let usage = pool.dynamic_memory_usage();
+
+        assert!(usage > 0);
+        assert_ne!(
+            usage, stats.bytes,
+            "reporting `usage` as the vsize sum is the defect this replaces"
+        );
+        assert!(
+            usage > stats.bytes,
+            "holding a transaction costs more than its virtual size: {usage} vs {}",
+            stats.bytes
+        );
+    }
+
+    #[test]
+    fn usage_grows_with_the_transactions_it_holds() {
+        let small = pool_with(4, 64).dynamic_memory_usage();
+        let more_entries = pool_with(8, 64).dynamic_memory_usage();
+        let bigger_scripts = pool_with(4, 4_096).dynamic_memory_usage();
+
+        assert!(more_entries > small, "{more_entries} vs {small}");
+        assert!(
+            bigger_scripts > small,
+            "script bytes are held too: {bigger_scripts} vs {small}"
+        );
+    }
+
+    /// Clearing releases the payload. It does not release the arena.
+    #[test]
+    fn usage_falls_when_the_pool_is_cleared() {
+        let mut pool = pool_with(4, 64);
+        let before = pool.dynamic_memory_usage();
+        pool.clear();
+        let after = pool.dynamic_memory_usage();
+        assert!(after < before, "{after} vs {before}");
+    }
+
+    /// A grown-then-emptied pool still holds its arena, and still says so.
+    ///
+    /// `slab::Slab` keeps its backing allocation across removals and across
+    /// `clear`; nothing here hands it back. Charging the arena from `len()`
+    /// therefore reported that retained memory as **zero** at exactly the
+    /// moment an operator reads `usage` to find out where the memory went --
+    /// a pool that peaked at a million transactions and then drained answers
+    /// "nothing", while the process RSS says otherwise.
+    ///
+    /// The bound below is the arena alone: after `clear` there are no live
+    /// entries, so every other term is zero and what remains is the arena or
+    /// nothing.
+    #[test]
+    fn the_arena_is_charged_after_the_pool_is_cleared() {
+        use core::mem::size_of;
+
+        let mut pool = pool_with(64, 64);
+        pool.clear();
+
+        let capacity = u64::try_from(pool.entries.capacity()).unwrap_or(0);
+        assert!(
+            capacity > 0,
+            "the fixture must leave a grown arena behind, or this proves nothing"
+        );
+        let arena = capacity.saturating_mul(u64::try_from(size_of::<MempoolEntry>()).unwrap_or(0));
+
+        let cleared = pool.dynamic_memory_usage();
+        // Strictly above the arena, not merely at it: the txid map is a hash
+        // map and keeps its capacity across `clear` for the same reason the
+        // slab does, so both retentions have to be counted or this fails.
+        assert!(
+            cleared > arena,
+            "the retained arena and txid map must both be counted: {cleared} vs {arena}"
+        );
+
+        // Against a pool that never grew, which is the difference the old
+        // accounting erased: both have no live entries, and only one of them is
+        // holding memory.
+        let fresh = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            ..MempoolLimits::default()
+        })
+        .dynamic_memory_usage();
+        assert_eq!(fresh, 0, "a pool that never grew holds nothing");
+        assert!(
+            cleared > fresh,
+            "a drained pool and a fresh one must not report the same footprint"
+        );
+    }
+
+    /// The priority index is charged for both copies of every entry.
+    ///
+    /// `ParetoFront` stores each entry in an ordered set *and* in a map from
+    /// id, because a removal is given an id and the set is keyed by priority.
+    /// Charging one `EntryId` per transaction, as this did, counted four bytes
+    /// where the index holds two whole keys -- an under-report on every
+    /// non-empty pool, growing with the pool.
+    ///
+    /// A lower bound, not a measurement: a B-tree leaves its nodes partly
+    /// filled, so the real footprint is above this and depends on insertion
+    /// order. The bound is what a test can state; that it scales with what is
+    /// stored is what the old term did not do.
+    #[test]
+    fn the_priority_index_is_charged_for_both_of_its_key_collections() {
+        use core::mem::size_of;
+
+        const COUNT: u64 = 32;
+
+        let mut pool = pool_with(u8::try_from(COUNT).unwrap_or(0), 64);
+        let index = pool.pareto.dynamic_memory_usage();
+
+        // The floor on what two key collections cost lives in `pareto.rs`,
+        // beside the private key type it is stated in terms of. This is the
+        // half that belongs here: that the pool charges what the index says.
+        let one_id_each = COUNT.saturating_mul(u64::try_from(size_of::<EntryId>()).unwrap_or(0));
+        assert!(
+            index > one_id_each.saturating_mul(4),
+            "the index holds two keys per entry, not one id: {index} vs {one_id_each}"
+        );
+
+        // What the pool's total actually attributes to the index: empty the
+        // index and leave everything else standing. Asserting only that the
+        // total is *at least* the index term would pass while the total was
+        // still computing its own figure from the entry count and ignoring the
+        // index entirely, which is the term this replaces.
+        let with_index = pool.dynamic_memory_usage();
+        pool.pareto = ParetoFront::new();
+        let without_index = pool.dynamic_memory_usage();
+        assert_eq!(
+            with_index.saturating_sub(without_index),
+            index,
+            "the pool must charge the index what the index says it costs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod entry_overhead_tests {
+    use alloc::sync::Arc;
+
+    use bitcoin_rs_primitives::Tx;
+
+    use super::*;
+
+    /// A transaction that owns no heap of its own: no inputs, no outputs, so
+    /// `transaction_heap_usage` is just the struct. What is left in the estimate
+    /// for a pool of these is the per-entry accounting, which is what this pins.
+    fn empty_tx(tag: u32) -> Tx {
+        Tx {
+            version: 2,
+            // The only thing distinguishing them, so they get distinct txids.
+            lock_time: tag,
+            inputs: alloc::vec::Vec::new(),
+            outputs: alloc::vec::Vec::new(),
+        }
+    }
+
+    #[test]
+    fn usage_counts_the_entry_itself_not_only_the_transaction() {
+        use core::mem::size_of;
+
+        let mut pool = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            ..MempoolLimits::default()
+        });
+        let count = 8_u32;
+        for tag in 0..count {
+            let entry = MempoolEntry::new(Arc::new(empty_tx(tag)), 100, 10_000, 1, 7);
+            let Ok(_id) = pool.insert_entry(entry) else {
+                panic!("fixture insert failed");
+            };
+        }
+
+        let live = u64::from(count);
+        let entry_bytes = u64::try_from(size_of::<MempoolEntry>()).unwrap_or(0);
+        let tx_bytes = u64::try_from(size_of::<Tx>()).unwrap_or(0);
+
+        // These transactions have no inputs, so the funding and spending indexes
+        // are empty and cannot make up the difference. Dropping the per-entry
+        // term leaves the estimate below this bound.
+        assert!(
+            pool.dynamic_memory_usage()
+                >= live.saturating_mul(entry_bytes.saturating_add(tx_bytes)),
+            "usage {} is below {live} entries of {entry_bytes} plus their transactions",
+            pool.dynamic_memory_usage()
+        );
     }
 }
