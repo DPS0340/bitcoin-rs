@@ -412,8 +412,8 @@ mod tests {
     use bitcoin_rs_primitives::{Hash256, OutPoint, Txid};
 
     use super::{
-        HashPrefixRow, ScriptHash, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow,
-        HASH_PREFIX_LEN,
+        HASH_PREFIX_LEN, HashPrefixRow, ScriptHash, ScriptHashRow, ScriptLiveRow,
+        SpendingPrefixRow, TxidRow,
     };
 
     #[test]
@@ -421,7 +421,9 @@ mod tests {
         let row = HashPrefixRow::new([0xa3, 0x84, 0x49, 0x1d, 0x38, 0x92, 0x9f, 0xcc], 123_456);
         assert_eq!(
             row.to_db_row(),
-            [0xa3, 0x84, 0x49, 0x1d, 0x38, 0x92, 0x9f, 0xcc, 0x40, 0xe2, 0x01, 0x00]
+            [
+                0xa3, 0x84, 0x49, 0x1d, 0x38, 0x92, 0x9f, 0xcc, 0x40, 0xe2, 0x01, 0x00
+            ]
         );
         assert_eq!(row.height(), 123_456);
     }
