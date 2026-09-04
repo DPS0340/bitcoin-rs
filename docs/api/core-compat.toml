@@ -97,8 +97,14 @@ differential_harness = false
 method = "getblockchaininfo"
 group = "blockchain"
 status = "deviation"
-deviation = "Core declares `bits` and `target` non-optional; this node emits neither. **A gap, not a decision** -- nobody weighed it, and `difficulty` does not substitute, being a derived float a caller cannot recover the compact target from. Tracked in #160."
-schema_missing = ["bits", "target"]
+deviation = "Core declares `warnings` as a string; this node emits an array. Optional prune and signet fields are serialized as JSON null rather than omitted. The earlier `bits`/`target` gap is closed. Tracked in #160."
+schema_mismatched = [
+    "automatic_pruning: Null vs BOOL",
+    "prune_target_size: Null vs NUM",
+    "pruneheight: Null vs NUM",
+    "signet_challenge: Null vs STR_HEX",
+    "warnings: Array vs STR",
+]
 
 [[rpc]]
 method = "getdifficulty"
@@ -113,7 +119,13 @@ status = "implemented_unverified"
 [[rpc]]
 method = "getchaintxstats"
 group = "blockchain"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "Optional window statistics (`txrate`, `window_interval`, `window_tx_count`) are serialized as JSON null; Core omits them when unknown. Tracked in #160."
+schema_mismatched = [
+    "txrate: Null vs NUM",
+    "window_interval: Null vs NUM",
+    "window_tx_count: Null vs NUM",
+]
 
 [[rpc]]
 method = "getblockcount"
@@ -209,15 +221,7 @@ status = "implemented_unverified"
 method = "getmempoolinfo"
 group = "mempool"
 status = "deviation"
-deviation = "`usage` is an estimate of this node's own structures, as Core's is of boost's; the two are not the same number for the same mempool. `maxmempool` bounds the virtual-size sum rather than `usage`, so unlike Core the two fields are not in the same currency and `usage` may exceed `maxmempool`. Five policy fields Core declares non-optional are absent, and `mempool_sequence` is emitted here though Core carries it on `getrawmempool` instead. **Neither has been decided on** -- some of the five describe knobs this node may not have, where an invented number would be worse than the omission, but that is a judgement nobody has made yet. Tracked in #160."
-schema_missing = [
-    "limitclustercount",
-    "limitclustersize",
-    "maxdatacarriersize",
-    "optimal",
-    "permitbaremultisig",
-]
-schema_extra = ["mempool_sequence"]
+deviation = "`usage` is an estimate of this node's own structures, as Core's is of boost's; the two are not the same number for the same mempool. `maxmempool` bounds the virtual-size sum rather than `usage`, so unlike Core the two fields are not in the same currency and `usage` may exceed `maxmempool`. The earlier shape gaps (five missing policy fields and extra `mempool_sequence`) are closed. Tracked in #160."
 
 [[rpc]]
 method = "getmempoolentry"
@@ -282,7 +286,9 @@ status = "implemented_unverified"
 [[rpc]]
 method = "getnetworkinfo"
 group = "network"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "Core declares `warnings` as a string; this node emits an array. Tracked in #160."
+schema_mismatched = ["warnings: Array vs STR"]
 
 [[rpc]]
 method = "getpeerinfo"
@@ -348,8 +354,13 @@ status = "implemented_unverified"
 method = "getmininginfo"
 group = "mining"
 status = "deviation"
-deviation = "Missing the four fields a miner works against, all declared non-optional by Core: `bits` and `target` for the current tip, `blockmintxfee` for the selection floor, and the `next` object describing the block about to be mined. **A gap, not a decision.** Being repaired in #109; tracked in #160."
-schema_missing = ["bits", "blockmintxfee", "next", "target"]
+deviation = "Optional `currentblocktx`, `currentblockweight`, and `signet_challenge` are serialized as JSON null; Core omits them. `warnings` is an array here and a string in Core's declaration. The earlier missing `bits`/`target`/`blockmintxfee`/`next` gap is closed. Tracked in #160."
+schema_mismatched = [
+    "currentblocktx: Null vs NUM",
+    "currentblockweight: Null vs NUM",
+    "signet_challenge: Null vs STR_HEX",
+    "warnings: Array vs STR",
+]
 
 [[rpc]]
 method = "submitblock"

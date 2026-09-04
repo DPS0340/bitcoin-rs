@@ -80,17 +80,7 @@ impl SchemaDiff {
     }
 }
 
-/// Whether a JSON value satisfies one of Core's declared result types.
-///
-/// **Transcribed from Core's `ExpectedType` in `rpc/util.cpp`**, case for case,
-/// rather than inferred from the type names. That matters more than it looks:
-/// `STR_AMOUNT` is *not* a string. Core maps it to `VNUM` and renders amounts
-/// as bare numbers -- the name describes the formatting, not the wire type. A
-/// mapping built from the names reports every amount field in every method as a
-/// type mismatch, which is what mine did before I read the table.
-///
-/// `ANY` and `ELISION` are Core's own opt-outs (`std::nullopt` there) and match
-/// anything. Unknown names are rejected while loading the schema below.
+/// Core's `RPCResult::Type` names, as `ExpectedType` in `rpc/util.cpp` maps them.
 #[derive(Clone, Copy)]
 enum SchemaType {
     None,
@@ -129,6 +119,17 @@ impl SchemaType {
     }
 }
 
+/// Whether a JSON value satisfies one of Core's declared result types.
+///
+/// **Transcribed from Core's `ExpectedType` in `rpc/util.cpp`**, case for case,
+/// rather than inferred from the type names. That matters more than it looks:
+/// `STR_AMOUNT` is *not* a string. Core maps it to `VNUM` and renders amounts
+/// as bare numbers -- the name describes the formatting, not the wire type. A
+/// mapping built from the names reports every amount field in every method as a
+/// type mismatch, which is what mine did before I read the table.
+///
+/// `ANY` and `ELISION` are Core's own opt-outs (`std::nullopt` there) and match
+/// anything. Unknown names are rejected while loading the schema below.
 #[must_use]
 pub fn type_matches(kind: &str, value: &Value) -> bool {
     let Some(kind) = SchemaType::parse(kind) else {
@@ -255,9 +256,10 @@ fn required_schema_str<'a>(value: &'a Value, key: &str, what: &str) -> &'a str {
     let Some(text) = value.get(key).and_then(JsonValueTrait::as_str) else {
         panic!("{what} must be a string");
     };
-    if text.is_empty() && key == "type" {
-        panic!("{what} must be a non-empty string");
-    }
+    assert!(
+        key != "type" || !text.is_empty(),
+        "{what} must be a non-empty string"
+    );
     text
 }
 
@@ -296,9 +298,10 @@ fn read_variant(value: &Value) -> CoreVariant {
         }
     };
     let kind = required_schema_str(value, "type", "schema variant type");
-    if SchemaType::parse(kind).is_none() {
-        panic!("unsupported schema variant type: {kind}");
-    }
+    assert!(
+        SchemaType::parse(kind).is_some(),
+        "unsupported schema variant type: {kind}"
+    );
     CoreVariant {
         when: value
             .get("when")
@@ -337,9 +340,10 @@ fn load_schemas_from(
                 let Some(array) = variants.as_array() else {
                     panic!("schema method `{name}` variants must be an array");
                 };
-                if array.is_empty() {
-                    panic!("schema method `{name}` must not carry an empty variants array");
-                }
+                assert!(
+                    !array.is_empty(),
+                    "schema method `{name}` must not carry an empty variants array"
+                );
                 array.iter().map(read_variant).collect()
             }
         };
@@ -352,13 +356,61 @@ fn load_schemas_from(
 mod tests {
     use alloc::sync::Arc;
 
+    use bitcoin_rs_primitives::{Block, Network};
+    use sonic_rs::JsonValueTrait as _;
+
     use super::{diff_best, load_schemas};
-    use crate::context::Context;
+    use crate::context::{
+        BlockTemplateRequest, BlockTemplateResult, BlockValidationResult, Context, MiningControl,
+        MiningControlError, MiningInfo,
+    };
+
+    /// Enough mining control for `getmininginfo` to answer. After main's
+    /// mining-control cutover the method refuses a bare context, and dropping
+    /// it from the table would shrink the oracle rather than record the
+    /// closed gap.
+    struct SchemaMiningControl;
+
+    impl MiningControl for SchemaMiningControl {
+        fn get_block_template(
+            &self,
+            _request: BlockTemplateRequest,
+        ) -> Result<BlockTemplateResult, MiningControlError> {
+            Err(MiningControlError::Unavailable(
+                "schema comparison does not assemble templates".into(),
+            ))
+        }
+
+        fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
+            Ok(MiningInfo {
+                blocks: 0,
+                last_candidate: None,
+                bits: 0x207f_ffff,
+                difficulty: 1.0,
+                network_hashes_per_second: 0.0,
+                pooled_transactions: 0,
+                network: Network::Regtest,
+                next_bits: 0x207f_ffff,
+                next_difficulty: 1.0,
+                minimum_fee_rate: 1_000,
+                signet: None,
+                warnings: Vec::new(),
+            })
+        }
+
+        fn submit_block(&self, _block: Block) -> Result<BlockValidationResult, MiningControlError> {
+            Ok(BlockValidationResult::Accepted)
+        }
+
+        fn publish_generation(&self) {}
+    }
 
     /// Methods this compares, and the parameters it compares them with.
     ///
-    /// Deliberately the ones that answer on a bare context. A method that needs
-    /// a chain, an index or a mempool would need a fixture per method, and a
+    /// Deliberately the ones that answer on a default context (plus mining
+    /// control and a debug log path, which `getmininginfo` and `getrpcinfo`
+    /// now require). A method that needs a
+    /// chain, an index or a mempool would need a fixture per method, and a
     /// fixture written to make a comparison pass is not evidence -- it is the
     /// answer, restated. The list grows as fixtures that mean something get
     /// built, and `coverage_is_recorded_so_it_cannot_silently_shrink` stops it
@@ -445,7 +497,11 @@ mod tests {
         let schemas = load_schemas();
         let manifest: toml::Table = toml::from_str(crate::compat_manifest::MANIFEST_TOML)
             .unwrap_or_else(|err| panic!("the compatibility manifest must parse: {err}"));
-        let handler = crate::Handler::new(Arc::new(Context::new()));
+        let handler = crate::Handler::new(Arc::new(
+            Context::new()
+                .with_mining_control(Arc::new(SchemaMiningControl))
+                .with_debug_log_path(std::path::PathBuf::from("/tmp/debug.log")),
+        ));
 
         let mut report = alloc::string::String::new();
         for (method, params) in COMPARED {
@@ -457,7 +513,7 @@ mod tests {
             let Ok(answer) = handler.dispatch(method, &parsed) else {
                 // A method in this list must answer, or it is not being
                 // compared and the list is overstating its own coverage.
-                panic!("`{method}` is listed as compared but does not answer on a bare context");
+                panic!("`{method}` {params} is listed as compared but does not answer");
             };
 
             let found = diff_best(schema, &answer);
@@ -593,7 +649,9 @@ mod tests {
     /// optional and the sparse `{isvalid: false}` object is then a silent pass.
     #[test]
     fn validateaddress_valid_fixture_emits_the_valid_fields() {
-        let handler = crate::Handler::new(Arc::new(Context::new()));
+        let handler = crate::Handler::new(Arc::new(
+            Context::new().with_mining_control(Arc::new(SchemaMiningControl)),
+        ));
         let params = sonic_rs::from_str("[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]")
             .unwrap_or_else(|err| panic!("{err}"));
         let answer = handler
