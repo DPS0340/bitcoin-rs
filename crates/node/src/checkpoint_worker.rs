@@ -31,7 +31,7 @@
 //! plausibly several GB near modern tips). At a 10k-block cadence the pause is
 //! seconds-to-tens-of-seconds — well under 1 % of wall time during IBD.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -49,7 +49,23 @@ use bitcoin_rs_utxo::stats::CoinStatsListener;
 use crate::apply::{ApplyAdmission, PruneBodyStore, UndoStore};
 use crate::checkpoint::{self, CheckpointError, CheckpointWrite};
 use crate::recovery_evidence;
-use crate::state::ChainEventPublisher;
+use crate::state::{CHAINSTATE_JOURNAL_DIR, ChainEventPublisher};
+
+fn clear_full_revalidation_marker(data_dir: &Path) -> core::result::Result<(), CheckpointError> {
+    let journal_path = data_dir.join(CHAINSTATE_JOURNAL_DIR);
+    let journal_dir =
+        match cap_std::fs::Dir::open_ambient_dir(&journal_path, cap_std::ambient_authority()) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+    match journal_dir.remove_file(crate::chainstate_journal::FULL_REVALIDATION_MARKER) {
+        Ok(()) => crate::checkpoint_fs::sync_dir(&journal_dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
 
 /// Block count between periodic checkpoint publications during sync.
 ///
@@ -228,6 +244,9 @@ impl CheckpointPublisher {
         self.undo_store
             .disarm_disconnect()
             .map_err(CheckpointError::from)?;
+        if matches!(written, CheckpointWrite::Published { .. }) {
+            clear_full_revalidation_marker(&self.data_dir)?;
+        }
         // Everything up to this tip is now recoverable, so undo records below
         // it may be pruned.
         self.durable_tip_height
@@ -330,4 +349,23 @@ fn wait_for_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(200).min(remaining));
     }
     shutdown.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CHAINSTATE_JOURNAL_DIR, clear_full_revalidation_marker};
+
+    #[test]
+    fn full_revalidation_marker_clears_after_checkpoint_publication() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let journal_dir = dir.path().join(CHAINSTATE_JOURNAL_DIR);
+        let marker = journal_dir.join(crate::chainstate_journal::FULL_REVALIDATION_MARKER);
+        std::fs::create_dir_all(&journal_dir)?;
+        std::fs::write(&marker, b"force full validation\n")?;
+
+        clear_full_revalidation_marker(dir.path())?;
+
+        assert!(!marker.exists());
+        Ok(())
+    }
 }

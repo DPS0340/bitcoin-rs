@@ -43,17 +43,6 @@ const MAX_HEAD_BYTES: u64 = 4 * 1024;
 const SEGMENT_NAME_MAX: usize = 32;
 pub(crate) const FULL_REVALIDATION_MARKER: &str = "full-revalidation";
 
-/// Durability batch size, in blocks (plan §2.3 default; config lands in Task 3).
-const DEFAULT_BATCH_BLOCKS: u32 = 500;
-/// Durability batch period, in seconds (plan §2.3 default; config lands in Task 3).
-const DEFAULT_BATCH_SECONDS: u64 = 5;
-/// Segment rotation threshold, in MiB (plan §2.1; config lands in Task 3).
-const DEFAULT_ROTATE_MIB: u64 = 256;
-/// Retention bound on total journal size, in MiB (plan §2.1; config lands in Task 3).
-const DEFAULT_MAX_JOURNAL_MIB: u64 = 2048;
-const DEFAULT_MAX_LAG_BLOCKS: u32 = DEFAULT_BATCH_BLOCKS;
-const DEFAULT_MAX_LAG_SECONDS: u64 = 30;
-
 /// Zero-padded 10-digit generation: lexicographic order equals numeric order.
 const SEGMENT_GEN_WIDTH: usize = 10;
 
@@ -98,6 +87,8 @@ pub(crate) enum JournalWriterFailpoint {
     HeadDirSync,
     /// Injected just before the storage-dependency flush at the boundary.
     StorageFlush,
+    /// Injected after a rewind head publishes but before tail truncation.
+    RewindTruncate,
 }
 
 #[derive(Debug, Error)]
@@ -319,6 +310,10 @@ pub(crate) struct JournalWriter<S: KvStore> {
     /// fails closed before any later block mutation; restart recovery truncates
     /// the active segment to the durable cursor and creates a fresh writer.
     append_gap_height: Option<u32>,
+    /// A durability boundary failed after all record bytes were tracked. The
+    /// next pre-apply check must retry that boundary regardless of configured
+    /// lag thresholds before permitting another chainstate mutation.
+    durability_retry_required: bool,
     state: WriterState,
     failpoint: Option<JournalWriterFailpoint>,
 }
@@ -383,6 +378,7 @@ impl<S: KvStore> JournalWriter<S> {
         store: std::sync::Arc<S>,
         head: HeadMarker,
     ) -> Result<Self, JournalWriterError> {
+        let defaults = crate::config::ChainstateJournalConfig::default();
         let mut writer = Self {
             dir,
             store,
@@ -407,14 +403,15 @@ impl<S: KvStore> JournalWriter<S> {
             record_count: head.record_count,
             durable_block_hash: head.block_hash,
             durable_prev_hash: head.prev_hash,
-            rotate_bytes: DEFAULT_ROTATE_MIB * 1024 * 1024,
-            batch_blocks: DEFAULT_BATCH_BLOCKS,
-            batch_seconds: Duration::from_secs(DEFAULT_BATCH_SECONDS),
-            max_journal_bytes: DEFAULT_MAX_JOURNAL_MIB * 1024 * 1024,
-            max_lag_blocks: DEFAULT_MAX_LAG_BLOCKS,
-            max_lag_seconds: Duration::from_secs(DEFAULT_MAX_LAG_SECONDS),
+            rotate_bytes: defaults.rotate_mib * 1024 * 1024,
+            batch_blocks: defaults.blocks,
+            batch_seconds: Duration::from_secs(defaults.seconds),
+            max_journal_bytes: defaults.max_journal_mib * 1024 * 1024,
+            max_lag_blocks: defaults.max_lag_blocks,
+            max_lag_seconds: Duration::from_secs(defaults.max_lag_seconds),
             last_boundary: Instant::now(),
             append_gap_height: None,
+            durability_retry_required: false,
             state: WriterState::Open,
             failpoint: None,
         };
@@ -491,6 +488,9 @@ impl<S: KvStore> JournalWriter<S> {
     /// chainstate. A failed durability retry stops that apply before any write.
     pub(crate) fn prepare_for_apply(&mut self) -> Result<(), JournalWriterError> {
         self.ensure_appendable()?;
+        if self.durability_retry_required {
+            self.advance_durability()?;
+        }
         self.flush_due()?;
         let lag = self
             .next_height
@@ -761,6 +761,12 @@ impl<S: KvStore> JournalWriter<S> {
 
     /// Boundary over the first `target` buffered records.
     fn advance_durability_upto(&mut self, target: usize) -> Result<(), JournalWriterError> {
+        let result = self.try_advance_durability_upto(target);
+        self.durability_retry_required = result.is_err();
+        result
+    }
+
+    fn try_advance_durability_upto(&mut self, target: usize) -> Result<(), JournalWriterError> {
         if self.pending_records.is_empty() || target == 0 {
             return Ok(());
         }
@@ -923,7 +929,10 @@ impl<S: KvStore> JournalWriter<S> {
         // The atomic head rewrite is the logical invalidation point. Physical
         // truncation follows; a crash between them leaves only an ignored tail.
         self.write_head_atomic(&marker)?;
-        self.truncate_after(cursor)?;
+        if let Err(error) = self.truncate_after(cursor) {
+            self.mark_append_gap(fork_height.saturating_add(1));
+            return Err(error);
+        }
 
         self.segment_gen = cursor.generation;
         self.segment_offset = cursor.offset;
@@ -992,6 +1001,7 @@ impl<S: KvStore> JournalWriter<S> {
     }
 
     fn truncate_after(&self, cursor: ForkCursor) -> Result<(), JournalWriterError> {
+        self.fail_rewind_truncate()?;
         let name = segment_name(cursor.generation);
         match self
             .dir
@@ -1218,6 +1228,10 @@ impl<S: KvStore> JournalWriter<S> {
 
     fn fail_storage_flush(&self) -> Result<(), JournalWriterError> {
         self.failpoint(JournalWriterFailpoint::StorageFlush)
+    }
+
+    fn fail_rewind_truncate(&self) -> Result<(), JournalWriterError> {
+        self.failpoint(JournalWriterFailpoint::RewindTruncate)
     }
 
     fn fail_head_temp_write(&self) -> Result<(), JournalWriterError> {
@@ -1518,6 +1532,26 @@ mod tests {
     }
 
     #[test]
+    fn writer_bootstrap_uses_chainstate_journal_config_defaults() -> TestResult {
+        let writer = open_fresh("config-defaults", Arc::new(CountingStore::new()))?;
+        let defaults = crate::config::ChainstateJournalConfig::default();
+
+        assert_eq!(writer.batch_blocks, defaults.blocks);
+        assert_eq!(writer.batch_seconds, Duration::from_secs(defaults.seconds));
+        assert_eq!(writer.rotate_bytes, defaults.rotate_mib * 1024 * 1024);
+        assert_eq!(
+            writer.max_journal_bytes,
+            defaults.max_journal_mib * 1024 * 1024
+        );
+        assert_eq!(writer.max_lag_blocks, defaults.max_lag_blocks);
+        assert_eq!(
+            writer.max_lag_seconds,
+            Duration::from_secs(defaults.max_lag_seconds)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn head_never_advances_without_counted_storage_flush() -> TestResult {
         let store = Arc::new(CountingStore::new());
         let mut writer = open_fresh("flush-order", Arc::clone(&store))?;
@@ -1652,6 +1686,39 @@ mod tests {
     }
 
     #[test]
+    fn failed_rewind_truncation_blocks_appends_until_restart() -> TestResult {
+        let store = Arc::new(CountingStore::new());
+        let dir;
+        {
+            let mut writer = open_fresh("rewind-truncate-gap", Arc::clone(&store))?;
+            writer.append(&sample_record(1))?;
+            writer.append(&sample_record(2))?;
+            writer.flush_to(2)?;
+            writer.inject_failpoint(JournalWriterFailpoint::RewindTruncate);
+
+            assert!(writer.rewind_to(1, [1; 32], [0; 32], 3).is_err());
+            writer.failpoint = None;
+            let persisted = HeadMarker::deserialize(&writer.dir.read("head.json")?)?;
+            assert_eq!(persisted.height, 1);
+            assert!(matches!(
+                writer.prepare_for_apply(),
+                Err(JournalWriterError::AppendGap { height: 2 })
+            ));
+            assert!(matches!(
+                writer.append(&sample_record(2)),
+                Err(JournalWriterError::AppendGap { height: 2 })
+            ));
+            dir = writer.dir.try_clone()?;
+        }
+
+        let mut reopened = JournalWriter::open(dir, store)?;
+        reopened.append(&sample_record(2))?;
+        reopened.flush_to(2)?;
+        assert_eq!(reopened.head().height, 2);
+        Ok(())
+    }
+
+    #[test]
     fn rotation_keeps_cursor_invariants() -> TestResult {
         let store = Arc::new(CountingStore::new());
         let mut writer = open_fresh("rotation", Arc::clone(&store))?;
@@ -1752,6 +1819,28 @@ mod tests {
         store.set_fail_flush(false);
         writer.prepare_for_apply()?;
         assert_eq!(writer.head().height, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_boundary_retries_before_next_apply_below_lag_limit() -> TestResult {
+        let store = Arc::new(CountingStore::new());
+        let mut writer = open_fresh("boundary-retry", Arc::clone(&store))?;
+        writer.configure(1, Duration::from_mins(1), 1, 10, 10, Duration::from_mins(1))?;
+        store.set_fail_flush(true);
+        assert!(matches!(
+            writer.append(&sample_record(1)),
+            Err(JournalWriterError::StorageFlush(_))
+        ));
+        assert_eq!(writer.head().height, 0);
+
+        store.set_fail_flush(false);
+        writer.prepare_for_apply()?;
+        assert_eq!(
+            writer.head().height,
+            1,
+            "the failed automatic boundary must be retried before another apply"
+        );
         Ok(())
     }
 

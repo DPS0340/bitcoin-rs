@@ -877,7 +877,14 @@ pub(crate) enum ResumeSource {
     Journal,
 }
 
-const CHAINSTATE_JOURNAL_DIR: &str = "chainstate-journal";
+pub(crate) const CHAINSTATE_JOURNAL_DIR: &str = "chainstate-journal";
+
+fn requires_full_revalidation(data_dir: &Path) -> bool {
+    data_dir
+        .join(CHAINSTATE_JOURNAL_DIR)
+        .join(crate::chainstate_journal::FULL_REVALIDATION_MARKER)
+        .is_file()
+}
 
 struct InitialChainstate {
     utxo: UtxoSet,
@@ -982,12 +989,7 @@ fn prepare_initial_chainstate(
     config: &NodeConfig,
 ) -> Result<InitialChainstate> {
     let journal_config = config.chainstate_journal;
-    let force_full_revalidation = config
-        .data_dir
-        .join(CHAINSTATE_JOURNAL_DIR)
-        .join(crate::chainstate_journal::FULL_REVALIDATION_MARKER)
-        .is_file();
-    if journal_config.enabled && force_full_revalidation {
+    if requires_full_revalidation(&config.data_dir) {
         metrics::counter!(
             "node.chainstate_journal.fallback_total",
             "reason" => "full_revalidation_marker"
@@ -1488,12 +1490,7 @@ impl NodeState {
             .load_disconnect_marker()
             .map_err(anyhow::Error::new)?
         {
-            let force_full_revalidation = config.chainstate_journal.enabled
-                && config
-                    .data_dir
-                    .join(CHAINSTATE_JOURNAL_DIR)
-                    .join(crate::chainstate_journal::FULL_REVALIDATION_MARKER)
-                    .is_file();
+            let force_full_revalidation = requires_full_revalidation(&config.data_dir);
             if marker.phase == crate::apply::DisconnectPhase::RolledBack && force_full_revalidation
             {
                 undo_store.disarm_disconnect().map_err(anyhow::Error::new)?;
@@ -2374,6 +2371,21 @@ mod tests {
             chainwork: bitcoin_rs_chain::node::ChainWork::ZERO,
             hash: bitcoin_rs_primitives::Hash256::from_le_bytes(&hash),
         })));
+    }
+
+    #[test]
+    fn full_revalidation_marker_is_sticky_when_journal_is_disabled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.chainstate_journal.enabled = false;
+        let journal_dir = config.data_dir.join(CHAINSTATE_JOURNAL_DIR);
+        let marker = journal_dir.join(crate::chainstate_journal::FULL_REVALIDATION_MARKER);
+        std::fs::create_dir_all(&journal_dir)?;
+        std::fs::write(&marker, b"force full validation\n")?;
+
+        assert!(requires_full_revalidation(&config.data_dir));
+        Ok(())
     }
 
     #[test]

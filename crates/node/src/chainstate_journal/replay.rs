@@ -19,7 +19,7 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
 use bitcoin_rs_utxo::{BorrowedBlockChanges, BorrowedUtxoAdd, UtxoSet};
 
-use super::record::{JournalRecord, Mutation, decode_record};
+use super::record::{FRAME_HEADER_LEN, JournalRecord, MAX_PAYLOAD_LEN, Mutation, decode_record};
 use super::writer::{HeadMarker, read_head_bytes};
 
 /// Classification of a boot replay attempt.
@@ -153,6 +153,23 @@ fn stream_committed_range(
     Ok(record_count)
 }
 
+fn checked_frame_len(payload_len: u32) -> Result<usize, JournalReplayError> {
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        JournalReplayError::CommittedRangeInvalid("payload length overflow".to_owned())
+    })?;
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(JournalReplayError::CommittedRangeInvalid(format!(
+            "payload length exceeds codec limit: {payload_len} > {MAX_PAYLOAD_LEN}"
+        )));
+    }
+    FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(core::mem::size_of::<u32>()))
+        .ok_or_else(|| {
+            JournalReplayError::CommittedRangeInvalid("frame length overflow".to_owned())
+        })
+}
+
 /// Streams one segment generation record by record, enforcing contiguity.
 fn stream_segment(
     dir: &cap_std::fs::Dir,
@@ -165,8 +182,9 @@ fn stream_segment(
 ) -> Result<u64, JournalReplayError> {
     use std::io::{Read, Seek, SeekFrom};
 
-    const FRAME_HEADER_U64: u64 = 4 + 1 + 4;
-    const FRAME_HEADER: usize = 4 + 1 + 4;
+    let frame_header_len = u64::try_from(FRAME_HEADER_LEN).map_err(|_| {
+        JournalReplayError::CommittedRangeInvalid("frame header size overflow".to_owned())
+    })?;
 
     let name = super::writer::segment_name_pub(generation);
     let file = dir.open(name.as_str()).map_err(|error| {
@@ -191,14 +209,14 @@ fn stream_segment(
 
     while offset < end {
         if offset
-            .checked_add(FRAME_HEADER_U64)
+            .checked_add(frame_header_len)
             .is_none_or(|header_end| header_end > end)
         {
             return Err(JournalReplayError::CommittedRangeInvalid(format!(
                 "segment {generation}: truncated frame header at offset {offset}"
             )));
         }
-        let mut header = [0_u8; FRAME_HEADER];
+        let mut header = [0_u8; FRAME_HEADER_LEN];
         reader.read_exact(&mut header).map_err(|error| {
             JournalReplayError::CommittedRangeInvalid(format!(
                 "segment {generation}: read frame header at offset {offset}: {error}"
@@ -209,12 +227,10 @@ fn stream_segment(
                 "frame header length slice mismatch".to_owned(),
             )
         })?);
-        let frame_len = FRAME_HEADER_U64
-            .checked_add(u64::from(payload_len))
-            .and_then(|length| length.checked_add(4))
-            .ok_or_else(|| {
-                JournalReplayError::CommittedRangeInvalid("frame length overflow".to_owned())
-            })?;
+        let frame_size = checked_frame_len(payload_len)?;
+        let frame_len = u64::try_from(frame_size).map_err(|_| {
+            JournalReplayError::CommittedRangeInvalid("frame size overflow".to_owned())
+        })?;
         if offset
             .checked_add(frame_len)
             .is_none_or(|frame_end| frame_end > end)
@@ -223,14 +239,11 @@ fn stream_segment(
                 "segment {generation}: truncated frame at offset {offset}"
             )));
         }
-        let frame_size = usize::try_from(frame_len).map_err(|_| {
-            JournalReplayError::CommittedRangeInvalid("frame size overflow".to_owned())
-        })?;
         let mut frame = Vec::with_capacity(frame_size);
         frame.extend_from_slice(&header);
         frame.resize(frame_size, 0);
         reader
-            .read_exact(&mut frame[FRAME_HEADER..])
+            .read_exact(&mut frame[FRAME_HEADER_LEN..])
             .map_err(|error| {
                 JournalReplayError::CommittedRangeInvalid(format!(
                     "segment {generation}: read frame at offset {offset}: {error}"
@@ -632,8 +645,12 @@ mod tests {
     use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
     use bitcoin_rs_utxo::{BorrowedBlockChanges, BorrowedUtxoAdd, UtxoSet};
 
-    use super::{JournalRecord, Mutation, replay_records, validate_replayed_head};
+    use super::{
+        JournalRecord, JournalReplayError, Mutation, checked_frame_len, replay_records,
+        validate_replayed_head,
+    };
     use crate::chainstate_journal::Coin;
+    use crate::chainstate_journal::record::MAX_PAYLOAD_LEN;
     use crate::chainstate_journal::writer::HeadMarker;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -699,6 +716,17 @@ mod tests {
         utxo.commit_borrowed_block(&changes, &base_tip.hash)?;
         listener.finish_block(0, 1);
         Ok((tree, utxo, listener.snapshot(), base_tip, base_coin))
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_before_payload_allocation() -> TestResult {
+        let oversized = u32::try_from(MAX_PAYLOAD_LEN.checked_add(1).ok_or("payload overflow")?)?;
+        assert!(matches!(
+            checked_frame_len(oversized),
+            Err(JournalReplayError::CommittedRangeInvalid(message))
+                if message.contains("payload length exceeds")
+        ));
+        Ok(())
     }
 
     #[test]

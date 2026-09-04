@@ -7,7 +7,7 @@ const MAGIC: [u8; 4] = *b"JRNL";
 const VERSION: u8 = 1;
 pub(crate) const FRAME_HEADER_LEN: usize = MAGIC.len() + 1 + core::mem::size_of::<u32>();
 const FRAME_TRAILER_LEN: usize = core::mem::size_of::<u32>();
-const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
 const MAX_MUTATIONS: u32 = 4_000_000;
 
 /// A complete coin, including the fields required by `CoinStats`' `MuHash` preimage.
