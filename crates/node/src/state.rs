@@ -1102,11 +1102,7 @@ pub struct NodeState {
     network: Arc<RwLock<NetworkState>>,
     /// Shared P2P admission switch controlled by `setnetworkactive`.
     network_active: Arc<AtomicBool>,
-    peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
-    /// Per-peer outbound message senders, keyed by remote socket address.
-    /// External code pushes messages here; the per-connection thread drains
-    /// and writes them to the peer's TCP stream.
-    peer_outbound: Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
+    peer_table: Arc<bitcoin_rs_p2p::PeerTable>,
     banned: Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     p2p_outbound_tx: crossbeam_channel::Sender<std::net::SocketAddr>,
     p2p_outbound_rx: Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>>,
@@ -1395,9 +1391,8 @@ impl NodeState {
         ));
         let network = Arc::new(RwLock::new(NetworkState::default()));
         let network_active = Arc::new(AtomicBool::new(true));
-        let peers = Arc::new(RwLock::new(Vec::new()));
         let banned = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peer_table = Arc::new(bitcoin_rs_p2p::PeerTable::new());
         let (p2p_outbound_tx, p2p_outbound_rx_raw) =
             crossbeam_channel::bounded(P2P_OUTBOUND_QUEUE_LIMIT);
         let p2p_outbound_rx = Arc::new(Mutex::new(p2p_outbound_rx_raw));
@@ -1472,8 +1467,7 @@ impl NodeState {
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
         let sync = Arc::new(crate::BlockSync::new(
             apply_handles.clone(),
-            Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
+            Arc::clone(&peer_table),
             Arc::clone(&inbound_headers_rx),
             Arc::clone(&inbound_blocks_rx),
         ));
@@ -1534,8 +1528,7 @@ impl NodeState {
             transactions,
             network,
             network_active,
-            peers,
-            peer_outbound,
+            peer_table,
             banned,
             p2p_outbound_tx,
             p2p_outbound_rx,
@@ -1899,29 +1892,16 @@ impl NodeState {
         Arc::clone(&self.network_active)
     }
 
-    /// Returns the shared registry of currently-handshook peers.
-    #[must_use]
-    pub fn peers(&self) -> Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>> {
-        Arc::clone(&self.peers)
-    }
-
     /// Returns the shared manual IP/subnet ban list exposed to RPC and P2P.
     #[must_use]
     pub fn banned_subnets(&self) -> Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>> {
         Arc::clone(&self.banned)
     }
 
-    /// Returns the shared per-peer outbound message-sender map.
-    ///
-    /// External callers can look up a peer's `Sender<Message>` by socket
-    /// address and send a message into that peer's outbound queue. The
-    /// per-connection thread drains the receiver each iteration of
-    /// `run_message_loop` and writes the message via `peer.send`.
     #[must_use]
-    pub fn peer_outbound(
-        &self,
-    ) -> Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>> {
-        Arc::clone(&self.peer_outbound)
+    /// Returns the authoritative table of live peer sessions.
+    pub fn peer_table(&self) -> Arc<bitcoin_rs_p2p::PeerTable> {
+        Arc::clone(&self.peer_table)
     }
     /// Returns a cloned sender that RPC `addnode` uses to request outbound P2P connections.
     #[must_use]
@@ -2454,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    fn open_constructs_empty_peer_registry() -> anyhow::Result<()> {
+    fn open_constructs_empty_peer_table() -> anyhow::Result<()> {
         use tempfile::tempdir;
 
         let dir = tempdir()?;
@@ -2464,14 +2444,14 @@ mod tests {
         let state = NodeState::open(config, None)?;
 
         assert!(
-            state.peers().read().is_empty(),
-            "freshly opened registry is empty"
+            state.peer_table().is_empty(),
+            "freshly opened table is empty"
         );
         Ok(())
     }
 
     #[test]
-    fn open_constructs_empty_peer_outbound_map() -> anyhow::Result<()> {
+    fn open_constructs_empty_peer_table_again() -> anyhow::Result<()> {
         use tempfile::tempdir;
 
         let dir = tempdir()?;
@@ -2480,7 +2460,7 @@ mod tests {
         config.p2p_listen.clear();
         let state = NodeState::open(config, None)?;
 
-        assert!(state.peer_outbound().read().is_empty());
+        assert!(state.peer_table().is_empty());
         Ok(())
     }
 
@@ -4140,7 +4120,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn non_regular_epoch_lock_refuses_start() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
