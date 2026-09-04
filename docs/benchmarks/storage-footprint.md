@@ -25,7 +25,7 @@ cargo run -p bitcoin-rs-storage --example storage_footprint --release --features
 | Undo value size | 256 B |
 | Index CF key/value sizes | TxConfirmed 12+8, TxMempool 5+4, BlockHeaders 80+0, Funding 12+8, Spending 12+8, Coinstats 12+8, BlockTree 37+0, UtxoMeta 16+8 |
 | Block-body key size | 37 B |
-| **Logical data size** | **127,970,000 B (122.04 MiB)** |
+| **Logical data size** | **129,570,000 B (123.57 MiB)** |
 
 The corpus is synthetic: deterministic keys and values with a fixed pattern
 (0xa5 for block bodies, 0xb3 for undo, pseudo-random for index rows). It is
@@ -39,17 +39,17 @@ all data remaining in the pre-allocated journal.
 
 | Backend | Total on-disk | Logical | Write amplification |
 |---|---:|---:|---:|
-| fjall (default) | 207,497,732 B (197.89 MiB) | 127,970,000 B (122.04 MiB) | 1.621x |
-| redb | 269,488,128 B (257.00 MiB) | 127,970,000 B (122.04 MiB) | 2.106x |
-| rocksdb | 134,671,921 B (128.43 MiB) | 127,970,000 B (122.04 MiB) | 1.052x |
+| fjall (default) | 207,497,732 B (197.89 MiB) | 129,570,000 B (123.57 MiB) | 1.601x |
+| redb | 269,488,128 B (257.00 MiB) | 129,570,000 B (123.57 MiB) | 2.080x |
+| rocksdb | 134,671,921 B (128.43 MiB) | 129,570,000 B (123.57 MiB) | 1.039x |
 
 ### After compression fix
 
 | Backend | Total on-disk | Logical | Write amplification |
 |---|---:|---:|---:|
-| **fjall (default)** | **85,858,577 B (81.88 MiB)** | 127,970,000 B (122.04 MiB) | **0.671x** |
-| redb | 269,488,128 B (257.00 MiB) | 127,970,000 B (122.04 MiB) | 2.106x |
-| rocksdb | 134,671,921 B (128.43 MiB) | 127,970,000 B (122.04 MiB) | 1.052x |
+| **fjall (default)** | **85,858,577 B (81.88 MiB)** | 129,570,000 B (123.57 MiB) | **0.663x** |
+| redb | 269,488,128 B (257.00 MiB) | 129,570,000 B (123.57 MiB) | 2.080x |
+| rocksdb | 134,671,921 B (128.43 MiB) | 129,570,000 B (123.57 MiB) | 1.039x |
 
 The fjall default backend dropped from **197.89 MiB to 81.88 MiB** — a **58.6%
 reduction**. The amplification went from 1.621x to 0.671x because the synthetic
@@ -84,11 +84,11 @@ to the final level), all on-disk data is uncompressed.
 RocksDB, by contrast, applies LZ4 compression on every level
 (`DBCompressionType::Lz4` set on both `db_options` and `cf_options`).
 
-The measurement exposed this: fjall's 1.621x amplification versus rocksdb's
-1.052x was almost entirely due to the missing L0/L1 compression. The per-CF
-breakdown showed the `spending` CF (12-byte keys, 0-byte values) consuming
-17.9 MiB for 200k rows — ~89 bytes/row of uncompressed index and bloom-filter
-overhead.
+The measurement exposed this: fjall's 1.601x amplification versus rocksdb's
+1.039x was almost entirely due to the missing L0/L1 compression. The per-CF
+breakdown showed the `spending` CF (12-byte keys, 8-byte values) consuming
+2,525,015 bytes for 200k rows. The eight-byte values are included in the
+logical-size and amplification calculations above.
 
 ## What was fixed
 
