@@ -4513,15 +4513,17 @@ mod chaintxstats_window_tests {
     /// count by the 64-bit interval; so does [`u64_to_f64`].
     #[test]
     fn txrate_keeps_counts_above_u32_max() {
-        const PAST: u64 = 1;
+        const PAST: u64 = 3;
         // `u32::MAX + 100`. Written as a literal because `u64::from` is not
         // const-stable here; the inequality below is what keeps it honest.
         const END: u64 = 4_294_967_395;
         let ctx = Context::new();
+        // Four blocks so a one-block window is legal and the two MTP
+        // boundaries differ (three or fewer keep the same median).
         let tip = super::chaintxstats_durability_tests::insert_counted_chain(
             &ctx,
-            &[1_000, 2_000],
-            &[PAST, END],
+            &[1_000, 2_000, 3_000, 4_000],
+            &[1, 2, PAST, END],
         );
         ctx.set_applied_tip(tip);
         let ctx = Arc::new(ctx);
