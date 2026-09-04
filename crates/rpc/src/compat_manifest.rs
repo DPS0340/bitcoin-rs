@@ -112,6 +112,29 @@ mod tests {
         Status::parse(&text)
             .unwrap_or_else(|| panic!("`{text}` is not a status this manifest defines"))
     }
+    /// Cargo feature this entry is gated by; empty when always compiled.
+    fn feature_of(entry: &toml::Table) -> &str {
+        entry
+            .get("feature")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+    }
+
+    /// True when the entry's feature is active in this build.
+    fn feature_active(entry: &toml::Table) -> bool {
+        let feature = feature_of(entry);
+        feature.is_empty() || (feature == "zmq" && cfg!(feature = "zmq"))
+    }
+
+    /// The longest REST registration prefix this example path matches.
+    fn rest_prefix(path: &str) -> &'static str {
+        crate::rest::REGISTRATIONS
+            .iter()
+            .copied()
+            .filter(|&prefix| path.starts_with(prefix))
+            .max_by_key(|&prefix| prefix.len())
+            .unwrap_or_else(|| panic!("`{path}` has no registered REST prefix"))
+    }
 
     /// The manifest names every method the dispatcher answers, and no others.
     ///
@@ -130,10 +153,20 @@ mod tests {
         assert!(!live.is_empty(), "the live registry must not be empty");
 
         let table = manifest();
-        let rpc_entries = entries(&table, "rpc");
-        let rpc_names: Vec<String> = rpc_entries.iter().map(|entry| field(entry, "method")).collect();
+        let rpc_entries: Vec<toml::Table> = entries(&table, "rpc")
+            .into_iter()
+            .filter(feature_active)
+            .collect();
+        let rpc_names: Vec<String> = rpc_entries
+            .iter()
+            .map(|entry| field(entry, "method"))
+            .collect();
         let listed: BTreeSet<String> = rpc_names.iter().cloned().collect();
-        assert_eq!(listed.len(), rpc_names.len(), "the manifest must not duplicate RPC methods");
+        assert_eq!(
+            listed.len(),
+            rpc_names.len(),
+            "the manifest must not duplicate RPC methods"
+        );
 
         let missing: Vec<&String> = live.difference(&listed).collect();
         assert!(
@@ -165,6 +198,9 @@ mod tests {
         let table = manifest();
 
         for entry in entries(&table, "rpc") {
+            if !feature_active(&entry) {
+                continue;
+            }
             let status = status_of(&entry);
             if matches!(status, Status::NotImplemented) {
                 continue;
@@ -341,9 +377,9 @@ mod tests {
 
     /// Every REST route the manifest lists is served, and unlisted paths 404.
     ///
-    /// The manifest is deliberately smaller than the REST surface for REST
-    /// (see the header comment in the TOML), so this checks only that listed
-    /// routes resolve, not bidirectional equality.
+    /// The manifest writes each route as a concrete served example (with
+    /// placeholders for hash/height/kind) so a human reader can use it, while
+    /// the router sees the same `REGISTRATIONS` prefixes main uses.
     #[test]
     fn the_manifest_and_the_rest_router_agree() {
         let ctx = Arc::new(Context::new());
@@ -353,16 +389,22 @@ mod tests {
             .map(|entry| field(entry, "path"))
             .collect();
         assert!(!listed.is_empty(), "the manifest must list the REST routes");
-          let listed_prefixes: BTreeSet<String> = listed.iter().map(|path| path.strip_suffix(".json").unwrap_or(path).to_owned()).collect();
-          let registered: BTreeSet<String> = crate::rest::REGISTRATIONS.iter().map(|path| (*path).to_owned()).collect();
-          assert_eq!(listed_prefixes, registered, "REST manifest and router registrations must agree");
 
-        // The manifest writes the header route with its parameters spelled out,
-        // which is what a reader needs and not what the router takes.
+        let listed_prefixes: BTreeSet<&'static str> =
+            listed.iter().map(|path| rest_prefix(path)).collect();
+        let registered: BTreeSet<&'static str> =
+            crate::rest::REGISTRATIONS.iter().copied().collect();
+        assert_eq!(
+            listed_prefixes, registered,
+            "REST manifest examples must cover exactly the registered prefixes"
+        );
+
         let genesis = "0000000000000000000000000000000000000000000000000000000000000000";
         for path in &listed {
             let concrete = path
                 .replace("<hash>", genesis)
+                .replace("<height>", "0")
+                .replace("<kind>", "info")
                 .replace("<json|hex|bin>", "json");
             let response = crate::rest::route(&ctx, &concrete, "count=1", true);
             assert_ne!(

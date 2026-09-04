@@ -129,11 +129,6 @@ group = "blockchain"
 status = "implemented_unverified"
 
 [[rpc]]
-method = "getblockfilter"
-group = "blockchain"
-status = "implemented_unverified"
-
-[[rpc]]
 method = "getindexinfo"
 group = "blockchain"
 status = "implemented_unverified"
@@ -242,6 +237,7 @@ deviation = "The `short`, `medium` and `long` horizons all carry the same feerat
 method = "getzmqnotifications"
 group = "util"
 status = "implemented_unverified"
+feature = "zmq"
 
 [[rpc]]
 method = "validateaddress"
@@ -372,54 +368,61 @@ status = "implemented_unverified"
 # ---------------------------------------------------------------------------
 # REST
 #
-# Every prefix registered by the REST router is listed here.  The gateway is
-# UNAUTHENTICATED: binding it to a public interface exposes chain data to anyone
-# who can reach the port.
+# Every prefix the REST router registers is listed here as a concrete served
+# example. The gateway is UNAUTHENTICATED: binding it to a public interface
+# exposes chain data to anyone who can reach the port.
 # ---------------------------------------------------------------------------
 
 [[rest]]
 path = "/rest/tx/"
 status = "implemented_unverified"
+
 [[rest]]
 path = "/rest/block/notxdetails/"
 status = "implemented_unverified"
+
 [[rest]]
 path = "/rest/block/"
 status = "implemented_unverified"
+
 [[rest]]
 path = "/rest/blockpart/"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "Binary formats only; JSON is rejected as in Core's original part endpoint."
+
 [[rest]]
-path = "/rest/blockfilter/"
+path = "/rest/chaininfo.json"
 status = "implemented_unverified"
+
 [[rest]]
-path = "/rest/blockfilterheaders/"
+path = "/rest/mempool/<kind>.json"
 status = "implemented_unverified"
+
 [[rest]]
-path = "/rest/chaininfo"
-status = "implemented_unverified"
-[[rest]]
-path = "/rest/mempool/"
-status = "implemented_unverified"
-[[rest]]
-path = "/rest/headers/"
+path = "/rest/headers/<hash>.json"
 status = "deviation"
 deviation = "Unknown but well-formed block hashes return an empty 200 response rather than 404, and query parameters other than count are ignored."
+
 [[rest]]
-path = "/rest/getutxos"
+path = "/rest/getutxos/<hash>-0.json"
 status = "implemented_unverified"
+
 [[rest]]
-path = "/rest/deploymentinfo/"
+path = "/rest/deploymentinfo.json"
 status = "implemented_unverified"
+
 [[rest]]
-path = "/rest/deploymentinfo"
+path = "/rest/deploymentinfo/<hash>.json"
 status = "implemented_unverified"
+
 [[rest]]
 path = "/rest/blockhashbyheight/"
 status = "implemented_unverified"
+
 [[rest]]
 path = "/rest/spenttxouts/"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "This node does not retain undo data, so every well-formed request answers Core's undo-unavailable error."
 
 # ---------------------------------------------------------------------------
 # ZMQ
@@ -452,5 +455,4 @@ status = "implemented_unverified"
 [[zmq]]
 topic = "sequence"
 notifier = "pubsequence"
-status = "deviation"
-deviation = "Block connect and disconnect events only. Core also publishes mempool accept and remove on this topic; those are unavailable until #74, so a subscriber must not read the absence of an A/R message as the absence of the event."
+status = "implemented_unverified"
