@@ -210,9 +210,6 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
 
     let tip_hash = parse_hash_hex(&meta.tip_hash_hex)
         .ok_or_else(|| anyhow::anyhow!("invalid recovery tip hash {}", meta.tip_hash_hex))?;
-    if let Some(progress) = &state.apply_handles().recovery_progress {
-        progress.mark_published(meta.height);
-    }
     match replay_from_bodies(
         state,
         restored_applied_tip.as_deref(),
@@ -220,6 +217,9 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
         tip_hash,
     ) {
         Ok(replayed) => {
+            if let Some(progress) = &state.apply_handles().recovery_progress {
+                progress.mark_published(meta.height);
+            }
             for height in &replayed {
                 state.push_replayed(*height);
             }
