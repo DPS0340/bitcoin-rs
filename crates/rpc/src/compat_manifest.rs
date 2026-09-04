@@ -390,6 +390,7 @@ mod tests {
             .collect();
         assert!(!listed.is_empty(), "the manifest must list the REST routes");
 
+
         let listed_prefixes: BTreeSet<&'static str> =
             listed.iter().map(|path| rest_prefix(path)).collect();
         let registered: BTreeSet<&'static str> =

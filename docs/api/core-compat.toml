@@ -333,7 +333,7 @@ status = "implemented_unverified"
 method = "deriveaddresses"
 group = "wallet"
 status = "disabled"
-note = "Only non-ranged addr() descriptors are supported; other descriptor forms and ranged descriptors return MethodDisabled."
+note = "Only non-ranged addr() descriptors are supported; other descriptor forms and ranged descriptors return MethodDisabled. For addr() descriptors, the optional range argument is not honored and returns MethodDisabled rather than expanding addresses."
 
 [[rpc]]
 method = "scantxoutset"
@@ -415,6 +415,9 @@ status = "implemented_unverified"
 path = "/rest/deploymentinfo/<hash>.json"
 status = "implemented_unverified"
 
+[[rest]]
+path = "/rest/headers/"
+status = "implemented_unverified"
 [[rest]]
 path = "/rest/blockhashbyheight/"
 status = "implemented_unverified"
