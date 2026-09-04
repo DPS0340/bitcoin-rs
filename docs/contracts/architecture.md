@@ -135,9 +135,8 @@ Owners:
   ownership has moved to `PeerTable` in `crates/p2p` (#215, #217), and orphaned
   node corpus tooling (`corpus.rs`) was dropped. `crates/node` still carries
   legacy domain mechanics: UTXO undo persistence and disconnect markers (`apply.rs`),
-  the P2P download scheduler (`sync.rs`), direct backend construction and cache
-  share dispatch (`state.rs`), and offline test tooling (`g2_muhash.rs`,
-  `g14_utxo_commit.rs`). Relocating these domain-owned mechanics into
+  the P2P download scheduler (`sync.rs`), and direct backend construction and
+  cache share dispatch (`state.rs`). Relocating these domain-owned mechanics into
   `crates/utxo`, `crates/storage`, `crates/p2p`, and dedicated tooling crates
   remains tracked under #217 (open). `crates/node` is the composition layer, but
   is not yet fully slim.
