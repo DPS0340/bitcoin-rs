@@ -589,8 +589,7 @@ impl ApplyAdmission {
         self.barrier.write()
     }
 
-    /// Excludes block application until the guard drops, then admission resumes.
-    /// [`Self::close`] is for shutdown; this is for a live durability barrier.
+    /// Temporarily pauses new chain transitions while the returned guard lives.
     pub(crate) fn pause(&self) -> RwLockWriteGuard<'_, ()> {
         self.barrier.write()
     }
@@ -864,14 +863,17 @@ pub struct ApplyHandles {
     /// Block height at or below which kernel / portable script execution is skipped during block apply.
     /// Non-script transaction checks still run. Zero disables the shortcut (full script checks on every block).
     pub assume_valid_height: u32,
-    /// Publishes crash-recovery progress after the body store is durable.
-    /// `None` in test harnesses.
-    pub(crate) recovery_progress: Option<Arc<crate::crash_recovery::ProgressPublisher>>,
-    /// Publishes coherent checkpoints after branch switches.
-    /// `None` in test harnesses.
-    pub(crate) checkpoint_publisher: Option<Arc<crate::checkpoint::CheckpointPublisher>>,
     /// Hash-pinned assume-valid trust gate; the height shortcut above applies only while this is trusted.
     pub assume_valid_gate: Arc<AssumeValidGate>,
+    /// Chainstate-journal writer, when the journal is enabled (issue #230).
+    ///
+    /// `None` = journal off: the apply path emits nothing and behaves exactly
+    /// as a checkpoint-only node. The writer is single-owner (the apply path);
+    /// the `Mutex` only makes the shared handle exclusive.
+    pub(crate) journal: Option<crate::chainstate_journal::SharedJournalWriter>,
+    /// Publishes checkpoints to settle rolled-back disconnect debt after a
+    /// non-fatal reorg. `None` in unit-test handle sets that never reorg.
+    pub(crate) checkpoint_publisher: Option<Arc<crate::checkpoint_worker::CheckpointPublisher>>,
 }
 
 impl ApplyHandles {
@@ -953,7 +955,7 @@ impl ApplyHandles {
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
             assume_valid_height: 0,
             assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
-            recovery_progress: None,
+            journal: None,
             checkpoint_publisher: None,
         }
     }
@@ -979,6 +981,8 @@ impl ApplyHandles {
 /// cannot run this early.
 struct DisconnectPlan {
     parent_tip: TipSnapshot,
+    parent_prev_hash: Hash256,
+    parent_chain_tx_count: u64,
     undo: bitcoin_rs_utxo::UndoBatch,
     height: u32,
     tx_count_delta: u64,
@@ -1019,7 +1023,7 @@ fn plan_disconnect(
     bitcoin_rs_consensus::verify_merkle_root_with_txids(block, &txids)
         .map_err(|_| ApplyError::DisconnectBodyMismatch { hash: block_hash })?;
 
-    let parent_tip = {
+    let (parent_tip, parent_prev_hash, parent_chain_tx_count) = {
         let tree = handles.block_tree.read();
         let node = tree.node(applied.tip_id)?;
         let parent_id = node.parent.ok_or(ApplyError::DisconnectNotTip {
@@ -1027,12 +1031,20 @@ fn plan_disconnect(
             tip: applied.hash,
         })?;
         let parent = tree.node(parent_id)?;
-        TipSnapshot {
-            tip_id: parent_id,
-            height: parent.height,
-            chainwork: parent.chainwork,
-            hash: parent.hash,
-        }
+        let parent_prev_hash = match parent.parent {
+            Some(grandparent_id) => tree.node(grandparent_id)?.hash,
+            None => Hash256::default(),
+        };
+        (
+            TipSnapshot {
+                tip_id: parent_id,
+                height: parent.height,
+                chainwork: parent.chainwork,
+                hash: parent.hash,
+            },
+            parent_prev_hash,
+            parent.chain_tx_count,
+        )
     };
 
     let encoded = handles
@@ -1074,6 +1086,8 @@ fn plan_disconnect(
 
     Ok(DisconnectPlan {
         parent_tip,
+        parent_prev_hash,
+        parent_chain_tx_count,
         undo,
         height,
         tx_count_delta,
@@ -1175,6 +1189,8 @@ pub(crate) fn disconnect_block_admitted(
     let block_hash = block.block_hash().0;
     let DisconnectPlan {
         parent_tip,
+        parent_prev_hash,
+        parent_chain_tx_count,
         undo,
         height,
         tx_count_delta,
@@ -1273,6 +1289,30 @@ pub(crate) fn disconnect_block_admitted(
         parent_tip.hash,
     );
     rewind_chain_tx_count(handles, tx_count_delta);
+    let journal_rewound = handles.journal.as_ref().is_some_and(|journal| {
+        let rewind_result = {
+            let mut journal = journal.lock();
+            journal.rewind_to(
+                parent_tip.height,
+                parent_tip.hash.to_le_bytes(),
+                parent_prev_hash.to_le_bytes(),
+                parent_chain_tx_count,
+            )
+        };
+        match rewind_result {
+            Ok(()) => true,
+            Err(error) => {
+                metrics::counter!("node.chainstate_journal.reorg_failures").increment(1);
+                tracing::warn!(
+                    height = parent_tip.height,
+                    hash = %parent_tip.hash,
+                    %error,
+                    "chainstate journal fork-head rewrite failed; retaining disconnect marker"
+                );
+                false
+            }
+        }
+    });
     handles.wake_tx_index();
     // The applied tip moved: every template long-poll waiter must observe it.
     handles.mining_generation.publish_generation();
@@ -1298,7 +1338,17 @@ pub(crate) fn disconnect_block_admitted(
             })
         })?;
 
-    // The marker deliberately stays set here.
+    if journal_rewound {
+        handles.undo_store.disarm_disconnect().map_err(|error| {
+            poison(crate::DisconnectError::MarkerStuck {
+                hash: block_hash,
+                height,
+                source: Box::new(ApplyError::UndoPersistence(error)),
+            })
+        })?;
+    }
+
+    // Without a durable journal fork transition, the marker deliberately stays set here.
     //
     // The authoritative rollback completed in memory, but it is not durable.
     // A crash can restore a checkpoint whose UTXO set and tip still contain
@@ -2213,6 +2263,17 @@ fn apply_block_admitted<'b>(
     let block_hash = block.block_hash().0;
     let prev_hash = block.header.prev_blockhash.0;
     let (prior, height) = applied_predecessor(handles, block_hash, prev_hash)?;
+    if let Some(journal) = &handles.journal {
+        let maintenance = {
+            let mut journal = journal.lock();
+            journal.prepare_for_apply()
+        };
+        if let Err(error) = maintenance {
+            metrics::counter!("node.chainstate_journal.backpressure_total").increment(1);
+            tracing::error!(height, %error, "chainstate journal backpressure stopped block apply");
+            return Err(ApplyError::JournalBackpressure(error.to_string()));
+        }
+    }
 
     // Self-consistency PoW: the block header's hash must satisfy its
     // declared target. This is the cheapest consensus gate; do it before
@@ -2525,6 +2586,78 @@ fn apply_block_admitted<'b>(
         .record(utxo_commit_dur.as_secs_f64());
     utxo_commit_result.map_err(ApplyError::UtxoCommit)?;
 
+    // §2.3 linearization point for the chainstate journal (issue #230): the
+    // in-memory UTXO commit above is the commit of record; everything the
+    // journal needs to reconstruct this block's semantic delta is still
+    // available here. Emit BEFORE `applied_tip.store` so any emission failure
+    // records the append gap before the new tip becomes visible; the next apply
+    // then stops in `prepare_for_apply` before mutating state. Successful
+    // emissions advance the pending frontier, while `flush_to` advances the
+    // durable head on the configured batch cadence. Emission remains
+    // best-effort for the current block: a transient journal I/O failure is
+    // §2.3 degraded-mode policy owns persistent failure) and must never fail
+    // the block — the journal is a recovery accelerator, not a consensus
+    // dependency. No fsync on this path; `flush_to` performs the §2.3
+    // durability boundary on the batch cadence.
+    if height > 0
+        && let Some(journal) = &handles.journal
+    {
+        let mut journal = journal.lock();
+        let undo_coins = undo
+            .restores()
+            .iter()
+            .map(|add| crate::chainstate_journal::Coin {
+                outpoint: add.outpoint,
+                txout: add.txout.clone(),
+                height: add.height,
+                coinbase: add.coinbase,
+            });
+        let record = crate::chainstate_journal::journal_record_for_block(
+            crate::chainstate_journal::BlockDeltaInputs {
+                height,
+                block_hash: block_hash.to_le_bytes(),
+                prev_hash: prev_hash.to_le_bytes(),
+                block_tx_count: tx_count_delta_for(block),
+                // `finish_block` runs later in the publication tail, so the
+                // listener still carries the parent height here: the delta of
+                // this block is exactly (height - parent_height) — normally 1,
+                // 0 for genesis (which never reaches this code path).
+                coin_stats_height_delta: i64::from(height)
+                    - i64::from(handles.coin_stats.snapshot().height),
+                raw_header: {
+                    let mut header_bytes = [0u8; 80];
+                    let encoded = bitcoin_rs_primitives::consensus_bytes(&block.header);
+                    debug_assert_eq!(encoded.len(), 80, "header consensus encoding is 80 bytes");
+                    header_bytes.copy_from_slice(&encoded);
+                    header_bytes
+                },
+            },
+            &changes,
+            undo_coins,
+        );
+        match record {
+            Ok(record) => {
+                if let Err(error) = journal.append(&record) {
+                    metrics::counter!("node.chainstate_journal.append_failures").increment(1);
+                    tracing::warn!(
+                        height,
+                        %error,
+                        "chainstate journal append failed; recovery may fall back to full re-validation"
+                    );
+                }
+            }
+            Err(error) => {
+                journal.mark_append_gap(height);
+                metrics::counter!("node.chainstate_journal.append_failures").increment(1);
+                tracing::warn!(
+                    height,
+                    %error,
+                    "chainstate journal delta extraction failed; recovery may fall back to full re-validation"
+                );
+            }
+        }
+    }
+
     // Everything past the UTXO commit publishes values prepared above and
     // cannot fail: the tip snapshot was resolved from the tree before the
     // first write, so the publication tail is infallible.
@@ -2637,16 +2770,6 @@ fn apply_block_admitted<'b>(
             .publish_sequence(crate::zmq_publisher::SequenceEvent::Connected(tip.hash));
     }
 
-    // Publish crash-recovery progress after the body store is durable.
-    if let Some(progress) = &handles.recovery_progress
-        && let Err(error) = progress.record_applied(height, tip.hash)
-    {
-        tracing::warn!(
-            %error,
-            height,
-            "crash-recovery progress not published; the replay window grows until the next successful publication"
-        );
-    }
     Ok(tip)
 }
 

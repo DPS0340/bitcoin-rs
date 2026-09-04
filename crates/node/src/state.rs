@@ -1,8 +1,8 @@
 //! Shared node state aggregating subsystem handles.
 //!
 //! V1 keeps this deliberately minimal: it owns the resolved [`NodeConfig`], the
-//! data-directory path, the open chainstate storage backend, and the replay log
-//! used by [`crate::crash_recovery`]. Subsystem wiring (chain / utxo / mempool
+//! data-directory path, and the open chainstate storage backend. Subsystem
+//! wiring (chain / utxo / mempool
 //! / index / p2p / rpc / script_index) parks here as the integration point matures.
 
 use arc_swap::ArcSwapOption;
@@ -349,6 +349,12 @@ pub enum ApplyError {
     /// not disconnect it, so the block must not be applied.
     #[error("undo persistence: {0}")]
     UndoPersistence(#[source] bitcoin_rs_storage::StorageError),
+    /// Journal durability or retention cannot recover within configured bounds.
+    ///
+    /// Refused before this block mutates chainstate; retry is safe after the
+    /// journal flushes or a checkpoint compacts retained segments.
+    #[error("chainstate journal backpressure stopped block apply: {0}")]
+    JournalBackpressure(String),
     /// A spent output had no resolved prevout, so the undo record would be
     /// unable to restore it.
     #[error("undo record cannot restore spent output {txid}:{vout}")]
@@ -563,7 +569,7 @@ impl NodeStorage {
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
-        checkpoint_publisher: &Arc<crate::checkpoint::CheckpointPublisher>,
+        durable_tip_height: &Arc<AtomicU32>,
     ) -> Result<Arc<dyn PruneService>> {
         match self {
             #[cfg(feature = "rocksdb")]
@@ -574,7 +580,7 @@ impl NodeStorage {
                 blocks,
                 transactions,
                 authority,
-                Arc::clone(checkpoint_publisher),
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "fjall")]
             Self::Fjall(store) => Ok(Arc::new(NodePruneService::new(
@@ -584,7 +590,7 @@ impl NodeStorage {
                 blocks,
                 transactions,
                 authority,
-                Arc::clone(checkpoint_publisher),
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "redb")]
             Self::Redb(store) => Ok(Arc::new(NodePruneService::new(
@@ -594,7 +600,7 @@ impl NodeStorage {
                 blocks,
                 transactions,
                 authority,
-                Arc::clone(checkpoint_publisher),
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Ok(Arc::new(NodePruneService::new(
@@ -604,7 +610,7 @@ impl NodeStorage {
                 blocks,
                 transactions,
                 authority,
-                Arc::clone(checkpoint_publisher),
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(not(any(
                 feature = "rocksdb",
@@ -676,6 +682,23 @@ impl NodeStorage {
         }
     }
 
+    fn journal_writer(
+        &self,
+        dir: cap_std::fs::Dir,
+        bootstrap: JournalBootstrap,
+    ) -> Result<crate::chainstate_journal::SharedJournalWriter> {
+        match self {
+            #[cfg(feature = "rocksdb")]
+            Self::RocksDb(store) => build_journal_writer(dir, Arc::clone(store), bootstrap),
+            #[cfg(feature = "fjall")]
+            Self::Fjall(store) => build_journal_writer(dir, Arc::clone(store), bootstrap),
+            #[cfg(feature = "redb")]
+            Self::Redb(store) => build_journal_writer(dir, Arc::clone(store), bootstrap),
+            #[cfg(feature = "mdbx")]
+            Self::Mdbx(store) => build_journal_writer(dir, Arc::clone(store), bootstrap),
+        }
+    }
+
     #[cfg(test)]
     fn stored_prune_body(
         &self,
@@ -729,6 +752,47 @@ impl NodeStorage {
             _ => match *self {},
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct JournalBootstrap {
+    open_existing: bool,
+    base_generation: u64,
+    height: u32,
+    block_hash: [u8; 32],
+    prev_hash: [u8; 32],
+    chain_tx_count: u64,
+    config: crate::config::ChainstateJournalConfig,
+}
+
+fn build_journal_writer<S: KvStore + 'static>(
+    dir: cap_std::fs::Dir,
+    store: Arc<S>,
+    bootstrap: JournalBootstrap,
+) -> Result<crate::chainstate_journal::SharedJournalWriter> {
+    let mut writer = if bootstrap.open_existing {
+        crate::chainstate_journal::JournalWriter::open(dir, store)?
+    } else {
+        crate::chainstate_journal::JournalWriter::initialize(
+            dir,
+            store,
+            bootstrap.base_generation,
+            (0, 0),
+            bootstrap.height,
+            bootstrap.block_hash,
+            bootstrap.prev_hash,
+            bootstrap.chain_tx_count,
+        )?
+    };
+    writer.configure(
+        bootstrap.config.blocks,
+        Duration::from_secs(bootstrap.config.seconds),
+        bootstrap.config.rotate_mib,
+        bootstrap.config.max_journal_mib,
+        bootstrap.config.max_lag_blocks,
+        Duration::from_secs(bootstrap.config.max_lag_seconds),
+    )?;
+    Ok(crate::chainstate_journal::shared_journal_writer(writer))
 }
 
 struct StoredBlockBodySource {
@@ -810,6 +874,262 @@ const STALE_RESTORE_ERROR_THRESHOLD: u32 = 1000;
 pub(crate) enum ResumeSource {
     Cold,
     Checkpoint,
+    Journal,
+}
+
+pub(crate) const CHAINSTATE_JOURNAL_DIR: &str = crate::chainstate_journal::JOURNAL_DIR_NAME;
+
+fn requires_full_revalidation(data_dir: &Path) -> bool {
+    data_dir
+        .join(CHAINSTATE_JOURNAL_DIR)
+        .join(crate::chainstate_journal::FULL_REVALIDATION_MARKER)
+        .is_file()
+}
+
+struct InitialChainstate {
+    utxo: UtxoSet,
+    coin_stats: bitcoin_rs_utxo::stats::CoinStats,
+    tree: bitcoin_rs_chain::BlockTree,
+    applied_tip: Option<TipSnapshot>,
+    chain_tx_count: u64,
+    resume_source: ResumeSource,
+    journal_bootstrap: Option<JournalBootstrap>,
+}
+
+fn reset_journal_dir(data_dir: &Path) -> Result<cap_std::fs::Dir> {
+    let path = data_dir.join(CHAINSTATE_JOURNAL_DIR);
+    match std::fs::remove_dir_all(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+    std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
+    crate::checkpoint_fs::open_data_dir(&path).with_context(|| format!("open {}", path.display()))
+}
+
+fn open_journal_dir(data_dir: &Path) -> Result<cap_std::fs::Dir> {
+    let path = data_dir.join(CHAINSTATE_JOURNAL_DIR);
+    std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
+    crate::checkpoint_fs::open_data_dir(&path).with_context(|| format!("open {}", path.display()))
+}
+
+fn checkpoint_bootstrap(
+    restored: &crate::checkpoint::RestoredChainstate,
+    config: crate::config::ChainstateJournalConfig,
+    open_existing: bool,
+) -> Result<JournalBootstrap> {
+    let node = restored.tree.node(restored.applied_tip.tip_id)?;
+    let prev_hash = match node.parent {
+        Some(parent) => restored.tree.node(parent)?.hash.to_le_bytes(),
+        None => [0_u8; 32],
+    };
+    Ok(JournalBootstrap {
+        open_existing,
+        base_generation: restored.generation,
+        height: restored.applied_tip.height,
+        block_hash: restored.applied_tip.hash.to_le_bytes(),
+        prev_hash,
+        chain_tx_count: restored.chain_tx_count,
+        config,
+    })
+}
+
+fn restored_initial(
+    restored: crate::checkpoint::RestoredChainstate,
+    config: crate::config::ChainstateJournalConfig,
+    open_existing: bool,
+    resume_source: ResumeSource,
+) -> Result<InitialChainstate> {
+    let journal_bootstrap = config
+        .enabled
+        .then(|| checkpoint_bootstrap(&restored, config, open_existing))
+        .transpose()?;
+    Ok(InitialChainstate {
+        utxo: restored.utxo,
+        coin_stats: restored.coin_stats,
+        tree: restored.tree,
+        applied_tip: Some(restored.applied_tip),
+        chain_tx_count: restored.chain_tx_count,
+        resume_source,
+        journal_bootstrap,
+    })
+}
+
+fn cold_initial_chainstate(
+    config: &NodeConfig,
+    journal_config: crate::config::ChainstateJournalConfig,
+    reset_journal: bool,
+) -> Result<InitialChainstate> {
+    if journal_config.enabled && reset_journal {
+        drop(reset_journal_dir(&config.data_dir)?);
+    }
+    Ok(InitialChainstate {
+        utxo: UtxoSet::new(),
+        coin_stats: bitcoin_rs_utxo::stats::CoinStats::default(),
+        tree: bitcoin_rs_chain::BlockTree::new(),
+        applied_tip: None,
+        chain_tx_count: 0,
+        resume_source: ResumeSource::Cold,
+        journal_bootstrap: journal_config.enabled.then_some(JournalBootstrap {
+            open_existing: false,
+            base_generation: 0,
+            height: 0,
+            block_hash: config.network.genesis_block_hash().to_le_bytes(),
+            prev_hash: [0_u8; 32],
+            chain_tx_count: 1,
+            config: journal_config,
+        }),
+    })
+}
+
+fn prepare_initial_chainstate(
+    checkpoint_load: crate::checkpoint::CheckpointLoad,
+    checkpoint_data_dir: &cap_std::fs::Dir,
+    checkpoint_config: crate::checkpoint::HeaderCheckpointConfig,
+    config: &NodeConfig,
+) -> Result<InitialChainstate> {
+    let journal_config = config.chainstate_journal;
+    if requires_full_revalidation(&config.data_dir) {
+        metrics::counter!(
+            "node.chainstate_journal.fallback_total",
+            "reason" => "full_revalidation_marker"
+        )
+        .increment(1);
+        tracing::warn!(
+            restore_source = "cold",
+            reason = "fork_below_checkpoint_base",
+            "chainstate restore requires full validation"
+        );
+        return cold_initial_chainstate(config, journal_config, false);
+    }
+    let crate::checkpoint::CheckpointLoad::Complete(restored) = checkpoint_load else {
+        if journal_config.enabled {
+            metrics::counter!(
+                "node.chainstate_journal.fallback_total",
+                "reason" => "no_checkpoint"
+            )
+            .increment(1);
+        }
+        tracing::info!(
+            restore_source = "cold",
+            reason = "no_complete_checkpoint",
+            "chainstate restore selected"
+        );
+        return cold_initial_chainstate(config, journal_config, true);
+    };
+    let restored = *restored;
+    if !journal_config.enabled {
+        tracing::info!(
+            restore_source = "checkpoint",
+            height = restored.applied_tip.height,
+            hash = %restored.applied_tip.hash,
+            chain_tx_count = restored.chain_tx_count,
+            reason = "journal_disabled",
+            "chainstate restore selected"
+        );
+        return restored_initial(restored, journal_config, false, ResumeSource::Checkpoint);
+    }
+
+    replay_checkpoint_journal(
+        restored,
+        checkpoint_data_dir,
+        checkpoint_config,
+        config,
+        journal_config,
+    )
+}
+
+fn replay_checkpoint_journal(
+    restored: crate::checkpoint::RestoredChainstate,
+    checkpoint_data_dir: &cap_std::fs::Dir,
+    checkpoint_config: crate::checkpoint::HeaderCheckpointConfig,
+    config: &NodeConfig,
+    journal_config: crate::config::ChainstateJournalConfig,
+) -> Result<InitialChainstate> {
+    let base_generation = restored.generation;
+    let base_height = restored.applied_tip.height;
+    let journal_dir = open_journal_dir(&config.data_dir)?;
+    let replay_started = std::time::Instant::now();
+    let replay = crate::chainstate_journal::replay_from_journal(
+        &journal_dir,
+        base_generation,
+        restored.tree,
+        restored.utxo,
+        restored.coin_stats,
+        restored.applied_tip,
+        restored.chain_tx_count,
+    );
+    let replay_seconds = replay_started.elapsed().as_secs_f64();
+    metrics::histogram!("node.chainstate_journal.replay_seconds").record(replay_seconds);
+    drop(journal_dir);
+    match replay {
+        crate::chainstate_journal::ReplayOutcome::Replayed(replayed) => {
+            let replayed_records = replayed.applied_tip.height.saturating_sub(base_height);
+            let (restore_source, resume_source) = if replayed_records == 0 {
+                ("checkpoint", ResumeSource::Checkpoint)
+            } else {
+                ("journal", ResumeSource::Journal)
+            };
+            tracing::info!(
+                restore_source,
+                checkpoint_generation = base_generation,
+                checkpoint_height = base_height,
+                height = replayed.applied_tip.height,
+                hash = %replayed.applied_tip.hash,
+                replayed_records,
+                chain_tx_count = replayed.chain_tx_count,
+                replay_seconds,
+                "chainstate restore selected"
+            );
+            let bootstrap = JournalBootstrap {
+                open_existing: true,
+                base_generation,
+                height: replayed.applied_tip.height,
+                block_hash: replayed.applied_tip.hash.to_le_bytes(),
+                prev_hash: [0_u8; 32],
+                chain_tx_count: replayed.chain_tx_count,
+                config: journal_config,
+            };
+            Ok(InitialChainstate {
+                utxo: replayed.utxo,
+                coin_stats: replayed.coin_stats,
+                tree: replayed.tree,
+                applied_tip: Some(replayed.applied_tip),
+                chain_tx_count: replayed.chain_tx_count,
+                resume_source,
+                journal_bootstrap: Some(bootstrap),
+            })
+        }
+        crate::chainstate_journal::ReplayOutcome::Fallback(error) => {
+            let reason = error.reason();
+            metrics::counter!(
+                "node.chainstate_journal.fallback_total",
+                "reason" => reason
+            )
+            .increment(1);
+            if error.is_checksum_failure() {
+                metrics::counter!("node.chainstate_journal.checksum_failures_total").increment(1);
+            }
+            tracing::warn!(
+                restore_source = "checkpoint",
+                checkpoint_generation = base_generation,
+                checkpoint_height = base_height,
+                reason,
+                %error,
+                replay_seconds,
+                "chainstate journal rejected; checkpoint recovery selected"
+            );
+            drop(reset_journal_dir(&config.data_dir)?);
+            let reloaded = crate::checkpoint::load_checkpoint_from_dir(
+                checkpoint_data_dir,
+                checkpoint_config,
+            )?;
+            let crate::checkpoint::CheckpointLoad::Complete(reloaded) = reloaded else {
+                bail!("checkpoint disappeared while recovering from journal fallback");
+            };
+            restored_initial(*reloaded, journal_config, false, ResumeSource::Checkpoint)
+        }
+    }
 }
 
 fn load_pruneheight<S: KvStore>(store: &S) -> Result<Option<u32>> {
@@ -833,11 +1153,11 @@ pub struct NodePruneService<S: KvStore> {
     transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
     authority: crate::apply::PruneAuthority,
     pruneheight: Mutex<Option<u32>>,
-    /// Block-body and undo pruning are bounded by the durable checkpoint base.
+    /// Height the last clean checkpoint would restore to, 0 when none exists.
     ///
-    /// A request beyond it publishes a checkpoint first, so pruning never
-    /// destroys bodies that crash recovery would replay.
-    checkpoint_publisher: Arc<crate::checkpoint::CheckpointPublisher>,
+    /// Undo pruning is bounded by this, not by the in-memory applied tip, which
+    /// can run far ahead of it.
+    durable_tip_height: Arc<AtomicU32>,
 }
 
 impl<S: KvStore> NodePruneService<S> {
@@ -849,7 +1169,7 @@ impl<S: KvStore> NodePruneService<S> {
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
-        checkpoint_publisher: Arc<crate::checkpoint::CheckpointPublisher>,
+        durable_tip_height: Arc<AtomicU32>,
     ) -> Result<Self> {
         let pruneheight = load_pruneheight(&*store)?;
         Ok(Self {
@@ -860,13 +1180,12 @@ impl<S: KvStore> NodePruneService<S> {
             transactions,
             authority,
             pruneheight: Mutex::new(pruneheight),
-            checkpoint_publisher,
+            durable_tip_height,
         })
     }
 }
 
 impl<S: KvStore> PruneService for NodePruneService<S> {
-    #[allow(clippy::too_many_lines)]
     fn prune_to_height(
         &self,
         requested_height: u32,
@@ -875,37 +1194,6 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             target_size_mb: 0,
             keep_below_tip: CORE_REORG_SAFETY_MARGIN,
         };
-        let mut pruneheight = self.pruneheight.lock();
-        let updated_pruneheight =
-            pruneheight.map_or(requested_height, |height| height.max(requested_height));
-        let pruner_tip = updated_pruneheight
-            .checked_add(policy.retention_depth())
-            .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
-        let live_tip = self.checkpoint_publisher.applied_tip.load_full();
-        let live_height = live_tip
-            .as_ref()
-            .map(|tip| tip.height)
-            .ok_or_else(|| PruneServiceError::failed("applied tip is unavailable"))?;
-        if is_prune_height_within_safety_margin(
-            updated_pruneheight,
-            live_height,
-            policy.retention_depth(),
-        ) {
-            return Err(PruneServiceError::failed(
-                "prune height is within reorg safety margin",
-            ));
-        }
-        if self
-            .checkpoint_publisher
-            .durable_tip_height
-            .load(Ordering::Acquire)
-            < pruner_tip
-        {
-            self.checkpoint_publisher
-                .publish()
-                .map_err(|error| PruneServiceError::failed(error.to_string()))?;
-        }
-
         let authority = self
             .authority
             .begin()
@@ -913,15 +1201,19 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         let applied_tip_height = authority
             .applied_tip_height()
             .ok_or_else(|| PruneServiceError::failed("applied tip is unavailable"))?;
-        if is_prune_height_within_safety_margin(
-            updated_pruneheight,
-            applied_tip_height,
-            policy.retention_depth(),
-        ) {
+        let mut pruneheight = self.pruneheight.lock();
+        let updated_pruneheight =
+            pruneheight.map_or(requested_height, |height| height.max(requested_height));
+        let safe_prune_height = applied_tip_height.saturating_sub(policy.retention_depth());
+        if updated_pruneheight > safe_prune_height {
             return Err(PruneServiceError::failed(
                 "prune height is within reorg safety margin",
             ));
         }
+        let pruner_tip = updated_pruneheight
+            .checked_add(policy.retention_depth())
+            .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
+
         let prune_candidates: Vec<(u32, bitcoin_rs_primitives::BlockHash, usize)> = {
             let blocks = self.blocks.read();
             blocks
@@ -957,9 +1249,7 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             &mut batch,
             &self.block_files,
             pruner_tip,
-            self.checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire),
+            self.durable_tip_height.load(Ordering::Acquire),
             policy,
         )
         .map_err(|err| PruneServiceError::failed(err.to_string()))?;
@@ -1000,14 +1290,6 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             pruneheight: *self.pruneheight.lock(),
         }
     }
-}
-
-fn is_prune_height_within_safety_margin(
-    prune_height: u32,
-    live_height: u32,
-    retention_depth: u32,
-) -> bool {
-    prune_height > live_height.saturating_sub(retention_depth)
 }
 
 const COMPILED_STORAGE_FEATURES: &[&str] = &[
@@ -1100,7 +1382,11 @@ struct TxIndexSpawn {
 
 /// Aggregate handle to a running node.
 pub struct NodeState {
-    checkpoint_publisher: Arc<crate::checkpoint::CheckpointPublisher>,
+    /// Height the last clean checkpoint would restore to, 0 when none exists.
+    ///
+    /// Published by `write_clean_checkpoint` and read by the pruner, which must
+    /// not delete an undo record a crash-restore would still need.
+    durable_tip_height: Arc<AtomicU32>,
     config: NodeConfig,
     data_dir: PathBuf,
     #[cfg(test)]
@@ -1148,7 +1434,6 @@ pub struct NodeState {
     chain_event_hints_rx: Arc<Mutex<Receiver<ChainEventHint>>>,
     apply_handles: crate::apply::ApplyHandles,
     sync: Arc<crate::BlockSync>,
-    replayed: Mutex<Vec<u32>>,
     /// Process-wide rollback-evidence warning snapshot (`ArcSwap`).
     warning_store: Arc<crate::recovery_evidence::WarningStore>,
 }
@@ -1205,27 +1490,38 @@ impl NodeState {
             .load_disconnect_marker()
             .map_err(anyhow::Error::new)?
         {
-            // Names directories rather than a `-reindex` option, because this
-            // node has no reindex. An instruction the operator cannot follow is
-            // worse than none.
-            //
-            // Remove the authoritative views. The marker covers a disconnect
-            // that did not reach a clean UTXO-and-tip checkpoint. TxIndex rows
-            // are derived state outside this marker, but a retained TxIndex
-            // watermark can stall rollback because wiping the chainstate
-            // removes the body positions the index refers to. Include the txindex
-            // path so the operator action is complete.
-            bail!(
-                "refusing to start: a disconnect of block {hash} at height {height} did not \
-                 reach a clean checkpoint, so the UTXO set and chain tip cannot be trusted \
-                 together. The node cannot repair this in place. Remove or quarantine \
-                 {chainstate}, {checkpoints}, and {txindex}, then resync.",
-                hash = marker.hash,
-                height = marker.height,
-                chainstate = config.data_dir.join("chainstate").display(),
-                checkpoints = config.data_dir.join("chainstate-checkpoints").display(),
-                txindex = config.data_dir.join("txindex").display(),
-            );
+            let force_full_revalidation = requires_full_revalidation(&config.data_dir);
+            if marker.phase == crate::apply::DisconnectPhase::RolledBack && force_full_revalidation
+            {
+                undo_store.disarm_disconnect().map_err(anyhow::Error::new)?;
+                tracing::warn!(
+                    height = marker.height,
+                    hash = %marker.hash,
+                    "accepting completed deep reorg; full chain validation is required"
+                );
+            } else {
+                // Names directories rather than a `-reindex` option, because this
+                // node has no reindex. An instruction the operator cannot follow is
+                // worse than none.
+                //
+                // Remove the authoritative views. The marker covers a disconnect
+                // that did not reach a clean UTXO-and-tip checkpoint. TxIndex rows
+                // are derived state outside this marker, but a retained TxIndex
+                // watermark can stall rollback because wiping the chainstate
+                // removes the body positions the index refers to. Include the txindex
+                // path so the operator action is complete.
+                bail!(
+                    "refusing to start: a disconnect of block {hash} at height {height} did not \
+                     reach a clean checkpoint, so the UTXO set and chain tip cannot be trusted \
+                     together. The node cannot repair this in place. Remove or quarantine \
+                     {chainstate}, {checkpoints}, and {txindex}, then resync.",
+                    hash = marker.hash,
+                    height = marker.height,
+                    chainstate = config.data_dir.join("chainstate").display(),
+                    checkpoints = config.data_dir.join("chainstate-checkpoints").display(),
+                    txindex = config.data_dir.join("txindex").display(),
+                );
+            }
         }
         let block_files =
             Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
@@ -1255,38 +1551,29 @@ impl NodeState {
             let _ = &zmq_endpoints;
             Arc::new(crate::NoOpZmqPublisher)
         };
-        let (
-            utxo_set,
-            initial_coin_stats,
-            block_tree_value,
-            restored_applied_tip,
-            restored_chain_tx_count,
+        let InitialChainstate {
+            utxo: mut utxo_set,
+            coin_stats: initial_coin_stats,
+            tree: block_tree_value,
+            applied_tip: restored_applied_tip,
+            chain_tx_count: restored_chain_tx_count,
             resume_source,
-        ) = match checkpoint_load {
-            crate::checkpoint::CheckpointLoad::Cold => (
-                bitcoin_rs_utxo::UtxoSet::new(),
-                bitcoin_rs_utxo::stats::CoinStats::default(),
-                bitcoin_rs_chain::BlockTree::new(),
-                None,
-                0,
-                ResumeSource::Cold,
-            ),
-            crate::checkpoint::CheckpointLoad::Complete(restored) => {
-                tracing::info!(
-                    height = restored.applied_tip.height,
-                    hash = %restored.applied_tip.hash,
-                    "restored chainstate checkpoint"
-                );
-                (
-                    restored.utxo,
-                    restored.coin_stats,
-                    restored.tree,
-                    Some(restored.applied_tip),
-                    restored.chain_tx_count,
-                    ResumeSource::Checkpoint,
-                )
-            }
-        };
+            journal_bootstrap,
+        } = prepare_initial_chainstate(
+            checkpoint_load,
+            &checkpoint_data_dir,
+            checkpoint_config,
+            &config,
+        )?;
+        if resume_source == ResumeSource::Checkpoint {
+            tracing::info!(
+                height = restored_applied_tip.as_ref().map_or(0, |tip| tip.height),
+                hash = %restored_applied_tip
+                    .as_ref()
+                    .map_or_else(|| config.network.genesis_block_hash(), |tip| tip.hash),
+                "restored chainstate checkpoint"
+            );
+        }
         // A2: Create the process-wide rollback-evidence warning store before
         // any detection or worker spawn. One ArcSwap holds the complete
         // immutable snapshot; getblockchaininfo loads one per request.
@@ -1324,6 +1611,7 @@ impl NodeState {
                 let source = match resume_source {
                     ResumeSource::Cold => "cold",
                     ResumeSource::Checkpoint => "checkpoint",
+                    ResumeSource::Journal => "journal",
                 };
                 recovery_reporter
                     .report_checkpoint_fallback(
@@ -1345,10 +1633,9 @@ impl NodeState {
                         gap,
                         threshold = STALE_RESTORE_ERROR_THRESHOLD,
                         "stale checkpoint restore: chainstate is {gap} blocks behind \
-                         the last durable applied-tip witness — the node is proceeding \
-                         with a valid but far-behind tip; crash recovery will replay \
-                         the gap from stored bodies when present, otherwise the sync \
-                         layer must re-fetch it"
+                         the last durable applied-tip witness — no committed journal \
+                         suffix covers the gap, so the node is proceeding with a valid \
+                         but far-behind tip and the sync layer must re-fetch it"
                     );
                 }
             }
@@ -1366,6 +1653,13 @@ impl NodeState {
         };
         let coin_stats_listener =
             bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
+        utxo_set.set_listener(Box::new(coin_stats_listener.clone()));
+        let journal = match journal_bootstrap {
+            Some(bootstrap) => {
+                Some(storage.journal_writer(open_journal_dir(&config.data_dir)?, bootstrap)?)
+            }
+            None => None,
+        };
         let utxo = Arc::new(utxo_set);
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
@@ -1473,35 +1767,7 @@ impl NodeState {
                 Arc::new(observer),
             )
         };
-        // A restored checkpoint is durable at its own height by definition, so
-        // start there rather than at zero, which would refuse all pruning.
-        let durable_tip_height = Arc::new(AtomicU32::new(
-            applied_tip.load().as_ref().map_or(0, |tip| tip.height),
-        ));
-        let admission = Arc::new(crate::apply::ApplyAdmission::new());
-        let recovery_progress = Arc::new(crate::crash_recovery::ProgressPublisher::new(
-            config.data_dir.join(crate::crash_recovery::META_FILENAME),
-            Arc::clone(&block_body_store),
-            restored_height,
-        ));
-        let checkpoint_publisher = Arc::new(crate::checkpoint::CheckpointPublisher {
-            admission: Arc::clone(&admission),
-            undo_store: Arc::clone(&undo_store),
-            block_body_store: Arc::clone(&block_body_store),
-            applied_tip: Arc::clone(&applied_tip),
-            checkpoint_data_dir: checkpoint_data_dir.try_clone()?,
-            network: config.network,
-            genesis_hash: config.network.genesis_block_hash(),
-            block_tree: Arc::clone(&block_tree),
-            utxo: Arc::clone(&utxo),
-            coin_stats: Arc::clone(&coin_stats),
-            chain_tx_count: Arc::clone(&chain_tx_count),
-            data_dir: config.data_dir.clone(),
-            chain_events: Arc::clone(&chain_events),
-            durable_tip_height: Arc::clone(&durable_tip_height),
-            recovery_progress: Some(Arc::clone(&recovery_progress)),
-        });
-        let apply_handles = crate::apply::ApplyHandles {
+        let mut apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
             applied_tip: Arc::clone(&applied_tip),
@@ -1518,8 +1784,8 @@ impl NodeState {
             zmq_publisher: Arc::clone(&zmq_publisher),
             chain_events: Arc::clone(&chain_events),
             block_body_store: Some(Arc::clone(&block_body_store)),
-            undo_store: Arc::clone(&undo_store),
-            admission,
+            undo_store,
+            admission: Arc::new(crate::apply::ApplyAdmission::new()),
             shutdown: Arc::clone(&shutdown),
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
             assume_valid_height: config.assume_valid_height,
@@ -1527,10 +1793,34 @@ impl NodeState {
                 config.network,
                 config.assume_valid_height,
             )),
-            recovery_progress: Some(recovery_progress),
-            checkpoint_publisher: Some(Arc::clone(&checkpoint_publisher)),
+            journal,
+            checkpoint_publisher: None,
         };
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
+        // A restored checkpoint is durable at its own height by definition, so
+        // start there rather than at zero, which would refuse all undo pruning.
+        let durable_tip_height = Arc::new(AtomicU32::new(
+            applied_tip.load().as_ref().map_or(0, |tip| tip.height),
+        ));
+        apply_handles.checkpoint_publisher =
+            Some(Arc::new(crate::checkpoint_worker::CheckpointPublisher {
+                admission: Arc::clone(&apply_handles.admission),
+                undo_store: Arc::clone(&apply_handles.undo_store),
+                block_body_store: Arc::clone(&block_body_store),
+                applied_tip: Arc::clone(&applied_tip),
+                checkpoint_data_dir: crate::checkpoint_fs::open_data_dir(&config.data_dir)
+                    .with_context(|| format!("open data_dir {}", config.data_dir.display()))?,
+                network: config.network,
+                genesis_hash: config.network.genesis_block_hash(),
+                block_tree: Arc::clone(&block_tree),
+                utxo: Arc::clone(&utxo),
+                coin_stats: Arc::clone(&coin_stats),
+                chain_tx_count: Arc::clone(&chain_tx_count),
+                journal: apply_handles.journal.clone(),
+                data_dir: config.data_dir.clone(),
+                chain_events: Arc::clone(&chain_events),
+                durable_tip_height: Arc::clone(&durable_tip_height),
+            }));
         let sync = Arc::new(crate::BlockSync::new(
             apply_handles.clone(),
             Arc::clone(&peer_table),
@@ -1544,7 +1834,7 @@ impl NodeState {
                 Arc::clone(&blocks),
                 Arc::clone(&transactions),
                 apply_handles.prune_authority(),
-                &checkpoint_publisher,
+                &durable_tip_height,
             )?)
         } else {
             None
@@ -1559,7 +1849,7 @@ impl NodeState {
         );
         let data_dir = config.data_dir.clone();
         Ok(Self {
-            checkpoint_publisher,
+            durable_tip_height,
             config,
             data_dir,
             #[cfg(test)]
@@ -1600,7 +1890,6 @@ impl NodeState {
             chain_event_hints_rx,
             apply_handles,
             sync,
-            replayed: Mutex::new(Vec::new()),
             warning_store,
         })
     }
@@ -1637,11 +1926,66 @@ impl NodeState {
         }
     }
 
+    /// Creates a [`crate::checkpoint_worker::CheckpointPublisher`] from this
+    /// state's shared handles, for use by the periodic checkpoint worker.
+    ///
+    /// The publisher owns its own `Dir` handle (reopened from the data-dir
+    /// path) and cloned `Arc`s, so it can be moved into a background thread
+    /// without borrowing from `self`.
+    pub(crate) fn checkpoint_publisher(
+        &self,
+    ) -> core::result::Result<
+        crate::checkpoint_worker::CheckpointPublisher,
+        crate::checkpoint::CheckpointError,
+    > {
+        Ok(crate::checkpoint_worker::CheckpointPublisher {
+            admission: Arc::clone(&self.apply_handles.admission),
+            undo_store: Arc::clone(&self.apply_handles.undo_store),
+            block_body_store: Arc::clone(&self.block_body_store),
+            applied_tip: Arc::clone(&self.applied_tip),
+            checkpoint_data_dir: crate::checkpoint_fs::open_data_dir(&self.data_dir)
+                .map_err(crate::checkpoint::CheckpointError::Io)?,
+            network: self.config.network,
+            genesis_hash: self.config.network.genesis_block_hash(),
+            block_tree: Arc::clone(&self.block_tree),
+            utxo: Arc::clone(&self.utxo),
+            coin_stats: Arc::clone(&self.coin_stats),
+            chain_tx_count: Arc::clone(&self.chain_tx_count),
+            journal: self.apply_handles.journal.clone(),
+            data_dir: self.data_dir.clone(),
+            chain_events: Arc::clone(&self.chain_events),
+            durable_tip_height: Arc::clone(&self.durable_tip_height),
+        })
+    }
+
+    /// Spawns the periodic checkpoint worker with a custom cadence.
+    ///
+    /// Production wiring goes through `start_node`, which uses
+    /// [`crate::checkpoint_worker::CHECKPOINT_INTERVAL_BLOCKS`] and
+    /// [`crate::checkpoint_worker::CHECKPOINT_INTERVAL_SECS`]. This method
+    /// is `pub` so integration tests can use a small cadence.
+    ///
+    /// Returns the worker's join handle. The worker exits when the node's
+    /// shutdown flag is set.
+    pub fn start_periodic_checkpoint(
+        &self,
+        interval_blocks: u32,
+        interval_secs: Duration,
+    ) -> Result<std::thread::JoinHandle<()>> {
+        let publisher = self.checkpoint_publisher().map_err(anyhow::Error::new)?;
+        Ok(crate::checkpoint_worker::spawn_periodic_checkpoint_worker(
+            publisher,
+            Arc::clone(&self.shutdown()),
+            interval_blocks,
+            interval_secs,
+        )?)
+    }
+
     pub(crate) fn write_clean_checkpoint(
         &self,
     ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
     {
-        self.checkpoint_publisher.publish()
+        self.checkpoint_publisher()?.publish()
     }
 
     /// Returns the configured storage backend that was opened.
@@ -1810,6 +2154,22 @@ impl NodeState {
         Arc::clone(&self.chain_tx_count)
     }
 
+    /// Shares the chain-transition mutex with the RPC layer.
+    ///
+    /// The applied tip and the cumulative transaction count are published one
+    /// after the other inside a transition. An RPC reader that takes this lock
+    /// sees the pair as the transition left it, rather than catching it halfway
+    /// through and reporting the new tip's height beside the old tip's count.
+    ///
+    /// Handing out the lock means an RPC read can wait for a connect to finish.
+    /// That is the trade Bitcoin Core already makes -- `getchaintxstats` holds
+    /// `cs_main` for its whole body -- and the wait here covers two atomic
+    /// loads rather than a whole handler.
+    #[must_use]
+    pub fn chain_transition_handle(&self) -> Arc<parking_lot::Mutex<()>> {
+        Arc::clone(&self.apply_handles.chain_transition)
+    }
+
     /// Returns the shared block-records handle exposed to RPC handlers.
     #[must_use]
     pub fn blocks(&self) -> Arc<RwLock<BlockLog>> {
@@ -1935,30 +2295,6 @@ impl NodeState {
         Arc::clone(&self.sync)
     }
 
-    /// Heights walked by the most recent crash-recovery replay.
-    #[must_use]
-    pub fn replayed_heights(&self) -> Vec<u32> {
-        self.replayed.lock().clone()
-    }
-
-    /// Records a height in the in-memory replay log.
-    pub(crate) fn push_replayed(&self, height: u32) {
-        self.replayed.lock().push(height);
-    }
-
-    /// Test helper: writes the sidecar as if progress at `height` had been
-    /// published; the hash is synthetic so replay cannot find a body — used
-    /// by sidecar-protocol tests only.
-    pub fn record_synthetic_block_for_recovery(&self, height: u32) -> Result<()> {
-        let mut bytes = [0_u8; 32];
-        bytes[..4].copy_from_slice(&height.to_le_bytes());
-        let meta = crate::crash_recovery::Meta {
-            height,
-            tip_hash_hex: Hash256::from_le_bytes(&bytes).to_string_be(),
-        };
-        crate::crash_recovery::write_meta(self, &meta)
-    }
-
     /// Returns the process-wide shutdown signal shared by all runtime workers.
     #[must_use]
     pub fn shutdown(&self) -> Arc<AtomicBool> {
@@ -2073,33 +2409,18 @@ mod tests {
         })));
     }
 
-    fn publish_applied_tip_with_chain(state: &NodeState, height: u32) -> anyhow::Result<()> {
-        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
-        let mut tree = state.block_tree.write();
-        let mut node_id =
-            tree.insert_header(genesis.header, bitcoin_rs_chain::node::NodeStatus::Active)?;
-        for current_height in 1..=height {
-            let parent_hash = tree.node(node_id)?.hash;
-            node_id = tree.insert_header(
-                Header {
-                    version: 1,
-                    prev_blockhash: BlockHash::from(parent_hash),
-                    merkle_root: Hash256::default(),
-                    time: genesis.header.time + current_height,
-                    bits: 0x207f_ffff,
-                    nonce: current_height,
-                },
-                bitcoin_rs_chain::node::NodeStatus::Active,
-            )?;
-        }
-        let tip = tree.node(node_id)?;
-        state.applied_tip.store(Some(Arc::new(TipSnapshot {
-            tip_id: node_id,
-            height: tip.height,
-            chainwork: tip.chainwork,
-            hash: tip.hash,
-        })));
-        state.coin_stats.finish_block(height, 0);
+    #[test]
+    fn full_revalidation_marker_is_sticky_when_journal_is_disabled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.chainstate_journal.enabled = false;
+        let journal_dir = config.data_dir.join(CHAINSTATE_JOURNAL_DIR);
+        let marker = journal_dir.join(crate::chainstate_journal::FULL_REVALIDATION_MARKER);
+        std::fs::create_dir_all(&journal_dir)?;
+        std::fs::write(&marker, b"force full validation\n")?;
+
+        assert!(requires_full_revalidation(&config.data_dir));
         Ok(())
     }
 
@@ -2822,7 +3143,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_pruning_follows_the_new_durable_checkpoint_base() -> anyhow::Result<()> {
+    fn undo_pruning_keeps_records_the_durable_tip_still_needs() -> anyhow::Result<()> {
         fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
             let byte = u8::try_from(height)
                 .map_err(|_| anyhow::anyhow!("test height {height} exceeds u8"))?;
@@ -2835,7 +3156,7 @@ mod tests {
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
-        publish_applied_tip_with_chain(&state, 11 + CORE_REORG_SAFETY_MARGIN)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
         for height in 10_u32..=12 {
             let hash = hash(height)?;
@@ -2856,13 +3177,11 @@ mod tests {
             });
         }
 
+        // No checkpoint has been written, so nothing is durable above genesis.
         assert_eq!(
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire),
+            state.durable_tip_height.load(Ordering::Acquire),
             0,
-            "the fixture must have no durable checkpoint before pruning"
+            "the fixture must have no durable checkpoint, or this proves nothing"
         );
 
         let Some(service) = state.prune_service() else {
@@ -2873,94 +3192,12 @@ mod tests {
             .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
 
         assert_eq!(
-            result.undo_rows_removed, 1,
-            "the checkpoint published before pruning makes height 10 reclaimable"
-        );
-        assert!(state.storage.stored_prune_undo(10, hash(10)?)?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn prune_request_beyond_durable_base_publishes_checkpoint_first() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
-        let state = NodeState::open(config, None)?;
-        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
-        state.apply_block(&genesis)?;
-
-        let target_height = 11 + CORE_REORG_SAFETY_MARGIN + 1;
-        let mut previous = genesis.block_hash();
-        let mut applied_tip = None;
-        for height in 1..=target_height {
-            let block = mined_regtest_child_at(previous, genesis.header.time + height)?;
-            applied_tip = Some(state.apply_block(&block)?);
-            previous = block.block_hash();
-        }
-        let applied_tip =
-            applied_tip.ok_or_else(|| anyhow::anyhow!("failed to apply any child blocks"))?;
-
-        let Some(service) = state.prune_service() else {
-            anyhow::bail!("prune service should exist when prune_target_mb > 0");
-        };
-        service
-            .prune_to_height(11)
-            .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
-
-        assert_eq!(
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire),
-            applied_tip.height
-        );
-        let meta = crate::crash_recovery::read_meta(&state)?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint did not publish recovery metadata"))?;
-        assert_eq!(meta.height, applied_tip.height);
-        assert!(
-            dir.path()
-                .join("node/chainstate-checkpoints/CURRENT")
-                .exists()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn prune_request_within_safety_margin_does_not_publish_checkpoint() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.prune_target_mb = 1;
-        let state = NodeState::open(config, None)?;
-        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
-        state.apply_block(&genesis)?;
-        let block = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
-        state.apply_block(&block)?;
-
-        let Some(service) = state.prune_service() else {
-            anyhow::bail!("prune service should exist when prune_target_mb > 0");
-        };
-        let result = service.prune_to_height(1);
-        assert!(matches!(
-            result,
-            Err(PruneServiceError::Failed(message))
-                if message == "prune height is within reorg safety margin"
-        ));
-        assert_eq!(
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire),
-            0
+            result.undo_rows_removed, 0,
+            "no undo record may go while a crash would restore below all of them"
         );
         assert!(
-            !state
-                .data_dir()
-                .join("chainstate-checkpoints/CURRENT")
-                .exists()
+            state.storage.stored_prune_undo(10, hash(10)?)?.is_some(),
+            "the record a restore would need must survive"
         );
         Ok(())
     }
@@ -3006,7 +3243,6 @@ mod tests {
         // prune to touch anything. Without that the prune is correctly refused,
         // which the sibling test asserts.
         state
-            .checkpoint_publisher
             .durable_tip_height
             .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
 
@@ -3079,7 +3315,7 @@ mod tests {
         std::fs::write(&prunable_file, [])?;
         std::fs::write(&current_file, [])?;
         let state = NodeState::open(config, None)?;
-        publish_applied_tip_with_chain(&state, 11 + CORE_REORG_SAFETY_MARGIN)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
 
         match &state.storage {
@@ -3098,19 +3334,6 @@ mod tests {
         service
             .prune_to_height(11)
             .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
-        assert!(
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire)
-                >= 11 + CORE_REORG_SAFETY_MARGIN
-        );
-        assert!(
-            state
-                .data_dir()
-                .join("chainstate-checkpoints/CURRENT")
-                .exists()
-        );
 
         assert!(!prunable_file.exists());
         assert!(current_file.exists());
@@ -3173,7 +3396,7 @@ mod tests {
         std::fs::write(blocks_dir.join("blk00001.dat"), [])?;
 
         let state = NodeState::open(config, None)?;
-        publish_applied_tip_with_chain(&state, 11 + CORE_REORG_SAFETY_MARGIN)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         // The hash is not needed: this test counts bytes in files, not bodies.
         let record = BlockRecord::from_block(10, &block);
@@ -3207,19 +3430,6 @@ mod tests {
         service
             .prune_to_height(11)
             .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
-        assert!(
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire)
-                >= 11 + CORE_REORG_SAFETY_MARGIN
-        );
-        assert!(
-            state
-                .data_dir()
-                .join("chainstate-checkpoints/CURRENT")
-                .exists()
-        );
 
         assert!(!prunable_file.exists(), "the fixture must actually prune");
         let Some(after) = state.block_body_store.disk_usage() else {
@@ -3252,10 +3462,6 @@ mod tests {
         config.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-        state
-            .checkpoint_publisher
-            .durable_tip_height
-            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
 
         let pruned_block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let pruned_hash = Hash256::from_le_bytes(pruned_block.block_hash().as_bytes());
@@ -3313,10 +3519,6 @@ mod tests {
         {
             let state = NodeState::open(config.clone(), None)?;
             publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
             let Some(service) = state.prune_service() else {
                 anyhow::bail!("prune service should exist when prune_target_mb > 0");
             };
@@ -3346,10 +3548,6 @@ mod tests {
         config.prune_target_mb = 1;
         let state = NodeState::open(config.clone(), None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-        state
-            .checkpoint_publisher
-            .durable_tip_height
-            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
         let Some(service) = state.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
         };
@@ -3413,10 +3611,6 @@ mod tests {
         config.prune_target_mb = 1;
         let state = NodeState::open(config, None)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-        state
-            .checkpoint_publisher
-            .durable_tip_height
-            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
         let Some(service) = state.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
         };
@@ -3505,10 +3699,6 @@ mod tests {
         });
         let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_store.clone();
         let blocks = Arc::new(RwLock::new(BlockLog::new()));
-        authority_state
-            .checkpoint_publisher
-            .durable_tip_height
-            .store(12 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
         blocks.write().push(BlockRecord {
             hash: BlockHash::from(hash),
@@ -3525,7 +3715,7 @@ mod tests {
             Arc::clone(&blocks),
             Arc::new(RwLock::new(HashMap::new())),
             authority_state.apply_handles().prune_authority(),
-            Arc::clone(&authority_state.checkpoint_publisher),
+            Arc::new(AtomicU32::new(11 + CORE_REORG_SAFETY_MARGIN)),
         )?);
 
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -3633,9 +3823,9 @@ mod tests {
             bitcoin_rs_utxo::stats::scan_coin_stats(view, next_tip.height, true)
         })?;
         rescanned.tx_count = listener_after_apply.tx_count;
-        assert_ne!(
+        assert_eq!(
             listener_after_apply.total_amount, rescanned.total_amount,
-            "default resume must not receive rolling UTXO notifications"
+            "checkpoint resume must keep rolling CoinStats attached to UTXO commits"
         );
         resumed.write_clean_checkpoint()?;
 
@@ -3716,12 +3906,60 @@ mod tests {
             bitcoin_rs_utxo::stats::scan_coin_stats(view, rolling.height, true)
         })?;
         scanned.tx_count = rolling.tx_count;
-        // Rolling per-coin accumulation is off by design (89f1dac5): the live
-        // listener tracks height and tx count only, and totals come from the
-        // on-demand scan. This mirrors clean_checkpoint's assertion below.
-        assert_ne!(
+        // The listener is attached only after checkpoint/journal restoration,
+        // then tracks subsequent live UTXO mutations without double-counting
+        // the restored snapshot.
+        assert_eq!(
             rolling.total_amount, scanned.total_amount,
-            "default resume must not receive rolling UTXO notifications"
+            "restored state must receive subsequent rolling UTXO notifications"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn journal_replay_restores_state_above_checkpoint() -> anyhow::Result<()> {
+        fn stable_hash(
+            view: &bitcoin_rs_utxo::UtxoSetView<'_>,
+        ) -> Result<bitcoin_rs_primitives::Hash256, bitcoin_rs_utxo::UtxoError> {
+            view.hash_serialized_3()
+        }
+
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("journal-resume");
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir;
+        config.p2p_listen.clear();
+        config.chainstate_journal.blocks = 1;
+
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let first = NodeState::open(config.clone(), None)?;
+        first.apply_block(&genesis)?;
+        first.write_clean_checkpoint()?;
+        drop(first);
+
+        // The first reopen discards the pre-checkpoint journal generation and
+        // initializes one whose authenticated base is the published checkpoint.
+        let base = NodeState::open(config.clone(), None)?;
+        assert_eq!(base.resume_source(), ResumeSource::Checkpoint);
+        let child = mined_regtest_child(genesis.block_hash())?;
+        let expected_tip = base.apply_block(&child)?;
+        let expected_utxo = base.utxo().with_stable_view(stable_hash)?;
+        let expected_stats = base.coin_stats().snapshot();
+        let expected_tx_count = base.chain_tx_count_handle().load(Ordering::Relaxed);
+        drop(base);
+
+        let resumed = NodeState::open(config, None)?;
+        assert_eq!(resumed.resume_source(), ResumeSource::Journal);
+        let resumed_tip = resumed
+            .applied_tip()
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("journal replay did not publish a tip"))?;
+        assert_eq!(resumed_tip.as_ref(), &expected_tip);
+        assert_eq!(resumed.utxo().with_stable_view(stable_hash)?, expected_utxo);
+        assert_eq!(resumed.coin_stats().snapshot(), expected_stats);
+        assert_eq!(
+            resumed.chain_tx_count_handle().load(Ordering::Relaxed),
+            expected_tx_count
         );
         Ok(())
     }
@@ -3797,76 +4035,32 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_settles_rolled_back_disconnect_debt() -> anyhow::Result<()> {
+    fn torn_disconnect_refusal_names_authoritative_stores_to_remove() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
-        let state = NodeState::open(config, None)?;
-        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
-        let genesis_hash = Hash256::from(genesis.block_hash());
-        state.apply_block(&genesis)?;
-        state.publish_checkpoint()?;
+        let state = NodeState::open(config.clone(), None)?;
+        state.apply_handles().undo_store.arm_disconnect(
+            10,
+            bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xcd; 32]),
+        )?;
+        drop(state);
 
-        let checkpoint_root = data_dir.join("chainstate-checkpoints");
-        let current_before = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
-            checkpoint_root.join("CURRENT"),
-        )?)?
-        .get("generation")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
-        state
-            .apply_handles()
-            .undo_store
-            .arm_disconnect(0, genesis_hash)?;
-        state
-            .apply_handles()
-            .undo_store
-            .complete_disconnect(0, genesis_hash)?;
-
-        assert!(state.checkpoint_publisher.settle_disconnect_debt()?);
-        assert!(
-            state
-                .apply_handles()
-                .undo_store
-                .load_disconnect_marker()?
-                .is_none()
-        );
-        let current_after = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
-            checkpoint_root.join("CURRENT"),
-        )?)?
-        .get("generation")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
-        assert!(current_after > current_before);
-        assert_eq!(
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire),
-            0
-        );
-        let meta = crate::crash_recovery::read_meta(&state)?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint did not publish recovery metadata"))?;
-        assert_eq!(meta.height, 0);
-        assert_eq!(meta.tip_hash_hex, genesis_hash.to_string_be());
-
-        let block_one = mined_regtest_child(genesis.block_hash())?;
-        let block_one_tip = state.apply_block(&block_one)?;
-        assert_eq!(block_one_tip.height, 1);
-
-        let inflight_hash = Hash256::from_le_bytes(&[0xcd; 32]);
-        state
-            .apply_handles()
-            .undo_store
-            .arm_disconnect(0, inflight_hash)?;
-        let marker_before = state.apply_handles().undo_store.load_disconnect_marker()?;
-        assert!(!state.checkpoint_publisher.settle_disconnect_debt()?);
-        assert_eq!(
-            state.apply_handles().undo_store.load_disconnect_marker()?,
-            marker_before
-        );
+        let error = match NodeState::open(config, None) {
+            Ok(_) => anyhow::bail!("node reopened with an armed disconnect marker"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        for store in ["chainstate", "chainstate-checkpoints", "txindex"] {
+            let path = data_dir.join(store);
+            assert!(
+                message.contains(&path.display().to_string()),
+                "startup refusal omitted {}: {message}",
+                path.display()
+            );
+        }
         Ok(())
     }
 
@@ -3912,21 +4106,16 @@ mod tests {
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
         assert!(current_after > current_before);
-        assert_eq!(
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire),
-            1
-        );
+        assert_eq!(state.durable_tip_height.load(Ordering::Acquire), 1);
         Ok(())
     }
 
     #[test]
     fn invalidate_block_settlement_failure_is_not_success() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("node");
+        config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
         let state = NodeState::open(config.clone(), None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
@@ -4039,43 +4228,7 @@ mod tests {
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
         assert!(current_after > current_before);
-        assert_eq!(
-            state
-                .checkpoint_publisher
-                .durable_tip_height
-                .load(Ordering::Acquire),
-            2
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn torn_disconnect_refusal_names_authoritative_stores_to_remove() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let data_dir = dir.path().join("node");
-        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
-        let state = NodeState::open(config.clone(), None)?;
-        state.apply_handles().undo_store.arm_disconnect(
-            10,
-            bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xcd; 32]),
-        )?;
-        drop(state);
-
-        let error = match NodeState::open(config, None) {
-            Ok(_) => anyhow::bail!("node reopened with an armed disconnect marker"),
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        for store in ["chainstate", "chainstate-checkpoints", "txindex"] {
-            let path = data_dir.join(store);
-            assert!(
-                message.contains(&path.display().to_string()),
-                "startup refusal omitted {}: {message}",
-                path.display()
-            );
-        }
+        assert_eq!(state.durable_tip_height.load(Ordering::Acquire), 2);
         Ok(())
     }
 
@@ -4111,9 +4264,6 @@ mod tests {
             generation > 0,
             "published checkpoint must have a positive generation"
         );
-        let block_one = mined_regtest_child(genesis.block_hash())?;
-        let block_one_tip = state.apply_block(&block_one)?;
-        assert_eq!(block_one_tip.height, 1);
         drop(state);
 
         let resumed = NodeState::open(config, None)?;
@@ -4124,23 +4274,6 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("checkpoint did not publish applied tip"))?;
         assert_eq!(applied.height, tip.height);
         assert_eq!(applied.hash, tip.hash);
-        Ok(())
-    }
-
-    #[test]
-    fn publish_checkpoint_keeps_admission_open() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        let state = NodeState::open(config, None)?;
-        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
-        state.apply_block(&genesis)?;
-        state.publish_checkpoint()?;
-
-        let block = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1)?;
-        let tip = state.apply_block(&block)?;
-        assert_eq!(tip.height, 1);
         Ok(())
     }
 
@@ -4557,7 +4690,7 @@ mod tests {
             lock_time: 0,
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid::default(), u32::MAX),
-                script_sig: time.to_le_bytes().to_vec(),
+                script_sig: vec![1, 1],
                 sequence: u32::MAX,
                 witness: Vec::new(),
             }],

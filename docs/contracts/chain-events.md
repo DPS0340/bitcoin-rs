@@ -93,7 +93,7 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
 ## Live gaps
 
 - **Cross-crate lifecycle boundary**: Slimming `crates/node` orchestration and shifting domain-owned mechanics to their respective crates is tracked under #217 (open).
-- **Full-stack crash convergence**: System-level convergence rules across chainstate checkpoints, block data, and secondary indexes are normative in [recovery.md](recovery.md). The recovery-meta sidecar protocol (`crates/node/src/crash_recovery.rs`) and the recovery-evidence bounded current/previous file protocol (`crates/node/src/recovery_evidence.rs`) are unit-proven; full-stack `kill -9` convergence with real block-body re-application is not yet exercised by a gate.
+- **Full-stack crash convergence**: System-level convergence rules across chainstate checkpoints, block data, and secondary indexes are normative in [recovery.md](recovery.md). Chainstate restart uses the authenticated checkpoint plus the redo-only journal contract in `docs/chainstate-recovery.md`; `crates/node/tests/crash_recovery.rs` exercises process `SIGKILL` boundaries, journal replay, reorg rewind/fallback, and upgrade compatibility. The retired recovery-meta sidecar is neither authoritative nor read, while the recovery-evidence bounded current/previous file protocol (`crates/node/src/recovery_evidence.rs`) remains proven by G11. End-to-end convergence spanning real block-body and secondary-index replay remains a live gap.
 
 ## Proven by
 
@@ -113,19 +113,9 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `stable_generation_is_even_after_disconnect`.
 - `crates/node/src/state.rs`:
   `checkpoint_refuses_inflight_disconnect_and_preserves_state`,
-  `checkpoint_settles_rolled_back_disconnect_debt`,
-  `publish_checkpoint_keeps_admission_open`,
   `invalidate_block_settles_disconnect_debt`,
   `invalidate_block_settlement_failure_is_not_success`,
-  `prune_request_within_safety_margin_does_not_publish_checkpoint`,
   `switch_to_branch_settles_disconnect_debt`.
-- `crates/node/tests/crash_recovery.rs` (G11):
-  `recovery_meta_write_leaves_readable_sidecar_without_tmp`,
-  `torn_meta_after_crash_is_refused`,
-  `stale_tmp_after_crash_does_not_corrupt_recovery`,
-  `crash_recovery_resumes_from_local_bodies_without_checkpoint_or_redownload`,
-  `crash_recovery_resumes_before_the_first_clean_checkpoint`,
-  `crash_recovery_replays_genesis_when_only_genesis_is_durable`.
 - `crates/node/src/recovery_evidence.rs` tests (G11):
   `witness_round_trips_and_falls_back_to_prev`,
   `foreign_genesis_current_cannot_displace_valid_prev`,

@@ -1,7 +1,5 @@
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::path::Path;
 
 use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot, accept_headers};
 use bitcoin_rs_primitives::{ConsensusEncode, Header, deserialize};
@@ -516,6 +514,8 @@ pub(crate) enum CheckpointLoad {
 }
 
 pub(crate) struct RestoredChainstate {
+    /// Authenticated immutable checkpoint generation from `CURRENT`/manifest.
+    pub(crate) generation: u64,
     pub(crate) tree: BlockTree,
     pub(crate) utxo: UtxoSet,
     pub(crate) coin_stats: CoinStats,
@@ -567,103 +567,11 @@ pub(crate) enum CheckpointError {
     Storage(#[from] bitcoin_rs_storage::StorageError),
     #[error("checkpoint refused while disconnect of block {hash} at height {height} is in flight")]
     DisconnectInFlight { hash: Hash256, height: u32 },
-}
-
-/// Shared owner of durable clean-checkpoint publication.
-pub(crate) struct CheckpointPublisher {
-    pub(crate) admission: Arc<crate::apply::ApplyAdmission>,
-    pub(crate) undo_store: Arc<dyn crate::apply::UndoStore>,
-    pub(crate) block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
-    pub(crate) applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
-    pub(crate) checkpoint_data_dir: Dir,
-    pub(crate) network: Network,
-    pub(crate) genesis_hash: Hash256,
-    pub(crate) block_tree: Arc<RwLock<BlockTree>>,
-    pub(crate) utxo: Arc<UtxoSet>,
-    pub(crate) coin_stats: Arc<CoinStatsListener>,
-    pub(crate) chain_tx_count: Arc<AtomicU64>,
-    pub(crate) data_dir: PathBuf,
-    pub(crate) chain_events: Arc<crate::state::ChainEventPublisher>,
-    pub(crate) durable_tip_height: Arc<AtomicU32>,
-    pub(crate) recovery_progress: Option<Arc<crate::crash_recovery::ProgressPublisher>>,
-}
-
-impl CheckpointPublisher {
-    /// Publishes a durable checkpoint and aligns all recovery evidence with it.
-    pub(crate) fn publish(&self) -> core::result::Result<CheckpointWrite, CheckpointError> {
-        let _exclusive_apply = self.admission.pause();
-        if let Some(marker) = self.undo_store.load_disconnect_marker()?
-            && marker.phase == crate::apply::DisconnectPhase::InFlight
-        {
-            return Err(CheckpointError::DisconnectInFlight {
-                hash: marker.hash,
-                height: marker.height,
-            });
-        }
-
-        self.block_body_store.sync()?;
-        let applied_tip = self.applied_tip.load_full();
-        let written = write_checkpoint_from_dir(
-            &self.checkpoint_data_dir,
-            HeaderCheckpointConfig {
-                network: self.network,
-                genesis: self.genesis_hash,
-            },
-            &self.block_tree,
-            &self.utxo,
-            &self.coin_stats,
-            applied_tip.as_deref(),
-            self.chain_tx_count.load(Ordering::Relaxed),
-        )?;
-
-        if let CheckpointWrite::Published { .. } = written
-            && let Some(tip) = applied_tip.as_ref()
-        {
-            let genesis_hex = self.genesis_hash.to_string_be();
-            let witness = crate::recovery_evidence::AppliedTipWitness::new(
-                genesis_hex,
-                self.chain_events.epoch(),
-                tip.height,
-                tip.hash.to_string_be(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |duration| duration.as_secs()),
-            );
-            crate::recovery_evidence::write_witness(&self.data_dir, &witness)
-                .map_err(|error| CheckpointError::Invalid(error.to_string()))?;
-
-            if let Some(progress) = &self.recovery_progress
-                && let Err(error) = progress.publish_now(tip.height, tip.hash)
-            {
-                tracing::warn!(
-                    %error,
-                    height = tip.height,
-                    "failed to align crash-recovery progress after checkpoint; \
-                     the checkpoint is durable but the sidecar may lag"
-                );
-            }
-        }
-
-        self.undo_store
-            .disarm_disconnect()
-            .map_err(CheckpointError::from)?;
-        self.durable_tip_height.store(
-            applied_tip.as_ref().map_or(0, |tip| tip.height),
-            Ordering::Release,
-        );
-        Ok(written)
-    }
-
-    pub(crate) fn settle_disconnect_debt(&self) -> core::result::Result<bool, CheckpointError> {
-        let Some(marker) = self.undo_store.load_disconnect_marker()? else {
-            return Ok(false);
-        };
-        if marker.phase == crate::apply::DisconnectPhase::InFlight {
-            return Ok(false);
-        }
-        self.publish()?;
-        Ok(true)
-    }
+    /// The replacement checkpoint's `CURRENT` is already durable; retiring the
+    /// sticky full-revalidation marker failed. Retryable I/O owned by the
+    /// checkpoint worker, not checkpoint corruption.
+    #[error("failed to retire full-revalidation marker: {0}")]
+    FullRevalidationMarker(std::io::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -821,6 +729,7 @@ pub(crate) fn load_checkpoint_from_dir(
 fn classify_checkpoint_error(error: CheckpointError) -> CheckpointLoadError {
     match error {
         CheckpointError::Io(error)
+        | CheckpointError::FullRevalidationMarker(error)
         | CheckpointError::Utxo(bitcoin_rs_utxo::UtxoError::Io(error))
         | CheckpointError::Storage(bitcoin_rs_storage::StorageError::Io(error)) => {
             classify_checkpoint_io(error)
@@ -1373,10 +1282,13 @@ fn load_headers(
 fn load_payloads(
     generation_dir: &Dir,
     manifest: &CheckpointManifestV1,
-    headers: RestoredHeaders,
+    mut headers: RestoredHeaders,
 ) -> Result<RestoredChainstate, CheckpointError> {
     let chain_tx_count = manifest.applied_tip.chain_tx_count;
     let (utxo, coin_stats) = load_payloads_inner(generation_dir, manifest, &headers)?;
+    headers
+        .tree
+        .restore_chain_tx_count(headers.applied_tip_id, chain_tx_count)?;
     let applied_node = headers
         .tree
         .node(headers.applied_tip_id)
@@ -1388,6 +1300,7 @@ fn load_payloads(
         hash: applied_node.hash,
     };
     Ok(RestoredChainstate {
+        generation: manifest.generation,
         tree: headers.tree,
         utxo,
         coin_stats,
