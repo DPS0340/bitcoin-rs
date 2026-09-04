@@ -101,6 +101,18 @@ mod tests {
     }
 
     #[test]
+    fn environment_parses_script_index_utxo() {
+        let config = super::load(
+            ["bitcoin-rs"],
+            std::iter::once(("BITCOIN_RS_SCRIPTINDEX", "utxo"))
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        )
+        .unwrap_or_else(|error| panic!("valid environment configuration: {error}"));
+
+        assert_eq!(config.indexes.script_index, ScriptIndexMode::Utxo);
+    }
+
+    #[test]
     fn toml_groups_zmq_topics_by_endpoint() {
         let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
         let path = dir.path().join("node.toml");
@@ -191,6 +203,18 @@ hwm = 5000
 
         assert!(!config.indexes.txindex);
         assert_eq!(config.indexes.script_index, ScriptIndexMode::Full);
+    }
+
+    #[test]
+    fn cli_scriptindex_utxo_enables_live_only_index() {
+        let config = super::load(
+            ["bitcoin-rs", "--txindex=false", "--scriptindex=utxo"],
+            std::iter::empty(),
+        )
+        .unwrap_or_else(|error| panic!("valid CLI configuration: {error}"));
+
+        assert!(!config.indexes.txindex);
+        assert_eq!(config.indexes.script_index, ScriptIndexMode::Utxo);
     }
 
     #[test]
