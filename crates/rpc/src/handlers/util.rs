@@ -4,7 +4,7 @@ use core::str::FromStr as _;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use sonic_rs::{JsonValueTrait, Value, json};
+use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value, json};
 
 use corepc_types::v31;
 
@@ -484,7 +484,7 @@ mod tests {
 mod validateaddress_tests {
     use super::*;
     use alloc::sync::Arc;
-    use sonic_rs::{JsonContainerTrait as _, JsonValueTrait};
+    use sonic_rs::JsonValueTrait;
 
     /// Both invalid classes must answer exactly `{"isvalid": false}`: the
     /// valid-only fields are absent, never default-valued.
