@@ -1290,14 +1290,15 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
     ) -> Result<Vec<OutPoint>, IndexError> {
-        if self
-            .capability_watermark(IndexCapability::ScriptLive)?
+        let snapshot = self.store.snapshot()?;
+        if snapshot
+            .get(ColumnFamily::UtxoMeta, SCRIPT_LIVE_WATERMARK_KEY)?
             .is_none()
         {
             return Ok(Vec::new());
         }
         let prefix = ScriptHashRow::scan_prefix(scripthash);
-        let iter = self.store.iter_prefix(ColumnFamily::ScriptLive, &prefix)?;
+        let iter = snapshot.iter_prefix(ColumnFamily::ScriptLive, &prefix)?;
         let mut outpoints = Vec::new();
         for row in iter {
             let (key, value) = row?;
