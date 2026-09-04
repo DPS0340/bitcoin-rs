@@ -1641,7 +1641,7 @@ fn transaction_heap_usage(tx: &Tx) -> u64 {
     for input in &tx.inputs {
         total = total.saturating_add(u64::try_from(input.script_sig.len()).unwrap_or(u64::MAX));
         total = total.saturating_add(
-            u64::try_from(input.witness.iter().map(|item| item.len()).sum::<usize>())
+            u64::try_from(input.witness.iter().map(std::vec::Vec::len).sum::<usize>())
                 .unwrap_or(u64::MAX),
         );
     }
