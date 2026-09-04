@@ -667,6 +667,14 @@ fn acquire_capability_reset<S: KvStore>(
         }
         if capabilities.script_history {
             batch.delete(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY);
+            // Same durable batch as FORMAT_VERSION_VALUE so a format-3
+            // upgrade cannot publish version 4 while leaving the row-value
+            // marker at 1.
+            batch.put(
+                ColumnFamily::UtxoMeta,
+                INDEX_FORMAT_VERSION_KEY,
+                &INDEX_FORMAT_VERSION.to_le_bytes(),
+            );
         }
         batch.delete(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY);
         if store.write_durable_if(&conditions, batch)? {
@@ -2687,13 +2695,6 @@ impl<S: KvStore> IndexWriter<S> {
                     generation,
                     IndexCapabilities::SCRIPT_HISTORY.to_mask(),
                 )?;
-                let mut marker = indexer.store.new_batch();
-                marker.put(
-                    ColumnFamily::UtxoMeta,
-                    INDEX_FORMAT_VERSION_KEY,
-                    &INDEX_FORMAT_VERSION.to_le_bytes(),
-                );
-                indexer.store.write(marker)?;
             }
             Some(value) => {
                 let version = value
