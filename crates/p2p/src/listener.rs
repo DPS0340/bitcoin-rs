@@ -536,7 +536,6 @@ fn run_outbound_connection(
     // accounting covers handshaking peers exactly like Core's connman.
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::Message>();
     let lease = crate::PeerLease::new(outbound_tx);
-    register_connection(&shared.peer_outbound, addr, lease.clone());
 
     let nonce = generate_nonce(addr);
     // Wrapped before the handshake, so the bytes it spends are counted too.
@@ -577,6 +576,7 @@ fn run_outbound_connection(
         addr_bind,
         remote_version,
         conn_time,
+        peer.version_received_time.unwrap_or(conn_time),
         counters,
     );
     lease
@@ -724,6 +724,7 @@ fn run_handshake(
         addr_bind,
         remote_version,
         conn_time,
+        peer.version_received_time.unwrap_or(conn_time),
         counters,
     );
     lease
