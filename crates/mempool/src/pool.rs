@@ -1493,6 +1493,12 @@ impl Mempool {
     /// after something spending it, through orphan promotion or out-of-order
     /// relay -- and a seed set of parents alone would miss the descendants
     /// this transaction is about to connect.
+    ///
+    /// `excluded` is the set of entry ids a replacement will evict. The walk
+    /// in [`Self::cluster_ids_seeded_by`] is the sole owner of that rule:
+    /// excluded seeds and neighbours are treated as absent, so a replacement
+    /// that shrinks an over-large cluster is not rejected by the cluster it
+    /// is about to clear.
     fn check_cluster_limits(
         &self,
         tx: &Tx,
@@ -1504,19 +1510,14 @@ impl Mempool {
             .inputs
             .iter()
             .filter_map(|input| self.by_txid.get(&input.previous_output.txid).copied())
-            .filter(|id| !excluded.contains(id))
             .collect::<Vec<_>>();
-        seeds.extend(
-            self.existing_spenders_of(txid, tx.outputs.len())
-                .into_iter()
-                .filter(|id| !excluded.contains(id)),
-        );
-        if seeds.is_empty() {
+        seeds.extend(self.existing_spenders_of(txid, tx.outputs.len()));
+        let cluster = self.cluster_ids_seeded_by(&seeds, excluded);
+        if cluster.is_empty() {
             // A cluster of one. Still checked, so a single oversized
             // transaction cannot pass a limit its cluster would fail.
             return cluster_within_limits(1, u64::from(vsize), &self.limits);
         }
-        let cluster = self.cluster_ids_seeded_by(&seeds, excluded);
         let count = u32::try_from(cluster.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
@@ -4004,6 +4005,146 @@ mod spend_index_tests {
             configured.cluster_limits(),
             (7, 4_242),
             "the reader must follow configuration, or the RPC reports a constant"
+        );
+    }
+
+    /// A replacement that evicts a member of a cluster at the count limit
+    /// must be judged against the post-eviction cluster. Counting the
+    /// soon-removed original would reject a replacement that does not grow
+    /// the cluster.
+    #[test]
+    fn a_replacement_that_evicts_from_a_full_cluster_is_admitted() {
+        // root → A (RBF), root → B. Cluster {root, A, B} is at the limit
+        // of three. Replacing A with another spend of the same input leaves
+        // the cluster at three.
+        let confirmed = OutPoint::new(txid_of([21_u8; 32]), 0);
+        let root = tx_with(&[confirmed], 2, 1);
+        let root_txid = root.txid();
+        let mut a = tx_with(&[OutPoint::new(root_txid, 0)], 1, 2);
+        a.inputs[0].sequence = 0xFFFF_FFFD;
+        let a_txid = a.txid();
+        let b = tx_with(&[OutPoint::new(root_txid, 1)], 1, 3);
+
+        let limits = MempoolLimits {
+            cluster_count: 3,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+        for tx in [root, a, b] {
+            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            else {
+                panic!("the three-member cluster must be admitted under a limit of three");
+            };
+        }
+
+        let replacement = tx_with(&[OutPoint::new(root_txid, 0)], 1, 4);
+        let result = pool.replace_transaction(
+            crate::ReplacementCandidate::new(Arc::new(replacement), 100, 12_000, 1),
+            4,
+            7,
+            4,
+        );
+        assert!(
+            result.is_ok(),
+            "a replacement that evicts from a full cluster must be admitted, \
+             not rejected by the entries it removes: {result:?}"
+        );
+        assert!(
+            pool.entry_id_by_txid(&a_txid).is_none(),
+            "the replaced original must leave the pool"
+        );
+    }
+
+    /// Preview and admission must quote the same cluster-count verdict.
+    /// Ancestor and descendant limits are lifted so only the cluster check
+    /// can refuse.
+    #[test]
+    fn check_package_limits_rejects_a_cluster_only_violation() {
+        let confirmed = OutPoint::new(txid_of([23_u8; 32]), 0);
+        let root = tx_with(&[confirmed], 3, 1);
+        let root_txid = root.txid();
+        let child_a = tx_with(&[OutPoint::new(root_txid, 0)], 1, 2);
+        let child_b = tx_with(&[OutPoint::new(root_txid, 1)], 1, 3);
+
+        let limits = MempoolLimits {
+            cluster_count: 3,
+            max_ancestors: 100,
+            max_ancestor_size: 1_000_000,
+            max_descendants: 100,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+        for tx in [root, child_a, child_b] {
+            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            else {
+                panic!("the three-member cluster must be admitted under a limit of three");
+            };
+        }
+
+        let child_c = tx_with(&[OutPoint::new(root_txid, 2)], 1, 4);
+        let excluded: HashSet<EntryId> = HashSet::new();
+        let preview = pool.check_package_limits(&child_c, 100, &excluded);
+        assert!(
+            matches!(preview, Err(PolicyError::ClusterCountLimit)),
+            "the preview must reject a cluster-only violation: {preview:?}"
+        );
+
+        let admission = pool.insert_entry(MempoolEntry::new(Arc::new(child_c), 100, 10_000, 4, 7));
+        assert!(
+            matches!(
+                admission,
+                Err(MempoolError::Policy(PolicyError::ClusterCountLimit))
+            ),
+            "admission must reject on cluster count: {admission:?}"
+        );
+        assert_eq!(
+            preview.map_err(MempoolError::from).err(),
+            admission.err(),
+            "preview and admission must reject on the same error"
+        );
+    }
+
+    /// A replacement preview must exclude the evicted original the same way
+    /// admission does, or `testmempoolaccept` and `sendrawtransaction`
+    /// disagree on a replacement into a full cluster.
+    #[test]
+    fn check_package_limits_excludes_a_replacement_s_evictions() {
+        let confirmed = OutPoint::new(txid_of([27_u8; 32]), 0);
+        let root = tx_with(&[confirmed], 2, 1);
+        let root_txid = root.txid();
+        let mut a = tx_with(&[OutPoint::new(root_txid, 0)], 1, 2);
+        a.inputs[0].sequence = 0xFFFF_FFFD;
+        let a_txid = a.txid();
+        let b = tx_with(&[OutPoint::new(root_txid, 1)], 1, 3);
+
+        let limits = MempoolLimits {
+            cluster_count: 3,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+        for tx in [root, a, b] {
+            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            else {
+                panic!("the three-member cluster must be admitted under a limit of three");
+            };
+        }
+
+        let Some(a_id) = pool.entry_id_by_txid(&a_txid) else {
+            panic!("A must be in the pool");
+        };
+        let replacement = tx_with(&[OutPoint::new(root_txid, 0)], 1, 4);
+        let mut excluded = HashSet::new();
+        excluded.insert(a_id);
+
+        let preview = pool.check_package_limits(&replacement, 100, &excluded);
+        assert!(
+            preview.is_ok(),
+            "preview must project the post-eviction cluster: {preview:?}"
+        );
+        assert_eq!(
+            pool.check_package_limits(&replacement, 100, &HashSet::new()),
+            Err(PolicyError::ClusterCountLimit),
+            "without the exclusion the same replacement is over the limit"
         );
     }
 

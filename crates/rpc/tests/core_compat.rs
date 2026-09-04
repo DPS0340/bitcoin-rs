@@ -105,8 +105,8 @@ fn mempool_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::
     assert!(info.loaded);
     assert_eq!(info.size, 0);
     // Policy fields project the enforced MempoolPolicySnapshot defaults:
-    // bare multisig permitted, the 83-byte nulldata budget, and the enforced
-    // ancestor-package bounds under the recorded cluster deviation.
+    // bare multisig permitted, the 83-byte nulldata budget, and the cluster
+    // limits admission enforces.
     assert!(info.permit_bare_multisig);
     assert!(info.optimal);
     assert_eq!(info.max_data_carrier_size, 83);

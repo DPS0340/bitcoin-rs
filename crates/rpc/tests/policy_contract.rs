@@ -1246,6 +1246,205 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_ancestor_count_limits()
     Ok(())
 }
 
+#[test]
+fn testmempoolaccept_and_sendrawtransaction_agree_on_cluster_count_limits()
+-> Result<(), Box<dyn Error>> {
+    // Root plus the candidate is two; a limit of one must refuse. Ancestor
+    // and descendant packages are size two, so only the cluster check can
+    // refuse — the contract the preview and admission must share.
+    let ctx = Arc::new(Context::new());
+    let root = {
+        let mut pool = ctx.mempool.pool().write();
+        pool.limits.cluster_count = 1;
+        pool.limits.max_ancestors = 100;
+        pool.limits.max_descendants = 100;
+        let root = tx(
+            OutPoint {
+                txid: Txid(Hash256::from_le_bytes(&[0xc1; 32])),
+                vout: 0,
+            },
+            50_000,
+            0xffff_ffff,
+        );
+        pool.insert_entry(MempoolEntry::new(Arc::new(root.clone()), 100, 10_000, 0, 1))?;
+        root
+    };
+    let follower = tx_multi_child(&fund_utxo(&ctx, 0xc2, 100_000), &root);
+    let handler = Handler::new(Arc::clone(&ctx));
+
+    let rows = handler
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&follower)]]))?
+        .as_array()
+        .ok_or("expected an array of results")?
+        .clone();
+    let row = rows.first().ok_or("expected one row")?;
+    assert_eq!(
+        row.get("allowed").and_then(JsonValueTrait::as_bool),
+        Some(false),
+        "preview must surface cluster count limits"
+    );
+    let reject_reason = row
+        .get("reject-reason")
+        .and_then(JsonValueTrait::as_str)
+        .ok_or("expected reject-reason")?;
+    assert!(
+        reject_reason.contains("too many transactions in cluster"),
+        "unexpected reject-reason: {reject_reason}"
+    );
+
+    let message = reject_message(
+        &handler
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&follower)]))
+            .err()
+            .ok_or("expected admission to enforce the cluster count")?,
+    );
+    assert!(
+        message.contains("too many transactions in cluster"),
+        "unexpected message: {message}"
+    );
+
+    let mut pool = Mempool::new(MempoolLimits {
+        cluster_count: 1,
+        max_ancestors: 100,
+        max_descendants: 100,
+        ..MempoolLimits::default()
+    });
+    pool.insert_entry(MempoolEntry::new(Arc::new(root), 100, 10_000, 0, 1))?;
+    let error = pool
+        .insert_entry(MempoolEntry::new(Arc::new(follower), 82, 10_000, 0, 1))
+        .err()
+        .ok_or("pool path must also reject")?;
+    assert_eq!(
+        error,
+        bitcoin_rs_mempool::MempoolError::Policy(PolicyError::ClusterCountLimit)
+    );
+    Ok(())
+}
+
+#[test]
+fn testmempoolaccept_and_sendrawtransaction_agree_on_cluster_size_limits()
+-> Result<(), Box<dyn Error>> {
+    let ctx = Arc::new(Context::new());
+    let root = {
+        let mut pool = ctx.mempool.pool().write();
+        pool.limits.cluster_count = 100;
+        pool.limits.cluster_size_vbytes = 250;
+        pool.limits.max_ancestors = 100;
+        pool.limits.max_ancestor_size = 1_000_000;
+        pool.limits.max_descendants = 100;
+        let root = tx(
+            OutPoint {
+                txid: Txid(Hash256::from_le_bytes(&[0xc3; 32])),
+                vout: 0,
+            },
+            50_000,
+            0xffff_ffff,
+        );
+        pool.insert_entry(MempoolEntry::new(Arc::new(root.clone()), 200, 10_000, 0, 1))?;
+        root
+    };
+    let follower = tx_multi_child(&fund_utxo(&ctx, 0xc4, 100_000), &root);
+    let handler = Handler::new(Arc::clone(&ctx));
+
+    let rows = handler
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&follower)]]))?
+        .as_array()
+        .ok_or("expected an array of results")?
+        .clone();
+    let row = rows.first().ok_or("expected one row")?;
+    assert_eq!(
+        row.get("allowed").and_then(JsonValueTrait::as_bool),
+        Some(false),
+        "preview must surface cluster size limits"
+    );
+    let reject_reason = row
+        .get("reject-reason")
+        .and_then(JsonValueTrait::as_str)
+        .ok_or("expected reject-reason")?;
+    assert!(
+        reject_reason.contains("cluster is too large"),
+        "unexpected reject-reason: {reject_reason}"
+    );
+
+    let message = reject_message(
+        &handler
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&follower)]))
+            .err()
+            .ok_or("expected admission to enforce the cluster size")?,
+    );
+    assert!(
+        message.contains("cluster is too large"),
+        "unexpected message: {message}"
+    );
+    Ok(())
+}
+
+#[test]
+fn testmempoolaccept_and_sendrawtransaction_agree_on_replacement_into_a_full_cluster()
+-> Result<(), Box<dyn Error>> {
+    // {root, original} sits at cluster_count = 2. Replacing the original
+    // leaves the cluster at two; preview and admission must both allow it.
+    let ctx = Arc::new(Context::new());
+    let (root, original) = {
+        let mut pool = ctx.mempool.pool().write();
+        pool.limits.cluster_count = 2;
+        let root = tx(
+            OutPoint {
+                txid: Txid(Hash256::from_le_bytes(&[0xc5; 32])),
+                vout: 0,
+            },
+            50_000,
+            0xffff_ffff,
+        );
+        let original = tx(OutPoint::new(rpc_txid(&root), 0), 40_000, 0xffff_fffd);
+        pool.insert_entry(MempoolEntry::new(Arc::new(root.clone()), 100, 10_000, 0, 1))?;
+        pool.insert_entry(MempoolEntry::new(
+            Arc::new(original.clone()),
+            100,
+            10_000,
+            0,
+            1,
+        ))?;
+        (root, original)
+    };
+    let replacement = tx(OutPoint::new(rpc_txid(&root), 0), 30_000, 0xffff_ffff);
+    let handler = Handler::new(Arc::clone(&ctx));
+
+    let rows = handler
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&replacement)]]))?
+        .as_array()
+        .ok_or("expected an array of results")?
+        .clone();
+    let row = rows.first().ok_or("expected one row")?;
+    assert_eq!(
+        row.get("allowed").and_then(JsonValueTrait::as_bool),
+        Some(true),
+        "preview must allow a replacement that does not grow the cluster: {row:?}"
+    );
+
+    let result = handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&replacement)]))?;
+    assert_eq!(
+        result.as_str().map(ToString::to_string),
+        Some(rpc_txid(&replacement).to_string())
+    );
+    {
+        let pool = ctx.mempool.read();
+        assert!(
+            !pool.contains_txid(&rpc_txid(&original)),
+            "the replaced original must leave"
+        );
+        assert!(
+            pool.contains_txid(&rpc_txid(&replacement)),
+            "the replacement must be pooled"
+        );
+        assert!(
+            pool.contains_txid(&rpc_txid(&root)),
+            "the shared parent must remain"
+        );
+    }
+    Ok(())
+}
+
 /// Multi-input variant of `tx`, used for replacement and fan-out shapes.
 fn tx_spending(inputs: &[(OutPoint, u32)], output_value: u64) -> Tx {
     Tx {

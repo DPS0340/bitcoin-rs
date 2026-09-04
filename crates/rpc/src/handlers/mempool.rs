@@ -22,7 +22,6 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let stats = pool.stats();
     let maxmempool = pool.limits.max_total_bytes;
     let live_min_relay_sat_per_kvb = pool.min_relay_fee_sat_per_kvb();
-    let (cluster_count, cluster_size_vbytes) = pool.cluster_limits();
     // `mempoolminfee` rises above `minrelaytxfee` when the pool approaches its
     // `maxmempool` byte limit. Bitcoin Core uses the eviction-floor heuristic:
     // once the pool exceeds 50% of `maxmempool`, new txs must pay strictly
@@ -50,17 +49,15 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         full_rbf: policy.full_rbf,
         permit_bare_multisig: policy.permit_bare_multisig,
         max_data_carrier_size: policy.max_data_carrier_size(),
-        // The limits admission actually enforces, read from the pool rather
-        // than restated here, so changing a limit changes what is reported.
-        //
-        // These are not the ancestor caps. Core 31 deprecated
-        // `-limitancestorcount`/`-limitdescendantcount` and replaced them with
-        // cluster limits, keeping the old pair only for wallet coin selection,
-        // so the two describe different policies -- and `max_ancestor_size`
-        // happening to equal `101_000` as well is a coincidence of value, not
-        // of meaning.
-        limit_cluster_count: i64::from(cluster_count),
-        limit_cluster_size: i64_saturated(cluster_size_vbytes),
+        // Cluster limits the snapshot owns. These are not the ancestor
+        // caps: Core 31 deprecated `-limitancestorcount` /
+        // `-limitdescendantcount` and replaced them with cluster limits,
+        // keeping the old pair only for wallet coin selection, so the two
+        // describe different policies -- and `max_ancestor_size` happening
+        // to equal `101_000` as well is a coincidence of value, not of
+        // meaning.
+        limit_cluster_count: i64::from(policy.cluster_count),
+        limit_cluster_size: i64_saturated(policy.cluster_size_vbytes),
         optimal: policy.optimal,
     })
 }
