@@ -209,7 +209,8 @@ pub(crate) fn getdescriptorinfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     // checked.
     let checksum = checked_checksum(descriptor, ChecksumRequirement::Optional)?;
 
-    let info = analyse(descriptor, convert::bitcoin_network(ctx.chain_network)).map_err(descriptor_error)?;
+    let info = analyse(descriptor, convert::bitcoin_network(ctx.chain_network))
+        .map_err(descriptor_error)?;
 
     typed_to_sonic(&v31::GetDescriptorInfo {
         // The canonical form comes from the parse, so a descriptor handed to this
@@ -279,7 +280,7 @@ pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Valu
 fn descriptor_error(error: DescriptorError) -> RpcError {
     match error {
         DescriptorError::Range(message) => RpcError::InvalidParameter(message.to_owned()),
-        other => RpcError::InvalidAddressOrKey(other.to_string()),
+        DescriptorError::Parse(message) => RpcError::InvalidAddressOrKey(message),
     }
 }
 
@@ -488,8 +489,7 @@ impl core::fmt::Display for DescriptorError {
 /// asked, which is the one thing this call must not do.
 fn analyse(text: &str, network: bitcoin::Network) -> Result<DescriptorInfo, DescriptorError> {
     if let Some(key) = parse_combo(text)? {
-        let (canonical, multipath_expansion, is_range, private) =
-            combo_key_forms(key, network)?;
+        let (canonical, multipath_expansion, is_range, private) = combo_key_forms(key, network)?;
         return Ok(DescriptorInfo {
             canonical,
             multipath_expansion,
@@ -534,17 +534,19 @@ fn analyse(text: &str, network: bitcoin::Network) -> Result<DescriptorInfo, Desc
             Some(unspendable) => {
                 let unspendable = unspendable?;
                 if let Unspendable::Address(address) = &unspendable {
-                    address.clone().require_network(network).map_err(|error| DescriptorError::Parse(error.to_string()))?;
+                    address
+                        .clone()
+                        .require_network(network)
+                        .map_err(|error| DescriptorError::Parse(error.to_string()))?;
                 }
                 Ok(DescriptorInfo {
-                canonical: unspendable.canonical(),
-                multipath_expansion: Vec::new(),
-                is_range: false,
-                is_solvable: false,
-                has_private_keys: false,
-                  })
-              }
-            }),
+                    canonical: unspendable.canonical(),
+                    multipath_expansion: Vec::new(),
+                    is_range: false,
+                    is_solvable: false,
+                    has_private_keys: false,
+                })
+            }
             None => Err(DescriptorError::Parse(error.to_string())),
         },
     }
@@ -552,8 +554,13 @@ fn analyse(text: &str, network: bitcoin::Network) -> Result<DescriptorInfo, Desc
 
 fn parse_combo(text: &str) -> Result<Option<&str>, DescriptorError> {
     let body = strip_checksum(text);
-    if let Some(key) = body.strip_prefix("combo(").and_then(|s| s.strip_suffix(')')) {
-        if key.is_empty() { return Err(DescriptorError::Parse("Invalid combo descriptor".into())); }
+    if let Some(key) = body
+        .strip_prefix("combo(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        if key.is_empty() {
+            return Err(DescriptorError::Parse("Invalid combo descriptor".into()));
+        }
         return Ok(Some(key));
     }
     Ok(None)
@@ -573,11 +580,10 @@ fn combo_key_forms(
     let is_range = descriptor.has_wildcard();
     let forms: Vec<String> = if descriptor.is_multipath() {
         descriptor
-            .clone()
             .into_single_descriptors()
             .map_err(|e| DescriptorError::Parse(e.to_string()))?
             .iter()
-            .map(|d| d.to_string())
+            .map(ToString::to_string)
             .collect()
     } else {
         vec![descriptor.to_string()]
@@ -585,6 +591,7 @@ fn combo_key_forms(
     let keys: Vec<String> = forms
         .into_iter()
         .map(|form| {
+            let form = form.split_once('#').map_or(&*form, |(prefix, _)| prefix);
             form.strip_prefix("pkh(")
                 .and_then(|s| s.strip_suffix(')'))
                 .map(str::to_owned)
@@ -756,7 +763,7 @@ impl Unspendable {
                     DescriptorError::Parse(
                         "Descriptor does not have a corresponding address".to_owned(),
                     )
-                }
+                }),
         }
     }
 }
@@ -1005,7 +1012,7 @@ mod tests {
 mod validateaddress_tests {
     use super::*;
     use alloc::sync::Arc;
-    use sonic_rs::{JsonContainerTrait as _, JsonValueTrait};
+    use sonic_rs::JsonValueTrait;
 
     /// Both invalid classes must answer exactly `{"isvalid": false}`: the
     /// valid-only fields are absent, never default-valued.
@@ -1315,7 +1322,12 @@ mod descriptor_checksum_tests {
                 .and_then(JsonValueTrait::as_str)
                 .is_some_and(|descriptor| descriptor.starts_with(&format!("combo({key})#")))
         );
-        assert_eq!(result.get("hasprivatekeys").and_then(JsonValueTrait::as_bool), Some(false));
+        assert_eq!(
+            result
+                .get("hasprivatekeys")
+                .and_then(JsonValueTrait::as_bool),
+            Some(false)
+        );
     }
 }
 

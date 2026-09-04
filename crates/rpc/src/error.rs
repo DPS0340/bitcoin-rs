@@ -39,6 +39,15 @@ pub enum RpcError {
     /// Bitcoin Core's `RPC_INVALID_ADDRESS_OR_KEY` (-5).
     #[error("{0}")]
     InvalidAddressOrKey(String),
+    /// A transaction was rejected by consensus or mempool policy.
+    #[error("{0}")]
+    TxRejected(String),
+    /// A transaction was refused before the network's rules were consulted.
+    ///
+    /// Bitcoin Core's `RPC_VERIFY_ERROR` (-25), which it uses for submissions
+    /// stopped by a caller-configured guard rather than by consensus or policy.
+    #[error("{0}")]
+    TxVerifyError(String),
     /// Internal server failure.
     #[error("internal error: {0}")]
     Internal(String),
@@ -61,6 +70,10 @@ impl RpcError {
     pub const CORE_NOT_FOUND: i64 = -5;
     /// Bitcoin Core invalid parameter value code.
     pub const CORE_INVALID_PARAMETER: i64 = -8;
+    /// Bitcoin Core transaction-rejected code, `RPC_VERIFY_REJECTED`.
+    pub const CORE_VERIFY_REJECTED: i64 = -26;
+    /// Bitcoin Core general submission-error code, `RPC_VERIFY_ERROR`.
+    pub const CORE_VERIFY_ERROR: i64 = -25;
 
     /// Builds the policy-disabled error for methods unavailable by configuration.
     #[must_use]
@@ -78,6 +91,8 @@ impl RpcError {
             Self::InvalidParams(_) => Self::INVALID_PARAMS,
             Self::InvalidType(_) => Self::CORE_INVALID_TYPE,
             Self::NotFound(_) | Self::InvalidAddressOrKey(_) => Self::CORE_NOT_FOUND,
+            Self::TxRejected(_) => Self::CORE_VERIFY_REJECTED,
+            Self::TxVerifyError(_) => Self::CORE_VERIFY_ERROR,
             Self::InvalidParameter(_) => Self::CORE_INVALID_PARAMETER,
             Self::MethodDisabled(_) | Self::Internal(_) => Self::INTERNAL_ERROR,
         }

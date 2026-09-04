@@ -1,5 +1,4 @@
-//! A1 red-green cycle tests: lifecycle snapshot, query adapter, namespace
-//! registry, heartbeat, and bounded shutdown.
+//! A1 red-green cycle tests for the txindex worker lifecycle.
 
 use super::*;
 use arc_swap::ArcSwap;

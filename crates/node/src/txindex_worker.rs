@@ -1,7 +1,9 @@
 //! Asynchronous, durable, node-owned transaction index runtime.
 //!
 //! The node creates and owns exactly one `TxIndexRuntime` when Core txindex or
-//! `ScriptIndex` enables an index capability. The runtime holds a process-local revision counter and a bounded
+//! `ScriptIndex` enables an index capability.
+//!
+//! The runtime holds a process-local revision counter and a bounded
 //! nonblocking wake channel; `ApplyHandles` clones it and wakes the worker
 //! after every committed `applied_tip.store`. The worker is a process-local
 //! reconciliation loop; storage-level CAS conditions on exact reset state,
@@ -74,6 +76,15 @@ pub(crate) const REDB_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
     max_rows: 16_000_000,
     max_bytes: BATCH_BYTE_LIMIT,
 };
+
+/// Default fork depth at which a stale txindex watermark routes to a
+/// selective reset + rebuild instead of a per-block rewind.
+///
+/// Grounded in three measured runs of per-block forward-ingest versus rollback
+/// cost (see `docs/benchmarks/index-rollback-rebuild-cutover.md`): the default
+/// routes the 834k-block stale-branch incident shape to a rebuild while organic
+/// reorgs (tens of blocks) keep rewinding block by block.
+pub(crate) const DEFAULT_ROLLBACK_REBUILD_CUTOVER: u32 = 100_000;
 
 const IDENTITY_CHUNK_BLOCKS: u32 = 65_536;
 const POSITION_PREFETCH_BLOCKS: usize = 65_536;

@@ -57,17 +57,8 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
 - The transaction index is the first consumer: per-capability watermarks
   select its rollback/forward legs, and its wake is the coalesced revision
   counter (`crates/node/src/txindex_worker.rs`).
-- The BIP157/158 filter index is the second consumer
-  (`crates/node/src/filterindex_worker.rs` over the
-  `crates/ext-blockfilterindex` namespace schema). It proves the shape is
-  real: one cursor, one atomic batch per block, wake on a hint or a poll
-  tick.
-- Hash-addressed rows survive disconnects by construction. A consumer whose
-  rows are hash-keyed (filter and header rows) rewinds only its active
-  pointer and cursor to the common ancestor and never deletes rows;
-  re-derived rows are idempotent overwrites. A consumer whose rows embed the
-  height (txindex position rows) deletes exactly its own rows during
-- rollback, guarded by the watermark identity.
+- The txindex worker is the current consumer. Its height-keyed position rows
+  delete exactly their own rows during rollback, guarded by watermark identity.
 - A consumer that cannot obtain a required body reports failure and stops;
   it never blocks the apply path, and a restart re-plans from the persisted
   pointer.
@@ -115,14 +106,6 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `missing_disconnected_body_resets_and_rebuilds_selected_capabilities`,
   `stale_script_index_reset_preserves_ready_tx_lookup_then_rebuilds`,
   `consumer_cursor_round_trips_bytes`.
-- `crates/node/tests/extensions.rs`:
-  `filter_extension_tip_equivalence_disabled_vs_enabled`,
-  `filter_extension_restarts_reconcile_from_persisted_pointer`,
-  `filter_extension_apply_outpaces_a_lagging_consumer`.
-- `crates/node/src/filterindex_worker.rs` tests:
-  `worker_indexes_genesis_then_child_with_retained_rows`,
-  `rewind_keeps_hash_addressed_rows`,
-  `store_write_failure_is_reported_not_swallowed`.
 - `crates/node/src/apply.rs`:
   `a_clean_disconnect_leaves_no_in_flight_marker`,
   `chain_change_proof_finish_restores_even_generation`,
