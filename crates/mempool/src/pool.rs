@@ -1402,12 +1402,12 @@ impl Mempool {
             .inputs
             .iter()
             .filter_map(|input| self.by_txid.get(&input.previous_output.txid).copied())
-            .filter(|id| !excluded.contains(id))
+            
             .collect::<Vec<_>>();
         seeds.extend(
             self.existing_spenders_of(entry.txid, entry.tx.outputs.len())
                 .into_iter()
-                .filter(|id| !excluded.contains(id)),
+                ,
         );
         if seeds.is_empty() {
             // A cluster of one. Still checked, so a single oversized
@@ -1597,6 +1597,8 @@ impl Mempool {
     ) -> Result<(), PolicyError> {
         let ancestors = self.ancestor_ids_for_tx(tx);
         self.check_ancestor_count_and_size(&ancestors, vsize)?;
+          let entry = MempoolEntry::new(Arc::new(tx.clone()), vsize, 0, 0, 0);
+          self.check_cluster_limits(&entry, excluded)?;
         self.check_descendant_limits_excluding(&ancestors, excluded)?;
         Ok(())
     }
@@ -3492,7 +3494,7 @@ mod spend_index_tests {
             panic!("fixture child_a is missing");
         };
 
-        let cluster = pool.cluster_ids_seeded_by(&[child_a_id]);
+        let cluster = pool.cluster_ids_seeded_by(&[child_a_id], &HashSet::new());
         let chain = pool.metadata_closure(&[child_a_id]);
 
         assert_eq!(
