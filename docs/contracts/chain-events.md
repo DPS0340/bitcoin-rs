@@ -90,7 +90,7 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
 ## Live gaps
 
 - **Cross-crate lifecycle boundary**: Slimming `crates/node` orchestration and shifting domain-owned mechanics to their respective crates is tracked under #217 (open).
-- **Crash/reorg recovery invariants**: Explicit system-level convergence rules across chainstate checkpoints, block data, and secondary indexes are tracked under #209 (open). The recovery-meta sidecar protocol (`crates/node/src/crash_recovery.rs`) and the recovery-evidence bounded current/previous file protocol (`crates/node/src/recovery_evidence.rs`) are proven by G11; full-stack `kill -9` convergence with real block-body re-application is not yet exercised by the gate.
+- **Crash/reorg recovery invariants**: System convergence rules across chainstate checkpoints, block data, and secondary indexes are tracked under #209. Startup crash recovery (`crates/node/src/crash_recovery.rs`) walks backward through block headers to identify missing blocks, then replays stored block bodies forward as locally validated blocks without re-verifying scripts, executing strictly before secondary index workers start (`crates/node/src/run.rs`). Cold genesis replay and stored-body crash recovery are proven by G11 tests in `crates/node/tests/crash_recovery.rs`.
 
 ## Proven by
 
@@ -117,7 +117,12 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `recovery_replays_from_last_committed_height_to_tip`,
   `recovery_meta_write_leaves_readable_sidecar_without_tmp`,
   `torn_meta_after_crash_is_refused`,
-  `stale_tmp_after_crash_does_not_corrupt_recovery`.
+  `stale_tmp_after_crash_does_not_corrupt_recovery`,
+  `crash_recovery_replays_from_stored_bodies_after_crash`,
+  `crash_recovery_replays_from_genesis_without_checkpoint`,
+  `crash_recovery_replays_genesis_only_without_checkpoint`,
+  `periodic_checkpoint_restores_to_latest_periodic_generation_after_crash`,
+  `periodic_checkpoint_published_during_sync_without_shutdown`.
 - `crates/node/src/recovery_evidence.rs` tests (G11):
   `witness_round_trips_and_falls_back_to_prev`,
   `foreign_genesis_current_cannot_displace_valid_prev`,
