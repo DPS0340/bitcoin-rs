@@ -412,8 +412,8 @@ mod tests {
     use bitcoin_rs_primitives::{Hash256, OutPoint, Txid};
 
     use super::{
-        HASH_PREFIX_LEN, HashPrefixRow, ScriptHash, ScriptHashRow, ScriptLiveRow,
-        SpendingPrefixRow, TxidRow,
+        HashPrefixRow, ScriptHash, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow,
+        HASH_PREFIX_LEN,
     };
 
     #[test]
@@ -421,9 +421,7 @@ mod tests {
         let row = HashPrefixRow::new([0xa3, 0x84, 0x49, 0x1d, 0x38, 0x92, 0x9f, 0xcc], 123_456);
         assert_eq!(
             row.to_db_row(),
-            [
-                0xa3, 0x84, 0x49, 0x1d, 0x38, 0x92, 0x9f, 0xcc, 0x40, 0xe2, 0x01, 0x00
-            ]
+            [0xa3, 0x84, 0x49, 0x1d, 0x38, 0x92, 0x9f, 0xcc, 0x40, 0xe2, 0x01, 0x00]
         );
         assert_eq!(row.height(), 123_456);
     }
@@ -453,14 +451,21 @@ mod tests {
     #[test]
     fn script_live_row_roundtrips_outpoint() {
         let scripthash = ScriptHash::from_byte_array([7_u8; 32]);
-        let txid = Txid::from(Hash256::from_le_bytes(&[9_u8; 32]));
+        // Nonuniform so a reversed-endian writer cannot satisfy the stored-byte
+        // assertion; a palindrome such as `[9; 32]` would.
+        let txid_le = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        let txid = Txid::from(Hash256::from_le_bytes(&txid_le));
         let outpoint = OutPoint::new(txid, 0x0a0b_0c0d);
         let row = ScriptLiveRow::new(scripthash, &outpoint);
 
         assert_eq!(&row.as_bytes()[..HASH_PREFIX_LEN], &[7_u8; 8]);
         assert_eq!(
             &row.as_bytes()[HASH_PREFIX_LEN..HASH_PREFIX_LEN + 32],
-            &[9_u8; 32]
+            &txid_le
         );
         assert_eq!(
             &row.as_bytes()[HASH_PREFIX_LEN + 32..],

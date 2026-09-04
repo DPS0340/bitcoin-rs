@@ -129,6 +129,34 @@ fn txindex_script_live_roundtrips_with_empty_value() -> TestResult<()> {
 }
 
 #[test]
+fn generic_redb_store_enforces_script_live_row_contract() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    let store = bitcoin_rs_storage::RedbStore::open(temp.path())?;
+
+    let live = script_live_44(1);
+    store.put(ColumnFamily::ScriptLive, &live, b"")?;
+    assert_eq!(
+        store.get(ColumnFamily::ScriptLive, &live)?,
+        Some(Vec::new())
+    );
+
+    // The generic store must reject the same invalid ScriptLive rows as the
+    // dedicated txindex store: non-empty values and wrong-width keys.
+    assert_invalid(store.put(ColumnFamily::ScriptLive, &script_live_44(2), b"value"));
+    assert_invalid(store.put(ColumnFamily::ScriptLive, &live[..12], b""));
+
+    let mut batch = store.new_batch();
+    batch.put(ColumnFamily::ScriptLive, &script_live_44(3), b"value");
+    assert_invalid(store.write(batch));
+    assert_eq!(
+        store.get(ColumnFamily::ScriptLive, &script_live_44(3))?,
+        None
+    );
+
+    Ok(())
+}
+
+#[test]
 fn txindex_position_values_follow_authoritative_rows() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
     let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
