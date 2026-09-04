@@ -96,6 +96,7 @@ impl<S> Peer<S> {
             receiver,
             magic,
             remote_version: None,
+            version_received_time: None,
             received_verack: false,
             capabilities: PeerCapabilities::default(),
             compact_blocks: CompactBlockNegotiation::default(),
