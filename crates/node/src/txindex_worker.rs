@@ -1789,7 +1789,7 @@ impl Worker {
         // The owned UTXO vector is the immutable seed source for `target`.
         // Keep the transition lock only through snapshot construction; the
         // bounded reset and all ScriptLive writes must not stall block apply.
-        let (target, coins) = {
+        let target = {
             let _transition = chain_transition.lock();
             let current = self.applied_tip.load_full();
             let Some(current) = current.as_deref() else {
@@ -1799,19 +1799,7 @@ impl Worker {
                 height: current.height,
                 hash: current.hash.to_le_bytes(),
             };
-            let coins = utxo.with_stable_view(|view| {
-                view.scan_all()
-                    .unspents
-                    .into_iter()
-                    .map(|coin| {
-                        (
-                            coin.outpoint,
-                            ScriptHash::from_script_bytes(&coin.txout.script_pubkey),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
-            (target, coins)
+            target
         };
 
         // A missing watermark is also the recovery state after a crash
@@ -1822,9 +1810,16 @@ impl Worker {
         self.writer
             .reset_capabilities(IndexCapabilities::SCRIPT_LIVE)
             .map_err(TxIndexWorkerError::Index)?;
-        self.writer
-            .seed_script_live(coins, target)
-            .map_err(TxIndexWorkerError::Index)?;
+        utxo.with_stable_view(|view| {
+            self.writer
+                .seed_script_live_stream(
+                    |emit| view.for_each_all(|outpoint, script| {
+                        emit(outpoint.clone(), ScriptHash::from_script_bytes(script));
+                    }),
+                    target,
+                )
+                .map_err(TxIndexWorkerError::Index)
+        })?;
         tracing::info!(
             height = target.height,
             rows = "authoritative UTXO scan",

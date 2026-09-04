@@ -744,6 +744,13 @@ impl UtxoSetView<'_> {
         scan
     }
 
+    /// Visits every live output without materializing the complete set.
+    pub fn for_each_all(&self, mut f: impl FnMut(&OutPoint, &[u8])) {
+        for shard in &self.set.shards {
+            shard.for_each_all(&mut f);
+        }
+    }
+
     /// Returns the full live-output entry for `op` in this stable view.
     #[must_use]
     pub fn get_entry(&self, op: &OutPoint) -> Option<crate::shard::LiveOutput> {
