@@ -20,7 +20,7 @@ use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits};
 use bitcoin_rs_node::{BlockSync, Network, NoOpZmqPublisher, apply::ApplyHandles};
-use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, Message, PeerInfo, PeerLease};
+use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, Message, PeerInfo, PeerLease, PeerCounters};
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use crossbeam_channel::unbounded;
@@ -88,6 +88,9 @@ fn synthetic_peer(addr: SocketAddr, inbound: bool) -> PeerInfo {
         start_height: 0,
         conn_time: 0,
         inbound,
+        addr_bind: addr,
+        time_offset: 0,
+        counters: Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
     }
 }
 

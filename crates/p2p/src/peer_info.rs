@@ -48,6 +48,7 @@ impl PeerInfo {
         addr_bind: SocketAddr,
         version: &VersionMessage,
         conn_time: u64,
+        version_received_time: u64,
         counters: Arc<PeerCounters>,
     ) -> Self {
         Self {
@@ -65,7 +66,7 @@ impl PeerInfo {
             // was at handshake.
             time_offset: version
                 .timestamp
-                .saturating_sub(i64::try_from(conn_time).unwrap_or(i64::MAX)),
+                .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX)),
             counters,
         }
     }
@@ -77,6 +78,7 @@ impl PeerInfo {
         addr_bind: SocketAddr,
         version: &VersionMessage,
         conn_time: u64,
+        version_received_time: u64,
         counters: Arc<PeerCounters>,
     ) -> Self {
         Self {
@@ -94,7 +96,7 @@ impl PeerInfo {
             // was at handshake.
             time_offset: version
                 .timestamp
-                .saturating_sub(i64::try_from(conn_time).unwrap_or(i64::MAX)),
+                .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX)),
             counters,
         }
     }
@@ -189,12 +191,12 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let mut version = fake_version();
         version.timestamp = 1_700_000_120;
-        let info = PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, counters());
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, 0, counters());
         assert_eq!(info.time_offset, 120);
 
         version.timestamp = 1_699_999_940;
         let behind =
-            PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, counters());
+            PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, 0, counters());
         assert_eq!(behind.time_offset, -60);
     }
 
@@ -203,7 +205,7 @@ mod tests {
     fn addr_bind_is_kept_apart_from_the_peer_address() {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 51_234);
-        let info = PeerInfo::inbound_from_version(peer, local, &fake_version(), 0, counters());
+        let info = PeerInfo::inbound_from_version(peer, local, &fake_version(), 0, 0, counters());
         assert_eq!(info.addr, peer);
         assert_eq!(info.addr_bind, local);
     }
@@ -212,7 +214,7 @@ mod tests {
     fn outbound_from_version_sets_inbound_false() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let version = fake_version();
-        let info = PeerInfo::outbound_from_version(addr, addr, &version, 100, counters());
+        let info = PeerInfo::outbound_from_version(addr, addr, &version, 100, 0, counters());
         assert!(!info.inbound);
         assert_eq!(info.start_height, 7);
         assert_eq!(info.conn_time, 100);
@@ -222,7 +224,7 @@ mod tests {
     fn inbound_from_version_sets_inbound_true() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let version = fake_version();
-        let info = PeerInfo::inbound_from_version(addr, addr, &version, 100, counters());
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 100, 0, counters());
         assert!(info.inbound);
     }
 
@@ -231,7 +233,7 @@ mod tests {
         let mut version = fake_version();
         version.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
-        let info = PeerInfo::inbound_from_version(addr, addr, &version, 0, counters());
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 0, 0, counters());
         assert_eq!(info.services_names(), vec!["NETWORK", "WITNESS"]);
     }
 
@@ -240,7 +242,7 @@ mod tests {
         let mut version = fake_version();
         version.services = ServiceFlags::NONE;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
-        let info = PeerInfo::inbound_from_version(addr, addr, &version, 0, counters());
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 0, 0, counters());
         assert!(info.services_names().is_empty());
     }
 

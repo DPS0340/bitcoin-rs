@@ -73,6 +73,8 @@ pub struct Peer<S> {
     pub magic: Magic,
     /// Last remote version message.
     pub remote_version: Option<VersionMessage>,
+    /// Local Unix timestamp when the remote Version message was received.
+    pub version_received_time: Option<u64>,
     /// Whether a remote verack has been received.
     pub received_verack: bool,
     /// Local view of negotiated feature flags.
