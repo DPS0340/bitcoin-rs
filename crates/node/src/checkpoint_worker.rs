@@ -381,7 +381,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join(JOURNAL_DIR_NAME), b"not a directory")?;
 
-        let error = retire_full_revalidation_marker(dir.path()).expect_err("open must fail");
+        let error = match retire_full_revalidation_marker(dir.path()) {
+            Err(error) => error,
+            Ok(()) => anyhow::bail!("opening a file as the journal directory must fail"),
+        };
         assert!(matches!(error, CheckpointError::FullRevalidationMarker(_)));
         Ok(())
     }
