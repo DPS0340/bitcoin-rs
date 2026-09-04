@@ -85,7 +85,7 @@ fn fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
         OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
         TxOut {
             value,
-            script_pubkey: p2wpkh_script(),
+            script_pubkey: op_true_script(),
         },
         false,
         1,

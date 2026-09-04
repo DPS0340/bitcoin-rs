@@ -1010,16 +1010,16 @@ mod tests {
     }
 
     fn transaction_with_funded_input(ctx: &Context) -> Tx {
-        // p2wpkh scriptPubKey: OP_0 <20-byte key hash>.
-        let script = vec![
-            0x00, 0x14, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-        ];
+        // OP_TRUE: an anyone-can-spend funding script, so the broadcast
+        // fixture's empty scriptSig satisfies script verification. The output
+        // stays P2WPKH: standardness only allows known output templates.
+        let spendable = vec![0x51];
+        let script = [vec![0x00, 0x14], vec![0x11; 20]].concat();
         let funding = transaction(
             None,
             TxOut {
                 value: 10_000,
-                script_pubkey: script.clone(),
+                script_pubkey: spendable.clone(),
             },
         );
         let txid = ctx.add_transaction(funding);
@@ -1028,7 +1028,7 @@ mod tests {
             OutPoint::new(txid, 0),
             TxOut {
                 value: 10_000,
-                script_pubkey: script.clone(),
+                script_pubkey: spendable,
             },
             false,
             1,

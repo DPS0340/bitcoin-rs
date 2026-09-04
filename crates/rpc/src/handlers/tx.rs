@@ -2242,9 +2242,18 @@ mod tests {
         );
     }
 
-    /// P2WPKH script: `OP_0` + push-20 + fixed 20-byte key hash.
-    fn retry_p2wpkh() -> Vec<u8> {
-        [vec![0x00, 0x14], vec![0x11; 20]].concat()
+    /// `P2WSH(OP_TRUE)`: a version-0 push-32 program whose witness script is a
+    /// bare `OP_TRUE`. It is a standard output template, and spendable by a
+    /// one-item `[OP_TRUE]` witness, so the retry fixtures chain parent and
+    /// child generations without signature material.
+    fn retry_spendable_script() -> Vec<u8> {
+        let mut script = vec![0x00, 0x20];
+        script.extend_from_slice(&[
+            0x4a, 0xe8, 0x15, 0x72, 0xf0, 0x6e, 0x1b, 0x88, 0xfd, 0x5c, 0xed, 0x7a, 0x1a, 0x00,
+            0x09, 0x45, 0x43, 0x2e, 0x83, 0xe1, 0x55, 0x1e, 0x6f, 0x72, 0x1e, 0xe9, 0xc0, 0x0b,
+            0x8c, 0xc3, 0x32, 0x60,
+        ]);
+        script
     }
 
     /// Funds a UTXO in the context's UTXO set and returns the outpoint.
@@ -2254,7 +2263,7 @@ mod tests {
             OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
             TxOut {
                 value,
-                script_pubkey: retry_p2wpkh(),
+                script_pubkey: retry_spendable_script(),
             },
             false,
             1,
@@ -2274,11 +2283,11 @@ mod tests {
                 previous_output: prevout,
                 script_sig: Vec::new(),
                 sequence: 0xffff_ffff,
-                witness: Vec::new(),
+                witness: vec![vec![0x51]],
             }],
             outputs: vec![TxOut {
                 value: output_value,
-                script_pubkey: retry_p2wpkh(),
+                script_pubkey: retry_spendable_script(),
             }],
         }
     }
@@ -2430,6 +2439,7 @@ mod gettxout_via_utxo_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod acceptance_tests {
     use alloc::sync::Arc;
 
@@ -2805,8 +2815,10 @@ mod acceptance_tests {
             let mut tree = ctx.block_tree.write();
             let mut prev_id: Option<NodeId> = None;
             for height in 0..=11_u32 {
-                let prev_hash =
-                    prev_id.map_or(Hash256::default(), |id| tree.node(id).unwrap().hash);
+                let prev_hash = match prev_id {
+                    Some(id) => tree.node(id).expect("parent node exists").hash,
+                    None => Hash256::default(),
+                };
                 let header = BlockHeader {
                     version: 1,
                     prev_blockhash: BlockHash::from(prev_hash),
@@ -2827,8 +2839,8 @@ mod acceptance_tests {
             let tree = ctx.block_tree.read();
             let applied_id = ids[10];
             let best_id = ids[11];
-            let applied_node = tree.node(applied_id).unwrap();
-            let best_node = tree.node(best_id).unwrap();
+            let applied_node = tree.node(applied_id).expect("applied node exists");
+            let best_node = tree.node(best_id).expect("best node exists");
             ctx.set_applied_tip(TipSnapshot {
                 tip_id: applied_id,
                 height: applied_node.height,
@@ -2845,8 +2857,10 @@ mod acceptance_tests {
         };
 
         (
-            ctx.median_time_past_for_hash(applied_hash).unwrap(),
-            ctx.median_time_past_for_hash(best_hash).unwrap(),
+            ctx.median_time_past_for_hash(applied_hash)
+                .expect("applied MTP exists"),
+            ctx.median_time_past_for_hash(best_hash)
+                .expect("best MTP exists"),
         )
     }
 
@@ -2856,8 +2870,8 @@ mod acceptance_tests {
     /// rejected.
     #[test]
     fn sendrawtransaction_rejects_tx_final_only_under_header_tip_mtp() {
-        let ctx = Arc::new(Context::new());
         const BASE: u32 = 500_000_000;
+        let ctx = Arc::new(Context::new());
         let (applied_mtp, best_mtp) = build_divergent_tips(&ctx);
 
         assert!(
