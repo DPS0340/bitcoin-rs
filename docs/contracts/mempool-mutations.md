@@ -111,7 +111,7 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
 
 - `crates/mempool/src/gateway.rs` (inline tests):
   `accepted_and_block_inclusion_events_arrive_in_commit_order`,
-  `remove_for_block_reports_block_inclusion_reason`,
+  `remove_for_block_publishes_removals_with_origins`,
   `remove_for_block_leaves_unmined_child_and_publishes_only_the_parent`,
   `failed_insert_and_noop_remove_publish_nothing`,
   `replacement_tags_direct_conflicts_and_descendants`,
