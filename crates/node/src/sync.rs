@@ -6682,6 +6682,9 @@ mod tests {
             start_height,
             conn_time: 0,
             inbound: true,
+            addr_bind: addr,
+            time_offset: 0,
+            counters: alloc::sync::Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
         }
     }
 
@@ -6690,6 +6693,9 @@ mod tests {
             // SERVICE_WITNESS (1 << 3) | NODE_NETWORK (1): native peer flags.
             services: 0b1001,
             inbound: false,
+            addr_bind: addr,
+            time_offset: 0,
+            counters: std::sync::Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
             ..synthetic_peer(addr, start_height)
         }
     }
