@@ -1811,7 +1811,7 @@ impl NodeState {
                 Arc::new(observer),
             )
         };
-        let apply_handles = crate::apply::ApplyHandles {
+        let mut apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
             applied_tip: Arc::clone(&applied_tip),
@@ -1838,18 +1838,38 @@ impl NodeState {
                 config.validation.assume_valid_height,
             )),
             journal,
+            checkpoint_publisher: None,
         };
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
+        // A restored checkpoint is durable at its own height by definition, so
+        // start there rather than at zero, which would refuse all undo pruning.
+        let durable_tip_height = Arc::new(AtomicU32::new(
+            applied_tip.load().as_ref().map_or(0, |tip| tip.height),
+        ));
+        apply_handles.checkpoint_publisher =
+            Some(Arc::new(crate::checkpoint_worker::CheckpointPublisher {
+                admission: Arc::clone(&apply_handles.admission),
+                undo_store: Arc::clone(&apply_handles.undo_store),
+                block_body_store: Arc::clone(&block_body_store),
+                applied_tip: Arc::clone(&applied_tip),
+                checkpoint_data_dir: crate::checkpoint_fs::open_data_dir(&config.data_dir)
+                    .with_context(|| format!("open data_dir {}", config.data_dir.display()))?,
+                network: config.network,
+                genesis_hash: config.network.genesis_block_hash(),
+                block_tree: Arc::clone(&block_tree),
+                utxo: Arc::clone(&utxo),
+                coin_stats: Arc::clone(&coin_stats),
+                chain_tx_count: Arc::clone(&chain_tx_count),
+                journal: apply_handles.journal.clone(),
+                data_dir: config.data_dir.clone(),
+                chain_events: Arc::clone(&chain_events),
+                durable_tip_height: Arc::clone(&durable_tip_height),
+            }));
         let sync = Arc::new(crate::BlockSync::new(
             apply_handles.clone(),
             Arc::clone(&peer_table),
             Arc::clone(&inbound_headers_rx),
             Arc::clone(&inbound_blocks_rx),
-        ));
-        // A restored checkpoint is durable at its own height by definition, so
-        // start there rather than at zero, which would refuse all undo pruning.
-        let durable_tip_height = Arc::new(AtomicU32::new(
-            applied_tip.load().as_ref().map_or(0, |tip| tip.height),
         ));
         let prune_service = if config.storage.prune_target_mb > 0 {
             Some(storage.prune_service(
@@ -4154,6 +4174,180 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_block_settles_disconnect_debt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p.listen.clear();
+        // Journal rewind disarms disconnect markers itself. These tests own the
+        // checkpoint-settlement path that remains when the journal cannot.
+        config.chainstate_journal.enabled = false;
+        let state = NodeState::open(config, None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1, 1)?;
+        state.apply_block(&block_one)?;
+        state.publish_checkpoint()?;
+
+        let current_before = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            data_dir.join("chainstate-checkpoints/CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+        let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2, 2)?;
+        state.apply_block(&block_two)?;
+
+        crate::reorg::invalidate_block(
+            &state.apply_handles(),
+            Hash256::from(block_two.block_hash()),
+        )?;
+
+        assert!(
+            state
+                .apply_handles()
+                .undo_store
+                .load_disconnect_marker()?
+                .is_none()
+        );
+        let current_after = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            data_dir.join("chainstate-checkpoints/CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+        assert!(current_after > current_before);
+        assert_eq!(state.durable_tip_height.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_block_settlement_failure_is_not_success() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir;
+        config.p2p.listen.clear();
+        config.chainstate_journal.enabled = false;
+        let state = NodeState::open(config.clone(), None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1, 1)?;
+        state.apply_block(&block_one)?;
+        state.publish_checkpoint()?;
+
+        let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2, 2)?;
+        state.apply_block(&block_two)?;
+
+        crate::checkpoint::inject_next_checkpoint_failpoint(
+            crate::checkpoint::CheckpointFailpoint::ManifestWrite,
+        );
+        let result = crate::reorg::invalidate_block(
+            &state.apply_handles(),
+            Hash256::from(block_two.block_hash()),
+        );
+        let Err(crate::reorg::ReorgError::CheckpointSettlement(_)) = result else {
+            anyhow::bail!("expected CheckpointSettlement, got {result:?}");
+        };
+
+        let marker = state
+            .apply_handles()
+            .undo_store
+            .load_disconnect_marker()?
+            .ok_or_else(|| anyhow::anyhow!("settlement failure cleared the disconnect marker"))?;
+        assert_eq!(
+            marker.phase,
+            bitcoin_rs_storage::DisconnectPhase::RolledBack
+        );
+
+        drop(state);
+        let error = match NodeState::open(config, None) {
+            Ok(_) => anyhow::bail!("node reopened with unsettled RolledBack debt"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("did not reach a clean checkpoint"),
+            "startup refusal omitted the checkpoint debt: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn switch_to_branch_settles_disconnect_debt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p.listen.clear();
+        config.chainstate_journal.enabled = false;
+        let state = NodeState::open(config, None)?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1, 1)?;
+        state.apply_block(&block_one)?;
+        state.publish_checkpoint()?;
+
+        let current_before = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            data_dir.join("chainstate-checkpoints/CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+
+        let genesis_id = state
+            .block_tree
+            .read()
+            .lookup(Hash256::from(genesis.block_hash()))
+            .ok_or_else(|| anyhow::anyhow!("missing genesis node"))?;
+        let mut parent = genesis_id;
+        let mut previous_hash = genesis.block_hash();
+        let mut fork_bodies = HashMap::new();
+        for height in 1..=2 {
+            let block =
+                mined_regtest_child_at(previous_hash, genesis.header.time + 10 + height, height)?;
+            let node_id = state.block_tree.write().insert_node(
+                Some(parent),
+                block.header,
+                bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+            )?;
+            fork_bodies.insert(
+                Hash256::from(block.block_hash()),
+                (block.clone(), bytes::Bytes::from(consensus_bytes(&block))),
+            );
+            parent = node_id;
+            previous_hash = block.block_hash();
+        }
+
+        let handles = state.apply_handles();
+        crate::reorg::switch_to_branch(
+            &handles,
+            parent,
+            |hash| fork_bodies.get(&hash).cloned(),
+            |_| {},
+        )?;
+
+        assert!(
+            state
+                .apply_handles()
+                .undo_store
+                .load_disconnect_marker()?
+                .is_none()
+        );
+        let current_after = serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+            data_dir.join("chainstate-checkpoints/CURRENT"),
+        )?)?
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("CURRENT has no generation"))?;
+        assert!(current_after > current_before);
+        assert_eq!(state.durable_tip_height.load(Ordering::Acquire), 2);
+        Ok(())
+    }
+
+    #[test]
     fn publish_checkpoint_refuses_when_no_applied_tip() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
@@ -4603,12 +4797,23 @@ mod tests {
     }
 
     fn mined_regtest_child(prev_blockhash: BlockHash) -> anyhow::Result<Block> {
+        mined_regtest_child_at(prev_blockhash, 1_296_688_603, 1)
+    }
+
+    fn mined_regtest_child_at(
+        prev_blockhash: BlockHash,
+        time: u32,
+        height: u32,
+    ) -> anyhow::Result<Block> {
+        let mut script_sig = vec![8];
+        script_sig.extend_from_slice(&height.to_le_bytes());
+        script_sig.extend_from_slice(&time.to_le_bytes());
         let coinbase = Tx {
             version: 2,
             lock_time: 0,
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid::default(), u32::MAX),
-                script_sig: vec![1, 1],
+                script_sig,
                 sequence: u32::MAX,
                 witness: Vec::new(),
             }],
@@ -4622,7 +4827,7 @@ mod tests {
                 version: 1,
                 prev_blockhash,
                 merkle_root: Hash256::default(),
-                time: 1_296_688_603,
+                time,
                 bits: 0x207f_ffff,
                 nonce: 0,
             },
