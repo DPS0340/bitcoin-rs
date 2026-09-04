@@ -691,6 +691,52 @@ fn format_version_rejection() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn format_3_open_resets_only_script_history() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(MemoryStore::default());
+    seed_populated_store(&store, 1)?;
+    store.put(ColumnFamily::Spending, b"legacy-spend", &[])?;
+    store.put(ColumnFamily::UtxoMeta, &[0x00, b'V'], &3_u32.to_le_bytes())?;
+    store.put(
+        ColumnFamily::UtxoMeta,
+        b"index:format_version",
+        &1_u32.to_le_bytes(),
+    )?;
+
+    let tx_lookup = store
+        .get(ColumnFamily::UtxoMeta, &[0x00, b'T'])?
+        .expect("tx lookup watermark");
+    let confirmed_before = store.count(ColumnFamily::TxConfirmed);
+    let headers_before = store.count(ColumnFamily::BlockHeaders);
+    assert!(store.count(ColumnFamily::Funding) > 0);
+    assert!(store.count(ColumnFamily::Spending) > 0);
+
+    let writer = IndexWriter::open(Arc::clone(&store), 1)?;
+
+    assert_eq!(
+        store.get(ColumnFamily::UtxoMeta, &[0x00, b'V'])?.as_deref(),
+        Some(4_u32.to_le_bytes().as_slice())
+    );
+    assert_eq!(
+        store
+            .get(ColumnFamily::UtxoMeta, b"index:format_version")?
+            .as_deref(),
+        Some(2_u32.to_le_bytes().as_slice())
+    );
+    assert_eq!(
+        writer.watermarks()?,
+        IndexWatermarks {
+            tx_lookup: Some(IndexWatermark::from_bytes(&tx_lookup)?),
+            script_history: None,
+        }
+    );
+    assert_eq!(store.count(ColumnFamily::TxConfirmed), confirmed_before);
+    assert_eq!(store.count(ColumnFamily::BlockHeaders), headers_before);
+    assert_eq!(store.count(ColumnFamily::Funding), 0);
+    assert_eq!(store.count(ColumnFamily::Spending), 0);
+    Ok(())
+}
+
+#[test]
 fn unversioned_rows_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     let mut indexer = Indexer::new(Arc::clone(&store));

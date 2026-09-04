@@ -250,8 +250,10 @@ Rationale:
   returns the first 8 bytes of the scripthash), so a single prefix scan
   over the Live CF returns both confirmed and unconfirmed rows for a
   scripthash without a second seek.
-- The value is empty for the same reason as Spending (Q2): the key is the
-  index; the caller fetches the transaction from the mempool by txid.
+- The value is empty because the Live key already names the outpoint
+  (`txid || vout`). The caller fetches the transaction from the mempool or
+  the confirmed index by that txid; a stored position or coin copy would
+  duplicate state the Live row is not authorized to own.
 
 **A smaller locator (e.g. dropping the prefix, or hashing the outpoint to
 fewer bytes) requires an injectivity proof:** a demonstration that no two
@@ -284,6 +286,10 @@ capability without touching the other. `acquire_capability_reset` and
 requested capability and clear only that capability's watermark. The reset
 state is tracked in `RESET_CAPABILITIES_KEY` with a monotonic version that
 prevents ABA across repeated resets.
+
+Opening a format-3 store (Spending keys without positions) is this kind of
+reset: `IndexWriter::open` rebuilds `ScriptHistory` only and leaves
+`TxLookup` ready. A foreign format version still refuses start.
 
 **Adding ScriptLive later must not force a History reindex.** ScriptLive
 rows would occupy a new column family (not one of the existing four). The

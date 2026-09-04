@@ -128,6 +128,10 @@ pub enum IndexError {
 // TxIndex metadata; data row keys begin with ASCII letters only and can never collide.
 const FORMAT_VERSION_KEY: &[u8] = &[0x00, b'V'];
 const FORMAT_VERSION_VALUE: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
+/// Format 3 stores Spending keys without positions. This build still
+/// understands those rows (resolvers fall back to a full block) and upgrades
+/// by resetting only `ScriptHistory`, leaving `TxLookup` ready (`IDX-04`).
+const FORMAT_VERSION_V3: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 const TX_LOOKUP_WATERMARK_KEY: &[u8] = &[0x00, b'T'];
 const SCRIPT_HISTORY_WATERMARK_KEY: &[u8] = &[0x00, b'S'];
 /// Monotonic revision shared by every ordinary index mutation.
@@ -2663,20 +2667,40 @@ pub struct IndexWriter<S: KvStore> {
 
 impl<S: KvStore> IndexWriter<S> {
     /// Opens a writer over `store`, rejecting unversioned index tables.
+    ///
+    /// Format 3 (Spending keys without positions) is upgraded in place by
+    /// resetting `ScriptHistory` only. Any other version mismatch is
+    /// [`IndexError::UnsupportedTxIndexFormatVersion`].
     pub fn open(store: std::sync::Arc<S>, generation: u64) -> Result<Self, IndexError> {
         let indexer = Indexer::new(store);
         match indexer
             .store
             .get(ColumnFamily::UtxoMeta, FORMAT_VERSION_KEY)?
         {
+            Some(value) if value.as_slice() == FORMAT_VERSION_VALUE => {}
+            Some(value) if value.as_slice() == FORMAT_VERSION_V3 => {
+                // Only Spending's representation changed. Reset ScriptHistory
+                // so new spending rows carry positions, and leave TxLookup
+                // serving (`IDX-04`). Foreign versions still refuse start.
+                resume_capability_reset(
+                    indexer.store.as_ref(),
+                    generation,
+                    IndexCapabilities::SCRIPT_HISTORY.to_mask(),
+                )?;
+                let mut marker = indexer.store.new_batch();
+                marker.put(
+                    ColumnFamily::UtxoMeta,
+                    INDEX_FORMAT_VERSION_KEY,
+                    &INDEX_FORMAT_VERSION.to_le_bytes(),
+                );
+                indexer.store.write(marker)?;
+            }
             Some(value) => {
-                if value.as_slice() != FORMAT_VERSION_VALUE {
-                    let version = value
-                        .get(..4)
-                        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                        .map_or(0, u32::from_le_bytes);
-                    return Err(IndexError::UnsupportedTxIndexFormatVersion { version });
-                }
+                let version = value
+                    .get(..4)
+                    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                    .map_or(0, u32::from_le_bytes);
+                return Err(IndexError::UnsupportedTxIndexFormatVersion { version });
             }
             None => {
                 if has_any_index_row(&*indexer.store)? {

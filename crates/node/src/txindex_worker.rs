@@ -703,7 +703,11 @@ pub(crate) struct OpenTxIndex {
     pub(crate) batch_limits: PreparedBatchLimits,
 }
 
-/// Opens an `IndexWriter` with legacy/unsupported-format selective reset.
+/// Opens an `IndexWriter` with legacy/unsupported-format recovery.
+///
+/// Format 3 is upgraded inside [`bitcoin_rs_index::IndexWriter::open`] by
+/// resetting `ScriptHistory` only. This path still full-resets foreign
+/// versions and cursorless legacy tables so they can rebuild.
 pub(crate) fn open_writer<S>(
     store: &Arc<S>,
     generation: u64,
