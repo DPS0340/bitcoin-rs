@@ -336,7 +336,8 @@ status = "implemented_unverified"
 [[rpc]]
 method = "deriveaddresses"
 group = "wallet"
-status = "implemented_unverified"
+status = "disabled"
+note = "Only non-ranged addr() descriptors are supported; other descriptor forms and ranged descriptors return MethodDisabled."
 
 [[rpc]]
 method = "scantxoutset"
@@ -371,21 +372,54 @@ status = "implemented_unverified"
 # ---------------------------------------------------------------------------
 # REST
 #
-# Deliberately small. #78 says to keep it that way until a concrete
-# consumer needs more, and the one consumer today is the remote validator.
-# The gateway is UNAUTHENTICATED: binding it to a public interface exposes
-# chain data to anyone who can reach the port.
+# Every prefix registered by the REST router is listed here.  The gateway is
+# UNAUTHENTICATED: binding it to a public interface exposes chain data to anyone
+# who can reach the port.
 # ---------------------------------------------------------------------------
 
 [[rest]]
-path = "/rest/chaininfo.json"
+path = "/rest/tx/"
 status = "implemented_unverified"
-note = "Same body as `getblockchaininfo`, so it inherits that method's status."
-
 [[rest]]
-path = "/rest/headers/<hash>.<json|hex|bin>"
+path = "/rest/block/notxdetails/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/block/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/blockpart/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/blockfilter/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/blockfilterheaders/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/chaininfo"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/mempool/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/headers/"
 status = "deviation"
-deviation = "An unknown but well-formed block hash answers 200 with an empty result rather than 404, because the remote validator uses 404 on `/rest/*` to detect a disabled gateway and cannot afford the two to be confused. Query parameters other than `count` are ignored, as Core ignores cache-busters."
+deviation = "Unknown but well-formed block hashes return an empty 200 response rather than 404, and query parameters other than count are ignored."
+[[rest]]
+path = "/rest/getutxos"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/deploymentinfo/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/deploymentinfo"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/blockhashbyheight/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/spenttxouts/"
+status = "implemented_unverified"
 
 # ---------------------------------------------------------------------------
 # ZMQ
