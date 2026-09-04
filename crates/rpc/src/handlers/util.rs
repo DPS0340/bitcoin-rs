@@ -488,12 +488,12 @@ impl core::fmt::Display for DescriptorError {
 /// asked, which is the one thing this call must not do.
 fn analyse(text: &str, network: bitcoin::Network) -> Result<DescriptorInfo, DescriptorError> {
     if let Some(key) = parse_combo(text)? {
-        let (public, private) = combo_key_forms(key)?;
-        ensure_combo_key_network(&public, network)?;
+        let (canonical, multipath_expansion, is_range, private) =
+            combo_key_forms(key, network)?;
         return Ok(DescriptorInfo {
-            canonical: format!("combo({public})"),
-            multipath_expansion: Vec::new(),
-            is_range: public.contains('*'),
+            canonical,
+            multipath_expansion,
+            is_range,
             is_solvable: true,
             has_private_keys: private,
         });
@@ -559,19 +559,45 @@ fn parse_combo(text: &str) -> Result<Option<&str>, DescriptorError> {
     Ok(None)
 }
 
-fn combo_key_forms(key: &str) -> Result<(String, bool), DescriptorError> {
+fn combo_key_forms(
+    key: &str,
+    network: bitcoin::Network,
+) -> Result<(String, Vec<String>, bool, bool), DescriptorError> {
     let secp = bitcoin::secp256k1::Secp256k1::signing_only();
-    let (descriptor, keys) = MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &format!("pkh({key})"))
-        .map_err(|e| DescriptorError::Parse(e.to_string()))?;
-    let rendered = descriptor.to_string();
-    let public = rendered.strip_prefix("pkh(").and_then(|s| s.strip_suffix(')')).ok_or_else(|| DescriptorError::Parse("Invalid combo key".into()))?;
-    Ok((public.to_owned(), !keys.is_empty()))
-}
-
-fn ensure_combo_key_network(key: &str, network: bitcoin::Network) -> Result<(), DescriptorError> {
-    let secp = bitcoin::secp256k1::Secp256k1::signing_only();
-    let (descriptor, _) = MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &format!("pkh({key})")).map_err(|e| DescriptorError::Parse(e.to_string()))?;
-    ensure_keys_match_network(&descriptor, network)
+    let (descriptor, parsed_keys) = MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(
+        &secp,
+        &format!("pkh({key})"),
+    )
+    .map_err(|e| DescriptorError::Parse(e.to_string()))?;
+    ensure_keys_match_network(&descriptor, network)?;
+    let is_range = descriptor.has_wildcard();
+    let forms: Vec<String> = if descriptor.is_multipath() {
+        descriptor
+            .clone()
+            .into_single_descriptors()
+            .map_err(|e| DescriptorError::Parse(e.to_string()))?
+            .iter()
+            .map(|d| d.to_string())
+            .collect()
+    } else {
+        vec![descriptor.to_string()]
+    };
+    let keys: Vec<String> = forms
+        .into_iter()
+        .map(|form| {
+            form.strip_prefix("pkh(")
+                .and_then(|s| s.strip_suffix(')'))
+                .map(str::to_owned)
+                .ok_or_else(|| DescriptorError::Parse("Invalid combo key".into()))
+        })
+        .collect::<Result<_, _>>()?;
+    let expansions: Vec<String> = keys.iter().map(|k| format!("combo({k})")).collect();
+    Ok((
+        expansions[0].clone(),
+        expansions,
+        is_range,
+        !parsed_keys.is_empty(),
+    ))
 }
 
 /// Derives the addresses a descriptor describes.
@@ -730,7 +756,7 @@ impl Unspendable {
                     DescriptorError::Parse(
                         "Descriptor does not have a corresponding address".to_owned(),
                     )
-                }),
+                }
         }
     }
 }
@@ -1272,6 +1298,24 @@ mod descriptor_checksum_tests {
             .err()
             .unwrap_or_else(|| panic!("addr(x) is not an address"));
         assert_eq!(error.code(), RpcError::CORE_NOT_FOUND, "{error:?}");
+    }
+
+    /// Bitcoin Core's descriptor documentation specifies combo(KEY) as the
+    /// shorthand for the legacy public-key forms. Keep its public
+    /// canonicalization and private-key redaction observable here.
+    #[test]
+    fn combo_is_canonicalized_and_private_keys_are_redacted() {
+        let ctx = Arc::new(Context::new());
+        let key = "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+        let result = getdescriptorinfo(&ctx, &json!([format!("combo({key})")]))
+            .unwrap_or_else(|err| panic!("getdescriptorinfo failed: {err}"));
+        assert!(
+            result
+                .get("descriptor")
+                .and_then(JsonValueTrait::as_str)
+                .is_some_and(|descriptor| descriptor.starts_with(&format!("combo({key})#")))
+        );
+        assert_eq!(result.get("hasprivatekeys").and_then(JsonValueTrait::as_bool), Some(false));
     }
 }
 
