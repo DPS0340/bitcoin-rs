@@ -209,10 +209,15 @@ impl TxIngressConsumer {
         );
 
         match result {
-            Ok(mutation) => {
+            // A replacement the size-limit trim shed after commit is not in
+            // the pool: record the reject exactly like a refused admission.
+            Ok(outcome) if outcome.is_shed() => {
+                self.tx_admission.record_reject(txid, wtxid);
+            }
+            Ok(outcome) => {
                 // Accepted-only relay: only relay if the mutation includes
                 // an Accepted outcome for this txid.
-                let accepted = mutation.changes.iter().any(|c| {
+                let accepted = outcome.into_mutation().changes.iter().any(|c| {
                     c.txid == Hash256::from(txid)
                         && matches!(c.outcome, bitcoin_rs_mempool::MutationOutcome::Accepted)
                 });

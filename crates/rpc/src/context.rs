@@ -1,10 +1,5 @@
 use alloc::sync::Arc;
-use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use std::path::PathBuf;
-
 use arc_swap::ArcSwapOption;
-
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits, MempoolObserver, MutationResult};
@@ -12,9 +7,12 @@ use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
 };
 use compact_str::CompactString;
+use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 
