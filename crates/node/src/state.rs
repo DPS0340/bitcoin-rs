@@ -1057,6 +1057,7 @@ struct TxIndexSpawn {
     block_source: crate::NodeBlockSource,
     body_source: Arc<dyn BlockBodySource>,
     wake_rx: Receiver<()>,
+    recovery_reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
 }
 
 /// Aggregate handle to a running node.
@@ -1197,26 +1198,28 @@ impl NodeState {
             Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
         let block_body_store = storage.block_body_store(Arc::clone(&block_files));
 
-        let zmq_publications = config.zmq_publications();
-        let active_zmq_notifications: Vec<_> = zmq_publications
+        let zmq_endpoints = config.zmq_endpoints();
+        let active_zmq_notifications: Vec<_> = zmq_endpoints
             .iter()
-            .map(|publication| {
-                ZmqNotification::new(
-                    publication.topic.notifier_type(),
-                    publication.endpoint.clone(),
-                    publication.hwm,
-                )
+            .flat_map(|endpoint| {
+                endpoint.topics.iter().map(|topic| {
+                    ZmqNotification::new(
+                        topic.notifier_type(),
+                        endpoint.endpoint.clone(),
+                        endpoint.effective_hwm(),
+                    )
+                })
             })
             .collect();
         #[cfg(feature = "zmq")]
-        let zmq_publisher: Arc<dyn crate::ZmqPublisher> = if zmq_publications.is_empty() {
+        let zmq_publisher: Arc<dyn crate::ZmqPublisher> = if zmq_endpoints.is_empty() {
             Arc::new(crate::NoOpZmqPublisher)
         } else {
-            Arc::new(crate::SocketZmqPublisher::bind(&zmq_publications)?)
+            Arc::new(crate::SocketZmqPublisher::bind(zmq_endpoints)?)
         };
         #[cfg(not(feature = "zmq"))]
         let zmq_publisher: Arc<dyn crate::ZmqPublisher> = {
-            let _ = &zmq_publications;
+            let _ = &zmq_endpoints;
             Arc::new(crate::NoOpZmqPublisher)
         };
         let (
@@ -1261,6 +1264,16 @@ impl NodeState {
         // valid format/bounds, matching genesis, older writer epoch, and
         // strictly greater witness height than the restored tip.
         let genesis_hex = config.network.genesis_block_hash().to_string_be();
+        // One reporter routes every rollback fact of this process — the
+        // checkpoint fallback detected here and the index-ahead rewinds the
+        // txindex worker detects later — through the same warning store and
+        // event marker.
+        let recovery_reporter = Arc::new(crate::recovery_evidence::RecoveryReporter::new(
+            Arc::clone(&warning_store),
+            config.data_dir.clone(),
+            genesis_hex.clone(),
+            epoch,
+        ));
         let restored_height = restored_applied_tip.as_ref().map_or(0, |tip| tip.height);
         let restored_hash = restored_applied_tip
             .as_ref()
@@ -1275,17 +1288,11 @@ impl NodeState {
                 &genesis_hex,
                 restored_height,
             ) {
-                let reporter = crate::recovery_evidence::RecoveryReporter::new(
-                    Arc::clone(&warning_store),
-                    config.data_dir.clone(),
-                    genesis_hex.clone(),
-                    epoch,
-                );
                 let source = match resume_source {
                     ResumeSource::Cold => "cold",
                     ResumeSource::Checkpoint => "checkpoint",
                 };
-                reporter
+                recovery_reporter
                     .report_checkpoint_fallback(
                         witness_height,
                         restored_height,
@@ -1371,6 +1378,7 @@ impl NodeState {
                             block_source,
                             body_source,
                             wake_rx,
+                            recovery_reporter: Arc::clone(&recovery_reporter),
                         }),
                         Some(lifecycle),
                         Some(adapter),
@@ -1380,11 +1388,7 @@ impl NodeState {
             };
         let capabilities = Arc::new(crate::capabilities::NodeCapabilities::new(
             crate::capabilities::CapabilityInputs {
-                applied_tip: Arc::clone(&applied_tip),
-                tx_query: tx_index_adapter.as_ref().map(|adapter| {
-                    let query: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = adapter.clone();
-                    query
-                }),
+                tx_lifecycle: tx_index_lifecycle.clone(),
                 tx_runtime: tx_index_runtime.clone(),
                 txindex_enabled: crate::capabilities::txindex_enabled(&config),
             },
@@ -1570,10 +1574,10 @@ impl NodeState {
     /// internal to the crate.
     pub fn publish_checkpoint(&self) -> Result<u64> {
         match self.write_clean_checkpoint()? {
-            crate::checkpoint::CheckpointWrite::Published { generation } => Ok(generation),
             crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => {
                 bail!("checkpoint refused: no applied tip to publish")
             }
+            crate::checkpoint::CheckpointWrite::Published { generation } => Ok(generation),
         }
     }
 
@@ -1775,6 +1779,7 @@ impl NodeState {
             spawn.block_source,
             Some(spawn.body_source),
             Arc::clone(&self.chain_events),
+            spawn.recovery_reporter,
             Arc::clone(&self.apply_handles.shutdown),
             spawn.wake_rx,
         )
@@ -2499,14 +2504,24 @@ mod tests {
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
-        config.zmqpubhashblock = vec!["inproc://state-zmq-pubhashblock".to_owned()];
-        config.zmqpubhashtx = vec!["inproc://state-zmq-pubhashtx".to_owned()];
-        config.zmqpubrawblock = vec!["inproc://state-zmq-pubrawblock".to_owned()];
-        config.zmqpubrawtx = vec!["inproc://state-zmq-pubrawtx".to_owned()];
-        config.zmqpubhashblockhwm = Some(17);
-        config.zmqpubhashtxhwm = Some(18);
-        config.zmqpubrawblockhwm = Some(19);
-        config.zmqpubrawtxhwm = Some(20);
+        config.notifications.zmq = vec![
+            crate::zmq_publisher::ZmqEndpointConfig {
+                endpoint: "inproc://state-zmq-block".to_owned(),
+                topics: vec![
+                    crate::zmq_publisher::ZmqTopic::HashBlock,
+                    crate::zmq_publisher::ZmqTopic::RawBlock,
+                ],
+                hwm: Some(17),
+            },
+            crate::zmq_publisher::ZmqEndpointConfig {
+                endpoint: "inproc://state-zmq-tx".to_owned(),
+                topics: vec![
+                    crate::zmq_publisher::ZmqTopic::HashTx,
+                    crate::zmq_publisher::ZmqTopic::RawTx,
+                ],
+                hwm: Some(20),
+            },
+        ];
         let state = NodeState::open(config, None)?;
 
         let notifications = state.active_zmq_notifications();
@@ -2520,9 +2535,9 @@ mod tests {
             .collect();
         assert_eq!(
             notification_types,
-            ["pubhashblock", "pubhashtx", "pubrawblock", "pubrawtx"]
+            ["pubhashblock", "pubrawblock", "pubhashtx", "pubrawtx"]
         );
-        assert_eq!(hwms, [17, 18, 19, 20]);
+        assert_eq!(hwms, [17, 17, 20, 20]);
         Ok(())
     }
 
@@ -4136,7 +4151,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn non_regular_epoch_lock_refuses_start() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
