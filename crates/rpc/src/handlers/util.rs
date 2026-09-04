@@ -4,10 +4,11 @@ use core::str::FromStr as _;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use miniscript::DefiniteDescriptorKey;
 use miniscript::Descriptor as MiniscriptDescriptor;
 use miniscript::ForEachKey as _;
-use miniscript::descriptor::DescriptorPublicKey;
-use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
+use miniscript::descriptor::{DescriptorPublicKey, DescriptorSecretKey, KeyMap};
+use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value, json};
 
 use corepc_types::v31;
 
@@ -212,7 +213,7 @@ pub(crate) fn getdescriptorinfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let info = analyse(descriptor, convert::bitcoin_network(ctx.chain_network))
         .map_err(descriptor_error)?;
 
-    typed_to_sonic(&v31::GetDescriptorInfo {
+    typed_to_sonic_omitting_nulls(&v31::GetDescriptorInfo {
         // The canonical form comes from the parse, so a descriptor handed to this
         // call with an `xprv` in it does not get one back.
         //
@@ -489,19 +490,21 @@ impl core::fmt::Display for DescriptorError {
 /// asked, which is the one thing this call must not do.
 fn analyse(text: &str, network: bitcoin::Network) -> Result<DescriptorInfo, DescriptorError> {
     if let Some(key) = parse_combo(text)? {
-        let (canonical, multipath_expansion, is_range, private) = combo_key_forms(key, network)?;
+        let combo = parse_combo_info(key, network)?;
         return Ok(DescriptorInfo {
-            canonical,
-            multipath_expansion,
-            is_range,
+            canonical: combo.canonical,
+            multipath_expansion: combo.multipath_expansion,
+            is_range: combo.is_range,
             is_solvable: true,
-            has_private_keys: private,
+            has_private_keys: combo.has_private_keys,
         });
     }
     let secp = bitcoin::secp256k1::Secp256k1::signing_only();
     match MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(&secp, text) {
         Ok((descriptor, keys)) => {
             ensure_keys_match_network(&descriptor, network)?;
+            let has_private_keys = !keys.is_empty();
+            ensure_secret_keys_match_network(keys, network)?;
             let multipath_expansion = if descriptor.is_multipath() {
                 descriptor
                     .clone()
@@ -522,7 +525,7 @@ fn analyse(text: &str, network: bitcoin::Network) -> Result<DescriptorInfo, Desc
                 multipath_expansion,
                 is_range: descriptor.has_wildcard(),
                 is_solvable: true,
-                has_private_keys: !keys.is_empty(),
+                has_private_keys,
             })
         }
         // `addr()` and `raw()` name an output without saying how to spend it,
@@ -566,45 +569,86 @@ fn parse_combo(text: &str) -> Result<Option<&str>, DescriptorError> {
     Ok(None)
 }
 
-fn combo_key_forms(
-    key: &str,
-    network: bitcoin::Network,
-) -> Result<(String, Vec<String>, bool, bool), DescriptorError> {
+/// A parsed `combo(KEY)`, using a single `pkh(KEY)` parse for every later step.
+///
+/// miniscript has no `combo` variant — BIP 384 is a set of scripts, not one —
+/// so the key is parsed through `pkh(...)` once and reused for canonicalization,
+/// private-key detection, network checks, and address derivation.
+struct ComboInfo {
+    canonical: String,
+    multipath_expansion: Vec<String>,
+    is_range: bool,
+    has_private_keys: bool,
+    paths: Vec<MiniscriptDescriptor<DescriptorPublicKey>>,
+}
+
+fn parse_combo_info(key: &str, network: bitcoin::Network) -> Result<ComboInfo, DescriptorError> {
     let secp = bitcoin::secp256k1::Secp256k1::signing_only();
     let (descriptor, parsed_keys) = MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(
         &secp,
         &format!("pkh({key})"),
     )
-    .map_err(|e| DescriptorError::Parse(e.to_string()))?;
+    .map_err(|error| DescriptorError::Parse(error.to_string()))?;
     ensure_keys_match_network(&descriptor, network)?;
+    let has_private_keys = !parsed_keys.is_empty();
+    ensure_secret_keys_match_network(parsed_keys, network)?;
+
     let is_range = descriptor.has_wildcard();
-    let forms: Vec<String> = if descriptor.is_multipath() {
+    let is_multipath = descriptor.is_multipath();
+    let paths = if is_multipath {
         descriptor
             .into_single_descriptors()
-            .map_err(|e| DescriptorError::Parse(e.to_string()))?
-            .iter()
-            .map(ToString::to_string)
-            .collect()
+            .map_err(|error| DescriptorError::Parse(error.to_string()))?
     } else {
-        vec![descriptor.to_string()]
+        vec![descriptor]
     };
-    let keys: Vec<String> = forms
-        .into_iter()
-        .map(|form| {
-            let form = form.split_once('#').map_or(&*form, |(prefix, _)| prefix);
-            form.strip_prefix("pkh(")
-                .and_then(|s| s.strip_suffix(')'))
-                .map(str::to_owned)
-                .ok_or_else(|| DescriptorError::Parse("Invalid combo key".into()))
-        })
-        .collect::<Result<_, _>>()?;
-    let expansions: Vec<String> = keys.iter().map(|k| format!("combo({k})")).collect();
-    Ok((
-        expansions[0].clone(),
-        expansions,
+    let forms = paths
+        .iter()
+        .map(combo_from_pkh)
+        .collect::<Result<Vec<_>, _>>()?;
+    let canonical = forms
+        .first()
+        .cloned()
+        .ok_or_else(|| DescriptorError::Parse("Invalid combo descriptor".into()))?;
+    Ok(ComboInfo {
+        canonical,
+        // Single-path descriptors must leave this empty so the RPC omits
+        // `multipathexpansion`, matching Core and the documented response.
+        multipath_expansion: if is_multipath { forms } else { Vec::new() },
         is_range,
-        !parsed_keys.is_empty(),
-    ))
+        has_private_keys,
+        paths,
+    })
+}
+
+fn combo_from_pkh(
+    descriptor: &MiniscriptDescriptor<DescriptorPublicKey>,
+) -> Result<String, DescriptorError> {
+    let form = descriptor.to_string();
+    let body = form
+        .split_once('#')
+        .map_or(form.as_str(), |(prefix, _)| prefix);
+    let key = body
+        .strip_prefix("pkh(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .ok_or_else(|| DescriptorError::Parse("Invalid combo key".into()))?;
+    Ok(format!("combo({key})"))
+}
+
+fn require_range_match(
+    is_range: bool,
+    range: Option<(u32, u32)>,
+) -> Result<(u32, u32), DescriptorError> {
+    match (is_range, range) {
+        (true, None) => Err(DescriptorError::Range(
+            "Range must be specified for a ranged descriptor",
+        )),
+        (false, Some(_)) => Err(DescriptorError::Range(
+            "Range should not be specified for an un-ranged descriptor",
+        )),
+        (false, None) => Ok((0, 0)),
+        (true, Some(bounds)) => Ok(bounds),
+    }
 }
 
 /// Derives the addresses a descriptor describes.
@@ -617,6 +661,16 @@ fn derive_descriptor_addresses(
     network: bitcoin::Network,
     range: Option<(u32, u32)>,
 ) -> Result<Vec<Vec<String>>, DescriptorError> {
+    if let Some(key) = parse_combo(text)? {
+        let combo = parse_combo_info(key, network)?;
+        let (begin, end) = require_range_match(combo.is_range, range)?;
+        let mut expansions = Vec::with_capacity(combo.paths.len());
+        for path in combo.paths {
+            expansions.push(derive_combo_addresses(&path, network, begin, end)?);
+        }
+        return Ok(expansions);
+    }
+
     // An `addr()` or `raw()` descriptor has exactly one output and no range.
     if let Some(unspendable) = parse_unspendable(strip_checksum(text)) {
         if range.is_some() {
@@ -628,25 +682,13 @@ fn derive_descriptor_addresses(
     }
 
     let secp = bitcoin::secp256k1::Secp256k1::signing_only();
-    let (descriptor, _keys) =
+    let (descriptor, keys) =
         MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(&secp, text)
             .map_err(|error| DescriptorError::Parse(error.to_string()))?;
 
-    match (descriptor.has_wildcard(), range) {
-        (true, None) => {
-            return Err(DescriptorError::Range(
-                "Range must be specified for a ranged descriptor",
-            ));
-        }
-        (false, Some(_)) => {
-            return Err(DescriptorError::Range(
-                "Range should not be specified for an un-ranged descriptor",
-            ));
-        }
-        _ => {}
-    }
-
+    let (begin, end) = require_range_match(descriptor.has_wildcard(), range)?;
     ensure_keys_match_network(&descriptor, network)?;
+    ensure_secret_keys_match_network(keys, network)?;
 
     let paths = if descriptor.is_multipath() {
         descriptor
@@ -656,7 +698,6 @@ fn derive_descriptor_addresses(
         vec![descriptor]
     };
 
-    let (begin, end) = range.unwrap_or((0, 0));
     let mut expansions = Vec::with_capacity(paths.len());
     for path in paths {
         let mut addresses = Vec::new();
@@ -674,6 +715,53 @@ fn derive_descriptor_addresses(
         expansions.push(addresses);
     }
     Ok(expansions)
+}
+
+/// BIP 384 / Core `combo(KEY)`: P2PKH, and for a compressed key also P2WPKH
+/// and P2SH-P2WPKH. Bare P2PK has no address and is skipped, as Core's
+/// `ExtractDestination` does in `DeriveAddresses`.
+fn derive_combo_addresses(
+    path: &MiniscriptDescriptor<DescriptorPublicKey>,
+    network: bitcoin::Network,
+    begin: u32,
+    end: u32,
+) -> Result<Vec<String>, DescriptorError> {
+    let mut addresses = Vec::new();
+    for index in begin..=end {
+        let derived = path
+            .at_derivation_index(index)
+            .map_err(|error| DescriptorError::Parse(error.to_string()))?;
+        addresses.push(descriptor_address(&derived, network)?);
+        let key = combo_key(&derived)?;
+        if let Ok(wpkh) = MiniscriptDescriptor::new_wpkh(key.clone()) {
+            addresses.push(descriptor_address(&wpkh, network)?);
+            let sh_wpkh = MiniscriptDescriptor::new_sh_wpkh(key)
+                .map_err(|error| DescriptorError::Parse(error.to_string()))?;
+            addresses.push(descriptor_address(&sh_wpkh, network)?);
+        }
+    }
+    Ok(addresses)
+}
+
+fn combo_key(
+    descriptor: &MiniscriptDescriptor<DefiniteDescriptorKey>,
+) -> Result<DefiniteDescriptorKey, DescriptorError> {
+    descriptor
+        .iter_pk()
+        .next()
+        .ok_or_else(|| DescriptorError::Parse("Invalid combo key".into()))
+}
+
+fn descriptor_address(
+    descriptor: &MiniscriptDescriptor<DefiniteDescriptorKey>,
+    network: bitcoin::Network,
+) -> Result<String, DescriptorError> {
+    descriptor
+        .address(network)
+        .map(|address| address.to_string())
+        .map_err(|_error| {
+            DescriptorError::Parse("Descriptor does not have a corresponding address".to_owned())
+        })
 }
 
 /// Refuses a descriptor whose extended keys belong to another network.
@@ -719,15 +807,41 @@ fn ensure_keys_match_network(
 
     match offender {
         None => Ok(()),
-        Some(found) => Err(DescriptorError::Parse(format!(
-            "Descriptor key is for {} but this node is on {network}",
-            if found == bitcoin::NetworkKind::Main {
-                "mainnet"
-            } else {
-                "a test network"
-            }
-        ))),
+        Some(found) => Err(network_mismatch(found, network)),
     }
+}
+
+/// WIF and other secret keys keep their network on the `KeyMap` that
+/// `parse_descriptor` returns, not on the public descriptor. A Single public
+/// key is networkless, so a testnet WIF would otherwise pass
+/// [`ensure_keys_match_network`] on a mainnet node.
+fn ensure_secret_keys_match_network(
+    secrets: KeyMap,
+    network: bitcoin::Network,
+) -> Result<(), DescriptorError> {
+    let wanted = bitcoin::NetworkKind::from(network);
+    for (_public, secret) in secrets {
+        let found = match secret {
+            DescriptorSecretKey::Single(single) => single.key.network,
+            DescriptorSecretKey::XPrv(xkey) => xkey.xkey.network,
+            DescriptorSecretKey::MultiXPrv(xkey) => xkey.xkey.network,
+        };
+        if found != wanted {
+            return Err(network_mismatch(found, network));
+        }
+    }
+    Ok(())
+}
+
+fn network_mismatch(found: bitcoin::NetworkKind, network: bitcoin::Network) -> DescriptorError {
+    DescriptorError::Parse(format!(
+        "Descriptor key is for {} but this node is on {network}",
+        if found == bitcoin::NetworkKind::Main {
+            "mainnet"
+        } else {
+            "a test network"
+        }
+    ))
 }
 
 /// A descriptor that names an output without saying how to spend it.
@@ -1307,9 +1421,12 @@ mod descriptor_checksum_tests {
         assert_eq!(error.code(), RpcError::CORE_NOT_FOUND, "{error:?}");
     }
 
-    /// Bitcoin Core's descriptor documentation specifies combo(KEY) as the
-    /// shorthand for the legacy public-key forms. Keep its public
-    /// canonicalization and private-key redaction observable here.
+    /// BIP 384 / Core `doc/descriptors.md`: `combo(KEY)` is the top-level
+    /// collection of `pk`/`pkh` (and, for a compressed key, `wpkh`/`sh(wpkh)`).
+    ///
+    /// A single-path combo must omit `multipathexpansion`. A private key is
+    /// reported and replaced by its public form, same as Core's
+    /// `provider.keys.size() > 0` plus `DescriptorImpl::ToString`.
     #[test]
     fn combo_is_canonicalized_and_private_keys_are_redacted() {
         let ctx = Arc::new(Context::new());
@@ -1328,6 +1445,122 @@ mod descriptor_checksum_tests {
                 .and_then(JsonValueTrait::as_bool),
             Some(false)
         );
+        assert_eq!(
+            result.get("issolvable").and_then(JsonValueTrait::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            result.get("isrange").and_then(JsonValueTrait::as_bool),
+            Some(false)
+        );
+        assert!(
+            result.get("multipath_expansion").is_none(),
+            "single-path combo must omit multipath_expansion: {result:?}"
+        );
+
+        // BIP32 test vector 1 master private key, so the redaction is against
+        // a published vector rather than this function's own output.
+        let xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+        let private = getdescriptorinfo(&ctx, &json!([format!("combo({xprv}/0/0)")]))
+            .unwrap_or_else(|err| panic!("combo with an xprv must parse: {err}"));
+        assert_eq!(
+            private
+                .get("hasprivatekeys")
+                .and_then(JsonValueTrait::as_bool),
+            Some(true)
+        );
+        let Some(canonical) = private.get("descriptor").and_then(JsonValueTrait::as_str) else {
+            panic!("descriptor missing: {private:?}");
+        };
+        assert!(
+            !canonical.contains(xprv),
+            "the private key must not come back out: {canonical}"
+        );
+        assert!(
+            canonical.starts_with(&format!("combo({xpub}/0/0)#")),
+            "the canonical form is the public combo: {canonical}"
+        );
+    }
+
+    /// Core's `getdescriptorinfo` expands a multipath descriptor into one
+    /// entry per path and returns the first as `descriptor`.
+    #[test]
+    fn combo_multipath_is_expanded() {
+        let ctx = Arc::new(Context::new());
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+        let result = getdescriptorinfo(&ctx, &json!([format!("combo({xpub}/<0;1>/*)")]))
+            .unwrap_or_else(|err| panic!("multipath combo must parse: {err}"));
+        let Some(canonical) = result.get("descriptor").and_then(JsonValueTrait::as_str) else {
+            panic!("descriptor missing: {result:?}");
+        };
+        assert!(
+            canonical.starts_with(&format!("combo({xpub}/0/*)#")),
+            "the first expansion is canonical: {canonical}"
+        );
+        let Some(expansions) = result.get("multipath_expansion").and_then(Value::as_array) else {
+            panic!("multipath combo must report expansions: {result:?}");
+        };
+        assert_eq!(expansions.len(), 2, "{result:?}");
+        let Some(first) = expansions.first().and_then(JsonValueTrait::as_str) else {
+            panic!("first expansion missing: {result:?}");
+        };
+        let Some(second) = expansions.get(1).and_then(JsonValueTrait::as_str) else {
+            panic!("second expansion missing: {result:?}");
+        };
+        assert_eq!(first, canonical);
+        assert!(
+            second.starts_with(&format!("combo({xpub}/1/*)#")),
+            "second path in specifier order: {second}"
+        );
+        assert_eq!(
+            result.get("isrange").and_then(JsonValueTrait::as_bool),
+            Some(true)
+        );
+    }
+
+    /// rust-bitcoin decodes both WIF prefixes; Core refuses a WIF whose
+    /// version byte is not this chain's. The network lives on the secret in
+    /// the keymap, not on the public `Single` key.
+    #[test]
+    fn combo_rejects_a_wif_from_another_network() {
+        let ctx = Arc::new(Context::new());
+        let wif = testnet_compressed_wif();
+        let error = getdescriptorinfo(&ctx, &json!([format!("combo({wif})")]))
+            .err()
+            .unwrap_or_else(|| panic!("a testnet WIF must not analyse on mainnet"));
+        assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
+        assert!(
+            error.to_string().contains("test network"),
+            "the refusal must say which network the key is for: {error}"
+        );
+    }
+
+    /// Same network check as derivation: a testnet extended key is not valid
+    /// descriptor info on a mainnet node.
+    #[test]
+    fn combo_rejects_a_testnet_extended_key_on_mainnet() {
+        let ctx = Arc::new(Context::new());
+        let tpub = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B";
+        let error = getdescriptorinfo(&ctx, &json!([format!("combo({tpub}/0/*)")]))
+            .err()
+            .unwrap_or_else(|| panic!("a testnet xpub must not analyse on mainnet"));
+        assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
+        assert!(error.to_string().contains("test network"), "got {error}");
+    }
+
+    fn testnet_compressed_wif() -> String {
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
+        ])
+        .unwrap_or_else(|err| panic!("secret 1 is valid: {err}"));
+        bitcoin::PrivateKey {
+            compressed: true,
+            network: bitcoin::NetworkKind::Test,
+            inner: secret,
+        }
+        .to_string()
     }
 }
 
@@ -1549,5 +1782,130 @@ mod deriveaddresses_tests {
                 "for {fixed}"
             );
         }
+    }
+
+    /// Bitcoin Core `test/functional/rpc_deriveaddresses.py`: `combo(tprv…/1/1/0)`
+    /// on regtest yields P2PKH, P2WPKH, and P2SH-P2WPKH. Bare P2PK is skipped.
+    #[test]
+    fn combo_derives_core_regtest_addresses() {
+        let mut ctx = Context::new();
+        ctx.chain_network = bitcoin_rs_primitives::Network::Regtest;
+        let ctx = Arc::new(ctx);
+        // Bitcoin Core `rpc_deriveaddresses.py`.
+        let tprv = "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK";
+        let result = deriveaddresses(&ctx, &json!([checksummed(&format!("combo({tprv}/1/1/0)"))]))
+            .unwrap_or_else(|err| panic!("combo must derive: {err}"));
+        assert_eq!(
+            result,
+            json!([
+                "mtfUoUax9L4tzXARpw1oTGxWyoogp52KhJ",
+                "bcrt1qjqmxmkpmxt80xz4y3746zgt0q3u3ferr34acd5",
+                "2NDvEwGfpEqJWfybzpKPHF2XH3jwoQV3D7x"
+            ])
+        );
+    }
+
+    /// BIP 384: an uncompressed key is only `pk` + `pkh`, so derivation is the
+    /// P2PKH address — the same address `pkh(KEY)` produces.
+    #[test]
+    fn combo_uncompressed_derives_only_p2pkh() {
+        let ctx = Arc::new(Context::new());
+        let key = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+        let combo = deriveaddresses(&ctx, &json!([checksummed(&format!("combo({key})"))]))
+            .unwrap_or_else(|err| panic!("uncompressed combo must derive: {err}"));
+        let pkh = deriveaddresses(&ctx, &json!([checksummed(&format!("pkh({key})"))]))
+            .unwrap_or_else(|err| panic!("pkh of the same key: {err}"));
+        assert_eq!(combo, pkh);
+        assert_eq!(combo.as_array().map(sonic_rs::Array::len), Some(1));
+    }
+
+    /// A compressed combo is the flat BIP 384 set: `pkh`, `wpkh`, `sh(wpkh)`.
+    #[test]
+    fn combo_compressed_derives_the_bip384_address_set() {
+        let ctx = Arc::new(Context::new());
+        let key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let combo = deriveaddresses(&ctx, &json!([checksummed(&format!("combo({key})"))]))
+            .unwrap_or_else(|err| panic!("compressed combo must derive: {err}"));
+        let pkh = deriveaddresses(&ctx, &json!([checksummed(&format!("pkh({key})"))]))
+            .unwrap_or_else(|err| panic!("pkh: {err}"));
+        let wpkh = deriveaddresses(&ctx, &json!([checksummed(&format!("wpkh({key})"))]))
+            .unwrap_or_else(|err| panic!("wpkh: {err}"));
+        let sh_wpkh = deriveaddresses(&ctx, &json!([checksummed(&format!("sh(wpkh({key}))"))]))
+            .unwrap_or_else(|err| panic!("sh(wpkh): {err}"));
+        let expected = json!([
+            pkh.as_array()
+                .and_then(|arr| arr.first())
+                .cloned()
+                .unwrap_or_else(|| panic!("pkh address")),
+            wpkh.as_array()
+                .and_then(|arr| arr.first())
+                .cloned()
+                .unwrap_or_else(|| panic!("wpkh address")),
+            sh_wpkh
+                .as_array()
+                .and_then(|arr| arr.first())
+                .cloned()
+                .unwrap_or_else(|| panic!("sh(wpkh) address")),
+        ]);
+        assert_eq!(combo, expected);
+    }
+
+    /// Ranged combo uses the same range contract as every other descriptor, and
+    /// each index contributes the BIP 384 address set.
+    #[test]
+    fn combo_range_must_match_and_derives_one_set_per_index() {
+        let ctx = Arc::new(Context::new());
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+        let ranged = checksummed(&format!("combo({xpub}/0/*)"));
+        let missing = deriveaddresses(&ctx, &json!([ranged]))
+            .err()
+            .unwrap_or_else(|| panic!("a ranged combo needs a range"));
+        assert_eq!(missing.code(), RpcError::CORE_INVALID_PARAMETER);
+
+        let fixed = checksummed(
+            "combo(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)",
+        );
+        let unwanted = deriveaddresses(&ctx, &json!([fixed, [0, 1]]))
+            .err()
+            .unwrap_or_else(|| panic!("a fixed combo takes no range"));
+        assert_eq!(unwanted.code(), RpcError::CORE_INVALID_PARAMETER);
+
+        let derived = deriveaddresses(&ctx, &json!([ranged, [0, 1]]))
+            .unwrap_or_else(|err| panic!("ranged combo must derive: {err}"));
+        let Some(addresses) = derived.as_array() else {
+            panic!("expected a flat array: {derived:?}");
+        };
+        assert_eq!(addresses.len(), 6, "3 addresses × 2 indices: {derived:?}");
+        let distinct: std::collections::BTreeSet<&str> = addresses
+            .iter()
+            .filter_map(JsonValueTrait::as_str)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            6,
+            "each script and index is distinct: {derived:?}"
+        );
+    }
+
+    /// A testnet WIF combo is refused on mainnet during derivation too.
+    #[test]
+    fn combo_does_not_derive_from_a_testnet_wif_on_mainnet() {
+        let ctx = Arc::new(Context::new());
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
+        ])
+        .unwrap_or_else(|err| panic!("secret 1 is valid: {err}"));
+        let wif = bitcoin::PrivateKey {
+            compressed: true,
+            network: bitcoin::NetworkKind::Test,
+            inner: secret,
+        }
+        .to_string();
+        let error = deriveaddresses(&ctx, &json!([checksummed(&format!("combo({wif})"))]))
+            .err()
+            .unwrap_or_else(|| panic!("a testnet WIF must not derive on mainnet"));
+        assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
+        assert!(error.to_string().contains("test network"), "got {error}");
     }
 }
