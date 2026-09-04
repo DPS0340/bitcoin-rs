@@ -145,7 +145,7 @@ def result_regions(body: str) -> list[str]:
         cursor = end
 
 
-def parse_variant(region: str) -> dict | None:
+def parse_variant(region: str, inherited_fields: list[dict] | None = None) -> dict | None:
     """Turn one `RPCResult{...}` region into a schema for that variant."""
     inner = region[1:-1] if region.startswith("{") else region
     head = HEAD_RE.match(inner)
@@ -199,6 +199,12 @@ def parse_variant(region: str) -> dict | None:
         top = min(depth for depth, _ in seen_at_depth)
         fields = [field for depth, field in seen_at_depth if depth == top]
 
+    # ELISION is Core's splice marker: inherit the fields from the preceding
+    # result variant rather than turning it into a fictitious empty-name field.
+    if any(field["type"] == "ELISION" for field in fields):
+        fields = [field for field in fields if field["type"] != "ELISION"]
+        fields[0:0] = inherited_fields or []
+
     fields.extend(
         {"type": match.group(1), "name": match.group(2), "optional": True}
         for match in EMPLACE_RE.finditer(rest)
@@ -214,7 +220,14 @@ def parse_variant(region: str) -> dict | None:
 
 def parse_result(regions: list[str]) -> dict | None:
     """Every shape a method can return, in the order Core declares them."""
-    variants = [v for v in (parse_variant(region) for region in regions) if v]
+    variants = []
+    inherited_fields = None
+    for region in regions:
+        variant = parse_variant(region, inherited_fields)
+        if variant:
+            variants.append(variant)
+            inherited_fields = variant.get("fields")
+    variants = [v for v in variants if v]
     if not variants:
         return None
     if len(variants) == 1:

@@ -90,8 +90,7 @@ impl SchemaDiff {
 /// type mismatch, which is what mine did before I read the table.
 ///
 /// `ANY` and `ELISION` are Core's own opt-outs (`std::nullopt` there) and match
-/// anything. An unrecognised name does too: a future Core adding a type must
-/// not turn into a spurious failure here.
+/// anything. Unknown names are rejected while loading the schema below.
 #[must_use]
 pub fn type_matches(kind: &str, value: &Value) -> bool {
     match kind {
@@ -101,7 +100,8 @@ pub fn type_matches(kind: &str, value: &Value) -> bool {
         "BOOL" => value.get_type() == JsonType::Boolean,
         "ARR" | "ARR_FIXED" => value.get_type() == JsonType::Array,
         "OBJ" | "OBJ_DYN" => value.get_type() == JsonType::Object,
-        _ => true,
+        "ANY" | "ELISION" => true,
+        _ => false,
     }
 }
 
@@ -249,6 +249,12 @@ pub fn load_schemas() -> alloc::collections::BTreeMap<alloc::string::String, Cor
                     .collect()
             })
             .unwrap_or_default();
+        let kind = value.get("type").and_then(JsonValueTrait::as_str)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or_else(|| panic!("schema variant type must be a non-empty string"));
+        if !matches!(kind, "NONE" | "STR" | "STR_HEX" | "NUM" | "STR_AMOUNT" | "NUM_TIME" | "BOOL" | "ARR" | "ARR_FIXED" | "OBJ" | "OBJ_DYN" | "ANY" | "ELISION") {
+            panic!("unsupported schema variant type: {kind}");
+        }
         CoreVariant {
             when: value
                 .get("when")
