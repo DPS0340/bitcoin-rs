@@ -1057,6 +1057,7 @@ struct TxIndexSpawn {
     block_source: crate::NodeBlockSource,
     body_source: Arc<dyn BlockBodySource>,
     wake_rx: Receiver<()>,
+    recovery_reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
 }
 
 /// Aggregate handle to a running node.
@@ -1263,6 +1264,16 @@ impl NodeState {
         // valid format/bounds, matching genesis, older writer epoch, and
         // strictly greater witness height than the restored tip.
         let genesis_hex = config.network.genesis_block_hash().to_string_be();
+        // One reporter routes every rollback fact of this process — the
+        // checkpoint fallback detected here and the index-ahead rewinds the
+        // txindex worker detects later — through the same warning store and
+        // event marker.
+        let recovery_reporter = Arc::new(crate::recovery_evidence::RecoveryReporter::new(
+            Arc::clone(&warning_store),
+            config.data_dir.clone(),
+            genesis_hex.clone(),
+            epoch,
+        ));
         let restored_height = restored_applied_tip.as_ref().map_or(0, |tip| tip.height);
         let restored_hash = restored_applied_tip
             .as_ref()
@@ -1277,17 +1288,11 @@ impl NodeState {
                 &genesis_hex,
                 restored_height,
             ) {
-                let reporter = crate::recovery_evidence::RecoveryReporter::new(
-                    Arc::clone(&warning_store),
-                    config.data_dir.clone(),
-                    genesis_hex.clone(),
-                    epoch,
-                );
                 let source = match resume_source {
                     ResumeSource::Cold => "cold",
                     ResumeSource::Checkpoint => "checkpoint",
                 };
-                reporter
+                recovery_reporter
                     .report_checkpoint_fallback(
                         witness_height,
                         restored_height,
@@ -1373,6 +1378,7 @@ impl NodeState {
                             block_source,
                             body_source,
                             wake_rx,
+                            recovery_reporter: Arc::clone(&recovery_reporter),
                         }),
                         Some(lifecycle),
                         Some(adapter),
@@ -1382,11 +1388,7 @@ impl NodeState {
             };
         let capabilities = Arc::new(crate::capabilities::NodeCapabilities::new(
             crate::capabilities::CapabilityInputs {
-                applied_tip: Arc::clone(&applied_tip),
-                tx_query: tx_index_adapter.as_ref().map(|adapter| {
-                    let query: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = adapter.clone();
-                    query
-                }),
+                tx_lifecycle: tx_index_lifecycle.clone(),
                 tx_runtime: tx_index_runtime.clone(),
                 txindex_enabled: crate::capabilities::txindex_enabled(&config),
             },
@@ -1572,10 +1574,10 @@ impl NodeState {
     /// internal to the crate.
     pub fn publish_checkpoint(&self) -> Result<u64> {
         match self.write_clean_checkpoint()? {
-            crate::checkpoint::CheckpointWrite::Published { generation } => Ok(generation),
             crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => {
                 bail!("checkpoint refused: no applied tip to publish")
             }
+            crate::checkpoint::CheckpointWrite::Published { generation } => Ok(generation),
         }
     }
 
@@ -1777,6 +1779,7 @@ impl NodeState {
             spawn.block_source,
             Some(spawn.body_source),
             Arc::clone(&self.chain_events),
+            spawn.recovery_reporter,
             Arc::clone(&self.apply_handles.shutdown),
             spawn.wake_rx,
         )
@@ -4132,7 +4135,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn non_regular_epoch_lock_refuses_start() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
