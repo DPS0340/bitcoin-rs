@@ -202,14 +202,14 @@ pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     })
 }
 
-pub(crate) fn getdescriptorinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+pub(crate) fn getdescriptorinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let descriptor = required_str(params, 0, "descriptor is required")?;
     // Optional here, as in Core: `Parse` is called without `require_checksum`,
     // so a bare descriptor is analysed and one carrying a checksum has it
     // checked.
     let checksum = checked_checksum(descriptor, ChecksumRequirement::Optional)?;
 
-    let info = analyse(descriptor).map_err(descriptor_error)?;
+    let info = analyse(descriptor, convert::bitcoin_network(ctx.chain_network)).map_err(descriptor_error)?;
 
     typed_to_sonic(&v31::GetDescriptorInfo {
         // The canonical form comes from the parse, so a descriptor handed to this
@@ -486,10 +486,22 @@ impl core::fmt::Display for DescriptorError {
 /// material back separately, and this function keeps only the fact that there
 /// was some. Echoing the caller's text back would return an `xprv` to whoever
 /// asked, which is the one thing this call must not do.
-fn analyse(text: &str) -> Result<DescriptorInfo, DescriptorError> {
+fn analyse(text: &str, network: bitcoin::Network) -> Result<DescriptorInfo, DescriptorError> {
+    if let Some(key) = parse_combo(text)? {
+        let (public, private) = combo_key_forms(key)?;
+        ensure_combo_key_network(&public, network)?;
+        return Ok(DescriptorInfo {
+            canonical: format!("combo({public})"),
+            multipath_expansion: Vec::new(),
+            is_range: public.contains('*'),
+            is_solvable: true,
+            has_private_keys: private,
+        });
+    }
     let secp = bitcoin::secp256k1::Secp256k1::signing_only();
     match MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(&secp, text) {
         Ok((descriptor, keys)) => {
+            ensure_keys_match_network(&descriptor, network)?;
             let multipath_expansion = if descriptor.is_multipath() {
                 descriptor
                     .clone()
@@ -519,16 +531,47 @@ fn analyse(text: &str) -> Result<DescriptorInfo, DescriptorError> {
         // refusing the question -- but it still checks that what is inside the
         // brackets is an address or a script, and so does this.
         Err(error) => match parse_unspendable(strip_checksum(text)) {
-            Some(unspendable) => Ok(DescriptorInfo {
-                canonical: unspendable?.canonical(),
+            Some(unspendable) => {
+                let unspendable = unspendable?;
+                if let Unspendable::Address(address) = &unspendable {
+                    address.clone().require_network(network).map_err(|error| DescriptorError::Parse(error.to_string()))?;
+                }
+                Ok(DescriptorInfo {
+                canonical: unspendable.canonical(),
                 multipath_expansion: Vec::new(),
                 is_range: false,
                 is_solvable: false,
                 has_private_keys: false,
+                  })
+              }
             }),
             None => Err(DescriptorError::Parse(error.to_string())),
         },
     }
+}
+
+fn parse_combo(text: &str) -> Result<Option<&str>, DescriptorError> {
+    let body = strip_checksum(text);
+    if let Some(key) = body.strip_prefix("combo(").and_then(|s| s.strip_suffix(')')) {
+        if key.is_empty() { return Err(DescriptorError::Parse("Invalid combo descriptor".into())); }
+        return Ok(Some(key));
+    }
+    Ok(None)
+}
+
+fn combo_key_forms(key: &str) -> Result<(String, bool), DescriptorError> {
+    let secp = bitcoin::secp256k1::Secp256k1::signing_only();
+    let (descriptor, keys) = MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &format!("pkh({key})"))
+        .map_err(|e| DescriptorError::Parse(e.to_string()))?;
+    let rendered = descriptor.to_string();
+    let public = rendered.strip_prefix("pkh(").and_then(|s| s.strip_suffix(')')).ok_or_else(|| DescriptorError::Parse("Invalid combo key".into()))?;
+    Ok((public.to_owned(), !keys.is_empty()))
+}
+
+fn ensure_combo_key_network(key: &str, network: bitcoin::Network) -> Result<(), DescriptorError> {
+    let secp = bitcoin::secp256k1::Secp256k1::signing_only();
+    let (descriptor, _) = MiniscriptDescriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &format!("pkh({key})")).map_err(|e| DescriptorError::Parse(e.to_string()))?;
+    ensure_keys_match_network(&descriptor, network)
 }
 
 /// Derives the addresses a descriptor describes.
