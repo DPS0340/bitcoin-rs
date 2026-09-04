@@ -470,6 +470,30 @@ fn count_through(
     cumulative_tx_count_through(&log, node.height)
 }
 
+/// Transactions inside the window, from one source for both ends.
+///
+/// The durable counter is a tip total and cannot name the ancestor, so it
+/// does not participate here. Mixing it with a log prefix would report
+/// `durable_tip - log_start` whenever the two disagreed. The tree answers
+/// when both nodes were counted; otherwise a complete genesis-to-end log
+/// prefix answers both ends together. `None` when neither source can.
+fn window_tx_count_between(
+    ctx: &Context,
+    tree: &bitcoin_rs_chain::BlockTree,
+    start_id: bitcoin_rs_chain::NodeId,
+    end_id: bitcoin_rs_chain::NodeId,
+) -> Option<u64> {
+    let start = tree.node(start_id).ok()?;
+    let end = tree.node(end_id).ok()?;
+    if end.chain_tx_count > 0 && start.chain_tx_count > 0 {
+        return Some(end.chain_tx_count.saturating_sub(start.chain_tx_count));
+    }
+    let log = ctx.blocks.read();
+    let end_count = cumulative_tx_count_through(&log, end.height)?;
+    let start_count = cumulative_tx_count_through(&log, start.height)?;
+    Some(end_count.saturating_sub(start_count))
+}
+
 /// Computes the figures behind a `getchaintxstats` response against a block
 /// tree the caller already holds a read guard on.
 ///
@@ -525,10 +549,7 @@ fn window_stats(
             "selected chain is missing the window ancestor".to_owned(),
         ));
     };
-    let start_tx_count = count_through(ctx, tree, start_id, false);
-    let window_tx_count = total_tx_count
-        .zip(start_tx_count)
-        .map(|(end, start)| end.saturating_sub(start));
+    let window_tx_count = window_tx_count_between(ctx, tree, start_id, selected_id);
     let end_mtp = tree.median_time_past_at(selected_id, 11).unwrap_or(0);
     let start_mtp = tree.median_time_past_at(start_id, 11).unwrap_or(0);
     let window_interval = u64::from(end_mtp.saturating_sub(start_mtp));
@@ -1587,7 +1608,7 @@ mod tests {
     use bitcoin_rs_primitives::{OutPoint, Tx, TxIn, Txid};
 
     use super::*;
-    use crate::context::{BlockLog, chain_stats};
+    use crate::context::BlockLog;
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 
     struct SingleBlockSource {
@@ -2808,14 +2829,11 @@ mod tests {
         assert_eq!(time, u64::from(expected_time));
     }
 
-    /// A log with every shape the windowed search has to survive.
+    /// A log with a duplicate height and uneven record sizes.
     ///
-    /// Heights are non-decreasing, which is the invariant the binary searches
-    /// rest on, but they are not a clean `0..n`: height 3 is recorded twice, as
-    /// a reorg leaves it, so the "first record at this height" and
-    /// "records at or below this height" boundaries are not the same thing.
-    /// Timestamps dip at height 5, because block times are not monotonic and an
-    /// earliest-in-window that assumed they were would be wrong there.
+    /// Heights are non-decreasing, which is the invariant the prefix sums rest
+    /// on, but they are not a clean `0..n`: height 3 is recorded twice, as a
+    /// reorg leaves it. The running totals must count both records.
     fn shaped_log() -> BlockLog {
         const HEIGHTS: [u32; 10] = [0, 1, 2, 3, 3, 4, 5, 6, 7, 8];
         const TIMES: [u32; 10] = [
@@ -2837,71 +2855,34 @@ mod tests {
         log
     }
 
-    /// Catches treating a duplicate applied height as one record or choosing
-    /// its last timestamp rather than its first.
+    /// A complete genesis-to-height prefix is a chain total; anything else is not.
+    ///
+    /// Height 3 is recorded twice in the fixture. The prefix through that
+    /// height includes both records. A log that starts after genesis cannot
+    /// answer at all — the sum would be an under-count, not a chain total.
     #[test]
-    fn chain_stats_at_the_duplicate_height() {
+    fn cumulative_tx_count_through_requires_a_genesis_prefix() {
         let log = shaped_log();
-        // applied=3, window from height 2: end = 5 (indices 0..=4 are <= 3),
-        // tip is the FIRST record at height 3 (time 1030, not 1031), window
-        // covers indices 2..=4.
-        let stats = chain_stats(&log, 3, 2);
-        assert_eq!(stats.total_tx_count, 1 + 4 + 7 + 10 + 13);
-        assert_eq!(stats.window_tx_count, 7 + 10 + 13);
-        assert_eq!(stats.tip_time, Some(1_030));
-        assert_eq!(stats.earliest_window_time, Some(1_020));
-    }
+        assert_eq!(
+            cumulative_tx_count_through(&log, 3),
+            Some(1 + 4 + 7 + 10 + 13)
+        );
+        assert_eq!(cumulative_tx_count_through(&log, 8), Some(145));
+        assert_eq!(
+            cumulative_tx_count_through(&log, 9),
+            None,
+            "a height the log has not reached is unknown"
+        );
 
-    /// Catches counting records above the applied tip in the total or window.
-    #[test]
-    fn chain_stats_applied_tip_bounds_exclude_records_above_the_tip() {
-        let log = shaped_log();
-        // applied=4, whole-chain window: indices 5..=9 (tx 19+22+25+28) sit
-        // above the tip and must not leak into either count.
-        let stats = chain_stats(&log, 4, 0);
-        assert_eq!(stats.total_tx_count, 1 + 4 + 7 + 10 + 13 + 16);
-        assert_eq!(stats.window_tx_count, 1 + 4 + 7 + 10 + 13 + 16);
-        assert_eq!(stats.tip_time, Some(1_040));
-        assert_eq!(stats.earliest_window_time, Some(1_000));
-    }
-
-    /// Catches using the first window timestamp instead of its true minimum.
-    #[test]
-    fn chain_stats_earliest_window_time_survives_non_monotonic_timestamps() {
-        let log = shaped_log();
-        // applied=8 (whole log), window from height 4: the window's earliest
-        // time is 1035 at height 5, INSIDE the window — an implementation that
-        // assumed times rise with height would answer 1040 (the window front).
-        let stats = chain_stats(&log, 8, 4);
-        assert_eq!(stats.total_tx_count, 145);
-        assert_eq!(stats.window_tx_count, 16 + 19 + 22 + 25 + 28);
-        assert_eq!(stats.tip_time, Some(1_080));
-        assert_eq!(stats.earliest_window_time, Some(1_035));
-    }
-
-    /// Catches exclusive lower bounds, nonempty zero windows, and failures to
-    /// handle sparse applied heights beyond the log without panicking.
-    #[test]
-    fn chain_stats_at_the_log_edges() {
-        let log = shaped_log();
-        // Window entirely above the applied tip: empty, never a panic.
-        let stats = chain_stats(&log, 8, 9);
-        assert_eq!(stats.total_tx_count, 145);
-        assert_eq!(stats.window_tx_count, 0);
-        assert_eq!(stats.tip_time, Some(1_080));
-        assert_eq!(stats.earliest_window_time, None);
-        // Applied tip past the end of the log: everything counts, no tip time.
-        let stats = chain_stats(&log, 10, 0);
-        assert_eq!(stats.total_tx_count, 145);
-        assert_eq!(stats.window_tx_count, 145);
-        assert_eq!(stats.tip_time, None);
-        assert_eq!(stats.earliest_window_time, Some(1_000));
-        // Applied tip at the log's first record.
-        let stats = chain_stats(&log, 0, 0);
-        assert_eq!(stats.total_tx_count, 1);
-        assert_eq!(stats.window_tx_count, 1);
-        assert_eq!(stats.tip_time, Some(1_000));
-        assert_eq!(stats.earliest_window_time, Some(1_000));
+        let mut without_genesis = BlockLog::new();
+        for record in log.iter().skip(1).cloned() {
+            without_genesis.push(record);
+        }
+        assert_eq!(
+            cumulative_tx_count_through(&without_genesis, 3),
+            None,
+            "a prefix that does not start at genesis is not a chain total"
+        );
     }
 
     /// The running sums are the log's only aggregates; push, pop, clear and the
@@ -4745,6 +4726,44 @@ mod chaintxstats_window_tests {
             field(&stats(&ctx, &json!([2, hash.to_string_be()])), "txcount"),
             Some((historical + 1) * (historical + 2) / 2),
             "a historical block is counted through the log, not handed the tip's total"
+        );
+    }
+
+    /// A known durable tip total must not suppress a window the log can count.
+    ///
+    /// The counter is one number, the total through the tip. Subtracting a
+    /// log prefix from that number is only right when the two agree. The
+    /// fixture sets them apart on purpose: mixing them would report
+    /// `TIP_TOTAL - log_start` instead of the window the log actually holds.
+    #[test]
+    fn a_durable_tip_total_does_not_block_a_complete_log_window() {
+        const TIP_TOTAL: u64 = 999_999;
+        let ctx = chain_ctx_with_counter(&TIMES, Some(TIP_TOTAL));
+        let blocks = 4_i64;
+        let final_height = TIMES.len() - 1;
+        let past_height = final_height - usize::try_from(blocks).unwrap_or(0);
+        let expected: i64 = (past_height + 1..=final_height)
+            .map(|height| i64::try_from(height).unwrap_or(0) + 1)
+            .sum();
+        let mixed = i64::try_from(TIP_TOTAL).unwrap_or(0)
+            - (0..=past_height)
+                .map(|height| i64::try_from(height).unwrap_or(0) + 1)
+                .sum::<i64>();
+        assert_ne!(
+            expected, mixed,
+            "the fixture must separate the two sources, or it proves nothing"
+        );
+
+        let result = stats(&ctx, &json!([blocks]));
+        assert_eq!(
+            field(&result, "txcount"),
+            Some(i64::try_from(TIP_TOTAL).unwrap_or(0)),
+            "the applied tip still answers from the durable counter"
+        );
+        assert_eq!(
+            field(&result, "window_tx_count"),
+            Some(expected),
+            "the window must come from the log, not durable_tip - log_start: {result:?}"
         );
     }
 
