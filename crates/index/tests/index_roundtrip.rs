@@ -702,9 +702,9 @@ fn format_3_open_resets_only_script_history() -> Result<(), Box<dyn std::error::
         &1_u32.to_le_bytes(),
     )?;
 
-    let tx_lookup = store
-        .get(ColumnFamily::UtxoMeta, &[0x00, b'T'])?
-        .expect("tx lookup watermark");
+    let Some(tx_lookup) = store.get(ColumnFamily::UtxoMeta, &[0x00, b'T'])? else {
+        return Err("tx lookup watermark".into());
+    };
     let confirmed_before = store.count(ColumnFamily::TxConfirmed);
     let headers_before = store.count(ColumnFamily::BlockHeaders);
     assert!(store.count(ColumnFamily::Funding) > 0);
