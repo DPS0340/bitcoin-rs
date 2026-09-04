@@ -93,6 +93,7 @@ impl CliArgs {
                 metrics_bind: self.metrics_bind,
             },
             notifications: None,
+            chainstate_journal: None,
             validation: ValidationOverrides {
                 assume_valid_height: self.assume_valid_height,
             },

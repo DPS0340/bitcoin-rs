@@ -263,6 +263,50 @@ hwm = 5000
         assert_eq!(config.network, Network::Mainnet);
     }
 
+    #[test]
+    fn toml_chainstate_journal_is_overridden_by_environment() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let path = dir.path().join("node.toml");
+        std::fs::write(
+            &path,
+            r#"
+[chainstate_journal]
+enabled = true
+blocks = 100
+"#,
+        )
+        .unwrap_or_else(|error| panic!("write toml: {error}"));
+
+        let config = super::load(
+            [
+                "bitcoin-rs",
+                "--config",
+                path.to_str().unwrap_or_else(|| panic!("utf-8 path")),
+            ],
+            [("BITCOIN_RS_CHAINSTATE_JOURNAL_BLOCKS", "200")]
+                .into_iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        )
+        .unwrap_or_else(|error| panic!("valid journal configuration: {error}"));
+
+        assert!(config.chainstate_journal.enabled);
+        assert_eq!(config.chainstate_journal.blocks, 200);
+        assert_eq!(config.chainstate_journal.seconds, 5);
+    }
+
+    #[test]
+    fn environment_rejects_invalid_chainstate_journal_boolean() {
+        let error = match super::load(
+            ["bitcoin-rs"],
+            std::iter::once(("BITCOIN_RS_CHAINSTATE_JOURNAL", "sometimes"))
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        ) {
+            Ok(_) => panic!("invalid journal boolean must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid boolean"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn known_non_utf8_environment_value_is_rejected() {

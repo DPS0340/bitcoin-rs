@@ -116,3 +116,7 @@ toml.workspace = true
 [[bench]]
 name = "sync_pipeline"
 harness = false
+
+[[bench]]
+name = "chainstate_journal"
+harness = false

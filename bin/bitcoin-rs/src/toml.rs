@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use bitcoin_rs_node::{
-    IndexOverrides, NetworkSelection, NotificationConfig, ObservabilityOverrides, P2pOverrides,
-    RpcOverrides, ScriptIndexMode, StorageOverrides, UserConfig, ValidationOverrides,
+    ChainstateJournalOverrides, IndexOverrides, NetworkSelection, NotificationConfig,
+    ObservabilityOverrides, P2pOverrides, RpcOverrides, ScriptIndexMode, StorageOverrides,
+    UserConfig, ValidationOverrides,
 };
 use bitcoin_rs_storage::StorageBackend;
 use serde::Deserialize;
@@ -33,6 +34,7 @@ struct TomlFile {
     log_level: Option<String>,
     metrics_bind: Option<SocketAddr>,
     notifications: Option<NotificationConfig>,
+    chainstate_journal: Option<ChainstateJournalOverrides>,
     assume_valid_height: Option<u32>,
 }
 
@@ -101,6 +103,7 @@ impl TomlFile {
                 metrics_bind: self.metrics_bind,
             },
             notifications: self.notifications,
+            chainstate_journal: self.chainstate_journal,
             validation: ValidationOverrides {
                 assume_valid_height: self.assume_valid_height,
             },

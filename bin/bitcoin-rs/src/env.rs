@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
-use bitcoin_rs_node::{NetworkSelection, ScriptIndexMode, UserConfig};
+use bitcoin_rs_node::{ChainstateJournalOverrides, NetworkSelection, ScriptIndexMode, UserConfig};
 use bitcoin_rs_storage::StorageBackend;
 
 use crate::cli::{parse_bool, parse_connect_list, parse_p2p_magic, parse_socket_list};
@@ -28,6 +28,13 @@ enum EnvSetting {
     LogLevel,
     MetricsBind,
     AssumeValidHeight,
+    ChainstateJournal,
+    ChainstateJournalBlocks,
+    ChainstateJournalSeconds,
+    ChainstateJournalRotateMib,
+    ChainstateJournalMaxJournalMib,
+    ChainstateJournalMaxLagBlocks,
+    ChainstateJournalMaxLagSeconds,
 }
 
 pub(crate) fn user_config_from_env(
@@ -68,6 +75,17 @@ fn env_setting(key: &str) -> Option<EnvSetting> {
         "BITCOIN_RS_LOG_LEVEL" => EnvSetting::LogLevel,
         "BITCOIN_RS_METRICS_BIND" => EnvSetting::MetricsBind,
         "BITCOIN_RS_ASSUME_VALID_HEIGHT" => EnvSetting::AssumeValidHeight,
+        "BITCOIN_RS_CHAINSTATE_JOURNAL" => EnvSetting::ChainstateJournal,
+        "BITCOIN_RS_CHAINSTATE_JOURNAL_BLOCKS" => EnvSetting::ChainstateJournalBlocks,
+        "BITCOIN_RS_CHAINSTATE_JOURNAL_SECONDS" => EnvSetting::ChainstateJournalSeconds,
+        "BITCOIN_RS_CHAINSTATE_JOURNAL_ROTATE_MIB" => EnvSetting::ChainstateJournalRotateMib,
+        "BITCOIN_RS_CHAINSTATE_JOURNAL_MAX_JOURNAL_MIB" => {
+            EnvSetting::ChainstateJournalMaxJournalMib
+        }
+        "BITCOIN_RS_CHAINSTATE_JOURNAL_MAX_LAG_BLOCKS" => EnvSetting::ChainstateJournalMaxLagBlocks,
+        "BITCOIN_RS_CHAINSTATE_JOURNAL_MAX_LAG_SECONDS" => {
+            EnvSetting::ChainstateJournalMaxLagSeconds
+        }
         _ => return None,
     })
 }
@@ -118,6 +136,25 @@ fn apply(layer: &mut UserConfig, setting: EnvSetting, value: &str) -> Result<()>
         EnvSetting::AssumeValidHeight => {
             layer.validation.assume_valid_height = Some(value.parse()?);
         }
+        EnvSetting::ChainstateJournal => journal(layer).enabled = Some(parse_bool(value)?),
+        EnvSetting::ChainstateJournalBlocks => journal(layer).blocks = Some(value.parse()?),
+        EnvSetting::ChainstateJournalSeconds => journal(layer).seconds = Some(value.parse()?),
+        EnvSetting::ChainstateJournalRotateMib => journal(layer).rotate_mib = Some(value.parse()?),
+        EnvSetting::ChainstateJournalMaxJournalMib => {
+            journal(layer).max_journal_mib = Some(value.parse()?);
+        }
+        EnvSetting::ChainstateJournalMaxLagBlocks => {
+            journal(layer).max_lag_blocks = Some(value.parse()?);
+        }
+        EnvSetting::ChainstateJournalMaxLagSeconds => {
+            journal(layer).max_lag_seconds = Some(value.parse()?);
+        }
     }
     Ok(())
+}
+
+fn journal(layer: &mut UserConfig) -> &mut ChainstateJournalOverrides {
+    layer
+        .chainstate_journal
+        .get_or_insert_with(ChainstateJournalOverrides::default)
 }
