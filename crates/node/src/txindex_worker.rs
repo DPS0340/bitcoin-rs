@@ -1961,16 +1961,11 @@ impl Worker {
                 hash: current.hash.to_le_bytes(),
             };
             let coins = utxo.with_stable_view(|view| {
-                view.scan_all()
-                    .unspents
-                    .into_iter()
-                    .map(|coin| {
-                        (
-                            coin.outpoint,
-                            ScriptHash::from_script_bytes(&coin.txout.script_pubkey),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                let mut coins = Vec::new();
+                view.for_each_all(|outpoint, script| {
+                    coins.push((*outpoint, ScriptHash::from_script_bytes(script)));
+                });
+                coins
             });
             (target, coins)
         };
