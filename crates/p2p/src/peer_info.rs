@@ -122,7 +122,7 @@ mod tests {
             | (1_u64 << 3)            // WITNESS
             | (1_u64 << 6)            // COMPACT_FILTERS
             | (1_u64 << 10)           // NETWORK_LIMITED
-            | (1_u64 << 11);          // P2P_V2
+            | (1_u64 << 11); // P2P_V2
 
         assert_eq!(
             peer_info_with_services(all_known).services_names(),

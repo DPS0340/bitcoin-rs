@@ -25,6 +25,8 @@ pub mod esplora;
 pub mod handlers;
 /// Declared compatibility surface versus Bitcoin Core 31.x.
 pub mod manifest;
+/// Unified registry: one row owns compat metadata plus dispatch arm.
+pub(crate) mod registry;
 /// Semantic Core projections without transport policy.
 pub mod render;
 /// Bitcoin Core-compatible REST endpoints.

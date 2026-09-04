@@ -1,5 +1,4 @@
-//! Durable rollback evidence: witness and marker file protocol with bounded
-//! current/previous recovery, one atomic warning snapshot, and reporting.
+//! Durable rollback evidence: witness and marker file protocol.
 //!
 //! Private to the node crate. Implements A2 of REC-A12.
 //!
