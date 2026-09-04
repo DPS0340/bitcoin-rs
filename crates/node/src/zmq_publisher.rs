@@ -4,13 +4,13 @@
 //! via ZMQ for client subscribers. `bitcoin-rs` keeps the apply path behind a
 //! small trait so notification failures cannot affect block connection.
 
-#[cfg(feature = "zmq")]
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use bitcoin_rs_primitives::{Hash256, Txid};
 #[cfg(feature = "zmq")]
 use core::fmt;
 #[cfg(feature = "zmq")]
 use hashbrown::HashSet;
+use std::collections::HashSet as StdHashSet;
 #[cfg(feature = "zmq")]
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -57,6 +57,22 @@ impl ZmqEndpointConfig {
     pub fn effective_hwm(&self) -> u32 {
         self.hwm.unwrap_or(DEFAULT_ZMQ_HWM)
     }
+}
+
+/// Validates grouped ZMQ configuration before it reaches a runtime boundary.
+pub fn validate_endpoint_configs(configs: &[ZmqEndpointConfig]) -> Result<()> {
+    let mut endpoints = StdHashSet::new();
+    for config in configs {
+        ensure!(!config.endpoint.trim().is_empty(), "ZMQ endpoint must not be empty");
+        ensure!(!config.topics.is_empty(), "ZMQ endpoint {} must have at least one topic", config.endpoint);
+        ensure!(endpoints.insert(&config.endpoint), "duplicate ZMQ endpoint: {}", config.endpoint);
+        ensure!(config.effective_hwm() <= i32::MAX as u32, "ZMQ HWM exceeds libzmq's signed SNDHWM range: {}", config.effective_hwm());
+        let mut topics = StdHashSet::new();
+        for topic in &config.topics {
+            ensure!(topics.insert(topic), "duplicate ZMQ topic on endpoint: {}", config.endpoint);
+        }
+    }
+    Ok(())
 }
 
 impl ZmqTopic {
@@ -323,6 +339,7 @@ impl SocketZmqPublisher {
     /// one owned socket and one HWM. Duplicate topics inside a group are
     /// recorded once.
     pub fn bind(endpoint_configs: &[ZmqEndpointConfig]) -> Result<Self> {
+        validate_endpoint_configs(endpoint_configs)?;
         let context = zmq::Context::new();
         let mut endpoints = Vec::new();
         let mut bound_endpoints = HashSet::<String>::new();
