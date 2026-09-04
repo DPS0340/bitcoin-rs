@@ -3925,9 +3925,8 @@ mod tests {
     #[test]
     fn invalidate_block_settlement_failure_is_not_success() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let data_dir = dir.path().join("node");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.data_dir = data_dir.clone();
+        config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         let state = NodeState::open(config.clone(), None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();

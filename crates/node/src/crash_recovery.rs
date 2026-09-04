@@ -473,7 +473,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join(META_FILENAME);
         let store = Arc::new(MapBodyStore::new(path.clone()));
-        let publisher = ProgressPublisher::new(path.clone(), store.clone(), 0);
+        let publisher = ProgressPublisher::new(path.clone(), store, 0);
         let first = hash(1);
         let lower = hash(2);
 
@@ -495,7 +495,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join(META_FILENAME);
         let store = Arc::new(MapBodyStore::new(path.clone()));
-        let publisher = ProgressPublisher::new(path.clone(), store.clone(), 0);
+        let publisher = ProgressPublisher::new(path.clone(), store, 0);
         let recovered = hash(1);
         let refetched = hash(2);
 
