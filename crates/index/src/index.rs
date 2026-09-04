@@ -761,6 +761,15 @@ fn resume_capability_reset<S: KvStore>(
             ORDINARY_STATE_REVISION_KEY,
             &work.next_revision,
         );
+        if capabilities.script_history {
+            // Resume of a claim that predates the acquire-batch marker
+            // still publishes the current row-value format.
+            completion.put(
+                ColumnFamily::UtxoMeta,
+                INDEX_FORMAT_VERSION_KEY,
+                &INDEX_FORMAT_VERSION.to_le_bytes(),
+            );
+        }
         if store.write_durable_if(&conditions, completion)? {
             return Ok(());
         }
