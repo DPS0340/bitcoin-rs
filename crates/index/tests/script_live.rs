@@ -170,12 +170,13 @@ impl KvSnapshot for MemorySnapshot {
         cf: ColumnFamily,
         prefix: &[u8],
     ) -> Result<KvIter<'a>, StorageError> {
-        let rows = self.cfs[cf.index()]
-            .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
-            .map(|(key, value)| Ok((key.clone(), value.clone())))
-            .collect::<Vec<_>>();
-        Ok(Box::new(rows.into_iter()))
+        let prefix = prefix.to_vec();
+        Ok(Box::new(
+            self.cfs[cf.index()]
+                .iter()
+                .filter(move |(key, _)| key.starts_with(&prefix))
+                .map(|(key, value)| Ok((key.clone(), value.clone()))),
+        ))
     }
 }
 

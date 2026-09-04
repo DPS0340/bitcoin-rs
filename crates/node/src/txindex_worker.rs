@@ -3225,7 +3225,7 @@ impl TxIndexQueryEngine {
             ));
         };
         let rows = Self::scan_live_rows(snapshot, budget, scripthash)?;
-        return utxo.with_stable_view(|view| {
+        utxo.with_stable_view(|view| {
             let mut records = Vec::with_capacity(rows.len());
             for row in rows {
                 let outpoint = row.outpoint();
@@ -3258,7 +3258,7 @@ impl TxIndexQueryEngine {
             });
             records.dedup_by(|a, b| a.txid == b.txid && a.vout == b.vout);
             Ok(records)
-        });
+        })
     }
 
     fn index_info_internal(

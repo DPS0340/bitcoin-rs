@@ -2,13 +2,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::NodeStatus;
-use bitcoin_rs_index::{ScriptHashRow, SpendingPrefixRow, TxidRow};
+use bitcoin_rs_index::{ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow};
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Network, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
     encode::double_sha256,
 };
 use bitcoin_rs_rpc::context::{BlockRecord, ScriptHistoryRecord};
 use bitcoin_rs_storage::{ColumnFamily, PrefixScan, PrefixScanLimit};
+use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 
 use super::*;
 
@@ -89,12 +90,11 @@ impl TxIndexSnapshot for QuerySnapshot {
         capability: IndexCapability,
     ) -> Result<Option<IndexWatermark>, IndexError> {
         Ok(match capability {
-            IndexCapability::TxLookup => Some(self.watermark),
+            IndexCapability::TxLookup | IndexCapability::ScriptLive => Some(self.watermark),
             IndexCapability::ScriptHistory => match self.script_history_watermark {
                 ScriptHistoryWatermark::MatchTx => Some(self.watermark),
                 ScriptHistoryWatermark::Override(watermark) => watermark,
             },
-            IndexCapability::ScriptLive => None,
         })
     }
 
@@ -126,6 +126,41 @@ impl TxIndexSnapshot for QuerySnapshot {
             ColumnFamily::Spending,
             &SpendingPrefixRow::scan_prefix(outpoint),
         )
+    }
+
+    fn live_rows(
+        &self,
+        scripthash: ScriptHash,
+        _limit: PrefixScanLimit,
+    ) -> Result<bitcoin_rs_index::ScriptLiveScan, IndexError> {
+        if let Some(aba) = &self.aba {
+            aba.trigger_on(
+                ColumnFamily::ScriptLive,
+                &ScriptHashRow::scan_prefix(scripthash),
+            );
+        }
+        let scan = self.scan_for(
+            ColumnFamily::ScriptLive,
+            &ScriptHashRow::scan_prefix(scripthash),
+        );
+        let encoded_bytes = scan.rows.iter().fold(0_usize, |total, (key, value)| {
+            total.saturating_add(key.len()).saturating_add(value.len())
+        });
+        let mut rows = Vec::with_capacity(scan.rows.len());
+        for (key, value) in scan.rows {
+            if !value.is_empty() {
+                return Err(IndexError::InvalidLiveRowValue { len: value.len() });
+            }
+            rows.push(
+                ScriptLiveRow::from_db_row(&key)
+                    .ok_or(IndexError::InvalidPrefixRowLength { len: key.len() })?,
+            );
+        }
+        Ok(bitcoin_rs_index::ScriptLiveScan {
+            rows,
+            encoded_bytes,
+            complete: scan.complete,
+        })
     }
 }
 
@@ -191,12 +226,20 @@ impl BlockBodySource for SingleBlockBody {
 
 impl QueryFixture {
     fn new(config: FixtureConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_script_history_watermark(config, ScriptHistoryWatermark::MatchTx)
+        Self::new_with_script_history_watermark(config, ScriptHistoryWatermark::MatchTx, None)
+    }
+
+    fn new_with_utxo(
+        config: FixtureConfig,
+        utxo: Arc<UtxoSet>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_script_history_watermark(config, ScriptHistoryWatermark::MatchTx, Some(utxo))
     }
 
     fn new_with_script_history_watermark(
         config: FixtureConfig,
         script_history_watermark: ScriptHistoryWatermark,
+        utxo: Option<Arc<UtxoSet>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let tip_id = tree.insert_header(config.block.header, NodeStatus::HeaderValid)?;
@@ -265,7 +308,7 @@ impl QueryFixture {
             tree,
             applied_tip,
             body_source,
-            None,
+            utxo,
             None,
         );
         Ok(Self { engine })
@@ -286,6 +329,7 @@ fn tx_queries_can_be_ready_while_script_history_is_backfilling()
             watermark: None,
         },
         ScriptHistoryWatermark::Override(None),
+        None,
     )?;
 
     assert!(TxIndexQuery::transaction(&fixture.engine, &txid)?.is_none());
@@ -474,19 +518,47 @@ fn unspent_outputs_preserve_distinct_vouts_for_same_transaction_and_script()
     let txid: Txid = block.txs[0].txid();
     let script = block.txs[0].outputs[0].script_pubkey.clone();
     let scripthash = ScriptHash::new(&script);
-    let funding_row = ScriptHashRow::row(scripthash, 0).to_db_row().to_vec();
-    let fixture = QueryFixture::new(FixtureConfig {
-        block,
-        retain_body: true,
-        scans: vec![scan_response(
-            ColumnFamily::Funding,
-            ScriptHashRow::scan_prefix(scripthash),
-            vec![(funding_row, Vec::new())],
-            true,
-        )],
-        aba_trigger: None,
-        watermark: None,
-    })?;
+    let outpoint0 = OutPoint { txid, vout: 0 };
+    let outpoint1 = OutPoint { txid, vout: 1 };
+
+    let utxo = Arc::new(UtxoSet::new());
+    let mut changes = BlockChanges::with_capacity(2, 0);
+    changes.add(UtxoAdd::new(
+        outpoint0,
+        block.txs[0].outputs[0].clone(),
+        true,
+        0,
+    ));
+    changes.add(UtxoAdd::new(
+        outpoint1,
+        block.txs[0].outputs[1].clone(),
+        true,
+        0,
+    ));
+    let block_hash: Hash256 = block.block_hash().into();
+    utxo.commit_block(&changes, &block_hash)?;
+
+    let live_row0 = ScriptLiveRow::new(scripthash, &outpoint0)
+        .as_bytes()
+        .to_vec();
+    let live_row1 = ScriptLiveRow::new(scripthash, &outpoint1)
+        .as_bytes()
+        .to_vec();
+    let fixture = QueryFixture::new_with_utxo(
+        FixtureConfig {
+            block,
+            retain_body: true,
+            scans: vec![scan_response(
+                ColumnFamily::ScriptLive,
+                ScriptHashRow::scan_prefix(scripthash),
+                vec![(live_row0, Vec::new()), (live_row1, Vec::new())],
+                true,
+            )],
+            aba_trigger: None,
+            watermark: None,
+        },
+        utxo,
+    )?;
 
     let outputs = fixture.engine.unspent_outputs(scripthash)?;
     let identities: Vec<_> = outputs
@@ -498,31 +570,37 @@ fn unspent_outputs_preserve_distinct_vouts_for_same_transaction_and_script()
 }
 
 #[test]
-fn unspent_outputs_reject_aggregate_scan_budget_exhaustion()
--> Result<(), Box<dyn std::error::Error>> {
+fn unspent_outputs_reject_truncated_live_scan() -> Result<(), Box<dyn std::error::Error>> {
     let mut block = Network::Regtest.genesis_block();
-    let transaction = &mut block.txs[0];
-    let output = transaction.outputs[0].clone();
-    transaction
+    let output = block.txs[0].outputs[0].clone();
+    block.txs[0]
         .outputs
         .extend(std::iter::repeat_n(output, QUERY_SCAN_COUNT_LIMIT - 1));
     block.header.merkle_root = compute_merkle_root(&block)
         .ok_or_else(|| std::io::Error::other("test block must have a merkle root"))?;
 
+    let txid: Txid = block.txs[0].txid();
     let scripthash = ScriptHash::new(&block.txs[0].outputs[0].script_pubkey);
-    let funding_row = ScriptHashRow::row(scripthash, 0).to_db_row().to_vec();
-    let fixture = QueryFixture::new(FixtureConfig {
-        block,
-        retain_body: true,
-        scans: vec![scan_response(
-            ColumnFamily::Funding,
-            ScriptHashRow::scan_prefix(scripthash),
-            vec![(funding_row, Vec::new())],
-            true,
-        )],
-        aba_trigger: None,
-        watermark: None,
-    })?;
+    let outpoint = OutPoint { txid, vout: 0 };
+    let live_row = ScriptLiveRow::new(scripthash, &outpoint)
+        .as_bytes()
+        .to_vec();
+    let utxo = Arc::new(UtxoSet::new());
+    let fixture = QueryFixture::new_with_utxo(
+        FixtureConfig {
+            block,
+            retain_body: true,
+            scans: vec![scan_response(
+                ColumnFamily::ScriptLive,
+                ScriptHashRow::scan_prefix(scripthash),
+                vec![(live_row, Vec::new())],
+                false,
+            )],
+            aba_trigger: None,
+            watermark: None,
+        },
+        utxo,
+    )?;
 
     assert!(matches!(
         fixture.engine.unspent_outputs(scripthash),
