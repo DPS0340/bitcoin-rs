@@ -18,7 +18,7 @@ const TXINDEX_FUNDING: FixedTable<12> = TableDefinition::new("txindex_v1_funding
 const TXINDEX_FUNDING_VALUES: TxIndexValueTable = TableDefinition::new("txindex_v1_funding_values");
 const TXINDEX_SPENDING: FixedTable<12> = TableDefinition::new("txindex_v1_spending");
 const TXINDEX_BLOCK_HEADERS: FixedTable<80> = TableDefinition::new("txindex_v1_block_headers");
-/// ScriptLive key width: `prefix(8) || txid(32) || vout(4)`.
+/// `ScriptLive` key width: `prefix(8) || txid(32) || vout(4)`.
 const SCRIPT_LIVE_KEY_LEN: usize = 44;
 const TXINDEX_SCRIPT_LIVE: FixedTable<SCRIPT_LIVE_KEY_LEN> =
     TableDefinition::new("txindex_v1_script_live");
@@ -770,7 +770,7 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Rejects a ScriptLive write that is not a 44-byte key with an empty value.
+/// Rejects a `ScriptLive` write that is not a 44-byte key with an empty value.
 ///
 /// The dedicated txindex store enforces this with a fixed-width table. The
 /// generic [`RedbStore`] path uses variable-width tables, so the same
@@ -783,7 +783,7 @@ fn validate_script_live_put(key: &[u8], value: &[u8]) -> Result<(), StorageError
     Ok(())
 }
 
-/// Validates ScriptLive puts in a generic [`RedbStore`] batch before a
+/// Validates `ScriptLive` puts in a generic [`RedbStore`] batch before a
 /// transaction begins, matching the dedicated txindex store's reject-first
 /// contract.
 fn validate_redb_store_batch(batch: &RedbWriteBatch) -> Result<(), StorageError> {
