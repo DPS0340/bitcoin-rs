@@ -3118,6 +3118,42 @@ impl<S: KvStore> IndexWriter<S> {
     /// Refuses to run over an existing live watermark. Seeding is for a fresh
     /// or reset capability; re-seeding a live view in place would have to
     /// reconcile stale rows, which is the reset path's job.
+    pub fn seed_script_live_stream<F>(
+        &mut self,
+        mut produce: F,
+        seed_tip: IndexWatermark,
+    ) -> Result<usize, IndexError>
+    where
+        F: FnMut(&mut dyn FnMut(OutPoint, crate::ScriptHash)),
+    {
+        self.ensure_prepared_ready()?;
+        if self.indexer.capability_watermark(IndexCapability::ScriptLive)?.is_some() {
+            return Err(IndexError::LiveAlreadySeeded);
+        }
+        const SEED_BATCH_ROWS: usize = 4_096;
+        let mut written = 0;
+        let mut batch = self.indexer.store.new_batch();
+        let mut in_batch = 0;
+        let mut add = |outpoint, scripthash| -> Result<(), IndexError> {
+            let row = crate::types::ScriptLiveRow::new(scripthash, &outpoint);
+            batch.put(ColumnFamily::ScriptLive, row.as_bytes(), &[]);
+            written += 1;
+            in_batch += 1;
+            if in_batch >= SEED_BATCH_ROWS {
+                let next = self.indexer.store.new_batch();
+                let old = std::mem::replace(&mut batch, next);
+                self.indexer.store.write_deferred(old)?;
+                in_batch = 0;
+            }
+            Ok(())
+        };
+        produce(&mut |op, hash| { let _ = add(op, hash); });
+        batch.put(ColumnFamily::UtxoMeta, FORMAT_VERSION_KEY, &FORMAT_VERSION_VALUE);
+        batch.put(ColumnFamily::UtxoMeta, SCRIPT_LIVE_WATERMARK_KEY, &seed_tip.to_bytes());
+        self.indexer.store.write_durable(batch)?;
+        Ok(written)
+    }
+
     pub fn seed_script_live<I>(
         &mut self,
         coins: I,
