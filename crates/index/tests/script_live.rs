@@ -654,6 +654,9 @@ fn live_and_history_watermarks_advance_independently() -> Result<(), Box<dyn std
 /// CONTRACT: IDX-07. Seeding writes rows and stamps the watermark last; recovery resets any
 /// partial rows before a fresh seed, and a second seed over the stamped
 /// watermark is refused.
+///
+/// CONTRACT: IDX-07 — partial ScriptLive rows remain unavailable until the
+/// live watermark is durably stamped.
 #[test]
 fn seeding_resets_partial_rows_and_stamps_once() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
