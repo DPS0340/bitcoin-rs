@@ -571,14 +571,109 @@
           "when": "for verbosity = 2",
           "fields": [
             {
-              "type": "ELISION",
-              "name": "",
+              "type": "STR_HEX",
+              "name": "hash",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "confirmations",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "size",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "strippedsize",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "weight",
+              "optional": false
+            },
+            {
+              "type": "OBJ",
+              "name": "coinbase_tx",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "height",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "version",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "versionHex",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "merkleroot",
               "optional": false
             },
             {
               "type": "ARR",
               "name": "tx",
               "optional": false
+            },
+            {
+              "type": "NUM_TIME",
+              "name": "time",
+              "optional": false
+            },
+            {
+              "type": "NUM_TIME",
+              "name": "mediantime",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "nonce",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "bits",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "target",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "difficulty",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "chainwork",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "nTx",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "previousblockhash",
+              "optional": true
+            },
+            {
+              "type": "STR_HEX",
+              "name": "nextblockhash",
+              "optional": true
             }
           ]
         },
@@ -587,14 +682,109 @@
           "when": "for verbosity = 3",
           "fields": [
             {
-              "type": "ELISION",
-              "name": "",
+              "type": "STR_HEX",
+              "name": "hash",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "confirmations",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "size",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "strippedsize",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "weight",
+              "optional": false
+            },
+            {
+              "type": "OBJ",
+              "name": "coinbase_tx",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "height",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "version",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "versionHex",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "merkleroot",
               "optional": false
             },
             {
               "type": "ARR",
               "name": "tx",
               "optional": false
+            },
+            {
+              "type": "NUM_TIME",
+              "name": "time",
+              "optional": false
+            },
+            {
+              "type": "NUM_TIME",
+              "name": "mediantime",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "nonce",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "bits",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "target",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "difficulty",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "chainwork",
+              "optional": false
+            },
+            {
+              "type": "NUM",
+              "name": "nTx",
+              "optional": false
+            },
+            {
+              "type": "STR_HEX",
+              "name": "previousblockhash",
+              "optional": true
+            },
+            {
+              "type": "STR_HEX",
+              "name": "nextblockhash",
+              "optional": true
             }
           ]
         }
@@ -1799,8 +1989,33 @@
           "when": "for verbosity = 2",
           "fields": [
             {
-              "type": "ELISION",
-              "name": "",
+              "type": "BOOL",
+              "name": "in_active_chain",
+              "optional": true
+            },
+            {
+              "type": "STR_HEX",
+              "name": "blockhash",
+              "optional": true
+            },
+            {
+              "type": "NUM",
+              "name": "confirmations",
+              "optional": true
+            },
+            {
+              "type": "NUM_TIME",
+              "name": "blocktime",
+              "optional": true
+            },
+            {
+              "type": "NUM",
+              "name": "time",
+              "optional": true
+            },
+            {
+              "type": "STR_HEX",
+              "name": "hex",
               "optional": false
             },
             {

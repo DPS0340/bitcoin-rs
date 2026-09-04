@@ -251,6 +251,64 @@ pub fn diff_best(schema: &CoreSchema, value: &Value) -> SchemaDiff {
 /// The extracted schema document, embedded so the check cannot drift from it.
 const SCHEMA_JSON: &str = include_str!("../../../../docs/api/core-rpc-schema.json");
 
+fn required_schema_str<'a>(value: &'a Value, key: &str, what: &str) -> &'a str {
+    let Some(text) = value.get(key).and_then(JsonValueTrait::as_str) else {
+        panic!("{what} must be a string");
+    };
+    if text.is_empty() && key == "type" {
+        panic!("{what} must be a non-empty string");
+    }
+    text
+}
+
+fn read_field(field: &Value) -> CoreField {
+    let name = required_schema_str(field, "name", "schema field name");
+    let kind = required_schema_str(field, "type", "schema field type");
+    let parsed =
+        SchemaType::parse(kind).unwrap_or_else(|| panic!("unsupported schema field type: {kind}"));
+    if matches!(parsed, SchemaType::Elision) {
+        panic!(
+            "schema field {name:?} is an unexpanded ELISION marker; \
+             regenerate docs/api/core-rpc-schema.json"
+        );
+    }
+    let optional = match field.get("optional") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .unwrap_or_else(|| panic!("schema field optional must be a boolean")),
+    };
+    CoreField {
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+        optional,
+    }
+}
+
+fn read_variant(value: &Value) -> CoreVariant {
+    let fields = match value.get("fields") {
+        None => alloc::vec![],
+        Some(fields) => {
+            let Some(array) = fields.as_array() else {
+                panic!("schema variant fields must be an array");
+            };
+            array.iter().map(read_field).collect()
+        }
+    };
+    let kind = required_schema_str(value, "type", "schema variant type");
+    if SchemaType::parse(kind).is_none() {
+        panic!("unsupported schema variant type: {kind}");
+    }
+    CoreVariant {
+        when: value
+            .get("when")
+            .and_then(JsonValueTrait::as_str)
+            .map(alloc::borrow::ToOwned::to_owned),
+        kind: kind.to_owned(),
+        fields,
+    }
+}
+
 /// Parses the extracted document into the shapes above.
 ///
 /// Hand-rolled rather than derived, because the document is data this repository
@@ -259,67 +317,32 @@ const SCHEMA_JSON: &str = include_str!("../../../../docs/api/core-rpc-schema.jso
 /// panic, not a silently empty schema set that would make every check pass.
 #[must_use]
 pub fn load_schemas() -> alloc::collections::BTreeMap<alloc::string::String, CoreSchema> {
-    let document: Value = sonic_rs::from_str(SCHEMA_JSON)
+    load_schemas_from(SCHEMA_JSON)
+}
+
+fn load_schemas_from(
+    json: &str,
+) -> alloc::collections::BTreeMap<alloc::string::String, CoreSchema> {
+    let document: Value = sonic_rs::from_str(json)
         .unwrap_or_else(|err| panic!("the extracted Core schema must parse: {err}"));
     let Some(methods) = document.get("methods").and_then(|m| m.as_object().cloned()) else {
         panic!("the extracted Core schema must carry a `methods` object");
     };
 
-    let read_variant = |value: &Value| -> CoreVariant {
-        let fields = value
-            .get("fields")
-            .and_then(|f| f.as_array().cloned())
-            .map(|array| {
-                array
-                    .iter()
-                    .map(|field| CoreField {
-                        name: field
-                            .get("name")
-                            .and_then(JsonValueTrait::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        kind: field
-                            .get("type")
-                            .and_then(JsonValueTrait::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        optional: field
-                            .get("optional")
-                            .and_then(JsonValueTrait::as_bool)
-                            .unwrap_or(false),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let kind = value.get("type").and_then(JsonValueTrait::as_str)
-            .filter(|kind| !kind.is_empty())
-            .unwrap_or_else(|| panic!("schema variant type must be a non-empty string"));
-        if SchemaType::parse(kind).is_none() {
-            panic!("unsupported schema variant type: {kind}");
-        }
-        CoreVariant {
-            when: value
-                .get("when")
-                .and_then(JsonValueTrait::as_str)
-                .map(alloc::borrow::ToOwned::to_owned),
-            kind: value
-                .get("type")
-                .and_then(JsonValueTrait::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            fields,
-        }
-    };
-
     let mut out = alloc::collections::BTreeMap::new();
     for (name, value) in &methods {
-        let variants = value
-            .get("variants")
-            .and_then(|v| v.as_array().cloned())
-            .map_or_else(
-                || alloc::vec![read_variant(value)],
-                |array| array.iter().map(read_variant).collect(),
-            );
+        let variants = match value.get("variants") {
+            None => alloc::vec![read_variant(value)],
+            Some(variants) => {
+                let Some(array) = variants.as_array() else {
+                    panic!("schema method `{name}` variants must be an array");
+                };
+                if array.is_empty() {
+                    panic!("schema method `{name}` must not carry an empty variants array");
+                }
+                array.iter().map(read_variant).collect()
+            }
+        };
         let _ = out.insert(name.to_owned(), CoreSchema { variants });
     }
     out
@@ -349,6 +372,8 @@ mod tests {
         ("getchaintips", "[]"),
         ("getmempoolinfo", "[]"),
         ("getrawmempool", "[]"),
+        ("getrawmempool", "[true]"),
+        ("getrawmempool", "[false, true]"),
         ("getmininginfo", "[]"),
         ("getnetworkinfo", "[]"),
         ("getpeerinfo", "[]"),
@@ -362,8 +387,11 @@ mod tests {
         ("estimatesmartfee", "[6]"),
         (
             "validateaddress",
-            "[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080\"]",
+            // BIP173 P2WPKH example: a valid mainnet witness address, so the
+            // comparison sees address, scriptPubKey, and the witness fields.
+            "[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]",
         ),
+        ("validateaddress", "[\"not a real address\"]"),
     ];
 
     /// The declared field lists for one method, from the manifest.
@@ -461,10 +489,30 @@ mod tests {
     /// reads -- and adding one is too.
     #[test]
     fn coverage_is_recorded_so_it_cannot_silently_shrink() {
+        let methods: alloc::collections::BTreeSet<_> =
+            COMPARED.iter().map(|(method, _)| *method).collect();
         assert_eq!(
-            COMPARED.len(),
+            methods.len(),
             20,
             "the compared-method list changed; update the count and say why in the PR"
+        );
+        assert_eq!(
+            COMPARED.len(),
+            23,
+            "the compared-invocation list changed; update the count and say why in the PR"
+        );
+        assert_eq!(
+            invocations("getrawmempool"),
+            &["[]", "[true]", "[false, true]"],
+            "getrawmempool must exercise the array, verbose, and sequence result shapes"
+        );
+        assert_eq!(
+            invocations("validateaddress"),
+            &[
+                "[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]",
+                "[\"not a real address\"]",
+            ],
+            "validateaddress must exercise both the valid and sparse-invalid shapes"
         );
 
         let schemas = load_schemas();
@@ -473,6 +521,154 @@ mod tests {
             "the extracted Core schema holds {} methods, which does not look like a \
              full extraction -- the extractor, not this node, is what broke",
             schemas.len()
+        );
+    }
+
+    fn invocations(method: &str) -> alloc::vec::Vec<&str> {
+        COMPARED
+            .iter()
+            .filter(|(name, _)| *name == method)
+            .map(|(_, params)| *params)
+            .collect()
+    }
+
+    /// Core's ELISION marker is a splice, not a field. The checked-in document
+    /// must already be expanded: a leftover empty-name ELISION would make
+    /// `getblock` verbosity 2 compare against a fictitious key and miss every
+    /// inherited field.
+    #[test]
+    fn extracted_schema_expands_elision_instead_of_emitting_it() {
+        let schemas = load_schemas();
+        for (method, schema) in &schemas {
+            for variant in &schema.variants {
+                for field in &variant.fields {
+                    assert_ne!(
+                        field.kind, "ELISION",
+                        "{method}: unexpanded ELISION field {:?}",
+                        field.name
+                    );
+                }
+            }
+        }
+
+        let getblock = schemas
+            .get("getblock")
+            .unwrap_or_else(|| panic!("getblock must be in the extracted schema"));
+        let verbosity_2 = getblock
+            .variants
+            .iter()
+            .find(|variant| variant.when.as_deref() == Some("for verbosity = 2"))
+            .unwrap_or_else(|| panic!("getblock must declare a verbosity-2 variant"));
+        let names: alloc::vec::Vec<_> = verbosity_2
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"hash") && names.contains(&"tx"),
+            "getblock verbosity 2 must inherit verbosity 1's fields, not only tx: {names:?}"
+        );
+
+        let getrawtransaction = schemas
+            .get("getrawtransaction")
+            .unwrap_or_else(|| panic!("getrawtransaction must be in the extracted schema"));
+        let verbosity_2 = getrawtransaction
+            .variants
+            .iter()
+            .find(|variant| variant.when.as_deref() == Some("for verbosity = 2"))
+            .unwrap_or_else(|| panic!("getrawtransaction must declare a verbosity-2 variant"));
+        let names: alloc::vec::Vec<_> = verbosity_2
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"hex") && names.contains(&"fee") && names.contains(&"vin"),
+            "getrawtransaction verbosity 2 must inherit verbosity 1's fields: {names:?}"
+        );
+    }
+
+    /// The BIP173 fixture must actually take the valid branch. An invalid
+    /// look-alike still schema-matches, because every valid-address field is
+    /// optional and the sparse `{isvalid: false}` object is then a silent pass.
+    #[test]
+    fn validateaddress_valid_fixture_emits_the_valid_fields() {
+        let handler = crate::Handler::new(Arc::new(Context::new()));
+        let params = sonic_rs::from_str("[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]")
+            .unwrap_or_else(|err| panic!("{err}"));
+        let answer = handler
+            .dispatch("validateaddress", &params)
+            .unwrap_or_else(|err| panic!("validateaddress must answer: {err}"));
+        let isvalid = answer
+            .get("isvalid")
+            .and_then(sonic_rs::JsonValueTrait::as_bool);
+        assert_eq!(isvalid, Some(true), "expected a valid address: {answer}");
+        for field in ["address", "scriptPubKey", "isscript", "iswitness"] {
+            assert!(
+                answer.get(field).is_some(),
+                "valid validateaddress must emit {field}: {answer}"
+            );
+        }
+    }
+
+    /// `STR_AMOUNT` is a number on the wire. Reading the name as a string is
+    /// how the first run reported every amount field as a type mismatch.
+    #[test]
+    fn str_amount_matches_a_number_not_a_string() {
+        let number = sonic_rs::from_str("1.5").unwrap_or_else(|err| panic!("{err}"));
+        let text = sonic_rs::from_str("\"1.5\"").unwrap_or_else(|err| panic!("{err}"));
+        assert!(super::type_matches("STR_AMOUNT", &number));
+        assert!(!super::type_matches("STR_AMOUNT", &text));
+        assert!(!super::type_matches("NOT_A_CORE_TYPE", &number));
+    }
+
+    /// `OBJ_DYN` keys are placeholders. Comparing them as literals reports the
+    /// placeholder missing and every real key extra.
+    #[test]
+    fn obj_dyn_compares_values_not_placeholder_keys() {
+        let schema = super::CoreSchema {
+            variants: alloc::vec![super::CoreVariant {
+                when: None,
+                kind: "OBJ_DYN".into(),
+                fields: alloc::vec![super::CoreField {
+                    name: "name".into(),
+                    kind: "OBJ".into(),
+                    optional: false,
+                }],
+            }],
+        };
+        let value = sonic_rs::from_str(r#"{"basicblockfilterindex":{}}"#)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(diff_best(&schema, &value).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a string")]
+    fn load_schemas_rejects_a_missing_field_name() {
+        let _ = super::load_schemas_from(
+            r#"{"methods":{"x":{"type":"OBJ","fields":[{"type":"NUM"}]}}}"#,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported schema field type")]
+    fn load_schemas_rejects_an_unknown_field_type() {
+        let _ = super::load_schemas_from(
+            r#"{"methods":{"x":{"type":"OBJ","fields":[{"name":"n","type":"NOT_A_TYPE"}]}}}"#,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "empty variants array")]
+    fn load_schemas_rejects_an_empty_variants_array() {
+        let _ = super::load_schemas_from(r#"{"methods":{"x":{"variants":[]}}}"#);
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpanded ELISION marker")]
+    fn load_schemas_rejects_an_unexpanded_elision_field() {
+        let _ = super::load_schemas_from(
+            r#"{"methods":{"x":{"type":"OBJ","fields":[{"name":"","type":"ELISION"}]}}}"#,
         );
     }
 }

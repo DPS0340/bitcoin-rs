@@ -199,11 +199,7 @@ def parse_variant(region: str, inherited_fields: list[dict] | None = None) -> di
         top = min(depth for depth, _ in seen_at_depth)
         fields = [field for depth, field in seen_at_depth if depth == top]
 
-    # ELISION is Core's splice marker: inherit the fields from the preceding
-    # result variant rather than turning it into a fictitious empty-name field.
-    if any(field["type"] == "ELISION" for field in fields):
-        fields = [field for field in fields if field["type"] != "ELISION"]
-        fields[0:0] = inherited_fields or []
+    fields = expand_elision(fields, inherited_fields)
 
     fields.extend(
         {"type": match.group(1), "name": match.group(2), "optional": True}
@@ -211,11 +207,57 @@ def parse_variant(region: str, inherited_fields: list[dict] | None = None) -> di
     )
 
     if fields:
-        seen: dict[str, dict] = {}
-        for field in fields:
-            seen.setdefault(field["name"], field)
-        schema["fields"] = list(seen.values())
+        schema["fields"] = dedupe_fields(fields)
     return schema
+
+
+def expand_elision(
+    fields: list[dict], inherited_fields: list[dict] | None
+) -> list[dict]:
+    """Replace Core's ELISION splice marker with the preceding variant's fields.
+
+    Serializing the marker as a field named `""` invents a key Core never
+    emits and drops every inherited name. The splice is the whole meaning.
+    """
+    if not any(field["type"] == "ELISION" for field in fields):
+        return fields
+    expanded = [field for field in fields if field["type"] != "ELISION"]
+    expanded[0:0] = inherited_fields or []
+    return expanded
+
+
+def dedupe_fields(fields: list[dict]) -> list[dict]:
+    """Keep the first declaration of each name, in Core's order."""
+    seen: dict[str, dict] = {}
+    for field in fields:
+        seen.setdefault(field["name"], field)
+    return list(seen.values())
+
+
+def expand_document_elision(document: dict) -> dict:
+    """Apply ELISION expansion to an already-extracted schema document.
+
+    The checked-in JSON is the extractor's output. When the expander changes,
+    this is the path that keeps the artifact honest without a Core tree:
+    leftover splice markers become the inherited fields the new extractor
+    would have written.
+    """
+    methods = document.get("methods")
+    if not isinstance(methods, dict):
+        raise ValueError("schema document must carry a methods object")
+    for schema in methods.values():
+        variants = schema.get("variants")
+        if not isinstance(variants, list):
+            continue
+        inherited_fields = None
+        for variant in variants:
+            fields = variant.get("fields") or []
+            if any(field.get("type") == "ELISION" for field in fields):
+                variant["fields"] = dedupe_fields(
+                    expand_elision(fields, inherited_fields)
+                )
+            inherited_fields = variant.get("fields")
+    return document
 
 
 def parse_result(regions: list[str]) -> dict | None:
@@ -245,11 +287,89 @@ def core_version(core: Path) -> str:
     return ".".join(parts)
 
 
+def write_document(path: Path, document: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(document, indent=2, sort_keys=False) + "\n", encoding="utf-8"
+    )
+
+
+def self_test() -> None:
+    """ELISION inherits the previous variant; it is not a field named `""`."""
+    prior = parse_variant(
+        '{RPCResult::Type::OBJ, "", {'
+        '{RPCResult::Type::NUM, "height", "the height"},'
+        '{RPCResult::Type::ARR, "tx", "ids"}}}'
+    )
+    assert prior is not None
+    assert [field["name"] for field in prior["fields"]] == ["height", "tx"]
+
+    expanded = parse_variant(
+        '{RPCResult::Type::OBJ, "", {'
+        '{RPCResult::Type::ELISION, "", "inherit"},'
+        '{RPCResult::Type::NUM, "fee", /*optional=*/true, "fee"}}}',
+        prior["fields"],
+    )
+    assert expanded is not None
+    assert all(field["type"] != "ELISION" for field in expanded["fields"])
+    assert [field["name"] for field in expanded["fields"]] == ["height", "tx", "fee"]
+    assert next(field for field in expanded["fields"] if field["name"] == "fee")[
+        "optional"
+    ]
+
+    leftover = {
+        "methods": {
+            "sample": {
+                "variants": [
+                    {"type": "OBJ", "fields": [{"type": "NUM", "name": "height"}]},
+                    {
+                        "type": "OBJ",
+                        "fields": [
+                            {"type": "ELISION", "name": ""},
+                            {"type": "ARR", "name": "tx"},
+                        ],
+                    },
+                ]
+            }
+        }
+    }
+    expand_document_elision(leftover)
+    expanded_fields = leftover["methods"]["sample"]["variants"][1]["fields"]
+    assert [field["name"] for field in expanded_fields] == ["height", "tx"]
+    assert all(field["type"] != "ELISION" for field in expanded_fields)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--core", required=True, type=Path, help="vendored Core tree")
-    parser.add_argument("--out", required=True, type=Path, help="schema JSON to write")
+    parser.add_argument("--core", type=Path, help="vendored Core tree")
+    parser.add_argument("--out", type=Path, help="schema JSON to write")
+    parser.add_argument(
+        "--expand-json",
+        type=Path,
+        help="rewrite ELISION markers in an already-extracted schema document",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check ELISION expansion without a Core tree",
+    )
     args = parser.parse_args()
+
+    if args.self_test:
+        self_test()
+        print("ok")
+        return 0
+
+    if args.expand_json is not None:
+        document = json.loads(args.expand_json.read_text(encoding="utf-8"))
+        expand_document_elision(document)
+        write_document(args.expand_json, document)
+        print(f"expanded ELISION markers -> {args.expand_json}")
+        return 0
+
+    if args.core is None or args.out is None:
+        parser.error("--core and --out are required unless --expand-json or --self-test is set")
+        return 2
 
     rpc_dir = args.core / "src" / "rpc"
     if not rpc_dir.is_dir():
@@ -267,7 +387,14 @@ def main() -> int:
                 continue
             schema = parse_result(regions)
             if schema is None:
-                continue
+                # Regions without a parseable variant are a broken declaration,
+                # not an empty method. Skipping them would drop the method from
+                # the oracle and the suite would still go green.
+                print(
+                    f"{path.name}: {name} has RPCResult regions that did not parse",
+                    file=sys.stderr,
+                )
+                return 1
             # A name collision across files would silently drop one; Core has
             # none, and saying so out loud is cheaper than finding out later.
             if name in methods:
@@ -291,10 +418,7 @@ def main() -> int:
         },
         "methods": dict(sorted(methods.items())),
     }
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(
-        json.dumps(document, indent=2, sort_keys=False) + "\n", encoding="utf-8"
-    )
+    write_document(args.out, document)
     print(f"{len(methods)} methods -> {args.out}")
     return 0
 
