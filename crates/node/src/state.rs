@@ -1636,10 +1636,9 @@ impl NodeState {
                         gap,
                         threshold = STALE_RESTORE_ERROR_THRESHOLD,
                         "stale checkpoint restore: chainstate is {gap} blocks behind \
-                         the last durable applied-tip witness — the node is proceeding \
-                         with a valid but far-behind tip; crash recovery will replay \
-                         the gap from stored bodies when present, otherwise the sync \
-                         layer must re-fetch it"
+                         the last durable applied-tip witness — no committed journal \
+                         suffix covers the gap, so the node is proceeding with a valid \
+                         but far-behind tip and the sync layer must re-fetch it"
                     );
                 }
             }

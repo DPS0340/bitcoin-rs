@@ -896,9 +896,9 @@ pub(crate) fn start_node(
     let Some(state) = guard.state.as_ref() else {
         panic!("state recorded above");
     };
-    // No sidecar consultation at boot: the V1 crash-recovery sidecar /
-    // body-replay path was retired (issue #230, task 0). A stale sidecar
-    // file on disk is ignored; recovery is checkpoint-based.
+    // No V1 recovery-sidecar consultation happens here. `NodeState::open`
+    // already restored the checkpoint and, when enabled, replayed the
+    // journal's committed suffix before derived-index workers were started.
 
     tracing::info!(
         network = ?state.config().network,
