@@ -915,11 +915,22 @@ pub(crate) fn start_node(
         state: Some(state),
         services: NodeServices::default(),
     };
+    {
+        let Some(state) = guard.state.as_ref() else {
+            // The guard was just built with `state: Some(state)` above.
+            panic!("state recorded above");
+        };
+        crash_recovery::recover_if_needed(state)?;
+    }
+    {
+        let Some(state) = guard.state.as_mut() else {
+            panic!("state recorded above");
+        };
+        state.start_index_workers()?;
+    }
     let Some(state) = guard.state.as_ref() else {
-        // The guard was just built with `state: Some(state)` above.
         panic!("state recorded above");
     };
-    crash_recovery::recover_if_needed(state)?;
 
     tracing::info!(
         network = ?state.config().network,

@@ -884,8 +884,11 @@ impl ProductionStateSyncFixture {
     ) -> Self {
         let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
         config.data_dir = dir.path().join("node");
-        let state = NodeState::open(config, None)
+        let mut state = NodeState::open(config, None)
             .unwrap_or_else(|error| panic!("open node state failed: {error}"));
+        state
+            .start_index_workers()
+            .unwrap_or_else(|error| panic!("start index workers failed: {error}"));
         let blocks = {
             let block_tree = state.block_tree();
             let mut tree = block_tree.write();
