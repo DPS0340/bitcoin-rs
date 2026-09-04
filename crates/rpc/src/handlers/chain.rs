@@ -17,7 +17,7 @@ use crate::compat::convert::{
     self, compact_target_hex, i32_saturated, i64_saturated, i64_saturated_len, sat_to_btc,
     typed_to_sonic, typed_to_sonic_omitting_nulls,
 };
-use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError};
+use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError, chain_stats};
 use crate::error::RpcError;
 use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
 
@@ -363,12 +363,28 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
                 let start = tree
                     .node(start_id)
                     .map_err(|error| RpcError::Internal(error.to_string()))?;
-                let window_tx_count = if total_tx_count == 0 || start.chain_tx_count == 0 {
+                let mut window_tx_count = if total_tx_count == 0 || start.chain_tx_count == 0 {
                     0
                 } else {
                     total_tx_count.saturating_sub(start.chain_tx_count)
                 };
-                let end_mtp = tree.median_time_past_at(selected_id, 11).unwrap_or(0);
+                if total_tx_count == 0 && ctx.applied_hash() == tip_hash {
+                      let log = ctx.blocks.read();
+                      let complete = log.first().is_some_and(|record| record.height == 0)
+                          && log.last().is_some_and(|record| {
+                              record.height == selected.height && record.hash == tip_hash
+                          });
+                      if complete {
+                          let stats = chain_stats(
+                              &log,
+                              selected.height,
+                              u64::from(start_height).saturating_add(1),
+                          );
+                          total_tx_count = stats.total_tx_count;
+                          window_tx_count = stats.window_tx_count;
+                      }
+                  }
+                  let end_mtp = tree.median_time_past_at(selected_id, 11).unwrap_or(0);
                 let start_mtp = tree.median_time_past_at(start_id, 11).unwrap_or(0);
                 let window_interval = u64::from(end_mtp.saturating_sub(start_mtp));
                 (total_tx_count, tip_time, window_tx_count, window_interval)
