@@ -322,22 +322,32 @@ impl Mempool {
     }
 
     /// Inserts an entry after applying ancestor and descendant policy checks.
-    /// On success the result carries the `Accepted` change followed by any
+    /// On success the outcome carries the `Accepted` change followed by any
     /// post-insert size-limit evictions as `Removed(PolicyEviction)`, in
-    /// commit order.
-    pub fn insert_entry(&mut self, entry: MempoolEntry) -> Result<MutationResult, MempoolError> {
+    /// commit order. When the trim sheds the entry itself the mutation is
+    /// still committed; it reports as
+    /// [`InsertionOutcome::ShedAfterCommit`] carrying that record, and only
+    /// an `Err` means nothing was committed.
+    pub fn insert_entry(
+        &mut self,
+        entry: MempoolEntry,
+    ) -> Result<crate::mutation::InsertionOutcome, MempoolError> {
         let prepared = self.validate_insert(entry, &HashSet::new())?;
         let txid = prepared.entry.txid;
         let result = self.commit_insert(prepared);
         // The trim evicts the worst-paying entries, and the arrival can be
-        // one of them. Reporting success anyway hands the caller a receipt for
-        // a transaction that is not in the pool -- and `sendrawtransaction`
-        // turns that into a success the sender will act on. Core makes the
-        // same check for the same reason (`validation.cpp`: `LimitMempoolSize`
-        if !self.contains_txid(&txid) {
-            return Err(MempoolError::Full);
-        }
-        Ok(result)
+        // one of them. The mutation already committed -- the sequence moved
+        // and any eviction is durable -- so the outcome carries the record;
+        // reporting plain success would hand the caller a receipt for a
+        // transaction that is not in the pool, which `sendrawtransaction`
+        // would turn into a success the sender acts on. Core makes the
+        // same check for the same reason (`validation.cpp`:
+        // `LimitMempoolSize`).
+        Ok(if self.contains_txid(&txid) {
+            crate::mutation::InsertionOutcome::Accepted(result)
+        } else {
+            crate::mutation::InsertionOutcome::ShedAfterCommit(result)
+        })
     }
 
     pub(crate) fn validate_insert(
@@ -2951,14 +2961,15 @@ mod tests {
         );
     }
 
-    /// A transaction the size limit sheds was never accepted.
+    /// A transaction the size limit sheds is never accepted.
     ///
     /// `insert_entry` indexes the arrival and only then trims the pool, so the
-    /// arrival can be what the trim takes. Returning its id anyway hands the
-    /// caller a receipt for a transaction that is not in the pool, and
-    /// `sendrawtransaction` turns that receipt into a success the sender acts
-    /// on. The paired accept is the point: the same pool, one better-paying
-    /// transaction, must still be admitted.
+    /// arrival can be what the trim takes. The mutation did commit — the
+    /// sequence moved and the trim eviction is durable — so the outcome
+    /// reports `ShedAfterCommit` carrying that record, not `Ok(Accepted)`;
+    /// a caller deriving success from `Accepted` would act on a transaction
+    /// that is not in the pool. The paired accept is the point: the same
+    /// pool, one better-paying transaction, must still be admitted.
     #[test]
     fn a_transaction_the_size_limit_sheds_is_not_accepted() {
         fn tx_paying(nonce: u8) -> Arc<Tx> {
@@ -2986,9 +2997,23 @@ mod tests {
 
         // Pays far less per byte than what is seated, so the trim takes it.
         let shed = pool.insert_entry(MempoolEntry::new(tx_paying(2), 900, 10, 2, 7));
+        let Ok(shed) = shed else {
+            panic!("the shed insert committed; Err means nothing did: {shed:?}");
+        };
         assert!(
-            matches!(shed, Err(MempoolError::Full)),
-            "a transaction evicted by the trim must not report success: {shed:?}"
+            shed.is_shed(),
+            "a transaction evicted by the trim must not report Accepted: {shed:?}"
+        );
+        assert_eq!(
+            shed.mutation().changes,
+            vec![
+                crate::mutation::change(&tx_paying(2).txid(), MutationOutcome::Accepted),
+                crate::mutation::change(
+                    &tx_paying(2).txid(),
+                    MutationOutcome::Removed(RemovalReason::PolicyEviction),
+                ),
+            ],
+            "the shed insert's record carries its own acceptance and removal"
         );
         assert_eq!(pool.len(), 1, "the seated transaction stays");
 
@@ -3004,14 +3029,15 @@ mod tests {
         );
     }
 
-    /// A replacement the size limit sheds must not report success.
+    /// A replacement the size limit sheds must not report plain success.
     ///
     /// `replace_transaction` evicts conflicting entries, inserts the
     /// replacement, and then trims. If the replacement itself is the
-    /// worst-paying entry, the trim takes it — but the caller would
-    /// receive `Ok` for a transaction that is no longer in the pool.
-    /// The post-insert survival check returns `Err(Full)` instead,
-    /// matching `insert_entry`.
+    /// worst-paying entry, the trim takes it — but the mutation already
+    /// committed, so the outcome reports `ShedAfterCommit` carrying the
+    /// committed record instead of `Ok(Accepted)`. A caller treating a
+    /// shed replacement as accepted would act on a transaction that is
+    /// no longer in the pool.
     #[test]
     fn a_replacement_the_size_limit_sheds_is_not_accepted() {
         let limits = MempoolLimits {
@@ -3043,6 +3069,7 @@ mod tests {
                 script_pubkey: vec![0x51],
             }],
         };
+        let original_txid = original.txid();
         let seated = pool.insert_entry(MempoolEntry::new(Arc::new(original), 100, 10_000, 1, 7));
         assert!(seated.is_ok(), "original must fit: {seated:?}");
 
@@ -3074,16 +3101,24 @@ mod tests {
                 script_pubkey: vec![0x52],
             }],
         };
+        let replacement_txid = replacement.txid();
         let result = pool.replace_transaction(
             crate::ReplacementCandidate::new(Arc::new(replacement), 900, 100_000, 1),
             2,
             7,
             4,
         );
+        let Ok(result) = result else {
+            panic!("the shed replacement committed; Err means nothing did: {result:?}");
+        };
+        assert!(
+            result.is_shed(),
+            "a replacement evicted by the trim must not report Accepted: {result:?}"
+        );
         assert_eq!(
-            result,
-            Err(crate::rbf::RbfError::Mempool(MempoolError::Full)),
-            "a replacement evicted by the trim must report Full, not success: {result:?}"
+            result.mutation().removed_txids(),
+            vec![original_txid, replacement_txid],
+            "the record carries the conflict removal then the shed replacement"
         );
     }
 

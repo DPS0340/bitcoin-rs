@@ -5,7 +5,7 @@ use bitcoin_rs_primitives::Tx;
 use hashbrown::HashSet;
 use thiserror::Error;
 
-use crate::mutation::{MutationResult, RemovalReason};
+use crate::mutation::RemovalReason;
 use crate::pool::tx_fee_rate;
 use crate::{EntryId, Mempool, MempoolEntry, MempoolError};
 
@@ -174,13 +174,18 @@ impl Mempool {
     /// computed earlier cannot silently race with concurrent admissions.
     /// Non-conflicting candidates take the same path with an empty eviction
     /// set.
+    ///
+    /// When the post-insert trim sheds the replacement itself, the conflict
+    /// removals and the insert have already committed; the outcome reports
+    /// as [`InsertionOutcome::ShedAfterCommit`] carrying that record, and
+    /// only an `Err` means nothing was committed.
     pub fn replace_transaction(
         &mut self,
         candidate: ReplacementCandidate,
         time: u64,
         height: u32,
         sigop_cost: u32,
-    ) -> Result<MutationResult, RbfError> {
+    ) -> Result<crate::mutation::InsertionOutcome, RbfError> {
         let candidate_txid = candidate.tx.txid();
         let plan = self.check_replacement(&candidate)?;
         let direct: HashSet<EntryId> = self.conflicts_for(&candidate.tx).into_iter().collect();
@@ -204,14 +209,16 @@ impl Mempool {
         self.remove_entries_with_reasons(&removals, &mut changes);
         let replacement = self.commit_insert(prepared);
         changes.extend(replacement.changes);
-        // The trim evicts the worst-paying entries, and the replacement can be
-        // one of them. Reporting success hands the caller a receipt for a
-        // transaction that is not in the pool — `sendrawtransaction` turns
-        // that into a success the sender acts on. Same check as
-        // `insert_entry`.
-        if !self.contains_txid(&candidate_txid) {
-            return Err(RbfError::Mempool(MempoolError::Full));
-        }
-        Ok(self.finish_mutation(changes))
+        // The trim evicts the worst-paying entries, and the replacement can
+        // be one of them. The conflict removals and the insert already
+        // committed, so the outcome carries the whole record; reporting
+        // plain success would hand the caller a receipt for a transaction
+        // that is not in the pool. Same check as `insert_entry`.
+        let result = self.finish_mutation(changes);
+        Ok(if self.contains_txid(&candidate_txid) {
+            crate::mutation::InsertionOutcome::Accepted(result)
+        } else {
+            crate::mutation::InsertionOutcome::ShedAfterCommit(result)
+        })
     }
 }

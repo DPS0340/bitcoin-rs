@@ -336,7 +336,8 @@ where
     // `replace_transaction` re-runs `check_replacement` internally. Paying for
     // one extra walk of the conflict set keeps BIP125 eviction implemented in
     // exactly one place; inlining it here would be a second copy to drift.
-    pool.replace_transaction(candidate, ctx.time, ctx.height, checks.sigop_cost)
+    let outcome = pool
+        .replace_transaction(candidate, ctx.time, ctx.height, checks.sigop_cost)
         .map_err(|error| match error {
             // `replace_transaction` reports every failure as an `RbfError`,
             // including the plain insertion limits, which have nothing to do
@@ -346,6 +347,11 @@ where
             RbfError::Mempool(mempool) => AcceptError::Mempool(mempool),
             rbf => AcceptError::Rbf(rbf),
         })?;
+    if outcome.is_shed() {
+        // The entry committed and was shed by the size-limit trim in the
+        // same step: the same refusal the pre-commit limit check produced.
+        return Err(AcceptError::Mempool(MempoolError::Full));
+    }
     let id = pool
         .entry_id_by_txid(&checks.txid)
         .ok_or(AcceptError::Mempool(MempoolError::TooManyEntries))?;

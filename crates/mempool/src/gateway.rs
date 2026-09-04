@@ -314,6 +314,26 @@ impl core::fmt::Debug for MempoolGateway {
     }
 }
 
+/// What publication reads from a committed mutating call: the record the
+/// pool committed. Plain pool mutations report their [`MutationResult`]
+/// directly; an admission insert reports through [`InsertionOutcome`] so a
+/// shed entry's removals publish like any other committed change.
+trait CommittedMutation {
+    fn committed(&self) -> &crate::mutation::MutationResult;
+}
+
+impl CommittedMutation for crate::mutation::MutationResult {
+    fn committed(&self) -> &crate::mutation::MutationResult {
+        self
+    }
+}
+
+impl CommittedMutation for crate::mutation::InsertionOutcome {
+    fn committed(&self) -> &crate::mutation::MutationResult {
+        self.mutation()
+    }
+}
+
 impl MempoolGateway {
     /// Wraps `pool` and optionally installs `observer`.
     ///
@@ -470,12 +490,13 @@ impl MempoolGateway {
         })
     }
 
-    /// Commits `pool.insert_entry` and publishes its result.
+    /// Commits `pool.insert_entry` and publishes its result, including the
+    /// removals of a shed-after-commit entry.
     pub fn insert_entry(
         &self,
         origin: AdmissionOrigin,
         entry: MempoolEntry,
-    ) -> Result<MutationResult, MempoolError> {
+    ) -> Result<crate::mutation::InsertionOutcome, MempoolError> {
         self.commit(origin, move |pool| pool.insert_entry(entry))
     }
 
@@ -514,16 +535,17 @@ impl MempoolGateway {
                 continue;
             }
             match self.insert_entry(origin, entry) {
-                Ok(result) => {
-                    // A successful insert does not promise the entry stayed:
-                    // the same commit can evict it — or any other entry —
-                    // under size pressure. Whatever the result says left the
-                    // pool is unavailable to later spenders, exactly as if
-                    // the pool had refused it up front.
-                    for removed in result.removed_txids() {
+                Ok(outcome) => {
+                    // A committed insert does not promise the entry stayed:
+                    // the same commit can shed it — or evict any other entry
+                    // — under size pressure. Whatever the outcome reports as
+                    // removed, the shed entry itself included, is unavailable
+                    // to later spenders, exactly as if the pool had refused
+                    // it up front.
+                    for removed in outcome.mutation().removed_txids() {
                         refused.insert(removed);
                     }
-                    committed.push(result);
+                    committed.push(outcome.into_mutation());
                 }
                 Err(_) => {
                     refused.insert(txid);
@@ -533,7 +555,8 @@ impl MempoolGateway {
         committed
     }
 
-    /// Commits `pool.replace_transaction` and publishes its result.
+    /// Commits `pool.replace_transaction` and publishes its result,
+    /// including the removals of a replacement the trim shed after commit.
     pub fn replace_transaction(
         &self,
         origin: AdmissionOrigin,
@@ -541,7 +564,7 @@ impl MempoolGateway {
         time: u64,
         height: u32,
         sigop_cost: u32,
-    ) -> Result<MutationResult, RbfError> {
+    ) -> Result<crate::mutation::InsertionOutcome, RbfError> {
         self.commit(origin, move |pool| {
             pool.replace_transaction(candidate, time, height, sigop_cost)
         })
@@ -561,6 +584,9 @@ impl MempoolGateway {
     /// preserving under-lock BIP125 and package-limit revalidation. On
     /// success, one `MutationResult` whose ordered removals precede exactly
     /// one accepted change is published via the existing commit/publish seam.
+    /// A replacement the post-insert trim shed after commit publishes its
+    /// committed removals and then rejects with the same
+    /// [`AdmitError::Policy`] the pre-commit refusal produced.
     ///
     /// Any mismatch or rejection returns before publish-mutex acquisition and
     /// before mutation.
@@ -645,7 +671,7 @@ impl MempoolGateway {
             fact.base_fee.unwrap_or(0),
             policy.incremental_relay_fee_sat_per_kvb,
         );
-        let result = pool
+        let outcome = pool
             .replace_transaction(candidate, request.time, request.height, fact.sigop_cost)
             .map_err(|rbf| {
                 // Map RbfError to the correct AcceptanceRejectReason variant.
@@ -664,7 +690,11 @@ impl MempoolGateway {
                 }
             })?;
 
-        // 6. Enqueue for publication and elect a drainer if needed.
+        // 6. Enqueue for publication and elect a drainer if needed. Both
+        //    outcome variants carry a committed mutation: a replacement the
+        //    trim shed publishes its conflict removals like any other commit.
+        let shed = outcome.is_shed();
+        let result = outcome.into_mutation();
         let mut elected = false;
         if !result.changes.is_empty() && self.observer.is_some() {
             let mut publish = self.publish.lock();
@@ -678,6 +708,16 @@ impl MempoolGateway {
         drop(pool);
         if elected {
             self.drain();
+        }
+        if shed {
+            // The replacement committed and was immediately shed by the
+            // size-limit trim; report the same failure the pre-commit
+            // refusal produced, after the removals above were published.
+            return Err(AdmitError::Policy(
+                crate::standardness::AcceptanceRejectReason::Replacement(
+                    RbfError::Mempool(crate::pool::MempoolError::Full),
+                ),
+            ));
         }
         Ok(AdmitOutcome::Committed(result))
     }
@@ -738,18 +778,22 @@ impl MempoolGateway {
     }
 
     /// The single commit-and-publish path every publishing mutation flows
-    /// through. A failed `mutate` returns before the publish mutex is taken.
+    /// through. A failed `mutate` returns before the publish mutex is taken
+    /// and means nothing was committed. A committed insert publishes
+    /// whichever outcome it produced - a shed-after-commit entry publishes
+    /// its removals too - then hands the outcome to the caller to interpret.
     /// Successful mutations acquire the publish mutex before releasing the
     /// pool guard, then call observers only after releasing the pool guard.
-    fn commit<E>(
+    fn commit<T: CommittedMutation, E>(
         &self,
         origin: AdmissionOrigin,
-        mutate: impl FnOnce(&mut Mempool) -> Result<MutationResult, E>,
-    ) -> Result<MutationResult, E> {
+        mutate: impl FnOnce(&mut Mempool) -> Result<T, E>,
+    ) -> Result<T, E> {
         let mut elected = false;
-        let result = {
+        let outcome = {
             let mut pool = self.pool.write();
-            let result = mutate(&mut pool)?;
+            let outcome = mutate(&mut pool)?;
+            let result = outcome.committed();
             if !result.changes.is_empty() && self.observer.is_some() {
                 let mut publish = self.publish.lock();
                 publish.queue.push_back(MutationEnvelope {
@@ -759,12 +803,12 @@ impl MempoolGateway {
                 elected = !publish.draining;
                 publish.draining = true;
             }
-            result
+            outcome
         };
         if elected {
             self.drain();
         }
-        Ok(result)
+        Ok(outcome)
     }
 
     /// The same path for pool methods that cannot fail.
@@ -946,7 +990,7 @@ mod tests {
         MempoolGateway, MempoolObserver,
     };
     use crate::mutation::{
-        AdmissionOrigin, MutationEnvelope, MutationOutcome, MutationResult, RemovalReason,
+        AdmissionOrigin, InsertionOutcome, MutationEnvelope, MutationOutcome, RemovalReason,
     };
     use crate::standardness::PackageTxContext;
     use crate::{Mempool, MempoolEntry, MempoolLimits};
@@ -1205,7 +1249,8 @@ mod tests {
                 7,
                 0,
             )
-            .expect("replacement lands");
+            .expect("replacement lands")
+            .into_mutation();
 
         assert_eq!(result.changes.len(), 3);
         assert_eq!(
@@ -1249,7 +1294,8 @@ mod tests {
         let gateway = gateway_with(None);
         let result = gateway
             .insert_entry(AdmissionOrigin::Rpc, entry(&tx(10)))
-            .expect("in");
+            .expect("in")
+            .into_mutation();
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.sequence_base, 1);
         assert_eq!(gateway.read().sequence_number(), 1);
@@ -1298,7 +1344,8 @@ mod tests {
             .expect("low in");
         let result = gateway
             .insert_entry(AdmissionOrigin::Rpc, high)
-            .expect("high in");
+            .expect("high in")
+            .into_mutation();
 
         assert_eq!(
             result.changes.len(),
@@ -1434,7 +1481,8 @@ mod tests {
         let second_handle = std::thread::spawn(move || {
             let result = second
                 .insert_entry(AdmissionOrigin::Rpc, entry(&tx(21)))
-                .expect("second in");
+                .expect("second in")
+                .into_mutation();
             let _ = done_tx.send(result);
         });
 
@@ -1475,7 +1523,7 @@ mod tests {
     struct ReentrantObserver {
         gateway: Mutex<Option<Arc<MempoolGateway>>>,
         stream: Mutex<Vec<u64>>,
-        nested: Mutex<Vec<MutationResult>>,
+        nested: Mutex<Vec<crate::mutation::InsertionOutcome>>,
     }
 
     impl MempoolObserver for ReentrantObserver {
@@ -1527,11 +1575,17 @@ mod tests {
             1,
             "the nested mutation completed and returned"
         );
+        let nested = nested
+            .first()
+            .map(|outcome: &InsertionOutcome| outcome.clone().into_mutation());
+        let Some(nested) = nested else {
+            panic!("nested mutation must be recorded");
+        };
         assert_eq!(
-            nested[0].sequence_base, 2,
+            nested.sequence_base, 2,
             "the nested mutation took the next sequence"
         );
-        assert_eq!(nested[0].len(), 1);
+        assert_eq!(nested.len(), 1);
         drop(nested);
         assert_eq!(
             *observer.stream.lock(),
@@ -1799,8 +1853,16 @@ mod tests {
 
         assert_eq!(
             committed.len(),
-            0,
-            "the parent's insert returns Err(Full); nothing is committed"
+            1,
+            "the parent insert committed and shed; the record is returned"
+        );
+        assert_eq!(
+            committed[0].changes,
+            vec![
+                crate::mutation::change(&parent_txid, MutationOutcome::Accepted),
+                crate::mutation::change(&parent_txid, MutationOutcome::Removed(RemovalReason::PolicyEviction)),
+            ],
+            "the parent's committed record includes its own acceptance and removal"
         );
         let pool = gateway.read();
         assert!(
@@ -1821,9 +1883,13 @@ mod tests {
             3,
             "the parent's insert advanced the sequence; the child assigns nothing"
         );
-        assert!(
-            observer.seen.lock().is_empty(),
-            "no publications: Err(Full) short-circuits before the publish queue"
+        assert_eq!(
+            observer.seen.lock().as_slice(),
+            &vec![
+                (hash(&parent_txid), MutationOutcome::Accepted),
+                (hash(&parent_txid), MutationOutcome::Removed(RemovalReason::PolicyEviction)),
+            ][..],
+            "the shed parent's committed record is published to the observer"
         );
     }
 
@@ -1838,6 +1904,180 @@ mod tests {
         assert!(committed.is_empty());
         assert_eq!(gateway.read().sequence_number(), before);
         assert!(observer.seen.lock().is_empty(), "nothing may publish");
+    }
+
+
+    /// An `insert_entry` that the size-limit trim sheds after commit
+    /// publishes the committed record to the observer, removes the entry,
+    /// and returns `ShedAfterCommit` so callers derive rejection.
+    #[test]
+    fn insert_entry_shed_after_commit_publishes_removal_and_rejects() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                min_relay_fee_sat_per_kvb: 0,
+                max_total_bytes: 150,
+                ..MempoolLimits::default()
+            }))),
+            Some(dyn_observer(&observer)),
+        );
+
+        let filler = tx(70);
+        let filler_txid = filler.txid();
+        gateway
+            .insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(filler), 100, 9_000, 1, 7),
+            )
+            .expect("filler in");
+        observer.seen.lock().clear();
+
+        let shed = tx(71);
+        let shed_txid = shed.txid();
+        let outcome = gateway
+            .insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(shed), 100, 100, 1, 7),
+            )
+            .expect("the insert committed");
+
+        assert!(outcome.is_shed(), "a trimmed insert must not report Accepted: {outcome:?}");
+        assert!(
+            !gateway.read().contains_txid(&shed_txid),
+            "the shed entry must not be in the pool"
+        );
+        assert!(gateway.read().contains_txid(&filler_txid), "filler stays");
+        assert_eq!(
+            outcome.mutation().changes,
+            vec![
+                crate::mutation::change(&shed_txid, MutationOutcome::Accepted),
+                crate::mutation::change(&shed_txid, MutationOutcome::Removed(RemovalReason::PolicyEviction)),
+            ],
+            "the record carries the shed entry's acceptance and removal"
+        );
+        assert_eq!(
+            observer.seen.lock().as_slice(),
+            &vec![
+                (hash(&shed_txid), MutationOutcome::Accepted),
+                (hash(&shed_txid), MutationOutcome::Removed(RemovalReason::PolicyEviction)),
+            ][..],
+            "the observer sees the committed shed record"
+        );
+    }
+
+    /// A `replace_transaction` that the size-limit trim sheds after commit
+    /// publishes the conflict removals and its own acceptance/removal to
+    /// the observer, removes the victims and the replacement, and returns
+    /// `ShedAfterCommit` so callers derive rejection.
+    #[test]
+    fn replace_transaction_shed_after_commit_publishes_removals_and_rejects() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                min_relay_fee_sat_per_kvb: 0,
+                max_total_bytes: 1_000,
+                ..MempoolLimits::default()
+            }))),
+            Some(dyn_observer(&observer)),
+        );
+
+        // Shared prevout: original and replacement conflict.
+        let prev = OutPoint::new(Txid(Hash256::from_le_bytes(&[0x73; 32])), 0);
+
+        let original = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: prev,
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFD,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51],
+            }],
+        };
+        let original_txid = original.txid();
+        gateway
+            .insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(original), 100, 10_000, 1, 7),
+            )
+            .expect("original in");
+
+        let bystander = tx(72);
+        let bystander_txid = bystander.txid();
+        gateway
+            .insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(bystander), 850, 8_500_000, 1, 7),
+            )
+            .expect("bystander in");
+
+        // After evicting the original (100 vbytes freed), the pool has
+        // 850 + 900 = 1750 > 1000. The trim evicts the lowest fee-rate
+        // package, which is the replacement itself (111 sat/vB) below the
+        // bystander (10_000 sat/vB), so the replacement is shed.
+        let replacement = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: prev,
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFD,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 100,
+                script_pubkey: vec![0x52],
+            }],
+        };
+        let replacement_txid = replacement.txid();
+        observer.seen.lock().clear();
+
+        let outcome = gateway
+            .replace_transaction(
+                AdmissionOrigin::Rpc,
+                crate::ReplacementCandidate::new(Arc::new(replacement), 900, 100_000, 1),
+                2,
+                7,
+                4,
+            )
+            .expect("the replacement committed");
+
+        assert!(
+            outcome.is_shed(),
+            "a trimmed replacement must not report Accepted: {outcome:?}"
+        );
+        let pool = gateway.read();
+        assert!(!pool.contains_txid(&original_txid), "the conflict was removed");
+        assert!(!pool.contains_txid(&replacement_txid), "the replacement was shed");
+        assert!(pool.contains_txid(&bystander_txid), "the bystander stays");
+
+        assert_eq!(
+            outcome.mutation().removed_txids(),
+            vec![original_txid, replacement_txid],
+            "the record carries the conflict removal then the shed replacement"
+        );
+        assert_eq!(
+            outcome.mutation().changes,
+            vec![
+                crate::mutation::change(&original_txid, MutationOutcome::Removed(RemovalReason::Replaced)),
+                crate::mutation::change(&replacement_txid, MutationOutcome::Accepted),
+                crate::mutation::change(&replacement_txid, MutationOutcome::Removed(RemovalReason::PolicyEviction)),
+            ],
+            "the record is conflict removal, then acceptance, then eviction"
+        );
+        assert_eq!(
+            observer.seen.lock().as_slice(),
+            &vec![
+                (hash(&original_txid), MutationOutcome::Removed(RemovalReason::Replaced)),
+                (hash(&replacement_txid), MutationOutcome::Accepted),
+                (hash(&replacement_txid), MutationOutcome::Removed(RemovalReason::PolicyEviction)),
+            ][..],
+            "the observer sees every committed change"
+        );
     }
 
     #[test]
