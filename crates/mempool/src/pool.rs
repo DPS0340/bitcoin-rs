@@ -68,6 +68,13 @@ pub enum MempoolError {
     /// The transaction violates mempool policy limits.
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    /// The pool was over its size limit and this transaction was what it shed.
+    ///
+    /// Bitcoin Core's `mempool full`: it adds the transaction, trims the pool,
+    /// and then checks whether what it added is still there. A transaction that
+    /// was trimmed away was never accepted, however briefly it was indexed.
+    #[error("mempool full: the transaction was evicted by the size limit")]
+    Full,
     /// The spending index names an entry that is missing from the pool, or an
     /// entry whose transaction does not spend the indexed outpoint.
     #[error("mempool spending index is inconsistent")]
@@ -315,12 +322,32 @@ impl Mempool {
     }
 
     /// Inserts an entry after applying ancestor and descendant policy checks.
-    /// On success the result carries the `Accepted` change followed by any
+    /// On success the outcome carries the `Accepted` change followed by any
     /// post-insert size-limit evictions as `Removed(PolicyEviction)`, in
-    /// commit order.
-    pub fn insert_entry(&mut self, entry: MempoolEntry) -> Result<MutationResult, MempoolError> {
+    /// commit order. When the trim sheds the entry itself the mutation is
+    /// still committed; it reports as
+    /// [`InsertionOutcome::ShedAfterCommit`] carrying that record, and only
+    /// an `Err` means nothing was committed.
+    pub fn insert_entry(
+        &mut self,
+        entry: MempoolEntry,
+    ) -> Result<crate::mutation::InsertionOutcome, MempoolError> {
         let prepared = self.validate_insert(entry, &HashSet::new())?;
-        Ok(self.commit_insert(prepared))
+        let txid = prepared.entry.txid;
+        let result = self.commit_insert(prepared);
+        // The trim evicts the worst-paying entries, and the arrival can be
+        // one of them. The mutation already committed -- the sequence moved
+        // and any eviction is durable -- so the outcome carries the record;
+        // reporting plain success would hand the caller a receipt for a
+        // transaction that is not in the pool, which `sendrawtransaction`
+        // would turn into a success the sender acts on. Core makes the
+        // same check for the same reason (`validation.cpp`:
+        // `LimitMempoolSize`).
+        Ok(if self.contains_txid(&txid) {
+            crate::mutation::InsertionOutcome::Accepted(result)
+        } else {
+            crate::mutation::InsertionOutcome::ShedAfterCommit(result)
+        })
     }
 
     pub(crate) fn validate_insert(
@@ -3034,6 +3061,167 @@ mod tests {
             pool.total_vsize() <= 1_000,
             "size limit must hold after inserts: {}",
             pool.total_vsize()
+        );
+    }
+
+    /// A transaction the size limit sheds is never accepted.
+    ///
+    /// `insert_entry` indexes the arrival and only then trims the pool, so the
+    /// arrival can be what the trim takes. The mutation did commit — the
+    /// sequence moved and the trim eviction is durable — so the outcome
+    /// reports `ShedAfterCommit` carrying that record, not `Ok(Accepted)`;
+    /// a caller deriving success from `Accepted` would act on a transaction
+    /// that is not in the pool. The paired accept is the point: the same
+    /// pool, one better-paying transaction, must still be admitted.
+    #[test]
+    fn a_transaction_the_size_limit_sheds_is_not_accepted() {
+        fn tx_paying(nonce: u8) -> Arc<Tx> {
+            Arc::new(Tx {
+                version: 2,
+                lock_time: 0,
+                inputs: Vec::new(),
+                outputs: vec![TxOut {
+                    value: 1_000 + u64::from(nonce),
+                    script_pubkey: vec![0x51, nonce],
+                }],
+            })
+        }
+
+        let limits = MempoolLimits {
+            max_total_bytes: 1_000,
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+
+        // Fills the pool at a rate the arrivals below are measured against.
+        let seated = pool.insert_entry(MempoolEntry::new(tx_paying(1), 900, 90_000, 1, 7));
+        assert!(seated.is_ok(), "the first transaction fits: {seated:?}");
+
+        // Pays far less per byte than what is seated, so the trim takes it.
+        let shed = pool.insert_entry(MempoolEntry::new(tx_paying(2), 900, 10, 2, 7));
+        let Ok(shed) = shed else {
+            panic!("the shed insert committed; Err means nothing did: {shed:?}");
+        };
+        assert!(
+            shed.is_shed(),
+            "a transaction evicted by the trim must not report Accepted: {shed:?}"
+        );
+        assert_eq!(
+            shed.mutation().changes,
+            vec![
+                crate::mutation::change(&tx_paying(2).txid(), MutationOutcome::Accepted),
+                crate::mutation::change(
+                    &tx_paying(2).txid(),
+                    MutationOutcome::Removed(RemovalReason::PolicyEviction),
+                ),
+            ],
+            "the shed insert's record carries its own acceptance and removal"
+        );
+        assert_eq!(pool.len(), 1, "the seated transaction stays");
+
+        // The paired accept: pays more, so the trim takes the other one.
+        let admitted = pool.insert_entry(MempoolEntry::new(tx_paying(3), 900, 900_000, 3, 7));
+        let Ok(_result) = admitted else {
+            panic!("a better-paying transaction must be admitted: {admitted:?}");
+        };
+        assert_eq!(pool.len(), 1, "the accepted transaction is the only entry");
+        assert!(
+            pool.entries.iter().any(|(_, entry)| entry.vsize == 900),
+            "an accepted entry must resolve"
+        );
+    }
+
+    /// A replacement the size limit sheds must not report plain success.
+    ///
+    /// `replace_transaction` evicts conflicting entries, inserts the
+    /// replacement, and then trims. If the replacement itself is the
+    /// worst-paying entry, the trim takes it — but the mutation already
+    /// committed, so the outcome reports `ShedAfterCommit` carrying the
+    /// committed record instead of `Ok(Accepted)`. A caller treating a
+    /// shed replacement as accepted would act on a transaction that is
+    /// no longer in the pool.
+    #[test]
+    fn a_replacement_the_size_limit_sheds_is_not_accepted() {
+        let limits = MempoolLimits {
+            max_total_bytes: 1_000,
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+
+        // Shared prevout so the replacement directly conflicts with the
+        // original — both spend the same outpoint.
+        let prev = OutPoint {
+            txid: txid_of([0x11; 32]),
+            vout: 0,
+        };
+
+        // Original: 100 vbytes, low fee rate (100 sat/vbyte).
+        let original = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: prev,
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFD,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51],
+            }],
+        };
+        let original_txid = original.txid();
+        let seated = pool.insert_entry(MempoolEntry::new(Arc::new(original), 100, 10_000, 1, 7));
+        assert!(seated.is_ok(), "original must fit: {seated:?}");
+
+        // Bystander: 850 vbytes, high fee rate (10_000 sat/vbyte), fills pool.
+        let bystander = tx(8, Vec::new());
+        let seated_by =
+            pool.insert_entry(MempoolEntry::new(Arc::new(bystander), 850, 8_500_000, 1, 7));
+        assert!(seated_by.is_ok(), "bystander must fit: {seated_by:?}");
+        assert_eq!(pool.len(), 2);
+
+        // Replacement: conflicts with the original (same prevout), higher
+        // absolute fee (BIP125 rule 3: 15_000 > 10_000), higher fee rate
+        // than the original (BIP125 rule 6: 150 > 100 sat/vbyte), but
+        // 900 vbytes at a far lower fee rate than the bystander
+        // (166 vs 10_000). After evicting the original (100 vbytes freed),
+        // the pool has 850 + 900 = 1750 > 1000, so the trim evicts the
+        // lowest-fee-rate entry — the replacement itself.
+        let replacement = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: prev,
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFD,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 100,
+                script_pubkey: vec![0x52],
+            }],
+        };
+        let replacement_txid = replacement.txid();
+        let result = pool.replace_transaction(
+            crate::ReplacementCandidate::new(Arc::new(replacement), 900, 100_000, 1),
+            2,
+            7,
+            4,
+        );
+        let Ok(result) = result else {
+            panic!("the shed replacement committed; Err means nothing did: {result:?}");
+        };
+        assert!(
+            result.is_shed(),
+            "a replacement evicted by the trim must not report Accepted: {result:?}"
+        );
+        assert_eq!(
+            result.mutation().removed_txids(),
+            vec![original_txid, replacement_txid],
+            "the record carries the conflict removal then the shed replacement"
         );
     }
 
