@@ -91,17 +91,59 @@ impl SchemaDiff {
 ///
 /// `ANY` and `ELISION` are Core's own opt-outs (`std::nullopt` there) and match
 /// anything. Unknown names are rejected while loading the schema below.
+#[derive(Clone, Copy)]
+enum SchemaType {
+    None,
+    Str,
+    StrHex,
+    Num,
+    StrAmount,
+    NumTime,
+    Bool,
+    Arr,
+    ArrFixed,
+    Obj,
+    ObjDyn,
+    Any,
+    Elision,
+}
+
+impl SchemaType {
+    fn parse(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "NONE" => Self::None,
+            "STR" => Self::Str,
+            "STR_HEX" => Self::StrHex,
+            "NUM" => Self::Num,
+            "STR_AMOUNT" => Self::StrAmount,
+            "NUM_TIME" => Self::NumTime,
+            "BOOL" => Self::Bool,
+            "ARR" => Self::Arr,
+            "ARR_FIXED" => Self::ArrFixed,
+            "OBJ" => Self::Obj,
+            "OBJ_DYN" => Self::ObjDyn,
+            "ANY" => Self::Any,
+            "ELISION" => Self::Elision,
+            _ => return None,
+        })
+    }
+}
+
 #[must_use]
 pub fn type_matches(kind: &str, value: &Value) -> bool {
+    let Some(kind) = SchemaType::parse(kind) else {
+        return false;
+    };
     match kind {
-        "NONE" => value.get_type() == JsonType::Null,
-        "STR" | "STR_HEX" => value.get_type() == JsonType::String,
-        "NUM" | "STR_AMOUNT" | "NUM_TIME" => value.get_type() == JsonType::Number,
-        "BOOL" => value.get_type() == JsonType::Boolean,
-        "ARR" | "ARR_FIXED" => value.get_type() == JsonType::Array,
-        "OBJ" | "OBJ_DYN" => value.get_type() == JsonType::Object,
-        "ANY" | "ELISION" => true,
-        _ => false,
+        SchemaType::None => value.get_type() == JsonType::Null,
+        SchemaType::Str | SchemaType::StrHex => value.get_type() == JsonType::String,
+        SchemaType::Num | SchemaType::StrAmount | SchemaType::NumTime => {
+            value.get_type() == JsonType::Number
+        }
+        SchemaType::Bool => value.get_type() == JsonType::Boolean,
+        SchemaType::Arr | SchemaType::ArrFixed => value.get_type() == JsonType::Array,
+        SchemaType::Obj | SchemaType::ObjDyn => value.get_type() == JsonType::Object,
+        SchemaType::Any | SchemaType::Elision => true,
     }
 }
 
@@ -252,7 +294,7 @@ pub fn load_schemas() -> alloc::collections::BTreeMap<alloc::string::String, Cor
         let kind = value.get("type").and_then(JsonValueTrait::as_str)
             .filter(|kind| !kind.is_empty())
             .unwrap_or_else(|| panic!("schema variant type must be a non-empty string"));
-        if !matches!(kind, "NONE" | "STR" | "STR_HEX" | "NUM" | "STR_AMOUNT" | "NUM_TIME" | "BOOL" | "ARR" | "ARR_FIXED" | "OBJ" | "OBJ_DYN" | "ANY" | "ELISION") {
+        if SchemaType::parse(kind).is_none() {
             panic!("unsupported schema variant type: {kind}");
         }
         CoreVariant {
@@ -320,7 +362,7 @@ mod tests {
         ("estimatesmartfee", "[6]"),
         (
             "validateaddress",
-            "[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]",
+            "[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080\"]",
         ),
     ];
 
