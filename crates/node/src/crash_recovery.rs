@@ -223,11 +223,11 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
         tip_hash,
     ) {
         Ok(replayed) => {
-            if let Some(progress) = &state.apply_handles().recovery_progress {
-                progress.mark_published(meta.height);
-            }
             for height in &replayed {
                 state.push_replayed(*height);
+            }
+            if let Some(progress) = &state.apply_handles().recovery_progress {
+                progress.mark_published(meta.height);
             }
             let first_replayed = replayed.first().copied().unwrap_or(gap_base);
             let last_replayed = replayed.last().copied().unwrap_or(gap_base);
