@@ -7,8 +7,8 @@ rebuilds.
 Owners:
 - `TxIndexRuntime`, `TxIndexQueryEngine`, `Worker` in `crates/node/src/txindex_worker.rs`
 - `IndexWriter`, `IndexReader`, `IndexCapabilities`, `IndexCapability`, `IndexWatermarks`, `IndexWatermark` in `crates/index/src/index.rs` and `crates/index/src/types.rs`
-- `FilterIndexWorker`, `FilterIndexQueryEngine` in `crates/node/src/filterindex_worker.rs`
-- Registry validation and capability snapshot in `crates/node/src/extensions.rs`
+- Capability status provider in `crates/node/src/capabilities.rs` and
+  `crates/rpc/src/context.rs`
 
 ## Clauses
 
@@ -22,11 +22,6 @@ Owners:
   configuration `scriptindex=1`) enables the `ScriptHistory` capability. This
   builds generic scripthash funding rows (`ScriptHashRow`), spending rows
   (`SpendingPrefixRow`), and outpoint spender records.
-- CLI `--blockfilterindex` (env `BITCOIN_RS_BLOCKFILTERINDEX`, configuration
-  `blockfilterindex=1`) enables the BIP157/158 basic block filter index extension.
-  Per `crates/node/src/config.rs`, `blockfilterindex` requires `txindex` or
-  `script_index` enabled (the filter index resolves deep spent prevouts through
-  the transaction index) and requires pruning disabled (`prune_target_mb == 0`).
 - Enabling either `--txindex` or `--scriptindex` spawns exactly one node-owned
   `TxIndexRuntime` worker thread. Enabling both permits both capability row
   families to share a single block-body parse and atomic forward commit batch
@@ -71,7 +66,7 @@ Owners:
 
 ### `IDX-05`: Restart reconciliation and schema version refusal
 
-- Index namespaces (`data_dir/txindex`, `data_dir/blockfilterindex`) maintain
+- The `data_dir/txindex` namespace maintains
   durable format versions and capability watermarks (`IndexWatermarks`,
   `ConsumerCursor`).
 - A stored schema or format version foreign to this build refuses start for that
@@ -92,9 +87,6 @@ Owners:
   - Height-keyed rows (transaction position rows) are removed using per-block
     watermark identity records to delete exactly the rows contributed by each
     disconnected block from the tip down to the common ancestor.
-  - Hash-addressed rows (BIP157/158 filter rows) require only rewinding the
-    active header pointer and cursor to the common ancestor; hash-keyed rows
-    remain intact and re-derived rows overwrite idempotently.
 - **Connect walk**:
   - The worker loads bodies from `PruneBodyStore`, constructs bounded forward
     batches (`PreparedBatchLimits`), and commits row mutations and updated
@@ -145,14 +137,5 @@ Owners:
   consistency, and revision ABA detection tests.
 - `crates/node/src/txindex_worker_catchup_tests.rs`: multi-branch catchup,
   parallel batching, and watermark alignment tests.
-- `crates/node/src/filterindex_worker.rs`:
-  - `worker_indexes_genesis_then_child_with_retained_rows`
-  - `rewind_keeps_hash_addressed_rows`
-  - `store_write_failure_is_reported_not_swallowed`
-  - `missing_body_fails_the_pass_without_touching_the_pointer`
-- `crates/node/tests/extensions.rs`:
-  - `filter_extension_tip_equivalence_disabled_vs_enabled`
-  - `filter_extension_restarts_reconcile_from_persisted_pointer`
-  - `filter_extension_apply_outpaces_a_lagging_consumer`
 - `bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs`: reorganization planning,
   execution, disconnect restoration, and index reconciliation gate.

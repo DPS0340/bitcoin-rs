@@ -110,7 +110,7 @@ fn mempool_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::
     assert!(info.permit_bare_multisig);
     assert!(info.optimal);
     assert_eq!(info.max_data_carrier_size, 83);
-    assert_eq!(info.limit_cluster_count, 25);
+    assert_eq!(info.limit_cluster_count, 64);
     assert_eq!(info.limit_cluster_size, 101_000);
     assert_eq!(info.max_mempool, 300_000_000);
     // fullrbf reports the real replacement policy: BIP125 rule 1 signaling
@@ -323,6 +323,7 @@ impl MiningControl for CompatMiningControl {
         Ok(MiningInfo {
             blocks: 0,
             last_candidate: None,
+            bits: 0x207f_ffff,
             difficulty: 1.0,
             network_hashes_per_second: 0.0,
             pooled_transactions: 0,
