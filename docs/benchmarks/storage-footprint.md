@@ -35,27 +35,14 @@ all data remaining in the pre-allocated journal.
 
 ## Results
 
-### Before compression fix
-
-| Backend | Total on-disk | Logical | Write amplification |
-|---|---:|---:|---:|
-| fjall (default) | 207,497,732 B (197.89 MiB) | 129,570,000 B (123.57 MiB) | 1.601x |
-| redb | 269,488,128 B (257.00 MiB) | 129,570,000 B (123.57 MiB) | 2.080x |
-| rocksdb | 134,671,921 B (128.43 MiB) | 129,570,000 B (123.57 MiB) | 1.039x |
-
-### After compression fix
-
-| Backend | Total on-disk | Logical | Write amplification |
-|---|---:|---:|---:|
-| **fjall (default)** | **85,858,577 B (81.88 MiB)** | 129,570,000 B (123.57 MiB) | **0.663x** |
-| redb | 269,488,128 B (257.00 MiB) | 129,570,000 B (123.57 MiB) | 2.080x |
-| rocksdb | 134,671,921 B (128.43 MiB) | 129,570,000 B (123.57 MiB) | 1.039x |
-
-The fjall default backend dropped from **197.89 MiB to 81.88 MiB** — a **58.6%
-reduction**. The amplification went from 1.621x to 0.671x because the synthetic
-corpus is highly compressible (16 KiB blocks of repeated bytes).
+The corpus definition was updated to write eight-byte values for every
+`Spending` row. The measurements below predate that change and must not be used:
+their logical-size and amplification figures describe a different corpus.
+Rerun the harness above for each backend before recording results here.
 
 ### Fjall per-column-family breakdown (after fix)
+
+This breakdown also predates the updated `Spending` values and must be rerun.
 
 | Column family | On-disk (bytes) | On-disk (KiB) |
 |---|---:|---:|
