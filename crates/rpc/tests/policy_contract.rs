@@ -1388,14 +1388,22 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_replacement_into_a_full_clu
     let (root, original) = {
         let mut pool = ctx.mempool.pool().write();
         pool.limits.cluster_count = 2;
-        let root = tx(
-            OutPoint {
-                txid: Txid(Hash256::from_le_bytes(&[0xc5; 32])),
-                vout: 0,
-            },
-            50_000,
-            0xffff_ffff,
-        );
+        // OP_TRUE so the RPC path can spend the root without a witness.
+        // P2WPKH here is what produced consensus-verification-failed.
+        let root = Tx {
+            outputs: vec![TxOut {
+                value: 50_000,
+                script_pubkey: op_true_script(),
+            }],
+            ..tx(
+                OutPoint {
+                    txid: Txid(Hash256::from_le_bytes(&[0xc5; 32])),
+                    vout: 0,
+                },
+                50_000,
+                0xffff_ffff,
+            )
+        };
         let original = tx(OutPoint::new(rpc_txid(&root), 0), 40_000, 0xffff_fffd);
         pool.insert_entry(MempoolEntry::new(Arc::new(root.clone()), 100, 10_000, 0, 1))?;
         pool.insert_entry(MempoolEntry::new(
