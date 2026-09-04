@@ -187,7 +187,9 @@ fn sendrawtransaction_readmits_a_transaction_evicted_from_the_mempool()
 
     // Policy eviction (fee-rate trim), not an RBF replacement: the
     // transaction is still valid and must be admitted again.
-    let removed = ctx.mempool.evict_below_fee_rate(AdmissionOrigin::Rpc, u64::MAX);
+    let removed = ctx
+        .mempool
+        .evict_below_fee_rate(AdmissionOrigin::Rpc, u64::MAX);
     assert!(
         !removed.changes.is_empty(),
         "the eviction must have removed the entry"
