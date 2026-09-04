@@ -397,11 +397,7 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
             stats.window_tx_count,
             window_open && stats.window_interval > 0,
         ) {
-            (Some(count), true) => {
-                let count_small = u32::try_from(count).unwrap_or(u32::MAX);
-                let interval_small = u32::try_from(stats.window_interval).unwrap_or(u32::MAX);
-                Some(f64::from(count_small) / f64::from(interval_small))
-            }
+            (Some(count), true) => Some(u64_to_f64(count) / u64_to_f64(stats.window_interval)),
             _ => None,
         };
         let mut result = typed_to_sonic_omitting_nulls(&v31::GetChainTxStats {
@@ -4502,11 +4498,58 @@ mod chaintxstats_window_tests {
         let Some(txrate) = result.get("txrate").and_then(JsonValueTrait::as_f64) else {
             panic!("txrate missing: {result:?}");
         };
-        let count_f = i32::try_from(count).unwrap_or(i32::MAX);
-        let interval_f = i32::try_from(interval).unwrap_or(i32::MAX);
+        let expected = super::u64_to_f64(u64::try_from(count).unwrap_or(0))
+            / super::u64_to_f64(u64::try_from(interval).unwrap_or(0));
         assert!(
-            (txrate - f64::from(count_f) / f64::from(interval_f)).abs() < f64::EPSILON,
-            "got {txrate}"
+            (txrate - expected).abs() < f64::EPSILON,
+            "got {txrate}, expected {expected}"
+        );
+    }
+
+    /// A rate must keep the full window count, not the low 32 bits.
+    ///
+    /// Capping through `u32::try_from` locks `txrate` once the window's
+    /// transactions pass 4_294_967_295. Bitcoin Core divides the 64-bit
+    /// count by the 64-bit interval; so does [`u64_to_f64`].
+    #[test]
+    fn txrate_keeps_counts_above_u32_max() {
+        const PAST: u64 = 1;
+        const END: u64 = u64::from(u32::MAX) + 100;
+        let ctx = Context::new();
+        let tip = super::chaintxstats_durability_tests::insert_counted_chain(
+            &ctx,
+            &[1_000, 2_000],
+            &[PAST, END],
+        );
+        ctx.set_applied_tip(tip);
+        let ctx = Arc::new(ctx);
+
+        let result = stats(&ctx, &json!([1]));
+        let count = END - PAST;
+        assert_eq!(
+            result
+                .get("window_tx_count")
+                .and_then(JsonValueTrait::as_u64),
+            Some(count)
+        );
+        let Some(interval) = result
+            .get("window_interval")
+            .and_then(JsonValueTrait::as_u64)
+        else {
+            panic!("window_interval missing: {result:?}");
+        };
+        let Some(txrate) = result.get("txrate").and_then(JsonValueTrait::as_f64) else {
+            panic!("txrate missing: {result:?}");
+        };
+        let expected = super::u64_to_f64(count) / super::u64_to_f64(interval);
+        let capped = f64::from(u32::MAX) / super::u64_to_f64(interval);
+        assert_ne!(
+            expected, capped,
+            "the fixture must sit above the old 32-bit cap"
+        );
+        assert!(
+            (txrate - expected).abs() < f64::EPSILON,
+            "got {txrate}, expected {expected}"
         );
     }
 
