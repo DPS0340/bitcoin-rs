@@ -1589,6 +1589,9 @@ impl Context {
     ///
     /// Returns the policy rejection verbatim (Core rejection strings) or
     /// the failure verbatim; nothing is inserted when this fails.
+    // Owned `Tx` is the public call form (`admit_transaction(tx, None)`).
+    // Admission only borrows; the value parameter is the compatibility contract.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn admit_transaction(
         &self,
         tx: Tx,
