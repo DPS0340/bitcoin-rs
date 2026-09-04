@@ -12,6 +12,7 @@ use std::process::ExitCode;
 
 mod cli;
 mod env;
+mod toml;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -24,9 +25,14 @@ fn load(
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
-    let env_layer = env::user_config_from_env(vars)?;
-    let cli_layer = cli.into_user_config();
-    bitcoin_rs_node::resolve(&[&env_layer, &cli_layer])
+    let mut layers = Vec::new();
+    if let Some(path) = &cli.config {
+        layers.push(toml::user_config_from_path(path)?);
+    }
+    layers.push(env::user_config_from_env(vars)?);
+    layers.push(cli.into_user_config());
+    let layer_refs: Vec<_> = layers.iter().collect();
+    bitcoin_rs_node::resolve(&layer_refs)
 }
 
 fn main() -> ExitCode {
@@ -83,23 +89,72 @@ mod tests {
     }
 
     #[test]
-    fn environment_parses_zmq_and_script_index() {
+    fn environment_parses_script_index() {
         let config = super::load(
             ["bitcoin-rs"],
-            [
-                ("BITCOIN_RS_ZMQPUBHASHTX", "tcp://127.0.0.1:28333"),
-                ("BITCOIN_RS_ZMQPUBHASHTXHWM", "42"),
-                ("BITCOIN_RS_SCRIPTINDEX", "full"),
-            ]
-            .into_iter()
-            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+            std::iter::once(("BITCOIN_RS_SCRIPTINDEX", "full"))
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
         )
         .unwrap_or_else(|error| panic!("valid environment configuration: {error}"));
 
         assert_eq!(config.indexes.script_index, ScriptIndexMode::Full);
-        assert_eq!(config.zmq.len(), 1);
-        assert_eq!(config.zmq[0].hwm, 42);
-        assert_eq!(config.zmq[0].endpoint, "tcp://127.0.0.1:28333");
+    }
+
+    #[test]
+    fn toml_groups_zmq_topics_by_endpoint() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let path = dir.path().join("node.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[notifications.zmq]]
+endpoint = "tcp://127.0.0.1:28332"
+topics = ["hashblock", "rawblock", "sequence"]
+
+[[notifications.zmq]]
+endpoint = "tcp://127.0.0.1:28333"
+topics = ["hashtx", "rawtx"]
+hwm = 5000
+"#,
+        )
+        .unwrap_or_else(|error| panic!("write toml: {error}"));
+
+        let config = super::load(
+            [
+                "bitcoin-rs",
+                "--config",
+                path.to_str().unwrap_or_else(|| panic!("utf-8 path")),
+            ],
+            std::iter::empty(),
+        )
+        .unwrap_or_else(|error| panic!("valid toml configuration: {error}"));
+
+        let endpoints = config.zmq_endpoints();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].endpoint, "tcp://127.0.0.1:28332");
+        assert_eq!(endpoints[0].effective_hwm(), 1_000);
+        assert_eq!(endpoints[1].effective_hwm(), 5_000);
+    }
+
+    #[test]
+    fn legacy_flat_zmq_toml_is_rejected() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, r#"zmqpubhashblock = ["tcp://127.0.0.1:28332"]"#)
+            .unwrap_or_else(|error| panic!("write toml: {error}"));
+
+        let error = match super::load(
+            [
+                "bitcoin-rs",
+                "--config",
+                path.to_str().unwrap_or_else(|| panic!("utf-8 path")),
+            ],
+            std::iter::empty(),
+        ) {
+            Ok(_) => panic!("legacy flat ZMQ keys must not be silently accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("failed to parse TOML config"));
     }
 
     #[test]

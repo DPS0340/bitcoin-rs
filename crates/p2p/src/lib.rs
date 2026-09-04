@@ -5,8 +5,10 @@
 pub mod addrv2;
 /// Peer banning and persistence.
 pub mod banlist;
-/// Per-connection identity and cancellation.
 pub mod connection;
+/// Per-connection identity and cancellation.
+/// Per-connection traffic counters.
+pub mod counters;
 /// Inbound message dispatcher.
 pub mod dispatch;
 /// Block download window, peer-assignment, stall, and scheduling policy.
@@ -25,6 +27,8 @@ pub mod listener;
 pub mod peer;
 /// Peer metadata published after a successful handshake.
 pub mod peer_info;
+/// Single owner of live peer sessions: leases and their handshake metadata.
+pub mod peer_table;
 /// Manual IP subnet banning primitives.
 pub mod subnet;
 /// Bitcoin P2P wire codec.
@@ -33,6 +37,7 @@ pub mod wire;
 pub mod wtxid;
 
 pub use connection::{ConnectionId, PeerLease, PeerSource, PeerStats};
+pub use counters::{CountingStream, PeerCounters};
 pub use dispatch::{ChainQuery, InventoryServing, TxInventory};
 pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use listener::spawn_outbound_connection;
@@ -43,6 +48,7 @@ pub use peer::{
     UPLOAD_TIMEFRAME_SECS, UploadTarget,
 };
 pub use peer_info::PeerInfo;
+pub use peer_table::{PeerSession, PeerTable};
 pub use subnet::{BannedSubnet, IpSubnet, SubnetParseError};
 pub use wire::{Message, PeerError};
 

@@ -2,13 +2,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
-use bitcoin_rs_node::zmq_publisher::ZmqTopic;
 use bitcoin_rs_node::{NetworkSelection, ScriptIndexMode, UserConfig};
 use bitcoin_rs_storage::StorageBackend;
 
-use crate::cli::{
-    parse_bool, parse_connect_list, parse_p2p_magic, parse_socket_list, parse_string_list,
-};
+use crate::cli::{parse_bool, parse_connect_list, parse_p2p_magic, parse_socket_list};
 
 #[derive(Copy, Clone)]
 enum EnvSetting {
@@ -28,12 +25,9 @@ enum EnvSetting {
     PruneTargetMb,
     TxIndex,
     DbcacheMb,
-    IndexRollbackRebuildCutover,
     LogLevel,
     MetricsBind,
     AssumeValidHeight,
-    ZmqEndpoints(ZmqTopic),
-    ZmqHwm(ZmqTopic),
 }
 
 pub(crate) fn user_config_from_env(
@@ -71,20 +65,9 @@ fn env_setting(key: &str) -> Option<EnvSetting> {
         "BITCOIN_RS_PRUNE_TARGET_MB" => EnvSetting::PruneTargetMb,
         "BITCOIN_RS_TXINDEX" => EnvSetting::TxIndex,
         "BITCOIN_RS_DBCACHE_MB" => EnvSetting::DbcacheMb,
-        "BITCOIN_RS_INDEX_ROLLBACK_REBUILD_CUTOVER" => EnvSetting::IndexRollbackRebuildCutover,
         "BITCOIN_RS_LOG_LEVEL" => EnvSetting::LogLevel,
         "BITCOIN_RS_METRICS_BIND" => EnvSetting::MetricsBind,
         "BITCOIN_RS_ASSUME_VALID_HEIGHT" => EnvSetting::AssumeValidHeight,
-        "BITCOIN_RS_ZMQPUBHASHBLOCK" => EnvSetting::ZmqEndpoints(ZmqTopic::HashBlock),
-        "BITCOIN_RS_ZMQPUBHASHTX" => EnvSetting::ZmqEndpoints(ZmqTopic::HashTx),
-        "BITCOIN_RS_ZMQPUBRAWBLOCK" => EnvSetting::ZmqEndpoints(ZmqTopic::RawBlock),
-        "BITCOIN_RS_ZMQPUBRAWTX" => EnvSetting::ZmqEndpoints(ZmqTopic::RawTx),
-        "BITCOIN_RS_ZMQPUBSEQUENCE" => EnvSetting::ZmqEndpoints(ZmqTopic::Sequence),
-        "BITCOIN_RS_ZMQPUBHASHBLOCKHWM" => EnvSetting::ZmqHwm(ZmqTopic::HashBlock),
-        "BITCOIN_RS_ZMQPUBHASHTXHWM" => EnvSetting::ZmqHwm(ZmqTopic::HashTx),
-        "BITCOIN_RS_ZMQPUBRAWBLOCKHWM" => EnvSetting::ZmqHwm(ZmqTopic::RawBlock),
-        "BITCOIN_RS_ZMQPUBRAWTXHWM" => EnvSetting::ZmqHwm(ZmqTopic::RawTx),
-        "BITCOIN_RS_ZMQPUBSEQUENCEHWM" => EnvSetting::ZmqHwm(ZmqTopic::Sequence),
         _ => return None,
     })
 }
@@ -130,19 +113,10 @@ fn apply(layer: &mut UserConfig, setting: EnvSetting, value: &str) -> Result<()>
         EnvSetting::PruneTargetMb => layer.storage.prune_target_mb = Some(value.parse()?),
         EnvSetting::TxIndex => layer.indexes.txindex = Some(parse_bool(value)?),
         EnvSetting::DbcacheMb => layer.storage.dbcache_mb = Some(value.parse()?),
-        EnvSetting::IndexRollbackRebuildCutover => {
-            layer.indexes.rollback_rebuild_cutover = Some(value.parse()?);
-        }
         EnvSetting::LogLevel => layer.observability.log_level = Some(value.to_owned()),
         EnvSetting::MetricsBind => layer.observability.metrics_bind = Some(value.parse()?),
         EnvSetting::AssumeValidHeight => {
             layer.validation.assume_valid_height = Some(value.parse()?);
-        }
-        EnvSetting::ZmqEndpoints(topic) => {
-            layer.zmq.endpoints.insert(topic, parse_string_list(value));
-        }
-        EnvSetting::ZmqHwm(topic) => {
-            layer.zmq.hwm.insert(topic, value.parse()?);
         }
     }
     Ok(())

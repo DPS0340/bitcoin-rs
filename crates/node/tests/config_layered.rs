@@ -1,12 +1,10 @@
 //! Resolver tests for grouped node configuration layers.
 
-use std::collections::BTreeMap;
-
 use anyhow::Result;
 use bitcoin_rs_node::zmq_publisher::ZmqTopic;
 use bitcoin_rs_node::{
-    NetworkSelection, NodeConfig, P2pOverrides, ScriptIndexMode, UserConfig, ValidationOverrides,
-    ZmqOverrides, ZmqPublication, resolve,
+    NetworkSelection, NodeConfig, NotificationConfig, P2pOverrides, ScriptIndexMode, UserConfig,
+    ValidationOverrides, ZmqEndpointConfig, resolve,
 };
 use bitcoin_rs_primitives::Network;
 
@@ -98,7 +96,6 @@ fn script_index_is_valid_without_core_txindex() -> Result<()> {
         indexes: bitcoin_rs_node::IndexOverrides {
             script_index: Some(ScriptIndexMode::Full),
             txindex: Some(false),
-            ..Default::default()
         },
         ..Default::default()
     };
@@ -109,134 +106,138 @@ fn script_index_is_valid_without_core_txindex() -> Result<()> {
 }
 
 #[test]
-fn zmq_endpoints_expand_in_topic_order_with_hwm() -> Result<()> {
-    let mut endpoints = BTreeMap::new();
-    endpoints.insert(
-        ZmqTopic::HashBlock,
-        vec![
-            "tcp://127.0.0.1:28332".to_owned(),
-            "tcp://127.0.0.1:28333".to_owned(),
-        ],
-    );
-    endpoints.insert(ZmqTopic::HashTx, vec!["tcp://127.0.0.1:28334".to_owned()]);
-    let mut hwm = BTreeMap::new();
-    hwm.insert(ZmqTopic::HashBlock, 9);
+fn zmq_endpoint_groups_keep_topics_and_publisher_default_hwm() -> Result<()> {
     let layer = UserConfig {
-        zmq: ZmqOverrides { endpoints, hwm },
+        notifications: Some(NotificationConfig {
+            zmq: vec![
+                ZmqEndpointConfig {
+                    endpoint: "tcp://127.0.0.1:28332".to_owned(),
+                    topics: vec![ZmqTopic::HashBlock, ZmqTopic::RawBlock, ZmqTopic::Sequence],
+                    hwm: None,
+                },
+                ZmqEndpointConfig {
+                    endpoint: "tcp://127.0.0.1:28333".to_owned(),
+                    topics: vec![ZmqTopic::HashTx, ZmqTopic::RawTx],
+                    hwm: Some(5_000),
+                },
+            ],
+        }),
         ..Default::default()
     };
     let config = resolve(&[&layer])?;
+    let endpoints = config.zmq_endpoints();
+    assert_eq!(endpoints.len(), 2);
+    assert_eq!(endpoints[0].endpoint, "tcp://127.0.0.1:28332");
     assert_eq!(
-        config.zmq.iter().map(|item| item.topic).collect::<Vec<_>>(),
-        [ZmqTopic::HashBlock, ZmqTopic::HashBlock, ZmqTopic::HashTx]
+        endpoints[0]
+            .topics
+            .iter()
+            .map(|topic| topic.as_str())
+            .collect::<Vec<_>>(),
+        ["hashblock", "rawblock", "sequence"]
     );
-    assert_eq!(
-        config.zmq.iter().map(|item| item.hwm).collect::<Vec<_>>(),
-        [9, 9, 1_000]
-    );
+    assert_eq!(endpoints[0].hwm, None);
+    assert_eq!(endpoints[0].effective_hwm(), 1_000);
+    assert_eq!(endpoints[1].endpoint, "tcp://127.0.0.1:28333");
+    assert_eq!(endpoints[1].effective_hwm(), 5_000);
     Ok(())
 }
 
 #[test]
-fn higher_layer_replaces_zmq_endpoint_and_preserves_order_and_hwm() -> Result<()> {
-    let mut lower_endpoints = BTreeMap::new();
-    lower_endpoints.insert(
-        ZmqTopic::HashBlock,
-        vec!["tcp://127.0.0.1:28332".to_owned()],
-    );
-    lower_endpoints.insert(ZmqTopic::RawTx, vec!["tcp://127.0.0.1:28333".to_owned()]);
-    let mut lower_hwm = BTreeMap::new();
-    lower_hwm.insert(ZmqTopic::HashBlock, 42);
+fn higher_layer_replaces_zmq_endpoint_groups() -> Result<()> {
     let lower = UserConfig {
-        zmq: ZmqOverrides {
-            endpoints: lower_endpoints,
-            hwm: lower_hwm,
-        },
+        notifications: Some(NotificationConfig {
+            zmq: vec![
+                ZmqEndpointConfig {
+                    endpoint: "tcp://127.0.0.1:28332".to_owned(),
+                    topics: vec![ZmqTopic::HashBlock],
+                    hwm: Some(42),
+                },
+                ZmqEndpointConfig {
+                    endpoint: "tcp://127.0.0.1:28333".to_owned(),
+                    topics: vec![ZmqTopic::RawTx],
+                    hwm: None,
+                },
+            ],
+        }),
         ..Default::default()
     };
-
-    let mut higher_endpoints = BTreeMap::new();
-    higher_endpoints.insert(
-        ZmqTopic::HashBlock,
-        vec!["tcp://127.0.0.1:28334".to_owned()],
-    );
     let higher = UserConfig {
-        zmq: ZmqOverrides {
-            endpoints: higher_endpoints,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let config = resolve(&[&lower, &higher])?;
-    assert_eq!(
-        config.zmq,
-        vec![
-            ZmqPublication {
-                topic: ZmqTopic::HashBlock,
+        notifications: Some(NotificationConfig {
+            zmq: vec![ZmqEndpointConfig {
                 endpoint: "tcp://127.0.0.1:28334".to_owned(),
-                hwm: 42,
-            },
-            ZmqPublication {
-                topic: ZmqTopic::RawTx,
-                endpoint: "tcp://127.0.0.1:28333".to_owned(),
-                hwm: 1_000,
-            },
-        ]
-    );
-    Ok(())
-}
-
-#[test]
-fn lower_layer_hwm_applies_to_higher_layer_endpoint() -> Result<()> {
-    let mut lower_hwm = BTreeMap::new();
-    lower_hwm.insert(ZmqTopic::HashBlock, 42);
-    let lower = UserConfig {
-        zmq: ZmqOverrides {
-            hwm: lower_hwm,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let mut higher_endpoints = BTreeMap::new();
-    higher_endpoints.insert(
-        ZmqTopic::HashBlock,
-        vec!["tcp://127.0.0.1:28334".to_owned()],
-    );
-    let higher = UserConfig {
-        zmq: ZmqOverrides {
-            endpoints: higher_endpoints,
-            ..Default::default()
-        },
+                topics: vec![ZmqTopic::HashBlock],
+                hwm: Some(7),
+            }],
+        }),
         ..Default::default()
     };
 
     let config = resolve(&[&lower, &higher])?;
     assert_eq!(
-        config.zmq,
-        vec![ZmqPublication {
-            topic: ZmqTopic::HashBlock,
+        config.notifications.zmq,
+        vec![ZmqEndpointConfig {
             endpoint: "tcp://127.0.0.1:28334".to_owned(),
-            hwm: 42,
+            topics: vec![ZmqTopic::HashBlock],
+            hwm: Some(7),
         }]
     );
     Ok(())
 }
 
 #[test]
+fn absent_higher_layer_notifications_preserve_lower_layer() -> Result<()> {
+    let lower = UserConfig {
+        notifications: Some(NotificationConfig {
+            zmq: vec![ZmqEndpointConfig {
+                endpoint: "tcp://127.0.0.1:28332".to_owned(),
+                topics: vec![ZmqTopic::HashBlock],
+                hwm: Some(42),
+            }],
+        }),
+        ..Default::default()
+    };
+    let higher = UserConfig::default();
+    let config = resolve(&[&lower, &higher])?;
+    assert_eq!(config.zmq_endpoints()[0].effective_hwm(), 42);
+    Ok(())
+}
+
+#[test]
+fn zmq_endpoint_groups_reject_duplicate_socket_and_topic_ownership() {
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
+    config.notifications.zmq = vec![
+        ZmqEndpointConfig {
+            endpoint: "tcp://127.0.0.1:28332".to_owned(),
+            topics: vec![ZmqTopic::HashBlock],
+            hwm: None,
+        },
+        ZmqEndpointConfig {
+            endpoint: "tcp://127.0.0.1:28332".to_owned(),
+            topics: vec![ZmqTopic::RawBlock],
+            hwm: Some(5_000),
+        },
+    ];
+    assert!(config.validate().is_err());
+
+    config.notifications.zmq.truncate(1);
+    config.notifications.zmq[0].topics.push(ZmqTopic::HashBlock);
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn resolved_zmq_hwm_is_validated() {
     let mut config = NodeConfig::default_for_network(Network::Regtest);
-    config.zmq.push(ZmqPublication {
-        topic: ZmqTopic::HashBlock,
+    config.notifications.zmq.push(ZmqEndpointConfig {
         endpoint: "tcp://127.0.0.1:28332".to_owned(),
-        hwm: 2_147_483_648,
+        topics: vec![ZmqTopic::HashBlock],
+        hwm: Some(2_147_483_648),
     });
     let error = match config.validate() {
         Ok(()) => panic!("out-of-range resolved ZMQ HWM must be rejected"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("pubhashblockhwm"));
+    assert!(error.to_string().contains("ZMQ HWM exceeds libzmq"));
 }
 
 #[test]

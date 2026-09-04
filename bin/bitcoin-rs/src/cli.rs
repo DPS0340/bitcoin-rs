@@ -3,10 +3,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Result, bail, ensure};
-use bitcoin_rs_node::zmq_publisher::ZmqTopic;
 use bitcoin_rs_node::{
     IndexOverrides, NetworkSelection, ObservabilityOverrides, P2pOverrides, RpcOverrides,
-    ScriptIndexMode, StorageOverrides, UserConfig, ValidationOverrides, ZmqOverrides,
+    ScriptIndexMode, StorageOverrides, UserConfig, ValidationOverrides,
 };
 use bitcoin_rs_storage::StorageBackend;
 use clap::Parser;
@@ -14,6 +13,8 @@ use clap::Parser;
 #[derive(Clone, Debug, Parser)]
 #[command(name = "bitcoin-rs", about = "Run a bitcoin-rs node")]
 pub(crate) struct CliArgs {
+    #[arg(long)]
+    pub(crate) config: Option<PathBuf>,
     #[arg(long, value_parser = parse_network)]
     pub(crate) network: Option<NetworkSelection>,
     #[arg(long = "p2p-magic", value_parser = parse_p2p_magic)]
@@ -52,50 +53,16 @@ pub(crate) struct CliArgs {
     pub(crate) txindex: Option<bool>,
     #[arg(long = "dbcache-mb")]
     pub(crate) dbcache_mb: Option<u64>,
-    #[arg(long = "index-rollback-rebuild-cutover")]
-    pub(crate) index_rollback_rebuild_cutover: Option<u32>,
     #[arg(long = "log-level")]
     pub(crate) log_level: Option<String>,
     #[arg(long = "metrics-bind")]
     pub(crate) metrics_bind: Option<SocketAddr>,
-    #[arg(long = "zmqpubhashblock", value_delimiter = ',')]
-    pub(crate) zmqpubhashblock: Option<Vec<String>>,
-    #[arg(long = "zmqpubhashtx", value_delimiter = ',')]
-    pub(crate) zmqpubhashtx: Option<Vec<String>>,
-    #[arg(long = "zmqpubrawblock", value_delimiter = ',')]
-    pub(crate) zmqpubrawblock: Option<Vec<String>>,
-    #[arg(long = "zmqpubrawtx", value_delimiter = ',')]
-    pub(crate) zmqpubrawtx: Option<Vec<String>>,
-    #[arg(long = "zmqpubsequence", value_delimiter = ',')]
-    pub(crate) zmqpubsequence: Option<Vec<String>>,
-    #[arg(long = "zmqpubhashblockhwm")]
-    pub(crate) zmqpubhashblockhwm: Option<u32>,
-    #[arg(long = "zmqpubhashtxhwm")]
-    pub(crate) zmqpubhashtxhwm: Option<u32>,
-    #[arg(long = "zmqpubrawblockhwm")]
-    pub(crate) zmqpubrawblockhwm: Option<u32>,
-    #[arg(long = "zmqpubrawtxhwm")]
-    pub(crate) zmqpubrawtxhwm: Option<u32>,
-    #[arg(long = "zmqpubsequencehwm")]
-    pub(crate) zmqpubsequencehwm: Option<u32>,
     #[arg(long = "assume-valid-height")]
     pub(crate) assume_valid_height: Option<u32>,
 }
 
 impl CliArgs {
     pub(crate) fn into_user_config(self) -> UserConfig {
-        let mut endpoints = std::collections::BTreeMap::new();
-        insert_endpoints(&mut endpoints, ZmqTopic::HashBlock, self.zmqpubhashblock);
-        insert_endpoints(&mut endpoints, ZmqTopic::HashTx, self.zmqpubhashtx);
-        insert_endpoints(&mut endpoints, ZmqTopic::RawBlock, self.zmqpubrawblock);
-        insert_endpoints(&mut endpoints, ZmqTopic::RawTx, self.zmqpubrawtx);
-        insert_endpoints(&mut endpoints, ZmqTopic::Sequence, self.zmqpubsequence);
-        let mut hwm = std::collections::BTreeMap::new();
-        insert_hwm(&mut hwm, ZmqTopic::HashBlock, self.zmqpubhashblockhwm);
-        insert_hwm(&mut hwm, ZmqTopic::HashTx, self.zmqpubhashtxhwm);
-        insert_hwm(&mut hwm, ZmqTopic::RawBlock, self.zmqpubrawblockhwm);
-        insert_hwm(&mut hwm, ZmqTopic::RawTx, self.zmqpubrawtxhwm);
-        insert_hwm(&mut hwm, ZmqTopic::Sequence, self.zmqpubsequencehwm);
         UserConfig {
             network: self.network,
             data_dir: self.data_dir,
@@ -120,37 +87,16 @@ impl CliArgs {
             indexes: IndexOverrides {
                 txindex: self.txindex,
                 script_index: self.script_index,
-                rollback_rebuild_cutover: self.index_rollback_rebuild_cutover,
             },
             observability: ObservabilityOverrides {
                 log_level: self.log_level,
                 metrics_bind: self.metrics_bind,
             },
-            zmq: ZmqOverrides { endpoints, hwm },
+            notifications: None,
             validation: ValidationOverrides {
                 assume_valid_height: self.assume_valid_height,
             },
         }
-    }
-}
-
-fn insert_endpoints(
-    endpoints: &mut std::collections::BTreeMap<ZmqTopic, Vec<String>>,
-    topic: ZmqTopic,
-    values: Option<Vec<String>>,
-) {
-    if let Some(values) = values {
-        endpoints.insert(topic, values);
-    }
-}
-
-fn insert_hwm(
-    hwm: &mut std::collections::BTreeMap<ZmqTopic, u32>,
-    topic: ZmqTopic,
-    value: Option<u32>,
-) {
-    if let Some(value) = value {
-        hwm.insert(topic, value);
     }
 }
 
@@ -163,9 +109,8 @@ fn parse_storage_backend(value: &str) -> std::result::Result<StorageBackend, Str
 }
 
 fn parse_script_index(value: &str) -> std::result::Result<ScriptIndexMode, String> {
-    ScriptIndexMode::parse(value).ok_or_else(|| {
-        format!("invalid scriptindex value `{value}`: expected `utxo`, `full`, or a boolean")
-    })
+    ScriptIndexMode::parse(value)
+        .ok_or_else(|| format!("invalid scriptindex value `{value}`: expected `full` or a boolean"))
 }
 
 pub(crate) fn parse_bool(value: &str) -> Result<bool> {
@@ -218,14 +163,5 @@ pub(crate) fn parse_connect_list(value: &str) -> Result<Vec<String>> {
         .split(',')
         .filter(|part| !part.trim().is_empty())
         .map(|part| parse_connect_endpoint(part.trim()).map_err(anyhow::Error::msg))
-        .collect()
-}
-
-pub(crate) fn parse_string_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
         .collect()
 }

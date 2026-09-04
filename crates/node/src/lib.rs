@@ -78,10 +78,10 @@ pub mod zmq_publisher;
 pub use bitcoin_rs_primitives::Network;
 pub use block_source::NodeBlockSource;
 pub use config::{
-    Auth, IndexConfig, IndexOverrides, NetworkSelection, NodeConfig, ObservabilityConfig,
-    ObservabilityOverrides, P2pConfig, P2pOverrides, RpcConfig, RpcOverrides, RuntimeInputs,
-    ScriptIndexMode, StorageConfig, StorageOverrides, UserConfig, ValidationConfig,
-    ValidationOverrides, ZmqOverrides, ZmqPublication, resolve,
+    Auth, IndexConfig, IndexOverrides, NetworkSelection, NodeConfig, NotificationConfig,
+    ObservabilityConfig, ObservabilityOverrides, P2pConfig, P2pOverrides, RpcConfig, RpcOverrides,
+    RuntimeInputs, ScriptIndexMode, StorageConfig, StorageOverrides, UserConfig, ValidationConfig,
+    ValidationOverrides, resolve,
 };
 pub use embed::{Node, NodeError, SyncProgress};
 pub use mining::{GenerationKey, MiningCoordinator};
@@ -93,4 +93,6 @@ pub use txindex_worker::TxIndexRuntime;
 pub use utxo_view::UtxoSetView;
 #[cfg(feature = "zmq")]
 pub use zmq_publisher::SocketZmqPublisher;
-pub use zmq_publisher::{NoOpZmqPublisher, SequenceEvent, TracingZmqPublisher, ZmqPublisher};
+pub use zmq_publisher::{
+    NoOpZmqPublisher, SequenceEvent, TracingZmqPublisher, ZmqEndpointConfig, ZmqPublisher, ZmqTopic,
+};

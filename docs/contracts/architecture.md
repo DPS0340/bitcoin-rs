@@ -116,8 +116,8 @@ Owners:
 - `bitcoin-rs-node` owns runtime startup/shutdown sequencing, configuration
   resolution and validation (`UserConfig` layers → `NodeConfig`), and
   process-level cache budgeting (`dbcache` distribution across chainstate and
-  txindex namespaces). The `bitcoin-rs` binary owns argv and environment
-  parsing.
+  txindex namespaces). The `bitcoin-rs` binary owns argv, environment, and
+  TOML parsing.
 
 ### `ARCH-06`: Hierarchy change and exception process
 

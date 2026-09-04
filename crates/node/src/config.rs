@@ -1,29 +1,28 @@
 //! Node configuration DTOs, resolution, and validation.
 
 use core::fmt;
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_storage::StorageBackend;
 use crossbeam_channel::Receiver;
+use serde::Deserialize;
 
 const DEFAULT_STORAGE_BACKEND: StorageBackend = StorageBackend::Fjall;
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_RPC_USER: &str = "bitcoin-rs";
 const DEFAULT_RPC_PASSWORD: &str = "bitcoin-rs";
 const DEFAULT_DBCACHE_MB: u64 = 450;
-const DEFAULT_INDEX_ROLLBACK_REBUILD_CUTOVER: u32 = 100_000;
-const DEFAULT_ZMQ_HWM: u32 = 1_000;
 const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
 const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
 
 /// A built-in node network and its associated P2P bootstrap profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub enum NetworkSelection {
     /// Bitcoin mainnet.
     Mainnet,
@@ -154,25 +153,29 @@ impl Default for Auth {
     }
 }
 
-/// One configured ZMQ PUB notification endpoint.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ZmqPublication {
-    /// Notification topic name.
-    pub topic: crate::zmq_publisher::ZmqTopic,
-    /// ZMQ endpoint to bind.
-    pub endpoint: String,
-    /// PUB socket high-water mark.
-    pub hwm: u32,
+/// Node notification adapters, grouped below the node-level configuration.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationConfig {
+    /// ZMQ PUB sockets, each owning its endpoint, topics, and optional HWM override.
+    pub zmq: Vec<crate::zmq_publisher::ZmqEndpointConfig>,
 }
 
 /// How much of the derived `ScriptIndex` a node maintains.
+///
+/// `ScriptIndex` is rebuildable derived state, so the mode is a capability
+/// selection rather than a storage compatibility question: `full` adds
+/// historical funding/spending rows while still maintaining the live-output
+/// view.
+///
+/// The boolean spellings remain behaviorally compatible: `--scriptindex`,
+/// `--scriptindex=true`, and `BITCOIN_RS_SCRIPTINDEX=true` all mean
+/// [`Self::Full`], and `false` means [`Self::Disabled`].
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum ScriptIndexMode {
     /// No `ScriptIndex` capability is maintained.
     #[default]
     Disabled,
-    /// Maintain only the compact live-output view.
-    Utxo,
     /// Maintain both the live-output view and historical script activity.
     Full,
 }
@@ -190,17 +193,16 @@ impl ScriptIndexMode {
         matches!(self, Self::Full)
     }
 
-    /// Whether this mode has a durable store backing every view it claims.
-    #[must_use]
-    pub const fn has_live_store(self) -> bool {
-        !matches!(self, Self::Utxo)
-    }
-
-    /// Parses a mode, including the historical boolean spellings.
+    /// Parses a mode from a configuration value.
+    ///
+    /// Accepts the historical boolean spellings for compatibility: `true`
+    /// means `full` and `false` means disabled. Parsing is case-insensitive.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "utxo" => Some(Self::Utxo),
+            // `true` is the historical boolean spelling and must keep meaning
+            // `full`; it is a separate pattern for that readability, not a
+            // distinct outcome.
             "full" | "true" | "1" | "yes" => Some(Self::Full),
             "false" | "0" | "no" => Some(Self::Disabled),
             _ => None,
@@ -254,8 +256,6 @@ pub struct IndexOverrides {
     pub txindex: Option<bool>,
     /// Script index mode.
     pub script_index: Option<ScriptIndexMode>,
-    /// Txindex rollback/rebuild cutover.
-    pub rollback_rebuild_cutover: Option<u32>,
 }
 
 /// User-supplied observability overrides.
@@ -265,43 +265,6 @@ pub struct ObservabilityOverrides {
     pub log_level: Option<String>,
     /// Optional Prometheus metrics bind address.
     pub metrics_bind: Option<SocketAddr>,
-}
-
-/// User-supplied ZMQ overrides.
-#[derive(Clone, Debug, Default)]
-pub struct ZmqOverrides {
-    /// PUB endpoints by topic.
-    pub endpoints: BTreeMap<crate::zmq_publisher::ZmqTopic, Vec<String>>,
-    /// PUB high-water marks by topic.
-    pub hwm: BTreeMap<crate::zmq_publisher::ZmqTopic, u32>,
-}
-
-impl ZmqOverrides {
-    fn merge_from(&mut self, other: &Self) {
-        for (topic, endpoints) in &other.endpoints {
-            self.endpoints.insert(*topic, endpoints.clone());
-        }
-        for (topic, hwm) in &other.hwm {
-            self.hwm.insert(*topic, *hwm);
-        }
-    }
-
-    fn publications(&self) -> Vec<ZmqPublication> {
-        self.endpoints
-            .iter()
-            .flat_map(|(topic, endpoints)| {
-                let hwm = self.hwm.get(topic).copied().unwrap_or(DEFAULT_ZMQ_HWM);
-                endpoints
-                    .iter()
-                    .cloned()
-                    .map(move |endpoint| ZmqPublication {
-                        topic: *topic,
-                        endpoint,
-                        hwm,
-                    })
-            })
-            .collect()
-    }
 }
 
 /// User-supplied validation overrides.
@@ -328,8 +291,8 @@ pub struct UserConfig {
     pub indexes: IndexOverrides,
     /// Logging and metrics settings.
     pub observability: ObservabilityOverrides,
-    /// ZMQ settings.
-    pub zmq: ZmqOverrides,
+    /// Notification adapters. `None` means this layer does not speak to them.
+    pub notifications: Option<NotificationConfig>,
     /// Validation settings.
     pub validation: ValidationOverrides,
 }
@@ -376,8 +339,6 @@ pub struct IndexConfig {
     pub txindex: bool,
     /// Script index mode.
     pub script_index: ScriptIndexMode,
-    /// Txindex rollback/rebuild cutover.
-    pub rollback_rebuild_cutover: u32,
 }
 
 /// Resolved observability configuration.
@@ -413,8 +374,8 @@ pub struct NodeConfig {
     pub indexes: IndexConfig,
     /// Logging and metrics settings.
     pub observability: ObservabilityConfig,
-    /// ZMQ publications in Core notifier order.
-    pub zmq: Vec<ZmqPublication>,
+    /// External notification adapters.
+    pub notifications: NotificationConfig,
     /// Validation settings.
     pub validation: ValidationConfig,
 }
@@ -445,13 +406,12 @@ impl NodeConfig {
             indexes: IndexConfig {
                 txindex: false,
                 script_index: ScriptIndexMode::Disabled,
-                rollback_rebuild_cutover: DEFAULT_INDEX_ROLLBACK_REBUILD_CUTOVER,
             },
             observability: ObservabilityConfig {
                 log_level: DEFAULT_LOG_LEVEL.to_owned(),
                 metrics_bind: None,
             },
-            zmq: Vec::new(),
+            notifications: NotificationConfig::default(),
             validation: ValidationConfig {
                 assume_valid_height: 0,
             },
@@ -465,40 +425,34 @@ impl NodeConfig {
         resolve(&[user])
     }
 
+    /// Returns configured ZMQ endpoint groups.
+    #[must_use]
+    pub fn zmq_endpoints(&self) -> &[crate::zmq_publisher::ZmqEndpointConfig] {
+        &self.notifications.zmq
+    }
+
     /// Validates backend availability and cross-field constraints.
     pub fn validate(&self) -> Result<()> {
-        ensure!(
+        anyhow::ensure!(
             self.storage.backend.is_compiled_in(),
             "unsupported storage backend {}",
             self.storage.backend
         );
         if self.p2p.magic != self.network.magic() {
-            ensure!(
+            anyhow::ensure!(
                 self.network == Network::Mainnet,
                 "P2P magic overrides currently require --network mainnet"
             );
-            ensure!(
+            anyhow::ensure!(
                 !self.p2p.connect.is_empty(),
                 "P2P magic overrides require at least one --connect peer"
             );
-            ensure!(
+            anyhow::ensure!(
                 !self.p2p.dns_seeds_enabled,
                 "P2P magic overrides require --dns-seeds-enabled=false"
             );
         }
-        ensure!(
-            self.indexes.script_index.has_live_store(),
-            "scriptindex=utxo is not yet usable: the compact live-output store it \
-             requires does not exist (#225). Only `full` and `disabled` are accepted. \
-             Blocked on #226 Q5, which selects the ScriptLive locator format."
-        );
-        for publication in &self.zmq {
-            ensure!(
-                publication.hwm <= 2_147_483_647,
-                "{}hwm exceeds libzmq SNDHWM range",
-                publication.topic.notifier_type()
-            );
-        }
+        crate::zmq_publisher::validate_endpoint_configs(&self.notifications.zmq)?;
         Ok(())
     }
 
@@ -542,9 +496,6 @@ impl NodeConfig {
         if let Some(value) = layer.indexes.script_index {
             self.indexes.script_index = value;
         }
-        if let Some(value) = layer.indexes.rollback_rebuild_cutover {
-            self.indexes.rollback_rebuild_cutover = value;
-        }
         if let Some(value) = &layer.observability.log_level {
             self.observability.log_level.clone_from(value);
         }
@@ -559,6 +510,9 @@ impl NodeConfig {
         }
         if let Some(value) = &layer.p2p.connect {
             self.p2p.connect.clone_from(value);
+        }
+        if let Some(notifications) = &layer.notifications {
+            self.notifications.clone_from(notifications);
         }
         if let Some(value) = layer.validation.assume_valid_height {
             self.validation.assume_valid_height = value;
@@ -587,12 +541,9 @@ impl NodeConfig {
 /// Resolves layers from lowest to highest precedence.
 pub fn resolve(layers: &[&UserConfig]) -> Result<NodeConfig> {
     let mut config = NodeConfig::default_for_network(Network::Mainnet);
-    let mut zmq = ZmqOverrides::default();
     for layer in layers {
         config.apply_layer(layer);
-        zmq.merge_from(&layer.zmq);
     }
-    config.zmq = zmq.publications();
     config.validate()?;
     Ok(config)
 }
