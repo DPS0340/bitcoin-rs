@@ -83,14 +83,17 @@ pub struct AdmissionRequest {
         bitcoin_rs_primitives::OutPoint,
         bitcoin_rs_primitives::TxOut,
     )>,
-    /// Median-time-past of the chain tip for BIP113 finality checks.
+    /// Median-time-past of the applied chain tip for BIP113 finality checks.
     /// Zero disables the locktime cutoff (pre-genesis).
     pub locktime_cutoff: u32,
     /// Caller-supplied maximum fee rate in sat/kvB; `None` means no cap.
     pub max_feerate_sat_per_kvb: Option<u64>,
     /// Wall-clock seconds for the mempool entry timestamp.
     pub time: u64,
-    /// Current applied block height for the mempool entry.
+    /// Current applied block height for the mempool entry. Finality is
+    /// evaluated at the next block height (`height + 1`), matching Core's
+    /// `CheckFinalTxAtTip`, while the stored entry keeps this applied tip
+    /// height.
     pub height: u32,
     /// How the transaction entered the node.
     pub origin: AdmissionOrigin,
@@ -654,10 +657,19 @@ impl MempoolGateway {
         }
         let chain_view = PrevoutMap(&request.prevouts);
         let view = crate::accept::MempoolUtxoView::new(&pool, &chain_view);
+        // Finality is evaluated at the height of the next block the
+        // transaction could be mined in (`height + 1`), exactly Core's
+        // `CheckFinalTxAtTip`.
+        let finality_height = request.height.checked_add(1).ok_or_else(|| {
+            // A u32 overflow on the next block height is not a valid chain
+            // state, but failing closed here matches the conservative choice:
+            // nothing is admitted when the finality question is unanswerable.
+            AdmitError::Consensus
+        })?;
         if let Err(_err) = bitcoin_rs_consensus::verify_transaction_non_script(
             &request.tx,
             &view,
-            request.height,
+            finality_height,
             request.locktime_cutoff,
         ) {
             return Err(AdmitError::Consensus);
@@ -1112,7 +1124,9 @@ mod tests {
                 tx.inputs[0].previous_output,
                 TxOut {
                     value: 11_000,
-                    script_pubkey: Vec::new(),
+                    // OP_TRUE: an anyone-can-spend prevout, the same shape the
+                    // RPC fixtures use, so script verification passes.
+                    script_pubkey: vec![0x51],
                 },
             )],
             locktime_cutoff: 0,
@@ -1167,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_for_block_reports_block_inclusion_not_explicit() {
+    fn remove_for_block_publishes_removals_with_origins() {
         let observer = Arc::new(RecordingObserver::default());
         let gateway = gateway_with(Some(dyn_observer(&observer)));
 
@@ -2080,6 +2094,73 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Finality evaluation at the next block height.
+    // ---------------------------------------------------------------------------
+    /// A transaction with `lock_time == tip_height` and a non-final input
+    /// sequence is admissible: it is final in the next block (`height + 1`),
+    /// exactly Core's `CheckFinalTxAtTip` — `IsFinalTx` returns true as soon
+    /// as the lock time is below the block height, before the sequence rule.
+    #[test]
+    fn admit_transaction_accepts_locktime_equal_to_tip_at_next_height() {
+        let gateway = gateway_with(None);
+        let mut tx = standard_tx(0x80);
+        tx.lock_time = 100;
+        tx.inputs[0].sequence = 0xFFFF_FFFE; // non-final
+
+        let mut request = admit_request(&gateway, &tx, AdmissionOrigin::Rpc);
+        request.height = 100;
+
+        let result = gateway.admit_transaction(request);
+        assert!(
+            matches!(result, Ok(AdmitOutcome::Committed(_))),
+            "lock_time == tip_height must be final in the next block: {result:?}"
+        );
+    }
+
+    /// A transaction with `lock_time == tip_height + 1` is still non-final at
+    /// the next block height.
+    #[test]
+    fn admit_transaction_rejects_locktime_one_past_tip() {
+        let gateway = gateway_with(None);
+        let mut tx = standard_tx(0x81);
+        tx.lock_time = 101;
+        tx.inputs[0].sequence = 0xFFFF_FFFE; // non-final
+
+        let mut request = admit_request(&gateway, &tx, AdmissionOrigin::Rpc);
+        request.height = 100;
+
+        let result = gateway.admit_transaction(request);
+        assert!(
+            matches!(result, Err(AdmitError::Consensus)),
+            "lock_time == tip_height + 1 must still be non-final: {result:?}"
+        );
+    }
+
+    /// A timestamp-locked transaction is evaluated against the caller-supplied
+    /// applied-tip median-time-past cutoff, not a header tip that may run
+    /// ahead.
+    #[test]
+    fn admit_transaction_rejects_locktime_final_only_under_header_mtp() {
+        let gateway = gateway_with(None);
+        let mut tx = standard_tx(0x82);
+        // Timestamp-based lock time, above the threshold.
+        tx.lock_time = 1_800_000_000;
+        tx.inputs[0].sequence = 0xFFFF_FFFE; // non-final
+
+        let mut request = admit_request(&gateway, &tx, AdmissionOrigin::Rpc);
+        // The applied-tip MTP is lower than the header-tip MTP; a tx with
+        // lock_time between them is rejected when the cutoff comes from the
+        // applied tip and would be admitted when it comes from the header tip.
+        request.locktime_cutoff = 1_700_000_000;
+
+        let result = gateway.admit_transaction(request);
+        assert!(
+            matches!(result, Err(AdmitError::Consensus)),
+            "lock_time above applied-tip MTP must be non-final: {result:?}"
+        );
+    }
+
     #[test]
     fn stale_generation_rejects_without_mutation_or_publication() {
         let observer = Arc::new(RecordingObserver::default());
@@ -2240,7 +2321,9 @@ mod tests {
                 replacement.inputs[0].previous_output,
                 TxOut {
                     value: 10_000,
-                    script_pubkey: Vec::new(),
+                    // OP_TRUE: anyone-can-spend, so script verification passes
+                    // and only the RBF rules are under test.
+                    script_pubkey: vec![0x51],
                 },
             )],
             locktime_cutoff: 0,

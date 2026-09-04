@@ -489,7 +489,9 @@ pub(crate) fn admit_transaction(
         // Without a pool guard: resolve UTXO data and combine with the
         // mempool-dependent prevouts captured above.
         let (context, prevouts) = resolve_full_context(ctx, &tx, &mempool_prevouts);
-        let locktime_cutoff = ctx.median_time_past_for_hash(ctx.best_hash()).unwrap_or(0);
+        let locktime_cutoff = ctx
+            .median_time_past_for_hash(ctx.applied_hash())
+            .unwrap_or(0);
 
         let request = AdmissionRequest {
             tx: Arc::new(tx.clone()),
@@ -576,7 +578,9 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
         // Without a pool guard: resolve UTXO data and combine with the
         // mempool-dependent prevouts captured above.
         let (context, prevouts) = resolve_full_context(ctx, &tx, &mempool_prevouts);
-        let locktime_cutoff = ctx.median_time_past_for_hash(ctx.best_hash()).unwrap_or(0);
+        let locktime_cutoff = ctx
+            .median_time_past_for_hash(ctx.applied_hash())
+            .unwrap_or(0);
 
         let request = AdmissionRequest {
             tx: Arc::new(tx.clone()),
@@ -2430,7 +2434,10 @@ mod acceptance_tests {
     use alloc::sync::Arc;
 
     use bitcoin::hex::DisplayHex as _;
-    use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes};
+    use bitcoin_rs_chain::{BlockHeader, NodeId, NodeStatus, TipSnapshot};
+    use bitcoin_rs_primitives::{
+        BlockHash, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+    };
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
@@ -2783,6 +2790,106 @@ mod acceptance_tests {
         assert!(
             sendrawtransaction(&mainnet, &json!([hex_of(&tx)])).is_err(),
             "mainnet must enforce standardness"
+        );
+    }
+    /// Builds a 12-header chain in `ctx.block_tree`, with the applied tip 6
+    /// blocks behind the header tip, and publishes both tips in `ctx`. Block
+    /// times start above the lock-time threshold so the MTP values actually
+    /// govern finality for the timestamp-locked transaction under test.
+    fn build_divergent_tips(ctx: &Context) -> (u32, u32) {
+        const BASE: u32 = 500_000_000;
+        const STEP: u32 = 600;
+
+        let mut ids = Vec::new();
+        {
+            let mut tree = ctx.block_tree.write();
+            let mut prev_id: Option<NodeId> = None;
+            for height in 0..=11_u32 {
+                let prev_hash =
+                    prev_id.map_or(Hash256::default(), |id| tree.node(id).unwrap().hash);
+                let header = BlockHeader {
+                    version: 1,
+                    prev_blockhash: BlockHash::from(prev_hash),
+                    merkle_root: Hash256::default(),
+                    time: BASE + STEP * height,
+                    bits: 0x207f_ffff,
+                    nonce: 0,
+                };
+                let id = tree
+                    .insert_node(prev_id, header, NodeStatus::HeaderValid)
+                    .unwrap_or_else(|err| panic!("insert header {height}: {err}"));
+                ids.push(id);
+                prev_id = Some(id);
+            }
+        }
+
+        let (applied_hash, best_hash) = {
+            let tree = ctx.block_tree.read();
+            let applied_id = ids[10];
+            let best_id = ids[11];
+            let applied_node = tree.node(applied_id).unwrap();
+            let best_node = tree.node(best_id).unwrap();
+            ctx.set_applied_tip(TipSnapshot {
+                tip_id: applied_id,
+                height: applied_node.height,
+                chainwork: applied_node.chainwork,
+                hash: applied_node.hash,
+            });
+            ctx.set_chain_tip(TipSnapshot {
+                tip_id: best_id,
+                height: best_node.height,
+                chainwork: best_node.chainwork,
+                hash: best_node.hash,
+            });
+            (applied_node.hash, best_node.hash)
+        };
+
+        (
+            ctx.median_time_past_for_hash(applied_hash).unwrap(),
+            ctx.median_time_past_for_hash(best_hash).unwrap(),
+        )
+    }
+
+    /// `sendrawtransaction` must take the BIP113 median-time-past from the
+    /// applied tip, not a header tip that has run ahead. A timestamp-locked
+    /// transaction that is final only under the header-tip MTP must be
+    /// rejected.
+    #[test]
+    fn sendrawtransaction_rejects_tx_final_only_under_header_tip_mtp() {
+        let ctx = Arc::new(Context::new());
+        const BASE: u32 = 500_000_000;
+        let (applied_mtp, best_mtp) = build_divergent_tips(&ctx);
+
+        assert!(
+            applied_mtp < best_mtp,
+            "fixture: header-tip MTP must exceed applied-tip MTP"
+        );
+
+        let lock_time = BASE + 3_300;
+        assert!(
+            applied_mtp < lock_time && lock_time < best_mtp,
+            "fixture: lock time must sit between the two MTPs"
+        );
+
+        seed_utxo(&ctx, 1, 100_000);
+        let mut tx = spending_tx(1, 90_000);
+        tx.lock_time = lock_time;
+        tx.inputs[0].sequence = 0xFFFF_FFFE; // non-final
+
+        let result = sendrawtransaction(&ctx, &json!([hex_of(&tx)]));
+        assert!(
+            result.is_err(),
+            "a tx final only under the header-tip MTP must be rejected; got {result:?}"
+        );
+        assert_eq!(
+            ctx.mempool.read().len(),
+            0,
+            "rejected tx must not enter the pool"
+        );
+        assert_eq!(
+            ctx.transactions.read().len(),
+            0,
+            "rejected tx must not be recorded as accepted"
         );
     }
 }
