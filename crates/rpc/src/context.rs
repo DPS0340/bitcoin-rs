@@ -1577,9 +1577,10 @@ impl Context {
     /// interval, so no concurrent admission can invalidate the verdict
     /// before it lands.
     ///
-    /// The pool fast path here is a best-effort pre-check for the
-    /// already-in-mempool no-op; the authoritative re-check runs inside
-    /// the locked evaluation. The RPC lookup cache is not membership.
+    /// Membership follows `POL-01` Duplicate submission in
+    /// `docs/policies/mempool-policy.md`. The pool read is a best-effort
+    /// pre-check; the locked evaluation is authoritative. The RPC lookup
+    /// cache is not membership.
     ///
     /// `max_feerate_sat_per_kvb` of `None` disables the max-fee cap,
     /// matching `sendrawtransaction`'s `maxfeerate=0` behavior.
@@ -1590,10 +1591,11 @@ impl Context {
     /// the failure verbatim; nothing is inserted when this fails.
     pub fn admit_transaction(
         &self,
-        tx: &Tx,
+        tx: Tx,
         max_feerate_sat_per_kvb: Option<u64>,
     ) -> Result<MutationResult, String> {
-        crate::handlers::tx::admit_transaction(self, tx, max_feerate_sat_per_kvb)
+        crate::handlers::tx::admit_transaction(self, &tx, max_feerate_sat_per_kvb)
+            .map_err(crate::handlers::tx::AdmissionFailure::into_string)
     }
 
     /// Returns the current tip height, or zero before initial sync publishes one.

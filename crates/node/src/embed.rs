@@ -294,8 +294,8 @@ impl Node {
     /// mempool `sequence` events and the mining generation wake; there is
     /// no second admission path and no per-call gateway.
     ///
-    /// An already-in-mempool transaction succeeds with an empty result, matching
-    /// RPC admission's already-known success.
+    /// Membership follows `POL-01` Duplicate submission in
+    /// `docs/policies/mempool-policy.md`.
     ///
     /// # Errors
     ///
@@ -307,7 +307,7 @@ impl Node {
         // the embedded surface admits under the identical cap.
         let max_feerate = Some(bitcoin_rs_rpc::context::DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB);
         self.context
-            .admit_transaction(&tx, max_feerate)
+            .admit_transaction(tx, max_feerate)
             .map_err(NodeError::Broadcast)
     }
 
