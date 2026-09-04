@@ -354,6 +354,7 @@ mod tests {
             .collect();
         assert!(!listed.is_empty(), "the manifest must list the REST routes");
           let listed_prefixes: BTreeSet<String> = listed.iter().map(|path| path.strip_suffix(".json").unwrap_or(path).to_owned()).collect();
+          assert_eq!(listed_prefixes.len(), listed.len(), "the REST manifest must not duplicate routes");
           let registered: BTreeSet<String> = crate::rest::REGISTRATIONS.iter().map(|path| (*path).to_owned()).collect();
           assert_eq!(listed_prefixes, registered, "REST manifest and router registrations must agree");
 
