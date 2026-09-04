@@ -185,8 +185,9 @@ fn sendrawtransaction_readmits_a_transaction_evicted_from_the_mempool()
     handler.dispatch("sendrawtransaction", &json!([raw.as_str()]))?;
     assert!(ctx.mempool.read().contains_txid(&txid), "first admission");
 
-    // The pool drops the entry, as a size-limit trim or expiry would.
-    let removed = ctx.mempool.remove_by_txid(AdmissionOrigin::Rpc, &txid);
+    // Policy eviction (fee-rate trim), not an RBF replacement: the
+    // transaction is still valid and must be admitted again.
+    let removed = ctx.mempool.evict_below_fee_rate(AdmissionOrigin::Rpc, u64::MAX);
     assert!(
         !removed.changes.is_empty(),
         "the eviction must have removed the entry"
