@@ -353,7 +353,7 @@ impl Mempool {
         let ancestors = self.ancestor_ids_for_tx(&entry.tx);
         self.check_ancestor_limits(&ancestors, &entry)?;
         self.check_descendant_limits_excluding(&ancestors, excluded)?;
-        self.check_cluster_limits(&entry)?;
+        self.check_cluster_limits(&entry, excluded)?;
 
         if excluded.is_empty() && u32::try_from(self.entries.vacant_key()).is_err() {
             return Err(MempoolError::TooManyEntries);
@@ -1350,11 +1350,15 @@ impl Mempool {
     /// The frontier alternates directions rather than expanding one and then
     /// the other, because reaching a sibling needs an up-edge followed by a
     /// down-edge, and reaching a cousin needs that twice.
-    fn cluster_ids_seeded_by(&self, seeds: &[EntryId]) -> Vec<EntryId> {
+    fn cluster_ids_seeded_by(
+        &self,
+        seeds: &[EntryId],
+        excluded: &HashSet<EntryId>,
+    ) -> Vec<EntryId> {
         let mut seen: Vec<EntryId> = Vec::new();
         let mut frontier: Vec<EntryId> = Vec::new();
         for seed in seeds {
-            if !seen.contains(seed) {
+            if !excluded.contains(seed) && !seen.contains(seed) {
                 seen.push(*seed);
                 frontier.push(*seed);
             }
@@ -1369,7 +1373,7 @@ impl Mempool {
                     .collect::<Vec<_>>()
             });
             for neighbour in parents.into_iter().chain(self.child_ids(id)) {
-                if !seen.contains(&neighbour) {
+                if !excluded.contains(&neighbour) && !seen.contains(&neighbour) {
                     seen.push(neighbour);
                     frontier.push(neighbour);
                 }
@@ -1388,20 +1392,29 @@ impl Mempool {
     /// after something spending it, through orphan promotion or out-of-order
     /// relay -- and a seed set of parents alone would miss the descendants
     /// this transaction is about to connect.
-    fn check_cluster_limits(&self, entry: &MempoolEntry) -> Result<(), PolicyError> {
+    fn check_cluster_limits(
+        &self,
+        entry: &MempoolEntry,
+        excluded: &HashSet<EntryId>,
+    ) -> Result<(), PolicyError> {
         let mut seeds = entry
             .tx
             .inputs
             .iter()
             .filter_map(|input| self.by_txid.get(&input.previous_output.txid).copied())
+            .filter(|id| !excluded.contains(id))
             .collect::<Vec<_>>();
-        seeds.extend(self.existing_spenders_of(entry.txid, entry.tx.outputs.len()));
+        seeds.extend(
+            self.existing_spenders_of(entry.txid, entry.tx.outputs.len())
+                .into_iter()
+                .filter(|id| !excluded.contains(id)),
+        );
         if seeds.is_empty() {
             // A cluster of one. Still checked, so a single oversized
             // transaction cannot pass a limit its cluster would fail.
             return cluster_within_limits(1, u64::from(entry.vsize), &self.limits);
         }
-        let cluster = self.cluster_ids_seeded_by(&seeds);
+        let cluster = self.cluster_ids_seeded_by(&seeds, excluded);
         let count = u32::try_from(cluster.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
