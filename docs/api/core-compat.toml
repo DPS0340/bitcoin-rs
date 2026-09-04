@@ -156,11 +156,6 @@ group = "blockchain"
 status = "implemented_unverified"
 
 [[rpc]]
-method = "getblockfilter"
-group = "blockchain"
-status = "implemented_unverified"
-
-[[rpc]]
 method = "getindexinfo"
 group = "blockchain"
 status = "implemented_unverified"
@@ -277,6 +272,7 @@ deviation = "The `short`, `medium` and `long` horizons all carry the same feerat
 method = "getzmqnotifications"
 group = "util"
 status = "implemented_unverified"
+feature = "zmq"
 
 [[rpc]]
 method = "validateaddress"
@@ -373,7 +369,8 @@ status = "implemented_unverified"
 [[rpc]]
 method = "deriveaddresses"
 group = "wallet"
-status = "implemented_unverified"
+status = "disabled"
+note = "Only non-ranged addr() descriptors are supported; other descriptor forms and ranged descriptors return MethodDisabled. For addr() descriptors, the optional range argument is not honored and returns MethodDisabled rather than expanding addresses."
 
 [[rpc]]
 method = "scantxoutset"
@@ -408,21 +405,64 @@ status = "implemented_unverified"
 # ---------------------------------------------------------------------------
 # REST
 #
-# Deliberately small. #78 says to keep it that way until a concrete
-# consumer needs more, and the one consumer today is the remote validator.
-# The gateway is UNAUTHENTICATED: binding it to a public interface exposes
-# chain data to anyone who can reach the port.
+# Every prefix the REST router registers is listed here as a concrete served
+# example. The gateway is UNAUTHENTICATED: binding it to a public interface
+# exposes chain data to anyone who can reach the port.
 # ---------------------------------------------------------------------------
+
+[[rest]]
+path = "/rest/tx/"
+status = "implemented_unverified"
+
+[[rest]]
+path = "/rest/block/notxdetails/"
+status = "implemented_unverified"
+
+[[rest]]
+path = "/rest/block/"
+status = "implemented_unverified"
+
+[[rest]]
+path = "/rest/blockpart/"
+status = "deviation"
+deviation = "Binary formats only; JSON is rejected as in Core's original part endpoint."
 
 [[rest]]
 path = "/rest/chaininfo.json"
 status = "implemented_unverified"
-note = "Same body as `getblockchaininfo`, so it inherits that method's status."
 
 [[rest]]
-path = "/rest/headers/<hash>.<json|hex|bin>"
+path = "/rest/mempool/<kind>.json"
+status = "implemented_unverified"
+
+[[rest]]
+path = "/rest/headers/<hash>.json"
 status = "deviation"
-deviation = "An unknown but well-formed block hash answers 200 with an empty result rather than 404, because the remote validator uses 404 on `/rest/*` to detect a disabled gateway and cannot afford the two to be confused. Query parameters other than `count` are ignored, as Core ignores cache-busters."
+deviation = "Unknown but well-formed block hashes return an empty 200 response rather than 404, and query parameters other than count are ignored."
+
+[[rest]]
+path = "/rest/getutxos/<hash>-0.json"
+status = "implemented_unverified"
+
+[[rest]]
+path = "/rest/deploymentinfo.json"
+status = "implemented_unverified"
+
+[[rest]]
+path = "/rest/deploymentinfo/<hash>.json"
+status = "implemented_unverified"
+
+[[rest]]
+path = "/rest/headers/"
+status = "implemented_unverified"
+[[rest]]
+path = "/rest/blockhashbyheight/"
+status = "implemented_unverified"
+
+[[rest]]
+path = "/rest/spenttxouts/"
+status = "deviation"
+deviation = "This node does not retain undo data, so every well-formed request answers Core's undo-unavailable error."
 
 # ---------------------------------------------------------------------------
 # ZMQ
@@ -455,5 +495,4 @@ status = "implemented_unverified"
 [[zmq]]
 topic = "sequence"
 notifier = "pubsequence"
-status = "deviation"
-deviation = "Block connect and disconnect events only. Core also publishes mempool accept and remove on this topic; those are unavailable until #74, so a subscriber must not read the absence of an A/R message as the absence of the event."
+status = "implemented_unverified"
