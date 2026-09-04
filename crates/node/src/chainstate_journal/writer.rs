@@ -26,6 +26,7 @@
 //! fails closed (handled by replay, later task).
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bitcoin_rs_storage::KvStore;
@@ -42,6 +43,57 @@ const MAX_HEAD_BYTES: u64 = 4 * 1024;
 /// Maximum serialized segment name length sanity bound.
 const SEGMENT_NAME_MAX: usize = 32;
 pub(crate) const FULL_REVALIDATION_MARKER: &str = "full-revalidation";
+/// Directory name under the node data dir that owns journal files and the
+/// sticky full-revalidation marker.
+pub(crate) const JOURNAL_DIR_NAME: &str = "chainstate-journal";
+
+/// Removes the sticky full-revalidation marker after a replacement checkpoint
+/// has reached its `CURRENT` commit point.
+///
+/// Ownership: the journal directory owns this file. Startup treats presence as
+/// authoritative independently of `chainstate_journal.enabled`. This helper is
+/// the only remover; journal compaction uses the same unlink-and-directory-sync
+/// sequence against an already-open journal directory.
+///
+/// Commit point: `unlink(full-revalidation)` followed by `fsync` of the journal
+/// directory. The replacement checkpoint's `CURRENT` rename and root sync is a
+/// prior, independent commit point. This helper does not publish checkpoints
+/// and does not roll `CURRENT` back if removal fails.
+///
+/// Durability / crash:
+/// - crash before unlink: the marker remains; every restart stays on cold
+///   validation and refuses the stale pre-reorg checkpoint
+/// - crash after unlink, before directory sync: a power loss may make the
+///   marker visible again; boot stays on cold validation until a later
+///   successful clear
+/// - crash after directory sync: the marker is gone; boot may restore the
+///   published replacement checkpoint
+///
+/// Failure classification: a missing journal directory or marker is success
+/// (already clear). Open, unlink, and directory-sync errors are I/O
+/// ([`JournalWriterError::Io`]). They are not consensus-fatal. The already
+/// published checkpoint remains durable; only marker retirement is unfinished.
+///
+/// Retry owner: the checkpoint worker. Callers must propagate the error so the
+/// worker's next tick retries publication (and therefore this clear). Do not
+/// treat a published checkpoint as finished while this returns `Err`.
+pub(crate) fn clear_full_revalidation_marker_at(data_dir: &Path) -> Result<(), JournalWriterError> {
+    let path = data_dir.join(JOURNAL_DIR_NAME);
+    let dir = match crate::checkpoint_fs::open_data_dir(&path) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    clear_full_revalidation_marker(&dir)
+}
+
+fn clear_full_revalidation_marker(dir: &cap_std::fs::Dir) -> Result<(), JournalWriterError> {
+    match dir.remove_file(FULL_REVALIDATION_MARKER) {
+        Ok(()) => crate::checkpoint_fs::sync_dir(dir).map_err(JournalWriterError::from),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// Zero-padded 10-digit generation: lexicographic order equals numeric order.
 const SEGMENT_GEN_WIDTH: usize = 10;
@@ -1151,11 +1203,7 @@ impl<S: KvStore> JournalWriter<S> {
         for name in entries {
             self.dir.remove_file(name)?;
         }
-        match self.dir.remove_file(FULL_REVALIDATION_MARKER) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        clear_full_revalidation_marker(&self.dir)?;
         crate::checkpoint_fs::sync_dir(&self.dir)?;
         Ok(())
     }
@@ -1381,6 +1429,20 @@ mod tests {
     use crate::chainstate_journal::record::{Coin, Mutation};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    #[test]
+    fn clear_full_revalidation_marker_unlinks_then_treats_absence_as_success() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let journal_dir = dir.path().join(JOURNAL_DIR_NAME);
+        let marker = journal_dir.join(FULL_REVALIDATION_MARKER);
+        std::fs::create_dir_all(&journal_dir)?;
+        std::fs::write(&marker, b"journal fork crossed below checkpoint base\n")?;
+
+        clear_full_revalidation_marker_at(dir.path())?;
+        assert!(!marker.exists());
+        clear_full_revalidation_marker_at(dir.path())?;
+        Ok(())
+    }
 
     /// Counts `flush()` calls and can fail them, proving the §2.3 order:
     /// the head marker must never advance without a counted flush.

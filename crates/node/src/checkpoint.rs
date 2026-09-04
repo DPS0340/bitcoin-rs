@@ -567,6 +567,11 @@ pub(crate) enum CheckpointError {
     Storage(#[from] bitcoin_rs_storage::StorageError),
     #[error("checkpoint refused while disconnect of block {hash} at height {height} is in flight")]
     DisconnectInFlight { hash: Hash256, height: u32 },
+    /// The replacement checkpoint's `CURRENT` is already durable; retiring the
+    /// sticky full-revalidation marker failed. Retryable I/O owned by the
+    /// checkpoint worker, not checkpoint corruption.
+    #[error("failed to retire full-revalidation marker: {0}")]
+    FullRevalidationMarker(std::io::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -724,6 +729,7 @@ pub(crate) fn load_checkpoint_from_dir(
 fn classify_checkpoint_error(error: CheckpointError) -> CheckpointLoadError {
     match error {
         CheckpointError::Io(error)
+        | CheckpointError::FullRevalidationMarker(error)
         | CheckpointError::Utxo(bitcoin_rs_utxo::UtxoError::Io(error))
         | CheckpointError::Storage(bitcoin_rs_storage::StorageError::Io(error)) => {
             classify_checkpoint_io(error)

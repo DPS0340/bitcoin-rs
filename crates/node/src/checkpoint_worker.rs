@@ -31,7 +31,7 @@
 //! plausibly several GB near modern tips). At a 10k-block cadence the pause is
 //! seconds-to-tens-of-seconds — well under 1 % of wall time during IBD.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -49,22 +49,17 @@ use bitcoin_rs_utxo::stats::CoinStatsListener;
 use crate::apply::{ApplyAdmission, PruneBodyStore, UndoStore};
 use crate::checkpoint::{self, CheckpointError, CheckpointWrite};
 use crate::recovery_evidence;
-use crate::state::{CHAINSTATE_JOURNAL_DIR, ChainEventPublisher};
+use crate::state::ChainEventPublisher;
 
-fn clear_full_revalidation_marker(data_dir: &Path) -> core::result::Result<(), CheckpointError> {
-    let journal_path = data_dir.join(CHAINSTATE_JOURNAL_DIR);
-    let journal_dir =
-        match cap_std::fs::Dir::open_ambient_dir(&journal_path, cap_std::ambient_authority()) {
-            Ok(dir) => dir,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-    match journal_dir.remove_file(crate::chainstate_journal::FULL_REVALIDATION_MARKER) {
-        Ok(()) => crate::checkpoint_fs::sync_dir(&journal_dir)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(())
+fn retire_full_revalidation_marker(data_dir: &std::path::Path) -> Result<(), CheckpointError> {
+    crate::chainstate_journal::clear_full_revalidation_marker_at(data_dir).map_err(|error| {
+        match error {
+            crate::chainstate_journal::JournalWriterError::Io(io) => {
+                CheckpointError::FullRevalidationMarker(io)
+            }
+            other => CheckpointError::Invalid(other.to_string()),
+        }
+    })
 }
 
 /// Block count between periodic checkpoint publications during sync.
@@ -244,8 +239,11 @@ impl CheckpointPublisher {
         self.undo_store
             .disarm_disconnect()
             .map_err(CheckpointError::from)?;
+        // Marker retirement is a second durability step after `CURRENT`.
+        // Propagate failure so the worker retries next tick; the published
+        // checkpoint stays, and the marker stays until unlink+dirsync commits.
         if matches!(written, CheckpointWrite::Published { .. }) {
-            clear_full_revalidation_marker(&self.data_dir)?;
+            retire_full_revalidation_marker(&self.data_dir)?;
         }
         // Everything up to this tip is now recoverable, so undo records below
         // it may be pruned.
@@ -353,19 +351,38 @@ fn wait_for_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHAINSTATE_JOURNAL_DIR, clear_full_revalidation_marker};
+    use super::retire_full_revalidation_marker;
+    use crate::chainstate_journal::JOURNAL_DIR_NAME;
+    use crate::checkpoint::CheckpointError;
 
     #[test]
     fn full_revalidation_marker_clears_after_checkpoint_publication() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let journal_dir = dir.path().join(CHAINSTATE_JOURNAL_DIR);
+        let journal_dir = dir.path().join(JOURNAL_DIR_NAME);
         let marker = journal_dir.join(crate::chainstate_journal::FULL_REVALIDATION_MARKER);
         std::fs::create_dir_all(&journal_dir)?;
         std::fs::write(&marker, b"force full validation\n")?;
 
-        clear_full_revalidation_marker(dir.path())?;
+        retire_full_revalidation_marker(dir.path())?;
 
         assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_full_revalidation_marker_is_success() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        retire_full_revalidation_marker(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn marker_clear_io_is_classified_as_retryable_marker_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(JOURNAL_DIR_NAME), b"not a directory")?;
+
+        let error = retire_full_revalidation_marker(dir.path()).expect_err("open must fail");
+        assert!(matches!(error, CheckpointError::FullRevalidationMarker(_)));
         Ok(())
     }
 }

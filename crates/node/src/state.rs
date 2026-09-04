@@ -877,7 +877,7 @@ pub(crate) enum ResumeSource {
     Journal,
 }
 
-pub(crate) const CHAINSTATE_JOURNAL_DIR: &str = "chainstate-journal";
+pub(crate) const CHAINSTATE_JOURNAL_DIR: &str = crate::chainstate_journal::JOURNAL_DIR_NAME;
 
 fn requires_full_revalidation(data_dir: &Path) -> bool {
     data_dir
