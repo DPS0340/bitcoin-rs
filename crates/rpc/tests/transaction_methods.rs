@@ -141,6 +141,9 @@ fn sendrawtransaction_rejects_missing_inputs() {
     assert_eq!(err.code(), RpcError::CORE_VERIFY_REJECTED);
 }
 
+/// POL-01 (`docs/policies/mempool-policy.md`, Duplicate submission):
+/// re-submitting a transaction that is still in the mempool succeeds
+/// without error and without a second insert.
 #[test]
 fn sendrawtransaction_idempotent_for_already_in_mempool() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -163,7 +166,8 @@ fn sendrawtransaction_idempotent_for_already_in_mempool() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// A transaction the mempool evicted after an earlier `sendrawtransaction`
+/// POL-01 (`docs/policies/mempool-policy.md`, Duplicate submission): a
+/// transaction the mempool evicted after an earlier `sendrawtransaction`
 /// must be admitted again on resubmission. Wallets rebroadcast unconfirmed
 /// transactions; a success reply that leaves the pool untouched would make
 /// that rebroadcast a silent no-op.

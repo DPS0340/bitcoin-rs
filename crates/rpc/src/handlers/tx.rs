@@ -454,8 +454,10 @@ pub(crate) fn admit_transaction(
 ) -> Result<MutationResult, String> {
     let txid = tx.txid();
 
-    // `ctx.transactions` is not consulted here. Block application never
-    // writes it; its only production writer is this path, after admission.
+    // `ctx.transactions` is not consulted here. POL-01 (Duplicate
+    // submission in `docs/policies/mempool-policy.md`) treats only current
+    // mempool membership as already-known. Block application never writes
+    // this cache; its only production writer is this path, after admission.
     // Treating it as "already confirmed" made a transaction the mempool later
     // evicted unrepeatable: every resubmission short-circuited to success
     // while the transaction was in neither the pool nor the chain. A
@@ -546,7 +548,7 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
     let txid = tx.txid();
 
     // No `ctx.transactions` short-circuit here either; see `admit_transaction`
-    // for why that cache is not a confirmation record.
+    // and POL-01 Duplicate submission: that cache is not a confirmation record.
 
     // Bounded retry: each attempt reads a fresh stable generation, captures
     // the exact mempool sequence under a read guard, resolves UTXO data
