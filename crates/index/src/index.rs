@@ -3172,6 +3172,10 @@ impl<S: KvStore> IndexWriter<S> {
         Ok(written)
     }
 
+    /// Seeds `ScriptLive` from an iterator of compact locators.
+    ///
+    /// Delegates to [`Self::seed_script_live_stream`] so deferred write
+    /// failures and watermark publication have one owner.
     pub fn seed_script_live<I>(
         &mut self,
         coins: I,

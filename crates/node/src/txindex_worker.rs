@@ -162,6 +162,8 @@ pub struct ReconcilePhase {
     pub tx_lookup: ReconcileLeg,
     /// Script-history leg.
     pub script_history: ReconcileLeg,
+    /// Compact live-output leg.
+    pub script_live: ReconcileLeg,
 }
 
 impl ReconcilePhase {
@@ -169,6 +171,7 @@ impl ReconcilePhase {
     pub const FORWARD: Self = Self {
         tx_lookup: ReconcileLeg::Forward,
         script_history: ReconcileLeg::Forward,
+        script_live: ReconcileLeg::Forward,
     };
 
     /// Returns the phase with `leg` assigned to every capability in
@@ -181,6 +184,9 @@ impl ReconcilePhase {
         if capabilities.script_history {
             self.script_history = leg;
         }
+        if capabilities.script_live {
+            self.script_live = leg;
+        }
         self
     }
 
@@ -190,6 +196,7 @@ impl ReconcilePhase {
         IndexCapabilities {
             tx_lookup: matches!(self.tx_lookup, ReconcileLeg::Rebuilding),
             script_history: matches!(self.script_history, ReconcileLeg::Rebuilding),
+            script_live: matches!(self.script_live, ReconcileLeg::Rebuilding),
         }
     }
 
@@ -197,7 +204,7 @@ impl ReconcilePhase {
     /// the lowest common ancestor any capability rewinds to.
     #[must_use]
     pub fn rolling_back(self) -> Option<(u32, u32)> {
-        [self.tx_lookup, self.script_history]
+        [self.tx_lookup, self.script_history, self.script_live]
             .into_iter()
             .filter_map(|leg| match leg {
                 ReconcileLeg::RollingBack {
@@ -220,6 +227,7 @@ impl ReconcilePhase {
         Self {
             tx_lookup: finish(self.tx_lookup),
             script_history: finish(self.script_history),
+            script_live: finish(self.script_live),
         }
     }
 }
