@@ -4514,7 +4514,9 @@ mod chaintxstats_window_tests {
     #[test]
     fn txrate_keeps_counts_above_u32_max() {
         const PAST: u64 = 1;
-        const END: u64 = u64::from(u32::MAX) + 100;
+        // `u32::MAX + 100`. Written as a literal because `u64::from` is not
+        // const-stable here; the inequality below is what keeps it honest.
+        const END: u64 = 4_294_967_395;
         let ctx = Context::new();
         let tip = super::chaintxstats_durability_tests::insert_counted_chain(
             &ctx,
@@ -4523,6 +4525,10 @@ mod chaintxstats_window_tests {
         );
         ctx.set_applied_tip(tip);
         let ctx = Arc::new(ctx);
+        assert!(
+            END > u64::from(u32::MAX),
+            "END must sit above the old 32-bit cap"
+        );
 
         let result = stats(&ctx, &json!([1]));
         let count = END - PAST;
