@@ -122,6 +122,12 @@ impl ProgressPublisher {
         cadence.height = height;
         cadence.at = Instant::now();
     }
+
+    fn reset_cadence(&self, height: u32) {
+        let mut cadence = self.cadence.lock();
+        cadence.height = height;
+        cadence.at = Instant::now();
+    }
 }
 
 fn meta_path(state: &NodeState) -> PathBuf {
@@ -233,6 +239,12 @@ pub fn recover_if_needed(state: &NodeState) -> Result<()> {
             );
         }
         Err(error) => {
+            // Replay may have failed after a previous recovery attempt advanced
+            // the cadence. Keep refetched blocks eligible for the normal
+            // block-count trigger from the restored base.
+            if let Some(progress) = &state.apply_handles().recovery_progress {
+                progress.reset_cadence(gap_base);
+            }
             tracing::warn!(
                 %error,
                 "replay from stored bodies failed; node resumes at the restored base and sync will refetch the gap"
