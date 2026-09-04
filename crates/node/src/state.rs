@@ -2134,6 +2134,22 @@ impl NodeState {
         Arc::clone(&self.chain_tx_count)
     }
 
+    /// Shares the chain-transition mutex with the RPC layer.
+    ///
+    /// The applied tip and the cumulative transaction count are published one
+    /// after the other inside a transition. An RPC reader that takes this lock
+    /// sees the pair as the transition left it, rather than catching it halfway
+    /// through and reporting the new tip's height beside the old tip's count.
+    ///
+    /// Handing out the lock means an RPC read can wait for a connect to finish.
+    /// That is the trade Bitcoin Core already makes -- `getchaintxstats` holds
+    /// `cs_main` for its whole body -- and the wait here covers two atomic
+    /// loads rather than a whole handler.
+    #[must_use]
+    pub fn chain_transition_handle(&self) -> Arc<parking_lot::Mutex<()>> {
+        Arc::clone(&self.apply_handles.chain_transition)
+    }
+
     /// Returns the shared block-records handle exposed to RPC handlers.
     #[must_use]
     pub fn blocks(&self) -> Arc<RwLock<BlockLog>> {
