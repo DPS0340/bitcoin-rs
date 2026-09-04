@@ -186,7 +186,7 @@ The durable record that an authoritative disconnect started and how far it got. 
 The per-block inverse of a UTXO commit, queued before later apply mutations and made durable by the clean checkpoint rather than a per-block fsync. Keyed by height **and** block hash so an abandoned-branch record cannot replay against another block at the same height. Retained after a disconnect because branch flip-flop is normal.
 
 ### Owed derived state
-State that connection writes and disconnection must account for. `coin_stats` needs an explicit inverse for its block-level fields (the default node recomputes them at checkpoint and stable reads). The filter index is block-hash-addressed and only repoints its last-tip cache. `TxIndex` is durable derived state outside the authoritative transaction (see *TxIndex capability watermarks*). `switch_to_branch` (`crates/node/src/reorg.rs`) is the production disconnect caller: it preloads all disconnect bodies and the available contiguous connect prefix, and a `ChainTransition` witness requires the authoritative plan to equal the preloaded plan before mutation. A permanent connect failure invalidates the failed header and descendants; an operational failure leaves the branch eligible for retry.
+State that connection writes and disconnection must account for. `coin_stats` needs an explicit inverse for its block-level fields (the default node recomputes them at checkpoint and stable reads). `TxIndex` is durable derived state outside the authoritative transaction (see *TxIndex capability watermarks*). `switch_to_branch` (`crates/node/src/reorg.rs`) is the production disconnect caller: it preloads all disconnect bodies and the available contiguous connect prefix, and a `ChainTransition` witness requires the authoritative plan to equal the preloaded plan before mutation. A permanent connect failure invalidates the failed header and descendants; an operational failure leaves the branch eligible for retry.
 
 ## Derived indexes
 
@@ -231,16 +231,16 @@ The coherent, non-torn view of the applied tip the chain-event publisher keeps i
 The bounded-channel wake-up `ChainEventPublisher::record` emits after replacing the snapshot cell: `{ kind, height, hash, epoch, sequence }`, one per committed connect or disconnect. Hints carry no payload to apply and a full channel drops them without blocking the commit path; recovery is always positional re-planning over the chain itself. Hints are not a recovery log.
 
 ### Reconciliation consumer
-An index that mirrors the applied chain by re-planning positionally against a fresh chain snapshot instead of receiving inline writes from the apply path. The txindex worker is the reference consumer; the BIP157/158 filter index is the second (`crates/node/src/filterindex_worker.rs`), which is what makes the seam real rather than a naming convention. A consumer owns its rows, its cursor, and its batch atomicity, and a failure or lag in it can never stall block application.
+An index that mirrors the applied chain by re-planning positionally against a fresh chain snapshot instead of receiving inline writes from the apply path. The txindex worker is the current consumer. A consumer owns its rows, its cursor, and its batch atomicity, and a failure or lag in it can never stall block application.
 
 ### Consumer cursor
 The durable 52-byte record `{ epoch, sequence, height, hash }` naming the exact chain state a consumer's rows already mirror (`crates/node/src/reconcile.rs`). Position (`height`, `hash`) anchors row truth; `epoch` and `sequence` are advisory identity that a restart or epoch bump invalidates without invalidating rows. It is written only when the publisher snapshot provably names the tip the rows reached, and always in the same atomic batch as the row mutations it describes.
 
-### Extension capability
-The named, compiled-in service unit the extension registry reports and validates: an `ExtensionDescriptor` carries the id, namespace directory, schema version, and required/incompatible capability ids, and exists even when the runtime toggle is off. Enabled instances live or fail independently of core (`docs/contracts/extensions.md`); `getcapabilities` reports the live `CapabilitySnapshot` with compiled/enabled/state per capability.
+### Capability status
+The node-owned status report for concrete services exposed by the RPC layer. It
+contains compiled/enabled state and progress facts without introducing a
+generic extension registry or lifecycle abstraction.
 
-### Filter-header pointer
-The namespace-owned `(height, hash)` marker for the newest block whose BIP157 filter header the consumer's header chain provably ends at (`crates/ext-blockfilterindex`). Because filter and header rows are hash-addressed, a reorg rewinds only this pointer and the consumer cursor — rows are retained and re-derived rows are idempotent overwrites — which is the disconnect contract that lets the filter consumer share the txindex reconciliation shape without row deletion.
 ## Mempool
 
 ### Resolution-time sampling

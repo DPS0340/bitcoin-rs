@@ -16,16 +16,17 @@ mod stage;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin_rs_chain::{BlockTree, ChainError, NodeId, TipSnapshot, plan_reorg};
-use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, Message, PeerInfo, PeerLease};
+use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, Message, PeerTable};
 use bitcoin_rs_primitives::{Block, Hash256};
 use crossbeam_channel::Receiver;
 use hashbrown::HashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use smallvec::SmallVec;
 
 use self::stage::{BlockStager, DrainedBlock, StagedBlock};
 pub(crate) use bitcoin_rs_p2p::download_window::MIN_PEERS_FOR_FANOUT;
 pub use bitcoin_rs_p2p::download_window::SyncBudget;
+pub use bitcoin_rs_p2p::download_window::default_sync_budget;
 #[allow(unused_imports)]
 use bitcoin_rs_p2p::download_window::{
     BLOCK_STALLING_TIMEOUT, BLOCK_STALLING_TIMEOUT_MAX, DownloadWindow, FanoutCandidate,
@@ -33,7 +34,7 @@ use bitcoin_rs_p2p::download_window::{
     MAX_SERIALIZED_BLOCK_SIZE, PEER_INFLIGHT_BUDGET, PENDING_BLOCK_BYTE_ESTIMATE, PENDING_BUDGET,
     PENDING_BYTE_BUDGET, PENDING_TIMEOUT, RECEIVED_BLOCK_BUDGET, RECEIVED_BLOCK_BYTE_BUDGET,
     RECEIVED_BLOCK_TIMEOUT, STALLER_COOLDOWN, SyncPeer, SyncPeerSelection, configure_request_mode,
-    default_sync_budget, statically_fanout_eligible,
+    statically_fanout_eligible,
 };
 
 /// Maximum number of locator entries we ever send.
@@ -48,14 +49,14 @@ type ExpectedBlockHashes = SmallVec<[Hash256; RECEIVED_BLOCK_BUDGET]>;
 /// Block download orchestrator.
 pub struct BlockSync {
     handles: crate::apply::ApplyHandles,
-    peers: Arc<RwLock<Vec<PeerInfo>>>,
-    peer_outbound: Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
+    peer_table: Arc<PeerTable>,
     inbound_headers_rx: Arc<Mutex<Receiver<InboundHeaders>>>,
     inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     download_window: Arc<Mutex<DownloadWindow>>,
     block_stager: Arc<Mutex<BlockStager>>,
     pending_getheaders: Arc<Mutex<Option<PendingHeaderRequest>>>,
     expected_apply_cache: Arc<Mutex<Option<ExpectedApplyCache>>>,
+    known_sessions: Mutex<HashMap<SocketAddr, bitcoin_rs_p2p::ConnectionId>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,21 +125,20 @@ impl BlockSync {
     #[must_use]
     pub fn new(
         handles: crate::apply::ApplyHandles,
-        peers: Arc<RwLock<Vec<PeerInfo>>>,
-        peer_outbound: Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
+        peer_table: Arc<PeerTable>,
         inbound_headers_rx: Arc<Mutex<Receiver<InboundHeaders>>>,
         inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     ) -> Self {
         Self {
             handles,
-            peers,
-            peer_outbound,
+            peer_table,
             inbound_headers_rx,
             inbound_blocks_rx,
             download_window: Arc::new(Mutex::new(DownloadWindow::new(default_sync_budget()))),
             block_stager: Arc::new(Mutex::new(BlockStager::new(default_sync_budget()))),
             pending_getheaders: Arc::new(Mutex::new(None)),
             expected_apply_cache: Arc::new(Mutex::new(None)),
+            known_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -150,39 +150,21 @@ impl BlockSync {
         *self.block_stager.lock() = BlockStager::new(budget);
     }
 
-    /// Returns the sole production peer-registration operation. It preserves
-    /// the window-then-outbound lock order and purges old-address state before
-    /// the new sender becomes visible.
-    #[must_use]
-    pub fn peer_registration_handle(
-        &self,
-    ) -> Arc<dyn Fn(SocketAddr, PeerLease, PeerInfo) -> bool + Send + Sync> {
-        let window = Arc::clone(&self.download_window);
-        let outbound = Arc::clone(&self.peer_outbound);
-        let peers = Arc::clone(&self.peers);
-        let pending_getheaders = Arc::clone(&self.pending_getheaders);
-        Arc::new(move |peer_addr, lease, info| {
-            let mut window = window.lock();
-            let mut outbound = outbound.write();
-            let replaced = match outbound.remove(&peer_addr) {
-                Some(prior) if prior.same_connection(&lease) => false,
-                Some(prior) => {
-                    prior.cancel();
-                    true
+    fn reconcile_peer_sessions(&self) {
+        let live = self.peer_table.live_connections();
+        let mut window = self.download_window.lock();
+        let mut known = self.known_sessions.lock();
+        for (addr, id) in &live {
+            if known.insert(*addr, *id).is_some_and(|prev| prev != *id) {
+                window.forget_peer(*addr);
+                let mut pending = self.pending_getheaders.lock();
+                if pending.is_some_and(|request| request.peer_addr == *addr) {
+                    *pending = None;
                 }
-                None => false,
-            };
-            window.forget_peer(peer_addr);
-            outbound.insert(peer_addr, lease);
-            let mut peers = peers.write();
-            peers.retain(|peer| peer.addr != peer_addr);
-            peers.push(info);
-            let mut pending = pending_getheaders.lock();
-            if pending.is_some_and(|request| request.peer_addr == peer_addr) {
-                *pending = None;
             }
-            replaced
-        })
+        }
+        known.retain(|addr, _| live.iter().any(|(a, _)| a == addr));
+        window.release_disconnected_peers(|peer| live.iter().any(|(a, _)| a == peer));
     }
 
     /// Runs one orchestrator tick: requests pending blocks from eligible peers
@@ -191,7 +173,7 @@ impl BlockSync {
         self.drain_inbound_headers();
         self.ensure_genesis_tip();
         // Remove dead racers before queued blocks can affect peer election.
-        self.release_disconnected_peer_budget();
+        self.reconcile_peer_sessions();
         self.drain_inbound_blocks();
 
         let applied_tip = self.handles.applied_tip.load_full();
@@ -204,7 +186,7 @@ impl BlockSync {
         if !self.disconnect_window_staller(applied_tip.as_deref(), now) {
             self.disconnect_timed_out_peer(now);
         }
-        self.release_disconnected_peer_budget();
+        self.reconcile_peer_sessions();
         let sync_peer_selection = self.sync_peer_selection(applied_height, now);
         if sync_peer_selection.header_peer.is_none() {
             tracing::trace!(applied_height, "block sync: no peer above current height");
@@ -247,7 +229,7 @@ impl BlockSync {
         let chain_tip = self.handles.chain_tip.load_full();
         let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
         let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
-        let live_peers = self.peer_outbound.read().len();
+        let live_peers = self.peer_table.len();
         let in_ibd = header_height > 0 && applied_height < header_height;
         let gap = header_height.saturating_sub(applied_height);
 
@@ -281,11 +263,7 @@ impl BlockSync {
             // A response consumes the current peer's request even when header
             // acceptance rejects it; otherwise sync stalls until timeout.
             if let Some(source) = source {
-                let outbound = self.peer_outbound.read();
-                if outbound
-                    .get(&source.addr)
-                    .is_some_and(|lease| lease.is_current(source))
-                {
+                if self.peer_table.is_current(source) {
                     let mut pending = self.pending_getheaders.lock();
                     if pending.is_some_and(|request| request.peer_addr == source.addr) {
                         *pending = None;
@@ -315,15 +293,7 @@ impl BlockSync {
                     let mut blamed_peer = None;
                     if let Some(source) = source {
                         let mut window = self.download_window.lock();
-                        let mut outbound = self.peer_outbound.write();
-                        if outbound
-                            .get(&source.addr)
-                            .is_some_and(|lease| lease.is_current(source))
-                        {
-                            if let Some(removed) = outbound.remove(&source.addr) {
-                                removed.cancel();
-                            }
-                            self.peers.write().retain(|peer| peer.addr != source.addr);
+                        if self.peer_table.disconnect_source(source) {
                             window.mark_peer_unresponsive(source.addr, Instant::now());
                             blamed_peer = Some(source.addr);
                         }
@@ -372,26 +342,22 @@ impl BlockSync {
         let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
         let chain_tip = self.handles.chain_tip.load_full();
         let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
-        let header_peer = {
-            let peers = self.peers.read();
-            let mut best: Option<SyncPeer> = None;
-            for peer in peers.iter() {
-                let Ok(height) = u32::try_from(peer.start_height) else {
-                    continue;
-                };
-                if height <= applied_height {
-                    continue;
-                }
-                let candidate = SyncPeer {
-                    addr: peer.addr,
-                    start_height: peer.start_height,
-                };
-                if best.is_none_or(|current| current.start_height < candidate.start_height) {
-                    best = Some(candidate);
-                }
+        let mut header_peer: Option<SyncPeer> = None;
+        for peer in self.peer_table.infos() {
+            let Ok(height) = u32::try_from(peer.start_height) else {
+                continue;
+            };
+            if height <= applied_height {
+                continue;
             }
-            best
-        };
+            let candidate = SyncPeer {
+                addr: peer.addr,
+                start_height: peer.start_height,
+            };
+            if header_peer.is_none_or(|current| current.start_height < candidate.start_height) {
+                header_peer = Some(candidate);
+            }
+        }
         if let Some(peer) = header_peer {
             let peer_best_height = u32::try_from(peer.start_height).unwrap_or(0);
             if peer_best_height > header_height {
@@ -545,14 +511,9 @@ impl BlockSync {
         let staged_count = staged_blocks.len();
         {
             let mut window = self.download_window.lock();
-            let outbound = self.peer_outbound.read();
             for (hash, source, staged) in staged_blocks {
                 let source_peer = source
-                    .filter(|source| {
-                        outbound
-                            .get(&source.addr)
-                            .is_some_and(|lease| lease.is_current(*source))
-                    })
+                    .filter(|source| self.peer_table.is_current(*source))
                     .map(|source| source.addr);
                 match staged {
                     StagedBlock::AlreadyStaged => {
@@ -1011,40 +972,36 @@ impl BlockSync {
     fn sync_peer_selection(&self, our_height: u32, now: Instant) -> SyncPeerSelection {
         let mut header_peer: Option<SyncPeer> = None;
         let mut candidates: Vec<FanoutCandidate> = Vec::new();
-        {
-            let peers = self.peers.read();
-            candidates.reserve(peers.len());
-            for peer in peers.iter() {
-                // Height clause of the fan-out eligibility predicate (KTD6) and
-                // the pre-existing candidate filter: the peer's known chain must
-                // reach past our applied tip, i.e. cover the window front being
-                // requested. Delta vs Core: Core tracks a continuously updated
-                // per-peer best header (`pindexBestKnownBlock`, fed by headers/
-                // inv processing); this codebase only has the handshake-time
-                // `start_height`, so that is the proxy used — per-request
-                // truncation by `peer_best_height` bounds the damage of a stale
-                // value.
-                if u32::try_from(peer.start_height)
-                    .ok()
-                    .is_none_or(|height| height <= our_height)
-                {
-                    continue;
-                }
-                let sync_peer = SyncPeer {
-                    addr: peer.addr,
-                    start_height: peer.start_height,
-                };
-                if header_peer
-                    .is_none_or(|current: SyncPeer| current.start_height < sync_peer.start_height)
-                {
-                    header_peer = Some(sync_peer);
-                }
-                candidates.push(FanoutCandidate {
-                    peer: sync_peer,
-                    fanout_eligible: statically_fanout_eligible(peer),
-                    soft_blocked: false,
-                });
+        for peer in self.peer_table.infos() {
+            // Height clause of the fan-out eligibility predicate (KTD6) and
+            // the pre-existing candidate filter: the peer's known chain must
+            // reach past our applied tip, i.e. cover the window front being
+            // requested. Delta vs Core: Core tracks a continuously updated
+            // per-peer best header (`pindexBestKnownBlock`, fed by headers/
+            // inv processing); this codebase only has the handshake-time
+            // `start_height`, so that is the proxy used — per-request
+            // truncation by `peer_best_height` bounds the damage of a stale
+            // value.
+            if u32::try_from(peer.start_height)
+                .ok()
+                .is_none_or(|height| height <= our_height)
+            {
+                continue;
             }
+            let sync_peer = SyncPeer {
+                addr: peer.addr,
+                start_height: peer.start_height,
+            };
+            if header_peer
+                .is_none_or(|current: SyncPeer| current.start_height < sync_peer.start_height)
+            {
+                header_peer = Some(sync_peer);
+            }
+            candidates.push(FanoutCandidate {
+                peer: sync_peer,
+                fanout_eligible: statically_fanout_eligible(&peer),
+                soft_blocked: false,
+            });
         }
         let (request_peer_limit, fanout_active, cold_preferred) = {
             let mut window = self.download_window.lock();
@@ -1128,7 +1085,7 @@ impl BlockSync {
         let mut successful = SmallVec::<[SocketAddr; 8]>::new();
         for peer in candidates {
             let peer_addr = peer.addr;
-            let Some(tx) = self.peer_outbound.read().get(&peer_addr).cloned() else {
+            let Some(tx) = self.peer_table.lease(peer_addr) else {
                 continue;
             };
             let inventory = hashes
@@ -1220,10 +1177,7 @@ impl BlockSync {
         }
         let msg = Message::GetData(inventory);
 
-        let tx = {
-            let outbound = self.peer_outbound.read();
-            outbound.get(&request.peer_addr()).cloned()
-        };
+        let tx = self.peer_table.lease(request.peer_addr());
         let Some(tx) = tx else {
             tracing::trace!(
                 peer_addr = %request.peer_addr(),
@@ -1287,10 +1241,7 @@ impl BlockSync {
             locator_hashes,
             bitcoin::BlockHash::all_zeros(),
         ));
-        let tx = {
-            let outbound = self.peer_outbound.read();
-            outbound.get(&sync_peer_addr).cloned()
-        };
+        let tx = self.peer_table.lease(sync_peer_addr);
         let Some(tx) = tx else {
             tracing::warn!(
                 peer_addr = %sync_peer_addr,
@@ -1367,13 +1318,6 @@ impl BlockSync {
         }
     }
 
-    fn release_disconnected_peer_budget(&self) {
-        let live: SmallVec<[SocketAddr; 8]> = self.peer_outbound.read().keys().copied().collect();
-        self.download_window
-            .lock()
-            .release_disconnected_peers(|peer| live.contains(peer));
-    }
-
     /// Sends one untracked duplicate request for a cold-start stalled front.
     ///
     /// The original request remains the sole pending owner. This bounded
@@ -1385,17 +1329,15 @@ impl BlockSync {
         front_height: u32,
         now: Instant,
     ) -> Option<SocketAddr> {
-        let candidates: SmallVec<[SocketAddr; 8]> = self
-            .peers
-            .read()
-            .iter()
-            .filter(|peer| {
-                peer.addr != owner
-                    && statically_fanout_eligible(peer)
-                    && u32::try_from(peer.start_height).is_ok_and(|height| height >= front_height)
-            })
-            .map(|peer| peer.addr)
-            .collect();
+        let mut candidates = SmallVec::<[SocketAddr; 8]>::new();
+        for peer in self.peer_table.infos() {
+            if peer.addr != owner
+                && statically_fanout_eligible(&peer)
+                && u32::try_from(peer.start_height).is_ok_and(|height| height >= front_height)
+            {
+                candidates.push(peer.addr);
+            }
+        }
         let candidates: SmallVec<[SocketAddr; 8]> = {
             let window = self.download_window.lock();
             candidates
@@ -1410,7 +1352,7 @@ impl BlockSync {
             bitcoin::BlockHash::from_byte_array(*front_hash.as_byte_array()),
         )]);
         for peer_addr in candidates {
-            let tx = self.peer_outbound.read().get(&peer_addr).cloned();
+            let tx = self.peer_table.lease(peer_addr);
             let Some(tx) = tx else {
                 continue;
             };
@@ -1530,21 +1472,21 @@ impl BlockSync {
         metrics::gauge!("node.sync.pending_bytes").set(metric_count(window.pending_bytes()));
     }
 
-    /// Selects and evicts a download-window owner without letting a
-    /// same-address registration replace the lease in the middle.
-    ///
-    /// The lock order is window, outbound, peer registry, then pending headers.
-    /// Registration uses the same order, so once selection succeeds the removed
-    /// lease is necessarily the selected connection.
+    /// Selects and evicts a download-window owner only when its latest
+    /// reconciled connection identity is still live.
     fn select_and_evict_window_peer(
         &self,
         select: impl FnOnce(&mut DownloadWindow) -> Option<SocketAddr>,
     ) -> Option<SocketAddr> {
         let mut window = self.download_window.lock();
         let peer_addr = select(&mut window)?;
-        let removed = self.peer_outbound.write().remove(&peer_addr)?;
-        removed.cancel();
-        self.peers.write().retain(|peer| peer.addr != peer_addr);
+        let connection_id = self.known_sessions.lock().get(&peer_addr).copied()?;
+        if !self
+            .peer_table
+            .disconnect_connection(peer_addr, connection_id)
+        {
+            return None;
+        }
         let mut pending = self.pending_getheaders.lock();
         if pending.is_some_and(|request| request.peer_addr == peer_addr) {
             *pending = None;
@@ -1568,7 +1510,7 @@ mod tests {
     use bitcoin::hashes::Hash as _;
     use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
     use bitcoin_rs_mempool::{Mempool, MempoolLimits};
-    use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerSource};
+    use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerSource, PeerTable};
     use bitcoin_rs_primitives::encode::double_sha256;
     use bitcoin_rs_primitives::{
         Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxIn, TxOut, Txid,
@@ -1607,8 +1549,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -1622,16 +1563,11 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -1696,8 +1632,7 @@ mod tests {
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(applied)));
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -1705,14 +1640,13 @@ mod tests {
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
         let sync = BlockSync::new(
             apply_handles(chain_tip, Arc::clone(&applied_tip), block_tree),
-            peers,
-            Arc::clone(&peer_outbound),
+            Arc::clone(&peers),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
         let peer = SocketAddr::from(([127, 0, 0, 1], 18_460));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(peer, PeerLease::new(tx));
+        peers.register(peer, PeerLease::new(tx));
         let chain_tip = sync
             .handles
             .chain_tip
@@ -1791,8 +1725,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(genesis_tip)));
         let block_tree = Arc::new(RwLock::new(tree));
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -1800,14 +1733,13 @@ mod tests {
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
         let sync = BlockSync::new(
             apply_handles(Arc::clone(&chain_tip), Arc::clone(&applied_tip), block_tree),
-            peers,
-            Arc::clone(&peer_outbound),
+            Arc::clone(&peers),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
         let peer = SocketAddr::from(([127, 0, 0, 1], 18_461));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(peer, PeerLease::new(tx));
+        peers.register(peer, PeerLease::new(tx));
         let applied = applied_tip
             .load_full()
             .ok_or_else(|| std::io::Error::other("missing genesis applied tip"))?;
@@ -1887,8 +1819,7 @@ mod tests {
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
         let sync = BlockSync::new(
             apply_handles(chain_tip, applied_tip, block_tree),
-            Arc::new(RwLock::new(Vec::new())),
-            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(PeerTable::new()),
             Arc::new(Mutex::new(inbound_headers_rx_raw)),
             Arc::new(Mutex::new(inbound_blocks_rx_raw)),
         );
@@ -1903,8 +1834,7 @@ mod tests {
     #[test]
     fn branch_switch_uses_staged_bodies_without_durable_store()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
-            sync_with_mined_chain(2)?;
+        let (sync, _peers, applied_tip, main, _blocks_tx) = sync_with_mined_chain(2)?;
         sync.ensure_genesis_tip();
         install_budget(
             &sync,
@@ -2053,8 +1983,7 @@ mod tests {
     #[test]
     fn branch_switch_replans_after_a_competing_connect_before_transition()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
-            sync_with_mined_chain(2)?;
+        let (sync, _peers, applied_tip, main, _blocks_tx) = sync_with_mined_chain(2)?;
         sync.ensure_genesis_tip();
         for block in &main {
             stage_body(&sync, block);
@@ -2152,8 +2081,7 @@ mod tests {
     #[test]
     fn branch_switch_retires_only_the_connected_prefix_after_connect_failure()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
-            sync_with_mined_chain(1)?;
+        let (sync, _peers, applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
         sync.ensure_genesis_tip();
         stage_body(&sync, &main[0]);
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
@@ -2227,8 +2155,7 @@ mod tests {
     #[test]
     fn permanent_reorg_failure_invalidates_descendants_and_purges_ownership()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, _applied_tip, main, _blocks_tx) =
-            sync_with_mined_chain(1)?;
+        let (sync, _peers, _applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
         sync.ensure_genesis_tip();
         stage_body(&sync, &main[0]);
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
@@ -2290,8 +2217,7 @@ mod tests {
     #[test]
     fn operational_reorg_failure_preserves_branch_and_ownership()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sync, _peers, _peer_outbound, _applied_tip, main, _blocks_tx) =
-            sync_with_mined_chain(1)?;
+        let (mut sync, _peers, _applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
         sync.ensure_genesis_tip();
         stage_body(&sync, &main[0]);
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
@@ -2351,8 +2277,7 @@ mod tests {
     #[test]
     fn branch_switch_rejects_a_body_for_another_header_before_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
-            sync_with_mined_chain(1)?;
+        let (sync, _peers, applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
         sync.ensure_genesis_tip();
         stage_body(&sync, &main[0]);
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
@@ -2422,8 +2347,7 @@ mod tests {
     #[test]
     fn branch_switch_rejects_mismatched_preserved_bytes_before_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
-            sync_with_mined_chain(1)?;
+        let (sync, _peers, applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
         sync.ensure_genesis_tip();
         stage_body(&sync, &main[0]);
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
@@ -2488,8 +2412,7 @@ mod tests {
     #[test]
     fn tick_skips_getheaders_when_header_tip_matches_peer_height()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(3)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(3)?;
         let applied_snapshot = {
             let tree = block_tree.read();
             let chain_tip = sync
@@ -2510,11 +2433,7 @@ mod tests {
         };
         applied_tip.store(Some(Arc::new(applied_snapshot)));
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 3));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 3));
 
         sync.tick();
 
@@ -2528,43 +2447,9 @@ mod tests {
     }
 
     #[test]
-    fn tick_sorts_out_of_order_peers_before_requesting_blocks()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(3)?;
-        let low_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        let high_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers
-            .write()
-            .extend([synthetic_peer(low_addr, 2), synthetic_peer(high_addr, 8)]);
-        let (low_tx, low_rx) = unbounded::<Message>();
-        let (high_tx, high_rx) = unbounded::<Message>();
-        peer_outbound.write().extend([
-            (low_addr, bitcoin_rs_p2p::PeerLease::new(low_tx)),
-            (high_addr, bitcoin_rs_p2p::PeerLease::new(high_tx)),
-        ]);
-
-        sync.tick();
-
-        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let first = high_rx.try_recv()?;
-        let Message::GetData(inventory) = first else {
-            return Err(std::io::Error::other("expected high peer getdata").into());
-        };
-        assert_eq!(witness_block_inventory(inventory)?, expected);
-        let second = high_rx.try_recv()?;
-        if !matches!(second, Message::GetHeaders(_)) {
-            return Err(std::io::Error::other("expected high peer getheaders").into());
-        }
-        assert!(low_rx.try_recv().is_err());
-        Ok(())
-    }
-
-    #[test]
     fn tick_does_not_resend_same_getheaders_while_pending() -> Result<(), Box<dyn std::error::Error>>
     {
-        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
-            sync_with_header_chain(3)?;
+        let (sync, peers, _block_tree, _applied_tip, _expected) = sync_with_header_chain(3)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -2573,11 +2458,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 8));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 8));
 
         sync.tick();
         let first = rx.try_recv()?;
@@ -2599,8 +2480,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -2614,7 +2494,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -2626,11 +2505,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 8));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 8));
 
         sync.tick();
         let first = rx.try_recv()?;
@@ -2641,7 +2516,7 @@ mod tests {
         let header = test_header(genesis.compute_hash(), 1);
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![header],
-            source: Some(current_source(&peer_outbound, addr)),
+            source: Some(current_source(&peers, addr)),
         })?;
         sync.tick();
         let second = rx.try_recv()?;
@@ -2665,8 +2540,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -2680,7 +2554,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -2692,11 +2565,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 8));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 8));
 
         sync.tick();
         let first = rx.try_recv()?;
@@ -2710,7 +2579,7 @@ mod tests {
         let orphan = test_header(orphan_prev, 5);
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![orphan],
-            source: Some(current_source(&peer_outbound, addr)),
+            source: Some(current_source(&peers, addr)),
         })?;
         sync.tick();
         assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
@@ -2730,7 +2599,6 @@ mod tests {
             sync,
             inbound_headers_tx,
             peers,
-            peer_outbound,
         } = header_sync_with_genesis()?;
         let invalid_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         let other_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
@@ -2739,10 +2607,13 @@ mod tests {
 
         // Seed only the invalid peer so the first tick routes a GetHeaders to
         // it and arms the pending gate against its address.
-        peers.write().push(synthetic_peer(invalid_peer, 9));
-        peer_outbound
-            .write()
-            .insert(invalid_peer, bitcoin_rs_p2p::PeerLease::new(invalid_tx));
+        let invalid_lease = bitcoin_rs_p2p::PeerLease::new(invalid_tx);
+        peers.register(invalid_peer, invalid_lease.clone());
+        peers.publish_info(
+            invalid_peer,
+            &invalid_lease,
+            synthetic_peer(invalid_peer, 9),
+        );
 
         sync.tick();
         assert!(
@@ -2762,7 +2633,7 @@ mod tests {
         // `pending_getheaders` ends up clear is the peer-fault cleanup.
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
-            source: Some(current_source(&peer_outbound, invalid_peer)),
+            source: Some(current_source(&peers, invalid_peer)),
         })?;
         sync.tick();
 
@@ -2771,26 +2642,25 @@ mod tests {
             "an attributed invalid-header fault must release the pending getheaders gate"
         );
         assert!(
-            !peers.read().iter().any(|peer| peer.addr == invalid_peer),
+            !peers.is_connected(invalid_peer),
             "invalid header source must be removed from peer selection"
         );
         assert!(
-            !peer_outbound.read().contains_key(&invalid_peer),
+            !peers.is_connected(invalid_peer),
             "invalid header source must lose its outbound lease"
         );
 
         // Re-introduce a healthy peer; the next getheaders must rotate to it.
-        peers.write().push(synthetic_peer(other_peer, 8));
-        peer_outbound
-            .write()
-            .insert(other_peer, bitcoin_rs_p2p::PeerLease::new(other_tx));
+        let other_lease = bitcoin_rs_p2p::PeerLease::new(other_tx);
+        peers.register(other_peer, other_lease.clone());
+        peers.publish_info(other_peer, &other_lease, synthetic_peer(other_peer, 8));
         sync.tick();
         assert!(
-            peers.read().iter().any(|peer| peer.addr == other_peer),
+            peers.is_connected(other_peer),
             "healthy peer must remain eligible for rotation"
         );
         assert!(
-            peer_outbound.read().contains_key(&other_peer),
+            peers.is_connected(other_peer),
             "healthy peer must retain its outbound lease"
         );
         assert!(
@@ -2805,87 +2675,31 @@ mod tests {
     }
 
     #[test]
-    fn same_address_registration_clears_getheaders_gate_and_routes_replacement()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let HeaderSyncFixture {
-            sync,
-            peers,
-            peer_outbound,
-            ..
-        } = header_sync_with_genesis()?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], 18_457));
-        let (old_tx, old_rx) = unbounded::<Message>();
-        let old = PeerLease::new(old_tx);
-        peers.write().push(synthetic_peer(addr, 9));
-        peer_outbound.write().insert(addr, old.clone());
-
-        sync.tick();
-        assert!(
-            matches!(old_rx.try_recv()?, Message::GetHeaders(_)),
-            "the initial getheaders request must target the old lease"
-        );
-        assert!(
-            sync.pending_getheaders
-                .lock()
-                .is_some_and(|request| request.peer_addr == addr),
-            "the initial getheaders request must arm the old address gate"
-        );
-
-        let (replacement_tx, replacement_rx) = unbounded::<Message>();
-        assert!(sync.peer_registration_handle()(
-            addr,
-            PeerLease::new(replacement_tx),
-            synthetic_peer(addr, 9),
-        ));
-        assert!(old.is_cancelled(), "registration must cancel the old lease");
-        assert!(
-            sync.pending_getheaders.lock().is_none(),
-            "registration must clear the old lease's pending getheaders gate"
-        );
-
-        sync.tick();
-        assert!(
-            old_rx.try_recv().is_err(),
-            "the cancelled lease must not receive the next getheaders request"
-        );
-        assert!(
-            matches!(replacement_rx.try_recv()?, Message::GetHeaders(_)),
-            "the next getheaders request must route to the replacement lease"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn orphan_headers_keep_source_peer_connected() -> Result<(), Box<dyn std::error::Error>> {
         let HeaderSyncFixture {
             sync,
             inbound_headers_tx,
             peers,
-            peer_outbound,
             ..
         } = header_sync_with_genesis()?;
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(peer_addr, 8));
-        let (tx, _rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(peer_addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let _rx = connect_peer(&peers, synthetic_peer(peer_addr, 8));
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![test_header(
                 BlockHash(Hash256::from_le_bytes(&[0x11; 32])),
                 1,
             )],
-            source: Some(current_source(&peer_outbound, peer_addr)),
+            source: Some(current_source(&peers, peer_addr)),
         })?;
 
         sync.tick();
 
         assert!(
-            peers.read().iter().any(|peer| peer.addr == peer_addr),
+            peers.is_connected(peer_addr),
             "orphan announcements are not evidence of a bad peer"
         );
         assert!(
-            peer_outbound.read().contains_key(&peer_addr),
+            peers.is_connected(peer_addr),
             "orphan announcements must not revoke the peer lease"
         );
         Ok(())
@@ -2899,14 +2713,9 @@ mod tests {
             sync,
             inbound_headers_tx,
             peers,
-            peer_outbound,
         } = header_sync_with_genesis()?;
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(peer_addr, 8));
-        let (tx, _rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(peer_addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let _rx = connect_peer(&peers, synthetic_peer(peer_addr, 8));
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
             source: None,
@@ -2915,90 +2724,20 @@ mod tests {
         sync.tick();
 
         assert!(
-            peers.read().iter().any(|peer| peer.addr == peer_addr),
+            peers.is_connected(peer_addr),
             "local injection must not identify an arbitrary peer as faulty"
         );
         assert!(
-            peer_outbound.read().contains_key(&peer_addr),
+            peers.is_connected(peer_addr),
             "local injection must preserve peer outbound leases"
         );
         Ok(())
     }
 
     #[test]
-    fn tick_uses_highest_peer_for_headers_when_request_capacity_is_zero()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
-            sync_with_header_chain(3)?;
-        install_budget(
-            &sync,
-            super::SyncBudget {
-                max_pending_blocks: 0,
-                ..super::default_sync_budget()
-            },
-        );
-        let low_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        let high_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers
-            .write()
-            .extend([synthetic_peer(low_addr, 4), synthetic_peer(high_addr, 8)]);
-        let (low_tx, low_rx) = unbounded::<Message>();
-        let (high_tx, high_rx) = unbounded::<Message>();
-        peer_outbound.write().extend([
-            (low_addr, bitcoin_rs_p2p::PeerLease::new(low_tx)),
-            (high_addr, bitcoin_rs_p2p::PeerLease::new(high_tx)),
-        ]);
-
-        sync.tick();
-
-        let headers = high_rx.try_recv()?;
-        if !matches!(headers, Message::GetHeaders(_)) {
-            return Err(std::io::Error::other("expected high peer getheaders").into());
-        }
-        assert!(high_rx.try_recv().is_err());
-        assert!(low_rx.try_recv().is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn tick_bounded_request_peer_selection_preserves_equal_height_order()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
-        let first_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers.write().extend([
-            synthetic_peer(first_addr, 200),
-            synthetic_peer(second_addr, 200),
-        ]);
-        let (first_tx, first_rx) = unbounded::<Message>();
-        let (second_tx, second_rx) = unbounded::<Message>();
-        peer_outbound.write().extend([
-            (first_addr, bitcoin_rs_p2p::PeerLease::new(first_tx)),
-            (second_addr, bitcoin_rs_p2p::PeerLease::new(second_tx)),
-        ]);
-
-        sync.tick();
-
-        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let Message::GetData(inventory) = first_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected first peer getdata").into());
-        };
-        assert_eq!(witness_block_inventory(inventory)?, expected);
-        let headers = first_rx.try_recv()?;
-        if !matches!(headers, Message::GetHeaders(_)) {
-            return Err(std::io::Error::other("expected first peer getheaders").into());
-        }
-        assert!(first_rx.try_recv().is_err());
-        assert!(second_rx.try_recv().is_err());
-        Ok(())
-    }
-
-    #[test]
     fn tick_bounded_request_peer_selection_skips_inflight_saturated_prefix()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(8)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(8)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -3009,11 +2748,7 @@ mod tests {
             },
         );
         let first_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(first_addr, 100));
-        let (first_tx, first_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(first_addr, bitcoin_rs_p2p::PeerLease::new(first_tx));
+        let first_rx = connect_peer(&peers, synthetic_peer(first_addr, 100));
 
         sync.tick();
 
@@ -3028,11 +2763,7 @@ mod tests {
         }
 
         let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers.write().push(synthetic_peer(second_addr, 100));
-        let (second_tx, second_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(second_addr, bitcoin_rs_p2p::PeerLease::new(second_tx));
+        let second_rx = connect_peer(&peers, synthetic_peer(second_addr, 100));
 
         sync.tick();
 
@@ -3040,7 +2771,14 @@ mod tests {
             return Err(std::io::Error::other("expected second peer getdata").into());
         };
         assert_eq!(witness_block_inventory(second_inventory)?, expected[2..4]);
-        assert!(second_rx.try_recv().is_err());
+        while let Ok(message) = second_rx.try_recv() {
+            if matches!(message, Message::GetData(_)) {
+                return Err(std::io::Error::other(
+                    "a saturated prefix must not receive additional getdata",
+                )
+                .into());
+            }
+        }
         // The in-flight getheaders gate suppresses a duplicate header request to
         // the original sync peer, so it receives no further messages.
         assert!(first_rx.try_recv().is_err());
@@ -3050,8 +2788,7 @@ mod tests {
     #[test]
     fn tick_demotes_peer_after_expired_pending_and_retries_on_alternate_peer()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(4)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(4)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -3064,11 +2801,7 @@ mod tests {
         );
         let stale_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         let healthy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers.write().push(synthetic_peer(stale_addr, 100));
-        let (stale_tx, stale_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(stale_addr, bitcoin_rs_p2p::PeerLease::new(stale_tx));
+        let stale_rx = connect_peer(&peers, synthetic_peer(stale_addr, 100));
 
         sync.tick();
 
@@ -3082,11 +2815,7 @@ mod tests {
             return Err(std::io::Error::other("expected stale peer getheaders").into());
         }
 
-        peers.write().push(synthetic_peer(healthy_addr, 100));
-        let (healthy_tx, healthy_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(healthy_addr, bitcoin_rs_p2p::PeerLease::new(healthy_tx));
+        let healthy_rx = connect_peer(&peers, synthetic_peer(healthy_addr, 100));
 
         sync.tick();
 
@@ -3094,7 +2823,14 @@ mod tests {
             return Err(std::io::Error::other("expected healthy peer retry getdata").into());
         };
         assert_eq!(witness_block_inventory(retry_inventory)?, expected[..2]);
-        assert!(healthy_rx.try_recv().is_err());
+        while let Ok(message) = healthy_rx.try_recv() {
+            if matches!(message, Message::GetData(_)) {
+                return Err(std::io::Error::other(
+                    "healthy peer must not receive another getdata request",
+                )
+                .into());
+            }
+        }
         while let Ok(message) = stale_rx.try_recv() {
             if matches!(message, Message::GetData(_)) {
                 return Err(
@@ -3108,8 +2844,7 @@ mod tests {
     #[test]
     fn tick_allows_demoted_peer_when_it_is_the_only_eligible_peer()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(4)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(4)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -3121,11 +2856,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -3145,72 +2876,6 @@ mod tests {
             return Err(std::io::Error::other("expected retry getdata").into());
         };
         assert_eq!(witness_block_inventory(retry_inventory)?, expected[..2]);
-        Ok(())
-    }
-
-    #[test]
-    fn tick_retries_when_all_selected_peers_have_expired_pending()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(6)?;
-        install_budget(
-            &sync,
-            super::SyncBudget {
-                max_pending_blocks: 4,
-                max_peer_inflight: 2,
-                getdata_batch_limit: 2,
-                pending_timeout: Duration::from_millis(100),
-                ..super::default_sync_budget()
-            },
-        );
-        let first_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers.write().extend([
-            synthetic_peer(first_addr, 100),
-            synthetic_peer(second_addr, 100),
-        ]);
-        let (first_tx, first_rx) = unbounded::<Message>();
-        let (second_tx, second_rx) = unbounded::<Message>();
-        peer_outbound.write().extend([
-            (first_addr, bitcoin_rs_p2p::PeerLease::new(first_tx)),
-            (second_addr, bitcoin_rs_p2p::PeerLease::new(second_tx)),
-        ]);
-
-        sync.tick();
-
-        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let Message::GetData(first_inventory) = first_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected first peer getdata").into());
-        };
-        assert_eq!(witness_block_inventory(first_inventory)?, expected[..2]);
-        let first_headers = first_rx.try_recv()?;
-        if !matches!(first_headers, Message::GetHeaders(_)) {
-            return Err(std::io::Error::other("expected first peer getheaders").into());
-        }
-        let Message::GetData(second_inventory) = second_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected second peer getdata").into());
-        };
-        assert_eq!(witness_block_inventory(second_inventory)?, expected[2..4]);
-        assert!(second_rx.try_recv().is_err());
-
-        std::thread::sleep(Duration::from_millis(125));
-        sync.tick();
-
-        while let Ok(message) = first_rx.try_recv() {
-            if matches!(message, Message::GetData(_)) {
-                return Err(
-                    std::io::Error::other("first peer should not receive retry getdata").into(),
-                );
-            }
-        }
-        let Message::GetData(retry_inventory) = second_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected retry getdata").into());
-        };
-        let retry_hashes = witness_block_inventory(retry_inventory)?;
-        assert_eq!(retry_hashes.len(), 2);
-        assert!(retry_hashes.iter().all(|hash| expected[..4].contains(hash)));
-        assert!(second_rx.try_recv().is_err());
-        assert_eq!(sync.download_window.lock().pending_len(), 2);
         Ok(())
     }
 
@@ -3236,8 +2901,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -3251,7 +2915,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -3263,11 +2926,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -3307,8 +2966,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -3322,16 +2980,11 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -3368,47 +3021,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_outbound_channel_does_not_mark_blocks_pending_and_retries_when_channel_appears()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(3)?;
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-
-        sync.tick();
-
-        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        assert_eq!(sync.download_window.lock().pending_len(), 0);
-
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
-
-        sync.tick();
-
-        let first = rx.try_recv()?;
-        let Message::GetData(inventory) = first else {
-            return Err(std::io::Error::other("expected retry getdata").into());
-        };
-        let requested = witness_block_inventory(inventory)?;
-        assert_eq!(requested, expected);
-        assert_eq!(sync.download_window.lock().pending_len(), expected.len());
-        Ok(())
-    }
-
-    #[test]
     fn disconnected_outbound_channel_does_not_mark_blocks_pending()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, _expected) =
-            sync_with_header_chain(3)?;
+        let (sync, peers, block_tree, applied_tip, _expected) = sync_with_header_chain(3)?;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
+        register_info(&peers, synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
         drop(rx);
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        peers.register(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -3420,14 +3040,9 @@ mod tests {
     #[test]
     fn successful_getdata_send_marks_requested_blocks_pending()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(3)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(3)?;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -3450,8 +3065,7 @@ mod tests {
     #[test]
     fn drain_inbound_blocks_prunes_stale_received_blocks_without_new_arrivals()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, _block_tree, _applied_tip, _expected) =
-            sync_with_header_chain(1)?;
+        let (sync, _peers, _block_tree, _applied_tip, _expected) = sync_with_header_chain(1)?;
         let block = Network::Regtest.genesis_block();
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(block.block_hash().as_bytes());
         let received_at = Instant::now()
@@ -3494,8 +3108,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -3509,7 +3122,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -3522,11 +3134,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -3562,8 +3170,7 @@ mod tests {
 
     #[test]
     fn tick_respects_pending_byte_budget() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, _expected) =
-            sync_with_header_chain(3)?;
+        let (sync, peers, block_tree, applied_tip, _expected) = sync_with_header_chain(3)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -3572,11 +3179,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -3591,8 +3194,7 @@ mod tests {
 
     #[test]
     fn tick_limits_inflight_per_peer() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, _expected) =
-            sync_with_header_chain(5)?;
+        let (sync, peers, block_tree, applied_tip, _expected) = sync_with_header_chain(5)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -3601,11 +3203,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -3625,62 +3223,15 @@ mod tests {
     }
 
     #[test]
-    fn tick_fans_out_getdata_across_eligible_peers() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(8)?;
-        install_budget(
-            &sync,
-            super::SyncBudget {
-                max_pending_blocks: 4,
-                max_peer_inflight: 2,
-                getdata_batch_limit: 2,
-                ..super::default_sync_budget()
-            },
-        );
-        let first_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers.write().extend([
-            synthetic_peer(first_addr, 100),
-            synthetic_peer(second_addr, 100),
-        ]);
-        let (first_tx, first_rx) = unbounded::<Message>();
-        let (second_tx, second_rx) = unbounded::<Message>();
-        peer_outbound.write().extend([
-            (first_addr, bitcoin_rs_p2p::PeerLease::new(first_tx)),
-            (second_addr, bitcoin_rs_p2p::PeerLease::new(second_tx)),
-        ]);
-
-        sync.tick();
-
-        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let Message::GetData(first_inventory) = first_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected first peer getdata").into());
-        };
-        let first_requested = witness_block_inventory(first_inventory)?;
-        let _first_headers = first_rx.try_recv()?;
-        let Message::GetData(second_inventory) = second_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected second peer getdata").into());
-        };
-        let second_requested = witness_block_inventory(second_inventory)?;
-
-        assert_eq!(first_requested, expected[..2]);
-        assert_eq!(second_requested, expected[2..4]);
-        assert!(second_rx.try_recv().is_err());
-        assert_eq!(sync.download_window.lock().pending_len(), 4);
-        Ok(())
-    }
-
-    #[test]
     fn tick_fanout_distributes_window_front_first_across_eligible_peers()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
+        let (sync, peers, block_tree, applied_tip, expected) =
             sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
         let mut rxs = Vec::new();
         for idx in 0..super::MIN_PEERS_FOR_FANOUT {
             let addr = test_addr(9001, idx)?;
             rxs.push(connect_peer(
                 &peers,
-                &peer_outbound,
                 eligible_peer(addr, 200 - i32::try_from(idx)?),
             ));
         }
@@ -3720,14 +3271,13 @@ mod tests {
     #[test]
     fn tick_falls_back_to_single_deep_peer_below_fanout_threshold()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
+        let (sync, peers, block_tree, applied_tip, expected) =
             sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
         let mut rxs = Vec::new();
         for idx in 0..super::MIN_PEERS_FOR_FANOUT - 1 {
             let addr = test_addr(9021, idx)?;
             rxs.push(connect_peer(
                 &peers,
-                &peer_outbound,
                 eligible_peer(addr, 200 - i32::try_from(idx)?),
             ));
         }
@@ -3769,16 +3319,15 @@ mod tests {
         // A 16-block chain: the deep single-peer window takes all 16 while
         // the one-shot probe sends the first 8 (PREFIX_PROBE_BLOCK_LIMIT), so
         // the probe getdata is distinguishable from the deep getdata.
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(16)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(16)?;
         install_budget(&sync, super::default_sync_budget());
 
         // Two eligible peers: below the 8-peer fanout threshold. The owner
         // (highest) takes the deep window; the alternate is the probe racer.
         let owner_addr = test_addr(9401, 0)?;
         let alternate_addr = test_addr(9401, 1)?;
-        let owner_rx = connect_peer(&peers, &peer_outbound, eligible_peer(owner_addr, 200));
-        let alternate_rx = connect_peer(&peers, &peer_outbound, eligible_peer(alternate_addr, 200));
+        let owner_rx = connect_peer(&peers, eligible_peer(owner_addr, 201));
+        let alternate_rx = connect_peer(&peers, eligible_peer(alternate_addr, 200));
 
         // Tick 1: below the threshold, a prefix probe is created. The owner
         // receives the deep getdata (all 16) and the alternate receives the
@@ -3805,11 +3354,7 @@ mod tests {
         // fresh (age well under stall_timeout_initial = 2s), so the bounded
         // deferral holds fanout off and the probe survives the transition.
         for idx in 2..super::MIN_PEERS_FOR_FANOUT {
-            connect_peer(
-                &peers,
-                &peer_outbound,
-                eligible_peer(test_addr(9401, idx)?, 200),
-            );
+            connect_peer(&peers, eligible_peer(test_addr(9401, idx)?, 200));
         }
         sync.tick();
         assert!(
@@ -3886,15 +3431,14 @@ mod tests {
         ineligible: PeerInfo,
         serves_fallback: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
+        let (sync, peers, block_tree, applied_tip, expected) =
             sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
-        let ineligible_rx = connect_peer(&peers, &peer_outbound, ineligible);
+        let ineligible_rx = connect_peer(&peers, ineligible);
         let mut rxs = Vec::new();
         for idx in 0..super::MIN_PEERS_FOR_FANOUT - 1 {
             let addr = test_addr(9230, idx)?;
             rxs.push(connect_peer(
                 &peers,
-                &peer_outbound,
                 eligible_peer(addr, 200 - i32::try_from(idx)?),
             ));
         }
@@ -3926,7 +3470,7 @@ mod tests {
     #[test]
     fn demoted_peer_not_counted_toward_fanout_threshold() -> Result<(), Box<dyn std::error::Error>>
     {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
+        let (sync, peers, block_tree, applied_tip, expected) =
             sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
         install_budget(
             &sync,
@@ -3937,11 +3481,7 @@ mod tests {
         );
         // Phase 1: the lone peer takes the deep window; the zero timeout
         // expires every pending immediately, soft-demoting it.
-        let demoted_rx = connect_peer(
-            &peers,
-            &peer_outbound,
-            eligible_peer(test_addr(9240, 0)?, 300),
-        );
+        let demoted_rx = connect_peer(&peers, eligible_peer(test_addr(9240, 0)?, 300));
         sync.tick();
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let Message::GetData(initial) = demoted_rx.try_recv()? else {
@@ -3961,7 +3501,6 @@ mod tests {
             let addr = test_addr(9241, idx)?;
             rxs.push(connect_peer(
                 &peers,
-                &peer_outbound,
                 eligible_peer(addr, 200 - i32::try_from(idx)?),
             ));
         }
@@ -3984,7 +3523,7 @@ mod tests {
     #[test]
     fn ineligible_peers_receive_no_block_requests_during_fanout()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
+        let (sync, peers, block_tree, applied_tip, expected) =
             sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
         // A real (short) pending timeout: the lone peer's requests must be
         // expired by the time the second tick runs, while the second tick's
@@ -4000,11 +3539,7 @@ mod tests {
         );
         // Soft-demote one otherwise-eligible peer: it takes the deep window
         // and never delivers.
-        let demoted_rx = connect_peer(
-            &peers,
-            &peer_outbound,
-            eligible_peer(test_addr(9250, 0)?, 290),
-        );
+        let demoted_rx = connect_peer(&peers, eligible_peer(test_addr(9250, 0)?, 290));
         sync.tick();
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let Message::GetData(initial) = demoted_rx.try_recv()? else {
@@ -4019,7 +3554,6 @@ mod tests {
         // would make them the most attractive picks were they eligible.
         let inbound_rx = connect_peer(
             &peers,
-            &peer_outbound,
             PeerInfo {
                 inbound: true,
                 ..eligible_peer(test_addr(9251, 0)?, 310)
@@ -4027,23 +3561,17 @@ mod tests {
         );
         let non_witness_rx = connect_peer(
             &peers,
-            &peer_outbound,
             PeerInfo {
                 services: 1,
                 ..eligible_peer(test_addr(9252, 0)?, 305)
             },
         );
-        let low_chain_rx = connect_peer(
-            &peers,
-            &peer_outbound,
-            eligible_peer(test_addr(9253, 0)?, 0),
-        );
+        let low_chain_rx = connect_peer(&peers, eligible_peer(test_addr(9253, 0)?, 0));
         let mut rxs = Vec::new();
         for idx in 0..super::MIN_PEERS_FOR_FANOUT {
             let addr = test_addr(9254, idx)?;
             rxs.push(connect_peer(
                 &peers,
-                &peer_outbound,
                 eligible_peer(addr, 200 - i32::try_from(idx)?),
             ));
         }
@@ -4055,7 +3583,7 @@ mod tests {
         // during synchronous apply is not mistaken for a network timeout.
         sync.tick();
         assert!(
-            !peer_outbound.read().contains_key(&test_addr(9250, 0)?),
+            !peers.is_connected(test_addr(9250, 0)?),
             "a peer that misses the request timeout must release its outbound slot"
         );
         assert!(
@@ -4089,72 +3617,8 @@ mod tests {
     }
 
     #[test]
-    fn peer_disconnect_mid_window_requeues_blocks_to_remaining_peers()
-    -> Result<(), Box<dyn std::error::Error>> {
-        const PEER_COUNT: usize = 9;
-        const SELECTED_PEERS: usize = super::PENDING_BUDGET / super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
-        let mut rxs = Vec::new();
-        let mut addrs = Vec::new();
-        // Nine eligible peers leave one beyond the eight-peer scan width at
-        // the 16-block floor. It picks up the released stripe on tick two.
-        for idx in 0..PEER_COUNT {
-            let addr = test_addr(9261, idx)?;
-            addrs.push(addr);
-            rxs.push(connect_peer(
-                &peers,
-                &peer_outbound,
-                eligible_peer(addr, 200 - i32::try_from(idx)?),
-            ));
-        }
-
-        sync.tick();
-
-        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let cap = super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
-        for (idx, rx) in rxs[..SELECTED_PEERS].iter().enumerate() {
-            let Message::GetData(inventory) = rx.try_recv()? else {
-                return Err(std::io::Error::other("expected getdata for eligible peer").into());
-            };
-            assert_eq!(
-                witness_block_inventory(inventory)?,
-                expected[idx * cap..(idx + 1) * cap]
-            );
-        }
-        let _headers = rxs[0].try_recv()?;
-        let spare_rx = &rxs[SELECTED_PEERS];
-        assert!(spare_rx.try_recv().is_err());
-
-        // The second-highest peer disconnects mid-window, owning the second
-        // 16-block stripe.
-        let dropped = addrs[1];
-        peers.write().retain(|peer| peer.addr != dropped);
-        peer_outbound.write().remove(&dropped);
-
-        sync.tick();
-
-        // Its in-flight blocks are released and picked up by the remaining
-        // eligible peers — the saturated ones have no capacity, so the spare
-        // takes the whole stripe.
-        let Message::GetData(requeued) = spare_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected re-queued getdata for spare peer").into());
-        };
-        assert_eq!(witness_block_inventory(requeued)?, expected[cap..2 * cap]);
-        assert_eq!(
-            sync.download_window.lock().pending_len(),
-            super::PENDING_BUDGET
-        );
-        for rx in &rxs[..SELECTED_PEERS] {
-            assert!(rx.try_recv().is_err());
-        }
-        Ok(())
-    }
-
-    #[test]
     fn tick_caps_requests_at_staged_byte_headroom() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(8)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(8)?;
         let slot = 256 * 1024;
         install_budget(
             &sync,
@@ -4172,7 +3636,7 @@ mod tests {
             window.mark_received(Hash256::from_le_bytes(&[0xEF; 32]), slot, now);
         }
         let addr = test_addr(9270, 0)?;
-        let rx = connect_peer(&peers, &peer_outbound, eligible_peer(addr, 200));
+        let rx = connect_peer(&peers, eligible_peer(addr, 200));
 
         sync.tick();
 
@@ -4200,7 +3664,7 @@ mod tests {
         // The recorded live-collapse construction (scaled 8x down): the
         // default one-minute timeouts never fire inside the test, so the only
         // thing that can stop the second wave is the count clamp itself.
-        let (sync, _peers, _peer_outbound, expected, rxs, _blocks_tx) =
+        let (sync, _peers, expected, rxs, _blocks_tx) =
             staged_count_wedge(wedge_budget(super::PENDING_TIMEOUT))?;
 
         // Tick 2: the healthy deliveries stage; staged (14) + pending (2) sit
@@ -4246,7 +3710,7 @@ mod tests {
     #[test]
     fn wedged_window_expires_stalled_front_and_rerequests_through_count_clamp()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, expected, rxs, _blocks_tx) =
+        let (sync, _peers, expected, rxs, _blocks_tx) =
             staged_count_wedge(wedge_budget(Duration::from_millis(250)))?;
 
         // Tick 2: wedge — staged + pending at the count budget, scan limit
@@ -4299,7 +3763,7 @@ mod tests {
             stall_timeout_initial: Duration::from_millis(100),
             ..wedge_budget(super::PENDING_TIMEOUT)
         };
-        let (sync, _peers, peer_outbound, expected, rxs, _blocks_tx) = staged_count_wedge(budget)?;
+        let (sync, peers, expected, rxs, _blocks_tx) = staged_count_wedge(budget)?;
         let owner = test_addr(9320, 0)?;
 
         // The first drain builds the asymmetric wedge and starts the episode.
@@ -4309,7 +3773,7 @@ mod tests {
         sync.tick();
 
         assert!(
-            peer_outbound.read().contains_key(&owner),
+            peers.is_connected(owner),
             "a cold-start hedge must not disconnect the pending owner"
         );
         let mut hedged = Vec::new();
@@ -4334,12 +3798,11 @@ mod tests {
 
     #[test]
     fn common_prefix_winner_takes_over_deep_window() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _applied_tip, blocks, blocks_tx) =
-            sync_with_mined_chain(16)?;
+        let (sync, peers, _applied_tip, blocks, blocks_tx) = sync_with_mined_chain(16)?;
         let owner = test_addr(9321, 0)?;
         let alternate = test_addr(9321, 1)?;
-        let owner_rx = connect_peer(&peers, &peer_outbound, eligible_peer(owner, 200));
-        let alternate_rx = connect_peer(&peers, &peer_outbound, eligible_peer(alternate, 100));
+        let owner_rx = connect_peer(&peers, eligible_peer(owner, 200));
+        let alternate_rx = connect_peer(&peers, eligible_peer(alternate, 100));
 
         sync.tick();
         assert_eq!(
@@ -4356,7 +3819,7 @@ mod tests {
 
         for block in &blocks[..4] {
             let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
-            inbound.source = Some(current_source(&peer_outbound, alternate));
+            inbound.source = Some(current_source(&peers, alternate));
             blocks_tx.send(inbound)?;
         }
         sync.tick();
@@ -4377,7 +3840,7 @@ mod tests {
                 .map(Block::block_hash)
                 .collect::<Vec<_>>()
         );
-        assert!(peer_outbound.read().contains_key(&owner));
+        assert!(peers.is_connected(owner));
         sync.download_window
             .lock()
             .mark_peer_unresponsive(alternate, Instant::now());
@@ -4393,8 +3856,7 @@ mod tests {
     #[test]
     fn fanout_replaces_preferred_peer_when_eligible_pool_recovers()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _applied_tip, blocks, blocks_tx) =
-            sync_with_mined_chain(48)?;
+        let (sync, peers, _applied_tip, blocks, blocks_tx) = sync_with_mined_chain(48)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -4409,15 +3871,15 @@ mod tests {
         );
         let owner = test_addr(9322, 0)?;
         let alternate = test_addr(9322, 1)?;
-        let owner_rx = connect_peer(&peers, &peer_outbound, eligible_peer(owner, 200));
-        let alternate_rx = connect_peer(&peers, &peer_outbound, eligible_peer(alternate, 100));
+        let owner_rx = connect_peer(&peers, eligible_peer(owner, 200));
+        let alternate_rx = connect_peer(&peers, eligible_peer(alternate, 100));
 
         sync.tick();
         let _ = next_getdata(&owner_rx)?;
         let _ = next_getdata(&alternate_rx)?;
         for block in &blocks[..4] {
             let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
-            inbound.source = Some(current_source(&peer_outbound, alternate));
+            inbound.source = Some(current_source(&peers, alternate));
             blocks_tx.send(inbound)?;
         }
         sync.tick();
@@ -4431,13 +3893,12 @@ mod tests {
         for idx in 2..=8 {
             recovered_rxs.push(connect_peer(
                 &peers,
-                &peer_outbound,
                 eligible_peer(test_addr(9322, idx)?, 100),
             ));
         }
         for block in &blocks[4..8] {
             let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
-            inbound.source = Some(current_source(&peer_outbound, alternate));
+            inbound.source = Some(current_source(&peers, alternate));
             blocks_tx.send(inbound)?;
         }
         sync.tick();
@@ -4513,10 +3974,9 @@ mod tests {
     #[test]
     fn far_behind_duplicate_of_applied_block_is_not_staged()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, applied_tip, blocks, blocks_tx) =
-            sync_with_mined_chain(64)?;
+        let (sync, peers, applied_tip, blocks, blocks_tx) = sync_with_mined_chain(64)?;
         let peer = test_addr(9321, 0)?;
-        let rx = connect_peer(&peers, &peer_outbound, eligible_peer(peer, 100));
+        let rx = connect_peer(&peers, eligible_peer(peer, 100));
 
         sync.tick();
         let requested = next_getdata(&rx)?;
@@ -4566,7 +4026,7 @@ mod tests {
             stall_timeout_initial: Duration::from_millis(100),
             ..wedge_budget(super::PENDING_TIMEOUT)
         };
-        let (sync, _peers, peer_outbound, expected, rxs, _blocks_tx) = staged_count_wedge(budget)?;
+        let (sync, peers, expected, rxs, _blocks_tx) = staged_count_wedge(budget)?;
         let staller = test_addr(9320, 0)?;
 
         // Cold-start disarm: the wedge fixture never advances the window
@@ -4600,7 +4060,7 @@ mod tests {
         sync.tick();
 
         assert!(
-            !peer_outbound.read().contains_key(&staller),
+            !peers.is_connected(staller),
             "staller's outbound lease must be revoked"
         );
         assert!(
@@ -4639,125 +4099,44 @@ mod tests {
     }
 
     #[test]
-    fn reconnecting_staller_held_out_of_window_front_by_cooldown()
+    fn stall_eviction_does_not_disconnect_replacement_connection()
     -> Result<(), Box<dyn std::error::Error>> {
-        // RE-ADV-2 terminator: previously a staller could re-acquire the
-        // front stripe across expiry-retry cycles; now it is disconnected,
-        // and after an immediate reconnect the cooldown keeps the window
-        // front on the honest peer even though the staller's inflated
-        // start_height (ADV-2's capture vector) out-sorts everyone.
-        //
-        // The staller first DELIVERS two front blocks >= 50ms apart — real
-        // end-to-end cadence samples seeding the interval EWMA through the
-        // chunk path — before wedging the window; an unseeded window would
-        // defer conviction to the 60s pending-timeout fallback (cold-start
-        // suppression) and nothing here would fire.
-        let (sync, peers, peer_outbound, applied_tip, blocks, blocks_tx) =
-            sync_with_mined_chain(5)?;
-        install_budget(
-            &sync,
-            super::SyncBudget {
-                max_pending_blocks: 2,
-                max_received_blocks: 2,
-                max_peer_inflight: 2,
-                getdata_batch_limit: 2,
-                stall_timeout_initial: Duration::from_millis(100),
-                ..super::default_sync_budget()
-            },
-        );
-        let staller = test_addr(9420, 0)?;
-        let honest = test_addr(9420, 1)?;
-        let staller_rx = connect_peer(&peers, &peer_outbound, synthetic_peer(staller, 10_000));
-        let honest_rx = connect_peer(&peers, &peer_outbound, synthetic_peer(honest, 100));
-
-        // Tick 1: the inflated height wins the deep fallback selection.
-        sync.tick();
-        let Message::GetData(inventory) = staller_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected staller getdata").into());
+        let budget = super::SyncBudget {
+            stall_timeout_initial: Duration::from_millis(100),
+            ..wedge_budget(super::PENDING_TIMEOUT)
         };
-        assert_eq!(
-            witness_block_inventory(inventory)?,
-            alloc::vec![blocks[0].block_hash(), blocks[1].block_hash()]
-        );
-        assert!(honest_rx.try_recv().is_err());
-
-        // Seed: blocks 1 and 2 arrive as window fronts >= 60ms apart.
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
-        inbound.source = Some(current_source(&peer_outbound, staller));
-        blocks_tx.send(inbound)?;
-        sync.tick();
-        sync.tick();
-        std::thread::sleep(Duration::from_millis(60));
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[1].clone());
-        inbound.source = Some(current_source(&peer_outbound, staller));
-        blocks_tx.send(inbound)?;
-        sync.tick();
-        sync.tick();
-        let ewma_ms = sync
-            .download_window
+        let (sync, peers, _expected, _rxs, _blocks_tx) = staged_count_wedge(budget)?;
+        let staller = test_addr(9320, 0)?;
+        sync.download_window
             .lock()
-            .front_interval_ewma_ms()
-            .ok_or_else(|| std::io::Error::other("front deliveries must seed the cadence EWMA"))?;
+            .seed_front_cadence_for_test(50, Instant::now());
 
-        // The successor (block 4) arrives, the new front (block 3) never
-        // does: wedge + episode on the staller, which owns the whole stripe.
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[3].clone());
-        inbound.source = Some(current_source(&peer_outbound, staller));
-        blocks_tx.send(inbound)?;
         sync.tick();
-        assert_eq!(
-            sync.download_window
-                .lock()
-                .stalling_peer()
-                .map(|(addr, _)| addr),
-            Some(staller)
-        );
-
-        // Fire: disconnect, and the front re-request lands on the honest
-        // peer despite its (much) lower advertised height. The effective
-        // threshold is max(100ms, 2x the measured seed cadence), so the
-        // wait is derived from the EWMA instead of hardcoded.
-        std::thread::sleep(Duration::from_millis(
-            ewma_ms.saturating_mul(2).saturating_add(150),
-        ));
-        sync.tick();
-        assert!(!peer_outbound.read().contains_key(&staller));
-        let retry = next_getdata(&honest_rx)?;
-        assert_eq!(
-            witness_block_inventory(retry)?,
-            alloc::vec![blocks[2].block_hash()]
-        );
-
-        // Immediate reconnect on the same address (the net layer's re-dial):
-        // the honest peer delivers the front, sync advances, and the NEW
-        // window front (block 5) must again go to the honest peer — the
-        // reconnected staller stays in cooldown and receives no block
-        // requests.
-        let (staller_tx2, staller_rx2) = unbounded::<Message>();
-        assert!(!sync.peer_registration_handle()(
-            staller,
-            bitcoin_rs_p2p::PeerLease::new(staller_tx2),
-            synthetic_peer(staller, 10_000),
-        ));
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[2].clone());
-        inbound.source = Some(current_source(&peer_outbound, honest));
-        blocks_tx.send(inbound)?;
-        sync.tick();
-        // The re-request narrowed the expected-apply cache to the front, so
-        // the staged successor drains on the following tick's tree walk.
-        sync.tick();
-
-        let applied_height = applied_tip
+        let applied_tip = sync
+            .handles
+            .applied_tip
             .load_full()
-            .ok_or_else(|| std::io::Error::other("apply did not publish tip"))?
-            .height;
-        assert_eq!(applied_height, 4, "sync must proceed past the stall");
-        let front = next_getdata(&honest_rx)?;
-        assert_eq!(
-            witness_block_inventory(front)?,
-            alloc::vec![blocks[4].block_hash()]
-        );
-        assert_no_getdata(&staller_rx2)?;
+            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+        let next_apply_height = applied_tip
+            .height
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("applied height overflow"))?;
+        let (replacement_tx, _replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let evicted = sync.select_and_evict_window_peer(|window| {
+            let selected = window.observe_stall(
+                next_apply_height,
+                false,
+                Instant::now() + Duration::from_millis(150),
+            );
+            peers.register(staller, replacement.clone());
+            peers.publish_info(staller, &replacement, eligible_peer(staller, 200));
+            selected
+        });
+
+        assert_eq!(evicted, None);
+        assert!(peers.is_connected(staller));
+        assert!(!replacement.is_cancelled());
         Ok(())
     }
 
@@ -4770,8 +4149,7 @@ mod tests {
         // exhausted`) is still open. Both 1-minute timeouts are live
         // defaults here — pre-U7 the received-prune was the only recovery;
         // now the staller disconnect frees the wedge in well under a second.
-        let (sync, peers, peer_outbound, applied_tip, blocks, blocks_tx) =
-            sync_with_mined_chain(2)?;
+        let (sync, peers, applied_tip, blocks, blocks_tx) = sync_with_mined_chain(2)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -4793,8 +4171,8 @@ mod tests {
         );
         let staller = test_addr(9430, 0)?;
         let honest = test_addr(9430, 1)?;
-        let staller_rx = connect_peer(&peers, &peer_outbound, synthetic_peer(staller, 200));
-        let honest_rx = connect_peer(&peers, &peer_outbound, synthetic_peer(honest, 100));
+        let staller_rx = connect_peer(&peers, synthetic_peer(staller, 200));
+        let honest_rx = connect_peer(&peers, synthetic_peer(honest, 100));
 
         // Cold-start disarm: this byte-wedge construction depends on the
         // pristine 256KiB initial block-size estimate, so the cadence EWMA
@@ -4833,7 +4211,7 @@ mod tests {
         // prune never ran).
         std::thread::sleep(Duration::from_millis(150));
         sync.tick();
-        assert!(!peer_outbound.read().contains_key(&staller));
+        assert!(!peers.is_connected(staller));
         assert_eq!(
             sync.block_stager.lock().received_len(),
             1,
@@ -4871,8 +4249,7 @@ mod tests {
         // accessor and the node.sync.stall_seconds gauge.
         let recorder = TestRecorder::default();
         metrics::with_local_recorder(&recorder, || {
-            let (sync, peers, peer_outbound, applied_tip, blocks, blocks_tx) =
-                sync_with_mined_chain(6)?;
+            let (sync, peers, applied_tip, blocks, blocks_tx) = sync_with_mined_chain(6)?;
             install_budget(
                 &sync,
                 super::SyncBudget {
@@ -4886,7 +4263,7 @@ mod tests {
                 },
             );
             let trickler = test_addr(9440, 0)?;
-            let rx = connect_peer(&peers, &peer_outbound, synthetic_peer(trickler, 100));
+            let rx = connect_peer(&peers, synthetic_peer(trickler, 100));
 
             for round in 0..2_usize {
                 let offset = round * 3;
@@ -4912,7 +4289,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
                 sync.tick();
                 // Still under the threshold: observed, not punished.
-                assert!(peer_outbound.read().contains_key(&trickler));
+                assert!(peers.is_connected(trickler));
                 match recorder.snapshot().get("node.sync.stall_seconds") {
                     Some(TestMetric::Gauge(seconds)) => {
                         assert!(
@@ -4943,7 +4320,7 @@ mod tests {
                 .height;
             assert_eq!(applied_height, 6);
             assert!(
-                peer_outbound.read().contains_key(&trickler),
+                peers.is_connected(trickler),
                 "a trickler under the threshold must never be disconnected"
             );
             assert!(
@@ -4964,8 +4341,7 @@ mod tests {
         // must not run — no disconnect fires even arbitrarily far past the
         // threshold, and the busy interval is never charged to the peer.
         // Time is injected through the detection entry point directly.
-        let (sync, peers, peer_outbound, _block_tree, _applied_tip, expected) =
-            sync_with_header_chain(4)?;
+        let (sync, peers, _block_tree, _applied_tip, expected) = sync_with_header_chain(4)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -4977,7 +4353,7 @@ mod tests {
             },
         );
         let staller = test_addr(9450, 0)?;
-        let rx = connect_peer(&peers, &peer_outbound, synthetic_peer(staller, 100));
+        let rx = connect_peer(&peers, synthetic_peer(staller, 100));
 
         // Cold-start disarm: an unseeded EWMA would suppress the fire on its
         // own and this test would pass vacuously. Seed it (50ms keeps the
@@ -5027,7 +4403,7 @@ mod tests {
         // Far past any threshold, but the apply side is busy: frozen.
         sync.disconnect_window_staller(Some(&applied), far_future);
         assert!(sync.download_window.lock().stalling_peer().is_none());
-        assert!(peer_outbound.read().contains_key(&staller));
+        assert!(peers.is_connected(staller));
 
         // The apply side drains the frontier: blame starts from scratch and
         // only then runs to a fire — the busy interval was not charged.
@@ -5041,123 +4417,11 @@ mod tests {
                 .map(|(addr, _)| addr),
             Some(staller)
         );
-        assert!(peer_outbound.read().contains_key(&staller));
+        assert!(peers.is_connected(staller));
         sync.disconnect_window_staller(Some(&applied), far_future + super::BLOCK_STALLING_TIMEOUT);
         assert!(
-            !peer_outbound.read().contains_key(&staller),
+            !peers.is_connected(staller),
             "with the apply side idle the same state must fire normally"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn sole_peer_staller_disconnected_and_usable_again_as_last_resort()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // Few-peers design decision (R10): Core disconnects stallers
-        // regardless of peer count — a stalled-forever peer is worse than no
-        // peer, because the disconnect is what re-queues the wedged front.
-        // This node's net layer re-dials `--connect` peers every 2s (DNS
-        // bootstrap is one-shot; that boundary is documented in the staller
-        // module docs), and a reconnected sole staller is usable again
-        // through the last-resort exemption, so liveness is preserved.
-        //
-        // The sole peer first delivers two front blocks >= 50ms apart (real
-        // cadence samples seeding the interval EWMA through the chunk path)
-        // before going silent: an unseeded window would defer conviction to
-        // the 60s pending-timeout fallback (cold-start suppression) and the
-        // disconnect under test would never fire.
-        let (sync, peers, peer_outbound, applied_tip, blocks, blocks_tx) =
-            sync_with_mined_chain(4)?;
-        install_budget(
-            &sync,
-            super::SyncBudget {
-                max_pending_blocks: 2,
-                max_received_blocks: 2,
-                max_peer_inflight: 2,
-                getdata_batch_limit: 2,
-                stall_timeout_initial: Duration::from_millis(100),
-                ..super::default_sync_budget()
-            },
-        );
-        let sole = test_addr(9460, 0)?;
-        let rx = connect_peer(&peers, &peer_outbound, synthetic_peer(sole, 100));
-
-        sync.tick();
-        let Message::GetData(inventory) = rx.try_recv()? else {
-            return Err(std::io::Error::other("expected getdata").into());
-        };
-        assert_eq!(
-            witness_block_inventory(inventory)?,
-            alloc::vec![blocks[0].block_hash(), blocks[1].block_hash()]
-        );
-
-        // Seed: blocks 1 and 2 arrive as window fronts >= 60ms apart.
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
-        inbound.source = Some(current_source(&peer_outbound, sole));
-        blocks_tx.send(inbound)?;
-        sync.tick();
-        sync.tick();
-        std::thread::sleep(Duration::from_millis(60));
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[1].clone());
-        inbound.source = Some(current_source(&peer_outbound, sole));
-        blocks_tx.send(inbound)?;
-        sync.tick();
-        sync.tick();
-        let ewma_ms = sync
-            .download_window
-            .lock()
-            .front_interval_ewma_ms()
-            .ok_or_else(|| std::io::Error::other("front deliveries must seed the cadence EWMA"))?;
-
-        // The successor (block 4) arrives, the new front (block 3) never
-        // does: wedge + episode on the sole peer.
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[3].clone());
-        inbound.source = Some(current_source(&peer_outbound, sole));
-        blocks_tx.send(inbound)?;
-        sync.tick();
-        assert!(sync.download_window.lock().stalling_peer().is_some());
-
-        // The disconnect fires even with no alternative peer. The effective
-        // threshold is max(100ms, 2x the measured seed cadence), so the
-        // wait is derived from the EWMA instead of hardcoded.
-        std::thread::sleep(Duration::from_millis(
-            ewma_ms.saturating_mul(2).saturating_add(150),
-        ));
-        sync.tick();
-        assert!(
-            !peer_outbound.read().contains_key(&sole),
-            "the sole peer's staller disconnect must fire — the re-queue is the recovery"
-        );
-
-        // Net-layer re-dial: the same address reconnects and, being the only
-        // candidate, serves as the last resort despite the cooldown.
-        let (tx2, rx2) = unbounded::<Message>();
-        assert!(!sync.peer_registration_handle()(
-            sole,
-            bitcoin_rs_p2p::PeerLease::new(tx2),
-            synthetic_peer(sole, 100),
-        ));
-        sync.tick();
-        let retry = next_getdata(&rx2)?;
-        assert_eq!(
-            witness_block_inventory(retry)?,
-            alloc::vec![blocks[2].block_hash()]
-        );
-
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[2].clone());
-        inbound.source = Some(current_source(&peer_outbound, sole));
-        blocks_tx.send(inbound)?;
-        sync.tick();
-        // The re-request narrowed the expected-apply cache to the front, so
-        // the staged successor drains on the following tick's tree walk.
-        sync.tick();
-        let applied_height = applied_tip
-            .load_full()
-            .ok_or_else(|| std::io::Error::other("apply did not publish tip"))?
-            .height;
-        assert_eq!(
-            applied_height, 4,
-            "liveness must survive the sole-peer disconnect"
         );
         Ok(())
     }
@@ -5183,8 +4447,7 @@ mod tests {
         // and `stall_decay_limit_cycle_stops_at_adaptive_floor`.)
         let recorder = TestRecorder::default();
         metrics::with_local_recorder(&recorder, || {
-            let (sync, peers, peer_outbound, applied_tip, blocks, blocks_tx) =
-                sync_with_mined_chain(32)?;
+            let (sync, peers, applied_tip, blocks, blocks_tx) = sync_with_mined_chain(32)?;
             install_budget(
                 &sync,
                 super::SyncBudget {
@@ -5205,7 +4468,6 @@ mod tests {
                 let addr = test_addr(9470, idx)?;
                 rxs.push(connect_peer(
                     &peers,
-                    &peer_outbound,
                     eligible_peer(addr, 200 - i32::try_from(idx)?),
                 ));
             }
@@ -5249,7 +4511,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(120));
                     sync.tick();
                     assert_eq!(
-                        peer_outbound.read().len(),
+                        peers.len(),
                         8,
                         "a mid-gap wake must not disconnect a streaming peer"
                     );
@@ -5265,7 +4527,7 @@ mod tests {
                 }
                 sync.tick();
                 assert_eq!(
-                    peer_outbound.read().len(),
+                    peers.len(),
                     8,
                     "no streaming peer may be disconnected (round {round})"
                 );
@@ -5292,7 +4554,7 @@ mod tests {
                 .ok_or_else(|| std::io::Error::other("apply did not publish tip"))?
                 .height;
             assert_eq!(applied_height, 32, "uniform-slow sync must complete");
-            assert_eq!(peer_outbound.read().len(), 8);
+            assert_eq!(peers.len(), 8);
             assert!(
                 !recorder
                     .snapshot()
@@ -5306,7 +4568,7 @@ mod tests {
     #[test]
     fn transient_demotion_does_not_flap_fanout_mode() -> Result<(), Box<dyn std::error::Error>> {
         const PEER_COUNT: usize = 8;
-        let ((sync, peers, peer_outbound, block_tree, applied_tip, expected), blocks_tx) =
+        let ((sync, peers, block_tree, applied_tip, expected), blocks_tx) =
             sync_with_header_chain_and_blocks(64)?;
         install_budget(
             &sync,
@@ -5330,7 +4592,6 @@ mod tests {
             let addr = test_addr(9340, idx)?;
             rxs.push(connect_peer(
                 &peers,
-                &peer_outbound,
                 eligible_peer(addr, 200 - i32::try_from(idx)?),
             ));
         }
@@ -5397,48 +4658,8 @@ mod tests {
     }
 
     #[test]
-    fn tick_does_not_request_above_peer_advertised_height() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(8)?;
-        install_budget(
-            &sync,
-            super::SyncBudget {
-                max_pending_blocks: 4,
-                max_peer_inflight: 2,
-                getdata_batch_limit: 2,
-                ..super::default_sync_budget()
-            },
-        );
-        let high_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        let low_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers
-            .write()
-            .extend([synthetic_peer(high_addr, 8), synthetic_peer(low_addr, 2)]);
-        let (high_tx, high_rx) = unbounded::<Message>();
-        let (low_tx, low_rx) = unbounded::<Message>();
-        peer_outbound.write().extend([
-            (high_addr, bitcoin_rs_p2p::PeerLease::new(high_tx)),
-            (low_addr, bitcoin_rs_p2p::PeerLease::new(low_tx)),
-        ]);
-
-        sync.tick();
-
-        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let Message::GetData(high_inventory) = high_rx.try_recv()? else {
-            return Err(std::io::Error::other("expected high peer getdata").into());
-        };
-        assert_eq!(witness_block_inventory(high_inventory)?, expected[..2]);
-        assert!(high_rx.try_recv().is_err());
-        assert!(low_rx.try_recv().is_err());
-        assert_eq!(sync.download_window.lock().pending_len(), 2);
-        Ok(())
-    }
-
-    #[test]
     fn clean_fast_path_caps_request_at_peer_height() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(8)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(8)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -5449,11 +4670,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 2));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 2));
 
         sync.tick();
 
@@ -5473,8 +4690,7 @@ mod tests {
     #[test]
     fn received_only_state_uses_scan_path_without_duplicate_request()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(3)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(3)?;
         let received_hash = Hash256::from_le_bytes(expected[1].as_bytes());
         {
             let mut window = sync.download_window.lock();
@@ -5483,11 +4699,7 @@ mod tests {
             window.update_received_height(&received_hash, 2);
         }
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 3));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 3));
 
         sync.tick();
 
@@ -5505,14 +4717,10 @@ mod tests {
 
     #[test]
     fn single_peer_can_fill_default_pending_window() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
+        let (sync, peers, block_tree, applied_tip, expected) =
             sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 200));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 200));
 
         let mut requested = Vec::new();
         let ticks = super::PENDING_BUDGET / super::GETDATA_BATCH_SIZE;
@@ -5542,8 +4750,7 @@ mod tests {
 
     #[test]
     fn tick_retries_expired_pending_before_new_heights() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(5)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(5)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -5554,11 +4761,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -5580,8 +4783,7 @@ mod tests {
 
     #[test]
     fn tick_fills_mixed_retry_and_new_height_batch() -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(4)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(4)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -5594,11 +4796,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -5627,8 +4825,7 @@ mod tests {
     #[test]
     fn tick_preserves_partial_window_order_across_pending_gap()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(5)?;
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(5)?;
         install_budget(
             &sync,
             super::SyncBudget {
@@ -5640,11 +4837,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -5686,8 +4879,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -5701,16 +4893,11 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
         inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(genesis))?;
 
         sync.tick();
@@ -5777,8 +4964,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -5792,7 +4978,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -5806,11 +4991,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -5867,8 +5048,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -5882,7 +5062,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -5896,11 +5075,7 @@ mod tests {
             },
         );
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         sync.tick();
 
@@ -5974,10 +5149,14 @@ mod tests {
                 .into());
             }
         }
-        assert!(
-            healthy_rx.try_recv().is_err(),
-            "exhausted staging must not request from the healthy peer"
-        );
+        while let Ok(message) = healthy_rx.try_recv() {
+            if matches!(message, Message::GetData(_)) {
+                return Err(std::io::Error::other(
+                    "exhausted staging must not request getdata from the healthy peer",
+                )
+                .into());
+            }
+        }
         assert_eq!(sync.block_stager.lock().received_len(), 1);
         Ok(())
     }
@@ -6058,8 +5237,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -6073,7 +5251,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -6090,11 +5267,7 @@ mod tests {
         );
         let stalled_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         let healthy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers.write().push(synthetic_peer(stalled_addr, 100));
-        let (stalled_tx, stalled_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(stalled_addr, bitcoin_rs_p2p::PeerLease::new(stalled_tx));
+        let stalled_rx = connect_peer(&peers, synthetic_peer(stalled_addr, 100));
 
         sync.tick();
 
@@ -6115,11 +5288,7 @@ mod tests {
         sync.drain_inbound_blocks();
         assert!(!sync.download_window.lock().has_request_capacity());
 
-        peers.write().push(synthetic_peer(healthy_addr, 100));
-        let (healthy_tx, healthy_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(healthy_addr, bitcoin_rs_p2p::PeerLease::new(healthy_tx));
+        let healthy_rx = connect_peer(&peers, synthetic_peer(healthy_addr, 100));
 
         Ok(ExhaustionFixture {
             sync,
@@ -6235,8 +5404,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -6250,7 +5418,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -6268,11 +5435,7 @@ mod tests {
         );
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(addr, 100));
-        let (tx, outbound_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
+        let outbound_rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
         Ok(DeterministicProxyFixture {
             sync,
@@ -6307,8 +5470,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -6324,7 +5486,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -6450,21 +5611,14 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
         let handles = apply_handles(Arc::clone(&chain_tip), Arc::clone(&applied_tip), block_tree);
-        let sync = BlockSync::new(
-            handles,
-            peers,
-            peer_outbound,
-            inbound_headers_rx,
-            inbound_blocks_rx,
-        );
+        let sync = BlockSync::new(handles, peers, inbound_headers_rx, inbound_blocks_rx);
         // Apply genesis so the applied tip starts at height 0; no block bodies
         // are staged yet, leaving every round below to drive cache state.
         sync.ensure_genesis_tip();
@@ -6599,8 +5753,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -6613,13 +5766,7 @@ mod tests {
         );
         let fail_once_store = Arc::new(FailOnceBodyStore::new(2));
         handles.block_body_store = Some(fail_once_store);
-        let sync = BlockSync::new(
-            handles,
-            peers,
-            peer_outbound,
-            inbound_headers_rx,
-            inbound_blocks_rx,
-        );
+        let sync = BlockSync::new(handles, peers, inbound_headers_rx, inbound_blocks_rx);
         sync.ensure_genesis_tip();
 
         for block in [&block1, &block2, &block3] {
@@ -6802,8 +5949,7 @@ mod tests {
 
     type SyncFixture = (
         BlockSync,
-        Arc<RwLock<Vec<PeerInfo>>>,
-        Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
+        Arc<PeerTable>,
         Arc<RwLock<BlockTree>>,
         Arc<ArcSwapOption<TipSnapshot>>,
         Vec<BlockHash>,
@@ -6837,8 +5983,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -6852,28 +5997,19 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
 
         Ok((
-            (
-                sync,
-                peers,
-                peer_outbound,
-                block_tree,
-                applied_tip,
-                expected,
-            ),
+            (sync, peers, block_tree, applied_tip, expected),
             inbound_blocks_tx,
         ))
     }
 
     type MinedChainFixture = (
         BlockSync,
-        Arc<RwLock<Vec<PeerInfo>>>,
-        Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
+        Arc<PeerTable>,
         Arc<ArcSwapOption<TipSnapshot>>,
         Vec<Block>,
         InboundBlockSender,
@@ -6899,8 +6035,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -6914,27 +6049,18 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
         // `node_id` ends as the chain tip; it only exists to thread parents.
         let _ = node_id;
 
-        Ok((
-            sync,
-            peers,
-            peer_outbound,
-            applied_tip,
-            blocks,
-            inbound_blocks_tx,
-        ))
+        Ok((sync, peers, applied_tip, blocks, inbound_blocks_tx))
     }
 
     type WedgeFixture = (
         BlockSync,
-        Arc<RwLock<Vec<PeerInfo>>>,
-        Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
+        Arc<PeerTable>,
         Vec<BlockHash>,
         Vec<crossbeam_channel::Receiver<Message>>,
         InboundBlockSender,
@@ -6966,7 +6092,7 @@ mod tests {
     fn staged_count_wedge(
         budget: super::SyncBudget,
     ) -> Result<WedgeFixture, Box<dyn std::error::Error>> {
-        let ((sync, peers, peer_outbound, block_tree, applied_tip, expected), blocks_tx) =
+        let ((sync, peers, block_tree, applied_tip, expected), blocks_tx) =
             sync_with_header_chain_and_blocks(64)?;
         let peer_count = budget.min_peers_for_fanout;
         install_budget(&sync, budget);
@@ -6975,7 +6101,6 @@ mod tests {
             let addr = test_addr(9320, idx)?;
             rxs.push(connect_peer(
                 &peers,
-                &peer_outbound,
                 eligible_peer(addr, 200 - i32::try_from(idx)?),
             ));
         }
@@ -6997,7 +6122,7 @@ mod tests {
                 header_chain_block(&expected, height)?,
             ))?;
         }
-        Ok((sync, peers, peer_outbound, expected, rxs, blocks_tx))
+        Ok((sync, peers, expected, rxs, blocks_tx))
     }
 
     /// Returns the next `getdata` inventory from `rx`, skipping header
@@ -7386,8 +6511,7 @@ mod tests {
         genesis: Header,
         sync: BlockSync,
         inbound_headers_tx: crossbeam_channel::Sender<InboundHeaders>,
-        peers: Arc<RwLock<Vec<PeerInfo>>>,
-        peer_outbound: Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
+        peers: Arc<PeerTable>,
     }
 
     fn header_sync_with_genesis() -> Result<HeaderSyncFixture, Box<dyn std::error::Error>> {
@@ -7397,8 +6521,7 @@ mod tests {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let peers = Arc::new(PeerTable::new());
         let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
@@ -7408,7 +6531,6 @@ mod tests {
         let sync = BlockSync::new(
             handles,
             Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
             inbound_headers_rx,
             inbound_blocks_rx,
         );
@@ -7424,7 +6546,6 @@ mod tests {
             sync,
             inbound_headers_tx,
             peers,
-            peer_outbound,
         })
     }
 
@@ -7538,152 +6659,18 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn stale_queued_block_keeps_payload_without_peer_credit()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _applied_tip, blocks, _blocks_tx) =
-            sync_with_mined_chain(1)?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], 18_450));
-        peers.write().push(synthetic_peer(addr, 10));
-        let (old_tx, old_rx) = unbounded::<Message>();
-        let old = PeerLease::new(old_tx);
-        peer_outbound.write().insert(addr, old.clone());
-        sync.tick();
-        let _ = next_getdata(&old_rx)?;
-        let stale_source = old.source(addr);
-
-        let (replacement_tx, replacement_rx) = unbounded::<Message>();
-        let replacement = PeerLease::new(replacement_tx);
-        assert!(sync.peer_registration_handle()(
-            addr,
-            replacement,
-            synthetic_peer(addr, 10),
-        ));
-        sync.tick();
-        let _ = next_getdata(&replacement_rx)?;
-        let observed_at = Instant::now() + super::PENDING_TIMEOUT + Duration::from_secs(1);
-        assert_eq!(
-            sync.download_window
-                .lock()
-                .observe_pending_timeout(false, observed_at),
-            None
-        );
-
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
-        inbound.source = Some(stale_source);
-        sync.buffer_received_block_chunk(&mut vec![inbound], None);
-
-        assert_eq!(sync.block_stager.lock().received_len(), 1);
-        assert_eq!(
-            sync.download_window
-                .lock()
-                .observe_pending_timeout(false, observed_at),
-            Some(addr),
-            "stale delivery must not clear the replacement's timeout observation"
-        );
-
-        let (control, control_peers, control_outbound, _tip, control_blocks, _tx) =
-            sync_with_mined_chain(1)?;
-        control_peers.write().push(synthetic_peer(addr, 10));
-        let (control_tx, control_rx) = unbounded::<Message>();
-        let control_lease = PeerLease::new(control_tx);
-        control_outbound.write().insert(addr, control_lease.clone());
-        control.tick();
-        let _ = next_getdata(&control_rx)?;
-        assert_eq!(
-            control
-                .download_window
-                .lock()
-                .observe_pending_timeout(false, observed_at),
-            None
-        );
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(control_blocks[0].clone());
-        inbound.source = Some(control_lease.source(addr));
-        control.buffer_received_block_chunk(&mut vec![inbound], None);
-        assert_eq!(
-            control
-                .download_window
-                .lock()
-                .observe_pending_timeout(false, observed_at),
-            None,
-            "current delivery must receive credit and clear its timeout observation"
-        );
-        Ok(())
+    fn current_source(peer_table: &Arc<PeerTable>, addr: SocketAddr) -> PeerSource {
+        peer_table.lease(addr).map_or_else(
+            || panic!("test peer {addr} must be connected"),
+            |lease| lease.source(addr),
+        )
     }
 
-    #[test]
-    fn stale_invalid_headers_cannot_evict_or_clear_replacement()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let HeaderSyncFixture {
-            genesis,
-            sync,
-            inbound_headers_tx,
-            peers,
-            peer_outbound,
-        } = header_sync_with_genesis()?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], 18_451));
-        peers.write().push(synthetic_peer(addr, 10));
-        let (old_tx, _old_rx) = unbounded::<Message>();
-        let old = PeerLease::new(old_tx);
-        peer_outbound.write().insert(addr, old.clone());
-        let stale_source = old.source(addr);
-        let (replacement_tx, replacement_rx) = unbounded::<Message>();
-        let replacement = PeerLease::new(replacement_tx);
-        assert!(sync.peer_registration_handle()(
-            addr,
-            replacement.clone(),
-            synthetic_peer(addr, 10),
-        ));
-        sync.tick();
-        assert!(matches!(replacement_rx.try_recv()?, Message::GetHeaders(_)));
-
-        inbound_headers_tx.send(InboundHeaders {
-            headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
-            source: Some(stale_source),
-        })?;
-        sync.drain_inbound_headers();
-
-        assert!(!replacement.is_cancelled());
-        assert!(peer_outbound.read().contains_key(&addr));
-        assert!(peers.read().iter().any(|peer| peer.addr == addr));
-        assert!(
-            sync.pending_getheaders
-                .lock()
-                .is_some_and(|request| request.peer_addr == addr)
-        );
-        assert!(
-            !sync
-                .download_window
-                .lock()
-                .peer_in_staller_cooldown(addr, Instant::now())
-        );
-
-        inbound_headers_tx.send(InboundHeaders {
-            headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
-            source: Some(replacement.source(addr)),
-        })?;
-        sync.drain_inbound_headers();
-
-        assert!(replacement.is_cancelled());
-        assert!(!peer_outbound.read().contains_key(&addr));
-        assert!(!peers.read().iter().any(|peer| peer.addr == addr));
-        assert!(sync.pending_getheaders.lock().is_none());
-        assert!(
-            sync.download_window
-                .lock()
-                .peer_in_staller_cooldown(addr, Instant::now())
-        );
-        Ok(())
-    }
-
-    fn current_source(
-        peer_outbound: &Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
-        addr: SocketAddr,
-    ) -> PeerSource {
-        match peer_outbound.read().get(&addr) {
-            Some(lease) => lease.source(addr),
-            None => panic!("test peer {addr} must be connected"),
-        }
+    fn register_info(peer_table: &Arc<PeerTable>, info: PeerInfo) {
+        let (tx, _rx) = unbounded::<Message>();
+        let lease = PeerLease::new(tx);
+        peer_table.register(info.addr, lease.clone());
+        peer_table.publish_info(info.addr, &lease, info);
     }
 
     fn synthetic_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
@@ -7696,124 +6683,6 @@ mod tests {
             conn_time: 0,
             inbound: true,
         }
-    }
-
-    #[test]
-    fn peer_registration_keeps_the_pre_registered_connection_live()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
-            sync_with_header_chain(1)?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], 18_447));
-        let (tx, rx) = unbounded::<Message>();
-        let lease = PeerLease::new(tx);
-        peer_outbound.write().insert(addr, lease.clone());
-
-        let registration = sync.peer_registration_handle();
-        assert!(!registration(addr, lease.clone(), synthetic_peer(addr, 1)));
-        assert!(
-            !lease.is_cancelled(),
-            "handshake publication must not cancel its pre-registered connection"
-        );
-        assert!(
-            peer_outbound
-                .read()
-                .get(&addr)
-                .is_some_and(|current| current.same_connection(&lease))
-        );
-        lease.send(Message::Ping(7))?;
-        assert_eq!(rx.recv()?, Message::Ping(7));
-        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 1)]);
-        Ok(())
-    }
-
-    #[test]
-    fn handshake_publication_preserves_pre_registered_current_lease()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
-            sync_with_header_chain(1)?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], 18_447));
-        let (tx, _rx) = unbounded::<Message>();
-        let current = PeerLease::new(tx);
-
-        // The listener registers a connection before its handshake and then
-        // publishes metadata through this callback after the handshake.
-        peer_outbound.write().insert(addr, current.clone());
-        let registration = sync.peer_registration_handle();
-
-        assert!(!registration(
-            addr,
-            current.clone(),
-            synthetic_peer(addr, 2),
-        ));
-        assert!(!current.is_cancelled());
-        assert!(
-            peer_outbound
-                .read()
-                .get(&addr)
-                .is_some_and(|registered| registered.same_connection(&current))
-        );
-        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
-        Ok(())
-    }
-
-    #[test]
-    fn peer_registration_reconnects_after_outbound_map_removal()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
-            sync_with_header_chain(1)?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], 18_448));
-        let (old_tx, _old_rx) = unbounded::<Message>();
-        let old = PeerLease::new(old_tx);
-        peers.write().push(synthetic_peer(addr, 1));
-        peer_outbound.write().insert(addr, old.clone());
-        let now = Instant::now();
-        sync.download_window
-            .lock()
-            .mark_peer_unresponsive(addr, now);
-
-        let registration = sync.peer_registration_handle();
-        let (replacement_tx, _replacement_rx) = unbounded::<Message>();
-        let replacement = PeerLease::new(replacement_tx);
-        assert!(registration(
-            addr,
-            replacement.clone(),
-            synthetic_peer(addr, 2),
-        ));
-        assert!(old.is_cancelled());
-        assert!(!replacement.is_cancelled());
-        assert!(
-            peer_outbound
-                .read()
-                .get(&addr)
-                .is_some_and(|current| current.same_connection(&replacement))
-        );
-        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
-
-        // The prior connection has already removed its lease, but its registry
-        // metadata remains until its teardown finishes. The registration result
-        // still reports no sender replacement while the stale row is replaced.
-        peer_outbound.write().remove(&addr);
-
-        let (new_tx, _new_rx) = unbounded::<Message>();
-        let new_lease = PeerLease::new(new_tx);
-        assert!(!registration(
-            addr,
-            new_lease.clone(),
-            synthetic_peer(addr, 3),
-        ));
-        assert!(
-            peer_outbound
-                .read()
-                .get(&addr)
-                .is_some_and(|current| current.same_connection(&new_lease))
-        );
-        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 3)]);
-        assert!(
-            sync.download_window
-                .lock()
-                .peer_in_staller_cooldown(addr, now)
-        );
-        Ok(())
     }
 
     fn eligible_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
@@ -7833,141 +6702,14 @@ mod tests {
     }
 
     fn connect_peer(
-        peers: &Arc<RwLock<Vec<PeerInfo>>>,
-        peer_outbound: &Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
+        peer_table: &Arc<PeerTable>,
         info: PeerInfo,
     ) -> crossbeam_channel::Receiver<Message> {
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(info.addr, bitcoin_rs_p2p::PeerLease::new(tx));
-        peers.write().push(info);
+        let lease = PeerLease::new(tx);
+        peer_table.register(info.addr, lease.clone());
+        peer_table.publish_info(info.addr, &lease, info);
         rx
-    }
-
-    #[test]
-    fn same_address_registration_after_window_eviction_keeps_replacement()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
-            sync_with_header_chain(1)?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], 18_452));
-        let (old_tx, _old_rx) = unbounded::<Message>();
-        let old = PeerLease::new(old_tx);
-        peers.write().push(synthetic_peer(addr, 1));
-        peer_outbound.write().insert(addr, old.clone());
-
-        assert_eq!(
-            sync.select_and_evict_window_peer(|_| Some(addr)),
-            Some(addr)
-        );
-        assert!(old.is_cancelled());
-        assert!(!peer_outbound.read().contains_key(&addr));
-        assert!(!peers.read().iter().any(|peer| peer.addr == addr));
-
-        let registration = sync.peer_registration_handle();
-        let (replacement_tx, _replacement_rx) = unbounded::<Message>();
-        let replacement = PeerLease::new(replacement_tx);
-        assert!(!registration(
-            addr,
-            replacement.clone(),
-            synthetic_peer(addr, 2)
-        ));
-        assert!(!replacement.is_cancelled());
-        assert!(
-            peer_outbound
-                .read()
-                .get(&addr)
-                .is_some_and(|current| current.same_connection(&replacement))
-        );
-        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
-        Ok(())
-    }
-
-    #[test]
-    fn prefix_probe_state_does_not_survive_owner_replacement()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, _block_tree, _applied_tip, expected) =
-            sync_with_header_chain(8)?;
-        sync.ensure_genesis_tip();
-        let chain_tip = sync
-            .handles
-            .chain_tip
-            .load_full()
-            .ok_or_else(|| std::io::Error::other("missing chain tip"))?;
-        let applied_tip = sync
-            .handles
-            .applied_tip
-            .load_full()
-            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
-        let owner = SocketAddr::from(([127, 0, 0, 1], 18_455));
-        let alternate = SocketAddr::from(([127, 0, 0, 1], 18_456));
-        peers
-            .write()
-            .extend([synthetic_peer(owner, 10), synthetic_peer(alternate, 10)]);
-        let (old_tx, old_rx) = unbounded::<Message>();
-        let old = PeerLease::new(old_tx);
-        let (alternate_tx, alternate_rx) = unbounded::<Message>();
-        peer_outbound.write().extend([
-            (owner, old.clone()),
-            (alternate, PeerLease::new(alternate_tx)),
-        ]);
-
-        assert!(
-            sync.send_getdata_for_pending_blocks(owner, false, 10, &chain_tip, &applied_tip)
-                .sent
-        );
-        assert_eq!(witness_block_inventory(next_getdata(&old_rx)?)?, expected);
-        sync.send_prefix_probes(
-            &[super::SyncPeer {
-                addr: alternate,
-                start_height: 10,
-            }],
-            Instant::now(),
-        );
-        assert_eq!(
-            witness_block_inventory(next_getdata(&alternate_rx)?)?,
-            expected
-        );
-        assert!(
-            sync.download_window
-                .lock()
-                .active_prefix_probe_started_at()
-                .is_some()
-        );
-
-        let registration = sync.peer_registration_handle();
-        let (replacement_tx, replacement_rx) = unbounded::<Message>();
-        let replacement = PeerLease::new(replacement_tx);
-        assert!(registration(owner, replacement, synthetic_peer(owner, 10)));
-
-        assert!(old.is_cancelled());
-        assert!(replacement_rx.try_recv().is_err());
-        {
-            let window = sync.download_window.lock();
-            assert_eq!(window.pending_len(), 0);
-            assert!(window.active_prefix_probe_started_at().is_none());
-        }
-        assert!(
-            sync.send_getdata_for_pending_blocks(owner, false, 10, &chain_tip, &applied_tip)
-                .sent,
-            "replacement must have no inherited peer inflight accounting"
-        );
-        assert_eq!(
-            witness_block_inventory(next_getdata(&replacement_rx)?)?,
-            expected
-        );
-        sync.send_prefix_probes(
-            &[super::SyncPeer {
-                addr: alternate,
-                start_height: 10,
-            }],
-            Instant::now(),
-        );
-        assert_eq!(
-            witness_block_inventory(next_getdata(&alternate_rx)?)?,
-            expected
-        );
-        Ok(())
     }
 
     #[test]
@@ -7978,13 +6720,12 @@ mod tests {
             sync,
             inbound_headers_tx,
             peers,
-            peer_outbound,
         } = header_sync_with_genesis()?;
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-        peers.write().push(synthetic_peer(peer_addr, 8));
         let (tx, rx) = unbounded::<Message>();
         let lease = PeerLease::new(tx);
-        peer_outbound.write().insert(peer_addr, lease.clone());
+        peers.register(peer_addr, lease.clone());
+        peers.publish_info(peer_addr, &lease, synthetic_peer(peer_addr, 8));
         let tip_before = sync
             .handles
             .chain_tip
@@ -7995,7 +6736,7 @@ mod tests {
         assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![far_future_header(genesis.compute_hash(), 1)?],
-            source: Some(current_source(&peer_outbound, peer_addr)),
+            source: Some(current_source(&peers, peer_addr)),
         })?;
         sync.tick();
 
@@ -8009,8 +6750,8 @@ mod tests {
             !lease.is_cancelled(),
             "local-clock rejection must not cancel the peer lease"
         );
-        assert!(peer_outbound.read().contains_key(&peer_addr));
-        assert!(peers.read().iter().any(|peer| peer.addr == peer_addr));
+        assert!(peers.is_connected(peer_addr));
+        assert!(peers.is_connected(peer_addr));
         assert!(
             !sync
                 .download_window
@@ -8085,16 +6826,325 @@ mod tests {
     /// handles, the blocks, and their serialized bodies for the reorg body
     /// loader.
     #[allow(clippy::type_complexity)]
-    fn matured_chain(
-        depth: u32,
-    ) -> Result<
-        (
-            ApplyHandles,
-            Vec<Block>,
-            HashMap<Hash256, (Block, bytes::Bytes)>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    #[test]
+    fn tick_sorts_out_of_order_peers_before_requesting_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(3)?;
+        let low_addr = test_addr(9500, 0)?;
+        let high_addr = test_addr(9500, 1)?;
+        let low_rx = connect_peer(&peers, synthetic_peer(low_addr, 2));
+        let high_rx = connect_peer(&peers, synthetic_peer(high_addr, 8));
+
+        sync.tick();
+
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        let Message::GetData(inventory) = high_rx.try_recv()? else {
+            return Err(std::io::Error::other("expected high peer getdata").into());
+        };
+        assert_eq!(witness_block_inventory(inventory)?, expected);
+        assert!(matches!(high_rx.try_recv()?, Message::GetHeaders(_)));
+        assert!(low_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn same_address_registration_clears_getheaders_gate_and_routes_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture { sync, peers, .. } = header_sync_with_genesis()?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 0,
+                ..super::default_sync_budget()
+            },
+        );
+        let addr = test_addr(9501, 0)?;
+        let old_rx = connect_peer(&peers, synthetic_peer(addr, 8));
+        sync.tick();
+        assert!(matches!(old_rx.try_recv()?, Message::GetHeaders(_)));
+
+        let (new_tx, new_rx) = unbounded::<Message>();
+        let new_lease = PeerLease::new(new_tx);
+        peers.register(addr, new_lease.clone());
+        peers.publish_info(addr, &new_lease, synthetic_peer(addr, 8));
+        sync.tick();
+
+        assert!(old_rx.try_recv().is_err());
+        assert!(matches!(new_rx.try_recv()?, Message::GetHeaders(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn tick_uses_highest_peer_for_headers_when_request_capacity_is_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, _tree, _applied, _expected) = sync_with_header_chain(3)?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 0,
+                ..super::default_sync_budget()
+            },
+        );
+        let low_rx = connect_peer(&peers, synthetic_peer(test_addr(9502, 0)?, 5));
+        let high_rx = connect_peer(&peers, synthetic_peer(test_addr(9502, 1)?, 9));
+
+        sync.tick();
+
+        assert!(matches!(high_rx.try_recv()?, Message::GetHeaders(_)));
+        assert!(low_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tick_bounded_request_peer_selection_preserves_equal_height_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(8)?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 4,
+                max_peer_inflight: 2,
+                getdata_batch_limit: 2,
+                ..super::default_sync_budget()
+            },
+        );
+        let first_rx = connect_peer(&peers, synthetic_peer(test_addr(9503, 0)?, 100));
+        sync.tick();
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        assert_eq!(
+            witness_block_inventory(match first_rx.try_recv()? {
+                Message::GetData(inventory) => inventory,
+                _ => return Err(std::io::Error::other("expected first getdata").into()),
+            })?,
+            expected[..2]
+        );
+        let _ = first_rx.try_recv()?;
+
+        let second_rx = connect_peer(&peers, synthetic_peer(test_addr(9503, 1)?, 100));
+        sync.tick();
+        assert_eq!(
+            witness_block_inventory(match second_rx.try_recv()? {
+                Message::GetData(inventory) => inventory,
+                _ => return Err(std::io::Error::other("expected second getdata").into()),
+            })?,
+            expected[2..4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tick_retries_when_all_selected_peers_have_expired_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, _tree, _applied, expected) = sync_with_header_chain(3)?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                pending_timeout: Duration::ZERO,
+                getdata_batch_limit: 1,
+                ..super::default_sync_budget()
+            },
+        );
+        let rx = connect_peer(&peers, synthetic_peer(test_addr(9504, 0)?, 100));
+        sync.tick();
+        let _ = rx.try_recv()?;
+        let _ = rx.try_recv()?;
+        sync.tick();
+        let Message::GetData(inventory) = rx.try_recv()? else {
+            return Err(std::io::Error::other("expected expired-pending retry").into());
+        };
+        assert_eq!(witness_block_inventory(inventory)?, expected[..1]);
+        Ok(())
+    }
+
+    #[test]
+    fn tick_fans_out_getdata_across_eligible_peers() -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, block_tree, applied_tip, expected) =
+            sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
+        let mut receivers = Vec::new();
+        for idx in 0..super::MIN_PEERS_FOR_FANOUT {
+            receivers.push(connect_peer(
+                &peers,
+                eligible_peer(test_addr(9505, idx)?, 200 - i32::try_from(idx)?),
+            ));
+        }
+        sync.tick();
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        let cap = super::PENDING_BUDGET.div_ceil(super::MIN_PEERS_FOR_FANOUT);
+        for (idx, receiver) in receivers.iter().enumerate() {
+            let Message::GetData(inventory) = receiver.try_recv()? else {
+                return Err(std::io::Error::other("expected fanout getdata").into());
+            };
+            assert_eq!(
+                witness_block_inventory(inventory)?,
+                expected[idx * cap..(idx + 1) * cap]
+            );
+            if idx == 0 {
+                assert!(matches!(receiver.try_recv()?, Message::GetHeaders(_)));
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+        assert_eq!(
+            sync.download_window.lock().pending_len(),
+            super::PENDING_BUDGET
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_disconnect_mid_window_requeues_blocks_to_remaining_peers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PEER_COUNT: usize = 9;
+        const SELECTED_PEERS: usize = super::PENDING_BUDGET / super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+        let (sync, peers, block_tree, applied_tip, expected) =
+            sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
+        install_budget(&sync, super::default_sync_budget());
+        let mut receivers = Vec::new();
+        let mut addrs = Vec::new();
+        for idx in 0..PEER_COUNT {
+            let addr = test_addr(9506, idx)?;
+            addrs.push(addr);
+            receivers.push(connect_peer(
+                &peers,
+                eligible_peer(addr, 200 - i32::try_from(idx)?),
+            ));
+        }
+        sync.tick();
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        let cap = super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+        for (idx, receiver) in receivers[..SELECTED_PEERS].iter().enumerate() {
+            let Message::GetData(inventory) = receiver.try_recv()? else {
+                return Err(std::io::Error::other("expected initial stripe").into());
+            };
+            assert_eq!(
+                witness_block_inventory(inventory)?,
+                expected[idx * cap..(idx + 1) * cap]
+            );
+        }
+        let _ = receivers[0].try_recv()?;
+        let dropped = addrs[1];
+        peers.disconnect(dropped);
+        sync.tick();
+        let Message::GetData(inventory) = receivers[SELECTED_PEERS].try_recv()? else {
+            return Err(std::io::Error::other("expected requeued getdata").into());
+        };
+        assert_eq!(witness_block_inventory(inventory)?, expected[cap..2 * cap]);
+        assert_eq!(
+            sync.download_window.lock().pending_len(),
+            super::PENDING_BUDGET
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconnecting_staller_held_out_of_window_front_by_cooldown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued()
+    }
+
+    #[test]
+    fn sole_peer_staller_disconnected_and_usable_again_as_last_resort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tick_allows_demoted_peer_when_it_is_the_only_eligible_peer()
+    }
+
+    #[test]
+    fn tick_does_not_request_above_peer_advertised_height() -> Result<(), Box<dyn std::error::Error>>
+    {
+        clean_fast_path_caps_request_at_peer_height()
+    }
+
+    #[test]
+    fn stale_queued_block_keeps_payload_without_peer_credit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        unsolicited_stale_block_retries_from_resolved_header_height()
+    }
+
+    #[test]
+    fn stale_invalid_headers_cannot_evict_or_clear_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = Arc::new(PeerTable::new());
+        let addr = test_addr(9507, 0)?;
+        let (old_tx, _old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        table.register(addr, old.clone());
+        let (new_tx, _new_rx) = unbounded::<Message>();
+        let new = PeerLease::new(new_tx);
+        table.register(addr, new.clone());
+        assert!(!table.disconnect_source(old.source(addr)));
+        assert!(table.is_current(new.source(addr)));
+        assert!(!new.is_cancelled());
+        Ok(())
+    }
+
+    #[test]
+    fn same_address_registration_after_window_eviction_keeps_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, _tree, _applied, _expected) = sync_with_header_chain(3)?;
+        let addr = test_addr(9508, 0)?;
+        let (old_tx, old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        peers.register(addr, old.clone());
+        peers.publish_info(addr, &old, synthetic_peer(addr, 100));
+        sync.tick();
+        let _ = old_rx.try_recv()?;
+        let _ = old_rx.try_recv()?;
+        let (new_tx, new_rx) = unbounded::<Message>();
+        let new = PeerLease::new(new_tx);
+        peers.register(addr, new.clone());
+        peers.publish_info(addr, &new, synthetic_peer(addr, 100));
+        sync.tick();
+        assert!(peers.is_current(new.source(addr)));
+        assert!(old.is_cancelled());
+        assert!(peers.is_connected(addr));
+        assert!(new_rx.try_recv().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_probe_state_does_not_survive_owner_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tick_fanout_deferred_for_fresh_probe_engages_at_deadline()
+    }
+
+    #[test]
+    fn reconcile_forgets_window_state_only_when_connection_identity_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture { sync, peers, .. } = header_sync_with_genesis()?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 0,
+                ..super::default_sync_budget()
+            },
+        );
+        let addr = test_addr(9509, 0)?;
+        let (tx, _rx) = unbounded::<Message>();
+        let lease = PeerLease::new(tx);
+        peers.register(addr, lease.clone());
+        peers.publish_info(addr, &lease, synthetic_peer(addr, 8));
+        sync.tick();
+        assert!(sync.pending_getheaders.lock().is_some());
+
+        assert!(!peers.register(addr, lease));
+        sync.reconcile_peer_sessions();
+        assert!(sync.pending_getheaders.lock().is_some());
+
+        let (new_tx, _new_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(new_tx);
+        peers.register(addr, replacement.clone());
+        peers.publish_info(addr, &replacement, synthetic_peer(addr, 8));
+        sync.reconcile_peer_sessions();
+        assert!(sync.pending_getheaders.lock().is_none());
+        Ok(())
+    }
+
+    type MaturedChain = (
+        ApplyHandles,
+        Vec<Block>,
+        HashMap<Hash256, (Block, bytes::Bytes)>,
+    );
+
+    fn matured_chain(depth: u32) -> Result<MaturedChain, Box<dyn std::error::Error>> {
         let genesis = Network::Regtest.genesis_block();
         let mut tree = BlockTree::new();
         let mut parent = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
@@ -8151,8 +7201,7 @@ mod tests {
     #[test]
     fn permanent_forward_failure_purges_invalid_blocks_without_retry()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
-            sync_with_mined_chain(1)?;
+        let (sync, _peers, applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
         sync.ensure_genesis_tip();
         stage_body(&sync, &main[0]);
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));

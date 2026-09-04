@@ -10,10 +10,10 @@ use bitcoin_rs_primitives::{Hash256, Txid};
 use core::fmt;
 #[cfg(feature = "zmq")]
 use hashbrown::HashSet;
-use std::collections::HashSet as StdHashSet;
 #[cfg(feature = "zmq")]
 use parking_lot::Mutex;
 use serde::Deserialize;
+use std::collections::HashSet as StdHashSet;
 #[cfg(feature = "zmq")]
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -63,13 +63,32 @@ impl ZmqEndpointConfig {
 pub fn validate_endpoint_configs(configs: &[ZmqEndpointConfig]) -> Result<()> {
     let mut endpoints = StdHashSet::new();
     for config in configs {
-        ensure!(!config.endpoint.trim().is_empty(), "ZMQ endpoint must not be empty");
-        ensure!(!config.topics.is_empty(), "ZMQ endpoint {} must have at least one topic", config.endpoint);
-        ensure!(endpoints.insert(&config.endpoint), "duplicate ZMQ endpoint: {}", config.endpoint);
-        ensure!(config.effective_hwm() <= i32::MAX as u32, "ZMQ HWM exceeds libzmq's signed SNDHWM range: {}", config.effective_hwm());
+        ensure!(
+            !config.endpoint.trim().is_empty(),
+            "ZMQ endpoint must not be empty"
+        );
+        ensure!(
+            !config.topics.is_empty(),
+            "ZMQ endpoint {} must have at least one topic",
+            config.endpoint
+        );
+        ensure!(
+            endpoints.insert(&config.endpoint),
+            "duplicate ZMQ endpoint: {}",
+            config.endpoint
+        );
+        ensure!(
+            i32::try_from(config.effective_hwm()).is_ok(),
+            "ZMQ HWM exceeds libzmq's signed SNDHWM range: {}",
+            config.effective_hwm()
+        );
         let mut topics = StdHashSet::new();
         for topic in &config.topics {
-            ensure!(topics.insert(topic), "duplicate ZMQ topic on endpoint: {}", config.endpoint);
+            ensure!(
+                topics.insert(topic),
+                "duplicate ZMQ topic on endpoint: {}",
+                config.endpoint
+            );
         }
     }
     Ok(())
@@ -339,7 +358,23 @@ impl SocketZmqPublisher {
     /// one owned socket and one HWM. Duplicate topics inside a group are
     /// recorded once.
     pub fn bind(endpoint_configs: &[ZmqEndpointConfig]) -> Result<Self> {
-        validate_endpoint_configs(endpoint_configs)?;
+        let deduped_configs: Vec<ZmqEndpointConfig> = endpoint_configs
+            .iter()
+            .map(|config| {
+                let mut seen = StdHashSet::new();
+                ZmqEndpointConfig {
+                    endpoint: config.endpoint.clone(),
+                    topics: config
+                        .topics
+                        .iter()
+                        .filter(|&&topic| seen.insert(topic))
+                        .copied()
+                        .collect(),
+                    hwm: config.hwm,
+                }
+            })
+            .collect();
+        validate_endpoint_configs(&deduped_configs)?;
         let context = zmq::Context::new();
         let mut endpoints = Vec::new();
         let mut bound_endpoints = HashSet::<String>::new();
@@ -351,7 +386,7 @@ impl SocketZmqPublisher {
         let mut notifiers = Vec::new();
         let mut seen_notifiers = HashSet::<(ZmqTopic, String)>::new();
 
-        for endpoint_config in endpoint_configs {
+        for endpoint_config in &deduped_configs {
             if !bound_endpoints.insert(endpoint_config.endpoint.clone()) {
                 bail!("duplicate ZMQ endpoint {}", endpoint_config.endpoint);
             }
