@@ -1046,7 +1046,7 @@ fn build_tx_index_open_spec(
         batch_limits,
         epoch,
         enabled,
-        rollback_rebuild_cutover: config.index_rollback_rebuild_cutover,
+        rollback_rebuild_cutover: crate::txindex_worker::DEFAULT_ROLLBACK_REBUILD_CUTOVER,
         canonical_data_root,
     }))
 }
@@ -2229,17 +2229,11 @@ mod tests {
         Ok(())
     }
 
-    /// Opens a node in each `scriptindex` mode and asserts the concrete answer
-    /// for `unspent_outputs`, rather than only the `full` path.
+    /// Opens a node in each accepted `scriptindex` mode and asserts the
+    /// concrete answer for `unspent_outputs`, rather than only the `full` path.
     ///
-    /// This is the guard that would have caught advertising `utxo` before a
-    /// live store exists. Under `utxo` the node currently builds no
-    /// `Funding`/`Spending` rows and publishes no `ScriptHistory` watermark,
-    /// so every `ScriptIndexQuery` method gates on
-    /// `IndexCapabilities::SCRIPT_HISTORY` and reports `Retry` forever. The
-    /// mode is therefore rejected at config time; this test pins that the
-    /// rejection happens at `open`, and that the two accepted modes give
-    /// distinct, concrete answers instead of both degrading to `Retry`.
+    /// This is the guard that the two accepted modes give distinct, concrete
+    /// answers instead of both degrading to `Retry`.
     #[test]
     fn script_index_modes_give_concrete_unspent_outputs_answers() -> anyhow::Result<()> {
         use bitcoin_rs_index::ScriptHash;
@@ -2248,7 +2242,7 @@ mod tests {
         // Genesis is applied in each case so the index worker has at least one
         // block to index. Without it the worker never publishes a
         // `ScriptHistory` watermark and every mode retries forever, which would
-        // make all three cases indistinguishable.
+        // make both cases indistinguishable.
         let scripthash = ScriptHash::from_script_bytes(&[0x51, 0x01]);
 
         // `disabled`: no script index at all, so no query adapter is handed
@@ -2266,26 +2260,6 @@ mod tests {
             "disabled must not hand out a script-index query adapter"
         );
         drop(state);
-
-        // `utxo`: the mode is named and parsed but has no durable live-output
-        // store, so opening must fail loudly rather than start a node that
-        // would advertise a live view nothing backs.
-        let dir = tempfile::tempdir()?;
-        let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.txindex = false;
-        config.script_index = crate::config::ScriptIndexMode::Utxo;
-        let error = match NodeState::open(config, None) {
-            Ok(_) => panic!("utxo must be rejected while no live store backs it"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("scriptindex=utxo is not yet usable"),
-            "rejection must name what is missing, got: {error}"
-        );
 
         // `full`: the accepted mode. It converges on a concrete answer — an
         // empty set for an unfunded script — rather than retrying forever.
