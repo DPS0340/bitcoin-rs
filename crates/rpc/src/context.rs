@@ -1562,9 +1562,9 @@ impl Context {
     /// interval, so no concurrent admission can invalidate the verdict
     /// before it lands.
     ///
-    /// The pool and transaction-cache fast paths here remain best-effort
-    /// pre-checks for the "already known" no-op; the authoritative
-    /// already-known re-check runs inside the locked evaluation.
+    /// The pool fast path here is a best-effort pre-check for the
+    /// already-in-mempool no-op; the authoritative re-check runs inside
+    /// the locked evaluation. The RPC lookup cache is not membership.
     ///
     /// `max_feerate_sat_per_kvb` of `None` disables the max-fee cap,
     /// matching `sendrawtransaction`'s `maxfeerate=0` behavior.

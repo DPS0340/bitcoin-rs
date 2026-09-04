@@ -294,7 +294,7 @@ impl Node {
     /// mempool `sequence` events and the mining generation wake; there is
     /// no second admission path and no per-call gateway.
     ///
-    /// An already-known transaction succeeds with an empty result, matching
+    /// An already-in-mempool transaction succeeds with an empty result, matching
     /// RPC admission's already-known success.
     ///
     /// # Errors
