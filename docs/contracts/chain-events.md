@@ -87,10 +87,20 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   through the `KvStore::write` path; `InMemoryUndoStore` is the test
   default. The marker lives in the `UndoData` column family.
 
+### Startup crash recovery
+
+On daemon start, `crash_recovery::recover_if_needed` walks backward through
+block headers to identify missing applied blocks, then replays stored bodies
+forward as locally validated blocks via `replay_local_block` without
+re-verifying scripts. Recovery completes before `NodeState::start_index_workers`
+(`crates/node/src/run.rs`), so chain-event consumers reconcile against a
+restored applied tip. System-level convergence after crash, checkpoint
+fallback, and reorg is owned by [recovery.md](recovery.md).
+
 ## Live gaps
 
 - **Cross-crate lifecycle boundary**: Slimming `crates/node` orchestration and shifting domain-owned mechanics to their respective crates is tracked under #217 (open).
-- **Crash/reorg recovery invariants**: System convergence rules across chainstate checkpoints, block data, and secondary indexes are tracked under #209. Startup crash recovery (`crates/node/src/crash_recovery.rs`) walks backward through block headers to identify missing blocks, then replays stored block bodies forward as locally validated blocks without re-verifying scripts, executing strictly before secondary index workers start (`crates/node/src/run.rs`). Cold genesis replay and stored-body crash recovery are proven by G11 tests in `crates/node/tests/crash_recovery.rs`.
+- **Full-stack crash convergence**: System-level convergence rules across chainstate checkpoints, block data, and secondary indexes are normative in [recovery.md](recovery.md) (`RCV-01`–`RCV-04`). The recovery-meta sidecar protocol (`crates/node/src/crash_recovery.rs`) and the recovery-evidence bounded current/previous file protocol (`crates/node/src/recovery_evidence.rs`) are unit-proven; full-stack `kill -9` convergence with real block-body re-application is not yet exercised by a gate.
 
 ## Proven by
 
@@ -99,13 +109,10 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `record_drops_hints_when_channel_full`,
   `active_chain_snapshot_starts_at_genesis_on_fresh_node`,
   `active_chain_snapshot_anchors_at_restored_tip_after_restart`.
-- `crates/node/src/txindex_worker_reconcile_tests.rs`:
-  `forward_commit_overlapping_tip_extension_repairs_on_next_pass`,
-  `forward_commit_overlapping_rival_reorg_repairs_on_next_pass`,
-  `snapshot_identity_changes_reconcile_from_the_cursor_position`,
-  `missing_disconnected_body_resets_and_rebuilds_selected_capabilities`,
-  `stale_script_index_reset_preserves_ready_tx_lookup_then_rebuilds`,
-  `consumer_cursor_round_trips_bytes`.
+- `crates/node/src/txindex_worker_recovery_tests.rs`:
+  `shallow_reorg_rewinds_to_common_ancestor_then_replays`,
+  `tip_change_during_rebuild_converges_on_new_tip`,
+  `missing_disconnected_body_routes_rewind_to_rebuild`.
 - `crates/node/src/apply.rs`:
   `a_clean_disconnect_leaves_no_in_flight_marker`,
   `chain_change_proof_finish_restores_even_generation`,
@@ -121,7 +128,7 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `crash_recovery_replays_from_stored_bodies_after_crash`,
   `crash_recovery_replays_from_genesis_without_checkpoint`,
   `crash_recovery_replays_genesis_only_without_checkpoint`,
-  `periodic_checkpoint_restores_to_latest_periodic_generation_after_crash`,
+  `periodic_checkpoint_anchors_progress_without_clean_shutdown`,
   `periodic_checkpoint_published_during_sync_without_shutdown`.
 - `crates/node/src/recovery_evidence.rs` tests (G11):
   `witness_round_trips_and_falls_back_to_prev`,
