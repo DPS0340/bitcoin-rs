@@ -225,6 +225,11 @@ pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     let payload = required_checked_descriptor_payload(descriptor)?;
     // Match addr(...) wrapper.
     if let Some(inner) = strip_addr_wrapper(payload) {
+        if params.as_array().is_some_and(|args| args.len() > 1) {
+            return Err(RpcError::MethodDisabled(
+                "range arguments are unavailable without a wallet",
+            ));
+        }
         if inner.contains('*') {
             return Err(RpcError::MethodDisabled(
                 "ranged descriptors are unavailable without a wallet",

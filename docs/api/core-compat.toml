@@ -337,7 +337,7 @@ status = "implemented_unverified"
 method = "deriveaddresses"
 group = "wallet"
 status = "disabled"
-note = "Only non-ranged addr() descriptors are supported; other descriptor forms and ranged descriptors return MethodDisabled."
+note = "Only non-ranged addr() descriptors are supported; other descriptor forms and ranged descriptors return MethodDisabled. For addr() descriptors, the optional range argument is not honored and returns MethodDisabled rather than expanding addresses."
 
 [[rpc]]
 method = "scantxoutset"
@@ -391,10 +391,12 @@ path = "/rest/blockpart/"
 status = "implemented_unverified"
 [[rest]]
 path = "/rest/blockfilter/"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "The node has no block-filter index, so valid block-filter requests return HTTP 404 rather than filter data."
 [[rest]]
 path = "/rest/blockfilterheaders/"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "The node has no block-filter index, so valid block-filter header requests return HTTP 404 rather than header data."
 [[rest]]
 path = "/rest/chaininfo"
 status = "implemented_unverified"
@@ -403,23 +405,26 @@ path = "/rest/mempool/"
 status = "implemented_unverified"
 [[rest]]
 path = "/rest/headers/"
-status = "deviation"
-deviation = "Unknown but well-formed block hashes return an empty 200 response rather than 404, and query parameters other than count are ignored."
+status = "implemented_unverified"
 [[rest]]
 path = "/rest/getutxos"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "Only URI-encoded outpoints are supported; the Bitcoin Core raw-body request form is not implemented."
 [[rest]]
 path = "/rest/deploymentinfo/"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "The response is available, but its deployments map is always empty because no deployment RPC is available to populate it."
 [[rest]]
 path = "/rest/deploymentinfo"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "The response is available, but its deployments map is always empty because no deployment RPC is available to populate it."
 [[rest]]
 path = "/rest/blockhashbyheight/"
 status = "implemented_unverified"
 [[rest]]
 path = "/rest/spenttxouts/"
-status = "implemented_unverified"
+status = "deviation"
+deviation = "The node retains no undo data, so well-formed spent-output requests return HTTP 404 rather than spent-output data."
 
 # ---------------------------------------------------------------------------
 # ZMQ
