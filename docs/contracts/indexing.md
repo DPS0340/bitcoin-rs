@@ -77,6 +77,11 @@ Owners:
     forward.
   - If the watermark is on an abandoned branch, the worker rolls back to the
     common ancestor and connects forward to the active tip.
+- `NodeState::open` restores the authenticated checkpoint and, when enabled,
+  replays the journal's committed suffix (`docs/chainstate-recovery.md`) before
+  `NodeState::start_index_workers()` spawns worker threads
+  (`crates/node/src/run.rs`), so index workers reconcile against a restored
+  active chainstate.
 
 ### `IDX-06`: Reorganization rollback and forward reconciliation
 
@@ -87,6 +92,11 @@ Owners:
   - Height-keyed rows (transaction position rows) are removed using per-block
     watermark identity records to delete exactly the rows contributed by each
     disconnected block from the tip down to the common ancestor.
+  - When the rollback depth (watermark height minus common ancestor height)
+    exceeds `txindex_worker::DEFAULT_ROLLBACK_REBUILD_CUTOVER` (100 000 blocks),
+    the worker routes to `reset_capabilities` and backfills forward instead of
+    executing a long block-by-block rollback
+    (`docs/benchmarks/index-rollback-rebuild-cutover.md`).
 - **Connect walk**:
   - The worker loads bodies from `PruneBodyStore`, constructs bounded forward
     batches (`PreparedBatchLimits`), and commits row mutations and updated

@@ -90,6 +90,16 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   through the `KvStore::write` path; `InMemoryUndoStore` is the test
   default. The marker lives in the `UndoData` column family.
 
+### Startup crash recovery
+
+On daemon start, `NodeState::open` restores the authenticated checkpoint
+and, when enabled, replays the journal's committed suffix
+(`docs/chainstate-recovery.md`) before `NodeState::start_index_workers`
+(`crates/node/src/run.rs`). Chain-event consumers therefore reconcile
+against a restored applied tip. The V1 recovery-meta sidecar is neither
+authoritative nor read. System-level convergence after crash, checkpoint
+fallback, and reorg is owned by [recovery.md](recovery.md).
+
 ## Live gaps
 
 - **Cross-crate lifecycle boundary**: Slimming `crates/node` orchestration and shifting domain-owned mechanics to their respective crates is tracked under #217 (open).
