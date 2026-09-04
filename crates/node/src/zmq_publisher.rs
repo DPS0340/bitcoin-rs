@@ -40,6 +40,7 @@ pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 ///
 /// Topics sharing an endpoint necessarily share its socket-level HWM.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ZmqEndpointConfig {
     /// ZMQ endpoint to bind.
     pub endpoint: String,
