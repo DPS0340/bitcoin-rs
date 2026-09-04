@@ -1,7 +1,9 @@
 //! Asynchronous, durable, node-owned transaction index runtime.
 //!
 //! The node creates and owns exactly one `TxIndexRuntime` when Core txindex or
-//! `ScriptIndex` enables an index capability. The runtime holds a process-local revision counter and a bounded
+//! `ScriptIndex` enables an index capability.
+//!
+//! The runtime holds a process-local revision counter and a bounded
 //! nonblocking wake channel; `ApplyHandles` clones it and wakes the worker
 //! after every committed `applied_tip.store`. The worker is a process-local
 //! reconciliation loop; storage-level CAS conditions on exact reset state,

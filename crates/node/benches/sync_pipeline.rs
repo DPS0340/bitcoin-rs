@@ -1,6 +1,37 @@
 //! Deterministic initial-sync proxy benchmark.
 // PERF: Criterion emits public harness items whose docs are irrelevant to the benchmark report.
-#![allow(missing_docs)]
+#![expect(
+    clippy::as_conversions,
+    reason = "benchmark casts are intentionally lossy for perf measurement"
+)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "benchmark: panicking on setup failure is correct behavior"
+)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "benchmark: truncation is intentional for perf measurement"
+)]
+#![expect(
+    clippy::cast_sign_loss,
+    reason = "benchmark: sign loss is intentional for perf measurement"
+)]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "benchmark: precision loss is intentional for perf measurement"
+)]
+#![expect(
+    clippy::items_after_statements,
+    reason = "benchmark: helper structs defined near use site for readability"
+)]
+#![expect(
+    clippy::suboptimal_flops,
+    reason = "benchmark: explicit mul-add is clearer than fma here"
+)]
+#![expect(
+    clippy::semicolon_if_nothing_returned,
+    reason = "benchmark: closure returns elapsed time, semicolon would break it"
+)]
 
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -15,16 +46,14 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_script::script::push_int;
 // seam: getdata inventory items stay rust-bitcoin at the p2p wire boundary.
 use bitcoin::hashes::Hash as _;
+use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::secp256k1::{All, Message as SecpMessage, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
     Amount, OutPoint as OracleOutPoint, ScriptBuf as OracleScriptBuf, Sequence as OracleSequence,
-    Transaction as OracleTx, TxIn as OracleTxIn, TxOut as OracleTxOut, Txid as OracleTxid,
-    Witness, absolute, opcodes, script::Builder as OracleBuilder, transaction,
+    Transaction as OracleTx, TxIn as OracleTxIn, TxOut as OracleTxOut, Txid as OracleTxid, Witness,
+    absolute, opcodes, script::Builder as OracleBuilder, transaction,
 };
-use bitcoin::p2p::message_blockdata::Inventory;
-use bitcoin_rs_primitives::deserialize;
-use parking_lot::Mutex as ParkingMutex;
 use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
 use bitcoin_rs_index::BlockSource as _;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
@@ -35,12 +64,14 @@ use bitcoin_rs_node::{
     sync::{SyncBudget, default_sync_budget},
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
+use bitcoin_rs_primitives::deserialize;
 use bitcoin_rs_rpc::context::{BlockBodySource, BlockLog, BlockRecord};
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use crossbeam_channel::unbounded;
 use hashbrown::HashMap;
+use parking_lot::Mutex as ParkingMutex;
 use parking_lot::{Mutex, RwLock};
 use tempfile::TempDir;
 
@@ -152,9 +183,8 @@ fn sync_pipeline_apply_signed_spend_proxy(c: &mut Criterion) {
     print_signed_spend_proxy_summary(&blocks);
 
     const SIGNED_SPEND_SAMPLES: usize = 30;
-    let samples: ParkingMutex<Vec<Duration>> = ParkingMutex::new(Vec::with_capacity(
-        SIGNED_SPEND_SAMPLES.saturating_mul(4),
-    ));
+    let samples: ParkingMutex<Vec<Duration>> =
+        ParkingMutex::new(Vec::with_capacity(SIGNED_SPEND_SAMPLES.saturating_mul(4)));
 
     c.bench_function("sync_pipeline_apply_signed_spend_proxy", |b| {
         b.iter_custom(|iters| {
@@ -1432,9 +1462,11 @@ impl SigningKeys {
 }
 
 fn secret_pubkey(secp: &Secp256k1<All>, byte: u8) -> bitcoin::PublicKey {
-    let secret = SecretKey::from_slice(&[byte; 32])
-        .unwrap_or_else(|e| panic!("invalid secret key: {e}"));
-    bitcoin::PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(secp, &secret))
+    let secret =
+        SecretKey::from_slice(&[byte; 32]).unwrap_or_else(|e| panic!("invalid secret key: {e}"));
+    bitcoin::PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(
+        secp, &secret,
+    ))
 }
 
 fn secret_key(byte: u8) -> SecretKey {
@@ -1511,7 +1543,9 @@ fn signed_fanout_coinbase_transaction(height: u32, keys: &SigningKeys) -> Tx {
     }
     // P2WPKH outputs (indices 22..44).
     for i in 0..22u32 {
-    let pkh = keys.p2wpkh[usize::try_from(i).unwrap()].wpubkey_hash().unwrap();
+        let pkh = keys.p2wpkh[usize::try_from(i).unwrap()]
+            .wpubkey_hash()
+            .unwrap();
         let script = OracleScriptBuf::new_p2wpkh(&pkh);
         outputs.push(TxOut {
             value: SPEND_PROXY_COINBASE_OUTPUT_VALUE,
@@ -1686,9 +1720,21 @@ fn build_signed_spend_tx(
 ) -> Tx {
     let oracle_txid = OracleTxid::from_byte_array(*source_txid.as_bytes());
     if vout < 22 {
-        build_signed_p2pkh_spend(oracle_txid, vout, prevout_value, keys, usize::try_from(vout).unwrap())
+        build_signed_p2pkh_spend(
+            oracle_txid,
+            vout,
+            prevout_value,
+            keys,
+            usize::try_from(vout).unwrap(),
+        )
     } else if vout < 44 {
-        build_signed_p2wpkh_spend(oracle_txid, vout, prevout_value, keys, usize::try_from(vout - 22).unwrap())
+        build_signed_p2wpkh_spend(
+            oracle_txid,
+            vout,
+            prevout_value,
+            keys,
+            usize::try_from(vout - 22).unwrap(),
+        )
     } else {
         build_signed_p2wsh_spend(oracle_txid, vout, prevout_value, keys)
     }
@@ -1785,10 +1831,7 @@ fn build_signed_p2wpkh_spend(
     sig.normalize_s();
     let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
     sig_bytes.push(EcdsaSighashType::All as u8);
-    tx.input[0].witness = Witness::from_slice(&[
-        sig_bytes,
-        pubkey.inner.serialize().to_vec(),
-    ]);
+    tx.input[0].witness = Witness::from_slice(&[sig_bytes, pubkey.inner.serialize().to_vec()]);
     to_native_tx(&tx)
 }
 
@@ -1854,8 +1897,7 @@ fn build_signed_p2wsh_spend(
 /// Consensus-bytes round-trip from rust-bitcoin oracle types to native `Tx`.
 fn to_native_tx(tx: &OracleTx) -> Tx {
     let bytes = bitcoin::consensus::serialize(tx);
-    deserialize(&bytes)
-        .unwrap_or_else(|e| panic!("oracle transaction must decode natively: {e}"))
+    deserialize(&bytes).unwrap_or_else(|e| panic!("oracle transaction must decode natively: {e}"))
 }
 
 fn print_signed_spend_proxy_summary(blocks: &[Block]) {

@@ -80,7 +80,11 @@ impl RelayRequest {
     /// Builds a relay request for an accepted transaction.
     #[must_use]
     pub fn new(txid: Txid, wtxid: Wtxid, source: Option<u64>) -> Self {
-        Self { txid, wtxid, source }
+        Self {
+            txid,
+            wtxid,
+            source,
+        }
     }
 }
 
@@ -339,7 +343,10 @@ mod tests {
         let mut ids = Vec::with_capacity(count);
         for _ in 0..count {
             let id = fresh_node_id();
-            peers.push(FakePeer { node_id: id, capacity: 64 });
+            peers.push(FakePeer {
+                node_id: id,
+                capacity: 64,
+            });
             ids.push(id);
         }
         (peers, ids)
@@ -360,7 +367,10 @@ mod tests {
         // source peer's capacity is unchanged.
         let locked = sink.peers.lock();
         assert_eq!(locked[0].capacity, 63);
-        assert_eq!(locked[1].capacity, 64, "source peer must not be announced to");
+        assert_eq!(
+            locked[1].capacity, 64,
+            "source peer must not be announced to"
+        );
         assert_eq!(locked[2].capacity, 63);
     }
 
@@ -468,8 +478,14 @@ mod tests {
         let id_a = fresh_node_id();
         let id_b = fresh_node_id();
         let sink = FakeSink::new(vec![
-            FakePeer { node_id: id_a, capacity: 0 },
-            FakePeer { node_id: id_b, capacity: 64 },
+            FakePeer {
+                node_id: id_a,
+                capacity: 0,
+            },
+            FakePeer {
+                node_id: id_b,
+                capacity: 64,
+            },
         ]);
         let outcome = sink.announce_inv(dummy_txid(0xE5), None);
 
@@ -483,13 +499,14 @@ mod tests {
 
     #[test]
     fn peer_relay_sink_excludes_source_by_node_id() {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::p2p::message_blockdata::Inventory;
+
         // End-to-end with real PeerLease objects: build the production peer
         // map, announce excluding one peer's node id, and confirm only the
         // other peer's outbound channel receives the inv.
-        use bitcoin::hashes::Hash as _;
-
-        let addr_a: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let addr_a: SocketAddr = "127.0.0.1:1".parse().expect("valid addr");
+        let addr_b: SocketAddr = "127.0.0.1:2".parse().expect("valid addr");
         let (tx_a, rx_a) = bounded::<Message>(8);
         let (tx_b, rx_b) = bounded::<Message>(8);
         let lease_a = PeerLease::new(tx_a);
@@ -510,12 +527,14 @@ mod tests {
 
         // The source peer (a) must not receive the inv; the other peer (b)
         // must receive exactly one inv carrying the announced txid.
-        assert!(rx_a.try_recv().is_err(), "source peer must not be announced to");
+        assert!(
+            rx_a.try_recv().is_err(),
+            "source peer must not be announced to"
+        );
         let msg_b = rx_b.try_recv().expect("non-source peer receives inv");
         match msg_b {
             Message::Inv(items) => {
                 assert_eq!(items.len(), 1, "one inventory vector per announce");
-                use bitcoin::p2p::message_blockdata::Inventory;
                 match items[0] {
                     Inventory::Transaction(hash) => {
                         assert_eq!(hash.as_byte_array(), txid.as_bytes());

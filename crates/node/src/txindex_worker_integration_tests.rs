@@ -1,7 +1,7 @@
-//! A1 named integration tests: worker-owned open, namespace registry,
-//! bounded shutdown, spawn failure, wake reconciliation, and backend
-//! matrix. These exercise the full worker lifecycle path including
-//! the test-only keyed open gate.
+//! A1 named integration tests for the txindex worker.
+//!
+//! These exercise the full worker lifecycle path including the test-only
+//! keyed open gate.
 #![expect(
     clippy::expect_used,
     reason = "test: integration tests use expect for clarity"

@@ -1,5 +1,4 @@
-//! UTXO connect accounting: building the mutation, undo, and value totals
-//! for one block from its transactions and a resolved set of spent prevouts.
+//! UTXO connect accounting for one block.
 //!
 //! The node crate coordinates *when* to connect a block and *what* resolved
 //! prevouts to pass; this module owns the mechanics of walking the block's

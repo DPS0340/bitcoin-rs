@@ -26,15 +26,14 @@ use smallvec::SmallVec;
 use self::stage::{BlockStager, DrainedBlock, StagedBlock};
 #[allow(unused_imports)]
 use bitcoin_rs_p2p::download_window::{
-    configure_request_mode, default_sync_budget, statically_fanout_eligible, DownloadWindow,
-    FanoutCandidate, SyncPeer, SyncPeerSelection, GETDATA_BATCH_SIZE,
-    INBOUND_BLOCK_STAGE_CHUNK, MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_SERIALIZED_BLOCK_SIZE,
-    PENDING_BLOCK_BYTE_ESTIMATE, PENDING_BUDGET, PENDING_BYTE_BUDGET,
-    PENDING_TIMEOUT, PEER_INFLIGHT_BUDGET, RECEIVED_BLOCK_BUDGET, RECEIVED_BLOCK_BYTE_BUDGET,
-    RECEIVED_BLOCK_TIMEOUT, BLOCK_STALLING_TIMEOUT, BLOCK_STALLING_TIMEOUT_MAX, STALLER_COOLDOWN,
+    BLOCK_STALLING_TIMEOUT, BLOCK_STALLING_TIMEOUT_MAX, DownloadWindow, FanoutCandidate,
+    GETDATA_BATCH_SIZE, INBOUND_BLOCK_STAGE_CHUNK, MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+    MAX_SERIALIZED_BLOCK_SIZE, PEER_INFLIGHT_BUDGET, PENDING_BLOCK_BYTE_ESTIMATE, PENDING_BUDGET,
+    PENDING_BYTE_BUDGET, PENDING_TIMEOUT, RECEIVED_BLOCK_BUDGET, RECEIVED_BLOCK_BYTE_BUDGET,
+    RECEIVED_BLOCK_TIMEOUT, STALLER_COOLDOWN, SyncPeer, SyncPeerSelection, configure_request_mode,
+    statically_fanout_eligible,
 };
-pub use bitcoin_rs_p2p::download_window::SyncBudget;
-pub(crate) use bitcoin_rs_p2p::download_window::MIN_PEERS_FOR_FANOUT;
+pub use bitcoin_rs_p2p::download_window::{MIN_PEERS_FOR_FANOUT, SyncBudget, default_sync_budget};
 
 /// Maximum number of locator entries we ever send.
 const LOCATOR_MAX_ENTRIES: usize = 32;
@@ -57,7 +56,6 @@ pub struct BlockSync {
     pending_getheaders: Arc<Mutex<Option<PendingHeaderRequest>>>,
     expected_apply_cache: Arc<Mutex<Option<ExpectedApplyCache>>>,
 }
-
 
 #[derive(Clone, Copy, Debug)]
 struct PendingHeaderRequest {
@@ -1557,7 +1555,6 @@ impl BlockSync {
 fn metric_count(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
-
 
 #[cfg(test)]
 mod tests {

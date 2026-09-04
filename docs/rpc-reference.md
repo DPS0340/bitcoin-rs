@@ -234,4 +234,4 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `rawtx` | 0.4.0 | Requires the zmq feature and a --zmqpubrawtx endpoint. |
 | `sequence` | 0.4.0 | Requires the zmq feature and a --zmqpubsequence endpoint. Publishes C/D block events and A/R mempool events; A/R carry reversed txid, the label byte, and the mempool sequence as u64 LE (crates/node/src/zmq_publisher.rs). |
 
-Row counts: Implemented 67, Deviation 10, Extension 2, Unimplemented 96 - total 175.
+Row counts: Implemented 66, Deviation 8, Extension 2, Unimplemented 96 - total 172.
