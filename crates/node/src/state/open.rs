@@ -391,6 +391,9 @@ impl NodeState {
             Some(Arc::clone(&mempool_gateway)),
         );
         let (capture_rawtx, capture_block_bytes) = followers.capture_flags();
+        // One retention registry per node: transitions pin old-branch bodies
+        // into it and the pruning pass folds the live floors into its line.
+        let retention = Arc::new(bitcoin_rs_storage::RetentionRegistry::new());
         let mut apply_handles = crate::apply::Chainstate {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
@@ -418,12 +421,15 @@ impl NodeState {
             checkpoint_publisher: None,
             capture_rawtx,
             capture_block_bytes,
+            retention: Arc::clone(&retention),
         };
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
         // The durable head is the chain's commit point: an unreadable row
         // fails startup, and a committed-but-unpublished gap (crash between
-        // the head batch and publication) is surfaced here, counted, and
-        // left for recovery replay rather than silently adopted.
+        // the head batch and publication) is replayed here from the durable
+        // bodies it certified, so ordinary operation starts on a state the
+        // head fully names (#655). A gap that is not an ancestor prefix of
+        // stored bodies fails startup closed.
         crate::apply::reconcile_at_boot(&apply_handles).map_err(anyhow::Error::new)?;
         // A restored checkpoint is durable at its own height by definition, so
         // start there rather than at zero, which would refuse all undo pruning.
@@ -465,6 +471,7 @@ impl NodeState {
                 Arc::clone(&transactions),
                 apply_handles.prune_authority(),
                 &durable_tip_height,
+                &retention,
             )?)
         } else {
             None

@@ -54,6 +54,9 @@ pub struct NodePruneService<S: KvStore> {
     /// Undo pruning is bounded by this, not by the in-memory applied tip, which
     /// can run far ahead of it.
     durable_tip_height: Arc<AtomicU32>,
+    /// Registry the prune line is recorded into after a committed pass, and
+    /// whose live leases clamp this pass's line below every pinned floor.
+    retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
 }
 
 impl<S: KvStore> NodePruneService<S> {
@@ -66,6 +69,7 @@ impl<S: KvStore> NodePruneService<S> {
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
         durable_tip_height: Arc<AtomicU32>,
+        retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
     ) -> Result<Self> {
         let pruneheight = load_pruneheight(&*store)?;
         Ok(Self {
@@ -77,6 +81,7 @@ impl<S: KvStore> NodePruneService<S> {
             authority,
             pruneheight: Mutex::new(pruneheight),
             durable_tip_height,
+            retention,
         })
     }
 }
@@ -111,9 +116,18 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
 
         let durable_tip_height = self.durable_tip_height.load(Ordering::Acquire);
-        let effective_prune_below = pruner_tip
-            .min(durable_tip_height)
-            .saturating_sub(policy.retention_depth());
+        let mut batch = self.store.new_batch();
+        let staged = stage_block_and_undo_prune(
+            &*self.store,
+            &mut batch,
+            &self.block_files,
+            pruner_tip,
+            durable_tip_height,
+            policy,
+            &self.retention,
+        )
+        .map_err(|err| PruneServiceError::failed(err.to_string()))?;
+        let effective_prune_below = staged.pruned_below;
         let prune_candidates: Vec<(u32, bitcoin_rs_primitives::BlockHash, usize)> = {
             let blocks = self.blocks.read();
             blocks
@@ -143,16 +157,6 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             })?;
             pruned_txids.extend(block.txs.iter().map(Tx::txid));
         }
-        let mut batch = self.store.new_batch();
-        let (block_outcome, undo_outcome, prunable_files) = stage_block_and_undo_prune(
-            &*self.store,
-            &mut batch,
-            &self.block_files,
-            pruner_tip,
-            self.durable_tip_height.load(Ordering::Acquire),
-            policy,
-        )
-        .map_err(|err| PruneServiceError::failed(err.to_string()))?;
         batch.put(
             ColumnFamily::UtxoMeta,
             PRUNEHEIGHT_METADATA_KEY,
@@ -161,7 +165,12 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         self.store
             .write(batch)
             .map_err(|err| PruneServiceError::failed(err.to_string()))?;
-        reclaim_staged_flat_block_files(&*self.store, &self.block_files, &prunable_files)
+        // Record before reclaim: acquiring a lease takes no transition lock,
+        // so a lease granted between the committing write and this record
+        // could otherwise pin rows the batch already deleted. Reclaim only
+        // ever deletes files this recorded line already covers.
+        self.retention.record_pruned_below(staged.pruned_below);
+        reclaim_staged_flat_block_files(&*self.store, &self.block_files, &staged.file_numbers)
             .map_err(|err| PruneServiceError::failed(err.to_string()))?;
 
         if !pruned_txids.is_empty() {
@@ -176,11 +185,12 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         Ok(PruneResult {
             requested_height,
             pruneheight: updated_pruneheight,
-            block_rows_removed: block_outcome.blocks_removed,
-            undo_rows_removed: undo_outcome.blocks_removed,
-            bytes_freed: block_outcome
+            block_rows_removed: staged.blocks.blocks_removed,
+            undo_rows_removed: staged.undo.blocks_removed,
+            bytes_freed: staged
+                .blocks
                 .bytes_freed
-                .saturating_add(undo_outcome.bytes_freed),
+                .saturating_add(staged.undo.bytes_freed),
         })
     }
 

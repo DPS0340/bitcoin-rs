@@ -76,16 +76,19 @@ pub fn invalidate_block(
                 .map_err(ReorgError::Plan)?
                 .ok_or(ReorgError::NoValidTip)?
         };
-
         let plan = current_reorg_plan(handles, target)?;
         let mut no_staged_body = |_| None;
-        let (disconnect_nodes, connect) = match plan.as_ref() {
+        let (disconnect_nodes, connect, _retention) = match plan.as_ref() {
             Some(plan) => {
                 let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
+                // The lease must exist before the bodies are first read, so
+                // a concurrent prune can never delete what the walk is
+                // about to re-read.
+                let retention = retention_lease_for(handles, &disconnect_nodes)?;
                 let connect = load_branch_bodies(handles, &plan.connect, &mut no_staged_body)?;
-                (disconnect_nodes, connect)
+                (disconnect_nodes, connect, Some(retention))
             }
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), None),
         };
         if !disconnect_nodes.is_empty() {
             preflight_disconnect_bodies(handles, &disconnect_nodes, &mut no_staged_body)?;
@@ -304,6 +307,19 @@ pub enum ReorgError {
     /// directory until a later checkpoint publishes this state.
     #[error("disconnect left a checkpoint debt the node could not settle: {0}")]
     CheckpointSettlement(#[source] anyhow::Error),
+    /// The switch needs old-branch history that pruning has already
+    /// deleted. Nothing was touched: the retention lease is refused before
+    /// the first mutation, and an exact-identity result is impossible
+    /// without the bodies. Recovery is a rebuild from retained canonical
+    /// data (`RCV-07`), not a retry.
+    #[error("reorg requires history at or above height {floor}, which is already pruned: {source}")]
+    RetentionUnavailable {
+        /// Height the switch pinned.
+        floor: u32,
+        /// Why the lease was refused.
+        #[source]
+        source: bitcoin_rs_storage::RetentionError,
+    },
 }
 
 impl ReorgError {
@@ -328,9 +344,31 @@ impl ReorgError {
             | Self::Unavailable(_)
             | Self::Refused { .. }
             | Self::DisconnectBodyLost { .. }
-            | Self::CheckpointSettlement(_) => false,
+            | Self::CheckpointSettlement(_)
+            | Self::RetentionUnavailable { .. } => false,
         }
     }
+}
+
+/// Pins the old-branch bodies a switch will re-read against pruning.
+///
+/// The floor is the fork ancestor: every disconnect-side body sits at or
+/// above it, and every connect-side body sits above the ancestor too, so
+/// one floor covers both walks. The caller holds the lease until the
+/// attempt settles — completed, refused, or failed — and the guard releases
+/// it exactly once on every exit path.
+fn retention_lease_for(
+    handles: &Chainstate,
+    disconnect_nodes: &[(Hash256, u32)],
+) -> core::result::Result<Option<bitcoin_rs_storage::RetentionLease>, ReorgError> {
+    let Some(&(_, floor)) = disconnect_nodes.iter().min_by_key(|&(_, height)| height) else {
+        return Ok(None);
+    };
+    handles
+        .retention
+        .acquire(floor)
+        .map(Some)
+        .map_err(|source| ReorgError::RetentionUnavailable { floor, source })
 }
 
 /// Switches the applied chain to `target`.
@@ -371,6 +409,13 @@ where
             return Err(ReorgError::MissingBody { hash, height });
         }
         let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
+        // Pin the old-branch bodies against pruning for this iteration. The
+        // guard outlives every exit path of the loop body — completed,
+        // refused, failed, and replanned attempts each hand the retention
+        // authority back exactly once — and it exists before the bodies are
+        // first read, so a concurrent prune can never delete what the walk
+        // is about to re-read.
+        let _retention = retention_lease_for(handles, &disconnect_nodes)?;
         preflight_disconnect_bodies(handles, &disconnect_nodes, &mut staged_body)?;
 
         let lock = handles

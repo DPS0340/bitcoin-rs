@@ -565,6 +565,10 @@ pub struct Chainstate {
     pub(crate) capture_rawtx: bool,
     /// Serialize the full block for a derived consumer (body store, index, rawblock).
     pub(crate) capture_block_bytes: bool,
+    /// Retention authority shared with the pruning pass: chain transitions
+    /// and required readers pin old-branch bodies here so pruning cannot
+    /// delete data an active transition still re-reads (#655, `RCV-08`).
+    pub(crate) retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
 }
 
 /// One admitted chain mutation.
@@ -815,6 +819,7 @@ impl Chainstate {
             checkpoint_publisher: None,
             capture_rawtx: false,
             capture_block_bytes: false,
+            retention: Arc::new(bitcoin_rs_storage::RetentionRegistry::new()),
         }
     }
 

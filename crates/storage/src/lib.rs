@@ -30,6 +30,8 @@ pub use trait_::{
 
 pub use undo::{DisconnectMarker, DisconnectPhase, InMemoryUndoStore, KvUndoStore, UndoStore};
 
+pub use pruning::{RetentionError, RetentionLease, RetentionRegistry};
+
 pub use durable_head::{
     BodyExtent, CommitRecords, DurableHead, DurableHeadStore, InMemoryDurableHeadStore,
     KvDurableHeadStore,

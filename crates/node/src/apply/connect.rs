@@ -137,7 +137,9 @@ pub(super) fn apply_block_admitted<'b>(
             Some((tip, height)) => (Some(tip), height),
             None => applied_predecessor(handles, block_hash, prev_hash)?,
         },
-        PublishMode::Now => applied_predecessor(handles, block_hash, prev_hash)?,
+        PublishMode::Now | PublishMode::Replay { .. } => {
+            applied_predecessor(handles, block_hash, prev_hash)?
+        }
     };
     if intent == ApplyIntent::Commit
         && let Some(journal) = &handles.journal
@@ -572,6 +574,27 @@ pub(super) fn apply_block_admitted<'b>(
             // The journal is derived from the durable head: it may lag the
             // batch, never lead it, so a kill between the two leaves the
             // head as the high-water mark of committed state.
+            emit_journal_record(
+                handles,
+                build_journal_record(
+                    block,
+                    height,
+                    block_hash,
+                    prev_hash,
+                    &undo,
+                    &changes,
+                    coin_stats_height_delta,
+                ),
+                height,
+            );
+            publish_connect(handles, &tip, tx_count_delta);
+            outcome.commit_id = commit_id;
+        }
+        PublishMode::Replay { commit_id } => {
+            // The gap block's durable batch committed before the crash: the
+            // stored head receipt covers its body, undo, and locator rows.
+            // Replay redoes only what publication owed — the journal tail
+            // and the coherent tip — and carries the receipt's commit id.
             emit_journal_record(
                 handles,
                 build_journal_record(

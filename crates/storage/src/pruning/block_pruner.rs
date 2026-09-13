@@ -72,8 +72,9 @@ pub(crate) fn prune_prefixed_rows<S: KvStore>(
     policy: PrunePolicy,
 ) -> Result<PruneOutcome, PruneError> {
     let mut batch = store.new_batch();
+    let prune_below_height = current_tip_height.saturating_sub(policy.retention_depth());
     let outcome =
-        prune_prefixed_rows_into_batch(store, &mut batch, cf, prefix, current_tip_height, policy)?;
+        prune_prefixed_rows_into_batch(store, &mut batch, cf, prefix, prune_below_height, policy)?;
 
     if !outcome.is_empty() {
         store.write(batch)?;
@@ -92,11 +93,10 @@ pub(crate) fn prune_prefixed_rows_into_batch<S: KvStore>(
     batch: &mut S::WriteBatch,
     cf: ColumnFamily,
     prefix: &[u8],
-    current_tip_height: u32,
+    prune_below_height: u32,
     policy: PrunePolicy,
 ) -> Result<PruneOutcome, PruneError> {
     let target_bytes = policy.target_size_bytes();
-    let prune_below_height = current_tip_height.saturating_sub(policy.retention_depth());
     let mut total_bytes = 0_u64;
     let mut candidates = Vec::new();
 
@@ -108,7 +108,7 @@ pub(crate) fn prune_prefixed_rows_into_batch<S: KvStore>(
         if let Some(height) = row_height(&key, prefix)
             && height < prune_below_height
         {
-            candidates.push((key, row_bytes));
+            candidates.push((key, row_bytes, height));
         }
     }
 
@@ -119,14 +119,14 @@ pub(crate) fn prune_prefixed_rows_into_batch<S: KvStore>(
     let mut remaining_bytes = total_bytes;
     let mut outcome = PruneOutcome::default();
 
-    for (key, row_bytes) in candidates {
+    for (key, row_bytes, height) in candidates {
         if remaining_bytes <= target_bytes {
             break;
         }
 
         batch.delete(cf, &key);
         remaining_bytes = remaining_bytes.saturating_sub(row_bytes);
-        outcome.record_removed(row_bytes);
+        outcome.record_removed(row_bytes, height);
     }
 
     Ok(outcome)
@@ -177,23 +177,26 @@ pub(crate) fn stage_flat_block_file_prune<S: KvStore>(
             )
         })?;
         let selected_file = file_numbers.binary_search(&position.file_no).is_ok();
-        let below_horizon = row_height(&key, BLOCK_BODY_PREFIX_BYTES)
-            .is_some_and(|height| height < prune_below_height);
+        // A row whose height does not parse still rides out with its file
+        // when the file is pruned; it cannot sit at or above the line, so
+        // the line-1 bound is the tallest it could be.
+        let height = row_height(&key, BLOCK_BODY_PREFIX_BYTES)
+            .unwrap_or_else(|| prune_below_height.saturating_sub(1));
+        let below_horizon = height < prune_below_height;
         if selected_file || below_horizon {
-            candidates.push((key, row_bytes, selected_file));
+            candidates.push((key, row_bytes, height, selected_file));
         }
     }
-
     let mut remaining_bytes = total_bytes;
     let mut outcome = PruneOutcome::default();
-    for (key, row_bytes, selected_file) in candidates {
+    for (key, row_bytes, height, selected_file) in candidates {
         if !selected_file && remaining_bytes <= target_bytes {
             continue;
         }
 
         batch.delete(BLOCK_DATA_CF, &key);
         remaining_bytes = remaining_bytes.saturating_sub(row_bytes);
-        outcome.record_removed(row_bytes);
+        outcome.record_removed(row_bytes, height);
     }
 
     Ok((outcome, file_numbers))

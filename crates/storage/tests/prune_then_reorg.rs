@@ -6,119 +6,128 @@ use std::collections::BTreeMap;
 
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_storage::pruning::{
-    BLOCK_DATA_CF, BlockPruner, PrunePolicy, block_body_key, reclaim_staged_flat_block_files,
-    stage_block_and_undo_prune,
+    BLOCK_DATA_CF, BlockPruner, PrunePolicy, RetentionRegistry, block_body_key,
+    reclaim_staged_flat_block_files, stage_block_and_undo_prune,
 };
 use bitcoin_rs_storage::{
-    ColumnFamily, FlatFileBlockStore, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch,
-    WriteCondition, block_file_max_height_key, encode_block_file_max_height,
+    BlockFilePosition, ColumnFamily, FlatFileBlockStore, KvIter, KvSnapshot, KvStore, StorageError,
+    WriteBatch, WriteCondition, block_file_max_height_key, encode_block_file_max_height,
 };
 use parking_lot::RwLock;
 use tempfile::tempdir;
+
+/// Prune everything below the requested height; `retention_depth` still
+/// floors at the 288-block reorg margin.
+const AGGRESSIVE: PrunePolicy = PrunePolicy {
+    target_size_mb: 0,
+    keep_below_tip: 0,
+};
+
+/// Returns whether a raw key is present in the block-body family.
+fn row_stored(store: &MemoryStore, key: &[u8]) -> Result<bool, StorageError> {
+    Ok(store.get(BLOCK_DATA_CF, key)?.is_some())
+}
+
+/// One appended body row: height, hash, and its flat-file position.
+type StoredRow = (u32, Hash256, BlockFilePosition);
+
+/// Appends `(height, payload)` bodies into one flat file, writing each
+/// locator row plus the file's max-height row.
+fn write_body_rows(
+    store: &MemoryStore,
+    block_files: &FlatFileBlockStore,
+    rows: &[(u32, &[u8])],
+) -> Result<Vec<StoredRow>, Box<dyn std::error::Error>> {
+    let mut appended = Vec::with_capacity(rows.len());
+    let mut batch = store.new_batch();
+    for &(height, payload) in rows {
+        let hash = fake_hash(height);
+        let position = block_files.append(height, *hash.as_byte_array(), payload)?;
+        batch.put(
+            BLOCK_DATA_CF,
+            &block_body_key(height, hash),
+            &position.encode(),
+        );
+        appended.push((height, hash, position));
+    }
+    let max_height = appended.iter().map(|&(height, _, _)| height).max();
+    if let Some(max_height) = max_height {
+        batch.put(
+            BLOCK_DATA_CF,
+            &block_file_max_height_key(appended[0].2.file_no),
+            &encode_block_file_max_height(max_height),
+        );
+    }
+    store.write(batch)?;
+    Ok(appended)
+}
 
 #[test]
 fn staged_flat_file_pruning_removes_all_selected_indexes_before_reclaim()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = MemoryStore::default();
     let data_dir = tempdir()?;
-    let first_old_hash = fake_hash(1);
-    let second_old_hash = fake_hash(2);
-    let current_hash = fake_hash(800);
-    let (first_old_position, second_old_position) = {
-        let block_files = FlatFileBlockStore::open(data_dir.path())?;
-        (
-            block_files.append(1, *first_old_hash.as_byte_array(), b"first old body")?,
-            block_files.append(2, *second_old_hash.as_byte_array(), b"second old body")?,
-        )
+    let old_rows = {
+        let seeding = FlatFileBlockStore::open(data_dir.path())?;
+        write_body_rows(
+            &store,
+            &seeding,
+            &[(1, b"first old body"), (2, b"second old body")],
+        )?
     };
+    // A fresh file for the current tip so the old file is reclaimable.
     std::fs::File::create(data_dir.path().join("blocks/blk00001.dat"))?;
     let block_files = FlatFileBlockStore::open(data_dir.path())?;
-    let current_position =
-        block_files.append(800, *current_hash.as_byte_array(), b"current body")?;
+    let current = write_body_rows(&store, &block_files, &[(800, b"current body")])?.remove(0);
+    assert_eq!(old_rows[0].2.file_no, 0);
+    assert_eq!(current.2.file_no, 1);
 
-    assert_eq!(first_old_position.file_no, 0);
-    assert_eq!(second_old_position.file_no, 0);
-    assert_eq!(current_position.file_no, 1);
     let policy = PrunePolicy {
         target_size_mb: 1,
         keep_below_tip: 0,
     };
-    assert!(
-        u64::try_from(
-            first_old_position.encode().len()
-                + second_old_position.encode().len()
-                + current_position.encode().len(),
-        )? < policy.target_size_bytes()
-    );
+    let first_old_key = block_body_key(1, old_rows[0].1);
+    let second_old_key = block_body_key(2, old_rows[1].1);
+    let current_key = block_body_key(800, current.1);
 
-    let first_old_key = block_body_key(1, first_old_hash);
-    let second_old_key = block_body_key(2, second_old_hash);
-    let current_key = block_body_key(800, current_hash);
-    let mut initial_batch = store.new_batch();
-    initial_batch.put(BLOCK_DATA_CF, &first_old_key, &first_old_position.encode());
-    initial_batch.put(
-        BLOCK_DATA_CF,
-        &second_old_key,
-        &second_old_position.encode(),
-    );
-    initial_batch.put(BLOCK_DATA_CF, &current_key, &current_position.encode());
-    initial_batch.put(
-        BLOCK_DATA_CF,
-        &block_file_max_height_key(first_old_position.file_no),
-        &encode_block_file_max_height(2),
-    );
-    initial_batch.put(
-        BLOCK_DATA_CF,
-        &block_file_max_height_key(current_position.file_no),
-        &encode_block_file_max_height(800),
-    );
-    store.write(initial_batch)?;
-
+    let retention = Arc::new(RetentionRegistry::new());
     let mut prune_batch = store.new_batch();
-    let (block_outcome, undo_outcome, file_numbers) =
-        stage_block_and_undo_prune(&store, &mut prune_batch, &block_files, 1_000, 1_000, policy)?;
-    assert_eq!(block_outcome.blocks_removed, 2);
-    assert_eq!(block_outcome.bytes_freed, 32);
-    assert!(undo_outcome.is_empty());
-    assert_eq!(file_numbers, vec![first_old_position.file_no]);
-    assert!(store.get(BLOCK_DATA_CF, &first_old_key)?.is_some());
-    assert!(store.get(BLOCK_DATA_CF, &second_old_key)?.is_some());
+    let staged = stage_block_and_undo_prune(
+        &store,
+        &mut prune_batch,
+        &block_files,
+        1_000,
+        1_000,
+        policy,
+        &retention,
+    )?;
+    assert_eq!(staged.blocks.blocks_removed, 2);
+    assert_eq!(staged.blocks.bytes_freed, 32);
+    assert!(staged.undo.is_empty());
+    assert_eq!(staged.file_numbers, vec![old_rows[0].2.file_no]);
+    // Rows 1 and 2 delete, so the recorded line is one past the highest
+    // deleted row — not the 712 policy line the pass stopped far short of.
+    assert_eq!(staged.pruned_below, 3);
 
     store.write(prune_batch)?;
-    assert!(store.get(BLOCK_DATA_CF, &first_old_key)?.is_none());
-    assert!(store.get(BLOCK_DATA_CF, &second_old_key)?.is_none());
-    assert!(store.get(BLOCK_DATA_CF, &current_key)?.is_some());
-    assert!(
-        store
-            .get(
-                BLOCK_DATA_CF,
-                &block_file_max_height_key(first_old_position.file_no),
-            )?
-            .is_some()
-    );
-    assert!(block_files.file_path(first_old_position.file_no).exists());
+    assert!(!row_stored(&store, &first_old_key)?);
+    assert!(!row_stored(&store, &second_old_key)?);
+    assert!(row_stored(&store, &current_key)?);
+    assert!(block_files.file_path(old_rows[0].2.file_no).exists());
 
-    reclaim_staged_flat_block_files(&store, &block_files, &file_numbers)?;
-    assert!(
-        store
-            .get(
-                BLOCK_DATA_CF,
-                &block_file_max_height_key(first_old_position.file_no),
-            )?
-            .is_none()
-    );
-    assert!(!block_files.file_path(first_old_position.file_no).exists());
-    assert!(store.get(BLOCK_DATA_CF, &current_key)?.is_some());
-    assert!(
-        store
-            .get(
-                BLOCK_DATA_CF,
-                &block_file_max_height_key(current_position.file_no),
-            )?
-            .is_some()
-    );
+    reclaim_staged_flat_block_files(&store, &block_files, &staged.file_numbers)?;
+    assert!(!row_stored(
+        &store,
+        &block_file_max_height_key(old_rows[0].2.file_no)
+    )?);
+    assert!(!block_files.file_path(old_rows[0].2.file_no).exists());
+    assert!(row_stored(&store, &current_key)?);
+    assert!(row_stored(
+        &store,
+        &block_file_max_height_key(current.2.file_no)
+    )?);
     assert_eq!(
-        block_files.load(current_position, 800, *current_hash.as_byte_array())?,
+        block_files.load(current.2, current.0, *current.1.as_byte_array())?,
         Some(b"current body".to_vec())
     );
     Ok(())
@@ -142,32 +151,104 @@ fn target_pruning_deletes_old_indexes_in_the_current_flat_file()
     );
     store.write(initial_batch)?;
 
+    let retention = Arc::new(RetentionRegistry::new());
     let mut prune_batch = store.new_batch();
-    let (block_outcome, _undo_outcome, file_numbers) = stage_block_and_undo_prune(
+    let staged = stage_block_and_undo_prune(
         &store,
         &mut prune_batch,
         &block_files,
         1_000,
         1_000,
-        // Aggressive policy: prune everything below the requested height;
-        // retention_depth still floors at the 288-block reorg margin.
+        AGGRESSIVE,
+        &retention,
+    )?;
+    assert!(staged.file_numbers.is_empty());
+    assert_eq!(staged.blocks.blocks_removed, 1);
+    assert_eq!(staged.blocks.bytes_freed, 16);
+
+    store.write(prune_batch)?;
+    assert!(!row_stored(&store, &key)?);
+    assert!(block_files.file_path(position.file_no).exists());
+    assert!(row_stored(
+        &store,
+        &block_file_max_height_key(position.file_no)
+    )?);
+    Ok(())
+}
+
+#[test]
+fn retention_lease_stops_the_prune_line_at_its_floor() -> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::default();
+    let data_dir = tempdir()?;
+    let old_hash = fake_hash(1);
+    let leased_hash = fake_hash(2);
+    let block_files = FlatFileBlockStore::open(data_dir.path())?;
+    let old_position = block_files.append(1, *old_hash.as_byte_array(), b"old body")?;
+    let leased_position = block_files.append(2, *leased_hash.as_byte_array(), b"leased body")?;
+    let old_key = block_body_key(1, old_hash);
+    let leased_key = block_body_key(2, leased_hash);
+    let mut initial_batch = store.new_batch();
+    initial_batch.put(BLOCK_DATA_CF, &old_key, &old_position.encode());
+    initial_batch.put(BLOCK_DATA_CF, &leased_key, &leased_position.encode());
+    initial_batch.put(
+        BLOCK_DATA_CF,
+        &block_file_max_height_key(old_position.file_no),
+        &encode_block_file_max_height(2),
+    );
+    store.write(initial_batch)?;
+
+    let retention = Arc::new(RetentionRegistry::new());
+    let lease = retention.acquire(2)?;
+    assert_eq!(retention.retention_floor(), Some(2));
+
+    let mut leased_batch = store.new_batch();
+    let staged = stage_block_and_undo_prune(
+        &store,
+        &mut leased_batch,
+        &block_files,
+        1_000,
+        1_000,
         PrunePolicy {
             target_size_mb: 0,
             keep_below_tip: 0,
         },
+        &retention,
     )?;
-    assert!(file_numbers.is_empty());
-    assert_eq!(block_outcome.blocks_removed, 1);
-    assert_eq!(block_outcome.bytes_freed, 16);
+    // The policy line (1000 - 288) folds down to the lease floor, and the
+    // row at the floor survives; only strictly-below rows delete.
+    assert_eq!(staged.pruned_below, 2);
+    assert_eq!(staged.blocks.blocks_removed, 1);
+    store.write(leased_batch)?;
+    assert!(store.get(BLOCK_DATA_CF, &old_key)?.is_none());
+    assert!(store.get(BLOCK_DATA_CF, &leased_key)?.is_some());
 
-    store.write(prune_batch)?;
-    assert!(store.get(BLOCK_DATA_CF, &key)?.is_none());
-    assert!(block_files.file_path(position.file_no).exists());
-    assert!(
-        store
-            .get(BLOCK_DATA_CF, &block_file_max_height_key(position.file_no))?
-            .is_some()
-    );
+    // Releasing hands the authority back exactly once, so the next pass
+    // deletes through the policy line again.
+    lease.release();
+    assert_eq!(retention.retention_floor(), None);
+    let mut released_batch = store.new_batch();
+    let staged = stage_block_and_undo_prune(
+        &store,
+        &mut released_batch,
+        &block_files,
+        1_000,
+        1_000,
+        PrunePolicy {
+            target_size_mb: 0,
+            keep_below_tip: 0,
+        },
+        &retention,
+    )?;
+    assert_eq!(staged.pruned_below, 3);
+    store.write(released_batch)?;
+    assert!(store.get(BLOCK_DATA_CF, &leased_key)?.is_none());
+    // The recorded line is what later lease requests are bounded by: a
+    // floor the prune line already crossed is refused as gone.
+    retention.record_pruned_below(staged.pruned_below);
+    assert!(matches!(
+        retention.acquire(2),
+        Err(bitcoin_rs_storage::pruning::RetentionError::PrunedBelow { .. })
+    ));
     Ok(())
 }
 

@@ -144,6 +144,32 @@ pub enum ApplyError {
         /// Parent the connecting block names.
         prev: bitcoin_rs_primitives::Hash256,
     },
+    /// The committed-but-unpublished gap cannot be replayed from durable
+    /// facts, so startup must fail closed.
+    ///
+    /// A serviceable gap is an ancestor prefix: the head chain descends
+    /// block by block from the stored tip down to the restored tip, and
+    /// every body is still stored. Anything else — the head at or below the
+    /// restored tip, a gap wider than one commit group, a missing body, or
+    /// a side chain that does not root at the restored tip — is not a
+    /// publication lag, and replaying it would fabricate history. Recovery
+    /// is a rebuild from retained canonical data (`RCV-07`); no partial
+    /// success publishes.
+    #[error(
+        "committed gap from restored height {restored_height} to head height {head_height} cannot be replayed: {reason}"
+    )]
+    DurableHeadGapUnrecoverable {
+        /// Tip the stored head certifies.
+        head_tip: bitcoin_rs_primitives::Hash256,
+        /// Height the stored head certifies.
+        head_height: u32,
+        /// Tip the restored chainstate sits at.
+        restored_tip: bitcoin_rs_primitives::Hash256,
+        /// Height the restored chainstate sits at.
+        restored_height: u32,
+        /// Why the gap is not a replayable publication lag.
+        reason: &'static str,
+    },
     /// Rewinding the block-level coinstats failed.
     ///
     /// The per-coin fields ride the UTXO change listener and are already
