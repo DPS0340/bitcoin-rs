@@ -55,6 +55,13 @@ pub const DURABLE_HEAD_GROUP_MAX_BYTES: usize = 8 << 20;
 pub(super) enum PublishMode<'a> {
     Now,
     Grouped(&'a mut WindowGroup),
+    /// Crash-recovery replay of a block whose durable batch already
+    /// committed. The stored head receipt covers it, so nothing syncs and
+    /// nothing re-commits: replay rebuilds the derived state the crash
+    /// lost — coins, bookkeeping, journal tail — and publishes.
+    Replay {
+        commit_id: u64,
+    },
 }
 
 /// One staged block awaiting its group's durable commit.

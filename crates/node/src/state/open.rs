@@ -426,8 +426,10 @@ impl NodeState {
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
         // The durable head is the chain's commit point: an unreadable row
         // fails startup, and a committed-but-unpublished gap (crash between
-        // the head batch and publication) is surfaced here, counted, and
-        // left for recovery replay rather than silently adopted.
+        // the head batch and publication) is replayed here from the durable
+        // bodies it certified, so ordinary operation starts on a state the
+        // head fully names (#655). A gap that is not an ancestor prefix of
+        // stored bodies fails startup closed.
         crate::apply::reconcile_at_boot(&apply_handles).map_err(anyhow::Error::new)?;
         // A restored checkpoint is durable at its own height by definition, so
         // start there rather than at zero, which would refuse all undo pruning.

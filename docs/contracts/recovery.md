@@ -313,7 +313,20 @@ state is harmless and keeps the node operating until replay closes the gap.
 
 - `crates/node/src/apply/durable.rs` (existing): owns the durable-head
   advance for connect, group, and disconnect commits, the lineage fence, and
-  the boot reconciliation of the stored head.
+  the boot reconciliation of the stored head. `reconcile_at_boot` replays a
+  committed-but-unpublished gap from the durable bodies the stored head
+  chain names — bounded by one commit group, applied through the ordinary
+  commit path with the head suppressed (`PublishMode::Replay`), publishing
+  only the state the head already certifies — and fails startup closed on a
+  gap that is not an ancestor prefix of stored bodies (`RCV-02`, `RCV-04`).
+- `crates/node/src/state/tests/recovery.rs` (#655):
+  - `boot_replays_the_committed_gap_without_recommitting_the_head`,
+    `boot_replays_from_every_committed_ancestor`: restart on the gap left by
+    a lost publication lands exactly on the stored head with its
+    `commit_id` untouched, at every committed ancestor, and a second
+    restart replays nothing;
+  - `boot_refuses_a_gap_whose_body_is_gone`: a gap whose durable facts are
+    gone fails startup closed instead of publishing a fabricated history.
 - `crates/node/src/apply/connect.rs` and
   `crates/node/src/apply/disconnect.rs` (existing): run the `RCV-02` tail —
   sync, one atomic batch, derived journal emission, then publication — and
@@ -337,7 +350,10 @@ state is harmless and keeps the node operating until replay closes the gap.
 - `crates/utxo/tests/overhaul_persistent_coins.rs` (existing): covers the
   `RCV-04A` metadata-lock, cache-resident progress, re-entry, and durability-pin rules.
 - `crates/node/tests/overhaul_streaming_reorg.rs` (planned): covers
-  `RCV-05`, `RCV-08`, and bounded disconnect and reorg memory.
+  `RCV-05` and bounded disconnect and reorg memory; `RCV-08`'s bounded
+  descriptors and committed-ancestor restarts are proven by
+  `crates/node/src/reorg` (bounded stream windows, retention leases) and
+  the #655 boot-replay tests above.
 - `crates/node/tests/overhaul_checkpoint_independence.rs` (planned):
   validates fresh replay, schema refusal, and checkpoint authority removal.
 - `crates/storage/tests/overhaul_atomic_durability.rs` (existing): tests the

@@ -496,3 +496,203 @@ fn switch_to_branch_refuses_history_the_prune_line_crossed() -> anyhow::Result<(
     assert!(handles.lock_transition().is_ok());
     Ok(())
 }
+
+// -----------------------------------------------------------------------
+// #655: restart on a committed-but-unpublished gap replays the durable
+// head chain and never re-commits it.
+// -----------------------------------------------------------------------
+
+/// Applies the regtest genesis plus `heights` mined children, publishing a
+/// checkpoint after the first block so a later restore has a base under the
+/// journal. Returns the temp dir, the node, and a config for reopening.
+fn applied_regtest_chain(
+    heights: u32,
+) -> anyhow::Result<(tempfile::TempDir, NodeState, crate::NodeConfig)> {
+    let dir = tempfile::tempdir()?;
+    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+    config.data_dir = dir.path().join("node");
+    config.p2p.listen.clear();
+    let state = NodeState::open(config.clone(), None)?;
+    let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+    state.apply_block(&genesis)?;
+    let mut previous = genesis.block_hash();
+    let mut time = genesis.header.time;
+    for height in 1..=heights {
+        time += 1;
+        let block = mined_regtest_child_at(previous, time, height)?;
+        state.apply_block(&block)?;
+        previous = block.block_hash();
+        if height == 1 {
+            state.publish_checkpoint()?;
+        }
+    }
+    Ok((dir, state, config))
+}
+
+/// Rewinds only the publication tail of the last `count` applied blocks.
+///
+/// The durable head stays where it committed; the derived state returns to
+/// exactly what a crash between the batch and the publication leaves:
+/// journal rewound to the parent, applied tip on the parent, transaction
+/// count rewound.
+fn simulate_lost_publication(state: &NodeState, count: u32) -> anyhow::Result<()> {
+    for _ in 0..count {
+        let tip = state
+            .chainstate()
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| anyhow::anyhow!("no applied tip to rewind"))?;
+        let (parent_tip, grandparent_hash, parent_tx_count) = {
+            let tree = state.block_tree.read();
+            let node = tree.node(tip.tip_id)?;
+            let parent_id = node
+                .parent
+                .ok_or_else(|| anyhow::anyhow!("tip has no parent"))?;
+            let parent = tree.node(parent_id)?;
+            let grandparent_hash = match parent.parent {
+                Some(grandparent) => tree.node(grandparent)?.hash.to_le_bytes(),
+                None => [0_u8; 32],
+            };
+            let snapshot = bitcoin_rs_chain::TipSnapshot {
+                tip_id: parent_id,
+                height: parent.height,
+                chainwork: parent.chainwork,
+                hash: parent.hash,
+            };
+            (snapshot, grandparent_hash, parent.chain_tx_count)
+        };
+        if let Some(journal) = state.chainstate().journal.as_ref() {
+            journal.lock().rewind_to(
+                parent_tip.height,
+                parent_tip.hash.to_le_bytes(),
+                grandparent_hash,
+                parent_tx_count,
+            )?;
+        }
+        state
+            .chain_tx_count
+            .store(parent_tx_count, Ordering::Release);
+        state
+            .chainstate()
+            .applied_tip
+            .store(Some(std::sync::Arc::new(parent_tip)));
+    }
+    Ok(())
+}
+
+/// A restart on a committed-but-unpublished gap replays the durable head
+/// chain through the ordinary commit path, lands exactly on the stored
+/// head, keeps its `commit_id` untouched, and leaves a node that operates
+/// normally — including a second restart that finds nothing to replay.
+#[test]
+fn boot_replays_the_committed_gap_without_recommitting_the_head() -> anyhow::Result<()> {
+    let (_dir, state, config) = applied_regtest_chain(4)?;
+    let head = state
+        .chainstate()
+        .durable_head
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("applied chain must have a durable head"))?;
+    let config_head_tip = head.tip;
+    let config_head_commit = head.commit_id;
+
+    simulate_lost_publication(&state, 2)?;
+    drop(state);
+
+    let reopened = NodeState::open(config.clone(), None)?;
+    let landed = reopened
+        .chainstate()
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("replay must publish a tip"))?;
+    assert_eq!(landed.hash, config_head_tip);
+    assert_eq!(landed.height, 4);
+    let head = reopened
+        .chainstate()
+        .durable_head
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("head must survive the restart"))?;
+    assert_eq!(head.tip, config_head_tip);
+    assert_eq!(head.commit_id, config_head_commit);
+    assert!(matches!(
+        reopened.resume_source(),
+        ResumeSource::Journal | ResumeSource::Checkpoint
+    ));
+
+    // The replay caught the journal up: a second restart replays nothing
+    // and lands on the same head.
+    drop(reopened);
+    let second = NodeState::open(config, None)?;
+    let landed = second
+        .chainstate()
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("second boot must publish a tip"))?;
+    assert_eq!(landed.hash, config_head_tip);
+    assert_eq!(landed.height, 4);
+    Ok(())
+}
+
+/// Restart at each committed ancestor is valid: whatever prefix the
+/// crash-stranded publication represents, the replay lands on the head.
+#[test]
+fn boot_replays_from_every_committed_ancestor() -> anyhow::Result<()> {
+    for lost in 0..=2_u32 {
+        let (_dir, state, config) = applied_regtest_chain(4)?;
+        let head = state
+            .chainstate()
+            .durable_head
+            .load()?
+            .ok_or_else(|| anyhow::anyhow!("applied chain must have a durable head"))?;
+        simulate_lost_publication(&state, lost)?;
+        drop(state);
+
+        let reopened = NodeState::open(config, None)?;
+        let landed = reopened
+            .chainstate()
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| anyhow::anyhow!("replay must publish a tip"))?;
+        assert_eq!(landed.hash, head.tip, "lost {lost} publications");
+        assert_eq!(landed.height, head.height, "lost {lost} publications");
+    }
+    Ok(())
+}
+
+/// A gap whose durable facts are gone fails closed: the node refuses to
+/// start rather than publish a fabricated history (`RCV-07`).
+#[test]
+fn boot_refuses_a_gap_whose_body_is_gone() -> anyhow::Result<()> {
+    let (_dir, state, _config) = applied_regtest_chain(3)?;
+    let head = state
+        .chainstate()
+        .durable_head
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("applied chain must have a durable head"))?;
+    simulate_lost_publication(&state, 1)?;
+    // Replace the gap block's locator row with one naming bytes that do
+    // not exist: the body is durable-gone as far as replay can tell.
+    state.storage.write_test_rows(&[(
+        bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+        bitcoin_rs_storage::pruning::block_body_key(head.height, head.tip).to_vec(),
+        bitcoin_rs_storage::BlockFilePosition {
+            file_no: 99,
+            offset: 0,
+            len: 1,
+        }
+        .encode()
+        .to_vec(),
+    )])?;
+    let config = state.config.clone();
+    drop(state);
+
+    let opened = NodeState::open(config, None);
+    let error = opened
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("open must fail"))?;
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("cannot be replayed"),
+        "open must fail on the unrecoverable gap, not silently: {rendered}"
+    );
+    Ok(())
+}
