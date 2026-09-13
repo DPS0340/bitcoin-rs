@@ -258,7 +258,11 @@ struct ComponentSummary {
 /// Raw `EntryId`s are slot indices: a removal recycles the slot, and an id
 /// captured before the removal names whatever occupies it next. Handles are
 /// what cached graph state and tests resolve through; a stale handle
-/// resolves to `None` instead of the new resident.
+/// resolves to `None` instead of the new resident. The mutation paths never
+/// mint one — graph state is slot-parallel and unlinked symmetrically — so
+/// the type is constructed only by the test fixtures that pin the
+/// stale-reference contract.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EntryHandle {
     id: EntryId,
@@ -278,8 +282,13 @@ pub(crate) struct EntryArena {
     slots: Vec<EntrySlot>,
     /// Vacated slot indices, most recent last: the next `insert` reuses
     /// them, matching `Slab`'s vacancy stack.
-    free: Vec<u32>,
+    free: Vec<usize>,
     live: usize,
+}
+
+/// Slot index of an entry id, or `None` when the id cannot name a slot.
+fn slot_index(id: EntryId) -> Option<usize> {
+    usize::try_from(id).ok()
 }
 
 impl EntryArena {
@@ -299,12 +308,11 @@ impl EntryArena {
             entry,
         };
         if let Some(index) = self.free.pop() {
-            let slot = self
-                .slots
-                .get_mut(index as usize)
-                .expect("vacancy stack names a live slot");
+            let Some(slot) = self.slots.get_mut(index) else {
+                panic!("vacancy stack names a live slot");
+            };
             slot.live = Some(live);
-            return index as usize;
+            return index;
         }
         self.slots.push(EntrySlot {
             generation: 0,
@@ -313,13 +321,13 @@ impl EntryArena {
         self.slots.len() - 1
     }
 
-    fn remove(&mut self, index: usize) -> Option<RetiredEntry> {
+    fn remove(&mut self, id: EntryId) -> Option<RetiredEntry> {
+        let index = slot_index(id)?;
         let slot = self.slots.get_mut(index)?;
         let live = slot.live.take()?;
         slot.generation = slot.generation.wrapping_add(1);
         self.live -= 1;
-        self.free
-            .push(u32::try_from(index).expect("slots never exceed the u32 entry-id space"));
+        self.free.push(index);
         Some(RetiredEntry {
             entry: live.entry,
             component: live.component,
@@ -327,24 +335,29 @@ impl EntryArena {
         })
     }
 
-    fn get(&self, index: usize) -> Option<&MempoolEntry> {
-        self.slots.get(index)?.entry()
+    fn get(&self, id: EntryId) -> Option<&MempoolEntry> {
+        self.slots.get(slot_index(id)?)?.entry()
     }
 
-    fn get_mut(&mut self, index: usize) -> Option<&mut MempoolEntry> {
-        self.slots.get_mut(index)?.entry_mut()
+    fn get_mut(&mut self, id: EntryId) -> Option<&mut MempoolEntry> {
+        self.slots.get_mut(slot_index(id)?)?.entry_mut()
     }
 
-    fn slot(&self, index: usize) -> Option<&LiveEntry> {
-        self.slots.get(index)?.live.as_ref()
+    fn slot(&self, id: EntryId) -> Option<&LiveEntry> {
+        self.slots.get(slot_index(id)?)?.live.as_ref()
     }
 
-    fn slot_mut(&mut self, index: usize) -> Option<&mut LiveEntry> {
-        self.slots.get_mut(index)?.live.as_mut()
+    fn slot_mut(&mut self, id: EntryId) -> Option<&mut LiveEntry> {
+        self.slots.get_mut(slot_index(id)?)?.live.as_mut()
     }
 
-    fn contains(&self, index: usize) -> bool {
-        self.slots.get(index).is_some_and(|slot| slot.live.is_some())
+    fn contains(&self, id: EntryId) -> bool {
+        let Some(index) = slot_index(id) else {
+            return false;
+        };
+        self.slots
+            .get(index)
+            .is_some_and(|slot| slot.live.is_some())
     }
 
     fn len(&self) -> usize {
@@ -362,9 +375,7 @@ impl EntryArena {
 
     /// The index the next `insert` will occupy.
     fn vacant_key(&self) -> usize {
-        self.free
-            .last()
-            .map_or(self.slots.len(), |&index| index as usize)
+        self.free.last().map_or(self.slots.len(), |&index| index)
     }
 
     fn clear(&mut self) {
@@ -373,9 +384,7 @@ impl EntryArena {
             slot.generation = slot.generation.wrapping_add(1);
         }
         self.free.clear();
-        self.free.extend((0..self.slots.len()).rev().map(|index| {
-            u32::try_from(index).expect("slots never exceed the u32 entry-id space")
-        }));
+        self.free.extend((0..self.slots.len()).rev());
         self.live = 0;
     }
 
@@ -392,17 +401,19 @@ impl EntryArena {
             .filter_map(|slot| slot.live.as_ref().map(|live| &live.links))
     }
 
-    fn handle_at(&self, index: usize) -> Option<EntryHandle> {
-        let slot = self.slots.get(index)?;
+    #[allow(dead_code)]
+    fn handle_at(&self, id: EntryId) -> Option<EntryHandle> {
+        let slot = self.slots.get(slot_index(id)?)?;
         slot.live.as_ref()?;
         Some(EntryHandle {
-            id: EntryId::try_from(index).ok()?,
+            id,
             generation: slot.generation,
         })
     }
 
+    #[allow(dead_code)]
     fn resolve(&self, handle: EntryHandle) -> Option<&MempoolEntry> {
-        let slot = self.slots.get(handle.id as usize)?;
+        let slot = self.slots.get(slot_index(handle.id)?)?;
         if slot.generation != handle.generation {
             return None;
         }
@@ -428,35 +439,34 @@ impl VisitSet {
     }
 
     fn test(&self, id: EntryId) -> bool {
-        let index = id as usize / 64;
-        let Some(&word) = self.words.get(index) else {
+        let Some(index) = slot_index(id) else {
             return false;
         };
-        word & (1_u64 << (id as usize % 64)) != 0
+        let Some(&word) = self.words.get(index / 64) else {
+            return false;
+        };
+        word & (1_u64 << (index % 64)) != 0
     }
 
     /// Returns whether the set did not already hold `id`.
     fn insert(&mut self, id: EntryId) -> bool {
-        let index = id as usize / 64;
-        if index >= self.words.len() {
-            self.words.resize(index + 1, 0);
+        let Some(index) = slot_index(id) else {
+            return false;
+        };
+        if index / 64 >= self.words.len() {
+            self.words.resize(index / 64 + 1, 0);
         }
-        let bit = 1_u64 << (id as usize % 64);
-        if self.words[index] & bit != 0 {
+        let bit = 1_u64 << (index % 64);
+        if self.words[index / 64] & bit != 0 {
             return false;
         }
-        self.words[index] |= bit;
+        self.words[index / 64] |= bit;
         self.members.push(id);
         true
     }
 
     fn members(&self) -> &[EntryId] {
         &self.members
-    }
-
-    fn clear(&mut self) {
-        self.words.clear();
-        self.members.clear();
     }
 }
 
@@ -757,7 +767,7 @@ impl Mempool {
             panic!("validate_insert accepted an entry id that does not fit u32");
         };
         for parent in &parents {
-            if let Some(slot) = self.entries.slot_mut(*parent as usize) {
+            if let Some(slot) = self.entries.slot_mut(*parent) {
                 // Slot ids are recycled, so a new id can be smaller than the
                 // ones already linked: insert at the sorted position instead
                 // of appending.
@@ -770,7 +780,7 @@ impl Mempool {
             }
         }
         for child in &children {
-            if let Some(slot) = self.entries.slot_mut(*child as usize) {
+            if let Some(slot) = self.entries.slot_mut(*child) {
                 let position = slot
                     .links
                     .parents
@@ -779,11 +789,8 @@ impl Mempool {
                 slot.links.parents.insert(position, id);
             }
         }
-        if let Some(slot) = self.entries.slot_mut(index) {
-            slot.links = GraphLinks {
-                parents,
-                children,
-            };
+        if let Some(slot) = self.entries.slot_mut(id) {
+            slot.links = GraphLinks { parents, children };
         }
         self.total_vsize = self.total_vsize.saturating_add(added_vsize);
         self.total_fee += u128::from(added_fee);
@@ -889,8 +896,7 @@ impl Mempool {
             }
             merged.push(neighbour_component);
             let absorbed = self
-                .components
-                .get(neighbour_component as usize)
+                .component_summary(neighbour_component)
                 .copied()
                 .unwrap_or_default();
             summary.member_count = summary.member_count.saturating_add(absorbed.member_count);
@@ -903,46 +909,54 @@ impl Mempool {
             let mut members = Vec::new();
             self.collect_component_members(neighbour, &mut visited, &mut members);
             for member in &members {
-                if let Some(slot) = self.entries.slot_mut(*member as usize) {
+                if let Some(slot) = self.entries.slot_mut(*member) {
                     slot.component = base_component;
                 }
             }
-            let vacated = self
-                .components
-                .get_mut(neighbour_component as usize)
-                .expect("component ids name live summaries");
-            *vacated = ComponentSummary::default();
+            if let Some(vacated) = self.component_summary_mut(neighbour_component) {
+                *vacated = ComponentSummary::default();
+            }
             self.free_component(neighbour_component);
         }
         let component = base.unwrap_or_else(|| self.alloc_component());
-        let slot = self
-            .components
-            .get_mut(component as usize)
-            .expect("component ids name live summaries");
-        *slot = summary;
+        if let Some(slot) = self.component_summary_mut(component) {
+            *slot = summary;
+        }
         component
     }
 
     /// Component id of a live entry, or `None` when the id is vacant.
     fn component_id(&self, id: EntryId) -> Option<u32> {
-        let index = usize::try_from(id).ok()?;
-        Some(self.entries.slot(index)?.component)
+        Some(self.entries.slot(id)?.component)
+    }
+
+    /// Cached summary of one component id.
+    fn component_summary(&self, component: u32) -> Option<&ComponentSummary> {
+        self.components.get(usize::try_from(component).ok()?)
+    }
+
+    /// Mutable variant of [`Self::component_summary`].
+    fn component_summary_mut(&mut self, component: u32) -> Option<&mut ComponentSummary> {
+        self.components.get_mut(usize::try_from(component).ok()?)
     }
 
     /// Mints a component id, recycling a freed one when available.
     fn alloc_component(&mut self) -> u32 {
         self.free_components.pop().unwrap_or_else(|| {
             self.components.push(ComponentSummary::default());
-            u32::try_from(self.components.len() - 1)
-                .expect("component count is bounded by the u32 entry-id space")
+            let id = u32::try_from(self.components.len() - 1);
+            match id {
+                Ok(id) => id,
+                // Component ids index the u32 entry-id space by construction.
+                Err(error) => panic!("component count exceeds the u32 entry-id space: {error}"),
+            }
         })
     }
 
     /// Returns a component id to the free list. Its summary must be zero.
     fn free_component(&mut self, component: u32) {
         debug_assert!(
-            self.components
-                .get(component as usize)
+            self.component_summary(component)
                 .is_some_and(|summary| *summary == ComponentSummary::default()),
             "freed a component that still reports members"
         );
@@ -979,8 +993,7 @@ impl Mempool {
 
     /// Parent and child links of a live entry.
     fn links(&self, id: EntryId) -> Option<&GraphLinks> {
-        let index = usize::try_from(id).ok()?;
-        Some(&self.entries.slot(index)?.links)
+        Some(&self.entries.slot(id)?.links)
     }
 
     /// Returns the number of transactions in the mempool.
@@ -1341,9 +1354,7 @@ impl Mempool {
     /// Returns an entry by public id.
     #[must_use]
     pub fn entry(&self, id: EntryId) -> Option<&MempoolEntry> {
-        usize::try_from(id)
-            .ok()
-            .and_then(|index| self.entries.get(index))
+        self.entries.get(id)
     }
 
     /// Walks every live entry in slab order.
@@ -1368,11 +1379,7 @@ impl Mempool {
                 Bound::Included((script_hash, 0)),
                 Bound::Included((script_hash, u32::MAX)),
             ))
-            .filter_map(move |(_, id)| {
-                usize::try_from(*id)
-                    .ok()
-                    .and_then(|index| entries.get(index))
-            })
+            .filter_map(move |(_, id)| entries.get(*id))
     }
 
     /// Returns whether any in-pool transaction has `wtxid`.
@@ -1769,23 +1776,17 @@ impl Mempool {
         let mut survivor_seeds: Vec<EntryId> = Vec::new();
         let mut seen_seeds = VisitSet::new();
         for (id, reason) in removals {
-            let Some(index) = usize::try_from(*id).ok() else {
-                continue;
-            };
-            if !self.entries.contains(index) {
+            if !self.entries.contains(*id) {
                 continue;
             }
-            let Some(retired) = self.entries.remove(index) else {
+            let Some(retired) = self.entries.remove(*id) else {
                 continue;
             };
             let entry = retired.entry;
             // The component shrinks by exactly this member; the survivors may
             // still be one component, or several, and that is settled once
             // every removal has been applied.
-            if let Some(summary) = self
-                .components
-                .get_mut(retired.component as usize)
-            {
+            if let Some(summary) = self.component_summary_mut(retired.component) {
                 summary.member_count = summary.member_count.saturating_sub(1);
                 summary.vsize = summary.vsize.saturating_sub(u64::from(entry.vsize));
                 if !dirty_components.contains(&retired.component) {
@@ -1794,7 +1795,7 @@ impl Mempool {
             }
             // Unlink symmetrically: a link never names a removed entry.
             for parent in &retired.links.parents {
-                if let Some(slot) = self.entries.slot_mut(*parent as usize) {
+                if let Some(slot) = self.entries.slot_mut(*parent) {
                     slot.links.children.retain(|child| child != id);
                 }
                 if seen_seeds.insert(*parent) {
@@ -1802,7 +1803,7 @@ impl Mempool {
                 }
             }
             for child in &retired.links.children {
-                if let Some(slot) = self.entries.slot_mut(*child as usize) {
+                if let Some(slot) = self.entries.slot_mut(*child) {
                     slot.links.parents.retain(|parent| parent != id);
                 }
                 if seen_seeds.insert(*child) {
@@ -1877,7 +1878,7 @@ impl Mempool {
     fn recompute_dirty_components(&mut self, seeds: &[EntryId], dirty: &[u32]) {
         let mut visited = VisitSet::new();
         for component in dirty {
-            let Some(summary) = self.components.get_mut(*component as usize) else {
+            let Some(summary) = self.component_summary_mut(*component) else {
                 continue;
             };
             if summary.member_count == 0 {
@@ -1887,7 +1888,7 @@ impl Mempool {
             *summary = ComponentSummary::default();
             let mut relabelled = false;
             for seed in seeds {
-                if !self.entries.contains(*seed as usize)
+                if !self.entries.contains(*seed)
                     || self.component_id(*seed) != Some(*component)
                     || visited.test(*seed)
                 {
@@ -1902,7 +1903,7 @@ impl Mempool {
                     *component
                 };
                 for member in &members {
-                    if let Some(slot) = self.entries.slot_mut(*member as usize) {
+                    if let Some(slot) = self.entries.slot_mut(*member) {
                         slot.component = target;
                     }
                 }
@@ -1910,11 +1911,12 @@ impl Mempool {
                     member_count: u32::try_from(members.len()).unwrap_or(u32::MAX),
                     vsize: members.iter().fold(0_u64, |total, member| {
                         total.saturating_add(
-                            self.entry(*member).map_or(0, |entry| u64::from(entry.vsize)),
+                            self.entry(*member)
+                                .map_or(0, |entry| u64::from(entry.vsize)),
                         )
                     }),
                 };
-                if let Some(slot) = self.components.get_mut(target as usize) {
+                if let Some(slot) = self.component_summary_mut(target) {
                     *slot = rebuilt;
                 }
             }
@@ -2251,7 +2253,7 @@ impl Mempool {
         vsize: u32,
         excluded: &HashSet<EntryId>,
     ) -> Result<(), PolicyError> {
-        let verdict = if excluded.is_empty() {
+        if excluded.is_empty() {
             let cached = self.check_cluster_limits_cached(tx, vsize);
             // The cache and the walk must agree while nothing is excluded;
             // running both under debug keeps a drift loud instead of latent.
@@ -2262,18 +2264,14 @@ impl Mempool {
             cached
         } else {
             self.check_cluster_limits_by_walk(tx, vsize, excluded)
-        };
-        verdict
+        }
     }
 
     /// The component-cache path: two numbers per joined component.
     fn check_cluster_limits_cached(&self, tx: &Tx, vsize: u32) -> Result<(), PolicyError> {
         let txid = tx.txid();
         let parents = self.in_pool_parents(tx);
-        let neighbours = parents
-            .iter()
-            .copied()
-            .chain(self.in_pool_children(txid));
+        let neighbours = parents.iter().copied().chain(self.in_pool_children(txid));
         let mut count = 1_u32;
         let mut total = u64::from(vsize);
         let mut merged: Vec<u32> = Vec::new();
@@ -2286,8 +2284,7 @@ impl Mempool {
             }
             merged.push(component);
             let summary = self
-                .components
-                .get(component as usize)
+                .component_summary(component)
                 .copied()
                 .unwrap_or_default();
             count = count.saturating_add(summary.member_count);
@@ -2401,14 +2398,6 @@ impl Mempool {
         }
     }
 
-    /// In-pool children of `id`: the cached link list, sorted and
-    /// deduplicated by construction.
-    fn child_ids(&self, id: EntryId) -> Vec<EntryId> {
-        self.links(id)
-            .map_or_else(Vec::new, |links| links.children.clone())
-    }
-
-
     /// Returns the txids of in-pool transactions whose inputs reference `id`,
     /// in `EntryId` order and deduplicated.
     ///
@@ -2481,9 +2470,7 @@ impl Mempool {
     }
 
     fn entry_mut(&mut self, id: EntryId) -> Option<&mut MempoolEntry> {
-        usize::try_from(id)
-            .ok()
-            .and_then(|index| self.entries.get_mut(index))
+        self.entries.get_mut(id)
     }
 
     fn entry_signals_rbf(&self, id: EntryId) -> bool {
@@ -4740,8 +4727,8 @@ mod spend_index_tests {
         let Some(root_id) = pool.entry_id_by_txid(&root_txid) else {
             panic!("fixture root is missing");
         };
-        for child in pool.child_ids(root_id) {
-            if !pool.child_ids(child).is_empty()
+        for child in pool.links(root_id).expect("pooled").children.clone() {
+            if !pool.links(child).expect("pooled").children.is_empty()
                 && let Some(entry) = pool.entry(child)
             {
                 return entry.txid;
@@ -5463,7 +5450,8 @@ mod graph_tests {
 
         fn below(&mut self, bound: usize) -> usize {
             // Truncation is wanted: fixture fuzzing, not cryptography.
-            (self.next() % bound as u64) as usize
+            let bound = u64::try_from(bound).unwrap_or(u64::MAX);
+            usize::try_from(self.next() % bound).unwrap_or(0)
         }
     }
 
@@ -5585,16 +5573,23 @@ mod graph_tests {
 
         // Each cached summary equals its members' enumeration.
         for (component, members) in &by_component {
-            let summary = &pool.components[*component as usize];
+            let summary = pool
+                .component_summary(*component)
+                .expect("component id names a live summary");
             let vsize = members.iter().fold(0_u64, |total, member| {
-                total
-                    .saturating_add(pool.entry(*member).map_or(0, |entry| u64::from(entry.vsize)))
+                total.saturating_add(
+                    pool.entry(*member)
+                        .map_or(0, |entry| u64::from(entry.vsize)),
+                )
             });
             assert_eq!(
                 summary.member_count,
                 u32::try_from(members.len()).unwrap_or(u32::MAX)
             );
-            assert_eq!(summary.vsize, vsize, "summary vsize for component {component}");
+            assert_eq!(
+                summary.vsize, vsize,
+                "summary vsize for component {component}"
+            );
         }
 
         // Links are symmetric, sorted, deduplicated, and live.
@@ -5604,15 +5599,19 @@ mod graph_tests {
             let mut sorted_parents = links.parents.clone();
             sorted_parents.sort_unstable();
             sorted_parents.dedup();
-            assert_eq!(sorted_parents, links.parents, "parents of {id} sorted+dedup");
+            assert_eq!(
+                sorted_parents, links.parents,
+                "parents of {id} sorted+dedup"
+            );
             let mut sorted_children = links.children.clone();
             sorted_children.sort_unstable();
             sorted_children.dedup();
-            assert_eq!(sorted_children, links.children, "children of {id} sorted+dedup");
+            assert_eq!(
+                sorted_children, links.children,
+                "children of {id} sorted+dedup"
+            );
             for parent in &links.parents {
-                let back = pool
-                    .links(*parent)
-                    .expect("parent link names a live entry");
+                let back = pool.links(*parent).expect("parent link names a live entry");
                 assert!(back.children.contains(&id), "link symmetry for {id}");
             }
             for child in &links.children {
@@ -5658,7 +5657,11 @@ mod graph_tests {
             &mut changes,
         );
         assert_graph_exact(&pool);
-        assert_eq!(reference_components(&pool).len(), 2, "bridge removal splits");
+        assert_eq!(
+            reference_components(&pool).len(),
+            2,
+            "bridge removal splits"
+        );
     }
 
     #[test]
@@ -5666,7 +5669,7 @@ mod graph_tests {
         let mut pool = fuzzer_pool();
         let first = insert_ok(&mut pool, 1, &[], 100);
         let first_id = pool.entry_id_by_txid(&first).expect("pooled");
-        let handle = pool.entries.handle_at(first_id as usize).expect("live slot");
+        let handle = pool.entries.handle_at(first_id).expect("live slot");
         assert!(pool.entries.resolve(handle).is_some());
 
         let mut changes = Vec::new();
@@ -5693,7 +5696,11 @@ mod graph_tests {
         let first = insert_ok(&mut pool, 1, &[], 100);
         let wtxid = pool.entry_by_txid(&first).map(|entry| entry.wtxid);
         assert!(pool.contains_wtxid(&wtxid.expect("pooled")));
-        assert_eq!(pool.entry_by_wtxid(&wtxid.expect("pooled")).map(|entry| entry.txid), Some(first));
+        assert_eq!(
+            pool.entry_by_wtxid(&wtxid.expect("pooled"))
+                .map(|entry| entry.txid),
+            Some(first)
+        );
 
         let first_id = pool.entry_id_by_txid(&first).expect("pooled");
         let mut changes = Vec::new();
@@ -5729,11 +5736,7 @@ mod graph_tests {
         // The cached summaries answer before anything commits.
         // b's and d's outputs are the unspent ones; spending them joins both
         // 2-member clusters plus the candidate.
-        let joiner = graph_tx(
-            5,
-            &[OutPoint::new(b, 0), OutPoint::new(d, 0)],
-            false,
-        );
+        let joiner = graph_tx(5, &[OutPoint::new(b, 0), OutPoint::new(d, 0)], false);
         let entry = MempoolEntry::new(Arc::new(joiner.clone()), 100, 1_000, TIME, HEIGHT);
         let error = pool
             .insert_entry(entry)
@@ -5784,10 +5787,7 @@ mod graph_tests {
         // Removing the sink cuts the diamond from the tail.
         let sink_id = pool.entry_id_by_txid(&sink).expect("pooled");
         let mut changes = Vec::new();
-        pool.remove_entries_with_reasons(
-            &[(sink_id, RemovalReason::PolicyEviction)],
-            &mut changes,
-        );
+        pool.remove_entries_with_reasons(&[(sink_id, RemovalReason::PolicyEviction)], &mut changes);
         assert_graph_exact(&pool);
         let parts = reference_components(&pool);
         assert_eq!(parts.len(), 2, "the sink held the two halves: {parts:?}");
@@ -5795,7 +5795,7 @@ mod graph_tests {
 
         // Cousins survive: root still has both siblings.
         let root_id = pool.entry_id_by_txid(&root).expect("pooled");
-        assert_eq!(pool.child_ids(root_id).len(), 2);
+        assert_eq!(pool.links(root_id).expect("pooled").children.len(), 2);
         let _ = end;
     }
 
@@ -5868,20 +5868,27 @@ mod graph_tests {
     ) -> Option<Txid> {
         let tx = graph_tx(nonce, inputs, false);
         let txid = tx.txid();
-        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(tx.clone()), vsize, 1_000, TIME, HEIGHT));
+        let outcome = pool.insert_entry(MempoolEntry::new(
+            Arc::new(tx.clone()),
+            vsize,
+            1_000,
+            TIME,
+            HEIGHT,
+        ));
         let outcome = outcome.ok()?;
         if !matches!(outcome, crate::mutation::InsertionOutcome::Accepted(_)) {
             return None;
         }
         txs.push(tx);
         let id = pool.entry_id_by_txid(&txid)?;
-        history.push((pool.entries.handle_at(id as usize)?, txid));
+        history.push((pool.entries.handle_at(id)?, txid));
         Some(txid)
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn random_mutations_leave_graph_semantics_exact() {
-        for seed in [0x5EED_u64, 0xC0FFEE, 0xB105] {
+        for seed in [0x5EED_u64, 0xC0_FFEE, 0xB1_05] {
             let mut pool = fuzzer_pool();
             let mut rng = XorShift::new(seed);
             let mut nonce = 0_u32;
@@ -5909,7 +5916,14 @@ mod graph_tests {
                             .map(|txid| OutPoint::new(*txid, 0))
                             .collect();
                         let vsize = 100 + u32::try_from(rng.below(5) * 10).unwrap_or(100);
-                        try_insert_tracked(&mut pool, &mut txs, &mut history, nonce, &picked, vsize);
+                        try_insert_tracked(
+                            &mut pool,
+                            &mut txs,
+                            &mut history,
+                            nonce,
+                            &picked,
+                            vsize,
+                        );
                         nonce += 1;
                     }
                     5 => {
@@ -5934,8 +5948,7 @@ mod graph_tests {
                             .map(|_| txs[rng.below(txs.len())].clone())
                             .collect::<Vec<_>>();
                         let confirmed_refs: Vec<&Tx> = confirmed.iter().collect();
-                        let confirmed_ids: Vec<Txid> =
-                            confirmed.iter().map(|tx| tx.txid()).collect();
+                        let confirmed_ids: Vec<Txid> = confirmed.iter().map(Tx::txid).collect();
                         let _ = pool.remove_for_block(&confirmed_refs, &confirmed_ids, HEIGHT + 1);
                     }
                     8 if !live.is_empty() => {
@@ -5957,7 +5970,8 @@ mod graph_tests {
                         }
                         let excluded: HashSet<EntryId> = evicted.iter().copied().collect();
                         let fee = 2_000 + u64::try_from(rng.below(1_000)).unwrap_or(0);
-                        let entry = MempoolEntry::new(Arc::new(candidate.clone()), 100, fee, TIME, HEIGHT);
+                        let entry =
+                            MempoolEntry::new(Arc::new(candidate.clone()), 100, fee, TIME, HEIGHT);
                         let Ok(prepared) = pool.validate_insert(entry, &excluded) else {
                             continue;
                         };
@@ -5970,7 +5984,7 @@ mod graph_tests {
                         let _committed = pool.commit_insert(prepared);
                         if let Some(id) = pool.entry_id_by_txid(&candidate.txid()) {
                             history.push((
-                                pool.entries.handle_at(id as usize).expect("live slot"),
+                                pool.entries.handle_at(id).expect("live slot"),
                                 candidate.txid(),
                             ));
                         }
@@ -6002,4 +6016,3 @@ mod graph_tests {
         }
     }
 }
-
