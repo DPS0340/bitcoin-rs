@@ -18,9 +18,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::checkpoint::publisher::CheckpointPublisher;
 use crate::checkpoint::CheckpointError;
 use crate::checkpoint::CheckpointWrite;
+use crate::checkpoint::publisher::CheckpointPublisher;
 /// Poll interval for the maintenance loop. Short enough to flush soon after
 /// a journal boundary passes and to drain retention pressure soon after it
 /// appears; long enough to avoid busy-waiting.
@@ -70,7 +70,9 @@ fn maintenance_loop(publisher: &CheckpointPublisher, shutdown: &AtomicBool) {
             continue;
         }
         if !prev_pressure {
-            tracing::info!("journal retention pressure; draining it through a checkpoint publication");
+            tracing::info!(
+                "journal retention pressure; draining it through a checkpoint publication"
+            );
             prev_pressure = true;
         }
         match publisher.publish() {

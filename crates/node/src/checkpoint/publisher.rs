@@ -54,7 +54,6 @@ fn retire_full_revalidation_marker(data_dir: &std::path::Path) -> Result<(), Che
     })
 }
 
-
 /// All the shared handles needed to publish a checkpoint from a background
 /// thread, without holding a reference to [`crate::state::NodeState`].
 ///
@@ -82,7 +81,6 @@ pub(crate) struct CheckpointPublisher {
 }
 
 impl CheckpointPublisher {
-
     /// Publishes a durable checkpoint, mirroring
     /// [`crate::state::NodeState::write_clean_checkpoint`].
     ///
