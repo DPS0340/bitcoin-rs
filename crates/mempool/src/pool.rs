@@ -1384,7 +1384,7 @@ impl Mempool {
 
     /// Returns whether any in-pool transaction has `wtxid`.
     ///
-    /// Linear in pool size: the pool indexes txids, not witness ids.
+    /// Indexed by `by_wtxid`; O(1) lookup.
     #[must_use]
     pub fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
         self.by_wtxid.contains_key(wtxid)
@@ -1392,7 +1392,7 @@ impl Mempool {
 
     /// Returns the in-pool entry for `wtxid`, or `None` if none matches.
     ///
-    /// Linear in pool size: the pool indexes txids, not witness ids.
+    /// Indexed by `by_wtxid`; O(1) lookup.
     #[must_use]
     pub fn entry_by_wtxid(&self, wtxid: &Wtxid) -> Option<&MempoolEntry> {
         let id = *self.by_wtxid.get(wtxid)?;
