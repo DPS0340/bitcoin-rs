@@ -46,7 +46,6 @@ pub use policy::PrunePolicy;
 pub use undo_pruner::{UndoPruner, block_undo_key};
 
 use crate::{StorageError, WriteBatch as _};
-use alloc::vec::Vec;
 use thiserror::Error;
 
 /// What one pruning pass staged for its caller's atomic batch.
@@ -63,7 +62,10 @@ pub struct StagedPrune {
     pub undo: PruneOutcome,
     /// Flat block files to reclaim after the batch commits.
     pub file_numbers: Vec<u32>,
-    /// Heights strictly below this line were staged for deletion.
+    /// One past the highest deleted row height; zero when the pass staged
+    /// nothing. This is the value to record through
+    /// [`RetentionRegistry::record_pruned_below`]: floors at or below it
+    /// may name deleted rows, floors above it name rows the pass left.
     pub pruned_below: u32,
 }
 
@@ -81,8 +83,10 @@ pub struct StagedPrune {
 /// from disconnecting its own tip.
 ///
 /// The pass never deletes rows pinned by a live [`RetentionLease`]: the
-/// policy line is folded with [`RetentionRegistry::retention_floor`], and
-/// the resulting line comes back as [`StagedPrune::pruned_below`].
+/// policy line is folded with [`RetentionRegistry::retention_floor`]. The
+/// line reported in [`StagedPrune::pruned_below`] is one past the highest
+/// row the pass actually staged — a byte target that stops early, or one
+/// already met, leaves nothing to record.
 pub fn stage_block_and_undo_prune<S: crate::KvStore>(
     store: &S,
     batch: &mut S::WriteBatch,
@@ -101,9 +105,9 @@ pub fn stage_block_and_undo_prune<S: crate::KvStore>(
     // The retention floor binds before the byte target does: a lease holder
     // proved it needs rows at or above its floor, so the line stops there
     // even when the pass could free more below it.
-    let pruned_below = policy_line.min(retention.retention_floor().unwrap_or(u32::MAX));
+    let prune_line = policy_line.min(retention.retention_floor().unwrap_or(u32::MAX));
     let (blocks, file_numbers) =
-        block_pruner::stage_flat_block_file_prune(store, batch, block_files, pruned_below, policy)?;
+        block_pruner::stage_flat_block_file_prune(store, batch, block_files, prune_line, policy)?;
     let undo = block_pruner::prune_prefixed_rows_into_batch(
         store,
         batch,
@@ -112,10 +116,14 @@ pub fn stage_block_and_undo_prune<S: crate::KvStore>(
         // The lease-clamped line, not a fresh derivation: the whole pass
         // must delete through one line, or a lease would hold block bodies
         // while their undo records delete around them (or the reverse).
-        pruned_below,
+        prune_line,
         policy,
     )?;
 
+    let pruned_below = blocks
+        .max_height
+        .max(undo.max_height)
+        .map_or(0, |height| height.saturating_add(1));
     Ok(StagedPrune {
         blocks,
         undo,
@@ -157,13 +165,19 @@ pub struct PruneOutcome {
     pub bytes_freed: u64,
     /// Number of block or undo rows deleted from storage.
     pub blocks_removed: u64,
+    /// Highest row height the pass staged for deletion, if any. A pass
+    /// whose byte target is met stops above rows it leaves behind, so
+    /// this — not the requested line — is what a completed pass may claim
+    /// as gone.
+    pub max_height: Option<u32>,
 }
 
 impl PruneOutcome {
     /// Adds one deleted row to the outcome.
-    pub(crate) const fn record_removed(&mut self, bytes: u64) {
+    pub(crate) fn record_removed(&mut self, bytes: u64, height: u32) {
         self.bytes_freed = self.bytes_freed.saturating_add(bytes);
         self.blocks_removed = self.blocks_removed.saturating_add(1);
+        self.max_height = Some(self.max_height.map_or(height, |seen| seen.max(height)));
     }
 
     /// Returns true when no rows were deleted.

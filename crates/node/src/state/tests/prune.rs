@@ -223,6 +223,85 @@ fn prune_service_deletes_seeded_storage_rows_and_advances_pruneheight() -> anyho
     Ok(())
 }
 
+/// A live retention lease clamps the manual prune line: rows the lease
+/// pins survive a prune that would otherwise delete them, the recorded
+/// line only names what actually went, a floor the line crossed is
+/// refused as gone, and releasing the lease hands the authority back
+/// exactly once (`RCV-08`, #655).
+#[test]
+fn prune_service_respects_an_active_retention_lease() -> anyhow::Result<()> {
+    fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
+        let byte =
+            u8::try_from(height).map_err(|_| anyhow::anyhow!("test height {height} exceeds u8"))?;
+        Ok(bitcoin_rs_primitives::Hash256::from_le_bytes(&[byte; 32]))
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+    config.data_dir = dir.path().join("node");
+    config.p2p.listen.clear();
+    config.storage.prune_target_mb = 1;
+    let state = NodeState::open(config, None)?;
+    publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+
+    for height in 10_u32..=12 {
+        let row = hash(height)?;
+        state
+            .block_body_store
+            .persist_block_body(height, row, b"block-body")?;
+        state
+            .chainstate()
+            .undo_store
+            .persist_undo(height, row, b"undo-body")?;
+        state.blocks.write().push(BlockRecord {
+            hash: BlockHash::from(row),
+            height,
+            body_size: 1,
+            header: None,
+            tx_count: 0,
+            time: 0,
+        });
+    }
+    state
+        .durable_tip_height
+        .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
+
+    let retention = std::sync::Arc::clone(&state.chainstate().retention);
+    // The policy line for this tip is height 11; a lease at 10 binds below
+    // it, so nothing the fixture seeded may delete.
+    let lease = retention.acquire(10)?;
+    let Some(service) = state.prune_service() else {
+        anyhow::bail!("prune service should exist when prune_target_mb > 0");
+    };
+
+    let pinned = service
+        .prune_to_height(11)
+        .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
+    assert_eq!(pinned.block_rows_removed, 0);
+    assert_eq!(pinned.undo_rows_removed, 0);
+    assert!(state.storage.stored_prune_body(10, hash(10)?)?.is_some());
+    // Nothing was deleted, so nothing may be recorded as gone: a floor
+    // below the pinned line stays grantable because that data still
+    // exists. (The probe lease drops as soon as the assert consumes it.)
+    assert_eq!(retention.pruned_below(), 0);
+    assert!(
+        retention.acquire(9).is_ok(),
+        "a pass that deleted nothing must not mark any height gone"
+    );
+
+    lease.release();
+    assert_eq!(retention.active_leases(), 0);
+    let released = service
+        .prune_to_height(11)
+        .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
+    assert_eq!(released.block_rows_removed, 1);
+    assert_eq!(released.undo_rows_removed, 1);
+    assert!(state.storage.stored_prune_body(10, hash(10)?)?.is_none());
+    assert!(state.storage.stored_prune_body(11, hash(11)?)?.is_some());
+    assert_eq!(retention.pruned_below(), 11);
+    Ok(())
+}
+
 #[test]
 fn prune_reclaims_whole_files_and_keeps_current_file() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -574,6 +653,8 @@ fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
     use super::super::prune::load_pruneheight;
     use bitcoin_rs_rpc::context::{BlockLog, PruneService};
     use bitcoin_rs_storage::FlatFileBlockStore;
+    use bitcoin_rs_storage::KvStore;
+    use bitcoin_rs_storage::WriteBatch as _;
     use parking_lot::RwLock;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
@@ -644,6 +725,26 @@ fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
         tx_count: 1,
         time: 0,
     });
+    // The prune line is computed from what the pass actually deletes, so
+    // seed one prunable body row at height 10: without it the pass deletes
+    // nothing and never reaches the blocking body-store load.
+    let mut seed = store.new_batch();
+    seed.put(
+        bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+        &bitcoin_rs_storage::pruning::block_body_key(10, hash),
+        &bitcoin_rs_storage::BlockFilePosition {
+            file_no: 0,
+            offset: 0,
+            len: 1,
+        }
+        .encode(),
+    );
+    seed.put(
+        bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+        &bitcoin_rs_storage::block_file_max_height_key(0),
+        &bitcoin_rs_storage::encode_block_file_max_height(10),
+    );
+    store.write(seed)?;
     let service = Arc::new(NodePruneService::new(
         Arc::clone(&store),
         block_files,
@@ -652,6 +753,7 @@ fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
         Arc::new(RwLock::new(HashMap::new())),
         authority_state.chainstate().prune_authority(),
         Arc::new(AtomicU32::new(11 + CORE_REORG_SAFETY_MARGIN)),
+        Arc::new(bitcoin_rs_storage::RetentionRegistry::new()),
     )?);
 
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);

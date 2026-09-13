@@ -391,6 +391,9 @@ impl NodeState {
             Some(Arc::clone(&mempool_gateway)),
         );
         let (capture_rawtx, capture_block_bytes) = followers.capture_flags();
+        // One retention registry per node: transitions pin old-branch bodies
+        // into it and the pruning pass folds the live floors into its line.
+        let retention = Arc::new(bitcoin_rs_storage::RetentionRegistry::new());
         let mut apply_handles = crate::apply::Chainstate {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
@@ -418,6 +421,7 @@ impl NodeState {
             checkpoint_publisher: None,
             capture_rawtx,
             capture_block_bytes,
+            retention: Arc::clone(&retention),
         };
         apply_handles.assume_valid_gate.evaluate(&block_tree.read());
         // The durable head is the chain's commit point: an unreadable row
@@ -465,6 +469,7 @@ impl NodeState {
                 Arc::clone(&transactions),
                 apply_handles.prune_authority(),
                 &durable_tip_height,
+                &retention,
             )?)
         } else {
             None

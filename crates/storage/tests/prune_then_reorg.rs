@@ -105,7 +105,9 @@ fn staged_flat_file_pruning_removes_all_selected_indexes_before_reclaim()
     assert_eq!(staged.blocks.bytes_freed, 32);
     assert!(staged.undo.is_empty());
     assert_eq!(staged.file_numbers, vec![old_rows[0].2.file_no]);
-    assert_eq!(staged.pruned_below, 712);
+    // Rows 1 and 2 delete, so the recorded line is one past the highest
+    // deleted row — not the 712 policy line the pass stopped far short of.
+    assert_eq!(staged.pruned_below, 3);
 
     store.write(prune_batch)?;
     assert!(!row_stored(&store, &first_old_key)?);
@@ -237,7 +239,7 @@ fn retention_lease_stops_the_prune_line_at_its_floor() -> Result<(), Box<dyn std
         },
         &retention,
     )?;
-    assert_eq!(staged.pruned_below, 712);
+    assert_eq!(staged.pruned_below, 3);
     store.write(released_batch)?;
     assert!(store.get(BLOCK_DATA_CF, &leased_key)?.is_none());
     // The recorded line is what later lease requests are bounded by: a

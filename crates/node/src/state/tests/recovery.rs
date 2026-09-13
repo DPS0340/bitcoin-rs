@@ -394,3 +394,105 @@ fn stale_checkpoint_restore_surfaces_warning_not_silence() -> anyhow::Result<()>
     );
     Ok(())
 }
+
+/// Builds the two-block fork fixture: applied genesis plus one mined child,
+/// a checkpoint published, and a sibling two-block fork known to the header
+/// tree with staged bodies.
+type ForkFixture = (
+    tempfile::TempDir,
+    NodeState,
+    bitcoin_rs_chain::NodeId,
+    HashMap<bitcoin_rs_primitives::Hash256, (bitcoin_rs_primitives::Block, bytes::Bytes)>,
+);
+
+fn forked_regtest_state() -> anyhow::Result<ForkFixture> {
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("node");
+    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+    config.data_dir = data_dir;
+    config.p2p.listen.clear();
+    config.chainstate_journal.enabled = false;
+    let state = NodeState::open(config, None)?;
+    let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+    state.apply_block(&genesis)?;
+    let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1, 1)?;
+    state.apply_block(&block_one)?;
+    state.publish_checkpoint()?;
+
+    let genesis_id = state
+        .block_tree
+        .read()
+        .lookup(Hash256::from(genesis.block_hash()))
+        .ok_or_else(|| anyhow::anyhow!("missing genesis node"))?;
+    let mut parent = genesis_id;
+    let mut previous_hash = genesis.block_hash();
+    let mut fork_bodies = HashMap::new();
+    for height in 1..=2 {
+        let block =
+            mined_regtest_child_at(previous_hash, genesis.header.time + 10 + height, height)?;
+        let node_id = state.block_tree.write().insert_node(
+            Some(parent),
+            block.header,
+            bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+        )?;
+        fork_bodies.insert(
+            Hash256::from(block.block_hash()),
+            (block.clone(), bytes::Bytes::from(consensus_bytes(&block))),
+        );
+        parent = node_id;
+        previous_hash = block.block_hash();
+    }
+    Ok((dir, state, parent, fork_bodies))
+}
+
+/// A completed switch holds its retention lease only for its own duration:
+/// the authority is back with pruning exactly once when it settles.
+#[test]
+fn switch_to_branch_releases_retention_authority_once() -> anyhow::Result<()> {
+    let (_dir, state, fork_tip, fork_bodies) = forked_regtest_state()?;
+    let handles = state.chainstate();
+    assert_eq!(handles.retention.active_leases(), 0);
+
+    crate::reorg::switch_to_branch(
+        &handles,
+        &state.chain_followers(),
+        fork_tip,
+        |hash| fork_bodies.get(&hash).cloned(),
+        |_| {},
+    )?;
+
+    assert_eq!(handles.retention.active_leases(), 0);
+    Ok(())
+}
+
+/// Old-branch history a prune already deleted refuses the switch before
+/// the first mutation: typed unavailable result, applied tip untouched,
+/// and no lease left behind (`RCV-08`).
+#[test]
+fn switch_to_branch_refuses_history_the_prune_line_crossed() -> anyhow::Result<()> {
+    let (_dir, state, fork_tip, fork_bodies) = forked_regtest_state()?;
+    let handles = state.chainstate();
+    let tip_before = handles.applied_tip.load_full().map(|tip| tip.hash);
+    handles.retention.record_pruned_below(5);
+
+    let outcome = crate::reorg::switch_to_branch(
+        &handles,
+        &state.chain_followers(),
+        fork_tip,
+        |hash| fork_bodies.get(&hash).cloned(),
+        |_| {},
+    );
+
+    assert!(matches!(
+        outcome,
+        Err(crate::reorg::ReorgError::RetentionUnavailable { floor: 1, .. })
+    ));
+    assert_eq!(
+        handles.applied_tip.load_full().map(|tip| tip.hash),
+        tip_before
+    );
+    assert_eq!(handles.retention.active_leases(), 0);
+    // A refused lease must not close admission: nothing was mutated.
+    assert!(handles.lock_transition().is_ok());
+    Ok(())
+}

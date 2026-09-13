@@ -105,6 +105,7 @@ impl NodeStorage {
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
         durable_tip_height: &Arc<AtomicU32>,
+        retention: &Arc<bitcoin_rs_storage::RetentionRegistry>,
     ) -> Result<Arc<dyn PruneService>> {
         self.deferred.prune_service(
             Arc::clone(block_files),
@@ -113,6 +114,7 @@ impl NodeStorage {
             transactions,
             authority,
             Arc::clone(durable_tip_height),
+            Arc::clone(retention),
         )
     }
 
@@ -199,8 +201,8 @@ trait DeferredChainstateServices: Send + Sync {
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
         durable_tip_height: Arc<AtomicU32>,
+        retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
     ) -> Result<Arc<dyn PruneService>>;
-
     fn journal_writer(
         &self,
         dir: cap_std::fs::Dir,
@@ -221,6 +223,7 @@ impl<S: KvStore> DeferredChainstateServices for ChainstateStoreServices<S> {
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
         durable_tip_height: Arc<AtomicU32>,
+        retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
     ) -> Result<Arc<dyn PruneService>> {
         Ok(Arc::new(NodePruneService::new(
             Arc::clone(&self.store),
@@ -230,6 +233,7 @@ impl<S: KvStore> DeferredChainstateServices for ChainstateStoreServices<S> {
             transactions,
             authority,
             durable_tip_height,
+            retention,
         )?))
     }
 
