@@ -8,7 +8,6 @@ use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid, Wtxid};
 use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
 use hashbrown::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
-use slab::Slab;
 use thiserror::Error;
 
 use crate::entry::fee_rate;
@@ -19,6 +18,7 @@ use crate::mutation::{
 use crate::{
     EntryId, MempoolEntry, MempoolLimits, MempoolPolicySnapshot, ParetoFront, PolicyError,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Script-index key for funding index range scans.
 #[derive(
@@ -111,8 +111,9 @@ pub struct PrioritisedTransaction {
 /// In-memory transaction pool with txid, funding, spending, and fee-priority indexes.
 #[derive(Debug)]
 pub struct Mempool {
-    /// Entry arena. Public ids are slab indices represented as `u32`.
-    pub(crate) entries: Slab<MempoolEntry>,
+    /// Entry arena. Public ids are slot indices represented as `u32`; the
+    /// arena's generation counters make recycled slots detectable.
+    pub(crate) entries: EntryArena,
     /// Tx id to entry id and acceptance sequence. Owned by this module; reach it
     /// through `contains_txid`, `entry_id_by_txid`, and `entry_by_txid`.
     by_txid: HashMap<Txid, IndexedEntry>,
@@ -122,6 +123,21 @@ pub struct Mempool {
     /// Spending index keyed by spent outpoint then entry id. Owned by this
     /// module; reach it through `is_outpoint_spent` and `outpoint_spender`.
     spending: std::collections::BTreeSet<(SpendingKey, EntryId)>,
+    /// Witness-id index. Owned by this module; reach it through
+    /// `contains_wtxid` and `entry_by_wtxid`.
+    by_wtxid: HashMap<Wtxid, EntryId>,
+    /// Cached connected-component (cluster) summaries, indexed by component
+    /// id. Maintained by `commit_insert` and `remove_entries_with_reasons`;
+    /// read by the admission fast path in `check_cluster_limits`.
+    components: Vec<ComponentSummary>,
+    /// Recycled component ids. A component whose last member leaves frees
+    /// its id here instead of growing the arena forever.
+    free_components: Vec<u32>,
+    /// Nodes examined by graph walks since the last reset. Instrumentation
+    /// for the bounded-work contract; one increment per walked entry. Atomic
+    /// only because the pool must stay `Sync` behind the gateway's shared
+    /// lock.
+    graph_steps: AtomicU64,
     /// Fee-priority index for mining and eviction consumers.
     pub(crate) pareto: ParetoFront,
     /// Active mempool policy limits.
@@ -171,6 +187,277 @@ pub struct Mempool {
 struct IndexedEntry {
     id: EntryId,
     admitted_sequence: u64,
+}
+/// One slot of the generational entry arena.
+///
+/// The generation lives beside the payload, not inside it: vacating a slot
+/// must bump the counter that stale handles are checked against, and a
+/// counter inside the taken value would be bumped on a moved-out copy.
+#[derive(Debug)]
+struct EntrySlot {
+    /// Bumped every time the slot is vacated. A handle stamped with the
+    /// previous generation no longer resolves, so a recycled slot cannot
+    /// hand a stale reference a new resident.
+    generation: u32,
+    live: Option<LiveEntry>,
+}
+
+impl EntrySlot {
+    fn entry(&self) -> Option<&MempoolEntry> {
+        self.live.as_ref().map(|live| &live.entry)
+    }
+
+    fn entry_mut(&mut self) -> Option<&mut MempoolEntry> {
+        self.live.as_mut().map(|live| &mut live.entry)
+    }
+}
+
+/// The live payload of an occupied slot.
+#[derive(Debug)]
+struct LiveEntry {
+    /// Id of the cached component this entry belongs to.
+    component: u32,
+    /// Resolved parent and child links inside the pool.
+    links: GraphLinks,
+    entry: MempoolEntry,
+}
+/// A removed entry, carrying the graph state the pool still has to unwind:
+/// its component (to decay and possibly split) and its links (to unlink).
+struct RetiredEntry {
+    entry: MempoolEntry,
+    component: u32,
+    links: GraphLinks,
+}
+
+/// Parent and child entry ids of one pooled transaction.
+///
+/// The spend indexes answer "who funds this script" and "who spends this
+/// outpoint" by range scan against raw scripts and outpoints. The links
+/// hold the same adjacency already resolved against in-pool membership, so
+/// graph walks read a `Vec` per step instead of re-deriving neighbours.
+/// Both directions are written symmetrically on insert and removal, so a
+/// link never names a removed entry, and both lists stay sorted and
+/// deduplicated.
+#[derive(Debug, Default)]
+struct GraphLinks {
+    parents: Vec<EntryId>,
+    children: Vec<EntryId>,
+}
+
+/// Cached connected-component summary: the two numbers the admission-time
+/// cluster check needs, kept exact by every mutation so the check reads
+/// them instead of walking the graph.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ComponentSummary {
+    member_count: u32,
+    vsize: u64,
+}
+
+/// A generation-stamped reference to one arena slot.
+///
+/// Raw `EntryId`s are slot indices: a removal recycles the slot, and an id
+/// captured before the removal names whatever occupies it next. Handles are
+/// what cached graph state and tests resolve through; a stale handle
+/// resolves to `None` instead of the new resident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EntryHandle {
+    id: EntryId,
+    generation: u32,
+}
+
+/// Generational entry arena.
+///
+/// `slab::Slab` recycles slot indices on removal, which is exactly right
+/// for the raw-id API and exactly wrong for cached graph state keyed by
+/// those ids. Wrapping each slot with a generation counter makes the reuse
+/// detectable: [`EntryArena::resolve`] returns `None` for a handle whose
+/// generation no longer matches. The method set mirrors `Slab`'s so the
+/// existing accessors keep their shape.
+#[derive(Debug)]
+pub(crate) struct EntryArena {
+    slots: Vec<EntrySlot>,
+    /// Vacated slot indices, most recent last: the next `insert` reuses
+    /// them, matching `Slab`'s vacancy stack.
+    free: Vec<u32>,
+    live: usize,
+}
+
+impl EntryArena {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+        }
+    }
+
+    fn insert(&mut self, entry: MempoolEntry, component: u32, links: GraphLinks) -> usize {
+        self.live += 1;
+        let live = LiveEntry {
+            component,
+            links,
+            entry,
+        };
+        if let Some(index) = self.free.pop() {
+            let slot = self
+                .slots
+                .get_mut(index as usize)
+                .expect("vacancy stack names a live slot");
+            slot.live = Some(live);
+            return index as usize;
+        }
+        self.slots.push(EntrySlot {
+            generation: 0,
+            live: Some(live),
+        });
+        self.slots.len() - 1
+    }
+
+    fn remove(&mut self, index: usize) -> Option<RetiredEntry> {
+        let slot = self.slots.get_mut(index)?;
+        let live = slot.live.take()?;
+        slot.generation = slot.generation.wrapping_add(1);
+        self.live -= 1;
+        self.free
+            .push(u32::try_from(index).expect("slots never exceed the u32 entry-id space"));
+        Some(RetiredEntry {
+            entry: live.entry,
+            component: live.component,
+            links: live.links,
+        })
+    }
+
+    fn get(&self, index: usize) -> Option<&MempoolEntry> {
+        self.slots.get(index)?.entry()
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut MempoolEntry> {
+        self.slots.get_mut(index)?.entry_mut()
+    }
+
+    fn slot(&self, index: usize) -> Option<&LiveEntry> {
+        self.slots.get(index)?.live.as_ref()
+    }
+
+    fn slot_mut(&mut self, index: usize) -> Option<&mut LiveEntry> {
+        self.slots.get_mut(index)?.live.as_mut()
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.slots.get(index).is_some_and(|slot| slot.live.is_some())
+    }
+
+    fn len(&self) -> usize {
+        self.live
+    }
+
+    fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// Length of the backing slot array, live and vacant alike.
+    fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The index the next `insert` will occupy.
+    fn vacant_key(&self) -> usize {
+        self.free
+            .last()
+            .map_or(self.slots.len(), |&index| index as usize)
+    }
+
+    fn clear(&mut self) {
+        for slot in &mut self.slots {
+            slot.live = None;
+            slot.generation = slot.generation.wrapping_add(1);
+        }
+        self.free.clear();
+        self.free.extend((0..self.slots.len()).rev().map(|index| {
+            u32::try_from(index).expect("slots never exceed the u32 entry-id space")
+        }));
+        self.live = 0;
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &MempoolEntry)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.entry().map(|entry| (index, entry)))
+    }
+
+    fn iter_links(&self) -> impl Iterator<Item = &GraphLinks> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.live.as_ref().map(|live| &live.links))
+    }
+
+    fn handle_at(&self, index: usize) -> Option<EntryHandle> {
+        let slot = self.slots.get(index)?;
+        slot.live.as_ref()?;
+        Some(EntryHandle {
+            id: EntryId::try_from(index).ok()?,
+            generation: slot.generation,
+        })
+    }
+
+    fn resolve(&self, handle: EntryHandle) -> Option<&MempoolEntry> {
+        let slot = self.slots.get(handle.id as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        slot.entry()
+    }
+}
+
+/// Membership bitset over entry ids that remembers insertion order.
+///
+/// The words grow to whatever the largest inserted id needs, so a walk's
+/// visited set is bounded by the ids it actually touches -- configured
+/// cluster limits decide the bound, never a fixed single word of sixty-four
+/// members. The member list gives walks a deterministic id order for free.
+#[derive(Debug, Default)]
+struct VisitSet {
+    words: Vec<u64>,
+    members: Vec<EntryId>,
+}
+
+impl VisitSet {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn test(&self, id: EntryId) -> bool {
+        let index = id as usize / 64;
+        let Some(&word) = self.words.get(index) else {
+            return false;
+        };
+        word & (1_u64 << (id as usize % 64)) != 0
+    }
+
+    /// Returns whether the set did not already hold `id`.
+    fn insert(&mut self, id: EntryId) -> bool {
+        let index = id as usize / 64;
+        if index >= self.words.len() {
+            self.words.resize(index + 1, 0);
+        }
+        let bit = 1_u64 << (id as usize % 64);
+        if self.words[index] & bit != 0 {
+            return false;
+        }
+        self.words[index] |= bit;
+        self.members.push(id);
+        true
+    }
+
+    fn members(&self) -> &[EntryId] {
+        &self.members
+    }
+
+    fn clear(&mut self) {
+        self.words.clear();
+        self.members.clear();
+    }
 }
 
 pub(crate) struct PreparedInsert {
@@ -259,10 +546,14 @@ impl Mempool {
     #[must_use]
     pub fn new(limits: MempoolLimits) -> Self {
         Self {
-            entries: Slab::new(),
+            entries: EntryArena::new(),
             by_txid: HashMap::new(),
             funding: std::collections::BTreeSet::new(),
             spending: std::collections::BTreeSet::new(),
+            by_wtxid: HashMap::new(),
+            components: Vec::new(),
+            free_components: Vec::new(),
+            graph_steps: AtomicU64::new(0),
             pareto: ParetoFront::new(),
             limits,
             total_vsize: 0,
@@ -294,6 +585,10 @@ impl Mempool {
         self.by_txid.clear();
         self.funding.clear();
         self.spending.clear();
+        self.by_wtxid.clear();
+        self.components.clear();
+        self.free_components.clear();
+        self.graph_steps.store(0, Ordering::Relaxed);
         self.pareto = ParetoFront::new();
         self.total_vsize = 0;
         self.total_fee = 0;
@@ -449,10 +744,34 @@ impl Mempool {
         let added_vsize = u64::from(entry.vsize);
         let added_fee = entry.fee;
         let added_fee_rate = entry.fee_rate;
-        let index = self.entries.insert(entry);
+        // Neighbours are resolved while the candidate is still outside the
+        // arena: parents through the txid index, children through the spend
+        // rows that already name this txid's outputs — an orphan promotion or
+        // out-of-order relay can have those in place long before the parent
+        // arrives. Joining them merges every component they sit in.
+        let parents = self.in_pool_parents(&entry.tx);
+        let children = self.in_pool_children(txid);
+        let component = self.merge_neighbour_components(&parents, &children, &entry);
+        let index = self.entries.insert(entry, component, GraphLinks::default());
         let Ok(id) = EntryId::try_from(index) else {
             panic!("validate_insert accepted an entry id that does not fit u32");
         };
+        for parent in &parents {
+            if let Some(slot) = self.entries.slot_mut(*parent as usize) {
+                slot.links.children.push(id);
+            }
+        }
+        for child in &children {
+            if let Some(slot) = self.entries.slot_mut(*child as usize) {
+                slot.links.parents.push(id);
+            }
+        }
+        if let Some(slot) = self.entries.slot_mut(index) {
+            slot.links = GraphLinks {
+                parents,
+                children,
+            };
+        }
         self.total_vsize = self.total_vsize.saturating_add(added_vsize);
         self.total_fee += u128::from(added_fee);
         *self.fee_rate_counts.entry(added_fee_rate).or_insert(0) += 1;
@@ -491,6 +810,164 @@ impl Mempool {
             self.estimator.tx_entered(txid, fee_rate, height);
         }
         self.finish_mutation(changes)
+    }
+
+    /// Resolved in-pool children — entries already spending an output of
+    /// `txid` — sorted and deduplicated. One contiguous range of the spend
+    /// index, so it also catches a child that named a vout beyond the
+    /// parent's output count before the parent arrived.
+    fn in_pool_children(&self, txid: Txid) -> Vec<EntryId> {
+        let start = (
+            SpendingKey::from(OutPoint::new(txid, u32::MIN)),
+            EntryId::MIN,
+        );
+        let end = (
+            SpendingKey::from(OutPoint::new(txid, u32::MAX)),
+            EntryId::MAX,
+        );
+        let mut children: Vec<EntryId> = self
+            .spending
+            .range(start..=end)
+            .map(|(_, child)| *child)
+            .collect();
+        children.sort_unstable();
+        children.dedup();
+        children
+    }
+    /// Resolved in-pool parents of a not-yet-pooled transaction: sorted and
+    /// deduplicated, so downstream link lists inherit that shape.
+    fn in_pool_parents(&self, tx: &Tx) -> Vec<EntryId> {
+        let mut parents: Vec<EntryId> = tx
+            .inputs
+            .iter()
+            .filter_map(|input| self.entry_id_by_txid(&input.previous_output.txid))
+            .collect();
+        parents.sort_unstable();
+        parents.dedup();
+        parents
+    }
+
+    /// Joins the candidate into one component spanning every distinct
+    /// component its in-pool neighbours sit in, returning the component id.
+    ///
+    /// Joining one component — a chain, a new leaf on a hub — is a single
+    /// summary read. Joining several is a merge: the later components are
+    /// relabelled onto the first with one bounded walk each and their ids
+    /// recycled. The candidate is still outside the arena here, so the walks
+    /// cannot reach it.
+    fn merge_neighbour_components(
+        &mut self,
+        parents: &[EntryId],
+        children: &[EntryId],
+        entry: &MempoolEntry,
+    ) -> u32 {
+        let mut summary = ComponentSummary {
+            member_count: 1,
+            vsize: u64::from(entry.vsize),
+        };
+        let mut base: Option<u32> = None;
+        let mut merged: Vec<u32> = Vec::new();
+        for neighbour in parents.iter().chain(children.iter()).copied() {
+            let Some(neighbour_component) = self.component_id(neighbour) else {
+                continue;
+            };
+            if merged.contains(&neighbour_component) {
+                continue;
+            }
+            merged.push(neighbour_component);
+            let absorbed = self
+                .components
+                .get(neighbour_component as usize)
+                .copied()
+                .unwrap_or_default();
+            summary.member_count = summary.member_count.saturating_add(absorbed.member_count);
+            summary.vsize = summary.vsize.saturating_add(absorbed.vsize);
+            let Some(base_component) = base else {
+                base = Some(neighbour_component);
+                continue;
+            };
+            let mut visited = VisitSet::new();
+            let mut members = Vec::new();
+            self.collect_component_members(neighbour, &mut visited, &mut members);
+            for member in &members {
+                if let Some(slot) = self.entries.slot_mut(*member as usize) {
+                    slot.component = base_component;
+                }
+            }
+            let vacated = self
+                .components
+                .get_mut(neighbour_component as usize)
+                .expect("component ids name live summaries");
+            *vacated = ComponentSummary::default();
+            self.free_component(neighbour_component);
+        }
+        let component = base.unwrap_or_else(|| self.alloc_component());
+        let slot = self
+            .components
+            .get_mut(component as usize)
+            .expect("component ids name live summaries");
+        *slot = summary;
+        component
+    }
+
+    /// Component id of a live entry, or `None` when the id is vacant.
+    fn component_id(&self, id: EntryId) -> Option<u32> {
+        let index = usize::try_from(id).ok()?;
+        Some(self.entries.slot(index)?.component)
+    }
+
+    /// Mints a component id, recycling a freed one when available.
+    fn alloc_component(&mut self) -> u32 {
+        self.free_components.pop().unwrap_or_else(|| {
+            self.components.push(ComponentSummary::default());
+            u32::try_from(self.components.len() - 1)
+                .expect("component count is bounded by the u32 entry-id space")
+        })
+    }
+
+    /// Returns a component id to the free list. Its summary must be zero.
+    fn free_component(&mut self, component: u32) {
+        debug_assert!(
+            self.components
+                .get(component as usize)
+                .is_some_and(|summary| *summary == ComponentSummary::default()),
+            "freed a component that still reports members"
+        );
+        self.free_components.push(component);
+    }
+
+    /// Collects the connected component holding `seed` with one walk over
+    /// the parent/child links, recording membership in `visited` so callers
+    /// can partition several seeds without re-walking.
+    fn collect_component_members(
+        &self,
+        seed: EntryId,
+        visited: &mut VisitSet,
+        members: &mut Vec<EntryId>,
+    ) {
+        if !visited.insert(seed) {
+            return;
+        }
+        members.push(seed);
+        let mut frontier = vec![seed];
+        while let Some(id) = frontier.pop() {
+            self.graph_steps.fetch_add(1, Ordering::Relaxed);
+            let Some(links) = self.links(id) else {
+                continue;
+            };
+            for neighbour in links.parents.iter().chain(links.children.iter()).copied() {
+                if visited.insert(neighbour) {
+                    members.push(neighbour);
+                    frontier.push(neighbour);
+                }
+            }
+        }
+    }
+
+    /// Parent and child links of a live entry.
+    fn links(&self, id: EntryId) -> Option<&GraphLinks> {
+        let index = usize::try_from(id).ok()?;
+        Some(&self.entries.slot(index)?.links)
     }
 
     /// Returns the number of transactions in the mempool.
@@ -686,20 +1163,21 @@ impl Mempool {
     pub fn dynamic_memory_usage(&self) -> u64 {
         use core::mem::size_of;
 
-        // The arena is charged at **capacity**, not at length. `slab::Slab`
-        // keeps its backing allocation across removals and across `clear`, so a
-        // pool that grew to a million entries and then emptied still holds the
-        // arena -- and charging `len()` reported that retained memory as zero,
-        // which is exactly the moment an operator looks at `usage` to find out
-        // where it went. Core charges its own pool the same way: `mapTx`'s
-        // allocator does not return nodes to the OS either.
+        // The arena is charged at **capacity**, not at length. The slot
+        // array keeps its backing allocation across removals and across
+        // `clear`, so a pool that grew to a million entries and then emptied
+        // still holds the arena -- and charging `len()` reported that
+        // retained memory as zero, which is exactly the moment an operator
+        // looks at `usage` to find out where it went. Core charges its own
+        // pool the same way: `mapTx`'s allocator does not return nodes to
+        // the OS either.
         //
-        // Everything below stays keyed to live entries. They are payload terms
-        // -- the transactions and the index keys -- and a removed entry's
-        // payload really is gone.
+        // Everything below stays keyed to live entries. They are payload
+        // terms -- the transactions and the index keys -- and a removed
+        // entry's payload really is gone.
         let arena = u64::try_from(self.entries.capacity())
             .unwrap_or(u64::MAX)
-            .saturating_mul(u64::try_from(size_of::<MempoolEntry>()).unwrap_or(0));
+            .saturating_mul(u64::try_from(size_of::<EntrySlot>()).unwrap_or(0));
 
         let transactions = self
             .entries
@@ -718,6 +1196,26 @@ impl Mempool {
         let spending = u64::try_from(self.spending.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::try_from(size_of::<(SpendingKey, EntryId)>()).unwrap_or(0));
+        let by_wtxid = u64::try_from(self.by_wtxid.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<(Wtxid, EntryId)>()).unwrap_or(0));
+        // The graph links are per-entry `Vec`s inside the arena slots: their
+        // headers ride in the slot size above, their payload is charged by
+        // capacity. The component summaries are the other cached arena.
+        let links = self.entries.iter_links().fold(0_u64, |total, link| {
+            let payload = link
+                .parents
+                .capacity()
+                .saturating_add(link.children.capacity());
+            total.saturating_add(
+                u64::try_from(payload)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::try_from(size_of::<EntryId>()).unwrap_or(0)),
+            )
+        });
+        let components = u64::try_from(self.components.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<ComponentSummary>()).unwrap_or(0));
         // The priority index stores every entry twice -- once ordered by
         // priority, once keyed by id so a removal need not search for what to
         // remove -- so it answers for itself rather than being charged one
@@ -727,11 +1225,13 @@ impl Mempool {
         arena
             .saturating_add(transactions)
             .saturating_add(by_txid)
+            .saturating_add(by_wtxid)
             .saturating_add(funding)
             .saturating_add(spending)
+            .saturating_add(links)
+            .saturating_add(components)
             .saturating_add(pareto)
     }
-
     /// Estimates the fee rate that historically confirmed within
     /// `conf_target_blocks`, from the admission and confirmation history this
     /// pool feeds itself. Returns `None` when the history is too thin to
@@ -867,9 +1367,7 @@ impl Mempool {
     /// Linear in pool size: the pool indexes txids, not witness ids.
     #[must_use]
     pub fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
-        self.entries
-            .iter()
-            .any(|(_id, entry)| entry.wtxid == *wtxid)
+        self.by_wtxid.contains_key(wtxid)
     }
 
     /// Returns the in-pool entry for `wtxid`, or `None` if none matches.
@@ -877,10 +1375,8 @@ impl Mempool {
     /// Linear in pool size: the pool indexes txids, not witness ids.
     #[must_use]
     pub fn entry_by_wtxid(&self, wtxid: &Wtxid) -> Option<&MempoolEntry> {
-        self.entries
-            .iter()
-            .map(|(_id, entry)| entry)
-            .find(|entry| entry.wtxid == *wtxid)
+        let id = *self.by_wtxid.get(wtxid)?;
+        self.entry(id)
     }
 
     /// Returns mempool entry ids in order of descending `fee_rate` (sat/kvB).
@@ -1155,7 +1651,7 @@ impl Mempool {
     #[must_use]
     pub fn evict_below_fee_rate(&mut self, threshold_sat_per_kvb: u64) -> MutationResult {
         let mut to_evict: Vec<Txid> = Vec::new();
-        for (_id, entry) in &self.entries {
+        for (_id, entry) in self.entries.iter() {
             if entry.fee_rate < threshold_sat_per_kvb {
                 to_evict.push(entry.txid);
             }
@@ -1192,10 +1688,27 @@ impl Mempool {
     }
 
     /// Returns all ancestor entry ids for `id`, excluding `id` itself.
+    ///
+    /// Walks the cached parent links, so the cost is the ancestors plus the
+    /// edges between them — not a per-input txid lookup per step.
     #[must_use]
     pub fn ancestor_ids_for_entry(&self, id: EntryId) -> Vec<EntryId> {
-        self.entry(id)
-            .map_or_else(Vec::new, |entry| self.ancestor_ids_for_tx(&entry.tx))
+        let mut seen = VisitSet::new();
+        let mut stack: Vec<EntryId> = Vec::new();
+        if let Some(links) = self.links(id) {
+            stack.extend_from_slice(&links.parents);
+        }
+        while let Some(ancestor) = stack.pop() {
+            if !seen.insert(ancestor) {
+                continue;
+            }
+            if let Some(links) = self.links(ancestor) {
+                stack.extend_from_slice(&links.parents);
+            }
+        }
+        let mut ancestors = seen.members().to_vec();
+        ancestors.sort_unstable();
+        ancestors
     }
 
     /// Returns all descendant entry ids for `id`, EXCLUDING `id` itself.
@@ -1229,7 +1742,7 @@ impl Mempool {
         removals: &[(EntryId, RemovalReason)],
         changes: &mut Vec<MutationChange>,
     ) {
-        // Collected first: once an entry is out of the slab its ancestors can no
+        // Collected first: once an entry is out of the arena its ancestors can no
         // longer be walked, and they are exactly the entries whose descendant
         // totals this removal invalidates. Surviving descendants are in the
         // closure too — `remove_entries` is reached from eviction paths that
@@ -1237,6 +1750,11 @@ impl Mempool {
         // along with their parent.
         let ids: Vec<EntryId> = removals.iter().map(|(id, _reason)| *id).collect();
         let affected = self.metadata_closure(&ids);
+        // Component state the removals disturb: the components losing
+        // members, and the surviving neighbours that seed their re-derivation.
+        let mut dirty_components: Vec<u32> = Vec::new();
+        let mut survivor_seeds: Vec<EntryId> = Vec::new();
+        let mut seen_seeds = VisitSet::new();
         for (id, reason) in removals {
             let Some(index) = usize::try_from(*id).ok() else {
                 continue;
@@ -1244,7 +1762,40 @@ impl Mempool {
             if !self.entries.contains(index) {
                 continue;
             }
-            let entry = self.entries.remove(index);
+            let Some(retired) = self.entries.remove(index) else {
+                continue;
+            };
+            let entry = retired.entry;
+            // The component shrinks by exactly this member; the survivors may
+            // still be one component, or several, and that is settled once
+            // every removal has been applied.
+            if let Some(summary) = self
+                .components
+                .get_mut(retired.component as usize)
+            {
+                summary.member_count = summary.member_count.saturating_sub(1);
+                summary.vsize = summary.vsize.saturating_sub(u64::from(entry.vsize));
+                if !dirty_components.contains(&retired.component) {
+                    dirty_components.push(retired.component);
+                }
+            }
+            // Unlink symmetrically: a link never names a removed entry.
+            for parent in &retired.links.parents {
+                if let Some(slot) = self.entries.slot_mut(*parent as usize) {
+                    slot.links.children.retain(|child| child != id);
+                }
+                if seen_seeds.insert(*parent) {
+                    survivor_seeds.push(*parent);
+                }
+            }
+            for child in &retired.links.children {
+                if let Some(slot) = self.entries.slot_mut(*child as usize) {
+                    slot.links.parents.retain(|parent| parent != id);
+                }
+                if seen_seeds.insert(*child) {
+                    survivor_seeds.push(*child);
+                }
+            }
             self.total_vsize = self.total_vsize.saturating_sub(u64::from(entry.vsize));
             self.total_fee -= u128::from(entry.fee);
             let removed_floor = match self.fee_rate_counts.entry(entry.fee_rate) {
@@ -1274,6 +1825,7 @@ impl Mempool {
                     .map(|(&rate, _count)| rate);
             }
             self.by_txid.remove(&entry.txid);
+            self.by_wtxid.remove(&entry.wtxid);
             self.push_change(changes, entry.txid, MutationOutcome::Removed(*reason));
             // A departure that is not a confirmation: eviction, replacement,
             // conflict, and reorg removal all free the estimator's pending
@@ -1294,13 +1846,72 @@ impl Mempool {
                     .remove(&(SpendingKey::from(input.previous_output), *id));
             }
         }
+        self.recompute_dirty_components(&survivor_seeds, &dirty_components);
         self.refresh_metadata(&affected);
     }
 
+    /// Settles the components the removals disturbed.
+    ///
+    /// A union-find cannot see a split: when the removed set was holding one
+    /// side of a component together, the survivors fall into several parts
+    /// that no single summary describes. Every survivor part touches a
+    /// removed entry — in a connected graph, each part of the remainder has
+    /// a neighbour in the removed set — so walking outward from those
+    /// neighbours repartitions exactly the affected components, each walk
+    /// bounded by the component it re-derives. Components that emptied
+    /// entirely are freed; a component that did not split is relabelled in
+    /// place with one walk.
+    fn recompute_dirty_components(&mut self, seeds: &[EntryId], dirty: &[u32]) {
+        let mut visited = VisitSet::new();
+        for component in dirty {
+            let Some(summary) = self.components.get_mut(*component as usize) else {
+                continue;
+            };
+            if summary.member_count == 0 {
+                self.free_component(*component);
+                continue;
+            }
+            *summary = ComponentSummary::default();
+            let mut relabelled = false;
+            for seed in seeds {
+                if !self.entries.contains(*seed as usize)
+                    || self.component_id(*seed) != Some(*component)
+                    || visited.test(*seed)
+                {
+                    continue;
+                }
+                let mut members = Vec::new();
+                self.collect_component_members(*seed, &mut visited, &mut members);
+                let target = if relabelled {
+                    self.alloc_component()
+                } else {
+                    relabelled = true;
+                    *component
+                };
+                for member in &members {
+                    if let Some(slot) = self.entries.slot_mut(*member as usize) {
+                        slot.component = target;
+                    }
+                }
+                let rebuilt = ComponentSummary {
+                    member_count: u32::try_from(members.len()).unwrap_or(u32::MAX),
+                    vsize: members.iter().fold(0_u64, |total, member| {
+                        total.saturating_add(
+                            self.entry(*member).map_or(0, |entry| u64::from(entry.vsize)),
+                        )
+                    }),
+                };
+                if let Some(slot) = self.components.get_mut(target as usize) {
+                    *slot = rebuilt;
+                }
+            }
+        }
+    }
     fn index_entry(&mut self, id: EntryId) {
         let Some(entry) = self.entry(id) else {
             return;
         };
+        let wtxid = entry.wtxid;
         let funding_keys = entry
             .tx
             .outputs
@@ -1319,6 +1930,7 @@ impl Mempool {
         for key in spending_keys {
             self.spending.insert(key);
         }
+        self.by_wtxid.insert(wtxid, id);
     }
 
     /// Recomputes one entry's six package totals directly from the spend
@@ -1327,7 +1939,6 @@ impl Mempool {
     /// This is the invariant written out: an entry's ancestor totals are its
     /// own plus every transitive in-mempool parent, and its descendant totals
     /// are its own plus every transitive in-mempool child — once for actual
-    /// fees, and once for the signed overlay that modified ordering reads.
     /// `recompute_all_metadata` arrives at the same numbers by a
     /// reset-then-accumulate pass over the whole pool; this arrives at them
     /// for one entry.
@@ -1577,32 +2188,32 @@ impl Mempool {
         seeds: &[EntryId],
         excluded: &HashSet<EntryId>,
     ) -> Vec<EntryId> {
-        let mut seen: Vec<EntryId> = Vec::new();
+        // The visited set is a growing bitset, not a scanned Vec: membership
+        // is one word test regardless of how many members the walk has seen,
+        // and the words grow to whatever the configured cluster limit admits.
+        let mut seen = VisitSet::new();
         let mut frontier: Vec<EntryId> = Vec::new();
         for seed in seeds {
-            if !excluded.contains(seed) && !seen.contains(seed) {
-                seen.push(*seed);
+            if !excluded.contains(seed) && seen.insert(*seed) {
                 frontier.push(*seed);
             }
         }
         while let Some(id) = frontier.pop() {
-            let parents = self.entry(id).map_or_else(Vec::new, |entry| {
-                entry
-                    .tx
-                    .inputs
-                    .iter()
-                    .filter_map(|input| self.entry_id_by_txid(&input.previous_output.txid))
-                    .collect::<Vec<_>>()
-            });
-            for neighbour in parents.into_iter().chain(self.child_ids(id)) {
-                if !excluded.contains(&neighbour) && !seen.contains(&neighbour) {
-                    seen.push(neighbour);
+            self.graph_steps.fetch_add(1, Ordering::Relaxed);
+            // In-pool adjacency is the cached link list; no per-step re-scan
+            // of the spend index.
+            let Some(links) = self.links(id) else {
+                continue;
+            };
+            for neighbour in links.parents.iter().chain(links.children.iter()).copied() {
+                if !excluded.contains(&neighbour) && seen.insert(neighbour) {
                     frontier.push(neighbour);
                 }
             }
         }
-        seen.sort_unstable();
-        seen
+        let mut cluster = seen.members().to_vec();
+        cluster.sort_unstable();
+        cluster
     }
 
     /// Refuses a transaction that would join a cluster over either limit.
@@ -1615,12 +2226,65 @@ impl Mempool {
     /// relay -- and a seed set of parents alone would miss the descendants
     /// this transaction is about to connect.
     ///
-    /// `excluded` is the set of entry ids a replacement will evict. The walk
-    /// in [`Self::cluster_ids_seeded_by`] is the sole owner of that rule:
-    /// excluded seeds and neighbours are treated as absent, so a replacement
-    /// that shrinks an over-large cluster is not rejected by the cluster it
-    /// is about to clear.
+    /// With nothing excluded the answer comes from the component cache: the
+    /// candidate's cluster is itself plus the union of its neighbours'
+    /// components, and the cache holds that union's count and vsize. With
+    /// evictions excluded the walk stays authoritative, because removing the
+    /// evicted set can cut a component into pieces and a summary cannot see
+    /// which piece the candidate would join.
     fn check_cluster_limits(
+        &self,
+        tx: &Tx,
+        vsize: u32,
+        excluded: &HashSet<EntryId>,
+    ) -> Result<(), PolicyError> {
+        let verdict = if excluded.is_empty() {
+            let cached = self.check_cluster_limits_cached(tx, vsize);
+            // The cache and the walk must agree while nothing is excluded;
+            // running both under debug keeps a drift loud instead of latent.
+            debug_assert_eq!(
+                self.check_cluster_limits_by_walk(tx, vsize, excluded),
+                cached
+            );
+            cached
+        } else {
+            self.check_cluster_limits_by_walk(tx, vsize, excluded)
+        };
+        verdict
+    }
+
+    /// The component-cache path: two numbers per joined component.
+    fn check_cluster_limits_cached(&self, tx: &Tx, vsize: u32) -> Result<(), PolicyError> {
+        let txid = tx.txid();
+        let parents = self.in_pool_parents(tx);
+        let neighbours = parents
+            .iter()
+            .copied()
+            .chain(self.in_pool_children(txid));
+        let mut count = 1_u32;
+        let mut total = u64::from(vsize);
+        let mut merged: Vec<u32> = Vec::new();
+        for neighbour in neighbours {
+            let Some(component) = self.component_id(neighbour) else {
+                continue;
+            };
+            if merged.contains(&component) {
+                continue;
+            }
+            merged.push(component);
+            let summary = self
+                .components
+                .get(component as usize)
+                .copied()
+                .unwrap_or_default();
+            count = count.saturating_add(summary.member_count);
+            total = total.saturating_add(summary.vsize);
+        }
+        cluster_within_limits(count, total, &self.limits)
+    }
+
+    /// The walk path: authoritative when a replacement excludes entries.
+    fn check_cluster_limits_by_walk(
         &self,
         tx: &Tx,
         vsize: u32,
@@ -1632,7 +2296,7 @@ impl Mempool {
             .iter()
             .filter_map(|input| self.entry_id_by_txid(&input.previous_output.txid))
             .collect::<Vec<_>>();
-        seeds.extend(self.existing_spenders_of(txid, tx.outputs.len()));
+        seeds.extend(self.in_pool_children(txid));
         let cluster = self.cluster_ids_seeded_by(&seeds, excluded);
         if cluster.is_empty() {
             // A cluster of one. Still checked, so a single oversized
@@ -1648,28 +2312,6 @@ impl Mempool {
         cluster_within_limits(count, cluster_vsize, &self.limits)
     }
 
-    /// In-pool entries already spending an output of `txid`.
-    ///
-    /// Keyed by txid rather than [`EntryId`] because the caller's transaction
-    /// has no entry id yet.
-    fn existing_spenders_of(&self, txid: Txid, output_count: usize) -> Vec<EntryId> {
-        let mut spenders = Vec::new();
-        for vout in 0..output_count {
-            let Ok(vout) = u32::try_from(vout) else {
-                continue;
-            };
-            for (_, spender) in self
-                .spending
-                .range(outpoint_range(OutPoint::new(txid, vout)))
-            {
-                if !spenders.contains(spender) {
-                    spenders.push(*spender);
-                }
-            }
-        }
-        spenders
-    }
-
     /// The cluster limits this pool enforces at admission.
     ///
     /// Read by `getmempoolinfo`, which reports enforced policy rather than a
@@ -1680,17 +2322,19 @@ impl Mempool {
     }
 
     fn ancestor_ids_for_tx(&self, tx: &Tx) -> Vec<EntryId> {
-        let mut ancestors = Vec::new();
+        // For a candidate that has no entry yet: resolve parents through the
+        // txid index, one step per in-pool ancestor, with the visited set as
+        // a growing bitset rather than a scanned Vec.
+        let mut seen = VisitSet::new();
         let mut stack = tx
             .inputs
             .iter()
             .filter_map(|input| self.entry_id_by_txid(&input.previous_output.txid))
             .collect::<Vec<_>>();
         while let Some(id) = stack.pop() {
-            if ancestors.contains(&id) {
+            if !seen.insert(id) {
                 continue;
             }
-            ancestors.push(id);
             if let Some(entry) = self.entry(id) {
                 for input in &entry.tx.inputs {
                     if let Some(parent) = self.entry_id_by_txid(&input.previous_output.txid) {
@@ -1699,78 +2343,75 @@ impl Mempool {
                 }
             }
         }
+        let mut ancestors = seen.members().to_vec();
         ancestors.sort_unstable();
         ancestors
     }
 
     fn collect_descendants_inclusive(&self, id: EntryId, out: &mut Vec<EntryId>) {
-        if out.contains(&id) {
-            return;
-        }
-        out.push(id);
-        self.collect_descendants_exclusive(id, out);
-    }
-
-    fn collect_descendants_exclusive(&self, id: EntryId, out: &mut Vec<EntryId>) {
-        for child in self.child_ids(id) {
-            if out.contains(&child) {
-                continue;
-            }
-            out.push(child);
-            self.collect_descendants_exclusive(child, out);
-        }
-    }
-
-    fn child_ids(&self, id: EntryId) -> Vec<EntryId> {
-        let Some(entry) = self.entry(id) else {
-            return Vec::new();
-        };
-        let txid = entry.txid;
-        let mut children = Vec::new();
-        for (vout, _) in entry.tx.outputs.iter().enumerate() {
-            let Ok(vout) = u32::try_from(vout) else {
+        let mut seen = VisitSet::new();
+        seen.insert(id);
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            out.push(current);
+            let Some(links) = self.links(current) else {
                 continue;
             };
-            let outpoint = OutPoint::new(txid, vout);
-            for (_, child) in self.spending.range(outpoint_range(outpoint)) {
-                children.push(*child);
+            for child in links.children.iter().copied() {
+                if seen.insert(child) {
+                    stack.push(child);
+                }
             }
         }
-        children.sort_unstable();
-        children.dedup();
-        children
     }
+
+    /// Descendants of `id` appended to `out`, skipping anything already in
+    /// it. Iterative over the child links, so depth follows membership, not
+    /// the recursion stack.
+    fn collect_descendants_exclusive(&self, id: EntryId, out: &mut Vec<EntryId>) {
+        let mut seen = VisitSet::new();
+        for existing in out.iter() {
+            seen.insert(*existing);
+        }
+        seen.insert(id);
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            let Some(links) = self.links(current) else {
+                continue;
+            };
+            for child in links.children.iter().copied() {
+                if seen.insert(child) {
+                    out.push(child);
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    /// In-pool children of `id`: the cached link list, sorted and
+    /// deduplicated by construction.
+    fn child_ids(&self, id: EntryId) -> Vec<EntryId> {
+        self.links(id)
+            .map_or_else(Vec::new, |links| links.children.clone())
+    }
+
 
     /// Returns the txids of in-pool transactions whose inputs reference `id`,
     /// in `EntryId` order and deduplicated.
     ///
-    /// This is Bitcoin Core's `spentby` field. The answer comes from one
-    /// contiguous range of the `spending` index — `O(log n + matching inputs)`
-    /// — where asking the same question by scanning is
-    /// `O(inputs in the whole pool)` per entry.
+    /// This is Bitcoin Core's `spentby` field. The answer is the cached
+    /// child-link list — each link was resolved against in-pool membership
+    /// when the child was admitted — where re-deriving it per query is a
+    /// range scan of the spending index per output.
     #[must_use]
     pub fn spender_txids(&self, id: EntryId) -> Vec<Txid> {
-        let Some(entry) = self.entry(id) else {
+        let Some(links) = self.links(id) else {
             return Vec::new();
         };
-        let start = (
-            SpendingKey::from(OutPoint::new(entry.txid, u32::MIN)),
-            EntryId::MIN,
-        );
-        let end = (
-            SpendingKey::from(OutPoint::new(entry.txid, u32::MAX)),
-            EntryId::MAX,
-        );
-        let mut spenders: Vec<EntryId> = self
-            .spending
-            .range(start..=end)
-            .map(|(_, child)| *child)
-            .collect();
-        spenders.sort_unstable();
-        spenders.dedup();
-        spenders
-            .into_iter()
-            .filter_map(|child| self.entry(child).map(|entry| entry.txid))
+        links
+            .children
+            .iter()
+            .filter_map(|child| self.entry(*child).map(|entry| entry.txid))
             .collect()
     }
 
@@ -4429,7 +5070,7 @@ mod spend_index_tests {
     #[test]
     fn the_cached_txid_matches_a_recomputation() {
         let (pool, _root_txid) = graph_pool();
-        for (_id, entry) in &pool.entries {
+        for (_id, entry) in pool.entries.iter() {
             assert_eq!(
                 entry.txid,
                 entry.tx.txid(),
@@ -4443,14 +5084,14 @@ mod spend_index_tests {
         let (pool, _root_txid) = graph_pool();
 
         let mut spenders_seen = 0_usize;
-        for (index, entry) in &pool.entries {
+        for (index, entry) in pool.entries.iter() {
             let Ok(id) = EntryId::try_from(index) else {
                 panic!("entry index {index} does not fit an EntryId");
             };
 
             // The scan the index replaces, written out rather than reused.
             let mut expected: Vec<Txid> = Vec::new();
-            for (_other_index, candidate) in &pool.entries {
+            for (_other_index, candidate) in pool.entries.iter() {
                 if candidate
                     .tx
                     .inputs
