@@ -1,11 +1,11 @@
-//! Checkpoint formats, loading, publication, and periodic scheduling.
+//! Checkpoint formats, loading, and publication.
 
 mod format;
 pub(crate) mod fs;
 mod io;
 mod load;
 mod publish;
-pub(crate) mod worker;
+pub(crate) mod publisher;
 
 use crate::checkpoint::fs::CheckpointRoot;
 #[cfg(test)]

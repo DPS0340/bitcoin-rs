@@ -54,8 +54,9 @@ pub(crate) struct NodeServices {
     /// Stops and joins its listener in Drop.
     pub(super) metrics: Option<crate::metrics::MetricsServer>,
     pub(super) rpc_thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
-    /// Joined before the final clean checkpoint publication.
-    pub(super) checkpoint_worker: Option<std::thread::JoinHandle<()>>,
+    /// Chainstate idle maintenance (journal flush, retention); joined
+    /// before the final clean checkpoint publication.
+    pub(super) maintenance_worker: Option<std::thread::JoinHandle<()>>,
     pub(super) tx_ingress: Option<std::thread::JoinHandle<()>>,
     /// Publishes the capability readiness gauge until shutdown.
     pub(super) readiness_sampler: Option<std::thread::JoinHandle<()>>,
@@ -72,7 +73,7 @@ pub(crate) struct NodeServices {
 
 impl NodeServices {
     /// Raises shutdown, wakes and joins the event loop, joins core services,
-    /// drains subsystems, joins bootstrap/checkpoint/signal workers, and only
+    /// drains subsystems, joins bootstrap/maintenance/signal workers, and only
     /// then publishes a clean checkpoint. The first error is returned after
     /// all remaining cleanup stages run; any error suppresses the checkpoint.
     pub(crate) fn teardown(
@@ -210,14 +211,14 @@ impl NodeServices {
                 );
             }
         }
-        if let Some(handle) = self.checkpoint_worker.take() {
+        if let Some(handle) = self.maintenance_worker.take() {
             if matches!(handle.join(), Ok(())) {
-                tracing::info!("periodic checkpoint worker exited cleanly");
+                tracing::info!("chainstate maintenance worker exited cleanly");
             } else {
-                tracing::error!("periodic checkpoint worker panicked");
+                tracing::error!("chainstate maintenance worker panicked");
                 set_first_error(
                     first_error,
-                    anyhow::anyhow!("periodic checkpoint worker panicked"),
+                    anyhow::anyhow!("chainstate maintenance worker panicked"),
                 );
             }
         }

@@ -700,6 +700,70 @@ fn boot_refuses_a_gap_whose_body_is_gone() -> anyhow::Result<()> {
 }
 
 // -----------------------------------------------------------------------
+// #634: restart with periodic full-checkpoint publication disabled.
+// -----------------------------------------------------------------------
+
+/// A checkpoint at height N with the journal and durable head advanced
+/// past it restores the exact pre-restart tip and `commit_id` on restart
+/// (`RCV-10`): the durable root is the recovery authority and the last
+/// checkpoint is only the replay base, so progress made since it stays
+/// recoverable with no periodic publisher running.
+#[test]
+fn restart_without_periodic_publication_restores_tip_and_commit_id() -> anyhow::Result<()> {
+    // The checkpoint lands at height 1; blocks 2-4 exist only in the
+    // journal suffix and the durable head chain.
+    let (_dir, state, config) = applied_regtest_chain(4)?;
+    let head = state
+        .chainstate()
+        .durable_head
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("applied chain must have a durable head"))?;
+    let pre_tip = state
+        .chainstate()
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("applied tip missing before restart"))?;
+    assert_eq!(pre_tip.height, 4);
+    drop(state);
+
+    // `NodeState::open` spawns no workers: this restart runs with periodic
+    // full-checkpoint publication disabled, recovery riding the stored
+    // checkpoint, the journal suffix, and the durable head.
+    let reopened = NodeState::open(config.clone(), None)?;
+    let landed = reopened
+        .chainstate()
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("restart must publish a tip"))?;
+    assert_eq!(landed.as_ref(), pre_tip.as_ref());
+    assert_eq!(landed.height, head.height);
+    let restored = reopened
+        .chainstate()
+        .durable_head
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("head must survive the restart"))?;
+    assert_eq!(restored.tip, head.tip);
+    assert_eq!(restored.commit_id, head.commit_id);
+    assert!(matches!(
+        reopened.resume_source(),
+        ResumeSource::Journal | ResumeSource::Checkpoint
+    ));
+
+    // The replay caught the journal up: a second restart, still with no
+    // periodic publisher, lands on the same head untouched.
+    drop(reopened);
+    let second = NodeState::open(config, None)?;
+    let landed = second
+        .chainstate()
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("second restart must publish a tip"))?;
+    assert_eq!(landed.hash, head.tip);
+    assert_eq!(landed.height, head.height);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
 // #655: prune-then-reorg and bounded deep-reorg scenarios.
 // -----------------------------------------------------------------------
 

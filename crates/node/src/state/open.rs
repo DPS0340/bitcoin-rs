@@ -436,8 +436,8 @@ impl NodeState {
         let durable_tip_height = Arc::new(AtomicU32::new(
             applied_tip.load().as_ref().map_or(0, |tip| tip.height),
         ));
-        apply_handles.checkpoint_publisher =
-            Some(Arc::new(crate::checkpoint::worker::CheckpointPublisher {
+        apply_handles.checkpoint_publisher = Some(Arc::new(
+            crate::checkpoint::publisher::CheckpointPublisher {
                 admission: Arc::clone(&apply_handles.admission),
                 undo_store: Arc::clone(&apply_handles.undo_store),
                 durable_head: Arc::clone(&apply_handles.durable_head),
@@ -455,7 +455,8 @@ impl NodeState {
                 data_dir: config.data_dir.clone(),
                 chain_events: Arc::clone(&chain_events),
                 durable_tip_height: Arc::clone(&durable_tip_height),
-            }));
+            },
+        ));
         let sync = Arc::new(crate::BlockSync::new(
             apply_handles.clone(),
             followers.clone(),

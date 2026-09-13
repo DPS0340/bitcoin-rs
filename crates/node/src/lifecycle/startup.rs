@@ -11,7 +11,7 @@ use crate::{
 
 use crossbeam_channel::bounded;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use super::{
     rpc::bind_rpc,
@@ -156,10 +156,7 @@ pub(crate) fn start_node(
             listener_extras,
         )
         .map_err(anyhow::Error::from)?;
-    guard.services.checkpoint_worker = Some(state.start_periodic_checkpoint(
-        crate::checkpoint::worker::CHECKPOINT_INTERVAL_BLOCKS,
-        Duration::from_secs(crate::checkpoint::worker::CHECKPOINT_INTERVAL_SECS),
-    )?);
+    guard.services.maintenance_worker = Some(state.start_chainstate_maintenance()?);
     guard.services.event_loop = Some(
         std::thread::Builder::new()
             .name("bitcoin-rs-event-loop".into())
