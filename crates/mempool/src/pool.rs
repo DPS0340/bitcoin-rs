@@ -758,12 +758,25 @@ impl Mempool {
         };
         for parent in &parents {
             if let Some(slot) = self.entries.slot_mut(*parent as usize) {
-                slot.links.children.push(id);
+                // Slot ids are recycled, so a new id can be smaller than the
+                // ones already linked: insert at the sorted position instead
+                // of appending.
+                let position = slot
+                    .links
+                    .children
+                    .binary_search(&id)
+                    .unwrap_or_else(|position| position);
+                slot.links.children.insert(position, id);
             }
         }
         for child in &children {
             if let Some(slot) = self.entries.slot_mut(*child as usize) {
-                slot.links.parents.push(id);
+                let position = slot
+                    .links
+                    .parents
+                    .binary_search(&id)
+                    .unwrap_or_else(|position| position);
+                slot.links.parents.insert(position, id);
             }
         }
         if let Some(slot) = self.entries.slot_mut(index) {
@@ -5417,3 +5430,576 @@ mod entry_overhead_tests {
         );
     }
 }
+
+/// Fixtures for the #638 graph contracts: dependency and conflict
+/// relationships stay exact across every mutation kind, component merges and
+/// splits match an independent reference calculation, recycled entry ids
+/// never resolve to a stale resident, cluster limits hold before a mutation
+/// commits, and walk work stays local to the affected cluster.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod graph_tests {
+    use super::*;
+
+    const TIME: u64 = 1_700_000_000;
+    const HEIGHT: u32 = 900;
+
+    /// Small deterministic PRNG so mutation sequences are reproducible.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn new(seed: u64) -> Self {
+            Self(seed.max(1))
+        }
+
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            // Truncation is wanted: fixture fuzzing, not cryptography.
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// Transaction whose txid is unique per `nonce`: the nonce rides in the
+    /// lock time, so two fixtures never collide.
+    fn graph_tx(nonce: u32, inputs: &[OutPoint], rbf: bool) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: LockTime::from_consensus(nonce),
+            inputs: inputs
+                .iter()
+                .map(|previous_output| TxIn {
+                    previous_output: *previous_output,
+                    script_sig: Script::new(),
+                    sequence: if rbf {
+                        Sequence::from_consensus(0xFFFF_FFFD)
+                    } else {
+                        Sequence::MAX
+                    },
+                    witness: Witness::new(),
+                })
+                .collect(),
+            outputs: alloc::vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: alloc::vec![0x51; 8].into(),
+            }],
+        }
+    }
+
+    fn fuzzer_pool() -> Mempool {
+        Mempool::new(MempoolLimits {
+            max_ancestors: 200,
+            max_ancestor_size: 10_000_000,
+            max_descendants: 200,
+            max_total_bytes: 0,
+            min_relay_fee_sat_per_kvb: 0,
+            cluster_count: 64,
+            ..MempoolLimits::default()
+        })
+    }
+
+    fn insert_ok(pool: &mut Mempool, nonce: u32, inputs: &[OutPoint], vsize: u32) -> Txid {
+        let tx = graph_tx(nonce, inputs, false);
+        let txid = tx.txid();
+        let outcome = pool
+            .insert_entry(MempoolEntry::new(Arc::new(tx), vsize, 1_000, TIME, HEIGHT))
+            .expect("fixture insert must pass validation");
+        assert!(
+            matches!(outcome, crate::mutation::InsertionOutcome::Accepted(_)),
+            "fixture {nonce} must survive the size trim"
+        );
+        txid
+    }
+
+    /// Independent component calculation: BFS over the txid index and one
+    /// whole-txid range of the spend index — the primitives this slice
+    /// wrapped, none of the cached graph state it maintains.
+    fn reference_components(pool: &Mempool) -> Vec<Vec<EntryId>> {
+        let mut seen: HashSet<EntryId> = HashSet::new();
+        let mut components = Vec::new();
+        let live: Vec<EntryId> = pool.by_txid.values().map(|indexed| indexed.id).collect();
+        for seed in live {
+            if !seen.insert(seed) {
+                continue;
+            }
+            let mut part = vec![seed];
+            let mut queue = vec![seed];
+            while let Some(id) = queue.pop() {
+                let entry = pool.entry(id).expect("oracle walks a live entry");
+                let parents = entry
+                    .tx
+                    .inputs
+                    .iter()
+                    .filter_map(|input| pool.entry_id_by_txid(&input.previous_output.txid));
+                let start = (
+                    SpendingKey::from(OutPoint::new(entry.txid, u32::MIN)),
+                    EntryId::MIN,
+                );
+                let end = (
+                    SpendingKey::from(OutPoint::new(entry.txid, u32::MAX)),
+                    EntryId::MAX,
+                );
+                let children = pool
+                    .spending
+                    .range(start..=end)
+                    .map(|(_, child)| *child)
+                    .collect::<Vec<_>>();
+                for neighbour in parents.chain(children) {
+                    if seen.insert(neighbour) {
+                        part.push(neighbour);
+                        queue.push(neighbour);
+                    }
+                }
+            }
+            part.sort_unstable();
+            components.push(part);
+        }
+        components.sort();
+        components
+    }
+
+    /// Every structural invariant the mutation paths must maintain,
+    /// checked against the reference calculation and the raw totals.
+    fn assert_graph_exact(pool: &Mempool) {
+        // Cached partition matches the independent calculation.
+        let mut cached: Vec<Vec<EntryId>> = Vec::new();
+        let mut by_component: HashMap<u32, Vec<EntryId>> = HashMap::new();
+        for (index, _entry) in pool.entries.iter() {
+            let id = EntryId::try_from(index).expect("slot index fits u32");
+            let component = pool.component_id(id).expect("live entry has a component");
+            by_component.entry(component).or_default().push(id);
+        }
+        for members in by_component.values_mut() {
+            members.sort_unstable();
+            cached.push(members.clone());
+        }
+        cached.sort();
+        assert_eq!(cached, reference_components(pool), "component partition");
+
+        // Each cached summary equals its members' enumeration.
+        for (component, members) in &by_component {
+            let summary = &pool.components[*component as usize];
+            let vsize = members.iter().fold(0_u64, |total, member| {
+                total
+                    .saturating_add(pool.entry(*member).map_or(0, |entry| u64::from(entry.vsize)))
+            });
+            assert_eq!(
+                summary.member_count,
+                u32::try_from(members.len()).unwrap_or(u32::MAX)
+            );
+            assert_eq!(summary.vsize, vsize, "summary vsize for component {component}");
+        }
+
+        // Links are symmetric, sorted, deduplicated, and live.
+        for (index, _entry) in pool.entries.iter() {
+            let id = EntryId::try_from(index).expect("slot index fits u32");
+            let links = pool.links(id).expect("live entry has links");
+            let mut sorted_parents = links.parents.clone();
+            sorted_parents.sort_unstable();
+            sorted_parents.dedup();
+            assert_eq!(sorted_parents, links.parents, "parents of {id} sorted+dedup");
+            let mut sorted_children = links.children.clone();
+            sorted_children.sort_unstable();
+            sorted_children.dedup();
+            assert_eq!(sorted_children, links.children, "children of {id} sorted+dedup");
+            for parent in &links.parents {
+                let back = pool
+                    .links(*parent)
+                    .expect("parent link names a live entry");
+                assert!(back.children.contains(&id), "link symmetry for {id}");
+            }
+            for child in &links.children {
+                let back = pool.links(*child).expect("child link names a live entry");
+                assert!(back.parents.contains(&id), "link symmetry for {id}");
+            }
+        }
+    }
+
+    fn graph_steps(pool: &Mempool) -> u64 {
+        pool.graph_steps.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn component_merges_and_splits_track_the_reference() {
+        let mut pool = fuzzer_pool();
+        let a1 = insert_ok(&mut pool, 1, &[], 100);
+        let a2 = insert_ok(&mut pool, 2, &[OutPoint::new(a1, 0)], 100);
+        let a3 = insert_ok(&mut pool, 3, &[OutPoint::new(a2, 0)], 100);
+        let b1 = insert_ok(&mut pool, 4, &[], 110);
+        let b2 = insert_ok(&mut pool, 5, &[OutPoint::new(b1, 0)], 110);
+        assert_graph_exact(&pool);
+        assert_eq!(reference_components(&pool).len(), 2, "two disjoint chains");
+
+        // A bridge spending into both chains merges them into one cluster.
+        let bridge = insert_ok(
+            &mut pool,
+            6,
+            &[OutPoint::new(a3, 0), OutPoint::new(b2, 0)],
+            120,
+        );
+        assert_graph_exact(&pool);
+        let merged = reference_components(&pool);
+        assert_eq!(merged.len(), 1, "bridge joins the chains: {merged:?}");
+        assert_eq!(merged[0].len(), 6);
+
+        // Removing the bridge splits the component again — a union-find
+        // could never see this.
+        let bridge_id = pool.entry_id_by_txid(&bridge).expect("bridge is pooled");
+        let mut changes = Vec::new();
+        pool.remove_entries_with_reasons(
+            &[(bridge_id, RemovalReason::PolicyEviction)],
+            &mut changes,
+        );
+        assert_graph_exact(&pool);
+        assert_eq!(reference_components(&pool).len(), 2, "bridge removal splits");
+    }
+
+    #[test]
+    fn a_recycled_entry_id_resolves_to_none_through_handles() {
+        let mut pool = fuzzer_pool();
+        let first = insert_ok(&mut pool, 1, &[], 100);
+        let first_id = pool.entry_id_by_txid(&first).expect("pooled");
+        let handle = pool.entries.handle_at(first_id as usize).expect("live slot");
+        assert!(pool.entries.resolve(handle).is_some());
+
+        let mut changes = Vec::new();
+        pool.remove_entries_with_reasons(
+            &[(first_id, RemovalReason::PolicyEviction)],
+            &mut changes,
+        );
+        // The slot is recycled by the next insert.
+        let second = insert_ok(&mut pool, 2, &[], 100);
+        let second_id = pool.entry_id_by_txid(&second).expect("pooled");
+        assert_eq!(second_id, first_id, "fixture relies on slot reuse");
+
+        // The stale handle resolves to nothing even though the raw id now
+        // names a different transaction.
+        assert!(pool.entries.resolve(handle).is_none());
+        assert_eq!(pool.entry(second_id).map(|entry| entry.txid), Some(second));
+        // And the cached graph state describes the new resident exactly.
+        assert_graph_exact(&pool);
+    }
+
+    #[test]
+    fn wtxid_lookups_track_mutations() {
+        let mut pool = fuzzer_pool();
+        let first = insert_ok(&mut pool, 1, &[], 100);
+        let wtxid = pool.entry_by_txid(&first).map(|entry| entry.wtxid);
+        assert!(pool.contains_wtxid(&wtxid.expect("pooled")));
+        assert_eq!(pool.entry_by_wtxid(&wtxid.expect("pooled")).map(|entry| entry.txid), Some(first));
+
+        let first_id = pool.entry_id_by_txid(&first).expect("pooled");
+        let mut changes = Vec::new();
+        pool.remove_entries_with_reasons(
+            &[(first_id, RemovalReason::PolicyEviction)],
+            &mut changes,
+        );
+        assert!(!pool.contains_wtxid(&wtxid.expect("pooled")));
+        assert!(pool.entry_by_wtxid(&wtxid.expect("pooled")).is_none());
+
+        let second = insert_ok(&mut pool, 2, &[], 100);
+        let second_wtxid = pool.entry_by_txid(&second).map(|entry| entry.wtxid);
+        assert_ne!(wtxid, second_wtxid);
+        assert!(pool.contains_wtxid(&second_wtxid.expect("pooled")));
+    }
+
+    #[test]
+    fn plain_admission_enforces_cluster_limits_through_the_cache() {
+        let mut pool = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            min_relay_fee_sat_per_kvb: 0,
+            cluster_count: 4,
+            cluster_size_vbytes: 1_000_000,
+            ..MempoolLimits::default()
+        });
+        let a = insert_ok(&mut pool, 1, &[], 100);
+        let b = insert_ok(&mut pool, 2, &[OutPoint::new(a, 0)], 100);
+        let c = insert_ok(&mut pool, 3, &[], 100);
+        let d = insert_ok(&mut pool, 4, &[OutPoint::new(c, 0)], 100);
+
+        // Two separate 2-member clusters. A candidate spending an output of
+        // each chain joins both plus itself — five over the limit of four.
+        // The cached summaries answer before anything commits.
+        // b's and d's outputs are the unspent ones; spending them joins both
+        // 2-member clusters plus the candidate.
+        let joiner = graph_tx(
+            5,
+            &[OutPoint::new(b, 0), OutPoint::new(d, 0)],
+            false,
+        );
+        let entry = MempoolEntry::new(Arc::new(joiner.clone()), 100, 1_000, TIME, HEIGHT);
+        let error = pool
+            .insert_entry(entry)
+            .expect_err("cluster of five is over the limit");
+        assert!(matches!(
+            error,
+            MempoolError::Policy(PolicyError::ClusterCountLimit)
+        ));
+        assert_eq!(pool.tx_count(), 4, "rejection commits nothing");
+        assert!(!pool.contains_txid(&joiner.txid()));
+
+        // The acceptance preview quotes the same verdict.
+        let excluded: HashSet<EntryId> = HashSet::new();
+        assert!(matches!(
+            pool.check_package_limits(&joiner, 100, &excluded),
+            Err(PolicyError::ClusterCountLimit)
+        ));
+
+        // A candidate inside the limit is admitted through the same path.
+        let _e = insert_ok(&mut pool, 6, &[OutPoint::new(a, 0)], 100);
+        assert_graph_exact(&pool);
+    }
+
+    #[test]
+    fn removal_splits_repartition_by_bounded_walk() {
+        let mut pool = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            min_relay_fee_sat_per_kvb: 0,
+            cluster_count: 8,
+            cluster_size_vbytes: 1_000_000,
+            ..MempoolLimits::default()
+        });
+        // Diamond with a tail: root, two siblings, sink, then a chain.
+        let root = insert_ok(&mut pool, 1, &[], 100);
+        let left = insert_ok(&mut pool, 2, &[OutPoint::new(root, 0)], 100);
+        let right = insert_ok(&mut pool, 3, &[OutPoint::new(root, 0)], 100);
+        let sink = insert_ok(
+            &mut pool,
+            4,
+            &[OutPoint::new(left, 0), OutPoint::new(right, 0)],
+            100,
+        );
+        let tail = insert_ok(&mut pool, 5, &[OutPoint::new(sink, 0)], 100);
+        let end = insert_ok(&mut pool, 6, &[OutPoint::new(tail, 0)], 100);
+        assert_graph_exact(&pool);
+        assert_eq!(reference_components(&pool)[0].len(), 6);
+
+        // Removing the sink cuts the diamond from the tail.
+        let sink_id = pool.entry_id_by_txid(&sink).expect("pooled");
+        let mut changes = Vec::new();
+        pool.remove_entries_with_reasons(
+            &[(sink_id, RemovalReason::PolicyEviction)],
+            &mut changes,
+        );
+        assert_graph_exact(&pool);
+        let parts = reference_components(&pool);
+        assert_eq!(parts.len(), 2, "the sink held the two halves: {parts:?}");
+        assert_eq!(parts[0].len() + parts[1].len(), 5);
+
+        // Cousins survive: root still has both siblings.
+        let root_id = pool.entry_id_by_txid(&root).expect("pooled");
+        assert_eq!(pool.child_ids(root_id).len(), 2);
+        let _ = end;
+    }
+
+    #[test]
+    fn graph_work_stays_local_on_worst_case_shapes() {
+        let mut pool = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            min_relay_fee_sat_per_kvb: 0,
+            cluster_count: 64,
+            cluster_size_vbytes: 1_000_000,
+            max_ancestors: 200,
+            max_descendants: 200,
+            ..MempoolLimits::default()
+        });
+        // Forty chains of ten: 400 entries in forty small clusters.
+        let mut nonce = 0_u32;
+        for _chain in 0..40 {
+            let mut parent = insert_ok(&mut pool, nonce, &[], 100);
+            nonce += 1;
+            for _depth in 0..9 {
+                parent = insert_ok(&mut pool, nonce, &[OutPoint::new(parent, 0)], 100);
+                nonce += 1;
+            }
+        }
+        assert_eq!(pool.tx_count(), 400);
+
+        // A new root joins nothing: no walk at all, whatever the pool size.
+        pool.graph_steps.store(0, Ordering::Relaxed);
+        let _ = insert_ok(&mut pool, nonce, &[], 100);
+        nonce += 1;
+        assert!(graph_steps(&pool) < 8, "isolated insert walked the pool");
+
+        // A leaf on one chain pays for that chain, not for the pool.
+        let live = pool.iter_txids();
+        let anchor = live[live.len() / 2];
+        pool.graph_steps.store(0, Ordering::Relaxed);
+        let _ = insert_ok(&mut pool, nonce, &[OutPoint::new(anchor, 0)], 100);
+        assert!(
+            graph_steps(&pool) < 4 * 10 + 48,
+            "leaf insert walked beyond its cluster: {}",
+            graph_steps(&pool)
+        );
+
+        // Splitting a chain re-derives only the two halves.
+        let middle = live[live.len() / 4];
+        let middle_id = pool.entry_id_by_txid(&middle).expect("pooled");
+        pool.graph_steps.store(0, Ordering::Relaxed);
+        let mut changes = Vec::new();
+        pool.remove_entries_with_reasons(
+            &[(middle_id, RemovalReason::PolicyEviction)],
+            &mut changes,
+        );
+        assert!(
+            graph_steps(&pool) < 4 * 10 + 64,
+            "split recompute walked beyond the broken cluster: {}",
+            graph_steps(&pool)
+        );
+        assert_graph_exact(&pool);
+    }
+
+    /// Fuzzer insert: tolerated to fail (a full cluster, an evicted parent),
+    /// records the handle and the tx body when it commits.
+    fn try_insert_tracked(
+        pool: &mut Mempool,
+        txs: &mut Vec<Tx>,
+        history: &mut Vec<(EntryHandle, Txid)>,
+        nonce: u32,
+        inputs: &[OutPoint],
+        vsize: u32,
+    ) -> Option<Txid> {
+        let tx = graph_tx(nonce, inputs, false);
+        let txid = tx.txid();
+        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(tx.clone()), vsize, 1_000, TIME, HEIGHT));
+        let outcome = outcome.ok()?;
+        if !matches!(outcome, crate::mutation::InsertionOutcome::Accepted(_)) {
+            return None;
+        }
+        txs.push(tx);
+        let id = pool.entry_id_by_txid(&txid)?;
+        history.push((pool.entries.handle_at(id as usize)?, txid));
+        Some(txid)
+    }
+
+    #[test]
+    fn random_mutations_leave_graph_semantics_exact() {
+        for seed in [0x5EED_u64, 0xC0FFEE, 0xB105] {
+            let mut pool = fuzzer_pool();
+            let mut rng = XorShift::new(seed);
+            let mut nonce = 0_u32;
+            let mut txs: Vec<Tx> = Vec::new();
+            // Every entry ever committed, for the stale-reference contract.
+            let mut history: Vec<(EntryHandle, Txid)> = Vec::new();
+
+            for _round in 0..350 {
+                let live = pool.iter_txids();
+                // Each round's budget is its own: reset before the mutation.
+                pool.graph_steps.store(0, Ordering::Relaxed);
+                match rng.below(10) {
+                    0..=4 => {
+                        // Attach to one to three live parents.
+                        if live.is_empty() {
+                            continue;
+                        }
+                        let count = 1 + rng.below(3.min(live.len()));
+                        let mut picked_parents: HashSet<Txid> = HashSet::new();
+                        for _ in 0..count {
+                            picked_parents.insert(live[rng.below(live.len())]);
+                        }
+                        let picked: Vec<OutPoint> = picked_parents
+                            .iter()
+                            .map(|txid| OutPoint::new(*txid, 0))
+                            .collect();
+                        let vsize = 100 + u32::try_from(rng.below(5) * 10).unwrap_or(100);
+                        try_insert_tracked(&mut pool, &mut txs, &mut history, nonce, &picked, vsize);
+                        nonce += 1;
+                    }
+                    5 => {
+                        try_insert_tracked(&mut pool, &mut txs, &mut history, nonce, &[], 100);
+                        nonce += 1;
+                    }
+                    6 if !live.is_empty() => {
+                        let victim = live[rng.below(live.len())];
+                        if let Some(id) = pool.entry_id_by_txid(&victim) {
+                            let mut changes = Vec::new();
+                            pool.remove_entries_with_reasons(
+                                &[(id, RemovalReason::PolicyEviction)],
+                                &mut changes,
+                            );
+                        }
+                    }
+                    7 if !txs.is_empty() => {
+                        // Confirmations of pooled fixtures; txids the pool no
+                        // longer holds are ignored by contract.
+                        let count = 1 + rng.below(3.min(txs.len()));
+                        let confirmed = (0..count)
+                            .map(|_| txs[rng.below(txs.len())].clone())
+                            .collect::<Vec<_>>();
+                        let confirmed_refs: Vec<&Tx> = confirmed.iter().collect();
+                        let confirmed_ids: Vec<Txid> =
+                            confirmed.iter().map(|tx| tx.txid()).collect();
+                        let _ = pool.remove_for_block(&confirmed_refs, &confirmed_ids, HEIGHT + 1);
+                    }
+                    8 if !live.is_empty() => {
+                        // Replacement shape: evict a random entry's conflicts
+                        // and descendants, then land a new spender of the same
+                        // outpoint. Validation runs before anything commits.
+                        let victim = live[rng.below(live.len())];
+                        let Some(victim_entry) = pool.entry_by_txid(&victim) else {
+                            continue;
+                        };
+                        let Some(input) = victim_entry.tx.inputs.first() else {
+                            continue;
+                        };
+                        let candidate = graph_tx(nonce, &[input.previous_output], true);
+                        nonce += 1;
+                        let evicted = pool.conflicts_with_descendants(&candidate);
+                        if evicted.is_empty() {
+                            continue;
+                        }
+                        let excluded: HashSet<EntryId> = evicted.iter().copied().collect();
+                        let fee = 2_000 + u64::try_from(rng.below(1_000)).unwrap_or(0);
+                        let entry = MempoolEntry::new(Arc::new(candidate.clone()), 100, fee, TIME, HEIGHT);
+                        let Ok(prepared) = pool.validate_insert(entry, &excluded) else {
+                            continue;
+                        };
+                        let removals = evicted
+                            .iter()
+                            .map(|id| (*id, RemovalReason::Replaced))
+                            .collect::<Vec<_>>();
+                        let mut changes = Vec::new();
+                        pool.remove_entries_with_reasons(&removals, &mut changes);
+                        let _committed = pool.commit_insert(prepared);
+                        if let Some(id) = pool.entry_id_by_txid(&candidate.txid()) {
+                            history.push((
+                                pool.entries.handle_at(id as usize).expect("live slot"),
+                                candidate.txid(),
+                            ));
+                        }
+                    }
+                    9 if pool.tx_count() > 8 => {
+                        // Trim pressure.
+                        let target = u64::try_from(rng.below(200) * 100).unwrap_or(0);
+                        crate::evict_lowest_fee_packages(&mut pool, target);
+                    }
+                    _ => {}
+                }
+
+                // The per-mutation contracts.
+                assert!(
+                    graph_steps(&pool) < 64 * 8 + 128,
+                    "walk budget exceeded: {}",
+                    graph_steps(&pool)
+                );
+                for (handle, txid) in &history {
+                    let live_now = pool.contains_txid(txid);
+                    assert_eq!(
+                        pool.entries.resolve(*handle).is_some(),
+                        live_now,
+                        "handle for {txid:?} must track liveness exactly"
+                    );
+                }
+                assert_graph_exact(&pool);
+            }
+        }
+    }
+}
+
