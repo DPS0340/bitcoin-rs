@@ -504,7 +504,8 @@ fn switch_to_branch_refuses_history_the_prune_line_crossed() -> anyhow::Result<(
 
 /// Applies the regtest genesis plus `heights` mined children, publishing a
 /// checkpoint after the first block so a later restore has a base under the
-/// journal. Returns the temp dir, the node, and a config for reopening.
+/// journal, with manual pruning enabled. Returns the temp dir, the node,
+/// and a config for reopening the same datadir.
 fn applied_regtest_chain(
     heights: u32,
 ) -> anyhow::Result<(tempfile::TempDir, NodeState, crate::NodeConfig)> {
@@ -512,6 +513,7 @@ fn applied_regtest_chain(
     let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
     config.data_dir = dir.path().join("node");
     config.p2p.listen.clear();
+    config.storage.prune_target_mb = 1;
     let state = NodeState::open(config.clone(), None)?;
     let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
     state.apply_block(&genesis)?;
@@ -694,5 +696,201 @@ fn boot_refuses_a_gap_whose_body_is_gone() -> anyhow::Result<()> {
         rendered.contains("cannot be replayed"),
         "open must fail on the unrecoverable gap, not silently: {rendered}"
     );
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// #655: prune-then-reorg and bounded deep-reorg scenarios.
+// -----------------------------------------------------------------------
+
+/// What one fork plan needs: the fork tip's node id, its staged bodies by
+/// hash, and its blocks in height order.
+type ForkPlan = (
+    bitcoin_rs_chain::NodeId,
+    HashMap<bitcoin_rs_primitives::Hash256, (bitcoin_rs_primitives::Block, bytes::Bytes)>,
+    Vec<(u32, bitcoin_rs_primitives::Hash256)>,
+);
+
+/// Mines a `depth`-block fork off the active chain at `fork_height` and
+/// inserts its headers, leaving its bodies for the caller's stager.
+fn plan_fork(
+    state: &NodeState,
+    fork_height: u32,
+    depth: u32,
+    time_base: u32,
+) -> anyhow::Result<ForkPlan> {
+    let ancestor = {
+        let tree = state.block_tree.read();
+        let tip = tree.tip().ok_or_else(|| anyhow::anyhow!("no chain tip"))?;
+        tree.node_at_height_from(tip.tip_id, fork_height)
+            .ok_or_else(|| anyhow::anyhow!("no active node at height {fork_height}"))?
+    };
+    let ancestor_hash = state.block_tree.read().node(ancestor)?.hash;
+    let mut parent = ancestor;
+    let mut previous = BlockHash::from(ancestor_hash);
+    let mut bodies = HashMap::new();
+    let mut ordered = Vec::new();
+    for height in fork_height + 1..=fork_height + depth {
+        let block = mined_regtest_child_at(previous, time_base.wrapping_add(height), height)?;
+        let hash = Hash256::from(block.block_hash());
+        let node_id = state.block_tree.write().insert_node(
+            Some(parent),
+            block.header,
+            bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+        )?;
+        bodies.insert(
+            hash,
+            (block.clone(), bytes::Bytes::from(consensus_bytes(&block))),
+        );
+        ordered.push((height, hash));
+        parent = node_id;
+        previous = block.block_hash();
+    }
+    Ok((parent, bodies, ordered))
+}
+
+/// Pruning may delete what a future deep reorg needs; the reorg then
+/// refuses with the defined unavailable result and the node stays whole.
+/// A reorg whose ancestor survives pruning still switches exactly.
+#[test]
+fn prune_then_reorg_refuses_deleted_history_but_keeps_retained_reorgs() -> anyhow::Result<()> {
+    let (_dir, state, _config) = applied_regtest_chain(320)?;
+    state.durable_tip_height.store(320, Ordering::Release);
+    let (deep_tip, deep_bodies, _deep_order) = plan_fork(&state, 20, 2, 1_400_000_000)?;
+    let (shallow_tip, shallow_bodies, _shallow_order) = plan_fork(&state, 100, 2, 1_500_000_000)?;
+    let Some(service) = state.prune_service() else {
+        anyhow::bail!("prune service should exist when prune_target_mb > 0");
+    };
+
+    // The completed prune deletes every row below height 30 (the line is
+    // the durable tip minus the 288-block margin) and records that line.
+    service
+        .prune_to_height(30)
+        .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
+    let handles = state.chainstate();
+    assert_eq!(handles.retention.pruned_below(), 30);
+
+    // A reorg rooted below the recorded line needs deleted bodies; the
+    // retention lease is refused before the first mutation.
+    let outcome = crate::reorg::switch_to_branch(
+        &handles,
+        &state.chain_followers(),
+        deep_tip,
+        |hash| deep_bodies.get(&hash).cloned(),
+        |_| {},
+    );
+    let Err(error) = outcome else {
+        panic!("a reorg rooted in pruned history must be refused");
+    };
+    assert!(
+        matches!(
+            &error,
+            crate::reorg::ReorgError::RetentionUnavailable { floor: 21, .. }
+        ),
+        "deep reorg must refuse deleted history, got: {error:?}"
+    );
+    assert_eq!(handles.retention.active_leases(), 0);
+
+    // A reorg rooted above the line still switches, disconnecting 220
+    // blocks exactly and reconnecting the fork.
+    crate::reorg::switch_to_branch(
+        &handles,
+        &state.chain_followers(),
+        shallow_tip,
+        |hash| shallow_bodies.get(&hash).cloned(),
+        |_| {},
+    )?;
+    let landed = handles
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("reorg must publish a tip"))?;
+    assert_eq!(landed.height, 102);
+    assert_eq!(handles.retention.active_leases(), 0);
+    Ok(())
+}
+
+/// A deep reorg streams in bounded prefixes: the stager offers a window at
+/// a time, the switch commits each verified prefix, and the final coins,
+/// tip, and transaction count match an independently replayed reference.
+#[test]
+fn deep_reorg_streams_bounded_prefixes_to_the_exact_reference() -> anyhow::Result<()> {
+    // A 16-body stager window keeps every switch's connect side bounded.
+    const STAGED_PREFIX: u32 = 16;
+    let (_dir, state, _config) = applied_regtest_chain(320)?;
+    let (fork_tip, fork_bodies, ordered) = plan_fork(&state, 20, 300, 1_600_000_000)?;
+    let height_of: HashMap<bitcoin_rs_primitives::Hash256, u32> = ordered
+        .iter()
+        .map(|(height, hash)| (*hash, *height))
+        .collect();
+    let height_of = std::sync::Arc::new(height_of);
+
+    // The reference applies the winning branch linearly on top of the same
+    // deterministic first 20 blocks.
+    let (_ref_dir, reference, _ref_config) = applied_regtest_chain(20)?;
+    for (height, hash) in &ordered {
+        let (block, _) = fork_bodies
+            .get(hash)
+            .ok_or_else(|| anyhow::anyhow!("fork body {height} missing from the plan"))?;
+        reference.apply_block(block)?;
+    }
+
+    let handles = state.chainstate();
+    // The rolling stager tracks fork progress through the connected-body
+    // callback: each switch may connect at most STAGED_PREFIX new blocks,
+    // and already-applied fork blocks stay servable for the disconnect
+    // walk, exactly like an external bounded stager holding staged forks.
+    let served_through = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(20));
+    let mut switches = 0_u32;
+    loop {
+        switches += 1;
+        assert!(
+            switches <= 48,
+            "bounded stepping did not converge after {switches} switches"
+        );
+        let served = served_through.clone();
+        let reporter = served_through.clone();
+        let reporter_heights = std::sync::Arc::clone(&height_of);
+        let outcome = crate::reorg::switch_to_branch(
+            &handles,
+            &state.chain_followers(),
+            fork_tip,
+            |hash| match height_of.get(&hash) {
+                Some(height) if *height <= served.load(Ordering::Acquire) + STAGED_PREFIX => {
+                    fork_bodies.get(&hash).cloned()
+                }
+                _ => None,
+            },
+            move |hash| {
+                if let Some(height) = reporter_heights.get(&hash) {
+                    reporter.store(*height, Ordering::Release);
+                }
+            },
+        );
+        match outcome {
+            Ok(()) => break,
+            Err(crate::reorg::ReorgError::MissingBody { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert!(
+        switches > 1,
+        "a 300-block reorg through a 16-body stager must take multiple bounded switches"
+    );
+
+    let landed = handles
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("reorg must publish a tip"))?;
+    let reference_tip = reference
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("reference must publish a tip"))?;
+    assert_eq!(landed.hash, reference_tip.hash);
+    assert_eq!(landed.height, reference_tip.height);
+    assert_eq!(
+        state.chain_tx_count.load(Ordering::Acquire),
+        reference.chain_tx_count.load(Ordering::Acquire)
+    );
+    assert_eq!(handles.retention.active_leases(), 0);
     Ok(())
 }
