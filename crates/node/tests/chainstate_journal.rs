@@ -174,47 +174,6 @@ fn disconnect_below_checkpoint_base_forces_full_validation() -> Result<()> {
 }
 
 #[test]
-fn periodic_publication_compacts_and_journals_new_suffix() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = NodeConfig::default_for_network(Network::Regtest);
-    config.data_dir = dir.path().join("periodic-node");
-    config.p2p.listen.clear();
-    config.chainstate_journal.blocks = 1;
-
-    let state = NodeState::open(config.clone(), None)?;
-    let worker = state.start_periodic_checkpoint(1, Duration::from_mins(1))?;
-    let genesis = Network::Regtest.genesis_block();
-    state.apply_block(&genesis)?;
-    let block1 = mined_regtest_child_at(genesis.block_hash(), 1)?;
-    let tip1 = state.apply_block(&block1)?;
-
-    let current = config.data_dir.join("chainstate-checkpoints/CURRENT");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !current.is_file() {
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::other("periodic checkpoint was not published").into());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let block2 = mined_regtest_child_at(BlockHash(tip1.hash), 2)?;
-    let expected_tip = state.apply_block(&block2)?;
-    state.shutdown().store(true, Ordering::Release);
-    worker
-        .join()
-        .map_err(|_| std::io::Error::other("periodic checkpoint worker panicked"))?;
-    drop(state);
-
-    let resumed = NodeState::open(config, None)?;
-    let resumed_tip = resumed
-        .applied_tip()
-        .load_full()
-        .ok_or_else(|| std::io::Error::other("periodic journal tip missing"))?;
-    assert_eq!(resumed_tip.as_ref(), &expected_tip);
-    Ok(())
-}
-
-#[test]
 fn idle_journal_batch_flushes_on_wall_clock_deadline() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = NodeConfig::default_for_network(Network::Regtest);
@@ -230,13 +189,12 @@ fn idle_journal_batch_flushes_on_wall_clock_deadline() -> Result<()> {
     state.publish_checkpoint()?;
     let child = mined_regtest_child_at(genesis.block_hash(), 1)?;
     let expected_tip = state.apply_block(&child)?;
-
-    let worker = state.start_periodic_checkpoint(u32::MAX, Duration::from_hours(1))?;
+    let worker = state.start_chainstate_maintenance()?;
     std::thread::sleep(Duration::from_secs(3));
     state.shutdown().store(true, Ordering::Release);
     worker
         .join()
-        .map_err(|_| std::io::Error::other("checkpoint worker panicked"))?;
+        .map_err(|_| std::io::Error::other("chainstate maintenance worker panicked"))?;
     drop(state);
 
     let resumed = NodeState::open(config, None)?;
@@ -245,6 +203,58 @@ fn idle_journal_batch_flushes_on_wall_clock_deadline() -> Result<()> {
         .load_full()
         .ok_or_else(|| std::io::Error::other("idle journal record was not durable"))?;
     assert_eq!(resumed_tip.as_ref(), &expected_tip);
+    Ok(())
+}
+
+/// Retention enforcement still runs without the periodic worker (#634):
+/// the chainstate maintenance worker answers journal retention pressure
+/// with a checkpoint publication used purely as a compaction-base advance
+/// (`RCV-10`); the durable root stays the only recovery authority.
+#[test]
+fn maintenance_worker_drains_retention_pressure_with_a_publication() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
+    config.data_dir = dir.path().join("maintenance-drain-node");
+    config.p2p.listen.clear();
+    config.chainstate_journal.max_journal_mib = 1;
+    config.chainstate_journal.rotate_mib = 1;
+
+    let genesis = Network::Regtest.genesis_block();
+    let state = NodeState::open(config.clone(), None)?;
+    state.apply_block(&genesis)?;
+    state.publish_checkpoint()?;
+    let current = config.data_dir.join("chainstate-checkpoints/CURRENT");
+    let baseline = std::fs::read_to_string(&current)?;
+
+    // Inflate the measured journal size past the retention budget: apply
+    // is refused before any tip mutation while the pressure stands.
+    let pressure = config
+        .data_dir
+        .join("chainstate-journal/segment-9999999999.log");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pressure)?
+        .set_len(1024 * 1024)?;
+
+    let worker = state.start_chainstate_maintenance()?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if std::fs::read_to_string(&current)? != baseline {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(
+                "maintenance worker did not publish under retention pressure",
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    state.shutdown().store(true, Ordering::Release);
+    worker
+        .join()
+        .map_err(|_| std::io::Error::other("chainstate maintenance worker panicked"))?;
     Ok(())
 }
 

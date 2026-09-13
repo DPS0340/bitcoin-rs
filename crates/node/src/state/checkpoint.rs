@@ -1,10 +1,9 @@
-//! Node-owned checkpoint publication and periodic worker startup.
+//! Node-owned checkpoint publication.
 
 use super::NodeState;
 use anyhow::Result;
 use anyhow::bail;
 use std::sync::Arc;
-use std::time::Duration;
 
 impl NodeState {
     /// Publishes a durable clean checkpoint and returns the published
@@ -22,8 +21,9 @@ impl NodeState {
         }
     }
 
-    /// Creates a [`crate::checkpoint::worker::CheckpointPublisher`] from this
-    /// state's shared handles, for use by the periodic checkpoint worker.
+    /// Creates a [`crate::checkpoint::publisher::CheckpointPublisher`] from
+    /// this state's shared handles, for the maintenance and publication
+    /// paths that move it into a background thread.
     ///
     /// The publisher owns its own `Dir` handle (reopened from the data-dir
     /// path) and cloned `Arc`s, so it can be moved into a background thread
@@ -31,10 +31,10 @@ impl NodeState {
     pub(crate) fn checkpoint_publisher(
         &self,
     ) -> core::result::Result<
-        crate::checkpoint::worker::CheckpointPublisher,
+        crate::checkpoint::publisher::CheckpointPublisher,
         crate::checkpoint::CheckpointError,
     > {
-        Ok(crate::checkpoint::worker::CheckpointPublisher {
+        Ok(crate::checkpoint::publisher::CheckpointPublisher {
             admission: Arc::clone(&self.apply_handles.admission),
             undo_store: Arc::clone(&self.apply_handles.undo_store),
             durable_head: Arc::clone(&self.apply_handles.durable_head),
@@ -53,29 +53,6 @@ impl NodeState {
             chain_events: Arc::clone(&self.chain_events),
             durable_tip_height: Arc::clone(&self.durable_tip_height),
         })
-    }
-
-    /// Spawns the periodic checkpoint worker with a custom cadence.
-    ///
-    /// Production no longer spawns this worker (#634 disabled
-    /// interval-driven publication); this method is `pub` only for the
-    /// integration test that pins the publication mechanics and is removed
-    /// with it.
-    ///
-    /// Returns the worker's join handle. The worker exits when the node's
-    /// shutdown flag is set.
-    pub fn start_periodic_checkpoint(
-        &self,
-        interval_blocks: u32,
-        interval_secs: Duration,
-    ) -> Result<std::thread::JoinHandle<()>> {
-        let publisher = self.checkpoint_publisher().map_err(anyhow::Error::new)?;
-        Ok(crate::checkpoint::worker::spawn_periodic_checkpoint_worker(
-            publisher,
-            Arc::clone(&self.shutdown()),
-            interval_blocks,
-            interval_secs,
-        )?)
     }
 
     pub(crate) fn write_clean_checkpoint(

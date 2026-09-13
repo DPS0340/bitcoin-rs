@@ -34,19 +34,13 @@ use crate::{
     checkpoint::{self, CheckpointError, CheckpointWrite},
     recovery_evidence,
     state::ChainEventPublisher,
-    state::maintenance::{POLL_INTERVAL, idle_journal_maintenance, wait_for_shutdown},
 };
 
 use parking_lot::RwLock;
 
 use std::{
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    sync::{Arc, atomic::Ordering},
 };
 
 fn retire_full_revalidation_marker(data_dir: &std::path::Path) -> Result<(), CheckpointError> {
@@ -262,95 +256,6 @@ impl CheckpointPublisher {
             .store(applied_tip.map_or(0, |tip| tip.height), Ordering::Release);
         Ok(written)
     }
-}
-
-/// Spawns the periodic checkpoint worker thread.
-///
-/// Production no longer spawns this worker: #634 disabled interval-driven
-/// publication, and idle durability plus retention live in
-/// [`crate::state::maintenance`]. It remains only for the integration test
-/// that pins the publication mechanics and is removed with it.
-pub(crate) fn spawn_periodic_checkpoint_worker(
-    publisher: CheckpointPublisher,
-    shutdown: Arc<AtomicBool>,
-    interval_blocks: u32,
-    interval_secs: Duration,
-) -> std::io::Result<JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("bitcoin-rs-checkpoint-worker".to_owned())
-        .spawn(move || {
-            let mut last_published_height: u32 = publisher
-                .applied_tip
-                .load()
-                .as_ref()
-                .map_or(0, |tip| tip.height);
-            let mut last_published_at = Instant::now();
-            let mut prev_pressure = false;
-
-            while !shutdown.load(Ordering::Relaxed) {
-                if wait_for_shutdown(&shutdown, POLL_INTERVAL) {
-                    break;
-                }
-
-                let retention_pressure = idle_journal_maintenance(&publisher);
-                let pressure_transition = retention_pressure && !prev_pressure;
-
-                let current_tip = publisher.applied_tip.load();
-                let Some(tip) = current_tip.as_ref() else {
-                    // No applied tip yet; nothing to checkpoint.
-                    continue;
-                };
-
-                prev_pressure = retention_pressure;
-
-                if pressure_transition {
-                    tracing::info!(
-                        "journal retention pressure: triggering checkpoint publication to drain",
-                    );
-                }
-
-                let blocks_advanced = tip.height.saturating_sub(last_published_height);
-                let elapsed = last_published_at.elapsed();
-
-                if !retention_pressure
-                    && blocks_advanced < interval_blocks
-                    && elapsed < interval_secs
-                {
-                    continue;
-                }
-
-                match publisher.publish() {
-                    Ok(CheckpointWrite::Published { generation }) => {
-                        last_published_height = tip.height;
-                        last_published_at = Instant::now();
-                        tracing::info!(
-                            generation,
-                            height = tip.height,
-                            blocks_advanced,
-                            elapsed_secs = elapsed.as_secs(),
-                            retention_pressure,
-                            "published periodic chainstate checkpoint during sync",
-                        );
-                    }
-                    Ok(CheckpointWrite::SkippedNoAppliedTip) => {
-                        tracing::debug!("periodic checkpoint skipped: no applied tip");
-                    }
-                    Err(CheckpointError::DisconnectInFlight { hash, height }) => {
-                        tracing::debug!(
-                            %hash,
-                            height,
-                            "periodic checkpoint deferred: disconnect in flight",
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "periodic checkpoint publication failed; will retry next tick",
-                        );
-                    }
-                }
-            }
-        })
 }
 
 #[cfg(test)]

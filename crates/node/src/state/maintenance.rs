@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::checkpoint::worker::CheckpointPublisher;
+use crate::checkpoint::publisher::CheckpointPublisher;
 use crate::checkpoint::CheckpointError;
 use crate::checkpoint::CheckpointWrite;
 /// Poll interval for the maintenance loop. Short enough to flush soon after

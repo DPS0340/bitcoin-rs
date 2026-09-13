@@ -437,7 +437,7 @@ impl NodeState {
             applied_tip.load().as_ref().map_or(0, |tip| tip.height),
         ));
         apply_handles.checkpoint_publisher =
-            Some(Arc::new(crate::checkpoint::worker::CheckpointPublisher {
+            Some(Arc::new(crate::checkpoint::publisher::CheckpointPublisher {
                 admission: Arc::clone(&apply_handles.admission),
                 undo_store: Arc::clone(&apply_handles.undo_store),
                 durable_head: Arc::clone(&apply_handles.durable_head),
