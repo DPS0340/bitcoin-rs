@@ -57,10 +57,10 @@ impl NodeState {
 
     /// Spawns the periodic checkpoint worker with a custom cadence.
     ///
-    /// Production wiring goes through `start_node`, which uses
-    /// [`crate::checkpoint::worker::CHECKPOINT_INTERVAL_BLOCKS`] and
-    /// [`crate::checkpoint::worker::CHECKPOINT_INTERVAL_SECS`]. This method
-    /// is `pub` so integration tests can use a small cadence.
+    /// Production no longer spawns this worker (#634 disabled
+    /// interval-driven publication); this method is `pub` only for the
+    /// integration test that pins the publication mechanics and is removed
+    /// with it.
     ///
     /// Returns the worker's join handle. The worker exits when the node's
     /// shutdown flag is set.

@@ -6,6 +6,7 @@
 mod checkpoint;
 mod events;
 mod index;
+pub(crate) mod maintenance;
 mod open;
 mod prune;
 mod restore;
