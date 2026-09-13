@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import socket
 import stat
 import subprocess
@@ -1701,6 +1702,83 @@ class SecurityContractTests(unittest.TestCase):
             self.assertTrue(armed.exists())
             self.assertTrue(_wait_pid_gone(int(grandchild_path.read_text())))
             self.assertFalse(arm.surviving_descendant_seen)
+
+    @staticmethod
+    def _spawn_grandchild_under_transient_parent() -> tuple[int, int]:
+        """Fork a parent that forks a sleeping grandchild and exits unreaped.
+
+        Returns ``(parent_pid, grandchild_pid)`` once the grandchild exists
+        and the parent is still alive; the parent exits ~0.3s later and stays
+        a zombie until the caller reaps it.
+        """
+        read_fd, write_fd = os.pipe()
+        parent = os.fork()
+        if parent == 0:
+            os.close(read_fd)
+            grandchild = os.fork()
+            if grandchild == 0:
+                os.close(write_fd)
+                time.sleep(30)
+                os._exit(0)
+            os.write(write_fd, str(grandchild).encode())
+            os.close(write_fd)
+            time.sleep(0.3)
+            os._exit(0)
+        os.close(write_fd)
+        grandchild = int(os.read(read_fd, 32))
+        os.close(read_fd)
+        return parent, grandchild
+
+    @staticmethod
+    def _wait_for_zombie(pid: int) -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            state = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0]
+            if state == "Z":
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"{pid} did not become a zombie")
+
+    def test_zombie_parent_forfeits_ownership_of_reparented_member(self) -> None:
+        with _ChildSubreaperScope():
+            parent, grandchild = self._spawn_grandchild_under_transient_parent()
+            try:
+                parent_start = _process_start_time(parent)
+                assert parent_start is not None
+                identity = ProcessIdentity.adopt(
+                    grandchild, ProcessGeneration(parent, parent_start)
+                )
+                assert identity is not None
+                self.assertTrue(identity.alive())
+                self._wait_for_zombie(parent)
+                self.assertTrue(identity.alive())
+                self.assertTrue(identity.signal(signal.SIGKILL))
+                identity.close()
+                self.assertEqual(os.waitpid(grandchild, 0)[0], grandchild)
+            finally:
+                os.waitpid(parent, 0)
+
+    def test_drain_settles_member_under_unreaped_zombie_parent(self) -> None:
+        with _ChildSubreaperScope():
+            parent, grandchild = self._spawn_grandchild_under_transient_parent()
+            try:
+                parent_start = _process_start_time(parent)
+                assert parent_start is not None
+                parent_generation = ProcessGeneration(parent, parent_start)
+                identity = ProcessIdentity.adopt(grandchild, parent_generation)
+                assert identity is not None
+                # The transient parent is the host's own child here; the
+                # member was discovered through its edge while it lived.
+                drain = _DescendantDrain(None, None, {parent_generation})
+                drain._identities[identity.generation] = identity
+                self._wait_for_zombie(parent)
+                deadline = time.monotonic_ns() + 4_000_000_000
+                drain.finish(violated_when_present=True, deadline_ns=deadline)
+                self.assertTrue(drain.settled)
+                self.assertTrue(drain.violated)
+                self.assertFalse(Path(f"/proc/{grandchild}").exists())
+            finally:
+                os.waitpid(parent, 0)
 
     def test_digest_failure_after_worker_start_closes_promptly(self) -> None:
         with tempfile.TemporaryDirectory(prefix="p2p-digest-worker-") as raw:

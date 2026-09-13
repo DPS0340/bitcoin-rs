@@ -1030,8 +1030,8 @@ def _direct_children_pids() -> list[int]:
     return sorted(set(_read_proc_children(os.getpid())))
 
 
-def _process_start_time(pid: int) -> int | None:
-    """Read /proc start-time ticks; None once the process is gone."""
+def _process_state_and_start_time(pid: int) -> tuple[str, int] | None:
+    """Read /proc state and start-time ticks; None once the process is gone."""
     try:
         stat_text = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
@@ -1040,9 +1040,31 @@ def _process_start_time(pid: int) -> int | None:
     if len(fields) < 20:
         return None  # unexpected /proc layout; refuse to guess
     try:
-        return int(fields[19])
+        return fields[0], int(fields[19])
     except ValueError:
         return None  # unparsable start time; refuse to guess
+
+
+def _process_start_time(pid: int) -> int | None:
+    """Read /proc start-time ticks; None once the process is gone."""
+    observed = _process_state_and_start_time(pid)
+    return None if observed is None else observed[1]
+
+
+_DEAD_PROCESS_STATES = frozenset("ZX")
+
+
+def _owning_start_time(pid: int) -> int | None:
+    """Start-time ticks of a process that can still own children.
+
+    The kernel reparents every child at the moment its parent exits, so
+    an unreaped zombie owns nothing even though its /proc entry still
+    verifies; treat it as gone for parent-edge validation.
+    """
+    observed = _process_state_and_start_time(pid)
+    if observed is None or observed[0] in _DEAD_PROCESS_STATES:
+        return None
+    return observed[1]
 
 
 @dataclass(frozen=True)
@@ -1119,7 +1141,7 @@ class ProcessIdentity:
         first_parent, generation = first
         if expected_parent is not None:
             parent_alive = (
-                _process_start_time(expected_parent.pid) == expected_parent.start_time
+                _owning_start_time(expected_parent.pid) == expected_parent.start_time
             )
             claimed = expected_parent.pid if parent_alive else os.getpid()
             if first_parent != claimed:
@@ -1135,7 +1157,7 @@ class ProcessIdentity:
         if expected_parent is None:
             return cls(pid, generation.start_time, pidfd)
         parent_alive = (
-            _process_start_time(expected_parent.pid) == expected_parent.start_time
+            _owning_start_time(expected_parent.pid) == expected_parent.start_time
         )
         still_owned_child = second[0] == expected_parent.pid and parent_alive
         valid_reparent = second[0] == os.getpid() and not parent_alive
@@ -1150,10 +1172,15 @@ class ProcessIdentity:
             return False
         if self.parent is None:
             return True
-        parent_start = _process_start_time(self.parent.pid)
+        parent_start = _owning_start_time(self.parent.pid)
         return (
             current[0] == self.parent.pid and parent_start == self.parent.start_time
         ) or (current[0] == os.getpid() and parent_start != self.parent.start_time)
+
+    def exists(self) -> bool:
+        """True while this exact generation is still present in /proc."""
+        current = _process_parent_and_generation(self.pid)
+        return current is not None and current[1] == self.generation
 
     def signal(self, number: int) -> bool:
         """Signal only while generation and owned ancestry still verify."""
@@ -1283,12 +1310,18 @@ class _DescendantDrain:
         self._reap_gone()
 
     def _reap_gone(self) -> None:
-        """Reap exactly known generations; never retain a numeric tombstone."""
+        """Reap exactly known generations; never retain a numeric tombstone.
+
+        A member that is not this process's child yet is retired only once
+        its generation has left /proc: a refused signal is not an exit, and
+        a live member still under another tree member reparents here later
+        and must stay tracked until it is reaped.
+        """
         for generation, identity in list(self._identities.items()):
             try:
                 done, _ = os.waitpid(identity.pid, os.WNOHANG)
             except ChildProcessError:
-                if not identity.alive():
+                if not identity.exists():
                     identity.close()
                     del self._identities[generation]
                     self._gone.add(generation)
