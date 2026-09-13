@@ -72,8 +72,9 @@ pub(crate) fn prune_prefixed_rows<S: KvStore>(
     policy: PrunePolicy,
 ) -> Result<PruneOutcome, PruneError> {
     let mut batch = store.new_batch();
+    let prune_below_height = current_tip_height.saturating_sub(policy.retention_depth());
     let outcome =
-        prune_prefixed_rows_into_batch(store, &mut batch, cf, prefix, current_tip_height, policy)?;
+        prune_prefixed_rows_into_batch(store, &mut batch, cf, prefix, prune_below_height, policy)?;
 
     if !outcome.is_empty() {
         store.write(batch)?;
@@ -92,11 +93,10 @@ pub(crate) fn prune_prefixed_rows_into_batch<S: KvStore>(
     batch: &mut S::WriteBatch,
     cf: ColumnFamily,
     prefix: &[u8],
-    current_tip_height: u32,
+    prune_below_height: u32,
     policy: PrunePolicy,
 ) -> Result<PruneOutcome, PruneError> {
     let target_bytes = policy.target_size_bytes();
-    let prune_below_height = current_tip_height.saturating_sub(policy.retention_depth());
     let mut total_bytes = 0_u64;
     let mut candidates = Vec::new();
 
