@@ -20,9 +20,7 @@ pub mod policy;
 /// Transport-neutral candidate assembly.
 pub mod template;
 
-pub use bip22::{
-    chain_reject_reason, consensus_reject_reason, header_reject_reason, missing_parent_reason,
-};
+pub use bip22::{chain_reject_reason, consensus_reject_reason, header_reject_reason};
 pub use coinbase::{
     MiningError, WITNESS_RESERVED_VALUE, update_uncommitted_block_structures,
     witness_commitment_script,

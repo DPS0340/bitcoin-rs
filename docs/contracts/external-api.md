@@ -132,8 +132,7 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 
 
 - **Owner**: `network_hash_ps` in `crates/mining/src/network_hashps.rs`.
-  Height resolution has one owner: `resolve_hash_ps_start`. Node
-  `MiningCoordinator::network_hash_ps` only supplies the locked block tree
+  Node `MiningCoordinator::network_hash_ps` only supplies the locked block tree
   and one applied-tip snapshot.
 - The method takes the block-tree read lock, then loads one applied-tip
   snapshot. Height checks and the hash-rate walk use that snapshot and that
@@ -590,9 +589,9 @@ owned by [wallet-facing.md](wallet-facing.md).
     `submit_header_requires_the_previous_header`,
     `submit_header_rejects_bad_diffbits`,
     `submit_header_rejects_time_too_new`
-  - `crates/mining/src/bip22/header_reject_tests.rs` tests `pow_failure_is_high_hash`,
-    `nbits_mismatch_is_bad_diffbits`
-    - Execution evidence: `cargo test -p bitcoin-rs-mining header_reject_tests` and
+  - `crates/mining/src/bip22/tests.rs` test
+    `header_reject_reason_uses_chain_vocabulary`
+    - Execution evidence: `cargo test -p bitcoin-rs-mining bip22` and
       `cargo test -p bitcoin-rs-rpc submitheader` (CI job `test`, commit `adc8e37`).
     - Core reference: Bitcoin Core v30.0 `src/rpc/mining.cpp` (`submitheader`)
       and `src/validation.cpp` header reject reasons (tag `v30.0`).
