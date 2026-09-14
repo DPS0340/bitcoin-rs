@@ -36,6 +36,8 @@ pub struct P2pConfig {
     pub dns_seeds_enabled: bool,
     /// Fixed outbound peer endpoints.
     pub connect: Vec<String>,
+    /// Whether fast sync (shallow, early fan-out over a larger outbound set) is enabled.
+    pub fast_sync: bool,
 }
 
 /// Resolved RPC configuration.
@@ -126,6 +128,7 @@ impl NodeConfig {
                 listen: Vec::new(),
                 dns_seeds_enabled: true,
                 connect: Vec::new(),
+                fast_sync: false,
             },
             rpc: RpcConfig {
                 bind: SocketAddr::from(([127, 0, 0, 1], Network::Mainnet.default_rpc_port())),
@@ -266,6 +269,9 @@ impl NodeConfig {
         }
         if let Some(value) = &layer.p2p.connect {
             self.p2p.connect.clone_from(value);
+        }
+        if let Some(value) = layer.p2p.fast_sync {
+            self.p2p.fast_sync = value;
         }
         if let Some(notifications) = &layer.notifications {
             self.notifications.clone_from(notifications);

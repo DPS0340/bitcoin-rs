@@ -76,12 +76,15 @@ Important defaults:
 | pruning | off |
 | txindex | off |
 | scriptindex | off |
+| fast sync | off |
 | metrics listener | off |
 | mining payout | unset |
 
 Change the default RPC credentials before exposing the port.
 
 `--txindex` is the explicit Core-compatible txindex promise. `--scriptindex=utxo` enables the live script view; `--scriptindex=full` also enables confirmed script history. `--rest=true` enables the unauthenticated Core REST routes on the RPC listener.
+
+`--fast-sync` (also `BITCOIN_RS_FAST_SYNC` or `fast_sync` in TOML) relaxes the block-download policy: the node targets 32 outbound peers instead of 8, fans block requests out as soon as two eligible peers are connected instead of eight, and stripes the download window across them at 8 blocks per peer instead of 16. Consensus validation is unchanged. The mode is opt-in and its throughput has not been measured against the default.
 
 ## Check progress
 

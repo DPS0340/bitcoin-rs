@@ -91,6 +91,8 @@ pub struct P2pOverrides {
     pub dns_seeds: Option<bool>,
     /// Fixed outbound peer endpoints.
     pub connect: Option<Vec<String>>,
+    /// Whether fast sync (shallow, early fan-out over a larger outbound set) is enabled.
+    pub fast_sync: Option<bool>,
 }
 
 /// User-supplied RPC overrides.
@@ -195,6 +197,9 @@ impl P2pOverrides {
         }
         if other.connect.is_some() {
             self.connect.clone_from(&other.connect);
+        }
+        if other.fast_sync.is_some() {
+            self.fast_sync = other.fast_sync;
         }
     }
 }

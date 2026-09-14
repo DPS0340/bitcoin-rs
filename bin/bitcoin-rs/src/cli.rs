@@ -49,6 +49,9 @@ pub(crate) struct CliArgs {
     pub(crate) dns_seeds_enabled: Option<bool>,
     #[arg(long = "connect", value_delimiter = ',', value_parser = parse_connect_endpoint)]
     pub(crate) connect: Option<Vec<String>>,
+    /// Fast sync: fan out block requests early and shallowly over a larger outbound peer set.
+    #[arg(long = "fast-sync", num_args = 0..=1, default_missing_value = "true")]
+    pub(crate) fast_sync: Option<bool>,
     #[arg(long = "prune-target-mb")]
     pub(crate) prune_target_mb: Option<u64>,
     #[arg(long)]
@@ -96,6 +99,7 @@ impl CliArgs {
                 listen: self.p2p_listen,
                 dns_seeds: self.dns_seeds_enabled,
                 connect: self.connect,
+                fast_sync: self.fast_sync,
             },
             rpc: RpcOverrides {
                 bind: self.rpc_bind,

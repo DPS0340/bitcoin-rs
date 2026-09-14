@@ -183,8 +183,8 @@ impl BlockSync {
     }
 
     /// Replaces the download window and block stager with ones configured by
-    /// `budget`. Intended for tests and benchmarks that need to exercise
-    /// non-default capacity limits.
+    /// `budget`: the fast-sync opt-in at node open, and tests and benchmarks
+    /// that exercise non-default capacity limits.
     pub fn install_budget(&self, budget: SyncBudget) {
         *self.download_window.lock() = DownloadWindow::new(budget);
         *self.block_stager.lock() = BlockStager::new(budget);

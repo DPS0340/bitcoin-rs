@@ -28,6 +28,7 @@ struct TomlFile {
     p2p_listen: Option<Vec<SocketAddr>>,
     dns_seeds_enabled: Option<bool>,
     connect: Option<Vec<String>>,
+    fast_sync: Option<bool>,
     prune_target_mb: Option<u64>,
     txindex: Option<bool>,
     dbcache_mb: Option<u64>,
@@ -77,6 +78,7 @@ impl TomlFile {
                 listen: self.p2p_listen,
                 dns_seeds: self.dns_seeds_enabled,
                 connect,
+                fast_sync: self.fast_sync,
             },
             rpc: RpcOverrides {
                 bind: self.rpc_bind,
