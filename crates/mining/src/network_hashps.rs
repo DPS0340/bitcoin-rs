@@ -96,7 +96,8 @@ pub fn estimate_network_hashps(
     if walk > i64::from(start_node.height) {
         walk = i64::from(start_node.height);
     }
-    let walk = u32::try_from(walk).unwrap_or(u32::MAX);
+    // A negative lookup other than -1 has no window; treat it as an empty walk.
+    let walk = u32::try_from(walk).unwrap_or(0);
     if walk == 0 {
         return 0.0;
     }
