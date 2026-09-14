@@ -13,6 +13,8 @@ workspace = true
 
 [features]
 default = []
+# Exposes cross-crate test seams without widening the production API.
+test-seam = []
 rocksdb = [
     "bitcoin-rs-storage/rocksdb",
     "bitcoin-rs-chain/rocksdb",

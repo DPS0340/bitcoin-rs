@@ -32,12 +32,12 @@ fn test_open_spec(dir: &std::path::Path, epoch: u64) -> DerivedIndexOpenSpec {
         canonical_data_root: dir.to_path_buf(),
         utxo: None,
         chain_transition: None,
-        open_store: Arc::new(|dir| {
+        open_store: Arc::new(move |dir| {
             let store = Arc::new(
                 bitcoin_rs_storage::FjallStore::open_with_cache(dir, 8 * 1024 * 1024)
                     .map_err(DerivedIndexWorkerError::Storage)?,
             );
-            open_derived_index_store_on_worker(store, DEFAULT_BATCH_LIMITS, 1)
+            open_derived_index_store_on_worker(store, DEFAULT_BATCH_LIMITS, epoch)
         }),
     }
 }

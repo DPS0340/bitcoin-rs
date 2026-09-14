@@ -4,17 +4,23 @@ use super::DerivedIndexLifecycle;
 use super::DerivedIndexOpenSpec;
 use super::DerivedIndexRuntime;
 use super::DerivedIndexWorker;
+#[cfg(any(test, feature = "test-seam"))]
 use super::FORWARD_BATCH_DELAY;
 use super::Generation;
 use super::IndexBlockSource;
+#[cfg(any(test, feature = "test-seam"))]
 use super::REVISION_QUIET_PERIOD;
+#[cfg(any(test, feature = "test-seam"))]
 use super::Worker;
 use super::namespace::NAMESPACE_REGISTRY;
 use super::namespace::NamespaceRegistry;
 use super::startup::fail_worker;
 use super::startup::run_worker_with_open;
+#[cfg(any(test, feature = "test-seam"))]
 use crate::IndexCapabilities;
+#[cfg(any(test, feature = "test-seam"))]
 use crate::PreparedBatchLimits;
+#[cfg(any(test, feature = "test-seam"))]
 use crate::writer::TxIndexWriter;
 use arc_swap::ArcSwap;
 use bitcoin_rs_chain::BlockBodySource;
@@ -37,6 +43,7 @@ impl DerivedIndexWorker {
     /// same commit point as the wake, so the worker treats the wake channel as
     /// its coalesced hint stream and recovers from dropped wakes by
     /// reconciling fresh snapshots.
+    #[cfg(any(test, feature = "test-seam"))]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         runtime: Arc<DerivedIndexRuntime>,
