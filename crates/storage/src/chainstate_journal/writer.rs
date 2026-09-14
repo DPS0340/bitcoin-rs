@@ -36,24 +36,43 @@ mod rewind;
 use super::record::JournalRecord;
 #[cfg(test)]
 use super::record::encode_record;
-use bitcoin_rs_storage::KvStore;
+use crate::KvStore;
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 use thiserror::Error;
 
-/// Magic prefix of `head.json` payload bytes (versioned container, crc32c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalPolicy {
+    pub batch_blocks: u32,
+    pub batch_seconds: Duration,
+    pub rotate_mib: u64,
+    pub max_journal_mib: u64,
+    pub max_lag_blocks: u32,
+    pub max_lag_seconds: Duration,
+}
+
+impl Default for JournalPolicy {
+    fn default() -> Self {
+        Self {
+            batch_blocks: 500,
+            batch_seconds: Duration::from_secs(5),
+            rotate_mib: 256,
+            max_journal_mib: 2048,
+            max_lag_blocks: 500,
+            max_lag_seconds: Duration::from_secs(30),
+        }
+    }
+}
+
 const HEAD_MAGIC: [u8; 4] = *b"JRNH";
-/// Current `head.json` format version.
 const HEAD_VERSION: u8 = 1;
-/// Maximum serialized `head.json` size accepted on load.
 const MAX_HEAD_BYTES: u64 = 4 * 1024;
-/// Maximum serialized segment name length sanity bound.
 const SEGMENT_NAME_MAX: usize = 32;
-pub(crate) const FULL_REVALIDATION_MARKER: &str = "full-revalidation";
+pub const FULL_REVALIDATION_MARKER: &str = "full-revalidation";
 /// Directory name under the node data dir that owns journal files and the
 /// sticky full-revalidation marker.
-pub(crate) const JOURNAL_DIR_NAME: &str = "chainstate-journal";
+pub const JOURNAL_DIR_NAME: &str = "chainstate-journal";
 
 /// Removes the sticky full-revalidation marker after a replacement checkpoint
 /// has reached its `CURRENT` commit point.
@@ -87,7 +106,7 @@ pub(crate) const JOURNAL_DIR_NAME: &str = "chainstate-journal";
 /// Retry owner: the checkpoint worker. Callers must propagate the error so the
 /// worker's next tick retries publication (and therefore this clear). Do not
 /// treat a published checkpoint as finished while this returns `Err`.
-pub(crate) fn clear_full_revalidation_marker_at(data_dir: &Path) -> Result<(), JournalWriterError> {
+pub fn clear_full_revalidation_marker_at(data_dir: &Path) -> Result<(), JournalWriterError> {
     let path = data_dir.join(JOURNAL_DIR_NAME);
     let dir = match crate::checkpoint::fs::open_data_dir(&path) {
         Ok(dir) => dir,
@@ -153,33 +172,25 @@ pub(crate) enum JournalWriterFailpoint {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum JournalWriterError {
-    /// Underlying filesystem error (segment append, sync, rename, ...).
+pub enum JournalWriterError {
     #[error("chainstate journal writer io error: {0}")]
     Io(#[from] std::io::Error),
-    /// The storage flush dependency failed at a durability boundary.
     #[error("chainstate journal storage flush failed: {0}")]
     StorageFlush(String),
-    /// Appends are not accepted in the writer's current state.
     #[error("chainstate journal writer is not open for appends: {state}")]
     NotOpen { state: &'static str },
-    /// A record was appended whose height does not continue the journal.
     #[error("chainstate journal append out of order: got {got}, expected {expected}")]
     OutOfOrder { got: u32, expected: u32 },
     /// A live block advanced after its journal append failed. Further applies
     /// must stop until restart recovery discards the partial tail.
     #[error("chainstate journal has an untracked append gap at height {height}")]
     AppendGap { height: u32 },
-    /// `head.json` is missing, unreadable, or fails its checksum.
     #[error("chainstate journal head marker is unreadable: {0}")]
     HeadUnreadable(String),
-    /// The active segment does not match the durable cursor it claims.
     #[error("chainstate journal cursor mismatch: {0}")]
     CursorMismatch(String),
-    /// Retained segment bytes reached the configured compaction budget.
     #[error("chainstate journal size {bytes} bytes reached configured limit {limit} bytes")]
     RetentionLimit { bytes: u64, limit: u64 },
-    /// A reorg crossed below the checkpoint base this journal presupposes.
     #[error("journal fork height {fork_height} is below checkpoint base {base_height}")]
     ForkBelowBase { fork_height: u32, base_height: u32 },
 }
@@ -191,32 +202,19 @@ pub(crate) enum JournalWriterError {
 /// rename or a bit flip fails closed at load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HeadMarker {
-    /// Checkpoint generation this journal extends.
-    pub(crate) base_generation: u64,
-    /// Applied-tip height of the checkpoint base.
-    pub(crate) base_height: u32,
-    /// Applied-tip hash of the checkpoint base.
-    pub(crate) base_hash: [u8; 32],
-    /// Cumulative transaction count through the checkpoint base.
-    pub(crate) base_chain_tx_count: u64,
-    /// Oldest RETAINED segment generation (the base cursor).
-    pub(crate) start_gen: u64,
-    /// Byte offset within the oldest retained segment's active record window.
-    pub(crate) start_offset: u64,
-    /// Generation of the segment holding the durable frontier.
-    pub(crate) journal_gen: u64,
-    /// Byte offset of the durable frontier inside `journal_gen`'s segment.
-    pub(crate) offset: u64,
-    /// Height of the last durably journaled block.
-    pub(crate) height: u32,
-    /// Hash of the last durably journaled block (32 raw bytes).
-    pub(crate) block_hash: [u8; 32],
-    /// Hash of its predecessor (32 raw bytes).
-    pub(crate) prev_hash: [u8; 32],
-    /// Cumulative transaction count through the head tip.
-    pub(crate) chain_tx_count: u64,
-    /// Number of records retained from `(start_gen, start_offset)` through head.
-    pub(crate) record_count: u64,
+    pub base_generation: u64,
+    pub base_height: u32,
+    pub base_hash: [u8; 32],
+    pub base_chain_tx_count: u64,
+    pub start_gen: u64,
+    pub start_offset: u64,
+    pub journal_gen: u64,
+    pub offset: u64,
+    pub height: u32,
+    pub block_hash: [u8; 32],
+    pub prev_hash: [u8; 32],
+    pub chain_tx_count: u64,
+    pub record_count: u64,
 }
 
 impl HeadMarker {
@@ -320,52 +318,32 @@ pub(crate) enum WriterState {
 
 /// The journal writer. One owner per node: the apply path appends; the
 /// publication primitive freezes/compacts/resumes.
-pub(crate) struct JournalWriter<S: KvStore> {
+pub struct JournalWriter<S: KvStore> {
     dir: cap_std::fs::Dir,
     store: std::sync::Arc<S>,
-    /// Checkpoint generation this writer extends.
     base_generation: u64,
-    /// Applied-tip height of the checkpoint base.
     base_height: u32,
-    /// Applied-tip hash of the checkpoint base.
     base_hash: [u8; 32],
-    /// Cumulative transaction count through the checkpoint base.
     base_chain_tx_count: u64,
-    /// Lightweight cursors for records written since the last boundary.
     pending_records: Vec<PendingRecordMeta>,
-    /// Byte offset of the end of the active segment file.
     segment_offset: u64,
-    /// Generation of the active segment.
     segment_gen: u64,
     /// Oldest retained (generation, offset) — the base cursor.
     start: (u64, u64),
     /// Durable frontier published via `head.json`.
     durable: DurableCursor,
-    /// Cumulative transaction count covered by `durable`.
     durable_chain_tx_count: u64,
-    /// Height expected by the next `append`.
     next_height: u32,
-    /// Cumulative `chain_tx_count` through the next append.
     chain_tx_count: u64,
-    /// Total retained records (from the base cursor through the durable head).
     record_count: u64,
-    /// Buffered byte threshold that forces a boundary (approximate; bytes).
     rotate_bytes: u64,
-    /// Blocks-per-boundary default.
     batch_blocks: u32,
-    /// Seconds-per-boundary default.
     batch_seconds: Duration,
-    /// Total retained segment-byte budget.
     max_journal_bytes: u64,
-    /// Maximum pending block count before pre-apply backpressure.
     max_lag_blocks: u32,
-    /// Maximum pending age before pre-apply backpressure.
     max_lag_seconds: Duration,
-    /// Last boundary instant, for the time-based trigger.
     last_boundary: Instant,
-    /// Hash of the durable head block (from the last boundary record).
     durable_block_hash: [u8; 32],
-    /// Hash of its predecessor.
     durable_prev_hash: [u8; 32],
     /// First live height whose append did not complete. Once set, the writer
     /// fails closed before any later block mutation; restart recovery truncates
@@ -380,7 +358,7 @@ pub(crate) struct JournalWriter<S: KvStore> {
 }
 
 impl<S: KvStore> JournalWriter<S> {
-    /// Current lifecycle state.
+    #[cfg(test)]
     pub(crate) fn state(&self) -> WriterState {
         self.state
     }
@@ -401,13 +379,13 @@ impl<S: KvStore> JournalWriter<S> {
         Ok(())
     }
 
-    pub(crate) fn mark_append_gap(&mut self, height: u32) {
+    /// Records that a failed append leaves a live-chain gap.
+    pub fn mark_append_gap(&mut self, height: u32) {
         self.append_gap_height.get_or_insert(height);
         metrics::gauge!("node.chainstate_journal.append_gap").set(1.0);
         self.record_lag_metrics();
     }
 
-    /// Durable head marker, for the boot path and metrics.
     pub(crate) fn head(&self) -> HeadMarker {
         HeadMarker {
             base_generation: self.base_generation,

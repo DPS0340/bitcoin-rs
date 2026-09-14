@@ -7,8 +7,7 @@ use super::JournalWriterError;
 use super::WriterState;
 use super::read_head_bytes;
 use super::segment_name;
-use bitcoin_rs_storage::KvStore;
-use std::time::Duration;
+use crate::KvStore;
 use std::time::Instant;
 
 impl<S: KvStore> JournalWriter<S> {
@@ -18,7 +17,7 @@ impl<S: KvStore> JournalWriter<S> {
     /// Recovery rules (plan §2.3): a torn tail beyond the head is ignored
     /// (the active segment is truncated back to the head cursor); a missing
     /// `head.json` with no segments is a fresh journal.
-    pub(crate) fn open(
+    pub fn open(
         dir: cap_std::fs::Dir,
         store: std::sync::Arc<S>,
     ) -> Result<Self, JournalWriterError> {
@@ -34,9 +33,8 @@ impl<S: KvStore> JournalWriter<S> {
         Self::restore(dir, store, head)
     }
 
-    /// Creates a fresh journal at the given base cursor.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn initialize(
+    pub fn initialize(
         dir: cap_std::fs::Dir,
         store: std::sync::Arc<S>,
         base_generation: u64,
@@ -71,7 +69,7 @@ impl<S: KvStore> JournalWriter<S> {
         store: std::sync::Arc<S>,
         head: HeadMarker,
     ) -> Result<Self, JournalWriterError> {
-        let defaults = crate::config::ChainstateJournalConfig::default();
+        let defaults = super::JournalPolicy::default();
         let mut writer = Self {
             dir,
             store,
@@ -97,11 +95,11 @@ impl<S: KvStore> JournalWriter<S> {
             durable_block_hash: head.block_hash,
             durable_prev_hash: head.prev_hash,
             rotate_bytes: defaults.rotate_mib * 1024 * 1024,
-            batch_blocks: defaults.blocks,
-            batch_seconds: Duration::from_secs(defaults.seconds),
+            batch_blocks: defaults.batch_blocks,
+            batch_seconds: defaults.batch_seconds,
             max_journal_bytes: defaults.max_journal_mib * 1024 * 1024,
             max_lag_blocks: defaults.max_lag_blocks,
-            max_lag_seconds: Duration::from_secs(defaults.max_lag_seconds),
+            max_lag_seconds: defaults.max_lag_seconds,
             last_boundary: Instant::now(),
             append_gap_height: None,
             durability_retry_required: false,

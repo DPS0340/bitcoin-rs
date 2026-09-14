@@ -3,7 +3,7 @@
 use super::JournalWriter;
 use super::JournalWriterError;
 use super::JournalWriterFailpoint;
-use bitcoin_rs_storage::KvStore;
+use crate::KvStore;
 
 impl<S: KvStore> JournalWriter<S> {
     // --- failpoint plumbing (mirrors checkpoint.rs) ---
@@ -50,7 +50,6 @@ impl<S: KvStore> JournalWriter<S> {
         Ok(())
     }
 
-    /// Arms the next failpoint (test-only; mirrors checkpoint.rs's injector).
     #[cfg(test)]
     pub(crate) fn inject_failpoint(&mut self, failpoint: JournalWriterFailpoint) {
         self.failpoint = Some(failpoint);

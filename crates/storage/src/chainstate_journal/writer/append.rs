@@ -8,7 +8,7 @@ use super::JournalWriterError;
 use super::JournalWriterFailpoint;
 use super::PendingRecordMeta;
 use super::segment_name;
-use bitcoin_rs_storage::KvStore;
+use crate::KvStore;
 use std::io::Write;
 
 impl<S: KvStore> JournalWriter<S> {

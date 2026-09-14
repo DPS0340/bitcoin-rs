@@ -264,10 +264,14 @@ Owners:
   share dispatch (`state.rs`). `P2pService` no longer holds a second download
   window. Relocating leftover node mechanics into `crates/utxo`,
   `crates/storage`, and `crates/p2p` remains tracked under #217 (open). A
-  dedicated `crates/chainstate` waits until journal,
-  checkpoint, and
-  `ChainEventPublisher` also leave node. `crates/node` is the composition
-  layer, but is not yet fully slim.
+  dedicated `crates/chainstate` waits until `ChainEventPublisher` and the
+  node-side chain/UTXO payload codecs leave node. Implemented — journal record
+  codec/writer/retention/replay streaming and checkpoint fs/format/atomic
+  publication/authenticated load now live in `bitcoin-rs-storage`
+  (`chainstate_journal`, `checkpoint`); node keeps chain/UTXO payload codecs
+  (`checkpoint/headers.rs`, `load_payloads`, `write_checkpoint_from_dir`),
+  `ReplayAccumulator`, `delta.rs`, and `CheckpointPublisher` orchestration.
+  `crates/node` is the composition layer, but is not yet fully slim.
 
 ## Proven by
 

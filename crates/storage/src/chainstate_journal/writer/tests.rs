@@ -2,16 +2,14 @@ use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bitcoin_rs_storage::{
-    ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition,
-};
+use crate::{ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
 use cap_std::ambient_authority;
 use parking_lot::Mutex;
 
 use super::*;
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, TxOut, Txid};
 
-use crate::chainstate_journal::record::{Coin, Mutation};
+use super::super::record::{Coin, Mutation};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -87,7 +85,7 @@ impl KvStore for CountingStore {
         unreachable!("unused in writer tests")
     }
 
-    fn arm_persist_fault(&self, _fault: bitcoin_rs_storage::PersistFault) {
+    fn arm_persist_fault(&self, _fault: crate::PersistFault) {
         unreachable!("unused in writer tests")
     }
 }

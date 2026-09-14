@@ -306,14 +306,14 @@ fn build_journal_writer<S: KvStore + 'static>(
             bootstrap.chain_tx_count,
         )?
     };
-    writer.configure(
-        bootstrap.config.blocks,
-        Duration::from_secs(bootstrap.config.seconds),
-        bootstrap.config.rotate_mib,
-        bootstrap.config.max_journal_mib,
-        bootstrap.config.max_lag_blocks,
-        Duration::from_secs(bootstrap.config.max_lag_seconds),
-    )?;
+    writer.configure(crate::chainstate_journal::JournalPolicy {
+        batch_blocks: bootstrap.config.blocks,
+        batch_seconds: Duration::from_secs(bootstrap.config.seconds),
+        rotate_mib: bootstrap.config.rotate_mib,
+        max_journal_mib: bootstrap.config.max_journal_mib,
+        max_lag_blocks: bootstrap.config.max_lag_blocks,
+        max_lag_seconds: Duration::from_secs(bootstrap.config.max_lag_seconds),
+    })?;
     Ok(crate::chainstate_journal::shared_journal_writer(writer))
 }
 

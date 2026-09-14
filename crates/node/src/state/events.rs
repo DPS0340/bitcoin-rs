@@ -173,14 +173,17 @@ const PROCESS_EPOCH_MAX_BYTES: u64 = 32;
 /// A corrupt file is an error, not a reset: silently restarting the counter
 /// would let a new run reuse an epoch old consumer cursors live in.
 fn load_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
-    let bytes =
-        match crate::checkpoint::fs::read_file(dir, PROCESS_EPOCH_FILE, PROCESS_EPOCH_MAX_BYTES) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(error).with_context(|| format!("read {PROCESS_EPOCH_FILE}"));
-            }
-        };
+    let bytes = match bitcoin_rs_storage::checkpoint::fs::read_file(
+        dir,
+        PROCESS_EPOCH_FILE,
+        PROCESS_EPOCH_MAX_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {PROCESS_EPOCH_FILE}"));
+        }
+    };
     let text = core::str::from_utf8(&bytes)
         .with_context(|| format!("{PROCESS_EPOCH_FILE} is not valid UTF-8"))?;
     text.trim().parse::<u64>().with_context(|| {
@@ -234,7 +237,7 @@ pub(super) fn allocate_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
     }
 
     let allocation = (|| -> Result<()> {
-        let mut file = crate::checkpoint::fs::create_file(dir, PROCESS_EPOCH_TEMP)
+        let mut file = bitcoin_rs_storage::checkpoint::fs::create_file(dir, PROCESS_EPOCH_TEMP)
             .with_context(|| format!("create {PROCESS_EPOCH_TEMP}"))?;
         file.write_all(&bytes)
             .with_context(|| format!("write {PROCESS_EPOCH_TEMP}"))?;
@@ -243,7 +246,7 @@ pub(super) fn allocate_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
         drop(file);
         dir.rename(PROCESS_EPOCH_TEMP, dir, PROCESS_EPOCH_FILE)
             .with_context(|| format!("publish {PROCESS_EPOCH_FILE}"))?;
-        crate::checkpoint::fs::sync_dir(dir)
+        bitcoin_rs_storage::checkpoint::fs::sync_dir(dir)
             .context("sync data dir after allocating the process epoch")
     })();
     if allocation.is_err() {

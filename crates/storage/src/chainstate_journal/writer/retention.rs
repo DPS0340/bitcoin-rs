@@ -7,21 +7,19 @@ use super::JournalWriterError;
 use super::WriterState;
 use super::clear_full_revalidation_marker;
 use super::parse_segment_name;
-use bitcoin_rs_storage::KvStore;
-use std::time::Duration;
+use crate::KvStore;
 use std::time::Instant;
 
 impl<S: KvStore> JournalWriter<S> {
-    /// Applies the resolved runtime batching and segment-rotation policy.
-    pub(crate) fn configure(
-        &mut self,
-        batch_blocks: u32,
-        batch_seconds: Duration,
-        rotate_mib: u64,
-        max_journal_mib: u64,
-        max_lag_blocks: u32,
-        max_lag_seconds: Duration,
-    ) -> Result<(), JournalWriterError> {
+    pub fn configure(&mut self, policy: super::JournalPolicy) -> Result<(), JournalWriterError> {
+        let super::JournalPolicy {
+            batch_blocks,
+            batch_seconds,
+            rotate_mib,
+            max_journal_mib,
+            max_lag_blocks,
+            max_lag_seconds,
+        } = policy;
         if batch_blocks == 0
             || batch_seconds.is_zero()
             || rotate_mib == 0
@@ -74,7 +72,6 @@ impl<S: KvStore> JournalWriter<S> {
         Ok(())
     }
 
-    /// Flushes an idle pending batch once its configured time boundary elapses.
     pub(crate) fn flush_due(&mut self) -> Result<(), JournalWriterError> {
         if self.state == WriterState::Open
             && !self.pending_records.is_empty()
@@ -85,7 +82,6 @@ impl<S: KvStore> JournalWriter<S> {
         Ok(())
     }
 
-    /// Whether segment retention requires an immediate checkpoint compaction.
     pub(crate) fn requires_compaction(&self) -> Result<bool, JournalWriterError> {
         Ok(self.journal_size_bytes()? >= self.max_journal_bytes)
     }

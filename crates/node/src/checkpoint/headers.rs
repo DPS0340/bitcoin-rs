@@ -106,7 +106,7 @@ pub(crate) enum HeaderCheckpointError {
     Chain(#[from] bitcoin_rs_chain::ChainError),
 }
 
-pub(crate) fn write_headers<W: Write>(
+pub(crate) fn write_headers<W: Write + ?Sized>(
     writer: &mut W,
     tree: &BlockTree,
     config: HeaderCheckpointConfig,
@@ -120,7 +120,7 @@ pub(crate) fn write_headers<W: Write>(
     write_headers_inner(writer, tree, config, best_tip_id, applied)
 }
 
-pub(super) fn write_selected_headers<W: Write>(
+pub(super) fn write_selected_headers<W: Write + ?Sized>(
     writer: &mut W,
     tree: &BlockTree,
     config: HeaderCheckpointConfig,
@@ -131,7 +131,7 @@ pub(super) fn write_selected_headers<W: Write>(
     write_headers_inner(writer, tree, config, best_tip_id, applied)
 }
 
-fn write_headers_inner<W: Write>(
+fn write_headers_inner<W: Write + ?Sized>(
     writer: &mut W,
     tree: &BlockTree,
     config: HeaderCheckpointConfig,
