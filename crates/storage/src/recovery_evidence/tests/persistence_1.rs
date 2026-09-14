@@ -121,20 +121,14 @@ fn marker_last_event_wins_preserves_prev() {
 #[test]
 fn reporter_report_checkpoint_fallback_writes_marker_and_warns() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(WarningStore::new());
-    let reporter = RecoveryReporter::new(
-        Arc::clone(&store),
-        dir.path().to_path_buf(),
-        "aaaa".to_owned(),
-        5,
-    );
+    let publisher = RecoveryEvidencePublisher::new(dir.path().to_path_buf(), "aaaa".to_owned(), 5);
 
-    reporter
-        .report_checkpoint_fallback(200, 100, "aaa", "checkpoint", "bbb", 1000)
-        .expect("report");
+    publisher
+        .publish_checkpoint_fallback(200, 100, "aaa", "checkpoint", "bbb", 1000)
+        .expect("publish");
 
     // Warning snapshot has checkpoint warning.
-    let warnings = store.warnings();
+    let warnings = publisher.warnings();
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("height 200"));
 
@@ -146,20 +140,14 @@ fn reporter_report_checkpoint_fallback_writes_marker_and_warns() {
 #[test]
 fn reporter_report_index_ahead_writes_marker_and_warns() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(WarningStore::new());
-    let reporter = RecoveryReporter::new(
-        Arc::clone(&store),
-        dir.path().to_path_buf(),
-        "aaaa".to_owned(),
-        5,
-    );
+    let publisher = RecoveryEvidencePublisher::new(dir.path().to_path_buf(), "aaaa".to_owned(), 5);
 
-    reporter
-        .report_index_ahead("txindex", 250, 100, "aaa", "ccc", 150, 1000)
-        .expect("report");
+    publisher
+        .publish_index_ahead("txindex", 250, 100, "aaa", "ccc", 150, 1000)
+        .expect("publish");
 
     // Warning snapshot has index warning.
-    let warnings = store.warnings();
+    let warnings = publisher.warnings();
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("txindex"));
 
@@ -177,7 +165,6 @@ fn checkpoint_fallback_with_index_far_ahead_converges_and_warns() {
     // Simulates the boot scenario: checkpoint restored at height K,
     // older-epoch witness at N>K, and txindex watermark above K.
     // Both warning classes must coexist in one snapshot after reopen.
-    let store = Arc::new(WarningStore::new());
     let dir = tempfile::tempdir().expect("tempdir");
     let genesis = "aaaa";
 
@@ -190,24 +177,19 @@ fn checkpoint_fallback_with_index_far_ahead_converges_and_warns() {
     let fallback = detect_checkpoint_fallback(&read, 5, genesis, 100);
     assert_eq!(fallback, Some((200, 100)), "checkpoint fallback detected");
 
-    // Report checkpoint fallback.
-    let reporter = RecoveryReporter::new(
-        Arc::clone(&store),
-        dir.path().to_path_buf(),
-        genesis.to_owned(),
-        5,
-    );
-    reporter
-        .report_checkpoint_fallback(200, 100, "aaa", "checkpoint", "bbb", 2000)
-        .expect("report checkpoint fallback");
+    // Publish checkpoint fallback.
+    let publisher = RecoveryEvidencePublisher::new(dir.path().to_path_buf(), genesis.to_owned(), 5);
+    publisher
+        .publish_checkpoint_fallback(200, 100, "aaa", "checkpoint", "bbb", 2000)
+        .expect("publish checkpoint fallback");
 
     // Index watermark ahead: txindex at 250, restored at 100, gap 150.
-    reporter
-        .report_index_ahead("txindex", 250, 100, "aaa", "ccc", 150, 3000)
-        .expect("report index ahead");
+    publisher
+        .publish_index_ahead("txindex", 250, 100, "aaa", "ccc", 150, 3000)
+        .expect("publish index ahead");
 
     // Both warning classes coexist in one snapshot.
-    let warnings = store.warnings();
+    let warnings = publisher.warnings();
     assert_eq!(
         warnings.len(),
         2,
@@ -234,52 +216,42 @@ fn marker_write_failure_fails_only_the_reporting_index() {
     // still set in memory (operator can see it), but the error is
     // returned so the caller can fail only that index capability.
     // The checkpoint warning (if any) must survive.
-    let store = Arc::new(WarningStore::new());
     let dir = tempfile::tempdir().expect("tempdir");
     let genesis = "aaaa";
 
     // Set a checkpoint warning first.
-    store.set_checkpoint("checkpoint fallback at 200");
-
-    let _reporter = RecoveryReporter::new(
-        Arc::clone(&store),
-        dir.path().to_path_buf(),
-        genesis.to_owned(),
-        5,
-    );
+    let publisher = RecoveryEvidencePublisher::new(dir.path().to_path_buf(), genesis.to_owned(), 5);
+    publisher
+        .publish_checkpoint_fallback(200, 100, "aaa", "checkpoint", "bbb", 1000)
+        .expect("publish checkpoint fallback");
 
     // Make the data dir read-only so marker write fails.
-    // We simulate this by pointing the reporter at a non-existent
+    // We simulate this by pointing the publisher at a non-existent
     // parent directory.
     let bad_dir = dir.path().join("nonexistent");
-    let bad_reporter = RecoveryReporter::new(Arc::clone(&store), bad_dir, genesis.to_owned(), 5);
+    let bad_publisher = RecoveryEvidencePublisher::new(bad_dir, genesis.to_owned(), 5);
 
-    // Index report fails (marker write to nonexistent dir).
-    let result = bad_reporter.report_index_ahead("txindex", 250, 100, "aaa", "ccc", 150, 1000);
+    // Index publish fails (marker write to nonexistent dir).
+    let result = bad_publisher.publish_index_ahead("txindex", 250, 100, "aaa", "ccc", 150, 1000);
     assert!(result.is_err(), "marker write failure must return an error");
 
     // The warning was still set in memory before the marker write.
-    let warnings = store.warnings();
+    let warnings = bad_publisher.warnings();
     assert_eq!(
         warnings.len(),
-        2,
-        "checkpoint warning survives index marker failure; index warning was set"
-    );
-    assert_eq!(
-        warnings[0], "checkpoint fallback at 200",
-        "checkpoint warning preserved"
-    );
-    assert!(
-        warnings[1].contains("txindex"),
+        1,
         "index warning was set before marker failure"
     );
+    assert!(warnings[0].contains("txindex"));
 
-    // The node (chain RPC) stays live: the store is still usable.
-    let snapshot = store.load();
-    assert_eq!(
-        snapshot.warnings().len(),
-        2,
-        "warning store is still readable after marker failure"
+    // The good publisher's checkpoint warning is unaffected, and both
+    // publishers stay readable after the marker failure.
+    assert!(
+        publisher
+            .warnings()
+            .iter()
+            .any(|w| w.contains("height 200")),
+        "checkpoint warning preserved on the good publisher"
     );
 }
 

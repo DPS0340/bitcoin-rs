@@ -6,7 +6,7 @@
 
 use super::ChainRollbackEvent;
 use super::EvidenceError;
-use super::RecoveryReporter;
+use super::RecoveryEvidencePublisher;
 use super::RollbackEventKind;
 use super::write_marker;
 
@@ -41,35 +41,10 @@ pub(super) fn index_ahead_warning(
     )
 }
 
-impl bitcoin_rs_index::runtime::IndexAheadSink for RecoveryReporter {
-    fn report_index_ahead(
-        &self,
-        capability: &str,
-        index_height: u32,
-        tip_height: u32,
-        tip_hash_be: &str,
-        index_hash_be: &str,
-        depth: u32,
-        unix_secs: u64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Self::report_index_ahead(
-            self,
-            capability,
-            index_height,
-            tip_height,
-            tip_hash_be,
-            index_hash_be,
-            depth,
-            unix_secs,
-        )
-        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
-    }
-}
-
-impl RecoveryReporter {
-    /// Reports a checkpoint-fallback event. Marker failure aborts
+impl RecoveryEvidencePublisher {
+    /// Publishes a checkpoint-fallback event. Marker failure aborts
     /// `NodeState::open`.
-    pub(crate) fn report_checkpoint_fallback(
+    pub fn publish_checkpoint_fallback(
         &self,
         witness_height: u32,
         restored_height: u32,
@@ -100,10 +75,10 @@ impl RecoveryReporter {
         write_marker(&self.data_dir, &event)
     }
 
-    /// Reports an index-watermark-ahead event. The warning snapshot is
+    /// Publishes an index-watermark-ahead event. The warning snapshot is
     /// updated before the marker write, so a marker failure (returned to the
     /// caller) still leaves the fact RPC-visible for this process.
-    pub(crate) fn report_index_ahead(
+    pub fn publish_index_ahead(
         &self,
         capability: &str,
         watermark_height: u32,

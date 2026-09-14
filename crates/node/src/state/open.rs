@@ -165,22 +165,15 @@ impl NodeState {
                 "restored chainstate checkpoint"
             );
         }
-        // A2: Create the process-wide rollback-evidence warning store before
-        // any detection or worker spawn. One ArcSwap holds the complete
-        // immutable snapshot; getblockchaininfo loads one per request.
-        let warning_store = Arc::new(crate::recovery_evidence::WarningStore::new());
-        // A2: Read the durable applied-tip witness and detect checkpoint
-        // fallback. Emit a structured WARN, update the warning snapshot, and
-        // durably publish the event marker — only after all conditions hold:
-        // valid format/bounds, matching genesis, older writer epoch, and
-        // strictly greater witness height than the restored tip.
+        // A2: Create the process-wide rollback-evidence reporter before any
+        // detection or worker spawn. One ArcSwap warning snapshot is loaded
+        // once per getblockchaininfo request.
         let genesis_hex = config.network.genesis_block_hash().to_string_be();
         // One reporter routes every rollback fact of this process — the
         // checkpoint fallback detected here and the index-ahead rewinds the
         // txindex worker detects later — through the same warning store and
         // event marker.
-        let recovery_reporter = Arc::new(crate::recovery_evidence::RecoveryReporter::new(
-            Arc::clone(&warning_store),
+        let recovery_reporter = Arc::new(crate::recovery_reporter::RecoveryReporter::new(
             config.data_dir.clone(),
             genesis_hex.clone(),
             epoch,
@@ -191,14 +184,16 @@ impl NodeState {
             .map_or_else(|| config.network.genesis_block_hash(), |tip| tip.hash)
             .to_string_be();
         if let Some(witness) =
-            crate::recovery_evidence::read_witness(&config.data_dir, &genesis_hex)
+            bitcoin_rs_storage::recovery_evidence::read_witness(&config.data_dir, &genesis_hex)
         {
-            if let Some((witness_height, _)) = crate::recovery_evidence::detect_checkpoint_fallback(
-                &witness,
-                epoch,
-                &genesis_hex,
-                restored_height,
-            ) {
+            if let Some((witness_height, _)) =
+                bitcoin_rs_storage::recovery_evidence::detect_checkpoint_fallback(
+                    &witness,
+                    epoch,
+                    &genesis_hex,
+                    restored_height,
+                )
+            {
                 let source = match resume_source {
                     ResumeSource::Cold => "cold",
                     ResumeSource::Checkpoint => "checkpoint",
@@ -548,7 +543,7 @@ impl NodeState {
             apply_handles,
             followers,
             sync,
-            warning_store,
+            recovery_reporter,
         })
     }
 }

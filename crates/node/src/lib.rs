@@ -37,8 +37,8 @@ pub mod logging;
 pub mod metrics;
 /// Node-owned mining candidate lifecycle coordinator.
 pub mod mining;
-/// Durable rollback evidence: witness and marker file protocol, warning snapshot.
-mod recovery_evidence;
+/// Node-owned adapter wiring recovery evidence into index and RPC sinks.
+mod recovery_reporter;
 
 /// Switching the applied chain from one branch to another.
 pub mod reorg;

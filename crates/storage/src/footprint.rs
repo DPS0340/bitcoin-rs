@@ -6,6 +6,9 @@
 //! physical attribution to a logical owner impossible; the physical ledger is
 //! the source of the data-directory budget.
 
+/// Storage-footprint evidence record format and budget verdict.
+pub mod evidence;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read};

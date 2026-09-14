@@ -189,7 +189,7 @@ fn oversized_current_witness_falls_back_to_prev() -> Result<()> {
     std::fs::write(dir.path().join("CURRENT_SCHEMA"), b"0\n")?;
     let genesis = Network::Regtest.genesis_block_hash().to_string_be();
     let prev = witness_json(&genesis, 3);
-    let mut current = " ".repeat(crate::recovery_evidence::MAX_FILE_BYTES + 1);
+    let mut current = " ".repeat(bitcoin_rs_storage::recovery_evidence::MAX_FILE_BYTES + 1);
     current.push_str(&witness_json(&genesis, 9));
     std::fs::write(dir.path().join("applied-tip-witness.json"), current)?;
     std::fs::write(dir.path().join("applied-tip-witness.json.prev"), prev)?;

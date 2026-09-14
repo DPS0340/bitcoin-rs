@@ -1,6 +1,6 @@
 //! Durable rollback evidence: witness and marker file protocol.
 //!
-//! Private to the node crate. Implements A2 of REC-A12.
+//! Owned by the storage crate. Implements A2 of REC-A12.
 //!
 //! ## Design
 //!
@@ -21,7 +21,7 @@
 //! snapshot per request.
 
 mod io;
-mod reporter;
+mod publisher;
 
 use arc_swap::ArcSwap;
 use io::read_bounded;
@@ -37,7 +37,7 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 /// Maximum file size for any evidence file (4 KiB).
-pub(crate) const MAX_FILE_BYTES: usize = 4096;
+pub const MAX_FILE_BYTES: usize = 4096;
 
 const WITNESS_FILE: &str = "applied-tip-witness.json";
 const WITNESS_PREV: &str = "applied-tip-witness.json.prev";
@@ -56,25 +56,28 @@ const MARKER_FORMAT: &str = "1";
 
 /// Durable record of the applied tip at the last clean checkpoint publication.
 ///
-/// Written only by `NodeState::write_clean_checkpoint` after
+/// Written by the node checkpoint publisher only after
 /// `CheckpointWrite::Published` and root fsync.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AppliedTipWitness {
-    pub(crate) format: String,
+pub struct AppliedTipWitness {
+    /// Format identifier.
+    pub format: String,
     /// Genesis block hash in hex.
-    pub(crate) genesis_hash: String,
+    pub genesis_hash: String,
     /// Process epoch that wrote this witness.
-    pub(crate) writer_epoch: u64,
-    pub(crate) height: u32,
+    pub writer_epoch: u64,
+    /// Applied-tip height.
+    pub height: u32,
     /// Block hash in hex.
-    pub(crate) block_hash: String,
+    pub block_hash: String,
     /// Unix time in seconds.
-    pub(crate) time: u64,
+    pub time: u64,
 }
 
 impl AppliedTipWitness {
-    pub(crate) fn new(
+    /// Creates a witness for `height`/`block_hash` at `time`.
+    pub fn new(
         genesis_hash: impl Into<String>,
         writer_epoch: u64,
         height: u32,
@@ -110,10 +113,7 @@ impl AppliedTipWitness {
 }
 
 /// Decodes an applied-tip witness from already-read sidecar bytes.
-pub(crate) fn decode_applied_tip_witness(
-    data: &[u8],
-    genesis_hash: &str,
-) -> Option<AppliedTipWitness> {
+pub fn decode_applied_tip_witness(data: &[u8], genesis_hash: &str) -> Option<AppliedTipWitness> {
     let witness = AppliedTipWitness::from_json(data)?;
     witness
         .is_valid_for(WITNESS_FORMAT, genesis_hash)
@@ -127,20 +127,33 @@ pub(crate) fn decode_applied_tip_witness(
 /// Exactly one rollback event kind.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "kind", deny_unknown_fields)]
-pub(crate) enum RollbackEventKind {
+pub enum RollbackEventKind {
+    /// The durable applied-tip witness is ahead of the restored tip.
     CheckpointFallback {
+        /// Restored applied-tip height.
         restored_height: u32,
+        /// Restored applied-tip hash in hex.
         restored_hash: String,
+        /// Resume source (`cold`, `checkpoint`, `journal`).
         source: String,
+        /// Witness height (the higher, pre-restore tip).
         old_height: u32,
+        /// Witness block hash in hex.
         old_hash: String,
     },
+    /// An index capability watermark is ahead of the restored tip.
     IndexWatermarkAhead {
+        /// Index capability id.
         capability: String,
+        /// Restored applied-tip height.
         restored_height: u32,
+        /// Restored applied-tip hash in hex.
         restored_hash: String,
+        /// Watermark height (the higher, pre-restore tip).
         old_height: u32,
+        /// Watermark block hash in hex.
         old_hash: String,
+        /// `old_height - restored_height`.
         gap: u32,
     },
 }
@@ -150,19 +163,22 @@ pub(crate) enum RollbackEventKind {
 /// Last-event-wins. The prior valid event is preserved as `.prev`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ChainRollbackEvent {
-    pub(crate) format: String,
+pub struct ChainRollbackEvent {
+    /// Format identifier.
+    pub format: String,
     /// Genesis block hash in hex.
-    pub(crate) genesis_hash: String,
+    pub genesis_hash: String,
     /// Process epoch that detected this event.
-    pub(crate) detecting_epoch: u64,
+    pub detecting_epoch: u64,
     /// Unix time in seconds.
-    pub(crate) time: u64,
-    pub(crate) event: RollbackEventKind,
+    pub time: u64,
+    /// The rollback event.
+    pub event: RollbackEventKind,
 }
 
 impl ChainRollbackEvent {
-    pub(crate) fn new(
+    /// Creates an event detected by `detecting_epoch` at `time`.
+    pub fn new(
         genesis_hash: impl Into<String>,
         detecting_epoch: u64,
         time: u64,
@@ -198,9 +214,11 @@ impl ChainRollbackEvent {
 
 /// Error from the bounded file protocol.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EvidenceError {
+pub enum EvidenceError {
+    /// Filesystem I/O failure.
     #[error("evidence I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// JSON serialization failure.
     #[error("evidence serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -214,7 +232,7 @@ pub(crate) enum EvidenceError {
 /// The rotation check is semantic: a parseable but foreign-genesis or
 /// wrong-format current is INVALID and is removed without displacing a
 /// valid `.prev`, mirroring `read_witness`'s acceptance criteria.
-pub(crate) fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(), EvidenceError> {
+pub fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(), EvidenceError> {
     write_bounded(
         dir,
         &witness.to_json(),
@@ -233,7 +251,7 @@ pub(crate) fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(
 ///
 /// Ignores malformed, oversized, wrong-format, and foreign-genesis evidence
 /// at DEBUG level.
-pub(crate) fn read_witness(dir: &Path, genesis_hash: &str) -> Option<AppliedTipWitness> {
+pub fn read_witness(dir: &Path, genesis_hash: &str) -> Option<AppliedTipWitness> {
     let data = read_bounded(dir, WITNESS_FILE, WITNESS_PREV)?;
     let witness = AppliedTipWitness::from_json(&data)?;
     if !witness.is_valid_for(WITNESS_FORMAT, genesis_hash) {
@@ -253,7 +271,7 @@ pub(crate) fn read_witness(dir: &Path, genesis_hash: &str) -> Option<AppliedTipW
 /// The rotation check is semantic: a parseable but foreign-genesis or
 /// wrong-format current is INVALID and is removed without displacing a
 /// valid `.prev`, mirroring `read_marker`'s acceptance criteria.
-pub(crate) fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
+pub fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
     write_bounded(
         dir,
         &event.to_json(),
@@ -269,8 +287,7 @@ pub(crate) fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(),
 
 /// Reads the most recent valid chain-rollback event marker, falling back to
 /// `.prev` when current is missing or invalid.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn read_marker(dir: &Path, genesis_hash: &str) -> Option<ChainRollbackEvent> {
+pub fn read_marker(dir: &Path, genesis_hash: &str) -> Option<ChainRollbackEvent> {
     let data = read_bounded(dir, MARKER_FILE, MARKER_PREV)?;
     let event = ChainRollbackEvent::from_json(&data)?;
     if !event.is_valid_for(MARKER_FORMAT, genesis_hash) {
@@ -287,7 +304,7 @@ pub(crate) fn read_marker(dir: &Path, genesis_hash: &str) -> Option<ChainRollbac
 /// One immutable warning snapshot holding both checkpoint-fallback and
 /// index-ahead warnings together.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct WarningSnapshot {
+pub struct WarningSnapshot {
     /// At most one checkpoint-fallback warning for the process.
     checkpoint: Option<String>,
     /// One warning per distinct index capability/evidence tuple, sorted by
@@ -298,7 +315,7 @@ pub(crate) struct WarningSnapshot {
 impl WarningSnapshot {
     /// Renders all warnings in deterministic order: checkpoint fallback
     /// first, then index warnings sorted by capability id.
-    pub(crate) fn warnings(&self) -> Vec<String> {
+    pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(msg) = &self.checkpoint {
             out.push(msg.clone());
@@ -318,7 +335,6 @@ impl WarningSnapshot {
 
     /// Returns a new snapshot with an index warning added if it is not an
     /// exact duplicate of an existing one. Preserves the checkpoint warning.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn with_index(mut self, msg: &str) -> Self {
         if !self.index.iter().any(|w| w == msg) {
             self.index.push(msg.to_owned());
@@ -330,38 +346,39 @@ impl WarningSnapshot {
 
 /// Process-wide warning snapshot store. One `ArcSwap` holds the complete
 /// immutable snapshot. Updates are atomic RCU transactions.
-pub(crate) struct WarningStore {
+pub struct WarningStore {
     snapshot: ArcSwap<WarningSnapshot>,
 }
 
 impl WarningStore {
-    pub(crate) fn new() -> Self {
+    /// Creates an empty warning store.
+    pub fn new() -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(WarningSnapshot::default()),
         }
     }
 
     /// Loads one immutable snapshot. Each caller gets a consistent view.
-    pub(crate) fn load(&self) -> Arc<WarningSnapshot> {
+    pub fn load(&self) -> Arc<WarningSnapshot> {
         self.snapshot.load_full()
     }
 
     /// Atomically sets the checkpoint-fallback warning. Deduplicates exact
     /// repeats.
-    pub(crate) fn set_checkpoint(&self, msg: &str) {
+    pub fn set_checkpoint(&self, msg: &str) {
         self.snapshot
             .rcu(|current| Arc::new((**current).clone().with_checkpoint(msg)));
     }
 
     /// Atomically adds an index-ahead warning. Deduplicates exact repeats.
     /// Preserves the checkpoint warning.
-    pub(crate) fn add_index(&self, msg: &str) {
+    pub fn add_index(&self, msg: &str) {
         self.snapshot
             .rcu(|current| Arc::new((**current).clone().with_index(msg)));
     }
 
     /// Renders all warnings in deterministic order from one immutable load.
-    pub(crate) fn warnings(&self) -> Vec<String> {
+    pub fn warnings(&self) -> Vec<String> {
         self.load().warnings()
     }
 }
@@ -369,12 +386,6 @@ impl WarningStore {
 impl Default for WarningStore {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl bitcoin_rs_rpc::context::RollbackWarningSource for WarningStore {
-    fn rollback_warnings(&self) -> Vec<String> {
-        self.warnings()
     }
 }
 
@@ -392,7 +403,7 @@ impl bitcoin_rs_rpc::context::RollbackWarningSource for WarningStore {
 ///   (where no applied tip means height zero).
 ///
 /// Does not require hash inequality. Does not warn for equal or lower heights.
-pub(crate) fn detect_checkpoint_fallback(
+pub fn detect_checkpoint_fallback(
     witness: &AppliedTipWitness,
     current_epoch: u64,
     genesis_hash: &str,
@@ -413,36 +424,54 @@ pub(crate) fn detect_checkpoint_fallback(
 }
 
 // ---------------------------------------------------------------------------
-// Reporter
+// Publisher
 // ---------------------------------------------------------------------------
 
-/// Concrete private reporter created once in `NodeState::open` and shared
-/// with the txindex worker. Routes checkpoint-fallback and index-ahead facts
-/// through one `WarningStore` and one event marker.
+/// Publishes recovery facts: WARN log, process-visible warning snapshot,
+/// then durable marker (RCV-12 ordering).
 ///
-/// For each event: emit structured WARN, atomically update the in-memory
-/// warning snapshot, then durably publish the event marker.
-pub(crate) struct RecoveryReporter {
-    warning_store: Arc<WarningStore>,
+/// Created once per process. Routes checkpoint-fallback and index-ahead facts
+/// through one `WarningStore` and one event marker.
+pub struct RecoveryEvidencePublisher {
+    warning_store: WarningStore,
     data_dir: PathBuf,
     genesis_hash: String,
     detecting_epoch: u64,
 }
 
-impl RecoveryReporter {
-    pub(crate) fn new(
-        warning_store: Arc<WarningStore>,
-        data_dir: PathBuf,
-        genesis_hash: String,
-        detecting_epoch: u64,
-    ) -> Self {
+impl RecoveryEvidencePublisher {
+    /// Creates a publisher with its own `WarningStore`.
+    pub fn new(data_dir: PathBuf, genesis_hash: String, detecting_epoch: u64) -> Self {
         Self {
-            warning_store,
+            warning_store: WarningStore::new(),
             data_dir,
             genesis_hash,
             detecting_epoch,
         }
     }
+
+    /// Renders all warnings in deterministic order from one immutable load.
+    pub fn warnings(&self) -> Vec<String> {
+        self.warning_store.warnings()
+    }
+}
+
+/// Reads the applied-tip witness through an opened data-dir anchor (current,
+/// then `.prev`); `(0, genesis)` when absent/invalid.
+pub fn read_witness_from_anchor(
+    anchor: &crate::footprint::DataDirAnchor,
+    genesis: &str,
+) -> Result<(u32, String), crate::footprint::FootprintError> {
+    const CURRENT: &str = "applied-tip-witness.json";
+    const PREV: &str = "applied-tip-witness.json.prev";
+    for name in [CURRENT, PREV] {
+        if let Some(bytes) = anchor.read_child_file(name, MAX_FILE_BYTES)?
+            && let Some(witness) = decode_applied_tip_witness(&bytes, genesis)
+        {
+            return Ok((witness.height, witness.block_hash));
+        }
+    }
+    Ok((0, genesis.to_owned()))
 }
 
 // ---------------------------------------------------------------------------

@@ -2,20 +2,14 @@ use super::*;
 
 fn test_recovery_reporter(
     data_dir: &std::path::Path,
-) -> (
-    Arc<crate::recovery_evidence::RecoveryReporter>,
-    Arc<crate::recovery_evidence::WarningStore>,
-) {
-    let warning_store = Arc::new(crate::recovery_evidence::WarningStore::new());
-    let reporter = Arc::new(crate::recovery_evidence::RecoveryReporter::new(
-        Arc::clone(&warning_store),
+) -> Arc<crate::recovery_reporter::RecoveryReporter> {
+    Arc::new(crate::recovery_reporter::RecoveryReporter::new(
         data_dir.to_path_buf(),
         bitcoin_rs_chain::Network::Regtest
             .genesis_block_hash()
             .to_string_be(),
         1,
-    ));
-    (reporter, warning_store)
+    ))
 }
 
 #[test]
@@ -37,7 +31,7 @@ fn txindex_worker_failure_makes_queries_unavailable_without_blocking_apply()
         bitcoin_rs_index::runtime::DEFAULT_BATCH_LIMITS,
         bitcoin_rs_index::IndexCapabilities::HISTORICAL,
         Arc::new(crate::state::ChainEventPublisher::detached(0).0),
-        test_recovery_reporter(evidence_dir.path()).0,
+        test_recovery_reporter(evidence_dir.path()),
         u32::MAX,
         wake_rx,
     )?;

@@ -252,7 +252,13 @@ Owners:
   and disconnect markers (`apply.rs`), the node-side sync executor (`sync.rs`
   driving `p2p::DownloadWindow`), and direct backend construction and cache
   share dispatch (`state.rs`). `P2pService` no longer holds a second download
-  window. Relocating leftover node mechanics into `crates/utxo`,
+  window. The durable recovery-evidence protocol (witness/marker codec,
+  bounded atomic write/read, warning snapshot) and the storage-footprint
+  evidence format/budget verdict now live in `crates/storage`
+  (`recovery_evidence`, `footprint::evidence`). Node keeps
+  `RecoveryReporter` only as the `IndexAheadSink`/`RollbackWarningSource`
+  adapter and `measure_storage_footprint` as config/backend-construction
+  orchestration. Relocating leftover node mechanics into `crates/utxo`,
   `crates/storage`, and `crates/p2p` remains tracked under #217 (open). A
   dedicated `crates/chainstate` waits until journal,
   checkpoint, and
