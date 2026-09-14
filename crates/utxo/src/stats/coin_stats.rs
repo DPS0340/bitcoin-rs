@@ -135,34 +135,24 @@ impl CoinStats {
     ///
     /// Returns an error when the stats are not at `disconnected_height`, or
     /// when `tx_delta` exceeds the recorded `tx_count`.
-    pub const fn rewind_block(
+    pub fn rewind_block(
         &mut self,
         disconnected_height: u32,
         parent_height: u32,
         tx_delta: u64,
     ) -> Result<(), CoinStatsRewindError> {
-        match self.check_rewind(disconnected_height, tx_delta) {
-            Ok(tx_count) => {
-                self.height = parent_height;
-                self.tx_count = tx_count;
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        self.tx_count = self.check_rewind(disconnected_height, tx_delta)?;
+        self.height = parent_height;
+        Ok(())
     }
 
-    /// The invariants [`Self::rewind_block`] enforces, without moving anything.
-    ///
-    /// Returns the transaction count the rewind would land on. A disconnect
-    /// preflights with this while a refusal is still free: the rewind itself
-    /// has to run after the UTXO undo, because the per-coin fields ride the
-    /// UTXO change listener.
+    /// [`Self::rewind_block`]'s checks without the move; returns the resulting
+    /// `tx_count`. Lets a disconnect refuse before the UTXO undo runs.
     ///
     /// # Errors
     ///
-    /// Returns an error when the stats are not at `disconnected_height`, or
-    /// when `tx_delta` exceeds the recorded `tx_count`.
-    pub const fn check_rewind(
+    /// Stats not at `disconnected_height`, or `tx_delta` exceeding `tx_count`.
+    pub fn check_rewind(
         &self,
         disconnected_height: u32,
         tx_delta: u64,
@@ -173,13 +163,12 @@ impl CoinStats {
                 found: self.height,
             });
         }
-        match self.tx_count.checked_sub(tx_delta) {
-            Some(tx_count) => Ok(tx_count),
-            None => Err(CoinStatsRewindError::TxCountUnderflow {
+        self.tx_count
+            .checked_sub(tx_delta)
+            .ok_or(CoinStatsRewindError::TxCountUnderflow {
                 tx_count: self.tx_count,
                 tx_delta,
-            }),
-        }
+            })
     }
 
     /// Serializes stats in a stable byte layout.
@@ -725,12 +714,11 @@ impl CoinStatsListener {
             .rewind_block(disconnected_height, parent_height, tx_delta)
     }
 
-    /// Checks [`Self::rewind_block`]'s invariants against the current stats
-    /// without moving them.
+    /// [`CoinStats::check_rewind`] against the current stats.
     ///
     /// # Errors
     ///
-    /// Propagates [`CoinStats::check_rewind`]'s invariant failures.
+    /// Propagates [`CoinStats::check_rewind`].
     pub fn check_rewind(
         &self,
         disconnected_height: u32,

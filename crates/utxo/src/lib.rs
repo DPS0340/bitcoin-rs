@@ -47,8 +47,8 @@ pub use snapshot::{
     write_snapshot_observed,
 };
 pub use undo::{
-    BlockRollback, RollbackError, RollbackFailure, UndoLoadError, load_block_undo,
-    persist_block_undo, rollback_block,
+    BlockRollback, RollbackError, UndoLoadError, load_block_undo, persist_block_undo,
+    rollback_block,
 };
 pub use undo_codec::{
     UNDO_FORMAT_VERSION, UndoCodecError, decode as decode_undo, encode as encode_undo,

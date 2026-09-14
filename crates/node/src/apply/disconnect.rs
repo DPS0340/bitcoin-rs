@@ -18,9 +18,7 @@ use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::Txid;
-use bitcoin_rs_utxo::{
-    BlockRollback, RollbackError, RollbackFailure, load_block_undo, rollback_block,
-};
+use bitcoin_rs_utxo::{BlockRollback, RollbackError, load_block_undo, rollback_block};
 use std::sync::Arc;
 
 pub(super) fn plan_disconnect(
@@ -127,23 +125,12 @@ pub(super) fn disconnect_block_admitted(
         handles.admission.close_permanently();
         error
     };
-    // The UTXO crate owns the marker-fenced rollback: arm, undo the UTXO set,
-    // rewind the block-level coinstats, move the marker to `RolledBack`. A
-    // `Refused` touched nothing; a `Fatal` may have torn state and poisons
-    // admission so only recovery reconciles it.
-    //
-    // Deliberately per-disconnect rather than per-reorg: each disconnect commits
-    // fully, so a branch switch interrupted BETWEEN disconnects leaves a
-    // consistent chain at a lower tip, which is recoverable by connecting
-    // forward. Holding the marker across a whole switch would refuse startup for
-    // that case and force a needless reindex.
-    //
-    // The marker's `RolledBack` write is the rollback's own durable receipt,
-    // still owed a checkpoint; only then does the durable head advance its
-    // commit id onto the parent tip: a reorg may lower the height, never the
-    // commit id. An `Err` from the head batch is not a rollback receipt, so
-    // like every failure past the undo it is fatal and recovery owns the
-    // reconciliation.
+    // Marker-fenced per disconnect, not per reorg: a switch interrupted between
+    // disconnects leaves a consistent lower tip that connects forward. A
+    // `Refused` touched nothing; anything else may have torn state and poisons
+    // admission so only recovery reconciles it. The marker stays `RolledBack`
+    // until the checkpoint below; the head then advances its commit id onto
+    // the parent tip (a reorg lowers height, never commit id).
     rollback_block(
         handles.undo_store.as_ref(),
         handles.utxo.as_ref(),
@@ -156,19 +143,22 @@ pub(super) fn disconnect_block_admitted(
         },
         &undo,
     )
-    .map_err(|error| match error {
-        RollbackError::Refused(source) => {
-            crate::DisconnectError::Refused(Box::new(ApplyError::UndoPersistence(source)))
+    .map_err(|error| {
+        let fatal = |source| {
+            poison(crate::DisconnectError::Fatal {
+                hash: block_hash,
+                height,
+                source: Box::new(source),
+            })
+        };
+        match error {
+            RollbackError::Refused(source) => {
+                crate::DisconnectError::Refused(Box::new(ApplyError::UndoPersistence(source)))
+            }
+            RollbackError::Utxo(source) => fatal(ApplyError::UtxoCommit(source)),
+            RollbackError::CoinStats(source) => fatal(ApplyError::CoinStatsRewind(source)),
+            RollbackError::Marker(source) => fatal(ApplyError::UndoPersistence(source)),
         }
-        RollbackError::Fatal(failure) => poison(crate::DisconnectError::Fatal {
-            hash: block_hash,
-            height,
-            source: Box::new(match failure {
-                RollbackFailure::Utxo(source) => ApplyError::UtxoCommit(source),
-                RollbackFailure::CoinStats(source) => ApplyError::CoinStatsRewind(source),
-                RollbackFailure::Marker(source) => ApplyError::UndoPersistence(source),
-            }),
-        }),
     })?;
     // The journal follows the durable head, never leads it: rewind the
     // derived journal onto the parent first, then advance the head, so a
