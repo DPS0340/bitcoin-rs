@@ -8,7 +8,7 @@ use bitcoin_rs_storage::StorageBackend;
 use super::auth::Auth;
 use super::journal::ChainstateJournalConfig;
 use super::network::{DRYNET4_CONNECT, DRYNET4_P2P_MAGIC, NetworkSelection};
-use super::user::{NotificationConfig, ScriptIndexMode, UserConfig};
+use super::user::{NotificationConfig, ScriptIndexMode, UserConfig, ValidationMode};
 
 const DEFAULT_STORAGE_BACKEND: StorageBackend = StorageBackend::Fjall;
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -74,6 +74,8 @@ pub struct ObservabilityConfig {
 pub struct ValidationConfig {
     /// Height through which script verification may be skipped.
     pub assume_valid_height: u32,
+    /// Which script verification the apply path may skip.
+    pub mode: ValidationMode,
 }
 
 /// Resolved mining configuration.
@@ -147,6 +149,7 @@ impl NodeConfig {
             chainstate_journal: ChainstateJournalConfig::default(),
             validation: ValidationConfig {
                 assume_valid_height: 0,
+                mode: ValidationMode::AssumeValid,
             },
             mining: MiningConfig::default(),
         };
@@ -281,6 +284,9 @@ impl NodeConfig {
         }
         if let Some(value) = layer.validation.assume_valid_height {
             self.validation.assume_valid_height = value;
+        }
+        if let Some(value) = layer.validation.mode {
+            self.validation.mode = value;
         }
     }
 

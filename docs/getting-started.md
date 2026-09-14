@@ -149,12 +149,16 @@ The target durable-root recovery model and its current evidence status are summa
 
 Only a measured physical high-water can prove the storage budget; a point-in-time filesystem snapshot is a lower bound. See [contracts/storage-footprint.md](contracts/storage-footprint.md).
 
-## Full script verification
+## Validation mode
 
-To disable assume-valid script skipping:
+`--validation-mode` (also `BITCOIN_RS_VALIDATION_MODE` or `validation_mode` in TOML) selects which historical script verification the apply path may skip. Non-script consensus checks always run.
+
+- `assume-valid` (default): Bitcoin Core `-assumevalid` semantics. Scripts are skipped through `--assume-valid-height` only while the active chain contains the pinned network anchor.
+- `full`: every script executes; `--assume-valid-height` is ignored.
+- `fast`: scripts are skipped for every block strictly below the current best header tip, so only the block at the tip executes scripts while catching up. This trusts the most-work header chain and is independent of `--fast-sync`.
 
 ```sh
-./target/release/bitcoin-rs --data-dir .bitcoin-rs --assume-valid-height 0
+./target/release/bitcoin-rs --data-dir .bitcoin-rs --validation-mode full
 ```
 
 ## More

@@ -5,7 +5,8 @@ use std::str::FromStr;
 use anyhow::{Result, bail, ensure};
 use bitcoin_rs_node::{
     IndexOverrides, MiningOverrides, NetworkSelection, ObservabilityOverrides, P2pOverrides,
-    RpcOverrides, ScriptIndexMode, StorageOverrides, UserConfig, ValidationOverrides,
+    RpcOverrides, ScriptIndexMode, StorageOverrides, UserConfig, ValidationMode,
+    ValidationOverrides,
 };
 use bitcoin_rs_storage::StorageBackend;
 use clap::Parser;
@@ -64,6 +65,8 @@ pub(crate) struct CliArgs {
     pub(crate) metrics_bind: Option<SocketAddr>,
     #[arg(long = "assume-valid-height")]
     pub(crate) assume_valid_height: Option<u32>,
+    #[arg(long = "validation-mode", value_parser = parse_validation_mode)]
+    pub(crate) validation_mode: Option<ValidationMode>,
     /// Watch-only coinbase payout address for solo mining templates.
     #[arg(long = "mining-payout-address")]
     pub(crate) mining_payout_address: Option<String>,
@@ -120,6 +123,7 @@ impl CliArgs {
             chainstate_journal: None,
             validation: ValidationOverrides {
                 assume_valid_height: self.assume_valid_height,
+                mode: self.validation_mode,
             },
             mining: MiningOverrides {
                 payout_address: self.mining_payout_address,
@@ -139,6 +143,14 @@ fn parse_storage_backend(value: &str) -> std::result::Result<StorageBackend, Str
 fn parse_script_index(value: &str) -> std::result::Result<ScriptIndexMode, String> {
     ScriptIndexMode::parse(value).ok_or_else(|| {
         format!("invalid scriptindex value `{value}`: expected `utxo`, `full`, or a boolean")
+    })
+}
+
+fn parse_validation_mode(value: &str) -> std::result::Result<ValidationMode, String> {
+    ValidationMode::parse(value).ok_or_else(|| {
+        format!(
+            "invalid validation-mode value `{value}`: expected `full`, `assume-valid`, or `fast`"
+        )
     })
 }
 

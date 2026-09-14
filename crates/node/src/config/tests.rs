@@ -349,6 +349,7 @@ fn later_network_selection_resets_earlier_p2p_overrides_atomically() {
         },
         validation: ValidationOverrides {
             assume_valid_height: Some(7),
+            mode: None,
         },
         ..UserConfig::default()
     };

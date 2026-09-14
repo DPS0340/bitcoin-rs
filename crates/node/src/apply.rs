@@ -17,6 +17,7 @@ mod publication;
 pub(crate) mod window;
 
 use crate::apply::error::ApplyError;
+use crate::config::ValidationMode;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::TipSnapshot;
@@ -552,6 +553,7 @@ pub struct Chainstate {
     pub(crate) chain_transition: Arc<parking_lot::Mutex<()>>,
     pub(crate) assume_valid_height: u32,
     pub(crate) assume_valid_gate: Arc<AssumeValidGate>,
+    pub(crate) validation_mode: ValidationMode,
     /// Chainstate-journal writer, when the journal is enabled (issue #230).
     ///
     /// `None` = journal off: the apply path emits nothing and behaves exactly
@@ -720,11 +722,19 @@ impl Chainstate {
     ) -> bool {
         match provenance {
             BlockProvenance::LocalReplay => true,
-            BlockProvenance::Network => {
-                self.assume_valid_height > 0
-                    && height <= self.assume_valid_height
-                    && self.assume_valid_gate.trusted()
-            }
+            BlockProvenance::Network => match self.validation_mode {
+                ValidationMode::Full => false,
+                ValidationMode::AssumeValid => {
+                    self.assume_valid_height > 0
+                        && height <= self.assume_valid_height
+                        && self.assume_valid_gate.trusted()
+                }
+                ValidationMode::Fast => self
+                    .chain_tip
+                    .load()
+                    .as_ref()
+                    .is_some_and(|header_tip| height < header_tip.height),
+            },
         }
     }
 
@@ -815,6 +825,7 @@ impl Chainstate {
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
             assume_valid_height: 0,
             assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
+            validation_mode: ValidationMode::AssumeValid,
             journal: None,
             checkpoint_publisher: None,
             capture_rawtx: false,

@@ -192,6 +192,32 @@ fn scripts_verified_upstream_follows_provenance() {
 }
 
 #[test]
+fn scripts_verified_upstream_follows_validation_mode() {
+    let mut handles = empty_apply_handles();
+    handles.assume_valid_height = 10;
+    handles.assume_valid_gate = Arc::new(AssumeValidGate::with_anchor(None));
+
+    handles.validation_mode = ValidationMode::Full;
+    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 10));
+    assert!(handles.scripts_verified_upstream(BlockProvenance::LocalReplay, 10));
+
+    handles.validation_mode = ValidationMode::Fast;
+    assert!(
+        !handles.scripts_verified_upstream(BlockProvenance::Network, 1),
+        "no header tip: nothing is trusted"
+    );
+    handles.chain_tip.store(Some(Arc::new(TipSnapshot {
+        tip_id: bitcoin_rs_chain::NodeId::default(),
+        height: 20,
+        chainwork: bitcoin_rs_chain::ChainWork::default(),
+        hash: Hash256::default(),
+    })));
+    assert!(handles.scripts_verified_upstream(BlockProvenance::Network, 19));
+    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 20));
+    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 21));
+}
+
+#[test]
 fn verify_block_transactions_rejects_duplicate_spends_when_assume_valid_height_zero()
 -> Result<(), Box<dyn std::error::Error>> {
     let (block, plan, utxo) = duplicate_spend_block()?;

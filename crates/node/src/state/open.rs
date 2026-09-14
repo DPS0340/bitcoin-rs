@@ -426,6 +426,7 @@ impl NodeState {
                 config.network,
                 config.validation.assume_valid_height,
             )),
+            validation_mode: config.validation.mode,
             journal,
             checkpoint_publisher: None,
             capture_rawtx,
