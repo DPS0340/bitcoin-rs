@@ -4,7 +4,7 @@ use super::*;
 fn applied_record_carries_block_metadata_without_the_body() {
     let block = block_with_transaction(coinbase_transaction(0x42));
     let block_hash = block.block_hash();
-    let record = bitcoin_rs_rpc::context::BlockRecord::from_block(7, &block);
+    let record = bitcoin_rs_index::block_log::BlockRecord::from_block(7, &block);
 
     assert_eq!(record.hash, block_hash);
     assert_eq!(record.height, 7);

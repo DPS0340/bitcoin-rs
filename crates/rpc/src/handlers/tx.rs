@@ -19,9 +19,10 @@ use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 use crate::compat::convert::{
     self, VerboseTxChain, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
 };
-use crate::context::{BlockRecord, Context};
+use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::{optional_bool, params_array, parse_txid, required_str, required_u64};
+use bitcoin_rs_index::block_log::BlockRecord;
 use corepc_types::v31;
 
 /// Encodes `bytes` as lowercase hexadecimal.
@@ -308,7 +309,7 @@ fn proof_via_index(ctx: &Arc<Context>, wanted: &hashbrown::HashSet<Txid>) -> Opt
 /// the ones this handler returned before the index path existed.
 fn proof_from_single_record(
     ctx: &Arc<Context>,
-    record: &crate::context::BlockRecord,
+    record: &bitcoin_rs_index::block_log::BlockRecord,
     wanted: &hashbrown::HashSet<Txid>,
 ) -> Result<Value, RpcError> {
     let Some(bytes) = ctx.block_body_bytes(record) else {
@@ -361,7 +362,7 @@ fn proof_from_block_log(
 /// that block is pruned, undecodable, or does not hold every wanted txid.
 fn proof_from_record(
     ctx: &Arc<Context>,
-    record: &crate::context::BlockRecord,
+    record: &bitcoin_rs_index::block_log::BlockRecord,
     wanted: &hashbrown::HashSet<Txid>,
 ) -> Option<Value> {
     let bytes = ctx.block_body_bytes(record)?;
@@ -954,8 +955,9 @@ mod tests {
     use super::getrawtransaction;
     use super::hex_encode;
     use crate::Handler;
-    use crate::context::{BlockRecord, Context, DerivedIndexQuery, TxQueryError};
+    use crate::context::{Context, DerivedIndexQuery, TxQueryError};
     use crate::error::RpcError;
+    use bitcoin_rs_index::block_log::BlockRecord;
 
     /// Minimal one-coinbase-tx fixture block standing in for the chain genesis.
     ///
@@ -1863,7 +1865,7 @@ mod tests {
     #[test]
     fn scan_does_not_hold_the_block_log_lock_across_a_body_load() {
         struct LockProbeSource {
-            blocks: Arc<parking_lot::RwLock<crate::context::BlockLog>>,
+            blocks: Arc<parking_lot::RwLock<bitcoin_rs_index::block_log::BlockLog>>,
             bodies: Vec<(u32, Vec<u8>)>,
         }
 

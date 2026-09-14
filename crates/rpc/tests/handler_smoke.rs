@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bitcoin_rs_chain::{BlockBodySource, ChainWork, NodeId, NodeStatus, TipSnapshot};
+use bitcoin_rs_index::block_log::BlockRecord;
 use bitcoin_rs_mempool::MempoolEntry;
 use bitcoin_rs_mining::{
     BlockTemplate, BlockTemplateRequest, BlockTemplateResult, BlockValidationResult, Candidate,
@@ -20,7 +21,7 @@ use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
     Sequence, Tx, TxIn, TxOut, Txid, Witness, consensus_bytes, encode::double_sha256,
 };
-use bitcoin_rs_rpc::context::{BlockRecord, ChainControl, ChainControlError, Context};
+use bitcoin_rs_rpc::context::{ChainControl, ChainControlError, Context};
 use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};

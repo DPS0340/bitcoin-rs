@@ -211,7 +211,7 @@ impl Harness {
             body_store: Some(body_store),
             batch_limits: DEFAULT_BATCH_LIMITS,
             enabled,
-            chain_events: TestChainCursor::detached(),
+            chain_events: Arc::new(TestChainCursor),
             reporter,
             wake_rx,
             quiet_period: Duration::ZERO,

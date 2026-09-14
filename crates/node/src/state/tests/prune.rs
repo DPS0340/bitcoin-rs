@@ -651,7 +651,8 @@ fn prune_refuses_after_apply_admission_closes() -> anyhow::Result<()> {
 #[test]
 fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
     use super::super::prune::load_pruneheight;
-    use bitcoin_rs_rpc::context::{BlockLog, PruneService};
+    use bitcoin_rs_index::block_log::BlockLog;
+    use bitcoin_rs_rpc::context::PruneService;
     use bitcoin_rs_storage::FlatFileBlockStore;
     use bitcoin_rs_storage::KvStore;
     use bitcoin_rs_storage::WriteBatch as _;

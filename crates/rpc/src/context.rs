@@ -95,10 +95,8 @@ impl Drop for RestRenderPermit {
     }
 }
 
-pub use bitcoin_rs_index::{
-    BlockLog, BlockRecord, RollbackWarningSource, cumulative_tx_count_through, record_at_height,
-    record_at_height_hash,
-};
+use bitcoin_rs_index::block_log::{BlockLog, BlockRecord, record_at_height, record_at_height_hash};
+use bitcoin_rs_index::query_api::RollbackWarningSource;
 
 /// Network counters and peer metadata exposed by network RPCs.
 #[derive(Clone, Debug, Default)]

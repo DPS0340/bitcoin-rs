@@ -52,13 +52,17 @@ pub(super) fn build_derived_index_open_spec(
         data_dir: config.data_dir.clone(),
         namespace: "txindex",
         storage_backend: config.storage.backend,
-        cache_bytes: txindex_cache_bytes,
         epoch,
         enabled,
         rollback_rebuild_cutover: bitcoin_rs_index::runtime::DEFAULT_ROLLBACK_REBUILD_CUTOVER,
         canonical_data_root,
         open_store: Arc::new(move |dir| {
-            open_derived_index_on_worker(backend, dir, cache_bytes, epoch)
+            crate::storage_backend::open_txindex(
+                backend,
+                dir,
+                Some(cache_bytes),
+                DerivedIndexComposer { backend, epoch },
+            )
         }),
         utxo: None,
         chain_transition: None,
@@ -85,20 +89,6 @@ impl crate::storage_backend::StoreConsumer for DerivedIndexComposer {
         };
         open_derived_index_store_on_worker(store, batch_limits, self.epoch)
     }
-}
-
-fn open_derived_index_on_worker(
-    backend: StorageBackend,
-    dir: &std::path::Path,
-    cache_bytes: u64,
-    epoch: u64,
-) -> Result<OpenDerivedIndex, bitcoin_rs_index::runtime::DerivedIndexWorkerError> {
-    crate::storage_backend::open_txindex(
-        backend,
-        dir,
-        Some(cache_bytes),
-        DerivedIndexComposer { backend, epoch },
-    )
 }
 
 pub(super) struct TxIndexSpawn {
@@ -166,10 +156,6 @@ impl NodeState {
             .derived_index_lifecycle
             .as_ref()
             .context("txindex lifecycle missing for a pending worker spawn")?;
-        let chain_events: Arc<dyn bitcoin_rs_index::reconcile::ChainCursorSource> =
-            self.chain_events.clone();
-        let recovery_reporter: Arc<dyn bitcoin_rs_index::runtime::IndexAheadSink> =
-            spawn.recovery_reporter.clone();
         let worker = bitcoin_rs_index::runtime::DerivedIndexWorker::spawn_with_open(
             Arc::clone(runtime),
             spawn.spec,
@@ -180,8 +166,8 @@ impl NodeState {
             Some(Arc::clone(&self.block_body_store)),
             spawn.block_source,
             Some(spawn.body_source),
-            chain_events,
-            recovery_reporter,
+            self.chain_events.clone(),
+            spawn.recovery_reporter,
             Arc::clone(&self.apply_handles.shutdown),
             spawn.wake_rx,
         )
@@ -239,63 +225,6 @@ impl NodeState {
                 // shutdown is observed; Drop is a no-op for the handle.
                 worker.detach();
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used, clippy::panic)]
-    use super::*;
-
-    /// `open_derived_index_on_worker` dispatches to the concrete backend
-    /// constructor and the store opens successfully on the caller's thread.
-    // CONTRACT: docs/contracts/architecture.md#ARCH-03
-    #[test]
-    fn open_dispatch_preserves_backend() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        #[cfg(feature = "fjall")]
-        {
-            let fjall_dir = dir.path().join("txindex-fjall");
-            std::fs::create_dir_all(&fjall_dir).expect("create fjall dir");
-            let result =
-                open_derived_index_on_worker(StorageBackend::Fjall, &fjall_dir, 8 * 1024 * 1024, 1);
-            assert!(
-                result.is_ok(),
-                "fjall backend open must succeed: {:?}",
-                result.err()
-            );
-        }
-
-        #[cfg(feature = "redb")]
-        {
-            let redb_dir = dir.path().join("txindex-redb");
-            std::fs::create_dir_all(&redb_dir).expect("create redb dir");
-            let result =
-                open_derived_index_on_worker(StorageBackend::Redb, &redb_dir, 8 * 1024 * 1024, 1);
-            assert!(
-                result.is_ok(),
-                "redb backend open must succeed: {:?}",
-                result.err()
-            );
-        }
-
-        #[cfg(feature = "rocksdb")]
-        {
-            let rocks_dir = dir.path().join("txindex-rocksdb");
-            std::fs::create_dir_all(&rocks_dir).expect("create rocksdb dir");
-            let result = open_derived_index_on_worker(
-                StorageBackend::RocksDb,
-                &rocks_dir,
-                8 * 1024 * 1024,
-                1,
-            );
-            assert!(
-                result.is_ok(),
-                "rocksdb backend open must succeed: {:?}",
-                result.err()
-            );
         }
     }
 }

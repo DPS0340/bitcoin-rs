@@ -43,7 +43,7 @@ use bitcoin_rs_primitives::consensus_bytes;
 
 use bitcoin_rs_primitives::encode::double_sha256;
 
-use bitcoin_rs_rpc::context::BlockRecord;
+use bitcoin_rs_index::block_log::BlockRecord;
 
 fn publish_applied_tip_height(state: &NodeState, height: u32) {
     let mut hash = [0_u8; 32];

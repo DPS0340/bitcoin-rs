@@ -22,9 +22,6 @@ pub mod types;
 /// Object-safe, fenced access to the durable index writer.
 pub mod writer;
 
-pub use block_log::{
-    BlockLog, BlockRecord, cumulative_tx_count_through, record_at_height, record_at_height_hash,
-};
 pub use capabilities::{
     CapabilitySnapshot, CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource,
     TXINDEX_CAPABILITY, derived_index_status, disabled_txindex, txindex_snapshot,
@@ -40,13 +37,6 @@ pub use mempool::{MempoolRowCounts, MempoolRowWriter};
 pub use query_api::{
     DerivedIndexInfo, DerivedIndexQuery, RollbackWarningSource, ScriptHistoryRecord,
     ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, SpendingRecord, TxQueryError,
-};
-pub use runtime::{
-    DEFAULT_BATCH_LIMITS, DEFAULT_ROLLBACK_REBUILD_CUTOVER, DerivedIndexCapability,
-    DerivedIndexLifecycle, DerivedIndexOpenSpec, DerivedIndexQueryAdapter, DerivedIndexQueryEngine,
-    DerivedIndexRuntime, DerivedIndexWorker, DerivedIndexWorkerError, Generation, IndexAheadSink,
-    IndexBlockSource, OpenDerivedIndex, QueryEngineLive, REDB_BATCH_LIMITS, ROCKSDB_BATCH_LIMITS,
-    open_derived_index_store_on_worker,
 };
 pub use types::{
     HASH_PREFIX_LEN, HASH_PREFIX_ROW_SIZE, HEADER_ROW_SIZE, HashPrefix, HashPrefixRow, HeaderRow,

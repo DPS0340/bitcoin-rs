@@ -220,7 +220,7 @@ fn tx_merkle_proof(ctx: &Context, id: &str) -> Response {
 fn confirmed_block(
     ctx: &Context,
     id: &str,
-) -> Result<(crate::context::BlockRecord, Vec<u8>, Txid), Response> {
+) -> Result<(bitcoin_rs_index::block_log::BlockRecord, Vec<u8>, Txid), Response> {
     let (transaction, Some(status)) = Projection::new(ctx).required_transaction(id)? else {
         return Err(not_found());
     };
@@ -401,7 +401,7 @@ pub(super) fn block_txs(ctx: &Context, h: &str, start: usize) -> Response {
 
 pub(super) fn block_transaction_values<'a>(
     ctx: &Context,
-    record: &crate::context::BlockRecord,
+    record: &bitcoin_rs_index::block_log::BlockRecord,
     transactions: impl IntoIterator<Item = &'a Tx>,
 ) -> Result<Vec<TransactionValue>, Response> {
     // A record fetched by hash can be from a losing branch. Do not reuse the

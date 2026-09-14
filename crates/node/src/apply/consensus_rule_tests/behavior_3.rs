@@ -76,7 +76,7 @@ fn txindex_worker_failure_makes_queries_unavailable_without_blocking_apply()
         Arc::clone(&runtime),
         reader,
         bitcoin_rs_index::runtime::IndexBlockSource::new(Arc::new(parking_lot::RwLock::new(
-            bitcoin_rs_rpc::context::BlockLog::new(),
+            bitcoin_rs_index::block_log::BlockLog::new(),
         ))),
         Arc::clone(&handles.block_tree),
         Arc::clone(&handles.applied_tip),
