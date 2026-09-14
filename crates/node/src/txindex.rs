@@ -136,8 +136,9 @@ const POSITION_PREFETCH_BLOCKS: usize = 65_536;
 /// are small; catch-up also prepares already-stored bodies, so this is not
 /// `RECEIVED_BLOCK_BUDGET`. The byte budget below is independent of P2P staging.
 const PREPARE_CHUNK_BLOCKS: usize = 256;
-/// Serialized-body budget for one parallel prepare step. Later bodies are not
-/// retained once this bound would be exceeded. Stops a 1 MiB-class window from
+/// Serialized-body budget for one parallel prepare step. Loading stops once
+/// the total reaches this bound; the body that reaches it is kept, so a step
+/// holds at most this budget plus one body. Stops a 1 MiB-class window from
 /// holding 256 bodies in RAM while still packing early-chain blocks up to the
 /// count cap.
 const PREPARE_CHUNK_BYTES: usize = 32 << 20;
