@@ -78,8 +78,9 @@ pub enum ValidationMode {
     /// while the active chain contains the anchor block.
     #[default]
     AssumeValid,
-    /// Skip every block strictly below the best header tip; only the block
-    /// at the header tip runs scripts. Trusts the most-work header chain.
+    /// Skip every block on the best header chain strictly below its tip;
+    /// only the tip block and competing branches run scripts. Trusts the
+    /// most-work header chain.
     Fast,
 }
 

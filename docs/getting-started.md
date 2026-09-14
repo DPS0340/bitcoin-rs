@@ -155,7 +155,7 @@ Only a measured physical high-water can prove the storage budget; a point-in-tim
 
 - `assume-valid` (default): Bitcoin Core `-assumevalid` semantics. Scripts are skipped through `--assume-valid-height` only while the active chain contains the pinned network anchor.
 - `full`: every script executes; `--assume-valid-height` is ignored.
-- `fast`: scripts are skipped for every block strictly below the current best header tip, so only the block at the tip executes scripts while catching up. This trusts the most-work header chain and is independent of `--fast-sync`.
+- `fast`: scripts are skipped for every block that lies on the best header chain strictly below its tip, so only the block at the tip executes scripts while catching up. Blocks on competing branches always run scripts. This trusts the most-work header chain and is independent of `--fast-sync`.
 
 ```sh
 ./target/release/bitcoin-rs --data-dir .bitcoin-rs --validation-mode full

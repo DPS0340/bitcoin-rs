@@ -715,10 +715,14 @@ impl<'a> ChainTransition<'a> {
 }
 
 impl Chainstate {
+    /// `Fast` trusts a block only when it is the node at `height` on the
+    /// best header tip's own chain, so a block on a competing branch never
+    /// borrows that trust.
     pub(crate) fn scripts_verified_upstream(
         &self,
         provenance: BlockProvenance,
         height: u32,
+        hash: Hash256,
     ) -> bool {
         match provenance {
             BlockProvenance::LocalReplay => true,
@@ -729,11 +733,17 @@ impl Chainstate {
                         && height <= self.assume_valid_height
                         && self.assume_valid_gate.trusted()
                 }
-                ValidationMode::Fast => self
-                    .chain_tip
-                    .load()
-                    .as_ref()
-                    .is_some_and(|header_tip| height < header_tip.height),
+                ValidationMode::Fast => {
+                    let Some(header_tip) = self.chain_tip.load_full() else {
+                        return false;
+                    };
+                    if height >= header_tip.height {
+                        return false;
+                    }
+                    let tree = self.block_tree.read();
+                    tree.node_at_height_from(header_tip.tip_id, height)
+                        .is_some_and(|id| tree.lookup(hash) == Some(id))
+                }
             },
         }
     }
