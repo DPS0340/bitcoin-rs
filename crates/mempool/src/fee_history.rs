@@ -1,18 +1,11 @@
 //! Owner-local persistence for the fee estimator's confirmation history.
 //!
-//! CONTRACT: docs/policies/db-migration.md — the history file carries an
-//! estimator-owned version outside `CURRENT_SCHEMA`. A corrupt, missing, or
-//! unknown-version payload degrades to insufficient-data status and the node
-//! starts; startup never fails on this file, no rate is ever fabricated, and
-//! a rejected file is left in place (the next owner save atomically replaces
-//! it with the state the node actually holds). There is no translation layer
-//! and no backup or rotation.
+//! CONTRACT: docs/policies/db-migration.md.
 
 use std::path::Path;
 
 use parking_lot::RwLock;
 
-use crate::HistoryReject;
 use crate::Mempool;
 
 /// Name of the estimator's history file inside the datadir.
@@ -38,23 +31,18 @@ pub fn load(data_dir: &Path, mempool: &RwLock<Mempool>) {
         );
         return;
     };
-    if metadata.len() > MAX_HISTORY_FILE_BYTES {
-        tracing::warn!(
-            path = %path.display(),
-            size = metadata.len(),
-            "fee-estimator history exceeds the version-1 size bound; \
-             degrading to insufficient data and leaving the file in place"
-        );
-        return;
-    }
-    let bytes = match std::fs::read(&path) {
+    let bytes = if metadata.len() > MAX_HISTORY_FILE_BYTES {
+        Err(std::io::Error::other("exceeds the version-1 size bound"))
+    } else {
+        std::fs::read(&path)
+    };
+    let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "fee-estimator history is unreadable; \
-                 degrading to insufficient data and leaving the file in place"
+                "fee-estimator history is unreadable; degrading to insufficient data and leaving the file in place"
             );
             return;
         }
@@ -66,18 +54,17 @@ pub fn load(data_dir: &Path, mempool: &RwLock<Mempool>) {
             bytes = bytes.len(),
             "restored fee-estimator history"
         ),
-        Err(reject) => warn_rejected(&path, reject),
+        Err(reject) => tracing::warn!(
+            path = %path.display(),
+            ?reject,
+            "fee-estimator history rejected; degrading to insufficient data and leaving the file in place"
+        ),
     }
 }
 
-/// Persists the estimator history at shutdown, after the event loop drained
-/// and no further mempool mutations run.
-///
-/// Publish protocol (mirrors the recovery-evidence writer): remove a stale
-/// temp, stage the payload with `create_new`, `sync_all` the temp, rename it
-/// over the live file, then best-effort sync the containing directory. A
-/// failure at any stage is a warning: owner-local persistence must never
-/// block a clean shutdown.
+/// Persists the estimator history at shutdown. Publish: stage with `create_new`,
+/// `sync_all`, rename over the live file, best-effort dir sync; any failure is a
+/// warning, never a failed shutdown.
 pub fn save(data_dir: &Path, mempool: &RwLock<Mempool>) {
     let bytes = mempool.read().estimator_history();
     let temp_path = data_dir.join(HISTORY_TEMP);
@@ -112,28 +99,6 @@ pub fn save(data_dir: &Path, mempool: &RwLock<Mempool>) {
             path = %live_path.display(),
             %error,
             "failed to save fee-estimator history; the node still shuts down cleanly"
-        ),
-    }
-}
-
-/// Typed warning for a rejected history payload; the file stays in place.
-fn warn_rejected(path: &Path, reject: HistoryReject) {
-    match reject {
-        HistoryReject::BadMagic => tracing::warn!(
-            path = %path.display(),
-            "fee-estimator history has a foreign magic prefix; \
-             degrading to insufficient data and leaving the file in place"
-        ),
-        HistoryReject::UnknownVersion(version) => tracing::warn!(
-            path = %path.display(),
-            version,
-            "fee-estimator history was written by an unknown format version; \
-             degrading to insufficient data and leaving the file in place"
-        ),
-        HistoryReject::Corrupt => tracing::warn!(
-            path = %path.display(),
-            "fee-estimator history is corrupt; \
-             degrading to insufficient data and leaving the file in place"
         ),
     }
 }

@@ -2,7 +2,6 @@
 
 use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_consensus::ConsensusError;
-use bitcoin_rs_primitives::Hash256;
 use compact_str::CompactString;
 
 use crate::MiningControlError;
@@ -69,25 +68,13 @@ pub fn chain_reject_reason(error: &ChainError) -> CompactString {
 
 /// `submitheader` rejection projection (API-13).
 pub fn header_reject_reason(error: ChainError) -> MiningControlError {
-    let reason = match error {
-        ChainError::InvalidPow { .. } => CompactString::from("high-hash"),
-        ChainError::ZeroTarget { .. }
-        | ChainError::TargetExceedsLimit { .. }
-        | ChainError::NbitsMismatch { .. } => CompactString::from("bad-diffbits"),
-        ChainError::TimestampTooEarly { .. } => CompactString::from("time-too-old"),
-        ChainError::TimestampTooFarAhead { .. } => CompactString::from("time-too-new"),
-        ChainError::MissingParent { prev_hash } => missing_parent_reason(prev_hash),
-        other => CompactString::from(other.to_string()),
-    };
-    MiningControlError::Rejected(reason)
+    MiningControlError::Rejected(match error {
+        ChainError::MissingParent { prev_hash } => {
+            CompactString::from(format!("Must submit previous header ({prev_hash}) first"))
+        }
+        other => chain_reject_reason(&other),
+    })
 }
 
-/// `submitheader` reason when the previous header is absent (API-13).
-pub fn missing_parent_reason(prev_hash: Hash256) -> CompactString {
-    CompactString::from(format!("Must submit previous header ({prev_hash}) first"))
-}
-
-#[cfg(test)]
-mod header_reject_tests;
 #[cfg(test)]
 mod tests;
