@@ -1,6 +1,6 @@
 use super::header_reject_reason;
+use crate::MiningControlError;
 use bitcoin_rs_chain::{ChainError, ChainWork};
-use bitcoin_rs_mining::MiningControlError;
 use bitcoin_rs_primitives::Hash256;
 
 // CONTRACT: docs/contracts/external-api.md#API-13

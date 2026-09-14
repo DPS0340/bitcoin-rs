@@ -1,8 +1,6 @@
 //! Mining control protocol projection over the node-owned coordinator.
 
 use super::MiningCoordinator;
-use super::estimate_network_hashps;
-use super::hash_ps_at;
 use bitcoin_rs_mining::BlockTemplateMode;
 use bitcoin_rs_mining::BlockTemplateRequest;
 use bitcoin_rs_mining::BlockTemplateResult;
@@ -22,7 +20,12 @@ impl MiningCoordinator {
         let network_hashes_per_second = {
             let tree = self.block_tree.read();
             tip.as_ref().map_or(0.0, |tip| {
-                estimate_network_hashps(&tree, Some(tip.tip_id), 120, self.network)
+                bitcoin_rs_mining::estimate_network_hashps(
+                    &tree,
+                    Some(tip.tip_id),
+                    120,
+                    self.network,
+                )
             })
         };
         let warnings = crate::metrics::node_warnings()
@@ -56,14 +59,9 @@ impl MiningControl for MiningCoordinator {
     }
 
     fn network_hash_ps(&self, lookup: i64, height: i64) -> Result<f64, MiningControlError> {
-        if lookup < -1 || lookup == 0 {
-            return Err(MiningControlError::InvalidRequest(CompactString::from(
-                "Invalid nblocks. Must be a positive number or -1.",
-            )));
-        }
         let tree = self.block_tree.read();
         let tip = self.applied_tip.load_full();
-        hash_ps_at(&tree, tip.as_deref(), lookup, height, self.network)
+        bitcoin_rs_mining::network_hash_ps(&tree, tip.as_deref(), lookup, height, self.network)
     }
 
     fn submit_block(&self, mut block: Block) -> Result<BlockValidationResult, MiningControlError> {

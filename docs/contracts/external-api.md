@@ -131,8 +131,10 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 ### `API-06`: `getnetworkhashps` snapshot and invalid-height behavior
 
 
-- **Owner**: `MiningCoordinator::network_hash_ps` in `crates/node/src/mining.rs`.
-  Height resolution has one owner: `resolve_hash_ps_start`.
+- **Owner**: `network_hash_ps` in `crates/mining/src/network_hashps.rs`.
+  Height resolution has one owner: `resolve_hash_ps_start`. Node
+  `MiningCoordinator::network_hash_ps` only supplies the locked block tree
+  and one applied-tip snapshot.
 - The method takes the block-tree read lock, then loads one applied-tip
   snapshot. Height checks and the hash-rate walk use that snapshot and that
   locked tree, not a second tip load.
@@ -258,6 +260,9 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 
 - **Owner**: `MiningCoordinator::submit_header` in `crates/node/src/mining.rs`.
   RPC decodes the hex and projects the result; it does not admit headers.
+  The reject-reason projection is `header_reject_reason` in
+  `crates/mining/src/bip22.rs`; admission itself stays
+  `MiningCoordinator::submit_header`.
 - Decode failures (invalid hex, fewer than 80 bytes) are Core `-22`
   (`Block header decode failed`). Extra bytes after an 80-byte header are
   ignored, matching Core `DecodeHexBlockHeader`.
@@ -338,7 +343,9 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 ### `API-19`: BIP22 reject reasons
 
 
-- **Owner**: `bip22_reject_reason` in `crates/node/src/mining/submission.rs`.
+- **Owner**: `bip22_reject_reason` in `crates/node/src/mining/submission.rs`
+  for the `ApplyError` arms, delegating to `consensus_reject_reason` and
+  `chain_reject_reason` in `crates/mining/src/bip22.rs`.
 - Proposal and `submitblock` project apply/consensus failures as Core
   `GetRejectReason` strings (`bad-cb-missing`, `bad-txnmrklroot`,
   `bad-cb-amount`, `high-hash`, `time-too-old`, …). Operational apply
@@ -556,8 +563,8 @@ owned by [wallet-facing.md](wallet-facing.md).
   `generateblock_raw_tx_does_not_require_mempool_admission`,
   `generate_without_submit_does_not_advance_the_tip`,
   `network_hash_ps_rejects_core_invalid_windows`;
-  `crates/node/src/mining/network_hashps_oracle_tests.rs` tests
-  `hash_ps_at_rejects_a_height_the_tip_cannot_resolve`;
+  `crates/mining/src/network_hashps/oracle_tests.rs` tests
+  `network_hash_ps_rejects_a_height_the_tip_cannot_resolve`;
   `crates/mining/tests/template_shape.rs` tests
   `candidate_solves_an_unsolved_regtest_header`,
   `ordered_assembly_keeps_snapshot_order`.
@@ -583,9 +590,9 @@ owned by [wallet-facing.md](wallet-facing.md).
     `submit_header_requires_the_previous_header`,
     `submit_header_rejects_bad_diffbits`,
     `submit_header_rejects_time_too_new`
-  - `crates/node/src/mining/header_reject_tests.rs` tests `pow_failure_is_high_hash`,
+  - `crates/mining/src/bip22/header_reject_tests.rs` tests `pow_failure_is_high_hash`,
     `nbits_mismatch_is_bad_diffbits`
-    - Execution evidence: `cargo test -p bitcoin-rs-node header_reject_tests` and
+    - Execution evidence: `cargo test -p bitcoin-rs-mining header_reject_tests` and
       `cargo test -p bitcoin-rs-rpc submitheader` (CI job `test`, commit `adc8e37`).
     - Core reference: Bitcoin Core v30.0 `src/rpc/mining.cpp` (`submitheader`)
       and `src/validation.cpp` header reject reasons (tag `v30.0`).
@@ -624,8 +631,10 @@ owned by [wallet-facing.md](wallet-facing.md).
     `applied_ancestor_with_unset_chain_tx_count_is_duplicate`,
     `duplicate_submit_returns_duplicate`
 - `API-19`:
-  - `crates/node/src/mining/apply_error_tests.rs` tests
-    `consensus_failures_use_core_bip22_reasons`, `header_failures_use_core_bip22_reasons`
+  - `crates/mining/src/bip22/tests.rs` tests
+    `consensus_failures_use_core_bip22_reasons`, `header_failures_use_core_bip22_reasons`;
+    `crates/node/src/mining/apply_error_tests.rs` test
+    `apply_errors_delegate_consensus_and_chain_reasons`
   - `crates/node/tests/mining.rs` tests `proposal_without_coinbase_is_bad_cb_missing`,
     `proposal_merkle_mismatch_is_bad_txnmrklroot`,
     `proposal_rejects_excess_coinbase_without_side_effects`
@@ -637,7 +646,7 @@ owned by [wallet-facing.md](wallet-facing.md).
     `contextual_rules_enforce_bip141_commitment_after_segwit_activation`,
     `bip141_coinbase_witness_must_have_exactly_one_32_byte_element`,
     `bip141_witness_commitment_last_output_wins`
-  - `crates/node/src/mining/apply_error_tests.rs` test
+  - `crates/mining/src/bip22/tests.rs` test
     `consensus_failures_use_core_bip22_reasons`
   - `crates/node/tests/mining.rs` tests
     `proposal_commitment_without_witness_nonce_is_bad_witness_nonce_size`,
