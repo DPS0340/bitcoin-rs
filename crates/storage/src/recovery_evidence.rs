@@ -1,58 +1,38 @@
-//! Durable rollback evidence: witness and marker file protocol.
+//! Durable rollback evidence.
 //!
-//! Owned by the storage crate. Implements A2 of REC-A12.
+//! Bounded, genesis-scoped JSON sidecars with a `.prev` rotation, plus the
+//! process-visible warning snapshot (RCV-12).
 //!
-//! ## Design
-//!
-//! Two root-level sidecar file families live beside `process-epoch`:
-//!
-//! - `applied-tip-witness.json` (+ `.prev`, `.tmp`): the applied tip at the
-//!   last durable checkpoint publication.
-//! - `chain-rollback-event.json` (+ `.prev`, `.tmp`): the last detected
-//!   rollback event (checkpoint fallback or index watermark ahead).
-//!
-//! Both use a bounded current/previous protocol: write to temp, fsync temp,
-//! rotate valid current to `.prev`, rename temp to current, fsync the
-//! directory. Reading falls back to `.prev` only when current is missing or
-//! invalid. Never selects by greatest height.
-//!
-//! One `ArcSwap` warning snapshot holds both checkpoint-fallback and
-//! index-ahead warnings together. `getblockchaininfo` loads one immutable
-//! snapshot per request.
+//! `applied-tip-witness.json` records the applied tip at the last durable
+//! checkpoint publication; `chain-rollback-event.json` records the last
+//! detected rollback event. Publishing stages `.tmp` (`create_new`, fsync),
+//! rotates a *valid* current to `.prev`, renames, and fsyncs the directory.
+//! Reads try current then `.prev`; a missing or invalid current falls
+//! through. Never selects by greatest height.
 
-mod io;
-mod publisher;
-
-use arc_swap::ArcSwap;
-use io::read_bounded;
-use io::write_bounded;
-use serde::Deserialize;
-use serde::Serialize;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 
 /// Maximum file size for any evidence file (4 KiB).
 pub const MAX_FILE_BYTES: usize = 4096;
 
+const FORMAT: &str = "1";
 const WITNESS_FILE: &str = "applied-tip-witness.json";
-const WITNESS_PREV: &str = "applied-tip-witness.json.prev";
-const WITNESS_TMP: &str = "applied-tip-witness.json.tmp";
-
 const MARKER_FILE: &str = "chain-rollback-event.json";
-const MARKER_PREV: &str = "chain-rollback-event.json.prev";
-const MARKER_TMP: &str = "chain-rollback-event.json.tmp";
 
-const WITNESS_FORMAT: &str = "1";
-const MARKER_FORMAT: &str = "1";
-
-// ---------------------------------------------------------------------------
-// Witness codec
-// ---------------------------------------------------------------------------
+/// Error from the bounded file protocol.
+#[derive(Debug, thiserror::Error)]
+pub enum EvidenceError {
+    /// Filesystem I/O failure.
+    #[error("evidence I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// JSON serialization failure.
+    #[error("evidence serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+}
 
 /// Durable record of the applied tip at the last clean checkpoint publication.
 ///
@@ -85,7 +65,7 @@ impl AppliedTipWitness {
         time: u64,
     ) -> Self {
         Self {
-            format: WITNESS_FORMAT.to_owned(),
+            format: FORMAT.to_owned(),
             genesis_hash: genesis_hash.into(),
             writer_epoch,
             height,
@@ -94,35 +74,16 @@ impl AppliedTipWitness {
         }
     }
 
-    /// Serializes to a JSON string (no trailing newline).
-    #[expect(clippy::expect_used, reason = "serialization of infallible types")]
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("witness serialization is infallible")
-    }
-
-    /// Deserializes from JSON bytes (with or without trailing newline).
-    fn from_json(data: &[u8]) -> Option<Self> {
-        let trimmed = data.strip_suffix(b"\n").unwrap_or(data);
-        serde_json::from_slice(trimmed).ok()
-    }
-
-    /// Returns true if the format matches and the genesis hash matches.
-    fn is_valid_for(&self, expected_format: &str, genesis_hash: &str) -> bool {
-        self.format == expected_format && self.genesis_hash == genesis_hash
+    /// Decodes bounded bytes; rejects wrong format or foreign genesis.
+    fn decode(data: &[u8], genesis_hash: &str) -> Option<Self> {
+        if data.len() > MAX_FILE_BYTES {
+            return None;
+        }
+        let w: Self =
+            serde_json::from_slice(data.strip_suffix(b"\n").unwrap_or(data)).ok()?;
+        (w.format == FORMAT && w.genesis_hash == genesis_hash).then_some(w)
     }
 }
-
-/// Decodes an applied-tip witness from already-read sidecar bytes.
-pub fn decode_applied_tip_witness(data: &[u8], genesis_hash: &str) -> Option<AppliedTipWitness> {
-    let witness = AppliedTipWitness::from_json(data)?;
-    witness
-        .is_valid_for(WITNESS_FORMAT, genesis_hash)
-        .then_some(witness)
-}
-
-// ---------------------------------------------------------------------------
-// Event marker codec
-// ---------------------------------------------------------------------------
 
 /// Exactly one rollback event kind.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -185,7 +146,7 @@ impl ChainRollbackEvent {
         event: RollbackEventKind,
     ) -> Self {
         Self {
-            format: MARKER_FORMAT.to_owned(),
+            format: FORMAT.to_owned(),
             genesis_hash: genesis_hash.into(),
             detecting_epoch,
             time,
@@ -193,267 +154,116 @@ impl ChainRollbackEvent {
         }
     }
 
-    #[expect(clippy::expect_used, reason = "serialization of infallible types")]
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("event serialization is infallible")
-    }
-
-    fn from_json(data: &[u8]) -> Option<Self> {
-        let trimmed = data.strip_suffix(b"\n").unwrap_or(data);
-        serde_json::from_slice(trimmed).ok()
-    }
-
-    fn is_valid_for(&self, expected_format: &str, genesis_hash: &str) -> bool {
-        self.format == expected_format && self.genesis_hash == genesis_hash
+    /// Decodes bounded bytes; rejects wrong format or foreign genesis.
+    fn decode(data: &[u8], genesis_hash: &str) -> Option<Self> {
+        if data.len() > MAX_FILE_BYTES {
+            return None;
+        }
+        let e: Self =
+            serde_json::from_slice(data.strip_suffix(b"\n").unwrap_or(data)).ok()?;
+        (e.format == FORMAT && e.genesis_hash == genesis_hash).then_some(e)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bounded current/previous file protocol
-// ---------------------------------------------------------------------------
-
-/// Error from the bounded file protocol.
-#[derive(Debug, thiserror::Error)]
-pub enum EvidenceError {
-    /// Filesystem I/O failure.
-    #[error("evidence I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    /// JSON serialization failure.
-    #[error("evidence serialization error: {0}")]
-    Json(#[from] serde_json::Error),
+/// Reads `name`, then `name.prev`; each candidate must decode.
+fn read_sidecar<T>(
+    dir: &Path,
+    name: &str,
+    decode: impl Fn(&[u8]) -> Option<T>,
+) -> Option<T> {
+    [name.to_owned(), format!("{name}.prev")]
+        .iter()
+        .find_map(|n| decode(&std::fs::read(dir.join(n)).ok()?))
 }
 
-// ---------------------------------------------------------------------------
-// Witness-specific helpers
-// ---------------------------------------------------------------------------
-
-/// Writes the applied-tip witness using the bounded current/prev protocol.
-///
-/// The rotation check is semantic: a parseable but foreign-genesis or
-/// wrong-format current is INVALID and is removed without displacing a
-/// valid `.prev`, mirroring `read_witness`'s acceptance criteria.
-pub fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(), EvidenceError> {
-    write_bounded(
-        dir,
-        &witness.to_json(),
-        WITNESS_FILE,
-        WITNESS_PREV,
-        WITNESS_TMP,
-        |data| {
-            AppliedTipWitness::from_json(data)
-                .is_some_and(|w| w.is_valid_for(WITNESS_FORMAT, &witness.genesis_hash))
-        },
-    )
+/// Atomic publish: stage `.tmp` (`create_new`, fsync), rotate a *valid*
+/// current to `.prev` (an invalid current is removed, never displacing a
+/// valid `.prev`), rename, fsync dir.
+fn write_sidecar(
+    dir: &Path,
+    name: &str,
+    payload: &str,
+    valid: impl Fn(&[u8]) -> bool,
+) -> Result<(), EvidenceError> {
+    use std::io::Write;
+    let current = dir.join(name);
+    let prev = dir.join(format!("{name}.prev"));
+    let tmp = dir.join(format!("{name}.tmp"));
+    // A stale tmp is left by a crashed earlier write; create_new below fails
+    // if it still exists.
+    let _ = std::fs::remove_file(&tmp);
+    let result = (|| -> Result<(), EvidenceError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(payload.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        if let Ok(data) = std::fs::read(&current) {
+            if valid(&data) {
+                let _ = std::fs::remove_file(&prev);
+                // Only a valid current may displace `.prev`.
+                std::fs::rename(&current, &prev)?;
+            } else {
+                // Invalid or oversized current: remove it, keep `.prev`.
+                let _ = std::fs::remove_file(&current);
+            }
+        }
+        std::fs::rename(&tmp, &current)?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // A returned failure must not leave the staged tmp behind (RCV-03).
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
-/// Reads the applied-tip witness, falling back to `.prev` when current is
-/// missing or invalid. Returns `None` if neither is available.
-///
-/// Ignores malformed, oversized, wrong-format, and foreign-genesis evidence
-/// at DEBUG level.
+/// Reads the applied-tip witness (current, then `.prev`).
 pub fn read_witness(dir: &Path, genesis_hash: &str) -> Option<AppliedTipWitness> {
-    let data = read_bounded(dir, WITNESS_FILE, WITNESS_PREV)?;
-    let witness = AppliedTipWitness::from_json(&data)?;
-    if !witness.is_valid_for(WITNESS_FORMAT, genesis_hash) {
-        tracing::debug!("witness has wrong format or foreign genesis, ignoring");
-        return None;
-    }
-    Some(witness)
+    read_sidecar(dir, WITNESS_FILE, |data| {
+        AppliedTipWitness::decode(data, genesis_hash)
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Marker-specific helpers
-// ---------------------------------------------------------------------------
-
-/// Writes the chain-rollback event marker using the bounded current/prev
-/// protocol. Last-event-wins; prior valid event preserved as `.prev`.
-///
-/// The rotation check is semantic: a parseable but foreign-genesis or
-/// wrong-format current is INVALID and is removed without displacing a
-/// valid `.prev`, mirroring `read_marker`'s acceptance criteria.
-pub fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
-    write_bounded(
-        dir,
-        &event.to_json(),
-        MARKER_FILE,
-        MARKER_PREV,
-        MARKER_TMP,
-        |data| {
-            ChainRollbackEvent::from_json(data)
-                .is_some_and(|e| e.is_valid_for(MARKER_FORMAT, &event.genesis_hash))
-        },
-    )
+/// Publishes the applied-tip witness atomically.
+pub fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(), EvidenceError> {
+    write_sidecar(dir, WITNESS_FILE, &serde_json::to_string(witness)?, |data| {
+        AppliedTipWitness::decode(data, &witness.genesis_hash).is_some()
+    })
 }
 
-/// Reads the most recent valid chain-rollback event marker, falling back to
-/// `.prev` when current is missing or invalid.
+/// Reads the most recent valid rollback marker (current, then `.prev`).
 pub fn read_marker(dir: &Path, genesis_hash: &str) -> Option<ChainRollbackEvent> {
-    let data = read_bounded(dir, MARKER_FILE, MARKER_PREV)?;
-    let event = ChainRollbackEvent::from_json(&data)?;
-    if !event.is_valid_for(MARKER_FORMAT, genesis_hash) {
-        tracing::debug!("marker has wrong format or foreign genesis, ignoring");
-        return None;
-    }
-    Some(event)
+    read_sidecar(dir, MARKER_FILE, |data| {
+        ChainRollbackEvent::decode(data, genesis_hash)
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Warning snapshot
-// ---------------------------------------------------------------------------
-
-/// One immutable warning snapshot holding both checkpoint-fallback and
-/// index-ahead warnings together.
-#[derive(Clone, Debug, Default)]
-pub struct WarningSnapshot {
-    /// At most one checkpoint-fallback warning for the process.
-    checkpoint: Option<String>,
-    /// One warning per distinct index capability/evidence tuple, sorted by
-    /// capability id and stable evidence fields.
-    index: Vec<String>,
+/// Publishes a rollback marker atomically. Last-event-wins.
+pub fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
+    write_sidecar(dir, MARKER_FILE, &serde_json::to_string(event)?, |data| {
+        ChainRollbackEvent::decode(data, &event.genesis_hash).is_some()
+    })
 }
 
-impl WarningSnapshot {
-    /// Renders all warnings in deterministic order: checkpoint fallback
-    /// first, then index warnings sorted by capability id.
-    pub fn warnings(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(msg) = &self.checkpoint {
-            out.push(msg.clone());
-        }
-        out.extend(self.index.iter().cloned());
-        out
-    }
-
-    /// Returns a new snapshot with the checkpoint warning set. Does not
-    /// overwrite an existing checkpoint warning (deduplicate exact repeats).
-    fn with_checkpoint(mut self, msg: &str) -> Self {
-        if self.checkpoint.as_deref() != Some(msg) {
-            self.checkpoint = Some(msg.to_owned());
-        }
-        self
-    }
-
-    /// Returns a new snapshot with an index warning added if it is not an
-    /// exact duplicate of an existing one. Preserves the checkpoint warning.
-    fn with_index(mut self, msg: &str) -> Self {
-        if !self.index.iter().any(|w| w == msg) {
-            self.index.push(msg.to_owned());
-            self.index.sort();
-        }
-        self
-    }
-}
-
-/// Process-wide warning snapshot store. One `ArcSwap` holds the complete
-/// immutable snapshot. Updates are atomic RCU transactions.
-pub struct WarningStore {
-    snapshot: ArcSwap<WarningSnapshot>,
-}
-
-impl WarningStore {
-    /// Creates an empty warning store.
-    pub fn new() -> Self {
-        Self {
-            snapshot: ArcSwap::from_pointee(WarningSnapshot::default()),
-        }
-    }
-
-    /// Loads one immutable snapshot. Each caller gets a consistent view.
-    pub fn load(&self) -> Arc<WarningSnapshot> {
-        self.snapshot.load_full()
-    }
-
-    /// Atomically sets the checkpoint-fallback warning. Deduplicates exact
-    /// repeats.
-    pub fn set_checkpoint(&self, msg: &str) {
-        self.snapshot
-            .rcu(|current| Arc::new((**current).clone().with_checkpoint(msg)));
-    }
-
-    /// Atomically adds an index-ahead warning. Deduplicates exact repeats.
-    /// Preserves the checkpoint warning.
-    pub fn add_index(&self, msg: &str) {
-        self.snapshot
-            .rcu(|current| Arc::new((**current).clone().with_index(msg)));
-    }
-
-    /// Renders all warnings in deterministic order from one immutable load.
-    pub fn warnings(&self) -> Vec<String> {
-        self.load().warnings()
-    }
-}
-
-impl Default for WarningStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Detection logic
-// ---------------------------------------------------------------------------
-
-/// Checks whether a witness constitutes checkpoint-fallback evidence.
-///
-/// Returns `Some((witness_height, restored_height))` when all conditions hold:
-/// - format and bounds are valid;
-/// - genesis matches;
-/// - witness epoch is older than the current process epoch;
-/// - witness height is strictly greater than the restored applied-tip height
-///   (where no applied tip means height zero).
-///
-/// Does not require hash inequality. Does not warn for equal or lower heights.
+/// `Some((witness_height, restored_height))` when the witness matches the
+/// genesis, was written by an older epoch, and sits strictly above the
+/// restored applied-tip height (no tip means zero).
 pub fn detect_checkpoint_fallback(
     witness: &AppliedTipWitness,
     current_epoch: u64,
     genesis_hash: &str,
     restored_height: u32,
 ) -> Option<(u32, u32)> {
-    if !witness.is_valid_for(WITNESS_FORMAT, genesis_hash) {
-        return None;
-    }
-    if witness.writer_epoch >= current_epoch {
-        // Current or future epoch — not eligible.
-        return None;
-    }
-    if witness.height <= restored_height {
-        // Equal or lower height — not a warning.
-        return None;
-    }
-    Some((witness.height, restored_height))
-}
-
-// ---------------------------------------------------------------------------
-// Publisher
-// ---------------------------------------------------------------------------
-
-/// Publishes recovery facts: WARN log, process-visible warning snapshot,
-/// then durable marker (RCV-12 ordering).
-///
-/// Created once per process. Routes checkpoint-fallback and index-ahead facts
-/// through one `WarningStore` and one event marker.
-pub struct RecoveryEvidencePublisher {
-    warning_store: WarningStore,
-    data_dir: PathBuf,
-    genesis_hash: String,
-    detecting_epoch: u64,
-}
-
-impl RecoveryEvidencePublisher {
-    /// Creates a publisher with its own `WarningStore`.
-    pub fn new(data_dir: PathBuf, genesis_hash: String, detecting_epoch: u64) -> Self {
-        Self {
-            warning_store: WarningStore::new(),
-            data_dir,
-            genesis_hash,
-            detecting_epoch,
-        }
-    }
-
-    /// Renders all warnings in deterministic order from one immutable load.
-    pub fn warnings(&self) -> Vec<String> {
-        self.warning_store.warnings()
-    }
+    (witness.format == FORMAT
+        && witness.genesis_hash == genesis_hash
+        && witness.writer_epoch < current_epoch
+        && witness.height > restored_height)
+        .then_some((witness.height, restored_height))
 }
 
 /// Reads the applied-tip witness through an opened data-dir anchor (current,
@@ -462,11 +272,9 @@ pub fn read_witness_from_anchor(
     anchor: &crate::footprint::DataDirAnchor,
     genesis: &str,
 ) -> Result<(u32, String), crate::footprint::FootprintError> {
-    const CURRENT: &str = "applied-tip-witness.json";
-    const PREV: &str = "applied-tip-witness.json.prev";
-    for name in [CURRENT, PREV] {
+    for name in [WITNESS_FILE, &format!("{WITNESS_FILE}.prev")] {
         if let Some(bytes) = anchor.read_child_file(name, MAX_FILE_BYTES)?
-            && let Some(witness) = decode_applied_tip_witness(&bytes, genesis)
+            && let Some(witness) = AppliedTipWitness::decode(&bytes, genesis)
         {
             return Ok((witness.height, witness.block_hash));
         }
@@ -474,9 +282,124 @@ pub fn read_witness_from_anchor(
     Ok((0, genesis.to_owned()))
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+#[derive(Clone, Default)]
+struct Warnings {
+    checkpoint: Option<String>,
+    index: Vec<String>,
+}
+
+/// Publishes recovery facts: WARN log, process-visible warning snapshot, then
+/// durable marker (RCV-12 ordering).
+pub struct RecoveryEvidencePublisher {
+    warnings: ArcSwap<Warnings>,
+    data_dir: PathBuf,
+    genesis_hash: String,
+    detecting_epoch: u64,
+}
+
+impl RecoveryEvidencePublisher {
+    /// Creates a publisher with an empty warning snapshot.
+    pub fn new(data_dir: PathBuf, genesis_hash: String, detecting_epoch: u64) -> Self {
+        Self {
+            warnings: ArcSwap::from_pointee(Warnings::default()),
+            data_dir,
+            genesis_hash,
+            detecting_epoch,
+        }
+    }
+
+    /// Checkpoint warning first, then index warnings sorted; one immutable load.
+    pub fn warnings(&self) -> Vec<String> {
+        let w = self.warnings.load();
+        w.checkpoint.iter().chain(&w.index).cloned().collect()
+    }
+
+    /// Publishes a checkpoint-fallback event. Marker failure aborts
+    /// `NodeState::open`.
+    pub fn publish_checkpoint_fallback(
+        &self,
+        witness_height: u32,
+        restored_height: u32,
+        restored_hash: &str,
+        source: &str,
+        old_hash: &str,
+        time: u64,
+    ) -> Result<(), EvidenceError> {
+        let msg = format!(
+            "Durable applied-tip witness at height {witness_height} is ahead of \
+             the restored tip at height {restored_height}. \
+             Chainstate was restored from a clean checkpoint, not rejected."
+        );
+        tracing::warn!(%msg, witness_height, restored_height, "checkpoint fallback detected");
+        self.update(move |w| w.checkpoint = Some(msg.clone()));
+        self.marker(
+            time,
+            RollbackEventKind::CheckpointFallback {
+                restored_height,
+                restored_hash: restored_hash.to_owned(),
+                source: source.to_owned(),
+                old_height: witness_height,
+                old_hash: old_hash.to_owned(),
+            },
+        )
+    }
+
+    /// Publishes an index-watermark-ahead event. The warning snapshot is
+    /// updated before the marker write, so a marker failure (returned to the
+    /// caller) still leaves the fact RPC-visible for this process.
+    pub fn publish_index_ahead(
+        &self,
+        capability: &str,
+        watermark_height: u32,
+        restored_height: u32,
+        restored_hash: &str,
+        old_hash: &str,
+        gap: u32,
+        time: u64,
+    ) -> Result<(), EvidenceError> {
+        let msg = format!(
+            "Index capability '{capability}' watermark at height \
+             {watermark_height} is {gap} block(s) ahead of the restored tip \
+             at height {restored_height}."
+        );
+        tracing::warn!(
+            %msg, capability, watermark_height, restored_height, gap,
+            "index watermark ahead of restored tip"
+        );
+        self.update(move |w| {
+            if !w.index.contains(&msg) {
+                w.index.push(msg.clone());
+                w.index.sort();
+            }
+        });
+        self.marker(
+            time,
+            RollbackEventKind::IndexWatermarkAhead {
+                capability: capability.to_owned(),
+                restored_height,
+                restored_hash: restored_hash.to_owned(),
+                old_height: watermark_height,
+                old_hash: old_hash.to_owned(),
+                gap,
+            },
+        )
+    }
+
+    fn update(&self, f: impl Fn(&mut Warnings)) {
+        self.warnings.rcu(|w| {
+            let mut next = (**w).clone();
+            f(&mut next);
+            Arc::new(next)
+        });
+    }
+
+    fn marker(&self, time: u64, event: RollbackEventKind) -> Result<(), EvidenceError> {
+        write_marker(
+            &self.data_dir,
+            &ChainRollbackEvent::new(&self.genesis_hash, self.detecting_epoch, time, event),
+        )
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]

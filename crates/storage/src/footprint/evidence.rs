@@ -5,9 +5,10 @@
 //! policy.
 
 use serde::Serialize;
-use std::collections::BTreeMap;
 
-use crate::footprint::{LogicalLedger, PhysicalLedger, PhysicalNamespace, PhysicalObservationKind};
+use crate::footprint::{
+    LogicalLedger, LogicalOwner, PhysicalLedger, PhysicalNamespace, PhysicalObservationKind,
+};
 
 /// Default unpruned, no-index mainnet peak budget: `1_000_000_000_000` allocated bytes.
 pub const DEFAULT_UNPRUNED_PEAK_BUDGET_BYTES: u64 = 1_000_000_000_000;
@@ -105,56 +106,30 @@ pub struct WatermarkEvidence {
 #[derive(Clone, Debug, Serialize)]
 pub struct LogicalEvidence {
     /// Owners in stable name order.
-    pub owners: Vec<LogicalOwnerEvidence>,
+    pub owners: Vec<LogicalOwner>,
     /// Sum of serialized key and value bytes. Not a filesystem allocation.
     pub serialized_bytes: u64,
     /// Reminder that this ledger is not the budget.
     pub not_a_filesystem_allocation: bool,
 }
 
-/// One logical owner row.
-#[derive(Clone, Debug, Serialize)]
-pub struct LogicalOwnerEvidence {
-    /// Owner name.
-    pub name: String,
-    /// Row or framed-record count.
-    pub rows: u64,
-    /// Serialized key bytes.
-    pub key_bytes: u64,
-    /// Serialized value bytes.
-    pub value_bytes: u64,
-    /// Key plus value bytes.
-    pub serialized_bytes: u64,
-}
-
 /// Physical ledger as emitted in evidence.
 #[derive(Clone, Debug, Serialize)]
 pub struct PhysicalEvidence {
     /// Top-level namespaces.
-    pub namespaces: Vec<PhysicalNamespaceEvidence>,
+    pub namespaces: Vec<PhysicalNamespace>,
     /// Root-level residual.
-    pub residual: PhysicalNamespaceEvidence,
+    pub residual: PhysicalNamespace,
     /// Allocated bytes of the data directory, hard links counted once.
     pub allocated_bytes: u64,
     /// Distinct inodes counted.
     pub inode_count: u64,
     /// Snapshot versus conservative high-water.
-    pub observation_kind: String,
+    pub observation_kind: PhysicalObservationKind,
     /// Conservative peak when supplied.
     pub high_water_allocated_bytes: Option<u64>,
     /// Figure a budget gate reads.
     pub budget_bytes: u64,
-}
-
-/// One physical namespace row.
-#[derive(Clone, Debug, Serialize)]
-pub struct PhysicalNamespaceEvidence {
-    /// Namespace name.
-    pub name: String,
-    /// Allocated bytes.
-    pub allocated_bytes: u64,
-    /// Category breakdown.
-    pub categories: BTreeMap<String, u64>,
 }
 
 /// Default-node peak-budget classification.
@@ -172,17 +147,7 @@ impl LogicalEvidence {
     /// Projects a logical ledger into evidence rows.
     pub fn from_ledger(ledger: &LogicalLedger) -> Self {
         Self {
-            owners: ledger
-                .owners
-                .iter()
-                .map(|owner| LogicalOwnerEvidence {
-                    name: owner.name.clone(),
-                    rows: owner.rows,
-                    key_bytes: owner.key_bytes,
-                    value_bytes: owner.value_bytes,
-                    serialized_bytes: owner.serialized_bytes,
-                })
-                .collect(),
+            owners: ledger.owners.clone(),
             serialized_bytes: ledger.serialized_bytes(),
             not_a_filesystem_allocation: true,
         }
@@ -193,32 +158,13 @@ impl PhysicalEvidence {
     /// Projects a physical ledger into evidence rows.
     pub fn from_ledger(ledger: &PhysicalLedger) -> Self {
         Self {
-            namespaces: ledger
-                .namespaces
-                .iter()
-                .map(PhysicalNamespaceEvidence::from_namespace)
-                .collect(),
-            residual: PhysicalNamespaceEvidence::from_namespace(&ledger.residual),
+            namespaces: ledger.namespaces.clone(),
+            residual: ledger.residual.clone(),
             allocated_bytes: ledger.allocated_bytes,
             inode_count: ledger.inode_count,
-            observation_kind: ledger.observation_kind.as_str().to_owned(),
+            observation_kind: ledger.observation_kind,
             high_water_allocated_bytes: ledger.high_water_allocated_bytes,
             budget_bytes: ledger.budget_bytes(),
-        }
-    }
-}
-
-impl PhysicalNamespaceEvidence {
-    /// Projects one physical namespace row.
-    pub fn from_namespace(namespace: &PhysicalNamespace) -> Self {
-        Self {
-            name: namespace.name.clone(),
-            allocated_bytes: namespace.allocated_bytes,
-            categories: namespace
-                .categories
-                .iter()
-                .map(|(name, bytes)| ((*name).to_owned(), *bytes))
-                .collect(),
         }
     }
 }
@@ -267,7 +213,7 @@ pub fn storage_footprint_json(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     // CONTRACT: `docs/contracts/storage-footprint.md` FP-01 owns the evidence
     // record shape and FP-04 owns the default-lane budget verdict policy;
@@ -307,19 +253,15 @@ mod tests {
     }
 
     #[test]
-    fn budget_verdict_is_inapplicable_off_the_default_lane() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ledger = crate::footprint::measure_physical_tree(dir.path()).expect("measure");
-        let budget = BudgetEvidence::evaluate(&identity("regtest", true), &ledger);
-        assert!(!budget.applies_to_this_record);
-        assert_eq!(budget.verdict, "inapplicable");
-    }
-
-    #[test]
     fn budget_verdict_orders_fail_snapshot_pin_pass() {
         let dir = tempfile::tempdir().expect("tempdir");
         let snapshot = crate::footprint::measure_physical_tree(dir.path()).expect("measure");
         let allocated = snapshot.allocated_bytes;
+
+        // Off the default lane the verdict is inapplicable.
+        let budget = BudgetEvidence::evaluate(&identity("regtest", true), &snapshot);
+        assert!(!budget.applies_to_this_record);
+        assert_eq!(budget.verdict, "inapplicable");
 
         // Snapshot alone cannot satisfy a peak gate.
         let budget = BudgetEvidence::evaluate(&identity("mainnet", true), &snapshot);
@@ -344,16 +286,5 @@ mod tests {
             .expect("high water");
         let budget = BudgetEvidence::evaluate(&identity("mainnet", true), &over);
         assert_eq!(budget.verdict, "fail");
-    }
-
-    #[test]
-    fn logical_evidence_marks_not_a_filesystem_allocation() {
-        let mut ledger = LogicalLedger::default();
-        ledger.push(crate::footprint::LogicalOwner::new("a.owner", 1, 2, 3));
-        ledger.push(crate::footprint::LogicalOwner::new("b.owner", 4, 5, 6));
-        let evidence = LogicalEvidence::from_ledger(&ledger);
-        assert!(evidence.not_a_filesystem_allocation);
-        assert_eq!(evidence.serialized_bytes, ledger.serialized_bytes());
-        assert_eq!(evidence.owners.len(), 2);
     }
 }

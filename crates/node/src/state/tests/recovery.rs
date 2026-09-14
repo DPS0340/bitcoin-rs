@@ -302,8 +302,9 @@ fn witness_is_published_only_after_current_root_sync() -> anyhow::Result<()> {
         "witness file must exist after checkpoint publication"
     );
     let genesis_hex = config.network.genesis_block_hash().to_string_be();
-    let witness = bitcoin_rs_storage::recovery_evidence::read_witness(&data_dir, &genesis_hex)
-        .ok_or_else(|| anyhow::anyhow!("witness must be readable"))?;
+    let witness =
+        bitcoin_rs_storage::recovery_evidence::read_witness(&data_dir, &genesis_hex)
+    .ok_or_else(|| anyhow::anyhow!("witness must be readable"))?;
     assert_eq!(witness.height, tip.height);
     assert_eq!(witness.block_hash, tip.hash.to_string_be());
     drop(state);
@@ -377,7 +378,7 @@ fn stale_checkpoint_restore_surfaces_warning_not_silence() -> anyhow::Result<()>
     // 5000 triggers checkpoint-fallback detection. The warning store
     // must carry the fallback warning — the restore must not be silent.
     let resumed = NodeState::open(config.clone(), None)?;
-    let warnings = resumed.recovery_reporter().warnings();
+    let warnings = resumed.recovery_reporter().0.warnings();
     assert!(
         !warnings.is_empty(),
         "a stale checkpoint restore 5000 blocks behind the witness must \

@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 pub use bitcoin_rs_storage::footprint::evidence::{
     BudgetEvidence, DEFAULT_UNPRUNED_PEAK_BUDGET_BYTES, EVIDENCE_FORMAT, EvidenceIdentity,
-    IndexWatermarkEvidence, LogicalEvidence, LogicalOwnerEvidence, PhysicalEvidence,
-    PhysicalNamespaceEvidence, StorageFootprintEvidence, WatermarkEvidence, storage_footprint_json,
+    IndexWatermarkEvidence, LogicalEvidence, PhysicalEvidence, StorageFootprintEvidence,
+    WatermarkEvidence, storage_footprint_json,
 };
 
 /// Optional overrides for one measurement invocation.

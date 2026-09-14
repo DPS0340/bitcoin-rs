@@ -3,12 +3,14 @@ use super::*;
 fn test_recovery_reporter(
     data_dir: &std::path::Path,
 ) -> Arc<crate::recovery_reporter::RecoveryReporter> {
-    Arc::new(crate::recovery_reporter::RecoveryReporter::new(
-        data_dir.to_path_buf(),
-        bitcoin_rs_chain::Network::Regtest
-            .genesis_block_hash()
-            .to_string_be(),
-        1,
+    Arc::new(crate::recovery_reporter::RecoveryReporter(
+        bitcoin_rs_storage::recovery_evidence::RecoveryEvidencePublisher::new(
+            data_dir.to_path_buf(),
+            bitcoin_rs_chain::Network::Regtest
+                .genesis_block_hash()
+                .to_string_be(),
+            1,
+        ),
     ))
 }
 

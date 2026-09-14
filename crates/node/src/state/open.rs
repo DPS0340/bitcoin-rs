@@ -165,27 +165,27 @@ impl NodeState {
                 "restored chainstate checkpoint"
             );
         }
-        // A2: Create the process-wide rollback-evidence reporter before any
-        // detection or worker spawn. One ArcSwap warning snapshot is loaded
-        // once per getblockchaininfo request.
-        let genesis_hex = config.network.genesis_block_hash().to_string_be();
-        // One reporter routes every rollback fact of this process — the
+        // A2: one reporter routes every rollback fact of this process — the
         // checkpoint fallback detected here and the index-ahead rewinds the
-        // txindex worker detects later — through the same warning store and
+        // txindex worker detects later — through one warning snapshot and one
         // event marker.
-        let recovery_reporter = Arc::new(crate::recovery_reporter::RecoveryReporter::new(
-            config.data_dir.clone(),
-            genesis_hex.clone(),
-            epoch,
+        let genesis_hex = config.network.genesis_block_hash().to_string_be();
+        let recovery_reporter = Arc::new(crate::recovery_reporter::RecoveryReporter(
+            bitcoin_rs_storage::recovery_evidence::RecoveryEvidencePublisher::new(
+                config.data_dir.clone(),
+                genesis_hex.clone(),
+                epoch,
+            ),
         ));
         let restored_height = restored_applied_tip.as_ref().map_or(0, |tip| tip.height);
         let restored_hash = restored_applied_tip
             .as_ref()
             .map_or_else(|| config.network.genesis_block_hash(), |tip| tip.hash)
             .to_string_be();
-        if let Some(witness) =
-            bitcoin_rs_storage::recovery_evidence::read_witness(&config.data_dir, &genesis_hex)
-        {
+        if let Some(witness) = bitcoin_rs_storage::recovery_evidence::read_witness(
+            &config.data_dir,
+            &genesis_hex,
+        ) {
             if let Some((witness_height, _)) =
                 bitcoin_rs_storage::recovery_evidence::detect_checkpoint_fallback(
                     &witness,
@@ -200,7 +200,8 @@ impl NodeState {
                     ResumeSource::Journal => "journal",
                 };
                 recovery_reporter
-                    .report_checkpoint_fallback(
+                    .0
+                    .publish_checkpoint_fallback(
                         witness_height,
                         restored_height,
                         &restored_hash,

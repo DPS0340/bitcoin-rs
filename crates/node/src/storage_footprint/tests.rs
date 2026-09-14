@@ -34,7 +34,7 @@ fn default_regtest_record_is_inapplicable_to_the_mainnet_budget() -> Result<()> 
     assert!(evidence.logical.not_a_filesystem_allocation);
     assert_eq!(
         evidence.physical.observation_kind,
-        PhysicalObservationKind::SnapshotLowerBound.as_str()
+        PhysicalObservationKind::SnapshotLowerBound
     );
     assert!(
         evidence
@@ -71,7 +71,7 @@ fn conservative_high_water_can_pass_the_default_mainnet_budget() -> Result<()> {
     assert_eq!(evidence.budget.verdict, "pass");
     assert_eq!(
         evidence.physical.observation_kind,
-        PhysicalObservationKind::ConservativeHighWater.as_str()
+        PhysicalObservationKind::ConservativeHighWater
     );
     Ok(())
 }
