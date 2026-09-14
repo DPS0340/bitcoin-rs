@@ -54,7 +54,9 @@ pub fn load(data_dir: &Path, mempool: &RwLock<Mempool>) {
     }
 }
 
-/// Persists the estimator history at shutdown. Publish: stage with `create_new`, `sync_all`, rename over the live file, best-effort dir sync; any failure is a warning, never a failed shutdown.
+/// Persists the estimator history at shutdown. Publish: stage with `create_new`,
+/// `sync_all`, rename over the live file, best-effort dir sync; any failure is a
+/// warning, never a failed shutdown.
 pub fn save(data_dir: &Path, mempool: &RwLock<Mempool>) {
     let bytes = mempool.read().estimator_history();
     let temp_path = data_dir.join(HISTORY_TEMP);

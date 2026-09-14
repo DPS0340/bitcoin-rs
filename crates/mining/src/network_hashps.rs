@@ -60,10 +60,10 @@ pub fn estimate_network_hashps(
     lookup: i64,
     network: Network,
 ) -> f64 {
-    let Some(start_node) = start_id
-        .and_then(|id| tree.node(id).ok())
-        .filter(|node| node.height != 0)
-    else {
+    let Some(start_id) = start_id else {
+        return 0.0;
+    };
+    let Some(start_node) = tree.node(start_id).ok().filter(|node| node.height != 0) else {
         return 0.0;
     };
     let mut walk = if lookup == -1 {
@@ -89,13 +89,10 @@ pub fn estimate_network_hashps(
     let mut max_time = min_time;
     let mut earliest_id = start_id;
     for _ in 0..walk {
-        let Some(parent) = earliest_id
-            .and_then(|id| tree.node(id).ok())
-            .and_then(|node| node.parent)
-        else {
+        let Some(parent) = tree.node(earliest_id).ok().and_then(|node| node.parent) else {
             return 0.0;
         };
-        earliest_id = Some(parent);
+        earliest_id = parent;
         let Ok(parent_node) = tree.node(parent) else {
             return 0.0;
         };
@@ -105,9 +102,6 @@ pub fn estimate_network_hashps(
     if min_time == max_time {
         return 0.0;
     }
-    let Some(earliest_id) = earliest_id else {
-        return 0.0;
-    };
     let Ok(earliest_node) = tree.node(earliest_id) else {
         return 0.0;
     };

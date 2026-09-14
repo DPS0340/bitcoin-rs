@@ -1,7 +1,7 @@
-//! Node-owned mining control facade: header admission and proposal/submission
+//! Node-owned mining control facade.
 //!
-//! Projection over the authoritative chainstate. Candidate lifecycle lives in
-//! `bitcoin_rs_mining`.
+//! Header admission and proposal/submission projection over the authoritative
+//! chainstate. Candidate lifecycle lives in `bitcoin_rs_mining`.
 
 mod candidate;
 mod control;

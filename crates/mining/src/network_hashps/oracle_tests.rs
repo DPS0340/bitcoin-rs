@@ -28,9 +28,10 @@ fn append(tree: &mut BlockTree, prev: BlockHash, time: u32) -> NodeId {
     .unwrap_or_else(|err| panic!("insert header at time {time}: {err}"))
 }
 
-#[allow(clippy::expect_used)]
 fn snapshot(tree: &BlockTree, tip_id: NodeId) -> TipSnapshot {
-    let node = tree.node(tip_id).expect("tip must exist");
+    let node = tree
+        .node(tip_id)
+        .unwrap_or_else(|err| panic!("missing tip: {err}"));
     TipSnapshot {
         tip_id,
         height: node.height,
