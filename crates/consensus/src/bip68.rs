@@ -130,7 +130,8 @@ mod tests {
         assert_eq!(super::check_sequence_lock(2, 2, 100, 0, 102, 0), Ok(()));
         let time_sequence = SEQUENCE_LOCKTIME_TYPE_FLAG | 2;
         assert!(
-            super::check_sequence_lock(2, time_sequence, 100, 1_000, 101, 1_000 + 2 * 512 - 1).is_err()
+            super::check_sequence_lock(2, time_sequence, 100, 1_000, 101, 1_000 + 2 * 512 - 1)
+                .is_err()
         );
         assert_eq!(
             super::check_sequence_lock(2, time_sequence, 100, 1_000, 101, 1_000 + 2 * 512),

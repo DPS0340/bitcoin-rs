@@ -2,7 +2,8 @@ use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
 use bitcoin_rs_primitives::{CompactTarget, Hash256, Network};
 
 pub use pow::compact_is_met_by;
-use pow::{compact_to_target, target_to_compact};
+pub use pow::compact_to_target;
+use pow::target_to_compact;
 
 use crate::{
     ChainError,
@@ -379,7 +380,7 @@ pub(crate) mod pow {
 
     /// Decodes a compact target, returning zero for negative encodings.
     #[must_use]
-    pub(crate) fn compact_to_target(bits: CompactTarget) -> ChainWork {
+    pub fn compact_to_target(bits: CompactTarget) -> ChainWork {
         let decoded = decode_compact(bits.to_consensus());
         if decoded.negative {
             ChainWork::ZERO

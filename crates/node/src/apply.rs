@@ -1340,7 +1340,6 @@ impl UtxoView for BlockLocalUtxoView<'_> {
 mod consensus_rule_tests;
 
 #[cfg(test)]
-#[cfg(test)]
 mod zmq_emit_tests;
 
 #[cfg(test)]
