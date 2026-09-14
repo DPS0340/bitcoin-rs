@@ -329,5 +329,5 @@ fn load_body_prefix(
     Ok(Some(bodies))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fjall"))]
 mod tests;
