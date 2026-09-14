@@ -174,14 +174,19 @@ impl Worker {
             return Ok(ChunkAction::Stalled);
         }
 
-        let Some(bodies) = load_body_prefix(body_reader.as_mut(), identities)
-            .map_err(DerivedIndexWorkerError::Storage)?
+        let Some(bodies) = load_body_prefix(body_reader.as_mut(), identities, &|| {
+            self.runtime.should_stop()
+        })
+        .map_err(DerivedIndexWorkerError::Storage)?
         else {
             if !state.batch.is_empty() {
                 *pending = Some(state.take(self.batch_limits));
             }
             return Ok(ChunkAction::Stalled);
         };
+        if self.runtime.should_stop() {
+            return Ok(ChunkAction::Stalled);
+        }
         let loaded = bodies.len();
         let sub_chunk = &identities[..loaded];
 
@@ -308,14 +313,19 @@ impl Worker {
 /// `PREPARE_CHUNK_BYTES`. Every body the reader hands out is retained, so the
 /// returned prefix is exactly the set of prefetched positions the reader
 /// consumed; the body that reaches the byte cap may carry the total past it.
+/// Stops early, keeping what was loaded, when `should_stop` reports shutdown.
 /// `Ok(None)` when a body is unavailable.
 fn load_body_prefix(
     reader: &mut dyn BlockBodyReader,
     identities: &[BlockIdentity],
+    should_stop: &dyn Fn() -> bool,
 ) -> Result<Option<Vec<Vec<u8>>>, StorageError> {
     let mut bodies = Vec::new();
     let mut loaded_bytes = 0_usize;
     for identity in identities.iter().take(PREPARE_CHUNK_BLOCKS) {
+        if should_stop() {
+            break;
+        }
         let hash = Hash256::from_le_bytes(&identity.hash);
         let Some(body) = reader.load_block_body(identity.height, hash)? else {
             return Ok(None);
