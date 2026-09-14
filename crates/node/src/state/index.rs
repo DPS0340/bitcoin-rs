@@ -250,6 +250,7 @@ mod tests {
 
     /// `open_derived_index_on_worker` dispatches to the concrete backend
     /// constructor and the store opens successfully on the caller's thread.
+    // CONTRACT: docs/contracts/architecture.md#ARCH-03
     #[test]
     fn open_dispatch_preserves_backend() {
         let dir = tempfile::tempdir().expect("tempdir");

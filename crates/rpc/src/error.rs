@@ -162,7 +162,8 @@ impl From<fmt::Error> for RpcError {
     }
 }
 
-pub(crate) fn tx_query_error(error: crate::context::TxQueryError) -> RpcError {
+/// Maps a transaction-index failure to an explicit JSON-RPC error.
+pub fn tx_query_error(error: crate::context::TxQueryError) -> RpcError {
     match error {
         crate::context::TxQueryError::Retry => {
             RpcError::Internal("transaction index is still catching up; retry later".to_owned())
