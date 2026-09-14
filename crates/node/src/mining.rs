@@ -204,6 +204,9 @@ impl MiningCoordinator {
 
     /// Admits `header` through [`accept_headers`], the same gate inbound P2P uses.
     fn accept_submitted_header(&self, header: Header) -> Result<(), MiningControlError> {
+        let _transition = self.apply_handles.lock_transition().map_err(|error| {
+            MiningControlError::Unavailable(CompactString::from(error.to_string()))
+        })?;
         let mut tree = self.block_tree.write();
         // Preserve accept_headers' idempotent duplicate path, including genesis.
         if tree.lookup(header.compute_hash().into()).is_some() {

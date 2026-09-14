@@ -278,12 +278,14 @@ fn assume_valid_height_override_has_precedence() -> Result<()> {
     let low = UserConfig {
         validation: ValidationOverrides {
             assume_valid_height: Some(10_000),
+            mode: None,
         },
         ..Default::default()
     };
     let high = UserConfig {
         validation: ValidationOverrides {
             assume_valid_height: Some(30_000),
+            mode: None,
         },
         ..Default::default()
     };

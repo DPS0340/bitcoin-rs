@@ -69,6 +69,34 @@ impl ScriptIndexMode {
     }
 }
 
+/// Which historical script verification the apply path may skip.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ValidationMode {
+    /// Every script executes; `assume_valid_height` is ignored.
+    Full,
+    /// Bitcoin Core `-assumevalid`: skip through the pinned anchor height
+    /// while the active chain contains the anchor block.
+    #[default]
+    AssumeValid,
+    /// Skip every block on the best header chain strictly below its tip;
+    /// only the tip block and competing branches run scripts. Trusts the
+    /// most-work header chain.
+    Fast,
+}
+
+impl ValidationMode {
+    /// Parses a mode from a configuration value, case-insensitively.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "assume-valid" | "assume_valid" | "assumevalid" => Some(Self::AssumeValid),
+            "fast" => Some(Self::Fast),
+            _ => None,
+        }
+    }
+}
+
 /// User-supplied storage overrides.
 #[derive(Clone, Debug, Default)]
 pub struct StorageOverrides {
@@ -91,6 +119,8 @@ pub struct P2pOverrides {
     pub dns_seeds: Option<bool>,
     /// Fixed outbound peer endpoints.
     pub connect: Option<Vec<String>>,
+    /// Whether fast sync (shallow, early fan-out over a larger outbound set) is enabled.
+    pub fast_sync: Option<bool>,
 }
 
 /// User-supplied RPC overrides.
@@ -131,6 +161,8 @@ pub struct ObservabilityOverrides {
 pub struct ValidationOverrides {
     /// Height through which script verification may be skipped.
     pub assume_valid_height: Option<u32>,
+    /// Which script verification the apply path may skip.
+    pub mode: Option<ValidationMode>,
 }
 
 /// User-supplied mining overrides.
@@ -196,6 +228,9 @@ impl P2pOverrides {
         if other.connect.is_some() {
             self.connect.clone_from(&other.connect);
         }
+        if other.fast_sync.is_some() {
+            self.fast_sync = other.fast_sync;
+        }
     }
 }
 
@@ -245,6 +280,9 @@ impl ValidationOverrides {
     fn overlay(&mut self, other: &Self) {
         if other.assume_valid_height.is_some() {
             self.assume_valid_height = other.assume_valid_height;
+        }
+        if other.mode.is_some() {
+            self.mode = other.mode;
         }
     }
 }

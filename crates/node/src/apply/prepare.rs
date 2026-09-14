@@ -348,7 +348,7 @@ pub(super) fn verify_block_transactions(
     }
     // The decision is owned by `scripts_verified_upstream`, which covers the
     // live assume-valid gate and locally validated crash-recovery replay.
-    let skip_scripts = handles.scripts_verified_upstream(provenance, context.height);
+    let skip_scripts = handles.scripts_verified_upstream(provenance, context.height, context.hash);
     if skip_scripts {
         return run_non_script_checks_only(
             block,
