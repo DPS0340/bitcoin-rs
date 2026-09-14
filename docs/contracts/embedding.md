@@ -57,8 +57,9 @@ the first embedder — there is one lifecycle implementation, not two.
   started on the same data dir afterwards resumes from that checkpoint.
   Dropping a node without `shutdown` runs the same teardown in
   `StartupAbort` mode — services joined, storage released, no checkpoint.
-- **EMB-08 — Mutations wake the template coordinator.** The node-owned
-  `MiningGenerationSignal` (crates/node/src/mining.rs) fans every
+- **EMB-08 — Mutations wake the template coordinator.** The
+  `bitcoin_rs_mining::MiningGenerationSignal` (crates/mining/src/generation_signal.rs),
+  constructed and wired by node, fans every
   authoritative mutation out to the attached coordinator: the gateway's
   mutation observer fires it after each committed mutation, and the apply
   path fires it after each authoritative applied-tip connect/disconnect.

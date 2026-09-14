@@ -9,12 +9,11 @@
 //! and no backup or rotation.
 
 use std::path::Path;
-use std::sync::Arc;
 
-use bitcoin_rs_mempool::HistoryReject;
 use parking_lot::RwLock;
 
-use bitcoin_rs_mempool::Mempool;
+use crate::HistoryReject;
+use crate::Mempool;
 
 /// Name of the estimator's history file inside the datadir.
 const HISTORY_FILE: &str = "fee-estimator-history.dat";
@@ -30,7 +29,7 @@ const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// A missing file is a normal cold start. A rejected payload logs a typed
 /// warning naming the reject reason and leaves the pool's fresh,
 /// insufficient-data estimator in place.
-pub(crate) fn load(data_dir: &Path, mempool: &Arc<RwLock<Mempool>>) {
+pub fn load(data_dir: &Path, mempool: &RwLock<Mempool>) {
     let path = data_dir.join(HISTORY_FILE);
     let Ok(metadata) = std::fs::metadata(&path) else {
         tracing::debug!(
@@ -79,14 +78,16 @@ pub(crate) fn load(data_dir: &Path, mempool: &Arc<RwLock<Mempool>>) {
 /// over the live file, then best-effort sync the containing directory. A
 /// failure at any stage is a warning: owner-local persistence must never
 /// block a clean shutdown.
-pub(crate) fn save(data_dir: &Path, mempool: &Arc<RwLock<Mempool>>) {
+pub fn save(data_dir: &Path, mempool: &RwLock<Mempool>) {
     let bytes = mempool.read().estimator_history();
     let temp_path = data_dir.join(HISTORY_TEMP);
     let live_path = data_dir.join(HISTORY_FILE);
     let result = (|| -> std::io::Result<()> {
         match std::fs::remove_file(&temp_path) {
             Ok(()) => {}
+            // No stale temp staged: nothing to remove.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A real IO failure on the temp path aborts the publish.
             Err(error) => return Err(error),
         }
         let mut file = std::fs::OpenOptions::new()
@@ -141,7 +142,7 @@ fn warn_rejected(path: &Path, reject: HistoryReject) {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits};
+    use crate::{MempoolEntry, MempoolLimits};
     use bitcoin_rs_primitives::{
         Amount, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
     };

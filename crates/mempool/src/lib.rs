@@ -15,6 +15,8 @@ pub mod entry;
 pub mod eviction;
 /// Fee-rate history-based fee-rate estimator.
 pub mod fee_estimator;
+/// Fee-estimator history datadir persistence.
+pub mod fee_history;
 /// Single mutation gateway and observer seam in front of the pool.
 pub mod gateway;
 /// Mutation records returned by every mutating pool method.

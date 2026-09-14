@@ -2,9 +2,7 @@
 
 use super::MiningCoordinator;
 use crate::ApplyError;
-use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::NodeStatus;
-use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_mining::BlockValidationResult;
 use bitcoin_rs_mining::MiningControlError;
 use bitcoin_rs_mining::update_uncommitted_block_structures;
@@ -143,67 +141,10 @@ fn bip22_reject_reason(error: &ApplyError) -> CompactString {
         ApplyError::UndoPrevoutMissing { .. } => {
             CompactString::from("bad-txns-inputs-missingorspent")
         }
-        ApplyError::Consensus(consensus) => bip22_consensus_reason(consensus),
-        ApplyError::Chain(chain) => bip22_chain_reason(chain),
+        // A consensus-rule failure inside block apply.
+        ApplyError::Consensus(consensus) => bitcoin_rs_mining::consensus_reject_reason(consensus),
+        // A header/chain admission failure inside block apply.
+        ApplyError::Chain(chain) => bitcoin_rs_mining::chain_reject_reason(chain),
         other => CompactString::from(other.to_string()),
     }
-}
-
-fn bip22_consensus_reason(error: &ConsensusError) -> CompactString {
-    CompactString::from(match error {
-        ConsensusError::EmptyInputs => "bad-txns-vin-empty",
-        ConsensusError::EmptyOutputs => "bad-txns-vout-empty",
-        ConsensusError::CoinbaseScriptSigSize { .. } => "bad-cb-length",
-        ConsensusError::NullPrevout { .. } => "bad-txns-prevout-null",
-        ConsensusError::DuplicateInput { .. } => "bad-txns-inputs-duplicate",
-        ConsensusError::MissingPrevout { .. } => "bad-txns-inputs-missingorspent",
-        ConsensusError::OutputValueOverflow => "bad-txns-txouttotal-toolarge",
-        ConsensusError::InputsLessThanOutputs { .. } => "bad-txns-in-belowout",
-        ConsensusError::SigopsLimit { .. } => "bad-blk-sigops",
-        ConsensusError::EmptyBlock | ConsensusError::MissingCoinbase => "bad-cb-missing",
-        ConsensusError::ExtraCoinbase { .. } => "bad-cb-multiple",
-        ConsensusError::MerkleMutation => "bad-txns-duplicate",
-        ConsensusError::MerkleRoot => "bad-txnmrklroot",
-        ConsensusError::CoinbaseAmount { .. } => "bad-cb-amount",
-        ConsensusError::BlockValueOverflow => "bad-txns-accumulated-fee-outofrange",
-        ConsensusError::WitnessNonceSize => "bad-witness-nonce-size",
-        ConsensusError::UnexpectedWitness => "unexpected-witness",
-        ConsensusError::WitnessCommitment => "bad-witness-merkle-match",
-        ConsensusError::BlockWeight { .. } => "bad-blk-weight",
-        ConsensusError::Script { reason, .. } => {
-            return CompactString::from(format!("block-script-verify-flag-failed ({reason})"));
-        }
-        ConsensusError::Bip { bip, reason } => return bip22_bip_reason(bip, reason),
-        ConsensusError::PrevoutMatrixSize { .. }
-        | ConsensusError::Kernel(_)
-        | ConsensusError::Encoding(_) => return CompactString::from(error.to_string()),
-    })
-}
-
-fn bip22_bip_reason(bip: &str, reason: &str) -> CompactString {
-    CompactString::from(match bip {
-        "BIP30" => "bad-txns-BIP30",
-        "BIP34" => "bad-cb-height",
-        "BIP68" | "BIP113" => "bad-txns-nonfinal",
-        "COINBASE_MATURITY" => "bad-txns-premature-spend-of-coinbase",
-        _ => {
-            return CompactString::from(format!(
-                "block-script-verify-flag-failed ({bip}: {reason})"
-            ));
-        }
-    })
-}
-
-fn bip22_chain_reason(error: &ChainError) -> CompactString {
-    CompactString::from(match error {
-        ChainError::InvalidPow { .. } => "high-hash",
-        ChainError::ZeroTarget { .. }
-        | ChainError::TargetExceedsLimit { .. }
-        | ChainError::NbitsMismatch { .. } => "bad-diffbits",
-        ChainError::TimestampTooEarly { .. } => "time-too-old",
-        ChainError::TimestampTooFarAhead { .. } => "time-too-new",
-        ChainError::MissingParent { .. } => "prev-blk-not-found",
-        ChainError::DuplicateHeader { .. } => "duplicate",
-        _ => return CompactString::from(error.to_string()),
-    })
 }

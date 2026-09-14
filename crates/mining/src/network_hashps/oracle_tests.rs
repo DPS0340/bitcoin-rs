@@ -1,10 +1,10 @@
 use super::estimate_network_hashps;
-use super::hash_ps_at;
+use super::network_hash_ps;
+use crate::MiningControlError;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_mining::MiningControlError;
 use bitcoin_rs_primitives::BlockHash;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
@@ -159,12 +159,12 @@ fn estimate_network_hashps_matches_core_getnetworkhashps() {
 
 #[test]
 // CONTRACT: docs/contracts/external-api.md#API-06
-fn hash_ps_at_rejects_a_height_the_tip_cannot_resolve() {
+fn network_hash_ps_rejects_a_height_the_tip_cannot_resolve() {
     let mut tree = BlockTree::new();
     let genesis = append(&mut tree, BlockHash::default(), 1_000_000);
     let mut stale = snapshot(&tree, genesis);
     stale.height = 4;
-    match hash_ps_at(&tree, Some(&stale), 120, 3, Network::Regtest) {
+    match network_hash_ps(&tree, Some(&stale), 120, 3, Network::Regtest) {
         Err(MiningControlError::InvalidRequest(message)) => {
             assert_eq!(message.as_str(), "Block does not exist at specified height");
         }

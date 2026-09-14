@@ -147,11 +147,17 @@ Owners:
   lifecycle: the `(applied_tip_hash, mempool_sequence)` generation key, the
   bounded template cache with single-flight assembly, long-poll publication,
   and BIP22/BIP23 template projection (`MiningService`, fed by node-owned
-  capability sources). RPC maps those types onto BIP22/BIP23 JSON and does
+  capability sources). Mining also owns `MiningGenerationSignal` (the
+  authoritative-mutation wake seam, `generation_signal`), `getnetworkhashps`
+  estimation (`network_hashps`), and the BIP22/`submitheader` reject
+  vocabulary (`bip22`). RPC maps those types onto BIP22/BIP23 JSON and does
   not cache templates or long-poll.
 - `bitcoin-rs-mempool` owns transaction admission preparation and retry,
   orphan bodies and their indexes, ready-orphan work, and recent rejects
-  through the shared `MempoolGateway`. `bitcoin-rs-p2p` owns the transaction
+  through the shared `MempoolGateway`. It also owns the fee-estimator history
+  file format and its atomic datadir persistence (`fee_history`,
+  `fee-estimator-history.dat`); node only calls `load` at open and `save` at
+  shutdown. `bitcoin-rs-p2p` owns the transaction
   inventory implementation, missing-parent requests, source-connection checks,
   and the bounded transaction relay queue, worker, and saturation policy.
   Node supplies the chain view, connects committed admission results to relay
@@ -248,6 +254,10 @@ Owners:
   `ChainFollowers` / `ChainEffects` and are dispatched after commit
   while the `ChainTransition` is still held; `Chainstate` does not hold
   them. `crates/p2p` owns `DownloadWindow`, `BlockStager`, and `SyncPlanner`.
+  Fee-history persistence, the mining wake seam, hash-rate estimation, and
+  the BIP22 reject vocabulary now live in `crates/mempool`/`crates/mining`;
+  node keeps the `MiningCoordinator` facade and the `tx_ingress` consumer as
+  composition.
   `crates/node` still carries leftover domain mechanics: UTXO undo persistence
   and disconnect markers (`apply.rs`), the node-side sync executor (`sync.rs`
   driving `p2p::DownloadWindow`), and direct backend construction and cache

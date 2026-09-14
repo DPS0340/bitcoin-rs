@@ -330,6 +330,7 @@ dependencies = [
  "sha2 0.11.0",
  "slab",
  "smallvec",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
