@@ -77,6 +77,14 @@ pub fn commit_publication(
         paths,
         failpoint,
     } = stage;
+    // Caller built the manifest for a different generation than the stage
+    // reserved; publishing it would make CURRENT point at an unreadable checkpoint.
+    if manifest.generation != generation {
+        return Err(CheckpointError::Invalid(format!(
+            "manifest generation {} does not match staged generation {generation}",
+            manifest.generation
+        )));
+    }
     let manifest_bytes = serde_json::to_vec(manifest)?;
     let mut mf = create_file(&staging, MANIFEST_FILE)?;
     write_file(

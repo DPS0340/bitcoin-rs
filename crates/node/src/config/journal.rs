@@ -96,14 +96,15 @@ pub struct ChainstateJournalConfig {
 
 impl Default for ChainstateJournalConfig {
     fn default() -> Self {
+        let policy = bitcoin_rs_storage::chainstate_journal::JournalPolicy::default();
         Self {
             enabled: true,
-            blocks: 500,
-            seconds: 5,
-            rotate_mib: 256,
-            max_journal_mib: 2048,
-            max_lag_blocks: 500,
-            max_lag_seconds: 30,
+            blocks: policy.batch_blocks,
+            seconds: policy.batch_seconds.as_secs(),
+            rotate_mib: policy.rotate_mib,
+            max_journal_mib: policy.max_journal_mib,
+            max_lag_blocks: policy.max_lag_blocks,
+            max_lag_seconds: policy.max_lag_seconds.as_secs(),
         }
     }
 }

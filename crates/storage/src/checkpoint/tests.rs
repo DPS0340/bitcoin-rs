@@ -354,6 +354,36 @@ fn unknown_entries_and_symlinks_are_never_deleted() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn commit_rejects_manifest_for_wrong_generation() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let data = open_root(dir.path())?;
+    let stage = begin_publication(&data, None)?;
+    let generation = stage.generation();
+    let manifest: CheckpointManifestV1 = serde_json::from_value(serde_json::json!({
+        "format": MANIFEST_FORMAT,
+        "version": MANIFEST_VERSION,
+        "generation": generation + 1,
+        "network": "regtest",
+        "network_magic": hex_encode(&bitcoin_rs_primitives::Network::Regtest.magic()),
+        "genesis_hash": bitcoin_rs_primitives::Network::Regtest.genesis_block_hash().to_string_be(),
+        "applied_tip": { "height": 0, "hash": "00".repeat(32), "chainwork": "00".repeat(32), "chain_tx_count": 0 },
+        "best_header_tip": { "height": 0, "hash": "00".repeat(32), "chainwork": "00".repeat(32), "chain_tx_count": 0 },
+        "headers": { "file": HEADERS_FILE, "codec": HEADER_CODEC, "version": 1, "bytes": 0, "sha256": "00".repeat(32), "header_count": 0, "best_chain_sha256": "00".repeat(32), "applied_chain_sha256": "00".repeat(32) },
+        "utxo": { "file": UTXO_FILE, "codec": UTXO_CODEC, "version": UTXO_VERSION, "bytes": 0, "sha256": "00".repeat(32), "record_count": 0, "output_count": 0, "muhash_trailer_sha256": "00".repeat(32) },
+        "coinstats": { "file": COINSTATS_FILE, "codec": COINSTATS_CODEC, "version": COINSTATS_VERSION, "bytes": COINSTATS_ARTIFACT_LEN, "sha256": "00".repeat(32), "height": 0, "total_amount": 0, "bogo_size": 0, "tx_count": 0, "utxo_count": 0, "muhash": "00".repeat(32) }
+    }))?;
+    assert!(matches!(
+        commit_publication(stage, &manifest),
+        Err(CheckpointError::Invalid(message)) if message.contains("does not match staged generation")
+    ));
+    assert!(matches!(
+        open_current_checkpoint(&data)?,
+        CheckpointOpen::Cold
+    ));
+    Ok(())
+}
+
+#[test]
 fn format_and_schema_helpers_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(HEADER_CODEC, "bitcoin-rs-canonical-headers");
     assert_eq!(UTXO_CODEC, "bitcoin-rs-utxo-spendable-v1");
