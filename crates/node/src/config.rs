@@ -19,7 +19,8 @@ pub use resolved::{
 pub use runtime::RuntimeInputs;
 pub use user::{
     IndexOverrides, MiningOverrides, NotificationConfig, ObservabilityOverrides, P2pOverrides,
-    RpcOverrides, ScriptIndexMode, StorageOverrides, UserConfig, ValidationOverrides,
+    RpcOverrides, ScriptIndexMode, StorageOverrides, UserConfig, ValidationMode,
+    ValidationOverrides,
 };
 
 #[cfg(test)]

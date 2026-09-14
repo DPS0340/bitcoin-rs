@@ -181,14 +181,83 @@ fn verify_block_transactions_rejects_bad_coinbase_script_sig() {
 #[test]
 fn scripts_verified_upstream_follows_provenance() {
     let mut handles = empty_apply_handles();
-    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 1));
-    assert!(handles.scripts_verified_upstream(BlockProvenance::LocalReplay, 1));
+    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 1, Hash256::default()));
+    assert!(handles.scripts_verified_upstream(BlockProvenance::LocalReplay, 1, Hash256::default()));
 
     handles.assume_valid_height = 10;
     handles.assume_valid_gate = Arc::new(AssumeValidGate::with_anchor(None));
-    assert!(handles.scripts_verified_upstream(BlockProvenance::Network, 10));
-    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 11));
-    assert!(handles.scripts_verified_upstream(BlockProvenance::LocalReplay, 11));
+    assert!(handles.scripts_verified_upstream(BlockProvenance::Network, 10, Hash256::default()));
+    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 11, Hash256::default()));
+    assert!(handles.scripts_verified_upstream(
+        BlockProvenance::LocalReplay,
+        11,
+        Hash256::default()
+    ));
+}
+
+#[test]
+fn scripts_verified_upstream_follows_validation_mode() -> Result<(), ApplyError> {
+    let mut handles = empty_apply_handles();
+    handles.assume_valid_height = 10;
+    handles.assume_valid_gate = Arc::new(AssumeValidGate::with_anchor(None));
+
+    handles.validation_mode = ValidationMode::Full;
+    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 10, Hash256::default()));
+    assert!(handles.scripts_verified_upstream(
+        BlockProvenance::LocalReplay,
+        10,
+        Hash256::default()
+    ));
+
+    handles.validation_mode = ValidationMode::Fast;
+    assert!(
+        !handles.scripts_verified_upstream(BlockProvenance::Network, 1, Hash256::default()),
+        "no header tip: nothing is trusted"
+    );
+
+    // Header chain 0..=3 on the best branch; a competing sibling at height 2.
+    let tip_id = seed_block_tree_with_times(&handles, &[1, 2, 3, 4])?;
+    let (best_at_2, fork_at_2) = {
+        let mut tree = handles.block_tree.write();
+        let best_at_2 = tree
+            .node_at_height_from(tip_id, 2)
+            .and_then(|id| tree.node(id).ok().map(|node| node.hash))
+            .ok_or(ApplyError::HeightOverflow(2))?;
+        let parent = tree
+            .node_at_height_from(tip_id, 1)
+            .ok_or(ApplyError::HeightOverflow(1))?;
+        let parent_hash = tree
+            .node(parent)
+            .map_err(|_| ApplyError::HeightOverflow(1))?
+            .hash;
+        let fork = tree.insert_node(
+            Some(parent),
+            Header {
+                version: 1,
+                prev_blockhash: BlockHash::from(parent_hash),
+                merkle_root: Hash256::default(),
+                time: 99,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 99,
+            },
+            NodeStatus::HeaderValid,
+        )?;
+        let fork_at_2 = tree
+            .node(fork)
+            .map_err(|_| ApplyError::HeightOverflow(2))?
+            .hash;
+        assert_eq!(tree.tip().map(|tip| tip.height), Some(3));
+        (best_at_2, fork_at_2)
+    };
+
+    assert!(handles.scripts_verified_upstream(BlockProvenance::Network, 2, best_at_2));
+    assert!(
+        !handles.scripts_verified_upstream(BlockProvenance::Network, 2, fork_at_2),
+        "competing branch must not borrow the best header chain's trust"
+    );
+    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 3, Hash256::default()));
+    assert!(!handles.scripts_verified_upstream(BlockProvenance::Network, 4, Hash256::default()));
+    Ok(())
 }
 
 #[test]

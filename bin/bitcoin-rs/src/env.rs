@@ -2,7 +2,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
-use bitcoin_rs_node::{ChainstateJournalOverrides, NetworkSelection, ScriptIndexMode, UserConfig};
+use bitcoin_rs_node::{
+    ChainstateJournalOverrides, NetworkSelection, ScriptIndexMode, UserConfig, ValidationMode,
+};
 use bitcoin_rs_storage::StorageBackend;
 
 use crate::cli::{parse_bool, parse_connect_list, parse_p2p_magic, parse_socket_list};
@@ -22,12 +24,14 @@ enum EnvSetting {
     P2pListen,
     DnsSeedsEnabled,
     Connect,
+    FastSync,
     PruneTargetMb,
     TxIndex,
     DbcacheMb,
     LogLevel,
     MetricsBind,
     AssumeValidHeight,
+    ValidationMode,
     MiningPayoutAddress,
     ChainstateJournal,
     ChainstateJournalBlocks,
@@ -70,12 +74,14 @@ fn env_setting(key: &str) -> Option<EnvSetting> {
         "BITCOIN_RS_P2P_LISTEN" => EnvSetting::P2pListen,
         "BITCOIN_RS_DNS_SEEDS_ENABLED" => EnvSetting::DnsSeedsEnabled,
         "BITCOIN_RS_CONNECT" => EnvSetting::Connect,
+        "BITCOIN_RS_FAST_SYNC" => EnvSetting::FastSync,
         "BITCOIN_RS_PRUNE_TARGET_MB" => EnvSetting::PruneTargetMb,
         "BITCOIN_RS_TXINDEX" => EnvSetting::TxIndex,
         "BITCOIN_RS_DBCACHE_MB" => EnvSetting::DbcacheMb,
         "BITCOIN_RS_LOG_LEVEL" => EnvSetting::LogLevel,
         "BITCOIN_RS_METRICS_BIND" => EnvSetting::MetricsBind,
         "BITCOIN_RS_ASSUME_VALID_HEIGHT" => EnvSetting::AssumeValidHeight,
+        "BITCOIN_RS_VALIDATION_MODE" => EnvSetting::ValidationMode,
         "BITCOIN_RS_MINING_PAYOUT_ADDRESS" => EnvSetting::MiningPayoutAddress,
         "BITCOIN_RS_CHAINSTATE_JOURNAL" => EnvSetting::ChainstateJournal,
         "BITCOIN_RS_CHAINSTATE_JOURNAL_BLOCKS" => EnvSetting::ChainstateJournalBlocks,
@@ -130,6 +136,7 @@ fn apply(layer: &mut UserConfig, setting: EnvSetting, value: &str) -> Result<()>
         EnvSetting::P2pListen => layer.p2p.listen = Some(parse_socket_list(value)?),
         EnvSetting::DnsSeedsEnabled => layer.p2p.dns_seeds = Some(parse_bool(value)?),
         EnvSetting::Connect => layer.p2p.connect = Some(parse_connect_list(value)?),
+        EnvSetting::FastSync => layer.p2p.fast_sync = Some(parse_bool(value)?),
         EnvSetting::PruneTargetMb => layer.storage.prune_target_mb = Some(value.parse()?),
         EnvSetting::TxIndex => layer.indexes.txindex = Some(parse_bool(value)?),
         EnvSetting::DbcacheMb => layer.storage.dbcache_mb = Some(value.parse()?),
@@ -137,6 +144,12 @@ fn apply(layer: &mut UserConfig, setting: EnvSetting, value: &str) -> Result<()>
         EnvSetting::MetricsBind => layer.observability.metrics_bind = Some(value.parse()?),
         EnvSetting::AssumeValidHeight => {
             layer.validation.assume_valid_height = Some(value.parse()?);
+        }
+        EnvSetting::ValidationMode => {
+            layer.validation.mode = Some(
+                ValidationMode::parse(value)
+                    .ok_or_else(|| anyhow::anyhow!("invalid validation-mode value `{value}`"))?,
+            );
         }
         EnvSetting::MiningPayoutAddress => {
             layer.mining.payout_address = Some(value.to_owned());

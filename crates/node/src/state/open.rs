@@ -27,6 +27,8 @@ use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolLimits;
+use bitcoin_rs_p2p::download_window::FAST_OUTBOUND_PEER_TARGET;
+use bitcoin_rs_p2p::download_window::fast_sync_budget;
 use bitcoin_rs_rpc::context::BlockLog;
 use bitcoin_rs_rpc::context::NetworkState;
 use bitcoin_rs_storage::FlatFileBlockStore;
@@ -320,6 +322,13 @@ impl NodeState {
             derived_index_capabilities(&config),
         ));
         let network = Arc::new(RwLock::new(NetworkState::default()));
+        // One active generation of outbound requests keeps the drain fed, so
+        // the active and queue limits track the peer target.
+        let outbound_target = if config.p2p.fast_sync {
+            FAST_OUTBOUND_PEER_TARGET
+        } else {
+            P2P_OUTBOUND_QUEUE_LIMIT
+        };
         let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
             bitcoin_rs_p2p::P2pServiceConfig {
                 listen_addrs: config.p2p.listen.clone(),
@@ -333,9 +342,9 @@ impl NodeState {
                     .collect(),
                 dns_port: config.network.default_p2p_port(),
                 fixed_peers: config.p2p.connect.clone(),
-                outbound_active_limit: P2P_OUTBOUND_QUEUE_LIMIT,
-                outbound_peer_target: P2P_OUTBOUND_QUEUE_LIMIT,
-                outbound_queue_limit: P2P_OUTBOUND_QUEUE_LIMIT,
+                outbound_active_limit: outbound_target,
+                outbound_peer_target: outbound_target,
+                outbound_queue_limit: outbound_target,
                 inbound_block_queue_limit: INBOUND_BLOCK_CHANNEL_LIMIT,
             },
             Arc::clone(&shutdown),
@@ -417,6 +426,7 @@ impl NodeState {
                 config.network,
                 config.validation.assume_valid_height,
             )),
+            validation_mode: config.validation.mode,
             journal,
             checkpoint_publisher: None,
             capture_rawtx,
@@ -464,6 +474,9 @@ impl NodeState {
             Arc::clone(&inbound_headers_rx),
             Arc::clone(&inbound_blocks_rx),
         ));
+        if config.p2p.fast_sync {
+            sync.install_budget(fast_sync_budget());
+        }
         let prune_service = if config.storage.prune_target_mb > 0 {
             Some(storage.prune_service(
                 &block_files,

@@ -91,6 +91,19 @@ pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 /// with [`PENDING_BUDGET`]: `PENDING_BUDGET / 16` would be 16, and fan-out
 /// would never engage at the 8-outbound default.
 pub const MIN_PEERS_FOR_FANOUT: usize = 8;
+/// Fast-sync per-peer stripe floor. Half the Core cap so the window spreads
+/// across a larger outbound set; opt-in, not measured against the default.
+pub const FAST_BLOCKS_IN_TRANSIT_PER_PEER: usize = 8;
+/// Fast-sync fan-out threshold: stripe as soon as a second eligible peer
+/// exists instead of waiting for a full outbound set.
+pub const FAST_MIN_PEERS_FOR_FANOUT: usize = 2;
+/// Fast-sync outbound peer target.
+///
+/// The peer count that fully stripes [`PENDING_BUDGET`] (and thus
+/// [`PENDING_BYTE_BUDGET`], the estimated in-flight bandwidth) at
+/// [`FAST_BLOCKS_IN_TRANSIT_PER_PEER`] each. More peers would sit idle behind
+/// the window; fewer leave the stripe deeper.
+pub const FAST_OUTBOUND_PEER_TARGET: usize = PENDING_BUDGET / FAST_BLOCKS_IN_TRANSIT_PER_PEER;
 /// Initial window-blocked stalling threshold.
 ///
 /// Mirrors Bitcoin Core's `BLOCK_STALLING_TIMEOUT_DEFAULT` (2s,
@@ -126,6 +139,11 @@ const _: () = assert!(PENDING_BUDGET == RECEIVED_BLOCK_BUDGET);
 const _: () = assert!(
     MIN_PEERS_FOR_FANOUT * MAX_BLOCKS_IN_TRANSIT_PER_PEER <= PENDING_BUDGET,
     "fan-out at the outbound target must not exceed the download window"
+);
+const _: () = assert!(
+    FAST_OUTBOUND_PEER_TARGET * FAST_BLOCKS_IN_TRANSIT_PER_PEER <= PENDING_BUDGET
+        && FAST_MIN_PEERS_FOR_FANOUT <= FAST_OUTBOUND_PEER_TARGET,
+    "fast-sync fan-out at its outbound target must not exceed the download window"
 );
 
 /// Maximum number of block inventory entries we request per tick.
@@ -240,6 +258,16 @@ pub const fn default_sync_budget() -> SyncBudget {
         stall_timeout_initial: BLOCK_STALLING_TIMEOUT,
         stall_timeout_max: BLOCK_STALLING_TIMEOUT_MAX,
         staller_cooldown: STALLER_COOLDOWN,
+    }
+}
+
+/// Returns the opt-in fast-sync [`SyncBudget`]: the default window striped
+/// shallower and earlier across up to [`FAST_OUTBOUND_PEER_TARGET`] peers.
+pub const fn fast_sync_budget() -> SyncBudget {
+    SyncBudget {
+        fanout_peer_inflight: FAST_BLOCKS_IN_TRANSIT_PER_PEER,
+        min_peers_for_fanout: FAST_MIN_PEERS_FOR_FANOUT,
+        ..default_sync_budget()
     }
 }
 
@@ -2099,7 +2127,10 @@ mod tests {
 
     use bitcoin_rs_primitives::Hash256;
 
-    use super::{DownloadWindow, SyncBudget};
+    use super::{
+        DownloadWindow, FAST_BLOCKS_IN_TRANSIT_PER_PEER, FAST_MIN_PEERS_FOR_FANOUT,
+        FAST_OUTBOUND_PEER_TARGET, PENDING_BUDGET, SyncBudget, fast_sync_budget,
+    };
 
     #[test]
     fn request_peer_scan_limit_accounts_for_pending_bytes_and_inflight_peers() {
@@ -2410,6 +2441,34 @@ mod tests {
         window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
         assert_eq!(window.request_peer_scan_limit(now), 8);
+    }
+
+    #[test]
+    fn fast_sync_budget_stripes_window_across_fast_outbound_target() {
+        let mut window = DownloadWindow::new(fast_sync_budget());
+        let now = Instant::now();
+
+        // One peer keeps the deep fallback.
+        window.set_fanout_eligible_peers(1, now);
+        assert!(!window.fanout_active());
+        assert_eq!(window.request_peer_scan_limit(now), 1);
+
+        // A second eligible peer engages fan-out immediately.
+        window.set_fanout_eligible_peers(FAST_MIN_PEERS_FOR_FANOUT, now);
+        assert!(window.fanout_active());
+        assert_eq!(window.effective_peer_inflight(), PENDING_BUDGET / 2);
+
+        // At the fast outbound target every peer holds the fast stripe and
+        // the scan reaches all of them.
+        window.set_fanout_eligible_peers(FAST_OUTBOUND_PEER_TARGET, now);
+        assert_eq!(
+            window.effective_peer_inflight(),
+            FAST_BLOCKS_IN_TRANSIT_PER_PEER
+        );
+        assert_eq!(
+            window.request_peer_scan_limit(now),
+            FAST_OUTBOUND_PEER_TARGET
+        );
     }
 
     #[test]

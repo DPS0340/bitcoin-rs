@@ -591,7 +591,11 @@ pub(super) fn prove_window<'a>(
             // window. Without it the batch prepared and executed every unit
             // before the per-block decision was ever reached, so assume-valid
             // did nothing at all on the windowed path.
-            if handles.scripts_verified_upstream(BlockProvenance::Network, context.height) {
+            if handles.scripts_verified_upstream(
+                BlockProvenance::Network,
+                context.height,
+                context.hash,
+            ) {
                 skipped[index] = true;
                 continue;
             }

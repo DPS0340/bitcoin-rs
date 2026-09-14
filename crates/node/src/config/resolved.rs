@@ -8,7 +8,7 @@ use bitcoin_rs_storage::StorageBackend;
 use super::auth::Auth;
 use super::journal::ChainstateJournalConfig;
 use super::network::{DRYNET4_CONNECT, DRYNET4_P2P_MAGIC, NetworkSelection};
-use super::user::{NotificationConfig, ScriptIndexMode, UserConfig};
+use super::user::{NotificationConfig, ScriptIndexMode, UserConfig, ValidationMode};
 
 const DEFAULT_STORAGE_BACKEND: StorageBackend = StorageBackend::Fjall;
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -36,6 +36,8 @@ pub struct P2pConfig {
     pub dns_seeds_enabled: bool,
     /// Fixed outbound peer endpoints.
     pub connect: Vec<String>,
+    /// Whether fast sync (shallow, early fan-out over a larger outbound set) is enabled.
+    pub fast_sync: bool,
 }
 
 /// Resolved RPC configuration.
@@ -72,6 +74,8 @@ pub struct ObservabilityConfig {
 pub struct ValidationConfig {
     /// Height through which script verification may be skipped.
     pub assume_valid_height: u32,
+    /// Which script verification the apply path may skip.
+    pub mode: ValidationMode,
 }
 
 /// Resolved mining configuration.
@@ -126,6 +130,7 @@ impl NodeConfig {
                 listen: Vec::new(),
                 dns_seeds_enabled: true,
                 connect: Vec::new(),
+                fast_sync: false,
             },
             rpc: RpcConfig {
                 bind: SocketAddr::from(([127, 0, 0, 1], Network::Mainnet.default_rpc_port())),
@@ -144,6 +149,7 @@ impl NodeConfig {
             chainstate_journal: ChainstateJournalConfig::default(),
             validation: ValidationConfig {
                 assume_valid_height: 0,
+                mode: ValidationMode::AssumeValid,
             },
             mining: MiningConfig::default(),
         };
@@ -267,6 +273,9 @@ impl NodeConfig {
         if let Some(value) = &layer.p2p.connect {
             self.p2p.connect.clone_from(value);
         }
+        if let Some(value) = layer.p2p.fast_sync {
+            self.p2p.fast_sync = value;
+        }
         if let Some(notifications) = &layer.notifications {
             self.notifications.clone_from(notifications);
         }
@@ -275,6 +284,9 @@ impl NodeConfig {
         }
         if let Some(value) = layer.validation.assume_valid_height {
             self.validation.assume_valid_height = value;
+        }
+        if let Some(value) = layer.validation.mode {
+            self.validation.mode = value;
         }
     }
 

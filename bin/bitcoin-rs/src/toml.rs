@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use bitcoin_rs_node::{
     ChainstateJournalOverrides, IndexOverrides, MiningOverrides, NetworkSelection,
     NotificationConfig, ObservabilityOverrides, P2pOverrides, RpcOverrides, ScriptIndexMode,
-    StorageOverrides, UserConfig, ValidationOverrides,
+    StorageOverrides, UserConfig, ValidationMode, ValidationOverrides,
 };
 use bitcoin_rs_storage::StorageBackend;
 use serde::Deserialize;
@@ -28,6 +28,7 @@ struct TomlFile {
     p2p_listen: Option<Vec<SocketAddr>>,
     dns_seeds_enabled: Option<bool>,
     connect: Option<Vec<String>>,
+    fast_sync: Option<bool>,
     prune_target_mb: Option<u64>,
     txindex: Option<bool>,
     dbcache_mb: Option<u64>,
@@ -36,6 +37,7 @@ struct TomlFile {
     notifications: Option<NotificationConfig>,
     chainstate_journal: Option<ChainstateJournalOverrides>,
     assume_valid_height: Option<u32>,
+    validation_mode: Option<String>,
     mining_payout_address: Option<String>,
 }
 
@@ -77,6 +79,7 @@ impl TomlFile {
                 listen: self.p2p_listen,
                 dns_seeds: self.dns_seeds_enabled,
                 connect,
+                fast_sync: self.fast_sync,
             },
             rpc: RpcOverrides {
                 bind: self.rpc_bind,
@@ -107,6 +110,17 @@ impl TomlFile {
             chainstate_journal: self.chainstate_journal,
             validation: ValidationOverrides {
                 assume_valid_height: self.assume_valid_height,
+                mode: self
+                    .validation_mode
+                    .as_deref()
+                    .map(|value| {
+                        ValidationMode::parse(value).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "invalid validation_mode value `{value}`: expected `full`, `assume-valid`, or `fast`"
+                            )
+                        })
+                    })
+                    .transpose()?,
             },
             mining: MiningOverrides {
                 payout_address: self.mining_payout_address,

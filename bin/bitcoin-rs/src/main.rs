@@ -115,7 +115,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
-    use bitcoin_rs_node::{Auth, Network, ScriptIndexMode};
+    use bitcoin_rs_node::{Auth, Network, ScriptIndexMode, ValidationMode};
 
     #[test]
     fn bitcoin_conf_is_applied_before_environment_and_cli() {
@@ -212,6 +212,44 @@ mod tests {
         .unwrap_or_else(|error| panic!("valid environment configuration: {error}"));
 
         assert_eq!(config.indexes.script_index, ScriptIndexMode::Utxo);
+    }
+
+    #[test]
+    fn fast_sync_defaults_off_and_enables_from_flag_or_environment() {
+        let config = super::load(["bitcoin-rs"], std::iter::empty::<(OsString, OsString)>())
+            .unwrap_or_else(|error| panic!("valid default configuration: {error}"));
+        assert!(!config.p2p.fast_sync);
+
+        let config = super::load(
+            ["bitcoin-rs", "--fast-sync"],
+            std::iter::empty::<(OsString, OsString)>(),
+        )
+        .unwrap_or_else(|error| panic!("valid CLI configuration: {error}"));
+        assert!(config.p2p.fast_sync);
+
+        let config = super::load(
+            ["bitcoin-rs", "--fast-sync=false"],
+            std::iter::once(("BITCOIN_RS_FAST_SYNC", "true"))
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        )
+        .unwrap_or_else(|error| panic!("valid layered configuration: {error}"));
+        assert!(!config.p2p.fast_sync);
+    }
+
+    #[test]
+    fn validation_mode_defaults_to_assume_valid_and_layers_flag_over_environment() {
+        let config = super::load(["bitcoin-rs"], std::iter::empty::<(OsString, OsString)>())
+            .unwrap_or_else(|error| panic!("valid default configuration: {error}"));
+        assert_eq!(config.validation.mode, ValidationMode::AssumeValid);
+
+        let config = super::load(
+            ["bitcoin-rs", "--validation-mode", "full"],
+            std::iter::once(("BITCOIN_RS_VALIDATION_MODE", "fast"))
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        )
+        .unwrap_or_else(|error| panic!("valid layered configuration: {error}"));
+        assert_eq!(config.validation.mode, ValidationMode::Full);
+        assert_eq!(ValidationMode::parse("lenient"), None);
     }
 
     #[test]

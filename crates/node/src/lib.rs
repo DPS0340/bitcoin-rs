@@ -80,7 +80,7 @@ pub use config::{
     MiningConfig, MiningOverrides, NetworkSelection, NodeConfig, NotificationConfig,
     ObservabilityConfig, ObservabilityOverrides, P2pConfig, P2pOverrides, RpcConfig, RpcOverrides,
     RuntimeInputs, ScriptIndexMode, StorageConfig, StorageOverrides, UserConfig, ValidationConfig,
-    ValidationOverrides, resolve,
+    ValidationMode, ValidationOverrides, resolve,
 };
 
 pub use embed::{Node, NodeError, SyncProgress};
