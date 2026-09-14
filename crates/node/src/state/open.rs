@@ -182,10 +182,9 @@ impl NodeState {
             .as_ref()
             .map_or_else(|| config.network.genesis_block_hash(), |tip| tip.hash)
             .to_string_be();
-        if let Some(witness) = bitcoin_rs_storage::recovery_evidence::read_witness(
-            &config.data_dir,
-            &genesis_hex,
-        ) {
+        if let Some(witness) =
+            bitcoin_rs_storage::recovery_evidence::read_witness(&config.data_dir, &genesis_hex)
+        {
             if let Some((witness_height, _)) =
                 bitcoin_rs_storage::recovery_evidence::detect_checkpoint_fallback(
                     &witness,

@@ -302,9 +302,8 @@ fn witness_is_published_only_after_current_root_sync() -> anyhow::Result<()> {
         "witness file must exist after checkpoint publication"
     );
     let genesis_hex = config.network.genesis_block_hash().to_string_be();
-    let witness =
-        bitcoin_rs_storage::recovery_evidence::read_witness(&data_dir, &genesis_hex)
-    .ok_or_else(|| anyhow::anyhow!("witness must be readable"))?;
+    let witness = bitcoin_rs_storage::recovery_evidence::read_witness(&data_dir, &genesis_hex)
+        .ok_or_else(|| anyhow::anyhow!("witness must be readable"))?;
     assert_eq!(witness.height, tip.height);
     assert_eq!(witness.block_hash, tip.hash.to_string_be());
     drop(state);

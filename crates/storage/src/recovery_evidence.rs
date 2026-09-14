@@ -79,8 +79,7 @@ impl AppliedTipWitness {
         if data.len() > MAX_FILE_BYTES {
             return None;
         }
-        let w: Self =
-            serde_json::from_slice(data.strip_suffix(b"\n").unwrap_or(data)).ok()?;
+        let w: Self = serde_json::from_slice(data.strip_suffix(b"\n").unwrap_or(data)).ok()?;
         (w.format == FORMAT && w.genesis_hash == genesis_hash).then_some(w)
     }
 }
@@ -159,18 +158,13 @@ impl ChainRollbackEvent {
         if data.len() > MAX_FILE_BYTES {
             return None;
         }
-        let e: Self =
-            serde_json::from_slice(data.strip_suffix(b"\n").unwrap_or(data)).ok()?;
+        let e: Self = serde_json::from_slice(data.strip_suffix(b"\n").unwrap_or(data)).ok()?;
         (e.format == FORMAT && e.genesis_hash == genesis_hash).then_some(e)
     }
 }
 
 /// Reads `name`, then `name.prev`; each candidate must decode.
-fn read_sidecar<T>(
-    dir: &Path,
-    name: &str,
-    decode: impl Fn(&[u8]) -> Option<T>,
-) -> Option<T> {
+fn read_sidecar<T>(dir: &Path, name: &str, decode: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
     [name.to_owned(), format!("{name}.prev")]
         .iter()
         .find_map(|n| decode(&std::fs::read(dir.join(n)).ok()?))
@@ -231,9 +225,12 @@ pub fn read_witness(dir: &Path, genesis_hash: &str) -> Option<AppliedTipWitness>
 
 /// Publishes the applied-tip witness atomically.
 pub fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(), EvidenceError> {
-    write_sidecar(dir, WITNESS_FILE, &serde_json::to_string(witness)?, |data| {
-        AppliedTipWitness::decode(data, &witness.genesis_hash).is_some()
-    })
+    write_sidecar(
+        dir,
+        WITNESS_FILE,
+        &serde_json::to_string(witness)?,
+        |data| AppliedTipWitness::decode(data, &witness.genesis_hash).is_some(),
+    )
 }
 
 /// Reads the most recent valid rollback marker (current, then `.prev`).

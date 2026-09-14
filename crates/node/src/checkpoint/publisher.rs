@@ -235,7 +235,8 @@ impl CheckpointPublisher {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
             );
-            write_witness(&self.data_dir, &witness).map_err(|e| CheckpointError::Invalid(e.to_string()))?;
+            write_witness(&self.data_dir, &witness)
+                .map_err(|e| CheckpointError::Invalid(e.to_string()))?;
         }
         // Remove the disconnect marker only after this checkpoint publishes the
         // matching UTXO set and applied tip.
