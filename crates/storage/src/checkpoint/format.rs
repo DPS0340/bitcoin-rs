@@ -29,6 +29,8 @@ pub(crate) fn valid_current_temp_name(name: &str) -> bool {
         })
 }
 
+/// Checkpoint-file network spelling. Core's `testnet` alias names
+/// [`Network::Testnet3`]. Evidence identity uses [`Network::identity_name`].
 pub fn network_name(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "mainnet",
