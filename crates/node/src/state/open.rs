@@ -185,14 +185,12 @@ impl NodeState {
         if let Some(witness) =
             bitcoin_rs_storage::recovery_evidence::read_witness(&config.data_dir, &genesis_hex)
         {
-            if let Some((witness_height, _)) =
-                bitcoin_rs_storage::recovery_evidence::detect_checkpoint_fallback(
-                    &witness,
-                    epoch,
-                    &genesis_hex,
-                    restored_height,
-                )
-            {
+            if bitcoin_rs_storage::recovery_evidence::checkpoint_fallback(
+                &witness,
+                epoch,
+                restored_height,
+            ) {
+                let witness_height = witness.height;
                 let source = match resume_source {
                     ResumeSource::Cold => "cold",
                     ResumeSource::Checkpoint => "checkpoint",

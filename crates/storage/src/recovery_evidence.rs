@@ -247,20 +247,14 @@ pub fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), Eviden
     })
 }
 
-/// `Some((witness_height, restored_height))` when the witness matches the
-/// genesis, was written by an older epoch, and sits strictly above the
-/// restored applied-tip height (no tip means zero).
-pub fn detect_checkpoint_fallback(
+/// True when the witness was written by an older epoch and sits strictly
+/// above the restored applied-tip height (no tip means zero).
+pub fn checkpoint_fallback(
     witness: &AppliedTipWitness,
     current_epoch: u64,
-    genesis_hash: &str,
     restored_height: u32,
-) -> Option<(u32, u32)> {
-    (witness.format == FORMAT
-        && witness.genesis_hash == genesis_hash
-        && witness.writer_epoch < current_epoch
-        && witness.height > restored_height)
-        .then_some((witness.height, restored_height))
+) -> bool {
+    witness.writer_epoch < current_epoch && witness.height > restored_height
 }
 
 /// Reads the applied-tip witness through an opened data-dir anchor (current,

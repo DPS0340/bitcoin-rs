@@ -1,5 +1,6 @@
 use super::*;
 use crate::Network;
+use bitcoin_rs_storage::footprint::evidence::DEFAULT_UNPRUNED_PEAK_BUDGET_BYTES;
 use bitcoin_rs_storage::measure_physical_tree;
 use tempfile::tempdir;
 

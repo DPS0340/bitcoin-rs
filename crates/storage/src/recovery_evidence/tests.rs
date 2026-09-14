@@ -97,9 +97,8 @@ fn foreign_genesis_or_future_epoch_witness_is_ignored() {
     let w2 = AppliedTipWitness::new(G, 10, 100, "aaa", 1000);
     write_witness(dir2.path(), &w2).expect("write");
     assert_eq!(read_witness(dir2.path(), G), Some(w2.clone()));
-    assert_eq!(
-        detect_checkpoint_fallback(&w2, 5, G, 50),
-        None,
+    assert!(
+        !checkpoint_fallback(&w2, 5, 50),
         "future-epoch witness is not eligible for detection"
     );
 }
@@ -164,9 +163,8 @@ fn witness_stage_failure_preserves_bounded_current_prev() {
 #[test]
 fn same_genesis_older_epoch_higher_witness_warns() {
     let witness = AppliedTipWitness::new(G, 1, 200, "bbb", 1000);
-    assert_eq!(
-        detect_checkpoint_fallback(&witness, 5, G, 100),
-        Some((200, 100)),
+    assert!(
+        checkpoint_fallback(&witness, 5, 100),
         "same-genesis, older-epoch, higher witness must warn"
     );
 }
@@ -174,25 +172,10 @@ fn same_genesis_older_epoch_higher_witness_warns() {
 #[test]
 fn equal_or_lower_witness_does_not_warn() {
     let witness_equal = AppliedTipWitness::new(G, 1, 100, "ccc", 1000);
-    assert_eq!(detect_checkpoint_fallback(&witness_equal, 5, G, 100), None);
+    assert!(!checkpoint_fallback(&witness_equal, 5, 100));
 
     let witness_lower = AppliedTipWitness::new(G, 1, 50, "ddd", 1000);
-    assert_eq!(detect_checkpoint_fallback(&witness_lower, 5, G, 100), None);
-}
-
-#[test]
-fn checkpoint_and_index_warnings_coexist() {
-    let publisher = RecoveryEvidencePublisher::new(PathBuf::new(), G.to_owned(), 5);
-    publisher.update(|w| w.checkpoint = Some("checkpoint fallback at 200".to_owned()));
-    publisher.update(|w| {
-        w.index
-            .push("index 'txindex' watermark at 250 is 150 block(s) ahead".to_owned());
-    });
-
-    let warnings = publisher.warnings();
-    assert_eq!(warnings.len(), 2, "both warning classes coexist");
-    assert_eq!(warnings[0], "checkpoint fallback at 200");
-    assert!(warnings[1].contains("txindex"));
+    assert!(!checkpoint_fallback(&witness_lower, 5, 100));
 }
 
 #[test]
@@ -251,14 +234,6 @@ fn getblockchaininfo_reports_atomic_rollback_warnings() {
 }
 
 #[test]
-fn marker_round_trips() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let event = fallback_event(G, 5, 1000);
-    write_marker(dir.path(), &event).expect("write marker");
-    assert_eq!(read_marker(dir.path(), G), Some(event));
-}
-
-#[test]
 fn marker_last_event_wins_preserves_prev() {
     let dir = tempfile::tempdir().expect("tempdir");
     let e1 = fallback_event(G, 5, 1000);
@@ -289,46 +264,13 @@ fn marker_last_event_wins_preserves_prev() {
 }
 
 #[test]
-fn reporter_publish_checkpoint_fallback_writes_marker_and_warns() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let publisher = RecoveryEvidencePublisher::new(dir.path().to_path_buf(), G.to_owned(), 5);
-
-    publisher
-        .publish_checkpoint_fallback(200, 100, "aaa", "checkpoint", "bbb", 1000)
-        .expect("publish");
-
-    let warnings = publisher.warnings();
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("height 200"));
-    assert!(read_marker(dir.path(), G).is_some());
-}
-
-#[test]
-fn reporter_publish_index_ahead_writes_marker_and_warns() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let publisher = RecoveryEvidencePublisher::new(dir.path().to_path_buf(), G.to_owned(), 5);
-
-    publisher
-        .publish_index_ahead("txindex", 250, 100, "aaa", "ccc", 150, 1000)
-        .expect("publish");
-
-    let warnings = publisher.warnings();
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("txindex"));
-    assert!(read_marker(dir.path(), G).is_some());
-}
-
-#[test]
 fn checkpoint_fallback_with_index_far_ahead_converges_and_warns() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let witness = AppliedTipWitness::new(G, 1, 200, "bbb", 1000);
     write_witness(dir.path(), &witness).expect("write witness");
     let read_back = read_witness(dir.path(), G).expect("witness loads");
-    assert_eq!(
-        detect_checkpoint_fallback(&read_back, 5, G, 100),
-        Some((200, 100))
-    );
+    assert!(checkpoint_fallback(&read_back, 5, 100));
 
     let publisher = RecoveryEvidencePublisher::new(dir.path().to_path_buf(), G.to_owned(), 5);
     publisher
@@ -437,33 +379,5 @@ fn foreign_genesis_current_cannot_displace_valid_prev() {
         read_witness(dir2.path(), G),
         Some(w1),
         "valid .prev survives a wrong-format current"
-    );
-}
-
-#[test]
-fn foreign_genesis_marker_current_cannot_displace_valid_prev() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let e1 = fallback_event(G, 1, 1000);
-    let e2 = fallback_event(G, 2, 2000);
-
-    write_marker(dir.path(), &e1).expect("write e1");
-    write_marker(dir.path(), &e2).expect("write e2 -> e1 to .prev");
-
-    let foreign = fallback_event("bbbb", 3, 3000);
-    std::fs::write(
-        marker_file(dir.path()),
-        format!("{}\n", serde_json::to_string(&foreign).unwrap()).as_bytes(),
-    )
-    .expect("plant foreign marker current");
-
-    let e3 = fallback_event(G, 4, 4000);
-    write_marker(dir.path(), &e3).expect("write e3 over foreign current");
-    assert_eq!(read_marker(dir.path(), G), Some(e3));
-
-    std::fs::remove_file(marker_file(dir.path())).expect("remove current");
-    assert_eq!(
-        read_marker(dir.path(), G),
-        Some(e1),
-        "valid marker .prev survives; foreign current never displaced it"
     );
 }

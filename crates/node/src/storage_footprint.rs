@@ -26,10 +26,12 @@ use scan::io_from_footprint;
 use scan::watermark_evidence;
 use std::sync::Arc;
 
+use bitcoin_rs_storage::footprint::evidence::{
+    BudgetEvidence, EVIDENCE_FORMAT, EvidenceIdentity, IndexWatermarkEvidence, LogicalEvidence,
+    PhysicalEvidence, WatermarkEvidence,
+};
 pub use bitcoin_rs_storage::footprint::evidence::{
-    BudgetEvidence, DEFAULT_UNPRUNED_PEAK_BUDGET_BYTES, EVIDENCE_FORMAT, EvidenceIdentity,
-    IndexWatermarkEvidence, LogicalEvidence, PhysicalEvidence, StorageFootprintEvidence,
-    WatermarkEvidence, storage_footprint_json,
+    StorageFootprintEvidence, storage_footprint_json,
 };
 
 /// Optional overrides for one measurement invocation.
