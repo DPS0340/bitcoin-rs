@@ -25,11 +25,11 @@ use anyhow::bail;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_index::block_log::BlockLog;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolLimits;
 use bitcoin_rs_p2p::download_window::FAST_OUTBOUND_PEER_TARGET;
 use bitcoin_rs_p2p::download_window::fast_sync_budget;
-use bitcoin_rs_rpc::context::BlockLog;
 use bitcoin_rs_rpc::context::NetworkState;
 use bitcoin_rs_storage::FlatFileBlockStore;
 use hashbrown::HashMap;
@@ -253,7 +253,7 @@ impl NodeState {
         // Owner-local fee-estimator history: adopt the persisted
         // confirmation history before any admission can run. A corrupt or
         // unknown-version file degrades to insufficient data (docs/policies/db-migration.md).
-        crate::fee_history::load(&config.data_dir, &mempool);
+        bitcoin_rs_mempool::fee_history::load(&config.data_dir, &mempool);
         let block_tree = Arc::new(RwLock::new(block_tree_value));
         let chain_tip = block_tree.read().tip_handle();
         let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());

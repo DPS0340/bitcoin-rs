@@ -134,8 +134,8 @@ fn catch_up_uses_one_body_reader_session() -> Result<(), Box<dyn std::error::Err
         batch_limits: DEFAULT_BATCH_LIMITS,
         enabled: IndexCapabilities::HISTORICAL,
         wake_rx,
-        chain_events: TestChainCursor::detached(),
-        reporter: Arc::new(NoopIndexAheadSink),
+        chain_events: Arc::new(TestChainCursor),
+        reporter: RecordedIndexAhead::new(),
         quiet_period: Duration::ZERO,
         batch_delay: Duration::ZERO,
         // The body-reader session test never exercises reset routing;

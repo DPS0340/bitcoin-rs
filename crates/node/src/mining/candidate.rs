@@ -1,8 +1,8 @@
 //! Candidate construction, single-flight assembly, and bounded template caching.
 
 use super::MiningCoordinator;
-use super::hex_encode;
 use super::submission::test_block_validity_error;
+use crate::checkpoint::hex_encode;
 use bitcoin_rs_mining::BlockValidationResult;
 use bitcoin_rs_mining::GenerateRequest;
 use bitcoin_rs_mining::GenerateSelection;

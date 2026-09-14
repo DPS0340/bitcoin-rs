@@ -2,10 +2,10 @@ use crate::TxIndexSnapshot;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::types::{TxPosition, TxPositionValue};
-use crate::{BlockRecord, query_api::ScriptHistoryRecord};
 use crate::{
     HashPrefixRow, IndexCapabilities, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow,
 };
+use crate::{block_log::BlockRecord, query_api::ScriptHistoryRecord};
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_primitives::{

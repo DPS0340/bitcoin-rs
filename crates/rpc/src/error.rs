@@ -162,23 +162,19 @@ impl From<fmt::Error> for RpcError {
     }
 }
 
-/// Maps a transaction-index failure to an explicit JSON-RPC error.
-pub fn tx_query_error(error: crate::context::TxQueryError) -> RpcError {
-    match error {
-        crate::context::TxQueryError::Retry => {
-            RpcError::Internal("transaction index is still catching up; retry later".to_owned())
-        }
-        crate::context::TxQueryError::Unavailable(reason) => {
-            RpcError::Internal(format!("transaction index unavailable: {reason}"))
-        }
-        crate::context::TxQueryError::Storage(reason) => {
-            RpcError::Internal(format!("transaction index storage error: {reason}"))
-        }
-    }
-}
-
 impl From<crate::context::TxQueryError> for RpcError {
+    /// Maps a transaction-index failure to an explicit JSON-RPC error.
     fn from(error: crate::context::TxQueryError) -> Self {
-        tx_query_error(error)
+        match error {
+            crate::context::TxQueryError::Retry => {
+                Self::Internal("transaction index is still catching up; retry later".to_owned())
+            }
+            crate::context::TxQueryError::Unavailable(reason) => {
+                Self::Internal(format!("transaction index unavailable: {reason}"))
+            }
+            crate::context::TxQueryError::Storage(reason) => {
+                Self::Internal(format!("transaction index storage error: {reason}"))
+            }
+        }
     }
 }

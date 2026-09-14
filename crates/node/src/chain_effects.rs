@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
+use bitcoin_rs_index::block_log::{BlockLog, BlockRecord};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Txid};
-use bitcoin_rs_rpc::context::{BlockLog, BlockRecord};
 use parking_lot::RwLock;
 
 use crate::apply::{ConnectOutcome, DisconnectOutcome};

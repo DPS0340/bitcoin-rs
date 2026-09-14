@@ -1,11 +1,11 @@
 // CONTRACT: `docs/contracts/architecture.md#ARCH-07` owns post-commit
 // consumer ordering; `MiningGenerationSignal` is the mining wake projection.
-use super::MempoolSequenceWake;
 use super::MiningGenerationSignal;
-use bitcoin_rs_mining::BlockTemplateRequest;
-use bitcoin_rs_mining::BlockTemplateResult;
-use bitcoin_rs_mining::MiningControl;
-use bitcoin_rs_mining::MiningControlError;
+use crate::BlockTemplateRequest;
+use crate::BlockTemplateResult;
+use crate::MempoolSequenceWake;
+use crate::MiningControl;
+use crate::MiningControlError;
 use bitcoin_rs_primitives::Block;
 use compact_str::CompactString;
 use parking_lot::Mutex;
@@ -31,7 +31,7 @@ impl MiningControl for RecordingControl {
         Err(unavailable())
     }
 
-    fn mining_info(&self) -> Result<bitcoin_rs_mining::MiningInfo, MiningControlError> {
+    fn mining_info(&self) -> Result<crate::MiningInfo, MiningControlError> {
         Err(unavailable())
     }
 
@@ -42,7 +42,7 @@ impl MiningControl for RecordingControl {
     fn submit_block(
         &self,
         _block: Block,
-    ) -> Result<bitcoin_rs_mining::BlockValidationResult, MiningControlError> {
+    ) -> Result<crate::BlockValidationResult, MiningControlError> {
         Err(unavailable())
     }
 
@@ -59,8 +59,8 @@ impl MiningControl for RecordingControl {
 
     fn generate(
         &self,
-        _request: bitcoin_rs_mining::GenerateRequest,
-    ) -> Result<Vec<bitcoin_rs_mining::GeneratedBlock>, MiningControlError> {
+        _request: crate::GenerateRequest,
+    ) -> Result<Vec<crate::GeneratedBlock>, MiningControlError> {
         Err(unavailable())
     }
 }

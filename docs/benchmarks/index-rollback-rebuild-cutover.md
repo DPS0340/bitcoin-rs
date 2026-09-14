@@ -1,6 +1,6 @@
 # Index rollback-versus-rebuild cutover
 
-This document owns the rollback-versus-rebuild cutover for optional index capabilities. In the target node the runtime that applies it moves from `crates/index/src/runtime/rollback.rs` to `crates/index/src/runtime.rs` (T29); the node keeps only wiring. The current default `100_000` is a remeasurement baseline on the target storage and data distribution, not a settled end-state value.
+This document owns the rollback-versus-rebuild cutover for optional index capabilities. In the target node the runtime that applies it moves from `crates/node/src/txindex/rollback.rs` to `crates/index/src/runtime.rs` (T29); the node keeps only wiring. The current default `100_000` is a remeasurement baseline on the target storage and data distribution, not a settled end-state value.
 
 ## Cell it owns
 

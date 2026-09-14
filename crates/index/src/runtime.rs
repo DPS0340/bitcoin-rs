@@ -266,8 +266,6 @@ pub struct DerivedIndexOpenSpec {
     /// Backend label retained for open-time logging; the concrete backend is
     /// constructed by `open_store`, which node owns.
     pub storage_backend: bitcoin_rs_storage::StorageBackend,
-    /// Backend cache size hint passed through to the open closure.
-    pub cache_bytes: u64,
     /// Process epoch stamped into new writer state.
     pub epoch: u64,
     /// Capability set the worker maintains.
@@ -331,7 +329,6 @@ pub struct OpenDerivedIndex {
     /// Snapshot-capable reader for the query engine.
     pub reader: Arc<dyn crate::IndexReader>,
     /// Batch limits selected by the composing backend.
-    #[allow(dead_code)]
     pub batch_limits: PreparedBatchLimits,
 }
 
@@ -386,32 +383,19 @@ impl crate::SpentCoinScripts for UndoScripts {
     }
 }
 
-/// Test cursor source for worker construction; the cursor is settable so tests
-/// can advance the published position without a chain.
+/// Test cursor source anchored at an empty tip for worker construction.
 #[cfg(test)]
-pub(crate) struct TestChainCursor {
-    cursor: Mutex<crate::reconcile::ConsumerCursor>,
-}
-
-#[cfg(test)]
-impl TestChainCursor {
-    /// A cursor source anchored at an empty tip.
-    pub(crate) fn detached() -> Arc<Self> {
-        Arc::new(Self {
-            cursor: Mutex::new(crate::reconcile::ConsumerCursor {
-                epoch: 0,
-                sequence: 0,
-                height: 0,
-                hash: Hash256::from_le_bytes(&[0; 32]),
-            }),
-        })
-    }
-}
+pub(crate) struct TestChainCursor;
 
 #[cfg(test)]
 impl crate::reconcile::ChainCursorSource for TestChainCursor {
     fn cursor(&self) -> crate::reconcile::ConsumerCursor {
-        *self.cursor.lock()
+        crate::reconcile::ConsumerCursor {
+            epoch: 0,
+            sequence: 0,
+            height: 0,
+            hash: Hash256::from_le_bytes(&[0; 32]),
+        }
     }
 }
 
@@ -456,26 +440,6 @@ impl IndexAheadSink for RecordedIndexAhead {
             depth,
             unix_secs,
         ));
-        Ok(())
-    }
-}
-
-/// No-op evidence sink for tests that only need "some sink".
-#[cfg(test)]
-pub(crate) struct NoopIndexAheadSink;
-
-#[cfg(test)]
-impl IndexAheadSink for NoopIndexAheadSink {
-    fn report_index_ahead(
-        &self,
-        _capability: &str,
-        _index_height: u32,
-        _tip_height: u32,
-        _tip_hash_be: &str,
-        _index_hash_be: &str,
-        _depth: u32,
-        _unix_secs: u64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 }

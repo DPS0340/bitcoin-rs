@@ -80,30 +80,18 @@ fn backend_error_is_preserved_without_becoming_abandonment() {
 fn shutdown_before_helper_creation_never_touches_the_store() -> std::io::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("must-not-be-created");
-    let mut spec = DerivedIndexOpenSpec {
+    let spec = DerivedIndexOpenSpec {
         data_dir: dir.path().to_path_buf(),
         namespace: "txindex",
         storage_backend: bitcoin_rs_storage::StorageBackend::Fjall,
-        cache_bytes: 8 << 20,
         epoch: 1,
         enabled: crate::IndexCapabilities::default(),
         rollback_rebuild_cutover: 0,
         canonical_data_root: dir.path().to_path_buf(),
-        open_store: std::sync::Arc::new(|dir| {
-            let store = std::sync::Arc::new(
-                bitcoin_rs_storage::FjallStore::open(dir)
-                    .map_err(DerivedIndexWorkerError::Storage)?,
-            );
-            crate::runtime::open_derived_index_store_on_worker(
-                store,
-                crate::DEFAULT_BATCH_LIMITS,
-                1,
-            )
-        }),
+        open_store: std::sync::Arc::new(|_| Err(DerivedIndexWorkerError::Stopped)),
         utxo: None,
         chain_transition: None,
     };
-    spec.open_store = std::sync::Arc::new(|_| Err(DerivedIndexWorkerError::Stopped));
     let result = open_derived_index_with_timeout(&spec, &path, Duration::from_secs(30), || true);
     assert!(matches!(result, Err(DerivedIndexWorkerError::Stopped)));
     assert!(!path.exists());

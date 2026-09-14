@@ -20,7 +20,7 @@ use crate::NodeConfig;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_index::BlockLog;
+use bitcoin_rs_index::block_log::BlockLog;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Tx;

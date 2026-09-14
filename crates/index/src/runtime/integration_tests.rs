@@ -25,19 +25,18 @@ fn test_open_spec(dir: &std::path::Path, epoch: u64) -> DerivedIndexOpenSpec {
         data_dir: dir.to_path_buf(),
         namespace: "txindex",
         storage_backend: bitcoin_rs_storage::StorageBackend::Fjall,
-        cache_bytes: 8 * 1024 * 1024,
         epoch,
         enabled: IndexCapabilities::default(),
         rollback_rebuild_cutover: 0,
         canonical_data_root: dir.to_path_buf(),
         utxo: None,
         chain_transition: None,
-        open_store: Arc::new(|dir| {
+        open_store: Arc::new(move |dir| {
             let store = Arc::new(
                 bitcoin_rs_storage::FjallStore::open_with_cache(dir, 8 * 1024 * 1024)
                     .map_err(DerivedIndexWorkerError::Storage)?,
             );
-            open_derived_index_store_on_worker(store, DEFAULT_BATCH_LIMITS, 1)
+            open_derived_index_store_on_worker(store, DEFAULT_BATCH_LIMITS, epoch)
         }),
     }
 }
@@ -67,7 +66,7 @@ fn build_worker_inputs(dir: &std::path::Path, epoch: u64) -> WorkerInputs {
     let shutdown = Arc::new(AtomicBool::new(false));
     let blocks = Arc::new(RwLock::new(BlockLog::new()));
     let block_source = IndexBlockSource::new(blocks);
-    let chain_events = TestChainCursor::detached();
+    let chain_events = Arc::new(TestChainCursor);
 
     WorkerInputs {
         runtime,
@@ -112,7 +111,7 @@ fn worker_open_panic_publishes_failed() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        Arc::new(NoopIndexAheadSink),
+        RecordedIndexAhead::new(),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -165,7 +164,7 @@ fn spawn_failure_publishes_failed_synchronously() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        Arc::new(NoopIndexAheadSink),
+        RecordedIndexAhead::new(),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -210,7 +209,7 @@ fn blocked_open_drop_detaches_within_deadline() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        Arc::new(NoopIndexAheadSink),
+        RecordedIndexAhead::new(),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -271,7 +270,7 @@ fn late_open_cannot_publish_after_revocation() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        Arc::new(NoopIndexAheadSink),
+        RecordedIndexAhead::new(),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -446,7 +445,7 @@ fn blocked_open_abandonment_detaches_and_poisons() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        Arc::new(NoopIndexAheadSink),
+        RecordedIndexAhead::new(),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
