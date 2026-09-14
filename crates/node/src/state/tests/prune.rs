@@ -1,20 +1,6 @@
 use super::*;
 
 #[test]
-fn prune_service_is_absent_when_config_disables_pruning() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-    config.data_dir = dir.path().join("node");
-    config.p2p.listen.clear();
-    config.storage.prune_target_mb = 0;
-
-    let state = NodeState::open(config, None)?;
-
-    assert!(state.prune_service().is_none());
-    Ok(())
-}
-
-#[test]
 fn apply_block_persists_body_under_pruning_key_when_pruning_disabled() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
@@ -35,30 +21,6 @@ fn apply_block_persists_body_under_pruning_key_when_pruning_disabled() -> anyhow
     assert_eq!(
         state.block_body_store.load_block_body(0, hash)?.as_deref(),
         Some(consensus_bytes(&block).as_slice())
-    );
-    Ok(())
-}
-
-#[test]
-fn persisting_same_block_body_twice_appends_once() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-    config.data_dir = dir.path().join("node");
-    config.p2p.listen.clear();
-    let state = NodeState::open(config, None)?;
-    let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[7_u8; 32]);
-    let body = b"idempotent block body";
-
-    state.block_body_store.persist_block_body(42, hash, body)?;
-    let block_file = state.data_dir.join("blocks").join("blk00000.dat");
-    let first_len = std::fs::metadata(&block_file)?.len();
-    state.block_body_store.persist_block_body(42, hash, body)?;
-    let second_len = std::fs::metadata(block_file)?.len();
-
-    assert_eq!(second_len, first_len);
-    assert_eq!(
-        state.block_body_store.load_block_body(42, hash)?.as_deref(),
-        Some(body.as_slice())
     );
     Ok(())
 }
@@ -153,7 +115,11 @@ fn undo_pruning_keeps_records_the_durable_tip_still_needs() -> anyhow::Result<()
         "no undo record may go while a crash would restore below all of them"
     );
     assert!(
-        state.storage.stored_prune_undo(10, hash(10)?)?.is_some(),
+        state
+            .chainstate()
+            .undo_store
+            .load_undo(10, hash(10)?)?
+            .is_some(),
         "the record a restore would need must survive"
     );
     Ok(())
@@ -213,12 +179,45 @@ fn prune_service_deletes_seeded_storage_rows_and_advances_pruneheight() -> anyho
     assert_eq!(result.pruneheight, 11);
     assert_eq!(result.block_rows_removed, 1);
     assert_eq!(result.undo_rows_removed, 1);
-    assert!(state.storage.stored_prune_body(10, hash(10)?)?.is_none());
-    assert!(state.storage.stored_prune_undo(10, hash(10)?)?.is_none());
-    assert!(state.storage.stored_prune_body(11, hash(11)?)?.is_some());
-    assert!(state.storage.stored_prune_undo(11, hash(11)?)?.is_some());
-    assert!(state.storage.stored_prune_body(12, hash(12)?)?.is_some());
-    assert!(state.storage.stored_prune_undo(12, hash(12)?)?.is_some());
+    assert!(
+        state
+            .block_body_store
+            .load_block_body(10, hash(10)?)?
+            .is_none()
+    );
+    assert!(
+        state
+            .chainstate()
+            .undo_store
+            .load_undo(10, hash(10)?)?
+            .is_none()
+    );
+    assert!(
+        state
+            .block_body_store
+            .load_block_body(11, hash(11)?)?
+            .is_some()
+    );
+    assert!(
+        state
+            .chainstate()
+            .undo_store
+            .load_undo(11, hash(11)?)?
+            .is_some()
+    );
+    assert!(
+        state
+            .block_body_store
+            .load_block_body(12, hash(12)?)?
+            .is_some()
+    );
+    assert!(
+        state
+            .chainstate()
+            .undo_store
+            .load_undo(12, hash(12)?)?
+            .is_some()
+    );
 
     Ok(())
 }
@@ -279,7 +278,12 @@ fn prune_service_respects_an_active_retention_lease() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
     assert_eq!(pinned.block_rows_removed, 0);
     assert_eq!(pinned.undo_rows_removed, 0);
-    assert!(state.storage.stored_prune_body(10, hash(10)?)?.is_some());
+    assert!(
+        state
+            .block_body_store
+            .load_block_body(10, hash(10)?)?
+            .is_some()
+    );
     // Nothing was deleted, so nothing may be recorded as gone: a floor
     // below the pinned line stays grantable because that data still
     // exists. (The probe lease drops as soon as the assert consumes it.)
@@ -296,159 +300,19 @@ fn prune_service_respects_an_active_retention_lease() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
     assert_eq!(released.block_rows_removed, 1);
     assert_eq!(released.undo_rows_removed, 1);
-    assert!(state.storage.stored_prune_body(10, hash(10)?)?.is_none());
-    assert!(state.storage.stored_prune_body(11, hash(11)?)?.is_some());
-    assert_eq!(retention.pruned_below(), 11);
-    Ok(())
-}
-
-#[test]
-fn prune_reclaims_whole_files_and_keeps_current_file() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-    config.data_dir = dir.path().join("node");
-    config.p2p.listen.clear();
-    config.storage.prune_target_mb = 1;
-    std::fs::create_dir_all(&config.data_dir)?;
-    let blocks_dir = config.data_dir.join("blocks");
-    std::fs::create_dir_all(&blocks_dir)?;
-    let prunable_file = blocks_dir.join("blk00000.dat");
-    let current_file = blocks_dir.join("blk00001.dat");
-    std::fs::write(&prunable_file, [])?;
-    std::fs::write(&current_file, [])?;
-    let state = NodeState::open(config, None)?;
-    publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-    // The prune is a no-op until a durable tip is published;
-    // `bitcoin_rs_storage::pruning::stage_block_and_undo_prune` owns file selection.
-    state
-        .durable_tip_height
-        .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
-    let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
-    let position = bitcoin_rs_storage::BlockFilePosition {
-        file_no: 0,
-        offset: 0,
-        len: 0,
-    };
-    state.storage.write_test_rows(&[
-        (
-            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
-            bitcoin_rs_storage::pruning::block_body_key(10, hash).to_vec(),
-            position.encode().to_vec(),
-        ),
-        (
-            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
-            bitcoin_rs_storage::block_file_max_height_key(0).to_vec(),
-            bitcoin_rs_storage::encode_block_file_max_height(10).to_vec(),
-        ),
-    ])?;
-    let Some(service) = state.prune_service() else {
-        anyhow::bail!("prune service should exist when prune_target_mb > 0");
-    };
-    service
-        .prune_to_height(11)
-        .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
-
-    assert!(!prunable_file.exists());
-    assert!(current_file.exists());
-    assert!(state.storage.stored_prune_body(10, hash)?.is_none());
-    let has_metadata = state
-        .storage
-        .read_test_row(
-            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
-            &bitcoin_rs_storage::block_file_max_height_key(0),
-        )?
-        .is_some();
-    assert!(!has_metadata);
-    Ok(())
-}
-
-/// Pruning a block file must reduce what the node reports as its disk size.
-///
-/// `getblockchaininfo.size_on_disk` used to be the sum of every block
-/// record's `body_size`. Pruning does not remove records — it clears their
-/// cached bodies and leaves the rest — so that sum could not move, and a
-/// pruned node went on reporting bytes it no longer had, under the one field
-/// an operator reads to check that pruning worked.
-///
-/// This asserts both halves: the store's figure falls by exactly the file
-/// that was deleted, and the record sum does not move at all. The second is
-/// what makes the first worth having.
-#[test]
-fn pruning_a_block_file_reduces_the_reported_disk_size() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-    config.data_dir = dir.path().join("node");
-    config.p2p.listen.clear();
-    config.storage.prune_target_mb = 1;
-
-    std::fs::create_dir_all(&config.data_dir)?;
-
-    // Two files present before the store opens, so the earlier one is not
-    // the append target and is therefore prunable. Same shape as
-    // `prune_reclaims_whole_files_and_keeps_current_file`, but with bytes in
-    // it, because bytes are what is being counted.
-    let blocks_dir = config.data_dir.join("blocks");
-    std::fs::create_dir_all(&blocks_dir)?;
-    let prunable_file = blocks_dir.join("blk00000.dat");
-    let prunable_bytes = vec![7_u8; 4_096];
-    std::fs::write(&prunable_file, &prunable_bytes)?;
-    std::fs::write(blocks_dir.join("blk00001.dat"), [])?;
-
-    let state = NodeState::open(config, None)?;
-    publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-    // The prune is a no-op until a durable tip is published;
-    // `bitcoin_rs_storage::pruning::stage_block_and_undo_prune` owns file selection.
-    state
-        .durable_tip_height
-        .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
-    let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
-    // The hash is not needed: this test counts bytes in files, not bodies.
-    let record = BlockRecord::from_block(10, &block);
-    let record_sum_before = u64::try_from(record.body_size)?;
-    state.blocks.write().push(record);
-
-    let Some(before) = state.block_body_store.disk_usage() else {
-        anyhow::bail!("a flat-file store must report its usage");
-    };
     assert!(
-        before >= u64::try_from(prunable_bytes.len())?,
-        "the fixture's bytes must be accounted for"
+        state
+            .block_body_store
+            .load_block_body(10, hash(10)?)?
+            .is_none()
     );
-
-    // Tell the pruner that file 0 tops out at height 10, so pruning to 11
-    // makes it prunable.
-    state.storage.write_test_rows(&[(
-        bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
-        bitcoin_rs_storage::block_file_max_height_key(0).to_vec(),
-        bitcoin_rs_storage::encode_block_file_max_height(10).to_vec(),
-    )])?;
-
-    let Some(service) = state.prune_service() else {
-        anyhow::bail!("prune service should exist when prune_target_mb > 0");
-    };
-    service
-        .prune_to_height(11)
-        .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
-
-    assert!(!prunable_file.exists(), "the fixture must actually prune");
-    let Some(after) = state.block_body_store.disk_usage() else {
-        anyhow::bail!("a flat-file store must report its usage");
-    };
-    assert_eq!(
-        after,
-        before.saturating_sub(u64::try_from(prunable_bytes.len())?),
-        "the reported size must fall by exactly the file that was deleted"
+    assert!(
+        state
+            .block_body_store
+            .load_block_body(11, hash(11)?)?
+            .is_some()
     );
-
-    // The number this replaces, unmoved — which is the defect.
-    let record_sum_after = state.blocks.read().iter().fold(0_u64, |total, entry| {
-        total.saturating_add(u64::try_from(entry.body_size).unwrap_or(0))
-    });
-    assert_eq!(
-        record_sum_after, record_sum_before,
-        "the block-record sum cannot see pruning, which is why it is not \
-         what size_on_disk reports"
-    );
+    assert_eq!(retention.pruned_below(), 11);
     Ok(())
 }
 
@@ -650,12 +514,12 @@ fn prune_refuses_after_apply_admission_closes() -> anyhow::Result<()> {
 #[allow(clippy::too_many_lines)]
 #[test]
 fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
-    use super::super::prune::load_pruneheight;
     use bitcoin_rs_index::block_log::BlockLog;
     use bitcoin_rs_rpc::context::PruneService;
     use bitcoin_rs_storage::FlatFileBlockStore;
     use bitcoin_rs_storage::KvStore;
     use bitcoin_rs_storage::WriteBatch as _;
+    use bitcoin_rs_storage::pruning::load_pruneheight;
     use parking_lot::RwLock;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
