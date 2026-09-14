@@ -135,27 +135,40 @@ impl CoinStats {
     ///
     /// Returns an error when the stats are not at `disconnected_height`, or
     /// when `tx_delta` exceeds the recorded `tx_count`.
-    pub const fn rewind_block(
+    pub fn rewind_block(
         &mut self,
         disconnected_height: u32,
         parent_height: u32,
         tx_delta: u64,
     ) -> Result<(), CoinStatsRewindError> {
+        self.tx_count = self.check_rewind(disconnected_height, tx_delta)?;
+        self.height = parent_height;
+        Ok(())
+    }
+
+    /// [`Self::rewind_block`]'s checks without the move; returns the resulting
+    /// `tx_count`. Lets a disconnect refuse before the UTXO undo runs.
+    ///
+    /// # Errors
+    ///
+    /// Stats not at `disconnected_height`, or `tx_delta` exceeding `tx_count`.
+    pub fn check_rewind(
+        &self,
+        disconnected_height: u32,
+        tx_delta: u64,
+    ) -> Result<u64, CoinStatsRewindError> {
         if self.height != disconnected_height {
             return Err(CoinStatsRewindError::HeightMismatch {
                 expected: disconnected_height,
                 found: self.height,
             });
         }
-        let Some(tx_count) = self.tx_count.checked_sub(tx_delta) else {
-            return Err(CoinStatsRewindError::TxCountUnderflow {
+        self.tx_count
+            .checked_sub(tx_delta)
+            .ok_or(CoinStatsRewindError::TxCountUnderflow {
                 tx_count: self.tx_count,
                 tx_delta,
-            });
-        };
-        self.height = parent_height;
-        self.tx_count = tx_count;
-        Ok(())
+            })
     }
 
     /// Serializes stats in a stable byte layout.
@@ -699,6 +712,23 @@ impl CoinStatsListener {
             .lock()
             .stats
             .rewind_block(disconnected_height, parent_height, tx_delta)
+    }
+
+    /// [`CoinStats::check_rewind`] against the current stats.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`CoinStats::check_rewind`].
+    pub fn check_rewind(
+        &self,
+        disconnected_height: u32,
+        tx_delta: u64,
+    ) -> Result<(), CoinStatsRewindError> {
+        self.state
+            .lock()
+            .stats
+            .check_rewind(disconnected_height, tx_delta)
+            .map(|_| ())
     }
 }
 
