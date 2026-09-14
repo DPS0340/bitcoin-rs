@@ -332,7 +332,7 @@ impl<'a> Projection<'a> {
 
     pub(super) fn block_value(
         &self,
-        record: &crate::context::BlockRecord,
+        record: &bitcoin_rs_index::block_log::BlockRecord,
     ) -> Result<BlockValue, Response> {
         let header = record
             .header_bytes()
@@ -368,7 +368,7 @@ impl<'a> Projection<'a> {
     pub(super) fn required_block(
         &self,
         text_hash: &str,
-    ) -> Result<(crate::context::BlockRecord, Block), Response> {
+    ) -> Result<(bitcoin_rs_index::block_log::BlockRecord, Block), Response> {
         let record = self.required_block_record(text_hash)?;
         let bytes = self
             .ctx
@@ -381,7 +381,7 @@ impl<'a> Projection<'a> {
     pub(super) fn required_block_record(
         &self,
         text_hash: &str,
-    ) -> Result<crate::context::BlockRecord, Response> {
+    ) -> Result<bitcoin_rs_index::block_log::BlockRecord, Response> {
         let hash = bitcoin_rs_primitives::Hash256::from_str(text_hash)
             .map_err(|_| bad("block hash must be 64 hex characters"))?;
         self.ctx.block_by_hash(hash).ok_or_else(not_found)

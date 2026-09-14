@@ -17,13 +17,14 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_primitives::{Amount, CompactTarget, LockTime, Script, Sequence, Witness};
 use sonic_rs::{JsonValueTrait as _, Value, json};
 
-use crate::context::{BlockRecord, Context};
+use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::chain::getblockchaininfo;
 use crate::handlers::mempool::{getmempoolinfo, getrawmempool};
 use crate::handlers::tx::getrawtransaction;
 use crate::render::{BlockChainContext, BlockTxVerbosity};
 use crate::tx_render;
+use bitcoin_rs_index::block_log::BlockRecord;
 
 const DEFAULT_HEADER_COUNT: u32 = 5;
 const MAX_HEADER_COUNT: u32 = 2_000;
@@ -908,8 +909,8 @@ fn not_found_owned(message: String) -> Response {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::context::BlockRecord;
     use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
+    use bitcoin_rs_index::block_log::BlockRecord;
     use bitcoin_rs_primitives::{OutPoint, Tx, TxIn};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait};
 

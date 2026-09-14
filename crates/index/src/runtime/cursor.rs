@@ -4,11 +4,11 @@ use super::CursorCommit;
 use super::DerivedIndexWorkerError;
 use super::PendingForward;
 use super::Worker;
-use bitcoin_rs_index::ConsumerCursorUpdate;
-use bitcoin_rs_index::IndexCapabilities;
-use bitcoin_rs_index::IndexError;
-use bitcoin_rs_index::IndexWatermark;
-use bitcoin_rs_index::IndexWatermarks;
+use crate::ConsumerCursorUpdate;
+use crate::IndexCapabilities;
+use crate::IndexError;
+use crate::IndexWatermark;
+use crate::IndexWatermarks;
 
 impl Worker {
     /// Persists the consumer cursor once the rows provably mirror the live
@@ -30,13 +30,13 @@ impl Worker {
         let Some(target) = loaded_tip.as_deref() else {
             return Ok(CursorCommit::Settled);
         };
-        let snapshot = self.chain_events.snapshot();
-        if snapshot.tip_hash != target.hash || snapshot.tip_height != target.height {
+        let snapshot = self.chain_events.cursor();
+        if snapshot.hash != target.hash || snapshot.height != target.height {
             return Ok(CursorCommit::Settled);
         }
         let expected = IndexWatermark {
-            height: snapshot.tip_height,
-            hash: snapshot.tip_hash.to_le_bytes(),
+            height: snapshot.height,
+            hash: snapshot.hash.to_le_bytes(),
         };
         if (self.enabled.tx_lookup && watermarks.tx_lookup != Some(expected))
             || (self.enabled.script_history && watermarks.script_history != Some(expected))
@@ -44,7 +44,7 @@ impl Worker {
         {
             return Ok(CursorCommit::NotAligned);
         }
-        let bytes = crate::reconcile::cursor_from_snapshot(&snapshot).to_bytes();
+        let bytes = snapshot.to_bytes();
         if self
             .writer
             .consumer_cursor()
@@ -115,9 +115,9 @@ impl Worker {
         result: Option<IndexWatermark>,
         mut watermarks: IndexWatermarks,
     ) -> Option<[u8; crate::reconcile::CURSOR_BYTE_LEN]> {
-        let snapshot = self.chain_events.snapshot();
+        let snapshot = self.chain_events.cursor();
         let result = result?;
-        if result.height != snapshot.tip_height || result.hash != snapshot.tip_hash.to_le_bytes() {
+        if result.height != snapshot.height || result.hash != snapshot.hash.to_le_bytes() {
             return None;
         }
         if capabilities.tx_lookup {
@@ -132,7 +132,7 @@ impl Worker {
         let aligned = (!self.enabled.tx_lookup || watermarks.tx_lookup == Some(result))
             && (!self.enabled.script_history || watermarks.script_history == Some(result))
             && (!self.enabled.script_live || watermarks.script_live == Some(result));
-        aligned.then(|| crate::reconcile::cursor_from_snapshot(&snapshot).to_bytes())
+        aligned.then(|| snapshot.to_bytes())
     }
 
     pub(super) fn commit_pending(

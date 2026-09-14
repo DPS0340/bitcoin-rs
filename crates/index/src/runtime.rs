@@ -14,14 +14,14 @@
 //! query gating refuses that temporary lag and the next worker pass repairs
 //! it. Independent durable capability watermarks let aligned row families
 //! share one parse and commit while divergent families backfill separately.
-//! A snapshot-gated query engine serves `bitcoin_rs_rpc::context::DerivedIndexQuery`
+//! A snapshot-gated query engine serves `crate::query_api::DerivedIndexQuery`
 //! and the generic [`ScriptIndexQuery`] without raw index mutex paths.
 
 use arc_swap::ArcSwap;
 
 use bitcoin_rs_chain::{BlockBodySource, BlockTree, TipSnapshot};
 
-use bitcoin_rs_index::{
+use crate::{
     BlockSource, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
     IndexWatermarks, IndexWriteFence, PreparedBatch, PreparedBatchLimits, ScriptHash,
     ScriptLiveScan, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
@@ -31,14 +31,13 @@ use bitcoin_rs_index::{
 
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, OutPoint, Tx, Txid, deserialize};
 
-use bitcoin_rs_rpc::{
-    capabilities::{
-        CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource, derived_index_status,
-    },
-    context::{
-        BlockLog, DerivedIndexInfo, DerivedIndexQuery, ScriptHistoryRecord, ScriptIndexQuery,
-        ScriptIndexRecord, ScriptIndexSnapshot, SpendingRecord, TxQueryError, record_at_height,
-    },
+use crate::block_log::{BlockLog, record_at_height};
+use crate::capabilities::{
+    CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource, derived_index_status,
+};
+use crate::query_api::{
+    DerivedIndexInfo, DerivedIndexQuery, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
+    ScriptIndexSnapshot, SpendingRecord, TxQueryError,
 };
 
 use bitcoin_rs_storage::{PrefixScanLimit, block_body::BlockBodyStore};
@@ -55,11 +54,9 @@ use namespace::{NAMESPACE_REGISTRY, NamespaceRegistry};
 
 use parking_lot::{Mutex, RwLock};
 
-use startup::open_derived_index_store_on_worker;
 #[cfg(test)]
-use startup::{fail_worker, open_derived_index_on_worker, open_derived_index_with_timeout};
+use startup::{fail_worker, open_derived_index_with_timeout};
 
-#[cfg(test)]
 use std::path::Path;
 use std::{
     path::PathBuf,
@@ -81,14 +78,16 @@ mod query;
 mod query_adapter;
 mod reconciliation;
 mod rollback;
+#[allow(clippy::module_inception)]
 mod runtime;
 mod scheduling;
 pub use runtime::DerivedIndexRuntime;
 mod startup;
+pub use startup::open_derived_index_store_on_worker;
 
-pub(crate) use capability::DerivedIndexCapability;
+pub use capability::DerivedIndexCapability;
 use query::IndexProgress;
-pub(crate) use query::{DerivedIndexQueryEngine, IndexBlockSource, QueryEngineLive};
+pub use query::{DerivedIndexQueryEngine, IndexBlockSource, QueryEngineLive};
 
 /// Bounded scan limits used by the query engine.
 ///
@@ -105,17 +104,20 @@ const MAX_SERIALIZED_BLOCK_BYTES: usize = 4_000_000;
 /// commit bounded.
 const BATCH_BYTE_LIMIT: usize = 256 << 20;
 
-pub(crate) const ROCKSDB_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
+/// Writer-side batch limits for the `RocksDB` backend.
+pub const ROCKSDB_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
     max_rows: 1_000_000,
     max_bytes: BATCH_BYTE_LIMIT,
 };
 
-pub(crate) const DEFAULT_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
+/// Writer-side batch limits for the default (fjall) backend.
+pub const DEFAULT_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
     max_rows: 1_000_000,
     max_bytes: BATCH_BYTE_LIMIT,
 };
 
-pub(crate) const REDB_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
+/// Writer-side batch limits for the redb backend.
+pub const REDB_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
     max_rows: 16_000_000,
     max_bytes: BATCH_BYTE_LIMIT,
 };
@@ -127,7 +129,7 @@ pub(crate) const REDB_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
 /// cost (see `docs/benchmarks/index-rollback-rebuild-cutover.md`): the default
 /// routes the 834k-block stale-branch incident shape to a rebuild while organic
 /// reorgs (tens of blocks) keep rewinding block by block.
-pub(crate) const DEFAULT_ROLLBACK_REBUILD_CUTOVER: u32 = 100_000;
+pub const DEFAULT_ROLLBACK_REBUILD_CUTOVER: u32 = 100_000;
 
 const IDENTITY_CHUNK_BLOCKS: u32 = 65_536;
 const POSITION_PREFETCH_BLOCKS: usize = 65_536;
@@ -153,28 +155,35 @@ const TXINDEX_OPEN_TIMEOUT: Duration = Duration::from_mins(30);
 /// Monotonic publication token. Each worker holds one; a revoked token makes
 /// `rcu` publication a no-op so a late worker cannot publish after abandonment.
 #[derive(Clone, Debug)]
-pub(crate) struct Generation {
+pub struct Generation {
     id: u64,
     revoked: Arc<AtomicBool>,
 }
 
 impl Generation {
-    pub(crate) fn new(id: u64) -> Self {
+    /// Creates a publication token for one worker generation.
+    #[must_use]
+    pub fn new(id: u64) -> Self {
         Self {
             id,
             revoked: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub(crate) fn id(&self) -> u64 {
+    /// Returns the generation identifier.
+    #[must_use]
+    pub fn id(&self) -> u64 {
         self.id
     }
 
-    pub(crate) fn revoke(&self) {
+    /// Revokes the token; late publication becomes a no-op.
+    pub fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
     }
 
-    pub(crate) fn is_revoked(&self) -> bool {
+    /// Returns true once the token is revoked.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
     }
 }
@@ -188,10 +197,14 @@ impl Generation {
 /// `DerivedIndexRuntime::phase`. `Opening`, `Failed`, and `ShutdownAbandoned`
 /// carry no payload; the adapter returns typed `Unavailable` for them.
 #[derive(Clone)]
-pub(crate) enum DerivedIndexLifecycle {
+pub enum DerivedIndexLifecycle {
+    /// The worker is still opening its store.
     Opening,
+    /// The complete query engine is published.
     Serving(Arc<DerivedIndexQueryEngine>),
+    /// The worker failed; the string is a bounded diagnostic.
     Failed(CompactString),
+    /// The worker was abandoned at shutdown before its store opened.
     ShutdownAbandoned,
 }
 
@@ -214,17 +227,21 @@ impl DerivedIndexLifecycle {
 }
 
 /// Stable outer query adapter constructed before backend open and before RPC
-/// context construction. Each method loads exactly one `ArcSwap` snapshot,
+/// context construction.
+///
+/// Each method loads exactly one `ArcSwap` snapshot,
 /// holds that `Arc` for the complete request, and delegates to the captured
 /// query engine if a payload exists. It never reads lifecycle state and query
 /// payload from separate loads.
 #[derive(Clone)]
-pub(crate) struct DerivedIndexQueryAdapter {
+pub struct DerivedIndexQueryAdapter {
     lifecycle: Arc<ArcSwap<DerivedIndexLifecycle>>,
 }
 
 impl DerivedIndexQueryAdapter {
-    pub(crate) fn new(lifecycle: Arc<ArcSwap<DerivedIndexLifecycle>>) -> Self {
+    /// Constructs the stable adapter over the lifecycle publication cell.
+    #[must_use]
+    pub fn new(lifecycle: Arc<ArcSwap<DerivedIndexLifecycle>>) -> Self {
         Self { lifecycle }
     }
 
@@ -241,20 +258,33 @@ impl DerivedIndexQueryAdapter {
 
 /// Immutable specification for worker-owned store open. Constructed
 /// synchronously in `NodeState::open`; consumed on the worker thread.
-pub(crate) struct DerivedIndexOpenSpec {
-    pub(crate) data_dir: PathBuf,
-    pub(crate) namespace: &'static str,
-    pub(crate) storage_backend: bitcoin_rs_storage::StorageBackend,
-    pub(crate) cache_bytes: u64,
-    pub(crate) epoch: u64,
-    pub(crate) enabled: IndexCapabilities,
-    pub(crate) rollback_rebuild_cutover: u32,
-    pub(crate) canonical_data_root: PathBuf,
+pub struct DerivedIndexOpenSpec {
+    /// Data directory the `txindex` namespace lives under.
+    pub data_dir: PathBuf,
+    /// Namespace subdirectory name.
+    pub namespace: &'static str,
+    /// Backend label retained for open-time logging; the concrete backend is
+    /// constructed by `open_store`, which node owns.
+    pub storage_backend: bitcoin_rs_storage::StorageBackend,
+    /// Process epoch stamped into new writer state.
+    pub epoch: u64,
+    /// Capability set the worker maintains.
+    pub enabled: IndexCapabilities,
+    /// Fork depth routing stale watermarks to reset+rebuild.
+    pub rollback_rebuild_cutover: u32,
+    /// Canonicalized data root used for namespace exclusion.
+    pub canonical_data_root: PathBuf,
+    /// Opens the durable store inside `dir`. Concrete backend construction
+    /// stays with the node's storage composition; the runtime only calls the
+    /// closure on its worker thread.
+    #[allow(clippy::type_complexity)]
+    pub open_store:
+        Arc<dyn Fn(&Path) -> Result<OpenDerivedIndex, DerivedIndexWorkerError> + Send + Sync>,
     /// Authoritative UTXO set used to seed and resolve the compact live view.
     /// Test-only open specs may leave this unset; live queries then fail closed.
-    pub(crate) utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
+    pub utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
     /// Serializes a live-view query or seed against a chain transition.
-    pub(crate) chain_transition: Option<Arc<Mutex<()>>>,
+    pub chain_transition: Option<Arc<Mutex<()>>>,
 }
 
 /// Test-only keyed open gate. Holds the worker inside the open phase until
@@ -283,42 +313,42 @@ pub(crate) fn wait_txindex_open_gate() {
 pub(crate) fn wait_txindex_open_gate() {}
 
 /// Handle used to spawn and join the supervised reconciliation worker.
-pub(crate) struct DerivedIndexWorker {
+pub struct DerivedIndexWorker {
     runtime: Arc<DerivedIndexRuntime>,
     join_handle: Option<JoinHandle<()>>,
-    pub(crate) generation: Option<Generation>,
+    /// Publication token; revoked on abandonment.
+    pub generation: Option<Generation>,
     /// Canonical namespace key for poisoning on abandonment.
     namespace_key: Option<PathBuf>,
 }
 
 /// Result of opening the txindex store: writer, reader, and batch limits.
-pub(crate) struct OpenDerivedIndex {
-    pub(crate) writer: Arc<dyn TxIndexWriter>,
-    pub(crate) reader: Arc<dyn bitcoin_rs_index::IndexReader>,
-    #[allow(dead_code)]
-    pub(crate) batch_limits: PreparedBatchLimits,
+pub struct OpenDerivedIndex {
+    /// Fenced durable writer.
+    pub writer: Arc<dyn TxIndexWriter>,
+    /// Snapshot-capable reader for the query engine.
+    pub reader: Arc<dyn crate::IndexReader>,
+    /// Batch limits selected by the composing backend.
+    pub batch_limits: PreparedBatchLimits,
 }
 
-struct DerivedIndexComposer {
-    backend: bitcoin_rs_storage::StorageBackend,
-    epoch: u64,
-}
-
-impl crate::storage_backend::StoreConsumer for DerivedIndexComposer {
-    type Output = OpenDerivedIndex;
-    type Error = DerivedIndexWorkerError;
-
-    fn consume<S>(self, store: Arc<S>) -> Result<Self::Output, Self::Error>
-    where
-        S: bitcoin_rs_storage::KvStore,
-    {
-        let batch_limits = match self.backend {
-            bitcoin_rs_storage::StorageBackend::RocksDb => ROCKSDB_BATCH_LIMITS,
-            bitcoin_rs_storage::StorageBackend::Fjall => DEFAULT_BATCH_LIMITS,
-            bitcoin_rs_storage::StorageBackend::Redb => REDB_BATCH_LIMITS,
-        };
-        open_derived_index_store_on_worker(store, batch_limits, self.epoch)
-    }
+/// Sink for index-ahead rollback evidence.
+///
+/// When a durable watermark sits above the restored applied tip, the worker
+/// reports it through this seam; node owns the concrete evidence (the
+/// `chain-rollback-event` marker plus the `getblockchaininfo` warning).
+pub trait IndexAheadSink: Send + Sync {
+    /// Records that `capability`'s durable index sits ahead of the restored tip.
+    fn report_index_ahead(
+        &self,
+        capability: &str,
+        index_height: u32,
+        tip_height: u32,
+        tip_hash_be: &str,
+        index_hash_be: &str,
+        depth: u32,
+        unix_secs: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Exact spent-coin script anchor decoded from one block's undo record.
@@ -347,37 +377,71 @@ impl UndoScripts {
     }
 }
 
-impl bitcoin_rs_index::SpentCoinScripts for UndoScripts {
+impl crate::SpentCoinScripts for UndoScripts {
     fn script_bytes(&self, txid: &[u8; 32], vout: u32) -> Option<&[u8]> {
         self.scripts.get(&(*txid, vout)).map(Vec::as_slice)
     }
 }
 
-/// Detached publisher for test worker construction; records still sequence.
+/// Test cursor source anchored at an empty tip for worker construction.
 #[cfg(test)]
-pub(crate) fn detached_chain_publisher() -> Arc<crate::state::ChainEventPublisher> {
-    Arc::new(crate::state::ChainEventPublisher::detached(0).0)
+pub(crate) struct TestChainCursor;
+
+#[cfg(test)]
+impl crate::reconcile::ChainCursorSource for TestChainCursor {
+    fn cursor(&self) -> crate::reconcile::ConsumerCursor {
+        crate::reconcile::ConsumerCursor {
+            epoch: 0,
+            sequence: 0,
+            height: 0,
+            hash: Hash256::from_le_bytes(&[0; 32]),
+        }
+    }
 }
 
-/// Reporter for test worker construction that writes rollback evidence
-/// under `data_dir` and exposes its warnings through the returned store.
+/// Test double standing in for node's `RecoveryReporter`; construction returns
+/// the sink handle plus the recording the test asserts against.
 #[cfg(test)]
-pub(crate) fn test_recovery_reporter(
-    data_dir: &Path,
-) -> (
-    Arc<crate::recovery_evidence::RecoveryReporter>,
-    Arc<crate::recovery_evidence::WarningStore>,
-) {
-    let warning_store = Arc::new(crate::recovery_evidence::WarningStore::new());
-    let reporter = Arc::new(crate::recovery_evidence::RecoveryReporter::new(
-        Arc::clone(&warning_store),
-        data_dir.to_path_buf(),
-        bitcoin_rs_chain::Network::Regtest
-            .genesis_block_hash()
-            .to_string_be(),
-        1,
-    ));
-    (reporter, warning_store)
+pub(crate) struct RecordedIndexAhead {
+    /// One entry per call: `(capability, index_height, tip_height,
+    /// tip_hash_be, index_hash_be, depth, unix_secs)`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) calls: Mutex<Vec<(String, u32, u32, String, String, u32, u64)>>,
+}
+
+#[cfg(test)]
+impl RecordedIndexAhead {
+    /// An empty recording sink.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[cfg(test)]
+impl IndexAheadSink for RecordedIndexAhead {
+    fn report_index_ahead(
+        &self,
+        capability: &str,
+        index_height: u32,
+        tip_height: u32,
+        tip_hash_be: &str,
+        index_hash_be: &str,
+        depth: u32,
+        unix_secs: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.calls.lock().push((
+            capability.to_owned(),
+            index_height,
+            tip_height,
+            tip_hash_be.to_owned(),
+            index_hash_be.to_owned(),
+            depth,
+            unix_secs,
+        ));
+        Ok(())
+    }
 }
 
 struct Worker {
@@ -388,10 +452,10 @@ struct Worker {
     body_store: Option<Arc<dyn BlockBodyStore>>,
     batch_limits: PreparedBatchLimits,
     enabled: IndexCapabilities,
-    chain_events: Arc<crate::state::ChainEventPublisher>,
+    chain_events: Arc<dyn crate::reconcile::ChainCursorSource>,
     /// Sink for the index-ahead rollback evidence (`chain-rollback-event`
     /// marker plus `getblockchaininfo` warning).
-    reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
+    reporter: Arc<dyn crate::runtime::IndexAheadSink>,
     wake_rx: Receiver<()>,
     quiet_period: Duration,
     batch_delay: Duration,
@@ -466,36 +530,66 @@ enum ReconcileAction {
     Stalled,
 }
 
+/// Errors the derived-index worker can surface.
 #[derive(Debug, thiserror::Error)]
-enum DerivedIndexWorkerError {
+pub enum DerivedIndexWorkerError {
+    /// The worker was stopped before it could finish the requested step.
     #[error("txindex worker stopped")]
     Stopped,
+    /// A shutdown request abandoned a store open still in flight.
     #[error("txindex store open abandoned on shutdown")]
     OpenStopped,
+    /// The durable watermark changed while a forward batch was pending.
     #[error("txindex durable watermark changed while a forward batch was pending")]
     PendingDurableChanged,
+    /// A durable store operation failed.
     #[error("txindex storage error: {0}")]
     Storage(#[from] bitcoin_rs_storage::StorageError),
+    /// The store did not open within the bounded wait.
     #[error(
         "txindex store open timed out after {secs}s — the storage engine recovery may be stuck"
     )]
-    OpenTimeout { secs: u64 },
+    OpenTimeout {
+        /// Seconds waited before abandoning the open.
+        secs: u64,
+    },
+    /// The index writer or reader reported a failure.
     #[error("txindex index error: {0}")]
     Index(#[from] IndexError),
+    /// A block body needed for indexing or rollback was absent.
     #[error("txindex worker: missing body at height {height}, hash {hash}")]
-    MissingBody { height: u32, hash: Hash256 },
+    MissingBody {
+        /// Height of the missing body.
+        height: u32,
+        /// Active-chain hash of the missing body.
+        hash: Hash256,
+    },
+    /// A capability requiring bodies was enabled without a body store.
     #[error("txindex worker: body store missing")]
     NoBodyStore,
+    /// `ScriptLive` was enabled without the authoritative UTXO view.
     #[error("txindex worker: authoritative UTXO view missing for ScriptLive")]
     MissingUtxo,
+    /// `ScriptLive` was enabled without the chain transition authority.
     #[error("txindex worker: chain transition authority missing for ScriptLive")]
     MissingChainTransition,
+    /// A rewind needed an undo record that is missing or unreadable.
     #[error("txindex worker: undo record missing or unreadable at height {height}, hash {hash}")]
-    UndoUnavailable { height: u32, hash: Hash256 },
+    UndoUnavailable {
+        /// Height of the unavailable undo record.
+        height: u32,
+        /// Hash of the block whose undo record is unavailable.
+        hash: Hash256,
+    },
+    /// The rollback plan referenced a chain node not present in the tree.
     #[error("txindex worker: target chain node missing at height {height}")]
-    MissingTargetChain { height: u32 },
+    MissingTargetChain {
+        /// Height of the missing chain node.
+        height: u32,
+    },
+    /// The rollback evidence sink failed to publish the index-ahead event.
     #[error("txindex worker: rollback evidence marker not written: {0}")]
-    RollbackEvidence(#[source] crate::recovery_evidence::EvidenceError),
+    RollbackEvidence(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl DerivedIndexWorkerError {

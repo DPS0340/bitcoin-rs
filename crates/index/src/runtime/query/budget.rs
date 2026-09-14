@@ -52,7 +52,7 @@ impl QueryBudget {
     pub(super) fn accept_live_scan(
         &mut self,
         scan: ScriptLiveScan,
-    ) -> Result<Vec<bitcoin_rs_index::ScriptLiveRow>, TxQueryError> {
+    ) -> Result<Vec<crate::ScriptLiveRow>, TxQueryError> {
         if !scan.complete {
             return Err(TxQueryError::Unavailable(
                 "txindex live prefix scan truncated".into(),

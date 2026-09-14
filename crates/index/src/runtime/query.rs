@@ -18,26 +18,29 @@ mod budget;
 mod scripts;
 mod transactions;
 
-pub(crate) use block_source::IndexBlockSource;
+pub use block_source::IndexBlockSource;
 use budget::QueryBudget;
 
 /// Authoritative Live query sources: capability selection, the UTXO set, and
 /// the chain-transition lock Live composition requires.
-pub(crate) struct QueryEngineLive {
-    pub(crate) utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
-    pub(crate) chain_transition: Option<Arc<Mutex<()>>>,
-    pub(crate) enabled: IndexCapabilities,
+pub struct QueryEngineLive {
+    /// Authoritative UTXO set for the compact live view.
+    pub utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
+    /// Serializes live-view work against a chain transition.
+    pub chain_transition: Option<Arc<Mutex<()>>>,
+    /// Capability set this engine serves.
+    pub enabled: IndexCapabilities,
 }
 
 /// Node-owned, snapshot-gated transaction-index query engine.
 ///
-/// Implements `bitcoin_rs_rpc::context::DerivedIndexQuery` and [`ScriptIndexQuery`] as the
+/// Implements `crate::query_api::DerivedIndexQuery` and [`ScriptIndexQuery`] as the
 /// only public read paths for the transaction index. Every query runs against
 /// one typed point-in-time snapshot, captures
 /// health/shutdown/revision/tip before and after work, and returns typed
 /// `Retry`/`Unavailable` when the answer cannot be proven.
 #[derive(Clone)]
-pub(crate) struct DerivedIndexQueryEngine {
+pub struct DerivedIndexQueryEngine {
     runtime: Arc<DerivedIndexRuntime>,
     reader: Arc<dyn IndexReader>,
     block_source: IndexBlockSource,
@@ -59,7 +62,7 @@ impl core::fmt::Debug for DerivedIndexQueryEngine {
 impl DerivedIndexQueryEngine {
     /// Builds a query engine over the shared reader and authoritative block source.
     #[must_use]
-    pub(crate) fn new(
+    pub fn new(
         runtime: Arc<DerivedIndexRuntime>,
         reader: Arc<dyn IndexReader>,
         block_source: IndexBlockSource,

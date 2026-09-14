@@ -4,28 +4,28 @@ use super::DerivedIndexLifecycle;
 use super::DerivedIndexOpenSpec;
 use super::DerivedIndexRuntime;
 use super::DerivedIndexWorker;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 use super::FORWARD_BATCH_DELAY;
 use super::Generation;
 use super::IndexBlockSource;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 use super::REVISION_QUIET_PERIOD;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 use super::Worker;
 use super::namespace::NAMESPACE_REGISTRY;
 use super::namespace::NamespaceRegistry;
 use super::startup::fail_worker;
 use super::startup::run_worker_with_open;
+#[cfg(any(test, feature = "test-seam"))]
+use crate::IndexCapabilities;
+#[cfg(any(test, feature = "test-seam"))]
+use crate::PreparedBatchLimits;
+#[cfg(any(test, feature = "test-seam"))]
+use crate::writer::TxIndexWriter;
 use arc_swap::ArcSwap;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::TipSnapshot;
-#[cfg(test)]
-use bitcoin_rs_index::IndexCapabilities;
-#[cfg(test)]
-use bitcoin_rs_index::PreparedBatchLimits;
-#[cfg(test)]
-use bitcoin_rs_index::writer::TxIndexWriter;
 use bitcoin_rs_storage::block_body::BlockBodyStore;
 use crossbeam_channel::Receiver;
 use parking_lot::RwLock;
@@ -43,9 +43,9 @@ impl DerivedIndexWorker {
     /// same commit point as the wake, so the worker treats the wake channel as
     /// its coalesced hint stream and recovers from dropped wakes by
     /// reconciling fresh snapshots.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn(
+    pub fn spawn(
         runtime: Arc<DerivedIndexRuntime>,
         writer: Arc<dyn TxIndexWriter>,
         applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
@@ -53,8 +53,8 @@ impl DerivedIndexWorker {
         body_store: Option<Arc<dyn BlockBodyStore>>,
         batch_limits: PreparedBatchLimits,
         enabled: IndexCapabilities,
-        chain_events: Arc<crate::state::ChainEventPublisher>,
-        reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
+        chain_events: Arc<dyn crate::reconcile::ChainCursorSource>,
+        reporter: Arc<dyn crate::runtime::IndexAheadSink>,
         rollback_rebuild_cutover: u32,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
@@ -117,7 +117,7 @@ impl DerivedIndexWorker {
     /// backend open returns. `reporter` receives the index-ahead rollback
     /// evidence the worker detects against the restored tip.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_with_open(
+    pub fn spawn_with_open(
         runtime: Arc<DerivedIndexRuntime>,
         spec: DerivedIndexOpenSpec,
         lifecycle: Arc<ArcSwap<DerivedIndexLifecycle>>,
@@ -127,8 +127,8 @@ impl DerivedIndexWorker {
         body_store: Option<Arc<dyn BlockBodyStore>>,
         block_source: IndexBlockSource,
         body_source: Option<Arc<dyn BlockBodySource>>,
-        chain_events: Arc<crate::state::ChainEventPublisher>,
-        reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
+        chain_events: Arc<dyn crate::reconcile::ChainCursorSource>,
+        reporter: Arc<dyn crate::runtime::IndexAheadSink>,
         shutdown: Arc<AtomicBool>,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
@@ -185,14 +185,14 @@ impl DerivedIndexWorker {
     }
 
     /// Returns true if the worker thread has exited.
-    pub(crate) fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.join_handle
             .as_ref()
             .is_some_and(std::thread::JoinHandle::is_finished)
     }
 
     /// Requests shutdown and joins the worker thread.
-    pub(crate) fn join(mut self) {
+    pub fn join(mut self) {
         self.runtime.request_shutdown();
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
@@ -203,14 +203,14 @@ impl DerivedIndexWorker {
     /// abandonment path in `bounded_index_shutdown` when the worker is still
     /// blocked past the deadline. The thread continues running; dropping the
     /// `JoinHandle` detaches it.
-    pub(crate) fn detach(&mut self) {
+    pub fn detach(&mut self) {
         self.join_handle = None;
     }
 
     /// Poisons the namespace associated with this worker. Used by the
     /// abandonment path so the namespace is permanently `Poisoned` and
     /// subsequent claims are rejected.
-    pub(crate) fn poison_namespace(&self) {
+    pub fn poison_namespace(&self) {
         if let (Some(key), Some(token)) = (&self.namespace_key, &self.generation) {
             NAMESPACE_REGISTRY.poison(key, token.id());
         }

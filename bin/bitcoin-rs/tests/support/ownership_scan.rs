@@ -708,17 +708,14 @@ fn is_authorized_gateway_call(
         })
 }
 
-/// Returns true when `path` belongs to one of the three derived-index
-/// capability owners: the `crates/index` crate that owns the type and its
-/// durable writer, the node txindex runtime that drives the worker and query
-/// engine, and the node state module whose `index.rs` is the only config
-/// projection.
+/// Returns true when `path` belongs to one of the two derived-index
+/// capability owners: the `crates/index` crate that owns the type, its
+/// durable writer, and the derived-index runtime driving the worker and
+/// query engine, and the node state module whose `index.rs` is the only
+/// config projection.
 fn is_index_capability_owner(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
-    normalized.contains("/crates/index/src/")
-        || normalized.contains("/crates/node/src/state/")
-        || normalized.contains("/crates/node/src/txindex.rs")
-        || normalized.contains("/crates/node/src/txindex/")
+    normalized.contains("/crates/index/src/") || normalized.contains("/crates/node/src/state/")
 }
 
 /// Returns true when `path` is `allowed` or reaches it across a directory
@@ -902,7 +899,7 @@ mod tests {
                 "let indexed = !derived_index_capabilities(&config).is_empty();",
             ),
             (
-                "/workspace/crates/node/src/txindex/query.rs",
+                "/workspace/crates/index/src/runtime/query.rs",
                 "self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {})",
             ),
             (

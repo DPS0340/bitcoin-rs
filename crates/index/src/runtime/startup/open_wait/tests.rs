@@ -2,6 +2,7 @@
 
 use super::super::open_derived_index_with_timeout;
 use super::*;
+use crate::runtime::DerivedIndexOpenSpec;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -79,15 +80,19 @@ fn backend_error_is_preserved_without_becoming_abandonment() {
 fn shutdown_before_helper_creation_never_touches_the_store() -> std::io::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("must-not-be-created");
-    let result = open_derived_index_with_timeout(
-        bitcoin_rs_storage::StorageBackend::Fjall,
-        &path,
-        8 << 20,
-        1,
-        Duration::ZERO,
-        Duration::from_secs(30),
-        || true,
-    );
+    let spec = DerivedIndexOpenSpec {
+        data_dir: dir.path().to_path_buf(),
+        namespace: "txindex",
+        storage_backend: bitcoin_rs_storage::StorageBackend::Fjall,
+        epoch: 1,
+        enabled: crate::IndexCapabilities::default(),
+        rollback_rebuild_cutover: 0,
+        canonical_data_root: dir.path().to_path_buf(),
+        open_store: std::sync::Arc::new(|_| Err(DerivedIndexWorkerError::Stopped)),
+        utxo: None,
+        chain_transition: None,
+    };
+    let result = open_derived_index_with_timeout(&spec, &path, Duration::from_secs(30), || true);
     assert!(matches!(result, Err(DerivedIndexWorkerError::Stopped)));
     assert!(!path.exists());
     Ok(())

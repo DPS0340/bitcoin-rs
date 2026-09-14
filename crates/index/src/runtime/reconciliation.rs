@@ -8,16 +8,16 @@ use super::Worker;
 use super::scheduling::BatchWait;
 use super::scheduling::wait_for_batch_deadline;
 use super::scheduling::wait_for_revision_quiet;
+use crate::IndexCapabilities;
+use crate::IndexError;
+use crate::IndexWatermark;
+use crate::IndexWatermarks;
+use crate::IndexWriteFence;
+use crate::reconcile::ReconcileLeg;
+use crate::reconcile::ReconcilePhase;
+use crate::reconcile::SelectedWatermark;
+use crate::reconcile::selected_watermark;
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_index::IndexCapabilities;
-use bitcoin_rs_index::IndexError;
-use bitcoin_rs_index::IndexWatermark;
-use bitcoin_rs_index::IndexWatermarks;
-use bitcoin_rs_index::IndexWriteFence;
-use bitcoin_rs_index::reconcile::ReconcileLeg;
-use bitcoin_rs_index::reconcile::ReconcilePhase;
-use bitcoin_rs_index::reconcile::SelectedWatermark;
-use bitcoin_rs_index::reconcile::selected_watermark;
 use bitcoin_rs_primitives::Hash256;
 use std::sync::Arc;
 use std::time::Duration;
@@ -434,7 +434,7 @@ impl Worker {
         target: &TipSnapshot,
     ) -> bool {
         let tree = self.block_tree.read();
-        crate::reconcile::position_on_active_chain(
+        crate::reconcile::block_tree::position_on_active_chain(
             &tree,
             Hash256::from_le_bytes(&watermark.hash),
             watermark.height,
@@ -453,7 +453,7 @@ impl Worker {
     ) -> Option<u32> {
         let target = target?;
         let tree = self.block_tree.read();
-        crate::reconcile::rollback_depth(
+        crate::reconcile::block_tree::rollback_depth(
             &tree,
             Hash256::from_le_bytes(&watermark.hash),
             watermark.height,

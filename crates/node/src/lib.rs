@@ -37,8 +37,6 @@ pub mod logging;
 pub mod metrics;
 /// Node-owned mining candidate lifecycle coordinator.
 pub mod mining;
-/// Chain-event reconciliation seam for index consumers.
-pub mod reconcile;
 /// Durable rollback evidence: witness and marker file protocol, warning snapshot.
 mod recovery_evidence;
 
@@ -59,7 +57,6 @@ pub mod storage_footprint;
 pub mod sync;
 /// P2P transaction ingress consumer.
 pub mod tx_ingress;
-mod txindex;
 /// Prevout lookups across a window of consecutive blocks.
 mod window_overlay;
 pub use apply::{
@@ -96,7 +93,7 @@ pub use storage_footprint::{
 
 pub use sync::BlockSync;
 
-pub use txindex::DerivedIndexRuntime;
+pub use bitcoin_rs_index::runtime::DerivedIndexRuntime;
 
 #[cfg(feature = "zmq")]
 pub use bitcoin_rs_rpc::zmq::SocketZmqPublisher;

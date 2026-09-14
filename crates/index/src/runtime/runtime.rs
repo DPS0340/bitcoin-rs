@@ -1,6 +1,6 @@
 //! Revision, health, and bounded wake state shared with committed chain followers.
 
-use bitcoin_rs_index::{
+use crate::{
     IndexCapabilities,
     reconcile::{ReconcileLeg, ReconcilePhase},
 };

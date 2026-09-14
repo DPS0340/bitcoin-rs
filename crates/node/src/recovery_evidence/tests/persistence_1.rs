@@ -1,6 +1,7 @@
 // CONTRACT: `docs/contracts/recovery.md#RCV-12` owns evidence size validation,
 // atomic marker publication, and warning-before-marker failure semantics.
 use super::*;
+use bitcoin_rs_index::runtime::IndexAheadSink;
 
 // -----------------------------------------------------------------------
 // A2.3: Warning snapshot tests

@@ -25,11 +25,11 @@ use anyhow::bail;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_index::block_log::BlockLog;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolLimits;
 use bitcoin_rs_p2p::download_window::FAST_OUTBOUND_PEER_TARGET;
 use bitcoin_rs_p2p::download_window::fast_sync_budget;
-use bitcoin_rs_rpc::context::BlockLog;
 use bitcoin_rs_rpc::context::NetworkState;
 use bitcoin_rs_storage::FlatFileBlockStore;
 use hashbrown::HashMap;
@@ -286,20 +286,23 @@ impl NodeState {
                 spec.utxo = Some(Arc::clone(&utxo));
                 spec.chain_transition = Some(Arc::clone(&chain_transition));
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
-                let runtime = Arc::new(crate::txindex::DerivedIndexRuntime::new(wake_tx));
+                let runtime =
+                    Arc::new(bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx));
                 let body_source: Arc<dyn BlockBodySource> =
                     Arc::new(StoredBlockBodySource::new(Arc::clone(&block_body_store)));
-                let block_source = crate::txindex::IndexBlockSource::new(Arc::clone(&blocks))
-                    .with_block_body_source(Arc::clone(&body_source))
-                    .with_block_tree(Arc::clone(&block_tree));
-                let lifecycle: Arc<arc_swap::ArcSwap<crate::txindex::DerivedIndexLifecycle>> =
-                    Arc::new(arc_swap::ArcSwap::from_pointee(
-                        crate::txindex::DerivedIndexLifecycle::Opening,
-                    ));
-                let adapter = Arc::new(crate::txindex::DerivedIndexQueryAdapter::new(Arc::clone(
-                    &lifecycle,
-                )));
-                let generation = crate::txindex::Generation::new(spec.epoch);
+                let block_source =
+                    bitcoin_rs_index::runtime::IndexBlockSource::new(Arc::clone(&blocks))
+                        .with_block_body_source(Arc::clone(&body_source))
+                        .with_block_tree(Arc::clone(&block_tree));
+                let lifecycle: Arc<
+                    arc_swap::ArcSwap<bitcoin_rs_index::runtime::DerivedIndexLifecycle>,
+                > = Arc::new(arc_swap::ArcSwap::from_pointee(
+                    bitcoin_rs_index::runtime::DerivedIndexLifecycle::Opening,
+                ));
+                let adapter = Arc::new(bitcoin_rs_index::runtime::DerivedIndexQueryAdapter::new(
+                    Arc::clone(&lifecycle),
+                ));
+                let generation = bitcoin_rs_index::runtime::Generation::new(spec.epoch);
                 (
                     Some(runtime),
                     Some(TxIndexSpawn {
@@ -316,11 +319,12 @@ impl NodeState {
             }
             None => (None, None, None, None),
         };
-        let derived_index_status = Arc::new(crate::txindex::DerivedIndexCapability::new(
-            derived_index_lifecycle.clone(),
-            derived_index_runtime.clone(),
-            derived_index_capabilities(&config),
-        ));
+        let derived_index_status =
+            Arc::new(bitcoin_rs_index::runtime::DerivedIndexCapability::new(
+                derived_index_lifecycle.clone(),
+                derived_index_runtime.clone(),
+                derived_index_capabilities(&config),
+            ));
         let network = Arc::new(RwLock::new(NetworkState::default()));
         // One active generation of outbound requests keeps the drain fed, so
         // the active and queue limits track the peer target.

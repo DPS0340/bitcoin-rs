@@ -1,25 +1,43 @@
 use super::*;
 
+fn test_recovery_reporter(
+    data_dir: &std::path::Path,
+) -> (
+    Arc<crate::recovery_evidence::RecoveryReporter>,
+    Arc<crate::recovery_evidence::WarningStore>,
+) {
+    let warning_store = Arc::new(crate::recovery_evidence::WarningStore::new());
+    let reporter = Arc::new(crate::recovery_evidence::RecoveryReporter::new(
+        Arc::clone(&warning_store),
+        data_dir.to_path_buf(),
+        bitcoin_rs_chain::Network::Regtest
+            .genesis_block_hash()
+            .to_string_be(),
+        1,
+    ));
+    (reporter, warning_store)
+}
+
 #[test]
 #[allow(clippy::arc_with_non_send_sync)]
 fn txindex_worker_failure_makes_queries_unavailable_without_blocking_apply()
 -> Result<(), Box<dyn std::error::Error>> {
     let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
     let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
-    let runtime = Arc::new(crate::txindex::DerivedIndexRuntime::new(wake_tx));
+    let runtime = Arc::new(bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx));
     let index: Arc<FailAfterStartupTxIndex> = Arc::new(FailAfterStartupTxIndex::new()?);
     let writer: Arc<dyn bitcoin_rs_index::writer::TxIndexWriter> = index.clone();
     let evidence_dir = tempfile::tempdir()?;
-    let _worker = crate::txindex::DerivedIndexWorker::spawn(
+    let _worker = bitcoin_rs_index::runtime::DerivedIndexWorker::spawn(
         Arc::clone(&runtime),
         writer,
         Arc::clone(&handles.applied_tip),
         Arc::clone(&handles.block_tree),
         None,
-        crate::txindex::DEFAULT_BATCH_LIMITS,
+        bitcoin_rs_index::runtime::DEFAULT_BATCH_LIMITS,
         bitcoin_rs_index::IndexCapabilities::HISTORICAL,
         Arc::new(crate::state::ChainEventPublisher::detached(0).0),
-        crate::txindex::test_recovery_reporter(evidence_dir.path()).0,
+        test_recovery_reporter(evidence_dir.path()).0,
         u32::MAX,
         wake_rx,
     )?;
@@ -54,16 +72,16 @@ fn txindex_worker_failure_makes_queries_unavailable_without_blocking_apply()
     );
 
     let reader: Arc<dyn bitcoin_rs_index::IndexReader> = index;
-    let query = crate::txindex::DerivedIndexQueryEngine::new(
+    let query = bitcoin_rs_index::runtime::DerivedIndexQueryEngine::new(
         Arc::clone(&runtime),
         reader,
-        crate::txindex::IndexBlockSource::new(Arc::new(parking_lot::RwLock::new(
-            bitcoin_rs_rpc::context::BlockLog::new(),
+        bitcoin_rs_index::runtime::IndexBlockSource::new(Arc::new(parking_lot::RwLock::new(
+            bitcoin_rs_index::block_log::BlockLog::new(),
         ))),
         Arc::clone(&handles.block_tree),
         Arc::clone(&handles.applied_tip),
         None,
-        crate::txindex::QueryEngineLive {
+        bitcoin_rs_index::runtime::QueryEngineLive {
             utxo: None,
             chain_transition: None,
             enabled: bitcoin_rs_index::IndexCapabilities::TX_LOOKUP,

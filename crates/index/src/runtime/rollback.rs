@@ -3,15 +3,15 @@
 use super::DerivedIndexWorkerError;
 use super::UndoScripts;
 use super::Worker;
+use crate::ConsumerCursorUpdate;
+use crate::IndexCapabilities;
+use crate::IndexWatermark;
+use crate::IndexWatermarks;
+use crate::IndexWriteFence;
+use crate::NoSpentScripts;
+use crate::ScriptHash;
+use crate::reconcile::ReconcileLeg;
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_index::ConsumerCursorUpdate;
-use bitcoin_rs_index::IndexCapabilities;
-use bitcoin_rs_index::IndexWatermark;
-use bitcoin_rs_index::IndexWatermarks;
-use bitcoin_rs_index::IndexWriteFence;
-use bitcoin_rs_index::NoSpentScripts;
-use bitcoin_rs_index::ScriptHash;
-use bitcoin_rs_index::reconcile::ReconcileLeg;
 use bitcoin_rs_primitives::Hash256;
 
 pub(super) fn index_ahead_capability_label(capabilities: IndexCapabilities) -> Option<String> {
@@ -142,7 +142,7 @@ impl Worker {
             .then(|| self.live_anchor(watermark.height, watermark.hash))
             .transpose()?;
 
-        let spent: &dyn bitcoin_rs_index::SpentCoinScripts =
+        let spent: &dyn crate::SpentCoinScripts =
             anchor.as_ref().map_or(&NoSpentScripts, |anchor| anchor);
 
         let prev = if watermark.height == 0 {

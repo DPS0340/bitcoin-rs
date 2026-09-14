@@ -41,6 +41,48 @@ pub(super) fn index_ahead_warning(
     )
 }
 
+impl bitcoin_rs_index::runtime::IndexAheadSink for RecoveryReporter {
+    /// Reports an index-watermark-ahead event. The warning snapshot is
+    /// updated before the marker write, so a marker failure (returned to the
+    /// caller) still leaves the fact RPC-visible for this process.
+    fn report_index_ahead(
+        &self,
+        capability: &str,
+        index_height: u32,
+        tip_height: u32,
+        tip_hash_be: &str,
+        index_hash_be: &str,
+        depth: u32,
+        unix_secs: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg = index_ahead_warning(capability, index_height, tip_height, depth);
+        tracing::warn!(
+            %msg, capability, index_height, tip_height, depth,
+            "index watermark ahead of restored tip"
+        );
+
+        // Update in-memory snapshot (preserves checkpoint warning).
+        self.warning_store.add_index(&msg);
+
+        // Durably publish the event marker.
+        let event = ChainRollbackEvent::new(
+            &self.genesis_hash,
+            self.detecting_epoch,
+            unix_secs,
+            RollbackEventKind::IndexWatermarkAhead {
+                capability: capability.to_owned(),
+                restored_height: tip_height,
+                restored_hash: tip_hash_be.to_owned(),
+                old_height: index_height,
+                old_hash: index_hash_be.to_owned(),
+                gap: depth,
+            },
+        );
+        write_marker(&self.data_dir, &event)
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
+    }
+}
+
 impl RecoveryReporter {
     /// Reports a checkpoint-fallback event. Marker failure aborts
     /// `NodeState::open`.
@@ -70,45 +112,6 @@ impl RecoveryReporter {
                 source: source.to_owned(),
                 old_height: witness_height,
                 old_hash: old_hash.to_owned(),
-            },
-        );
-        write_marker(&self.data_dir, &event)
-    }
-
-    /// Reports an index-watermark-ahead event. The warning snapshot is
-    /// updated before the marker write, so a marker failure (returned to the
-    /// caller) still leaves the fact RPC-visible for this process.
-    pub(crate) fn report_index_ahead(
-        &self,
-        capability: &str,
-        watermark_height: u32,
-        restored_height: u32,
-        restored_hash: &str,
-        old_hash: &str,
-        gap: u32,
-        time: u64,
-    ) -> Result<(), EvidenceError> {
-        let msg = index_ahead_warning(capability, watermark_height, restored_height, gap);
-        tracing::warn!(
-            %msg, capability, watermark_height, restored_height, gap,
-            "index watermark ahead of restored tip"
-        );
-
-        // Update in-memory snapshot (preserves checkpoint warning).
-        self.warning_store.add_index(&msg);
-
-        // Durably publish the event marker.
-        let event = ChainRollbackEvent::new(
-            &self.genesis_hash,
-            self.detecting_epoch,
-            time,
-            RollbackEventKind::IndexWatermarkAhead {
-                capability: capability.to_owned(),
-                restored_height,
-                restored_hash: restored_hash.to_owned(),
-                old_height: watermark_height,
-                old_hash: old_hash.to_owned(),
-                gap,
             },
         );
         write_marker(&self.data_dir, &event)

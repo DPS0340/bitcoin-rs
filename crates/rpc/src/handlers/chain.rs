@@ -19,11 +19,10 @@ use crate::compat::convert::{
     self, compact_target_hex, i32_saturated, i64_saturated, i64_saturated_len, sat_to_btc,
     typed_to_sonic, typed_to_sonic_omitting_nulls,
 };
-use crate::context::{
-    BlockRecord, ChainControlError, Context, TxQueryError, cumulative_tx_count_through,
-};
+use crate::context::{ChainControlError, Context, TxQueryError};
 use crate::error::RpcError;
 use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
+use bitcoin_rs_index::block_log::{BlockRecord, cumulative_tx_count_through};
 
 pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
@@ -647,9 +646,9 @@ pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     let mediantime = ctx
         .median_time_past_for_hash(Hash256::from(block_hash))
         .unwrap_or(0);
-    let fee_fields = compute_fee_fields(ctx, &block).map_err(TxQueryError::into_rpc_error)?;
+    let fee_fields = compute_fee_fields(ctx, &block).map_err(crate::error::RpcError::from)?;
     let utxo_size_inc =
-        utxo_size_inc_for_block(ctx, &block).map_err(TxQueryError::into_rpc_error)?;
+        utxo_size_inc_for_block(ctx, &block).map_err(crate::error::RpcError::from)?;
     let txs = u64::try_from(block.txs.len()).unwrap_or(u64::MAX);
     let mut total_out = 0_u64;
     let mut total_size = 0_u64;
@@ -1615,8 +1614,8 @@ mod tests {
     use bitcoin_rs_primitives::{OutPoint, Tx, TxIn, Txid};
 
     use super::*;
-    use crate::context::BlockLog;
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
+    use bitcoin_rs_index::block_log::BlockLog;
 
     struct SingleBlockSource {
         height: u32,

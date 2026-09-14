@@ -328,3 +328,133 @@ pub fn selected_watermark(
 
 #[cfg(test)]
 mod tests;
+
+/// Coherent applied-tip position supplied by the authoritative chain owner.
+///
+/// The chain owner (node) implements this over its single-write snapshot
+/// publication; the index runtime reads the cursor wherever it previously read
+/// a publisher snapshot. The index does not own or advance these fields.
+pub trait ChainCursorSource: Send + Sync {
+    /// Returns the current consumer-visible chain cursor.
+    fn cursor(&self) -> ConsumerCursor;
+}
+
+/// [`ActiveChainView`] adapters over the authoritative [`BlockTree`].
+///
+/// The index owns reconciliation policy; the tree only answers topology
+/// questions against one selected active tip.
+pub mod block_tree {
+    use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
+    use bitcoin_rs_primitives::Hash256;
+
+    use super::{ActiveChainView, ChainIdentity, ChainTip, ConsumerCursor, ReconcilePlan};
+
+    struct BlockTreeActiveChain<'a> {
+        tree: &'a BlockTree,
+        active_tip: NodeId,
+    }
+
+    impl ActiveChainView for BlockTreeActiveChain<'_> {
+        fn contains(&self, position: Hash256) -> bool {
+            self.tree.lookup(position).is_some()
+        }
+
+        fn position_on_active_chain(&self, position: Hash256, height: u32) -> bool {
+            let Some(position_id) = self.tree.lookup(position) else {
+                return false;
+            };
+            self.tree
+                .node_at_height_from(self.active_tip, height)
+                .is_some_and(|active| active == position_id)
+        }
+
+        fn common_ancestor_height(&self, position: Hash256) -> Option<u32> {
+            let position_id = self.tree.lookup(position)?;
+            let ancestor = self
+                .tree
+                .find_common_ancestor(position_id, self.active_tip)?;
+            self.tree.node(ancestor).ok().map(|node| node.height)
+        }
+    }
+
+    const fn target(tip: &TipSnapshot) -> ChainTip {
+        ChainTip {
+            hash: tip.hash,
+            height: tip.height,
+        }
+    }
+
+    /// Plans one reconciliation pass against the authoritative tree.
+    #[must_use]
+    pub fn plan(
+        cursor: &ConsumerCursor,
+        target_tip: &TipSnapshot,
+        tree: &BlockTree,
+    ) -> ReconcilePlan {
+        let chain = BlockTreeActiveChain {
+            tree,
+            active_tip: target_tip.tip_id,
+        };
+        super::plan(cursor, target(target_tip), &chain)
+    }
+
+    /// Plans from the publisher's cursor plus the authoritative tip.
+    ///
+    /// The publisher cursor is only a shortcut when it also names `target`; an
+    /// old or torn cursor must not manufacture `CaughtUp` against a different
+    /// tip.
+    #[must_use]
+    pub fn plan_from_cursor(
+        cursor: &ConsumerCursor,
+        publisher: &ConsumerCursor,
+        target_tip: &TipSnapshot,
+        tree: &BlockTree,
+    ) -> ReconcilePlan {
+        let chain = BlockTreeActiveChain {
+            tree,
+            active_tip: target_tip.tip_id,
+        };
+        let identity = ChainIdentity {
+            epoch: publisher.epoch,
+            sequence: publisher.sequence,
+            tip_hash: publisher.hash,
+            tip_height: publisher.height,
+        };
+        super::plan_from_identity(cursor, &identity, target(target_tip), &chain)
+    }
+
+    /// Height of the newest block shared by `position` and `active_tip`.
+    #[must_use]
+    pub fn common_ancestor_height(
+        tree: &BlockTree,
+        position: Hash256,
+        active_tip: NodeId,
+    ) -> Option<u32> {
+        let chain = BlockTreeActiveChain { tree, active_tip };
+        ActiveChainView::common_ancestor_height(&chain, position)
+    }
+
+    /// Canonical stale-branch depth, with the decision owned by `index`.
+    #[must_use]
+    pub fn rollback_depth(
+        tree: &BlockTree,
+        position: Hash256,
+        position_height: u32,
+        active_tip: NodeId,
+    ) -> Option<u32> {
+        let chain = BlockTreeActiveChain { tree, active_tip };
+        super::rollback_depth(&chain, position, position_height)
+    }
+
+    /// Whether `position` at `height` lies on the selected active chain.
+    #[must_use]
+    pub fn position_on_active_chain(
+        tree: &BlockTree,
+        position: Hash256,
+        height: u32,
+        active_tip: NodeId,
+    ) -> bool {
+        let chain = BlockTreeActiveChain { tree, active_tip };
+        ActiveChainView::position_on_active_chain(&chain, position, height)
+    }
+}

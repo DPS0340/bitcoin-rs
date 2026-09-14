@@ -2,12 +2,12 @@
 
 use anyhow::Result;
 use anyhow::bail;
+use bitcoin_rs_index::block_log::BlockLog;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::Txid;
 use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
 use bitcoin_rs_primitives::deserialize;
-use bitcoin_rs_rpc::context::BlockLog;
 use bitcoin_rs_rpc::context::PruneResult;
 use bitcoin_rs_rpc::context::PruneService;
 use bitcoin_rs_rpc::context::PruneServiceError;

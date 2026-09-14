@@ -159,18 +159,26 @@ mod tests {
             include_str!("storage_footprint/scan.rs"),
             None,
         ),
-        ("txindex.rs", include_str!("txindex.rs"), None),
         (
-            "txindex/startup.rs",
-            include_str!("txindex/startup.rs"),
+            "index/runtime.rs",
+            include_str!("../../index/src/runtime.rs"),
             None,
         ),
         (
-            "txindex/lifecycle.rs",
-            include_str!("txindex/lifecycle.rs"),
+            "index/runtime/startup.rs",
+            include_str!("../../index/src/runtime/startup.rs"),
             None,
         ),
-        ("txindex/query.rs", include_str!("txindex/query.rs"), None),
+        (
+            "index/runtime/lifecycle.rs",
+            include_str!("../../index/src/runtime/lifecycle.rs"),
+            None,
+        ),
+        (
+            "index/runtime/query.rs",
+            include_str!("../../index/src/runtime/query.rs"),
+            None,
+        ),
     ];
 
     const CONCRETE_OPEN_TOKENS: &[&str] = &[

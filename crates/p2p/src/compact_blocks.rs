@@ -41,7 +41,7 @@ pub const MAX_PENDING_RECONSTRUCTIONS: usize = 4;
 pub const MAX_PENDING_RETAINED_BYTES: usize = 8 * 1_024 * 1_024;
 /// A pending entry older than this is dropped; a chain change cannot strand
 /// memory longer than one deadline.
-pub const PENDING_DEADLINE: Duration = Duration::from_secs(60);
+pub const PENDING_DEADLINE: Duration = Duration::from_mins(1);
 /// Above this many missing transactions the `getblocktxn` round trip is
 /// skipped: a full-block `getdata` is then the cheaper request.
 pub const MAX_REQUESTED_MISSING: usize = 128;

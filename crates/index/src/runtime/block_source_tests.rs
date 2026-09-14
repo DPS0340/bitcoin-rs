@@ -6,9 +6,9 @@
 //! never identifies a block.
 
 use super::*;
+use crate::block_log::BlockRecord;
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_primitives::{Network, consensus_bytes};
-use bitcoin_rs_rpc::context::BlockRecord;
 use std::error::Error;
 
 type TestResult = Result<(), Box<dyn Error>>;

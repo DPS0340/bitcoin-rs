@@ -3,10 +3,10 @@
 //! Each test drives `Worker::reconcile_once` against an authoritative
 //! `BlockTree` plus applied tip and observes only the contract surface: the
 //! durable watermarks, the published `ReconcilePhase`, and the rollback
-//! evidence (`WarningStore` plus `chain-rollback-event.json`).
+//! evidence reported through the `IndexAheadSink` seam.
 
+use crate::reconcile::{ReconcileLeg, ReconcilePhase};
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_index::reconcile::{ReconcileLeg, ReconcilePhase};
 
 use bitcoin::{
     Amount, Block, BlockHash, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Witness,
@@ -19,13 +19,11 @@ use bitcoin::{
 
 use bitcoin_rs_chain::{BlockTree, NodeId, NodeStatus, TipSnapshot};
 
-use bitcoin_rs_index::IndexCapabilities;
+use crate::IndexCapabilities;
 
 use bitcoin_rs_primitives::Hash256;
 
 use bitcoin_rs_storage::{FjallStore, StorageError, block_body::BlockBodyStore};
-
-use crate::recovery_evidence::{RollbackEventKind, WarningStore, read_marker};
 
 use hashbrown::HashMap;
 
@@ -169,11 +167,10 @@ impl ForkFixture {
 
 struct Harness {
     _index_dir: tempfile::TempDir,
-    evidence_dir: tempfile::TempDir,
     writer: Arc<dyn TxIndexWriter>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     runtime: Arc<DerivedIndexRuntime>,
-    warnings: Arc<WarningStore>,
+    evidence: Arc<RecordedIndexAhead>,
     worker: Worker,
 }
 
@@ -192,15 +189,15 @@ impl Harness {
         enabled: IndexCapabilities,
     ) -> Self {
         let index_dir = tempfile::tempdir().expect("index dir");
-        let evidence_dir = tempfile::tempdir().expect("evidence dir");
         let store = Arc::new(FjallStore::open(index_dir.path()).expect("fjall open"));
         let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::RwLock::new(
-            bitcoin_rs_index::IndexWriter::open(store, 1).expect("index writer open"),
+            crate::IndexWriter::open(store, 1).expect("index writer open"),
         ));
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(16);
         let runtime = Arc::new(DerivedIndexRuntime::new(wake_tx));
-        let (reporter, warnings) = test_recovery_reporter(evidence_dir.path());
+        let evidence = RecordedIndexAhead::new();
+        let reporter: Arc<dyn IndexAheadSink> = evidence.clone();
         let body_store: Arc<dyn BlockBodyStore> = fixture.bodies.clone();
         let utxo = enabled
             .script_live
@@ -214,7 +211,7 @@ impl Harness {
             body_store: Some(body_store),
             batch_limits: DEFAULT_BATCH_LIMITS,
             enabled,
-            chain_events: detached_chain_publisher(),
+            chain_events: Arc::new(TestChainCursor),
             reporter,
             wake_rx,
             quiet_period: Duration::ZERO,
@@ -225,11 +222,10 @@ impl Harness {
         };
         Self {
             _index_dir: index_dir,
-            evidence_dir,
             writer,
             applied_tip,
             runtime,
-            warnings,
+            evidence,
             worker,
         }
     }
@@ -306,11 +302,17 @@ impl Harness {
         assert_eq!(self.runtime.phase(), ReconcilePhase::FORWARD);
     }
 
-    fn index_ahead_marker(&self) -> Option<RollbackEventKind> {
-        let genesis = bitcoin_rs_chain::Network::Regtest
-            .genesis_block_hash()
-            .to_string_be();
-        read_marker(self.evidence_dir.path(), &genesis).map(|event| event.event)
+    /// The recorded `report_index_ahead` call, if any:
+    /// `(capability, index_height, tip_height, tip_hash_be, index_hash_be,
+    /// depth)`.
+    fn index_ahead_call(&self) -> Option<(String, u32, u32, String, String, u32)> {
+        self.evidence
+            .calls
+            .lock()
+            .first()
+            .map(|(cap, ih, th, thb, ihb, d, _)| {
+                (cap.clone(), *ih, *th, thb.clone(), ihb.clone(), *d)
+            })
     }
 }
 
@@ -333,8 +335,7 @@ fn shallow_reorg_rewinds_to_common_ancestor_then_replays() {
     h.assert_at(&b2);
 
     // Same height on both branches: not "ahead", so no rollback evidence.
-    assert!(h.warnings.warnings().is_empty());
-    assert!(h.index_ahead_marker().is_none());
+    assert!(h.evidence.calls.lock().is_empty());
 }
 
 /// `RCV-04`: a watermark above the applied tip is an operator-visible
@@ -358,25 +359,18 @@ fn index_ahead_of_restored_tip_is_reported_once_and_rewound() {
     h.assert_at(&a1);
 
     assert_eq!(
-        h.warnings.warnings().len(),
+        h.evidence.calls.lock().len(),
         1,
         "one warning per rollback pass"
     );
-    match h.index_ahead_marker() {
-        Some(RollbackEventKind::IndexWatermarkAhead {
-            capability,
-            restored_height,
-            restored_hash,
-            old_height,
-            old_hash,
-            gap,
-        }) => {
+    match h.index_ahead_call() {
+        Some((capability, index_height, tip_height, tip_hash_be, index_hash_be, depth)) => {
             assert_eq!(capability, "tx_lookup,script_history");
-            assert_eq!((restored_height, old_height, gap), (1, 3, 2));
-            assert_eq!(restored_hash, a1.hash.to_string_be());
-            assert_eq!(old_hash, a3.hash.to_string_be());
+            assert_eq!((tip_height, index_height, depth), (1, 3, 2));
+            assert_eq!(tip_hash_be, a1.hash.to_string_be());
+            assert_eq!(index_hash_be, a3.hash.to_string_be());
         }
-        other => panic!("expected IndexWatermarkAhead marker, got {other:?}"),
+        other => panic!("expected IndexWatermarkAhead report, got {other:?}"),
     }
 }
 
@@ -398,21 +392,14 @@ fn live_only_index_ahead_is_reported_and_reseeded() {
     h.set_tip(&a1);
     let first = h.worker.reconcile_once(&mut pending).expect("ahead pass");
     assert!(!matches!(first, ReconcileAction::CaughtUp));
-    match h.index_ahead_marker() {
-        Some(RollbackEventKind::IndexWatermarkAhead {
-            capability,
-            restored_height,
-            restored_hash,
-            old_height,
-            old_hash,
-            gap,
-        }) => {
+    match h.index_ahead_call() {
+        Some((capability, index_height, tip_height, tip_hash_be, index_hash_be, depth)) => {
             assert_eq!(capability, "script_live");
-            assert_eq!((restored_height, old_height, gap), (1, 3, 2));
-            assert_eq!(restored_hash, a1.hash.to_string_be());
-            assert_eq!(old_hash, a3.hash.to_string_be());
+            assert_eq!((tip_height, index_height, depth), (1, 3, 2));
+            assert_eq!(tip_hash_be, a1.hash.to_string_be());
+            assert_eq!(index_hash_be, a3.hash.to_string_be());
         }
-        other => panic!("expected IndexWatermarkAhead marker, got {other:?}"),
+        other => panic!("expected IndexWatermarkAhead report, got {other:?}"),
     }
     assert_eq!(
         h.watermarks().script_live.map(|w| w.height),
@@ -455,10 +442,7 @@ fn deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up() {
 
     h.settle(&mut pending);
     h.assert_at(&b3);
-    assert!(
-        h.index_ahead_marker().is_none(),
-        "equal height is not ahead"
-    );
+    assert!(h.index_ahead_call().is_none(), "equal height is not ahead");
 }
 
 /// `RCV-06`: the applied tip moving while a rebuild is in flight does not

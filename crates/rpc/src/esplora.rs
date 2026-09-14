@@ -532,7 +532,7 @@ mod tests {
             txs: vec![transaction.clone()],
         };
         block.header.merkle_root = fixture_merkle_root(&block.txids());
-        let record = crate::context::BlockRecord::from_block(0, &block);
+        let record = bitcoin_rs_index::block_log::BlockRecord::from_block(0, &block);
         let txid = transaction.txid();
         let mut context = Context::new();
         context.chain_network = bitcoin_rs_primitives::Network::Regtest;
@@ -997,7 +997,9 @@ mod tests {
     fn composed_response_retries_when_the_applied_tip_identity_changes() {
         let block = fixture_genesis();
         let mut context = Context::new();
-        context.add_block(crate::context::BlockRecord::from_block(0, &block));
+        context.add_block(bitcoin_rs_index::block_log::BlockRecord::from_block(
+            0, &block,
+        ));
         let tip = {
             let mut tree = context.block_tree.write();
             tree.insert_node(None, block.header, NodeStatus::Active)
@@ -1121,7 +1123,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut ctx = Context::new();
         for record in &records {
-            ctx.add_block(crate::context::BlockRecord::synthetic(
+            ctx.add_block(bitcoin_rs_index::block_log::BlockRecord::synthetic(
                 record.height,
                 BlockHash::default(),
             ));
@@ -1179,7 +1181,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut ctx = Context::new();
         for record in &history {
-            ctx.add_block(crate::context::BlockRecord::synthetic(
+            ctx.add_block(bitcoin_rs_index::block_log::BlockRecord::synthetic(
                 record.height,
                 BlockHash::default(),
             ));
@@ -1370,7 +1372,7 @@ mod tests {
             },
             txs: vec![transaction.clone()],
         };
-        let stale_record = crate::context::BlockRecord::from_block(1, &stale_block);
+        let stale_record = bitcoin_rs_index::block_log::BlockRecord::from_block(1, &stale_block);
         let mut ctx = Context::new();
         ctx.block_body_source = Some(Arc::new(SingleBlockSource {
             height: 1,
