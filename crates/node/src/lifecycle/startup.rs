@@ -88,19 +88,22 @@ pub(crate) fn start_node(
     let sync = state.sync();
     let peer_ready_sync = Arc::clone(&sync);
     let loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
-    let mining_control: Arc<dyn bitcoin_rs_mining::MiningControl> =
-        Arc::new(crate::MiningCoordinator::new(
-            state.config().network,
-            state.applied_tip(),
-            state.block_tree(),
-            state.mempool(),
-            state.chainstate(),
-            state.chain_followers(),
-            state.config().mining.payout_script.clone(),
-            Arc::clone(&shutdown),
-        ));
+    let coordinator = Arc::new(crate::MiningCoordinator::new(
+        state.config().network,
+        state.applied_tip(),
+        state.block_tree(),
+        state.mempool(),
+        state.chainstate(),
+        state.chain_followers(),
+        state.config().mining.payout_script.clone(),
+        Arc::clone(&shutdown),
+    ));
+    let sequence_wake: Arc<dyn bitcoin_rs_mining::MempoolSequenceWake> = coordinator.clone();
+    let mining_control: Arc<dyn bitcoin_rs_mining::MiningControl> = coordinator;
+    let signal = state.mining_generation_signal();
     // The signal holds a Weak reference; the RPC context owns the coordinator.
-    state.mining_generation_signal().attach(&mining_control);
+    signal.attach(&mining_control);
+    signal.attach_sequence_wake(&sequence_wake);
     let gateway = state.mempool_gateway();
     let tx_inventory: Arc<dyn bitcoin_rs_p2p::TxInventory> = gateway.clone();
     let compact_hints: Arc<dyn bitcoin_rs_p2p::CompactBlockHints> = gateway.clone();

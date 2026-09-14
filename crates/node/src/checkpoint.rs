@@ -1,6 +1,7 @@
 //! Checkpoint formats, loading, and publication.
 
 mod format;
+pub(crate) use format::hex_encode;
 pub(crate) mod fs;
 mod io;
 mod load;
@@ -18,8 +19,6 @@ use bitcoin_rs_utxo::stats::CoinStats;
 use bitcoin_rs_utxo::stats::CoinStatsListener;
 use cap_std::fs::Dir;
 use cap_std::fs::File;
-#[cfg(test)]
-use format::hex_encode;
 use load::classify_checkpoint_error;
 use load::classify_open_error;
 use load::corrupt_checkpoint;
