@@ -435,7 +435,7 @@ fn daa_non_retarget_height_requires_parent_bits() -> Result<(), Box<dyn std::err
         2,
     );
 
-    let error = match check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, 2) {
+    let error = match validate_seeded_header_nbits(&handles, &block, 2) {
         Ok(()) => panic!("non-retarget height must inherit parent nBits"),
         Err(error) => error,
     };

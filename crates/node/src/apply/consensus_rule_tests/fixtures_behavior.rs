@@ -238,6 +238,27 @@ pub(super) fn fixture_txid(seed: u8) -> Txid {
 /// Compact target encoding of a 256-bit target: mirrors Bitcoin Core's
 /// `GetCompact` and `bitcoin_rs_chain`'s crate-private
 /// `pow::target_to_compact` (lossy past three bytes, sign bit never set).
+pub(super) fn compact_to_target(bits: u32) -> ChainWork {
+    let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
+    let mut mantissa = u64::from(bits & 0x007f_ffff);
+    let target = if exponent <= 3 {
+        mantissa >>= 8 * (3 - exponent);
+        ChainWork::from(mantissa)
+    } else {
+        let shift = 8 * (exponent - 3);
+        if shift < 256 {
+            ChainWork::from(mantissa) << shift
+        } else {
+            ChainWork::ZERO
+        }
+    };
+    if mantissa != 0 && bits & 0x0080_0000 != 0 {
+        ChainWork::ZERO
+    } else {
+        target
+    }
+}
+
 pub(super) fn target_to_compact_lossy(target: ChainWork) -> u32 {
     if target == ChainWork::ZERO {
         return 0;
@@ -253,6 +274,43 @@ pub(super) fn target_to_compact_lossy(target: ChainWork) -> u32 {
         size += 1;
     }
     compact | (u32::try_from(size).unwrap_or(0) << 24)
+}
+
+pub(super) fn validate_seeded_header_nbits(
+    handles: &Chainstate,
+    block: &Block,
+    height: u32,
+) -> core::result::Result<(), ApplyError> {
+    if height == 0 {
+        return Ok(());
+    }
+    let prior = handles.chain_tip.load_full();
+    let Some(parent_id) = prior.as_deref().map(|tip| tip.tip_id) else {
+        return Err(ApplyError::Chain(
+            bitcoin_rs_chain::ChainError::MissingParent {
+                prev_hash: block.header.prev_blockhash.0,
+            },
+        ));
+    };
+    let tree = handles.block_tree.read();
+    bitcoin_rs_chain::header_sync::validate_header_nbits(
+        &tree,
+        parent_id,
+        &block.header,
+        handles.network,
+    )
+    .map_err(|error| match error {
+        bitcoin_rs_chain::ChainError::NbitsMismatch {
+            actual,
+            expected,
+            height,
+        } => ApplyError::NbitsNonRetargetMismatch {
+            actual,
+            expected,
+            height,
+        },
+        error => ApplyError::Chain(error),
+    })
 }
 
 pub(super) fn retarget_bits_for_test(
@@ -453,9 +511,4 @@ pub(super) fn apply_followed(
     block: &Block,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     Ok(followers.apply_connect(handles, block)?.tip)
-}
-
-#[allow(clippy::arc_with_non_send_sync)]
-pub(super) fn empty_utxo() -> Arc<UtxoSet> {
-    Arc::new(UtxoSet::new())
 }

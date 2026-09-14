@@ -23,7 +23,7 @@ fn daa_retarget_accepts_expected_bits_at_boundary() -> Result<(), Box<dyn std::e
         interval,
     );
 
-    assert!(check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, interval).is_ok());
+    assert!(validate_seeded_header_nbits(&handles, &block, interval).is_ok());
     Ok(())
 }
 
@@ -46,7 +46,7 @@ fn daa_retarget_rejects_wrong_bits_at_boundary() -> Result<(), Box<dyn std::erro
         interval,
     );
 
-    let error = match check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, interval) {
+    let error = match validate_seeded_header_nbits(&handles, &block, interval) {
         Ok(()) => panic!("retarget height must reject non-computed nBits"),
         Err(error) => error,
     };
@@ -78,7 +78,7 @@ fn daa_retarget_clamps_fast_timespan_to_quarter_target() -> Result<(), Box<dyn s
         interval,
     );
 
-    assert!(check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, interval).is_ok());
+    assert!(validate_seeded_header_nbits(&handles, &block, interval).is_ok());
     Ok(())
 }
 
@@ -109,7 +109,7 @@ fn daa_retarget_clamps_slow_timespan_to_quadruple_target() -> Result<(), Box<dyn
         interval,
     );
 
-    assert!(check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, interval).is_ok());
+    assert!(validate_seeded_header_nbits(&handles, &block, interval).is_ok());
     Ok(())
 }
 
@@ -127,7 +127,7 @@ fn testnet_allows_min_difficulty_after_time_gap() -> Result<(), Box<dyn std::err
     )?;
     let block = block_with_pow_header(parent_hash, pow_limit_bits, DAA_ANCHOR_TIME + 1_801, 2);
 
-    assert!(check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, 2).is_ok());
+    assert!(validate_seeded_header_nbits(&handles, &block, 2).is_ok());
     Ok(())
 }
 
@@ -147,10 +147,10 @@ fn testnet_timely_block_after_min_difficulty_inherits_last_non_min_bits()
     )?;
     let timely_time = DAA_ANCHOR_TIME + 2_400;
     let accepted = block_with_pow_header(parent_hash, regular_bits, timely_time, 3);
-    assert!(check_pow_limit_and_continuity_for_seeded_tip(&handles, &accepted, 3).is_ok());
+    assert!(validate_seeded_header_nbits(&handles, &accepted, 3).is_ok());
 
     let rejected = block_with_pow_header(parent_hash, pow_limit_bits, timely_time, 4);
-    let error = match check_pow_limit_and_continuity_for_seeded_tip(&handles, &rejected, 3) {
+    let error = match validate_seeded_header_nbits(&handles, &rejected, 3) {
         Ok(()) => panic!("timely testnet block must inherit the last non-min nBits"),
         Err(error) => error,
     };
@@ -172,7 +172,7 @@ fn mainnet_rejects_min_difficulty_after_time_gap() -> Result<(), Box<dyn std::er
     )?;
     let block = block_with_pow_header(parent_hash, pow_limit_bits, DAA_ANCHOR_TIME + 1_801, 2);
 
-    let error = match check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, 2) {
+    let error = match validate_seeded_header_nbits(&handles, &block, 2) {
         Ok(()) => panic!("mainnet must not allow testnet minimum-difficulty exception"),
         Err(error) => error,
     };
@@ -202,7 +202,7 @@ fn testnet_min_difficulty_does_not_override_retarget_boundary()
         interval,
     );
 
-    let error = match check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, interval) {
+    let error = match validate_seeded_header_nbits(&handles, &block, interval) {
         Ok(()) => panic!("testnet minimum-difficulty exception must not replace retarget math"),
         Err(error) => error,
     };

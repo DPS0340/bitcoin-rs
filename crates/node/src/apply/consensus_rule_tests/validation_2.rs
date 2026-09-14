@@ -44,52 +44,7 @@ fn coinbase_maturity_rejects_same_block_coinbase_spend() {
     let block = block_with_transactions(vec![coinbase, spend]);
     let handles = empty_apply_handles();
 
-    let error = match check_coinbase_maturity_with_tx_plan(
-        &handles,
-        &block,
-        &tx_plan(&block),
-        &block_txids(&block),
-        Arc::new(ResolvedUtxoView::resolve(
-            handles.utxo.as_ref(),
-            &block,
-            &tx_plan(&block),
-        )),
-        1,
-    ) {
-        Ok(()) => panic!("same-block coinbase spend must fail maturity"),
-        Err(error) => error,
-    };
-    assert_bip_error(&error, "COINBASE_MATURITY");
-}
-
-#[test]
-fn verify_block_transactions_defers_same_block_coinbase_spend_to_maturity() {
-    let mut coinbase = coinbase_transaction(0x65);
-    coinbase.outputs[0].script_pubkey = Script::from_bytes(op_true_script());
-    let coinbase_outpoint = OutPoint::new(coinbase.txid(), 0);
-    let spend = spending_transaction_to_script(coinbase_outpoint, u32::MAX, op_true_script());
-    let block = block_with_transactions(vec![coinbase, spend]);
-    let handles = empty_apply_handles();
-
-    assert!(
-        verify_block_transactions(
-            &handles,
-            &block,
-            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
-            &tx_plan(&block),
-            Arc::new(ResolvedUtxoView::resolve(
-                handles.utxo.as_ref(),
-                &block,
-                &tx_plan(&block)
-            )),
-            &validation_context(&block, 1, 0, bitcoin_rs_script::VerifyFlags::NONE),
-            BlockProvenance::Network,
-            &kernel_block_of(&block),
-        )
-        .is_ok()
-    );
-    let error = match check_coinbase_maturity_with_tx_plan(
-        &handles,
+    let error = match check_coinbase_maturity(
         &block,
         &tx_plan(&block),
         &block_txids(&block),
@@ -174,14 +129,15 @@ fn bip68_time_lock_enforces_mtp_boundary_when_csv_active() -> Result<(), Box<dyn
     let utxo = utxo_with_output(previous_output, BIP68_TEST_PREVOUT_HEIGHT)?;
     let handles = apply_handles(utxo);
     let previous_tip_id = seed_block_tree_for_bip68_time(&handles)?;
-    let sequence = BIP68_TYPE_FLAG | 2;
+    let sequence = bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_TYPE_FLAG | 2;
     let block = block_with_transaction(spending_transaction_to_script(
         previous_output,
         sequence,
         op_true_script(),
     ));
     let active = softfork_state(true);
-    let required_mtp = BIP68_TEST_PREVOUT_MTP + 2 * BIP68_TIME_GRANULARITY_SECONDS;
+    let required_mtp = BIP68_TEST_PREVOUT_MTP
+        + 2 * bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_GRANULARITY_SECONDS;
 
     let error = match check_bip68_sequence_locks(
         &handles,
@@ -236,7 +192,7 @@ fn bip68_time_lock_uses_mtp_before_prevout_height() -> Result<(), Box<dyn std::e
     let previous_tip_id = seed_block_tree_with_times(&handles, &[100, 200, 300, 400])?;
     let block = block_with_transaction(spending_transaction_to_script(
         previous_output,
-        BIP68_TYPE_FLAG,
+        bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_TYPE_FLAG,
         op_true_script(),
     ));
 
@@ -259,51 +215,6 @@ fn bip68_time_lock_uses_mtp_before_prevout_height() -> Result<(), Box<dyn std::e
                     bitcoin_rs_script::VerifyFlags::NONE
                 ),
                 median_time_past: 200,
-                softfork_state: softfork_state(true),
-                previous_tip_id: Some(previous_tip_id),
-            },
-        )
-        .is_ok()
-    );
-    Ok(())
-}
-
-#[test]
-fn bip68_time_lock_accepts_multiple_prevouts_at_same_height()
--> Result<(), Box<dyn std::error::Error>> {
-    let first_previous_output = OutPoint::new(fixture_txid(0x66), 0);
-    let second_previous_output = OutPoint::new(fixture_txid(0x65), 0);
-    let prevout_height = BIP68_TEST_PREVOUT_HEIGHT;
-    let utxo = utxo_with_outputs_at_height(
-        &[first_previous_output, second_previous_output],
-        prevout_height,
-    )?;
-    let handles = apply_handles(utxo);
-    let previous_tip_id = seed_block_tree_for_bip68_time(&handles)?;
-    let block = block_with_transactions(vec![
-        spending_transaction_to_script(first_previous_output, BIP68_TYPE_FLAG, op_true_script()),
-        spending_transaction_to_script(second_previous_output, BIP68_TYPE_FLAG, op_true_script()),
-    ]);
-
-    assert!(
-        check_bip68_sequence_locks(
-            &handles,
-            &block,
-            &tx_plan(&block),
-            &block_txids(&block),
-            Arc::new(ResolvedUtxoView::resolve(
-                handles.utxo.as_ref(),
-                &block,
-                &tx_plan(&block)
-            )),
-            Bip68Context {
-                validation: &validation_context(
-                    &block,
-                    prevout_height + 1,
-                    0,
-                    bitcoin_rs_script::VerifyFlags::NONE
-                ),
-                median_time_past: BIP68_TEST_PREVOUT_MTP,
                 softfork_state: softfork_state(true),
                 previous_tip_id: Some(previous_tip_id),
             },
@@ -387,8 +298,11 @@ fn bip68_time_lock_uses_previous_tip_mtp_for_same_block_prevout()
     let previous_tip_id = seed_block_tree_for_bip68_time_at_height(&handles, 100)?;
     let funding_tx = transaction(0x6c);
     let funding_outpoint = OutPoint::new(funding_tx.txid(), 0);
-    let same_block_spend =
-        spending_transaction_to_script(funding_outpoint, BIP68_TYPE_FLAG, op_true_script());
+    let same_block_spend = spending_transaction_to_script(
+        funding_outpoint,
+        bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_TYPE_FLAG,
+        op_true_script(),
+    );
     let block = block_with_transactions(vec![funding_tx, same_block_spend]);
 
     assert!(

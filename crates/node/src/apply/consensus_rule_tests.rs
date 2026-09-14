@@ -38,8 +38,6 @@ use fixtures_behavior::block_with_transaction;
 use fixtures_behavior::block_with_transactions;
 use fixtures_behavior::empty_apply_handles_for_network;
 #[cfg(test)]
-use fixtures_behavior::empty_utxo;
-#[cfg(test)]
 use fixtures_behavior::excess_value_spend_block;
 #[cfg(test)]
 use fixtures_behavior::fixture_txid;
@@ -65,7 +63,7 @@ use fixtures_behavior::tx_plan;
 #[cfg(test)]
 use fixtures_behavior::utxo_with_output;
 #[cfg(test)]
-use fixtures_behavior::utxo_with_outputs_at_height;
+use fixtures_behavior::validate_seeded_header_nbits;
 #[cfg(test)]
 use fixtures_behavior::validation_context;
 #[cfg(test)]

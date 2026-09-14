@@ -95,7 +95,7 @@ fn testnet4_retarget_uses_first_period_bits_after_min_difficulty_tip()
         interval,
     );
 
-    assert!(check_pow_limit_and_continuity_for_seeded_tip(&handles, &block, interval).is_ok());
+    assert!(validate_seeded_header_nbits(&handles, &block, interval).is_ok());
     Ok(())
 }
 

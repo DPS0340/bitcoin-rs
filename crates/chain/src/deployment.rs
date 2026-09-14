@@ -5,6 +5,7 @@
 //! or mining caller needs at a connect height.
 
 use bitcoin_rs_consensus::bip9::versionbits_block_version;
+use bitcoin_rs_consensus::bip30::BIP34_IMPLIES_BIP30_LIMIT;
 use bitcoin_rs_consensus::{
     CSV_DEPLOYMENT_ID, DeploymentContext, DeploymentParams, DeploymentState,
     MEDIAN_TIME_PAST_WINDOW, SEGWIT_DEPLOYMENT_ID, SoftforkState, compute_state, deployment_params,
@@ -130,6 +131,37 @@ pub fn candidate_version(
             (params.bit, state)
         })
     }))
+}
+
+/// Returns whether the BIP30 duplicate-txid scan is required at `height`.
+#[must_use]
+pub fn bip30_duplicate_scan_required(
+    tree: &BlockTree,
+    network: Network,
+    height: u32,
+    previous_tip: Option<NodeId>,
+) -> bool {
+    if height >= BIP34_IMPLIES_BIP30_LIMIT || !network.is_bip34_active(height) {
+        return true;
+    }
+
+    let Some(expected_activation_hash) = network.bip34_activation_hash() else {
+        return true;
+    };
+    let Some(previous_tip) = previous_tip else {
+        return true;
+    };
+
+    let Some(activation_id) =
+        tree.node_at_height_from(previous_tip, network.bip34_activation_height())
+    else {
+        return true;
+    };
+    let Ok(activation_node) = tree.node(activation_id) else {
+        return true;
+    };
+
+    activation_node.hash != expected_activation_hash
 }
 
 fn deployment_active(
