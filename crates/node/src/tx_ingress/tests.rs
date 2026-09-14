@@ -82,7 +82,7 @@ fn coinbase_tx(value: u64) -> Tx {
     Tx {
         version: 1,
         inputs: vec![TxIn {
-            previous_output: OutPoint::default(),
+            previous_output: OutPoint::new(Txid::default(), u32::MAX),
             script_sig: Script::from_bytes(vec![0x51]),
             sequence: Sequence::from_consensus(0xFFFF_FFFF),
             witness: Witness::new(),

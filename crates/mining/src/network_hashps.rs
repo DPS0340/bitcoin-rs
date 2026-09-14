@@ -121,6 +121,6 @@ fn hashes_per_second(work_be_bytes: [u8; 32], time_delta_secs: i64) -> f64 {
     work / f64::from(u32::try_from(time_delta_secs).unwrap_or(u32::MAX))
 }
 
-/// Core `GetNetworkHashPS` oracle tests.
+/// Oracle: Bitcoin Core `GetNetworkHashPS`, `src/rpc/mining.cpp` (kernel 31.99).
 #[cfg(test)]
 mod oracle_tests;

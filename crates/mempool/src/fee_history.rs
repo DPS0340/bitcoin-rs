@@ -155,9 +155,11 @@ mod tests {
         let fresh = open_pool();
         assert_eq!(fresh.read().estimate_fee_rate(1), None);
         load(dir.path(), &fresh);
+        let seeded_rate = seeded.read().estimate_fee_rate(1);
+        assert!(seeded_rate.is_some());
         assert_eq!(
             fresh.read().estimate_fee_rate(1),
-            seeded.read().estimate_fee_rate(1),
+            seeded_rate,
             "the saved history must survive the datadir round trip"
         );
     }
