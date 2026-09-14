@@ -109,10 +109,7 @@ pub fn prune_to_height<S: crate::KvStore>(
             StorageError::InvalidOperation("prune height is within reorg safety margin").into(),
         );
     }
-    let pruner_tip = pruneheight.checked_add(CORE_REORG_SAFETY_MARGIN).ok_or({
-        // The requested line cannot be represented with its retention margin.
-        StorageError::InvalidOperation("prune height overflow")
-    })?;
+    let pruner_tip = pruneheight + CORE_REORG_SAFETY_MARGIN;
 
     let mut batch = store.new_batch();
     let staged = stage_block_and_undo_prune(

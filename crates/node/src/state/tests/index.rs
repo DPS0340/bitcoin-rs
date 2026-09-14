@@ -45,6 +45,7 @@ fn open_skips_tx_index_when_disabled() -> anyhow::Result<()> {
     config.p2p.listen.clear();
     let state = NodeState::open(config, None)?;
 
+    assert!(state.chain_followers().effects().derived_index().is_none());
     assert!(
         state.derived_index_query().is_none(),
         "txindex disabled by default"
@@ -65,6 +66,7 @@ fn index_workers_start_only_when_asked() -> anyhow::Result<()> {
     config.indexes.txindex = true;
     let mut state = NodeState::open(config, None)?;
 
+    assert!(state.chain_followers().effects().derived_index().is_some());
     assert!(
         state
             .derived_index_lifecycle
