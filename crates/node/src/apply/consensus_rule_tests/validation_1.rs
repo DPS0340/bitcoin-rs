@@ -217,7 +217,7 @@ fn scripts_verified_upstream_follows_validation_mode() -> Result<(), ApplyError>
 
     // Header chain 0..=3 on the best branch; a competing sibling at height 2.
     let tip_id = seed_block_tree_with_times(&handles, &[1, 2, 3, 4])?;
-    let (best_at_2, fork_at_2, tip) = {
+    let (best_at_2, fork_at_2) = {
         let mut tree = handles.block_tree.write();
         let best_at_2 = tree
             .node_at_height_from(tip_id, 2)
@@ -246,11 +246,9 @@ fn scripts_verified_upstream_follows_validation_mode() -> Result<(), ApplyError>
             .node(fork)
             .map_err(|_| ApplyError::HeightOverflow(2))?
             .hash;
-        let tip = tree.tip().ok_or(ApplyError::HeightOverflow(3))?;
-        (best_at_2, fork_at_2, tip)
+        assert_eq!(tree.tip().map(|tip| tip.height), Some(3));
+        (best_at_2, fork_at_2)
     };
-    assert_eq!(tip.height, 3);
-    handles.chain_tip.store(Some(tip));
 
     assert!(handles.scripts_verified_upstream(BlockProvenance::Network, 2, best_at_2));
     assert!(

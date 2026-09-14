@@ -40,6 +40,15 @@ impl BlockSync {
                 }
             }
 
+            // Header admission moves the header tip, which the apply path
+            // reads under the transition; the lock keeps it fixed until commit.
+            let transition = match self.handles.lock_transition() {
+                Ok(transition) => transition,
+                Err(error) => {
+                    tracing::debug!(%error, "block sync: header admission refused; dropping batch");
+                    continue;
+                }
+            };
             let mut tree = self.handles.block_tree.write();
             let acceptance = bitcoin_rs_chain::accept_headers(
                 &mut tree,
@@ -62,6 +71,7 @@ impl BlockSync {
                             });
                     self.handles.assume_valid_gate.evaluate(&tree);
                     drop(tree);
+                    drop(transition);
                     if let (Some(tip_hash), Some(source)) = (announced_tip, source) {
                         self.peer_table
                             .note_announced_tip(source, tip_hash, active_height);
@@ -75,6 +85,7 @@ impl BlockSync {
                 }
                 Err(error) if is_peer_fault(&error) => {
                     drop(tree);
+                    drop(transition);
                     let mut blamed_peer = None;
                     if let Some(source) = source {
                         let mut window = self.download_window.lock();
@@ -100,6 +111,7 @@ impl BlockSync {
                 }
                 Err(error) => {
                     drop(tree);
+                    drop(transition);
                     tracing::warn!(
                         received = batch_len,
                         %error,

@@ -717,7 +717,10 @@ impl<'a> ChainTransition<'a> {
 impl Chainstate {
     /// `Fast` trusts a block only when it is the node at `height` on the
     /// best header tip's own chain, so a block on a competing branch never
-    /// borrows that trust.
+    /// borrows that trust. The tip is read from the tree under the same read
+    /// guard as the ancestry walk, and every header-tip writer holds the
+    /// chain-transition lock, so the answer stays true through the caller's
+    /// commit.
     pub(crate) fn scripts_verified_upstream(
         &self,
         provenance: BlockProvenance,
@@ -734,15 +737,14 @@ impl Chainstate {
                         && self.assume_valid_gate.trusted()
                 }
                 ValidationMode::Fast => {
-                    let Some(header_tip) = self.chain_tip.load_full() else {
+                    let tree = self.block_tree.read();
+                    let Some(header_tip) = tree.tip() else {
                         return false;
                     };
-                    if height >= header_tip.height {
-                        return false;
-                    }
-                    let tree = self.block_tree.read();
-                    tree.node_at_height_from(header_tip.tip_id, height)
-                        .is_some_and(|id| tree.lookup(hash) == Some(id))
+                    height < header_tip.height
+                        && tree
+                            .node_at_height_from(header_tip.tip_id, height)
+                            .is_some_and(|id| tree.lookup(hash) == Some(id))
                 }
             },
         }
@@ -759,7 +761,8 @@ impl Chainstate {
     /// Admission plus the exclusive transition lock, without mempool generation.
     ///
     /// Used for read-consistent planning that may abort without mutating
-    /// (reorg replans, `validate_block`, pruning). Mutation requires
+    /// (reorg replans, `validate_block`, pruning) and for header admission,
+    /// which moves the header tip without touching chainstate. Mutation requires
     /// [`Self::begin_transition`] or [`Self::begin_transition_locked`].
     pub(crate) fn lock_transition(&self) -> core::result::Result<TransitionLock<'_>, ApplyError> {
         begin_chain_transition(&self.admission, &self.chain_transition)
