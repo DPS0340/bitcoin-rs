@@ -60,15 +60,12 @@ pub fn estimate_network_hashps(
     lookup: i64,
     network: Network,
 ) -> f64 {
-    let Some(start_id) = start_id else {
+    let Some(start_node) = start_id
+        .and_then(|id| tree.node(id).ok())
+        .filter(|node| node.height != 0)
+    else {
         return 0.0;
     };
-    let Ok(start_node) = tree.node(start_id) else {
-        return 0.0;
-    };
-    if start_node.height == 0 {
-        return 0.0;
-    }
     let mut walk = if lookup == -1 {
         let interval = i64::from(network.retarget_interval());
         if interval <= 0 {
@@ -92,14 +89,14 @@ pub fn estimate_network_hashps(
     let mut max_time = min_time;
     let mut earliest_id = start_id;
     for _ in 0..walk {
-        let Ok(node) = tree.node(earliest_id) else {
+        let Some(parent) = earliest_id
+            .and_then(|id| tree.node(id).ok())
+            .and_then(|node| node.parent)
+        else {
             return 0.0;
         };
-        let Some(parent) = node.parent else {
-            return 0.0;
-        };
-        earliest_id = parent;
-        let Ok(parent_node) = tree.node(earliest_id) else {
+        earliest_id = Some(parent);
+        let Ok(parent_node) = tree.node(parent) else {
             return 0.0;
         };
         min_time = min_time.min(parent_node.header.time);
@@ -108,6 +105,9 @@ pub fn estimate_network_hashps(
     if min_time == max_time {
         return 0.0;
     }
+    let Some(earliest_id) = earliest_id else {
+        return 0.0;
+    };
     let Ok(earliest_node) = tree.node(earliest_id) else {
         return 0.0;
     };
@@ -127,11 +127,6 @@ fn hashes_per_second(work_be_bytes: [u8; 32], time_delta_secs: i64) -> f64 {
     work / f64::from(u32::try_from(time_delta_secs).unwrap_or(u32::MAX))
 }
 
-/// Oracle: Bitcoin Core `GetNetworkHashPS` in `src/rpc/mining.cpp` (kernel 31.99).
-///
-/// `workDiff = nChainWork[end] - nChainWork[start]` over `lookup` parent walks,
-/// `timeDiff = max(GetBlockTime) - min(GetBlockTime)` in that window, result
-/// `workDiff.getdouble() / timeDiff`. Non-monotonic timestamps use min/max, not
-/// first/last. `lookup == -1` walks `height % DifficultyAdjustmentInterval + 1`.
+/// Core `GetNetworkHashPS` oracle tests.
 #[cfg(test)]
 mod oracle_tests;
