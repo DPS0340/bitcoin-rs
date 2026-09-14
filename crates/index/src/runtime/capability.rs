@@ -11,14 +11,16 @@ use super::{
 const PROGRESS_READ_ATTEMPTS: usize = 4;
 
 /// Worker-owned txindex facts for the RPC capability projection.
-pub(crate) struct DerivedIndexCapability {
+pub struct DerivedIndexCapability {
     lifecycle: Option<Arc<ArcSwap<DerivedIndexLifecycle>>>,
     runtime: Option<Arc<DerivedIndexRuntime>>,
     enabled: IndexCapabilities,
 }
 
 impl DerivedIndexCapability {
-    pub(crate) fn new(
+    /// Builds the capability projection over the worker publication cells.
+    #[must_use]
+    pub fn new(
         lifecycle: Option<Arc<ArcSwap<DerivedIndexLifecycle>>>,
         runtime: Option<Arc<DerivedIndexRuntime>>,
         enabled: IndexCapabilities,

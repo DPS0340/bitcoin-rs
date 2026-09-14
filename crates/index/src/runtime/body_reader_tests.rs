@@ -113,7 +113,7 @@ fn catch_up_uses_one_body_reader_session() -> Result<(), Box<dyn std::error::Err
     let data_dir = tempfile::tempdir()?;
     let index_store = Arc::new(bitcoin_rs_storage::FjallStore::open(data_dir.path())?);
     let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::RwLock::new(
-        bitcoin_rs_index::IndexWriter::open(index_store, 1)?,
+        crate::IndexWriter::open(index_store, 1)?,
     ));
     let body_store = Arc::new(SessionBodyStore {
         height: tip.height,
@@ -134,8 +134,8 @@ fn catch_up_uses_one_body_reader_session() -> Result<(), Box<dyn std::error::Err
         batch_limits: DEFAULT_BATCH_LIMITS,
         enabled: IndexCapabilities::HISTORICAL,
         wake_rx,
-        chain_events: detached_chain_publisher(),
-        reporter: test_recovery_reporter(data_dir.path()).0,
+        chain_events: TestChainCursor::detached(),
+        reporter: Arc::new(NoopIndexAheadSink),
         quiet_period: Duration::ZERO,
         batch_delay: Duration::ZERO,
         // The body-reader session test never exercises reset routing;

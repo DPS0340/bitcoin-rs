@@ -647,9 +647,9 @@ pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     let mediantime = ctx
         .median_time_past_for_hash(Hash256::from(block_hash))
         .unwrap_or(0);
-    let fee_fields = compute_fee_fields(ctx, &block).map_err(TxQueryError::into_rpc_error)?;
+    let fee_fields = compute_fee_fields(ctx, &block).map_err(crate::error::tx_query_error)?;
     let utxo_size_inc =
-        utxo_size_inc_for_block(ctx, &block).map_err(TxQueryError::into_rpc_error)?;
+        utxo_size_inc_for_block(ctx, &block).map_err(crate::error::tx_query_error)?;
     let txs = u64::try_from(block.txs.len()).unwrap_or(u64::MAX);
     let mut total_out = 0_u64;
     let mut total_size = 0_u64;

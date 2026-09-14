@@ -11,7 +11,7 @@ Owners:
 - Bounded observer delivery and gap accounting:
   `crates/rpc/src/zmq.rs`, `crates/mempool/src/mutation.rs`
 - Index wake and consumer reconciliation:
-  `crates/index/src/runtime.rs`, `crates/node/src/reconcile.rs`
+  `crates/index/src/runtime.rs`, `crates/index/src/reconcile.rs`
 
 ## Clauses
 

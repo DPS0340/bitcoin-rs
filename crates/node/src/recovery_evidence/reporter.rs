@@ -41,6 +41,31 @@ pub(super) fn index_ahead_warning(
     )
 }
 
+impl bitcoin_rs_index::runtime::IndexAheadSink for RecoveryReporter {
+    fn report_index_ahead(
+        &self,
+        capability: &str,
+        index_height: u32,
+        tip_height: u32,
+        tip_hash_be: &str,
+        index_hash_be: &str,
+        depth: u32,
+        unix_secs: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Self::report_index_ahead(
+            self,
+            capability,
+            index_height,
+            tip_height,
+            tip_hash_be,
+            index_hash_be,
+            depth,
+            unix_secs,
+        )
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
+    }
+}
+
 impl RecoveryReporter {
     /// Reports a checkpoint-fallback event. Marker failure aborts
     /// `NodeState::open`.

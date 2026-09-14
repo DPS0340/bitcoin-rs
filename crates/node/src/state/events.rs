@@ -79,6 +79,18 @@ pub struct ChainEventPublisher {
     hints: Sender<ChainEventHint>,
 }
 
+impl bitcoin_rs_index::reconcile::ChainCursorSource for ChainEventPublisher {
+    fn cursor(&self) -> bitcoin_rs_index::reconcile::ConsumerCursor {
+        let snapshot = self.snapshot();
+        bitcoin_rs_index::reconcile::ConsumerCursor {
+            epoch: snapshot.epoch,
+            sequence: snapshot.sequence,
+            height: snapshot.tip_height,
+            hash: snapshot.tip_hash,
+        }
+    }
+}
+
 impl ChainEventPublisher {
     pub(super) fn new(epoch: u64, initial: ChainSnapshot) -> (Self, Receiver<ChainEventHint>) {
         let (hints, receiver) = crossbeam_channel::bounded(CHAIN_HINT_CHANNEL_LIMIT);

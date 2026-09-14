@@ -8,15 +8,16 @@ use super::{
 /// Private index-side `BlockSource`: active-chain identity from the tree,
 /// bodies from the chain body store. Not a node-owned concept.
 #[derive(Clone)]
-pub(crate) struct IndexBlockSource {
+pub struct IndexBlockSource {
     blocks: Arc<RwLock<BlockLog>>,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
     block_tree: Option<Arc<RwLock<BlockTree>>>,
 }
 
 impl IndexBlockSource {
+    /// A source backed only by the log of connected block records.
     #[must_use]
-    pub(crate) const fn new(blocks: Arc<RwLock<BlockLog>>) -> Self {
+    pub const fn new(blocks: Arc<RwLock<BlockLog>>) -> Self {
         Self {
             blocks,
             block_body_source: None,
@@ -24,19 +25,23 @@ impl IndexBlockSource {
         }
     }
 
+    /// Adds the chain body store used to fetch raw block bodies.
     #[must_use]
-    pub(crate) fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
+    pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
         self.block_body_source = Some(source);
         self
     }
 
+    /// Adds the authoritative block tree used for active-chain identity.
     #[must_use]
-    pub(crate) fn with_block_tree(mut self, tree: Arc<RwLock<BlockTree>>) -> Self {
+    pub fn with_block_tree(mut self, tree: Arc<RwLock<BlockTree>>) -> Self {
         self.block_tree = Some(tree);
         self
     }
 
-    pub(crate) fn block_body_bytes_for(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
+    /// Returns the stored body bytes for the block identified by height and
+    /// hash, or `None` when no body store is attached or the body is absent.
+    pub fn block_body_bytes_for(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
         self.block_body_source.as_ref()?.block_body(height, hash)
     }
 

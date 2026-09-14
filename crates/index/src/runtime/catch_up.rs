@@ -10,15 +10,15 @@ use super::PREPARE_CHUNK_BYTES;
 use super::PendingForward;
 use super::ReconcileAction;
 use super::Worker;
+use crate::IndexCapabilities;
+use crate::IndexError;
+use crate::IndexWatermark;
+use crate::IndexWatermarks;
+use crate::IndexWriteFence;
+use crate::NoSpentScripts;
+use crate::PreparedBatch;
+use crate::PreparedBlock;
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_index::IndexCapabilities;
-use bitcoin_rs_index::IndexError;
-use bitcoin_rs_index::IndexWatermark;
-use bitcoin_rs_index::IndexWatermarks;
-use bitcoin_rs_index::IndexWriteFence;
-use bitcoin_rs_index::NoSpentScripts;
-use bitcoin_rs_index::PreparedBatch;
-use bitcoin_rs_index::PreparedBlock;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_storage::StorageError;
 use bitcoin_rs_storage::block_body::BlockBodyReader;
@@ -219,7 +219,7 @@ impl Worker {
             .zip(bodies.par_iter())
             .enumerate()
             .map(|(index, (identity, body))| {
-                let spent: &dyn bitcoin_rs_index::SpentCoinScripts = match anchors.as_ref() {
+                let spent: &dyn crate::SpentCoinScripts = match anchors.as_ref() {
                     Some(anchors) => &anchors[index],
                     None => &NoSpentScripts,
                 };

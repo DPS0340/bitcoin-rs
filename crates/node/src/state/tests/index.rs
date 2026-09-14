@@ -98,7 +98,7 @@ fn index_workers_start_only_when_asked() -> anyhow::Result<()> {
             .is_some_and(|lifecycle| {
                 matches!(
                     lifecycle.load().as_ref(),
-                    crate::txindex::DerivedIndexLifecycle::Opening
+                    bitcoin_rs_index::runtime::DerivedIndexLifecycle::Opening
                 )
             })
     );
@@ -113,7 +113,7 @@ fn index_workers_start_only_when_asked() -> anyhow::Result<()> {
         .is_some_and(|lifecycle| {
             matches!(
                 lifecycle.load().as_ref(),
-                crate::txindex::DerivedIndexLifecycle::Opening
+                bitcoin_rs_index::runtime::DerivedIndexLifecycle::Opening
             )
         })
     {

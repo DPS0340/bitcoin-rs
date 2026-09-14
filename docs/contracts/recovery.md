@@ -13,7 +13,7 @@ Owners:
 - Crash and lost-write fault tests: `crates/node/tests/overhaul_crash_matrix.rs`
 - Reorg and disconnect: `crates/node/tests/overhaul_streaming_reorg.rs`
 - Checkpoint independence: `crates/node/tests/overhaul_checkpoint_independence.rs`
-- Index worker recovery: `crates/node/src/txindex/recovery_tests.rs`
+- Index worker recovery: `crates/index/src/runtime/recovery_tests.rs`
 - Policy: `docs/policies/db-migration.md`
 
 ## Durable root
@@ -358,7 +358,7 @@ state is harmless and keeps the node operating until replay closes the gap.
   validates fresh replay, schema refusal, and checkpoint authority removal.
 - `crates/storage/tests/overhaul_atomic_durability.rs` (existing): tests the
   storage-level prior-or-whole-proposed rule and durable batch completion.
-- `crates/node/src/txindex/recovery_tests.rs` (existing):
+- `crates/index/src/runtime/recovery_tests.rs` (existing):
   - `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
     (`RCV-05`);
   - `tip_change_during_rebuild_converges_on_new_tip` (`RCV-06`);

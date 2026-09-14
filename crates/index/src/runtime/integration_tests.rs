@@ -8,9 +8,9 @@
 )]
 
 use super::*;
+use crate::block_log::BlockLog;
 use arc_swap::ArcSwap;
 use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_rpc::context::BlockLog;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -32,6 +32,13 @@ fn test_open_spec(dir: &std::path::Path, epoch: u64) -> DerivedIndexOpenSpec {
         canonical_data_root: dir.to_path_buf(),
         utxo: None,
         chain_transition: None,
+        open_store: Arc::new(|dir| {
+            let store = Arc::new(
+                bitcoin_rs_storage::FjallStore::open_with_cache(dir, 8 * 1024 * 1024)
+                    .map_err(DerivedIndexWorkerError::Storage)?,
+            );
+            open_derived_index_store_on_worker(store, DEFAULT_BATCH_LIMITS, 1)
+        }),
     }
 }
 
@@ -46,7 +53,7 @@ struct WorkerInputs {
     shutdown: Arc<AtomicBool>,
     wake_rx: Receiver<()>,
     block_source: IndexBlockSource,
-    chain_events: Arc<crate::state::ChainEventPublisher>,
+    chain_events: Arc<dyn crate::reconcile::ChainCursorSource>,
 }
 
 fn build_worker_inputs(dir: &std::path::Path, epoch: u64) -> WorkerInputs {
@@ -60,7 +67,7 @@ fn build_worker_inputs(dir: &std::path::Path, epoch: u64) -> WorkerInputs {
     let shutdown = Arc::new(AtomicBool::new(false));
     let blocks = Arc::new(RwLock::new(BlockLog::new()));
     let block_source = IndexBlockSource::new(blocks);
-    let chain_events = detached_chain_publisher();
+    let chain_events = TestChainCursor::detached();
 
     WorkerInputs {
         runtime,
@@ -105,7 +112,7 @@ fn worker_open_panic_publishes_failed() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        test_recovery_reporter(dir.path()).0,
+        Arc::new(NoopIndexAheadSink),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -158,7 +165,7 @@ fn spawn_failure_publishes_failed_synchronously() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        test_recovery_reporter(dir.path()).0,
+        Arc::new(NoopIndexAheadSink),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -203,7 +210,7 @@ fn blocked_open_drop_detaches_within_deadline() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        test_recovery_reporter(dir.path()).0,
+        Arc::new(NoopIndexAheadSink),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -264,7 +271,7 @@ fn late_open_cannot_publish_after_revocation() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        test_recovery_reporter(dir.path()).0,
+        Arc::new(NoopIndexAheadSink),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -382,64 +389,10 @@ fn wakes_before_store_open_are_reconciled() {
 
 #[test]
 fn async_index_open_preserves_backend() {
-    // Verify that open_derived_index_on_worker dispatches to the correct
-    // backend constructor and the store opens successfully on the
-    // worker thread.
     let dir = tempfile::tempdir().expect("tempdir");
-
-    #[cfg(feature = "fjall")]
-    {
-        let fjall_dir = dir.path().join("txindex-fjall");
-        std::fs::create_dir_all(&fjall_dir).expect("create fjall dir");
-        let result = open_derived_index_on_worker(
-            bitcoin_rs_storage::StorageBackend::Fjall,
-            &fjall_dir,
-            8 * 1024 * 1024,
-            1,
-            Duration::ZERO,
-        );
-        assert!(
-            result.is_ok(),
-            "fjall backend open must succeed: {:?}",
-            result.err()
-        );
-    }
-
-    #[cfg(feature = "redb")]
-    {
-        let redb_dir = dir.path().join("txindex-redb");
-        std::fs::create_dir_all(&redb_dir).expect("create redb dir");
-        let result = open_derived_index_on_worker(
-            bitcoin_rs_storage::StorageBackend::Redb,
-            &redb_dir,
-            8 * 1024 * 1024,
-            1,
-            Duration::ZERO,
-        );
-        assert!(
-            result.is_ok(),
-            "redb backend open must succeed: {:?}",
-            result.err()
-        );
-    }
-
-    #[cfg(feature = "rocksdb")]
-    {
-        let rocks_dir = dir.path().join("txindex-rocksdb");
-        std::fs::create_dir_all(&rocks_dir).expect("create rocksdb dir");
-        let result = open_derived_index_on_worker(
-            bitcoin_rs_storage::StorageBackend::RocksDb,
-            &rocks_dir,
-            8 * 1024 * 1024,
-            1,
-            Duration::ZERO,
-        );
-        assert!(
-            result.is_ok(),
-            "rocksdb backend open must succeed: {:?}",
-            result.err()
-        );
-    }
+    let spec = test_open_spec(dir.path(), 1);
+    let opened = (spec.open_store)(&dir.path().join("txindex"));
+    assert!(opened.is_ok(), "composing open closure must succeed");
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +446,7 @@ fn blocked_open_abandonment_detaches_and_poisons() {
         inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
-        test_recovery_reporter(dir.path()).0,
+        Arc::new(NoopIndexAheadSink),
         Arc::clone(&inputs.shutdown),
         inputs.wake_rx,
     )
@@ -596,12 +549,14 @@ fn open_timeout_publishes_error_not_infinite_spin() {
     // Simulate a stuck open: the helper thread will sleep 10 seconds before
     // even attempting the store open. The timeout is set to 1 second, so the
     // deadline fires while the helper is still sleeping.
+    let mut spec = test_open_spec(dir.path(), 1);
+    spec.open_store = Arc::new(move |_dir| {
+        std::thread::sleep(Duration::from_secs(10));
+        Err(DerivedIndexWorkerError::Stopped)
+    });
     let result = open_derived_index_with_timeout(
-        bitcoin_rs_storage::StorageBackend::Fjall,
+        &spec,
         &dir.path().join("txindex"),
-        8 * 1024 * 1024,
-        1,
-        Duration::from_secs(10),
         Duration::from_secs(1),
         || shutdown.load(Ordering::Acquire),
     );

@@ -6,6 +6,11 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::bail;
 use bitcoin_rs_chain::BlockBodySource;
+use bitcoin_rs_index::runtime::{
+    DEFAULT_BATCH_LIMITS, OpenDerivedIndex, REDB_BATCH_LIMITS, ROCKSDB_BATCH_LIMITS,
+    open_derived_index_store_on_worker,
+};
+use bitcoin_rs_storage::{KvStore, StorageBackend};
 use crossbeam_channel::Receiver;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +34,7 @@ pub(super) fn build_derived_index_open_spec(
     config: &NodeConfig,
     txindex_cache_bytes: u64,
     epoch: u64,
-) -> Result<Option<crate::txindex::DerivedIndexOpenSpec>> {
+) -> Result<Option<bitcoin_rs_index::runtime::DerivedIndexOpenSpec>> {
     let enabled = derived_index_capabilities(config);
     if enabled.is_empty() {
         return Ok(None);
@@ -41,24 +46,65 @@ pub(super) fn build_derived_index_open_spec(
         .data_dir
         .canonicalize()
         .unwrap_or_else(|_| config.data_dir.clone());
-    Ok(Some(crate::txindex::DerivedIndexOpenSpec {
+    let backend = config.storage.backend;
+    let cache_bytes = txindex_cache_bytes;
+    Ok(Some(bitcoin_rs_index::runtime::DerivedIndexOpenSpec {
         data_dir: config.data_dir.clone(),
         namespace: "txindex",
         storage_backend: config.storage.backend,
         cache_bytes: txindex_cache_bytes,
         epoch,
         enabled,
-        rollback_rebuild_cutover: crate::txindex::DEFAULT_ROLLBACK_REBUILD_CUTOVER,
+        rollback_rebuild_cutover: bitcoin_rs_index::runtime::DEFAULT_ROLLBACK_REBUILD_CUTOVER,
         canonical_data_root,
+        open_store: Arc::new(move |dir| {
+            open_derived_index_on_worker(backend, dir, cache_bytes, epoch)
+        }),
         utxo: None,
         chain_transition: None,
     }))
 }
 
+struct DerivedIndexComposer {
+    backend: StorageBackend,
+    epoch: u64,
+}
+
+impl crate::storage_backend::StoreConsumer for DerivedIndexComposer {
+    type Output = OpenDerivedIndex;
+    type Error = bitcoin_rs_index::runtime::DerivedIndexWorkerError;
+
+    fn consume<S>(self, store: Arc<S>) -> Result<Self::Output, Self::Error>
+    where
+        S: KvStore,
+    {
+        let batch_limits = match self.backend {
+            StorageBackend::RocksDb => ROCKSDB_BATCH_LIMITS,
+            StorageBackend::Fjall => DEFAULT_BATCH_LIMITS,
+            StorageBackend::Redb => REDB_BATCH_LIMITS,
+        };
+        open_derived_index_store_on_worker(store, batch_limits, self.epoch)
+    }
+}
+
+fn open_derived_index_on_worker(
+    backend: StorageBackend,
+    dir: &std::path::Path,
+    cache_bytes: u64,
+    epoch: u64,
+) -> Result<OpenDerivedIndex, bitcoin_rs_index::runtime::DerivedIndexWorkerError> {
+    crate::storage_backend::open_txindex(
+        backend,
+        dir,
+        Some(cache_bytes),
+        DerivedIndexComposer { backend, epoch },
+    )
+}
+
 pub(super) struct TxIndexSpawn {
-    pub(super) spec: crate::txindex::DerivedIndexOpenSpec,
-    pub(super) generation: crate::txindex::Generation,
-    pub(super) block_source: crate::txindex::IndexBlockSource,
+    pub(super) spec: bitcoin_rs_index::runtime::DerivedIndexOpenSpec,
+    pub(super) generation: bitcoin_rs_index::runtime::Generation,
+    pub(super) block_source: bitcoin_rs_index::runtime::IndexBlockSource,
     pub(super) body_source: Arc<dyn BlockBodySource>,
     pub(super) wake_rx: Receiver<()>,
     pub(super) recovery_reporter: Arc<crate::recovery_evidence::RecoveryReporter>,
@@ -120,7 +166,11 @@ impl NodeState {
             .derived_index_lifecycle
             .as_ref()
             .context("txindex lifecycle missing for a pending worker spawn")?;
-        let worker = crate::txindex::DerivedIndexWorker::spawn_with_open(
+        let chain_events: Arc<dyn bitcoin_rs_index::reconcile::ChainCursorSource> =
+            self.chain_events.clone();
+        let recovery_reporter: Arc<dyn bitcoin_rs_index::runtime::IndexAheadSink> =
+            spawn.recovery_reporter.clone();
+        let worker = bitcoin_rs_index::runtime::DerivedIndexWorker::spawn_with_open(
             Arc::clone(runtime),
             spawn.spec,
             Arc::clone(lifecycle),
@@ -130,8 +180,8 @@ impl NodeState {
             Some(Arc::clone(&self.block_body_store)),
             spawn.block_source,
             Some(spawn.body_source),
-            Arc::clone(&self.chain_events),
-            spawn.recovery_reporter,
+            chain_events,
+            recovery_reporter,
             Arc::clone(&self.apply_handles.shutdown),
             spawn.wake_rx,
         )
@@ -179,7 +229,7 @@ impl NodeState {
                 }
                 if let Some(lifecycle) = &self.derived_index_lifecycle {
                     lifecycle.store(Arc::new(
-                        crate::txindex::DerivedIndexLifecycle::ShutdownAbandoned,
+                        bitcoin_rs_index::runtime::DerivedIndexLifecycle::ShutdownAbandoned,
                     ));
                 }
                 // Poison the namespace so it cannot be reclaimed in this process.
@@ -189,6 +239,62 @@ impl NodeState {
                 // shutdown is observed; Drop is a no-op for the handle.
                 worker.detach();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    /// `open_derived_index_on_worker` dispatches to the concrete backend
+    /// constructor and the store opens successfully on the caller's thread.
+    #[test]
+    fn open_dispatch_preserves_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        #[cfg(feature = "fjall")]
+        {
+            let fjall_dir = dir.path().join("txindex-fjall");
+            std::fs::create_dir_all(&fjall_dir).expect("create fjall dir");
+            let result =
+                open_derived_index_on_worker(StorageBackend::Fjall, &fjall_dir, 8 * 1024 * 1024, 1);
+            assert!(
+                result.is_ok(),
+                "fjall backend open must succeed: {:?}",
+                result.err()
+            );
+        }
+
+        #[cfg(feature = "redb")]
+        {
+            let redb_dir = dir.path().join("txindex-redb");
+            std::fs::create_dir_all(&redb_dir).expect("create redb dir");
+            let result =
+                open_derived_index_on_worker(StorageBackend::Redb, &redb_dir, 8 * 1024 * 1024, 1);
+            assert!(
+                result.is_ok(),
+                "redb backend open must succeed: {:?}",
+                result.err()
+            );
+        }
+
+        #[cfg(feature = "rocksdb")]
+        {
+            let rocks_dir = dir.path().join("txindex-rocksdb");
+            std::fs::create_dir_all(&rocks_dir).expect("create rocksdb dir");
+            let result = open_derived_index_on_worker(
+                StorageBackend::RocksDb,
+                &rocks_dir,
+                8 * 1024 * 1024,
+                1,
+            );
+            assert!(
+                result.is_ok(),
+                "rocksdb backend open must succeed: {:?}",
+                result.err()
+            );
         }
     }
 }

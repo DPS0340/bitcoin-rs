@@ -1,17 +1,17 @@
-use bitcoin_rs_index::TxIndexSnapshot;
+use crate::TxIndexSnapshot;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::NodeStatus;
-use bitcoin_rs_index::types::{TxPosition, TxPositionValue};
-use bitcoin_rs_index::{
+use crate::types::{TxPosition, TxPositionValue};
+use crate::{BlockRecord, query_api::ScriptHistoryRecord};
+use crate::{
     HashPrefixRow, IndexCapabilities, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow,
 };
+use arc_swap::ArcSwapOption;
+use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, LockTime, Network, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes, encode::double_sha256,
 };
-use bitcoin_rs_rpc::context::{BlockRecord, ScriptHistoryRecord};
 use bitcoin_rs_storage::{ColumnFamily, PrefixScan, PrefixScanLimit};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 
@@ -63,14 +63,13 @@ impl QuerySnapshot {
         });
         let mut rows = Vec::with_capacity(scan.rows.len());
         for (key, value) in scan.rows {
-            if key.len() != bitcoin_rs_index::HASH_PREFIX_ROW_SIZE {
+            if key.len() != crate::HASH_PREFIX_ROW_SIZE {
                 return Err(IndexError::InvalidPrefixRowLength { len: key.len() });
             }
-            let prefix = key[..bitcoin_rs_index::HASH_PREFIX_LEN]
+            let prefix = key[..crate::HASH_PREFIX_LEN]
                 .try_into()
                 .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
-            let height = key
-                [bitcoin_rs_index::HASH_PREFIX_LEN..bitcoin_rs_index::HASH_PREFIX_ROW_SIZE]
+            let height = key[crate::HASH_PREFIX_LEN..crate::HASH_PREFIX_ROW_SIZE]
                 .try_into()
                 .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
             rows.push(TxIndexScanRow {
@@ -138,7 +137,7 @@ impl TxIndexSnapshot for QuerySnapshot {
         &self,
         scripthash: ScriptHash,
         _limit: PrefixScanLimit,
-    ) -> Result<bitcoin_rs_index::ScriptLiveScan, IndexError> {
+    ) -> Result<crate::ScriptLiveScan, IndexError> {
         assert!(
             self.chain_transition.try_lock().is_none(),
             "ScriptLive scan must run under chain-transition authority"
@@ -166,7 +165,7 @@ impl TxIndexSnapshot for QuerySnapshot {
                     .ok_or(IndexError::InvalidPrefixRowLength { len: key.len() })?,
             );
         }
-        Ok(bitcoin_rs_index::ScriptLiveScan {
+        Ok(crate::ScriptLiveScan {
             rows,
             encoded_bytes,
             complete: scan.complete,
@@ -359,9 +358,7 @@ impl QueryFixture {
             source
         });
         let block_source = IndexBlockSource::new(Arc::new(RwLock::new(
-            records
-                .into_iter()
-                .collect::<bitcoin_rs_rpc::context::BlockLog>(),
+            records.into_iter().collect::<crate::block_log::BlockLog>(),
         )));
         let engine = DerivedIndexQueryEngine::new(
             runtime,

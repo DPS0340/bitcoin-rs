@@ -13,13 +13,31 @@ workspace = true
 
 [features]
 default = []
-rocksdb = ["bitcoin-rs-storage/rocksdb"]
-fjall = ["bitcoin-rs-storage/fjall"]
-redb = ["bitcoin-rs-storage/redb"]
+rocksdb = [
+    "bitcoin-rs-storage/rocksdb",
+    "bitcoin-rs-chain/rocksdb",
+    "bitcoin-rs-utxo/rocksdb",
+]
+fjall = [
+    "bitcoin-rs-storage/fjall",
+    "bitcoin-rs-chain/fjall",
+    "bitcoin-rs-utxo/fjall",
+]
+redb = [
+    "bitcoin-rs-storage/redb",
+    "bitcoin-rs-chain/redb",
+    "bitcoin-rs-utxo/redb",
+]
 
 [dependencies]
 bitcoin-rs-primitives.workspace = true
 bitcoin-rs-storage = { workspace = true, default-features = false }
+bitcoin-rs-chain.workspace = true
+bitcoin-rs-utxo.workspace = true
+arc-swap.workspace = true
+compact_str.workspace = true
+crossbeam-channel.workspace = true
+rayon.workspace = true
 sha2.workspace = true
 bitcoin_slices.workspace = true
 hashbrown.workspace = true

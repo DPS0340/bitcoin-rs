@@ -2,12 +2,12 @@
 //!
 //! Protocol-facing types remain in node, not in the derived index crate.
 
-use bitcoin_rs_index::ScriptHash;
-use bitcoin_rs_primitives::{OutPoint, Tx, Txid};
-use bitcoin_rs_rpc::context::{
+use crate::ScriptHash;
+use crate::query_api::{
     DerivedIndexInfo, DerivedIndexQuery, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot,
     SpendingRecord, TxQueryError,
 };
+use bitcoin_rs_primitives::{OutPoint, Tx, Txid};
 
 use super::DerivedIndexQueryAdapter;
 

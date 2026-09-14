@@ -20,11 +20,11 @@ use crate::NodeConfig;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_index::BlockLog;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::Txid;
-use bitcoin_rs_rpc::context::BlockLog;
 use bitcoin_rs_rpc::context::NetworkState;
 use bitcoin_rs_rpc::context::PruneService;
 use bitcoin_rs_utxo::UtxoSet;
@@ -93,14 +93,15 @@ pub struct NodeState {
     block_body_store: Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore>,
     utxo: Arc<UtxoSet>,
     coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
-    derived_index_runtime: Option<Arc<crate::txindex::DerivedIndexRuntime>>,
+    derived_index_runtime: Option<Arc<bitcoin_rs_index::runtime::DerivedIndexRuntime>>,
     derived_index_spawn: Option<TxIndexSpawn>,
-    derived_index_worker: Option<crate::txindex::DerivedIndexWorker>,
-    derived_index_lifecycle: Option<Arc<arc_swap::ArcSwap<crate::txindex::DerivedIndexLifecycle>>>,
+    derived_index_worker: Option<bitcoin_rs_index::runtime::DerivedIndexWorker>,
+    derived_index_lifecycle:
+        Option<Arc<arc_swap::ArcSwap<bitcoin_rs_index::runtime::DerivedIndexLifecycle>>>,
     /// Stable query adapter for txindex/script-index, constructed before open.
-    derived_index_adapter: Option<Arc<crate::txindex::DerivedIndexQueryAdapter>>,
+    derived_index_adapter: Option<Arc<bitcoin_rs_index::runtime::DerivedIndexQueryAdapter>>,
     /// Live txindex facts for the RPC `getcapabilities` projection.
-    derived_index_status: Arc<crate::txindex::DerivedIndexCapability>,
+    derived_index_status: Arc<bitcoin_rs_index::runtime::DerivedIndexCapability>,
     prune_service: Option<Arc<dyn PruneService>>,
     zmq_publisher: Arc<dyn crate::ZmqPublisher>,
     mempool: Arc<RwLock<Mempool>>,

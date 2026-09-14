@@ -1,6 +1,6 @@
 # Index rollback-versus-rebuild cutover
 
-This document owns the rollback-versus-rebuild cutover for optional index capabilities. In the target node the runtime that applies it moves from `crates/node/src/txindex/rollback.rs` to `crates/index/src/runtime.rs` (T29); the node keeps only wiring. The current default `100_000` is a remeasurement baseline on the target storage and data distribution, not a settled end-state value.
+This document owns the rollback-versus-rebuild cutover for optional index capabilities. In the target node the runtime that applies it moves from `crates/index/src/runtime/rollback.rs` to `crates/index/src/runtime.rs` (T29); the node keeps only wiring. The current default `100_000` is a remeasurement baseline on the target storage and data distribution, not a settled end-state value.
 
 ## Cell it owns
 
@@ -55,7 +55,7 @@ Historical results are retained from the pre-rewrite document. Headings are demo
 
 ### Knob
 
-`txindex::DEFAULT_ROLLBACK_REBUILD_CUTOVER` (`crates/node/src/txindex.rs`), default
+`txindex::DEFAULT_ROLLBACK_REBUILD_CUTOVER` (`crates/index/src/runtime.rs`), default
 `100_000`.
 
 Decision rule implemented by the txindex worker (`reconcile_once`): for each
@@ -114,7 +114,7 @@ rounds to 100,000. With that default, the #208 834k-gap incident shape
 routes to rebuild and ≤ ~100-block organic reorgs continue to rewind. The
 routing rule itself (rewind at or below the cutover, rebuild above it) is
 exercised on small fork fixtures with explicit cutover values in
-`crates/node/src/txindex/recovery_tests.rs`. The per-block ratio does
+`crates/index/src/runtime/recovery_tests.rs`. The per-block ratio does
 not prove rebuild always scales better because total costs depend on tip
 height versus rollback depth.
 

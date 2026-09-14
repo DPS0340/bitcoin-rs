@@ -35,7 +35,7 @@ impl DerivedIndexQueryEngine {
         snapshot: &dyn TxIndexSnapshot,
         budget: &mut QueryBudget,
         scripthash: ScriptHash,
-    ) -> Result<Vec<bitcoin_rs_index::ScriptLiveRow>, TxQueryError> {
+    ) -> Result<Vec<crate::ScriptLiveRow>, TxQueryError> {
         let limit = budget.next_scan_limit()?;
         let scan: ScriptLiveScan = snapshot
             .live_rows(scripthash, limit)
