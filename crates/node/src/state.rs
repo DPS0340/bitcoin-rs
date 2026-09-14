@@ -243,8 +243,6 @@ impl NodeState {
         Arc::clone(&self.chain_tx_count)
     }
 
-    /// Shares the chain-transition mutex with the RPC layer.
-    ///
     /// Returns the shared block-records handle exposed to RPC handlers.
     #[must_use]
     pub fn blocks(&self) -> Arc<RwLock<BlockLog>> {
