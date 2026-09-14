@@ -12,6 +12,7 @@ use bitcoin_rs_rpc::context::PruneStatus;
 use bitcoin_rs_storage::FlatFileBlockStore;
 use bitcoin_rs_storage::KvStore;
 use bitcoin_rs_storage::StorageError;
+use bitcoin_rs_storage::pruning::PruneError;
 use hashbrown::HashMap;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -90,18 +91,15 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             durable_tip_height,
             updated_pruneheight,
             |pruned_below| {
-                let prune_candidates: Vec<(u32, bitcoin_rs_primitives::BlockHash, usize)> = {
+                let prune_candidates: Vec<(u32, bitcoin_rs_primitives::BlockHash)> = {
                     let blocks = self.blocks.read();
                     blocks
                         .iter()
                         .filter(|record| record.height < pruned_below && record.tx_count > 0)
-                        .map(|record| (record.height, record.hash, record.tx_count))
+                        .map(|record| (record.height, record.hash))
                         .collect()
                 };
-                for (height, hash, tx_count) in prune_candidates {
-                    if tx_count == 0 {
-                        continue;
-                    }
+                for (height, hash) in prune_candidates {
                     let bytes = self
                         .block_body_store
                         .load_block_body(height, hash.0)?
@@ -119,12 +117,12 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
                 Ok(())
             },
         )
-        .map_err(|err| {
-            let message = err.to_string();
-            let message = message
-                .strip_prefix("invalid operation: ")
-                .unwrap_or(&message);
-            PruneServiceError::failed(message)
+        .map_err(|err| match err {
+            // The reorg-margin/overflow refusals are operator-facing RPC text; pass them through verbatim.
+            PruneError::Storage(StorageError::InvalidOperation(message)) => {
+                PruneServiceError::failed(message)
+            }
+            other => PruneServiceError::failed(other.to_string()),
         })?;
 
         if !pruned_txids.is_empty() {
