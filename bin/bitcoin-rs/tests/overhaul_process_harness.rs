@@ -69,6 +69,8 @@ fn replacement_signaling_differs_from_pinned_core() {
     use bitcoin::Sequence;
     use bitcoin::consensus::encode::serialize_hex;
 
+    // Pin the public RPC text independently of RbfError::Display so an
+    // accidental wire-contract change remains observable in this process test.
     const REJECTION: &str = "BIP125 rule 1: an original transaction does not opt in";
 
     for signals in [false, true] {
