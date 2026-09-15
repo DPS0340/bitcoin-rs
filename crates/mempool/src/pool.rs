@@ -565,7 +565,7 @@ pub struct MempoolChunk {
     /// Snapshot entry positions, in dependency order.
     pub indices: Vec<usize>,
     /// Modified fees used for ordering, including local prioritisation.
-    pub modified_fee: i64,
+    pub modified_fee: i128,
     /// Exact policy weight used in the fee-rate denominator.
     pub policy_weight: u32,
 }
@@ -582,7 +582,7 @@ impl MempoolMiningSnapshot {
                 let weight =
                     crate::accounting::charged_weight(entry.weight, entry.vsize, entry.sigop_cost);
                 Ok(crate::fee_diagram::FeeWeight {
-                    fee: i64::try_from(fee).map_err(|_| crate::FeeDiagramError::Arithmetic)?,
+                    fee,
                     weight: u32::try_from(weight).map_err(|_| crate::FeeDiagramError::Weight)?,
                 })
             })
@@ -747,7 +747,7 @@ impl Mempool {
         }
         let required = crate::rbf::required_fee(min_rate, entry.vsize)
             .map_err(|_| PolicyError::FeeArithmetic)?;
-        if entry.modified_fee() < i128::from(required) {
+        if entry.modified_fee() < required {
             let modified_rate = entry.modified_fee() * 1_000 / i128::from(entry.vsize);
             return Err(PolicyError::BelowMinRelayFee {
                 tx_rate: u64::try_from(modified_rate).unwrap_or(0),
@@ -2417,23 +2417,6 @@ impl Mempool {
         u32::try_from(ancestors.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1)
-    }
-
-    /// Checks the candidate's projected cluster after the named evictions.
-    /// Ancestor and descendant aggregates remain query metadata, not separate
-    /// admission caps under the Core 31.1 cluster policy.
-    pub fn check_package_limits(
-        &self,
-        tx: &Tx,
-        vsize: u32,
-        excluded: &HashSet<EntryId>,
-    ) -> Result<(), PolicyError> {
-        self.check_cluster_limits(
-            tx,
-            crate::accounting::charged_weight(tx.weight(), vsize, 0),
-            excluded,
-        )?;
-        Ok(())
     }
 
     fn entry_mut(&mut self, id: EntryId) -> Option<&mut MempoolEntry> {
@@ -4910,7 +4893,7 @@ mod spend_index_tests {
     /// Ancestor and descendant limits are lifted so only the cluster check
     /// can refuse.
     #[test]
-    fn check_package_limits_rejects_a_cluster_only_violation() {
+    fn replacement_preview_rejects_a_cluster_only_violation() {
         let confirmed = OutPoint::new(txid_of([23_u8; 32]), 0);
         let root = tx_with(&[confirmed], 3, 1);
         let root_txid = root.txid();
@@ -4930,10 +4913,19 @@ mod spend_index_tests {
         }
 
         let child_c = tx_with(&[OutPoint::new(root_txid, 2)], 1, 4);
-        let excluded: HashSet<EntryId> = HashSet::new();
-        let preview = pool.check_package_limits(&child_c, 100, &excluded);
+        let preview = pool.check_replacement(&crate::ReplacementCandidate::new(
+            Arc::new(child_c.clone()),
+            100,
+            10_000,
+            1_000,
+        ));
         assert!(
-            matches!(preview, Err(PolicyError::ClusterCountLimit)),
+            matches!(
+                preview,
+                Err(crate::RbfError::Mempool(MempoolError::Policy(
+                    PolicyError::ClusterCountLimit
+                )))
+            ),
             "the preview must reject a cluster-only violation: {preview:?}"
         );
 
@@ -4946,7 +4938,7 @@ mod spend_index_tests {
             "admission must reject on cluster count: {admission:?}"
         );
         assert_eq!(
-            preview.map_err(MempoolError::from).err(),
+            preview.map_err(crate::RbfError::into_pool_error).err(),
             admission.err(),
             "preview and admission must reject on the same error"
         );
@@ -4956,7 +4948,7 @@ mod spend_index_tests {
     /// admission does, or `testmempoolaccept` and `sendrawtransaction`
     /// disagree on a replacement into a full cluster.
     #[test]
-    fn check_package_limits_excludes_a_replacement_s_evictions() {
+    fn replacement_preview_excludes_planned_evictions() {
         let confirmed = OutPoint::new(txid_of([27_u8; 32]), 0);
         let root = tx_with(&[confirmed], 2, 1);
         let root_txid = root.txid();
@@ -4981,18 +4973,21 @@ mod spend_index_tests {
             panic!("A must be in the pool");
         };
         let replacement = tx_with(&[OutPoint::new(root_txid, 0)], 1, 4);
-        let mut excluded = HashSet::new();
-        excluded.insert(a_id);
-
-        let preview = pool.check_package_limits(&replacement, 100, &excluded);
-        assert!(
-            preview.is_ok(),
-            "preview must project the post-eviction cluster: {preview:?}"
-        );
+        let preview = pool
+            .check_replacement(&crate::ReplacementCandidate::new(
+                Arc::new(replacement.clone()),
+                100,
+                20_000,
+                1_000,
+            ))
+            .expect("replacement preview excludes its victim");
+        assert_eq!(preview.evicted, vec![a_id]);
+        assert_eq!(pool.tx_count(), 3, "preview does not mutate");
         assert_eq!(
-            pool.check_package_limits(&replacement, 100, &HashSet::new()),
-            Err(PolicyError::ClusterCountLimit),
-            "without the exclusion the same replacement is over the limit"
+            pool.insert_entry(MempoolEntry::new(Arc::new(replacement), 100, 20_000, 1, 7))
+                .err(),
+            Some(MempoolError::Policy(PolicyError::ClusterCountLimit)),
+            "ordinary insertion cannot grow this full cluster"
         );
     }
 
@@ -5671,10 +5666,16 @@ mod graph_tests {
         assert!(!pool.contains_txid(&joiner.txid()));
 
         // The acceptance preview quotes the same verdict.
-        let excluded: HashSet<EntryId> = HashSet::new();
         assert!(matches!(
-            pool.check_package_limits(&joiner, 100, &excluded),
-            Err(PolicyError::ClusterCountLimit)
+            pool.check_replacement(&crate::ReplacementCandidate::new(
+                Arc::new(joiner),
+                100,
+                1_000,
+                1_000
+            )),
+            Err(crate::RbfError::Mempool(MempoolError::Policy(
+                PolicyError::ClusterCountLimit
+            )))
         ));
 
         // A candidate inside the limit is admitted through the same path.

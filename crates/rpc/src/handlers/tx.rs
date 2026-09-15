@@ -787,9 +787,8 @@ fn parse_btc_amount(value: &Value) -> Result<u64, RpcError> {
 /// `MaxFeeExceeded` is a parameter error (`-32602`), pinned by the
 /// policy-contract integration test. All other admission rejections are
 /// transaction rejections (`-26`), matching Bitcoin Core's
-/// `RPC_VERIFY_REJECTED` code. The string for `MinRelayFeeNotMet` uses
-/// the frozen hyphenated form `min relay fee not met`, not the mempool's
-/// Display.
+/// `RPC_VERIFY_REJECTED` code. Both typed cluster-limit failures map to
+/// Core's public `too-large-cluster` reason.
 fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
     match reason {
         AcceptanceRejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
@@ -798,8 +797,8 @@ fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
 }
 
 /// Maps an [`AcceptanceRejectReason`] to the frozen RPC reject-reason string.
-/// Every variant matches the mempool's `Display` except `MinRelayFeeNotMet`,
-/// which uses the frozen hyphenated form.
+/// Cluster count and weight failures share Core's `too-large-cluster` reason;
+/// other variants use the mempool owner's public policy reason.
 fn reject_reason_to_frozen_string(reason: AcceptanceRejectReason) -> String {
     match reason {
         AcceptanceRejectReason::PackageLimit(

@@ -4,8 +4,8 @@
 //! rate. Parametric min-cuts find the highest-rate set without enumerating
 //! subsets. This module owns no transactions or mutable mempool state.
 
-use core::cmp::Ordering;
-use std::collections::VecDeque;
+use core::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, VecDeque};
 
 use thiserror::Error;
 
@@ -27,7 +27,7 @@ pub enum FeeDiagramError {
 /// to virtual bytes; using rounded vsize changes comparisons for witnesses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FeeWeight {
-    pub fee: i64,
+    pub fee: i128,
     pub weight: u32,
 }
 
@@ -40,18 +40,21 @@ impl FeeWeight {
         if i32::try_from(weight).is_err() {
             return Err(FeeDiagramError::Weight);
         }
-        Ok(Self {
-            fee: self
-                .fee
-                .checked_add(other.fee)
-                .ok_or(FeeDiagramError::Arithmetic)?,
-            weight,
-        })
+        let fee = self
+            .fee
+            .checked_add(other.fee)
+            .ok_or(FeeDiagramError::Arithmetic)?;
+        // All later rate comparisons multiply by a positive i32-sized weight.
+        // This covers every u64 base fee plus i64 overlay in a representable
+        // graph, and rejects synthetic wider facts before an infallible sort.
+        fee.checked_mul(i128::from(i32::MAX))
+            .ok_or(FeeDiagramError::Arithmetic)?;
+        Ok(Self { fee, weight })
     }
 
     pub(crate) fn rate_cmp(self, other: Self) -> Ordering {
-        (i128::from(self.fee) * i128::from(other.weight))
-            .cmp(&(i128::from(other.fee) * i128::from(self.weight)))
+        // validate/checked_add establish the product bound before sorting.
+        (self.fee * i128::from(other.weight)).cmp(&(other.fee * i128::from(self.weight)))
     }
 }
 
@@ -149,6 +152,7 @@ fn validate(fees: &[FeeWeight], parents: &[Vec<usize>]) -> Result<(), FeeDiagram
         if fee.weight == 0 || i32::try_from(fee.weight).is_err() {
             return Err(FeeDiagramError::Weight);
         }
+        FeeWeight::default().checked_add(*fee)?;
         if ancestors
             .iter()
             .any(|&parent| parent >= fees.len() || parent == index)
@@ -162,21 +166,48 @@ fn validate(fees: &[FeeWeight], parents: &[Vec<usize>]) -> Result<(), FeeDiagram
     Ok(())
 }
 
-fn topological(parents: &[Vec<usize>], members: &[usize]) -> Result<Vec<usize>, FeeDiagramError> {
-    let mut remaining = vec![false; parents.len()];
+/// Stable topological order, preferring the supplied order among ready nodes.
+/// Shared by linearization and mutation publication; no quadratic rescanning.
+pub(crate) fn topological(
+    parents: &[Vec<usize>],
+    members: &[usize],
+) -> Result<Vec<usize>, FeeDiagramError> {
+    let mut rank = vec![usize::MAX; parents.len()];
+    for (index, &member) in members.iter().enumerate() {
+        let slot = rank.get_mut(member).ok_or(FeeDiagramError::Dependencies)?;
+        if *slot != usize::MAX {
+            return Err(FeeDiagramError::Dependencies);
+        }
+        *slot = index;
+    }
+    let mut children = vec![Vec::new(); parents.len()];
+    let mut incoming = vec![0_usize; parents.len()];
+    let mut ready = BinaryHeap::new();
     for &member in members {
-        remaining[member] = true;
+        for &parent in &parents[member] {
+            let parent_rank = *rank.get(parent).ok_or(FeeDiagramError::Dependencies)?;
+            if parent_rank != usize::MAX {
+                incoming[member] += 1;
+                children[parent].push(member);
+            }
+        }
+        if incoming[member] == 0 {
+            ready.push(Reverse(rank[member]));
+        }
     }
     let mut ordered = Vec::with_capacity(members.len());
-    while ordered.len() < members.len() {
-        let next = members.iter().copied().find(|&member| {
-            remaining[member] && parents[member].iter().all(|&parent| !remaining[parent])
-        });
-        let Some(next) = next else {
-            return Err(FeeDiagramError::Dependencies);
-        };
-        remaining[next] = false;
-        ordered.push(next);
+    while let Some(Reverse(index)) = ready.pop() {
+        let member = members[index];
+        ordered.push(member);
+        for &child in &children[member] {
+            incoming[child] -= 1;
+            if incoming[child] == 0 {
+                ready.push(Reverse(rank[child]));
+            }
+        }
+    }
+    if ordered.len() != members.len() {
+        return Err(FeeDiagramError::Dependencies);
     }
     Ok(ordered)
 }
@@ -370,8 +401,17 @@ fn closure(
         if !remaining[index] {
             continue;
         }
-        let gain = i128::from(fee.fee) * i128::from(rate.weight)
-            - i128::from(fee.weight) * i128::from(rate.fee);
+        let candidate_value = fee
+            .fee
+            .checked_mul(i128::from(rate.weight))
+            .ok_or(FeeDiagramError::Arithmetic)?;
+        let threshold = rate
+            .fee
+            .checked_mul(i128::from(fee.weight))
+            .ok_or(FeeDiagramError::Arithmetic)?;
+        let gain = candidate_value
+            .checked_sub(threshold)
+            .ok_or(FeeDiagramError::Arithmetic)?;
         if gain > 0 {
             let gain = gain.unsigned_abs();
             positive = positive
@@ -408,17 +448,25 @@ fn points(chunks: &[FeeWeight]) -> Result<Vec<FeeWeight>, FeeDiagramError> {
     Ok(result)
 }
 
-fn value_at(points: &[FeeWeight], at: u32) -> (i128, i128) {
+fn value_at(points: &[FeeWeight], at: u32) -> Result<(i128, i128), FeeDiagramError> {
     let end = points.partition_point(|point| point.weight <= at);
     if end == points.len() {
-        return (i128::from(points[end - 1].fee), 1);
+        return Ok((points[end - 1].fee, 1));
     }
     let start = points[end - 1];
     let stop = points[end];
     let span = i128::from(stop.weight - start.weight);
-    let fee = i128::from(start.fee) * span
-        + (i128::from(stop.fee) - i128::from(start.fee)) * i128::from(at - start.weight);
-    (fee, span)
+    let base = start
+        .fee
+        .checked_mul(span)
+        .ok_or(FeeDiagramError::Arithmetic)?;
+    let rise = stop
+        .fee
+        .checked_sub(start.fee)
+        .and_then(|delta| delta.checked_mul(i128::from(at - start.weight)))
+        .ok_or(FeeDiagramError::Arithmetic)?;
+    let fee = base.checked_add(rise).ok_or(FeeDiagramError::Arithmetic)?;
+    Ok((fee, span))
 }
 
 /// Pointwise comparison, including horizontal tails. Crossing curves are
@@ -432,8 +480,8 @@ pub(crate) fn compare(
     let mut higher = false;
     let mut lower = false;
     for point in left.iter().chain(&right).skip(1) {
-        let (left_fee, left_span) = value_at(&left, point.weight);
-        let (right_fee, right_span) = value_at(&right, point.weight);
+        let (left_fee, left_span) = value_at(&left, point.weight)?;
+        let (right_fee, right_span) = value_at(&right, point.weight)?;
         let left_scaled = left_fee
             .checked_mul(right_span)
             .ok_or(FeeDiagramError::Arithmetic)?;

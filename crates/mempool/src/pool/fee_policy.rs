@@ -46,30 +46,26 @@ pub(crate) struct PolicyChunk {
 }
 
 impl PolicyGraph {
-    pub(crate) fn removal_order(
-        &self,
-        selected: &HashSet<EntryId>,
-    ) -> Result<Vec<EntryId>, RbfError> {
-        let mut remaining: HashSet<usize> = self
+    pub(crate) fn removal_order(&self, priority: &[EntryId]) -> Result<Vec<EntryId>, RbfError> {
+        let positions: HashMap<_, _> = self
             .nodes
             .iter()
             .enumerate()
-            .filter_map(|(index, node)| node.id.filter(|id| selected.contains(id)).map(|_| index))
+            .filter_map(|(index, node)| node.id.map(|id| (id, index)))
             .collect();
-        let mut ordered = Vec::with_capacity(remaining.len());
-        while !remaining.is_empty() {
-            let next = (0..self.nodes.len())
-                .find(|index| {
-                    remaining.contains(index)
-                        && self.parents[*index]
-                            .iter()
-                            .all(|parent| !remaining.contains(parent))
-                })
-                .ok_or(RbfError::InconsistentGraph)?;
-            remaining.remove(&next);
-            ordered.push(self.nodes[next].id.ok_or(RbfError::InconsistentGraph)?);
-        }
-        Ok(ordered)
+        let members = priority
+            .iter()
+            .map(|id| {
+                positions
+                    .get(id)
+                    .copied()
+                    .ok_or(RbfError::InconsistentGraph)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        fee_diagram::topological(&self.parents, &members)?
+            .into_iter()
+            .map(|index| self.nodes[index].id.ok_or(RbfError::InconsistentGraph))
+            .collect()
     }
 
     pub(crate) fn affected_diagram(&self, chunks: &[PolicyChunk]) -> Vec<FeeWeight> {
@@ -81,20 +77,12 @@ impl PolicyGraph {
     }
     pub(crate) fn check_limits(&self, limits: MempoolLimits) -> Result<(), RbfError> {
         for members in fee_diagram::components(&self.parents)? {
-            if u32::try_from(members.len()).map_or(true, |count| count > limits.cluster_count) {
-                return Err(PolicyError::ClusterCountLimit.into());
-            }
+            let count = u32::try_from(members.len()).map_err(|_| PolicyError::ClusterCountLimit)?;
             let weight = members.iter().try_fold(0_u64, |sum, &node| {
                 sum.checked_add(u64::from(self.nodes[node].value.weight))
                     .ok_or(RbfError::ArithmeticOverflow)
             })?;
-            let limit = limits
-                .cluster_size_vbytes
-                .checked_mul(4)
-                .ok_or(RbfError::ArithmeticOverflow)?;
-            if weight > limit {
-                return Err(PolicyError::ClusterSizeLimit.into());
-            }
+            super::cluster_within_limits(count, weight, &limits)?;
         }
         Ok(())
     }
@@ -123,9 +111,9 @@ pub(crate) fn policy_weight(wire_weight: u64, vsize: u32, sigops: u32) -> Result
 }
 
 impl Mempool {
-    pub(crate) fn modified_fee_for(&self, txid: Txid, base_fee: u64) -> Result<i64, RbfError> {
-        let base = i64::try_from(base_fee).map_err(|_| RbfError::ArithmeticOverflow)?;
-        base.checked_add(self.fee_deltas.get(&txid).copied().unwrap_or(0))
+    pub(crate) fn modified_fee_for(&self, txid: Txid, base_fee: u64) -> Result<i128, RbfError> {
+        i128::from(base_fee)
+            .checked_add(i128::from(self.fee_deltas.get(&txid).copied().unwrap_or(0)))
             .ok_or(RbfError::ArithmeticOverflow)
     }
     pub(crate) fn policy_stamp(&self) -> PolicyStamp {
@@ -199,8 +187,7 @@ impl Mempool {
         let mut before = PolicyGraph::default();
         for &id in &members {
             let entry = self.entry(id).ok_or(RbfError::InconsistentGraph)?;
-            let fee =
-                i64::try_from(entry.modified_fee()).map_err(|_| RbfError::ArithmeticOverflow)?;
+            let fee = entry.modified_fee();
             before.nodes.push(GraphNode {
                 id: Some(id),
                 txid: entry.txid,

@@ -179,6 +179,9 @@ fn weight_size_and_sigop_limits_are_independent() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+// POL-05/06: one fee chunk is indivisible, and its positive unconfirmed
+// BIP68 lock is not final at the next block. The valid parent cannot be
+// retried separately after the whole child-parent chunk is skipped.
 #[test]
 fn bip68_unmet_unconfirmed_parent_package_is_skipped() -> Result<(), Box<dyn Error>> {
     let parent = snapshot_entry(Arc::new(independent_tx(1)), 1_000, 0, 400, 100, 0, vec![]);
@@ -214,6 +217,10 @@ fn bip68_unmet_lock_is_ignored_when_csv_is_inactive() -> Result<(), Box<dyn Erro
     Ok(())
 }
 
+// POL-05: CandidateContext resource limits apply to a complete fee chunk.
+// Exact configured limits fit; one excess unit skips both child and parent.
+// Core 31.1 node/miner.cpp::addChunks likewise calls SkipBuilderChunk after
+// TestChunkBlockLimits, rather than extracting a parent from the failed chunk.
 #[test]
 fn exact_resource_limits_accept_dependency_closed_package() -> Result<(), Box<dyn Error>> {
     let payout = vec![0x51];
@@ -402,7 +409,7 @@ fn non_final_packages_are_skipped() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn missing_ancestors_fail_assembly_without_rechecking_the_dag() {
+fn malformed_graph_snapshots_fail_with_typed_owner_errors() {
     let missing = MempoolMiningSnapshot {
         sequence: 1,
         entries: vec![snapshot_entry(
@@ -420,7 +427,9 @@ fn missing_ancestors_fail_assembly_without_rechecking_the_dag() {
         Err(MiningError::MissingAncestor { .. })
     ));
 
-    // The mempool owner's graph projection rejects cyclic snapshot facts.
+    // POL-05 requires an admitted dependency DAG. The graph owner rejects
+    // these forged cyclic facts with Dependencies instead of fabricating a
+    // valid transaction order; mining propagates that same typed failure.
     let cyclic = MempoolMiningSnapshot {
         sequence: 2,
         entries: vec![

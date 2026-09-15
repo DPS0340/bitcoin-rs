@@ -180,7 +180,7 @@ fn modified_fees_and_small_relay_charges_are_enforced() -> Result<(), Box<dyn st
 }
 
 #[test]
-fn an_evicted_dependency_and_unrepresentable_fees_fail_before_mutation()
+fn an_evicted_dependency_fails_without_narrowing_representable_fees()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut pool = pool();
     let original = spend(1, &[coin(100)], 1);
@@ -195,10 +195,10 @@ fn an_evicted_dependency_and_unrepresentable_fees_fail_before_mutation()
         pool.check_replacement(&dependent).err(),
         Some(RbfError::Mempool(MempoolError::EvictedParent))
     );
-    let overflow = candidate(spend(3, &[coin(100)], 1), u64::MAX);
-    assert_eq!(
-        pool.check_replacement(&overflow).err(),
-        Some(RbfError::ArithmeticOverflow)
+    let wide = candidate(spend(3, &[coin(100)], 1), u64::MAX);
+    assert!(
+        pool.check_replacement(&wide).is_ok(),
+        "u64 fee metadata remains representable in the checked i128 diagram"
     );
     assert_eq!(pool.sequence_number(), before);
     assert!(pool.contains_txid(&original_id));

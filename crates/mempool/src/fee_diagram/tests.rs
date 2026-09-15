@@ -1,6 +1,6 @@
 use super::*;
 
-fn values(rows: &[(i64, u32)]) -> Vec<FeeWeight> {
+fn values(rows: &[(i128, u32)]) -> Vec<FeeWeight> {
     rows.iter()
         .map(|&(fee, weight)| FeeWeight { fee, weight })
         .collect()
@@ -113,6 +113,21 @@ fn negative_parent_and_independent_competitor() -> Result<(), FeeDiagramError> {
 }
 
 #[test]
+fn signed_priority_extremes_preserve_one_satoshi_and_parent_cancellation()
+-> Result<(), FeeDiagramError> {
+    let maximum = i128::from(i64::MAX);
+    let before = values(&[(maximum + 1_000, 400)]);
+    let after = values(&[(maximum + 1_001, 400)]);
+    assert_eq!(compare(&after, &before)?, Some(Ordering::Greater));
+    let fees = values(&[(i128::from(i64::MIN) + 1_000, 400), (maximum + 2_000, 400)]);
+    let chunks = linearize(&fees, &[vec![], vec![0]])?;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].members, vec![0, 1]);
+    assert_eq!(chunks[0].total.fee, 2_999);
+    Ok(())
+}
+
+#[test]
 fn invalid_graphs_and_arithmetic_fail_explicitly() {
     assert_eq!(
         linearize(&values(&[(1, 0)]), &[vec![]]),
@@ -127,7 +142,7 @@ fn invalid_graphs_and_arithmetic_fail_explicitly() {
         Err(FeeDiagramError::Dependencies)
     );
     assert_eq!(
-        linearize(&values(&[(i64::MAX, 1), (1, 1)]), &[vec![], vec![]]),
+        linearize(&values(&[(i128::MAX, 1), (1, 1)]), &[vec![], vec![]]),
         Err(FeeDiagramError::Arithmetic)
     );
     assert_eq!(
@@ -135,7 +150,7 @@ fn invalid_graphs_and_arithmetic_fail_explicitly() {
         Err(FeeDiagramError::Weight)
     );
     assert_eq!(
-        compare(&values(&[(i64::MAX, 1), (1, 1)]), &[]),
+        compare(&values(&[(i128::MAX, 1), (1, 1)]), &[]),
         Err(FeeDiagramError::Arithmetic)
     );
 }
@@ -179,7 +194,7 @@ fn chunks_match_exhaustive_closed_subsets() -> Result<(), FeeDiagramError> {
         for _ in 0..80 {
             let fees: Vec<_> = (0..nodes)
                 .map(|_| FeeWeight {
-                    fee: i64::try_from(next(&mut seed) % 301).unwrap_or(0) - 100,
+                    fee: i128::from(next(&mut seed) % 301) - 100,
                     weight: u32::try_from(next(&mut seed) % 31 + 1).unwrap_or(1),
                 })
                 .collect();
@@ -217,11 +232,10 @@ fn chunks_match_exhaustive_closed_subsets() -> Result<(), FeeDiagramError> {
                     {
                         continue;
                     }
-                    let fee: i128 = members.iter().map(|&i| i128::from(fees[i].fee)).sum();
+                    let fee: i128 = members.iter().map(|&i| fees[i].fee).sum();
                     let weight: i128 = members.iter().map(|&i| i128::from(fees[i].weight)).sum();
                     assert!(
-                        fee * i128::from(chunk.total.weight)
-                            <= i128::from(chunk.total.fee) * weight,
+                        fee * i128::from(chunk.total.weight) <= chunk.total.fee * weight,
                         "nonoptimal chunk {chunk:?}; subset {subset:b}; fees {fees:?}; parents {parents:?}"
                     );
                 }

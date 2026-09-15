@@ -60,7 +60,7 @@ its accepted-before-capacity-removals event order.
 | Fee floors | Minimum relay uses modified fees and the integer relay charge. The pressure heuristic differs from Core (§5). | Both-RPC floor tests and process prioritisation |
 | Sigops | Gateway computes BIP141 cost from resolved outputs; at most 16,000. Policy weight is `max(wire_weight, sigops * 20)`, and policy vsize is its ceiling divided by four. | Independent rust-bitcoin accounting tests and admission boundaries |
 | Finality | Absolute locktime at tip+1; BIP68 uses confirmed height/MTP, unconfirmed parents at the next block, gated on CSV; coinbase depth at least 100. | `policy_contract`, `admission`, gateway tests |
-| Maximum fee | Caller maximum is checked only after successful policy/script verification. | Both-RPC precedence tests |
+| Maximum fee | After successful policy/script verification, base fee is compared to the integer charge at the caller rate and actual vsize; a zero charge disables the guard. | Both-RPC precedence tests and signed 1 sat maximum-fee boundary |
 
 The raw trusted pool API accepts caller-provided policy vsize. If it does not
 match resolved weight, the raw fixture is charged at `vsize * 4`. Production
@@ -118,6 +118,7 @@ Run the production comparisons with the exact pinned binary supplied through
 cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_process_harness policy_cases:: -- --nocapture
 cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_process_harness replacement_signaling_matches_pinned_core -- --exact --nocapture
 cargo test --locked -p bitcoin-rs-mempool -p bitcoin-rs-mining -p bitcoin-rs-rpc
+cargo test --locked -p bitcoin-rs-mining --test overhaul_resource_bounds -- --nocapture
 bash scripts/ci-pr.sh clippy
 ```
 
@@ -127,3 +128,7 @@ skipping. Mathematical vectors are in `fee_diagram/tests.rs`; exact graph/TRUC
 boundaries are in `replacement_profile` and `graph_limits`; package shape,
 ephemeral spending and fee-only invalidation are in `package::tests`.
 No throughput, latency or default promotion follows from these correctness tests.
+
+The scoped CL-14 graph-resource capture emits RSS/retained-byte samples and
+source digests into the same CI artifact directory. Its synthetic admitted
+chains and one-pass times do not establish a product performance baseline.

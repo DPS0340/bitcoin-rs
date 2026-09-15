@@ -138,7 +138,7 @@ impl RbfError {
 
 /// Core `CFeeRate::GetFee`: truncate the product, but charge at least one
 /// satoshi for nonempty relay at a positive rate. No saturated fee can pass.
-pub(crate) fn required_fee(rate: u64, vsize: u32) -> Result<i64, RbfError> {
+pub(crate) fn required_fee(rate: u64, vsize: u32) -> Result<i128, RbfError> {
     let fee = u128::from(rate)
         .checked_mul(u128::from(vsize))
         .ok_or(RbfError::ArithmeticOverflow)?
@@ -148,7 +148,7 @@ pub(crate) fn required_fee(rate: u64, vsize: u32) -> Result<i64, RbfError> {
     } else {
         fee
     };
-    i64::try_from(fee).map_err(|_| RbfError::ArithmeticOverflow)
+    i128::try_from(fee).map_err(|_| RbfError::ArithmeticOverflow)
 }
 
 pub(crate) struct ReplacementInputs {
@@ -200,6 +200,8 @@ impl ReplacementInputs {
             }
         }
         let mut removed = self.evicted.clone();
+        let mut removal_priority: Vec<_> = self.evicted.iter().copied().collect();
+        removal_priority.sort_unstable();
         let mut size = self.projected_vsize;
         if needs_trim {
             for chunk in after_chunks.iter().rev() {
@@ -219,6 +221,7 @@ impl ReplacementInputs {
                     let node = &after_graph.nodes[member];
                     let id = node.id.ok_or(RbfError::InconsistentGraph)?;
                     if removed.insert(id) {
+                        removal_priority.push(id);
                         size = size
                             .checked_sub(u64::from(node.vsize))
                             .ok_or(RbfError::ArithmeticOverflow)?;
@@ -229,7 +232,7 @@ impl ReplacementInputs {
                 return Err(MempoolError::Full.into());
             }
         }
-        let order = before_graph.removal_order(&removed)?;
+        let order = before_graph.removal_order(&removal_priority)?;
         let removals = order
             .into_iter()
             .map(|id| {
@@ -293,8 +296,8 @@ impl Mempool {
         incremental_fee_rate: u64,
         sibling_eviction: bool,
     ) -> Result<ReplacementInputs, RbfError> {
-        if u32::try_from(self.conflicting_cluster_count(&conflicts)?)
-            .map_or(true, |count| count > self.limits.max_replacement_clusters)
+        if !u32::try_from(self.conflicting_cluster_count(&conflicts)?)
+            .is_ok_and(|count| count <= self.limits.max_replacement_clusters)
         {
             return Err(if sibling_eviction {
                 RbfError::TooManySiblingConflictingClusters
@@ -309,14 +312,12 @@ impl Mempool {
         };
         if !conflicts.is_empty() {
             let modified_fee = self.modified_fee_for(entry.txid, entry.fee)?;
-            let fees = evicted.iter().try_fold(0_i64, |total, &id| {
+            let fees = evicted.iter().try_fold(0_i128, |total, &id| {
                 let fee = self
                     .entry(id)
                     .ok_or(RbfError::InconsistentGraph)?
                     .modified_fee();
-                total
-                    .checked_add(i64::try_from(fee).map_err(|_| RbfError::ArithmeticOverflow)?)
-                    .ok_or(RbfError::ArithmeticOverflow)
+                total.checked_add(fee).ok_or(RbfError::ArithmeticOverflow)
             })?;
             if modified_fee < fees {
                 return Err(if sibling_eviction {

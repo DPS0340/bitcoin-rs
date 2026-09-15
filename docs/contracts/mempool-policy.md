@@ -46,7 +46,8 @@ is checked against its status and rationale.
   but invalidate prepared graphs and contextual rejection-cache entries.
 - Standardness, available inputs, sigop limits, modified fee floors, next-block
   finality and graph policy precede scripts. The caller maximum fee guard runs
-  only after successful admission verification. An invalid transaction cannot
+  only after successful admission verification, comparing the base fee to
+  `CFeeRate::GetFee(vsize)` rather than a rounded rate quote. An invalid transaction cannot
   select a more convenient maximum-fee error.
 - A verified plan carries prepared insertion and ordered removals. The writer
   rechecks its stamp before any mutation. Capacity refusal, stale preparation
@@ -70,7 +71,10 @@ is checked against its status and rationale.
 - Signaling and the old new-unconfirmed-input restriction do not gate replacement.
   At most 100 distinct direct-conflict clusters are considered. Victims include
   every descendant, and the candidate must not spend an evicted dependency.
-- Modified fees, including priority deltas, cover all victims plus the integer
+- Modified fees retain the existing signed i128 representation of a u64 base
+  fee plus i64 prioritisation. Large legal priority overlays cannot disable
+  template construction, and only actual fees contribute to the coinbase.
+  Modified fees, including priority deltas, cover all victims plus the integer
   incremental relay charge. Exact checked arithmetic rejects an unrepresentable
   fee/weight. Equality or crossing of complete affected fee diagrams rejects;
   surviving relatives and newly joined clusters participate in the comparison.
@@ -79,6 +83,13 @@ is checked against its status and rationale.
   replacement, mining and eviction. No mutable alternate graph or persistent
   chunk representation is added. Solver work is bounded by the captured node
   and edge counts; each cluster follows its configured count/weight bounds.
+- Mining treats every derived fee chunk as indivisible. If its finality,
+  weight, serialized-size or sigop check fails, all members are skipped and
+  dependent later chunks remain unavailable. The configured candidate limits
+  are inclusive. Invalid or cyclic snapshot references produce typed owner
+  errors, never a fabricated order. Core 31.1 `node/miner.cpp::addChunks`
+  supplies the independent reference for whole-chunk skipping; local configured
+  limits and BIP68 checks follow this contract and POL-06.
 - Core's bounded, history-dependent SFL work behavior is intentionally not
   emulated. The exact solver and its independently checked arithmetic do not
   prove Core parity in non-optimal transient states. This difference remains

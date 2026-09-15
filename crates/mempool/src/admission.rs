@@ -1846,7 +1846,11 @@ mod tests {
             gateway.preview_transactions(&[(*tx).clone()], None, &chain),
             Err(SubmitError::RetryExhausted)
         );
-        assert_eq!(chain.reads.load(Ordering::SeqCst), MAX_ADMISSION_RETRIES);
+        assert_eq!(
+            chain.reads.load(Ordering::SeqCst),
+            4,
+            "POL-03/CL-15 pins four attempts independently of the loop constant"
+        );
         assert!(gateway.read().is_empty());
         Ok(())
     }

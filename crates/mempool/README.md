@@ -24,7 +24,7 @@ rather than fabricating when history is thin.
 Mempool behavioral contracts are defined in `docs/contracts/`:
 
 - **Mutation gateway and ordering**: Gateway serialization, atomic `MutationResult` records, per-change sequence assignments, and generation-validated admission/retry follow [`docs/contracts/mempool-mutations.md`](../../docs/contracts/mempool-mutations.md) (`MPL-01`, `MPL-02`, `MPL-04`).
-- **Relay standardness and policy**: Admission checks, limits, Core 31.1 replacement rules, and eviction ranking follow [`docs/contracts/mempool-policy.md`](../../docs/contracts/mempool-policy.md) (`POL-01`).
+- **Relay standardness and policy**: Admission checks, limits, Core 31.1 replacement rules, and eviction ranking follow [`docs/contracts/mempool-policy.md`](../../docs/contracts/mempool-policy.md) (`POL-01`, `POL-05`).
 
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the
 project vocabulary.

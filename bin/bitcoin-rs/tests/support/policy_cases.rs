@@ -415,4 +415,47 @@ fn cluster_limit_fee_increment_and_prioritisation_boundaries() {
         "modified effective fee rate is captured on both nodes"
     );
     pair.check(&replacement, None);
+
+    // Core PreChecks uses modified fees for the relay floor as well as RBF.
+    let low_base_fee = transaction(&[pair.coins[3].clone()], 1, 1, 2);
+    pair.check(&low_base_fee, Some("min relay fee not met"));
+    for process in [&mut pair.core, &mut pair.node] {
+        assert_eq!(
+            process
+                .rpc(
+                    "prioritisetransaction",
+                    &json!([low_base_fee.compute_txid().to_string(), 0, 1_000,])
+                )
+                .expect("pre-admission fee delta"),
+            json!(true)
+        );
+    }
+    pair.check(&low_base_fee, None);
+
+    // At more than 1,000 vbytes a floor(fee*1000/vsize) comparison can hide
+    // one excess satoshi. Core applies GetFee(vsize) to the caller's limit.
+    let above_max = (1_800..2_000)
+        .map(|fee| (fee, transaction(&[pair.coins[2].clone()], 50, fee, 2)))
+        .find(|(fee, tx)| *fee == u64::try_from(tx.vsize()).expect("vsize") + 1)
+        .expect("signed maximum-fee boundary")
+        .1;
+    for process in [&mut pair.core, &mut pair.node] {
+        let before = process
+            .rpc("getrawmempool", &json!([false, true]))
+            .expect("before fee guard");
+        let preview = process
+            .rpc(
+                "testmempoolaccept",
+                &json!([[serialize_hex(&above_max)], 0.00001]),
+            )
+            .expect("maximum fee preview");
+        assert_eq!(preview[0]["allowed"], json!(false), "{preview}");
+        assert_eq!(preview[0]["reject-reason"], json!("max-fee-exceeded"));
+        assert_eq!(
+            process
+                .rpc("getrawmempool", &json!([false, true]))
+                .expect("after fee guard"),
+            before
+        );
+    }
 }

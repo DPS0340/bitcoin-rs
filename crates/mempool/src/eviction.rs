@@ -31,11 +31,28 @@ impl EvictionInputs {
             if size > self.target {
                 return Err(crate::FeeDiagramError::Dependencies.into());
             }
+            let priority: Vec<_> = chunks
+                .iter()
+                .rev()
+                .flat_map(|chunk| chunk.indices.iter().copied())
+                .filter(|&index| selected[index])
+                .collect();
+            let parents = snapshot
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .ancestors
+                        .iter()
+                        .map(|&index| {
+                            usize::try_from(index).map_err(|_| crate::FeeDiagramError::Dependencies)
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             removals.extend(
-                chunks
-                    .iter()
-                    .flat_map(|chunk| chunk.indices.iter().copied())
-                    .filter(|&index| selected[index])
+                crate::fee_diagram::topological(&parents, &priority)?
+                    .into_iter()
                     .map(|index| (ids[index], RemovalReason::PolicyEviction)),
             );
         }
@@ -91,8 +108,8 @@ pub fn evict_lowest_fee_packages(
         .map_err(crate::RbfError::into_pool_error)
 }
 
-/// Dynamic mempool minimum fee under size pressure, matching Core's
-/// `mempoolminfee` heuristic used by `getmempoolinfo`.
+/// Local pressure-floor heuristic projected by `getmempoolinfo`.
+/// It differs from Core's rolling minimum and decay, as recorded in POL-05.
 ///
 /// When the pool occupies at least half of `max_total_bytes`, new admissions
 /// must pay more than the cheapest currently-evictable entry by
@@ -169,6 +186,60 @@ mod tests {
             "the lowest-fee package leaves first, tagged PolicyEviction"
         );
         assert_eq!(pool.len(), 1);
+    }
+
+    /// POL-05/MPL-02: low-fee choices retain their publication priority;
+    /// selected dependencies must precede their descendants.
+    #[test]
+    fn multiple_evictions_preserve_fee_priority_and_dependency_order()
+    -> Result<(), crate::MempoolError> {
+        let mut pool = Mempool::new(MempoolLimits::default());
+        for (tag, fee) in [(1, 3_000), (2, 1_000), (3, 2_000)] {
+            pool.insert_entry(MempoolEntry::new(Arc::new(tx(tag)), 100, fee, 1, 1))?;
+        }
+        let changes = evict_lowest_fee_packages(&mut pool, 100)?;
+        let ids: Vec<_> = changes.iter().map(|change| change.txid).collect();
+        assert_eq!(
+            ids,
+            vec![Hash256::from(tx(2).txid()), Hash256::from(tx(3).txid())]
+        );
+
+        let mut pool = Mempool::new(MempoolLimits::default());
+        let mut parent = tx(4);
+        parent.outputs[0].value = Amount::from_sat(5_000);
+        parent.outputs[0].script_pubkey = vec![0x51].into();
+        let mut child = tx(5);
+        child.inputs[0].previous_output = OutPoint::new(parent.txid(), 0);
+        child.outputs[0].value = Amount::from_sat(3_100);
+        let expected = vec![
+            Hash256::from(tx(6).txid()),
+            Hash256::from(parent.txid()),
+            Hash256::from(child.txid()),
+        ];
+        for (transaction, fee) in [(parent, 100), (child, 1_900), (tx(6), 500), (tx(7), 10_000)] {
+            pool.insert_entry(MempoolEntry::new(Arc::new(transaction), 100, fee, 1, 1))?;
+        }
+        let changes = evict_lowest_fee_packages(&mut pool, 100)?;
+        assert_eq!(
+            changes.iter().map(|change| change.txid).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(pool.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn insertion_preflight_keeps_the_same_lowest_first_removal_order()
+    -> Result<(), crate::MempoolError> {
+        let mut pool = Mempool::new(MempoolLimits::default());
+        for (tag, fee) in [(1, 3_000), (2, 1_000), (3, 2_000)] {
+            pool.insert_entry(MempoolEntry::new(Arc::new(tx(tag)), 100, fee, 1, 1))?;
+        }
+        pool.limits.max_total_bytes = 200;
+        let changes = pool.insert_entry(MempoolEntry::new(Arc::new(tx(4)), 100, 10_000, 1, 1))?;
+        assert_eq!(changes.removed_txids(), vec![tx(2).txid(), tx(3).txid()]);
+        assert_eq!(pool.total_vsize(), 200);
+        Ok(())
     }
 
     #[test]

@@ -87,7 +87,7 @@ pub enum StandardnessError {
     /// Non-witness serialization is below the relay minimum.
     #[error("transaction non-witness size is below the relay minimum")]
     TransactionTooSmall,
-    /// A non-`OP_RETURN` output value is below the dust threshold.
+    /// Ephemeral dust violates the output-count or zero-fee requirement.
     #[error("dust")]
     DustOutput,
 }
@@ -255,10 +255,14 @@ pub enum AcceptanceRejectReason {
 }
 
 /// Caller fee guard shared by policy-only evaluation and verified admission.
-/// Callers choose its place in their contract; the rate arithmetic remains
-/// owned by the same helper that computes mempool entry fee rates.
+/// Core compares the actual fee to `CFeeRate::GetFee(vsize)`, not to a
+/// rounded per-kvB quote. Zero disables the guard. The relay-charge helper
+/// owns the rounding and minimum-one-satoshi rule for both boundaries.
 pub(crate) fn exceeds_max_feerate(fee: u64, vsize: u32, maximum: Option<u64>) -> bool {
-    maximum.is_some_and(|max| crate::entry::fee_rate(fee, u64::from(vsize)) > max)
+    maximum.is_some_and(|max| {
+        crate::rbf::required_fee(max, vsize)
+            .is_ok_and(|limit| limit != 0 && i128::from(fee) > limit)
+    })
 }
 /// Returns true when `tx`'s BIP68 sequence locks are satisfied at the next block.
 ///
@@ -363,7 +367,7 @@ pub(crate) fn evaluate_one(
         effective_fee_rate: pool
             .modified_fee_for(txid, context.fee)
             .ok()
-            .and_then(|fee| (vsize != 0).then(|| i128::from(fee) * 1_000 / i128::from(vsize)))
+            .and_then(|fee| (vsize != 0).then(|| fee * 1_000 / i128::from(vsize)))
             .and_then(|rate| u64::try_from(rate).ok()),
         reject_reason: reject,
     }
@@ -569,6 +573,23 @@ fn is_standard_nulldata(script: &[u8]) -> bool {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maximum_fee_uses_core_amount_rounding_including_one_satoshi_boundaries() {
+        // Core feerate.cpp GetFee: truncation, minimum one sat, zero disables.
+        for (fee, vsize, rate, rejects) in [
+            (2_000, 2_000, 1_000, false),
+            (2_001, 2_000, 1_000, true),
+            (u64::MAX, 1_000, u64::MAX - 1, true),
+            (1, 999, 1, false),
+            (2, 999, 1, true),
+            (10_000, 200, 0, false),
+            (1, 0, 1_000, false),
+            (2_100_000_000_000_000, u32::MAX, u64::MAX, false),
+        ] {
+            assert_eq!(exceeds_max_feerate(fee, vsize, Some(rate)), rejects);
+        }
+    }
     use bitcoin_rs_primitives::{OutPoint, Tx, TxIn, TxOut};
     use bitcoin_rs_script::{is_multisig, minimal_non_dust, opcode, push_data};
 
