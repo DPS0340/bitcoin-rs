@@ -1,8 +1,10 @@
 //! CL-14 evidence for the mempool surfaces changed by #639.
 //!
-//! Raw admitted-graph fixtures isolate graph costs; signed input validity is
-//! covered by `overhaul_process_harness`. RSS is process `VmHWM`, and retained
-//! bytes are the pool's capacity-based estimate. A vsize limit is not an RSS
+//! Raw count-bound chains isolate graph costs; verified P2WSH chains check
+//! sigop-adjusted and fractional weight boundaries against rust-bitcoin.
+//! Process custody is covered by `overhaul_process_harness`. Linux RSS is
+//! process `VmHWM`; other platforms explicitly leave RSS unavailable. Retained
+//! bytes are the pool's capacity-based estimates at operation endpoints. A vsize limit is not an RSS
 //! limit. These samples do not certify unrelated resources or performance.
 
 use std::error::Error;
@@ -11,9 +13,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bitcoin::hashes::{Hash as _, sha256};
+use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
 use bitcoin_rs_mempool::{
     AdmissionChain, AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolEntry, MempoolGateway,
-    MempoolLimits, ReplacementCandidate,
+    MempoolLimits, PolicyError, ReplacementCandidate, SubmitError, SubmitOutcome,
 };
 use bitcoin_rs_mining::{CandidateContext, assemble_candidate};
 use bitcoin_rs_primitives::{
@@ -80,17 +83,21 @@ fn fixture(members: u32) -> TestResult<Fixture> {
     })
 }
 
-fn rss_kib(field: &str) -> TestResult<u64> {
+fn rss_kib(field: &str) -> TestResult<Option<u64>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
     let status = std::fs::read_to_string("/proc/self/status")?;
     let row = status
         .lines()
         .find(|line| line.starts_with(field))
         .ok_or("missing Linux RSS field")?;
-    Ok(row
-        .split_whitespace()
-        .nth(1)
-        .ok_or("missing RSS value")?
-        .parse()?)
+    Ok(Some(
+        row.split_whitespace()
+            .nth(1)
+            .ok_or("missing RSS value")?
+            .parse()?,
+    ))
 }
 
 fn sample(gateway: &MempoolGateway) -> TestResult<Value> {
@@ -104,10 +111,11 @@ fn sample(gateway: &MempoolGateway) -> TestResult<Value> {
     }))
 }
 
-struct Chain;
+struct Chain(Vec<(OutPoint, TxOut)>);
 impl AdmissionChain for Chain {
     fn snapshot(&self, _: &Tx) -> Option<ChainAdmissionSnapshot> {
         Some(ChainAdmissionSnapshot {
+            prevouts: self.0.clone(),
             height: 200,
             csv_active: true,
             ..ChainAdmissionSnapshot::default()
@@ -169,7 +177,7 @@ fn exercise(stage: &str, fixture: &Fixture) -> TestResult<Value> {
                 .map(|&(outpoint, value)| transaction(outpoint, value - 1_000, &script))
                 .collect();
             let sequence = gateway.read().sequence_number();
-            let facts = gateway.preview_transactions(&txs, None, &Chain)?;
+            let facts = gateway.preview_transactions(&txs, None, &Chain(Vec::new()))?;
             assert!(facts.package_error.is_none(), "{facts:?}");
             assert_eq!(facts.results.len(), 25);
             assert!(
@@ -206,10 +214,153 @@ fn exercise(stage: &str, fixture: &Fixture) -> TestResult<Value> {
     }
 }
 
+fn witness_program(script: &[u8]) -> Vec<u8> {
+    [
+        vec![0, 32],
+        sha256::Hash::hash(script).to_byte_array().to_vec(),
+    ]
+    .concat()
+}
+
+/// BIP141 / Core 31.1 policy.cpp: adjusted weight is max(wire, sigops*20).
+/// Each witness script executes a false branch containing 199 multisig
+/// opcodes: 201 counted opcodes, 3,980 static sigops, and a true result.
+fn weight_fixture(extra: u8) -> TestResult<(MempoolGateway, Chain, Tx, u64)> {
+    let heavy_script = [vec![0x00, 0x63], vec![0xae; 199], vec![0x68, 0x51]].concat();
+    let middle_script = [vec![0x61; 20], vec![0x51]].concat();
+    let last_script = [vec![0x61; 42 + usize::from(extra)], vec![0x51]].concat();
+    let heavy_program = witness_program(&heavy_script);
+    let coins: Vec<_> = (9_000_u32..9_004)
+        .map(|tag| {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&tag.to_le_bytes());
+            (
+                OutPoint::new(Txid(Hash256::from_le_bytes(&bytes)), 0),
+                TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: Script::from_bytes(heavy_program.clone()),
+                },
+            )
+        })
+        .collect();
+    let mut parent = transaction(coins[0].0, 300_000, &witness_program(&middle_script));
+    parent.inputs = coins
+        .iter()
+        .map(|(outpoint, _)| TxIn {
+            previous_output: *outpoint,
+            script_sig: Script::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_stack(vec![heavy_script.clone()]),
+        })
+        .collect();
+    let oracle: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&bitcoin_rs_primitives::consensus_bytes(&parent))?;
+    let sigops = oracle.total_sigop_cost(|_| {
+        Some(bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(100_000),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(heavy_program.clone()),
+        })
+    });
+    assert_eq!(sigops, 15_920, "independent rust-bitcoin sigop count");
+    let wire_weight = oracle.weight().to_wu();
+    let gateway = MempoolGateway::new(
+        Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+        None,
+    );
+    let chain = Chain(coins);
+    let parent_id = parent.txid();
+    assert!(matches!(
+        gateway.submit_transaction(Arc::new(parent), AdmissionOrigin::Rpc, None, 1, &chain)?,
+        SubmitOutcome::Committed(_)
+    ));
+    {
+        let pool = gateway.read();
+        assert_eq!(pool.limits.cluster_size_vbytes, 101_000);
+        let entry = pool
+            .entry_by_txid(&parent_id)
+            .ok_or("missing weighted parent")?;
+        assert_eq!(entry.sigop_cost, 15_920);
+        assert_eq!(entry.vsize, 79_600);
+        assert!(wire_weight < 318_400);
+        assert_eq!(
+            pool.mining_snapshot().fee_chunks()?[0].policy_weight,
+            318_400
+        );
+    }
+    let mut middle = transaction(
+        OutPoint::new(parent_id, 0),
+        299_000,
+        &witness_program(&last_script),
+    );
+    middle.inputs[0].witness = Witness::from_stack(vec![middle_script]);
+    assert_eq!(middle.weight(), 401);
+    let middle_id = middle.txid();
+    assert!(matches!(
+        gateway.submit_transaction(Arc::new(middle), AdmissionOrigin::Rpc, None, 1, &chain)?,
+        SubmitOutcome::Committed(_)
+    ));
+    let mut last = transaction(OutPoint::new(middle_id, 0), 300, &[0, 20]);
+    last.outputs = vec![
+        TxOut {
+            value: Amount::from_sat(300),
+            script_pubkey: Script::from_bytes([vec![0, 20], vec![1; 20]].concat())
+        };
+        685
+    ];
+    last.inputs[0].witness = Witness::from_stack(vec![last_script]);
+    let oracle: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&bitcoin_rs_primitives::consensus_bytes(&last))?;
+    assert_eq!(oracle.weight().to_wu(), 85_199 + u64::from(extra));
+    Ok((gateway, chain, last, wire_weight))
+}
+
+fn check_weight_boundary(extra: u8) -> TestResult<Value> {
+    let (gateway, chain, last, root_wire_weight) = weight_fixture(extra)?;
+    let before = sample(&gateway)?;
+    let sequence = gateway.read().sequence_number();
+    let start = Instant::now();
+    let preview = gateway.preview_transactions(std::slice::from_ref(&last), None, &chain)?;
+    assert_eq!(preview.results[0].allowed, Some(extra == 0));
+    assert_eq!(gateway.read().sequence_number(), sequence);
+    let submitted =
+        gateway.submit_transaction(Arc::new(last), AdmissionOrigin::Rpc, None, 1, &chain);
+    if extra == 0 {
+        assert!(matches!(submitted?, SubmitOutcome::Committed(_)));
+        let pool = gateway.read();
+        let weight: u64 = pool
+            .mining_snapshot()
+            .fee_chunks()?
+            .iter()
+            .map(|chunk| u64::from(chunk.policy_weight))
+            .sum();
+        assert_eq!(weight, 404_000);
+        assert_eq!(
+            pool.total_vsize(),
+            101_001,
+            "rounded entry sizes must not replace exact cluster weight"
+        );
+    } else {
+        assert_eq!(
+            submitted,
+            Err(SubmitError::Policy(AcceptanceRejectReason::PackageLimit(
+                PolicyError::ClusterSizeLimit
+            )))
+        );
+        assert_eq!(gateway.read().sequence_number(), sequence);
+    }
+    Ok(
+        json!({"stage": "adjusted-weight-boundary", "extra_weight": extra,
+        "before": before, "after": sample(&gateway)?, "elapsed_us": start.elapsed().as_micros(),
+        "result": {"root_sigops": 15_920, "root_wire_weight": root_wire_weight,
+            "root_policy_weight": 318_400, "projected_cluster_weight": 404_000 + u32::from(extra),
+            "cluster_weight_limit": 404_000, "allowed": extra == 0}}),
+    )
+}
+
 #[test]
 fn mempool_policy_resource_capture_at_resolved_graph_bounds() -> TestResult {
     let mut measurements = Vec::new();
-    let mut retained_peak = 0_u64;
+    let mut retained_endpoint_max = 0_u64;
     for stage in ["package-preview", "mining", "replacement", "eviction"] {
         let fixture = fixture(if stage == "package-preview" {
             MEMBERS - 1
@@ -222,7 +373,7 @@ fn mempool_policy_resource_capture_at_resolved_graph_bounds() -> TestResult {
         let elapsed = start.elapsed().as_micros();
         let after = sample(&fixture.gateway)?;
         for value in [&before, &after] {
-            retained_peak = retained_peak.max(
+            retained_endpoint_max = retained_endpoint_max.max(
                 value["retained_estimate_bytes"]
                     .as_u64()
                     .ok_or("retained estimate missing")?,
@@ -230,8 +381,19 @@ fn mempool_policy_resource_capture_at_resolved_graph_bounds() -> TestResult {
         }
         measurements.push(json!({"stage": stage, "elapsed_us": elapsed, "before": before, "after": after, "result": result}));
     }
+    for extra in [0, 1] {
+        let measurement = check_weight_boundary(extra)?;
+        for endpoint in ["before", "after"] {
+            retained_endpoint_max = retained_endpoint_max.max(
+                measurement[endpoint]["retained_estimate_bytes"]
+                    .as_u64()
+                    .ok_or("missing weight-case estimate")?,
+            );
+        }
+        measurements.push(measurement);
+    }
     let report = json!({
-        "scope": "mempool policy owner only; raw admitted-graph fixtures",
+        "scope": "mempool policy owner; raw count-bound fixtures and verified P2WSH weight boundaries",
         "platform": std::env::consts::OS, "architecture": std::env::consts::ARCH,
         "source_sha256": {
             "fee_diagram": sha256::Hash::hash(include_bytes!("../../../crates/mempool/src/fee_diagram.rs")).to_string(),
@@ -242,10 +404,13 @@ fn mempool_policy_resource_capture_at_resolved_graph_bounds() -> TestResult {
             "cargo_lock": sha256::Hash::hash(include_bytes!("../../../Cargo.lock")).to_string(),
         },
         "cluster_count_bound": MEMBERS, "conflicting_cluster_bound": CLUSTERS,
-        "retained_estimate_high_water_bytes": retained_peak,
+        "retained_estimate_endpoint_max_bytes": retained_endpoint_max,
         "process_rss_high_water_kib": rss_kib("VmHWM:")?,
         "rss_limit": Value::Null,
-        "notes": "RSS has no configured mempool-specific cap. Vsize and structural limits are checked separately. Single-pass time samples are not a regression or throughput claim.",
+        "rss_unavailable_reason": (!cfg!(target_os = "linux")).then_some("No RSS collector is configured for this platform; policy checks still run."),
+        "transient_retained_allocation_high_water_bytes": Value::Null,
+        "complete_cl14_evidence": false,
+        "notes": "RSS has no configured mempool-specific cap. Retained estimates are endpoint samples and omit transient allocations. Vsize and structural limits are checked separately. These partial measurements are not full CL-14 evidence or a regression/throughput claim.",
         "measurements": measurements,
     });
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/process-harness");

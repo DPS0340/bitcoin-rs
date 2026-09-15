@@ -427,9 +427,10 @@ fn malformed_graph_snapshots_fail_with_typed_owner_errors() {
         Err(MiningError::MissingAncestor { .. })
     ));
 
-    // POL-05 requires an admitted dependency DAG. The graph owner rejects
-    // these forged cyclic facts with Dependencies instead of fabricating a
-    // valid transaction order; mining propagates that same typed failure.
+    // POL-05 requires an admitted dependency DAG. This fixture bypasses
+    // admission: assemble_candidate calls MempoolMiningSnapshot::fee_chunks,
+    // whose mempool-owned fee-diagram validator rejects the forged cycle
+    // with Dependencies. Mining propagates that failure without making an order.
     let cyclic = MempoolMiningSnapshot {
         sequence: 2,
         entries: vec![

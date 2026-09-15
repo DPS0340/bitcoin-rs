@@ -4889,9 +4889,10 @@ mod spend_index_tests {
         );
     }
 
-    /// Preview and admission must quote the same cluster-count verdict.
-    /// Ancestor and descendant limits are lifted so only the cluster check
-    /// can refuse.
+    /// POL-05/06 (`docs/contracts/mempool-policy.md`): preview and commit
+    /// enforce the same projected cluster bound. Core 31.1
+    /// `src/validation.cpp::ReplacementChecks` validates the change set's
+    /// cluster limits before accepting a replacement.
     #[test]
     fn replacement_preview_rejects_a_cluster_only_violation() {
         let confirmed = OutPoint::new(txid_of([23_u8; 32]), 0);
@@ -4944,9 +4945,10 @@ mod spend_index_tests {
         );
     }
 
-    /// A replacement preview must exclude the evicted original the same way
-    /// admission does, or `testmempoolaccept` and `sendrawtransaction`
-    /// disagree on a replacement into a full cluster.
+    /// POL-05 (`docs/contracts/mempool-policy.md`): planned victims are
+    /// absent from the projected graph. Core 31.1
+    /// `src/validation.cpp::ReplacementChecks` stages removals before
+    /// `CheckMemPoolPolicyLimits`, so replacing a member does not grow a full cluster.
     #[test]
     fn replacement_preview_excludes_planned_evictions() {
         let confirmed = OutPoint::new(txid_of([27_u8; 32]), 0);

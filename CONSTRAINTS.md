@@ -157,3 +157,15 @@ callers that construct entries before admission. For `Tx::default()` it must
 preserve the metadata values `(size, weight, bip141_vsize) = (10, 40, 10)`,
 use the txid as the wtxid, and produce a zero fee rate. The regression test is
 `crates/mempool/src/entry.rs::raw_empty_entry_keeps_zero_input_behavior`.
+
+
+### CL-14 collection coverage
+
+The current mempool command checks the affected policy surfaces, including
+sigop-adjusted weight, the 404,000-WU cluster boundary, 64-member clusters,
+25-row packages and 100 conflicting clusters. It captures Linux process RSS
+high-water when available and retained-byte **endpoint estimates**. Its report
+explicitly leaves temporary retained-allocation peak and full CL-14 evidence
+unmeasured. A successful scoped collection does not mark the global CL-14 row
+or other owners' requirements complete; the product/performance matrix above
+remains authoritative.

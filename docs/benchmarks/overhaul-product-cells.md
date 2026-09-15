@@ -80,8 +80,17 @@ exercises the changed policy owners with 100 count-bound dependency chains:
 6,400 admitted entries for mining, replacement and eviction; package preview
 offers 25 children to 63-member chains and checks the projected 64-member bound.
 It verifies membership/vsize, package, mutation-response and block resource
-bounds, and records Linux process RSS high-water and the pool's retained-byte
-estimate before and after each operation.
+bounds. Verified P2WSH scripts add 15,920 sigops to a parent whose policy
+weight is 318,400 WU; fractional witness descendants put its cluster at
+404,000 and 404,001 WU. An independent rust-bitcoin oracle checks sigops and
+wire weight, and preview/commit must accept only the exact-boundary case.
+The accepted cluster's rounded entry sizes sum to 101,001 vB, so a rounded-size
+implementation cannot pass this check.
+
+Linux process RSS high-water is recorded; other platforms retain the same
+policy checks and report RSS as unavailable. Retained bytes are capacity-based
+estimates before and after each operation. Their maximum is explicitly an
+endpoint maximum, not the peak of temporary allocations inside the operation.
 
 The raw admitted-graph fixture isolates graph costs. Signed process custody
 belongs to `overhaul_process_harness`. These supporting JSON captures are not
