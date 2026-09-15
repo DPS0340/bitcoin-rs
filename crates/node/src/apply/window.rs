@@ -382,8 +382,11 @@ pub(super) fn invalidate_failed_subtree(
 /// state (issue #618): the same block applies successfully after restart.
 /// Treating these as Permanent would freeze the node at the tip and
 /// invalidate a valid header subtree with no retry path. The native
-/// interpreter path does not produce this spurious failure, so its
 /// `ConsensusError::Script` remains Permanent.
+/// `WitnessNonceSize` is Permanent here because the staging gate
+/// (`check_block_witness_well_formed`) rejects witness-stripped bodies before
+/// they reach apply (issue #1070); a body that reaches apply with this error
+/// is genuinely invalid, not a peer stripping artifact.
 pub(crate) fn is_permanent_apply_error(error: &ApplyError) -> bool {
     match error {
         ApplyError::ProofOfWork { .. }

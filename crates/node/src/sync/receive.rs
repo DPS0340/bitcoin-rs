@@ -5,8 +5,9 @@ use alloc::vec::Vec;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_consensus::check_block_witness_well_formed;
+use bitcoin_rs_p2p::{DroppedBlock, StagedBlock};
 use bitcoin_rs_p2p::InboundBlock;
-use bitcoin_rs_p2p::StagedBlock;
 use bitcoin_rs_p2p::download_window::INBOUND_BLOCK_STAGE_CHUNK;
 use bitcoin_rs_primitives::Hash256;
 use std::time::Instant;
@@ -150,6 +151,26 @@ impl BlockSync {
             for inbound in blocks.drain(..) {
                 let hash = Hash256::from(inbound.block.block_hash());
                 let source = inbound.source;
+                // Issue #1070: a peer can strip witness data from a block body
+                // without changing the block hash (computed from the header
+                // only). The stager keeps the first body per hash, so a
+                // stripped body would permanently wedge sync. Reject it before
+                // staging and drop for retry so a different peer can supply the
+                // correct body. The apply-path WitnessNonceSize classification
+                // stays Permanent: with this gate, a body that reaches apply
+                // with a witness defect is genuinely invalid, not stripped.
+                if let Err(error) = check_block_witness_well_formed(&inbound.block) {
+                    metrics::counter!("node.sync.witness_malformed_drops").increment(1);
+                    tracing::warn!(%hash, %error, "block sync: witness-malformed body; dropping for retry");
+                    staged_blocks.push((
+                        hash,
+                        source,
+                        StagedBlock::DroppedForRetry {
+                            dropped: DroppedBlock { hash },
+                        },
+                    ));
+                    continue;
+                }
                 let staged = stager.insert(
                     hash,
                     next_expected_hash,

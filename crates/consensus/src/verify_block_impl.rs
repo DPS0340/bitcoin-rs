@@ -367,6 +367,36 @@ pub fn check_witness_malleation(
 pub fn block_witness_commitment_matches(block: &Block, wtxids: &[Wtxid]) -> bool {
     check_witness_malleation(block, true, wtxids).is_ok()
 }
+/// Checks witness well-formedness of a block body without chain context.
+///
+/// A peer can strip witness data from a block body without changing the block
+/// hash (computed from the header only). The BIP141 commitment output is
+/// committed to in the merkle root, so a peer cannot forge or remove it.
+/// When a commitment is present, the coinbase witness must be exactly one
+/// 32-byte element and the commitment must match the computed witness merkle
+/// root. Blocks without a commitment output pass: pre-segwit blocks have no
+/// witness to strip, and witness-without-commitment is a different invalidity
+/// class caught later by the apply path.
+///
+/// This is the staging-time gate that prevents a witness-stripped body from
+/// occupying the stager's single-body slot (issue #1070): the body is dropped
+/// for retry so a different peer can supply the correct one.
+pub fn check_block_witness_well_formed(block: &Block) -> Result<(), ConsensusError> {
+    let Some(commitment) = witness_commitment(block) else {
+        return Ok(());
+    };
+    let Some(input) = block.txs.first().and_then(|tx| tx.inputs.first()) else {
+        return Err(ConsensusError::WitnessNonceSize);
+    };
+    if input.witness.len() != 1 || input.witness[0].len() != 32 {
+        return Err(ConsensusError::WitnessNonceSize);
+    }
+    let wtxids: Vec<Wtxid> = block.txs.iter().map(Tx::wtxid).collect();
+    if !witness_commitment_hash_matches(block, &wtxids, commitment, &input.witness[0]) {
+        return Err(ConsensusError::WitnessCommitment);
+    }
+    Ok(())
+}
 
 fn witness_commitment_hash_matches(
     block: &Block,
