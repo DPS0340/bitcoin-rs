@@ -6,9 +6,9 @@ use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_consensus::check_block_witness_well_formed;
-use bitcoin_rs_p2p::{DroppedBlock, StagedBlock};
 use bitcoin_rs_p2p::InboundBlock;
 use bitcoin_rs_p2p::download_window::INBOUND_BLOCK_STAGE_CHUNK;
+use bitcoin_rs_p2p::{DroppedBlock, StagedBlock};
 use bitcoin_rs_primitives::Hash256;
 use std::time::Instant;
 

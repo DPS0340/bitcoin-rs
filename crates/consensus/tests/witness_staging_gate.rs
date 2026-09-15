@@ -5,8 +5,8 @@
 //! gate that prevents a peer from wedging sync by sending a witness-stripped
 //! body (issue #1070). They are not mined or UTXO-valid chain fixtures.
 
-use bitcoin_rs_consensus::check_block_witness_well_formed;
 use bitcoin_rs_consensus::ConsensusError;
+use bitcoin_rs_consensus::check_block_witness_well_formed;
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Header, LockTime, OutPoint, Script, Sequence, Tx,
     TxIn, TxOut, Txid, Witness,
@@ -35,7 +35,7 @@ fn coinbase(witness: Option<Vec<Vec<u8>>>, commitment: Option<[u8; 32]>) -> Tx {
             previous_output: OutPoint::new(Txid::default(), u32::MAX),
             script_sig: Script::from_bytes(vec![1, 1]),
             sequence: Sequence::from_consensus(u32::MAX),
-            witness: witness.map_or_else(Witness::new, |items| Witness::from_stack(items)),
+            witness: witness.map_or_else(Witness::new, Witness::from_stack),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(50),
@@ -81,10 +81,7 @@ fn commitment_block_with_stripped_witness_is_rejected() {
 #[test]
 fn commitment_block_with_mismatched_commitment_is_rejected() {
     let wrong_commitment = [0xFF; 32];
-    let block = block(coinbase(
-        Some(vec![vec![0; 32]]),
-        Some(wrong_commitment),
-    ));
+    let block = block(coinbase(Some(vec![vec![0; 32]]), Some(wrong_commitment)));
     assert_eq!(
         check_block_witness_well_formed(&block),
         Err(ConsensusError::WitnessCommitment)
