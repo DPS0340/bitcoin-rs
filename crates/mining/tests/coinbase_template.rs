@@ -141,7 +141,10 @@ fn fee_overflow_is_reported_instead_of_wrapping() {
     };
     let err = assemble_candidate(&context(1, false), &snapshot, &[0x51])
         .expect_err("fee overflow must fail");
-    assert_eq!(err, MiningError::FeeOverflow);
+    assert_eq!(
+        err,
+        MiningError::FeeDiagram(bitcoin_rs_mempool::FeeDiagramError::Arithmetic)
+    );
 }
 
 /// The reserved reorg batch must store resolved BIP141 cost all the way
@@ -237,9 +240,11 @@ fn reconsidered_prevout_cost_reaches_the_mining_sigop_budget() -> Result<(), Box
     let mut limited = context(101, true);
     limited.max_sigops = 5;
     let candidate = assemble_candidate(&limited, &snapshot, &[0x51])?;
-    assert_eq!(candidate.transactions.len(), 1);
-    assert_eq!(candidate.transactions[0].txid, parent.txid());
-    assert_eq!(candidate.sigop_cost, 4);
+    assert!(
+        candidate.transactions.is_empty(),
+        "the complete CPFP chunk exceeds the sigop budget"
+    );
+    assert_eq!(candidate.sigop_cost, 0);
     limited.max_sigops = 6;
     let candidate = assemble_candidate(&limited, &snapshot, &[0x51])?;
     assert_eq!(candidate.transactions.len(), 2);

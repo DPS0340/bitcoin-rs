@@ -207,7 +207,21 @@ fn snapshot_with(txs: &[Tx], fees: &[u64]) -> MempoolMiningSnapshot {
         entries: txs
             .iter()
             .zip(fees.iter())
-            .map(|(tx, fee)| snapshot_entry(tx.clone(), *fee))
+            .enumerate()
+            .map(|(index, (tx, fee))| {
+                let mut entry = snapshot_entry(tx.clone(), *fee);
+                entry.ancestors = txs[..index]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, parent)| {
+                        tx.inputs
+                            .iter()
+                            .any(|input| input.previous_output.txid == parent.txid())
+                    })
+                    .map(|(parent, _)| u32::try_from(parent).unwrap_or(u32::MAX))
+                    .collect();
+                entry
+            })
             .collect(),
     }
 }

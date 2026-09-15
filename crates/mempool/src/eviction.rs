@@ -1,43 +1,94 @@
 use alloc::vec::Vec;
 
-use crate::entry::fee_rate;
+use crate::Mempool;
 use crate::mutation::{MutationChange, RemovalReason};
-use crate::{EntryId, Mempool};
 
-/// Evicts the lowest-fee descendant packages until the pool fits.
-///
-/// Shrinks the pool to at or below `target_size_bytes`, returning one
-/// `Removed(PolicyEviction)` change per evicted entry, in eviction
-/// commit order (each package commits parent before its descendants).
+pub(crate) struct EvictionInputs {
+    stamp: crate::pool::fee_policy::PolicyStamp,
+    data: Option<(crate::MempoolMiningSnapshot, Vec<crate::EntryId>)>,
+    size: u64,
+    target: u64,
+}
+
+impl EvictionInputs {
+    pub(crate) fn verify(self) -> Result<crate::rbf::PreparedPoolChange, crate::MempoolError> {
+        let mut removals = Vec::new();
+        if let Some((snapshot, ids)) = self.data {
+            let chunks = snapshot.fee_chunks()?;
+            let mut size = self.size;
+            let mut selected = vec![false; snapshot.entries.len()];
+            for chunk in chunks.iter().rev() {
+                if size <= self.target {
+                    break;
+                }
+                for &index in &chunk.indices {
+                    selected[index] = true;
+                    size = size
+                        .checked_sub(u64::from(snapshot.entries[index].vsize))
+                        .ok_or(crate::FeeDiagramError::Arithmetic)?;
+                }
+            }
+            if size > self.target {
+                return Err(crate::FeeDiagramError::Dependencies.into());
+            }
+            removals.extend(
+                chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.indices.iter().copied())
+                    .filter(|&index| selected[index])
+                    .map(|index| (ids[index], RemovalReason::PolicyEviction)),
+            );
+        }
+        Ok(crate::rbf::PreparedPoolChange {
+            stamp: self.stamp,
+            evicted: Vec::new(),
+            removals,
+            entry: None,
+        })
+    }
+}
+
+impl Mempool {
+    pub(crate) fn capture_eviction(
+        &self,
+        target: u64,
+    ) -> Result<EvictionInputs, crate::MempoolError> {
+        let size = self.total_vsize();
+        let data = if size <= target {
+            None
+        } else {
+            let snapshot = self.mining_snapshot();
+            let ids = snapshot
+                .entries
+                .iter()
+                .map(|entry| {
+                    self.entry_id_by_txid(&entry.txid)
+                        .ok_or(crate::MempoolError::FeeDiagram(
+                            crate::FeeDiagramError::Dependencies,
+                        ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Some((snapshot, ids))
+        };
+        Ok(EvictionInputs {
+            stamp: self.policy_stamp(),
+            data,
+            size,
+            target,
+        })
+    }
+}
+
+/// Evicts the lowest-fee dependency chunks until the pool fits.
+/// The complete selection is validated before any mutation occurs.
 pub fn evict_lowest_fee_packages(
     pool: &mut Mempool,
     target_size_bytes: u64,
-) -> Vec<MutationChange> {
-    let mut changes = Vec::new();
-    while pool.total_vsize() > target_size_bytes {
-        let Some(id) = lowest_fee_package(pool) else {
-            break;
-        };
-        pool.remove_entry_and_descendants_into(id, RemovalReason::PolicyEviction, &mut changes);
-    }
-    changes
-}
-
-fn lowest_fee_package(pool: &Mempool) -> Option<EntryId> {
-    pool.entries
-        .iter()
-        .filter_map(|(index, entry)| {
-            let id = EntryId::try_from(index).ok()?;
-            let rate = fee_rate(entry.descendant_fee, entry.descendant_size);
-            Some((id, rate, entry.time))
-        })
-        .min_by(|left, right| {
-            left.1
-                .cmp(&right.1)
-                .then_with(|| right.2.cmp(&left.2))
-                .then_with(|| left.0.cmp(&right.0))
-        })
-        .map(|(id, _, _)| id)
+) -> Result<Vec<MutationChange>, crate::MempoolError> {
+    let plan = pool.capture_eviction(target_size_bytes)?.verify()?;
+    pool.commit_pool_change(plan)
+        .map(|result| result.changes)
+        .map_err(crate::RbfError::into_pool_error)
 }
 
 /// Dynamic mempool minimum fee under size pressure, matching Core's
@@ -108,7 +159,7 @@ mod tests {
         pool.insert_entry(high).expect("high");
         pool.insert_entry(low).expect("low");
 
-        let evicted = evict_lowest_fee_packages(&mut pool, 100);
+        let evicted = evict_lowest_fee_packages(&mut pool, 100).expect("eviction policy");
         assert_eq!(
             evicted,
             vec![MutationChange {
@@ -134,7 +185,7 @@ mod tests {
         assert_eq!(pool.lowest_fee_rate(), Some(2_000));
         assert_eq!(mempool_min_fee_sat_per_kvb(&pool, 1_000), 3_000);
 
-        let evicted = evict_lowest_fee_packages(&mut pool, 200);
+        let evicted = evict_lowest_fee_packages(&mut pool, 200).expect("eviction policy");
         assert_eq!(evicted.len(), 1);
         assert_eq!(pool.lowest_fee_rate(), Some(4_000));
         assert_eq!(mempool_min_fee_sat_per_kvb(&pool, 1_000), 5_000);
