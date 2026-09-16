@@ -1,15 +1,14 @@
 use super::*;
 
 #[test]
-fn permanent_connect_failure_through_switch_to_branch_invalidates_subtree()
+fn mutated_connect_body_through_switch_to_branch_preserves_subtree()
 -> Result<(), Box<dyn std::error::Error>> {
     use bitcoin_rs_primitives::{Amount, Script};
     let (handles, main, mut bodies) = matured_chain(101)?;
     // Build a competing fork rooted at block 50. The first fork block has a
     // corrupted body (coinbase value changed → txid changed → merkle root
-    // mismatch), so the connect dies permanently on the very first block.
-    // A descendant header extends the invalid subtree so the test proves
-    // the whole subtree is invalidated, not just the failed block.
+    // mismatch), so the connect stops on the first body. The descendant
+    // header must remain eligible for a later delivery of the correct body.
     let fork_root_hash = main[49].block_hash();
     let mut tree = handles.block_tree.write();
     let mut fork_parent = tree
@@ -40,8 +39,7 @@ fn permanent_connect_failure_through_switch_to_branch_invalidates_subtree()
 
     // Corrupt the first fork block's body: change the coinbase value so
     // the txid no longer matches the header's merkle root. This is a
-    // permanent consensus failure (MerkleRoot), which the classifier
-    // marks as permanent and invalidates the subtree.
+    // body mutation (MerkleRoot), which must not invalidate the subtree.
     let mut corrupt = fork_blocks[0].clone();
     corrupt.txs[0].outputs[0].value = Amount::from_sat(2);
     fork_blocks[0] = corrupt;
@@ -67,33 +65,22 @@ fn permanent_connect_failure_through_switch_to_branch_invalidates_subtree()
         ..
     }) = outcome
     else {
-        panic!("permanent connect failure must return ConnectFailed");
+        panic!("mutated connect body must return ConnectFailed");
     };
     assert_eq!(
         disconnected, 51,
         "the full disconnect prefix must be reported"
     );
-    assert_eq!(
-        connected, 0,
-        "nothing connected before the permanent failure"
-    );
-    // The invalidated subtree must contain both the failed block and its
-    // descendant, so the caller can purge every bounded carrier.
-    let invalid_hash = Hash256::from_le_bytes(fork_blocks[0].block_hash().as_bytes());
-    let descendant_hash = Hash256::from_le_bytes(fork_blocks[1].block_hash().as_bytes());
+    assert_eq!(connected, 0, "nothing connected before the body mutation");
     assert!(
-        invalidated.contains(&invalid_hash),
-        "the failed block must be in the invalidated set: {invalidated:?}"
+        invalidated.is_empty(),
+        "body mutation cannot poison headers"
     );
-    assert!(
-        invalidated.contains(&descendant_hash),
-        "the descendant must be in the invalidated set: {invalidated:?}"
-    );
-    // The block tree must mark the entire subtree Invalid.
+    // Both headers remain valid and may be retried with another body.
     {
         let tree = handles.block_tree.read();
-        assert_eq!(tree.node(invalid_id)?.status, NodeStatus::Invalid);
-        assert_eq!(tree.node(descendant_id)?.status, NodeStatus::Invalid);
+        assert_eq!(tree.node(invalid_id)?.status, NodeStatus::HeaderValid);
+        assert_eq!(tree.node(descendant_id)?.status, NodeStatus::HeaderValid);
     }
     // The applied tip must be back at the fork root (block 50), the
     // successful disconnect prefix.

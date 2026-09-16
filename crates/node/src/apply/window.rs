@@ -284,12 +284,8 @@ pub(super) fn apply_window_admitted(
                         invalidated: Box::default(),
                     });
                 }
-                let invalidated = invalidate_failed_subtree(handles, block, &source);
-                let disposition = if is_permanent_apply_error(&source) {
-                    WindowApplyDisposition::Permanent
-                } else {
-                    WindowApplyDisposition::Operational
-                };
+                let disposition = classify_apply_error(&source);
+                let invalidated = invalidate_failed_subtree(handles, block, disposition);
                 // The prefix that committed in memory stays committed: flush
                 // its durable group before reporting, so the durable head
                 // and the published tip keep moving together. A flush
@@ -353,9 +349,9 @@ pub(super) fn apply_window_admitted(
 pub(super) fn invalidate_failed_subtree(
     handles: &Chainstate,
     block: &Block,
-    source: &ApplyError,
+    disposition: WindowApplyDisposition,
 ) -> Box<[Hash256]> {
-    if !is_permanent_apply_error(source) {
+    if disposition != WindowApplyDisposition::Permanent {
         return Box::default();
     }
     let hash = block.block_hash().0;
@@ -368,14 +364,13 @@ pub(super) fn invalidate_failed_subtree(
         .into_boxed_slice()
 }
 
-/// Returns true when an apply failure is a permanent block-invalidity
-/// condition, not an operational error.
+/// Classifies an apply failure by what it proves about the header branch.
 ///
 /// Only these failures poison the branch: the block and its descendants can
 /// never become valid, so invalidating the subtree is safe and the node
 /// republishes the best valid tip rather than retrying the same block.
-/// Operational failures (storage, UTXO commit, undo record, shutdown) are
-/// transient and must not permanently mark a block invalid.
+/// Body-binding failures do not prove the header invalid: a different body
+/// can have the same header hash. Operational failures also invalidate nothing.
 ///
 /// Kernel-backed script verification failures are classified Operational
 /// because `bitcoinkernel` can reject a valid block depending on process
@@ -385,27 +380,30 @@ pub(super) fn invalidate_failed_subtree(
 /// interpreter path does not produce this spurious failure, so its
 /// `ConsensusError::Script` remains Permanent.
 ///
-/// `WitnessNonceSize` is Permanent here because the staging gate
-/// (`check_block_body_binding`) rejects witness-stripped bodies before
-/// they reach apply (issue #1070); a body that reaches apply with this error
-/// is genuinely invalid, not a peer stripping artifact.
-pub(crate) fn is_permanent_apply_error(error: &ApplyError) -> bool {
+pub(crate) fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
+    use WindowApplyDisposition::{BodyMutated, Operational, Permanent};
+    use bitcoin_rs_consensus::ConsensusError;
     match error {
         ApplyError::ProofOfWork { .. }
         | ApplyError::TargetAboveLimit
-        | ApplyError::NbitsNonRetargetMismatch { .. } => true,
+        | ApplyError::NbitsNonRetargetMismatch { .. } => Permanent,
         ApplyError::Consensus(error) => match error {
-            bitcoin_rs_consensus::ConsensusError::PrevoutMatrixSize { .. }
-            | bitcoin_rs_consensus::ConsensusError::Kernel(_)
-            | bitcoin_rs_consensus::ConsensusError::Encoding(_) => false,
-            bitcoin_rs_consensus::ConsensusError::Script { reason, .. }
+            ConsensusError::MerkleRoot
+            | ConsensusError::MerkleMutation
+            | ConsensusError::WitnessNonceSize
+            | ConsensusError::WitnessCommitment
+            | ConsensusError::UnexpectedWitness => BodyMutated,
+            ConsensusError::PrevoutMatrixSize { .. }
+            | ConsensusError::Kernel(_)
+            | ConsensusError::Encoding(_) => Operational,
+            ConsensusError::Script { reason, .. }
                 if reason.starts_with("kernel script verification failed:") =>
             {
-                false
+                Operational
             }
-            _ => true,
+            _ => Permanent,
         },
-        _ => false,
+        _ => Operational,
     }
 }
 

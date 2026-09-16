@@ -119,7 +119,9 @@ where
                 progress.connected += 1;
             }
             Err(source) => {
-                let invalidated = if crate::apply::window::is_permanent_apply_error(&source) {
+                let invalidated = if crate::apply::window::classify_apply_error(&source)
+                    == crate::apply::WindowApplyDisposition::Permanent
+                {
                     let mut tree = handles.block_tree.write();
                     tree.lookup(body.hash)
                         .and_then(|node_id| tree.invalidate_subtree(node_id).ok())

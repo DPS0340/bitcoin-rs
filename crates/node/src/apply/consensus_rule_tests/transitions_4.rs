@@ -317,8 +317,7 @@ fn connect_and_disconnect_wake_the_mining_generation() -> Result<(), Box<dyn std
 }
 
 #[test]
-fn permanent_window_failure_invalidates_failed_subtree_and_descendants()
--> Result<(), Box<dyn std::error::Error>> {
+fn mutated_body_keeps_failed_header_subtree_retryable() -> Result<(), Box<dyn std::error::Error>> {
     let handles = empty_apply_handles_for_network(Network::Regtest);
     let genesis = Network::Regtest.genesis_block();
     let genesis_tip = applied_header_tip(&handles, genesis.block_hash().0, &genesis, 0)?;
@@ -335,8 +334,8 @@ fn permanent_window_failure_invalidates_failed_subtree_and_descendants()
         vec![coinbase_transaction(2)],
     )?;
     // Corrupt the body against its own header: the txid changes, so the
-    // header merkle root no longer matches and block rules reject the
-    // block with a permanent consensus error before any write.
+    // header merkle root no longer matches. The body is mutated, but a
+    // different body can still satisfy the same header.
     let mut bad_body = bad.clone();
     bad_body.txs[0].outputs[0].value = Amount::from_sat(2);
     let descendant = mined_block_with_prev_hash_and_transactions(
@@ -358,27 +357,23 @@ fn permanent_window_failure_invalidates_failed_subtree_and_descendants()
     let Err(error) = outcome else {
         panic!("a body contradicting its header merkle root must fail");
     };
-    assert_eq!(error.disposition(), WindowApplyDisposition::Permanent);
-    assert_eq!(
-        error.invalidated(),
-        &[bad_hash, descendant_hash],
-        "the failed block and every descendant are invalid, in slab order"
-    );
+    assert_eq!(error.disposition(), WindowApplyDisposition::BodyMutated);
+    assert!(error.invalidated().is_empty());
     {
         let tree = handles.block_tree.read();
         assert_eq!(
             tree.node_by_hash(bad_hash).map(|node| node.status),
-            Some(NodeStatus::Invalid)
+            Some(NodeStatus::HeaderValid)
         );
         assert_eq!(
             tree.node_by_hash(descendant_hash).map(|node| node.status),
-            Some(NodeStatus::Invalid)
+            Some(NodeStatus::HeaderValid)
         );
     }
     assert_eq!(
         handles.applied_tip.load_full().map(|tip| tip.hash),
         Some(applied_hash),
-        "invalidation republishes the valid prefix, never the failed block"
+        "the failed body must not advance the applied tip"
     );
     assert_eq!(handles.utxo.len(), 1, "the failed block committed nothing");
     Ok(())

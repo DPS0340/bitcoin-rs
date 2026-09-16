@@ -144,6 +144,42 @@ fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[test]
+fn malformed_pending_owner_is_disconnected_and_other_peer_gets_same_hash()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sync, block_hash, _correct_block, stripped_block) = segwit_sync_fixture()?;
+    let peer_a = test_addr(9750, 0)?;
+    let peer_b = test_addr(9750, 1)?;
+    let rx_a = connect_peer(&sync.peer_table, synthetic_peer(peer_a, 1));
+    sync.tick();
+    let first = next_getdata(&rx_a)?;
+    assert_eq!(witness_block_inventory(first)?, vec![BlockHash(block_hash)]);
+    let source_a = current_source(&sync.peer_table, peer_a);
+    let rx_b = connect_peer(&sync.peer_table, synthetic_peer(peer_b, 1));
+
+    let mut malformed = InboundBlock::from_decoded(stripped_block);
+    malformed.source = Some(source_a);
+    let mut batch = vec![malformed];
+    assert_eq!(
+        sync.buffer_received_block_chunk(&mut batch, Some(block_hash)),
+        1
+    );
+    assert!(!sync.peer_table.is_current(source_a));
+    assert!(
+        sync.download_window
+            .lock()
+            .peer_in_staller_cooldown(peer_a, std::time::Instant::now())
+    );
+
+    sync.tick();
+    assert_eq!(
+        witness_block_inventory(next_getdata(&rx_b)?)?,
+        vec![BlockHash(block_hash)]
+    );
+    assert_no_getdata(&rx_a)?;
+    Ok(())
+}
+
 /// A body with altered non-witness transaction data retains the header hash
 /// but fails the txid Merkle-root binding. It must not occupy the stager slot,
 /// leaving the original body eligible to arrive later.

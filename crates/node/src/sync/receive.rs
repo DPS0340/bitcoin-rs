@@ -270,11 +270,17 @@ impl BlockSync {
                 }
             }
             for (hash, source) in reject_deliveries {
-                let source_peer = source
-                    .filter(|source| self.peer_table.is_current(*source))
-                    .map(|source| source.addr);
-                if window.reject_delivery(hash, source_peer) == RejectDelivery::ReleasedPending {
+                let current_source = source.filter(|source| self.peer_table.is_current(*source));
+                if window.reject_delivery(hash, current_source.map(|source| source.addr))
+                    == RejectDelivery::ReleasedPending
+                {
                     retry_count = retry_count.saturating_add(1);
+                    if let Some(source) = current_source {
+                        if self.peer_table.disconnect_source(source) {
+                            window.mark_peer_unresponsive(source.addr, now);
+                            tracing::warn!(peer_addr = %source.addr, %hash, "block sync: peer served mutated block body; disconnecting");
+                        }
+                    }
                 }
             }
         }

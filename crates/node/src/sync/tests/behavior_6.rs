@@ -99,8 +99,7 @@ fn prefix_probe_state_does_not_survive_owner_replacement() -> Result<(), Box<dyn
 }
 
 #[test]
-fn permanent_forward_failure_purges_invalid_blocks_without_retry()
--> Result<(), Box<dyn std::error::Error>> {
+fn mutated_forward_body_preserves_descendant_for_retry() -> Result<(), Box<dyn std::error::Error>> {
     use bitcoin_rs_primitives::Amount;
     let (sync, _peers, applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
     sync.ensure_genesis_tip();
@@ -110,7 +109,7 @@ fn permanent_forward_failure_purges_invalid_blocks_without_retry()
     let main_hash = main[0].block_hash();
     let bad = mined_block_with_prev_hash(main_hash, 2, vec![coinbase_transaction(2)]);
     // The value change alters the txid, so the staged body contradicts the
-    // header's merkle root: a permanent consensus failure.
+    // header's merkle root: a mutated body, not an invalid header.
     let mut bad_body = bad.clone();
     bad_body.txs[0].outputs[0].value = Amount::from_sat(2);
     let descendant = mined_block_with_prev_hash(bad.block_hash(), 3, vec![coinbase_transaction(3)]);
@@ -128,20 +127,20 @@ fn permanent_forward_failure_purges_invalid_blocks_without_retry()
     assert_eq!(
         sync.apply_buffered_blocks(None),
         (0, 1),
-        "the permanent failure must stop the window with nothing committed"
+        "the mutated body must stop the window with nothing committed"
     );
     let bad_hash = Hash256::from_le_bytes(bad.block_hash().as_bytes());
     let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_bytes());
     assert!(!sync.block_stager.lock().contains(&bad_hash));
     let descendant_staged = sync.block_stager.lock().contains(&descendant_hash);
     assert!(
-        !descendant_staged,
-        "invalid descendants must be purged from bounded staging"
+        descendant_staged,
+        "valid descendant must remain staged for retry"
     );
     assert_eq!(
         sync.apply_buffered_blocks(None),
         (0, 0),
-        "the frontier must not cycle: nothing re-offers the invalidated blocks"
+        "without a replacement body the frontier must wait for re-download"
     );
     assert_eq!(applied_tip.load_full().map(|tip| tip.height), Some(1));
     Ok(())

@@ -380,9 +380,9 @@ pub fn block_witness_commitment_matches(block: &Block, wtxids: &[Wtxid]) -> bool
 /// required to carry a witness nonce, and witness data without a commitment
 /// is `unexpected-witness` only when segwit is active.
 ///
-/// Merkle verification runs first, preserving the full block-rule error
-/// precedence. The witness verdict is delegated to
-/// [`check_witness_malleation`] to avoid duplicating consensus logic. Two
+/// Merkle verification runs before witness verification in this binding gate;
+/// this is not the full block-rule error precedence. The witness verdict is
+/// delegated to [`check_witness_malleation`] to avoid duplicating consensus logic. Two
 /// cost-only fast paths are hoisted ahead of wtxid hashing without changing
 /// the delegated verdict:
 ///
