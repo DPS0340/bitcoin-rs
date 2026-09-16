@@ -522,7 +522,7 @@ fn next_merkle_level_scalar(level: &mut Vec<Txid>) {
 mod tests {
     use bitcoin_rs_primitives::{
         Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script,
-        Sequence, Tx, TxIn, TxOut, Txid, Witness, Wtxid,
+        Sequence, Tx, TxIn, TxOut, Txid, Witness,
     };
 
     use super::{
