@@ -71,7 +71,7 @@ fn block(tx: Tx) -> Block {
 fn commitment_block_with_stripped_witness_is_rejected() {
     let block = block(coinbase(None, Some(ZERO_RESERVED_COMMITMENT)));
     assert_eq!(
-        check_block_witness_well_formed(&block),
+        check_block_witness_well_formed(&block, true),
         Err(ConsensusError::WitnessNonceSize)
     );
 }
@@ -83,7 +83,7 @@ fn commitment_block_with_mismatched_commitment_is_rejected() {
     let wrong_commitment = [0xFF; 32];
     let block = block(coinbase(Some(vec![vec![0; 32]]), Some(wrong_commitment)));
     assert_eq!(
-        check_block_witness_well_formed(&block),
+        check_block_witness_well_formed(&block, true),
         Err(ConsensusError::WitnessCommitment)
     );
 }
@@ -96,7 +96,7 @@ fn commitment_block_with_correct_witness_passes() {
         Some(vec![vec![0; 32]]),
         Some(ZERO_RESERVED_COMMITMENT),
     ));
-    assert_eq!(check_block_witness_well_formed(&block), Ok(()));
+    assert_eq!(check_block_witness_well_formed(&block, true), Ok(()));
 }
 
 /// (d) A block without a BIP141 commitment output passes the staging gate
@@ -105,5 +105,28 @@ fn commitment_block_with_correct_witness_passes() {
 #[test]
 fn block_without_commitment_passes() {
     let block = block(coinbase(None, None));
-    assert_eq!(check_block_witness_well_formed(&block), Ok(()));
+    assert_eq!(check_block_witness_well_formed(&block, true), Ok(()));
+}
+
+/// (e) A pre-segwit block with a commitment-like output and no witness must
+/// pass the gate. Before segwit activation the commitment is not enforced,
+/// so a coincidental `6a24aa21a9ed` output must not trigger a witness-nonce
+/// check that the apply path would not perform (P1-1 regression).
+#[test]
+fn commitment_output_pre_segwit_without_witness_passes() {
+    let block = block(coinbase(None, Some(ZERO_RESERVED_COMMITMENT)));
+    assert_eq!(check_block_witness_well_formed(&block, false), Ok(()));
+}
+
+/// (f) A block without a commitment but with injected witness data must be
+/// rejected as unexpected-witness. A malicious peer cannot add bogus witness
+/// to a non-witness transaction without changing the txid or block hash, so
+/// the gate must catch this before staging (P1-2 regression).
+#[test]
+fn no_commitment_with_injected_witness_is_rejected() {
+    let block = block(coinbase(Some(vec![vec![0; 32]]), None));
+    assert_eq!(
+        check_block_witness_well_formed(&block, true),
+        Err(ConsensusError::UnexpectedWitness)
+    );
 }

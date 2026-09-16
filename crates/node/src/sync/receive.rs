@@ -5,6 +5,8 @@ use alloc::vec::Vec;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_chain::softfork_state;
+use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_consensus::check_block_witness_well_formed;
 use bitcoin_rs_p2p::InboundBlock;
 use bitcoin_rs_p2p::download_window::INBOUND_BLOCK_STAGE_CHUNK;
@@ -119,6 +121,7 @@ impl BlockSync {
         .then_some(active_tip.tip_id)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn buffer_received_block_chunk(
         &self,
         blocks: &mut Vec<InboundBlock>,
@@ -144,13 +147,44 @@ impl BlockSync {
                     })
             });
         }
+
+        // Pre-pass: compute the witness staging gate for each block before
+        // acquiring the stager lock. The gate hashes every transaction (wtxid
+        // + witness merkle tree) and must not hold the stager lock. segwit_active
+        // is derived from the block tree using the same canonical path as the
+        // apply path (softfork_state over the parent node), so the gate
+        // reproduces exact consensus semantics.
+        let witness_results: Vec<Result<(), ConsensusError>> = {
+            let tree = self.handles.block_tree.read();
+            blocks
+                .iter()
+                .map(|inbound| {
+                    let hash = Hash256::from(inbound.block.block_hash());
+                    let segwit_active = tree
+                        .lookup(hash)
+                        .and_then(|node_id| tree.node(node_id).ok())
+                        .is_none_or(|node| {
+                            softfork_state(&tree, self.handles.network, node.parent, node.height)
+                                .segwit_active
+                        });
+                    check_block_witness_well_formed(&inbound.block, segwit_active)
+                })
+                .collect()
+        };
+
         let mut staged_blocks = Vec::with_capacity(blocks.len());
         let now = Instant::now();
         {
             let mut stager = self.block_stager.lock();
-            for inbound in blocks.drain(..) {
+            for (inbound, witness_result) in blocks.drain(..).zip(witness_results) {
                 let hash = Hash256::from(inbound.block.block_hash());
                 let source = inbound.source;
+                // AlreadyStaged takes priority: a correct body already staged
+                // must not be displaced by a late malformed duplicate (P2-3).
+                if stager.contains(&hash) {
+                    staged_blocks.push((hash, source, StagedBlock::AlreadyStaged));
+                    continue;
+                }
                 // Issue #1070: a peer can strip witness data from a block body
                 // without changing the block hash (computed from the header
                 // only). The stager keeps the first body per hash, so a
@@ -159,13 +193,13 @@ impl BlockSync {
                 // correct body. The apply-path WitnessNonceSize classification
                 // stays Permanent: with this gate, a body that reaches apply
                 // with a witness defect is genuinely invalid, not stripped.
-                if let Err(error) = check_block_witness_well_formed(&inbound.block) {
+                if let Err(error) = witness_result {
                     metrics::counter!("node.sync.witness_malformed_drops").increment(1);
                     tracing::warn!(%hash, %error, "block sync: witness-malformed body; dropping for retry");
                     staged_blocks.push((
                         hash,
                         source,
-                        StagedBlock::DroppedForRetry {
+                        StagedBlock::MalformedBodyForRetry {
                             dropped: DroppedBlock { hash },
                         },
                     ));
@@ -208,6 +242,10 @@ impl BlockSync {
                         window.drop_for_retry(&dropped.hash);
                         retry_count = retry_count.saturating_add(1);
                         tracing::warn!(%hash, "block sync: received block buffer full; dropping block for retry");
+                    }
+                    StagedBlock::MalformedBodyForRetry { dropped } => {
+                        window.drop_for_retry(&dropped.hash);
+                        retry_count = retry_count.saturating_add(1);
                     }
                 }
             }

@@ -78,6 +78,12 @@ pub enum StagedBlock {
         /// Bodies evicted so this insert could fit the slot budget.
         dropped: Vec<DroppedBlock>,
     },
+    /// The body was rejected by the witness staging gate and should be
+    /// re-requested from a different peer (issue #1070).
+    MalformedBodyForRetry {
+        /// The rejected body.
+        dropped: DroppedBlock,
+    },
     /// The body was refused (byte budget or oversize) and should be
     /// re-requested.
     DroppedForRetry {
@@ -648,6 +654,9 @@ mod tests {
             super::StagedBlock::DroppedForRetry { .. } => {
                 panic!("incoming block should fit after evicting staged blocks")
             }
+            super::StagedBlock::MalformedBodyForRetry { .. } => {
+                panic!("insert never returns MalformedBodyForRetry")
+            }
         };
 
         assert_eq!(dropped.len(), 3);
@@ -683,6 +692,9 @@ mod tests {
             super::StagedBlock::Memory { dropped, .. } => dropped,
             super::StagedBlock::DroppedForRetry { .. } => {
                 panic!("incoming block should fit after evicting staged blocks")
+            }
+            super::StagedBlock::MalformedBodyForRetry { .. } => {
+                panic!("insert never returns MalformedBodyForRetry")
             }
         };
 
@@ -745,6 +757,9 @@ mod tests {
             super::StagedBlock::Memory { dropped, .. } => dropped,
             super::StagedBlock::DroppedForRetry { .. } => {
                 panic!("incoming block should fit after evicting staged blocks")
+            }
+            super::StagedBlock::MalformedBodyForRetry { .. } => {
+                panic!("insert never returns MalformedBodyForRetry")
             }
         };
 
@@ -949,6 +964,9 @@ mod tests {
             super::StagedBlock::Memory { dropped, .. } => dropped,
             super::StagedBlock::DroppedForRetry { .. } => {
                 panic!("incoming block should fit after evicting staged blocks")
+            }
+            super::StagedBlock::MalformedBodyForRetry { .. } => {
+                panic!("insert never returns MalformedBodyForRetry")
             }
         };
 
