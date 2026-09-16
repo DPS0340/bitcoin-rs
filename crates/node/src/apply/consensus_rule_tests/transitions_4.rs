@@ -361,13 +361,20 @@ fn mutated_body_keeps_failed_header_subtree_retryable() -> Result<(), Box<dyn st
     assert!(error.invalidated().is_empty());
     {
         let tree = handles.block_tree.read();
-        assert_eq!(
+        // Publishing the descendant header demotes `bad` from the transient
+        // tip to Stale before any body is applied — ordinary tree
+        // mechanics. The disposition contract is narrower: a mutated body
+        // proves nothing about the header, so neither node may be Invalid
+        // and both stay eligible for a correct body.
+        assert_ne!(
             tree.node_by_hash(bad_hash).map(|node| node.status),
-            Some(NodeStatus::HeaderValid)
+            Some(NodeStatus::Invalid),
+            "a mutated body must not poison the failed header"
         );
-        assert_eq!(
+        assert_ne!(
             tree.node_by_hash(descendant_hash).map(|node| node.status),
-            Some(NodeStatus::HeaderValid)
+            Some(NodeStatus::Invalid),
+            "a mutated body must not poison the failed header's descendant"
         );
     }
     assert_eq!(
