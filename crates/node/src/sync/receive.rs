@@ -9,8 +9,8 @@ use bitcoin_rs_chain::softfork_state;
 use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_consensus::check_block_witness_well_formed;
 use bitcoin_rs_p2p::InboundBlock;
+use bitcoin_rs_p2p::StagedBlock;
 use bitcoin_rs_p2p::download_window::INBOUND_BLOCK_STAGE_CHUNK;
-use bitcoin_rs_p2p::{DroppedBlock, StagedBlock};
 use bitcoin_rs_primitives::Hash256;
 use std::time::Instant;
 
@@ -148,40 +148,63 @@ impl BlockSync {
             });
         }
 
-        // Pre-pass: compute the witness staging gate for each block before
-        // acquiring the stager lock. The gate hashes every transaction (wtxid
-        // + witness merkle tree) and must not hold the stager lock. segwit_active
-        // is derived from the block tree using the same canonical path as the
-        // apply path (softfork_state over the parent node), so the gate
-        // reproduces exact consensus semantics.
-        let witness_results: Vec<Result<(), ConsensusError>> = {
-            let tree = self.handles.block_tree.read();
+        // Already-staged precheck: skip the expensive witness hashing for
+        // blocks whose hash is already in the stager. A correct body already
+        // staged must not be displaced by a late malformed duplicate (P2-3).
+        let already_staged: Vec<bool> = {
+            let stager = self.block_stager.lock();
             blocks
                 .iter()
-                .map(|inbound| {
-                    let hash = Hash256::from(inbound.block.block_hash());
-                    let segwit_active = tree
-                        .lookup(hash)
-                        .and_then(|node_id| tree.node(node_id).ok())
-                        .is_none_or(|node| {
-                            softfork_state(&tree, self.handles.network, node.parent, node.height)
-                                .segwit_active
-                        });
-                    check_block_witness_well_formed(&inbound.block, segwit_active)
-                })
+                .map(|inbound| stager.contains(&Hash256::from(inbound.block.block_hash())))
                 .collect()
         };
 
+        // For non-staged blocks, derive segwit_active from the tree (cheap
+        // lookups) then compute the witness gate without holding the tree
+        // lock. segwit_active uses the same canonical path as the apply path
+        // (softfork_state over the parent node) so the gate reproduces exact
+        // consensus semantics.
+        let witness_results: Vec<Result<(), ConsensusError>> = blocks
+            .iter()
+            .zip(&already_staged)
+            .map(|(inbound, already_staged)| {
+                if *already_staged {
+                    Ok(())
+                } else {
+                    let hash = Hash256::from(inbound.block.block_hash());
+                    let segwit_active = {
+                        let tree = self.handles.block_tree.read();
+                        tree.lookup(hash)
+                            .and_then(|node_id| tree.node(node_id).ok())
+                            .is_none_or(|node| {
+                                softfork_state(
+                                    &tree,
+                                    self.handles.network,
+                                    node.parent,
+                                    node.height,
+                                )
+                                .segwit_active
+                            })
+                    };
+                    check_block_witness_well_formed(&inbound.block, segwit_active)
+                }
+            })
+            .collect();
+
+        // Stager lock: TOCTOU recheck + insert. Witness-failed blocks are
+        // tracked separately for the window's source-aware reject_delivery.
         let mut staged_blocks = Vec::with_capacity(blocks.len());
+        let mut reject_deliveries = Vec::new();
         let now = Instant::now();
         {
             let mut stager = self.block_stager.lock();
-            for (inbound, witness_result) in blocks.drain(..).zip(witness_results) {
+            for (inbound, (already_staged, witness_result)) in blocks
+                .drain(..)
+                .zip(already_staged.into_iter().zip(witness_results))
+            {
                 let hash = Hash256::from(inbound.block.block_hash());
                 let source = inbound.source;
-                // AlreadyStaged takes priority: a correct body already staged
-                // must not be displaced by a late malformed duplicate (P2-3).
-                if stager.contains(&hash) {
+                if already_staged {
                     staged_blocks.push((hash, source, StagedBlock::AlreadyStaged));
                     continue;
                 }
@@ -189,20 +212,20 @@ impl BlockSync {
                 // without changing the block hash (computed from the header
                 // only). The stager keeps the first body per hash, so a
                 // stripped body would permanently wedge sync. Reject it before
-                // staging and drop for retry so a different peer can supply the
-                // correct body. The apply-path WitnessNonceSize classification
-                // stays Permanent: with this gate, a body that reaches apply
-                // with a witness defect is genuinely invalid, not stripped.
+                // staging and let the window's source-aware reject_delivery
+                // decide whether to release the pending request. The
+                // apply-path WitnessNonceSize classification stays Permanent:
+                // with this gate, a body that reaches apply with a witness
+                // defect is genuinely invalid, not stripped.
                 if let Err(error) = witness_result {
                     metrics::counter!("node.sync.witness_malformed_drops").increment(1);
-                    tracing::warn!(%hash, %error, "block sync: witness-malformed body; dropping for retry");
-                    staged_blocks.push((
-                        hash,
-                        source,
-                        StagedBlock::MalformedBodyForRetry {
-                            dropped: DroppedBlock { hash },
-                        },
-                    ));
+                    tracing::warn!(%hash, %error, "block sync: witness-malformed body; rejecting delivery");
+                    reject_deliveries.push((hash, source));
+                    continue;
+                }
+                // TOCTOU: recheck under the stager lock before inserting.
+                if stager.contains(&hash) {
+                    staged_blocks.push((hash, source, StagedBlock::AlreadyStaged));
                     continue;
                 }
                 let staged = stager.insert(
@@ -216,8 +239,12 @@ impl BlockSync {
             }
         }
 
+        // Window lock: process staged results and reject deliveries.
+        // reject_delivery is called under the window lock only (no stager
+        // lock) so the source-aware retry policy is owned entirely by the
+        // DownloadWindow.
         let mut retry_count = 0_u64;
-        let staged_count = staged_blocks.len();
+        let staged_count = staged_blocks.len() + reject_deliveries.len();
         {
             let mut window = self.download_window.lock();
             for (hash, source, staged) in staged_blocks {
@@ -243,11 +270,14 @@ impl BlockSync {
                         retry_count = retry_count.saturating_add(1);
                         tracing::warn!(%hash, "block sync: received block buffer full; dropping block for retry");
                     }
-                    StagedBlock::MalformedBodyForRetry { dropped } => {
-                        window.drop_for_retry(&dropped.hash);
-                        retry_count = retry_count.saturating_add(1);
-                    }
                 }
+            }
+            for (hash, source) in reject_deliveries {
+                let source_peer = source
+                    .filter(|source| self.peer_table.is_current(*source))
+                    .map(|source| source.addr);
+                window.reject_delivery(hash, source_peer);
+                retry_count = retry_count.saturating_add(1);
             }
         }
         if retry_count > 0 {

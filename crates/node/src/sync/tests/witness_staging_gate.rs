@@ -103,8 +103,10 @@ fn segwit_sync_fixture() -> Result<(BlockSync, Hash256, Block, Block), Box<dyn s
     Ok((sync, block_hash, correct_block, stripped_block))
 }
 
-/// (g) A malformed (witness-stripped) body arrives first and is dropped for
-/// retry; the correct body arrives later and is staged normally.
+/// (g) A malformed (witness-stripped) body arrives first and is rejected for
+/// delivery; the correct body arrives later and is staged normally. The
+/// window's source-aware `reject_delivery` is a no-op here (no pending, no
+/// source), but the stager must remain clean so the correct body can stage.
 #[test]
 fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::error::Error>> {
     let (sync, block_hash, correct_block, stripped_block) = segwit_sync_fixture()?;
@@ -112,7 +114,7 @@ fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::
     // Send the stripped (malformed) body first.
     let mut batch = vec![InboundBlock::from_decoded(stripped_block)];
     let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
-    assert_eq!(received, 1, "malformed body should be processed (dropped)");
+    assert_eq!(received, 1, "malformed body should be processed (rejected)");
     assert!(
         batch.is_empty(),
         "buffer_received_block_chunk should drain the batch"
@@ -136,14 +138,17 @@ fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::
     // The stager must now contain the correct body.
     assert!(
         sync.block_stager.lock().contains(&block_hash),
-        "correct body must be staged after malformed was dropped"
+        "correct body must be staged after malformed was rejected"
     );
 
     Ok(())
 }
 
 /// (h) A correct body is staged first; a late malformed duplicate for the
-/// same hash must not displace it or corrupt the received/window state.
+/// same hash must not displace it or corrupt the received/window state. The
+/// already-staged precheck skips witness hashing for the duplicate, so no
+/// `reject_delivery` or window manipulation occurs — the duplicate is a pure
+/// `AlreadyStaged` credited as a duplicate delivery.
 #[test]
 fn correct_body_staged_then_malformed_duplicate_is_ignored()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -158,6 +163,7 @@ fn correct_body_staged_then_malformed_duplicate_is_ignored()
         "correct body must be staged"
     );
     let staged_bytes = sync.block_stager.lock().received_bytes();
+    let window_received = sync.download_window.lock().received_len();
 
     // Send the stripped (malformed) duplicate.
     let mut batch = vec![InboundBlock::from_decoded(stripped_block)];
@@ -178,6 +184,13 @@ fn correct_body_staged_then_malformed_duplicate_is_ignored()
         sync.block_stager.lock().received_len(),
         1,
         "only one body should be staged"
+    );
+    // The already-staged precheck skips witness hashing, so no
+    // reject_delivery touches the window — received state is unchanged.
+    assert_eq!(
+        sync.download_window.lock().received_len(),
+        window_received,
+        "window received state must not change from an already-staged duplicate"
     );
 
     Ok(())

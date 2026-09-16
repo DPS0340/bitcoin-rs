@@ -381,17 +381,36 @@ pub fn block_witness_commitment_matches(block: &Block, wtxids: &[Wtxid]) -> bool
 /// is `unexpected-witness` only when segwit is active.
 ///
 /// The final verdict is delegated to [`check_witness_malleation`] to avoid
-/// duplicating consensus logic. When neither a commitment nor any witness is
-/// present the block is trivially well-formed and wtxid hashing is skipped
-/// (fast path). Otherwise wtxids are computed once and the apply-path check
-/// decides — its `None`-commitment branch does not consult `wtxids`, so the
-/// delegation is semantics-preserving.
+/// duplicating consensus logic. Two cost-only fast paths are hoisted ahead of
+/// wtxid hashing without changing the delegated verdict:
+///
+/// 1. When neither a commitment nor any witness is present the block is
+///    trivially well-formed (the delegated check returns `Ok`).
+/// 2. When segwit is active and a commitment is present but the coinbase
+///    witness nonce shape is wrong (missing input or not exactly 1×32B), the
+///    delegated check's first branch returns [`ConsensusError::WitnessNonceSize`]
+///    without consulting `wtxids`, so the same error is returned before the
+///    expensive hashing. This is **not** done when segwit is inactive: the
+///    delegated check may return `Ok` for a commitment-like output pre-activation.
 pub fn check_block_witness_well_formed(
     block: &Block,
     segwit_active: bool,
 ) -> Result<(), ConsensusError> {
-    if witness_commitment(block).is_none() && !block_has_witness(block) {
+    let commitment = witness_commitment(block);
+    if commitment.is_none() && !block_has_witness(block) {
         return Ok(());
+    }
+    // Early shape check: hoisted first branch of check_witness_malleation.
+    // When segwit is active and a commitment exists, a malformed coinbase
+    // witness nonce shape fails before wtxid hashing. The delegated check
+    // never consults wtxids in this branch, so the semantics are identical.
+    if segwit_active && commitment.is_some() {
+        let Some(input) = block.txs.first().and_then(|tx| tx.inputs.first()) else {
+            return Err(ConsensusError::WitnessNonceSize);
+        };
+        if input.witness.len() != 1 || input.witness[0].len() != 32 {
+            return Err(ConsensusError::WitnessNonceSize);
+        }
     }
     let wtxids: Vec<Wtxid> = block.txs.iter().map(Tx::wtxid).collect();
     check_witness_malleation(block, segwit_active, &wtxids)

@@ -119,7 +119,7 @@ fn commitment_output_pre_segwit_without_witness_passes() {
 }
 
 /// (f) A block without a commitment but with injected witness data must be
-/// rejected as unexpected-witness. A malicious peer cannot add bogus witness
+/// rejected as unexpected-witness. A malicious peer can add bogus witness
 /// to a non-witness transaction without changing the txid or block hash, so
 /// the gate must catch this before staging (P1-2 regression).
 #[test]

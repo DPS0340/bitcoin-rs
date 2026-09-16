@@ -2019,6 +2019,34 @@ impl DownloadWindow {
         }
     }
 
+    /// Rejects a malformed block delivery, source-aware (issue #1070).
+    ///
+    /// When the delivering peer owns the pending request for `hash`, the
+    /// pending is released so the block becomes re-requestable from a
+    /// different peer. When a different peer delivers the malformed body
+    /// unsolicited, the body is discarded and any existing pending request is
+    /// preserved — the original owner may still supply the correct body.
+    ///
+    /// The malformed body was never staged, so no received state is touched.
+    pub fn reject_delivery(
+        &mut self,
+        hash: Hash256,
+        source_peer: Option<SocketAddr>,
+    ) -> RejectDelivery {
+        let is_owner = self
+            .pending
+            .get(&hash)
+            .is_some_and(|pending| Some(pending.peer_addr) == source_peer);
+        if is_owner {
+            if let Some(pending) = self.remove_pending(&hash) {
+                self.next_request_height = self.next_request_height.min(pending.height);
+            }
+            RejectDelivery::ReleasedPending
+        } else {
+            RejectDelivery::DiscardedUnsolicited
+        }
+    }
+
     fn expire_pending(&mut self, now: Instant) -> Vec<PeerRequestEntry> {
         if self
             .next_pending_deadline
@@ -2067,6 +2095,23 @@ impl DownloadWindow {
     fn release_peer_block(&mut self, peer_addr: SocketAddr) {
         release_peer_block(&mut self.peer_inflight, peer_addr);
     }
+}
+
+/// Outcome of rejecting a malformed block delivery (issue #1070).
+///
+/// The window decides whether the delivering peer owned the pending request.
+/// Only the owner's malformed delivery releases the pending slot so the block
+/// becomes re-requestable; an unsolicited malformed body from a different peer
+/// is discarded without disturbing the in-flight request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectDelivery {
+    /// The pending owner delivered the malformed body. Its pending request was
+    /// released so the block can be re-requested from a different peer.
+    ReleasedPending,
+    /// A peer other than the pending owner delivered the malformed body
+    /// (or no pending existed). The body is discarded; any existing pending
+    /// request is preserved.
+    DiscardedUnsolicited,
 }
 
 fn release_peer_block(
@@ -4212,6 +4257,80 @@ mod tests {
         assert!(!window.peer_inflight.contains_key(&peer_addr));
         assert!(window.preferred_peer.is_none());
         assert!(window.peer_in_staller_cooldown(peer_addr, now));
+    }
+
+    /// (i) When the pending owner delivers a malformed body, `reject_delivery`
+    /// releases the pending request so the block becomes re-requestable from a
+    /// different peer. The pending slot and peer inflight are freed.
+    #[test]
+    fn reject_delivery_from_pending_owner_releases_pending() {
+        let now = Instant::now();
+        let owner = peer_addr(1);
+        let block_hash = hash(0x42);
+        let mut window = DownloadWindow::new(test_budget());
+        insert_pending(&mut window, owner, block_hash, 100, now);
+        assert!(window.contains_pending(&block_hash));
+        assert_eq!(window.pending_len(), 1);
+
+        let outcome = window.reject_delivery(block_hash, Some(owner));
+
+        assert_eq!(outcome, super::RejectDelivery::ReleasedPending);
+        assert!(!window.contains_pending(&block_hash));
+        assert_eq!(window.pending_len(), 0);
+        // next_request_height lowered so the block is re-requestable.
+        assert!(window.next_request_height <= 100);
+    }
+
+    /// (ii) When a peer other than the pending owner delivers a malformed body
+    /// unsolicited, `reject_delivery` discards the body and preserves the
+    /// existing pending request — the original owner may still supply the
+    /// correct body.
+    #[test]
+    fn reject_delivery_from_different_peer_preserves_pending() {
+        let now = Instant::now();
+        let owner = peer_addr(1);
+        let other = peer_addr(2);
+        let block_hash = hash(0x42);
+        let mut window = DownloadWindow::new(test_budget());
+        insert_pending(&mut window, owner, block_hash, 100, now);
+        assert!(window.contains_pending(&block_hash));
+        assert_eq!(window.pending_len(), 1);
+
+        let outcome = window.reject_delivery(block_hash, Some(other));
+
+        assert_eq!(outcome, super::RejectDelivery::DiscardedUnsolicited);
+        assert!(window.contains_pending(&block_hash));
+        assert_eq!(window.pending_len(), 1);
+        // next_request_height unchanged — the pending is still in flight.
+        assert_eq!(window.next_request_height, 1);
+    }
+
+    /// `reject_delivery` with no source peer (local injection) preserves any
+    /// existing pending — a local injection cannot prove it was the owner.
+    #[test]
+    fn reject_delivery_with_no_source_preserves_pending() {
+        let now = Instant::now();
+        let owner = peer_addr(1);
+        let block_hash = hash(0x42);
+        let mut window = DownloadWindow::new(test_budget());
+        insert_pending(&mut window, owner, block_hash, 100, now);
+
+        let outcome = window.reject_delivery(block_hash, None);
+
+        assert_eq!(outcome, super::RejectDelivery::DiscardedUnsolicited);
+        assert!(window.contains_pending(&block_hash));
+    }
+
+    /// `reject_delivery` with no pending is a no-op (`DiscardedUnsolicited`).
+    #[test]
+    fn reject_delivery_with_no_pending_is_noop() {
+        let mut window = DownloadWindow::new(test_budget());
+        let block_hash = hash(0x99);
+
+        let outcome = window.reject_delivery(block_hash, Some(peer_addr(1)));
+
+        assert_eq!(outcome, super::RejectDelivery::DiscardedUnsolicited);
+        assert_eq!(window.pending_len(), 0);
     }
 
     fn test_budget() -> SyncBudget {
