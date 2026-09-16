@@ -62,7 +62,7 @@ fn segwit_block(prev_blockhash: BlockHash, height: u32, witness: bool) -> Block 
     )
 }
 
-/// Sets up a BlockSync with genesis applied, a single segwit block header in
+/// Sets up a `BlockSync` with genesis applied, a single segwit block header in
 /// the tree, and a default sync budget. Returns the sync, the block hash, and
 /// both body variants (correct and stripped).
 fn segwit_sync_fixture() -> Result<(BlockSync, Hash256, Block, Block), Box<dyn std::error::Error>> {
@@ -110,7 +110,7 @@ fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::
     let (sync, block_hash, correct_block, stripped_block) = segwit_sync_fixture()?;
 
     // Send the stripped (malformed) body first.
-    let mut batch = vec![InboundBlock::from_decoded(stripped_block.clone())];
+    let mut batch = vec![InboundBlock::from_decoded(stripped_block)];
     let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
     assert_eq!(received, 1, "malformed body should be processed (dropped)");
     assert!(
@@ -130,7 +130,7 @@ fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::
     );
 
     // Now send the correct body.
-    let mut batch = vec![InboundBlock::from_decoded(correct_block.clone())];
+    let mut batch = vec![InboundBlock::from_decoded(correct_block)];
     let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
     assert_eq!(received, 1, "correct body should be processed (staged)");
     // The stager must now contain the correct body.
@@ -150,7 +150,7 @@ fn correct_body_staged_then_malformed_duplicate_is_ignored()
     let (sync, block_hash, correct_block, stripped_block) = segwit_sync_fixture()?;
 
     // Send the correct body first.
-    let mut batch = vec![InboundBlock::from_decoded(correct_block.clone())];
+    let mut batch = vec![InboundBlock::from_decoded(correct_block)];
     let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
     assert_eq!(received, 1, "correct body should be staged");
     assert!(
@@ -160,7 +160,7 @@ fn correct_body_staged_then_malformed_duplicate_is_ignored()
     let staged_bytes = sync.block_stager.lock().received_bytes();
 
     // Send the stripped (malformed) duplicate.
-    let mut batch = vec![InboundBlock::from_decoded(stripped_block.clone())];
+    let mut batch = vec![InboundBlock::from_decoded(stripped_block)];
     let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
     assert_eq!(received, 1, "duplicate should be processed (AlreadyStaged)");
 
