@@ -36,8 +36,9 @@ fn branch_switch_retires_only_the_connected_prefix_after_connect_failure()
         let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
         let bytes = consensus_bytes(&block).len();
         stage_body(&sync, &block);
-        sync.download_window
+        sync.body_sync
             .lock()
+            .window
             .mark_received(hash, bytes, Instant::now());
         fork.push(block);
     }
@@ -57,16 +58,17 @@ fn branch_switch_retires_only_the_connected_prefix_after_connect_failure()
     );
     let first = Hash256::from_le_bytes(fork[0].block_hash().as_bytes());
     let failed = Hash256::from_le_bytes(fork[1].block_hash().as_bytes());
-    assert!(!sync.block_stager.lock().contains(&first));
-    assert!(!sync.block_stager.lock().contains(&failed));
+    assert!(!sync.body_sync.lock().stager.contains(&first));
+    assert!(!sync.body_sync.lock().stager.contains(&failed));
     assert!(
-        sync.block_stager
+        sync.body_sync
             .lock()
+            .stager
             .contains(&Hash256::from_le_bytes(main[0].block_hash().as_bytes())),
         "unrelated staged body must not be retired"
     );
     assert_eq!(
-        sync.download_window.lock().received_len(),
+        sync.body_sync.lock().window.received_len(),
         0,
         "the mutated body must release download accounting"
     );
@@ -117,8 +119,9 @@ fn permanent_reorg_failure_invalidates_descendants_and_purges_ownership()
         stage_body(&sync, block);
         let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
         let bytes = consensus_bytes(block).len();
-        sync.download_window
+        sync.body_sync
             .lock()
+            .window
             .mark_received(hash, bytes, Instant::now());
     }
 
@@ -134,12 +137,13 @@ fn permanent_reorg_failure_invalidates_descendants_and_purges_ownership()
             "the valid main branch must win after subtree invalidation"
         );
     }
-    let stager = sync.block_stager.lock();
+    let body_sync = sync.body_sync.lock();
+    let stager = &body_sync.stager;
     assert!(stager.contains(&main_hash));
     assert!(!stager.contains(&invalid_hash));
     assert!(!stager.contains(&descendant_hash));
-    drop(stager);
-    assert_eq!(sync.download_window.lock().received_len(), 0);
+    drop(body_sync);
+    assert_eq!(sync.body_sync.lock().window.received_len(), 0);
     // MPL-04: rejecting the invalid branch must still allow the selected
     // valid main branch to reconnect through ordinary forward apply.
     assert!(sync.handles.mempool_gateway.stable_generation().is_some());
@@ -194,8 +198,9 @@ fn operational_reorg_failure_preserves_branch_and_retries_without_restart()
         stage_body(&sync, block);
         let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
         let bytes = consensus_bytes(block).len();
-        sync.download_window
+        sync.body_sync
             .lock()
+            .window
             .mark_received(hash, bytes, Instant::now());
     }
 
@@ -203,7 +208,7 @@ fn operational_reorg_failure_preserves_branch_and_retries_without_restart()
         &sync.handles,
         &sync.followers,
         descendant_id,
-        |hash| sync.block_stager.lock().staged_body(hash),
+        |hash| sync.body_sync.lock().stager.staged_body(hash),
         |hash| sync.retire_applied_reorg_body(hash),
     );
     assert!(
@@ -230,11 +235,12 @@ fn operational_reorg_failure_preserves_branch_and_retries_without_restart()
         assert_ne!(tree.node(descendant_id)?.status, NodeStatus::Invalid);
         assert_eq!(tree.tip().map(|tip| tip.tip_id), Some(descendant_id));
     }
-    let stager = sync.block_stager.lock();
+    let body_sync = sync.body_sync.lock();
+    let stager = &body_sync.stager;
     assert!(stager.contains(&fork_hash));
     assert!(stager.contains(&descendant_hash));
-    drop(stager);
-    assert_eq!(sync.download_window.lock().received_len(), 2);
+    drop(body_sync);
+    assert_eq!(sync.body_sync.lock().window.received_len(), 2);
     // MPL-04: a known committed prefix must finish its generation, so a
     // transient pre-UTXO refusal cannot wedge admission and later applies.
     assert!(
@@ -246,7 +252,7 @@ fn operational_reorg_failure_preserves_branch_and_retries_without_restart()
         &sync.handles,
         &sync.followers,
         descendant_id,
-        |hash| sync.block_stager.lock().staged_body(hash),
+        |hash| sync.body_sync.lock().stager.staged_body(hash),
         |hash| sync.retire_applied_reorg_body(hash),
     )?;
     assert_eq!(
@@ -255,9 +261,9 @@ fn operational_reorg_failure_preserves_branch_and_retries_without_restart()
         "retrying the same reorg must reach the target without restarting"
     );
     assert!(sync.handles.mempool_gateway.stable_generation().is_some());
-    assert!(!sync.block_stager.lock().contains(&fork_hash));
-    assert!(!sync.block_stager.lock().contains(&descendant_hash));
-    assert_eq!(sync.download_window.lock().received_len(), 0);
+    assert!(!sync.body_sync.lock().stager.contains(&fork_hash));
+    assert!(!sync.body_sync.lock().stager.contains(&descendant_hash));
+    assert_eq!(sync.body_sync.lock().window.received_len(), 0);
     Ok(())
 }
 

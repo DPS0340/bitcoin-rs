@@ -79,7 +79,8 @@ type ExpectedBlockHashes = SmallVec<[Hash256; RECEIVED_BLOCK_BUDGET]>;
 
 /// Block download orchestrator.
 ///
-/// Drives the P2P-owned [`DownloadWindow`] and [`BlockStager`]. See
+/// Drives the P2P-owned [`DownloadWindow`] and [`BlockStager`] through one
+/// node-owned body-sync state. See
 /// `docs/contracts/architecture.md` for the download-window ownership
 /// contract.
 pub struct BlockSync {
@@ -88,8 +89,7 @@ pub struct BlockSync {
     peer_table: Arc<PeerTable>,
     inbound_headers_rx: Arc<Mutex<Receiver<InboundHeaders>>>,
     inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
-    download_window: Arc<Mutex<DownloadWindow>>,
-    block_stager: Arc<Mutex<BlockStager>>,
+    body_sync: Mutex<BodySyncState>,
     pending_getheaders: Arc<Mutex<Option<PendingHeaderRequest>>>,
     expected_apply_cache: Arc<Mutex<Option<ExpectedApplyCache>>>,
     known_sessions: Mutex<HashMap<SocketAddr, bitcoin_rs_p2p::ConnectionId>>,
@@ -100,6 +100,13 @@ pub struct BlockSync {
     /// churn staged state. Only recreating the sync object (restart path)
     /// clears it; there is no in-place recovery that re-evens generation.
     apply_halted: std::sync::atomic::AtomicBool,
+}
+
+/// One lock owns the coupled download and staged-body state. Consensus and
+/// chain I/O stay outside this lock; P2P still owns each component's policy.
+struct BodySyncState {
+    window: DownloadWindow,
+    stager: BlockStager,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,8 +163,10 @@ impl BlockSync {
             peer_table,
             inbound_headers_rx,
             inbound_blocks_rx,
-            download_window: Arc::new(Mutex::new(DownloadWindow::new(default_sync_budget()))),
-            block_stager: Arc::new(Mutex::new(BlockStager::new(default_sync_budget()))),
+            body_sync: Mutex::new(BodySyncState {
+                window: DownloadWindow::new(default_sync_budget()),
+                stager: BlockStager::new(default_sync_budget()),
+            }),
             pending_getheaders: Arc::new(Mutex::new(None)),
             expected_apply_cache: Arc::new(Mutex::new(None)),
             known_sessions: Mutex::new(HashMap::new()),
@@ -186,8 +195,10 @@ impl BlockSync {
     /// `budget`: the fast-sync opt-in at node open, and tests and benchmarks
     /// that exercise non-default capacity limits.
     pub fn install_budget(&self, budget: SyncBudget) {
-        *self.download_window.lock() = DownloadWindow::new(budget);
-        *self.block_stager.lock() = BlockStager::new(budget);
+        *self.body_sync.lock() = BodySyncState {
+            window: DownloadWindow::new(budget),
+            stager: BlockStager::new(budget),
+        };
     }
 
     /// Runs one orchestrator tick: requests pending blocks from eligible peers

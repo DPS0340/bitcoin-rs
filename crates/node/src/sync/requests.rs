@@ -32,11 +32,11 @@ impl BlockSync {
     /// Every alternate receives the same earliest hashes, so the probe cannot
     /// create a unique out-of-order height hole. It runs once per deep owner.
     pub(super) fn send_prefix_probes(&self, probe_peers: &[SyncPeer], now: Instant) {
-        let window = self.download_window.lock();
-        let Some((owner, hashes, required_height)) = window.prefix_probe_plan() else {
+        let Some((owner, hashes, required_height)) =
+            self.body_sync.lock().window.prefix_probe_plan()
+        else {
             return;
         };
-        drop(window);
         let candidates = probe_peers.iter().filter(|peer| {
             peer.addr != owner
                 && u32::try_from(peer.best_known_height)
@@ -64,8 +64,10 @@ impl BlockSync {
             return;
         }
         let block_count = hashes.len();
-        let mut window = self.download_window.lock();
-        window.confirm_prefix_probe(owner, hashes, &successful, now);
+        self.body_sync
+            .lock()
+            .window
+            .confirm_prefix_probe(owner, hashes, &successful, now);
         metrics::counter!("node.sync.prefix_probe_peers")
             .increment(u64::try_from(successful.len()).unwrap_or(u64::MAX));
         tracing::info!(
@@ -141,8 +143,7 @@ impl BlockSync {
             return GetdataRequestOutcome::default();
         };
 
-        let mut window = self.download_window.lock();
-        let request = window.next_peer_request(
+        let request = self.body_sync.lock().window.next_peer_request(
             sync_peer_addr,
             allow_expired_retry_from_peer,
             chain_tip,
@@ -155,7 +156,6 @@ impl BlockSync {
         let Some(request) = request else {
             return GetdataRequestOutcome::default();
         };
-        drop(window);
 
         let compact_fetch = self.compact_fetch_eligible(&request, chain_tip);
         let (inventory, expected_hashes, is_contiguous) =
@@ -177,7 +177,7 @@ impl BlockSync {
         let still_current = self.peer_table.with_current(source, || {
             send_ok = tx.send(msg).is_ok();
             if send_ok {
-                has_request_capacity = self.download_window.lock().mark_requested(&request, now);
+                has_request_capacity = self.body_sync.lock().window.mark_requested(&request, now);
             }
         });
         if !still_current {
@@ -256,7 +256,8 @@ impl BlockSync {
         }
         drop(tree);
         let candidates: SmallVec<[SocketAddr; 8]> = {
-            let window = self.download_window.lock();
+            let body_sync = self.body_sync.lock();
+            let window = &body_sync.window;
             candidates
                 .into_iter()
                 .filter(|addr| {

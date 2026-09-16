@@ -51,14 +51,14 @@ fn batch_drain_restores_unapplied_tail_after_mid_batch_failure()
         Some(1),
         "height 1 should apply before the fail-once height 2 body persistence error"
     );
-    assert_eq!(sync.block_stager.lock().received_len(), 1);
-    assert_eq!(sync.download_window.lock().received_len(), 1);
+    assert_eq!(sync.body_sync.lock().stager.received_len(), 1);
+    assert_eq!(sync.body_sync.lock().window.received_len(), 1);
     assert!(
-        !sync.block_stager.lock().contains(&block2_hash),
+        !sync.body_sync.lock().stager.contains(&block2_hash),
         "failed block should be dropped for retry rather than restored"
     );
     assert!(
-        sync.block_stager.lock().contains(&block3_hash),
+        sync.body_sync.lock().stager.contains(&block3_hash),
         "tail block must be restored after the mid-batch failure"
     );
     // The mid-batch failure must hand the gateway generation back so the

@@ -14,7 +14,8 @@ fn tick_caps_requests_at_staged_byte_headroom() -> Result<(), Box<dyn std::error
     // Two of three staging slots already occupied: the staged-byte gate is
     // still open, but only one more estimated block fits.
     {
-        let mut window = sync.download_window.lock();
+        let mut body_sync = sync.body_sync.lock();
+        let window = &mut body_sync.window;
         let now = Instant::now();
         window.mark_received(Hash256::from_le_bytes(&[0xEE; 32]), slot, now);
         window.mark_received(Hash256::from_le_bytes(&[0xEF; 32]), slot, now);
@@ -58,7 +59,8 @@ fn stalled_front_stripe_wedges_into_request_backpressure_not_evict_churn()
     sync.tick();
 
     {
-        let window = sync.download_window.lock();
+        let body_sync = sync.body_sync.lock();
+        let window = &body_sync.window;
         assert_eq!(window.received_len(), 14);
         assert_eq!(window.pending_len(), 2);
         for front in &expected[..2] {
@@ -78,7 +80,8 @@ fn stalled_front_stripe_wedges_into_request_backpressure_not_evict_churn()
     for rx in &rxs {
         assert_no_getdata(rx)?;
     }
-    let stager = sync.block_stager.lock();
+    let body_sync = sync.body_sync.lock();
+    let stager = &body_sync.stager;
     assert_eq!(stager.received_len(), 14, "no evictions may occur");
     for height in 3..=16_u32 {
         let hash = Hash256::from_le_bytes(expected[usize::try_from(height)? - 1].as_bytes());
@@ -87,7 +90,7 @@ fn stalled_front_stripe_wedges_into_request_backpressure_not_evict_churn()
             "every delivered block must remain staged (height {height})"
         );
     }
-    assert_eq!(sync.download_window.lock().pending_len(), 2);
+    assert_eq!(body_sync.window.pending_len(), 2);
     Ok(())
 }
 
@@ -124,7 +127,7 @@ fn cold_start_stall_hedges_front_without_reassigning_owner()
 
     // The first drain builds the asymmetric wedge and starts the episode.
     sync.tick();
-    assert_eq!(sync.download_window.lock().pending_len(), 2);
+    assert_eq!(sync.body_sync.lock().window.pending_len(), 2);
     std::thread::sleep(Duration::from_millis(150));
     sync.tick();
 
@@ -141,7 +144,7 @@ fn cold_start_stall_hedges_front_without_reassigning_owner()
         }
     }
     assert_eq!(hedged, expected[..1]);
-    assert_eq!(sync.download_window.lock().pending_len(), 2);
+    assert_eq!(sync.body_sync.lock().window.pending_len(), 2);
 
     // The confirmed front hash is not duplicated again on later ticks.
     std::thread::sleep(Duration::from_millis(50));
@@ -184,7 +187,7 @@ fn fanout_replaces_preferred_peer_when_eligible_pool_recovers()
     sync.tick();
     let _ = next_getdata(&alternate_rx)?;
     assert_eq!(
-        sync.download_window.lock().preferred_peer(),
+        sync.body_sync.lock().window.preferred_peer(),
         Some(alternate)
     );
 
@@ -202,10 +205,11 @@ fn fanout_replaces_preferred_peer_when_eligible_pool_recovers()
     }
     sync.tick();
 
-    let window = sync.download_window.lock();
+    let body_sync = sync.body_sync.lock();
+    let window = &body_sync.window;
     assert!(window.preferred_peer().is_none());
     assert!(window.fanout_active());
-    drop(window);
+    drop(body_sync);
     assert!(
         recovered_rxs.iter().any(|rx| rx.try_recv().is_ok()),
         "a recovered eligible peer must receive a fanout request"
@@ -290,8 +294,9 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
     // own and this test would pass vacuously. Seed it (50ms keeps the
     // decay floor at the default 2s initial threshold) so the no-fire
     // phase below pins the apply-side no-blame guard specifically.
-    sync.download_window
+    sync.body_sync
         .lock()
+        .window
         .seed_front_cadence_for_test(50, Instant::now());
 
     sync.tick();
@@ -305,12 +310,14 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
     {
         let block = Network::Regtest.genesis_block();
         let serialized = bytes::Bytes::from(consensus_bytes(&block));
-        sync.block_stager
+        sync.body_sync
             .lock()
+            .stager
             .insert(successor, None, block, serialized, Instant::now());
     }
-    sync.download_window
+    sync.body_sync
         .lock()
+        .window
         .mark_received(successor, 80, Instant::now());
 
     // Apply-side backpressure: the next expected block (the frontier) is
@@ -319,8 +326,9 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
     {
         let block = Network::Regtest.genesis_block();
         let serialized = bytes::Bytes::from(consensus_bytes(&block));
-        sync.block_stager
+        sync.body_sync
             .lock()
+            .stager
             .insert(frontier, None, block, serialized, Instant::now());
     }
 
@@ -333,17 +341,22 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
 
     // Far past any threshold, but the apply side is busy: frozen.
     sync.disconnect_window_staller(Some(&applied), far_future);
-    assert!(sync.download_window.lock().stalling_peer().is_none());
+    assert!(sync.body_sync.lock().window.stalling_peer().is_none());
     assert!(peers.is_connected(staller));
 
     // The apply side drains the frontier: blame starts from scratch and
     // only then runs to a fire — the busy interval was not charged.
-    let drained = sync.block_stager.lock().drain_expected_prefix(&[frontier]);
+    let drained = sync
+        .body_sync
+        .lock()
+        .stager
+        .drain_expected_prefix(&[frontier]);
     assert_eq!(drained.len(), 1);
     sync.disconnect_window_staller(Some(&applied), far_future);
     assert_eq!(
-        sync.download_window
+        sync.body_sync
             .lock()
+            .window
             .stalling_peer()
             .map(|(addr, _)| addr),
         Some(staller)
@@ -394,7 +407,7 @@ fn transient_demotion_does_not_flap_fanout_mode() -> Result<(), Box<dyn std::err
     // Tick 1: eight eligible peers engage fan-out and stripe the window.
     sync.tick();
     assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-    assert!(sync.download_window.lock().fanout_active());
+    assert!(sync.body_sync.lock().window.fanout_active());
     for (idx, rx) in rxs.iter().enumerate() {
         let Message::GetData(inventory) = rx.try_recv()? else {
             return Err(std::io::Error::other("expected striped getdata").into());
@@ -419,7 +432,7 @@ fn transient_demotion_does_not_flap_fanout_mode() -> Result<(), Box<dyn std::err
     // so the stalled stripe is redistributed in cap-sized batches instead
     // of re-concentrating the whole window on one deep peer.
     assert!(
-        sync.download_window.lock().fanout_active(),
+        sync.body_sync.lock().window.fanout_active(),
         "one demotion below the threshold must not disengage fan-out"
     );
     assert_no_getdata(&rxs[0])?;
@@ -448,6 +461,6 @@ fn transient_demotion_does_not_flap_fanout_mode() -> Result<(), Box<dyn std::err
     // Tick 3: the dip heals (7 -> 8) and the mode is still fan-out — the
     // window stayed in one mode across 8 -> 7 -> 8.
     sync.tick();
-    assert!(sync.download_window.lock().fanout_active());
+    assert!(sync.body_sync.lock().window.fanout_active());
     Ok(())
 }

@@ -39,8 +39,9 @@ fn slow_trickle_front_peer_observable_but_never_disconnected()
             ))?;
             sync.tick();
             assert_eq!(
-                sync.download_window
+                sync.body_sync
                     .lock()
+                    .window
                     .stalling_peer()
                     .map(|(addr, _)| addr),
                 Some(trickler),
@@ -66,9 +67,9 @@ fn slow_trickle_front_peer_observable_but_never_disconnected()
                 blocks[offset].clone(),
             ))?;
             sync.tick();
-            assert!(sync.download_window.lock().stalling_peer().is_none());
+            assert!(sync.body_sync.lock().window.stalling_peer().is_none());
             assert_eq!(
-                sync.download_window.lock().stall_timeout(),
+                sync.body_sync.lock().window.stall_timeout(),
                 super::super::BLOCK_STALLING_TIMEOUT,
                 "front progress must keep the adaptive threshold at its floor"
             );
@@ -259,7 +260,7 @@ fn single_peer_can_fill_default_pending_window() -> Result<(), Box<dyn std::erro
 
     assert_eq!(requested, expected);
     assert_eq!(
-        sync.download_window.lock().pending_len(),
+        sync.body_sync.lock().window.pending_len(),
         super::super::PENDING_BUDGET
     );
     Ok(())
@@ -291,7 +292,8 @@ fn tick_preserves_partial_window_order_across_pending_gap() -> Result<(), Box<dy
     assert_eq!(witness_block_inventory(first)?, expected[..4]);
     let _headers = rx.try_recv()?;
     {
-        let mut window = sync.download_window.lock();
+        let mut body_sync = sync.body_sync.lock();
+        let window = &mut body_sync.window;
         window.mark_applied(&Hash256::from_le_bytes(expected[0].as_bytes()));
         window.drop_for_retry(&Hash256::from_le_bytes(expected[1].as_bytes()));
     }
@@ -305,7 +307,7 @@ fn tick_preserves_partial_window_order_across_pending_gap() -> Result<(), Box<dy
         witness_block_inventory(second)?,
         vec![expected[1], expected[4]]
     );
-    assert_eq!(sync.download_window.lock().pending_len(), 4);
+    assert_eq!(sync.body_sync.lock().window.pending_len(), 4);
     Ok(())
 }
 

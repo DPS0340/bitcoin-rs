@@ -7,7 +7,7 @@ use super::*;
 fn fatal_settlement_halts_further_apply_attempts() -> Result<(), Box<dyn std::error::Error>> {
     let (sync, _peers, _applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
     stage_body(&sync, &main[0]);
-    let staged = sync.block_stager.lock().received_len();
+    let staged = sync.body_sync.lock().stager.received_len();
     assert!(
         staged > 0,
         "the staged block must be queued before the halt"
@@ -23,7 +23,7 @@ fn fatal_settlement_halts_further_apply_attempts() -> Result<(), Box<dyn std::er
         "a halted sync must not start another transition"
     );
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         staged,
         "halted ticks must preserve staged blocks for recreation"
     );
@@ -53,11 +53,11 @@ fn drain_inbound_blocks_keeps_oversized_burst_within_received_budget()
     fixture.sync.drain_inbound_blocks();
 
     assert!(
-        fixture.sync.block_stager.lock().received_len() <= max_received_blocks,
+        fixture.sync.body_sync.lock().stager.received_len() <= max_received_blocks,
         "block stager must enforce received block count budget"
     );
     assert!(
-        fixture.sync.download_window.lock().received_len() <= max_received_blocks,
+        fixture.sync.body_sync.lock().window.received_len() <= max_received_blocks,
         "download window must mirror received block count budget"
     );
     assert!(
@@ -319,8 +319,9 @@ fn far_future_matching_peer_retries_without_peer_blame() -> Result<(), Box<dyn s
     assert!(peers.is_connected(peer_addr));
     assert!(
         !sync
-            .download_window
+            .body_sync
             .lock()
+            .window
             .peer_in_staller_cooldown(peer_addr, Instant::now()),
         "local-clock rejection must not blame the peer"
     );

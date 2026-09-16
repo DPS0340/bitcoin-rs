@@ -99,7 +99,7 @@ fn retargeting_pending_requests_drops_losing_branch_hashes()
         "retargeted requests must not retain hashes from the losing branch"
     );
     assert_eq!(
-        sync.download_window.lock().pending_len(),
+        sync.body_sync.lock().window.pending_len(),
         winning_hashes.len(),
         "retargeting must release losing-branch pending capacity"
     );
@@ -218,21 +218,22 @@ fn branch_switch_uses_staged_bodies_without_durable_store() -> Result<(), Box<dy
         .tip()
         .ok_or_else(|| std::io::Error::other("fork tip was not published"))?;
     sync.handles.chain_tip.store(Some(fork_tip));
-    assert_eq!(sync.block_stager.lock().received_len(), 2);
-    assert_eq!(sync.download_window.lock().received_len(), 0);
+    assert_eq!(sync.body_sync.lock().stager.received_len(), 2);
+    assert_eq!(sync.body_sync.lock().window.received_len(), 0);
 
     let stage_received = |block: &Block| {
         stage_body(&sync, block);
         let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
         let bytes = consensus_bytes(block).len();
-        sync.download_window
+        sync.body_sync
             .lock()
+            .window
             .mark_received(hash, bytes, Instant::now());
         hash
     };
 
     let first_hash = stage_received(&fork[0]);
-    assert_eq!(sync.block_stager.lock().received_len(), 3);
+    assert_eq!(sync.body_sync.lock().stager.received_len(), 3);
     assert_eq!(
         sync.outweighed_branch_target(),
         Some(fork_parent),
@@ -244,13 +245,13 @@ fn branch_switch_uses_staged_bodies_without_durable_store() -> Result<(), Box<dy
         .ok_or_else(|| std::io::Error::other("branch prefix did not publish a tip"))?;
     assert_eq!(first_tip.height, 1);
     assert_eq!(first_tip.hash, first_hash);
-    assert_eq!(sync.block_stager.lock().received_len(), 2);
-    assert_eq!(sync.download_window.lock().received_len(), 0);
+    assert_eq!(sync.body_sync.lock().stager.received_len(), 2);
+    assert_eq!(sync.body_sync.lock().window.received_len(), 0);
 
     for (index, block) in fork.iter().enumerate().skip(1) {
         let hash = stage_received(block);
         assert_eq!(
-            sync.block_stager.lock().received_len(),
+            sync.body_sync.lock().stager.received_len(),
             3,
             "the tiny stager has room for one suffix body"
         );
@@ -264,8 +265,8 @@ fn branch_switch_uses_staged_bodies_without_durable_store() -> Result<(), Box<dy
             .ok_or_else(|| std::io::Error::other("forward suffix did not publish a tip"))?;
         assert_eq!(tip.height, u32::try_from(index + 1)?);
         assert_eq!(tip.hash, hash);
-        assert_eq!(sync.block_stager.lock().received_len(), 2);
-        assert_eq!(sync.download_window.lock().received_len(), 0);
+        assert_eq!(sync.body_sync.lock().stager.received_len(), 2);
+        assert_eq!(sync.body_sync.lock().window.received_len(), 0);
     }
 
     install_budget(
@@ -282,13 +283,13 @@ fn branch_switch_uses_staged_bodies_without_durable_store() -> Result<(), Box<dy
         stage_body(&sync, block);
     }
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         5,
         "bounded staging must contain every reverse-switch plan body"
     );
     // The reverse switch must resolve all five disconnect and connect bodies from
     // the bounded stager, without durable storage or fixture-vector lookup.
-    let explicit_body = |hash: Hash256| sync.block_stager.lock().staged_body(hash);
+    let explicit_body = |hash: Hash256| sync.body_sync.lock().stager.staged_body(hash);
     let main_target = sync
         .handles
         .block_tree
@@ -313,7 +314,7 @@ fn branch_switch_uses_staged_bodies_without_durable_store() -> Result<(), Box<dy
         "bounded staging must supply the reverse branch switch without durable storage"
     );
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         3,
         "only connected bodies retire from bounded staging after the reverse switch"
     );
@@ -385,7 +386,7 @@ fn branch_switch_replans_after_a_competing_connect_before_transition()
                 &sync.followers,
                 fork_parent,
                 |hash| {
-                    let body = sync.block_stager.lock().staged_body(hash);
+                    let body = sync.body_sync.lock().stager.staged_body(hash);
                     if !paused {
                         paused = true;
                         assert!(preloaded_tx.send(()).is_ok());

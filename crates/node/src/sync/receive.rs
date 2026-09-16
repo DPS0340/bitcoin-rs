@@ -36,12 +36,12 @@ impl BlockSync {
                 );
             }
         }
-        if received == 0 && self.block_stager.lock().received_len() == 0 {
+        if received == 0 && self.body_sync.lock().stager.received_len() == 0 {
             return;
         }
 
         let now = Instant::now();
-        let dropped = self.block_stager.lock().prune_expired(now);
+        let dropped = self.body_sync.lock().stager.prune_expired(now);
         let pruned = !dropped.is_empty();
         if pruned {
             let tree = self.handles.block_tree.read();
@@ -55,7 +55,8 @@ impl BlockSync {
                 })
                 .collect();
             drop(tree);
-            let mut window = self.download_window.lock();
+            let mut body_sync = self.body_sync.lock();
+            let window = &mut body_sync.window;
             for (hash, height) in height_updates {
                 window.update_received_height(&hash, height);
             }
@@ -153,7 +154,8 @@ impl BlockSync {
         // blocks whose hash is already in the stager. A correct body already
         // staged must not be displaced by a late malformed duplicate (P2-3).
         let already_staged: Vec<bool> = {
-            let stager = self.block_stager.lock();
+            let body_sync = self.body_sync.lock();
+            let stager = &body_sync.stager;
             blocks
                 .iter()
                 .map(|inbound| stager.contains(&Hash256::from(inbound.block.block_hash())))
@@ -198,7 +200,8 @@ impl BlockSync {
         let mut reject_deliveries = Vec::new();
         let now = Instant::now();
         {
-            let mut stager = self.block_stager.lock();
+            let mut body_sync = self.body_sync.lock();
+            let stager = &mut body_sync.stager;
             for (inbound, (already_staged, binding_result)) in blocks
                 .drain(..)
                 .zip(already_staged.into_iter().zip(binding_results))
@@ -251,7 +254,8 @@ impl BlockSync {
         let mut retry_count = 0_u64;
         let staged_count = staged_blocks.len() + reject_deliveries.len();
         {
-            let mut window = self.download_window.lock();
+            let mut body_sync = self.body_sync.lock();
+            let window = &mut body_sync.window;
             for (hash, source_peer, staged) in staged_blocks {
                 match staged {
                     StagedBlock::AlreadyStaged => {
@@ -280,20 +284,22 @@ impl BlockSync {
             let current = source.is_some_and(|source| {
                 self.peer_table.with_current(source, || {
                     rejected = self
-                        .download_window
+                        .body_sync
                         .lock()
+                        .window
                         .reject_delivery(hash, Some(source.addr));
                 })
             });
             if !current {
-                self.download_window.lock().reject_delivery(hash, None);
+                self.body_sync.lock().window.reject_delivery(hash, None);
             }
             if rejected == RejectDelivery::ReleasedPending {
                 retry_count = retry_count.saturating_add(1);
                 if let Some(source) = source {
                     if self.peer_table.disconnect_source(source) {
-                        self.download_window
+                        self.body_sync
                             .lock()
+                            .window
                             .mark_peer_unresponsive(source.addr, now);
                         tracing::warn!(peer_addr = %source.addr, %hash, "block sync: peer served mutated block body; disconnecting");
                     }

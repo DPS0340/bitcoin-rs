@@ -49,7 +49,7 @@ fn mid_window_failure_releases_retained_work_to_the_stager()
         stage_body(&sync, block);
     }
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         4,
         "all four bodies start staged"
     );
@@ -65,14 +65,15 @@ fn mid_window_failure_releases_retained_work_to_the_stager()
         "only the committed prefix may move the applied tip"
     );
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         2,
         "blocks 3 and 4 must be restored to bounded staging, not held or lost"
     );
     for block in &blocks[2..] {
         assert!(
-            sync.block_stager
+            sync.body_sync
                 .lock()
+                .stager
                 .staged_body(Hash256::from_le_bytes(block.block_hash().as_bytes()))
                 .is_some(),
             "restored block must still be drainable with its original body"
@@ -91,7 +92,7 @@ fn mid_window_failure_releases_retained_work_to_the_stager()
     );
     assert_eq!(applied_tip.load_full().map(|tip| tip.height), Some(4));
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         0,
         "nothing staged may survive a completed round"
     );

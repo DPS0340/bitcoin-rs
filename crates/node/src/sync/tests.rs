@@ -254,7 +254,8 @@ fn unsolicited_stale_block_retries_from_resolved_header_height()
     );
     let _headers = rx.try_recv()?;
     {
-        let mut window = sync.download_window.lock();
+        let mut body_sync = sync.body_sync.lock();
+        let window = &mut body_sync.window;
         window.mark_applied(&Hash256::from_le_bytes(block1_hash.as_bytes()));
         window.mark_applied(&Hash256::from_le_bytes(expected_hash.as_bytes()));
     }
@@ -262,8 +263,8 @@ fn unsolicited_stale_block_retries_from_resolved_header_height()
     inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block2))?;
     sync.drain_inbound_blocks();
 
-    assert_eq!(sync.block_stager.lock().received_len(), 0);
-    assert_eq!(sync.download_window.lock().received_len(), 0);
+    assert_eq!(sync.body_sync.lock().stager.received_len(), 0);
+    assert_eq!(sync.body_sync.lock().window.received_len(), 0);
 
     sync.tick();
 
@@ -318,7 +319,7 @@ fn tick_fanout_deferred_for_fresh_probe_engages_at_deadline()
         "the alternate must receive the one-shot probe prefix"
     );
     assert!(
-        !sync.download_window.lock().fanout_active(),
+        !sync.body_sync.lock().window.fanout_active(),
         "below the threshold fanout must stay off"
     );
 
@@ -331,7 +332,7 @@ fn tick_fanout_deferred_for_fresh_probe_engages_at_deadline()
     }
     sync.tick();
     assert!(
-        !sync.download_window.lock().fanout_active(),
+        !sync.body_sync.lock().window.fanout_active(),
         "a fresh prefix probe must defer the threshold-crossing tick"
     );
 
@@ -340,7 +341,8 @@ fn tick_fanout_deferred_for_fresh_probe_engages_at_deadline()
     // `Instant::now()` used when the probe is created, so read it back and
     // add exactly `stall_timeout_initial`. Then assert the planned
     // duration equals the budget before engaging fanout.
-    let mut window = sync.download_window.lock();
+    let mut body_sync = sync.body_sync.lock();
+    let window = &mut body_sync.window;
     let started_at = window
         .active_prefix_probe_started_at()
         .ok_or_else(|| std::io::Error::other("probe must remain active after deferral"))?;
@@ -431,15 +433,17 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
     // suppression, pinned at the window level). Seed it at 50ms — the
     // decay floor stays max(2x50ms, 100ms) = the injected initial
     // threshold — so this test keeps pinning the adaptive-timeout fire.
-    sync.download_window
+    sync.body_sync
         .lock()
+        .window
         .seed_front_cadence_for_test(50, Instant::now());
 
     // Tick 2: the wedge forms (staged 14 + pending 2 at the count
     // budget) and the stall episode starts on the front-stripe owner.
     sync.tick();
     {
-        let window = sync.download_window.lock();
+        let body_sync = sync.body_sync.lock();
+        let window = &body_sync.window;
         assert_eq!(window.received_len(), 14);
         assert_eq!(window.pending_len(), 2);
         assert_eq!(
@@ -460,8 +464,9 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
         "staller's outbound lease must be revoked"
     );
     assert!(
-        sync.download_window
+        sync.body_sync
             .lock()
+            .window
             .peer_in_staller_cooldown(staller, Instant::now()),
         "disconnected staller must enter the cooldown"
     );
@@ -480,12 +485,13 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
         "the stalled front stripe must be re-requested from a healthy peer"
     );
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         14,
         "staged progress must survive the staller disconnect"
     );
     {
-        let window = sync.download_window.lock();
+        let body_sync = sync.body_sync.lock();
+        let window = &body_sync.window;
         assert_eq!(window.pending_len(), 2);
         for front in &expected[..2] {
             assert!(window.contains_pending(&Hash256::from_le_bytes(front.as_bytes())));
@@ -596,7 +602,7 @@ fn staging_exhaustion_fixture() -> Result<ExhaustionFixture, Box<dyn std::error:
     // budget, closing the request gate.
     inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block2))?;
     sync.drain_inbound_blocks();
-    assert!(!sync.download_window.lock().has_request_capacity());
+    assert!(!sync.body_sync.lock().window.has_request_capacity());
 
     let healthy_rx = connect_peer(&peers, synthetic_peer(healthy_addr, 100));
 
@@ -755,8 +761,9 @@ fn apply_cache_fixture(
 fn stage_body(sync: &BlockSync, block: &Block) {
     let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
     let serialized = bytes::Bytes::from(consensus_bytes(block));
-    sync.block_stager
+    sync.body_sync
         .lock()
+        .stager
         .insert(hash, None, block.clone(), serialized, Instant::now());
 }
 
