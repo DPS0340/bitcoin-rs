@@ -5,7 +5,7 @@
 //! and backend feature-forwarding rules described in
 //! `docs/contracts/architecture.md`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::process::Command;
 
 /// Storage engine crates. Only `bitcoin-rs-storage` may depend on these.
@@ -97,31 +97,6 @@ pub(crate) struct Validation {
     pub cycle_checked_crates: usize,
     /// Human-readable summary.
     pub summary: String,
-}
-
-/// One operator-facing binary feature profile, mirroring a CI build lane.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FeatureProfile {
-    /// Lane name used in violation messages.
-    pub(crate) name: &'static str,
-    /// CLI `--features` tokens applied to the binary crate.
-    pub(crate) features: &'static [&'static str],
-    /// Whether the binary's default features participate.
-    pub(crate) defaults: bool,
-}
-
-impl FeatureProfile {
-    pub(crate) const fn new(
-        name: &'static str,
-        features: &'static [&'static str],
-        defaults: bool,
-    ) -> Self {
-        Self {
-            name,
-            features,
-            defaults,
-        }
-    }
 }
 
 /// Locates the workspace root `Cargo.toml` from the integration test's
@@ -229,37 +204,6 @@ impl WorkspaceGraph {
             features,
             classified,
         }
-    }
-
-    /// Adds a synthetic normal dependency for use in negative tests.
-    pub(crate) fn add_normal_dep(&mut self, from: &str, to: &str) {
-        self.normal_deps
-            .entry(from.to_owned())
-            .or_default()
-            .push(to.to_owned());
-    }
-
-    /// Adds a synthetic storage-engine dependency for use in negative tests.
-    pub(crate) fn add_engine_dep(&mut self, on: &str, engine: &str) {
-        assert!(
-            ENGINE_CRATES.contains(&engine),
-            "`{engine}` is not a known storage engine"
-        );
-        self.engine_deps
-            .entry(on.to_owned())
-            .or_default()
-            .push(engine.to_owned());
-    }
-
-    /// Adds or replaces a synthetic cargo feature for use in negative tests.
-    /// Replacing (rather than merging) keeps each negative test focused on
-    /// the rule it attacks; pass the full implies list the crate really has
-    /// when attacking something else.
-    pub(crate) fn set_feature(&mut self, on: &str, feature: &str, implies: &[&str]) {
-        self.features.entry(on.to_owned()).or_default().insert(
-            feature.to_owned(),
-            implies.iter().map(ToString::to_string).collect(),
-        );
     }
 
     /// Validates the graph and returns either a summary or a list of violations.
@@ -516,156 +460,5 @@ impl WorkspaceGraph {
         }
 
         color.len()
-    }
-
-    /// Resolves one binary feature profile to the activated workspace
-    /// crate/feature sets, walking the same `crate/feature` and `dep:` token
-    /// chains as `g19_validation_default`.
-    ///
-    /// Dependency-edge default features are deliberately not modeled: the
-    /// workspace pins `default-features = false` on the consensus and node
-    /// edges, and every engine surface (kernel, zmq, backends) reaches the
-    /// binary only through the explicit forwarding chains this walk follows.
-    pub(crate) fn resolve_profile(
-        &self,
-        profile: &FeatureProfile,
-    ) -> BTreeMap<String, BTreeSet<String>> {
-        let mut activated: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut queue: Vec<(String, String)> = Vec::new();
-        if profile.defaults
-            && let Some(defaults) = self
-                .features
-                .get(BIN_CRATE)
-                .and_then(|features| features.get("default"))
-        {
-            for feature in defaults {
-                queue.push((BIN_CRATE.to_owned(), feature.clone()));
-            }
-        }
-        for feature in profile.features {
-            queue.push((BIN_CRATE.to_owned(), (*feature).to_owned()));
-        }
-        while let Some((package, feature)) = queue.pop() {
-            if !activated
-                .entry(package.clone())
-                .or_default()
-                .insert(feature.clone())
-            {
-                continue;
-            }
-            let Some(implies) = self
-                .features
-                .get(&package)
-                .and_then(|features| features.get(&feature))
-            else {
-                continue;
-            };
-            for token in implies {
-                if let Some((target, target_feature)) = token.split_once('/') {
-                    let target = target.trim_end_matches('?');
-                    queue.push((target.to_owned(), target_feature.to_owned()));
-                } else if token == "default" {
-                    if let Some(defaults) = self
-                        .features
-                        .get(&package)
-                        .and_then(|features| features.get("default"))
-                    {
-                        for default in defaults {
-                            queue.push((package.clone(), default.clone()));
-                        }
-                    }
-                } else {
-                    // Same-package features and `dep:` activation markers.
-                    queue.push((package.clone(), token.clone()));
-                }
-            }
-        }
-        activated
-    }
-
-    /// Returns the ownership violations of one binary feature profile: the
-    /// profile must reach a storage backend through the node forwarding
-    /// chain, backend features must stay on the forwarding allowlist, and
-    /// the kernel and ZMQ engines must follow their explicit selection
-    /// chains — present exactly when the profile selects them.
-    pub(crate) fn profile_ownership_violations(&self, profile: &FeatureProfile) -> Vec<String> {
-        let activated = self.resolve_profile(profile);
-        let mut violations = Vec::new();
-
-        // The backend must reach the storage crate as an activated feature
-        // through the node forwarding chain: a backend feature name at node
-        // alone does not compose storage. Storage declares every backend by
-        // its plain name (`fjall`, `redb`, `rocksdb`), so the plain test
-        // covers every engine uniformly.
-        let backend_reached = activated.get(STORAGE_CRATE).is_some_and(|features| {
-            features
-                .iter()
-                .any(|feature| BACKEND_FEATURES.contains(&feature.as_str()))
-        });
-        if !backend_reached {
-            violations.push(format!(
-                "profile `{}` activates no storage backend through the node \
-                 forwarding chain; a node without a backend cannot compose its \
-                 storage",
-                profile.name
-            ));
-        }
-
-        let node_features = activated.get(NODE_CRATE);
-        for (package, features) in &activated {
-            for feature in features {
-                if BACKEND_FEATURES.contains(&feature.as_str())
-                    && !BACKEND_FORWARDING_CRATES.contains(&package.as_str())
-                {
-                    violations.push(format!(
-                        "profile `{}` activates backend feature `{feature}` on \
-                         non-forwarding crate `{package}`",
-                        profile.name
-                    ));
-                }
-            }
-        }
-
-        let kernel_selected = node_features.is_some_and(|features| features.contains("kernel"));
-        let consensus_kernel = activated
-            .get("bitcoin-rs-consensus")
-            .is_some_and(|features| features.contains("dep:bitcoinkernel"));
-        if kernel_selected != consensus_kernel {
-            violations.push(if kernel_selected {
-                format!(
-                    "profile `{}` selects `kernel` without reaching `dep:bitcoinkernel` \
-                     on `bitcoin-rs-consensus`",
-                    profile.name
-                )
-            } else {
-                format!(
-                    "profile `{}` must keep the kernel engine out of the production graph",
-                    profile.name
-                )
-            });
-        }
-
-        let zmq_selected = activated
-            .get(BIN_CRATE)
-            .is_some_and(|features| features.contains("zmq"));
-        let zmq_owned = activated
-            .get(RPC_CRATE)
-            .is_some_and(|features| features.contains("dep:zmq"));
-        if zmq_selected != zmq_owned {
-            violations.push(if zmq_selected {
-                format!(
-                    "profile `{}` selects `zmq` without enabling the owned `dep:zmq` \
-                     dependency on `{RPC_CRATE}`",
-                    profile.name
-                )
-            } else {
-                format!(
-                    "profile `{}` must keep the ZMQ surface out of the production graph",
-                    profile.name
-                )
-            });
-        }
-
-        violations
     }
 }

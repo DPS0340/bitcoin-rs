@@ -411,17 +411,6 @@ impl ProcessNode {
         self.child.id()
     }
 
-    /// Path of the datadir this process owns.
-    ///
-    /// Panics only if `take_datadir` already moved custody, which no
-    /// scenario may do while the process is still running.
-    pub(crate) fn datadir_path(&self) -> &Path {
-        self.datadir
-            .as_ref()
-            .map(TempDir::path)
-            .expect("datadir custody moved while the process still holds it")
-    }
-
     /// Moves datadir custody out of a stopped process for a restart.
     pub(crate) fn take_datadir(&mut self) -> Result<TempDir, HarnessError> {
         self.datadir
