@@ -133,7 +133,6 @@ pub struct NodeState {
     inbound_tx_tx: Sender<bitcoin_rs_p2p::InboundTx>,
     inbound_tx_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundTx>>>,
     chain_events: Arc<ChainEventPublisher>,
-    chain_event_hints_rx: Arc<Mutex<Receiver<ChainEventHint>>>,
     apply_handles: crate::apply::Chainstate,
     /// Derived consumers of committed chain events. Not held by `Chainstate`.
     followers: crate::chain_effects::ChainFollowers,
@@ -401,19 +400,6 @@ impl NodeState {
         self.chain_events.snapshot()
     }
 
-    /// Returns the chain-event publisher. The apply path records committed
-    /// connects/disconnects through it; consumers read the snapshot from it.
-    #[must_use]
-    pub fn chain_event_publisher(&self) -> Arc<ChainEventPublisher> {
-        Arc::clone(&self.chain_events)
-    }
-
-    /// Returns the shared hint receiver handle for reconciliation consumers.
-    #[must_use]
-    pub fn chain_event_hints(&self) -> Arc<Mutex<Receiver<ChainEventHint>>> {
-        Arc::clone(&self.chain_event_hints_rx)
-    }
-
     /// Returns the shared block-download orchestrator.
     #[must_use]
     pub fn sync(&self) -> Arc<crate::BlockSync> {
@@ -444,15 +430,6 @@ impl NodeState {
     pub fn apply_block(&self, block: &Block) -> core::result::Result<TipSnapshot, ApplyError> {
         let outcome = self.followers.apply_connect(&self.apply_handles, block)?;
         Ok(outcome.tip)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn check_coinbase_maturity(
-        &self,
-        block: &Block,
-        height: u32,
-    ) -> core::result::Result<(), ApplyError> {
-        crate::apply::check_coinbase_maturity(&self.apply_handles, block, height)
     }
 }
 

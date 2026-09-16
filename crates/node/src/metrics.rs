@@ -6,8 +6,6 @@ mod prometheus;
 
 mod readiness;
 
-mod uptime;
-
 mod warnings;
 
 pub use evidence::{
@@ -17,7 +15,6 @@ pub use evidence::{
 pub use prometheus::MetricsServer;
 pub(crate) use prometheus::start_metrics;
 pub(crate) use readiness::spawn_readiness_sampler;
-pub use uptime::{process_start, process_uptime, record_process_start};
 pub use warnings::{WarningKind, Warnings, node_warnings};
 
 #[cfg(test)]

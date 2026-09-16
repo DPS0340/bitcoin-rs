@@ -137,41 +137,6 @@ const BIP68_TIME_GRANULARITY_SECONDS: u32 = 512;
 const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const LOCAL_OVERLAY_TXID_SET_THRESHOLD: usize = 8;
 
-/// Double SHA256, kept next to the witness merkle reduction its only remaining
-/// caller (a test fixture helper) uses.
-#[cfg(test)]
-fn sha256d(data: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    use sha2::Sha256;
-    let inner = Sha256::digest(data);
-    let outer = Sha256::digest(inner);
-    outer.into()
-}
-
-/// Merkle reduction over 32-byte leaves, duplicating the last leaf on odd
-/// widths; test-fixture helper after the witness-commitment precheck moved to
-/// the consensus crate.
-#[cfg(test)]
-fn merkle_root_bytes(leaves: &mut Vec<[u8; 32]>) -> Option<[u8; 32]> {
-    if leaves.is_empty() {
-        return None;
-    }
-    while leaves.len() > 1 {
-        let original_len = leaves.len();
-        let mut next = Vec::with_capacity(original_len.div_ceil(2));
-        for pos in 0..original_len.div_ceil(2) {
-            let left = leaves[2 * pos];
-            let right = leaves[(2 * pos + 1).min(original_len - 1)];
-            let mut pair = [0_u8; 64];
-            pair[..32].copy_from_slice(&left);
-            pair[32..].copy_from_slice(&right);
-            next.push(sha256d(&pair));
-        }
-        *leaves = next;
-    }
-    Some(leaves[0])
-}
-
 /// Admission barrier shared by every cloned apply handle.
 pub(crate) struct ApplyAdmission {
     closed: AtomicBool,
@@ -1355,22 +1320,6 @@ impl UtxoView for BlockLocalUtxoView<'_> {
         }
         self.base.lookup(outpoint)
     }
-}
-
-#[cfg(test)]
-pub(crate) fn check_coinbase_maturity(
-    handles: &Chainstate,
-    block: &Block,
-    height: u32,
-) -> core::result::Result<(), ApplyError> {
-    let tx_plan = plan_block_transactions(block, &block_txids(block));
-    let resolved = Arc::new(ResolvedUtxoView::resolve(
-        handles.utxo.as_ref(),
-        block,
-        &tx_plan,
-    ));
-    let txids = block_txids(block);
-    check_coinbase_maturity_with_tx_plan(handles, block, &tx_plan, &txids, resolved, height)
 }
 
 #[cfg(test)]

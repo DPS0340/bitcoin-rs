@@ -269,7 +269,7 @@ impl NodeState {
         let transactions = Arc::new(RwLock::new(HashMap::new()));
         // Created before the txindex worker spawn: the worker mirrors this
         // publisher's snapshot into its persisted consumer cursor.
-        let (chain_events_raw, chain_event_hints_rx_raw) =
+        let (chain_events_raw, _chain_event_hints_rx) =
             ChainEventPublisher::new(epoch, initial_snapshot);
         let shutdown = Arc::new(AtomicBool::new(false));
         let chain_events = Arc::new(chain_events_raw);
@@ -365,7 +365,6 @@ impl NodeState {
         let (inbound_tx_tx, inbound_tx_rx_raw) =
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundTx>(INBOUND_TX_CHANNEL_LIMIT);
         let inbound_tx_rx = Arc::new(Mutex::new(inbound_tx_rx_raw));
-        let chain_event_hints_rx = Arc::new(Mutex::new(chain_event_hints_rx_raw));
         // The template-coordinator wake exists from node birth so the apply
         // path and the gateway can fire it before `run` builds the
         // coordinator; the coordinator attaches itself once constructed.
@@ -544,7 +543,6 @@ impl NodeState {
             inbound_tx_tx,
             inbound_tx_rx,
             chain_events: Arc::clone(&chain_events),
-            chain_event_hints_rx,
             apply_handles,
             followers,
             sync,

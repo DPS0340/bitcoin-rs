@@ -34,7 +34,7 @@ fn active_chain_snapshot_starts_at_genesis_on_fresh_node() -> anyhow::Result<()>
     config.p2p.listen.clear();
 
     let state = NodeState::open(config.clone(), None)?;
-    let epoch = state.chain_event_publisher().epoch();
+    let epoch = state.chain_events.epoch();
     assert_eq!(
         state.active_chain_snapshot(),
         ChainSnapshot {
@@ -85,14 +85,8 @@ fn active_chain_snapshot_anchors_at_restored_tip_after_restart() -> anyhow::Resu
 }
 
 #[test]
-fn record_publishes_snapshot_and_hints_in_commit_order() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-    config.data_dir = dir.path().join("node");
-    config.p2p.listen.clear();
-
-    let state = NodeState::open(config, None)?;
-    let publisher = state.chain_event_publisher();
+fn record_publishes_snapshot_and_hints_in_commit_order() {
+    let (publisher, rx) = ChainEventPublisher::detached(7);
     let epoch = publisher.epoch();
     let hash_a = Hash256::from_le_bytes(&[0xAA; 32]);
     let hash_b = Hash256::from_le_bytes(&[0xBB; 32]);
@@ -118,11 +112,6 @@ fn record_publishes_snapshot_and_hints_in_commit_order() -> anyhow::Result<()> {
     assert_eq!(second, expected_second);
     assert_eq!(
         publisher.snapshot(),
-        state.active_chain_snapshot(),
-        "node and publisher expose one snapshot view"
-    );
-    assert_eq!(
-        state.active_chain_snapshot(),
         ChainSnapshot {
             epoch,
             sequence: 2,
@@ -132,10 +121,8 @@ fn record_publishes_snapshot_and_hints_in_commit_order() -> anyhow::Result<()> {
         "the last committed event wins the snapshot cell"
     );
 
-    let rx = state.chain_event_hints();
     let mut hints = Vec::new();
-    let hint_rx = rx.lock();
-    while let Ok(hint) = hint_rx.try_recv() {
+    while let Ok(hint) = rx.try_recv() {
         hints.push(hint);
     }
     assert_eq!(
@@ -143,19 +130,11 @@ fn record_publishes_snapshot_and_hints_in_commit_order() -> anyhow::Result<()> {
         vec![expected_first, expected_second],
         "one hint per committed event, in commit order"
     );
-    Ok(())
 }
 
 #[test]
 fn record_drops_hints_when_channel_full() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
-    config.data_dir = dir.path().join("node");
-    config.p2p.listen.clear();
-
-    let state = NodeState::open(config, None)?;
-    let publisher = state.chain_event_publisher();
-    let rx = state.chain_event_hints();
+    let (publisher, rx) = ChainEventPublisher::detached(7);
     for sequence in 1..=super::CHAIN_HINT_CHANNEL_LIMIT {
         let sequence = u64::try_from(sequence)?;
         let mut tip = [0_u8; 32];
@@ -181,7 +160,7 @@ fn record_drops_hints_when_channel_full() -> anyhow::Result<()> {
         "the record itself is sequenced even when its hint is dropped"
     );
     assert_eq!(
-        state.active_chain_snapshot(),
+        publisher.snapshot(),
         ChainSnapshot {
             epoch: publisher.epoch(),
             sequence: overflow.sequence,
@@ -191,8 +170,7 @@ fn record_drops_hints_when_channel_full() -> anyhow::Result<()> {
     );
 
     let mut drained = Vec::new();
-    let drain_rx = rx.lock();
-    while let Ok(hint) = drain_rx.try_recv() {
+    while let Ok(hint) = rx.try_recv() {
         drained.push(hint.sequence);
     }
     assert_eq!(

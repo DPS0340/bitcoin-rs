@@ -38,7 +38,7 @@ pub(crate) use emit::{JournalEmit, SharedJournalWriter, shared_journal_writer};
 #[allow(unused_imports)]
 // module surface; consumers arrive in Task 2 (writer), 4 (emit), 5 (replay)
 pub(crate) use record::{
-    BlockMeta, Coin, JournalRecord, JournalRecordError, Mutation, decode_record, encode_record,
+    Coin, JournalRecord, JournalRecordError, Mutation, decode_record, encode_record,
 };
 pub(crate) use replay::{ReplayOutcome, replay_from_journal};
 #[allow(unused_imports)]
