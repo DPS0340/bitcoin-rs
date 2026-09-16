@@ -114,7 +114,7 @@ use std::sync::atomic::Ordering;
 use window::PublishMode;
 use window::apply_window_admitted;
 #[cfg(test)]
-use window::is_permanent_apply_error;
+use window::classify_apply_error;
 #[cfg(test)]
 use window::prove_window;
 pub use window::{DURABLE_HEAD_GROUP_BLOCKS, DURABLE_HEAD_GROUP_MAX_BYTES};
@@ -972,7 +972,8 @@ pub struct WindowApplyError {
     pub source: ApplyError,
     /// How the caller must treat this failure: `Permanent` failures poisoned
     /// the failed block's header subtree while the chain transition was still
-    /// held; `Operational` failures poisoned nothing; `Fatal` means the
+    /// held; `BodyMutated` discards only the delivered body; `Operational`
+    /// failures poisoned nothing; `Fatal` means the
     /// transition itself could not be settled (the reserved even generation
     /// could not be published), so admission stays closed until recovery.
     pub disposition: WindowApplyDisposition,
@@ -1012,17 +1013,21 @@ impl WindowApplyError {
     }
 }
 
-/// Whether a window failure is permanent or operational.
+/// Whether a window failure invalidates the header branch, only its delivered
+/// body, or neither.
 ///
-/// The caller must not re-classify the source error: the node classifier and
-/// the reorg classifier are the same predicate, and the disposition here is
-/// what that predicate decided at the failure point.
+/// The caller must not re-classify the source error: the node and reorg paths
+/// share one classifier, and this disposition is its decision at failure time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowApplyDisposition {
     /// The failed block and its descendants can never be valid. Their header
     /// subtrees were invalidated under the window's chain transition; purge
     /// every returned hash from staged/download state without retrying.
     Permanent,
+    /// The delivered body is mutated or not bound to its header. Discard this
+    /// body and retry the same header/hash from another source; do not poison
+    /// the header or its descendants.
+    BodyMutated,
     /// Transient failure (storage, UTXO commit, shutdown). Nothing was
     /// invalidated; the failed block and its tail stay retryable.
     Operational,
