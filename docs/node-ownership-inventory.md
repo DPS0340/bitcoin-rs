@@ -43,7 +43,8 @@ Production LOC (test modules excluded), root file + subtree:
 | mining | 245 | 334 | 579 | Mild |
 | chain_effects | 558 | 0 | 558 | n/a |
 | tx_ingress | 168 | 0 | 168 | n/a |
-| **Total** | | | **≈22 800** | |
+| process singles (event_loop, run, signal, shutdown, logging, storage_backend, import) | 872 | 0 | 872 | n/a |
+| **Total** | | | **≈22 400** | |
 
 `bitcoin-rs-node` depends on all eleven other workspace crates — the widest
 fan-in in the workspace, which is the "hidden implementation crate" risk #1085
