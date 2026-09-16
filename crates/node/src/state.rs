@@ -63,14 +63,6 @@ pub(crate) const P2P_OUTBOUND_QUEUE_LIMIT: usize = 8;
 // wakes the drain on every block, is never throttled.
 pub(crate) const INBOUND_BLOCK_CHANNEL_LIMIT: usize = 512;
 
-// Bounds chain-event hints between the block-apply commit path and
-// reconciliation consumers (#77). Hints are wake-ups, never data: a consumer
-// that misses one recovers by reconciling `ChainSnapshot` against its own
-// cursor using the chain itself. The bound is single-sourced from the
-// inbound-block bound so both channels share the same flood posture; a full
-// channel drops the hint and never blocks the commit path.
-pub(crate) const CHAIN_HINT_CHANNEL_LIMIT: usize = INBOUND_BLOCK_CHANNEL_LIMIT;
-
 // Bounds inbound peer transactions between the per-peer listener threads and
 // the single ingress consumer. A full channel applies TCP backpressure to
 // that peer's read loop; other peers keep their own threads. Sized to absorb

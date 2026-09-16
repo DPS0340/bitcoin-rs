@@ -269,8 +269,7 @@ impl NodeState {
         let transactions = Arc::new(RwLock::new(HashMap::new()));
         // Created before the txindex worker spawn: the worker mirrors this
         // publisher's snapshot into its persisted consumer cursor.
-        let (chain_events_raw, _chain_event_hints_rx) =
-            ChainEventPublisher::new(epoch, initial_snapshot);
+        let chain_events_raw = ChainEventPublisher::new(epoch, initial_snapshot);
         let shutdown = Arc::new(AtomicBool::new(false));
         let chain_events = Arc::new(chain_events_raw);
         let chain_transition = Arc::new(parking_lot::Mutex::new(()));
