@@ -2033,6 +2033,35 @@ impl DownloadWindow {
         hash: Hash256,
         source_peer: Option<SocketAddr>,
     ) -> RejectDelivery {
+        // A malformed response is still proof that this peer answered. Do not
+        // let a first-tick timeout observation disconnect it on the next tick.
+        if self.pending_timeout_observation.is_some_and(|observation| {
+            observation.hash == hash && Some(observation.peer_addr) == source_peer
+        }) {
+            self.pending_timeout_observation = None;
+        }
+
+        // A rejected race participant cannot remain eligible to complete the
+        // cold-front race. Clear the episode without electing a winner or
+        // blaming either peer; a later observation may arm another hedge.
+        if self.cold_front.is_some_and(|state| match state {
+            ColdFrontState::Waiting {
+                owner,
+                hash: waiting_hash,
+                ..
+            } => waiting_hash == hash && Some(owner) == source_peer,
+            ColdFrontState::Racing {
+                owner,
+                alternate,
+                hash: racing_hash,
+            } => {
+                racing_hash == hash
+                    && source_peer.is_some_and(|peer| peer == owner || peer == alternate)
+            }
+        }) {
+            self.cold_front = None;
+        }
+
         let is_owner = self
             .pending
             .get(&hash)
@@ -2106,7 +2135,9 @@ impl DownloadWindow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectDelivery {
     /// The pending owner delivered the malformed body. Its pending request was
-    /// released so the block can be re-requested from a different peer.
+    /// released so the block can be re-requested from a different peer. Any
+    /// matching timeout observation and cold-front race participation are
+    /// cleared for a peer that demonstrably responded.
     ReleasedPending,
     /// A peer other than the pending owner delivered the malformed body
     /// (or no pending existed). The body is discarded; any existing pending
@@ -4279,6 +4310,100 @@ mod tests {
         assert_eq!(window.pending_len(), 0);
         // next_request_height lowered so the block is re-requestable.
         assert!(window.next_request_height <= 100);
+    }
+
+    /// Rejecting the observed owner's response proves it was responsive, so a
+    /// stale first-tick timeout observation must not convict it later.
+    #[test]
+    fn reject_delivery_from_owner_clears_timeout_observation() {
+        let now = Instant::now();
+        let owner = peer_addr(1);
+        let block_hash = hash(0x42);
+        let mut window = DownloadWindow::new(test_budget());
+        insert_pending(&mut window, owner, block_hash, 100, now);
+        window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
+            peer_addr: owner,
+            hash: block_hash,
+        });
+
+        assert_eq!(
+            window.reject_delivery(block_hash, Some(owner)),
+            super::RejectDelivery::ReleasedPending
+        );
+        assert!(window.pending_timeout_observation.is_none());
+        assert_eq!(window.observe_pending_timeout(false, now), None);
+        assert!(!window.peer_in_staller_cooldown(owner, now));
+    }
+
+    /// Either participant's malformed response terminates a cold-front race
+    /// without electing a winner. If both copies are malformed, no stale
+    /// `Racing` state remains and the owner's pending request is released.
+    #[test]
+    fn reject_delivery_cleans_cold_front_race_participants() {
+        let now = Instant::now();
+        let owner = peer_addr(1);
+        let alternate = peer_addr(2);
+        let block_hash = hash(0x42);
+        let mut window = DownloadWindow::new(test_budget());
+        insert_pending(&mut window, owner, block_hash, 100, now);
+        window.cold_front = Some(super::ColdFrontState::Racing {
+            owner,
+            alternate,
+            hash: block_hash,
+        });
+
+        assert_eq!(
+            window.reject_delivery(block_hash, Some(alternate)),
+            super::RejectDelivery::DiscardedUnsolicited
+        );
+        assert!(window.cold_front.is_none());
+        assert!(window.contains_pending(&block_hash));
+        let retry_started = now + Duration::from_secs(3);
+        assert_eq!(window.observe_cold_front(100, false, retry_started), None);
+        assert_eq!(
+            window.observe_cold_front(100, false, retry_started + Duration::from_secs(2)),
+            Some((owner, block_hash))
+        );
+
+        assert_eq!(
+            window.reject_delivery(block_hash, Some(owner)),
+            super::RejectDelivery::ReleasedPending
+        );
+        assert!(window.cold_front.is_none());
+        assert!(!window.contains_pending(&block_hash));
+    }
+
+    /// An unrelated malformed delivery cannot cancel another peer's timeout
+    /// observation or cold-front race.
+    #[test]
+    fn reject_delivery_from_unrelated_peer_preserves_observations() {
+        let now = Instant::now();
+        let owner = peer_addr(1);
+        let alternate = peer_addr(2);
+        let unrelated = peer_addr(3);
+        let block_hash = hash(0x42);
+        let mut window = DownloadWindow::new(test_budget());
+        insert_pending(&mut window, owner, block_hash, 100, now);
+        window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
+            peer_addr: owner,
+            hash: block_hash,
+        });
+        window.cold_front = Some(super::ColdFrontState::Racing {
+            owner,
+            alternate,
+            hash: block_hash,
+        });
+
+        assert_eq!(
+            window.reject_delivery(block_hash, Some(unrelated)),
+            super::RejectDelivery::DiscardedUnsolicited
+        );
+        assert!(window.pending_timeout_observation.is_some());
+        assert!(matches!(
+            window.cold_front,
+            Some(super::ColdFrontState::Racing { .. })
+        ));
+        assert!(window.contains_pending(&block_hash));
     }
 
     /// (ii) When a peer other than the pending owner delivers a malformed body

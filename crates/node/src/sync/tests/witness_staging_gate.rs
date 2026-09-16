@@ -1,6 +1,6 @@
-//! Node-level witness staging-gate interaction tests (issue #1070).
+//! Node-level body/header binding interaction tests (issue #1070).
 //!
-//! These exercise the `buffer_received_block_chunk` flow: the witness gate
+//! These exercise the `buffer_received_block_chunk` flow: the binding gate
 //! pre-pass, `AlreadyStaged` priority over late malformed duplicates, and
 //! recovery when a malformed body is followed by the correct one.
 
@@ -140,6 +140,39 @@ fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::
         sync.block_stager.lock().contains(&block_hash),
         "correct body must be staged after malformed was rejected"
     );
+
+    Ok(())
+}
+
+/// A body with altered non-witness transaction data retains the header hash
+/// but fails the txid Merkle-root binding. It must not occupy the stager slot,
+/// leaving the original body eligible to arrive later.
+#[test]
+fn altered_non_witness_body_dropped_then_correct_body_staged()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sync, block_hash, correct_block, _) = segwit_sync_fixture()?;
+    let mut altered_block = correct_block.clone();
+    altered_block.txs[0].outputs[0].value = Amount::from_sat(2);
+    assert_eq!(
+        Hash256::from_le_bytes(altered_block.block_hash().as_bytes()),
+        block_hash,
+        "altering body transaction bytes must retain the header-derived hash"
+    );
+
+    let mut batch = vec![InboundBlock::from_decoded(altered_block)];
+    assert_eq!(
+        sync.buffer_received_block_chunk(&mut batch, Some(block_hash)),
+        1
+    );
+    assert!(!sync.block_stager.lock().contains(&block_hash));
+    assert_eq!(sync.download_window.lock().received_len(), 0);
+
+    let mut batch = vec![InboundBlock::from_decoded(correct_block)];
+    assert_eq!(
+        sync.buffer_received_block_chunk(&mut batch, Some(block_hash)),
+        1
+    );
+    assert!(sync.block_stager.lock().contains(&block_hash));
 
     Ok(())
 }

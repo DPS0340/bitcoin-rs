@@ -7,8 +7,9 @@ use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::softfork_state;
 use bitcoin_rs_consensus::ConsensusError;
-use bitcoin_rs_consensus::check_block_witness_well_formed;
+use bitcoin_rs_consensus::check_block_body_binding;
 use bitcoin_rs_p2p::InboundBlock;
+use bitcoin_rs_p2p::RejectDelivery;
 use bitcoin_rs_p2p::StagedBlock;
 use bitcoin_rs_p2p::download_window::INBOUND_BLOCK_STAGE_CHUNK;
 use bitcoin_rs_primitives::Hash256;
@@ -148,7 +149,7 @@ impl BlockSync {
             });
         }
 
-        // Already-staged precheck: skip the expensive witness hashing for
+        // Already-staged precheck: skip the expensive body-binding hashes for
         // blocks whose hash is already in the stager. A correct body already
         // staged must not be displaced by a late malformed duplicate (P2-3).
         let already_staged: Vec<bool> = {
@@ -160,11 +161,11 @@ impl BlockSync {
         };
 
         // For non-staged blocks, derive segwit_active from the tree (cheap
-        // lookups) then compute the witness gate without holding the tree
+        // lookups) then compute the body-binding gate without holding the tree
         // lock. segwit_active uses the same canonical path as the apply path
         // (softfork_state over the parent node) so the gate reproduces exact
         // consensus semantics.
-        let witness_results: Vec<Result<(), ConsensusError>> = blocks
+        let binding_results: Vec<Result<(), ConsensusError>> = blocks
             .iter()
             .zip(&already_staged)
             .map(|(inbound, already_staged)| {
@@ -186,21 +187,21 @@ impl BlockSync {
                                 .segwit_active
                             })
                     };
-                    check_block_witness_well_formed(&inbound.block, segwit_active)
+                    check_block_body_binding(&inbound.block, segwit_active)
                 }
             })
             .collect();
 
-        // Stager lock: TOCTOU recheck + insert. Witness-failed blocks are
+        // Stager lock: TOCTOU recheck + insert. Binding-failed blocks are
         // tracked separately for the window's source-aware reject_delivery.
         let mut staged_blocks = Vec::with_capacity(blocks.len());
         let mut reject_deliveries = Vec::new();
         let now = Instant::now();
         {
             let mut stager = self.block_stager.lock();
-            for (inbound, (already_staged, witness_result)) in blocks
+            for (inbound, (already_staged, binding_result)) in blocks
                 .drain(..)
-                .zip(already_staged.into_iter().zip(witness_results))
+                .zip(already_staged.into_iter().zip(binding_results))
             {
                 let hash = Hash256::from(inbound.block.block_hash());
                 let source = inbound.source;
@@ -208,18 +209,14 @@ impl BlockSync {
                     staged_blocks.push((hash, source, StagedBlock::AlreadyStaged));
                     continue;
                 }
-                // Issue #1070: a peer can strip witness data from a block body
-                // without changing the block hash (computed from the header
-                // only). The stager keeps the first body per hash, so a
-                // stripped body would permanently wedge sync. Reject it before
-                // staging and let the window's source-aware reject_delivery
-                // decide whether to release the pending request. The
-                // apply-path WitnessNonceSize classification stays Permanent:
-                // with this gate, a body that reaches apply with a witness
-                // defect is genuinely invalid, not stripped.
-                if let Err(error) = witness_result {
-                    metrics::counter!("node.sync.witness_malformed_drops").increment(1);
-                    tracing::warn!(%hash, %error, "block sync: witness-malformed body; rejecting delivery");
+                // Issue #1070: the header-derived block hash does not bind the
+                // delivered transaction or witness bytes by itself. The
+                // stager keeps the first body per hash, so reject any body
+                // whose txid Merkle tree or witness commitment does not bind
+                // to the header before it can occupy that slot.
+                if let Err(error) = binding_result {
+                    metrics::counter!("node.sync.body_binding_drops").increment(1);
+                    tracing::warn!(%hash, %error, "block sync: body/header binding failed; rejecting delivery");
                     reject_deliveries.push((hash, source));
                     continue;
                 }
@@ -276,8 +273,9 @@ impl BlockSync {
                 let source_peer = source
                     .filter(|source| self.peer_table.is_current(*source))
                     .map(|source| source.addr);
-                window.reject_delivery(hash, source_peer);
-                retry_count = retry_count.saturating_add(1);
+                if window.reject_delivery(hash, source_peer) == RejectDelivery::ReleasedPending {
+                    retry_count = retry_count.saturating_add(1);
+                }
             }
         }
         if retry_count > 0 {

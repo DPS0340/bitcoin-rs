@@ -367,12 +367,12 @@ pub fn check_witness_malleation(
 pub fn block_witness_commitment_matches(block: &Block, wtxids: &[Wtxid]) -> bool {
     check_witness_malleation(block, true, wtxids).is_ok()
 }
-/// Checks witness well-formedness of a block body for the staging gate.
+/// Checks that a block body is bound to its header before staging.
 ///
-/// A peer can strip witness data from a block body without changing the block
-/// hash (computed from the header only). This gate rejects such bodies before
-/// they occupy the stager's single-body slot (issue #1070), dropping them for
-/// retry so a different peer can supply the correct one.
+/// A peer can alter either transaction data or witness data without changing
+/// the block hash, which is computed from the header only. This gate verifies
+/// the transaction-ID Merkle root, Merkle mutation, and witness commitment
+/// rules before a body occupies the stager's single-body slot (issue #1070).
 ///
 /// `segwit_active` must match the apply path's contextual derivation
 /// (`BlockRuleContext.segwit_active`) so the gate reproduces exact consensus
@@ -380,9 +380,11 @@ pub fn block_witness_commitment_matches(block: &Block, wtxids: &[Wtxid]) -> bool
 /// required to carry a witness nonce, and witness data without a commitment
 /// is `unexpected-witness` only when segwit is active.
 ///
-/// The final verdict is delegated to [`check_witness_malleation`] to avoid
-/// duplicating consensus logic. Two cost-only fast paths are hoisted ahead of
-/// wtxid hashing without changing the delegated verdict:
+/// Merkle verification runs first, preserving the full block-rule error
+/// precedence. The witness verdict is delegated to
+/// [`check_witness_malleation`] to avoid duplicating consensus logic. Two
+/// cost-only fast paths are hoisted ahead of wtxid hashing without changing
+/// the delegated verdict:
 ///
 /// 1. When neither a commitment nor any witness is present the block is
 ///    trivially well-formed (the delegated check returns `Ok`).
@@ -392,10 +394,13 @@ pub fn block_witness_commitment_matches(block: &Block, wtxids: &[Wtxid]) -> bool
 ///    without consulting `wtxids`, so the same error is returned before the
 ///    expensive hashing. This is **not** done when segwit is inactive: the
 ///    delegated check may return `Ok` for a commitment-like output pre-activation.
-pub fn check_block_witness_well_formed(
+pub fn check_block_body_binding(
     block: &Block,
     segwit_active: bool,
 ) -> Result<(), ConsensusError> {
+    let txids: Vec<Txid> = block.txs.iter().map(Tx::txid).collect();
+    verify_merkle_root_with_txids(block, &txids)?;
+
     let commitment = witness_commitment(block);
     if commitment.is_none() && !block_has_witness(block) {
         return Ok(());

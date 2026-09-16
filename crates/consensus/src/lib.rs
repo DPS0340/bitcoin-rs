@@ -65,7 +65,7 @@ pub use rust_path::{TipState, UtxoView};
 pub use sigops::transaction_sigop_cost;
 pub use sigops::transaction_sigop_cost as total_sigop_cost;
 pub use verify_block::{
-    BlockRuleContext, MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_WEIGHT, check_block_witness_well_formed,
+    BlockRuleContext, MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_WEIGHT, check_block_body_binding,
     compute_merkle_root, verify_block_rules, verify_block_rules_precomputed,
     verify_merkle_root_with_txids,
 };

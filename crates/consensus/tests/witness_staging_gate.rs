@@ -1,15 +1,16 @@
-//! Witness staging-gate regressions for `check_block_witness_well_formed`.
+//! Body/header binding regressions for `check_block_body_binding`.
 //!
 //! Independent reference: BIP141 commitment structure and Bitcoin Core v31.0
-//! `CheckWitnessMalleation`. These fixtures isolate the staging-time witness
-//! gate that prevents a peer from wedging sync by sending a witness-stripped
-//! body (issue #1070). They are not mined or UTXO-valid chain fixtures.
+//! `CheckWitnessMalleation` and `CheckBlock`. These fixtures isolate the
+//! staging-time gate that prevents a peer from wedging sync by sending a body
+//! that does not bind to its header (issue #1070). They are not mined or
+//! UTXO-valid chain fixtures.
 
 use bitcoin_rs_consensus::ConsensusError;
-use bitcoin_rs_consensus::check_block_witness_well_formed;
+use bitcoin_rs_consensus::{check_block_body_binding, compute_merkle_root};
 use bitcoin_rs_primitives::{
-    Amount, Block, BlockHash, CompactTarget, Header, LockTime, OutPoint, Script, Sequence, Tx,
-    TxIn, TxOut, Txid, Witness,
+    Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script, Sequence,
+    Tx, TxIn, TxOut, Txid, Witness,
 };
 
 const PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
@@ -71,7 +72,7 @@ fn block(tx: Tx) -> Block {
 fn commitment_block_with_stripped_witness_is_rejected() {
     let block = block(coinbase(None, Some(ZERO_RESERVED_COMMITMENT)));
     assert_eq!(
-        check_block_witness_well_formed(&block, true),
+        check_block_body_binding(&block, true),
         Err(ConsensusError::WitnessNonceSize)
     );
 }
@@ -83,7 +84,7 @@ fn commitment_block_with_mismatched_commitment_is_rejected() {
     let wrong_commitment = [0xFF; 32];
     let block = block(coinbase(Some(vec![vec![0; 32]]), Some(wrong_commitment)));
     assert_eq!(
-        check_block_witness_well_formed(&block, true),
+        check_block_body_binding(&block, true),
         Err(ConsensusError::WitnessCommitment)
     );
 }
@@ -96,16 +97,15 @@ fn commitment_block_with_correct_witness_passes() {
         Some(vec![vec![0; 32]]),
         Some(ZERO_RESERVED_COMMITMENT),
     ));
-    assert_eq!(check_block_witness_well_formed(&block, true), Ok(()));
+    assert_eq!(check_block_body_binding(&block, true), Ok(()));
 }
 
-/// (d) A block without a BIP141 commitment output passes the staging gate
-/// regardless of witness presence: pre-segwit blocks have no witness to
-/// strip, and witness-without-commitment is a different invalidity class.
+/// (d) A block without a BIP141 commitment or witness data passes the staging
+/// gate.
 #[test]
 fn block_without_commitment_passes() {
     let block = block(coinbase(None, None));
-    assert_eq!(check_block_witness_well_formed(&block, true), Ok(()));
+    assert_eq!(check_block_body_binding(&block, true), Ok(()));
 }
 
 /// (e) A pre-segwit block with a commitment-like output and no witness must
@@ -115,7 +115,7 @@ fn block_without_commitment_passes() {
 #[test]
 fn commitment_output_pre_segwit_without_witness_passes() {
     let block = block(coinbase(None, Some(ZERO_RESERVED_COMMITMENT)));
-    assert_eq!(check_block_witness_well_formed(&block, false), Ok(()));
+    assert_eq!(check_block_body_binding(&block, false), Ok(()));
 }
 
 /// (f) A block without a commitment but with injected witness data must be
@@ -126,7 +126,48 @@ fn commitment_output_pre_segwit_without_witness_passes() {
 fn no_commitment_with_injected_witness_is_rejected() {
     let block = block(coinbase(Some(vec![vec![0; 32]]), None));
     assert_eq!(
-        check_block_witness_well_formed(&block, true),
+        check_block_body_binding(&block, true),
         Err(ConsensusError::UnexpectedWitness)
+    );
+}
+
+/// A peer cannot replace non-witness transaction bytes while retaining the
+/// valid header. The changed txid no longer matches the header Merkle root.
+#[test]
+fn altered_non_witness_transaction_is_rejected() {
+    let mut malformed = block(coinbase(None, None));
+    let expected_hash = malformed.block_hash();
+    malformed.txs[0].outputs[0].value = Amount::from_sat(49);
+    assert_eq!(malformed.block_hash(), expected_hash);
+
+    assert_eq!(
+        check_block_body_binding(&malformed, true),
+        Err(ConsensusError::MerkleRoot)
+    );
+}
+
+/// A matching but ambiguous transaction-ID tree is rejected before staging.
+#[test]
+fn merkle_mutation_is_rejected() {
+    let tx = coinbase(None, None);
+    let mut leaves = vec![*tx.txid().as_bytes(); 2];
+    let Some(root) = compute_merkle_root(&mut leaves) else {
+        panic!("two leaves must have a Merkle root");
+    };
+    let mutated = Block {
+        header: Header {
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::from_le_bytes(&root),
+            time: 0,
+            bits: CompactTarget::from_consensus(0),
+            nonce: 0,
+        },
+        txs: vec![tx.clone(), tx],
+    };
+
+    assert_eq!(
+        check_block_body_binding(&mutated, true),
+        Err(ConsensusError::MerkleMutation)
     );
 }

@@ -386,7 +386,7 @@ pub(super) fn invalidate_failed_subtree(
 /// `ConsensusError::Script` remains Permanent.
 ///
 /// `WitnessNonceSize` is Permanent here because the staging gate
-/// (`check_block_witness_well_formed`) rejects witness-stripped bodies before
+/// (`check_block_body_binding`) rejects witness-stripped bodies before
 /// they reach apply (issue #1070); a body that reaches apply with this error
 /// is genuinely invalid, not a peer stripping artifact.
 pub(crate) fn is_permanent_apply_error(error: &ApplyError) -> bool {
