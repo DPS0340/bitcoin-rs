@@ -29,9 +29,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Required PR gate (issue #171): the shortest useful failure signal. `fmt` and
-# `deny` stay parallel (no workspace compile); `rust` compiles the kernel-free
-# graph once and runs clippy before the test profiles so a lint failure does
-# not wait for the fixture downloads or the test suite. Every command lives in
+# `deny` stay parallel (no workspace compile). The compile graph is split into
+# parallel fail-fast lanes (issue #1081): `clippy` reports lint failures
+# without waiting behind any test lane, and the three test lanes run their
+# profiles concurrently instead of serially inside one ~11-minute job, so a
+# failing profile surfaces at its lane's position rather than after every
+# other profile. Each lane's rust-cache key includes the job id, so a lane
+# restores only its own dependency graph instead of the single 2.4 GB archive
+# the old `rust` job restored on every run. Every command lives in
 # scripts/ci-pr.sh. The kernel C++ surface, MSRV compile, native-script
 # evidence, comparator corpus, and bench smoke are deep lanes in main.yml and
 # run on `main` only.
@@ -63,7 +68,7 @@ jobs:
       # installs no C++ toolchain.
       - run: ./scripts/ci-pr.sh deny
 
-  rust:
+  clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -71,20 +76,66 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      # One kernel-free compile graph. Clippy first: a lint failure fails the
-      # job before the fixture downloads or the test suite. Profile commands
-      # live in scripts/ci-pr.sh.
+        with:
+          # A red clippy run still warms the dependency cache for the next
+          # push of the same PR (issue #1081's edit/push/fix loop).
+          cache-on-failure: true
+      # Fails fast at the first profile: a lint failure is the shortest
+      # actionable signal and no longer waits behind fixture downloads or any
+      # test lane. Profile commands live in scripts/ci-pr.sh.
       - run: ./scripts/ci-pr.sh clippy
+
+  test-crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          cache-on-failure: true
+      # The consensus, node, and rpc profiles are fixture-free: only the
+      # binary's tests read the pinned Core/Apalache fixtures.
+      - run: ./scripts/ci-pr.sh test-crates
+
+  test-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          cache-on-failure: true
       - name: Provision pinned Core and Apalache fixtures
         run: bash scripts/provision-ci-reference-fixtures.sh
-      # Kernel-free test profiles, smallest first. The formal solver run is
-      # main-only (main.yml's unfiltered full-node tests own it).
-      - run: ./scripts/ci-pr.sh test
+      - run: ./scripts/ci-pr.sh test-binary
       - name: Preserve public process compatibility evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: process-compatibility-native-${{ github.run_attempt }}
+          name: process-compatibility-native-binary-${{ github.run_attempt }}
+          path: target/process-harness/**
+          if-no-files-found: warn
+          retention-days: 7
+
+  test-workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          cache-on-failure: true
+      # bin/bitcoin-rs is a workspace member, so the kernel-free workspace
+      # pass runs its default-feature test binaries, including the
+      # process-harness suite that launches the pinned bitcoind.
+      - name: Provision pinned Core and Apalache fixtures
+        run: bash scripts/provision-ci-reference-fixtures.sh
+      - run: ./scripts/ci-pr.sh test-workspace
+      - name: Preserve public process compatibility evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: process-compatibility-native-workspace-${{ github.run_attempt }}
           path: target/process-harness/**
           if-no-files-found: warn
           retention-days: 7
