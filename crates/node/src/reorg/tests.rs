@@ -166,7 +166,10 @@ fn refused_reorg_with_failed_finish_preserves_original_progress() -> anyhow::Res
     assert_eq!((disconnected, connected, stopped_at), (3, 2, 42));
     assert_eq!(hash, Hash256::from_le_bytes(&[0x67; 32]));
     assert!(matches!(source.as_ref(), ApplyError::BlockValueOverflow));
-    assert_eq!(disposition, crate::apply::WindowApplyDisposition::Permanent);
+    assert_eq!(
+        disposition,
+        crate::apply::WindowApplyDisposition::Operational
+    );
     assert!(invalidated.is_empty());
     assert_eq!(handles.mempool_gateway.stable_generation(), None);
     assert!(matches!(
