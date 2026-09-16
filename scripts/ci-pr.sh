@@ -27,13 +27,19 @@ usage() {
 [[ $# -eq 1 ]] || usage
 
 # Fail-fast runner for the pull-request lanes: the first failing command
-# aborts the lane immediately (set -e propagates the exit status).
+# aborts the lane immediately. The FAILED marker keeps the log contract
+# shared with the collect runner, so failure latency stays measurable by
+# grepping the ==> markers in either mode (issue #1081).
 failfast() {
   local label="$1"
   shift
   echo "==> ${label}"
-  "$@"
-  echo "==> ok: ${label}"
+  if "$@"; then
+    echo "==> ok: ${label}"
+  else
+    echo "==> FAILED: ${label}" >&2
+    exit 1
+  fi
 }
 
 # Collect-all runner for the deep lane.
