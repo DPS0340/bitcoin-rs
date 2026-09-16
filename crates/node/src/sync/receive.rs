@@ -236,18 +236,23 @@ impl BlockSync {
             }
         }
 
-        // Window lock: process staged results and reject deliveries.
-        // reject_delivery is called under the window lock only (no stager
-        // lock) so the source-aware retry policy is owned entirely by the
-        // DownloadWindow.
+        // Resolve staged sources before taking the window lock. Request sends
+        // hold PeerTable's read lock while marking the window, so no window
+        // holder may acquire PeerTable in the opposite order.
+        let staged_blocks: Vec<_> = staged_blocks
+            .into_iter()
+            .map(|(hash, source, staged)| {
+                let source_peer = source
+                    .filter(|source| self.peer_table.is_current(*source))
+                    .map(|source| source.addr);
+                (hash, source_peer, staged)
+            })
+            .collect();
         let mut retry_count = 0_u64;
         let staged_count = staged_blocks.len() + reject_deliveries.len();
         {
             let mut window = self.download_window.lock();
-            for (hash, source, staged) in staged_blocks {
-                let source_peer = source
-                    .filter(|source| self.peer_table.is_current(*source))
-                    .map(|source| source.addr);
+            for (hash, source_peer, staged) in staged_blocks {
                 match staged {
                     StagedBlock::AlreadyStaged => {
                         metrics::counter!("node.sync.duplicate_deliveries").increment(1);
@@ -269,17 +274,28 @@ impl BlockSync {
                     }
                 }
             }
-            for (hash, source) in reject_deliveries {
-                let current_source = source.filter(|source| self.peer_table.is_current(*source));
-                if window.reject_delivery(hash, current_source.map(|source| source.addr))
-                    == RejectDelivery::ReleasedPending
-                {
-                    retry_count = retry_count.saturating_add(1);
-                    if let Some(source) = current_source {
-                        if self.peer_table.disconnect_source(source) {
-                            window.mark_peer_unresponsive(source.addr, now);
-                            tracing::warn!(peer_addr = %source.addr, %hash, "block sync: peer served mutated block body; disconnecting");
-                        }
+        }
+        for (hash, source) in reject_deliveries {
+            let mut rejected = RejectDelivery::DiscardedUnsolicited;
+            let current = source.is_some_and(|source| {
+                self.peer_table.with_current(source, || {
+                    rejected = self
+                        .download_window
+                        .lock()
+                        .reject_delivery(hash, Some(source.addr));
+                })
+            });
+            if !current {
+                self.download_window.lock().reject_delivery(hash, None);
+            }
+            if rejected == RejectDelivery::ReleasedPending {
+                retry_count = retry_count.saturating_add(1);
+                if let Some(source) = source {
+                    if self.peer_table.disconnect_source(source) {
+                        self.download_window
+                            .lock()
+                            .mark_peer_unresponsive(source.addr, now);
+                        tracing::warn!(peer_addr = %source.addr, %hash, "block sync: peer served mutated block body; disconnecting");
                     }
                 }
             }

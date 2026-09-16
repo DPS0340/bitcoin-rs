@@ -19,12 +19,14 @@ fn regtest_state() -> anyhow::Result<(tempfile::TempDir, NodeState)> {
 }
 
 fn connect_failure(source: ApplyError) -> ReorgError {
+    let disposition = crate::apply::window::classify_apply_error(&source);
     ReorgError::ConnectFailed {
         disconnected: 3,
         connected: 2,
         hash: Hash256::from_le_bytes(&[0x67; 32]),
         stopped_at: 42,
         source: Box::new(source),
+        disposition,
         invalidated: Vec::new(),
     }
 }
@@ -155,6 +157,7 @@ fn refused_reorg_with_failed_finish_preserves_original_progress() -> anyhow::Res
         hash,
         stopped_at,
         source,
+        disposition,
         invalidated,
     } = *original
     else {
@@ -163,6 +166,7 @@ fn refused_reorg_with_failed_finish_preserves_original_progress() -> anyhow::Res
     assert_eq!((disconnected, connected, stopped_at), (3, 2, 42));
     assert_eq!(hash, Hash256::from_le_bytes(&[0x67; 32]));
     assert!(matches!(source.as_ref(), ApplyError::BlockValueOverflow));
+    assert_eq!(disposition, crate::apply::WindowApplyDisposition::Permanent);
     assert!(invalidated.is_empty());
     assert_eq!(handles.mempool_gateway.stable_generation(), None);
     assert!(matches!(

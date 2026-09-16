@@ -61,6 +61,7 @@ fn mutated_connect_body_through_switch_to_branch_preserves_subtree()
     let Err(crate::reorg::ReorgError::ConnectFailed {
         disconnected,
         connected,
+        disposition,
         invalidated,
         ..
     }) = outcome
@@ -72,6 +73,10 @@ fn mutated_connect_body_through_switch_to_branch_preserves_subtree()
         "the full disconnect prefix must be reported"
     );
     assert_eq!(connected, 0, "nothing connected before the body mutation");
+    assert_eq!(
+        disposition,
+        crate::apply::WindowApplyDisposition::BodyMutated
+    );
     assert!(
         invalidated.is_empty(),
         "body mutation cannot poison headers"

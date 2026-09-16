@@ -41,20 +41,11 @@ fn branch_switch_retires_only_the_connected_prefix_after_connect_failure()
             .mark_received(hash, bytes, Instant::now());
         fork.push(block);
     }
-    let outcome = crate::reorg::switch_to_branch(
-        &sync.handles,
-        &sync.followers,
-        fork_parent,
-        |hash| sync.block_stager.lock().staged_body(hash),
-        |hash| sync.retire_applied_reorg_body(hash),
+    assert_eq!(
+        sync.handles.chain_tip.load_full().map(|tip| tip.tip_id),
+        Some(fork_parent)
     );
-    assert!(
-        matches!(
-            outcome,
-            Err(crate::reorg::ReorgError::ConnectFailed { stopped_at: 1, .. })
-        ),
-        "the mutated second body must fail after one committed connect, got {outcome:?}"
-    );
+    sync.switch_branch_if_outweighed();
 
     let tip = applied_tip
         .load_full()
@@ -67,11 +58,25 @@ fn branch_switch_retires_only_the_connected_prefix_after_connect_failure()
     let first = Hash256::from_le_bytes(fork[0].block_hash().as_bytes());
     let failed = Hash256::from_le_bytes(fork[1].block_hash().as_bytes());
     assert!(!sync.block_stager.lock().contains(&first));
-    assert!(sync.block_stager.lock().contains(&failed));
+    assert!(!sync.block_stager.lock().contains(&failed));
+    assert!(
+        sync.block_stager
+            .lock()
+            .contains(&Hash256::from_le_bytes(main[0].block_hash().as_bytes())),
+        "unrelated staged body must not be retired"
+    );
     assert_eq!(
         sync.download_window.lock().received_len(),
-        1,
-        "only the failed block may retain download accounting"
+        0,
+        "the mutated body must release download accounting"
+    );
+    assert_ne!(
+        sync.handles
+            .block_tree
+            .read()
+            .node_by_hash(failed)
+            .map(|node| node.status),
+        Some(NodeStatus::Invalid)
     );
     Ok(())
 }
