@@ -1,5 +1,4 @@
-//! Shared dependency-graph parser and validator for `g17_dependency_direction`
-//! and `overhaul_ownership`.
+//! Shared dependency-graph parser and validator for `g17_dependency_direction`.
 //!
 //! The validator enforces the five-layer one-way dependency model, the
 //! storage-engine ownership boundary, the ZMQ surface ownership boundary,
@@ -7,9 +6,7 @@
 //! `docs/contracts/architecture.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::process::Command;
-use std::sync::LazyLock;
 
 /// Storage engine crates. Only `bitcoin-rs-storage` may depend on these.
 pub(crate) const ENGINE_CRATES: [&str; 3] = ["fjall", "redb", "rust-rocksdb"];
@@ -157,33 +154,6 @@ fn run_cargo_metadata() -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON")
-}
-
-/// Directories of the cargo-metadata workspace members, resolved once.
-///
-/// The ownership scan walks exactly these directories: sibling checkouts
-/// under `.outline/worktree/`, vendored trees, and any other non-member
-/// production code under the checkout root must never influence a gate run.
-pub(crate) fn workspace_member_dirs() -> &'static [PathBuf] {
-    static DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
-        let metadata = run_cargo_metadata();
-        let mut dirs: Vec<PathBuf> = metadata["packages"]
-            .as_array()
-            .expect("packages array")
-            .iter()
-            .map(|package| {
-                let manifest = package["manifest_path"].as_str().expect("manifest path");
-                std::path::Path::new(manifest)
-                    .parent()
-                    .expect("manifest parent")
-                    .to_owned()
-            })
-            .collect();
-        dirs.sort();
-        dirs.dedup();
-        dirs
-    });
-    DIRS.as_slice()
 }
 
 impl WorkspaceGraph {
