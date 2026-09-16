@@ -315,8 +315,10 @@ impl BlockSync {
         &self,
         select: impl FnOnce(&mut DownloadWindow) -> Option<SocketAddr>,
     ) -> Option<SocketAddr> {
-        let mut window = self.download_window.lock();
-        let peer_addr = select(&mut window)?;
+        let peer_addr = {
+            let mut window = self.download_window.lock();
+            select(&mut window)?
+        };
         let connection_id = self.known_sessions.lock().get(&peer_addr).copied()?;
         if !self
             .peer_table

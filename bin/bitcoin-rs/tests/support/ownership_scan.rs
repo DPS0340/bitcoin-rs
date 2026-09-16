@@ -118,6 +118,8 @@ pub(crate) const PEER_TABLE_PATTERNS: &[&str] =
 pub(crate) const AUTHORIZED_PEER_TABLE_CALLS: &[(&str, &str)] = &[
     // Header sync tears down the peer a fault was blamed on.
     ("crates/node/src/sync/headers.rs", "self.peer_table"),
+    // Body sync tears down the current pending owner after a binding failure.
+    ("crates/node/src/sync/receive.rs", "self.peer_table"),
     // Download-window selection drops a stale peer connection.
     ("crates/node/src/sync/peers.rs", "self.peer_table"),
 ];
