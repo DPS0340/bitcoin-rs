@@ -258,15 +258,26 @@ impl BlockSync {
         let Some(next_apply_height) = applied_tip.height.checked_add(1) else {
             return false;
         };
-        let apply_side_busy = self
-            .next_expected_block_hash()
-            .is_some_and(|hash| self.block_stager.lock().contains(&hash));
+        // Snapshot the apply frontier once, before the window lock: the hash
+        // keys the stuck-clock episode and gates the escalation's final
+        // equality check, and `apply_side_busy` derives from the same
+        // snapshot so both inputs describe one observation. The snapshot
+        // reads `block_tree`, so it must stay outside
+        // [`Self::select_and_evict_window_peer`] — its callback runs under
+        // the window lock, and tree->window is the codebase's lock order.
+        let frontier_hash = self.next_expected_block_hash();
+        let apply_side_busy =
+            frontier_hash.is_some_and(|hash| self.block_stager.lock().contains(&hash));
         let mut cold_hedge = None;
         let mut apply_side_escalation = None;
         let mut fired = false;
         let removed_peer = self.select_and_evict_window_peer(|window| {
-            apply_side_escalation =
-                window.observe_apply_side_bound(next_apply_height, apply_side_busy, now);
+            apply_side_escalation = window.observe_apply_side_bound(
+                next_apply_height,
+                frontier_hash,
+                apply_side_busy,
+                now,
+            );
             cold_hedge = window.observe_cold_front(next_apply_height, apply_side_busy, now);
             let selected = window.observe_stall(next_apply_height, apply_side_busy, now);
             fired = selected.is_some();
@@ -281,7 +292,7 @@ impl BlockSync {
             // evict the stuck staged body for refetch and stand down for
             // this tick. No peer is convicted here; while the body is
             // absent the unsuppressed stall path applies as usual.
-            self.escalate_stuck_staged_body(next_apply_height, suppressed_for);
+            self.escalate_stuck_staged_body(next_apply_height, frontier_hash, suppressed_for);
             return false;
         }
         if fired {
@@ -312,18 +323,35 @@ impl BlockSync {
     ///
     /// Fired by [`DownloadWindow::observe_apply_side_bound`] after the
     /// apply-side suppression held for two full `received_timeout` windows.
-    /// The eviction reuses the staged-body prune's requeue flow — stager
-    /// removal first, then the tree-height re-evaluation, then the window
-    /// drop-for-retry — so the request path re-requests the body: either the
-    /// fresh delivery applies, or, while the body is absent, the normal
-    /// unsuppressed stall path engages. If a peer then fails to re-deliver,
-    /// THAT is a peer fault and the existing conviction machinery handles
-    /// it; the eviction itself carries no blame.
-    fn escalate_stuck_staged_body(&self, next_apply_height: u32, suppressed_for: Duration) {
-        let Some(frontier) = self.next_expected_block_hash() else {
+    /// `frontier_hash` is the snapshot the window observation fired on; the
+    /// final equality check against the live frontier ensures a same-height
+    /// branch replacement between observation and eviction cannot drain a
+    /// body that never stalled. The eviction reuses the staged-body prune's
+    /// requeue flow — stager removal first, then the tree-height re-evaluation,
+    /// then the window drop-for-retry — so the request path re-requests the
+    /// body: either the fresh delivery applies, or, while the body is
+    /// absent, the normal unsuppressed stall path engages. If a peer then
+    /// fails to re-deliver, THAT is a peer fault and the existing conviction
+    /// machinery handles it; the eviction itself carries no blame.
+    fn escalate_stuck_staged_body(
+        &self,
+        next_apply_height: u32,
+        frontier_hash: Option<Hash256>,
+        suppressed_for: Duration,
+    ) {
+        let Some(frontier_hash) = frontier_hash else {
             return;
         };
-        let evicted = self.block_stager.lock().drain_expected_prefix(&[frontier]);
+        if self.next_expected_block_hash() != Some(frontier_hash) {
+            // Raced with a frontier change (e.g. a same-height branch
+            // switch): the convicted body is no longer the expected one and
+            // must not be drained.
+            return;
+        }
+        let evicted = self
+            .block_stager
+            .lock()
+            .drain_expected_prefix(&[frontier_hash]);
         if evicted.is_empty() {
             // Raced: the body was applied or pruned between the window
             // observation and this eviction; nothing is stuck anymore.
@@ -331,16 +359,16 @@ impl BlockSync {
         }
         let height = {
             let tree = self.handles.block_tree.read();
-            tree.lookup(frontier)
+            tree.lookup(frontier_hash)
                 .and_then(|node_id| tree.node(node_id).ok())
                 .map(|node| node.height)
         };
         {
             let mut window = self.download_window.lock();
             if let Some(height) = height {
-                window.update_received_height(&frontier, height);
+                window.update_received_height(&frontier_hash, height);
             }
-            window.drop_received_for_retry(&frontier);
+            window.drop_received_for_retry(&frontier_hash);
         }
         metrics::counter!("node.sync.apply_side_stall_escalations").increment(1);
         tracing::warn!(

@@ -418,15 +418,22 @@ struct StallEpisode {
 }
 
 /// One continuous apply-side stuck episode: the apply frontier pinned at
-/// `height` across [`DownloadWindow::observe_apply_side_bound`] calls.
+/// `(height, frontier_hash)` with a staged body held (`apply_side_busy`)
+/// across [`DownloadWindow::observe_apply_side_bound`] calls.
 ///
-/// Keyed by frontier height, not by the busy flag: the prune/refetch cycle
-/// briefly removes and re-delivers the stuck staged body (flipping
-/// `apply_side_busy` off and back on within one tick), and the conviction is
-/// about the pinned frontier, not about any one staged copy.
+/// Keyed by height AND hash: the prune/refetch cycle briefly removes and
+/// re-delivers the stuck staged body (flipping `apply_side_busy` off and
+/// back on within one tick) and the conviction is about the pinned
+/// frontier, so the episode survives that seam — while a same-height branch
+/// replacement swaps in a different expected body and must start its own
+/// clock. The episode also starts only while a body is actually staged: an
+/// idle frontier (nothing staged yet) accumulates nothing, so a frontier
+/// that simply took long to deliver its first body does not have that
+/// delivery evicted on arrival.
 #[derive(Clone, Copy, Debug)]
 struct ApplySideStuck {
     height: u32,
+    frontier_hash: Hash256,
     since: Instant,
 }
 #[derive(Clone, Copy, Debug)]
@@ -522,8 +529,10 @@ pub struct DownloadWindow {
     /// blame across unrelated episodes.
     stall: Option<StallEpisode>,
     /// Current apply-side stuck observation, if any (#1091 bound). Re-keyed
-    /// on the apply-front height every [`Self::observe_apply_side_bound`]
-    /// call; a front advance resets it, brief unbusy seams do not.
+    /// on the apply-front `(height, hash)` every
+    /// [`Self::observe_apply_side_bound`] call; a front advance or a
+    /// same-height branch replacement resets it, brief unbusy seams do not,
+    /// and an idle frontier starts no clock at all.
     apply_side_stuck: Option<ApplySideStuck>,
     /// Adaptive stalling threshold: starts at `stall_timeout_initial` (2s),
     /// doubles on every staller disconnect up to `stall_timeout_max` (64s),
@@ -923,9 +932,13 @@ impl DownloadWindow {
     /// `gap=1`).
     ///
     /// This observation advances the stuck clock: an episode keyed by the
-    /// apply-front height. It accumulates across the brief unbusy seams of
-    /// that sawtooth, and a front advance — the apply side actually
-    /// progressing — resets it. Once one continuous stuck interval reaches
+    /// apply-front `(height, frontier_hash)`. It accumulates across the
+    /// brief unbusy seams of that sawtooth, and any frontier change — the
+    /// apply side actually progressing, or a same-height branch replacement
+    /// swapping the expected body — resets it. An idle frontier (no body
+    /// staged yet) starts no clock, so a frontier that simply took longer
+    /// than the bound to deliver does not have its first normal delivery
+    /// evicted on arrival. Once one continuous stuck interval reaches
     /// twice `SyncBudget::received_timeout` (one full staged-body expiry
     /// plus one full refetch window have both failed to unblock the
     /// frontier), it fires: the caller must escalate WITHOUT peer blame, by
@@ -934,20 +947,40 @@ impl DownloadWindow {
     /// Firing re-arms the clock, so a persistently stuck frontier escalates
     /// at most once per bound.
     ///
+    /// `frontier_hash` is `None` when no next-expected block exists (the
+    /// applied tip sits at the chain tip): nothing can be stuck, and a
+    /// leftover episode is dropped.
+    ///
     /// Returns `Some(suppressed_for)` exactly on fire.
     pub fn observe_apply_side_bound(
         &mut self,
         next_apply_height: u32,
+        frontier_hash: Option<Hash256>,
         apply_side_busy: bool,
         now: Instant,
     ) -> Option<Duration> {
+        let Some(frontier_hash) = frontier_hash else {
+            // No expected frontier: nothing can be stuck.
+            self.apply_side_stuck = None;
+            return None;
+        };
         match self.apply_side_stuck {
-            Some(stuck) if stuck.height == next_apply_height => {}
-            _ => {
+            Some(stuck)
+                if stuck.height == next_apply_height && stuck.frontier_hash == frontier_hash => {}
+            _ if apply_side_busy => {
+                // A new episode starts only while a body for this frontier
+                // is actually staged; an idle frontier accumulates nothing.
                 self.apply_side_stuck = Some(ApplySideStuck {
                     height: next_apply_height,
+                    frontier_hash,
                     since: now,
                 });
+            }
+            _ => {
+                // The frontier changed (or its body is absent with no active
+                // episode): no clock may run for a frontier with nothing
+                // staged about it.
+                self.apply_side_stuck = None;
             }
         }
         if !apply_side_busy {
@@ -4548,12 +4581,16 @@ mod tests {
         let start = Instant::now();
         // test_budget received_timeout is 30s, so the bound is 60s.
         let bound = test_budget().received_timeout.saturating_mul(2);
+        let frontier = hash(0x07);
 
-        // Stuck at the same frontier height: observations prime and advance
-        // the clock, but nothing fires below the bound.
-        assert_eq!(window.observe_apply_side_bound(7, true, start), None);
+        // Stuck at the same frontier (height, hash): observations prime and
+        // advance the clock, but nothing fires below the bound.
         assert_eq!(
-            window.observe_apply_side_bound(7, true, just_below(start, bound, 1)),
+            window.observe_apply_side_bound(7, Some(frontier), true, start),
+            None
+        );
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(frontier), true, just_below(start, bound, 1)),
             None
         );
         // The no-blame suppression itself is unchanged below the bound.
@@ -4568,20 +4605,27 @@ mod tests {
         let mut window = DownloadWindow::new(test_budget());
         let start = Instant::now();
         let bound = test_budget().received_timeout.saturating_mul(2);
-        let _ = window.observe_apply_side_bound(7, true, start);
+        let frontier = hash(0x07);
+        let _ = window.observe_apply_side_bound(7, Some(frontier), true, start);
 
-        let fired = window.observe_apply_side_bound(7, true, start + bound);
+        let fired = window.observe_apply_side_bound(7, Some(frontier), true, start + bound);
         assert_eq!(fired, Some(bound));
         // Re-armed: the next stuck observation does not immediately re-fire,
         // so a persistently stuck frontier escalates once per bound, not
         // once per tick.
         assert_eq!(
-            window.observe_apply_side_bound(7, true, start + bound + Duration::from_secs(1)),
+            window.observe_apply_side_bound(
+                7,
+                Some(frontier),
+                true,
+                start + bound + Duration::from_secs(1)
+            ),
             None
         );
         assert_eq!(
             window.observe_apply_side_bound(
                 7,
+                Some(frontier),
                 true,
                 start + bound.saturating_mul(2) + Duration::from_secs(1)
             ),
@@ -4595,24 +4639,30 @@ mod tests {
         // the re-request re-delivers it, and the fresh insert re-stamps its
         // received_at — so per-body age never convicts and apply_side_busy
         // flickers off for a seam. The stuck clock keys on the frontier
-        // height and must accumulate across that seam.
+        // (height, hash) and must accumulate across that seam.
         let mut window = DownloadWindow::new(test_budget());
         let start = Instant::now();
         let bound = test_budget().received_timeout.saturating_mul(2);
-        let _ = window.observe_apply_side_bound(7, true, start);
+        let frontier = hash(0x07);
+        let _ = window.observe_apply_side_bound(7, Some(frontier), true, start);
 
         assert_eq!(
-            window.observe_apply_side_bound(7, true, just_below(start, bound, 10)),
+            window.observe_apply_side_bound(7, Some(frontier), true, just_below(start, bound, 10)),
             None
         );
         // The prune seam: the body is briefly absent (unbusy), then the
         // refetched copy is staged again.
         assert_eq!(
-            window.observe_apply_side_bound(7, false, just_below(start, bound, 9)),
+            window.observe_apply_side_bound(7, Some(frontier), false, just_below(start, bound, 9)),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(7, true, start + bound + Duration::from_secs(1)),
+            window.observe_apply_side_bound(
+                7,
+                Some(frontier),
+                true,
+                start + bound + Duration::from_secs(1)
+            ),
             Some(bound + Duration::from_secs(1))
         );
     }
@@ -4622,22 +4672,107 @@ mod tests {
         let mut window = DownloadWindow::new(test_budget());
         let start = Instant::now();
         let bound = test_budget().received_timeout.saturating_mul(2);
-        let _ = window.observe_apply_side_bound(7, true, start);
+        let frontier = hash(0x07);
+        let _ = window.observe_apply_side_bound(7, Some(frontier), true, start);
         assert_eq!(
-            window.observe_apply_side_bound(7, true, just_below(start, bound, 1)),
+            window.observe_apply_side_bound(7, Some(frontier), true, just_below(start, bound, 1)),
             None
         );
 
         // The frontier applies and advances: conviction clears and the new
         // stuck height starts its own full bound.
         let moved = start + bound + Duration::from_secs(1);
-        assert_eq!(window.observe_apply_side_bound(8, true, moved), None);
+        let advanced = hash(0x08);
         assert_eq!(
-            window.observe_apply_side_bound(8, true, just_below(moved, bound, 1)),
+            window.observe_apply_side_bound(8, Some(advanced), true, moved),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(8, true, moved + bound),
+            window.observe_apply_side_bound(8, Some(advanced), true, just_below(moved, bound, 1)),
+            None
+        );
+        assert_eq!(
+            window.observe_apply_side_bound(8, Some(advanced), true, moved + bound),
+            Some(bound)
+        );
+    }
+
+    #[test]
+    fn apply_side_bound_never_runs_on_idle_frontier_before_first_delivery() {
+        // The episode used to start before the busy check, so a frontier
+        // that simply took longer than the bound to deliver its first body
+        // had that delivery evicted on arrival. The stuck clock may only
+        // run while a body is actually staged.
+        let mut window = DownloadWindow::new(test_budget());
+        let start = Instant::now();
+        let bound = test_budget().received_timeout.saturating_mul(2);
+        let frontier = hash(0x07);
+
+        // Idle (nothing staged) far past the bound: no episode, no clock.
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(frontier), false, start),
+            None
+        );
+        let delivered = start + bound + Duration::from_secs(10);
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(frontier), false, delivered),
+            None
+        );
+
+        // The first normal delivery arrives: the clock starts here and must
+        // hold a full bound before any escalation.
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(frontier), true, delivered),
+            None
+        );
+        assert_eq!(
+            window.observe_apply_side_bound(
+                7,
+                Some(frontier),
+                true,
+                just_below(delivered, bound, 1)
+            ),
+            None
+        );
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(frontier), true, delivered + bound),
+            Some(bound)
+        );
+    }
+
+    #[test]
+    fn apply_side_bound_resets_on_same_height_frontier_replacement() {
+        // A same-height branch replacement swaps the expected body: the new
+        // branch's fresh delivery must not be evicted on the old branch's
+        // inherited stuck time.
+        let mut window = DownloadWindow::new(test_budget());
+        let start = Instant::now();
+        let bound = test_budget().received_timeout.saturating_mul(2);
+        let branch_a = hash(0xA1);
+        let branch_b = hash(0xB2);
+
+        // Branch A nearly exhausted its bound.
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(branch_a), true, start),
+            None
+        );
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(branch_a), true, just_below(start, bound, 1)),
+            None
+        );
+
+        // Same height, different frontier body: a fresh episode.
+        let moved = start + bound + Duration::from_secs(1);
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(branch_b), true, moved),
+            None
+        );
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(branch_b), true, just_below(moved, bound, 1)),
+            None
+        );
+        assert_eq!(
+            window.observe_apply_side_bound(7, Some(branch_b), true, moved + bound),
             Some(bound)
         );
     }

@@ -400,7 +400,11 @@ fn staged_frontier_stuck_past_bound_escalates_without_blame()
     assert_eq!(witness_block_inventory(inventory)?, expected[..2]);
 
     // The #1091 wedge shape: the frontier (and a successor) staged, nothing
-    // applied — apply_side_busy true and stuck.
+    // applied — apply_side_busy true and stuck. Both bodies register in the
+    // window exactly as real deliveries do (mark_received_from): the
+    // escalation requeues through drop_received_for_retry, which only acts
+    // on received entries, so an unregistered frontier would leave the
+    // refetch assertion below vacuous.
     let frontier = Hash256::from_le_bytes(expected[0].as_bytes());
     let successor = Hash256::from_le_bytes(expected[1].as_bytes());
     for hash in [frontier, successor] {
@@ -410,9 +414,13 @@ fn staged_frontier_stuck_past_bound_escalates_without_blame()
             .lock()
             .insert(hash, None, block, serialized, Instant::now());
     }
+    let staged_at = Instant::now();
     sync.download_window
         .lock()
-        .mark_received(successor, 80, Instant::now());
+        .mark_received_from(frontier, 80, Some(staller), staged_at);
+    sync.download_window
+        .lock()
+        .mark_received(successor, 80, staged_at);
 
     let applied = sync
         .handles
@@ -426,7 +434,12 @@ fn staged_frontier_stuck_past_bound_escalates_without_blame()
 
     // Below the bound the suppression holds and nothing is evicted.
     sync.disconnect_window_staller(Some(&applied), start);
-    sync.disconnect_window_staller(Some(&applied), bound.checked_sub(Duration::from_secs(1)).map_or(start, |just_below| start + just_below));
+    sync.disconnect_window_staller(
+        Some(&applied),
+        bound
+            .checked_sub(Duration::from_secs(1))
+            .map_or(start, |just_below| start + just_below),
+    );
     assert!(
         sync.block_stager.lock().contains(&frontier),
         "below the bound the staged frontier must stay put"
@@ -446,6 +459,16 @@ fn staged_frontier_stuck_past_bound_escalates_without_blame()
         "the apply-side escalation must never blame or disconnect the front peer"
     );
     assert!(sync.download_window.lock().stalling_peer().is_none());
+
+    // The eviction requeues the frontier through the window's
+    // drop-for-retry path, so the next tick re-requests it — the refetch
+    // re-arm actually engaged, not just the stager removal.
+    sync.tick();
+    let requeued = witness_block_inventory(next_getdata(&rx)?)?;
+    assert!(
+        requeued.contains(&expected[0]),
+        "the escalation must requeue the evicted frontier for refetch, got {requeued:?}"
+    );
 
     // With the body evicted the normal unsuppressed stall path engages: the
     // front peer now owes an unanswered request and is convicted as before.
