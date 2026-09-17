@@ -3,8 +3,8 @@
 Status: working inventory for the [#1085](https://github.com/gosuda/bitcoin-rs/issues/1085)
 architecture reset. Informative analysis, not a contract. Derived from the code
 at `c0195fbf` (origin/main) — current behavior and current call graph, not from
-any prior refactor plan. Supersedes the #1038/#1073/#1075 baselines, which
-#1085 declares stale.
+any prior refactor plan. Supersedes the #1038/#1073/#1075 baselines; #1085
+declares them stale.
 
 Method: every substantial `crates/node` responsibility was read against a
 deletion-biased template (state owned, invariants, inbound callers, cross-domain
@@ -12,7 +12,9 @@ judgment, delete hypothesis, caller-simplification hypothesis, collapse
 hypothesis, irreducible owner, minimal remaining API). Claims below carry
 `file:line` evidence. Items marked **[verified]** were re-checked by direct
 grep/read against the tree; items marked **[hypothesis]** are reviewer-facing
-predictions that the subtraction phases must confirm before acting.
+predictions that the subtraction phases must confirm before acting. Rows with no marker
+come from the same read-through as the marked rows but were not singled out as
+contested; treat them as verified-equivalent unless a cluster section says otherwise.
 
 ## Reading rules
 
@@ -23,15 +25,18 @@ predictions that the subtraction phases must confirm before acting.
 - `MOVE` — last resort; each entry states why DELETE and COLLAPSE are
   insufficient and names the **existing** owner crate.
 
+How to use this by phase: Phase 2/3 → Subtraction ledger; Phase 4 →
+  MOVE ledger; Phase 5 → `state` + `storage_backend` cluster section.
+
 ## Measured current shape
 
-Production LOC (test modules excluded), root file + subtree:
+Measured LOC, root file + subtree (inline `cfg(test)` and bench-only `metrics/evidence/` counted; `mod tests/` dirs excluded):
 
 | Module | Root | Subtree | Total | `foo.rs + foo/` smell |
 | --- | ---: | ---: | ---: | --- |
 | apply | 1404 | 3536 | 4940 | Yes — root holds `Chainstate`, admission, constants, plumbing types, `cfg(test)` helpers beside a substantial subtree |
 | chainstate_journal | 49 | 3209 | 3258 | No — root is a true index file |
-| state | 460 | 2100 | 2560 | Yes — root is a 38-field aggregate with 35+ getters beside layered subtree |
+| state | 460 | 2100 | 2560 | Yes — root is a 44-field aggregate (43 in non-test builds; only `resume_source` is `cfg(test)`) with 35+ getters beside layered subtree |
 | checkpoint | 485 | 2043 | 2528 | Yes — root holds schema/errors/dispatch beside load/publish subtrees |
 | sync | 279 | 1926 | 2205 | Borderline — root conductor + p2p-mechanics subtree |
 | reorg | 496 | 411 | 907 | Yes — subtree is one-caller helpers |
@@ -55,13 +60,13 @@ names.
 | Responsibility | Class | Confidence | One-line basis |
 | --- | --- | --- | --- |
 | `apply` core (admission, `Chainstate`, connect/disconnect/window/durable) | KEEP (+ internal COLLAPSE) | high | Only realisation of ARCH-07 transition admission in the workspace |
-| `apply/contextual.rs` consensus/chain rule helpers | MOVE→consensus/chain (partly DELETE) | medium | Re-implements or misfiles domain rules; see MOVE ledger |
+| `apply/contextual.rs` consensus/chain rule helpers | MOVE→consensus/chain (partly DELETE) | medium [hypothesis] | Re-implements or misfiles domain rules; see MOVE ledger |
 | `apply.rs` `cfg(test)` hash helpers, wrapper chain | DELETE | high [verified] | Duplicates consensus capability / adds indirection |
 | `sync` conductor (`BlockSync::tick`) | KEEP (shrinks) | high | Cross-domain sequencing p2p→apply |
 | `sync/{peers,requests,receive,headers}` p2p mechanics | DELETE/COLLAPSE into p2p owner | medium [hypothesis] | ~claims of duplication of `p2p::download_window` APIs; Phase-2/3 must confirm coverage |
 | `sync/commit.rs` window application | COLLAPSE into apply | high | It is apply-window logic reached only via sync |
 | `sync/branches.rs` | COLLAPSE into reorg | high | Reorg-branch policy beside the reorg owner |
-| `state.rs` `NodeState` aggregate | COLLAPSE (shrink fields/getters) | high | 11 fields + several getters duplicate `Chainstate` handles; two getters test-only |
+| `state.rs` `NodeState` aggregate | COLLAPSE (shrink fields/getters) | high | 10 fields + several getters duplicate `Chainstate` handles; two getters test-only |
 | `state/open.rs` | COLLAPSE into lifecycle startup | high | Pure wiring plus two genuinely-node concerns (epoch alloc, marker preflight) |
 | `state/storage.rs` `NodeStorage` + `DeferredChainstateServices` | DELETE/MOVE seam to storage | high | Storage-domain constructors; deferral buys nothing |
 | `state/restore.rs` | KEEP | high | Sole owner of checkpoint-vs-journal restore selection |
@@ -88,7 +93,7 @@ names.
 | `storage_footprint` cluster | KEEP | high | FP-01..04 owner; `--measure-storage` caller |
 | `metrics` prometheus + readiness | KEEP | high | Live scrape surface |
 | `metrics/uptime.rs` | DELETE | high [verified] | `record_process_start` never called in production |
-| `metrics/evidence/*` | DELETE (contingent on #1084) | high | Bench/gate-only once #1084 removes the gates |
+| `metrics/evidence/*` | DELETE (contingent on #1084) | high | Deletable only after folding `EvidenceIdentity` into prometheus.rs and #1084 gate removal |
 | `metrics/warnings.rs` write-side | DELETE candidate (audit) | high [verified] | `set`/`unset` have no production writer; registry is permanently empty |
 | `config` cluster | KEEP | high | Live layered config, ARCH-05 |
 | `embed` facade | KEEP | high | Documented embedding contract (EMB-01..08) |
@@ -128,8 +133,8 @@ Subtractions inside apply:
   collapses by inlining (~30 LOC; connect.rs:42-47 wrapper has two refs).
 - `prove_window` prelude duplication with `connect.rs` (~150 LOC) **[hypothesis]**.
 - `contextual.rs:24-49` `compact_to_target` re-implements
-  `chain::header_sync::pow_to_target` per its own comment — DELETE the node
-  copy once chain exports the function. `compute_verify_flags` belongs with
+  `chain::header_sync::pow::compact_to_target` per its own comment — DELETE the
+  node copy once chain widens visibility (currently `pub(crate)`). `compute_verify_flags` belongs with
   `chain::softfork`; coinbase-maturity/BIP68/BIP30 helpers and the
   `COINBASE_MATURITY`/`BIP68_*` constants (apply.rs:131-138) belong in
   consensus next to the rules they implement. These are MOVE-ledger entries.
@@ -157,12 +162,12 @@ subtraction: conductor of roughly 125-195 LOC with the subtree gone. The
 
 ### state + storage_backend (2775)
 
-`NodeState` (state.rs:82-143) is a 38-field aggregate; at least 11 fields hold
-the identical `Arc` already inside `apply_handles: Chainstate`
+`NodeState` (state.rs:82-143) is a 44-field aggregate (43 in non-test builds;
+only `resume_source` is `cfg(test)`); at least 10 fields hold the identical
+`Arc` already inside `apply_handles: Chainstate`
 (`chain_tip`, `applied_tip`, `chain_tx_count`, `block_tree`, `utxo`,
 `coin_stats`, `mempool`, `mempool_gateway`, `chain_events`,
-`block_body_store`, `undo_store`/`durable_head`/`journal` via subsystem paths)
-**[verified against apply.rs:502-535 field list]**. Readers could go through
+`block_body_store`) **[verified against apply.rs:497-535 field list]**. Readers could go through
 `Chainstate` accessors; Phase 5 collapses the duplicate fields and ~22
 pass-through getters. Two getters — `chain_event_publisher()` (state.rs:410)
 and `chain_event_hints()` (state.rs:414) — have only test callers
@@ -354,19 +359,18 @@ adjust the assumptions carried in the #1076 thread:
 
 ## Subtraction ledger (Phase 2/3 input)
 
-Confirmed, low-risk deletions (production LOC):
+Confirmed, low-risk deletions (LOC counted the same way as the table above):
 
-- `import.rs` + its tests (49)
-- `embed/testing.rs` (15)
-- `metrics/uptime.rs` (38)
-- journal `BlockMeta` + accessor (~40)
-- `recovery_evidence::read_marker` + production suppression (~30)
-- `apply.rs` `cfg(test)` hash/merkle helpers + `scratch::is_coinbase` (~60 test-LOC)
-- apply wrapper-chain inlining (~30)
-- `NodeState` test-only getters `chain_event_publisher`/`chain_event_hints` (~15)
+- `import.rs` + its tests (49) (done in #1090; public-API break: landed under the 0.6.0 workspace version bump per docs/policies/source-compatibility.md 4.1)
+- `embed/testing.rs` (15) (done in #1090)
+- `metrics/uptime.rs` (38) (done in #1090; public-API break: landed under the 0.6.0 workspace version bump per docs/policies/source-compatibility.md 4.1)
+- journal `BlockMeta` + accessor (~40) (done in #1090)
+- `recovery_evidence::read_marker` + production suppression (~30) (done in #1090)
+- `apply.rs` `cfg(test)` hash/merkle helpers + `scratch::is_coinbase` (~60 test-LOC) (done in #1090)
+- apply wrapper-chain inlining (~30) (done in #1090)
+- `NodeState` test-only getters `chain_event_publisher`/`chain_event_hints` (~15) (done in #1090)
 - `checkpoint/io.rs` after inlining failpoint field (~90)
 - `checkpoint/format.rs` hex/network helpers (~50)
-- `metrics/warnings.rs` write-side, after the audit above (~60)
 
 Collapse candidates (net-negative, no ownership change):
 
@@ -378,9 +382,14 @@ Collapse candidates (net-negative, no ownership change):
 - `DeferredChainstateServices` seam (~-80)
 - prove_window/connect.rs prelude dedupe (~-150) **[hypothesis]**
 
-Contingent on #1084: `metrics/evidence/*` (~420), plus the shape-pinning test
-files named per cluster (≈6 of 14 checkpoint tests, config/status shape tests,
+Contingent on #1084: `metrics/evidence/*` (~250 after folding `EvidenceIdentity`
+into prometheus.rs), plus the shape-pinning test files named per cluster (≈6 of 14 checkpoint tests, config/status shape tests,
 admission/internals tests in apply, ~30% of sync tests).
+
+Contingent on open question 2 (maintainer call): `metrics/warnings.rs`
+write-side (~60) — the write API (`Warnings::set`/`unset`, `node_warnings()`)
+is public, so downstream audit required before deletion.
+
 
 Bigger bets requiring their own verification PRs: sync subtree subtraction
 into p2p (~-900 node-side) **[hypothesis]**; `wake_tx_index` removal (latency
@@ -411,7 +420,7 @@ exist.
    lacks the surface. Why not COLLAPSE: keeping domain rules inside the apply
    orchestrator is the exact "node as hidden implementation crate" pattern
    #1085 rejects. The one true DELETE inside this entry:
-   `compact_to_target` (duplicates `chain::header_sync::pow_to_target`).
+   `compact_to_target` (duplicates `chain::header_sync::pow::compact_to_target`).
 
 No other MOVE survives the template: sync mechanics are DELETE/COLLAPSE
 candidates (capability exists in p2p), and everything else is KEEP.
