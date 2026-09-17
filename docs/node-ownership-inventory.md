@@ -40,7 +40,7 @@ Measured LOC, root file + subtree (inline `cfg(test)` and bench-only `metrics/ev
 | checkpoint | 485 | 2043 | 2528 | Yes — root holds schema/errors/dispatch beside load/publish subtrees |
 | sync | 279 | 1926 | 2205 | Borderline — root conductor + p2p-mechanics subtree |
 | reorg | 496 | 411 | 907 | Yes — subtree is one-caller helpers |
-| metrics | 29 | 842 | 871 | Yes — mostly because of the bench-only `evidence/` subtree |
+| metrics | 29 | 842 | 871 | Yes — mostly the `evidence/` subtree (bench ledger machinery plus the production-wired `EvidenceIdentity`; see metrics cluster) |
 | config | 27 | 970 | 997 | No — root is a true index file |
 | recovery_evidence | 454 | 240 | 694 | No |
 | storage_footprint | 328 | 321 | 649 | No |
@@ -76,13 +76,13 @@ names.
 | `state/maintenance.rs` | COLLAPSE into lifecycle services | high | One idle worker owning poll interval only |
 | `state/checkpoint.rs` | COLLAPSE into checkpoint publisher | high | Pure delegation; duplicated constructor |
 | `storage_backend.rs` | KEEP | high | Enforced sole owner of engine construction (ARCH-03) |
-| `chainstate_journal` cluster | KEEP (whole) | high | No existing owner; distinct codec/replay/writer invariants |
-| journal `BlockMeta` + accessor | DELETE | high [verified] | Production-dead |
+| `chainstate_journal` cluster | KEEP remaining cluster | high | No existing owner; distinct codec/replay/writer invariants (`BlockMeta` already removed in #1090) |
+| journal `BlockMeta` + accessor | DELETE | high [verified] | Production-dead (done in #1090) |
 | `checkpoint` load/publish core | KEEP | high | Atomic publication is lifecycle orchestration over four storage traits |
 | `checkpoint/publisher.rs` + `state/checkpoint.rs` | COLLAPSE | high | Same ownership split in two files + duplicated ctor |
 | `checkpoint/headers.rs` | MOVE→chain | high | Pure chain-domain codec; see MOVE ledger |
 | `checkpoint/io.rs` | DELETE (inline) | medium | Test plumbing: production path injects `failpoint=None` |
-| `checkpoint/format.rs` | DELETE partial | high | Hex codec belongs with the codec user; network name to primitives |
+| `checkpoint/format.rs` | DELETE partial | high | Hex codec belongs with the codec user; `network_name` stays checkpoint-owned (Core `testnet` spelling, not primitives `identity_name()` which returns `testnet3`) |
 | `checkpoint/fs.rs` CURRENT_SCHEMA machinery | DELETE candidate | medium [hypothesis] | Version 0, no schema-bump contract enforced |
 | `reorg` root | KEEP | high | Only cross-owner branch-switch sequencer |
 | `reorg/{bodies,execution,settlement}` | COLLAPSE into reorg.rs | high | One-caller helpers; single ~430-line file result |
@@ -94,7 +94,7 @@ names.
 | `metrics` prometheus + readiness | KEEP | high | Live scrape surface |
 | `metrics/uptime.rs` | DELETE | high [verified] | `record_process_start` never called in production |
 | `metrics/evidence/*` | DELETE (contingent on #1084) | high | Deletable only after folding `EvidenceIdentity` into prometheus.rs and #1084 gate removal |
-| `metrics/warnings.rs` write-side | DELETE candidate (audit) | high [verified] | `set`/`unset` have no production writer; registry is permanently empty |
+| `metrics/warnings.rs` write-side | DELETE candidate (audit) | high [verified] | `set`/`unset` have no in-repository production writer; write API is public so downstream audit required |
 | `config` cluster | KEEP | high | Live layered config, ARCH-05 |
 | `embed` facade | KEEP | high | Documented embedding contract (EMB-01..08) |
 | `embed/testing.rs` | DELETE | high | Test-only `block_on`; inline into tests |
@@ -124,10 +124,11 @@ publisher — i.e. genuinely cross-domain orchestration. KEEP.
 Subtractions inside apply:
 
 - `cfg(test)` `sha256d`/`merkle_root_bytes` (apply.rs:142-175) duplicate
-  consensus merkle capability — the docstrings say so themselves **[verified]**.
-  Same for `block_txids` (apply.rs:1144-1150) and `apply/scratch.rs`
-  `is_coinbase` (duplicates `bitcoin_rs_utxo::is_coinbase_tx` imported at
-  apply.rs:60).
+  consensus merkle capability — the docstrings say so themselves **[verified]**
+  (done in #1090). Same for `apply/scratch.rs` `is_coinbase` (duplicates
+  `bitcoin_rs_utxo::is_coinbase_tx` imported at apply.rs:60) (done in #1090).
+  `block_txids` (apply.rs:1144-1150) is KEEP: live fixture helper with ~40
+  test/fixture callers, re-verified by #1090.
 - The 4-hop wrapper chain `apply_block_with_serialized_admitted →
   apply_block_inner → apply_committed_block_admitted → apply_block_admitted`
   collapses by inlining (~30 LOC; connect.rs:42-47 wrapper has two refs).
@@ -235,8 +236,10 @@ is already clean (different files, temporal coordination only).
 Subtractions: COLLAPSE publisher.rs + state/checkpoint.rs into one publisher
 (eliminates the duplicated constructor); DELETE io.rs test plumbing
 (production injects `failpoint=None` — io.rs:9-15); DELETE format.rs hex
-helpers with the headers.rs move, `network_name` → primitives; shrink fs.rs
-CURRENT_SCHEMA machinery (~50 LOC, version 0, no bump contract)
+helpers with the headers.rs move; `network_name` stays checkpoint-owned
+(Core `testnet` spelling must be preserved — primitives `identity_name()`
+returns `testnet3` for the same variant, so this is not a move onto that API);
+shrink fs.rs CURRENT_SCHEMA machinery (~50 LOC, version 0, no bump contract)
 **[hypothesis]**; MOVE headers.rs (below).
 
 ### reorg + chain_effects (1465)
@@ -282,16 +285,18 @@ exist (docs/contracts/storage-footprint.md:116).
 
 `metrics`: KEEP prometheus + readiness (live wiring startup.rs:50-66).
 DELETE uptime.rs (38 LOC — `record_process_start` has no production caller;
-the uptime clock is never set in a real process) **[verified]**. DELETE the
-`metrics/evidence/*` subtree (~420 LOC) once #1084 removes
-`overhaul_evidence`/`g18` — its remaining caller is one bench; fold
-`EvidenceIdentity::of_process` into prometheus.rs. `warnings.rs`: the
-write-side (`set`/`unset`, `WarningKind` enum) has **no production writer** —
-the registry can never hold a warning today; the only reader is
-`getmininginfo` (mining/control.rs:31) **[verified]**. Either the write-side
-is dead scaffolding (delete, and drop the always-empty projection) or
+the uptime clock is never set in a real process) **[verified]** (done in
+#1090). DELETE the `metrics/evidence/*` bench ledger machinery (~250 LOC)
+once #1084 removes `overhaul_evidence`/`g18` — first fold
+`EvidenceIdentity::of_process` into prometheus.rs, which production startup
+(lifecycle/startup.rs:51-52) and the Prometheus recorder depend on.
+`warnings.rs`: the write-side (`set`/`unset`, `WarningKind` enum) has no
+in-repository production writer — the write API is public, so downstream
+embedders may populate it; the only in-repository reader is `getmininginfo`
+(mining/control.rs:31) **[verified]**. Either the write-side
+is dead scaffolding (delete, and drop the in-repository-empty projection) or
 production wiring is missing — audit before deleting, since removing the
-always-empty field is observable at RPC level.
+in-repository-empty field is observable at RPC level.
 
 ### config, embed, lifecycle, mining, tx_ingress, process singles (3416)
 
@@ -370,7 +375,7 @@ Confirmed, low-risk deletions (LOC counted the same way as the table above):
 - apply wrapper-chain inlining (~30) (done in #1090)
 - `NodeState` test-only getters `chain_event_publisher`/`chain_event_hints` (~15) (done in #1090)
 - `checkpoint/io.rs` after inlining failpoint field (~90)
-- `checkpoint/format.rs` hex/network helpers (~50)
+- `checkpoint/format.rs` hex helpers (~50; `network_name` stays checkpoint-owned — Core `testnet` spelling, not primitives `identity_name()`)
 
 Collapse candidates (net-negative, no ownership change):
 
@@ -431,9 +436,10 @@ candidates (capability exists in p2p), and everything else is KEEP.
    selection/eviction/probe scheduling completely enough to delete the node
    copies, or does the capability need to transfer (making it a MOVE)? Needs a
    function-by-function diff before Phase 2 acts.
-2. Warnings write-side: delete the never-written registry (and the
-   always-empty RPC projection), or is missing production wiring a bug to
-   fix? Observable RPC change either way — maintainer call.
+2. Warnings write-side: delete the registry with no in-repository writer (and the
+   in-repository-empty RPC projection), fix missing production wiring as a bug, or
+   keep it as an intentional embedder extension point (the write API is public)?
+   Observable RPC change either way — maintainer call.
 3. Journal wholesale deletion ("checkpoint-only restore"): rejected for this
    inventory as a separate decision; recorded so it is not lost.
 4. `metrics/evidence` deletion timing: gate removal (#1084) first, then the
