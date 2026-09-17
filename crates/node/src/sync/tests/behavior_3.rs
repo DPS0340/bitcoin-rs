@@ -361,6 +361,117 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn staged_frontier_stuck_past_bound_escalates_without_blame()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Issue #1091 regression: a well-formed next-expected body staged but
+    // never applied used to hold `apply_side_busy` (and with it stall
+    // conviction, pending-timeout conviction, and the cold-front hedge)
+    // forever. The 60s staged-body prune does not rescue the window — it
+    // expires the body, the re-request re-delivers it, and the fresh insert
+    // re-stamps its received_at, re-arming the suppression. The bound must
+    // therefore key on the stuck frontier: past two received_timeouts the
+    // staged body is evicted for refetch, no peer is blamed, and with the
+    // body absent the unsuppressed stall path engages again. Time is
+    // injected through the detection entry point directly.
+    let (sync, peers, _block_tree, _applied_tip, expected) = sync_with_header_chain(4)?;
+    install_budget(
+        &sync,
+        super::super::SyncBudget {
+            max_pending_blocks: 2,
+            max_received_blocks: 2,
+            max_peer_inflight: 2,
+            getdata_batch_limit: 2,
+            ..super::super::default_sync_budget()
+        },
+    );
+    let staller = test_addr(9470, 0)?;
+    let rx = connect_peer(&peers, synthetic_peer(staller, 100));
+
+    // Cold-start disarm, exactly like the no-blame test above, so the final
+    // phase fires on the fixed threshold rather than the unseeded-EWMA gate.
+    sync.download_window
+        .lock()
+        .seed_front_cadence_for_test(50, Instant::now());
+
+    sync.tick();
+    let Message::GetData(inventory) = rx.try_recv()? else {
+        return Err(std::io::Error::other("expected getdata").into());
+    };
+    assert_eq!(witness_block_inventory(inventory)?, expected[..2]);
+
+    // The #1091 wedge shape: the frontier (and a successor) staged, nothing
+    // applied — apply_side_busy true and stuck.
+    let frontier = Hash256::from_le_bytes(expected[0].as_bytes());
+    let successor = Hash256::from_le_bytes(expected[1].as_bytes());
+    for hash in [frontier, successor] {
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
+        sync.block_stager
+            .lock()
+            .insert(hash, None, block, serialized, Instant::now());
+    }
+    sync.download_window
+        .lock()
+        .mark_received(successor, 80, Instant::now());
+
+    let applied = sync
+        .handles
+        .applied_tip
+        .load_full()
+        .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+    let bound = super::super::default_sync_budget()
+        .received_timeout
+        .saturating_mul(2);
+    let start = Instant::now();
+
+    // Below the bound the suppression holds and nothing is evicted.
+    sync.disconnect_window_staller(Some(&applied), start);
+    sync.disconnect_window_staller(Some(&applied), bound.checked_sub(Duration::from_secs(1)).map_or(start, |just_below| start + just_below));
+    assert!(
+        sync.block_stager.lock().contains(&frontier),
+        "below the bound the staged frontier must stay put"
+    );
+    assert!(peers.is_connected(staller));
+    assert!(sync.download_window.lock().stalling_peer().is_none());
+
+    // Past the bound: escalation evicts the stuck staged body for refetch
+    // and blames nobody.
+    sync.disconnect_window_staller(Some(&applied), start + bound + Duration::from_secs(1));
+    assert!(
+        !sync.block_stager.lock().contains(&frontier),
+        "past the bound the stuck staged frontier must be evicted for refetch"
+    );
+    assert!(
+        peers.is_connected(staller),
+        "the apply-side escalation must never blame or disconnect the front peer"
+    );
+    assert!(sync.download_window.lock().stalling_peer().is_none());
+
+    // With the body evicted the normal unsuppressed stall path engages: the
+    // front peer now owes an unanswered request and is convicted as before.
+    sync.disconnect_window_staller(
+        Some(&applied),
+        start + bound + Duration::from_secs(1) + super::super::BLOCK_STALLING_TIMEOUT,
+    );
+    assert_eq!(
+        sync.download_window
+            .lock()
+            .stalling_peer()
+            .map(|(addr, _)| addr),
+        Some(staller)
+    );
+    sync.disconnect_window_staller(
+        Some(&applied),
+        start + bound + Duration::from_secs(1) + super::super::BLOCK_STALLING_TIMEOUT * 2,
+    );
+    assert!(
+        !peers.is_connected(staller),
+        "after the escalation a genuinely stalling peer must be convictable"
+    );
+    Ok(())
+}
+
+#[test]
 fn transient_demotion_does_not_flap_fanout_mode() -> Result<(), Box<dyn std::error::Error>> {
     const PEER_COUNT: usize = 8;
     let ((sync, peers, block_tree, applied_tip, expected), blocks_tx) =
