@@ -21,8 +21,8 @@ while the `IndexReader` trait captures a point-in-time `TxIndexSnapshot` for bou
 typed scans (`TxIndexScan`). The datadir-wide `CURRENT_SCHEMA` marker owns the
 compatibility boundary for these rows; an incompatible datadir fails before the index
 store opens. Around the rows sit the stable types (`ScriptHash`, `HashPrefixRow`,
-`HeaderRow`, `TxidRow`, `SpendingPrefixRow`), `MempoolRowWriter` for unconfirmed rows
-and generic script-history resolution.
+`ScriptHashRow`, `ScriptLiveRow`, `SpendingPrefixRow`, `TxPosition`) and generic
+script-history resolution.
 
 ## Implementation boundaries
 

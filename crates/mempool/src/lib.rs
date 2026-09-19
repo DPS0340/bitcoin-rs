@@ -43,15 +43,15 @@ pub mod standardness;
 mod truc;
 
 pub use admission::{
-    AdmissionChain, ChainAdmissionSnapshot, PrevoutMeta, SubmitError, SubmitOutcome,
+    AdmissionChain, ChainAdmissionSnapshot, OrphanRetry, PrevoutMeta, SubmitError, SubmitOutcome,
 };
 pub use entry::{EntryId, MempoolEntry};
 pub(crate) use eviction::evict_lowest_fee_packages;
 pub use fee_diagram::FeeDiagramError;
 pub use fee_estimator::{FeeEstimator, FeeRate, HistoryReject};
 pub use gateway::{
-    AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeGuard, CompositeObserver,
-    MempoolGateway, MempoolObserver,
+    AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeError, ChainChangeGuard,
+    CompositeObserver, MempoolGateway, MempoolObserver,
 };
 #[cfg(any(test, feature = "test-seam"))]
 pub use gateway::{arm_admission_park, reset_admission_park};
@@ -65,6 +65,6 @@ pub use pool::{
     Mempool, MempoolChunk, MempoolError, MempoolMiningSnapshot, MempoolStats, PrioritiseError,
     PrioritisedTransaction, ScriptHash, SnapshotEntry,
 };
-pub use rbf::{RbfError, ReplacementCandidate};
+pub use rbf::{RbfError, ReplacementCandidate, ReplacementPlan};
 pub use standardness::{StandardnessError, StandardnessPolicy, is_standard_tx};
 pub use truc::TrucError;

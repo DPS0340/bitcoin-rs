@@ -40,7 +40,7 @@ const fn decode_u24_le(bytes: [u8; 3]) -> u32 {
 }
 
 /// Prefix used as the seek key for electrs-style hash-prefix rows.
-pub(crate) type HashPrefix = [u8; HASH_PREFIX_LEN];
+pub type HashPrefix = [u8; HASH_PREFIX_LEN];
 
 /// A stable electrs hash-prefix row: eight prefix bytes followed by a big-endian height.
 #[derive(
