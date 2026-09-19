@@ -260,11 +260,13 @@ pub enum ReorgError {
     /// unrecoverable one. A later switch can continue from a coherent prefix;
     /// a failed UTXO commit must first recover its authoritative state.
     ///
-    /// When `source` is permanently invalid (`PoW`, `nBits`, or consensus),
+    /// When the failure is permanently branch-invalid (`PoW`, `nBits`, or
+    /// non-mutation consensus),
     /// the failed block's subtree is invalidated while the chain transition is
     /// still held, and `invalidated` carries every hash that was marked
     /// `Invalid` so the caller can purge staged/download state after releasing
-    /// the transition. Operational failures leave `invalidated` empty.
+    /// the transition. Body mutation and operational failures leave
+    /// `invalidated` empty; `disposition` distinguishes their retry handling.
     #[error("reorg stopped after connecting to height {stopped_at} at block {hash}: {source}")]
     ConnectFailed {
         /// Fully disconnected blocks before the failure, in plan order.
@@ -278,9 +280,12 @@ pub enum ReorgError {
         /// Why the connect failed.
         #[source]
         source: Box<ApplyError>,
+        /// Whether the failure invalidates the branch, only this body, or
+        /// neither. This is decided by the apply classifier at the failure.
+        disposition: crate::apply::WindowApplyDisposition,
         /// Hashes of the invalid subtree, in deterministic slab order, when the
         /// failure was allowlisted for permanent invalidation. Empty for
-        /// operational failures.
+        /// body mutation and operational failures.
         invalidated: Vec<Hash256>,
     },
     /// A disconnect died partway. The chainstate is torn.
