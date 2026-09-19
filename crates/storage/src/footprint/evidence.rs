@@ -203,6 +203,7 @@ fn is_default_unpruned_mainnet(identity: &EvidenceIdentity) -> bool {
         && !identity.txindex
         && identity.script_index == "disabled"
         && !identity.blockfilterindex
+        && identity.index_lane == "default"
 }
 
 /// Writes pretty JSON evidence.
@@ -257,9 +258,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let snapshot = crate::footprint::measure_physical_tree(dir.path()).expect("measure");
         let allocated = snapshot.allocated_bytes;
-
         // Off the default lane the verdict is inapplicable.
         let budget = BudgetEvidence::evaluate(&identity("regtest", true), &snapshot);
+        assert!(!budget.applies_to_this_record);
+        assert_eq!(budget.verdict, "inapplicable");
+
+        // A non-default index lane is inapplicable even when every other
+        // field is default-shaped (FP-04 names the lane explicitly).
+        let mut off_lane = identity("mainnet", true);
+        off_lane.index_lane = "txindex".to_owned();
+        let budget = BudgetEvidence::evaluate(&off_lane, &snapshot);
         assert!(!budget.applies_to_this_record);
         assert_eq!(budget.verdict, "inapplicable");
 

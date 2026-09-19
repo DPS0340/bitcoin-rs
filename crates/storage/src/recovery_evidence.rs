@@ -32,6 +32,9 @@ pub enum EvidenceError {
     /// JSON serialization failure.
     #[error("evidence serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A staged payload exceeds the bounded file size.
+    #[error("evidence payload is {found} bytes, over the {limit}-byte limit")]
+    TooLarge { found: usize, limit: usize },
 }
 
 /// Durable record of the applied tip at the last clean checkpoint publication.
@@ -183,10 +186,20 @@ fn write_sidecar(
     let current = dir.join(name);
     let prev = dir.join(format!("{name}.prev"));
     let tmp = dir.join(format!("{name}.tmp"));
-    // A stale tmp is left by a crashed earlier write; create_new below fails
-    // if it still exists.
-    let _ = std::fs::remove_file(&tmp);
     let result = (|| -> Result<(), EvidenceError> {
+        // Reject an oversized payload before staging anything: the readers
+        // refuse files over MAX_FILE_BYTES, so staging one would report a
+        // success no read can ever observe while displacing `.prev`.
+        let staged = payload.len() + 1;
+        if staged > MAX_FILE_BYTES {
+            return Err(EvidenceError::TooLarge {
+                found: staged,
+                limit: MAX_FILE_BYTES,
+            });
+        }
+        // A stale tmp is left by a crashed earlier write; create_new below
+        // fails if it still exists.
+        let _ = std::fs::remove_file(&tmp);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

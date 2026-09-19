@@ -330,6 +330,56 @@ fn oversized_evidence_file_is_ignored() {
     );
 }
 
+#[test]
+fn oversized_witness_write_is_rejected_without_rotating() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let w1 = AppliedTipWitness::new(G, 1, 100, "aaa", 1000);
+    write_witness(dir.path(), &w1).expect("write w1");
+
+    let big = AppliedTipWitness::new(G, 2, 200, "a".repeat(MAX_FILE_BYTES), 2000);
+    let error = write_witness(dir.path(), &big).unwrap_err();
+    assert!(
+        matches!(error, EvidenceError::TooLarge { .. }),
+        "oversized write is rejected, got {error:?}"
+    );
+    assert_eq!(
+        read_witness(dir.path(), G),
+        Some(w1),
+        "rejected write leaves current untouched"
+    );
+    assert!(
+        !witness_tmp(dir.path()).exists(),
+        "rejected write stages no tmp tail"
+    );
+
+    let event = fallback_event(G, 3, 3000);
+    write_marker(dir.path(), &event).expect("write marker");
+    let big_event = ChainRollbackEvent::new(
+        G,
+        4,
+        4000,
+        RollbackEventKind::CheckpointFallback {
+            restored_height: 100,
+            restored_hash: "a".repeat(MAX_FILE_BYTES),
+            source: "checkpoint".to_owned(),
+            old_height: 200,
+            old_hash: "bbb".to_owned(),
+        },
+    );
+    assert!(
+        matches!(
+            write_marker(dir.path(), &big_event).unwrap_err(),
+            EvidenceError::TooLarge { .. }
+        ),
+        "oversized marker is rejected"
+    );
+    assert_eq!(
+        read_marker(dir.path(), G),
+        Some(event),
+        "rejected marker leaves current untouched"
+    );
+}
+
 // Semantic rotation: a parseable but foreign-genesis or wrong-format current
 // cannot displace a valid .prev.
 #[test]
