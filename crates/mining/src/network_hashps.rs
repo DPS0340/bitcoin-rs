@@ -8,42 +8,9 @@ use compact_str::CompactString;
 
 use crate::MiningControlError;
 
-/// Resolves the `getnetworkhashps` start node from one tip snapshot.
-///
-/// This is the sole height-resolution owner for that RPC. `None` is an empty
-/// chain (rate `0.0`). An explicit height that is absent from that snapshot is
-/// Core's invalid-parameter error, not a zero rate.
-// CONTRACT: docs/contracts/external-api.md#API-06
-fn resolve_hash_ps_start(
-    tree: &BlockTree,
-    tip: Option<&TipSnapshot>,
-    height: i64,
-) -> Result<Option<NodeId>, MiningControlError> {
-    // Any height the snapshot cannot resolve is Core's invalid-parameter
-    // error: below -1, above the tip, or absent from the tip's ancestry.
-    let missing_height = || {
-        MiningControlError::InvalidRequest(CompactString::from(
-            "Block does not exist at specified height",
-        ))
-    };
-    let tip_height = tip.map_or(-1, |snapshot| i64::from(snapshot.height));
-    if height < -1 || height > tip_height {
-        return Err(missing_height());
-    }
-    let Some(tip) = tip else {
-        return Ok(None);
-    };
-    if height < 0 {
-        return Ok(Some(tip.tip_id));
-    }
-    let requested = u32::try_from(height).map_err(|_| missing_height())?;
-    tree.node_at_height_from(tip.tip_id, requested)
-        .map(Some)
-        .ok_or_else(missing_height)
-}
-
 /// Core `GetNetworkHashPS` for `getnetworkhashps` (API-06). Owns lookup and
 /// height validation.
+// CONTRACT: docs/contracts/external-api.md#API-06
 pub fn network_hash_ps(
     tree: &BlockTree,
     tip: Option<&TipSnapshot>,
@@ -56,14 +23,33 @@ pub fn network_hash_ps(
             "Invalid nblocks. Must be a positive number or -1.",
         )));
     }
-    let start = resolve_hash_ps_start(tree, tip, height)?;
-    Ok(estimate_network_hashps(tree, start, lookup, network))
+    // Any height the snapshot cannot resolve is Core's invalid-parameter
+    // error: below -1, above the tip, or absent from the tip's ancestry.
+    let missing_height = || {
+        MiningControlError::InvalidRequest(CompactString::from(
+            "Block does not exist at specified height",
+        ))
+    };
+    let tip_height = tip.map_or(-1, |snapshot| i64::from(snapshot.height));
+    if height < -1 || height > tip_height {
+        return Err(missing_height());
+    }
+    let Some(tip) = tip else {
+        return Ok(0.0);
+    };
+    let start = if height < 0 {
+        tip.tip_id
+    } else {
+        let requested = u32::try_from(height).map_err(|_| missing_height())?;
+        tree.node_at_height_from(tip.tip_id, requested)
+            .ok_or_else(missing_height)?
+    };
+    Ok(estimate_network_hashps(tree, Some(start), lookup, network))
 }
 
 /// Estimates hashes/s over `lookup` blocks ending at an already-resolved start.
 ///
-/// Height validation lives in [`resolve_hash_ps_start`]. The window is Core's
-/// parent walk (`GetNetworkHashPS`): `lookup` parent pointers from the start
+/// The window is Core's parent walk (`GetNetworkHashPS`): `lookup` parent pointers from the start
 /// node, min/max header time, `chainwork` delta over that span. A missing
 /// start or unwalkable window is a zero rate so `getmininginfo` can stay
 /// best-effort.

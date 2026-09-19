@@ -1,13 +1,7 @@
 //! Node-owned mining control facade.
 //!
-//! Candidate lifecycle state lives in [`bitcoin_rs_mining::coordinator`];
-//! this module keeps the node-owned header admission and proposal/submission
-//! projection. The wake seam (`MiningGenerationSignal`), the BIP22/`submitheader`
-//! reject vocabulary, and `getnetworkhashps` estimation live in
-//! `bitcoin_rs_mining`; the fee-estimator history file lives in
-//! `bitcoin_rs_mempool::fee_history`. Proposal mode dry-runs the ordinary apply
-//! validation path without persistence; solved-block submission returns only
-//! after validation, persistence, and chain-state application complete.
+//! Header admission and proposal/submission projection over the
+//! authoritative chainstate. Candidate lifecycle lives in `bitcoin_rs_mining`.
 
 mod candidate;
 mod control;
@@ -38,10 +32,9 @@ use bitcoin_rs_mining::MiningControlError;
 pub use bitcoin_rs_mining::MiningGenerationSignal;
 use bitcoin_rs_mining::MiningRule;
 use bitcoin_rs_mining::MiningService;
+use bitcoin_rs_mining::header_reject_reason;
 use bitcoin_rs_mining::snapshot_for_selection;
-use bitcoin_rs_mining::{header_reject_reason, missing_parent_reason};
 use bitcoin_rs_primitives::CompactTarget;
-use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
 use bitcoin_rs_primitives::Network;
 use compact_str::CompactString;
@@ -135,9 +128,9 @@ impl MiningCoordinator {
             .map_err(header_reject_reason);
         }
         let parent = tree.lookup(header.prev_blockhash.into()).ok_or_else(|| {
-            MiningControlError::Rejected(missing_parent_reason(Hash256::from(
-                header.prev_blockhash,
-            )))
+            header_reject_reason(ChainError::MissingParent {
+                prev_hash: header.prev_blockhash.into(),
+            })
         })?;
         if tree
             .node(parent)
@@ -250,13 +243,3 @@ impl MempoolSequenceWake for MiningCoordinator {
 
 #[cfg(test)]
 mod apply_error_tests;
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}

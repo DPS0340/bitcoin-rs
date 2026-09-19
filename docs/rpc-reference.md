@@ -41,8 +41,6 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `gettxout` | 0.4.0 |  |
 | `gettxoutproof` | 0.4.0 |  |
 | `verifytxoutproof` | 0.4.0 |  |
-| `sendrawtransaction` | 0.4.0 |  |
-| `testmempoolaccept` | 0.4.0 |  |
 | `decoderawtransaction` | 0.4.0 |  |
 | `createrawtransaction` | 0.4.0 |  |
 | `combinepsbt` | 0.4.0 |  |
@@ -84,7 +82,9 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | surface | since | notes |
 |---|---|---|
 | `scantxoutset` | 0.4.0 | Accepts only addr() scan descriptors; Core supports the full descriptor set (crates/rpc/src/handlers/chain.rs). Response uses the v28 scan contract; the status action answers null. |
-| `getmempoolinfo` | 0.4.0 | Policy fields project the enforced MempoolPolicySnapshot (crates/mempool/src/policy.rs): fullrbf always reports the enforced BIP125 signaling requirement (false) where Core 31.1 emits the field only under -deprecatedrpc=fullrbf; limitclustercount and limitclustersize project the cluster limits admission enforces; optimal is always true because the fee-rate index is rewritten under the pool write lock (crates/rpc/src/handlers/mempool.rs). |
+| `sendrawtransaction` | 0.4.0 | Core 31.1 replacement, modified-fee, cluster and TRUC cases are process-verified in overhaul_process_harness::policy_cases. Exact optimal graph ordering does not emulate Core transient SFL work-budget states. Capacity/floor accounting and generic consensus error details retain the differences in docs/policies/mempool-policy.md; aggregate package submission is unsupported. |
+| `testmempoolaccept` | 0.4.0 | Single preview shares committed admission verification. Core 31.1 package shape, dependency, fail-fast and replacement-disallowed cases are process-verified in overhaul_process_harness::policy_cases. Exact graph ordering, capacity/floor behavior and generic error details retain the differences in docs/policies/mempool-policy.md. Aggregate package submission is unsupported. |
+| `getmempoolinfo` | 0.4.0 | Policy fields project the enforced MempoolPolicySnapshot: fullrbf is true and cluster bounds are enforced. optimal is always true for exact graph ordering rather than Core background SFL state. usage estimates local structures; maxmempool bounds virtual size rather than allocator usage. The pressure floor is a local heuristic, not Core rolling decay. See docs/policies/mempool-policy.md. |
 | `estimatesmartfee` | 0.4.0 | See docs/contracts/external-api.md#API-26 for conf_target and estimate_mode validation. The estimate comes from this node's mempool confirmation-history estimator with a 25-block horizon; estimate_mode is accepted and ignored (no ECONOMICAL/CONSERVATIVE split), and insufficient history returns an `errors` array (crates/rpc/src/handlers/util.rs). |
 | `getmemoryinfo` | 0.4.0 | mode=mallocinfo is rejected with an invalid-parameter error instead of returning allocator XML (crates/rpc/src/handlers/util.rs). |
 | `estimaterawfee` | 0.4.0 | local_shape: the fee estimator does not expose Core decay/scale/pass/fail internals, so horizon objects carry feerate only and the no-estimate branch stays {} (crates/rpc/src/handlers/util.rs). |
@@ -132,7 +132,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `getprivatebroadcastinfo` | n/a | Private-broadcast store not implemented. |
 | `joinpsbts` | n/a | PSBT merge not implemented (combine/finalize only). |
 | `signrawtransactionwithkey` | n/a | Signing requires key material this process never holds. |
-| `submitpackage` | n/a | Package acceptance not implemented. |
+| `submitpackage` | n/a | Aggregate CPFP and package RBF submission are intentionally unsupported; multi-row testmempoolaccept implements Core PackageTestAccept. See docs/policies/mempool-policy.md. |
 | `utxoupdatepsbt` | n/a | PSBT update from the UTXO set not implemented. |
 | `enumeratesigners` | n/a | No external signer support. |
 | `createmultisig` | n/a | No key material (policy). |
@@ -236,4 +236,4 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `rawtx` | 0.4.0 | Requires the zmq feature and a --zmqpubrawtx endpoint. |
 | `sequence` | 0.4.0 | Requires the zmq feature and a --zmqpubsequence endpoint. Publishes C/D block events and A/R mempool events; A/R carry reversed txid, the label byte, and the mempool sequence as u64 LE (crates/rpc/src/zmq.rs). |
 
-Row counts: Implemented 71, Deviation 8, Extension 2, Unimplemented 93 - total 174.
+Row counts: Implemented 69, Deviation 10, Extension 2, Unimplemented 93 - total 174.

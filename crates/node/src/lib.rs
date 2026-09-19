@@ -25,8 +25,6 @@ pub mod embed;
 /// Central synchronous event loop.
 pub mod event_loop;
 
-/// Block import pipeline.
-pub mod import;
 /// Owned startup, rollback, and ordered service shutdown.
 mod lifecycle;
 /// Tracing initialization.
@@ -55,8 +53,6 @@ pub mod storage_footprint;
 pub mod sync;
 /// P2P transaction ingress consumer.
 pub mod tx_ingress;
-/// Prevout lookups across a window of consecutive blocks.
-mod window_overlay;
 pub use apply::{
     ChainTransition, Chainstate, ChainstateSnapshot, ConnectOutcome, DisconnectOutcome,
     error::{ApplyError, DisconnectError},

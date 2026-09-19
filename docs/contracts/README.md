@@ -15,7 +15,7 @@ When code and a contract disagree, fix the drift in the same change. Do not dupl
 
 | Contract | Clauses | Scope | Primary proof |
 | --- | --- | --- | --- |
-| [architecture.md](architecture.md) | `ARCH-01`–`ARCH-08` | Layering, storage confinement, composition, chainstate authority, single mutation owners | `g17_dependency_direction`; `overhaul_ownership`; node apply/effects tests |
+| [architecture.md](architecture.md) | `ARCH-01`–`ARCH-08` | Layering, storage confinement, composition, chainstate authority, single mutation owners | `g17_dependency_direction`; node apply/effects tests |
 | [validation-default.md](validation-default.md) | `VAL-01`–`VAL-03` | Kernel/native default decision and portable validation | `g19_validation_default`; Core-vector and kernel parity tests |
 | [indexing.md](indexing.md) | `IDX-01`–`IDX-08` | Capability gating, coherent reads, reset/rebuild, reorg reconciliation, worker scheduling | txindex worker recovery/query/lifecycle/scheduling suites; RPC capability tests |
 | [recovery.md](recovery.md) | `RCV-01`–`RCV-11` | Durable root, ordered commits, crash outcomes, reorgs, schema refusal | storage durability tests; txindex recovery tests; planned chainstate crash/reorg suites |
@@ -42,7 +42,6 @@ The overhaul suites map to current contracts, not task numbers:
 - `bin/bitcoin-rs/tests/overhaul_process_harness.rs` → `REF-02`, `REF-07`
 - `bin/bitcoin-rs/tests/overhaul_evidence.rs` → `HPA-12`
 - `bin/bitcoin-rs/tests/overhaul_external_miner.rs` → `API-14`, `API-15`
-- `bin/bitcoin-rs/tests/overhaul_ownership.rs` → `ARCH-01`, `ARCH-02`, `ARCH-08`
 - `crates/consensus/tests/overhaul_parse_parity.rs` → `VAL-02`
 - `crates/consensus/tests/overhaul_prepared_inputs.rs` → `POL-03`, `VAL-02`
 - `crates/node/tests/overhaul_config_status.rs` → `ARCH-05`, `IDX-02`

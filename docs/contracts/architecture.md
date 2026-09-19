@@ -258,12 +258,16 @@ Owners:
   the BIP22 reject vocabulary now live in `crates/mempool`/`crates/mining`;
   node keeps the `MiningCoordinator` facade and the `tx_ingress` consumer as
   composition.
-  `crates/node` still carries leftover domain mechanics: UTXO undo persistence
-  and disconnect markers (`apply.rs`), the node-side sync executor (`sync.rs`
-  driving `p2p::DownloadWindow`), and direct backend construction and cache
-  share dispatch (`state.rs`). `P2pService` no longer holds a second download
-  window. Relocating leftover node mechanics into `crates/utxo`,
-  `crates/storage`, and `crates/p2p` remains tracked under #217 (open). A
+  `crates/utxo` owns UTXO undo persistence, the marker-fenced block rollback,
+  and the apply-side window prevout overlay (`bitcoin_rs_utxo::undo`,
+  `bitcoin_rs_utxo::overlay`); `crates/node` calls `persist_block_undo`,
+  `load_block_undo`, and `rollback_block` and keeps only the ordering of that
+  rollback against the journal, durable head, and tip publication.
+  `crates/node` still carries leftover domain mechanics: the node-side sync
+  executor (`sync.rs` driving `p2p::DownloadWindow`), and direct backend
+  construction and cache share dispatch (`state.rs`). `P2pService` no longer
+  holds a second download window. Relocating leftover node mechanics into
+  `crates/storage` and `crates/p2p` remains tracked under #217 (open). A
   dedicated `crates/chainstate` waits until `ChainEventPublisher` and the
   node-side chain/UTXO payload codecs leave node. Implemented — journal record
   codec/writer/retention/replay streaming and checkpoint fs/format/atomic
@@ -286,21 +290,6 @@ Owners:
     backend feature forwarding is confined to operator tiers and service
     adapters, and rejects empty backend markers on crates that do not own an
     engine.
-  - `workspace_single_writer_boundaries_are_respected`: walks all production
-    `.rs` files under workspace member `src/` directories and confirms the
-    single-writer boundaries: mempool mutations go through the `MempoolGateway`,
-    derived-index capability selection stays with its owners (`crates/index`,
-    the node txindex runtime, and the node state config projection), peer
-    registration/cancellation stays with `crates/p2p`, and chainstate
-    transition promotion (`lock_transition`, `begin_transition_locked`) stays
-    inside `crates/node/src/`.
-- `bin/bitcoin-rs/tests/overhaul_ownership.rs`:
-  - `transaction_consumers_can_depend_on_mempool` and
-    `mempool_cannot_depend_on_transaction_consumers` exercise the allowed and
-    forbidden consumer directions.
-  - `synthetic_same_layer_cycle_fails` demonstrates the acyclicity check.
-  - `chainstate_transition_scan_passes` demonstrates the chainstate transition
-    promotion boundary stays inside `crates/node/src/`.
 - Manifest enforcement:
   - Root `Cargo.toml`: workspace member list and package versions.
   - `crates/storage/Cargo.toml`: engine dependency definitions.

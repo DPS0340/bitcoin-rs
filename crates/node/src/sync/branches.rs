@@ -64,8 +64,17 @@ impl BlockSync {
                 );
             }
             Err(crate::reorg::ReorgError::ConnectFailed {
-                hash, invalidated, ..
+                hash,
+                disposition,
+                invalidated,
+                ..
             }) => {
+                if disposition == crate::apply::WindowApplyDisposition::BodyMutated {
+                    // Only the delivered body is bad. Keep the header branch
+                    // and its descendants, but free this slot for a new body.
+                    self.block_stager.lock().retire_applied(&hash);
+                    self.download_window.lock().drop_for_retry(&hash);
+                }
                 // Invalid descendants cannot occupy bounded download state or
                 // they can prevent the newly selected valid branch from refilling.
                 if !invalidated.is_empty() {

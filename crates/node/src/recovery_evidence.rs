@@ -252,7 +252,7 @@ pub(crate) fn read_witness(dir: &Path, genesis_hash: &str) -> Option<AppliedTipW
 ///
 /// The rotation check is semantic: a parseable but foreign-genesis or
 /// wrong-format current is INVALID and is removed without displacing a
-/// valid `.prev`, mirroring `read_marker`'s acceptance criteria.
+/// valid `.prev`.
 pub(crate) fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
     write_bounded(
         dir,
@@ -265,19 +265,6 @@ pub(crate) fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(),
                 .is_some_and(|e| e.is_valid_for(MARKER_FORMAT, &event.genesis_hash))
         },
     )
-}
-
-/// Reads the most recent valid chain-rollback event marker, falling back to
-/// `.prev` when current is missing or invalid.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn read_marker(dir: &Path, genesis_hash: &str) -> Option<ChainRollbackEvent> {
-    let data = read_bounded(dir, MARKER_FILE, MARKER_PREV)?;
-    let event = ChainRollbackEvent::from_json(&data)?;
-    if !event.is_valid_for(MARKER_FORMAT, genesis_hash) {
-        tracing::debug!("marker has wrong format or foreign genesis, ignoring");
-        return None;
-    }
-    Some(event)
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +305,6 @@ impl WarningSnapshot {
 
     /// Returns a new snapshot with an index warning added if it is not an
     /// exact duplicate of an existing one. Preserves the checkpoint warning.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn with_index(mut self, msg: &str) -> Self {
         if !self.index.iter().any(|w| w == msg) {
             self.index.push(msg.to_owned());

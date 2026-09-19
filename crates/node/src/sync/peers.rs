@@ -15,6 +15,7 @@ use bitcoin_rs_p2p::download_window::configure_request_mode;
 use bitcoin_rs_p2p::download_window::statically_fanout_eligible;
 use bitcoin_rs_primitives::Hash256;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::time::Instant;
 
 pub(super) fn is_peer_fault(error: &ChainError) -> bool {
@@ -237,7 +238,10 @@ impl BlockSync {
     /// Computes the sync-layer terms of the stall predicate and advances the
     /// window's stall state machine ([`DownloadWindow::observe_stall`] holds
     /// the predicate itself). While the stager holds the next expected block,
-    /// the apply side owns the frontier and no peer is blamed.
+    /// the apply side owns the frontier and no peer is blamed; that
+    /// suppression is time-bounded (`DownloadWindow::observe_apply_side_bound`):
+    /// past the bound the stuck staged body is evicted for refetch, still
+    /// without blame (issue #1091).
     ///
     /// On fire the peer's outbound entry is removed. The p2p loop observes
     /// that lease removal and exits; the next tick releases and reassigns the
@@ -254,12 +258,26 @@ impl BlockSync {
         let Some(next_apply_height) = applied_tip.height.checked_add(1) else {
             return false;
         };
-        let apply_side_busy = self
-            .next_expected_block_hash()
-            .is_some_and(|hash| self.block_stager.lock().contains(&hash));
+        // Snapshot the apply frontier once, before the window lock: the hash
+        // keys the stuck-clock episode and gates the escalation's final
+        // equality check, and `apply_side_busy` derives from the same
+        // snapshot so both inputs describe one observation. The snapshot
+        // reads `block_tree`, so it must stay outside
+        // [`Self::select_and_evict_window_peer`] — its callback runs under
+        // the window lock, and tree->window is the codebase's lock order.
+        let frontier_hash = self.next_expected_block_hash();
+        let apply_side_busy =
+            frontier_hash.is_some_and(|hash| self.block_stager.lock().contains(&hash));
         let mut cold_hedge = None;
+        let mut apply_side_escalation = None;
         let mut fired = false;
         let removed_peer = self.select_and_evict_window_peer(|window| {
+            apply_side_escalation = window.observe_apply_side_bound(
+                next_apply_height,
+                frontier_hash,
+                apply_side_busy,
+                now,
+            );
             cold_hedge = window.observe_cold_front(next_apply_height, apply_side_busy, now);
             let selected = window.observe_stall(next_apply_height, apply_side_busy, now);
             fired = selected.is_some();
@@ -269,6 +287,14 @@ impl BlockSync {
             metrics::gauge!("node.sync.stall_seconds").set(stall_seconds);
             selected
         });
+        if let Some(suppressed_for) = apply_side_escalation {
+            // The no-blame suppression outlived its bound (issue #1091):
+            // evict the stuck staged body for refetch and stand down for
+            // this tick. No peer is convicted here; while the body is
+            // absent the unsuppressed stall path applies as usual.
+            self.escalate_stuck_staged_body(next_apply_height, frontier_hash, suppressed_for);
+            return false;
+        }
         if fired {
             let Some(peer_addr) = removed_peer else {
                 return false;
@@ -290,6 +316,67 @@ impl BlockSync {
                 .confirm_cold_front_hedge(owner, alternate, front_hash);
         }
         false
+    }
+
+    /// Issue #1091 escalation: evict the stuck staged next-expected body for
+    /// refetch, without blaming any peer.
+    ///
+    /// Fired by [`DownloadWindow::observe_apply_side_bound`] after the
+    /// apply-side suppression held for two full `received_timeout` windows.
+    /// `frontier_hash` is the snapshot the window observation fired on; the
+    /// final equality check against the live frontier ensures a same-height
+    /// branch replacement between observation and eviction cannot drain a
+    /// body that never stalled. The eviction reuses the staged-body prune's
+    /// requeue flow — stager removal first, then the tree-height re-evaluation,
+    /// then the window drop-for-retry — so the request path re-requests the
+    /// body: either the fresh delivery applies, or, while the body is
+    /// absent, the normal unsuppressed stall path engages. If a peer then
+    /// fails to re-deliver, THAT is a peer fault and the existing conviction
+    /// machinery handles it; the eviction itself carries no blame.
+    fn escalate_stuck_staged_body(
+        &self,
+        next_apply_height: u32,
+        frontier_hash: Option<Hash256>,
+        suppressed_for: Duration,
+    ) {
+        let Some(frontier_hash) = frontier_hash else {
+            return;
+        };
+        if self.next_expected_block_hash() != Some(frontier_hash) {
+            // Raced with a frontier change (e.g. a same-height branch
+            // switch): the convicted body is no longer the expected one and
+            // must not be drained.
+            return;
+        }
+        let evicted = self
+            .block_stager
+            .lock()
+            .drain_expected_prefix(&[frontier_hash]);
+        if evicted.is_empty() {
+            // Raced: the body was applied or pruned between the window
+            // observation and this eviction; nothing is stuck anymore.
+            return;
+        }
+        let height = {
+            let tree = self.handles.block_tree.read();
+            tree.lookup(frontier_hash)
+                .and_then(|node_id| tree.node(node_id).ok())
+                .map(|node| node.height)
+        };
+        {
+            let mut window = self.download_window.lock();
+            if let Some(height) = height {
+                window.update_received_height(&frontier_hash, height);
+            }
+            window.drop_received_for_retry(&frontier_hash);
+        }
+        metrics::counter!("node.sync.apply_side_stall_escalations").increment(1);
+        tracing::warn!(
+            next_apply_height,
+            suppressed_secs = suppressed_for.as_secs(),
+            "block sync: staged next-expected body stuck past the apply-side bound; \
+             evicting it for refetch without blaming any peer"
+        );
     }
 
     pub(super) fn disconnect_timed_out_peer(&self, now: Instant) -> bool {
@@ -315,8 +402,10 @@ impl BlockSync {
         &self,
         select: impl FnOnce(&mut DownloadWindow) -> Option<SocketAddr>,
     ) -> Option<SocketAddr> {
-        let mut window = self.download_window.lock();
-        let peer_addr = select(&mut window)?;
+        let peer_addr = {
+            let mut window = self.download_window.lock();
+            select(&mut window)?
+        };
         let connection_id = self.known_sessions.lock().get(&peer_addr).copied()?;
         if !self
             .peer_table

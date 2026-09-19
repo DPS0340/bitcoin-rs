@@ -39,23 +39,30 @@ job set.
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs for pull requests
 against any base branch, including stacked PRs, and for pushes to `main`. Its
-three jobs are `fmt`, `deny` (parallel, no workspace compile), and `rust` (one
-kernel-free compile graph: clippy, then the test profiles). Every gate command
-lives in [`scripts/ci-pr.sh`](scripts/ci-pr.sh) -- CI, the pre-commit hooks,
-and this guide all invoke that script, so the commands cannot drift:
+jobs are `fmt`, `deny` (parallel, no workspace compile), `clippy`, and three
+test lanes (`test-crates`, `test-binary`, `test-workspace`), all parallel;
+every lane fails fast at its first failing profile, so the first actionable
+failure is not delayed behind unrelated profiles (issue #1081). Every gate
+command lives in [`scripts/ci-pr.sh`](scripts/ci-pr.sh) -- CI, the
+pre-commit hooks, and this guide all invoke that script, so the commands
+cannot drift:
 
 ```sh
-./scripts/ci-pr.sh fmt      # format check
-./scripts/ci-pr.sh clippy   # three kernel-free all-target profiles
-./scripts/ci-pr.sh test     # kernel-free test profiles, smallest first
-./scripts/ci-pr.sh deny     # full dependency graph, metadata only
-./scripts/ci-pr.sh all      # everything above
+./scripts/ci-pr.sh fmt            # format check
+./scripts/ci-pr.sh clippy         # three kernel-free all-target profiles
+./scripts/ci-pr.sh test-crates    # consensus, node, rpc profiles (fixture-free)
+./scripts/ci-pr.sh test-binary    # binary profile (rocksdb,fjall,redb)
+./scripts/ci-pr.sh test-workspace # workspace kernel-free pass
+./scripts/ci-pr.sh test           # every test lane in sequence, smallest first
+./scripts/ci-pr.sh deny           # full dependency graph, metadata only
+./scripts/ci-pr.sh deep           # every profile, collecting all failures
+./scripts/ci-pr.sh all            # fmt + deep + deny
 ```
 
 Plain `cargo test --workspace` and `cargo clippy --workspace` also enable the
 library defaults and therefore build the C++ kernel. The script passes the
-kernel-free feature selection. The node, binary, and workspace test profiles
-expect the pinned Core and Apalache fixtures:
+kernel-free feature selection. The binary and workspace test lanes expect the
+pinned Core and Apalache fixtures:
 `bash scripts/provision-ci-reference-fixtures.sh`.
 
 The [pre-commit configuration](.pre-commit-config.yaml) runs the same script,

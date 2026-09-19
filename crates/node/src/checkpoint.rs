@@ -49,10 +49,11 @@ fn classify_checkpoint_error(error: CheckpointError) -> CheckpointLoadError {
 
 pub(crate) mod headers;
 
+pub(crate) use bitcoin_rs_storage::checkpoint::hex_encode;
 #[cfg(test)]
 pub(crate) use bitcoin_rs_storage::checkpoint::{
     CHECKPOINT_ROOT, CURRENT_FILE, CheckpointCorruption, CheckpointFailpoint, CurrentV1,
-    MANIFEST_FILE, hex_encode,
+    MANIFEST_FILE,
 };
 pub(crate) use bitcoin_rs_storage::checkpoint::{
     COINSTATS_ARTIFACT_LEN, COINSTATS_CODEC, COINSTATS_FILE, COINSTATS_MAGIC,
