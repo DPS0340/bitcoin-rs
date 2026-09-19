@@ -105,12 +105,6 @@ impl ByteSpan {
         u64::from(self.start) + u64::from(self.len)
     }
 
-    /// The span as `u64` image-relative offsets.
-    #[must_use]
-    pub fn range_u64(self) -> Range<u64> {
-        u64::from(self.start)..self.end()
-    }
-
     /// Locates the span inside a segment file that starts at `base`,
     /// widening the `u32` image offset in checked `u64` arithmetic.
     ///

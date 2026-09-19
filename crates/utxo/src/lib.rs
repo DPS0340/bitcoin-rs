@@ -13,21 +13,21 @@ mod compress;
 /// UTXO connect accounting: block mutation, undo, and value totals.
 pub mod connect;
 /// UTXO hash-table key.
-pub mod key;
+mod key;
 /// Prevout lookups over the committed set plus prepared-but-uncommitted blocks.
-pub mod overlay;
+mod overlay;
 /// Owned UTXO records.
-pub mod record;
+mod record;
 /// UTXO-set mutations and lookup.
 pub mod set;
 /// Shard internals.
-pub mod shard;
+mod shard;
 /// Native bitcoin-rs UTXO snapshot format.
 pub mod snapshot;
 /// Running UTXO-set statistics over the live set above.
 pub mod stats;
 /// Block-level undo persistence and the marker-fenced rollback.
-pub mod undo;
+mod undo;
 /// Versioned on-disk encoding for undo records.
 pub mod undo_codec;
 

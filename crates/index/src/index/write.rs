@@ -114,8 +114,8 @@ impl<S: KvStore> IndexWriter<S> {
     /// A missing live watermark with leftover rows is treated as an
     /// interrupted seed: `ScriptLive` is reset before any new row is
     /// written so a later watermark cannot advertise a stale view.
-    pub fn seed_script_live_stream<F>(
-        &mut self,
+    pub(crate) fn seed_script_live_stream<F>(
+        &self,
         mut produce: F,
         seed_tip: IndexWatermark,
     ) -> Result<usize, IndexError>
@@ -355,68 +355,6 @@ impl<S: KvStore> IndexWriter<S> {
         )?;
         self.indexer.last_counts = merged.counts();
         Ok(final_watermark)
-    }
-
-    /// Atomically rolls back one tip block and writes the parent watermark.
-    ///
-    /// Captures its own fence before any store-dependent derivation and
-    /// clears the consumer cursor atomically: without a valid replacement
-    /// block the cursor names rows that no longer exist.
-    pub fn commit_rollback_one(
-        &mut self,
-        prev: Option<IndexWatermark>,
-        body: &[u8],
-    ) -> Result<(), IndexError> {
-        let (fence, _) = self.fenced_watermarks()?;
-        self.commit_rollback_one_for_with_cursor(
-            fence,
-            IndexCapabilities::HISTORICAL,
-            prev,
-            body,
-            ConsumerCursorUpdate::Clear,
-        )
-    }
-
-    /// Atomically rolls back one block for the selected capabilities,
-    /// capturing its own fence and clearing the consumer cursor.
-    pub fn commit_rollback_one_for(
-        &mut self,
-        capabilities: IndexCapabilities,
-        prev: Option<IndexWatermark>,
-        body: &[u8],
-    ) -> Result<(), IndexError> {
-        if capabilities.script_live {
-            return Err(IndexError::MissingSpentScripts);
-        }
-        let (fence, _) = self.fenced_watermarks()?;
-        self.commit_rollback_one_for_with_cursor(
-            fence,
-            capabilities,
-            prev,
-            body,
-            ConsumerCursorUpdate::Clear,
-        )
-    }
-
-    /// Rolls back a selected transition using authoritative spent-coin
-    /// scripts. `ScriptLive` uses this anchor to restore rows for outputs that
-    /// the disconnected block had spent.
-    pub fn commit_rollback_one_with_spent_scripts(
-        &mut self,
-        capabilities: IndexCapabilities,
-        prev: Option<IndexWatermark>,
-        body: &[u8],
-        spent_scripts: &dyn SpentCoinScripts,
-    ) -> Result<(), IndexError> {
-        let (fence, _) = self.fenced_watermarks()?;
-        self.commit_rollback_one_for_with_cursor_with_spent_scripts(
-            fence,
-            capabilities,
-            prev,
-            body,
-            ConsumerCursorUpdate::Clear,
-            spent_scripts,
-        )
     }
 
     /// Atomically rolls back one block and applies one explicit consumer

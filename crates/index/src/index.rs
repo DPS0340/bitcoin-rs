@@ -15,7 +15,7 @@ mod write;
 pub use block::{MAX_LIVE_SCRIPT_SIZE, NoSpentScripts, SpentCoinScripts};
 pub use capability::{IndexCapabilities, IndexCapability, IndexWatermark, IndexWatermarks};
 pub use error::IndexError;
-pub use format::{INDEX_FORMAT_VERSION, IndexFormat};
+pub use format::INDEX_FORMAT_VERSION;
 pub use prepared::{PreparedBatch, PreparedBatchLimits, PreparedBlock};
 pub use reader::Indexer;
 pub use resolve::{BlockSource, ScriptHistoryEntry};

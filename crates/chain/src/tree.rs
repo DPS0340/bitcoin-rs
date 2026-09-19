@@ -257,20 +257,6 @@ impl BlockTree {
         self.tip().map(|tip| tip.tip_id)
     }
 
-    /// Returns a reference to the `BlockTreeNode` of the published tip, or
-    /// `None` if no tip is published or the tip's `NodeId` is stale.
-    #[must_use]
-    pub fn tip_node(&self) -> Option<&BlockTreeNode> {
-        self.node(self.tip_id()?).ok()
-    }
-
-    /// Returns the chainwork of the published tip, or `None` if no tip is
-    /// published yet.
-    #[must_use]
-    pub fn tip_chainwork(&self) -> Option<ChainWork> {
-        self.tip().map(|tip| tip.chainwork)
-    }
-
     /// Returns the height of the published tip, or `None` if no tip is
     /// published yet.
     #[must_use]
@@ -285,27 +271,6 @@ impl BlockTree {
         self.tip().map(|tip| tip.hash)
     }
 
-    /// Returns all hashes on the published active chain from tip down to root.
-    ///
-    /// Returns an empty vec if no tip is published. Walks parent pointers via
-    /// `ancestor_chain(tip_id)`, then projects `.hash` per node.
-    ///
-    /// Cost: O(N) where N = active-chain length. For locator-style sampling
-    /// prefer `block_locator(tip_id, max_entries)`.
-    #[must_use]
-    pub fn iter_active_chain_hashes(&self) -> Vec<Hash256> {
-        let Some(tip) = self.tip() else {
-            return Vec::new();
-        };
-        let Ok(ids) = self.ancestor_chain(tip.tip_id) else {
-            return Vec::new();
-        };
-        ids.into_iter()
-            .filter_map(|id| self.node(id).ok())
-            .map(|node| node.hash)
-            .collect()
-    }
-
     /// Returns a cheap-clonable handle to the canonical best-tip pointer.
     ///
     /// Sharing this handle lets lock-free readers observe tip advances
@@ -318,12 +283,16 @@ impl BlockTree {
 
     /// Returns the cached BIP9 deployment state for `(node_id, deployment_id)`, if any.
     #[must_use]
-    pub fn cached_bip9_state(&self, node_id: NodeId, deployment_id: u32) -> Option<CachedState> {
+    pub(crate) fn cached_bip9_state(
+        &self,
+        node_id: NodeId,
+        deployment_id: u32,
+    ) -> Option<CachedState> {
         self.bip9_cache.get(node_id, deployment_id)
     }
 
     /// Stores the cached BIP9 deployment state for `(node_id, deployment_id)`.
-    pub fn cache_bip9_state(&self, node_id: NodeId, deployment_id: u32, state: CachedState) {
+    pub(crate) fn cache_bip9_state(&self, node_id: NodeId, deployment_id: u32, state: CachedState) {
         self.bip9_cache.insert(node_id, deployment_id, state);
     }
 
@@ -488,14 +457,6 @@ impl BlockTree {
         let tip = self.tip()?;
         let node_id = self.node_at_height_from(tip.tip_id, height)?;
         self.node(node_id).ok()
-    }
-
-    /// Returns the `BlockHeader` at active-chain `height`, looking up via the
-    /// published tip. Returns `None` when no tip is published or no active-chain
-    /// node exists at that height.
-    #[must_use]
-    pub fn header_at_active_height(&self, height: u32) -> Option<&BlockHeader> {
-        self.active_node_at_height(height).map(|node| &node.header)
     }
 
     /// Height of `hash` on the ancestry of `tip_id`, or `None` if the hash is
@@ -1386,7 +1347,6 @@ mod tests {
     fn tip_id_returns_none_before_publish() {
         let tree = BlockTree::new();
         assert!(tree.tip_id().is_none());
-        assert!(tree.tip_node().is_none());
     }
 
     #[test]
@@ -1397,17 +1357,8 @@ mod tests {
         let genesis_hash = tree.node(genesis_id)?.hash;
 
         assert_eq!(tree.tip_id(), Some(genesis_id));
-        let Some(node) = tree.tip_node() else {
-            panic!("tip_node returned None for published tip");
-        };
-        assert_eq!(node.hash, genesis_hash);
+        assert_eq!(tree.node(genesis_id)?.hash, genesis_hash);
         Ok(())
-    }
-
-    #[test]
-    fn tip_chainwork_returns_none_before_publish() {
-        let tree = BlockTree::new();
-        assert!(tree.tip_chainwork().is_none());
     }
 
     #[test]
@@ -1420,37 +1371,6 @@ mod tests {
     fn tip_hash_returns_none_before_publish() {
         let tree = BlockTree::new();
         assert!(tree.tip_hash().is_none());
-    }
-
-    #[test]
-    fn iter_active_chain_hashes_returns_empty_for_no_tip() {
-        let tree = BlockTree::new();
-        assert!(tree.iter_active_chain_hashes().is_empty());
-    }
-
-    #[test]
-    fn iter_active_chain_hashes_returns_genesis_only_for_singleton_chain()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-        let genesis_hash = tree.node(genesis_id)?.hash;
-
-        let hashes = tree.iter_active_chain_hashes();
-
-        assert_eq!(hashes, vec![genesis_hash]);
-        Ok(())
-    }
-
-    #[test]
-    fn tip_chainwork_returns_published_tip_chainwork() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-        let cw = tree.node(genesis_id)?.chainwork;
-
-        assert_eq!(tree.tip_chainwork(), Some(cw));
-        Ok(())
     }
 
     #[test]
@@ -1497,33 +1417,6 @@ mod tests {
         };
         assert_eq!(node.height, 0);
         assert_eq!(node.hash, tree.node(genesis_id)?.hash);
-        Ok(())
-    }
-
-    #[test]
-    fn header_at_active_height_returns_genesis_header_after_publish_tip()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-        let genesis_hash = tree.node(genesis_id)?.hash;
-
-        let Some(header) = tree.header_at_active_height(0) else {
-            panic!("expected header at height 0");
-        };
-
-        assert_eq!(hash_from_header(header), genesis_hash);
-        Ok(())
-    }
-
-    #[test]
-    fn header_at_active_height_returns_none_above_tip() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-        let _genesis_hash = tree.node(genesis_id)?.hash;
-
-        assert!(tree.header_at_active_height(1).is_none());
         Ok(())
     }
 

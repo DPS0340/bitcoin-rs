@@ -761,9 +761,9 @@ pub(super) fn check_bip68_sequence_locks(
             let Some(entry) = view.lookup_meta(&tx_input.previous_output) else {
                 continue;
             };
-            let prevout_mtp = if sequence & bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_TYPE_FLAG
-                != 0
-            {
+            let prevout_mtp = if bitcoin_rs_consensus::bip68::sequence_lock_is_time_based(
+                sequence.to_consensus(),
+            ) {
                 if entry.height == height {
                     // A same-block prevout uses the MTP before the block being connected.
                     mtp

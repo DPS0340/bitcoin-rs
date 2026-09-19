@@ -69,8 +69,9 @@ impl BlockSync {
         let mut applied = 0_usize;
         let mut failed = 0_usize;
         let Some(staged_count) = self
-            .block_stager
+            .body_sync
             .lock()
+            .stager
             .ready_received_len(next_expected_hash)
         else {
             return (0, 0);
@@ -87,7 +88,11 @@ impl BlockSync {
                 let run = self.expected_block_hashes(horizon);
                 let expected_len = run.as_ref().map_or(0, |run| run.hashes.len());
                 let drained = match run.as_ref() {
-                    Some(run) => self.block_stager.lock().drain_expected_prefix(&run.hashes),
+                    Some(run) => self
+                        .body_sync
+                        .lock()
+                        .stager
+                        .drain_expected_prefix(&run.hashes),
                     None => Vec::new(),
                 };
                 if let Some(run) = run {
@@ -153,8 +158,9 @@ impl BlockSync {
                     // at the next chunk head.
                     let restore_from =
                         restore_split(chunk_start, stopped, chunk.len()).min(drained.len());
-                    self.block_stager
+                    self.body_sync
                         .lock()
+                        .stager
                         .restore_many(drained[restore_from..].iter().cloned());
                     if error.disposition == WindowCommitDisposition::Permanent {
                         // The failed block's descendants can never become
@@ -165,15 +171,10 @@ impl BlockSync {
                         // expected-apply cache is dropped below because the
                         // round failed.
                         {
-                            let mut stager = self.block_stager.lock();
+                            let mut body_sync = self.body_sync.lock();
                             for invalid_hash in &error.invalidated {
-                                stager.retire_applied(invalid_hash);
-                            }
-                        }
-                        {
-                            let mut window = self.download_window.lock();
-                            for invalid_hash in &error.invalidated {
-                                window.drop_for_retry(invalid_hash);
+                                body_sync.stager.retire_applied(invalid_hash);
+                                body_sync.window.drop_for_retry(invalid_hash);
                             }
                         }
                         metrics::counter!("node.sync.invalidated_blocks")
@@ -190,7 +191,8 @@ impl BlockSync {
         }
         if !applied_hashes.is_empty() || failed_hash.is_some() {
             {
-                let mut window = self.download_window.lock();
+                let mut body_sync = self.body_sync.lock();
+                let window = &mut body_sync.window;
                 for hash in &applied_hashes {
                     window.mark_received_applied(hash);
                 }
@@ -220,7 +222,7 @@ impl BlockSync {
     pub(super) fn expected_apply_horizon(&self, staged_count: usize) -> usize {
         // Snapshot the cap and release the window lock before any tree read so we
         // never invert the tree -> window lock order used elsewhere.
-        let max_pending_blocks = self.download_window.lock().max_pending_blocks();
+        let max_pending_blocks = self.body_sync.lock().window.max_pending_blocks();
         staged_count.max(max_pending_blocks)
     }
 
@@ -318,8 +320,9 @@ impl BlockSync {
         }
         let expected_end = cache.offset.saturating_add(expected_len);
         let drained = self
-            .block_stager
+            .body_sync
             .lock()
+            .stager
             .drain_expected_prefix(&cache.hashes[cache.offset..expected_end]);
         Some((drained, expected_len))
     }

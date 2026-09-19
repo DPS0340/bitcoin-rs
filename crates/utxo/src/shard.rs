@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Per-shard hash table of compact, inline UTXO record owners.
-pub struct ShardTable {
+pub(crate) struct ShardTable {
     /// Hash table of pointer-sized compact `UtxoRecord` owners stored inline (8 bytes on `x86_64`).
     pub table: HashTable<UtxoRecord>,
 }
@@ -88,14 +88,14 @@ pub struct LiveOutputMeta {
 }
 
 /// One cache-padded, lock-protected UTXO shard.
-pub struct Shard {
+pub(crate) struct Shard {
     inner: CachePadded<RwLock<ShardTable>>,
 }
 
 impl Shard {
     /// Builds an empty shard.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: CachePadded::new(RwLock::new(ShardTable::new())),
         }
@@ -142,10 +142,10 @@ impl Shard {
 
     /// Returns an owned transaction output if `key:vout` is live in this shard.
     #[must_use]
-    pub fn get(&self, key: &UtxoKey, txid: &Hash256, vout: u32) -> Option<TxOut> {
+    pub(crate) fn get(&self, key: UtxoKey, txid: &Hash256, vout: u32) -> Option<TxOut> {
         let table = self.inner.read();
         let record = table.table.find(key.hash(), |record| {
-            record.key() == *key && record.txid() == *txid
+            record.key() == key && record.txid() == *txid
         })?;
         let output = record.find_output(vout)?;
         Some(txout_from_parts(output.value, output.script_pubkey))
@@ -154,10 +154,10 @@ impl Shard {
     /// Returns the full live-output entry (txout + coinbase + height)
     /// if `key:vout` is live in this shard.
     #[must_use]
-    pub fn get_entry(&self, key: &UtxoKey, txid: &Hash256, vout: u32) -> Option<LiveOutput> {
+    pub(crate) fn get_entry(&self, key: UtxoKey, txid: &Hash256, vout: u32) -> Option<LiveOutput> {
         let table = self.inner.read();
         let record = table.table.find(key.hash(), |record| {
-            record.key() == *key && record.txid() == *txid
+            record.key() == key && record.txid() == *txid
         })?;
         let output = record.find_output(vout)?;
         Some(LiveOutput {
@@ -169,10 +169,15 @@ impl Shard {
 
     /// Returns live-output metadata without materializing script bytes.
     #[must_use]
-    pub fn get_meta(&self, key: &UtxoKey, txid: &Hash256, vout: u32) -> Option<LiveOutputMeta> {
+    pub(crate) fn get_meta(
+        &self,
+        key: UtxoKey,
+        txid: &Hash256,
+        vout: u32,
+    ) -> Option<LiveOutputMeta> {
         let table = self.inner.read();
         let record = table.table.find(key.hash(), |record| {
-            record.key() == *key && record.txid() == *txid
+            record.key() == key && record.txid() == *txid
         })?;
         let output = record.find_output(vout)?;
         Some(LiveOutputMeta {
@@ -183,12 +188,12 @@ impl Shard {
 
     /// Returns true when this shard has any live output for `txid`.
     #[must_use]
-    pub fn has_live_outputs_for_txid(&self, key: &UtxoKey, txid: &Hash256) -> bool {
+    pub(crate) fn has_live_outputs_for_txid(&self, key: UtxoKey, txid: &Hash256) -> bool {
         let table = self.inner.read();
         table
             .table
             .find(key.hash(), |record| {
-                record.key() == *key && record.txid() == *txid
+                record.key() == key && record.txid() == *txid
             })
             .is_some_and(|record| !record.is_empty())
     }
@@ -273,32 +278,6 @@ impl Shard {
         let mut table = self.inner.write();
         replace_record(&mut table, key, txid, record);
         Ok(())
-    }
-
-    /// Reload seam for the persistence layer: inserts an already-validated
-    /// encoded record (the cache-refill path after eviction). The record
-    /// carries its own full-txid identity; the key is the derived
-    /// accelerator, never the identity.
-    pub(crate) fn insert_encoded_record(&self, key: UtxoKey, record: UtxoRecord) {
-        let mut table = self.inner.write();
-        replace_record(&mut table, key, record.txid(), record);
-    }
-
-    /// Eviction seam for the persistence layer: removes the resident record
-    /// with this exact full identity. The caller must have the record
-    /// durably in the backing store; the shard holds no other copy.
-    pub(crate) fn remove_resident_record(&self, key: UtxoKey, txid: Hash256) {
-        let mut table = self.inner.write();
-        remove_record(&mut table, key, txid);
-    }
-
-    /// Snapshot seam for the persistence layer: the record's canonical
-    /// encoded bytes by full identity, for before- and after-images.
-    pub(crate) fn record_bytes(&self, key: UtxoKey, txid: Hash256) -> Option<Vec<u8>> {
-        let table = self.inner.read();
-        find_record(&table, key, txid)
-            .filter(|record| !record.is_empty())
-            .map(|record| record.encoded_bytes().to_vec())
     }
 }
 

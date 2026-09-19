@@ -6,11 +6,8 @@ fn bip68_time_lock_rejects_delayed_same_block_prevout() -> Result<(), Box<dyn st
     let previous_tip_id = seed_block_tree_for_bip68_time_at_height(&handles, 100)?;
     let funding_tx = transaction(0x6d);
     let funding_outpoint = OutPoint::new(funding_tx.txid(), 0);
-    let same_block_spend = spending_transaction_to_script(
-        funding_outpoint,
-        bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_TYPE_FLAG | 1,
-        op_true_script(),
-    );
+    let same_block_spend =
+        spending_transaction_to_script(funding_outpoint, BIP68_TYPE_FLAG | 1, op_true_script());
     let block = block_with_transactions(vec![funding_tx, same_block_spend]);
 
     let error = match check_bip68_sequence_locks(
@@ -45,7 +42,7 @@ fn bip68_time_lock_rejects_missing_previous_tip_context() -> Result<(), Box<dyn 
     let previous_output = OutPoint::new(fixture_txid(0x6a), 0);
     let utxo = utxo_with_output(previous_output, BIP68_TEST_PREVOUT_HEIGHT)?;
     let handles = apply_handles(utxo);
-    let sequence = bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_TYPE_FLAG | 1;
+    let sequence = BIP68_TYPE_FLAG | 1;
     let block = block_with_transaction(spending_transaction_to_script(
         previous_output,
         sequence,
@@ -65,8 +62,7 @@ fn bip68_time_lock_rejects_missing_previous_tip_context() -> Result<(), Box<dyn 
         )),
         Bip68Context {
             validation: &validation_context(&block, 0, 0, bitcoin_rs_script::VerifyFlags::NONE),
-            median_time_past: BIP68_TEST_PREVOUT_MTP
-                + bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_GRANULARITY_SECONDS,
+            median_time_past: BIP68_TEST_PREVOUT_MTP + BIP68_TIME_GRANULARITY_SECONDS,
             softfork_state: active,
             previous_tip_id: None,
         },
@@ -85,7 +81,7 @@ fn bip68_time_lock_rejects_missing_prevout_ancestor_context()
     let utxo = utxo_with_output(previous_output, BIP68_TEST_PREVOUT_HEIGHT)?;
     let handles = apply_handles(utxo);
     let previous_tip_id = seed_block_tree_for_bip68_time_at_height(&handles, 0)?;
-    let sequence = bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_TYPE_FLAG | 1;
+    let sequence = BIP68_TYPE_FLAG | 1;
     let block = block_with_transaction(spending_transaction_to_script(
         previous_output,
         sequence,
@@ -105,8 +101,7 @@ fn bip68_time_lock_rejects_missing_prevout_ancestor_context()
         )),
         Bip68Context {
             validation: &validation_context(&block, 0, 0, bitcoin_rs_script::VerifyFlags::NONE),
-            median_time_past: BIP68_TEST_PREVOUT_MTP
-                + bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_GRANULARITY_SECONDS,
+            median_time_past: BIP68_TEST_PREVOUT_MTP + BIP68_TIME_GRANULARITY_SECONDS,
             softfork_state: active,
             previous_tip_id: Some(previous_tip_id),
         },

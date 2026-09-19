@@ -22,9 +22,9 @@ use bitcoin::{
     TxMerkleNode, TxOut, Txid, Witness,
 };
 use bitcoin_rs_index::{
-    IndexCapabilities, IndexCapability, IndexError, IndexWatermark, IndexWatermarks, IndexWriter,
-    MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, ScriptHash, ScriptLiveRow,
-    SpentCoinScripts,
+    ConsumerCursorUpdate, IndexCapabilities, IndexCapability, IndexError, IndexWatermark,
+    IndexWatermarks, IndexWriter, MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits,
+    ScriptHash, ScriptLiveRow, SpentCoinScripts,
 };
 use bitcoin_rs_primitives::{Hash256, OutPoint as NativeOutPoint, Txid as NativeTxid};
 use bitcoin_rs_storage::{
@@ -32,6 +32,24 @@ use bitcoin_rs_storage::{
     WriteCondition,
 };
 use parking_lot::RwLock;
+
+fn commit_rollback_one_with_spent_scripts<S: KvStore>(
+    writer: &mut IndexWriter<S>,
+    capabilities: IndexCapabilities,
+    prev: Option<IndexWatermark>,
+    body: &[u8],
+    spent_scripts: &dyn SpentCoinScripts,
+) -> Result<(), IndexError> {
+    let (fence, _) = writer.fenced_watermarks()?;
+    writer.commit_rollback_one_for_with_cursor_with_spent_scripts(
+        fence,
+        capabilities,
+        prev,
+        body,
+        ConsumerCursorUpdate::Clear,
+        spent_scripts,
+    )
+}
 
 // --- Minimal in-memory KvStore -------------------------------------------
 
@@ -407,7 +425,8 @@ fn live_rows_follow_connect_spend_and_disconnect() -> Result<(), Box<dyn std::er
         height: 1,
         hash: chain.tip,
     };
-    chain.writer.commit_rollback_one_with_spent_scripts(
+    commit_rollback_one_with_spent_scripts(
+        &mut chain.writer,
         IndexCapabilities::ALL,
         Some(prev),
         &body2,
@@ -464,7 +483,8 @@ fn live_rows_restore_a_replaced_outpoint() -> Result<(), Box<dyn std::error::Err
         height: 0,
         hash: chain.tip,
     };
-    chain.writer.commit_rollback_one_with_spent_scripts(
+    commit_rollback_one_with_spent_scripts(
+        &mut chain.writer,
         IndexCapabilities::ALL,
         Some(prev),
         &body,

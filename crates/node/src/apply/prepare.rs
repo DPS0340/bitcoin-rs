@@ -57,47 +57,26 @@ pub(super) fn parse_block_for_apply(
             ),
         ));
     }
-    #[cfg(feature = "kernel")]
-    let (kernel_block, txids) = {
-        let raw_block: bytes::Bytes =
-            provided_serialized.unwrap_or_else(|| bytes::Bytes::from(consensus_bytes(block)));
-        let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
-            .map_err(ApplyError::Consensus)?;
-        if kernel_block.transaction_count() != block.txs.len() {
-            return Err(ApplyError::Consensus(
-                bitcoin_rs_consensus::ConsensusError::Kernel(format!(
-                    "kernel parsed {} transactions, decoder produced {}",
-                    kernel_block.transaction_count(),
-                    block.txs.len()
-                )),
-            ));
-        }
-        let txids = kernel_block.txids().map_err(ApplyError::Consensus)?;
-        (kernel_block, txids)
-    };
-    // Without the kernel the checked borrowed layout is the one parse: it
-    // derives the txids, witness IDs, weight, byte positions, and the
-    // Merkle verdicts in a single pass, and the decoded block feeds only
-    // the stages that mutate or verify against it. No second transaction
-    // tree decode happens on this path.
-    #[cfg(not(feature = "kernel"))]
-    let (kernel_block, txids) = {
-        let raw_block: bytes::Bytes =
-            provided_serialized.unwrap_or_else(|| bytes::Bytes::from(consensus_bytes(block)));
-        let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
-            .map_err(ApplyError::Consensus)?;
-        if kernel_block.transaction_count() != block.txs.len() {
-            return Err(ApplyError::Consensus(
-                bitcoin_rs_consensus::ConsensusError::Kernel(format!(
-                    "layout parsed {} transactions, decoder produced {}",
-                    kernel_block.transaction_count(),
-                    block.txs.len()
-                )),
-            ));
-        }
-        let txids = kernel_block.txids().to_vec();
-        (kernel_block, txids)
-    };
+    // Both `KernelBlock` backends share one shape — parse once, count check,
+    // txids — so the caller stays uniform whichever feature resolved the type.
+    // In kernel builds the txids and the transactions that script verification
+    // runs come from the kernel parse; without it the checked borrowed layout
+    // derives txids, witness IDs, weight, byte positions, and Merkle verdicts
+    // in a single pass, with no second transaction tree decode.
+    let raw_block: bytes::Bytes =
+        provided_serialized.unwrap_or_else(|| bytes::Bytes::from(consensus_bytes(block)));
+    let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
+        .map_err(ApplyError::Consensus)?;
+    if kernel_block.transaction_count() != block.txs.len() {
+        return Err(ApplyError::Consensus(
+            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
+                "block parse produced {} transactions, decoder produced {}",
+                kernel_block.transaction_count(),
+                block.txs.len()
+            )),
+        ));
+    }
+    let txids = kernel_block.txids().map_err(ApplyError::Consensus)?;
     Ok((kernel_block, txids))
 }
 

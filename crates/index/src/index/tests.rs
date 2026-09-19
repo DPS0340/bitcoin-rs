@@ -12,6 +12,21 @@ use crate::{ScriptHash, ScriptHashRow, ScriptHistoryEntry, SpendingPrefixRow, Tx
 
 type StoredRows = Vec<(ColumnFamily, Vec<u8>)>;
 
+fn commit_rollback_one<S: KvStore>(
+    writer: &mut IndexWriter<S>,
+    prev: Option<crate::IndexWatermark>,
+    body: &[u8],
+) -> Result<(), IndexError> {
+    let (fence, _) = writer.fenced_watermarks()?;
+    writer.commit_rollback_one_for_with_cursor(
+        fence,
+        crate::IndexCapabilities::HISTORICAL,
+        prev,
+        body,
+        crate::ConsumerCursorUpdate::Clear,
+    )
+}
+
 #[test]
 fn raw_op_return_check_matches_script_prefix_semantics() {
     assert!(!is_op_return_script(&[]));
@@ -141,9 +156,12 @@ fn resolve_unspent_outputs_returns_txid_vout_value_for_funded_scripthash()
         block,
         target_height: 0,
     };
-    let outputs = writer
+    let outputs: Vec<(Txid, u32, u64)> = writer
         .indexer()
-        .resolve_unspent_outputs(scripthash, &source)?;
+        .resolve_unspent_outputs_with_height(scripthash, &source)?
+        .into_iter()
+        .map(|(txid, vout, value, _height)| (txid, vout, value))
+        .collect();
 
     assert_eq!(outputs, vec![(txid, 0, value)]);
     Ok(())
@@ -404,7 +422,7 @@ fn rollback_removes_every_row_a_matching_commit_wrote() -> Result<(), Box<dyn st
         );
     }
 
-    writer.commit_rollback_one(None, &body)?;
+    commit_rollback_one(&mut writer, None, &body)?;
     assert_eq!(
         stored_rows(writer.indexer())?,
         before,
@@ -420,7 +438,7 @@ fn rollback_without_a_watermark_is_rejected() -> Result<(), Box<dyn std::error::
     let body = consensus_bytes(&candidate);
 
     assert!(matches!(
-        writer.commit_rollback_one(None, &body),
+        commit_rollback_one(&mut writer, None, &body),
         Err(IndexError::NonContiguousPrepared { watermark: None })
     ));
     assert!(stored_rows(writer.indexer())?.is_empty());
@@ -434,11 +452,11 @@ fn a_second_rollback_is_rejected_once_the_watermark_is_gone()
     let candidate = rollback_fixture_block();
     let body = consensus_bytes(&candidate);
     writer.commit_block(0, &body)?;
-    writer.commit_rollback_one(None, &body)?;
+    commit_rollback_one(&mut writer, None, &body)?;
     let after_first = stored_rows(writer.indexer())?;
 
     assert!(matches!(
-        writer.commit_rollback_one(None, &body),
+        commit_rollback_one(&mut writer, None, &body),
         Err(IndexError::NonContiguousPrepared { watermark: None })
     ));
     assert_eq!(
@@ -527,7 +545,7 @@ fn rollback_deletes_nothing_when_the_write_fails() -> Result<(), Box<dyn std::er
 
     let failing = Arc::new(FailingWriteStore(RocksDbStore::open(dir.path())?));
     let mut writer = IndexWriter::open(Arc::clone(&failing), 1)?;
-    let outcome = writer.commit_rollback_one(None, &body);
+    let outcome = commit_rollback_one(&mut writer, None, &body);
     assert!(outcome.is_err(), "a failing write must surface as an error");
     drop(writer);
     drop(failing);
@@ -570,7 +588,7 @@ fn a_stale_rollback_body_leaves_a_replacement_blocks_rows_alone()
 
     let old_body = consensus_bytes(&old_block);
     writer.commit_block(0, &old_body)?;
-    writer.commit_rollback_one(None, &old_body)?;
+    commit_rollback_one(&mut writer, None, &old_body)?;
     writer.commit_block(0, &consensus_bytes(&replacement))?;
     writer.flush()?;
     let after_replacement = stored_rows(writer.indexer())?;
@@ -580,7 +598,7 @@ fn a_stale_rollback_body_leaves_a_replacement_blocks_rows_alone()
     );
 
     assert!(
-        writer.commit_rollback_one(None, &old_body).is_err(),
+        commit_rollback_one(&mut writer, None, &old_body).is_err(),
         "rolling back the old body against the replacement watermark must fail"
     );
     writer.flush()?;

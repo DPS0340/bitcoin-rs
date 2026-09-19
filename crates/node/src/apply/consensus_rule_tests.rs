@@ -25,6 +25,8 @@ use std::sync::Arc;
 
 const BIP68_TEST_PREVOUT_HEIGHT: u32 = 100;
 const BIP68_TEST_PREVOUT_MTP: u32 = 1_000_000;
+const BIP68_TYPE_FLAG: u32 = 1 << 22;
+const BIP68_TIME_GRANULARITY_SECONDS: u32 = 512;
 
 /// A store that refuses every write, to prove the undo persistence is a
 /// real gate rather than a best-effort side effect.

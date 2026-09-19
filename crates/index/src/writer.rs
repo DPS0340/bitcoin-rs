@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// Object-safe `ScriptLive` seed producer used by [`TxIndexWriter`].
-pub type ScriptLiveSeedProduce<'a> = dyn FnMut(&mut dyn FnMut(OutPoint, ScriptHash) -> Result<(), IndexError>) -> Result<(), IndexError>
+pub(crate) type ScriptLiveSeedProduce<'a> = dyn FnMut(&mut dyn FnMut(OutPoint, ScriptHash) -> Result<(), IndexError>) -> Result<(), IndexError>
     + 'a;
 
 /// Erased prepared-index writer used by derived-index reconciliation.

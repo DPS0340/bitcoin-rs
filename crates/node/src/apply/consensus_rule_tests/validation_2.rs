@@ -135,11 +135,8 @@ fn bip68_time_lock_uses_previous_tip_mtp_for_same_block_prevout()
     let previous_tip_id = seed_block_tree_for_bip68_time_at_height(&handles, 100)?;
     let funding_tx = transaction(0x6c);
     let funding_outpoint = OutPoint::new(funding_tx.txid(), 0);
-    let same_block_spend = spending_transaction_to_script(
-        funding_outpoint,
-        bitcoin_rs_consensus::bip68::SEQUENCE_LOCKTIME_TYPE_FLAG,
-        op_true_script(),
-    );
+    let same_block_spend =
+        spending_transaction_to_script(funding_outpoint, BIP68_TYPE_FLAG, op_true_script());
     let block = block_with_transactions(vec![funding_tx, same_block_spend]);
 
     assert!(

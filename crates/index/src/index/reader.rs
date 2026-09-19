@@ -170,7 +170,10 @@ impl<S: KvStore> Indexer<S> {
     /// **Height ordering:** same as [`Self::iter_funding_rows`]: the 4-byte
     /// height suffix is big-endian (format 5), so prefix-range scans arrive
     /// in chronological order.
-    pub fn iter_txid_rows(&self, txid: &Txid) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
+    pub(crate) fn iter_txid_rows(
+        &self,
+        txid: &Txid,
+    ) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
         let prefix = TxidRow::scan_prefix(txid);
         let iter = self.store.iter_prefix(ColumnFamily::TxConfirmed, &prefix)?;
         collect_prefix_rows(iter)

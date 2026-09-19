@@ -117,11 +117,7 @@ pub struct NodeState {
     peer_table: Arc<bitcoin_rs_p2p::PeerTable>,
     banned: Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     p2p_outbound_tx: crossbeam_channel::Sender<std::net::SocketAddr>,
-    p2p_outbound_rx: Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>>,
-    inbound_headers_tx: Sender<bitcoin_rs_p2p::InboundHeaders>,
-    inbound_headers_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>>,
     inbound_blocks_tx: Sender<bitcoin_rs_p2p::InboundBlock>,
-    inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     inbound_tx_tx: Sender<bitcoin_rs_p2p::InboundTx>,
     inbound_tx_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundTx>>>,
     chain_events: Arc<ChainEventPublisher>,
@@ -249,22 +245,6 @@ impl NodeState {
         Arc::clone(&self.chain_tx_count)
     }
 
-    /// Shares the chain-transition mutex with the RPC layer.
-    ///
-    /// The applied tip and the cumulative transaction count are published one
-    /// after the other inside a transition. An RPC reader that takes this lock
-    /// sees the pair as the transition left it, rather than catching it halfway
-    /// through and reporting the new tip's height beside the old tip's count.
-    ///
-    /// Handing out the lock means an RPC read can wait for a connect to finish.
-    /// That is the trade Bitcoin Core already makes -- `getchaintxstats` holds
-    /// `cs_main` for its whole body -- and the wait here covers two atomic
-    /// loads rather than a whole handler.
-    #[must_use]
-    pub fn chain_transition_handle(&self) -> Arc<parking_lot::Mutex<()>> {
-        Arc::clone(&self.apply_handles.chain_transition)
-    }
-
     /// Returns the shared block-records handle exposed to RPC handlers.
     #[must_use]
     pub fn blocks(&self) -> Arc<RwLock<BlockLog>> {
@@ -326,51 +306,16 @@ impl NodeState {
         self.p2p_outbound_tx.clone()
     }
 
-    /// Returns the shared receiver consumed by the outbound P2P drain worker.
-    #[must_use]
-    pub fn p2p_outbound_receiver(
-        &self,
-    ) -> Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>> {
-        Arc::clone(&self.p2p_outbound_rx)
-    }
-
-    /// Returns the rollback-evidence warning store for `getblockchaininfo`.
-    #[must_use]
-    pub(crate) fn warning_store(&self) -> Arc<crate::recovery_evidence::WarningStore> {
-        Arc::clone(&self.warning_store)
-    }
-
-    /// Returns a cloned `Sender` that the P2P listener pushes inbound
-    /// block headers into. The matching `Receiver` is polled by
-    /// `BlockSync::tick` to extend the `BlockTree`.
-    pub fn inbound_headers_sender(&self) -> Sender<bitcoin_rs_p2p::InboundHeaders> {
-        self.inbound_headers_tx.clone()
-    }
-
-    /// Returns the shared receiver handle consumed by `BlockSync::tick`.
-    ///
-    /// Exposed so tests and `BlockSync::new` can wire the channel; production
-    /// code calls `state.sync()` and lets the orchestrator own the drain.
-    #[must_use]
-    pub fn inbound_headers_rx_handle(
-        &self,
-    ) -> Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>> {
-        Arc::clone(&self.inbound_headers_rx)
-    }
-
     /// Returns a cloned `Sender` that the P2P listener pushes inbound
     /// blocks into for verification and relay.
     pub fn inbound_blocks_sender(&self) -> Sender<bitcoin_rs_p2p::InboundBlock> {
         self.inbound_blocks_tx.clone()
     }
 
-    /// Returns the shared receiver handle consumed by `BlockSync::tick`.
-    ///
-    /// Exposed so tests and `BlockSync::new` can wire the channel; production
-    /// code calls `state.sync()` and lets the orchestrator own the drain.
+    /// Returns the rollback-evidence warning store for `getblockchaininfo`.
     #[must_use]
-    pub fn inbound_blocks_rx_handle(&self) -> Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>> {
-        Arc::clone(&self.inbound_blocks_rx)
+    pub(crate) fn warning_store(&self) -> Arc<crate::recovery_evidence::WarningStore> {
+        Arc::clone(&self.warning_store)
     }
 
     /// Returns a cloned `Sender` that the P2P listener pushes inbound

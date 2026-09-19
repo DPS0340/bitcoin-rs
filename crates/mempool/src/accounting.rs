@@ -37,7 +37,7 @@ pub(crate) fn policy_vsize(tx: &Tx, sigop_cost: u32) -> u32 {
 /// never make an incomplete transaction admissible. Range validation remains
 /// the existing consensus verifier's responsibility.
 #[must_use]
-pub fn prepared_context(
+pub(crate) fn prepared_context(
     tx: &Tx,
     prevouts: &[(OutPoint, TxOut)],
     missing_inputs: bool,
