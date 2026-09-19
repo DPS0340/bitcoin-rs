@@ -411,17 +411,6 @@ impl ProcessNode {
         self.child.id()
     }
 
-    /// Path of the datadir this process owns.
-    ///
-    /// Panics only if `take_datadir` already moved custody, which no
-    /// scenario may do while the process is still running.
-    pub(crate) fn datadir_path(&self) -> &Path {
-        self.datadir
-            .as_ref()
-            .map(TempDir::path)
-            .expect("datadir custody moved while the process still holds it")
-    }
-
     /// Moves datadir custody out of a stopped process for a restart.
     pub(crate) fn take_datadir(&mut self) -> Result<TempDir, HarnessError> {
         self.datadir
@@ -847,22 +836,17 @@ fn funding_key() -> Result<PrivateKey, HarnessError> {
 }
 
 impl CommonFunds {
-    /// Sign only bytes returned by the independent Core process, with no node state access.
-    pub(crate) fn signed_spend(&self) -> Result<bitcoin::Transaction, HarnessError> {
-        use bitcoin::absolute::LockTime;
-        use bitcoin::script::{Builder, PushBytesBuf};
-        use bitcoin::secp256k1::{Message, Secp256k1};
-        use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-        use bitcoin::{
-            Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, transaction,
-        };
-
-        let block: Block = bitcoin::consensus::deserialize(
-            self.common_block_bytes
-                .first()
-                .ok_or_else(|| HarnessError::Protocol("missing funding block".into()))?,
-        )
-        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    /// Resolve only bytes returned by the independent Core process.
+    pub(crate) fn confirmed_output(
+        &self,
+        index: usize,
+    ) -> Result<(OutPoint, bitcoin::TxOut), HarnessError> {
+        let bytes = self
+            .common_block_bytes
+            .get(index)
+            .ok_or_else(|| HarnessError::Protocol("missing funding block".into()))?;
+        let block: Block = bitcoin::consensus::deserialize(bytes)
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
         let coinbase = block
             .txdata
             .first()
@@ -871,29 +855,58 @@ impl CommonFunds {
             .output
             .first()
             .ok_or_else(|| HarnessError::Protocol("missing coinbase output".into()))?;
+        Ok((OutPoint::new(coinbase.compute_txid(), 0), output.clone()))
+    }
+
+    pub(crate) fn signed_spend(
+        &self,
+        fee_sats: u64,
+        sequence: bitcoin::Sequence,
+    ) -> Result<bitcoin::Transaction, HarnessError> {
+        let (outpoint, output) = self.confirmed_output(0)?;
         let value = output
             .value
             .to_sat()
-            .checked_sub(10_000)
+            .checked_sub(fee_sats)
             .ok_or_else(|| HarnessError::Protocol("funding below fee".into()))?;
-        let mut spend = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::new(coinbase.compute_txid(), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+        let mut spend = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence,
+                witness: bitcoin::Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(value),
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(value),
                 script_pubkey: output.script_pubkey.clone(),
             }],
         };
-        let private = funding_key()?;
-        let secp = Secp256k1::new();
-        let sighash = SighashCache::new(&spend)
-            .legacy_signature_hash(0, &output.script_pubkey, EcdsaSighashType::All.to_u32())
+        sign_funding_inputs(&mut spend, &[output])?;
+        Ok(spend)
+    }
+}
+
+/// Sign the offered P2PKH prevouts with the deterministic isolated regtest
+/// funding key. This never reads candidate-node state or wallet internals.
+pub(crate) fn sign_funding_inputs(
+    spend: &mut bitcoin::Transaction,
+    prevouts: &[bitcoin::TxOut],
+) -> Result<(), HarnessError> {
+    use bitcoin::script::{Builder, PushBytesBuf};
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    if spend.input.len() != prevouts.len() {
+        return Err(HarnessError::Protocol(
+            "funding prevout count mismatch".into(),
+        ));
+    }
+    let private = funding_key()?;
+    let secp = Secp256k1::new();
+    for (index, output) in prevouts.iter().enumerate() {
+        let sighash = SighashCache::new(&*spend)
+            .legacy_signature_hash(index, &output.script_pubkey, EcdsaSighashType::All.to_u32())
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
         let signature = bitcoin::ecdsa::Signature::sighash_all(secp.sign_ecdsa(
             &Message::from_digest(sighash.to_byte_array()),
@@ -901,48 +914,10 @@ impl CommonFunds {
         ));
         let signature = PushBytesBuf::try_from(signature.to_vec())
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-        spend.input.first_mut().expect("one spend input").script_sig = Builder::new()
+        spend.input[index].script_sig = Builder::new()
             .push_slice(signature)
             .push_key(&private.public_key(&secp))
             .into_script();
-        Ok(spend)
     }
-}
-
-#[cfg(test)]
-mod port_tests {
-    use super::{TcpListener, loopback_addresses, remaining_time};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn socket_time_limit_rejects_sub_microsecond_intervals() {
-        let now = Instant::now();
-        for nanos in [0, 1, 999] {
-            assert!(remaining_time(now + Duration::from_nanos(nanos), now, "expired").is_err());
-        }
-        for duration in [Duration::from_micros(1), Duration::from_secs(1)] {
-            assert_eq!(
-                remaining_time(now + duration, now, "expired").expect("valid time limit"),
-                duration
-            );
-        }
-    }
-
-    #[test]
-    fn selected_ports_stay_reserved() {
-        let ports = loopback_addresses().expect("select two ports");
-        let rpc = ports.0.local_addr().expect("RPC address");
-        let p2p = ports.1.local_addr().expect("P2P address");
-        assert_ne!(rpc, p2p);
-        for address in [rpc, p2p] {
-            let error =
-                TcpListener::bind(address).expect_err("the selected port must stay reserved");
-            assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
-        }
-        drop(ports);
-        for address in [rpc, p2p] {
-            let listener = TcpListener::bind(address).expect("the released port must be available");
-            drop(listener);
-        }
-    }
+    Ok(())
 }

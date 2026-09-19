@@ -34,7 +34,7 @@ fn active_chain_snapshot_starts_at_genesis_on_fresh_node() -> anyhow::Result<()>
     config.p2p.listen.clear();
 
     let state = NodeState::open(config.clone(), None)?;
-    let epoch = state.chain_event_publisher().epoch();
+    let epoch = state.chain_events.epoch();
     assert_eq!(
         state.active_chain_snapshot(),
         ChainSnapshot {
@@ -85,17 +85,36 @@ fn active_chain_snapshot_anchors_at_restored_tip_after_restart() -> anyhow::Resu
 }
 
 #[test]
-fn record_advances_sequence_and_replaces_snapshot() {
+// CONTRACT: docs/contracts/chain-events.md#EVT-01
+fn record_returns_hints_in_commit_order_and_advances_the_snapshot() {
     let publisher = ChainEventPublisher::detached(7);
+    let epoch = publisher.epoch();
     let hash_a = Hash256::from_le_bytes(&[0xAA; 32]);
     let hash_b = Hash256::from_le_bytes(&[0xBB; 32]);
 
-    publisher.record(1, hash_a);
-    publisher.record(0, hash_b);
+    let first = publisher.record(HintKind::Connected, 1, hash_a);
+    let second = publisher.record(HintKind::Disconnected, 0, hash_b);
+
+    let expected_first = ChainEventHint {
+        kind: HintKind::Connected,
+        height: 1,
+        hash: hash_a,
+        epoch,
+        sequence: 1,
+    };
+    let expected_second = ChainEventHint {
+        kind: HintKind::Disconnected,
+        height: 0,
+        hash: hash_b,
+        epoch,
+        sequence: 2,
+    };
+    assert_eq!(first, expected_first);
+    assert_eq!(second, expected_second);
     assert_eq!(
         publisher.snapshot(),
         ChainSnapshot {
-            epoch: 7,
+            epoch,
             sequence: 2,
             tip_hash: hash_b,
             tip_height: 0,

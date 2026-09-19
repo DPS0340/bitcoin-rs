@@ -30,11 +30,40 @@ pub struct ChainSnapshot {
     pub tip_height: u32,
 }
 
+/// Which committed chain event a [`ChainEventHint`] describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintKind {
+    /// A block was committed onto the tip.
+    Connected,
+    /// The tip moved back to its parent during a disconnect/reorg.
+    Disconnected,
+}
+
+/// One committed chain event as sequenced by
+/// [`ChainEventPublisher::record`].
+///
+/// A connect or disconnect of one block. The `epoch` field is what makes a
+/// persisted consumer cursor `(epoch, sequence)` stale on restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainEventHint {
+    /// Whether the block was added to or removed from the tip.
+    pub kind: HintKind,
+    /// Height of the block the event committed.
+    pub height: u32,
+    /// Hash of the block the event committed.
+    pub hash: Hash256,
+    /// Process epoch the event belongs to.
+    pub epoch: u64,
+    /// Commit-counter value assigned to this event.
+    pub sequence: u64,
+}
+
 /// Single write path for chain events.
 ///
-/// [`Self::record`] advances the commit sequence and replaces the snapshot
-/// cell. Production wiring goes through `NodeState::open`; [`Self::detached`]
-/// exists for `Chainstate` composition in tests.
+/// [`Self::record`] advances the commit sequence, replaces the snapshot
+/// cell, and returns the committed event, in that order. Production wiring
+/// goes through `NodeState::open`; [`Self::detached`] exists for
+/// `Chainstate` composition in tests.
 pub struct ChainEventPublisher {
     epoch: u64,
     sequence: AtomicU64,
@@ -91,10 +120,10 @@ impl ChainEventPublisher {
 
     /// Records one committed connect or disconnect.
     ///
-    /// Publication order is fixed: advance the sequence, then replace the
-    /// snapshot cell. Sequence values start at `1`; a snapshot with sequence
-    /// `0` means no committed event yet.
-    pub fn record(&self, height: u32, hash: Hash256) {
+    /// Publication order is fixed: advance the sequence, replace the snapshot
+    /// cell, then return the committed event. Sequence values start at `1`; a
+    /// snapshot with sequence `0` means no committed event yet.
+    pub fn record(&self, kind: HintKind, height: u32, hash: Hash256) -> ChainEventHint {
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         *self.snapshot.write() = ChainSnapshot {
             epoch: self.epoch,
@@ -102,6 +131,13 @@ impl ChainEventPublisher {
             tip_hash: hash,
             tip_height: height,
         };
+        ChainEventHint {
+            kind,
+            height,
+            hash,
+            epoch: self.epoch,
+            sequence,
+        }
     }
 }
 

@@ -30,8 +30,10 @@ use bitcoin_rs_rpc::context::PruneService;
 use bitcoin_rs_utxo::UtxoSet;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
+pub use events::ChainEventHint;
 pub use events::ChainEventPublisher;
 pub use events::ChainSnapshot;
+pub use events::HintKind;
 use hashbrown::HashMap;
 use index::TxIndexSpawn;
 use parking_lot::Mutex;
@@ -335,13 +337,6 @@ impl NodeState {
         self.chain_events.snapshot()
     }
 
-    /// Returns the chain-event publisher. The apply path records committed
-    /// connects/disconnects through it; consumers read the snapshot from it.
-    #[must_use]
-    pub fn chain_event_publisher(&self) -> Arc<ChainEventPublisher> {
-        Arc::clone(&self.chain_events)
-    }
-
     /// Returns the shared block-download orchestrator.
     #[must_use]
     pub fn sync(&self) -> Arc<crate::BlockSync> {
@@ -372,15 +367,6 @@ impl NodeState {
     pub fn apply_block(&self, block: &Block) -> core::result::Result<TipSnapshot, ApplyError> {
         let outcome = self.followers.apply_connect(&self.apply_handles, block)?;
         Ok(outcome.tip)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn check_coinbase_maturity(
-        &self,
-        block: &Block,
-        height: u32,
-    ) -> core::result::Result<(), ApplyError> {
-        crate::apply::check_coinbase_maturity(&self.apply_handles, block, height)
     }
 }
 
