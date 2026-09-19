@@ -1,6 +1,8 @@
 #[cfg(test)]
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::{Block, OutPoint, Txid, consensus_bytes};
+#[cfg(test)]
+use bitcoin_rs_utxo::is_coinbase_tx;
 use hashbrown::HashSet;
 
 pub(super) type SameBlockSpentSet = HashSet<OutPoint>;
@@ -33,7 +35,7 @@ impl ApplyScratch {
             spent_inputs: block
                 .txs
                 .iter()
-                .filter(|tx| !is_coinbase(tx))
+                .filter(|tx| !is_coinbase_tx(tx))
                 .map(|tx| tx.inputs.len())
                 .sum(),
         };
@@ -118,7 +120,7 @@ fn detect_same_block_spends(
     let mut same_block_spent = None;
     let mut same_block_spent_input_count = 0usize;
     for (tx, txid) in block.txs.iter().zip(txids) {
-        if !is_coinbase(tx) {
+        if !is_coinbase_tx(tx) {
             for input in &tx.inputs {
                 if seen_txids.contains(&input.previous_output.txid) {
                     same_block_spent
@@ -131,11 +133,4 @@ fn detect_same_block_spends(
         seen_txids.insert(*txid);
     }
     (same_block_spent, same_block_spent_input_count)
-}
-
-#[cfg(test)]
-fn is_coinbase(tx: &Tx) -> bool {
-    tx.inputs.len() == 1
-        && tx.inputs[0].previous_output.txid == Txid::default()
-        && tx.inputs[0].previous_output.vout == u32::MAX
 }

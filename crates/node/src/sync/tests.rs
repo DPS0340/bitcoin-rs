@@ -792,8 +792,12 @@ fn sync_with_header_chain_and_blocks(
 
     for height in 1_u32..=height {
         let parent_hash = BlockHash::from(tree.node(tip_id)?.hash);
-        let header = test_header(parent_hash, height);
-        tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
+        // Headers whose merkle root commits to a deterministic real body,
+        // so blocks delivered through the inbound channel pass the staging
+        // gate's txid-merkle binding check (issue #1070).
+        let block =
+            mined_block_with_prev_hash(parent_hash, height, vec![coinbase_transaction(height)]);
+        tip_id = tree.insert_node(Some(tip_id), block.header, NodeStatus::HeaderValid)?;
         expected.push(BlockHash::from(tree.node(tip_id)?.hash));
     }
 
@@ -965,9 +969,10 @@ fn assert_no_getdata(
     Ok(())
 }
 
-/// Reconstructs the deliverable block body (header-only, empty `txs`)
-/// for `height` of a [`sync_with_header_chain`] fixture: the block hash
-/// is the header hash, so the delivery matches the fixture's tree node.
+/// Reconstructs the deliverable block body for `height` of a
+/// [`sync_with_header_chain`] fixture. The body carries the deterministic
+/// coinbase whose merkle root the fixture's header commits to, so the
+/// delivery binds to the header and passes the staging gate.
 fn header_chain_block(
     expected: &[BlockHash],
     height: u32,
@@ -978,10 +983,8 @@ fn header_chain_block(
     } else {
         expected[index - 1]
     };
-    let block = Block {
-        header: test_header(prev_blockhash, height),
-        txs: Vec::new(),
-    };
+    let block =
+        mined_block_with_prev_hash(prev_blockhash, height, vec![coinbase_transaction(height)]);
     assert_eq!(
         block.block_hash(),
         expected[index],
@@ -1234,7 +1237,7 @@ fn apply_handles(
         )),
         mempool,
         mempool_gateway,
-        Arc::new(crate::state::ChainEventPublisher::detached(0).0),
+        Arc::new(crate::state::ChainEventPublisher::detached(0)),
     )
 }
 
@@ -1701,3 +1704,6 @@ mod validation_1;
 
 #[cfg(test)]
 mod persistence_1;
+
+#[cfg(test)]
+mod witness_staging_gate;

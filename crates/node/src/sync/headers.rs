@@ -88,9 +88,10 @@ impl BlockSync {
                     drop(transition);
                     let mut blamed_peer = None;
                     if let Some(source) = source {
-                        let mut window = self.download_window.lock();
                         if self.peer_table.disconnect_source(source) {
-                            window.mark_peer_unresponsive(source.addr, Instant::now());
+                            self.download_window
+                                .lock()
+                                .mark_peer_unresponsive(source.addr, Instant::now());
                             blamed_peer = Some(source.addr);
                         }
                     }

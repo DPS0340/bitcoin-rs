@@ -114,7 +114,7 @@ use std::sync::atomic::Ordering;
 use window::PublishMode;
 use window::apply_window_admitted;
 #[cfg(test)]
-use window::is_permanent_apply_error;
+use window::classify_apply_error;
 #[cfg(test)]
 use window::prove_window;
 pub use window::{DURABLE_HEAD_GROUP_BLOCKS, DURABLE_HEAD_GROUP_MAX_BYTES};
@@ -136,41 +136,6 @@ const BIP68_MASK: u32 = 0x0000_ffff;
 const BIP68_TIME_GRANULARITY_SECONDS: u32 = 512;
 const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const LOCAL_OVERLAY_TXID_SET_THRESHOLD: usize = 8;
-
-/// Double SHA256, kept next to the witness merkle reduction its only remaining
-/// caller (a test fixture helper) uses.
-#[cfg(test)]
-fn sha256d(data: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    use sha2::Sha256;
-    let inner = Sha256::digest(data);
-    let outer = Sha256::digest(inner);
-    outer.into()
-}
-
-/// Merkle reduction over 32-byte leaves, duplicating the last leaf on odd
-/// widths; test-fixture helper after the witness-commitment precheck moved to
-/// the consensus crate.
-#[cfg(test)]
-fn merkle_root_bytes(leaves: &mut Vec<[u8; 32]>) -> Option<[u8; 32]> {
-    if leaves.is_empty() {
-        return None;
-    }
-    while leaves.len() > 1 {
-        let original_len = leaves.len();
-        let mut next = Vec::with_capacity(original_len.div_ceil(2));
-        for pos in 0..original_len.div_ceil(2) {
-            let left = leaves[2 * pos];
-            let right = leaves[(2 * pos + 1).min(original_len - 1)];
-            let mut pair = [0_u8; 64];
-            pair[..32].copy_from_slice(&left);
-            pair[32..].copy_from_slice(&right);
-            next.push(sha256d(&pair));
-        }
-        *leaves = next;
-    }
-    Some(leaves[0])
-}
 
 /// Admission barrier shared by every cloned apply handle.
 pub(crate) struct ApplyAdmission {
@@ -972,7 +937,8 @@ pub struct WindowApplyError {
     pub source: ApplyError,
     /// How the caller must treat this failure: `Permanent` failures poisoned
     /// the failed block's header subtree while the chain transition was still
-    /// held; `Operational` failures poisoned nothing; `Fatal` means the
+    /// held; `BodyMutated` discards only the delivered body; `Operational`
+    /// failures poisoned nothing; `Fatal` means the
     /// transition itself could not be settled (the reserved even generation
     /// could not be published), so admission stays closed until recovery.
     pub disposition: WindowApplyDisposition,
@@ -1012,17 +978,21 @@ impl WindowApplyError {
     }
 }
 
-/// Whether a window failure is permanent or operational.
+/// Whether a window failure invalidates the header branch, only its delivered
+/// body, or neither.
 ///
-/// The caller must not re-classify the source error: the node classifier and
-/// the reorg classifier are the same predicate, and the disposition here is
-/// what that predicate decided at the failure point.
+/// The caller must not re-classify the source error: the node and reorg paths
+/// share one classifier, and this disposition is its decision at failure time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowApplyDisposition {
     /// The failed block and its descendants can never be valid. Their header
     /// subtrees were invalidated under the window's chain transition; purge
     /// every returned hash from staged/download state without retrying.
     Permanent,
+    /// The delivered body is mutated or not bound to its header. Discard this
+    /// body and retry the same header/hash from another source; do not poison
+    /// the header or its descendants.
+    BodyMutated,
     /// Transient failure (storage, UTXO commit, shutdown). Nothing was
     /// invalidated; the failed block and its tail stay retryable.
     Operational,
