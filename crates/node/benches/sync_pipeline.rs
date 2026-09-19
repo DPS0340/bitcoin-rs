@@ -80,19 +80,33 @@ use parking_lot::{Mutex, RwLock};
 use tempfile::TempDir;
 
 const PROXY_BLOCKS: u32 = 32;
+
 const SYNC_PROXY_BLOCKS: u32 = 128;
+
 const SYNC_PROXY_HEADER_HEIGHT: u32 = 4_096;
+
 const SYNC_PROXY_BLOCKS_USIZE: usize = 128;
+
 const SYNC_PROXY_PEERS: usize = 512;
+
 const SYNC_OVERSIZED_BURST_BLOCKS: u32 = 1_024;
+
 const SYNC_OVERSIZED_BURST_BLOCKS_USIZE: usize = 1_024;
+
 const SYNC_REVERSE_SCAN_OVERFLOW_BODY_BLOCKS: u32 = 384;
+
 const SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_START_HEIGHT: usize = 257;
+
 const SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_BLOCKS: usize = 128;
+
 const SPEND_PROXY_COINBASE_MATURITY: u32 = 100;
+
 const SPEND_PROXY_SPEND_BLOCKS: u32 = 16;
+
 const SPEND_PROXY_FANOUT: u32 = 64;
+
 const SPEND_PROXY_COINBASE_OUTPUT_VALUE: u64 = 78_125_000;
+
 const SPEND_PROXY_SPEND_OUTPUT_VALUE: u64 = 78_124_999;
 
 fn sync_pipeline_apply_proxy(c: &mut Criterion) {
@@ -629,7 +643,7 @@ impl SyncFixture {
             Arc::clone(&block_tree),
         )
         .capturing(capture_rawtx, capture_block_bytes);
-        let sync = BlockSync::new(
+        let sync = bitcoin_rs_node::sync::block_sync(
             handles,
             followers,
             Arc::clone(&peer_table),
@@ -1480,6 +1494,7 @@ fn pow_met(bits: CompactTarget, hash: &BlockHash) -> bool {
 
 /// BIP141 witness commitment prefix: `OP_RETURN OP_PUSH36 BIP141_COMMITMENT_TAG`.
 const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+
 /// BIP141 reserved witness value for the coinbase input.
 const WITNESS_RESERVED_VALUE: [u8; 32] = [0; 32];
 
