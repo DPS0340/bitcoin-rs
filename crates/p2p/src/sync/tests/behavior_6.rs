@@ -36,7 +36,7 @@ fn tick_fans_out_getdata_across_eligible_peers() -> Result<(), Box<dyn std::erro
         ));
     }
     sync.tick();
-    assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+    assert_applied_genesis(&applied_tip, &block_tree)?;
     // Effective fan-out stripe (mirrors `effective_peer_inflight`).
     let cap = super::super::PENDING_BUDGET
         .div_ceil(super::super::MIN_PEERS_FOR_FANOUT)
@@ -102,7 +102,7 @@ fn prefix_probe_state_does_not_survive_owner_replacement() -> Result<(), Box<dyn
 fn mutated_forward_body_preserves_descendant_for_retry() -> Result<(), Box<dyn std::error::Error>> {
     use bitcoin_rs_primitives::Amount;
     let (sync, _peers, applied_tip, main, _blocks_tx) = sync_with_mined_chain(1)?;
-    sync.ensure_genesis_tip();
+    sync.chain.bootstrap_genesis();
     stage_body(&sync, &main[0]);
     assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
 
@@ -114,7 +114,7 @@ fn mutated_forward_body_preserves_descendant_for_retry() -> Result<(), Box<dyn s
     bad_body.txs[0].outputs[0].value = Amount::from_sat(2);
     let descendant = mined_block_with_prev_hash(bad.block_hash(), 3, vec![coinbase_transaction(3)]);
     {
-        let mut tree = sync.handles.block_tree.write();
+        let mut tree = sync.chain.block_tree().write();
         let main_id = tree
             .lookup(Hash256::from_le_bytes(main_hash.as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing applied main block"))?;

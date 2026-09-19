@@ -1,11 +1,12 @@
-//! Node-level body/header binding interaction tests (issue #1070).
+//! Executor-level body/header binding interaction tests (issue #1070).
 //!
 //! These exercise the `buffer_received_block_chunk` flow: the binding gate
-//! pre-pass, `AlreadyStaged` priority over late malformed duplicates, and
-//! recovery when a malformed body is followed by the correct one.
+//! pre-pass through the chain seam, `AlreadyStaged` priority over late
+//! malformed duplicates, and recovery when a malformed body is followed by
+//! the correct one.
 
 use super::*;
-use bitcoin_rs_p2p::InboundBlock;
+use crate::InboundBlock;
 use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
 
 /// BIP141 witness commitment prefix: `OP_RETURN` `OP_PUSHBYTES_36` `commitment_header`.
@@ -67,7 +68,7 @@ fn segwit_block(prev_blockhash: BlockHash, height: u32, witness: bool) -> Block 
 /// both body variants (correct and stripped).
 fn segwit_sync_fixture() -> Result<(BlockSync, Hash256, Block, Block), Box<dyn std::error::Error>> {
     let (sync, _peers, _applied_tip, _main, _blocks_tx) = sync_with_mined_chain(0)?;
-    sync.ensure_genesis_tip();
+    sync.chain.bootstrap_genesis();
     install_budget(&sync, super::super::default_sync_budget());
 
     let genesis = Network::Regtest.genesis_block();
@@ -80,12 +81,12 @@ fn segwit_sync_fixture() -> Result<(BlockSync, Hash256, Block, Block), Box<dyn s
     // Insert the header into the tree so the witness gate can derive
     // segwit_active from the parent (genesis) and the block height.
     let genesis_id = sync
-        .handles
-        .block_tree
+        .chain
+        .block_tree()
         .read()
         .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
         .ok_or("missing genesis node")?;
-    sync.handles.block_tree.write().insert_node(
+    sync.chain.block_tree().write().insert_node(
         Some(genesis_id),
         correct_block.header,
         NodeStatus::HeaderValid,

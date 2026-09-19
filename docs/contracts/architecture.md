@@ -263,11 +263,14 @@ Owners:
   `bitcoin_rs_utxo::overlay`); `crates/node` calls `persist_block_undo`,
   `load_block_undo`, and `rollback_block` and keeps only the ordering of that
   rollback against the journal, durable head, and tip publication.
-  `crates/node` still carries leftover domain mechanics: the node-side sync
-  executor (`sync.rs` driving `p2p::DownloadWindow`), and direct backend
+  The block-download executor lives in `crates/p2p/src/sync.rs` behind
+  `SyncChain`; node retains the seam implementation for header admission,
+  body binding, window commit, branch switch, and genesis bootstrap.
+  `crates/node` still carries leftover domain mechanics: direct backend
   construction and cache share dispatch (`state.rs`). `P2pService` no longer
   holds a second download window. Relocating leftover node mechanics into
-  `crates/storage` and `crates/p2p` remains tracked under #217 (open). A
+  `crates/utxo`, `crates/storage`, and `crates/p2p` remains tracked under #217
+  (open). A
   dedicated `crates/chainstate` waits until journal,
   checkpoint, and
   `ChainEventPublisher` also leave node. `crates/node` is the composition
@@ -316,3 +319,4 @@ Owners:
   and `crates/node/tests/config_layered.rs` test
   `mining_payout_address_decodes_after_all_layers`: watch-only mining payout is
   decoded once after overlay, against the resolved network (`ARCH-05`).
+// weave: run 'weave explain docs/contracts/architecture.md' for per-hunk detail, 'weave check' to verify your resolution
