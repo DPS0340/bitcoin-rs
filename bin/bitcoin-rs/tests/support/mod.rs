@@ -10,7 +10,6 @@
 )]
 
 pub(crate) mod dependency_graph;
-pub(crate) mod ownership_scan;
 pub(crate) mod process_node;
 pub(crate) mod process_peer;
 pub(crate) mod reference_set;
