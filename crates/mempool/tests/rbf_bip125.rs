@@ -1,8 +1,5 @@
-//! BIP125 replacement-by-fee policy vectors.
-//!
-//! Preview-surface BIP125 rule-1 coverage that used the removed
-//! `evaluate_package_acceptance` helper now lives in
-//! `crates/rpc/tests/policy_contract.rs::bip125_rule1_nonsignaling_originals_reject_on_both_rpcs`.
+//! Signal-independent replacement and retained historical BIP125 policy vectors.
+//! Core process evidence lives in `replacement_signaling_matches_pinned_core`.
 #![allow(clippy::expect_used)]
 
 extern crate alloc;
@@ -41,7 +38,7 @@ struct Case {
     expected: Result<(), RbfError>,
 }
 
-const CASES: [Case; 8] = [
+const CASES: [Case; 9] = [
     Case {
         name: "accepts direct opt-in replacement",
         original: OriginalSpec {
@@ -59,7 +56,7 @@ const CASES: [Case; 8] = [
         expected: Ok(()),
     },
     Case {
-        name: "rule 1 rejects non-signaling originals",
+        name: "accepts non-signaling originals",
         original: OriginalSpec {
             sequence: 0xFFFF_FFFF,
             fee: 1_000,
@@ -72,10 +69,26 @@ const CASES: [Case; 8] = [
             new_unconfirmed_input: false,
             extra_descendants: 0,
         },
-        expected: Err(RbfError::Rule1NoOptIn),
+        expected: Ok(()),
     },
     Case {
-        name: "rule 2 rejects new unconfirmed input",
+        name: "accepts originals at the non-signaling sequence boundary",
+        original: OriginalSpec {
+            sequence: 0xFFFF_FFFE,
+            fee: 1_000,
+            vsize: 100,
+        },
+        replacement: ReplacementSpec {
+            fee: 1_200,
+            vsize: 100,
+            min_relay_fee_rate: 1,
+            new_unconfirmed_input: false,
+            extra_descendants: 0,
+        },
+        expected: Ok(()),
+    },
+    Case {
+        name: "cannot spend an evicted parent",
         original: OriginalSpec {
             sequence: 0xFFFF_FFFD,
             fee: 1_000,
@@ -88,12 +101,12 @@ const CASES: [Case; 8] = [
             new_unconfirmed_input: true,
             extra_descendants: 0,
         },
-        expected: Err(RbfError::Rule2NewUnconfirmedInput),
+        expected: Err(RbfError::Mempool(MempoolError::EvictedParent)),
     },
     Case {
         name: "rule 3 requires replacement to pay original absolute fees",
         original: OriginalSpec {
-            sequence: 0xFFFF_FFFD,
+            sequence: 0xFFFF_FFFF,
             fee: 1_000,
             vsize: 100,
         },
@@ -109,7 +122,7 @@ const CASES: [Case; 8] = [
     Case {
         name: "rule 4 requires incremental relay fee",
         original: OriginalSpec {
-            sequence: 0xFFFF_FFFD,
+            sequence: 0xFFFF_FFFE,
             fee: 1_000,
             vsize: 100,
         },
@@ -123,7 +136,7 @@ const CASES: [Case; 8] = [
         expected: Err(RbfError::Rule4InsufficientIncrementalFee),
     },
     Case {
-        name: "rule 5 rejects too many evictions",
+        name: "many victims in one conflicting cluster are allowed",
         original: OriginalSpec {
             sequence: 0xFFFF_FFFD,
             fee: 1_000,
@@ -136,10 +149,10 @@ const CASES: [Case; 8] = [
             new_unconfirmed_input: false,
             extra_descendants: 100,
         },
-        expected: Err(RbfError::Rule5TooManyEvictions),
+        expected: Ok(()),
     },
     Case {
-        name: "rule 6 requires replacement fee rate to improve",
+        name: "fee diagram must strictly improve",
         original: OriginalSpec {
             sequence: 0xFFFF_FFFD,
             fee: 2_000,
@@ -152,10 +165,10 @@ const CASES: [Case; 8] = [
             new_unconfirmed_input: false,
             extra_descendants: 0,
         },
-        expected: Err(RbfError::Rule6InsufficientFeeRate),
+        expected: Err(RbfError::InsufficientFeerateDiagram),
     },
     Case {
-        name: "accepts inherited opt-in replacement",
+        name: "accepts an original with an unconfirmed parent",
         original: OriginalSpec {
             sequence: 0xFFFF_FFFF,
             fee: 1_000,
@@ -173,11 +186,11 @@ const CASES: [Case; 8] = [
 ];
 
 #[test]
-fn bip125_replacement_rules_are_enforced() -> Result<(), Box<dyn Error>> {
+fn retained_replacement_rules_are_enforced() -> Result<(), Box<dyn Error>> {
     for case in CASES {
-        let inherited = case.name == "accepts inherited opt-in replacement";
+        let has_parent = case.name == "accepts an original with an unconfirmed parent";
         let (pool, replacement_tx) =
-            pool_with_conflict(case.original, case.replacement, inherited)?;
+            pool_with_conflict(case.original, case.replacement, has_parent)?;
         let candidate = ReplacementCandidate::new(
             Arc::new(replacement_tx),
             case.replacement.vsize,
@@ -191,24 +204,13 @@ fn bip125_replacement_rules_are_enforced() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Rule 1 is about every original, not about one of them.
-///
-/// A replacement that conflicts with an opt-in transaction and a final one used
-/// to be accepted on the strength of the opt-in alone, evicting the final
-/// transaction with it. The final transaction never signalled that it could be
-/// replaced, and BIP125 says it therefore cannot be.
+/// POL-05: mixing signaling and nonsignaling conflicts cannot reintroduce
+/// a signal requirement. The replacement itself does not signal either.
 #[test]
-fn rule_one_requires_every_conflict_to_opt_in() -> Result<(), Box<dyn Error>> {
+fn replacements_accept_mixed_signaling_conflicts() -> Result<(), Box<dyn Error>> {
     const RBF_SEQUENCE: u32 = 0xffff_fffd;
     const FINAL_SEQUENCE: u32 = 0xffff_ffff;
-    for (name, second_sequence, expected) in [
-        ("both originals opt in", RBF_SEQUENCE, Ok(())),
-        (
-            "one original is final",
-            FINAL_SEQUENCE,
-            Err(RbfError::Rule1NoOptIn),
-        ),
-    ] {
+    for second_sequence in [RBF_SEQUENCE, 0xffff_fffe, FINAL_SEQUENCE] {
         let mut pool = Mempool::new(MempoolLimits::default());
         let first_input = outpoint(1, 0);
         let second_input = outpoint(2, 0);
@@ -221,15 +223,18 @@ fn rule_one_requires_every_conflict_to_opt_in() -> Result<(), Box<dyn Error>> {
         // One replacement, conflicting with both of them.
         let replacement = tx_from_inputs(
             40,
-            &[(first_input, RBF_SEQUENCE), (second_input, RBF_SEQUENCE)],
+            &[
+                (first_input, FINAL_SEQUENCE),
+                (second_input, FINAL_SEQUENCE),
+            ],
             1,
         );
         let candidate = ReplacementCandidate::new(Arc::new(replacement), 200, 10_000, 1);
 
         assert_eq!(
             pool.check_replacement(&candidate).map(|_| ()),
-            expected,
-            "{name}"
+            Ok(()),
+            "second original sequence {second_sequence:#x}"
         );
     }
     Ok(())
@@ -238,16 +243,12 @@ fn rule_one_requires_every_conflict_to_opt_in() -> Result<(), Box<dyn Error>> {
 fn pool_with_conflict(
     original: OriginalSpec,
     replacement: ReplacementSpec,
-    inherited: bool,
+    has_parent: bool,
 ) -> Result<(Mempool, Tx), Box<dyn Error>> {
     let limits = if replacement.extra_descendants == 0 {
         MempoolLimits::default()
     } else {
         MempoolLimits {
-            max_ancestors: 200,
-            max_ancestor_size: 1_000_000,
-            max_descendants: 200,
-            max_replacement_evictions: 100,
             // A chain this long is one cluster this long, so the cluster caps
             // have to be lifted alongside the ancestor caps or admission
             // refuses the fixture before the replacement rules are reached.
@@ -261,8 +262,8 @@ fn pool_with_conflict(
     let external_input = outpoint(1, 0);
     let mut original_input = external_input;
 
-    if inherited {
-        let parent = tx_from_inputs(10, &[(outpoint(9, 0), 0xFFFF_FFFD)], 1);
+    if has_parent {
+        let parent = tx_from_inputs(10, &[(outpoint(9, 0), 0xFFFF_FFFF)], 1);
         original_input = OutPoint::new(parent.txid(), 0);
         pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 500, 1, 1))?;
     }
@@ -292,7 +293,7 @@ fn pool_with_conflict(
     }
 
     let mut inputs = vec![(external_input, 0xFFFF_FFFD)];
-    if inherited {
+    if has_parent {
         inputs[0] = (original_input, 0xFFFF_FFFD);
     }
     if replacement.new_unconfirmed_input {
@@ -442,7 +443,7 @@ fn replace_transaction_rejection_preserves_pool_state() -> Result<(), Box<dyn Er
         assert_eq!(pool_fingerprint(&pool), before);
     }
 
-    // (c) Rule 1/3/4/5/6 rejections leave the pool fingerprint untouched.
+    // (c) Policy rejections leave the pool fingerprint untouched.
     for case in CASES.iter().filter(|case| case.expected.is_err()) {
         let (mut pool, replacement_tx) =
             pool_with_conflict(case.original, case.replacement, false)?;
@@ -467,13 +468,11 @@ fn replace_transaction_rejection_preserves_pool_state() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn replace_transaction_descendant_limits_use_post_eviction_projection() -> Result<(), Box<dyn Error>>
-{
+fn replace_transaction_cluster_limits_use_post_eviction_projection() -> Result<(), Box<dyn Error>> {
     // P + 23 retained children + conflict C = 25 inclusive. Excluding C leaves
     // room for the replacement that re-spends P; counting C would over-reject.
     let mut pool = Mempool::new(MempoolLimits {
-        max_descendants: 25,
-        max_replacement_evictions: 100,
+        cluster_count: 25,
         ..MempoolLimits::default()
     });
     let parent = tx_from_inputs(10, &[(outpoint(1, 0), 0xFFFF_FFFD)], 24);

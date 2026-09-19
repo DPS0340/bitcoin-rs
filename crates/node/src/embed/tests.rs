@@ -10,6 +10,22 @@ use parking_lot::Mutex;
 use bitcoin_rs_rpc::zmq::MempoolSequenceObserver;
 use bitcoin_rs_rpc::zmq::{SequenceEvent, ZmqPublisher};
 
+/// Polls a synchronous node future to completion without an executor
+/// dependency; the node drives its own threads synchronously.
+fn block_on<F: Future>(future: F) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct RecordingSequencePublisher {
     sequence_events: Mutex<Vec<SequenceEvent>>,
@@ -93,7 +109,7 @@ fn broadcast_publishes_one_ordered_a_event_through_the_shared_gateway() {
     let observer: Arc<dyn MempoolObserver> = Arc::new(MempoolSequenceObserver::new(recording));
     let config = embedded_config(&dir.path().join("node"));
 
-    let node = testing::block_on(Node::start(
+    let node = block_on(Node::start(
         config,
         crate::RuntimeInputs::default().with_mempool_observer(observer),
     ))
@@ -121,7 +137,7 @@ fn broadcast_publishes_one_ordered_a_event_through_the_shared_gateway() {
 
     let broadcast_tx = spending_tx(broadcast_prevout);
     let broadcast_txid = broadcast_tx.txid();
-    let result = testing::block_on(node.broadcast(broadcast_tx)).expect("broadcast accepted");
+    let result = block_on(node.broadcast(broadcast_tx)).expect("broadcast accepted");
     assert_eq!(result.len(), 1, "one admission commits one change");
     assert_eq!(
         result.changes[0].txid,
@@ -153,5 +169,5 @@ fn broadcast_publishes_one_ordered_a_event_through_the_shared_gateway() {
         "a direct pool insertion must not satisfy the gateway publication assertion"
     );
 
-    testing::block_on(node.shutdown()).expect("clean shutdown");
+    block_on(node.shutdown()).expect("clean shutdown");
 }

@@ -14,6 +14,7 @@ use super::fixtures_behavior::utxo_with_output;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::node::ChainWork;
 use bitcoin_rs_chain::node::NodeStatus;
+use bitcoin_rs_consensus::verify_block::compute_merkle_root;
 use bitcoin_rs_primitives::BlockHash;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
@@ -171,7 +172,7 @@ pub(super) fn op_return_script(data: &[u8]) -> Vec<u8> {
 /// little-endian id bytes, duplicating the last leaf on odd widths.
 pub(super) fn txids_merkle_root(block: &Block) -> Option<Hash256> {
     let mut leaves: Vec<[u8; 32]> = block.txs.iter().map(|tx| *tx.txid().as_bytes()).collect();
-    merkle_root_bytes(&mut leaves).map(|bytes| Hash256::from_le_bytes(&bytes))
+    compute_merkle_root(&mut leaves).map(|bytes| Hash256::from_le_bytes(&bytes))
 }
 
 pub(super) fn scaled_pow_limit_bits(handles: &Chainstate, divisor: u64) -> u32 {

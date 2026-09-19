@@ -25,8 +25,6 @@ pub mod embed;
 /// Central synchronous event loop.
 pub mod event_loop;
 
-/// Block import pipeline.
-pub mod import;
 /// Owned startup, rollback, and ordered service shutdown.
 mod lifecycle;
 /// Tracing initialization.
