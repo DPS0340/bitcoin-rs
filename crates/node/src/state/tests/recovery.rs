@@ -7,7 +7,7 @@ fn full_revalidation_marker_is_sticky_when_journal_is_disabled() -> anyhow::Resu
     config.data_dir = dir.path().join("node");
     config.chainstate_journal.enabled = false;
     let journal_dir = config.data_dir.join(CHAINSTATE_JOURNAL_DIR);
-    let marker = journal_dir.join(crate::chainstate_journal::FULL_REVALIDATION_MARKER);
+    let marker = journal_dir.join(bitcoin_rs_storage::chainstate_journal::FULL_REVALIDATION_MARKER);
     std::fs::create_dir_all(&journal_dir)?;
     std::fs::write(&marker, b"force full validation\n")?;
 

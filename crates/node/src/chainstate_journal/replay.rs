@@ -1,289 +1,28 @@
-//! Boot fast path: validates and replays the journal above a checkpoint base.
-//!
-//! Ownership: this module is the single owner of journal **consumption** —
-//! reading records back, validating the committed range, rebuilding the
-//! `BlockTree` header chain, and applying semantic mutations into the
-//! `§2.2` state enumeration (`UtxoSet` + `CoinStats` + `chain_tx_count`). The
-//! writer (`writer.rs`) owns production; the codec (`record.rs`) owns the
-//! wire format; nothing else re-derives replay.
-//!
-//! Fail-closed policy (plan §2.1/rev 5): any corruption at or inside the
-//! committed range — crc mismatch, malformed record, contiguity violation
-//! against the base tip — invalidates the whole journal generation and
-//! returns [`ReplayOutcome::Fallback`], so the node re-validates from the
-//! checkpoint exactly as it would without a journal. Corruption beyond the
-//! head is truncated by the writer's own recovery and never reaches here.
+//! Boot fast path: replays validated journal records into chainstate.
 
 use bitcoin_rs_chain::{BlockTree, NodeStatus};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
+use bitcoin_rs_storage::chainstate_journal::{
+    Coin, JournalRecord, JournalReplayBase, JournalReplayError, Mutation, replay_committed_range,
+};
 use bitcoin_rs_utxo::{BorrowedBlockChanges, BorrowedUtxoAdd, UtxoSet};
-
-use super::record::{FRAME_HEADER_LEN, JournalRecord, MAX_PAYLOAD_LEN, Mutation, decode_record};
-use super::writer::{HeadMarker, read_head_bytes};
 
 /// Classification of a boot replay attempt.
 pub(crate) enum ReplayOutcome {
-    /// The journal carried the chain to `head`: the reconstructed state and
-    /// tip are authoritative.
     Replayed(Box<ReplayedState>),
-    /// The journal is absent or unusable; the caller must fall back to the
-    /// checkpoint and full re-validation. Never partial.
     Fallback(JournalReplayError),
 }
 
 /// State reconstructed by a successful replay.
 pub(crate) struct ReplayedState {
-    /// Checkpoint tree extended through the journal head.
     pub tree: BlockTree,
-    /// Checkpoint UTXO set with all committed-range mutations applied.
     pub utxo: UtxoSet,
-    /// `CoinStats` after the same ordered mutations and block metadata.
     pub coin_stats: bitcoin_rs_utxo::stats::CoinStats,
-    /// Valid applied-tip snapshot derived from the rebuilt tree node.
     pub applied_tip: bitcoin_rs_chain::TipSnapshot,
-    /// Cumulative chain transaction count through the head.
     pub chain_tx_count: u64,
 }
 
-/// Why a replay did not (or could not) run.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum JournalReplayError {
-    /// No journal directory contents (no head marker): nothing to replay.
-    #[error("no journal head marker")]
-    NoHead,
-    /// The head marker failed its crc32c/version checks.
-    #[error("journal head marker unreadable: {0}")]
-    HeadUnreadable(String),
-    /// The journal's base is not the restored checkpoint tip: the generation
-    /// describes a different chain and must be discarded.
-    #[error("journal base does not match the checkpoint tip")]
-    BaseMismatch,
-    /// A record inside the committed range is corrupt or non-contiguous:
-    /// fail closed, never truncate the committed prefix.
-    #[error("committed journal range is invalid: {0}")]
-    CommittedRangeInvalid(String),
-    /// Header-chain rebuild rejected a journaled header: fail closed.
-    #[error("header rebuild rejected: {0}")]
-    HeaderRebuildRejected(String),
-}
-
-impl JournalReplayError {
-    pub(crate) const fn reason(&self) -> &'static str {
-        match self {
-            Self::NoHead => "no_head",
-            Self::HeadUnreadable(_) => "head_unreadable",
-            Self::BaseMismatch => "base_mismatch",
-            Self::CommittedRangeInvalid(_) => "committed_range_invalid",
-            Self::HeaderRebuildRejected(_) => "header_rebuild_rejected",
-        }
-    }
-
-    pub(crate) fn is_checksum_failure(&self) -> bool {
-        match self {
-            Self::HeadUnreadable(_) => true,
-            Self::CommittedRangeInvalid(message) => {
-                message.contains("crc") || message.contains("checksum")
-            }
-            Self::NoHead | Self::BaseMismatch | Self::HeaderRebuildRejected(_) => false,
-        }
-    }
-}
-
-/// Reads and validates the committed range `(start..=head)` from the journal
-/// directory: every record decodes, crc32c passes, and the contiguity
-/// predicate (`record[i].height == record[i-1].height + 1` AND
-/// `record[i].prev_hash == record[i-1].block_hash`) holds, with the first
-/// record anchored to the checkpoint base tip.
-fn stream_committed_range(
-    dir: &cap_std::fs::Dir,
-    head: &HeadMarker,
-    base_tip_hash: [u8; 32],
-    base_tip_height: u32,
-    mut apply_record: impl FnMut(JournalRecord) -> Result<(), JournalReplayError>,
-) -> Result<u64, JournalReplayError> {
-    let mut generations = Vec::new();
-    for entry in dir.entries().map_err(|error| {
-        JournalReplayError::CommittedRangeInvalid(format!("segment listing failed: {error}"))
-    })? {
-        let entry = entry.map_err(|error| {
-            JournalReplayError::CommittedRangeInvalid(format!("segment entry: {error}"))
-        })?;
-        if let Some(generation) =
-            super::writer::parse_segment_name(entry.file_name().to_string_lossy().as_ref())
-            && generation >= head.start_gen
-            && generation <= head.journal_gen
-        {
-            generations.push(generation);
-        }
-    }
-    generations.sort_unstable();
-    if generations.first() != Some(&head.start_gen) || generations.last() != Some(&head.journal_gen)
-    {
-        return Err(JournalReplayError::CommittedRangeInvalid(
-            "retained segment window is incomplete".to_owned(),
-        ));
-    }
-
-    let mut expected_height = base_tip_height.checked_add(1).ok_or_else(|| {
-        JournalReplayError::CommittedRangeInvalid("base tip height overflow".to_owned())
-    })?;
-    let mut expected_prev = base_tip_hash;
-    let mut record_count = 0_u64;
-    for generation in &generations {
-        let end = if *generation == head.journal_gen {
-            head.offset
-        } else {
-            u64::MAX
-        };
-        record_count = record_count
-            .checked_add(stream_segment(
-                dir,
-                *generation,
-                head,
-                end,
-                &mut expected_height,
-                &mut expected_prev,
-                &mut apply_record,
-            )?)
-            .ok_or_else(|| {
-                JournalReplayError::CommittedRangeInvalid("record count overflow".to_owned())
-            })?;
-    }
-    Ok(record_count)
-}
-
-fn checked_frame_len(payload_len: u32) -> Result<usize, JournalReplayError> {
-    let payload_len = usize::try_from(payload_len).map_err(|_| {
-        JournalReplayError::CommittedRangeInvalid("payload length overflow".to_owned())
-    })?;
-    if payload_len > MAX_PAYLOAD_LEN {
-        return Err(JournalReplayError::CommittedRangeInvalid(format!(
-            "payload length exceeds codec limit: {payload_len} > {MAX_PAYLOAD_LEN}"
-        )));
-    }
-    FRAME_HEADER_LEN
-        .checked_add(payload_len)
-        .and_then(|length| length.checked_add(core::mem::size_of::<u32>()))
-        .ok_or_else(|| {
-            JournalReplayError::CommittedRangeInvalid("frame length overflow".to_owned())
-        })
-}
-
-/// Streams one segment generation record by record, enforcing contiguity.
-fn stream_segment(
-    dir: &cap_std::fs::Dir,
-    generation: u64,
-    head: &HeadMarker,
-    window_end: u64,
-    expected_height: &mut u32,
-    expected_prev: &mut [u8; 32],
-    apply_record: &mut impl FnMut(JournalRecord) -> Result<(), JournalReplayError>,
-) -> Result<u64, JournalReplayError> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let frame_header_len = u64::try_from(FRAME_HEADER_LEN).map_err(|_| {
-        JournalReplayError::CommittedRangeInvalid("frame header size overflow".to_owned())
-    })?;
-
-    let name = super::writer::segment_name(generation);
-    let file = dir.open(name.as_str()).map_err(|error| {
-        JournalReplayError::CommittedRangeInvalid(format!("open segment {generation}: {error}"))
-    })?;
-    let length = file.metadata().map_err(|error| {
-        JournalReplayError::CommittedRangeInvalid(format!("stat segment {generation}: {error}"))
-    })?;
-    let end = window_end.min(length.len());
-    let mut offset = if generation == head.start_gen {
-        head.start_offset
-    } else {
-        0
-    };
-    let mut reader = std::io::BufReader::new(file);
-    reader.seek(SeekFrom::Start(offset)).map_err(|error| {
-        JournalReplayError::CommittedRangeInvalid(format!(
-            "seek segment {generation} to {offset}: {error}"
-        ))
-    })?;
-    let mut record_count = 0_u64;
-
-    while offset < end {
-        if offset
-            .checked_add(frame_header_len)
-            .is_none_or(|header_end| header_end > end)
-        {
-            return Err(JournalReplayError::CommittedRangeInvalid(format!(
-                "segment {generation}: truncated frame header at offset {offset}"
-            )));
-        }
-        let mut header = [0_u8; FRAME_HEADER_LEN];
-        reader.read_exact(&mut header).map_err(|error| {
-            JournalReplayError::CommittedRangeInvalid(format!(
-                "segment {generation}: read frame header at offset {offset}: {error}"
-            ))
-        })?;
-        let payload_len = u32::from_le_bytes(header[5..9].try_into().map_err(|_| {
-            JournalReplayError::CommittedRangeInvalid(
-                "frame header length slice mismatch".to_owned(),
-            )
-        })?);
-        let frame_size = checked_frame_len(payload_len)?;
-        let frame_len = u64::try_from(frame_size).map_err(|_| {
-            JournalReplayError::CommittedRangeInvalid("frame size overflow".to_owned())
-        })?;
-        if offset
-            .checked_add(frame_len)
-            .is_none_or(|frame_end| frame_end > end)
-        {
-            return Err(JournalReplayError::CommittedRangeInvalid(format!(
-                "segment {generation}: truncated frame at offset {offset}"
-            )));
-        }
-        let mut frame = Vec::with_capacity(frame_size);
-        frame.extend_from_slice(&header);
-        frame.resize(frame_size, 0);
-        reader
-            .read_exact(&mut frame[FRAME_HEADER_LEN..])
-            .map_err(|error| {
-                JournalReplayError::CommittedRangeInvalid(format!(
-                    "segment {generation}: read frame at offset {offset}: {error}"
-                ))
-            })?;
-        let record = decode_record(&frame).map_err(|error| {
-            JournalReplayError::CommittedRangeInvalid(format!(
-                "segment {generation} offset {offset}: {error}"
-            ))
-        })?;
-        if record.height != *expected_height || record.prev_hash != *expected_prev {
-            return Err(JournalReplayError::CommittedRangeInvalid(format!(
-                "contiguity break at height {}: expected ({}, {}), found ({}, {})",
-                record.height,
-                *expected_height,
-                hex(expected_prev),
-                record.height,
-                hex(&record.prev_hash)
-            )));
-        }
-        *expected_height = record.height.checked_add(1).ok_or_else(|| {
-            JournalReplayError::CommittedRangeInvalid("record height overflow".to_owned())
-        })?;
-        *expected_prev = record.block_hash;
-        offset = offset.checked_add(frame_len).ok_or_else(|| {
-            JournalReplayError::CommittedRangeInvalid("frame offset overflow".to_owned())
-        })?;
-        apply_record(record)?;
-        record_count = record_count.checked_add(1).ok_or_else(|| {
-            JournalReplayError::CommittedRangeInvalid("record count overflow".to_owned())
-        })?;
-    }
-    Ok(record_count)
-}
-
-/// Replays a usable journal above an owned checkpoint state.
-///
-/// The base identity is authenticated against `head.json` before any mutation.
-/// Callers reload the checkpoint on [`ReplayOutcome::Fallback`], so a semantic
-/// failure can never expose a partially replayed state.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_from_journal(
     dir: &cap_std::fs::Dir,
@@ -294,73 +33,44 @@ pub(crate) fn replay_from_journal(
     base_tip: bitcoin_rs_chain::TipSnapshot,
     base_chain_tx_count: u64,
 ) -> ReplayOutcome {
-    let head_bytes = match read_head_bytes(dir) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return ReplayOutcome::Fallback(JournalReplayError::NoHead),
-        Err(error) => {
-            return ReplayOutcome::Fallback(JournalReplayError::HeadUnreadable(error.to_string()));
-        }
-    };
-    let head = match HeadMarker::deserialize(&head_bytes) {
-        Ok(head) => head,
-        Err(error) => {
-            return ReplayOutcome::Fallback(JournalReplayError::HeadUnreadable(error.to_string()));
-        }
-    };
-    if head.base_generation != base_generation
-        || head.base_height != base_tip.height
-        || head.base_hash != base_tip.hash.to_le_bytes()
-        || head.base_chain_tx_count != base_chain_tx_count
-        || head.height < base_tip.height
-    {
-        return ReplayOutcome::Fallback(JournalReplayError::BaseMismatch);
-    }
+    let base_tip_hash = base_tip.hash.to_le_bytes();
+    let base_tip_height = base_tip.height;
     let mut replay =
         match ReplayAccumulator::new(tree, utxo, coin_stats, base_tip, base_chain_tx_count) {
             Ok(replay) => replay,
             Err(error) => return ReplayOutcome::Fallback(error),
         };
-    let record_count = if head.height == replay.applied_tip.height {
-        if head.block_hash != head.base_hash
-            || head.chain_tx_count != base_chain_tx_count
-            || head.record_count != 0
-        {
-            return ReplayOutcome::Fallback(JournalReplayError::BaseMismatch);
-        }
-        0
-    } else {
-        match stream_committed_range(dir, &head, head.base_hash, head.base_height, |record| {
-            replay.apply(&record)
-        }) {
-            Ok(record_count) => record_count,
-            Err(error) => return ReplayOutcome::Fallback(error),
-        }
+    let head = match replay_committed_range(
+        dir,
+        JournalReplayBase {
+            generation: base_generation,
+            height: base_tip_height,
+            block_hash: base_tip_hash,
+            chain_tx_count: base_chain_tx_count,
+        },
+        |record| replay.apply(record),
+    ) {
+        Ok(head) => head,
+        Err(error) => return ReplayOutcome::Fallback(error),
     };
-    if record_count != head.record_count {
-        return ReplayOutcome::Fallback(JournalReplayError::CommittedRangeInvalid(
-            "record count does not match head marker".to_owned(),
-        ));
-    }
     let state = replay.finish();
-    if let Err(error) = validate_replayed_head(&state, &head) {
+    if let Err(error) = validate_replayed_head(&state, head.height, head.block_hash) {
         return ReplayOutcome::Fallback(error);
     }
-    if state.chain_tx_count == head.chain_tx_count {
-        ReplayOutcome::Replayed(Box::new(state))
-    } else {
-        ReplayOutcome::Fallback(JournalReplayError::CommittedRangeInvalid(
+    if state.chain_tx_count != head.chain_tx_count {
+        return ReplayOutcome::Fallback(JournalReplayError::CommittedRangeInvalid(
             "chain transaction count does not match head marker".to_owned(),
-        ))
+        ));
     }
+    ReplayOutcome::Replayed(Box::new(state))
 }
 
 fn validate_replayed_head(
     state: &ReplayedState,
-    head: &HeadMarker,
+    height: u32,
+    block_hash: [u8; 32],
 ) -> Result<(), JournalReplayError> {
-    if state.applied_tip.height != head.height
-        || state.applied_tip.hash.to_le_bytes() != head.block_hash
-    {
+    if state.applied_tip.height != height || state.applied_tip.hash.to_le_bytes() != block_hash {
         return Err(JournalReplayError::CommittedRangeInvalid(
             "replayed tip identity does not match head marker".to_owned(),
         ));
@@ -602,7 +312,7 @@ fn advance_coin_stats(
 
 fn require_live_coin(
     utxo: &UtxoSet,
-    coin: &super::record::Coin,
+    coin: &Coin,
     record_height: u32,
     mutation: &str,
 ) -> Result<(), JournalReplayError> {
@@ -645,13 +355,8 @@ mod tests {
     use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
     use bitcoin_rs_utxo::{BorrowedBlockChanges, BorrowedUtxoAdd, UtxoSet};
 
-    use super::{
-        JournalRecord, JournalReplayError, Mutation, checked_frame_len, replay_records,
-        validate_replayed_head,
-    };
-    use crate::chainstate_journal::Coin;
-    use crate::chainstate_journal::record::MAX_PAYLOAD_LEN;
-    use crate::chainstate_journal::writer::HeadMarker;
+    use super::{JournalRecord, Mutation, replay_records, validate_replayed_head};
+    use bitcoin_rs_storage::chainstate_journal::Coin;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
     type BaseState = (BlockTree, UtxoSet, CoinStats, TipSnapshot, Coin);
@@ -719,13 +424,39 @@ mod tests {
     }
 
     #[test]
-    fn oversized_frame_is_rejected_before_payload_allocation() -> TestResult {
-        let oversized = u32::try_from(MAX_PAYLOAD_LEN.checked_add(1).ok_or("payload overflow")?)?;
-        assert!(matches!(
-            checked_frame_len(oversized),
-            Err(JournalReplayError::CommittedRangeInvalid(message))
-                if message.contains("payload length exceeds")
-        ));
+    fn replayed_frontier_must_match_the_durable_head_identity() -> TestResult {
+        let (tree, utxo, coin_stats, base_tip, _) = base_state()?;
+        let next_header = header(BlockHash(base_tip.hash), 2, 2);
+        let next_hash = next_header.compute_hash();
+        let record = JournalRecord {
+            height: 1,
+            block_hash: next_hash.0.to_le_bytes(),
+            prev_hash: base_tip.hash.to_le_bytes(),
+            block_tx_count: 2,
+            coin_stats_height_delta: 1,
+            raw_header: raw_header(&next_header),
+            mutations: Vec::new(),
+        };
+        let replayed = replay_records(vec![record], tree, utxo, coin_stats, base_tip, 1)?;
+
+        validate_replayed_head(
+            &replayed,
+            replayed.applied_tip.height,
+            replayed.applied_tip.hash.to_le_bytes(),
+        )?;
+        assert!(
+            validate_replayed_head(
+                &replayed,
+                replayed.applied_tip.height + 1,
+                replayed.applied_tip.hash.to_le_bytes(),
+            )
+            .is_err()
+        );
+        let mut wrong_hash = replayed.applied_tip.hash.to_le_bytes();
+        wrong_hash[0] ^= 0xff;
+        assert!(
+            validate_replayed_head(&replayed, replayed.applied_tip.height, wrong_hash).is_err()
+        );
         Ok(())
     }
 
@@ -759,48 +490,6 @@ mod tests {
         let node = replayed.tree.node(replayed.applied_tip.tip_id)?;
         assert_eq!(node.hash, replayed.applied_tip.hash);
         assert_eq!(node.chainwork, replayed.applied_tip.chainwork);
-        Ok(())
-    }
-
-    #[test]
-    fn replayed_frontier_must_match_the_durable_head_identity() -> TestResult {
-        let (tree, utxo, coin_stats, base_tip, _) = base_state()?;
-        let next_header = header(BlockHash(base_tip.hash), 2, 2);
-        let next_hash = next_header.compute_hash();
-        let base_hash = base_tip.hash.to_le_bytes();
-        let record = JournalRecord {
-            height: 1,
-            block_hash: next_hash.0.to_le_bytes(),
-            prev_hash: base_tip.hash.to_le_bytes(),
-            block_tx_count: 2,
-            coin_stats_height_delta: 1,
-            raw_header: raw_header(&next_header),
-            mutations: Vec::new(),
-        };
-        let replayed = replay_records(vec![record], tree, utxo, coin_stats, base_tip, 1)?;
-        let head = HeadMarker {
-            base_generation: 1,
-            base_height: 0,
-            base_hash,
-            base_chain_tx_count: 1,
-            start_gen: 1,
-            start_offset: 0,
-            journal_gen: 1,
-            offset: 1,
-            height: replayed.applied_tip.height,
-            block_hash: replayed.applied_tip.hash.to_le_bytes(),
-            prev_hash: base_hash,
-            chain_tx_count: replayed.chain_tx_count,
-            record_count: 1,
-        };
-
-        validate_replayed_head(&replayed, &head)?;
-        let mut wrong_height = head;
-        wrong_height.height += 1;
-        assert!(validate_replayed_head(&replayed, &wrong_height).is_err());
-        let mut wrong_hash = head;
-        wrong_hash.block_hash[0] ^= 0xff;
-        assert!(validate_replayed_head(&replayed, &wrong_hash).is_err());
         Ok(())
     }
 }

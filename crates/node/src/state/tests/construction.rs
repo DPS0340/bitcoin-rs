@@ -110,8 +110,8 @@ fn new_datadir_initializes_current_schema_before_storage() -> anyhow::Result<()>
     let data_dir = config.data_dir.clone();
     let _state = NodeState::open(config, None)?;
     assert_eq!(
-        std::fs::read(data_dir.join(crate::checkpoint::fs::CURRENT_SCHEMA_FILE))?,
-        crate::checkpoint::fs::current_schema_bytes()
+        std::fs::read(data_dir.join(bitcoin_rs_storage::checkpoint::fs::CURRENT_SCHEMA_FILE))?,
+        bitcoin_rs_storage::checkpoint::fs::current_schema_bytes()
     );
     assert!(!data_dir.join(".CURRENT_SCHEMA.tmp").exists());
     assert!(data_dir.join("chainstate").exists());
@@ -130,7 +130,7 @@ fn unmarked_nonempty_datadir_adopts_baseline_schema() -> anyhow::Result<()> {
     let data_dir = config.data_dir.clone();
     let _state = NodeState::open(config, None)?;
     assert_eq!(
-        std::fs::read(data_dir.join(crate::checkpoint::fs::CURRENT_SCHEMA_FILE))?,
+        std::fs::read(data_dir.join(bitcoin_rs_storage::checkpoint::fs::CURRENT_SCHEMA_FILE))?,
         b"0\n"
     );
     assert!(
@@ -150,7 +150,7 @@ fn mismatched_datadir_schema_is_refused_before_storage_opens() -> anyhow::Result
     std::fs::write(
         config
             .data_dir
-            .join(crate::checkpoint::fs::CURRENT_SCHEMA_FILE),
+            .join(bitcoin_rs_storage::checkpoint::fs::CURRENT_SCHEMA_FILE),
         b"1\n",
     )?;
 

@@ -99,33 +99,3 @@ fn no_applied_tip_skips_without_changing_current() -> Result<(), Box<dyn std::er
     assert_eq!(fs::read(current_path)?, before);
     Ok(())
 }
-
-#[test]
-fn authenticated_header_tip_and_commitment_mutations_require_resync()
--> Result<(), Box<dyn std::error::Error>> {
-    for case in 0..4 {
-        let dir = tempfile::tempdir()?;
-        let (tree, _, applied) = chain_with_applied_height(2, 0)?;
-        let applied_tip = tip_snapshot(&tree, applied)?;
-        let tree = RwLock::new(tree);
-        super::super::write_checkpoint(
-            dir.path(),
-            config(),
-            &tree,
-            &UtxoSet::new(),
-            &CoinStatsListener::new(CoinStats::new()),
-            Some(&applied_tip),
-        )?;
-        mutate_authenticated_manifest(dir.path(), |manifest| match case {
-            0 => manifest.best_header_tip.hash = "00".repeat(32),
-            1 => manifest.applied_tip.hash = "00".repeat(32),
-            2 => manifest.headers.best_chain_sha256 = "00".repeat(32),
-            _ => manifest.headers.applied_chain_sha256 = "00".repeat(32),
-        })?;
-        let Err(error) = load_checkpoint(dir.path(), config()) else {
-            return Err("corrupt checkpoint unexpectedly loaded".into());
-        };
-        assert!(error.to_string().contains("full resync"));
-    }
-    Ok(())
-}

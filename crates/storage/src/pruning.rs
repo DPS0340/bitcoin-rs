@@ -7,7 +7,7 @@
 //! `bitcoin` as dependencies and referenced none of them: the only things it
 //! ever touched were this crate and `Hash256`.
 //!
-//! [`stage_block_and_undo_prune`] is the main entry point. It stages
+//! [`crate::pruning::stage_block_and_undo_prune`] is the main entry point. It stages
 //! block-body and undo-row deletion together with prune-height metadata into
 //! one caller-owned atomic batch, so node wiring commits them in a single
 //! backend commit. Both kinds of data are pruned against the durable tip
@@ -15,18 +15,18 @@
 //! checkpoint, and bodies between that base and the crash-recovery sidecar tip
 //! are evidence needed for local replay while undo records are needed to
 //! disconnect back through the restored chain. After the index rows commit,
-//! [`reclaim_staged_flat_block_files`] deletes the staged flat block files,
-//! and [`PruneOutcome`] reports the bytes and row counts freed.
+//! [`crate::pruning::reclaim_staged_flat_block_files`] deletes the staged flat block files,
+//! and [`crate::pruning::PruneOutcome`] reports the bytes and row counts freed.
 //!
 //! Rows pinned by a live [`RetentionLease`] are never staged: the policy
 //! line folds with the registry's retention floor before any deletion is
 //! selected, so a reader holding a lease keeps exactly its required history.
 //!
-//! [`PrunePolicy`] carries no behaviour of its own: the node builds one from
+//! [`crate::pruning::PrunePolicy`] carries no behaviour of its own: the node builds one from
 //! configuration and hands it in, which is the policy/mechanism split this
 //! module keeps.
 //!
-//! Note that [`block_body_key`] and [`BLOCK_DATA_CF`] are not only pruning
+//! Note that [`crate::pruning::block_body_key`] and [`crate::pruning::BLOCK_DATA_CF`] are not only pruning
 //! concerns -- they are the block-body key schema, and the node reads bodies
 //! through them on the ordinary path. That is the sharper reason this is a
 //! storage module: the schema was living in the crate that deletes rows.

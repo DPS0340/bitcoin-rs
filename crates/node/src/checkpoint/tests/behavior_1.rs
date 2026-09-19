@@ -1,31 +1,5 @@
 use super::*;
 
-/// The checkpoint manifest's codec identifiers are on-disk values.
-///
-/// Pinned as literals rather than through the constants, because comparing a
-/// constant to itself proves nothing: the writer and the reader use the same
-/// three names, so renaming one keeps a single binary perfectly
-/// self-consistent while every checkpoint already on disk stops loading and
-/// requires an explicit full resync (`docs/policies/db-migration.md`). That
-/// failure is invisible to a round-trip test and expensive in production.
-///
-/// These identifiers are the current schema's on-disk codec names. Changing
-/// one requires a schema epoch bump and an explicit resync.
-#[test]
-fn manifest_codec_identifiers_are_current_and_frozen() {
-    assert_eq!(super::super::HEADER_CODEC, "bitcoin-rs-canonical-headers");
-    assert_eq!(super::super::UTXO_CODEC, "bitcoin-rs-utxo-spendable-v1");
-    assert_eq!(super::super::COINSTATS_CODEC, "bitcoin-rs-coinstats-v1");
-    assert_eq!(
-        super::super::CURRENT_FORMAT,
-        "bitcoin-rs-chainstate-current"
-    );
-    assert_eq!(
-        super::super::MANIFEST_FORMAT,
-        "bitcoin-rs-chainstate-checkpoint"
-    );
-}
-
 #[test]
 fn round_trip_replays_consensus_validated_active_chain() -> Result<(), Box<dyn std::error::Error>> {
     let (tree, best_tip_id, applied) = chain_with_applied_height(3, 1)?;
@@ -123,39 +97,6 @@ fn reader_rejects_bad_prefix_count_and_trailing_bytes() -> Result<(), Box<dyn st
 }
 
 #[test]
-fn reader_rejects_metadata_and_commitment_mutations() -> Result<(), Box<dyn std::error::Error>> {
-    let (tree, best_tip_id, applied) = chain_with_applied_height(2, 1)?;
-    let (bytes, written) = write_checkpoint(&tree, best_tip_id, applied)?;
-
-    let mut wrong_best = written.metadata;
-    wrong_best.best.hash = Hash256::from_le_bytes(&[0x11; 32]);
-    assert!(headers::read_headers(&mut Cursor::new(&bytes), config(), wrong_best).is_err());
-
-    let mut wrong_applied = written.metadata;
-    wrong_applied.applied = headers::HeaderCheckpointTip {
-        hash: written.metadata.best.hash,
-        ..written.metadata.applied
-    };
-    assert!(headers::read_headers(&mut Cursor::new(&bytes), config(), wrong_applied).is_err());
-
-    let mut wrong_applied_prefix_commitment = written.metadata;
-    wrong_applied_prefix_commitment.applied_prefix_commitment[0] ^= 1;
-    assert!(
-        headers::read_headers(
-            &mut Cursor::new(bytes.clone()),
-            config(),
-            wrong_applied_prefix_commitment
-        )
-        .is_err()
-    );
-
-    let mut wrong_commitment = written.metadata;
-    wrong_commitment.best_chain_commitment[0] ^= 1;
-    assert!(headers::read_headers(&mut Cursor::new(bytes), config(), wrong_commitment).is_err());
-    Ok(())
-}
-
-#[test]
 fn publication_selects_applied_ancestry_and_forgets_competing_fork()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
@@ -224,84 +165,6 @@ fn publication_selects_applied_ancestry_and_forgets_competing_fork()
     );
     assert_eq!(restored.applied_tip.height, applied_point.height);
     assert_eq!(restored.applied_tip.hash, applied_point.hash);
-    Ok(())
-}
-
-#[test]
-fn every_publication_failpoint_leaves_old_or_fully_valid_current()
--> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let (tree, _, applied) = chain_with_applied_height(0, 0)?;
-    let applied_tip = tip_snapshot(&tree, applied)?;
-    let tree = RwLock::new(tree);
-    let utxo = UtxoSet::new();
-    let listener = CoinStatsListener::new(CoinStats::new());
-    super::super::write_checkpoint(
-        dir.path(),
-        config(),
-        &tree,
-        &utxo,
-        &listener,
-        Some(&applied_tip),
-    )?;
-
-    for failpoint in [
-        CheckpointFailpoint::HeadersWrite,
-        CheckpointFailpoint::HeadersSync,
-        CheckpointFailpoint::UtxoWrite,
-        CheckpointFailpoint::UtxoSync,
-        CheckpointFailpoint::CoinStatsWrite,
-        CheckpointFailpoint::CoinStatsSync,
-        CheckpointFailpoint::ManifestWrite,
-        CheckpointFailpoint::ManifestSync,
-        CheckpointFailpoint::StageSync,
-        CheckpointFailpoint::GenerationRename,
-        CheckpointFailpoint::GenerationRootSync,
-        CheckpointFailpoint::CurrentTempWrite,
-        CheckpointFailpoint::CurrentTempSync,
-        CheckpointFailpoint::CurrentRename,
-    ] {
-        let current_path = dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE);
-        let previous_current = fs::read(&current_path)?;
-        assert!(
-            write_checkpoint_with_failpoint(
-                dir.path(),
-                config(),
-                &tree,
-                &utxo,
-                &listener,
-                Some(&applied_tip),
-                failpoint,
-            )
-            .is_err(),
-            "{failpoint:?}"
-        );
-        assert_eq!(
-            fs::read(&current_path)?,
-            previous_current,
-            "pre-CURRENT failure changed the authoritative pointer at {failpoint:?}"
-        );
-        assert!(matches!(
-            load_checkpoint(dir.path(), config())?,
-            CheckpointLoad::Complete(_)
-        ));
-    }
-    assert!(
-        write_checkpoint_with_failpoint(
-            dir.path(),
-            config(),
-            &tree,
-            &utxo,
-            &listener,
-            Some(&applied_tip),
-            CheckpointFailpoint::CurrentRootSync,
-        )
-        .is_err()
-    );
-    assert!(matches!(
-        load_checkpoint(dir.path(), config())?,
-        CheckpointLoad::Complete(_)
-    ));
     Ok(())
 }
 
@@ -397,28 +260,6 @@ fn semantic_utxo_trailing_byte_with_rebound_hashes_requires_resync()
         return Err("semantic UTXO corruption unexpectedly loaded".into());
     };
     assert!(error.to_string().contains("full resync"));
-    Ok(())
-}
-
-#[test]
-fn configured_network_mismatch_is_fatal() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let (tree, _, applied) = chain_with_applied_height(0, 0)?;
-    let applied_tip = tip_snapshot(&tree, applied)?;
-    let tree = RwLock::new(tree);
-    super::super::write_checkpoint(
-        dir.path(),
-        config(),
-        &tree,
-        &UtxoSet::new(),
-        &CoinStatsListener::new(CoinStats::new()),
-        Some(&applied_tip),
-    )?;
-    let wrong = headers::HeaderCheckpointConfig {
-        network: Network::Testnet3,
-        genesis: Network::Testnet3.genesis_block_hash(),
-    };
-    assert!(load_checkpoint(dir.path(), wrong).is_err());
     Ok(())
 }
 

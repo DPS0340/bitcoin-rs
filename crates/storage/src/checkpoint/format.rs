@@ -3,17 +3,17 @@
 use super::CheckpointError;
 use bitcoin_rs_primitives::Network;
 
-pub(super) fn generation_name(generation: u64) -> String {
+pub(crate) fn generation_name(generation: u64) -> String {
     format!("gen-{generation:020}")
 }
 
-pub(super) fn valid_generation_name(name: &str) -> bool {
+pub(crate) fn valid_generation_name(name: &str) -> bool {
     name.len() == 24
         && name.starts_with("gen-")
         && name[4..].bytes().all(|byte| byte.is_ascii_digit())
 }
 
-pub(super) fn valid_staging_name(name: &str) -> bool {
+pub(crate) fn valid_staging_name(name: &str) -> bool {
     name.strip_prefix(".gen-")
         .and_then(|value| value.strip_suffix(".tmp"))
         .is_some_and(|digits| {
@@ -21,7 +21,7 @@ pub(super) fn valid_staging_name(name: &str) -> bool {
         })
 }
 
-pub(super) fn valid_current_temp_name(name: &str) -> bool {
+pub(crate) fn valid_current_temp_name(name: &str) -> bool {
     name.strip_prefix(".CURRENT-")
         .and_then(|value| value.strip_suffix(".tmp"))
         .is_some_and(|digits| {
@@ -31,7 +31,7 @@ pub(super) fn valid_current_temp_name(name: &str) -> bool {
 
 /// Checkpoint-file network spelling. Core's `testnet` alias names
 /// [`Network::Testnet3`]. Evidence identity uses [`Network::identity_name`].
-pub(super) fn network_name(network: Network) -> &'static str {
+pub fn network_name(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "mainnet",
         Network::Testnet3 => "testnet",
@@ -41,7 +41,8 @@ pub(super) fn network_name(network: Network) -> &'static str {
     }
 }
 
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+/// Encodes bytes as lowercase hexadecimal without separators.
+pub fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
@@ -51,7 +52,8 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-pub(super) fn decode_hex<const N: usize>(encoded: &str) -> Result<[u8; N], CheckpointError> {
+/// Decodes exactly `2 * N` lowercase hexadecimal characters.
+pub fn decode_hex<const N: usize>(encoded: &str) -> Result<[u8; N], CheckpointError> {
     if encoded.len() != N.saturating_mul(2)
         || !encoded
             .bytes()
