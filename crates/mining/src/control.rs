@@ -2,7 +2,7 @@
 //!
 //! RPC projects these types onto BIP22/BIP23 JSON. The node implements
 //! [`MiningControl`]. Caching and long-poll live in this crate's
-//! [`coordinator`](crate::coordinator); proposal validation and solved-block
+//! [`MiningService`](crate::MiningService); proposal validation and solved-block
 //! submission stay on the node's authoritative apply path.
 
 use std::sync::Arc;

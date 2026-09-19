@@ -530,4 +530,3 @@ fn spending_position_mismatch_falls_back_to_full_block() -> Result<(), Box<dyn s
     assert_eq!(fixture.full_reads()?, 1);
     Ok(())
 }
-// weave: run 'weave explain crates/index/src/runtime/query_tests.rs' for per-hunk detail, 'weave check' to verify your resolution

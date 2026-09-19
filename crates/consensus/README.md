@@ -9,9 +9,9 @@ Bitcoin Core's C++ consensus engine. The `bin/bitcoin-rs` binary does not enable
 Issue #213 keeps that split until native wins the signed-spend and full-replay
 gates; see [`docs/contracts/validation-default.md`](../../docs/contracts/validation-default.md).
 
-Rule checks live in small per-subject modules (`bip9`, `bip30`, `bip34`, `bip65`,
-`bip66`, `bip68`, `bip112`, `bip113`, `bip141`, `bip143`, `bip341`, `bip342`), surfaced
-through the `verify_transaction` family (with median-time-past and borrowed variants),
+Rule checks live in `verify_tx` and `verify_block` with per-subject helpers
+(`bip9`, `bip30`, `bip34`, `bip68`, `bip113`), surfaced through the
+`verify_transaction` family (with median-time-past and borrowed variants),
 `is_final_tx`, and the `verify_block_rules` family including Merkle-root verification.
 `compute_merkle_root` is the sole pairwise SHA-256d fold (AVX2 or spine) used by
 block rules, witness-commitment checks, and mining candidate assembly.
@@ -21,7 +21,7 @@ script preparation reuses, and `kernel::KernelContext::verify_tx` verifies a
 transaction's inputs through bitcoinkernel over any `UtxoView`. BIP9 activation is
 `compute_state`
 over a `DeploymentContext` with `DeploymentParams`. Consensus bounds are exported as
-`MAX_SCRIPT_SIZE`, `MAX_MONEY`, and `MAX_BLOCK_SIGOPS_COST`; failures are `ConsensusError`
+`MAX_SCRIPT_SIZE` and `MAX_BLOCK_SIGOPS_COST`; failures are `ConsensusError`
 variants.
 
 ## Features

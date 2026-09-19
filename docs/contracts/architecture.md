@@ -266,10 +266,10 @@ Owners:
   node keeps the `MiningCoordinator` facade and the `tx_ingress` consumer as
   composition.
   `crates/utxo` owns UTXO undo persistence, the marker-fenced block rollback,
-  and the apply-side window prevout overlay (`bitcoin_rs_utxo::undo`,
-  `bitcoin_rs_utxo::overlay`); `crates/node` calls `persist_block_undo`,
-  `load_block_undo`, and `rollback_block` and keeps only the ordering of that
-  rollback against the journal, durable head, and tip publication.
+  and the apply-side window prevout overlay (`WindowOverlay`); `crates/node`
+  calls `persist_block_undo`, `load_block_undo`, and `rollback_block` and keeps
+  only the ordering of that rollback against the journal, durable head, and
+  tip publication.
   The block-download executor lives in `crates/p2p/src/sync.rs` behind
   `SyncChain`; node retains the seam implementation for header admission,
   body binding, window commit, branch switch, and genesis bootstrap.

@@ -1,7 +1,7 @@
 //! Bitcoin Core-compatible REST surface used by remote clients.
 //!
 //! The twelve supported route prefixes mirror Core's `StartREST` registration table.
-//! JSON projections come from [`crate::render`] and [`crate::tx_render`]; hex
+//! JSON projections come from `crate::render` and `crate::tx_render`; hex
 //! and binary payloads use consensus serialization. Applied-chain membership is
 //! always resolved through [`crate::context::Context`] ancestry facts — never
 //! from the header tip alone.

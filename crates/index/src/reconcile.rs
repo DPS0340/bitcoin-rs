@@ -2,7 +2,7 @@
 //!
 //! The index owner decides how durable derived state reaches consistency with a
 //! supplied active chain. The caller owns the authoritative chain representation
-//! and implements [`crate::reconcile::ActiveChainView`]; agreement between index watermarks alone
+//! and implements `crate::reconcile::ActiveChainView`; agreement between index watermarks alone
 //! never prove query readiness.
 
 use bitcoin_rs_primitives::Hash256;
@@ -35,7 +35,7 @@ pub struct ConsumerCursor {
 }
 
 impl ConsumerCursor {
-    /// Encodes the durable representation in [`CURSOR_BYTE_LEN`] bytes.
+    /// Encodes the durable representation in `CURSOR_BYTE_LEN` bytes.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; CURSOR_BYTE_LEN] {
         let mut bytes = [0_u8; CURSOR_BYTE_LEN];
@@ -277,4 +277,3 @@ pub(crate) mod block_tree {
         ActiveChainView::position_on_active_chain(&chain, position, height)
     }
 }
-// weave: run 'weave explain crates/index/src/reconcile.rs' for per-hunk detail, 'weave check' to verify your resolution
