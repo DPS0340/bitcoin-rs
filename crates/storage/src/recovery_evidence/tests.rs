@@ -380,6 +380,30 @@ fn oversized_witness_write_is_rejected_without_rotating() {
     );
 }
 
+#[test]
+fn foreign_format_write_is_rejected_without_rotating() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let w1 = AppliedTipWitness::new(G, 1, 100, "aaa", 1000);
+    write_witness(dir.path(), &w1).expect("write w1");
+
+    let mut bad = AppliedTipWitness::new(G, 2, 200, "bbb", 2000);
+    bad.format = "9".to_owned();
+    let error = write_witness(dir.path(), &bad).unwrap_err();
+    assert!(
+        matches!(error, EvidenceError::InvalidRecord),
+        "unwritable record is rejected, got {error:?}"
+    );
+    assert_eq!(
+        read_witness(dir.path(), G),
+        Some(w1),
+        "rejected write leaves current untouched"
+    );
+    assert!(
+        !witness_tmp(dir.path()).exists(),
+        "rejected write stages no tmp tail"
+    );
+}
+
 // Semantic rotation: a parseable but foreign-genesis or wrong-format current
 // cannot displace a valid .prev.
 #[test]

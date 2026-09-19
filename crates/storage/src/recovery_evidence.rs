@@ -40,6 +40,9 @@ pub enum EvidenceError {
         /// The `MAX_FILE_BYTES` bound the readers enforce.
         limit: usize,
     },
+    /// A payload the evidence readers cannot decode.
+    #[error("evidence payload fails its own read validation")]
+    InvalidRecord,
 }
 
 /// Durable record of the applied tip at the last clean checkpoint publication.
@@ -201,6 +204,12 @@ fn write_sidecar(
                 found: staged,
                 limit: MAX_FILE_BYTES,
             });
+        }
+        // A payload the readers cannot decode must never be staged: it would
+        // report success while displacing a valid current with unreadable
+        // bytes (foreign format, wrong genesis, or oversized fields).
+        if !valid(payload.as_bytes()) {
+            return Err(EvidenceError::InvalidRecord);
         }
         // A stale tmp is left by a crashed earlier write; create_new below
         // fails if it still exists.
