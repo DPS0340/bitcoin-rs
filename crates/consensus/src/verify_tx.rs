@@ -113,7 +113,8 @@ fn is_null_outpoint(outpoint: &OutPoint) -> bool {
 ///
 /// # Errors
 ///
-/// Returns `ConsensusError::Bip` when the coinbase output has fewer than 100 confirmations.
+/// Returns `ConsensusError::Bip` when the spend height is less than 100 above
+/// the height that created the coinbase output.
 pub fn check_coinbase_maturity(
     coinbase: bool,
     created_height: u32,

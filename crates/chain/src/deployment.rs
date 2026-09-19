@@ -293,16 +293,21 @@ mod tests {
         let mut activation_id = None;
         for height in 0..=activation_height.saturating_add(1) {
             let header = synthetic_header(prev_hash, height);
-            let node_id = tree.insert_header(header, NodeStatus::HeaderValid)?;
+            // The activation header must enter the index under its
+            // authenticated hash; mutating afterwards would leave the child
+            // prev_blockhash and the by_hash key pointing at a discarded hash.
+            let node_id = if height == activation_height {
+                tree.insert_header_with_hash(header, expected_hash, NodeStatus::HeaderValid)?
+            } else {
+                tree.insert_header(header, NodeStatus::HeaderValid)?
+            };
             if height == activation_height {
                 activation_id = Some(node_id);
             }
             prev_hash = BlockHash::from(tree.node(node_id)?.hash);
             tip = Some(node_id);
         }
-        let activation_id =
-            activation_id.ok_or_else(|| std::io::Error::other("missing activation node"))?;
-        tree.node_mut(activation_id)?.hash = expected_hash;
+        activation_id.ok_or_else(|| std::io::Error::other("missing activation node"))?;
         tip.ok_or_else(|| std::io::Error::other("missing previous tip").into())
     }
 
@@ -316,13 +321,19 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("activation height overflow"))?;
         let mut tree = BlockTree::new();
         let previous_tip = seed_known_bip34_activation_chain(&mut tree, network)?;
-
-        assert!(!super::bip30_duplicate_scan_required(
-            &tree,
-            network,
-            height,
-            Some(previous_tip),
-        ));
+        // The child of the activation header must commit to the authenticated
+        // hash, not to a pre-mutation synthetic hash.
+        let expected = network
+            .bip34_activation_hash()
+            .ok_or_else(|| std::io::Error::other("network has no fixed BIP34 activation hash"))?;
+        let child_id = tree
+            .node_at_height_from(previous_tip, height)
+            .ok_or_else(|| std::io::Error::other("seeded child missing"))?;
+        assert_eq!(
+            tree.node(child_id)?.header.prev_blockhash,
+            BlockHash::from(expected),
+            "activation child must point at the authenticated activation hash"
+        );
         Ok(())
     }
 

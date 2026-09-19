@@ -1,5 +1,41 @@
 use super::*;
 
+/// The allowance includes the fees the block actually earned.
+///
+/// A rule that only compared against the subsidy would pass the proposal test
+/// below and still be wrong in both directions: it would refuse every real
+/// block that collects fees, and it would let a block claim fees it never
+/// earned.
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn the_coinbase_allowance_counts_the_fees_the_block_earned()
+-> Result<(), Box<dyn std::error::Error>> {
+    let subsidy =
+        bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+    // The seeded output is 1000 sats and the spend pays 1 sat onward.
+    let fee = 999_u64;
+    let funded = OutPoint::new(fixture_txid(0x71), 0);
+    let spend = spending_transaction_to_script(funded, u32::MAX, op_true_script());
+
+    let (handles, exact) = height_one_prepared(vec![spend.clone()], subsidy + fee)?;
+    assert!(
+        handles.apply_block(&exact).is_ok(),
+        "the coinbase may claim the subsidy plus the fee it collected"
+    );
+
+    let (handles, over) = height_one_prepared(vec![spend], subsidy + fee + 1)?;
+    assert!(
+        matches!(
+            handles.apply_block(&over),
+            Err(ApplyError::Consensus(
+                bitcoin_rs_consensus::ConsensusError::CoinbaseAmount { allowed, .. }
+            )) if allowed == subsidy + fee
+        ),
+        "one satoshi past the fee must be refused"
+    );
+    Ok(())
+}
+
 /// Proposal must run the same pre-write gates commit runs, including the
 /// coinbase-amount check, and must not persist or publish a tip.
 #[test]

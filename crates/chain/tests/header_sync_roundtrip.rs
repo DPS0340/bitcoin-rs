@@ -1,5 +1,5 @@
 //! Header synchronization integration tests.
-use bitcoin_rs_chain::header_sync::{compact_to_target, next_work_required, validate_header_nbits};
+use bitcoin_rs_chain::header_sync::{next_work_required, validate_header_nbits};
 use bitcoin_rs_chain::{
     BlockHeader, BlockTree, ChainError, Network, NodeStatus, accept_headers, current_unix_seconds,
 };
@@ -482,8 +482,8 @@ const MAINNET_POW_LIMIT_BITS: u32 = 0x1d00_ffff;
 const MAINNET_POW_LIMIT_DIV_4_BITS: u32 = 0x1c3f_ffc0;
 const DAA_ANCHOR_TIME: u32 = 1_600_000_000;
 
-fn pow_limit_bits(_network: Network) -> u32 {
-    MAINNET_POW_LIMIT_BITS
+fn pow_limit_bits(network: Network) -> u32 {
+    target_to_compact_lossy(network.max_target())
 }
 
 fn target_to_compact_lossy(target: bitcoin_rs_chain::ChainWork) -> u32 {
@@ -503,8 +503,34 @@ fn target_to_compact_lossy(target: bitcoin_rs_chain::ChainWork) -> u32 {
     compact | (u32::try_from(size).unwrap_or(0) << 24)
 }
 
+/// Independent `SetCompact` decoder: the test oracle for difficulty
+/// expectations. Hand-rolled against the encoding spec, never importing the
+/// production decoder, so a decoder regression cannot move both sides of an
+/// assertion together.
+fn decode_compact_to_target(bits: u32) -> bitcoin_rs_chain::ChainWork {
+    use bitcoin_rs_chain::ChainWork;
+    let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
+    let mut mantissa = bits & 0x007f_ffff;
+    let target = if exponent <= 3 {
+        mantissa >>= 8 * (3 - exponent);
+        ChainWork::from(mantissa)
+    } else {
+        let shift = 8 * (exponent - 3);
+        if shift < 256 {
+            ChainWork::from(mantissa) << shift
+        } else {
+            ChainWork::ZERO
+        }
+    };
+    if mantissa != 0 && bits & 0x0080_0000 != 0 {
+        ChainWork::ZERO
+    } else {
+        target
+    }
+}
+
 fn scaled_pow_limit_bits(network: Network, divisor: u64) -> u32 {
-    let limit = compact_to_target(CompactTarget::from_consensus(pow_limit_bits(network)));
+    let limit = decode_compact_to_target(pow_limit_bits(network));
     target_to_compact_lossy(limit / bitcoin_rs_chain::ChainWork::from(divisor))
 }
 
@@ -515,14 +541,12 @@ fn retarget_bits_for_test(
     expected_timespan: u32,
 ) -> u32 {
     let actual_timespan = actual_timespan.clamp(expected_timespan / 4, expected_timespan * 4);
-    let previous_target = compact_to_target(CompactTarget::from_consensus(previous_bits));
+    let previous_target = decode_compact_to_target(previous_bits);
     let actual = bitcoin_rs_chain::ChainWork::from(actual_timespan);
     let expected = bitcoin_rs_chain::ChainWork::from(expected_timespan);
     let target = ((previous_target / expected) * actual)
         + (((previous_target % expected) * actual) / expected);
-    target_to_compact_lossy(target.min(compact_to_target(CompactTarget::from_consensus(
-        pow_limit_bits(network),
-    ))))
+    target_to_compact_lossy(target.min(decode_compact_to_target(pow_limit_bits(network))))
 }
 
 fn seed_headers(
