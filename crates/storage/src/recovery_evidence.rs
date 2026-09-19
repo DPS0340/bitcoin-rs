@@ -34,7 +34,12 @@ pub enum EvidenceError {
     Json(#[from] serde_json::Error),
     /// A staged payload exceeds the bounded file size.
     #[error("evidence payload is {found} bytes, over the {limit}-byte limit")]
-    TooLarge { found: usize, limit: usize },
+    TooLarge {
+        /// Staged byte count including the trailing newline.
+        found: usize,
+        /// The `MAX_FILE_BYTES` bound the readers enforce.
+        limit: usize,
+    },
 }
 
 /// Durable record of the applied tip at the last clean checkpoint publication.
