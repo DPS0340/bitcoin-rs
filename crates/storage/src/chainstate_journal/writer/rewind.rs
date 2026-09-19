@@ -11,7 +11,7 @@ use super::JournalWriterError;
 use super::WriterState;
 use super::parse_segment_name;
 use super::segment_name;
-use bitcoin_rs_storage::KvStore;
+use crate::KvStore;
 use std::io::Read;
 use std::time::Instant;
 

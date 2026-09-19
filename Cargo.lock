@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-chain"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "bitcoin",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-consensus"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-index"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "bitcoin",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-mempool"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "bitcoin",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-mining"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bitcoin",
  "bitcoin-rs-chain",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-node"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-p2p"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "bitcoin",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-primitives"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytemuck",
  "ruint",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-rpc"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-script"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bitcoin",
  "bitcoin-rs-consensus",
@@ -501,17 +501,20 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-storage"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "bitcoin-rs-primitives",
  "bytemuck",
  "bytes",
+ "cap-fs-ext",
+ "cap-std",
  "crossbeam-channel",
  "fjall",
  "hashbrown 0.17.1",
  "metrics",
  "parking_lot",
+ "proptest",
  "redb",
  "rust-rocksdb",
  "rustix",
@@ -525,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-rs-utxo"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bitcoin",
  "bitcoin-rs-primitives",

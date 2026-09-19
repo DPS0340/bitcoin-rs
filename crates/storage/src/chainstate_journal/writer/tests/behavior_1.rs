@@ -5,20 +5,18 @@ use std::io::Write;
 #[test]
 fn writer_bootstrap_uses_chainstate_journal_config_defaults() -> TestResult {
     let writer = open_fresh("config-defaults", Arc::new(CountingStore::new()))?;
-    let defaults = crate::config::ChainstateJournalConfig::default();
+    let defaults = super::super::JournalPolicy::default();
 
-    assert_eq!(writer.batch_blocks, defaults.blocks);
-    assert_eq!(writer.batch_seconds, Duration::from_secs(defaults.seconds));
+    assert_eq!(writer.batch_blocks, defaults.batch_blocks);
+    assert_eq!(writer.batch_seconds, defaults.batch_seconds);
     assert_eq!(writer.rotate_bytes, defaults.rotate_mib * 1024 * 1024);
     assert_eq!(
         writer.max_journal_bytes,
         defaults.max_journal_mib * 1024 * 1024
     );
     assert_eq!(writer.max_lag_blocks, defaults.max_lag_blocks);
-    assert_eq!(
-        writer.max_lag_seconds,
-        Duration::from_secs(defaults.max_lag_seconds)
-    );
+    assert_eq!(writer.max_lag_seconds, defaults.max_lag_seconds);
+
     Ok(())
 }
 
@@ -255,7 +253,14 @@ fn freeze_rejects_appends_and_compaction_flow_completes() -> TestResult {
 fn failed_boundary_retries_before_next_apply_below_lag_limit() -> TestResult {
     let store = Arc::new(CountingStore::new());
     let mut writer = open_fresh("boundary-retry", Arc::clone(&store))?;
-    writer.configure(1, Duration::from_mins(1), 1, 10, 10, Duration::from_mins(1))?;
+    writer.configure(super::super::JournalPolicy {
+        batch_blocks: 1,
+        batch_seconds: Duration::from_mins(1),
+        rotate_mib: 1,
+        max_journal_mib: 10,
+        max_lag_blocks: 10,
+        max_lag_seconds: Duration::from_mins(1),
+    })?;
     store.set_fail_flush(true);
     assert!(matches!(
         writer.append(&sample_record(1)),

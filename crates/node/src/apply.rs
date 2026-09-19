@@ -8,7 +8,6 @@
 #[cfg(test)]
 use rayon::prelude::*;
 mod connect;
-mod contextual;
 mod disconnect;
 mod durable;
 mod entrypoints;
@@ -21,6 +20,8 @@ use crate::config::ValidationMode;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::TipSnapshot;
+#[cfg(test)]
+use bitcoin_rs_chain::compact_is_met_by;
 #[cfg(test)]
 use bitcoin_rs_consensus::MAX_SCRIPT_SIZE;
 use bitcoin_rs_consensus::rust_path::UtxoView;
@@ -69,19 +70,11 @@ use connect::applied_predecessor;
 use connect::apply_block_with_serialized_admitted;
 use connect::apply_committed_block_admitted;
 #[cfg(test)]
-use contextual::check_bip30_and_bip34;
+use connect::check_bip30_and_bip34;
 #[cfg(test)]
-use contextual::check_bip68_sequence_locks;
+use connect::check_bip68_sequence_locks;
 #[cfg(test)]
-use contextual::check_coinbase_maturity_with_tx_plan;
-#[cfg(test)]
-use contextual::check_pow_limit_and_continuity;
-#[cfg(test)]
-use contextual::compact_is_met_by;
-#[cfg(test)]
-use contextual::compact_to_target;
-#[cfg(test)]
-use contextual::compute_verify_flags;
+use connect::check_coinbase_maturity;
 use disconnect::disconnect_block_admitted;
 use hashbrown::HashMap;
 #[cfg(test)]
@@ -126,15 +119,6 @@ mod scratch;
 pub(crate) use bitcoin_rs_storage::{DisconnectPhase, KvUndoStore, UndoStore};
 pub(crate) use durable::reconcile_at_boot;
 
-/// Number of blocks after a coinbase that its outputs become spendable.
-/// Consensus rule since Bitcoin v0.3.1; universal across networks.
-const COINBASE_MATURITY: u32 = 100;
-/// BIP68 sequence-bit masks.
-const BIP68_DISABLE_FLAG: u32 = 0x8000_0000;
-const BIP68_TYPE_FLAG: u32 = 0x0040_0000;
-const BIP68_MASK: u32 = 0x0000_ffff;
-const BIP68_TIME_GRANULARITY_SECONDS: u32 = 512;
-const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const LOCAL_OVERLAY_TXID_SET_THRESHOLD: usize = 8;
 
 /// Admission barrier shared by every cloned apply handle.
@@ -524,7 +508,7 @@ pub struct Chainstate {
     /// `None` = journal off: the apply path emits nothing and behaves exactly
     /// as a checkpoint-only node. The writer is single-owner (the apply path);
     /// the `Mutex` only makes the shared handle exclusive.
-    pub(crate) journal: Option<crate::chainstate_journal::SharedJournalWriter>,
+    pub(crate) journal: Option<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter>,
     /// Publishes checkpoints to settle rolled-back disconnect debt after a
     /// non-fatal reorg. `None` in unit-test handle sets that never reorg.
     pub(crate) checkpoint_publisher: Option<Arc<crate::checkpoint::publisher::CheckpointPublisher>>,
@@ -1325,18 +1309,6 @@ impl UtxoView for BlockLocalUtxoView<'_> {
 #[cfg(test)]
 mod consensus_rule_tests;
 
-#[cfg(test)]
-fn check_pow_limit_and_continuity_for_seeded_tip(
-    handles: &Chainstate,
-    block: &Block,
-    height: u32,
-) -> core::result::Result<(), ApplyError> {
-    let prior = handles.chain_tip.load_full();
-    check_pow_limit_and_continuity(handles, prior.as_deref(), block, height)
-}
-
-#[cfg(test)]
-mod contextual_softfork_tests;
 #[cfg(test)]
 mod zmq_emit_tests;
 

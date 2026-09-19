@@ -146,3 +146,6 @@ pub(crate) fn metric_f64(value: u64) -> f64 {
 pub(crate) fn metric_f64_from_usize(value: usize) -> f64 {
     metric_f64(u64::try_from(value).unwrap_or(u64::MAX))
 }
+
+pub mod chainstate_journal;
+pub mod checkpoint;

@@ -266,10 +266,10 @@ Owners:
   node keeps the `MiningCoordinator` facade and the `tx_ingress` consumer as
   composition.
   `crates/utxo` owns UTXO undo persistence, the marker-fenced block rollback,
-  and the apply-side window prevout overlay (`bitcoin_rs_utxo::undo`,
-  `bitcoin_rs_utxo::overlay`); `crates/node` calls `persist_block_undo`,
-  `load_block_undo`, and `rollback_block` and keeps only the ordering of that
-  rollback against the journal, durable head, and tip publication.
+  and the apply-side window prevout overlay (`WindowOverlay`); `crates/node`
+  calls `persist_block_undo`, `load_block_undo`, and `rollback_block` and keeps
+  only the ordering of that rollback against the journal, durable head, and
+  tip publication.
   The block-download executor lives in `crates/p2p/src/sync.rs` behind
   `SyncChain`; node retains the seam implementation for header admission,
   body binding, window commit, branch switch, and genesis bootstrap.
@@ -278,10 +278,14 @@ Owners:
   holds a second download window. Durable recovery evidence (witness/marker sidecars, warning snapshot) and the storage-footprint evidence format/budget verdict live in `crates/storage` (`recovery_evidence`, `footprint::evidence`); node keeps `RecoveryReporter` as the `IndexAheadSink`/`RollbackWarningSource` adapter and as the checkpoint-fallback publication path into the storage publisher, plus `measure_storage_footprint` orchestration. Relocating leftover node mechanics into
   `crates/utxo`, `crates/storage`, and `crates/p2p` remains tracked under #217
   (open). A
-  dedicated `crates/chainstate` waits until journal,
-  checkpoint, and
-  `ChainEventPublisher` also leave node. `crates/node` is the composition
-  layer, but is not yet fully slim.
+  dedicated `crates/chainstate` waits until `ChainEventPublisher` and the
+  node-side chain/UTXO payload codecs leave node. Implemented — journal record
+  codec/writer/retention/replay streaming and checkpoint fs/format/atomic
+  publication/authenticated load now live in `bitcoin-rs-storage`
+  (`chainstate_journal`, `checkpoint`); node keeps chain/UTXO payload codecs
+  (`checkpoint/headers.rs`, `load_payloads`, `write_checkpoint_from_dir`),
+  `ReplayAccumulator`, `delta.rs`, and `CheckpointPublisher` orchestration.
+  `crates/node` is the composition layer, but is not yet fully slim.
 
 ## Proven by
 

@@ -26,7 +26,7 @@ use bitcoin_rs_utxo::BorrowedBlockChanges;
 use hashbrown::HashMap;
 use thiserror::Error;
 
-use super::record::{Coin, JournalRecord, Mutation};
+use bitcoin_rs_storage::chainstate_journal::{Coin, JournalRecord, Mutation};
 
 #[derive(Debug, Error)]
 pub(crate) enum JournalDeltaError {

@@ -5,7 +5,7 @@ use super::HeadMarker;
 use super::JournalWriter;
 use super::JournalWriterError;
 use super::segment_name;
-use bitcoin_rs_storage::KvStore;
+use crate::KvStore;
 use std::io::Write;
 use std::time::Instant;
 

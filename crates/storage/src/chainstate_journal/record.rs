@@ -14,72 +14,76 @@ const MAX_MUTATIONS: u32 = 4_000_000;
 
 /// A complete coin, including the fields required by `CoinStats`' `MuHash` preimage.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Coin {
+pub struct Coin {
     /// Transaction output identifier.
-    pub(crate) outpoint: OutPoint,
-    /// Output value and script.
-    pub(crate) txout: TxOut,
-    /// Height at which this output was created.
-    pub(crate) height: u32,
-    /// Whether the creating transaction was coinbase.
-    pub(crate) coinbase: bool,
+    pub outpoint: OutPoint,
+    /// Value, script, and other output data.
+    pub txout: TxOut,
+    /// Height at which the output was created.
+    pub height: u32,
+    /// Whether the creating transaction is a coinbase transaction.
+    pub coinbase: bool,
 }
 
-/// An ordered in-block chainstate mutation.
+/// One ordered UTXO mutation in a committed journal record.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Mutation {
+pub enum Mutation {
     /// Add a newly created output.
-    Create { coin: Coin },
+    Create {
+        /// Output created by the block.
+        coin: Coin,
+    },
     /// Remove a spent output.
-    Spend { coin: Coin },
+    Spend {
+        /// Output spent by the block.
+        coin: Coin,
+    },
     /// Replace a BIP30 duplicate-txid output.
-    Overwrite { old_coin: Coin, new_coin: Coin },
+    Overwrite {
+        /// Prior output replaced by the duplicate transaction.
+        old_coin: Coin,
+        /// New output written by the duplicate transaction.
+        new_coin: Coin,
+    },
 }
 
-/// One framed journal record for one applied block.
+/// One block's authenticated chainstate changes and replay metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct JournalRecord {
-    /// Height of the block represented by this record.
-    pub(crate) height: u32,
-    /// Hash of the block represented by this record.
-    pub(crate) block_hash: [u8; 32],
-    /// Hash of the preceding block.
-    pub(crate) prev_hash: [u8; 32],
+pub struct JournalRecord {
+    /// Block height represented by this record.
+    pub height: u32,
+    /// Block hash in internal byte order.
+    pub block_hash: [u8; 32],
+    /// Parent block hash in internal byte order.
+    pub prev_hash: [u8; 32],
     /// Number of transactions in the block.
-    pub(crate) block_tx_count: u64,
-    /// `CoinStats` height delta applied by the block.
-    pub(crate) coin_stats_height_delta: i64,
+    pub block_tx_count: u64,
+    /// Signed `CoinStats` height delta contributed by the block.
+    pub coin_stats_height_delta: i64,
     /// The block's full 80-byte consensus header. Boot replay rebuilds the
     /// checkpoint→head header chain in the `BlockTree` from these, which is what
     /// makes the post-replay `TipSnapshot` (`NodeId` + `chainwork`) reconstructible.
-    pub(crate) raw_header: [u8; 80],
+    pub raw_header: [u8; 80],
     /// Mutations in exact commit order.
-    pub(crate) mutations: Vec<Mutation>,
+    pub mutations: Vec<Mutation>,
 }
 
-/// Errors returned when a journal frame cannot be decoded.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub(crate) enum JournalRecordError {
-    /// The four-byte record marker did not match.
     #[error("chainstate journal record has bad magic")]
     BadMagic,
-    /// The record version is not supported.
     #[error("unsupported chainstate journal record version {found}, expected {expected}")]
     BadVersion { found: u8, expected: u8 },
-    /// The payload checksum did not match.
     #[error(
         "chainstate journal record checksum mismatch: expected {expected:#010x}, found {found:#010x}"
     )]
     CrcMismatch { expected: u32, found: u32 },
-    /// The frame ended before a complete field was available.
     #[error("chainstate journal record ended unexpectedly")]
     UnexpectedEof,
-    /// The frame was structurally invalid.
     #[error("malformed chainstate journal record payload")]
     MalformedPayload,
 }
 
-/// Encodes a journal record with magic, version, length, payload, and CRC32C.
 pub(crate) fn encode_record(record: &JournalRecord) -> io::Result<Vec<u8>> {
     let expected_payload_len = record_payload_len(record);
     let capacity = expected_payload_len
@@ -151,7 +155,6 @@ impl Write for CountingWriter {
     }
 }
 
-/// Decodes and validates one complete journal record.
 pub(crate) fn decode_record(bytes: &[u8]) -> Result<JournalRecord, JournalRecordError> {
     if bytes.len() < FRAME_HEADER_LEN {
         return Err(JournalRecordError::UnexpectedEof);

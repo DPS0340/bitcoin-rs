@@ -469,6 +469,16 @@ impl BlockTree {
         (active.hash == hash).then_some(active.height)
     }
 
+    /// Median-time-past of the block *before* `height` on the chain ending at `tip`; `None` when that ancestor is missing.
+    #[must_use]
+    pub fn median_time_past_before_height(&self, tip: NodeId, height: u32) -> Option<u32> {
+        if height == 0 {
+            return None;
+        }
+        let node = self.node_at_height_from(tip, height - 1)?;
+        self.median_time_past_at(node, bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW)
+    }
+
     /// Returns the median time of the most recent `window` blocks, inclusive
     /// of `start_id`, walking backward via parent pointers.
     ///
@@ -1220,6 +1230,34 @@ mod tests {
             panic!("chain has 11 blocks should yield Some");
         };
         assert_eq!(mtp, 1_003_000);
+        Ok(())
+    }
+
+    #[test]
+    fn median_time_past_before_height_rejects_zero() -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let mut prev_hash = BlockHash::default();
+        let mut tip = None;
+        for i in 0..3_u32 {
+            let header = BlockHeader {
+                version: 1,
+                prev_blockhash: prev_hash,
+                merkle_root: Hash256::default(),
+                time: 1_000_000 + i * 600,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            };
+            prev_hash = header.compute_hash();
+            tip = Some(tree.insert_header(header, NodeStatus::HeaderValid)?);
+        }
+        let Some(tip) = tip else {
+            panic!("three blocks should yield a tip");
+        };
+        // No block precedes height 0.
+        assert_eq!(tree.median_time_past_before_height(tip, 0), None);
+        // The block before height 1 is genesis; the median over the single
+        // available timestamp is that timestamp.
+        assert_eq!(tree.median_time_past_before_height(tip, 1), Some(1_000_000));
         Ok(())
     }
 

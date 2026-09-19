@@ -45,14 +45,16 @@ use std::{
 };
 
 fn retire_full_revalidation_marker(data_dir: &std::path::Path) -> Result<(), CheckpointError> {
-    crate::chainstate_journal::clear_full_revalidation_marker_at(data_dir).map_err(|error| {
-        match error {
-            crate::chainstate_journal::JournalWriterError::Io(io) => {
+    bitcoin_rs_storage::chainstate_journal::clear_full_revalidation_marker_at(data_dir).map_err(
+        |error| match error {
+            bitcoin_rs_storage::chainstate_journal::JournalWriterError::Io(io) => {
                 CheckpointError::FullRevalidationMarker(io)
             }
-            other => CheckpointError::Invalid(other.to_string()),
-        }
-    })
+            other => CheckpointError::Store(
+                bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(other.to_string()),
+            ),
+        },
+    )
 }
 
 /// All the shared handles needed to publish a checkpoint from a background
@@ -74,7 +76,7 @@ pub(crate) struct CheckpointPublisher {
     pub(crate) utxo: Arc<UtxoSet>,
     pub(crate) coin_stats: Arc<CoinStatsListener>,
     pub(crate) chain_tx_count: Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) journal: Option<crate::chainstate_journal::SharedJournalWriter>,
+    pub(crate) journal: Option<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter>,
 
     pub(crate) data_dir: PathBuf,
     pub(crate) chain_events: Arc<ChainEventPublisher>,
@@ -91,9 +93,11 @@ impl CheckpointPublisher {
         let _exclusive_apply = self.admission.pause();
         let mut journal = self.journal.as_ref().map(|journal| journal.lock());
         if let Some(writer) = journal.as_mut() {
-            writer
-                .freeze()
-                .map_err(|error| CheckpointError::Invalid(error.to_string()))?;
+            writer.freeze().map_err(|error| {
+                CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
+                    error.to_string(),
+                ))
+            })?;
         }
         let applied_tip = self.applied_tip.load_full();
         let chain_tx_count = self
@@ -113,7 +117,13 @@ impl CheckpointPublisher {
                         tip_prev_hash.to_le_bytes(),
                         chain_tx_count,
                     )
-                    .map_err(|error| CheckpointError::Invalid(error.to_string()))
+                    .map_err(|error| {
+                        CheckpointError::Store(
+                            bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
+                                error.to_string(),
+                            ),
+                        )
+                    })
             });
             if let Err(error) = compact_result {
                 result = Err(error);
@@ -122,7 +132,9 @@ impl CheckpointPublisher {
         if let Some(writer) = journal.as_mut()
             && let Err(error) = writer.resume()
         {
-            let resume_error = CheckpointError::Invalid(error.to_string());
+            let resume_error = CheckpointError::Store(
+                bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(error.to_string()),
+            );
             if result.is_ok() {
                 result = Err(resume_error);
             } else {
@@ -151,7 +163,9 @@ impl CheckpointPublisher {
     fn tip_prev_hash(&self, tip: &TipSnapshot) -> core::result::Result<Hash256, CheckpointError> {
         let tree = self.block_tree.read();
         let node = tree.node(tip.tip_id).map_err(|error| {
-            CheckpointError::Invalid(format!("checkpoint tip is absent from block tree: {error}"))
+            CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
+                format!("checkpoint tip is absent from block tree: {error}"),
+            ))
         })?;
         let Some(parent_id) = node.parent else {
             return Ok(Hash256::default());
@@ -159,7 +173,9 @@ impl CheckpointPublisher {
         tree.node(parent_id)
             .map(|parent| parent.hash)
             .map_err(|error| {
-                CheckpointError::Invalid(format!("checkpoint tip parent is absent: {error}"))
+                CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
+                    format!("checkpoint tip parent is absent: {error}"),
+                ))
             })
     }
 
@@ -184,7 +200,9 @@ impl CheckpointPublisher {
         // below); the guard has nothing to compare there.
         if let (Some(head), Some(tip)) = (
             self.durable_head.load().map_err(|error| {
-                CheckpointError::Invalid(format!("durable head unreadable: {error}"))
+                CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
+                    format!("durable head unreadable: {error}"),
+                ))
             })?,
             applied_tip,
         ) {
@@ -235,8 +253,11 @@ impl CheckpointPublisher {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
             );
-            write_witness(&self.data_dir, &witness)
-                .map_err(|e| CheckpointError::Invalid(e.to_string()))?;
+            write_witness(&self.data_dir, &witness).map_err(|e| {
+                CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
+                    e.to_string(),
+                ))
+            })?;
         }
         // Remove the disconnect marker only after this checkpoint publishes the
         // matching UTXO set and applied tip.
@@ -260,14 +281,15 @@ impl CheckpointPublisher {
 #[cfg(test)]
 mod tests {
     use super::retire_full_revalidation_marker;
-    use crate::chainstate_journal::JOURNAL_DIR_NAME;
     use crate::checkpoint::CheckpointError;
+    use bitcoin_rs_storage::chainstate_journal::JOURNAL_DIR_NAME;
 
     #[test]
     fn full_revalidation_marker_clears_after_checkpoint_publication() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let journal_dir = dir.path().join(JOURNAL_DIR_NAME);
-        let marker = journal_dir.join(crate::chainstate_journal::FULL_REVALIDATION_MARKER);
+        let marker =
+            journal_dir.join(bitcoin_rs_storage::chainstate_journal::FULL_REVALIDATION_MARKER);
         std::fs::create_dir_all(&journal_dir)?;
         std::fs::write(&marker, b"force full validation\n")?;
 

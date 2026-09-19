@@ -23,12 +23,13 @@ pub(crate) enum ResumeSource {
     Journal,
 }
 
-pub(crate) const CHAINSTATE_JOURNAL_DIR: &str = crate::chainstate_journal::JOURNAL_DIR_NAME;
+pub(crate) const CHAINSTATE_JOURNAL_DIR: &str =
+    bitcoin_rs_storage::chainstate_journal::JOURNAL_DIR_NAME;
 
 pub(super) fn requires_full_revalidation(data_dir: &Path) -> bool {
     data_dir
         .join(CHAINSTATE_JOURNAL_DIR)
-        .join(crate::chainstate_journal::FULL_REVALIDATION_MARKER)
+        .join(bitcoin_rs_storage::chainstate_journal::FULL_REVALIDATION_MARKER)
         .is_file()
 }
 
@@ -50,13 +51,15 @@ fn reset_journal_dir(data_dir: &Path) -> Result<cap_std::fs::Dir> {
         Err(error) => return Err(error).with_context(|| format!("remove {}", path.display())),
     }
     std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
-    crate::checkpoint::fs::open_data_dir(&path).with_context(|| format!("open {}", path.display()))
+    bitcoin_rs_storage::checkpoint::fs::open_data_dir(&path)
+        .with_context(|| format!("open {}", path.display()))
 }
 
 pub(super) fn open_journal_dir(data_dir: &Path) -> Result<cap_std::fs::Dir> {
     let path = data_dir.join(CHAINSTATE_JOURNAL_DIR);
     std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
-    crate::checkpoint::fs::open_data_dir(&path).with_context(|| format!("open {}", path.display()))
+    bitcoin_rs_storage::checkpoint::fs::open_data_dir(&path)
+        .with_context(|| format!("open {}", path.display()))
 }
 
 fn restored_initial(

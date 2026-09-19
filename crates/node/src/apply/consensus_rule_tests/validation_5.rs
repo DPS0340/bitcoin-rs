@@ -154,30 +154,6 @@ fn disconnect_refuses_duplicate_last_transaction_merkle_mutation()
 }
 
 #[test]
-fn apply_block_rejects_same_block_coinbase_spend() -> Result<(), Box<dyn std::error::Error>> {
-    let genesis = Network::Regtest.genesis_block();
-    let handles = apply_handles_without_tx_index(Network::Regtest, empty_utxo());
-    let genesis_tip =
-        applied_header_tip(&handles, Hash256::from(genesis.block_hash()), &genesis, 0)?;
-    handles.applied_tip.store(Some(Arc::new(genesis_tip)));
-
-    let mut coinbase = coinbase_transaction(0x94);
-    coinbase.outputs[0].script_pubkey = Script::from_bytes(op_true_script());
-    let coinbase_outpoint = OutPoint::new(coinbase.txid(), 0);
-    let spend = spending_transaction_to_script(coinbase_outpoint, u32::MAX, op_true_script());
-    let block =
-        mined_block_with_prev_hash_and_transactions(genesis.block_hash(), vec![coinbase, spend])?;
-
-    let error = match handles.apply_block(&block).map(|outcome| outcome.tip) {
-        Ok(_) => panic!("same-block coinbase spend must fail the apply"),
-        Err(error) => error,
-    };
-
-    assert_bip_error(&error, "COINBASE_MATURITY");
-    Ok(())
-}
-
-#[test]
 fn apply_block_rejects_future_same_block_prevout_without_utxo_commit()
 -> Result<(), Box<dyn std::error::Error>> {
     let genesis = Network::Regtest.genesis_block();
@@ -230,10 +206,12 @@ fn bip16_exception_accepts_bare_p2sh_template_spend_that_normal_p2sh_rejects()
     };
 
     // At height 170060 the only height-gated flag is P2SH, so:
-    //   exception block -> compute_verify_flags drops P2SH
-    //   normal block    -> compute_verify_flags carries P2SH
-    let exc_flags = compute_verify_flags(Network::Mainnet, 170_060, exception_hash, softforks);
-    let normal_flags = compute_verify_flags(Network::Mainnet, 170_060, normal_hash, softforks);
+    //   exception block -> verify_flags drops P2SH
+    //   normal block    -> verify_flags carries P2SH
+    let exc_flags =
+        bitcoin_rs_consensus::verify_flags(Network::Mainnet, 170_060, exception_hash, softforks);
+    let normal_flags =
+        bitcoin_rs_consensus::verify_flags(Network::Mainnet, 170_060, normal_hash, softforks);
     assert!(!exc_flags.contains(bitcoin_rs_script::VerifyFlags::P2SH));
     assert!(normal_flags.contains(bitcoin_rs_script::VerifyFlags::P2SH));
 
@@ -330,4 +308,44 @@ fn body_mutation_errors_never_invalidate_header_subtrees() {
             WindowApplyDisposition::BodyMutated
         );
     }
+}
+
+#[test]
+fn apply_block_rejects_same_block_coinbase_spend() -> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block();
+    let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
+    let genesis_tip =
+        applied_header_tip(&handles, Hash256::from(genesis.block_hash()), &genesis, 0)?;
+    handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+    let mut coinbase = coinbase_transaction(0x94);
+    coinbase.outputs[0].script_pubkey = Script::from_bytes(op_true_script());
+    let coinbase_outpoint = OutPoint::new(coinbase.txid(), 0);
+    let spend = spending_transaction_to_script(coinbase_outpoint, u32::MAX, op_true_script());
+    let block =
+        mined_block_with_prev_hash_and_transactions(genesis.block_hash(), vec![coinbase, spend])?;
+
+    let error = match handles.apply_block(&block).map(|outcome| outcome.tip) {
+        Ok(_) => panic!("same-block coinbase spend must fail the apply"),
+        Err(error) => error,
+    };
+
+    assert_bip_error(&error, "COINBASE_MATURITY");
+    assert_eq!(
+        handles
+            .applied_tip
+            .load_full()
+            .as_deref()
+            .map(|tip| tip.hash),
+        Some(Hash256::from(genesis.block_hash())),
+        "a refused apply must not move the applied tip"
+    );
+    assert!(
+        handles
+            .undo_store
+            .load_undo(1, Hash256::from(block.block_hash()))?
+            .is_none(),
+        "a refused apply must not write an undo record"
+    );
+    Ok(())
 }

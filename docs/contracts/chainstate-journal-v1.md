@@ -3,7 +3,7 @@
 **Contract:** `chainstate-journal-writer/v1.0.0`
 
 This document is the normative contract for the writer tests in
-`crates/node/src/chainstate_journal/writer/tests/`. Test names and comments
+`crates/storage/src/chainstate_journal/writer/tests/`. Test names and comments
 refer to the requirement IDs below; implementation details are not part of the
 contract.
 

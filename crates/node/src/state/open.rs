@@ -55,14 +55,16 @@ impl NodeState {
         config.validate()?;
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
-        let checkpoint_data_dir = crate::checkpoint::fs::open_data_dir(&config.data_dir)
-            .with_context(|| format!("open data_dir {}", config.data_dir.display()))?;
-        crate::checkpoint::fs::ensure_current_schema(&checkpoint_data_dir).with_context(|| {
-            format!(
-                "validate CURRENT_SCHEMA for datadir {}",
-                config.data_dir.display()
-            )
-        })?;
+        let checkpoint_data_dir =
+            bitcoin_rs_storage::checkpoint::fs::open_data_dir(&config.data_dir)
+                .with_context(|| format!("open data_dir {}", config.data_dir.display()))?;
+        bitcoin_rs_storage::checkpoint::fs::ensure_current_schema(&checkpoint_data_dir)
+            .with_context(|| {
+                format!(
+                    "validate CURRENT_SCHEMA for datadir {}",
+                    config.data_dir.display()
+                )
+            })?;
         // Allocate the process epoch before anything else can consume one:
         // durable, strictly greater than every earlier run of this data dir.
         let epoch = allocate_process_epoch(&checkpoint_data_dir)?;
@@ -448,8 +450,10 @@ impl NodeState {
                 durable_head: Arc::clone(&apply_handles.durable_head),
                 block_body_store: Arc::clone(&block_body_store),
                 applied_tip: Arc::clone(&applied_tip),
-                checkpoint_data_dir: crate::checkpoint::fs::open_data_dir(&config.data_dir)
-                    .with_context(|| format!("open data_dir {}", config.data_dir.display()))?,
+                checkpoint_data_dir: bitcoin_rs_storage::checkpoint::fs::open_data_dir(
+                    &config.data_dir,
+                )
+                .with_context(|| format!("open data_dir {}", config.data_dir.display()))?,
                 network: config.network,
                 genesis_hash: config.network.genesis_block_hash(),
                 block_tree: Arc::clone(&block_tree),

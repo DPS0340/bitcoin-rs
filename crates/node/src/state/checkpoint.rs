@@ -40,7 +40,7 @@ impl NodeState {
             durable_head: Arc::clone(&self.apply_handles.durable_head),
             block_body_store: Arc::clone(&self.block_body_store),
             applied_tip: Arc::clone(&self.applied_tip),
-            checkpoint_data_dir: crate::checkpoint::fs::open_data_dir(&self.data_dir)
+            checkpoint_data_dir: bitcoin_rs_storage::checkpoint::fs::open_data_dir(&self.data_dir)
                 .map_err(crate::checkpoint::CheckpointError::Io)?,
             network: self.config.network,
             genesis_hash: self.config.network.genesis_block_hash(),

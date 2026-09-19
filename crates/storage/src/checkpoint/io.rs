@@ -3,13 +3,13 @@
 use super::CURRENT_FILE;
 use super::CheckpointError;
 use super::CheckpointFailpoint;
-use crate::checkpoint::fs::CheckpointRoot;
-use crate::checkpoint::fs::sync_dir;
+use super::fs::CheckpointRoot;
+use super::fs::sync_dir;
 use cap_std::fs::Dir;
 use cap_std::fs::File;
 use std::io::Write;
 
-pub(super) fn injected_io(
+pub(crate) fn injected_io(
     configured: Option<CheckpointFailpoint>,
     boundary: CheckpointFailpoint,
 ) -> std::io::Result<()> {
@@ -19,7 +19,7 @@ pub(super) fn injected_io(
     Ok(())
 }
 
-pub(super) fn write_file(
+pub(crate) fn write_file(
     file: &mut File,
     bytes: &[u8],
     configured: Option<CheckpointFailpoint>,
@@ -30,7 +30,7 @@ pub(super) fn write_file(
     Ok(())
 }
 
-pub(super) fn sync_file(
+pub(crate) fn sync_file(
     file: &File,
     configured: Option<CheckpointFailpoint>,
     boundary: CheckpointFailpoint,
@@ -40,7 +40,7 @@ pub(super) fn sync_file(
     Ok(())
 }
 
-pub(super) fn sync_checkpoint_dir(
+pub(crate) fn sync_checkpoint_dir(
     dir: &Dir,
     configured: Option<CheckpointFailpoint>,
     boundary: CheckpointFailpoint,
@@ -50,7 +50,7 @@ pub(super) fn sync_checkpoint_dir(
     Ok(())
 }
 
-pub(super) fn sync_root(
+pub(crate) fn sync_root(
     root: &CheckpointRoot,
     configured: Option<CheckpointFailpoint>,
     boundary: CheckpointFailpoint,
@@ -66,7 +66,7 @@ pub(super) fn sync_root(
     target_os = "android",
     target_os = "redox"
 ))]
-pub(super) fn rename_generation(
+pub(crate) fn rename_generation(
     root: &CheckpointRoot,
     from: &str,
     to: &str,
@@ -78,7 +78,7 @@ pub(super) fn rename_generation(
     Ok(())
 }
 
-pub(super) fn rename_current(
+pub(crate) fn rename_current(
     root: &CheckpointRoot,
     from: &str,
     configured: Option<CheckpointFailpoint>,
