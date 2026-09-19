@@ -125,7 +125,7 @@ fn disconnected_outbound_channel_does_not_mark_blocks_pending()
     sync.tick();
 
     assert_applied_genesis(&applied_tip, &block_tree)?;
-    assert_eq!(sync.download_window.lock().pending_len(), 0);
+    assert_eq!(sync.body_sync.lock().window.pending_len(), 0);
     Ok(())
 }
 
@@ -172,7 +172,7 @@ fn tick_fanout_distributes_window_front_first_across_eligible_peers()
         assert!(rx.try_recv().is_err(), "no peer may exceed the fan-out cap");
     }
     assert_eq!(
-        sync.download_window.lock().pending_len(),
+        sync.body_sync.lock().window.pending_len(),
         super::super::PENDING_BUDGET,
         "fan-out must fill the deep window"
     );
@@ -188,7 +188,7 @@ fn wedged_window_expires_stalled_front_and_rerequests_through_count_clamp()
     // Tick 2: wedge — staged + pending at the count budget, scan limit
     // zero, the stalled front still pending.
     sync.tick();
-    assert_eq!(sync.download_window.lock().pending_len(), 2);
+    assert_eq!(sync.body_sync.lock().window.pending_len(), 2);
 
     // Past the pending timeout the wedge must process its own deadlines:
     // the expired front credits the scan-limit count headroom, the
@@ -214,12 +214,13 @@ fn wedged_window_expires_stalled_front_and_rerequests_through_count_clamp()
         "the stalled front stripe must be re-requested from a healthy peer"
     );
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         14,
         "staged progress must survive the wedge"
     );
     {
-        let window = sync.download_window.lock();
+        let body_sync = sync.body_sync.lock();
+        let window = &body_sync.window;
         assert_eq!(window.pending_len(), 2);
         for front in &expected[..2] {
             assert!(window.contains_pending(&Hash256::from_le_bytes(front.as_bytes())));
@@ -257,12 +258,13 @@ fn common_prefix_winner_takes_over_deep_window() -> Result<(), Box<dyn std::erro
     sync.tick();
 
     assert_eq!(
-        sync.download_window.lock().preferred_peer(),
+        sync.body_sync.lock().window.preferred_peer(),
         Some(alternate)
     );
     assert!(
-        sync.download_window
+        sync.body_sync
             .lock()
+            .window
             .peer_in_staller_cooldown(owner, Instant::now())
     );
     assert_eq!(
@@ -273,12 +275,13 @@ fn common_prefix_winner_takes_over_deep_window() -> Result<(), Box<dyn std::erro
             .collect::<Vec<_>>()
     );
     assert!(peers.is_connected(owner));
-    sync.download_window
+    sync.body_sync
         .lock()
+        .window
         .mark_peer_unresponsive(alternate, Instant::now());
     sync.tick();
     assert_eq!(
-        sync.download_window.lock().preferred_peer(),
+        sync.body_sync.lock().window.preferred_peer(),
         Some(alternate),
         "a temporary soft block skips the winner without erasing its election"
     );
@@ -294,8 +297,9 @@ fn stall_eviction_does_not_disconnect_replacement_connection()
     };
     let (sync, peers, _expected, _rxs, _blocks_tx) = staged_count_wedge(budget)?;
     let staller = test_addr(9320, 0)?;
-    sync.download_window
+    sync.body_sync
         .lock()
+        .window
         .seed_front_cadence_for_test(50, Instant::now());
 
     sync.tick();
@@ -366,8 +370,9 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout()
     // is seeded directly instead of via two real front deliveries (the
     // real sampling path is pinned by the window tests). 50ms keeps the
     // decay floor at the injected 100ms initial threshold.
-    sync.download_window
+    sync.body_sync
         .lock()
+        .window
         .seed_front_cadence_for_test(50, Instant::now());
 
     sync.tick();
@@ -384,7 +389,8 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout()
     blocks_tx.send(crate::InboundBlock::from_decoded(blocks[1].clone()))?;
     sync.tick();
     {
-        let window = sync.download_window.lock();
+        let body_sync = sync.body_sync.lock();
+        let window = &body_sync.window;
         assert!(!window.has_request_capacity());
         assert_eq!(window.stalling_peer().map(|(addr, _)| addr), Some(staller));
     }
@@ -398,7 +404,7 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout()
     sync.tick();
     assert!(!peers.is_connected(staller));
     assert_eq!(
-        sync.block_stager.lock().received_len(),
+        sync.body_sync.lock().stager.received_len(),
         1,
         "recovery must not discard staged progress (prune-free)"
     );
