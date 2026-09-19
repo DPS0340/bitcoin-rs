@@ -64,8 +64,9 @@ impl BlockSync {
                     let mut blamed_peer = None;
                     if let Some(source) = source {
                         if self.peer_table.disconnect_source(source) {
-                            self.download_window
+                            self.body_sync
                                 .lock()
+                                .window
                                 .mark_peer_unresponsive(source.addr, Instant::now());
                             blamed_peer = Some(source.addr);
                         }
@@ -172,7 +173,6 @@ impl BlockSync {
         };
         let target_height = u32::try_from(target_height).unwrap_or(0);
         let now = Instant::now();
-        let _window = self.download_window.lock();
         if self.has_pending_getheaders(sync_peer_addr, locator_tip_hash, target_height, now) {
             tracing::trace!(
                 peer_addr = %sync_peer_addr,
