@@ -531,6 +531,37 @@ mod tests {
         assert_eq!(block.txs, native.txs);
     }
 
+    /// Two missing transactions become one ordered `getblocktxn`
+    /// request for both absolute indexes, and the `blocktxn`
+    /// completes the block.
+    #[test]
+    fn missing_txs_request_ordered_getblocktxn_and_complete_on_blocktxn() {
+        let (native, cmpct) = sample_cmpct(vec![test_tx(1), test_tx(2), test_tx(3)], 2, 0x9a);
+        let hints = SetHints {
+            txs: vec![native.txs[0].clone()],
+        };
+        let mut reconstruction = Reconstruction::new();
+
+        let outcome =
+            reconstruction.receive_cmpctblock(&cmpct, COMPACT_BLOCK_VERSION, &hints, now());
+        let Outcome::RequestMissing(request) = outcome else {
+            panic!("expected getblocktxn request, got {outcome:?}");
+        };
+        assert_eq!(request.txs_request.indexes, vec![1, 2]);
+
+        let txn = BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: request.txs_request.block_hash,
+                transactions: vec![registry_tx(&test_tx(2)), registry_tx(&test_tx(3))],
+            },
+        };
+        let outcome = reconstruction.receive_blocktxn(&txn, now());
+        let Outcome::Complete(block) = outcome else {
+            panic!("expected complete reconstruction, got {outcome:?}");
+        };
+        assert_eq!(block.txs, native.txs);
+    }
+
     /// A `blocktxn` whose size does not match the outstanding request falls
     /// back to the full block instead of guessing. A late retry for the same
     /// block after fallback is ignored.

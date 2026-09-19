@@ -1,18 +1,26 @@
 # Recovery contract
 
 How the node recovers an authoritative chainstate after a crash, a lost
-write, a reorganization, or an incompatible datadir. `chainstate` is the
-single durable authority. Every other persisted component is derived and
-reconciles to it.
+write, a reorganization, or an incompatible datadir. The chainstate is
+the single durable authority. It is not yet extracted: the
+`crates/chainstate` crate has not landed, so the authority today is the
+`crates/node/src/apply` commit protocol over the storage durable head.
+Every other persisted component is derived and reconciles to it.
 
 Owners:
 - Authoritative durable root and ordered commit protocol:
-  `crates/chainstate/src/transition.rs`
-- Recovery and schema admission: `crates/chainstate/src/recovery.rs`
-- Persistent coin transition boundary: `crates/utxo/src/set/persistent.rs`
-- Crash and lost-write fault tests: `crates/node/tests/overhaul_crash_matrix.rs`
-- Reorg and disconnect: `crates/node/tests/overhaul_streaming_reorg.rs`
-- Checkpoint independence: `crates/node/tests/overhaul_checkpoint_independence.rs`
+  `crates/node/src/apply/` (`connect.rs`, `disconnect.rs`)
+- Recovery and schema admission: `crates/node/src/state/` (`open.rs`;
+  tests in `state/tests/`)
+- Persistent coin transition boundary: `crates/utxo/src/set.rs`
+  (transition types); durable form in
+  `crates/storage/src/durable_head.rs`
+- Crash and lost-write fault tests:
+  `crates/node/tests/crash_recovery.rs`
+- Reorg and disconnect: `crates/node/src/reorg/` and
+  `crates/node/src/disconnect.rs`
+- Checkpoint independence: retired with the `overhaul_*` purge; no
+  surviving equivalent (re-add with the checkpoint slice)
 - Index worker recovery: `crates/index/src/runtime/recovery_tests.rs`
 - Policy: `docs/policies/db-migration.md`
 
@@ -73,8 +81,10 @@ strictly monotonic on disconnect as well as on connect: a reorg lowers
 
 ### `RCV-01`: Authority and identity
 
-- `crates/chainstate` is the only authoritative position. Block bodies,
-  `txindex`, `scriptindex`, and undo or lookup metadata are derived.
+- The chainstate is the only authoritative position. Until the
+  `crates/chainstate` extraction lands, that position is held by the
+  `crates/node/src/apply` commit protocol. Block bodies, `txindex`,
+  `scriptindex`, and undo or lookup metadata are derived.
 - Every derived position is a `(height, block_hash)` pair, not height alone.
 - Off the active chain: stale `(height, block_hash)` pairs are rewound to the
   common ancestor, not to a height.

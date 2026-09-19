@@ -453,8 +453,8 @@ fn parse_content_length(headers: &[(String, String)], status: u16) -> Result<usi
         .collect();
     if status == 204 {
         // Accept both capture forms: RFC 9110 §8.6 omission and the
-        // libevent-era Core `Content-Length: 0`. Our own server's
-        // omission is pinned by the negative probe.
+        // libevent-era Core `Content-Length: 0`. The omission form is
+        // pinned by `decoder_refusal_tests::content_length_table`.
         return match declared.as_slice() {
             [] => Ok(0),
             [single] if *single == "0" => Ok(0),
@@ -505,5 +505,77 @@ pub(crate) fn wait_for_server(address: SocketAddr) -> Result<(), HttpError> {
             }
             Err(error) => return Err(HttpError::Io(error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod decoder_refusal_tests {
+    use std::net::TcpListener;
+
+    use super::{Connection, HttpError, parse_content_length, parse_status_line};
+
+    /// The framing strictness the deleted `negative_probes` module used to
+    /// pin: exact version, three ASCII digits, one reason separator.
+    #[test]
+    fn status_line_table() {
+        let (_, status, reason) = parse_status_line("HTTP/1.1 200 OK").unwrap();
+        assert_eq!((status, reason.as_str()), (200, "OK"));
+        for bad in [
+            "HTTP/1.0 200 OK",
+            "HTTP/1.1200 OK",
+            "HTTP/1.1 20 OK",
+            "HTTP/1.1 20X OK",
+            "HTTP/1.1 200",
+        ] {
+            assert!(parse_status_line(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// 204 takes absent-or-zero length; anything else needs exactly one
+    /// ASCII-decimal declaration under the body ceiling.
+    #[test]
+    fn content_length_table() {
+        let headers = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(parse_content_length(&[], 204).unwrap(), 0);
+        assert_eq!(
+            parse_content_length(&headers(&[("content-length", "0")]), 204).unwrap(),
+            0
+        );
+        assert!(parse_content_length(&headers(&[("content-length", "5")]), 204).is_err());
+        assert_eq!(
+            parse_content_length(&headers(&[("content-length", "12")]), 200).unwrap(),
+            12
+        );
+        for bad in [
+            &[][..],
+            &[("content-length", "")][..],
+            &[("content-length", "1a")][..],
+        ] {
+            assert!(parse_content_length(&headers(bad), 200).is_err());
+        }
+        assert!(
+            parse_content_length(
+                &headers(&[("content-length", "12"), ("content-length", "12")]),
+                200
+            )
+            .is_err()
+        );
+        assert!(parse_content_length(&headers(&[("content-length", "16777217")]), 200).is_err());
+    }
+
+    /// A response with no outstanding request is refused before any read.
+    #[test]
+    fn response_without_outstanding_request_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || listener.accept().ok());
+        let mut connection = Connection::connect(address).unwrap();
+        let error = connection.read_response().unwrap_err();
+        assert!(matches!(error, HttpError::Framing(_)));
     }
 }
