@@ -266,9 +266,11 @@ impl KernelBlock {
     }
 
     /// Transaction IDs derived in the single parse pass.
-    #[must_use]
-    pub fn txids(&self) -> &[bitcoin_rs_primitives::Txid] {
-        self.facts.txids()
+    ///
+    /// Shares the kernel build's `Result<Vec<Txid>>` shape so callers do not
+    /// fork on which backend produced the block view.
+    pub fn txids(&self) -> Result<Vec<bitcoin_rs_primitives::Txid>, crate::ConsensusError> {
+        Ok(self.facts.txids().to_vec())
     }
 
     /// Transaction count as parsed.
