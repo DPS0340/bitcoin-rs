@@ -13,26 +13,6 @@ use bitcoin_rs_mining::MiningInfo;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Header;
 
-impl MiningCoordinator {
-    pub(super) fn mining_info_snapshot(&self) -> Result<MiningInfo, MiningControlError> {
-        let tip = self.applied_tip.load_full();
-        let network_hashes_per_second = {
-            let tree = self.block_tree.read();
-            tip.as_ref().map_or(0.0, |tip| {
-                bitcoin_rs_mining::estimate_network_hashps(
-                    &tree,
-                    Some(tip.tip_id),
-                    120,
-                    self.network,
-                )
-            })
-        };
-        let warnings = Vec::new();
-        self.service
-            .mining_info(network_hashes_per_second, warnings, tip.as_deref())
-    }
-}
-
 impl MiningControl for MiningCoordinator {
     fn get_block_template(
         &self,
@@ -50,7 +30,21 @@ impl MiningControl for MiningCoordinator {
     }
 
     fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
-        self.mining_info_snapshot()
+        let tip = self.applied_tip.load_full();
+        let network_hashes_per_second = {
+            let tree = self.block_tree.read();
+            tip.as_ref().map_or(0.0, |tip| {
+                bitcoin_rs_mining::estimate_network_hashps(
+                    &tree,
+                    Some(tip.tip_id),
+                    120,
+                    self.network,
+                )
+            })
+        };
+        let warnings = Vec::new();
+        self.service
+            .mining_info(network_hashes_per_second, warnings, tip.as_deref())
     }
 
     fn network_hash_ps(&self, lookup: i64, height: i64) -> Result<f64, MiningControlError> {
