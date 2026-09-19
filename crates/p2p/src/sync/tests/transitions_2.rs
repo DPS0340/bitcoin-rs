@@ -103,7 +103,7 @@ fn retargeting_pending_requests_drops_losing_branch_hashes()
         "retargeted requests must not retain hashes from the losing branch"
     );
     assert_eq!(
-        sync.download_window.lock().pending_len(),
+        sync.body_sync.lock().window.pending_len(),
         winning_hashes.len(),
         "retargeting must release losing-branch pending capacity"
     );

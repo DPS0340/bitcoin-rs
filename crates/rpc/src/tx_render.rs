@@ -14,13 +14,13 @@ use bitcoin_rs_primitives::{BlockHash, Network, OutPoint, Tx, TxIn, TxOut, Txid,
 use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
 use sonic_rs::{Value, json};
 
-use crate::script_util::{
+use bitcoin_rs_script::{
     is_multisig, is_op_return, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
 };
 
 /// Optional confirmed-chain fields projected beside a transaction object.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransactionChainContext {
+pub(crate) struct TransactionChainContext {
     /// Confirming block hash.
     pub block_hash: BlockHash,
     /// Confirmations on the applied chain, or `0` when the named block is inactive.
@@ -36,7 +36,7 @@ pub struct TransactionChainContext {
 
 /// Per-input prevout projected by Core verbosity 2.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TxPrevout {
+pub(crate) struct TxPrevout {
     /// Whether the prevout was created by a coinbase.
     pub generated: bool,
     /// Confirming height of the prevout.
@@ -52,7 +52,7 @@ pub struct TxPrevout {
 /// Parsed with sonic's raw-number mode so the decimal spelling survives
 /// serialization instead of being reduced through binary floating point.
 #[must_use]
-pub fn btc_amount_json(satoshis: u64) -> Value {
+pub(crate) fn btc_amount_json(satoshis: u64) -> Value {
     let whole = satoshis / 100_000_000;
     let fractional = satoshis % 100_000_000;
     let text = format!("{whole}.{fractional:08}");
@@ -65,7 +65,7 @@ pub fn btc_amount_json(satoshis: u64) -> Value {
 
 /// Render one transaction in Bitcoin Core's verbose object shape.
 #[must_use]
-pub fn transaction_json(
+pub(crate) fn transaction_json(
     tx: &Tx,
     network: Network,
     chain: Option<TransactionChainContext>,
@@ -75,7 +75,7 @@ pub fn transaction_json(
 
 /// Render one transaction, optionally including verbosity-2 `fee` and `prevout`.
 #[must_use]
-pub fn transaction_json_with_prevouts(
+pub(crate) fn transaction_json_with_prevouts(
     tx: &Tx,
     network: Network,
     chain: Option<TransactionChainContext>,
@@ -146,7 +146,7 @@ pub fn transaction_json_with_prevouts(
 
 /// Render a `scriptPubKey` object in Bitcoin Core's verbose shape.
 #[must_use]
-pub fn script_pub_key_json(script: &[u8], network: Network) -> Value {
+pub(crate) fn script_pub_key_json(script: &[u8], network: Network) -> Value {
     let script_type = classify_script(script);
     let mut value = json!({
         "asm": script_asm(script),
@@ -218,7 +218,7 @@ fn output_json(output: &TxOut, n: usize, network: Network) -> Value {
 
 /// A one-input, null-prevout transaction (Core's `IsCoinBase`).
 #[must_use]
-pub fn is_coinbase(tx: &Tx) -> bool {
+pub(crate) fn is_coinbase(tx: &Tx) -> bool {
     // Core's `COutPoint::IsNull`: zero txid and `u32::MAX` vout. `OutPoint`'s
     // derived `Default` has vout `0`, which is not the null outpoint.
     tx.inputs.len() == 1 && tx.inputs[0].previous_output == OutPoint::new(Txid::default(), u32::MAX)

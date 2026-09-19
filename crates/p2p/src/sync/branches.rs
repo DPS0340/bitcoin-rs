@@ -29,7 +29,7 @@ impl BlockSync {
         };
         let outcome = self.chain.switch_to_branch(
             target,
-            &mut |hash| self.block_stager.lock().staged_body(hash),
+            &mut |hash| self.body_sync.lock().stager.staged_body(hash),
             &mut |hash| self.retire_applied_reorg_body(hash),
         );
         match outcome {
@@ -71,22 +71,18 @@ impl BlockSync {
                 if disposition == WindowCommitDisposition::BodyMutated {
                     // Only the delivered body is bad. Keep the header branch
                     // and its descendants, but free this slot for a new body.
-                    self.block_stager.lock().retire_applied(&hash);
-                    self.download_window.lock().drop_for_retry(&hash);
+                    let mut body_sync = self.body_sync.lock();
+                    body_sync.stager.retire_applied(&hash);
+                    body_sync.window.drop_for_retry(&hash);
                 }
                 // Invalid descendants cannot occupy bounded download state or
                 // they can prevent the newly selected valid branch from refilling.
                 if !invalidated.is_empty() {
                     {
-                        let mut stager = self.block_stager.lock();
+                        let mut body_sync = self.body_sync.lock();
                         for invalid_hash in &invalidated {
-                            stager.retire_applied(invalid_hash);
-                        }
-                    }
-                    {
-                        let mut window = self.download_window.lock();
-                        for invalid_hash in &invalidated {
-                            window.drop_for_retry(invalid_hash);
+                            body_sync.stager.retire_applied(invalid_hash);
+                            body_sync.window.drop_for_retry(invalid_hash);
                         }
                     }
                 }
@@ -114,8 +110,9 @@ impl BlockSync {
 
     #[doc(hidden)]
     pub fn retire_applied_reorg_body(&self, hash: Hash256) {
-        self.download_window.lock().mark_received_applied(&hash);
-        self.block_stager.lock().retire_applied(&hash);
+        let mut body_sync = self.body_sync.lock();
+        body_sync.window.mark_received_applied(&hash);
+        body_sync.stager.retire_applied(&hash);
     }
 
     /// Returns the header tip when the applied chain is not on its branch.

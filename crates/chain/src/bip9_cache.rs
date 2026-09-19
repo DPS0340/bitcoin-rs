@@ -32,7 +32,7 @@ pub(crate) struct Bip9Cache {
 /// the chain crate does not interpret it. The `since_height` is the activation
 /// (or start-of-current-period) height for diagnostic display.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CachedState {
+pub(crate) struct CachedState {
     /// Caller-defined state discriminant.
     pub tag: u8,
     /// Block height at which the state was determined.

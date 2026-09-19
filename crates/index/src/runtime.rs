@@ -65,13 +65,21 @@ use std::{
 };
 
 mod capability;
+
 mod catch_up;
+
 mod cursor;
+
 mod lifecycle;
+
 mod namespace;
+
 mod query;
+
 mod reconciliation;
+
 mod rollback;
+
 mod startup;
 pub use startup::open_derived_index_store_on_worker;
 
@@ -90,6 +98,7 @@ pub struct DerivedIndexRuntime {
     failure_message: RwLock<Option<CompactString>>,
     phase: arc_swap::ArcSwap<ReconcilePhase>,
 }
+
 impl DerivedIndexRuntime {
     /// Creates shared runtime state.
     #[must_use]
@@ -212,9 +221,13 @@ impl ScriptIndexQuery for DerivedIndexQueryAdapter {
 ///
 /// These are query-side safety limits, not the writer batch limits.
 const QUERY_SCAN_ROW_LIMIT: usize = 1_000_000;
+
 const QUERY_SCAN_BYTE_LIMIT: usize = 64 << 20;
+
 const QUERY_SCAN_COUNT_LIMIT: usize = 4_096;
+
 const QUERY_BODY_READ_LIMIT: usize = 4_096;
+
 const MAX_SERIALIZED_BLOCK_BYTES: usize = 4_000_000;
 
 /// Writer-side batch limits.
@@ -245,19 +258,24 @@ pub const REDB_BATCH_LIMITS: PreparedBatchLimits = PreparedBatchLimits {
 pub const DEFAULT_ROLLBACK_REBUILD_CUTOVER: u32 = 100_000;
 
 const IDENTITY_CHUNK_BLOCKS: u32 = 65_536;
+
 const POSITION_PREFETCH_BLOCKS: usize = 65_536;
+
 /// In-memory parallel-prepare cap owned by this worker. 256 matches the IBD
 /// download window so a filled staging set can prepare in one pass when bodies
 /// are small; catch-up also prepares already-stored bodies, so this is not
 /// `RECEIVED_BLOCK_BUDGET`. The byte budget below is independent of P2P staging.
 const PREPARE_CHUNK_BLOCKS: usize = 256;
+
 /// Serialized-body budget for one parallel prepare step. Loading stops once
 /// the total reaches this bound; the body that reaches it is kept, so a step
 /// holds at most this budget plus one body. Stops a 1 MiB-class window from
 /// holding 256 bodies in RAM while still packing early-chain blocks up to the
 /// count cap.
 const PREPARE_CHUNK_BYTES: usize = 32 << 20;
+
 const REVISION_QUIET_PERIOD: Duration = Duration::from_millis(100);
+
 const FORWARD_BATCH_DELAY: Duration = Duration::from_millis(100);
 
 /// Upper bound on waiting for backend recovery. Timeout isolates the index
@@ -296,7 +314,7 @@ impl Generation {
 
     /// Reports whether this generation was revoked.
     #[must_use]
-    pub fn is_revoked(&self) -> bool {
+    pub(crate) fn is_revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
     }
 }

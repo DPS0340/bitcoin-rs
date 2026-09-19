@@ -7,20 +7,18 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-/// Rayon-backed Schnorr verification helpers.
-pub mod batch;
 /// Transaction signature checker: ECDSA, Schnorr, locktime, and sequence verification.
 pub mod checker;
 /// The opcode evaluator: the bounded stack machine behind the interpreter.
 pub mod eval;
 /// Script verification wrapper.
-pub mod interpreter;
+mod interpreter;
 /// Native script parsing, classification, and building helpers.
 pub mod script;
 /// Signature operation counters.
 pub mod sigops;
 /// Bounded script stack with Core's 1000-item maximum depth.
-pub mod stack;
+mod stack;
 /// Taproot verification helpers.
 pub mod taproot;
 

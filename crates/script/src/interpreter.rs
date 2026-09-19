@@ -428,9 +428,6 @@ pub enum ScriptError {
 pub struct Interpreter;
 
 impl Interpreter {
-    /// Number of taproot inputs at which block validation uses the batch Schnorr path.
-    pub const BATCH_SCHNORR_THRESHOLD: usize = 16;
-
     /// Executes a script spend through the enabled script backend.
     ///
     /// When `script_sig` and `witness` already match the bytes stored on

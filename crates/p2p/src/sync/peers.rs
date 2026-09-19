@@ -92,12 +92,12 @@ impl BlockSync {
     /// `docs/solutions/architecture-patterns/p2p-owns-peer-lifecycle.md`.
     pub fn on_peer_ready(&self, source: crate::PeerSource) {
         // Window before table, matching `tick` / `send_getdata_for_pending_blocks`.
-        let mut window = self.download_window.lock();
+        let mut body_sync = self.body_sync.lock();
         if !self.peer_table.is_current(source) {
             return;
         }
-        window.forget_peer(source.addr);
-        drop(window);
+        body_sync.window.forget_peer(source.addr);
+        drop(body_sync);
         let mut pending = self.pending_getheaders.lock();
         if pending.is_some_and(|request| request.peer_addr == source.addr)
             && self.peer_table.is_current(source)
@@ -108,7 +108,8 @@ impl BlockSync {
 
     pub(super) fn reconcile_peer_sessions(&self) {
         let live = self.peer_table.live_connections();
-        let mut window = self.download_window.lock();
+        let mut body_sync = self.body_sync.lock();
+        let window = &mut body_sync.window;
         let mut known = self.known_sessions.lock();
         for (addr, id) in &live {
             if known.insert(*addr, *id).is_some_and(|prev| prev != *id) {
@@ -169,13 +170,14 @@ impl BlockSync {
         }
         drop(tree);
         let (request_peer_limit, fanout_active, cold_preferred) = {
-            let mut window = self.download_window.lock();
+            let mut body_sync = self.body_sync.lock();
+            let window = &mut body_sync.window;
             for candidate in &mut candidates {
                 candidate.soft_blocked = window.peer_has_expired_pending(candidate.peer.addr, now)
                     || window.peer_in_staller_cooldown(candidate.peer.addr, now);
                 candidate.fanout_eligible = candidate.fanout_eligible && !candidate.soft_blocked;
             }
-            let cold_preferred = configure_request_mode(&mut window, &candidates, now);
+            let cold_preferred = configure_request_mode(window, &candidates, now);
             (
                 window.request_peer_scan_limit(now),
                 window.fanout_active(),
@@ -267,7 +269,7 @@ impl BlockSync {
         // the window lock, and tree->window is the codebase's lock order.
         let frontier_hash = self.next_expected_block_hash();
         let apply_side_busy =
-            frontier_hash.is_some_and(|hash| self.block_stager.lock().contains(&hash));
+            frontier_hash.is_some_and(|hash| self.body_sync.lock().stager.contains(&hash));
         let mut cold_hedge = None;
         let mut apply_side_escalation = None;
         let mut fired = false;
@@ -311,8 +313,9 @@ impl BlockSync {
             && let Some(alternate) =
                 self.send_cold_front_hedge(owner, front_hash, next_apply_height, now)
         {
-            self.download_window
+            self.body_sync
                 .lock()
+                .window
                 .confirm_cold_front_hedge(owner, alternate, front_hash);
         }
         false
@@ -349,8 +352,9 @@ impl BlockSync {
             return;
         }
         let evicted = self
-            .block_stager
+            .body_sync
             .lock()
+            .stager
             .drain_expected_prefix(&[frontier_hash]);
         if evicted.is_empty() {
             // Raced: the body was applied or pruned between the window
@@ -364,11 +368,13 @@ impl BlockSync {
                 .map(|node| node.height)
         };
         {
-            let mut window = self.download_window.lock();
+            let mut body_sync = self.body_sync.lock();
             if let Some(height) = height {
-                window.update_received_height(&frontier_hash, height);
+                body_sync
+                    .window
+                    .update_received_height(&frontier_hash, height);
             }
-            window.drop_received_for_retry(&frontier_hash);
+            body_sync.window.drop_received_for_retry(&frontier_hash);
         }
         metrics::counter!("node.sync.apply_side_stall_escalations").increment(1);
         tracing::warn!(
@@ -382,7 +388,7 @@ impl BlockSync {
     pub(super) fn disconnect_timed_out_peer(&self, now: Instant) -> bool {
         let apply_side_busy = self
             .next_expected_block_hash()
-            .is_some_and(|hash| self.block_stager.lock().contains(&hash));
+            .is_some_and(|hash| self.body_sync.lock().stager.contains(&hash));
         let Some(peer_addr) = self.select_and_evict_window_peer(|window| {
             window.observe_pending_timeout(apply_side_busy, now)
         }) else {
@@ -403,8 +409,8 @@ impl BlockSync {
         select: impl FnOnce(&mut DownloadWindow) -> Option<SocketAddr>,
     ) -> Option<SocketAddr> {
         let peer_addr = {
-            let mut window = self.download_window.lock();
-            select(&mut window)?
+            let mut body_sync = self.body_sync.lock();
+            select(&mut body_sync.window)?
         };
         let connection_id = self.known_sessions.lock().get(&peer_addr).copied()?;
         if !self

@@ -16,13 +16,13 @@ pub mod auth;
 pub mod capabilities;
 /// Bitcoin Core wire-contract boundary: versioned response types and the
 /// sanctioned native<->bitcoin conversions backing them.
-pub mod compat;
+mod compat;
 /// The Bitcoin Core compatibility manifest, and the checks that keep it true.
 pub mod compat_manifest;
 /// Dependency-injected RPC state.
 pub mod context;
 /// JSON-RPC error mapping.
-pub mod error;
+mod error;
 /// Esplora-compatible HTTP endpoints backed by node-owned indexes.
 pub mod esplora;
 /// Method dispatch and Core-compatible handlers.
@@ -32,15 +32,13 @@ pub mod manifest;
 /// Unified registry: one row owns compat metadata plus dispatch arm.
 pub(crate) mod registry;
 /// Semantic Core projections without transport policy.
-pub mod render;
+mod render;
 /// Bitcoin Core-compatible REST endpoints.
 pub mod rest;
-/// Byte-level script helpers mirrored from `bitcoin-rs-script` (see module docs).
-pub mod script_util;
 /// Synchronous HTTP/1.1 JSON-RPC server.
-pub mod server;
+mod server;
 /// Transaction, block, and header rendering.
-pub mod tx_render;
+mod tx_render;
 /// Bitcoin Core-compatible ZMQ notification protocol and transport.
 pub mod zmq;
 

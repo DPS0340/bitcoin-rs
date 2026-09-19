@@ -7,8 +7,6 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{UtxoKey, record::OwnedUtxoOut, shard::Shard};
-mod persistent;
-pub use persistent::{CoinDurability, CoinLedger, PersistentUtxoError, PersistentUtxoSet};
 
 /// Below this many combined add+remove operations, a multi-shard no-listener
 /// commit runs serially: a `rayon` scope plus per-shard task dispatch costs
@@ -769,7 +767,7 @@ impl UtxoSetView<'_> {
     #[must_use]
     pub fn get_entry(&self, op: &OutPoint) -> Option<crate::shard::LiveOutput> {
         let key = UtxoKey::from_txid(&op.txid);
-        self.set.shards[usize::from(key.shard())].get_entry(&key, &op.txid.into(), op.vout)
+        self.set.shards[usize::from(key.shard())].get_entry(key, &op.txid.into(), op.vout)
     }
 
     pub(crate) const fn shard(&self, idx: usize) -> &Shard {
@@ -849,7 +847,7 @@ impl UtxoSet {
     #[must_use]
     pub fn get(&self, op: &OutPoint) -> Option<TxOut> {
         let key = UtxoKey::from_txid(&op.txid);
-        self.shards[usize::from(key.shard())].get(&key, &op.txid.into(), op.vout)
+        self.shards[usize::from(key.shard())].get(key, &op.txid.into(), op.vout)
     }
 
     /// Returns the full live-output entry (txout + coinbase + height)
@@ -857,14 +855,14 @@ impl UtxoSet {
     #[must_use]
     pub fn get_entry(&self, op: &OutPoint) -> Option<crate::shard::LiveOutput> {
         let key = UtxoKey::from_txid(&op.txid);
-        self.shards[usize::from(key.shard())].get_entry(&key, &op.txid.into(), op.vout)
+        self.shards[usize::from(key.shard())].get_entry(key, &op.txid.into(), op.vout)
     }
 
     /// Returns live-output metadata without materializing script bytes.
     #[must_use]
     pub fn get_meta(&self, op: &OutPoint) -> Option<crate::shard::LiveOutputMeta> {
         let key = UtxoKey::from_txid(&op.txid);
-        self.shards[usize::from(key.shard())].get_meta(&key, &op.txid.into(), op.vout)
+        self.shards[usize::from(key.shard())].get_meta(key, &op.txid.into(), op.vout)
     }
 
     /// Scans a stable whole-set view for exact scriptPubKey matches.
@@ -888,7 +886,7 @@ impl UtxoSet {
     #[must_use]
     pub fn has_live_outputs_for_txid(&self, txid: &Hash256) -> bool {
         let key = UtxoKey::from_txid(&Txid::from(*txid));
-        self.shards[usize::from(key.shard())].has_live_outputs_for_txid(&key, txid)
+        self.shards[usize::from(key.shard())].has_live_outputs_for_txid(key, txid)
     }
 
     /// Reverses one connected block using its undo data.

@@ -97,12 +97,6 @@ impl BlockFacts {
         }
     }
 
-    /// Returns consensus block weight without deriving identifiers or a Merkle root.
-    #[must_use]
-    pub fn block_weight(txs: &[Tx]) -> u64 {
-        decoded_block_weight(txs)
-    }
-
     /// Returns transaction IDs in block order.
     #[must_use]
     pub fn txids(&self) -> &[Txid] {
@@ -256,12 +250,6 @@ impl<'b> BlockView<'b> {
         self.facts
             .wtxids()
             .unwrap_or_else(|| unreachable!("witness IDs were just computed"))
-    }
-
-    /// Returns witness transaction IDs if they are already available.
-    #[must_use]
-    pub fn computed_witness_ids(&self) -> Option<&[Wtxid]> {
-        self.facts.wtxids()
     }
 
     /// Sets the resolved prevout matrix in block and input order.
