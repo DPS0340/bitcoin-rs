@@ -2,10 +2,11 @@ use super::*;
 
 /// The allowance includes the fees the block actually earned.
 ///
-/// A rule that only compared against the subsidy would pass the proposal test
-/// below and still be wrong in both directions: it would refuse every real
-/// block that collects fees, and it would let a block claim fees it never
-/// earned.
+/// The accept arm pins that a subsidy-only comparison is not enough: a real
+/// block collecting fees must be accepted (also covered end-to-end by the
+/// mining template test). The reject arm pins the exact bound: the allowance
+/// tracks earned fees, so one satoshi past subsidy-plus-fee is refused. The
+/// no-fee over-subsidy case below pins the subsidy bound on its own.
 #[test]
 #[allow(clippy::arc_with_non_send_sync)]
 fn the_coinbase_allowance_counts_the_fees_the_block_earned()

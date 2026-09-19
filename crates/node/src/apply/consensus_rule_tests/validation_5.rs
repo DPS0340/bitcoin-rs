@@ -331,5 +331,21 @@ fn apply_block_rejects_same_block_coinbase_spend() -> Result<(), Box<dyn std::er
     };
 
     assert_bip_error(&error, "COINBASE_MATURITY");
+    assert_eq!(
+        handles
+            .applied_tip
+            .load_full()
+            .as_deref()
+            .map(|tip| tip.hash),
+        Some(Hash256::from(genesis.block_hash())),
+        "a refused apply must not move the applied tip"
+    );
+    assert!(
+        handles
+            .undo_store
+            .load_undo(1, Hash256::from(block.block_hash()))?
+            .is_none(),
+        "a refused apply must not write an undo record"
+    );
     Ok(())
 }

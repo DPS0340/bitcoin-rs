@@ -334,6 +334,10 @@ mod tests {
             BlockHash::from(expected),
             "activation child must point at the authenticated activation hash"
         );
+        assert!(
+            !super::bip30_duplicate_scan_required(&tree, network, height, Some(previous_tip)),
+            "known BIP34 activation must skip the duplicate scan"
+        );
         Ok(())
     }
 
