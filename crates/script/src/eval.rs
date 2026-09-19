@@ -172,11 +172,11 @@ pub const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 /// Maximum non-push opcodes per script.
 pub const MAX_OPS_PER_SCRIPT: usize = 201;
 /// Maximum public keys in a bare multisig.
-pub const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
+pub(crate) const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
 /// Maximum combined depth of the main and alt stacks.
 pub const MAX_STACK_SIZE: usize = 1000;
 /// Bytes per passed signature charged against BIP342's validation weight.
-pub const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
+pub(crate) const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
 /// BIP342 validation-weight offset accounting for the witness itself.
 pub const VALIDATION_WEIGHT_OFFSET: i64 = 50;
 
@@ -342,18 +342,6 @@ fn item_bytes(item: &ScriptItem) -> Cow<'_, [u8]> {
 
 /// Position marker used when no `OP_CODESEPARATOR` has executed.
 pub const CODESEPARATOR_POSITION: u32 = 0xFFFF_FFFF;
-
-/// Everything the evaluator needs beyond the script itself.
-pub struct ExecContext<'a, 'c> {
-    /// Enabled verification flags.
-    pub flags: VerifyFlags,
-    /// Signature checker for `CHECKSIG`-family opcodes.
-    pub checker: &'a mut TxSignatureChecker<'c>,
-    /// Signature version governing sighash selection and tapscript rules.
-    pub sigversion: SigVersion,
-    /// BIP342 validation weight left; `None` outside tapscript.
-    pub validation_weight_left: Option<i64>,
-}
 
 /// Executes `script` against `stack`, mirroring Core's `EvalScript`.
 ///

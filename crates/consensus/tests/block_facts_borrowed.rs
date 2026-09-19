@@ -106,7 +106,6 @@ fn legacy_and_mixed_lazy_witness_ids_match_oracle_and_reuse_cache() {
         let oracle: bitcoin::Block = bitcoin::consensus::deserialize(&bytes).expect("oracle");
         let txids = block.txs.iter().map(Tx::txid).collect();
         let mut view = BlockView::new(&block.txs, txids);
-        assert!(view.computed_witness_ids().is_none());
         let ids = view.witness_ids();
         assert_eq!(ids.len(), oracle.txdata.len());
         for (actual, expected) in ids.iter().zip(&oracle.txdata) {

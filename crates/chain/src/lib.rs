@@ -21,7 +21,7 @@ pub mod tree;
 use bitcoin_rs_primitives::Hash256;
 use thiserror::Error;
 
-pub use bip9_cache::CachedState;
+pub(crate) use bip9_cache::CachedState;
 pub use bitcoin_rs_consensus::SoftforkState;
 pub use bitcoin_rs_primitives::Network;
 pub use block_body::{BlockBodyMetadata, BlockBodySource};

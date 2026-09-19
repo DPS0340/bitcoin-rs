@@ -13,7 +13,7 @@ use crate::{IndexError, IndexWriter};
 /// Any marker older than the current format 5 full-resets for rebuild: every
 /// row family changed, so no in-place upgrade path exists. Cursorless legacy
 /// tables reset the same way.
-pub fn open_writer<S>(store: &Arc<S>, generation: u64) -> Result<IndexWriter<S>, IndexError>
+pub(crate) fn open_writer<S>(store: &Arc<S>, generation: u64) -> Result<IndexWriter<S>, IndexError>
 where
     S: bitcoin_rs_storage::KvStore,
 {

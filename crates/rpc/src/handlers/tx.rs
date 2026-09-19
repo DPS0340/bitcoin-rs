@@ -3,7 +3,6 @@ use core::str::FromStr as _;
 use hashbrown::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::script_util::{opcode, push_data};
 use bitcoin::consensus::encode::serialize as bitcoin_serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
@@ -13,6 +12,7 @@ use bitcoin_rs_primitives::{
     Amount, Block as NativeBlock, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes, deserialize as native_deserialize,
 };
+use bitcoin_rs_script::{opcode, push_data};
 use miniscript::psbt::PsbtExt as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 

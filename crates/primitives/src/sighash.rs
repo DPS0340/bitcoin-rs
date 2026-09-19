@@ -591,25 +591,6 @@ impl Sighash {
         )
     }
 
-    /// Computes the BIP342 tapscript signature hash.
-    pub fn compute_bip342(
-        tx: &Tx,
-        input_idx: usize,
-        prevouts: &[TxOut],
-        sighash_type: Self,
-        leaf_hash: Hash256,
-        annex: Option<&[u8]>,
-    ) -> Result<Hash256, SighashError> {
-        Self::compute_bip341(
-            tx,
-            input_idx,
-            prevouts,
-            sighash_type,
-            Some(leaf_hash),
-            annex,
-        )
-    }
-
     /// Returns the consensus byte for the sighash mode.
     #[must_use]
     pub const fn to_u8(self) -> u8 {
@@ -846,7 +827,7 @@ mod tests {
             pin("75d68237360f5032d84419d0d32e2061cbc7ce286c58e7846ab291f707215ba8")
         );
         assert_eq!(
-            Sighash::compute_bip342(&tx, 0, &prevouts, Sighash::Default, leaf, None),
+            Sighash::compute_bip341(&tx, 0, &prevouts, Sighash::Default, Some(leaf), None),
             Ok(pin(
                 "4cc7918733b1c9abd997206fac92d03183ec712d059dd5da5bd099e39b66a1d6"
             ))

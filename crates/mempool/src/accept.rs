@@ -15,7 +15,7 @@ use bitcoin_rs_primitives::{OutPoint, TxOut};
 /// Deliberately does **not** hide outputs another mempool transaction spends.
 /// Detecting that is the replacement path's job, and hiding them here would
 /// turn every RBF attempt into a missing-inputs rejection.
-pub struct MempoolUtxoView<'a, V> {
+pub(crate) struct MempoolUtxoView<'a, V> {
     pool: &'a Mempool,
     chain: &'a V,
 }
@@ -23,7 +23,7 @@ pub struct MempoolUtxoView<'a, V> {
 impl<'a, V> MempoolUtxoView<'a, V> {
     /// Layers `pool`'s unconfirmed outputs over `chain`.
     #[must_use]
-    pub const fn new(pool: &'a Mempool, chain: &'a V) -> Self {
+    pub(crate) const fn new(pool: &'a Mempool, chain: &'a V) -> Self {
         Self { pool, chain }
     }
 }

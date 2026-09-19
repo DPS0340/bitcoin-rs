@@ -503,12 +503,6 @@ impl UtxoRecord {
         Ok(Self { buf })
     }
 
-    /// Reloads a record from its stored canonical bytes. A rejected row is
-    /// typed corruption, never a partially trusted record.
-    pub(crate) fn from_stored_bytes(bytes: &[u8]) -> Result<Self, UtxoError> {
-        Self::from_encoded(ThinRecordBuf::from_slice(bytes)?)
-    }
-
     /// Builds a record from snapshot-owned outputs in their serialized order.
     ///
     /// This is a snapshot/untrusted boundary, so the encoded payload is
@@ -915,12 +909,6 @@ impl UtxoRecord {
             }
         }
         true
-    }
-
-    /// The canonical encoded bytes of this record: before/after images for
-    /// the persistence layer; reload goes through [`Self::from_stored_bytes`].
-    pub(crate) fn encoded_bytes(&self) -> &[u8] {
-        self.buf.as_bytes()
     }
 
     /// Bytes this record holds from the allocator: header plus buffer capacity.
@@ -1492,7 +1480,7 @@ mod tests {
         //   varint(u32::MAX) = 5, varint(compress(42)) = 2,
         //   varint(u32::MAX << 1 | 1) = 5, varint(2) = 1, script = 2
         assert_eq!(
-            record.encoded_bytes().len(),
+            record.buf.as_bytes().len(),
             RECORD_HEADER_LEN + 15,
             "v5 output layout changed"
         );
@@ -1527,7 +1515,7 @@ mod tests {
             let expected = RECORD_HEADER_LEN + 1 + vout_width + len_width + payload;
             let record = UtxoRecord::from_owned_outputs(Hash256::default(), &[case])?;
             assert_eq!(
-                record.encoded_bytes().len(),
+                record.buf.as_bytes().len(),
                 expected,
                 "payload_len disagreed with write_payload"
             );
@@ -1562,7 +1550,7 @@ mod tests {
     fn malformed_encoded_boundaries_are_rejected() -> Result<(), UtxoError> {
         let record =
             UtxoRecord::from_owned_outputs(Hash256::default(), &[output(0, &[0x51, 0xAC], 1)])?;
-        let encoded = record.encoded_bytes();
+        let encoded = record.buf.as_bytes();
 
         let truncated_metadata = encoded
             .get(..RECORD_HEADER_LEN + 2)
@@ -1720,7 +1708,7 @@ mod tests {
     fn thin_owner_exact_constructor_has_no_slack() -> Result<(), UtxoError> {
         let record =
             UtxoRecord::from_owned_outputs(Hash256::default(), &[output(0, &[0x51, 0xAC], 1)])?;
-        assert_eq!(record.buf.len(), record.encoded_bytes().len());
+        assert_eq!(record.buf.len(), record.buf.as_bytes().len());
         assert_eq!(record.buf.capacity(), record.buf.len());
         Ok(())
     }
@@ -1733,7 +1721,7 @@ mod tests {
         )?;
         let clone = record.clone();
         assert_eq!(clone, record);
-        assert_eq!(clone.encoded_bytes(), record.encoded_bytes());
+        assert_eq!(clone.buf.as_bytes(), record.buf.as_bytes());
         // Clones retain no slack and own a distinct allocation.
         assert_eq!(clone.buf.capacity(), clone.buf.len());
         assert_ne!(

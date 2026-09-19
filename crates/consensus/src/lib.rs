@@ -16,26 +16,12 @@
 /// Maximum consensus script size in bytes.
 pub const MAX_SCRIPT_SIZE: usize = 10_000;
 
-/// BIP112 sequence-lock checks.
-pub mod bip112;
 /// BIP113 median-time-past checks.
-pub mod bip113;
-/// BIP141 segwit checks.
-pub mod bip141;
-/// BIP143 segwit-v0 sighash checks.
-pub mod bip143;
+mod bip113;
 /// BIP30 duplicate-transaction checks.
 pub mod bip30;
 /// BIP34 coinbase height checks.
 pub mod bip34;
-/// BIP341 taproot checks.
-pub mod bip341;
-/// BIP342 tapscript checks.
-pub mod bip342;
-/// BIP65 locktime checks.
-pub mod bip65;
-/// BIP66 DER-signature checks.
-pub mod bip66;
 /// BIP68 relative-locktime checks.
 pub mod bip68;
 /// BIP9 versionbits checks.
@@ -61,7 +47,7 @@ pub use bip9::{
 };
 pub use bip113::{MEDIAN_TIME_PAST_WINDOW, locktime_cutoff};
 pub use block_view::BlockView;
-pub use rust_path::{TipState, UtxoView};
+pub use rust_path::UtxoView;
 pub use sigops::transaction_sigop_cost;
 pub use sigops::transaction_sigop_cost as total_sigop_cost;
 pub use verify_block::{
@@ -214,13 +200,6 @@ pub enum ConsensusError {
     #[error("consensus encoding failed: {0}")]
     Encoding(String),
 }
-
-/// Maximum valid money supply in satoshis.
-///
-/// The 21-million-BTC rule is owned by
-/// [`bitcoin_rs_primitives::Amount::MAX_MONEY`]; consensus checks use this
-/// satoshi view of that constant.
-pub const MAX_MONEY: u64 = bitcoin_rs_primitives::Amount::MAX_MONEY.to_sat();
 
 /// Coinbase subsidy at `height`, in satoshis.
 ///

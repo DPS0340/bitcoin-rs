@@ -67,9 +67,9 @@ pub enum RpcError {
 
 impl RpcError {
     /// Standard JSON-RPC parse error code.
-    pub const PARSE_ERROR: i64 = -32_700;
+    pub(crate) const PARSE_ERROR: i64 = -32_700;
     /// Standard JSON-RPC invalid request code.
-    pub const INVALID_REQUEST: i64 = -32_600;
+    pub(crate) const INVALID_REQUEST: i64 = -32_600;
     /// Standard JSON-RPC unknown method code.
     pub const METHOD_NOT_FOUND: i64 = -32_601;
     /// Standard JSON-RPC invalid params code.
@@ -77,21 +77,21 @@ impl RpcError {
     /// Standard JSON-RPC internal error code.
     pub const INTERNAL_ERROR: i64 = -32_603;
     /// Bitcoin Core invalid type code.
-    pub const CORE_INVALID_TYPE: i64 = -3;
+    pub(crate) const CORE_INVALID_TYPE: i64 = -3;
     /// Bitcoin Core not-found code.
     pub const CORE_NOT_FOUND: i64 = -5;
     /// Bitcoin Core invalid parameter value code.
-    pub const CORE_INVALID_PARAMETER: i64 = -8;
+    pub(crate) const CORE_INVALID_PARAMETER: i64 = -8;
     /// Bitcoin Core transaction-rejected code, `RPC_VERIFY_REJECTED`.
     pub const CORE_VERIFY_REJECTED: i64 = -26;
     /// Bitcoin Core general submission-error code, `RPC_VERIFY_ERROR`.
-    pub const CORE_VERIFY_ERROR: i64 = -25;
+    pub(crate) const CORE_VERIFY_ERROR: i64 = -25;
     /// Bitcoin Core `RPC_DESERIALIZATION_ERROR`.
-    pub const CORE_DESERIALIZATION_ERROR: i64 = -22;
+    pub(crate) const CORE_DESERIALIZATION_ERROR: i64 = -22;
     /// Bitcoin Core `RPC_CLIENT_NOT_CONNECTED`.
-    pub const CORE_CLIENT_NOT_CONNECTED: i64 = -9;
+    pub(crate) const CORE_CLIENT_NOT_CONNECTED: i64 = -9;
     /// Bitcoin Core `RPC_CLIENT_IN_INITIAL_DOWNLOAD`.
-    pub const CORE_CLIENT_IN_INITIAL_DOWNLOAD: i64 = -10;
+    pub(crate) const CORE_CLIENT_IN_INITIAL_DOWNLOAD: i64 = -10;
 
     /// Builds the policy-disabled error for methods unavailable by configuration.
     #[must_use]

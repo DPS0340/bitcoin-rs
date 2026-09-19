@@ -133,7 +133,7 @@ pub const CORE_VERSION: &str = "31.x";
 
 /// No-wallet policy note shared by every wallet-class row; the crate refuses
 /// to hold private key material (see `crates/rpc/src/lib.rs`).
-pub(crate) const NO_WALLET: &str =
+pub const NO_WALLET: &str =
     "No wallet: this process holds no private-key material (crates/rpc/src/lib.rs).";
 
 /// Every external surface, declared against Core 31.x.

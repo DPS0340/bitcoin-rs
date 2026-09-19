@@ -109,7 +109,7 @@ pub struct ReconcilePhase {
 
 impl ReconcilePhase {
     /// Every capability moving forward.
-    pub const FORWARD: Self = Self {
+    pub(crate) const FORWARD: Self = Self {
         tx_lookup: ReconcileLeg::Forward,
         script_history: ReconcileLeg::Forward,
         script_live: ReconcileLeg::Forward,
@@ -144,7 +144,7 @@ impl ReconcilePhase {
     /// Widest rollback in flight: the highest watermark being rewound and
     /// the lowest common ancestor any capability rewinds to.
     #[must_use]
-    pub fn rolling_back(self) -> Option<(u32, u32)> {
+    pub(crate) fn rolling_back(self) -> Option<(u32, u32)> {
         [self.tx_lookup, self.script_history, self.script_live]
             .into_iter()
             .filter_map(|leg| match leg {
@@ -160,7 +160,7 @@ impl ReconcilePhase {
     /// Ends every rollback leg; rebuild legs persist until their rows reach
     /// the applied tip.
     #[must_use]
-    pub fn rollbacks_finished(self) -> Self {
+    pub(crate) fn rollbacks_finished(self) -> Self {
         let finish = |leg| match leg {
             ReconcileLeg::RollingBack { .. } => ReconcileLeg::Forward,
             other => other,
@@ -277,3 +277,4 @@ pub(crate) mod block_tree {
         ActiveChainView::position_on_active_chain(&chain, position, height)
     }
 }
+// weave: run 'weave explain crates/index/src/reconcile.rs' for per-hunk detail, 'weave check' to verify your resolution
