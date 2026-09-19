@@ -342,9 +342,10 @@ The index tracks two independently versioned capabilities via
 (`INDEX_FORMAT_VERSION`, currently 3) is the soft report marker in `UtxoMeta` (the
 hard open-gate marker is the durability key `[0x00, b'V']`, row-format 5). It
 arrays, and at which width (version 3: 6-byte u24 positions). The anticipated
-`TxPosition`-width bump is this version. An older durability marker refuses
-start (`UnsupportedTxIndexFormatVersion`) and recovery full-resets the store
-for rebuild, so an old-format index is rebuilt rather than read in place.
+`TxPosition`-width bump is this version. A durability marker other than the
+current value refuses start (`UnsupportedTxIndexFormatVersion`) and recovery
+full-resets the store for rebuild, so a foreign-format index is rebuilt
+rather than read in place.
 
 **Per-capability reset.** The `IndexCapabilities` mask allows resetting one
 capability without touching the other. `acquire_capability_reset` and

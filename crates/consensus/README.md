@@ -21,7 +21,8 @@ script preparation reuses, and `kernel::KernelContext::verify_tx` verifies a
 transaction's inputs through bitcoinkernel over any `UtxoView`. BIP9 activation is
 `compute_state`
 over a `DeploymentContext` with `DeploymentParams`. Consensus bounds are exported as
-`MAX_SCRIPT_SIZE` and `MAX_BLOCK_SIGOPS_COST`; failures are `ConsensusError`
+`MAX_SCRIPT_SIZE`, `MAX_BLOCK_SIGOPS_COST`, `MAX_BLOCK_WEIGHT`, and
+`MAX_BLOCK_SERIALIZED_SIZE`; failures are `ConsensusError`
 variants.
 
 ## Features
