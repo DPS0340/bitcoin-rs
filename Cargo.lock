@@ -407,6 +407,7 @@ dependencies = [
  "arc-swap",
  "bitcoin",
  "bitcoin-rs-chain",
+ "bitcoin-rs-consensus",
  "bitcoin-rs-mempool",
  "bitcoin-rs-primitives",
  "bitcoin-rs-storage",

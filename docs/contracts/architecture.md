@@ -244,7 +244,14 @@ Owners:
   transactions during reorg handling.
 
 ## Live gaps
-
+- **Node architecture reset (#1085)**: the `crates/node` ownership baseline is
+  being re-derived from the current call graph. The Phase-1 inventory lives in
+  [../node-ownership-inventory.md](../node-ownership-inventory.md) and
+  supersedes the intermediate assumptions of #1038, #1073, and #1075.
+  Ownership moves follow the inventory's phase sequencing: low-risk deletions with
+  no upstream dependency have already landed (e.g. #1090); items the inventory marks
+  as contingent (e.g. `metrics/evidence/*`) are gated on their named preconditions
+  (respectively #1084); Phase 4 proceeds via the MOVE ledger.
 - **Node slimming and extraction (#217)**: Peer connection session and lease
   ownership has moved to `PeerTable` / `P2pService` in `crates/p2p` (#215,
   #217, #218). BIP9/softfork lookups, P2P chain serving, txindex status
@@ -263,11 +270,14 @@ Owners:
   `bitcoin_rs_utxo::overlay`); `crates/node` calls `persist_block_undo`,
   `load_block_undo`, and `rollback_block` and keeps only the ordering of that
   rollback against the journal, durable head, and tip publication.
-  `crates/node` still carries leftover domain mechanics: the node-side sync
-  executor (`sync.rs` driving `p2p::DownloadWindow`), and direct backend
+  The block-download executor lives in `crates/p2p/src/sync.rs` behind
+  `SyncChain`; node retains the seam implementation for header admission,
+  body binding, window commit, branch switch, and genesis bootstrap.
+  `crates/node` still carries leftover domain mechanics: direct backend
   construction and cache share dispatch (`state.rs`). `P2pService` no longer
   holds a second download window. Durable recovery evidence (witness/marker sidecars, warning snapshot) and the storage-footprint evidence format/budget verdict live in `crates/storage` (`recovery_evidence`, `footprint::evidence`); node keeps only the `RecoveryReporter` trait adapter and `measure_storage_footprint` orchestration. Relocating leftover node mechanics into
-  `crates/storage` and `crates/p2p` remains tracked under #217 (open). A
+  `crates/utxo`, `crates/storage`, and `crates/p2p` remains tracked under #217
+  (open). A
   dedicated `crates/chainstate` waits until journal,
   checkpoint, and
   `ChainEventPublisher` also leave node. `crates/node` is the composition
@@ -316,3 +326,4 @@ Owners:
   and `crates/node/tests/config_layered.rs` test
   `mining_payout_address_decodes_after_all_layers`: watch-only mining payout is
   decoded once after overlay, against the resolved network (`ARCH-05`).
+// weave: run 'weave explain docs/contracts/architecture.md' for per-hunk detail, 'weave check' to verify your resolution
