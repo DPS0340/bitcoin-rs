@@ -101,15 +101,15 @@ impl fmt::Display for StorageBackend {
 /// Indexed authoritative block bodies and read sessions.
 pub mod block_body;
 /// Append-only flat files for immutable block bodies.
-pub mod block_file;
+mod block_file;
 /// Process cache-budget division shared by the storage backends.
 pub mod cache_budget;
 /// Logical column-family names shared by all storage backends.
-pub mod column_families;
+mod column_families;
 /// Durable chain head record and its atomic commit boundary.
 pub mod durable_head;
 /// Storage error type.
-pub mod error;
+mod error;
 /// Custody-grade logical and physical storage-footprint ledgers.
 pub mod footprint;
 /// Retention and deletion of block bodies and undo rows.
@@ -117,7 +117,7 @@ pub mod pruning;
 /// Durable rollback-evidence sidecars and the warning snapshot.
 pub mod recovery_evidence;
 /// Backend-neutral key-value store traits.
-pub mod trait_;
+mod trait_;
 /// Per-block UTXO undo records and the in-flight disconnect marker.
 pub mod undo;
 

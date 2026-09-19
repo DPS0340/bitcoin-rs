@@ -40,8 +40,9 @@ impl BlockSync {
     }
 
     pub(super) fn record_sync_metrics(&self) {
-        let window = self.download_window.lock();
-        let stager = self.block_stager.lock();
+        let body_sync = self.body_sync.lock();
+        let window = &body_sync.window;
+        let stager = &body_sync.stager;
         metrics::gauge!("node.sync.pending_blocks").set(metric_count(window.pending_len()));
         metrics::gauge!("node.sync.pending_bytes").set(metric_count(window.pending_bytes()));
         metrics::gauge!("node.sync.received_blocks").set(metric_count(stager.received_len()));
@@ -58,7 +59,8 @@ impl BlockSync {
     }
 
     pub(super) fn record_pending_sync_metrics(&self) {
-        let window = self.download_window.lock();
+        let body_sync = self.body_sync.lock();
+        let window = &body_sync.window;
         metrics::gauge!("node.sync.pending_blocks").set(metric_count(window.pending_len()));
         metrics::gauge!("node.sync.pending_bytes").set(metric_count(window.pending_bytes()));
     }

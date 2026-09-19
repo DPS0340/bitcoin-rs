@@ -131,7 +131,7 @@ impl MempoolEntry {
 
     /// Modified transaction fee rate in sat/kvB.
     #[must_use]
-    pub fn modified_fee_rate(&self) -> i128 {
+    pub(crate) fn modified_fee_rate(&self) -> i128 {
         signed_fee_rate(self.modified_fee(), u64::from(self.vsize))
     }
 
@@ -143,7 +143,7 @@ impl MempoolEntry {
 
     /// Modified ancestor package fee rate in sat/kvB.
     #[must_use]
-    pub fn modified_ancestor_fee_rate(&self) -> i128 {
+    pub(crate) fn modified_ancestor_fee_rate(&self) -> i128 {
         signed_fee_rate(
             i128::from(self.ancestor_fee) + self.ancestor_fee_delta,
             self.ancestor_size,

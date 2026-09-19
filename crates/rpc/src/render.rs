@@ -10,7 +10,7 @@ use crate::tx_render::transaction_json;
 
 /// Applied-chain facts required to project a header or block.
 #[derive(Clone, Debug, PartialEq)]
-pub struct BlockChainContext {
+pub(crate) struct BlockChainContext {
     /// Height of this block on the applied chain when active; still reported
     /// for known headers that are not active.
     pub height: u32,
@@ -30,7 +30,7 @@ pub struct BlockChainContext {
 
 /// Transaction array shape for `getblock` verbosity levels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockTxVerbosity {
+pub(crate) enum BlockTxVerbosity {
     /// Verbosity 1: array of txid strings.
     Ids,
     /// Verbosity 2+: array of full transaction objects.
@@ -39,13 +39,13 @@ pub enum BlockTxVerbosity {
 
 /// Render a block header using Bitcoin Core's verbose header shape.
 #[must_use]
-pub fn header_json(header: &Header, chain: &BlockChainContext) -> Value {
+pub(crate) fn header_json(header: &Header, chain: &BlockChainContext) -> Value {
     header_common_json(header, chain)
 }
 
 /// Render a block using Bitcoin Core's verbose block shape.
 #[must_use]
-pub fn block_json(
+pub(crate) fn block_json(
     block: &Block,
     chain: &BlockChainContext,
     tx_verbosity: BlockTxVerbosity,
@@ -78,14 +78,8 @@ pub fn block_json(
 
 /// Hex-encode a header using consensus serialization.
 #[must_use]
-pub fn header_hex(header: &Header) -> String {
+pub(crate) fn header_hex(header: &Header) -> String {
     hex_encode(&consensus_bytes(header))
-}
-
-/// Hex-encode a block using consensus serialization.
-#[must_use]
-pub fn block_hex(block: &Block) -> String {
-    hex_encode(&consensus_bytes(block))
 }
 
 /// Compute Bitcoin Core confirmations from applied-chain membership facts.
@@ -93,7 +87,7 @@ pub fn block_hex(block: &Block) -> String {
 /// `on_active_chain` must already encode applied-chain membership for
 /// `block_height`. Height alone is insufficient after a reorg.
 #[must_use]
-pub fn confirmations(applied_height: u32, block_height: u32, on_active_chain: bool) -> i64 {
+pub(crate) fn confirmations(applied_height: u32, block_height: u32, on_active_chain: bool) -> i64 {
     if !on_active_chain || block_height > applied_height {
         return -1;
     }

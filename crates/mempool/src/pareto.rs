@@ -11,7 +11,7 @@ use crate::{EntryId, MempoolEntry};
 /// Insertion and removal stay logarithmic so peer-driven mempool growth does
 /// not re-sort the complete priority set.
 #[derive(Clone, Debug, Default)]
-pub struct ParetoFront {
+pub(crate) struct ParetoFront {
     /// Keys in priority order.
     order: BTreeSet<ParetoKey>,
     /// The key currently indexed for each entry.
@@ -78,7 +78,7 @@ impl ParetoKey {
 impl ParetoFront {
     /// Creates an empty priority index.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             order: BTreeSet::new(),
             keys: BTreeMap::new(),
@@ -90,7 +90,7 @@ impl ParetoFront {
     /// Replacement is not a special case for the caller but is one here: an
     /// entry whose ancestor fee rate changed has a different key, so the stale
     /// key must leave the ordered set or the entry would be indexed twice.
-    pub fn insert(&mut self, id: EntryId, entry: &MempoolEntry) {
+    pub(crate) fn insert(&mut self, id: EntryId, entry: &MempoolEntry) {
         let key = ParetoKey::new(id, entry);
         if let Some(previous) = self.keys.insert(id, key) {
             let _ = self.order.remove(&previous);
@@ -99,7 +99,7 @@ impl ParetoFront {
     }
 
     /// Removes an entry from the priority index.
-    pub fn remove(&mut self, id: EntryId) -> bool {
+    pub(crate) fn remove(&mut self, id: EntryId) -> bool {
         let Some(key) = self.keys.remove(&id) else {
             return false;
         };
@@ -107,19 +107,20 @@ impl ParetoFront {
     }
 
     /// Returns the highest-priority `n` entry identifiers.
-    pub fn top_n(&self, n: usize) -> impl Iterator<Item = EntryId> + '_ {
+    pub(crate) fn top_n(&self, n: usize) -> impl Iterator<Item = EntryId> + '_ {
         self.order.iter().take(n).map(|key| key.id)
     }
 
     /// Returns `true` if the front is empty.
+    #[cfg(test)]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
 
     /// Returns the number of indexed entries.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.order.len()
     }
 
@@ -140,7 +141,7 @@ impl ParetoFront {
     /// What matters is that the term scales with what is stored, which one
     /// `EntryId` per entry did not.
     #[must_use]
-    pub fn dynamic_memory_usage(&self) -> u64 {
+    pub(crate) fn dynamic_memory_usage(&self) -> u64 {
         use core::mem::size_of;
 
         let ordered = u64::try_from(self.order.len())

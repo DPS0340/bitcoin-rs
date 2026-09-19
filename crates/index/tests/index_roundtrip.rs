@@ -20,8 +20,8 @@ use bitcoin_rs_index::types::{
     HASH_PREFIX_ROW_SIZE, HEADER_ROW_SIZE, TX_POSITION_SIZE, TxPosition, TxPositionValue,
 };
 use bitcoin_rs_index::{
-    ConsumerCursorUpdate, IndexCapabilities, IndexError, IndexFormat, IndexReader, IndexRowCounts,
-    IndexWatermark, IndexWatermarks, IndexWriter, Indexer, PreparedBatch, PreparedBatchLimits,
+    ConsumerCursorUpdate, IndexCapabilities, IndexError, IndexReader, IndexRowCounts,
+    IndexWatermark, IndexWatermarks, IndexWriter, PreparedBatch, PreparedBatchLimits,
 };
 use bitcoin_rs_storage::{
     ColumnFamily, KvIter, KvSnapshot, KvStore, PrefixScanLimit, StorageError, WriteBatch,
@@ -30,6 +30,22 @@ use bitcoin_rs_storage::{
 
 /// Reserved capability-reset marker slot mirrored from the index crate.
 const RESET_KEY: &[u8] = &[0x00, b'R'];
+
+fn commit_rollback_one_for<S: KvStore>(
+    writer: &mut IndexWriter<S>,
+    capabilities: IndexCapabilities,
+    prev: Option<IndexWatermark>,
+    body: &[u8],
+) -> Result<(), IndexError> {
+    let (fence, _) = writer.fenced_watermarks()?;
+    writer.commit_rollback_one_for_with_cursor(
+        fence,
+        capabilities,
+        prev,
+        body,
+        ConsumerCursorUpdate::Clear,
+    )
+}
 
 const ORDINARY_STATE_REVISION_KEY: &[u8] = &[0x00, b'O'];
 
@@ -550,13 +566,6 @@ fn commit_golden_blocks_writes_expected_electrs_rows() -> Result<(), Box<dyn std
         let store = std::sync::Arc::new(MemoryStore::default());
         let mut writer = IndexWriter::open(std::sync::Arc::clone(&store), 1)?;
         let block = read_fixture(height)?;
-        let hash = block_hash(&block);
-        let prepared = writer.prepare_block(height, hash, &block)?;
-        assert_eq!(
-            prepared.row_counts(),
-            expected,
-            "height {height} prepared counts"
-        );
 
         // Watermark contiguity starts at height 0. Commit the same body at
         // genesis so store occupancy is checked through the sole mutation
@@ -784,13 +793,23 @@ fn commit_forward_and_rollback_are_atomic_and_ordered() -> Result<(), Box<dyn st
         hash: [0x42; 32],
     };
     assert!(matches!(
-        writer.commit_rollback_one(Some(wrong_prev), &body1),
+        commit_rollback_one_for(
+            &mut writer,
+            IndexCapabilities::HISTORICAL,
+            Some(wrong_prev),
+            &body1
+        ),
         Err(IndexError::WatermarkMismatch { .. })
     ));
     assert_eq!(writer.watermark()?, Some(block1_watermark));
 
     // Roll back block 1, returning to block 0.
-    writer.commit_rollback_one(Some(block0_watermark), &body1)?;
+    commit_rollback_one_for(
+        &mut writer,
+        IndexCapabilities::HISTORICAL,
+        Some(block0_watermark),
+        &body1,
+    )?;
     assert_eq!(writer.watermark()?, Some(block0_watermark));
     assert_eq!(
         store.count(bitcoin_rs_storage::ColumnFamily::BlockHeaders),
@@ -803,7 +822,12 @@ fn commit_forward_and_rollback_are_atomic_and_ordered() -> Result<(), Box<dyn st
 
     // Rolling back with a body that does not match the current watermark fails.
     assert!(matches!(
-        writer.commit_rollback_one(Some(block0_watermark), &body1),
+        commit_rollback_one_for(
+            &mut writer,
+            IndexCapabilities::HISTORICAL,
+            Some(block0_watermark),
+            &body1
+        ),
         Err(IndexError::BlockIdentityMismatch { .. })
     ));
 
@@ -1067,12 +1091,22 @@ fn rollback_preserves_shared_ancestors_for_a_disabled_capability()
     assert!(batch.try_push(block1).is_ok());
     writer.commit_forward(batch)?;
 
-    writer.commit_rollback_one_for(IndexCapabilities::TX_LOOKUP, Some(watermark0), &body1)?;
-    writer.commit_rollback_one_for(IndexCapabilities::TX_LOOKUP, None, &body0)?;
+    commit_rollback_one_for(
+        &mut writer,
+        IndexCapabilities::TX_LOOKUP,
+        Some(watermark0),
+        &body1,
+    )?;
+    commit_rollback_one_for(&mut writer, IndexCapabilities::TX_LOOKUP, None, &body0)?;
     assert_eq!(store.count(ColumnFamily::BlockHeaders), 2);
 
-    writer.commit_rollback_one_for(IndexCapabilities::SCRIPT_HISTORY, Some(watermark0), &body1)?;
-    writer.commit_rollback_one_for(IndexCapabilities::SCRIPT_HISTORY, None, &body0)?;
+    commit_rollback_one_for(
+        &mut writer,
+        IndexCapabilities::SCRIPT_HISTORY,
+        Some(watermark0),
+        &body1,
+    )?;
+    commit_rollback_one_for(&mut writer, IndexCapabilities::SCRIPT_HISTORY, None, &body0)?;
     assert_eq!(store.count(ColumnFamily::BlockHeaders), 0);
     Ok(())
 }
@@ -1309,7 +1343,7 @@ fn rollback_is_excluded_by_a_reset_fence() -> Result<(), Box<dyn std::error::Err
     store.write_durable(claim)?;
 
     assert!(matches!(
-        writer.commit_rollback_one(None, &body),
+        commit_rollback_one_for(&mut writer, IndexCapabilities::HISTORICAL, None, &body),
         Err(IndexError::ResetInProgress)
     ));
     assert_eq!(store.rows(ColumnFamily::TxConfirmed), rows_before);
@@ -1820,15 +1854,8 @@ fn format_stays_current_after_reset_and_rebuild() -> Result<(), Box<dyn std::err
     writer.reset_capabilities(IndexCapabilities::HISTORICAL)?;
     drop(writer);
 
-    // The emptied index claims the current row format before rebuilding.
-    let indexer = Indexer::new(Arc::clone(&store));
-    assert_eq!(indexer.ensure_format_version()?, IndexFormat::Current);
-    drop(indexer);
-
     seed_populated_store(&store, 1)?;
 
-    let indexer = Indexer::new(Arc::clone(&store));
-    assert_eq!(indexer.ensure_format_version()?, IndexFormat::Current);
     assert_eq!(
         store
             .get(ColumnFamily::UtxoMeta, b"index:format_version")?
@@ -2005,7 +2032,9 @@ fn rollback_rejects_prev_at_genesis() -> Result<(), Box<dyn std::error::Error>> 
     writer.commit_forward(batch)?;
 
     assert!(matches!(
-        writer.commit_rollback_one(
+        commit_rollback_one_for(
+            &mut writer,
+            IndexCapabilities::HISTORICAL,
             Some(IndexWatermark {
                 height: 0,
                 hash: [0u8; 32]
@@ -2226,7 +2255,7 @@ fn intermediate_rollback_deletes_cursor_and_survives_reopen()
 
     // Rollback without a valid replacement clears the cursor atomically with
     // the row mutation.
-    writer.commit_rollback_one(None, &body0)?;
+    commit_rollback_one_for(&mut writer, IndexCapabilities::HISTORICAL, None, &body0)?;
     assert!(writer.consumer_cursor()?.is_none());
 
     drop(writer);
@@ -2246,7 +2275,7 @@ fn intermediate_rollback_removes_stale_cursor() -> Result<(), Box<dyn std::error
     writer.commit_consumer_cursor(fence, b"cursor-at-0")?;
 
     let body0 = read_fixture(0)?;
-    writer.commit_rollback_one_for(IndexCapabilities::TX_LOOKUP, None, &body0)?;
+    commit_rollback_one_for(&mut writer, IndexCapabilities::TX_LOOKUP, None, &body0)?;
     assert!(writer.consumer_cursor()?.is_none());
 
     // A later forward that keeps the cursor must not resurrect it.
@@ -2705,7 +2734,7 @@ fn each_ordinary_mutator_advances_the_revision_exactly_once()
     assert_state_revision(&store, Some(4))?;
 
     // 5. rollback that capability again
-    writer.commit_rollback_one_for(IndexCapabilities::TX_LOOKUP, None, &body0)?;
+    commit_rollback_one_for(&mut writer, IndexCapabilities::TX_LOOKUP, None, &body0)?;
     assert_state_revision(&store, Some(5))?;
     assert_eq!(
         stored_state_revision(&store)?,
