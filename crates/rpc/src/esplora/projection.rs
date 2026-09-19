@@ -3,15 +3,15 @@
 use core::str::FromStr as _;
 use std::sync::Arc;
 
-use crate::script_util::{
-    instructions, is_op_return, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
-};
 use bitcoin::{Address, Network as BitcoinNetwork, Script};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::ScriptHash as MempoolScriptHash;
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxOut, Txid, deserialize,
+};
+use bitcoin_rs_script::script::{
+    instructions, is_op_return, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
 };
 
 use crate::context::{Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError};
@@ -602,8 +602,8 @@ fn inner_scripts(
         .and_then(|_| instructions(&input.script_sig).last())
         .and_then(Result::ok)
         .and_then(|instruction| match instruction {
-            crate::script_util::Instruction::PushBytes(bytes) => Some(bytes.to_vec()),
-            crate::script_util::Instruction::Op(_) => None,
+            bitcoin_rs_script::Instruction::PushBytes(bytes) => Some(bytes.to_vec()),
+            bitcoin_rs_script::Instruction::Op(_) => None,
         });
     let is_witness_script = prevout.is_some_and(|output| is_p2wsh(&output.script_pubkey))
         || redeem.as_deref().is_some_and(is_p2wsh);

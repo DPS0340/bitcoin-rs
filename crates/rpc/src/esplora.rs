@@ -68,7 +68,7 @@ fn dispatch_get(
 /// `path` is the rest after `/api` or `/esplora`. Unknown paths 404.
 /// The listener demux never calls this outside those directories.
 #[must_use]
-pub fn route_post(handler: &Handler, surface: Surface, path: &str, body: &[u8]) -> Response {
+pub(crate) fn route_post(handler: &Handler, surface: Surface, path: &str, body: &[u8]) -> Response {
     if surface == Surface::Backend {
         if let Some(response) = backend::post(handler, path, body) {
             return response;

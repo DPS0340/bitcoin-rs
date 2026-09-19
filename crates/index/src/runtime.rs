@@ -183,7 +183,7 @@ impl Generation {
 
     /// Returns true once the token is revoked.
     #[must_use]
-    pub fn is_revoked(&self) -> bool {
+    pub(crate) fn is_revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
     }
 }

@@ -5,9 +5,9 @@ selection, and reorganization planning — how far valid headers are known (the 
 tip), tracked independently of the apply frontier.
 
 `BlockTree` is the central type: nodes live in a slab addressed by compact `NodeId`s,
-`lookup` and `node_by_hash` resolve header hashes, `ancestors` and
-`iter_active_chain_hashes` walk parent chains, and the best tip is published as an
-atomically swappable `TipSnapshot` (`tip`, `tip_id`, `tip_height`, `tip_chainwork`) for
+`lookup` and `node_by_hash` resolve header hashes, `ancestors` walks parent
+chains, and the best tip is published as an
+atomically swappable `TipSnapshot` (`tip`, `tip_id`, `tip_height`) for
 lock-free readers. `accept_headers` admits a header batch after the contextual checks —
 proof of work, compact-target validation against the network's difficulty rules
 (`validate_header_nbits`), median-time-past and future-drift bounds

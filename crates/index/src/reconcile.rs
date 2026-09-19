@@ -10,7 +10,7 @@ use bitcoin_rs_primitives::Hash256;
 use crate::{IndexCapabilities, IndexWatermark, IndexWatermarks};
 
 /// Durable consumer-cursor length: epoch (8 LE) + sequence (8 LE) + height (4 LE) + hash.
-pub const CURSOR_BYTE_LEN: usize = 52;
+pub(crate) const CURSOR_BYTE_LEN: usize = 52;
 
 /// Applied-tip identity consumed by index reconciliation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,7 +160,8 @@ pub fn plan(
 /// Publisher identity is only a shortcut when it also names `target`; an old or
 /// torn identity must not manufacture `CaughtUp` against a different tip.
 #[must_use]
-pub fn plan_from_identity(
+#[cfg(test)]
+pub(crate) fn plan_from_identity(
     cursor: &ConsumerCursor,
     identity: &ChainIdentity,
     target: ChainTip,
@@ -183,7 +184,7 @@ pub fn plan_from_identity(
 
 /// Canonical stale-branch depth used to choose rollback versus rebuild.
 #[must_use]
-pub fn rollback_depth(
+pub(crate) fn rollback_depth(
     chain: &impl ActiveChainView,
     position: Hash256,
     position_height: u32,
@@ -226,7 +227,7 @@ pub struct ReconcilePhase {
 
 impl ReconcilePhase {
     /// Every capability moving forward.
-    pub const FORWARD: Self = Self {
+    pub(crate) const FORWARD: Self = Self {
         tx_lookup: ReconcileLeg::Forward,
         script_history: ReconcileLeg::Forward,
         script_live: ReconcileLeg::Forward,
@@ -261,7 +262,7 @@ impl ReconcilePhase {
     /// Widest rollback in flight: the highest watermark being rewound and
     /// the lowest common ancestor any capability rewinds to.
     #[must_use]
-    pub fn rolling_back(self) -> Option<(u32, u32)> {
+    pub(crate) fn rolling_back(self) -> Option<(u32, u32)> {
         [self.tx_lookup, self.script_history, self.script_live]
             .into_iter()
             .filter_map(|leg| match leg {
@@ -277,7 +278,7 @@ impl ReconcilePhase {
     /// Ends every rollback leg; rebuild legs persist until their rows reach
     /// the applied tip.
     #[must_use]
-    pub fn rollbacks_finished(self) -> Self {
+    pub(crate) fn rollbacks_finished(self) -> Self {
         let finish = |leg| match leg {
             ReconcileLeg::RollingBack { .. } => ReconcileLeg::Forward,
             other => other,
@@ -295,7 +296,7 @@ impl ReconcilePhase {
 /// `Valid(None)` is an aligned, unindexed selection, not an empty selection
 /// and not proof that a query is ready.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum SelectedWatermark {
+pub(crate) enum SelectedWatermark {
     /// Every selected capability has the same optional height and block hash.
     Valid(Option<IndexWatermark>),
     /// No capability was selected, or selected capabilities disagree.
@@ -304,7 +305,7 @@ pub enum SelectedWatermark {
 
 /// Selects an exact common watermark without consulting or owning chainstate.
 #[must_use]
-pub fn selected_watermark(
+pub(crate) fn selected_watermark(
     watermarks: IndexWatermarks,
     capabilities: IndexCapabilities,
 ) -> SelectedWatermark {
@@ -347,7 +348,7 @@ pub mod block_tree {
     use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
     use bitcoin_rs_primitives::Hash256;
 
-    use super::{ActiveChainView, ChainIdentity, ChainTip, ConsumerCursor, ReconcilePlan};
+    use super::{ActiveChainView, ChainTip, ConsumerCursor, ReconcilePlan};
 
     struct BlockTreeActiveChain<'a> {
         tree: &'a BlockTree,
@@ -396,31 +397,6 @@ pub mod block_tree {
             active_tip: target_tip.tip_id,
         };
         super::plan(cursor, target(target_tip), &chain)
-    }
-
-    /// Plans from the publisher's cursor plus the authoritative tip.
-    ///
-    /// The publisher cursor is only a shortcut when it also names `target`; an
-    /// old or torn cursor must not manufacture `CaughtUp` against a different
-    /// tip.
-    #[must_use]
-    pub fn plan_from_cursor(
-        cursor: &ConsumerCursor,
-        publisher: &ConsumerCursor,
-        target_tip: &TipSnapshot,
-        tree: &BlockTree,
-    ) -> ReconcilePlan {
-        let chain = BlockTreeActiveChain {
-            tree,
-            active_tip: target_tip.tip_id,
-        };
-        let identity = ChainIdentity {
-            epoch: publisher.epoch,
-            sequence: publisher.sequence,
-            tip_hash: publisher.hash,
-            tip_height: publisher.height,
-        };
-        super::plan_from_identity(cursor, &identity, target(target_tip), &chain)
     }
 
     /// Height of the newest block shared by `position` and `active_tip`.

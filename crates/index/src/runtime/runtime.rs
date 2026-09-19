@@ -38,14 +38,14 @@ impl DerivedIndexRuntime {
     }
 
     /// Publishes the reconciliation phase. Only the worker thread writes it.
-    pub fn publish_phase(&self, phase: ReconcilePhase) {
+    pub(crate) fn publish_phase(&self, phase: ReconcilePhase) {
         if **self.phase.load() != phase {
             self.phase.store(Arc::new(phase));
         }
     }
 
     /// Publishes `leg` for `capabilities`, leaving the other legs as they are.
-    pub fn publish_leg(&self, capabilities: IndexCapabilities, leg: ReconcileLeg) {
+    pub(crate) fn publish_leg(&self, capabilities: IndexCapabilities, leg: ReconcileLeg) {
         self.publish_phase(self.phase().with_leg(capabilities, leg));
     }
 
@@ -66,7 +66,7 @@ impl DerivedIndexRuntime {
     }
 
     /// Marks the worker as failed with an explanatory message.
-    pub fn publish_failed(&self, message: impl Into<CompactString>) {
+    pub(crate) fn publish_failed(&self, message: impl Into<CompactString>) {
         *self.failure_message.write() = Some(message.into());
         self.failed.store(true, Ordering::Release);
     }
@@ -79,7 +79,7 @@ impl DerivedIndexRuntime {
 
     /// Returns true once a failure or shutdown has been published.
     #[must_use]
-    pub fn should_stop(&self) -> bool {
+    pub(crate) fn should_stop(&self) -> bool {
         self.shutdown.load(Ordering::Acquire) || self.failed.load(Ordering::Acquire)
     }
 

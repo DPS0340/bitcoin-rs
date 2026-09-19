@@ -721,8 +721,9 @@ impl Context {
     }
 
     /// Returns active ZMQ notification metadata from the live publisher.
+    #[cfg(feature = "zmq")]
     #[must_use]
-    pub fn zmq_notifications(&self) -> Vec<crate::zmq::ZmqNotifier> {
+    pub(crate) fn zmq_notifications(&self) -> Vec<crate::zmq::ZmqNotifier> {
         self.zmq_publisher.active_notifiers()
     }
 
@@ -768,7 +769,7 @@ impl Context {
 
     /// Borrows the provisional chain capability shared with P2P admission.
     #[must_use]
-    pub fn admission_chain(&self) -> ChainAdmissionView<'_> {
+    pub(crate) fn admission_chain(&self) -> ChainAdmissionView<'_> {
         ChainAdmissionView::new(
             &self.utxo,
             &self.applied_tip,
@@ -827,8 +828,12 @@ impl Context {
     /// Returns `self` sharing `handle` as the cumulative chain transaction count.
     ///
     /// The node owns the counter; the RPC surface only reads it.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_chain_tx_count(mut self, handle: Arc<core::sync::atomic::AtomicU64>) -> Self {
+    pub(crate) fn with_chain_tx_count(
+        mut self,
+        handle: Arc<core::sync::atomic::AtomicU64>,
+    ) -> Self {
         self.chain_tx_count = handle;
         self
     }
@@ -911,7 +916,7 @@ impl Context {
 
     /// Returns the current best block hash, or all-zero before initial sync.
     #[must_use]
-    pub fn best_hash(&self) -> Hash256 {
+    pub(crate) fn best_hash(&self) -> Hash256 {
         self.chain_tip
             .load_full()
             .map_or_else(Hash256::default, |tip| tip.hash)
@@ -949,7 +954,7 @@ impl Context {
 
     /// Returns the applied-chain hash at `height`, from the restored header index.
     #[must_use]
-    pub fn active_hash_at_height(&self, height: u32) -> Option<Hash256> {
+    pub(crate) fn active_hash_at_height(&self, height: u32) -> Option<Hash256> {
         let tip = self.applied_tip.load_full()?;
         self.hash_at_height_from_tip(&tip, height)
     }
@@ -977,7 +982,7 @@ impl Context {
     /// it. For a tree-resolved `(height, hash)` pair, the log may contribute
     /// matching durable body metadata.
     #[must_use]
-    pub fn record_for_hash(&self, hash: Hash256) -> Option<BlockRecord> {
+    pub(crate) fn record_for_hash(&self, hash: Hash256) -> Option<BlockRecord> {
         // Tree authority resolves identity first; the exact `(height, hash)`
         // record may then enrich its payload fields.
         if let Some(mut record) = self.header_record(hash) {
@@ -1017,7 +1022,7 @@ impl Context {
     /// Before the first applied-tip publication, genesis and cache-only test
     /// records remain available.
     #[must_use]
-    pub fn block_hash_at_height(&self, height: u32) -> Option<Hash256> {
+    pub(crate) fn block_hash_at_height(&self, height: u32) -> Option<Hash256> {
         if let Some(tip) = self.applied_tip.load_full() {
             return self.hash_at_height_from_tip(&tip, height);
         }
@@ -1038,7 +1043,7 @@ impl Context {
     /// Once an applied tip exists, its ancestry is authoritative. The session
     /// vector is a cache-only fallback before the first applied-tip publication.
     #[must_use]
-    pub fn block_by_height(&self, height: u32) -> Option<BlockRecord> {
+    pub(crate) fn block_by_height(&self, height: u32) -> Option<BlockRecord> {
         if let Some(tip) = self.applied_tip.load_full() {
             let hash = self.hash_at_height_from_tip(&tip, height)?;
             return self.record_for_hash(hash);
@@ -1064,14 +1069,17 @@ impl Context {
 
     /// Returns lowercase serialized block hex from durable body storage.
     #[must_use]
-    pub fn block_body_hex(&self, record: &BlockRecord) -> Option<String> {
+    pub(crate) fn block_body_hex(&self, record: &BlockRecord) -> Option<String> {
         Some(hex_encode(&self.block_body_bytes(record)?))
     }
 
     /// Returns the median-time-past at the block with `hash`, or `None` if the
     /// block is not in the tree.
     #[must_use]
-    pub fn median_time_past_for_hash(&self, hash: bitcoin_rs_primitives::Hash256) -> Option<u32> {
+    pub(crate) fn median_time_past_for_hash(
+        &self,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Option<u32> {
         let tree = self.block_tree.read();
         let node_id = tree.lookup(hash)?;
         tree.median_time_past_at(node_id, 11)
@@ -1082,13 +1090,16 @@ impl Context {
     ///
     /// Composes `BlockTree::height_of_hash` (chain crate commit `ef9ff41`).
     #[must_use]
-    pub fn height_for_hash(&self, hash: bitcoin_rs_primitives::Hash256) -> Option<u32> {
+    pub(crate) fn height_for_hash(&self, hash: bitcoin_rs_primitives::Hash256) -> Option<u32> {
         self.block_tree.read().height_of_hash(hash)
     }
 
     /// Returns the 64-char lowercase hex chainwork at the block with `hash`.
     #[must_use]
-    pub fn chain_work_hex_for_hash(&self, hash: bitcoin_rs_primitives::Hash256) -> Option<String> {
+    pub(crate) fn chain_work_hex_for_hash(
+        &self,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Option<String> {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
         let bytes: [u8; 32] = node.chainwork.to_be_bytes();
@@ -1097,7 +1108,7 @@ impl Context {
 
     /// Returns the hash of the block at `height + 1` on the active chain.
     #[must_use]
-    pub fn next_block_hash_for_height(
+    pub(crate) fn next_block_hash_for_height(
         &self,
         height: u32,
     ) -> Option<bitcoin_rs_primitives::Hash256> {

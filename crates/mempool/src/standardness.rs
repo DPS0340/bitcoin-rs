@@ -172,7 +172,7 @@ pub struct PackageAcceptanceFacts {
 /// encoded as `next_height` and `next_mtp`, matching the consensus helper's
 /// unconfirmed-prevout convention.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Bip68Admission<'a> {
+pub(crate) struct Bip68Admission<'a> {
     /// Whether CSV (BIP68/112/113) is active for the next block.
     pub csv_active: bool,
     /// Height of the block that would include `tx` (applied tip + 1).
@@ -519,7 +519,7 @@ pub(crate) fn is_dust(output: &TxOut, dust_relay_fee: u64) -> bool {
 /// `OP_RETURN` outputs have a zero threshold, so a 0-value nulldata output is
 /// not dust.
 #[must_use]
-pub fn tx_has_dust_outputs(tx: &Tx, dust_relay_fee: u64) -> bool {
+pub(crate) fn tx_has_dust_outputs(tx: &Tx, dust_relay_fee: u64) -> bool {
     tx.outputs
         .iter()
         .any(|output| is_dust(output, dust_relay_fee))

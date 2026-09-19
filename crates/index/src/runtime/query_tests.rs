@@ -1,10 +1,8 @@
 use crate::TxIndexSnapshot;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::types::{TxPosition, TxPositionValue};
-use crate::{
-    HashPrefixRow, IndexCapabilities, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow,
-};
+use crate::types::{TxPosition, TxPositionValue, TxidRow};
+use crate::{HashPrefixRow, IndexCapabilities, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow};
 use crate::{block_log::BlockRecord, query_api::ScriptHistoryRecord};
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::NodeStatus;
@@ -66,10 +64,10 @@ impl QuerySnapshot {
             if key.len() != crate::HASH_PREFIX_ROW_SIZE {
                 return Err(IndexError::InvalidPrefixRowLength { len: key.len() });
             }
-            let prefix = key[..crate::HASH_PREFIX_LEN]
+            let prefix = key[..crate::types::HASH_PREFIX_LEN]
                 .try_into()
                 .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
-            let height = key[crate::HASH_PREFIX_LEN..crate::HASH_PREFIX_ROW_SIZE]
+            let height = key[crate::types::HASH_PREFIX_LEN..crate::HASH_PREFIX_ROW_SIZE]
                 .try_into()
                 .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
             rows.push(TxIndexScanRow {
