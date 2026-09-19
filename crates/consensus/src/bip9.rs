@@ -55,8 +55,8 @@ impl DeploymentState {
 
 /// Extended deployment parameters for the BIP9 state machine.
 ///
-/// `Deployment` (the older struct) carries only `bit`/`start_time`/`timeout`.
-/// `DeploymentParams` adds `period` and `threshold` for the state machine.
+/// `DeploymentParams` carries `period` and `threshold` alongside the
+/// `bit`/`start_time`/`timeout` signalling window for the state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeploymentParams {
     /// Bit number signalled in the block version.

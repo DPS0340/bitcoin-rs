@@ -1,3 +1,4 @@
+//! Capability-scoped checkpoint directory and file operations.
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -12,22 +13,25 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 
-/// Name of the datadir-wide clean-cutover schema marker.
-pub(crate) const CURRENT_SCHEMA_FILE: &str = "CURRENT_SCHEMA";
+/// Marker filename containing the current datadir schema epoch.
+pub const CURRENT_SCHEMA_FILE: &str = "CURRENT_SCHEMA";
 const CURRENT_SCHEMA_TEMP_FILE: &str = ".CURRENT_SCHEMA.tmp";
 const CURRENT_SCHEMA_VERSION: u32 = 0;
 // This serialized marker is the single source of truth for the current
 // persistent format epoch. Increment it for a schema-breaking storage change;
 // no converter or compatibility reader accompanies the bump.
 
-pub(crate) fn open_data_dir(path: &Path) -> io::Result<Dir> {
+/// Opens a directory with ambient authority for initial datadir access.
+pub fn open_data_dir(path: &Path) -> io::Result<Dir> {
     Dir::open_ambient_dir(path, ambient_authority())
 }
 
-/// Opens the current datadir epoch. A non-empty directory without the marker is
-/// treated as baseline epoch 0 and adopted only while epoch 0 is current; a
-/// later schema epoch rejects it and requires an explicit resync.
-pub(crate) fn ensure_current_schema(data: &Dir) -> io::Result<()> {
+/// Opens the current datadir epoch.
+///
+/// A non-empty directory without the marker is treated as baseline epoch 0 and
+/// adopted only while epoch 0 is current; a later schema epoch rejects it and
+/// requires an explicit resync.
+pub fn ensure_current_schema(data: &Dir) -> io::Result<()> {
     match read_file(data, CURRENT_SCHEMA_FILE, 16) {
         Ok(bytes) => validate_current_schema(&bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -77,7 +81,8 @@ fn validate_current_schema(bytes: &[u8]) -> io::Result<()> {
     ))
 }
 
-pub(crate) fn current_schema_bytes() -> Vec<u8> {
+/// Returns the newline-terminated bytes for the current schema marker.
+pub fn current_schema_bytes() -> Vec<u8> {
     let mut bytes = CURRENT_SCHEMA_VERSION.to_string().into_bytes();
     bytes.push(b'\n');
     bytes
@@ -191,7 +196,8 @@ impl CheckpointRoot {
     }
 }
 
-pub(crate) fn create_file(dir: &Dir, name: &str) -> io::Result<File> {
+/// Creates a new regular file without following symlinks.
+pub fn create_file(dir: &Dir, name: &str) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options
         .write(true)
@@ -213,7 +219,8 @@ pub(crate) fn open_file(dir: &Dir, name: &str) -> io::Result<File> {
     Ok(file)
 }
 
-pub(crate) fn read_file(dir: &Dir, name: &str, limit: u64) -> io::Result<Vec<u8>> {
+/// Reads a regular file and rejects content larger than `limit` bytes.
+pub fn read_file(dir: &Dir, name: &str, limit: u64) -> io::Result<Vec<u8>> {
     let mut file = open_file(dir, name)?;
     let length = file.metadata()?.len();
     if length > limit {
@@ -243,7 +250,8 @@ pub(crate) fn read_file(dir: &Dir, name: &str, limit: u64) -> io::Result<Vec<u8>
     target_os = "android",
     target_os = "redox"
 ))]
-pub(crate) fn sync_dir(dir: &Dir) -> io::Result<()> {
+/// Flushes a directory entry to durable storage where the platform supports it.
+pub fn sync_dir(dir: &Dir) -> io::Result<()> {
     // cap-std directory capabilities use O_PATH on Linux; reopen "." read-only
     // so fsync has an I/O-capable descriptor without leaving this capability.
     let mut options = OpenOptions::new();
@@ -260,7 +268,8 @@ pub(crate) fn sync_dir(dir: &Dir) -> io::Result<()> {
     target_os = "android",
     target_os = "redox"
 )))]
-pub(crate) fn sync_dir(_dir: &Dir) -> io::Result<()> {
+/// Returns success when the platform cannot fsync directory handles.
+pub fn sync_dir(_dir: &Dir) -> io::Result<()> {
     // Windows does not support flushing a directory handle with the access
     // mode used by cap-std. File contents are still flushed by File::sync_all.
     Ok(())

@@ -14,10 +14,6 @@ This document owns the UTXO set memory and coin-record cells of the target node.
 
 Accelerators (truncated prefixes) remain hints, never identity. No heap object per coin. No second database. An arena or pool proposal reopens only with attribution on its own production allocator and domain workload.
 
-```bash
-cargo test --locked -p bitcoin-rs-utxo --no-default-features --features fjall --test overhaul_persistent_coins -- --nocapture
-```
-
 ## Required identities per sample
 
 Every sample in this cell records six identities. The T02 collector rejects a sample that lacks any of them; a rejected sample is not evidence.

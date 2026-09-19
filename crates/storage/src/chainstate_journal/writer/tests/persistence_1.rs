@@ -68,14 +68,14 @@ fn head_never_advances_without_counted_storage_flush() -> TestResult {
 fn configured_lag_limits_retry_persistent_flush_failures() -> TestResult {
     let store = Arc::new(CountingStore::new());
     let mut writer = open_fresh("lag-backpressure", Arc::clone(&store))?;
-    writer.configure(
-        1,
-        Duration::from_secs(10),
-        1,
-        10,
-        1,
-        Duration::from_secs(10),
-    )?;
+    writer.configure(super::super::JournalPolicy {
+        batch_blocks: 1,
+        batch_seconds: Duration::from_secs(10),
+        rotate_mib: 1,
+        max_journal_mib: 10,
+        max_lag_blocks: 1,
+        max_lag_seconds: Duration::from_secs(10),
+    })?;
     store.set_fail_flush(true);
     assert!(matches!(
         writer.append(&sample_record(1)),
@@ -97,14 +97,14 @@ fn configured_lag_limits_retry_persistent_flush_failures() -> TestResult {
 fn configured_lag_time_forces_pre_apply_durability() -> TestResult {
     let store = Arc::new(CountingStore::new());
     let mut writer = open_fresh("lag-time", store)?;
-    writer.configure(
-        10,
-        Duration::from_secs(10),
-        1,
-        10,
-        10,
-        Duration::from_secs(1),
-    )?;
+    writer.configure(super::super::JournalPolicy {
+        batch_blocks: 10,
+        batch_seconds: Duration::from_secs(10),
+        rotate_mib: 1,
+        max_journal_mib: 10,
+        max_lag_blocks: 10,
+        max_lag_seconds: Duration::from_secs(1),
+    })?;
     writer.append(&sample_record(1))?;
     writer.last_boundary = Instant::now()
         .checked_sub(Duration::from_secs(2))
@@ -119,14 +119,14 @@ fn configured_lag_time_forces_pre_apply_durability() -> TestResult {
 fn retention_limit_blocks_until_checkpoint_compaction() -> TestResult {
     let store = Arc::new(CountingStore::new());
     let mut writer = open_fresh("retention", store)?;
-    writer.configure(
-        10,
-        Duration::from_secs(10),
-        1,
-        1,
-        10,
-        Duration::from_secs(10),
-    )?;
+    writer.configure(super::super::JournalPolicy {
+        batch_blocks: 10,
+        batch_seconds: Duration::from_secs(10),
+        rotate_mib: 1,
+        max_journal_mib: 1,
+        max_lag_blocks: 10,
+        max_lag_seconds: Duration::from_secs(10),
+    })?;
     let name = segment_name(writer.segment_gen);
     let mut options = cap_std::fs::OpenOptions::new();
     options.write(true).create(true);

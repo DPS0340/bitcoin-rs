@@ -20,6 +20,10 @@ redb = ["dep:redb"]
 [dependencies]
 bitcoin-rs-primitives.workspace = true
 bytemuck.workspace = true
+cap-std.workspace = true
+cap-fs-ext.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 bytes.workspace = true
 crossbeam-channel.workspace = true
 hashbrown.workspace = true
@@ -35,6 +39,7 @@ fjall = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 
 [dev-dependencies]
+proptest.workspace = true
 rustix.workspace = true
 sha2.workspace = true
 tempfile = ">=3.20.0, <4"

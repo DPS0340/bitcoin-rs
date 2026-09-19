@@ -203,7 +203,17 @@ fn validate_candidate_nbits(
     validate_header_nbits(tree, parent_id, header, network)
 }
 
-fn validate_pow(header: &BlockHeader, hash: Hash256, network: Network) -> Result<(), ChainError> {
+/// Validates a header's proof-of-work target and hash.
+///
+/// # Errors
+///
+/// Returns [`ChainError::ZeroTarget`], [`ChainError::TargetExceedsLimit`], or
+/// [`ChainError::InvalidPow`] when the header's target/hash is invalid.
+pub fn validate_pow(
+    header: &BlockHeader,
+    hash: Hash256,
+    network: Network,
+) -> Result<(), ChainError> {
     let target = compact_to_target(header.bits);
     if target == ChainWork::ZERO {
         return Err(ChainError::ZeroTarget { hash });

@@ -19,10 +19,9 @@ and the node-facing mining contract ([`MiningControl`](crate::MiningControl),
 [`BlockTemplate`](crate::BlockTemplate), [`MiningInfo`](crate::MiningInfo),
 [`MiningControl::generate`](crate::MiningControl::generate)).
 BIP22/BIP23 JSON projection follows the [API-07 contract](../../docs/contracts/external-api.md#api-07-bip22bip23-template-extras).
-The [`coordinator`](crate::coordinator) module owns the candidate lifecycle:
+[`MiningService`](crate::MiningService) owns the candidate lifecycle:
 generation keys, the bounded template cache with single-flight assembly, and
-long-poll publication, driven by [`MiningService`](crate::MiningService) over
-node-supplied capability sources. Generate assemble-solve-submit, block
+long-poll publication over node-supplied capability sources. Generate assemble-solve-submit, block
 submission, and header-only admission (`submitheader` via `accept_headers`)
 live in the node-owned coordinator that implements `MiningControl`.
 

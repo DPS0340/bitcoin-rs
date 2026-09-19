@@ -342,9 +342,10 @@ The index tracks two independently versioned capabilities via
 (`INDEX_FORMAT_VERSION`, currently 3) is the soft report marker in `UtxoMeta` (the
 hard open-gate marker is the durability key `[0x00, b'V']`, row-format 5). It
 arrays, and at which width (version 3: 6-byte u24 positions). The anticipated
-`TxPosition`-width bump is this version. Readers already handle
-`IndexFormat::Legacy` by falling back to full block scans, so an old-format
-index remains correct, just slower.
+`TxPosition`-width bump is this version. A durability marker other than the
+current value refuses start (`UnsupportedTxIndexFormatVersion`) and recovery
+full-resets the store for rebuild, so a foreign-format index is rebuilt
+rather than read in place.
 
 **Per-capability reset.** The `IndexCapabilities` mask allows resetting one
 capability without touching the other. `acquire_capability_reset` and
@@ -380,8 +381,8 @@ counter's semantics; it just means more writes advance it.
 
 **No dual-read path.** The reader does not maintain a "read from old format,
 then read from new format" fallback for a capability that has not been
-reset. The `IndexFormat::Legacy` fallback is for the row-value format
-(positions vs no positions), not for the presence or absence of a column
+reset. The row-format gate covers the row-value format
+(positions vs no positions), not the presence or absence of a column
 family. A new CF is either populated (after the first ingest) or empty
 (before it); the reader handles both without a format check.
 

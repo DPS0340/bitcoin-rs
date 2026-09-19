@@ -1,150 +1,66 @@
 //! Checkpoint formats, loading, and publication.
 
-mod format;
-pub(crate) use format::hex_encode;
-pub(crate) mod fs;
-mod io;
 mod load;
 mod publish;
 pub(crate) mod publisher;
 
-use crate::checkpoint::fs::CheckpointRoot;
-#[cfg(test)]
-use crate::checkpoint::fs::open_data_dir;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Hash256;
+#[cfg(test)]
+use bitcoin_rs_storage::checkpoint::open_data_dir;
+use bitcoin_rs_storage::checkpoint::{
+    CheckpointError as StoreError, CheckpointIdentity, open_current_checkpoint, read_manifest,
+};
+pub(crate) use bitcoin_rs_storage::checkpoint::{
+    CheckpointLoadError, CheckpointOpen, classify_checkpoint_io, corrupt_checkpoint,
+};
 use bitcoin_rs_utxo::UtxoSet;
-use bitcoin_rs_utxo::stats::CoinStats;
+#[cfg(test)]
 use bitcoin_rs_utxo::stats::CoinStatsListener;
+use bitcoin_rs_utxo::stats::{CoinStats, coin_stats::COIN_STATS_ENCODED_LEN};
 use cap_std::fs::Dir;
-use cap_std::fs::File;
-use load::classify_checkpoint_error;
-use load::classify_open_error;
-use load::corrupt_checkpoint;
 use load::load_headers;
 use load::load_payloads;
-use load::read_current;
-use load::read_manifest;
+#[cfg(test)]
 use parking_lot::RwLock;
-use publish::write_checkpoint_inner;
-use serde::Deserialize;
-use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
-use std::io::BufWriter;
-use std::io::Write;
+pub(crate) use publish::write_checkpoint_from_dir;
 #[cfg(test)]
 use std::path::Path;
 use thiserror::Error;
 
+fn classify_checkpoint_error(error: CheckpointError) -> CheckpointLoadError {
+    match error {
+        // Direct checkpoint I/O or domain I/O failed transiently.
+        CheckpointError::Io(error)
+        | CheckpointError::FullRevalidationMarker(error)
+        | CheckpointError::Utxo(bitcoin_rs_utxo::UtxoError::Io(error))
+        | CheckpointError::Storage(bitcoin_rs_storage::StorageError::Io(error)) => {
+            classify_checkpoint_io(error)
+        }
+        // Storage protocol validation failed and owns its classification.
+        CheckpointError::Store(error) => {
+            bitcoin_rs_storage::checkpoint::classify_checkpoint_error(error)
+        }
+        // Domain decoding or consistency validation failed.
+        error => corrupt_checkpoint(error.to_string()),
+    }
+}
+
 pub(crate) mod headers;
 
-const CHECKPOINT_ROOT: &str = "chainstate-checkpoints";
-const CURRENT_FILE: &str = "CURRENT";
-const MANIFEST_FILE: &str = "manifest-v1.json";
-const HEADERS_FILE: &str = "headers-v1.dat";
-const UTXO_FILE: &str = "utxo-v4.dat";
-const COINSTATS_FILE: &str = "coinstats-v1.dat";
-const CURRENT_FORMAT: &str = "bitcoin-rs-chainstate-current";
-const MANIFEST_FORMAT: &str = "bitcoin-rs-chainstate-checkpoint";
-const HEADER_CODEC: &str = "bitcoin-rs-canonical-headers";
-const UTXO_CODEC: &str = "bitcoin-rs-utxo-spendable-v1";
-// This identifier is written into `manifest-v1.json` and matched on load. It
-// is an on-disk value; changing it requires a schema epoch bump and resync.
-const COINSTATS_CODEC: &str = "bitcoin-rs-coinstats-v1";
-const CURRENT_VERSION: u32 = 1;
-const MANIFEST_VERSION: u32 = 1;
-const UTXO_VERSION: u32 = 4;
-const COINSTATS_VERSION: u32 = 1;
-const COINSTATS_MAGIC: [u8; 8] = *b"BRSSTAT\0";
-const COINSTATS_PAYLOAD_LEN: u32 = 804;
-const COINSTATS_ARTIFACT_LEN: u64 = 820;
-const MAX_CHECKPOINT_PAYLOAD_BYTES: u64 = 64_u64 * 1024 * 1024 * 1024;
-const MAX_CHECKPOINT_METADATA_BYTES: u64 = 1024 * 1024;
-
-const CHECKPOINT_WRITE_BUFFER_SIZE: usize = 64 * 1024;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CurrentV1 {
-    format: String,
-    version: u32,
-    generation: u64,
-    directory: String,
-    manifest_sha256: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CheckpointTipV1 {
-    height: u32,
-    hash: String,
-    chainwork: String,
-    /// Cumulative transaction count of the chain through this tip.
-    ///
-    /// Only meaningful for the applied tip; the best-header tip records `0`,
-    /// since headers carry no transactions.
-    chain_tx_count: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeadersArtifactV1 {
-    file: String,
-    codec: String,
-    version: u32,
-    bytes: u64,
-    sha256: String,
-    header_count: u64,
-    best_chain_sha256: String,
-    applied_chain_sha256: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UtxoArtifactV1 {
-    file: String,
-    codec: String,
-    version: u32,
-    bytes: u64,
-    sha256: String,
-    record_count: u64,
-    output_count: u64,
-    muhash_trailer_sha256: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CoinStatsArtifactV1 {
-    file: String,
-    codec: String,
-    version: u32,
-    bytes: u64,
-    sha256: String,
-    height: u32,
-    total_amount: u64,
-    bogo_size: u64,
-    tx_count: u64,
-    utxo_count: u64,
-    muhash: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CheckpointManifestV1 {
-    format: String,
-    version: u32,
-    generation: u64,
-    network: String,
-    network_magic: String,
-    genesis_hash: String,
-    applied_tip: CheckpointTipV1,
-    best_header_tip: CheckpointTipV1,
-    headers: HeadersArtifactV1,
-    utxo: UtxoArtifactV1,
-    coinstats: CoinStatsArtifactV1,
-}
+pub(crate) use bitcoin_rs_storage::checkpoint::hex_encode;
+#[cfg(test)]
+pub(crate) use bitcoin_rs_storage::checkpoint::{
+    CHECKPOINT_ROOT, CURRENT_FILE, CheckpointCorruption, CheckpointFailpoint, CurrentV1,
+    MANIFEST_FILE,
+};
+pub(crate) use bitcoin_rs_storage::checkpoint::{
+    COINSTATS_ARTIFACT_LEN, COINSTATS_CODEC, COINSTATS_FILE, COINSTATS_MAGIC,
+    COINSTATS_PAYLOAD_LEN, COINSTATS_VERSION, CheckpointManifestV1, CheckpointTipV1,
+    CoinStatsArtifactV1, HEADER_CODEC, HEADERS_FILE, HeadersArtifactV1, MANIFEST_FORMAT,
+    MANIFEST_VERSION, UTXO_CODEC, UTXO_FILE, UTXO_VERSION, UtxoArtifactV1,
+};
 
 pub(crate) enum CheckpointLoad {
     Cold,
@@ -158,8 +74,7 @@ pub(crate) struct RestoredChainstate {
     pub(crate) utxo: UtxoSet,
     pub(crate) coin_stats: CoinStats,
     pub(crate) applied_tip: TipSnapshot,
-    /// Cumulative transaction count through `applied_tip`, or `0` when the
-    /// manifest predates the field.
+    /// Cumulative transaction count through `applied_tip`.
     pub(crate) chain_tx_count: u64,
 }
 
@@ -170,25 +85,7 @@ pub(crate) enum CheckpointWrite {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum CheckpointCorruption {
-    #[error(
-        "corrupt current-schema checkpoint: {reason}; remove or replace the datadir and restart to perform a full resync"
-    )]
-    Invalid { reason: String },
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum CheckpointLoadError {
-    #[error(transparent)]
-    Corrupt(#[from] CheckpointCorruption),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-}
-
-#[derive(Debug, Error)]
 pub(crate) enum CheckpointError {
-    #[error("checkpoint I/O failed: {0}")]
-    Io(#[from] std::io::Error),
     #[error("header checkpoint failed: {0}")]
     Header(#[from] headers::HeaderCheckpointError),
     #[error("checkpoint chain state failed: {0}")]
@@ -197,12 +94,12 @@ pub(crate) enum CheckpointError {
     Utxo(#[from] bitcoin_rs_utxo::UtxoError),
     #[error("CoinStats checkpoint decode failed: {0}")]
     CoinStats(#[from] bitcoin_rs_utxo::stats::CoinStatsDecodeError),
-    #[error("checkpoint JSON failed: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("checkpoint invariant failed: {0}")]
-    Invalid(String),
+    #[error("checkpoint I/O failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("checkpoint block-body durability failed: {0}")]
     Storage(#[from] bitcoin_rs_storage::StorageError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
     #[error("checkpoint refused while disconnect of block {hash} at height {height} is in flight")]
     DisconnectInFlight { hash: Hash256, height: u32 },
     #[error(
@@ -214,119 +111,37 @@ pub(crate) enum CheckpointError {
         head: Hash256,
         head_height: u32,
     },
-    /// The replacement checkpoint's `CURRENT` is already durable; retiring the
-    /// sticky full-revalidation marker failed. Retryable I/O owned by the
-    /// checkpoint worker, not checkpoint corruption.
+    /// The replacement checkpoint's `CURRENT` is already durable; retiring the sticky
+    /// full-revalidation marker failed. Retryable I/O owned by the checkpoint worker,
+    /// not checkpoint corruption.
     #[error("failed to retire full-revalidation marker: {0}")]
     FullRevalidationMarker(std::io::Error),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CheckpointFailpoint {
-    HeadersWrite,
-    HeadersSync,
-    UtxoWrite,
-    UtxoSync,
-    CoinStatsWrite,
-    CoinStatsSync,
-    ManifestWrite,
-    ManifestSync,
-    StageSync,
-    GenerationRename,
-    GenerationRootSync,
-    CurrentTempWrite,
-    CurrentTempSync,
-    CurrentRename,
-    CurrentRootSync,
-}
-
-struct GenerationPaths {
-    #[cfg(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    ))]
-    staging: String,
-    final_dir: String,
-    current_temp: String,
-    directory: String,
-}
-
-struct HashingWriter<'a> {
-    file: BufWriter<&'a mut File>,
-    hasher: Sha256,
-    bytes: u64,
-    fail: bool,
-}
-
-impl<'a> HashingWriter<'a> {
-    fn new(
-        file: &'a mut File,
-        configured: Option<CheckpointFailpoint>,
-        boundary: CheckpointFailpoint,
-    ) -> Self {
-        Self {
-            file: BufWriter::with_capacity(CHECKPOINT_WRITE_BUFFER_SIZE, file),
-            hasher: Sha256::new(),
-            bytes: 0,
-            fail: configured == Some(boundary),
-        }
-    }
-
-    fn finish(mut self) -> std::io::Result<(u64, [u8; 32])> {
-        self.file.flush()?;
-        Ok((self.bytes, self.hasher.finalize().into()))
-    }
-}
-
-impl Write for HashingWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.fail {
-            return Err(std::io::Error::from_raw_os_error(28));
-        }
-        let written = self.file.write(bytes)?;
-        self.hasher.update(&bytes[..written]);
-        self.bytes = self
-            .bytes
-            .checked_add(u64::try_from(written).map_err(std::io::Error::other)?)
-            .ok_or_else(|| std::io::Error::other("checkpoint byte count overflow"))?;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
-    }
-}
+#[allow(clippy::as_conversions)]
+const _: () = assert!(COINSTATS_PAYLOAD_LEN as usize == COIN_STATS_ENCODED_LEN);
 
 pub(crate) fn load_checkpoint_from_dir(
     data_dir: &Dir,
     config: headers::HeaderCheckpointConfig,
 ) -> Result<CheckpointLoad, CheckpointLoadError> {
-    let root = match CheckpointRoot::open_existing(data_dir, CHECKPOINT_ROOT) {
-        Ok(Some(root)) => root,
-        Ok(None) => return Ok(CheckpointLoad::Cold),
-        Err(error) => return Err(classify_open_error("open checkpoint root", error)),
+    let opened = open_current_checkpoint(data_dir)?;
+    let CheckpointOpen::Current {
+        generation_dir,
+        current,
+    } = opened
+    else {
+        return Ok(CheckpointLoad::Cold);
     };
-
-    let current = match read_current(&root) {
-        Ok(Some(current)) => current,
-        // CURRENT is the publication commit point. A root without it can be
-        // leftover from a first publication that crashed before the pointer
-        // became visible; none of that generation is committed state.
-        Ok(None) => return Ok(CheckpointLoad::Cold),
-        Err(error) => return Err(classify_checkpoint_error(error)),
-    };
-    let generation_dir = root.open_dir(&current.directory).map_err(|error| {
-        classify_open_error(
-            &format!("open checkpoint generation {}", current.directory),
-            error,
-        )
-    })?;
-    let manifest = match read_manifest(&generation_dir, &current, config) {
-        Ok(manifest) => manifest,
-        Err(error) => return Err(classify_checkpoint_error(error)),
-    };
+    let manifest = read_manifest(
+        &generation_dir,
+        &current,
+        CheckpointIdentity {
+            network: config.network,
+            genesis: config.genesis,
+        },
+    )
+    .map_err(|error| classify_checkpoint_error(error.into()))?;
     if manifest.headers.version != headers::HEADER_VERSION {
         return Err(corrupt_checkpoint(format!(
             "headers checkpoint version {} is not current",
@@ -339,9 +154,9 @@ pub(crate) fn load_checkpoint_from_dir(
             manifest.headers.codec
         )));
     }
-
     let restored_headers = match load_headers(&generation_dir, config, &manifest) {
         Ok(headers) => headers,
+        // Header codec reported a checkpoint version newer than this node.
         Err(CheckpointError::Header(headers::HeaderCheckpointError::UnsupportedVersion {
             actual,
         })) => {
@@ -349,6 +164,7 @@ pub(crate) fn load_checkpoint_from_dir(
                 "headers checkpoint version {actual} is not current"
             )));
         }
+        // Header loading failed for a non-version corruption or I/O reason.
         Err(error) => return Err(classify_checkpoint_error(error)),
     };
     if manifest.utxo.version != UTXO_VERSION {
@@ -371,52 +187,11 @@ pub(crate) fn load_checkpoint_from_dir(
     }
     match load_payloads(&generation_dir, &manifest, restored_headers) {
         Ok(restored) => Ok(CheckpointLoad::Complete(Box::new(restored))),
+        // Payload loading failed after authenticated metadata checks.
         Err(error) => Err(classify_checkpoint_error(error)),
     }
 }
 
-fn is_checkpoint_corruption(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::NotFound
-            | std::io::ErrorKind::InvalidData
-            | std::io::ErrorKind::NotADirectory
-            | std::io::ErrorKind::IsADirectory
-            | std::io::ErrorKind::UnexpectedEof
-    )
-}
-#[cfg(test)]
-fn load_checkpoint(
-    data_dir: &Path,
-    config: headers::HeaderCheckpointConfig,
-) -> Result<CheckpointLoad, CheckpointLoadError> {
-    let data_dir = match open_data_dir(data_dir) {
-        Ok(data_dir) => data_dir,
-        Err(_) => return Ok(CheckpointLoad::Cold),
-    };
-    load_checkpoint_from_dir(&data_dir, config)
-}
-
-pub(crate) fn write_checkpoint_from_dir(
-    data_dir: &Dir,
-    config: headers::HeaderCheckpointConfig,
-    block_tree: &RwLock<BlockTree>,
-    utxo: &UtxoSet,
-    coin_stats: &CoinStatsListener,
-    applied_tip: Option<&TipSnapshot>,
-    chain_tx_count: u64,
-) -> Result<CheckpointWrite, CheckpointError> {
-    write_checkpoint_inner(
-        data_dir,
-        config,
-        block_tree,
-        utxo,
-        coin_stats,
-        applied_tip,
-        chain_tx_count,
-        test_failpoint(),
-    )
-}
 #[cfg(test)]
 fn write_checkpoint(
     data_dir: &Path,
@@ -439,26 +214,15 @@ fn write_checkpoint(
 }
 
 #[cfg(test)]
-pub(crate) fn write_checkpoint_with_failpoint(
+pub(crate) fn load_checkpoint(
     data_dir: &Path,
     config: headers::HeaderCheckpointConfig,
-    block_tree: &RwLock<BlockTree>,
-    utxo: &UtxoSet,
-    coin_stats: &CoinStatsListener,
-    applied_tip: Option<&TipSnapshot>,
-    failpoint: CheckpointFailpoint,
-) -> Result<CheckpointWrite, CheckpointError> {
-    let data_dir = open_data_dir(data_dir)?;
-    write_checkpoint_inner(
-        &data_dir,
-        config,
-        block_tree,
-        utxo,
-        coin_stats,
-        applied_tip,
-        0,
-        Some(failpoint),
-    )
+) -> Result<CheckpointLoad, CheckpointLoadError> {
+    let data_dir = match open_data_dir(data_dir) {
+        Ok(data_dir) => data_dir,
+        Err(_) => return Ok(CheckpointLoad::Cold),
+    };
+    load_checkpoint_from_dir(&data_dir, config)
 }
 
 #[cfg(test)]
@@ -469,16 +233,6 @@ std::thread_local! {
 #[cfg(test)]
 pub(crate) fn inject_next_checkpoint_failpoint(failpoint: CheckpointFailpoint) {
     NEXT_CHECKPOINT_FAILPOINT.with(|slot| slot.set(Some(failpoint)));
-}
-
-#[cfg(test)]
-fn test_failpoint() -> Option<CheckpointFailpoint> {
-    NEXT_CHECKPOINT_FAILPOINT.with(std::cell::Cell::take)
-}
-
-#[cfg(not(test))]
-const fn test_failpoint() -> Option<CheckpointFailpoint> {
-    None
 }
 
 #[cfg(test)]

@@ -36,9 +36,9 @@ kernel_vendor_commit = "4b51ffdddfa82b84a03a1fa76bbfa72a4f0b6ccf"
 kernel_source_commit = "fb0e8612d6f74071af77b3f27d915da69e0a726b"
 kernel_sys_crate_sha256 = "2906bc31f02dff7af9611fe9129c9eae021bd359f9d8e79824026fe1aaf28ab1"
 # Set when a differential harness compares *values* against a running reference
-# (#78 scope item 2). Still false, and deliberately so: the shape comparison in
-# `crates/rpc/src/compat/schema.rs` checks field names, types and optionality
-# against Core's own declarations, which is real verification but not this one.
+# (#78 scope item 2). Still false, and deliberately so: no harness currently
+# compares result values or shapes against Core's own declarations, and the
+# schema_* deviations recorded on entries below are unenforced documentation.
 # A method whose shape matches can still answer a different number.
 #
 # No entry may claim `supported` while this is false, and the suite enforces it.
@@ -145,18 +145,13 @@ jar_sha256 = "079b6c2320252469dcf79afec6886b8255d3dd1b34a9484433c88986752efaa8"
 #   schema_extra       This node emits these and Core does not declare them.
 #   schema_mismatched  Both emit them, with disagreeing JSON types.
 #
-# These are checked, not written down: `crates/rpc/src/compat/schema.rs`
-# dispatches the method, compares the answer against Core's own declared result
-# schema, and requires the difference it finds to be exactly the difference
-# recorded here. A field that starts differing fails; so does one recorded here
-# that stops differing, because a stale deviation is a lie in the other
-# direction.
-#
-# The schemas come from Core's `RPCResult` declarations, extracted by
-# `tools/core-rpc-schema/extract.py` into `docs/api/core-rpc-schema.json`. That
-# is a check of *shape* -- names, types, optionality -- and not of values.
-# Values need a live Core, which #78 keeps as a separate documented lane, and
-# is why a clean shape comparison still does not earn `supported`.
+# These are recorded, not checked: the schemas come from Core's `RPCResult`
+# declarations, extracted by `tools/core-rpc-schema/extract.py` into
+# `docs/api/core-rpc-schema.json`, and the deviations below were transcribed
+# from that comparison. That is a record of *shape* -- names, types,
+# optionality -- and not of values. Values need a live Core, which #78 keeps
+# as a separate documented lane, and is why a clean shape record still does
+# not earn `supported`.
 
 
 # ---------------------------------------------------------------------------

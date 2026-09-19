@@ -22,8 +22,8 @@ Owners:
   `crates/node/tests/crash_recovery.rs`
 - Reorg and disconnect: `crates/node/src/reorg/` and
   `crates/node/src/apply/disconnect.rs`
-- Checkpoint independence: retired with the `overhaul_*` purge; no
-  surviving equivalent (re-add with the checkpoint slice)
+- Checkpoint publication and recovery:
+  `crates/node/src/checkpoint/` and `crates/storage/src/checkpoint/`
 - Index worker recovery: `crates/index/src/runtime/recovery_tests.rs`
 - Policy: `docs/policies/db-migration.md`
 
@@ -170,35 +170,6 @@ isolated local environment. A process kill is not a substitute for simulated
 power loss. Fault-injection storage tests must exercise lost writes, partial
 writes, and failures around sync completion in addition to child-process kill
 tests.
-
-### `RCV-04A`: Persistent coin transition boundary
-
-- `PersistentUtxoSet` serializes refill, mutation, persistence, and flush with
-  an explicit in-flight generation. Its metadata mutex is held only while
-  observing or updating transition and cache bookkeeping; backing-store I/O
-  and UTXO listener callbacks run without that mutex.
-- A mutation transition excludes other persistent operations until it
-  completes, so no concurrent refill or read can cross an unpublished coin
-  generation. During a non-mutating storage transition, a cache-resident
-  `get` may complete immediately; a cache miss joins the serialized
-  transition before consulting storage.
-- A listener running on the active mutation thread must not wait on its own
-  transition. Re-entering a `PersistentUtxoSet` operation from that owner
-  returns `PersistentUtxoError::ReentrantOperation`; no nested persistent
-  transition begins.
-- A deferred mutation retains a pin for its changed transaction, including
-  its latest pending before-image payload, until a durability receipt covers
-  it. A successful explicit `flush`, or a successful non-empty `Durable` or
-  `CasGuarded` persistence operation, covers every earlier completed deferred
-  write and clears all retained pins. An empty or no-op mutation performs no
-  store durability operation and must not clear pins. A failed flush provides
-  no receipt and leaves pins intact; failed persistence or a CAS mismatch
-  never treats retained pins as durably completed and leaves the failed
-  mutation quarantined.
-- Timed concurrency regressions use their finite timeout only as a deadlock
-  detector. The timeout is not a latency target or service-level guarantee;
-  the contract requires progress before the deliberately blocked storage
-  boundary is released.
 
 ### `RCV-05`: Deep rollback and selective rebuild
 
@@ -360,15 +331,18 @@ state is harmless and keeps the node operating until replay closes the gap.
 - `crates/node/tests/crash_recovery.rs` (existing): the `RCV-04` crash
   points — SIGKILL restart across journal, reorg, and publication scenarios,
   partial-write handling, and upgrade-matrix fallback.
-- `crates/utxo/tests/overhaul_persistent_coins.rs` (existing): covers the
-  `RCV-04A` metadata-lock, cache-resident progress, re-entry, and durability-pin rules.
 - `crates/node/src/reorg/` and `crates/node/src/apply/disconnect.rs`
   (existing): cover `RCV-05` and bounded disconnect and reorg memory;
   `RCV-08`'s bounded descriptors and committed-ancestor restarts are proven
   by `crates/node/src/reorg` (bounded stream windows, retention leases) and
   the #655 boot-replay tests above.
-- Checkpoint independence: retired with the `overhaul_*` purge; no surviving
-  equivalent (re-add with the checkpoint slice).
+- Checkpoint publication and recovery (existing):
+  `crates/node/src/checkpoint/tests/` covers consensus-valid active-chain
+  replay, applied-ancestry selection, competing-fork rejection, and
+  immutable-generation resume; `crates/storage/src/checkpoint/tests.rs`
+  covers generation publication, failpoint preservation, and
+  manifest/artifact validation. This replaces the retired `overhaul_*`
+  checkpoint-independence row.
 - `crates/storage/tests/overhaul_atomic_durability.rs` (existing): tests the
   storage-level prior-or-whole-proposed rule and durable batch completion.
 - `crates/index/src/runtime/recovery_tests.rs` (existing):

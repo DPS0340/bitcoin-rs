@@ -5,6 +5,7 @@
 //! or mining caller needs at a connect height.
 
 use bitcoin_rs_consensus::bip9::versionbits_block_version;
+use bitcoin_rs_consensus::bip30::BIP34_IMPLIES_BIP30_LIMIT;
 use bitcoin_rs_consensus::{
     CSV_DEPLOYMENT_ID, DeploymentContext, DeploymentParams, DeploymentState,
     MEDIAN_TIME_PAST_WINDOW, SEGWIT_DEPLOYMENT_ID, SoftforkState, compute_state, deployment_params,
@@ -132,6 +133,37 @@ pub fn candidate_version(
     }))
 }
 
+/// Returns whether the BIP30 duplicate-txid scan is required at `height`.
+#[must_use]
+pub fn bip30_duplicate_scan_required(
+    tree: &BlockTree,
+    network: Network,
+    height: u32,
+    previous_tip: Option<NodeId>,
+) -> bool {
+    if height >= BIP34_IMPLIES_BIP30_LIMIT || !network.is_bip34_active(height) {
+        return true;
+    }
+
+    let Some(expected_activation_hash) = network.bip34_activation_hash() else {
+        return true;
+    };
+    let Some(previous_tip) = previous_tip else {
+        return true;
+    };
+
+    let Some(activation_id) =
+        tree.node_at_height_from(previous_tip, network.bip34_activation_height())
+    else {
+        return true;
+    };
+    let Ok(activation_node) = tree.node(activation_id) else {
+        return true;
+    };
+
+    activation_node.hash != expected_activation_hash
+}
+
 fn deployment_active(
     tree: &BlockTree,
     network: Network,
@@ -189,6 +221,7 @@ fn cached_deployment_state(
 mod tests {
     use crate::node::NodeStatus;
     use bitcoin_rs_consensus::DeploymentContext;
+    use bitcoin_rs_consensus::bip30::BIP34_IMPLIES_BIP30_LIMIT;
     use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Header, Network};
 
     use super::{DeploymentView, softfork_state};
@@ -245,6 +278,95 @@ mod tests {
 
         assert_eq!(mtp, 1_003_000);
         Ok(())
+    }
+
+    fn seed_known_bip34_activation_chain(
+        tree: &mut BlockTree,
+        network: Network,
+    ) -> Result<crate::NodeId, Box<dyn std::error::Error>> {
+        let activation_height = network.bip34_activation_height();
+        let expected_hash = network
+            .bip34_activation_hash()
+            .ok_or_else(|| std::io::Error::other("network has no fixed BIP34 activation hash"))?;
+        let mut prev_hash = BlockHash::default();
+        let mut tip = None;
+        let mut activation_id = None;
+        for height in 0..=activation_height.saturating_add(1) {
+            let header = synthetic_header(prev_hash, height);
+            // The activation header must enter the index under its
+            // authenticated hash; mutating afterwards would leave the child
+            // prev_blockhash and the by_hash key pointing at a discarded hash.
+            let node_id = if height == activation_height {
+                tree.insert_header_with_hash(header, expected_hash, NodeStatus::HeaderValid)?
+            } else {
+                tree.insert_header(header, NodeStatus::HeaderValid)?
+            };
+            if height == activation_height {
+                activation_id = Some(node_id);
+            }
+            prev_hash = BlockHash::from(tree.node(node_id)?.hash);
+            tip = Some(node_id);
+        }
+        activation_id.ok_or_else(|| std::io::Error::other("missing activation node"))?;
+        tip.ok_or_else(|| std::io::Error::other("missing previous tip").into())
+    }
+
+    #[test]
+    fn bip30_skips_duplicate_scan_after_known_bip34_activation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::Testnet3;
+        let height = network
+            .bip34_activation_height()
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("activation height overflow"))?;
+        let mut tree = BlockTree::new();
+        let previous_tip = seed_known_bip34_activation_chain(&mut tree, network)?;
+        // The child of the activation header must commit to the authenticated
+        // hash, not to a pre-mutation synthetic hash.
+        let expected = network
+            .bip34_activation_hash()
+            .ok_or_else(|| std::io::Error::other("network has no fixed BIP34 activation hash"))?;
+        let child_id = tree
+            .node_at_height_from(previous_tip, height)
+            .ok_or_else(|| std::io::Error::other("seeded child missing"))?;
+        assert_eq!(
+            tree.node(child_id)?.header.prev_blockhash,
+            BlockHash::from(expected),
+            "activation child must point at the authenticated activation hash"
+        );
+        assert!(
+            !super::bip30_duplicate_scan_required(&tree, network, height, Some(previous_tip)),
+            "known BIP34 activation must skip the duplicate scan"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bip30_duplicate_scan_runs_without_known_bip34_activation_hash()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::Regtest;
+        let height = network
+            .bip34_activation_height()
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("activation height overflow"))?;
+
+        assert!(super::bip30_duplicate_scan_required(
+            &BlockTree::new(),
+            network,
+            height,
+            None,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bip30_duplicate_scan_runs_at_core_recheck_limit() {
+        assert!(super::bip30_duplicate_scan_required(
+            &BlockTree::new(),
+            Network::Mainnet,
+            BIP34_IMPLIES_BIP30_LIMIT,
+            None,
+        ));
     }
 
     #[test]

@@ -108,11 +108,11 @@ pub fn write_snapshot(
 ///
 /// Returns the selected trailer and observer only after the complete snapshot is
 /// written successfully.
-pub fn write_snapshot_observed<O: SnapshotCoinObserver>(
+pub fn write_snapshot_observed<O: SnapshotCoinObserver, W: Write + ?Sized>(
     set: &UtxoSet,
     tip_hash: &Hash256,
     height: u32,
-    writer: &mut impl Write,
+    writer: &mut W,
     mut observer: O,
 ) -> Result<([u8; MUHASH_TRAILER_LEN], O), UtxoError> {
     set.with_stable_view(|view| {
