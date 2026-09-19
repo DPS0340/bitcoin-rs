@@ -587,4 +587,58 @@ mod decoder_refusal_tests {
             .expect_err("unsolicited response is refused");
         assert!(matches!(error, HttpError::Framing(_)));
     }
+
+    /// Serves one canned byte string to a single connection, draining the
+    /// request the client sends to legitimize the response first.
+    fn serve_once(canned: &[u8]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let address = listener.local_addr().expect("bound socket has an address");
+        let canned = canned.to_owned();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().ok()?;
+            let mut discard = [0_u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut discard);
+            std::io::Write::write_all(&mut stream, &canned).ok()
+        });
+        address
+    }
+
+    /// Wire-level refusals through a live loopback server, plus one framed
+    /// happy path: the pure-function tables above cannot see the
+    /// `Connection` read path (header loop, line ceiling, framing gates).
+    #[test]
+    fn wire_level_refusals_and_framed_read() {
+        let address = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let mut connection = Connection::connect(address).expect("loopback connects");
+        connection
+            .send_request_fragmented(b"GET /", None)
+            .expect("request sends");
+        let response = connection.read_response().expect("framed response decodes");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+
+        let mut cases: Vec<Vec<u8>> = vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n".to_vec(),
+        ];
+        let mut long_status = b"HTTP/1.1 200 ".to_vec();
+        long_status.extend(std::iter::repeat_n(b'A', 2000));
+        long_status.extend_from_slice(b"\r\n");
+        cases.push(long_status);
+        for canned in &cases {
+            let address = serve_once(canned);
+            let mut connection = Connection::connect(address).expect("loopback connects");
+            connection
+                .send_request_fragmented(b"GET /", None)
+                .expect("request sends");
+            let error = connection
+                .read_response()
+                .expect_err("wire violation is refused");
+            assert!(
+                matches!(error, HttpError::Framing(_)),
+                "unexpected error: {error:?}"
+            );
+        }
+    }
 }

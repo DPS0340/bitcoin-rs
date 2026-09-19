@@ -3,9 +3,12 @@
 How the node recovers an authoritative chainstate after a crash, a lost
 write, a reorganization, or an incompatible datadir. The chainstate is
 the single durable authority. It is not yet extracted: the
-`crates/chainstate` crate has not landed, so the authority today is the
-`crates/node/src/apply` commit protocol over the storage durable head.
-Every other persisted component is derived and reconciles to it.
+`crates/chainstate` crate has not landed, so commit ordering today is owned
+by the `crates/node/src/apply` commit protocol over the storage durable
+head. That head certifies ordering and high-water bounds, not coin contents:
+without a restored checkpoint the node starts with an empty chainstate
+(`reconcile_at_boot` warns and continues). Every other persisted component
+is derived and reconciles to it.
 
 Owners:
 - Authoritative durable root and ordered commit protocol:
@@ -18,7 +21,7 @@ Owners:
 - Crash and lost-write fault tests:
   `crates/node/tests/crash_recovery.rs`
 - Reorg and disconnect: `crates/node/src/reorg/` and
-  `crates/node/src/disconnect.rs`
+  `crates/node/src/apply/disconnect.rs`
 - Checkpoint independence: retired with the `overhaul_*` purge; no
   surviving equivalent (re-add with the checkpoint slice)
 - Index worker recovery: `crates/index/src/runtime/recovery_tests.rs`
@@ -354,18 +357,18 @@ state is harmless and keeps the node operating until replay closes the gap.
   reopen, fence, and fault laws for the head store.
 - `crates/chainstate/src/recovery.rs` (planned): owns schema admission,
   `incompatible_schema` refusal, and `CURRENT_SCHEMA` increment logic.
-- `crates/node/tests/overhaul_crash_matrix.rs` (planned): exercises the
-  `RCV-04` crash and lost-write points, including process kill, lost and
-  partial writes, and ambiguous durable completion.
+- `crates/node/tests/crash_recovery.rs` (existing): the `RCV-04` crash
+  points — SIGKILL restart across journal, reorg, and publication scenarios,
+  partial-write handling, and upgrade-matrix fallback.
 - `crates/utxo/tests/overhaul_persistent_coins.rs` (existing): covers the
   `RCV-04A` metadata-lock, cache-resident progress, re-entry, and durability-pin rules.
-- `crates/node/tests/overhaul_streaming_reorg.rs` (planned): covers
-  `RCV-05` and bounded disconnect and reorg memory; `RCV-08`'s bounded
-  descriptors and committed-ancestor restarts are proven by
-  `crates/node/src/reorg` (bounded stream windows, retention leases) and
+- `crates/node/src/reorg/` and `crates/node/src/apply/disconnect.rs`
+  (existing): cover `RCV-05` and bounded disconnect and reorg memory;
+  `RCV-08`'s bounded descriptors and committed-ancestor restarts are proven
+  by `crates/node/src/reorg` (bounded stream windows, retention leases) and
   the #655 boot-replay tests above.
-- `crates/node/tests/overhaul_checkpoint_independence.rs` (planned):
-  validates fresh replay, schema refusal, and checkpoint authority removal.
+- Checkpoint independence: retired with the `overhaul_*` purge; no surviving
+  equivalent (re-add with the checkpoint slice).
 - `crates/storage/tests/overhaul_atomic_durability.rs` (existing): tests the
   storage-level prior-or-whole-proposed rule and durable batch completion.
 - `crates/index/src/runtime/recovery_tests.rs` (existing):
