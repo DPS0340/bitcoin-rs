@@ -61,9 +61,11 @@ for independent cross-checking.
 ## Flags
 
 `flags` strings parse via `VerifyFlags::from_core_names` and match the
-derivation in production's `compute_verify_flags`
-(`crates/node/src/apply.rs`): `P2SH` is set **unconditionally** at every
-height (BIP16 is treated as always-on for supported validation paths — hence
+derivation in production's `bitcoin_rs_consensus::verify_flags`
+(`crates/consensus/src/verify_block.rs`): `P2SH` is set at every height
+**except** the network's BIP16 exception hash (`Network::is_bip16_p2sh_exception`:
+mainnet block 170060, testnet3 block 394), for which it is omitted (BIP16 is
+otherwise treated as always-on for supported validation paths — hence
 `P2SH`, never `NONE`, on the height-170/2812 legacy fixtures, where it is
 verdict-identical because no P2SH-pattern output is spent), and the remaining
 bits follow mainnet activation heights (BIP66 DERSIG ≥ 363,725; BIP65 CLTV ≥

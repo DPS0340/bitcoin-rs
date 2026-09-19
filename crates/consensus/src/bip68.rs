@@ -1,3 +1,5 @@
+use crate::ConsensusError;
+
 /// BIP68 disable flag (`1 << 31`).
 pub const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
 /// BIP68 type flag: set means time-based, clear means height-based (`1 << 22`).
@@ -6,6 +8,58 @@ pub(crate) const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 pub(crate) const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_ffff;
 /// BIP68 time-based granularity in seconds (`2^9`).
 pub(crate) const SEQUENCE_LOCKTIME_GRANULARITY_SECONDS: u32 = 512;
+
+/// Checks one input's BIP68 relative lock; `prevout_mtp` is only read for time-based locks.
+///
+/// # Errors
+///
+/// Returns `ConsensusError::Bip` when the relative lock is not yet satisfied.
+pub fn check_sequence_lock(
+    tx_version: i32,
+    sequence: u32,
+    prevout_height: u32,
+    prevout_mtp: u32,
+    block_height: u32,
+    block_mtp: u32,
+) -> Result<(), ConsensusError> {
+    if sequence_lock_satisfied(
+        tx_version,
+        sequence,
+        prevout_height,
+        prevout_mtp,
+        block_height,
+        block_mtp,
+    ) {
+        return Ok(());
+    }
+    if sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
+        let relative_intervals = sequence & SEQUENCE_LOCKTIME_MASK;
+        let earliest_time = prevout_mtp.saturating_add(
+            relative_intervals.saturating_mul(SEQUENCE_LOCKTIME_GRANULARITY_SECONDS),
+        );
+        // Time-based relative lock remains unsatisfied at the candidate MTP.
+        return Err(ConsensusError::Bip {
+            bip: "BIP68",
+            reason: format!(
+                "input sequence time-based lock unmet: prevout mtp {prevout_mtp} + {relative_intervals}*512s = {earliest_time} > current mtp {block_mtp}"
+            ),
+        });
+    }
+    let relative_blocks = sequence & SEQUENCE_LOCKTIME_MASK;
+    // Height-based relative lock remains unsatisfied at the candidate height.
+    Err(ConsensusError::Bip {
+        bip: "BIP68",
+        reason: format!(
+            "input sequence height-based lock unmet: prevout at height {prevout_height} + {relative_blocks} blocks > current {block_height}"
+        ),
+    })
+}
+
+/// Returns whether `sequence` uses the time-based relative-lock encoding.
+#[must_use]
+pub const fn sequence_lock_is_time_based(sequence: u32) -> bool {
+    sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0
+}
 
 /// Returns whether a relative sequence lock is satisfied at `block_height` / `block_mtp`.
 ///
@@ -38,7 +92,9 @@ pub fn sequence_lock_satisfied(
 
 #[cfg(test)]
 mod tests {
-    use super::sequence_lock_satisfied;
+    use super::{
+        SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_TYPE_FLAG, sequence_lock_satisfied,
+    };
 
     #[test]
     fn next_block_height_lock_of_one_is_met_after_one_confirmation() {
@@ -50,5 +106,29 @@ mod tests {
     fn unconfirmed_parent_fails_positive_relative_height_lock() {
         assert!(!sequence_lock_satisfied(2, 1, 11, 0, 11, 0));
         assert!(sequence_lock_satisfied(2, 0, 11, 0, 11, 0));
+    }
+
+    #[test]
+    fn check_sequence_lock_reports_height_and_time_boundaries() {
+        assert!(super::check_sequence_lock(2, 2, 100, 0, 101, 0).is_err());
+        assert_eq!(super::check_sequence_lock(2, 2, 100, 0, 102, 0), Ok(()));
+        let time_sequence = SEQUENCE_LOCKTIME_TYPE_FLAG | 2;
+        assert!(
+            super::check_sequence_lock(2, time_sequence, 100, 1_000, 101, 1_000 + 2 * 512 - 1)
+                .is_err()
+        );
+        assert_eq!(
+            super::check_sequence_lock(2, time_sequence, 100, 1_000, 101, 1_000 + 2 * 512),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_sequence_lock_ignores_version_one_and_disabled_sequences() {
+        assert_eq!(super::check_sequence_lock(1, 2, 100, 0, 100, 0), Ok(()));
+        assert_eq!(
+            super::check_sequence_lock(2, SEQUENCE_LOCKTIME_DISABLE_FLAG | 2, 100, 0, 100, 0),
+            Ok(())
+        );
     }
 }
