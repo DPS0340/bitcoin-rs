@@ -111,6 +111,37 @@ pub struct NetworkState {
     pub timestamp: u64,
 }
 
+/// Typed synchronization progress behind `getblockchaininfo`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncProgress {
+    /// Consensus network the node follows.
+    pub network: Network,
+    /// Blocks fully applied to chainstate.
+    pub blocks: u32,
+    /// Validated headers known to the node (may lead `blocks` during sync).
+    pub headers: u32,
+    /// Hash of the best fully applied block.
+    pub best_block_hash: Hash256,
+    /// Difficulty at the applied tip (Core `GetDifficulty`).
+    pub difficulty: f64,
+    /// Applied tip header timestamp, UNIX seconds.
+    pub time: u64,
+    /// Median time past of the last eleven applied blocks.
+    pub median_time: u64,
+    /// Core `GuessVerificationProgress` in the inclusive range `[0, 1]`.
+    pub verification_progress: f64,
+    /// Whether the node is still in initial block download.
+    pub initial_block_download: bool,
+    /// Applied chain work, big-endian hex (`"00"` before the first tip).
+    pub chain_work: String,
+    /// Bytes the block store occupies on disk.
+    pub size_on_disk: u64,
+    /// Whether pruning is enabled.
+    pub pruned: bool,
+    /// Prune floor height, present only on a pruned node.
+    pub prune_height: Option<u32>,
+}
+
 /// Current pruning state reported by chain RPCs.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PruneStatus {
@@ -721,8 +752,9 @@ impl Context {
     }
 
     /// Returns active ZMQ notification metadata from the live publisher.
+    #[cfg(feature = "zmq")]
     #[must_use]
-    pub fn zmq_notifications(&self) -> Vec<crate::zmq::ZmqNotifier> {
+    pub(crate) fn zmq_notifications(&self) -> Vec<crate::zmq::ZmqNotifier> {
         self.zmq_publisher.active_notifiers()
     }
 
@@ -732,6 +764,83 @@ impl Context {
         self.prune_service
             .as_ref()
             .map_or_else(PruneStatus::default, |service| service.status())
+    }
+
+    /// Typed synchronization progress: the `getblockchaininfo` facts without
+    /// RPC JSON. Chainwork is the applied tip's when one exists.
+    #[must_use]
+    pub fn sync_progress(&self) -> SyncProgress {
+        let applied_tip = self.applied_tip.load_full();
+        let applied = applied_tip.as_ref().map_or(0, |tip| tip.height);
+        let headers = self.height();
+        let (difficulty, time, median_time) =
+            applied_tip.as_ref().map_or((0.0, 0_u64, 0_u64), |tip| {
+                let tree = self.block_tree.read();
+                tree.node(tip.tip_id).map_or((0.0, 0, 0), |node| {
+                    (
+                        self.difficulty_for_bits(node.header.bits),
+                        u64::from(node.header.time),
+                        u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
+                    )
+                })
+            });
+        let now = crate::handlers::chain::unix_now();
+        // Core's estimate when the verified-transaction count is known, the
+        // height ratio when it is not; `None` is a pre-tracking datadir and
+        // means unknown, never zero.
+        let verification_progress = self.chain_tx_count().map_or_else(
+            || {
+                if headers > 0 {
+                    (f64::from(applied) / f64::from(headers)).min(1.0)
+                } else {
+                    0.0
+                }
+            },
+            |chain_tx_count| {
+                crate::handlers::chain::verification_progress(
+                    self.chain_network,
+                    chain_tx_count,
+                    applied,
+                    headers,
+                    time,
+                    now,
+                )
+            },
+        );
+        let prune_status = self.prune_status();
+        SyncProgress {
+            network: self.chain_network,
+            blocks: applied,
+            headers,
+            best_block_hash: applied_tip
+                .as_ref()
+                .map_or_else(Hash256::default, |tip| tip.hash),
+            difficulty,
+            time,
+            median_time,
+            verification_progress,
+            initial_block_download: self.is_initial_block_download(now),
+            chain_work: applied_tip
+                .as_deref()
+                .map_or_else(|| self.chainwork_hex(), Self::tip_chainwork_hex),
+            size_on_disk: self
+                .block_storage_disk_usage()
+                .unwrap_or_else(|| self.blocks.read().size_on_disk()),
+            pruned: prune_status.pruned,
+            prune_height: prune_status.pruneheight,
+        }
+    }
+
+    /// Big-endian hex of one tip snapshot's chainwork.
+    fn tip_chainwork_hex(tip: &TipSnapshot) -> String {
+        let bytes: [u8; 32] = tip.chainwork.to_be_bytes();
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use core::fmt::Write as _;
+
+            let _: fmt::Result = write!(&mut out, "{byte:02x}");
+        }
+        out
     }
 
     /// Returns the f64 difficulty for `bits` using Bitcoin Core's calculation.
@@ -768,7 +877,7 @@ impl Context {
 
     /// Borrows the provisional chain capability shared with P2P admission.
     #[must_use]
-    pub fn admission_chain(&self) -> ChainAdmissionView<'_> {
+    pub(crate) fn admission_chain(&self) -> ChainAdmissionView<'_> {
         ChainAdmissionView::new(
             &self.utxo,
             &self.applied_tip,
@@ -827,8 +936,12 @@ impl Context {
     /// Returns `self` sharing `handle` as the cumulative chain transaction count.
     ///
     /// The node owns the counter; the RPC surface only reads it.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_chain_tx_count(mut self, handle: Arc<core::sync::atomic::AtomicU64>) -> Self {
+    pub(crate) fn with_chain_tx_count(
+        mut self,
+        handle: Arc<core::sync::atomic::AtomicU64>,
+    ) -> Self {
         self.chain_tx_count = handle;
         self
     }
@@ -911,7 +1024,7 @@ impl Context {
 
     /// Returns the current best block hash, or all-zero before initial sync.
     #[must_use]
-    pub fn best_hash(&self) -> Hash256 {
+    pub(crate) fn best_hash(&self) -> Hash256 {
         self.chain_tip
             .load_full()
             .map_or_else(Hash256::default, |tip| tip.hash)
@@ -949,7 +1062,7 @@ impl Context {
 
     /// Returns the applied-chain hash at `height`, from the restored header index.
     #[must_use]
-    pub fn active_hash_at_height(&self, height: u32) -> Option<Hash256> {
+    pub(crate) fn active_hash_at_height(&self, height: u32) -> Option<Hash256> {
         let tip = self.applied_tip.load_full()?;
         self.hash_at_height_from_tip(&tip, height)
     }
@@ -977,7 +1090,7 @@ impl Context {
     /// it. For a tree-resolved `(height, hash)` pair, the log may contribute
     /// matching durable body metadata.
     #[must_use]
-    pub fn record_for_hash(&self, hash: Hash256) -> Option<BlockRecord> {
+    pub(crate) fn record_for_hash(&self, hash: Hash256) -> Option<BlockRecord> {
         // Tree authority resolves identity first; the exact `(height, hash)`
         // record may then enrich its payload fields.
         if let Some(mut record) = self.header_record(hash) {
@@ -1017,7 +1130,7 @@ impl Context {
     /// Before the first applied-tip publication, genesis and cache-only test
     /// records remain available.
     #[must_use]
-    pub fn block_hash_at_height(&self, height: u32) -> Option<Hash256> {
+    pub(crate) fn block_hash_at_height(&self, height: u32) -> Option<Hash256> {
         if let Some(tip) = self.applied_tip.load_full() {
             return self.hash_at_height_from_tip(&tip, height);
         }
@@ -1038,7 +1151,7 @@ impl Context {
     /// Once an applied tip exists, its ancestry is authoritative. The session
     /// vector is a cache-only fallback before the first applied-tip publication.
     #[must_use]
-    pub fn block_by_height(&self, height: u32) -> Option<BlockRecord> {
+    pub(crate) fn block_by_height(&self, height: u32) -> Option<BlockRecord> {
         if let Some(tip) = self.applied_tip.load_full() {
             let hash = self.hash_at_height_from_tip(&tip, height)?;
             return self.record_for_hash(hash);
@@ -1064,14 +1177,17 @@ impl Context {
 
     /// Returns lowercase serialized block hex from durable body storage.
     #[must_use]
-    pub fn block_body_hex(&self, record: &BlockRecord) -> Option<String> {
+    pub(crate) fn block_body_hex(&self, record: &BlockRecord) -> Option<String> {
         Some(hex_encode(&self.block_body_bytes(record)?))
     }
 
     /// Returns the median-time-past at the block with `hash`, or `None` if the
     /// block is not in the tree.
     #[must_use]
-    pub fn median_time_past_for_hash(&self, hash: bitcoin_rs_primitives::Hash256) -> Option<u32> {
+    pub(crate) fn median_time_past_for_hash(
+        &self,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Option<u32> {
         let tree = self.block_tree.read();
         let node_id = tree.lookup(hash)?;
         tree.median_time_past_at(node_id, 11)
@@ -1082,13 +1198,16 @@ impl Context {
     ///
     /// Composes `BlockTree::height_of_hash` (chain crate commit `ef9ff41`).
     #[must_use]
-    pub fn height_for_hash(&self, hash: bitcoin_rs_primitives::Hash256) -> Option<u32> {
+    pub(crate) fn height_for_hash(&self, hash: bitcoin_rs_primitives::Hash256) -> Option<u32> {
         self.block_tree.read().height_of_hash(hash)
     }
 
     /// Returns the 64-char lowercase hex chainwork at the block with `hash`.
     #[must_use]
-    pub fn chain_work_hex_for_hash(&self, hash: bitcoin_rs_primitives::Hash256) -> Option<String> {
+    pub(crate) fn chain_work_hex_for_hash(
+        &self,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Option<String> {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
         let bytes: [u8; 32] = node.chainwork.to_be_bytes();
@@ -1097,7 +1216,7 @@ impl Context {
 
     /// Returns the hash of the block at `height + 1` on the active chain.
     #[must_use]
-    pub fn next_block_hash_for_height(
+    pub(crate) fn next_block_hash_for_height(
         &self,
         height: u32,
     ) -> Option<bitcoin_rs_primitives::Hash256> {

@@ -4,17 +4,15 @@
 /// Applied-block records shared with derived-index readers.
 pub mod block_log;
 /// Core-compatible capability status projection.
-pub mod capabilities;
+mod capabilities;
 /// Confirmed block indexing over the workspace key-value store.
-pub mod index;
-/// Unconfirmed transaction row writing over the workspace key-value store.
-pub mod mempool;
+mod index;
 /// Derived-index query contracts shared with surface adapters.
 pub mod query_api;
 /// Derived-index reconciliation phase and exact capability watermark alignment.
 pub mod reconcile;
 /// Open-time recovery for disposable derived index storage.
-pub mod recovery;
+mod recovery;
 /// Asynchronous durable derived-index runtime.
 pub mod runtime;
 /// Stable electrs-shaped row types.
@@ -28,17 +26,16 @@ pub use capabilities::{
 };
 pub use index::{
     BlockSource, ConsumerCursorUpdate, INDEX_FORMAT_VERSION, IndexCapabilities, IndexCapability,
-    IndexError, IndexFormat, IndexReader, IndexRowCounts, IndexWatermark, IndexWatermarks,
-    IndexWriteFence, IndexWriter, Indexer, MAX_LIVE_SCRIPT_SIZE, NoSpentScripts, PreparedBatch,
-    PreparedBatchLimits, PreparedBlock, ScriptHistoryEntry, ScriptLiveScan, SpentCoinScripts,
-    TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    IndexError, IndexReader, IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriteFence,
+    IndexWriter, Indexer, MAX_LIVE_SCRIPT_SIZE, NoSpentScripts, PreparedBatch, PreparedBatchLimits,
+    PreparedBlock, ScriptHistoryEntry, ScriptLiveScan, SpentCoinScripts, TxIndexScan,
+    TxIndexScanRow, TxIndexSnapshot,
 };
-pub use mempool::{MempoolRowCounts, MempoolRowWriter};
 pub use query_api::{
     DerivedIndexInfo, DerivedIndexQuery, RollbackWarningSource, ScriptHistoryRecord,
     ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, SpendingRecord, TxQueryError,
 };
 pub use types::{
-    HASH_PREFIX_LEN, HASH_PREFIX_ROW_SIZE, HEADER_ROW_SIZE, HashPrefix, HashPrefixRow, HeaderRow,
-    SCRIPT_LIVE_ROW_SIZE, ScriptHash, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow,
+    HASH_PREFIX_ROW_SIZE, HEADER_ROW_SIZE, HashPrefixRow, ScriptHash, ScriptHashRow, ScriptLiveRow,
+    SpendingPrefixRow,
 };

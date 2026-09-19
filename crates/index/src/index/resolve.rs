@@ -107,39 +107,6 @@ impl<S: KvStore> Indexer<S> {
     ///
     /// The lossy 8-byte prefix is exact-resolved here: only outputs whose script
     /// hashes match the full 32-byte `scripthash` are emitted.
-    pub fn resolve_unspent_outputs<B: BlockSource>(
-        &self,
-        scripthash: crate::ScriptHash,
-        source: &B,
-    ) -> Result<Vec<(Txid, u32, u64)>, IndexError> {
-        Ok(self
-            .resolve_unspent_outputs_with_height(scripthash, source)?
-            .into_iter()
-            .map(|(txid, vout, value, _height)| (txid, vout, value))
-            .collect())
-    }
-
-    /// Naive reference implementation of [`Self::resolve_unspent_outputs`].
-    ///
-    /// Retained as the correctness oracle for the resolver equivalence tests and
-    /// as the `before` arm of the `resolve_unspent` benchmark group. Deliberately
-    /// carries no optimization: an oracle that shares an optimization with the
-    /// implementation it checks cannot catch a fault in that optimization.
-    ///
-    /// Not a fallback path — [`Self::resolve_unspent_outputs`] is always correct
-    /// and always faster. Call that one.
-    pub fn resolve_unspent_outputs_scan<B: BlockSource>(
-        &self,
-        scripthash: crate::ScriptHash,
-        source: &B,
-    ) -> Result<Vec<(Txid, u32, u64)>, IndexError> {
-        Ok(self
-            .resolve_unspent_outputs_with_height_scan(scripthash, source)?
-            .into_iter()
-            .map(|(txid, vout, value, _height)| (txid, vout, value))
-            .collect())
-    }
-
     /// Same as `resolve_unspent_outputs` but each tuple carries the funding height.
     ///
     /// Returns `(txid, vout, value_sats, funding_height)` quadruples sorted by
@@ -159,52 +126,6 @@ impl<S: KvStore> Indexer<S> {
             match positioned_unspent_outputs(scripthash, height, value, source) {
                 Some(found) => outputs.extend(found),
                 None => scan_height_unspent_outputs(scripthash, height, source, &mut outputs),
-            }
-        }
-        outputs.sort_by_key(|&(_, _, _, height)| height);
-        Ok(outputs)
-    }
-
-    /// Naive reference implementation of [`Self::resolve_unspent_outputs_with_height`].
-    ///
-    /// Computes every transaction's txid before testing any output script, which
-    /// is the shape this resolver had before the lazy-txid change. Retained as
-    /// the correctness oracle for the resolver equivalence tests and as the
-    /// `before` arm of the `resolve_unspent` benchmark group.
-    ///
-    /// Not a fallback path — [`Self::resolve_unspent_outputs_with_height`] is
-    /// always correct and always faster. Call that one. Like the fast path,
-    /// this sorts by funding height so the reference and the optimized resolver
-    /// agree on order.
-    pub fn resolve_unspent_outputs_with_height_scan<B: BlockSource>(
-        &self,
-        scripthash: crate::ScriptHash,
-        source: &B,
-    ) -> Result<Vec<(Txid, u32, u64, u32)>, IndexError> {
-        let rows = self.iter_funding_rows(scripthash)?;
-        let mut outputs = Vec::new();
-        let mut last_height: Option<u32> = None;
-        let mut cached_block: Option<Block> = None;
-        for row in &rows {
-            let height = row.height();
-            if last_height != Some(height) {
-                cached_block = source.block_at_height(height);
-                last_height = Some(height);
-            }
-            let Some(block) = cached_block.as_ref() else {
-                continue;
-            };
-            for tx in &block.txs {
-                let txid = tx.txid();
-                for (vout_idx, output) in tx.outputs.iter().enumerate() {
-                    if crate::ScriptHash::from_script_bytes(&output.script_pubkey) != scripthash {
-                        continue;
-                    }
-                    let Ok(vout) = u32::try_from(vout_idx) else {
-                        continue;
-                    };
-                    outputs.push((txid, vout, output.value.to_sat(), height));
-                }
             }
         }
         outputs.sort_by_key(|&(_, _, _, height)| height);
@@ -246,37 +167,6 @@ impl<S: KvStore> Indexer<S> {
                     if tx.txid() == txid {
                         return Ok(Some(tx.clone()));
                     }
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Naive reference implementation of [`Self::resolve_transaction`].
-    ///
-    /// Loads and fully decodes the block for each candidate row, then computes
-    /// every transaction's txid until one matches. Retained as the correctness
-    /// oracle and the `before` arm of the `resolve_transaction` benchmark group.
-    pub fn resolve_transaction_scan<B: BlockSource + ?Sized>(
-        &self,
-        txid: Txid,
-        source: &B,
-    ) -> Result<Option<Tx>, IndexError> {
-        let rows = self.iter_txid_rows(&txid)?;
-        let mut last_height: Option<u32> = None;
-        let mut cached_block: Option<Block> = None;
-        for row in &rows {
-            let height = row.height();
-            if last_height != Some(height) {
-                cached_block = source.block_at_height(height);
-                last_height = Some(height);
-            }
-            let Some(block) = cached_block.as_ref() else {
-                continue;
-            };
-            for tx in &block.txs {
-                if tx.txid() == txid {
-                    return Ok(Some(tx.clone()));
                 }
             }
         }

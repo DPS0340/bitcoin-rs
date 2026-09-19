@@ -36,15 +36,16 @@ fn far_behind_duplicate_of_applied_block_is_not_staged() -> Result<(), Box<dyn s
     );
     let stale_hash = Hash256::from_le_bytes(blocks[0].block_hash().as_bytes());
     assert!(
-        !sync.download_window.lock().contains_pending(&stale_hash),
+        !sync.body_sync.lock().window.contains_pending(&stale_hash),
         "the replay must be unsolicited after its request was applied"
     );
 
     blocks_tx.send(crate::InboundBlock::from_decoded(blocks[0].clone()))?;
     sync.tick();
 
-    assert!(!sync.block_stager.lock().contains(&stale_hash));
-    let window = sync.download_window.lock();
+    assert!(!sync.body_sync.lock().stager.contains(&stale_hash));
+    let body_sync = sync.body_sync.lock();
+    let window = &body_sync.window;
     assert_eq!(window.pending_len(), 0);
     assert_eq!(window.received_len(), 0);
     assert!(!window.contains_pending(&stale_hash));
@@ -57,7 +58,8 @@ fn received_only_state_uses_scan_path_without_duplicate_request()
     let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(3)?;
     let received_hash = Hash256::from_le_bytes(expected[1].as_bytes());
     {
-        let mut window = sync.download_window.lock();
+        let mut body_sync = sync.body_sync.lock();
+        let window = &mut body_sync.window;
         let needs_height = window.mark_received(received_hash, 80, Instant::now());
         assert!(needs_height);
         window.update_received_height(&received_hash, 2);

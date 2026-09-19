@@ -98,7 +98,7 @@ impl Mempool {
 
 /// Evicts the lowest-fee dependency chunks until the pool fits.
 /// The complete selection is validated before any mutation occurs.
-pub fn evict_lowest_fee_packages(
+pub(crate) fn evict_lowest_fee_packages(
     pool: &mut Mempool,
     target_size_bytes: u64,
 ) -> Result<Vec<MutationChange>, crate::MempoolError> {

@@ -4,13 +4,13 @@ use sha2::{Digest as _, Sha256};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Number of bytes retained from hashes in electrs index rows.
-pub const HASH_PREFIX_LEN: usize = 8;
+pub(crate) const HASH_PREFIX_LEN: usize = 8;
 /// Number of bytes used for big-endian block heights in index rows.
 ///
 /// Big-endian makes lexicographic KV order match numeric height order within
 /// one prefix, so LSM prefix compression and chronological scans share the
 /// same key layout.
-pub const HEIGHT_SIZE: usize = 4;
+pub(crate) const HEIGHT_SIZE: usize = 4;
 /// Serialized byte length of a hash-prefix row.
 pub const HASH_PREFIX_ROW_SIZE: usize = HASH_PREFIX_LEN + HEIGHT_SIZE;
 /// Serialized byte length of a Bitcoin block header.
@@ -40,7 +40,7 @@ const fn decode_u24_le(bytes: [u8; 3]) -> u32 {
 }
 
 /// Prefix used as the seek key for electrs-style hash-prefix rows.
-pub type HashPrefix = [u8; HASH_PREFIX_LEN];
+pub(crate) type HashPrefix = [u8; HASH_PREFIX_LEN];
 
 /// A stable electrs hash-prefix row: eight prefix bytes followed by a big-endian height.
 #[derive(
@@ -163,7 +163,7 @@ pub struct SpendingPrefixRow;
 
 impl SpendingPrefixRow {
     /// Returns the prefix used to scan rows for a previous outpoint.
-    pub fn scan_prefix(outpoint: &OutPoint) -> HashPrefix {
+    pub(crate) fn scan_prefix(outpoint: &OutPoint) -> HashPrefix {
         spending_prefix(outpoint.txid.as_bytes(), outpoint.vout)
     }
 
@@ -186,16 +186,17 @@ impl SpendingPrefixRow {
 }
 
 /// Row builder for transaction-id rows.
-pub struct TxidRow;
+pub(crate) struct TxidRow;
 
 impl TxidRow {
     /// Returns the prefix used to scan rows for a transaction id.
-    pub fn scan_prefix(txid: &Txid) -> HashPrefix {
+    pub(crate) fn scan_prefix(txid: &Txid) -> HashPrefix {
         txid_prefix(txid.as_bytes())
     }
 
     /// Builds a database row for a transaction occurrence at `height`.
-    pub fn row(txid: &Txid, height: u32) -> HashPrefixRow {
+    #[cfg(test)]
+    pub(crate) fn row(txid: &Txid, height: u32) -> HashPrefixRow {
         HashPrefixRow::new(Self::scan_prefix(txid), height)
     }
 
@@ -224,31 +225,26 @@ impl TxidRow {
     Immutable,
 )]
 #[repr(C)]
-pub struct HeaderRow {
+pub(crate) struct HeaderRow {
     /// Raw Bitcoin block-header bytes in consensus order.
     pub header: [u8; HEADER_ROW_SIZE],
 }
 
 impl HeaderRow {
-    /// Creates a header row from raw consensus header bytes.
-    pub const fn new(header: [u8; HEADER_ROW_SIZE]) -> Self {
-        Self { header }
-    }
-
     /// Copies a header row from a byte slice.
-    pub fn from_header_bytes(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn from_header_bytes(bytes: &[u8]) -> Option<Self> {
         let header = bytes.try_into().ok()?;
         Some(Self { header })
     }
 
     /// Returns the serialized database row.
-    pub const fn to_db_row(self) -> [u8; HEADER_ROW_SIZE] {
+    pub(crate) const fn to_db_row(self) -> [u8; HEADER_ROW_SIZE] {
         self.header
     }
 }
 
 /// Byte width of one live script-index row key: `scan-prefix || txid || vout_u24`.
-pub const SCRIPT_LIVE_ROW_SIZE: usize = HASH_PREFIX_LEN + 32 + 3;
+pub(crate) const SCRIPT_LIVE_ROW_SIZE: usize = HASH_PREFIX_LEN + 32 + 3;
 
 /// One live-output row: a currently unspent outpoint filed under its script.
 ///
@@ -283,7 +279,7 @@ impl ScriptLiveRow {
     }
 
     /// Rebuilds a row from stored key bytes, refusing any other length.
-    pub fn from_db_row(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn from_db_row(bytes: &[u8]) -> Option<Self> {
         let key: [u8; SCRIPT_LIVE_ROW_SIZE] = bytes.try_into().ok()?;
         Some(Self { key })
     }

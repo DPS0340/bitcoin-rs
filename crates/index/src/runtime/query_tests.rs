@@ -2,10 +2,8 @@ use crate::TxIndexSnapshot;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::block_log::BlockRecord;
-use crate::types::{TxPosition, TxPositionValue};
-use crate::{
-    HashPrefixRow, IndexCapabilities, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow,
-};
+use crate::types::{TxPosition, TxPositionValue, TxidRow};
+use crate::{HashPrefixRow, IndexCapabilities, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow};
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_primitives::{
@@ -24,6 +22,7 @@ struct ScanResponse {
     prefix: Vec<u8>,
     scan: PrefixScan,
 }
+
 #[derive(Clone)]
 struct QuerySnapshot {
     watermark: IndexWatermark,
@@ -65,10 +64,10 @@ impl QuerySnapshot {
             if key.len() != crate::HASH_PREFIX_ROW_SIZE {
                 return Err(IndexError::InvalidPrefixRowLength { len: key.len() });
             }
-            let prefix = key[..crate::HASH_PREFIX_LEN]
+            let prefix = key[..crate::types::HASH_PREFIX_LEN]
                 .try_into()
                 .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
-            let height = key[crate::HASH_PREFIX_LEN..crate::HASH_PREFIX_ROW_SIZE]
+            let height = key[crate::types::HASH_PREFIX_LEN..crate::HASH_PREFIX_ROW_SIZE]
                 .try_into()
                 .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
             rows.push(TxIndexScanRow {
@@ -531,3 +530,4 @@ fn spending_position_mismatch_falls_back_to_full_block() -> Result<(), Box<dyn s
     assert_eq!(fixture.full_reads()?, 1);
     Ok(())
 }
+// weave: run 'weave explain crates/index/src/runtime/query_tests.rs' for per-hunk detail, 'weave check' to verify your resolution

@@ -1,9 +1,6 @@
 //! Bounded prepared-block ownership and batch admission.
 
-use super::{
-    capability::IndexCapabilities, capability::IndexWatermark, rows::IndexRowCounts,
-    rows::PendingRows,
-};
+use super::{capability::IndexCapabilities, capability::IndexWatermark, rows::PendingRows};
 
 /// Hard limits for one prepared forward write.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -38,11 +35,6 @@ impl PreparedBlock {
             height: self.height,
             hash: self.hash,
         }
-    }
-
-    /// Row-family counts retained by this prepared block.
-    pub fn row_counts(&self) -> IndexRowCounts {
-        self.rows.counts()
     }
 }
 

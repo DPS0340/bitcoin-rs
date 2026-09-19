@@ -54,14 +54,12 @@ const CANDIDATE_CACHE_LIMIT: usize = 8;
 const CANDIDATE_GENERATION_RETRIES: usize = 8;
 /// Error message identifying a generation-key race during candidate assembly.
 const GENERATION_RACE: &str = "generation key changed during candidate assembly";
-/// Bitcoin Core's mempool-only long-poll cooldown before returning a new template.
-pub const DEFAULT_MEMPOOL_UPDATE_WAIT: Duration = Duration::from_secs(10);
 /// Upper bound for a single long-poll wait slice while rechecking predicates.
 const LONG_POLL_SLICE: Duration = Duration::from_secs(1);
 
 /// Applied-tip hash plus mempool sequence that identify one candidate generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct GenerationKey {
+pub(crate) struct GenerationKey {
     /// Applied tip hash in consensus little-endian storage order.
     pub tip_hash: Hash256,
     /// Mempool sequence captured with the tip.
@@ -71,7 +69,7 @@ pub struct GenerationKey {
 impl GenerationKey {
     /// Opaque BIP22/BIP23 long-poll identity for this generation.
     #[must_use]
-    pub fn template_id(self) -> TemplateId {
+    pub(crate) fn template_id(self) -> TemplateId {
         TemplateId::new(&self.tip_hash, self.mempool_sequence)
     }
 }

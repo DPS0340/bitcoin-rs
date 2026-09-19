@@ -273,11 +273,7 @@ fn kernel_block_entry_matches_oracle_identities() {
     let bytes = fixture_bytes(SEGWIT_HEIGHT);
     let oracle: bitcoin::Block = bitcoin::consensus::deserialize(&bytes).expect("oracle decode");
     let parsed = KernelBlock::parse(&bytes).expect("one-pass block parse");
-    // The kernel build surfaces identities as a Result; the native build
-    // hands them over as an already-derived slice.
-    #[cfg(not(feature = "kernel"))]
-    let parsed_txids: Vec<Txid> = parsed.txids().to_vec();
-    #[cfg(feature = "kernel")]
+    // Both backends surface identities through the same `Result` shape.
     let parsed_txids: Vec<Txid> = parsed
         .txids()
         .unwrap_or_else(|error| panic!("kernel txids failed: {error:?}"));
