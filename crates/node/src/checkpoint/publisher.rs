@@ -29,10 +29,11 @@ use bitcoin_rs_storage::block_body::BlockBodyStore;
 
 use bitcoin_rs_utxo::{UtxoSet, stats::CoinStatsListener};
 
+use bitcoin_rs_storage::recovery_evidence::{AppliedTipWitness, write_witness};
+
 use crate::{
     apply::{ApplyAdmission, UndoStore},
     checkpoint::{self, CheckpointError, CheckpointWrite},
-    recovery_evidence,
     state::ChainEventPublisher,
 };
 
@@ -243,7 +244,7 @@ impl CheckpointPublisher {
             && let Some(tip) = applied_tip
         {
             let genesis_hex = self.genesis_hash.to_string_be();
-            let witness = recovery_evidence::AppliedTipWitness::new(
+            let witness = AppliedTipWitness::new(
                 genesis_hex,
                 self.chain_events.epoch(),
                 tip.height,
@@ -252,7 +253,7 @@ impl CheckpointPublisher {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
             );
-            recovery_evidence::write_witness(&self.data_dir, &witness).map_err(|e| {
+            write_witness(&self.data_dir, &witness).map_err(|e| {
                 CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
                     e.to_string(),
                 ))
