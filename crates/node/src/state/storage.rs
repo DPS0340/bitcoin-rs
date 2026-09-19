@@ -151,7 +151,7 @@ pub(super) trait DeferredChainstateServices: Send + Sync {
         &self,
         dir: cap_std::fs::Dir,
         bootstrap: JournalBootstrap,
-    ) -> Result<crate::chainstate_journal::SharedJournalWriter>;
+    ) -> Result<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter>;
 }
 
 struct ChainstateStoreServices<S> {
@@ -185,7 +185,7 @@ impl<S: KvStore> DeferredChainstateServices for ChainstateStoreServices<S> {
         &self,
         dir: cap_std::fs::Dir,
         bootstrap: JournalBootstrap,
-    ) -> Result<crate::chainstate_journal::SharedJournalWriter> {
+    ) -> Result<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter> {
         build_journal_writer(dir, Arc::clone(&self.store), bootstrap)
     }
 }
@@ -221,11 +221,11 @@ fn build_journal_writer<S: KvStore + 'static>(
     dir: cap_std::fs::Dir,
     store: Arc<S>,
     bootstrap: JournalBootstrap,
-) -> Result<crate::chainstate_journal::SharedJournalWriter> {
+) -> Result<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter> {
     let mut writer = if bootstrap.open_existing {
-        crate::chainstate_journal::JournalWriter::open(dir, store)?
+        bitcoin_rs_storage::chainstate_journal::JournalWriter::open(dir, store)?
     } else {
-        crate::chainstate_journal::JournalWriter::initialize(
+        bitcoin_rs_storage::chainstate_journal::JournalWriter::initialize(
             dir,
             store,
             bootstrap.base_generation,
@@ -236,7 +236,7 @@ fn build_journal_writer<S: KvStore + 'static>(
             bootstrap.chain_tx_count,
         )?
     };
-    writer.configure(crate::chainstate_journal::JournalPolicy {
+    writer.configure(bitcoin_rs_storage::chainstate_journal::JournalPolicy {
         batch_blocks: bootstrap.config.blocks,
         batch_seconds: Duration::from_secs(bootstrap.config.seconds),
         rotate_mib: bootstrap.config.rotate_mib,
@@ -244,7 +244,7 @@ fn build_journal_writer<S: KvStore + 'static>(
         max_lag_blocks: bootstrap.config.max_lag_blocks,
         max_lag_seconds: Duration::from_secs(bootstrap.config.max_lag_seconds),
     })?;
-    Ok(crate::chainstate_journal::shared_journal_writer(writer))
+    Ok(bitcoin_rs_storage::chainstate_journal::shared_journal_writer(writer))
 }
 
 pub(super) struct StoredBlockBodySource {

@@ -524,7 +524,7 @@ pub struct Chainstate {
     /// `None` = journal off: the apply path emits nothing and behaves exactly
     /// as a checkpoint-only node. The writer is single-owner (the apply path);
     /// the `Mutex` only makes the shared handle exclusive.
-    pub(crate) journal: Option<crate::chainstate_journal::SharedJournalWriter>,
+    pub(crate) journal: Option<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter>,
     /// Publishes checkpoints to settle rolled-back disconnect debt after a
     /// non-fatal reorg. `None` in unit-test handle sets that never reorg.
     pub(crate) checkpoint_publisher: Option<Arc<crate::checkpoint::publisher::CheckpointPublisher>>,

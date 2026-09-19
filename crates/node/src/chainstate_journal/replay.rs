@@ -356,7 +356,7 @@ mod tests {
     use bitcoin_rs_utxo::{BorrowedBlockChanges, BorrowedUtxoAdd, UtxoSet};
 
     use super::{JournalRecord, Mutation, replay_records, validate_replayed_head};
-    use crate::chainstate_journal::Coin;
+    use bitcoin_rs_storage::chainstate_journal::Coin;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
     type BaseState = (BlockTree, UtxoSet, CoinStats, TipSnapshot, Coin);

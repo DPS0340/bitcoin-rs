@@ -44,16 +44,16 @@ use std::{
 };
 
 fn retire_full_revalidation_marker(data_dir: &std::path::Path) -> Result<(), CheckpointError> {
-    crate::chainstate_journal::clear_full_revalidation_marker_at(data_dir).map_err(|error| {
-        match error {
-            crate::chainstate_journal::JournalWriterError::Io(io) => {
+    bitcoin_rs_storage::chainstate_journal::clear_full_revalidation_marker_at(data_dir).map_err(
+        |error| match error {
+            bitcoin_rs_storage::chainstate_journal::JournalWriterError::Io(io) => {
                 CheckpointError::FullRevalidationMarker(io)
             }
             other => CheckpointError::Store(
                 bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(other.to_string()),
             ),
-        }
-    })
+        },
+    )
 }
 
 /// All the shared handles needed to publish a checkpoint from a background
@@ -75,7 +75,7 @@ pub(crate) struct CheckpointPublisher {
     pub(crate) utxo: Arc<UtxoSet>,
     pub(crate) coin_stats: Arc<CoinStatsListener>,
     pub(crate) chain_tx_count: Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) journal: Option<crate::chainstate_journal::SharedJournalWriter>,
+    pub(crate) journal: Option<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter>,
 
     pub(crate) data_dir: PathBuf,
     pub(crate) chain_events: Arc<ChainEventPublisher>,
@@ -280,14 +280,15 @@ impl CheckpointPublisher {
 #[cfg(test)]
 mod tests {
     use super::retire_full_revalidation_marker;
-    use crate::chainstate_journal::JOURNAL_DIR_NAME;
     use crate::checkpoint::CheckpointError;
+    use bitcoin_rs_storage::chainstate_journal::JOURNAL_DIR_NAME;
 
     #[test]
     fn full_revalidation_marker_clears_after_checkpoint_publication() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let journal_dir = dir.path().join(JOURNAL_DIR_NAME);
-        let marker = journal_dir.join(crate::chainstate_journal::FULL_REVALIDATION_MARKER);
+        let marker =
+            journal_dir.join(bitcoin_rs_storage::chainstate_journal::FULL_REVALIDATION_MARKER);
         std::fs::create_dir_all(&journal_dir)?;
         std::fs::write(&marker, b"force full validation\n")?;
 

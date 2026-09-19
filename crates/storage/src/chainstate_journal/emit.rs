@@ -4,9 +4,9 @@
 //! `Chainstate` is not (it is a concrete struct shared by every backend).
 //! This module is the single owner of that erasure: the apply path holds an
 //! [`SharedJournalWriter`] and never names `S`. The trait mirrors exactly the
-//! operations the apply path may perform (append + batched flush); state
-//! transitions (`freeze`/`compact`/`resume`) belong to the publication path
-//! and stay off this trait.
+//! operations the apply path may perform: append, batched flush, fork rewinds,
+//! and the retention and checkpoint-publication transitions (`freeze`,
+//! `compact_to_checkpoint`, `resume`).
 
 use std::sync::Arc;
 

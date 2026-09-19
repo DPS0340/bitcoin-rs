@@ -23,12 +23,13 @@ pub(crate) enum ResumeSource {
     Journal,
 }
 
-pub(crate) const CHAINSTATE_JOURNAL_DIR: &str = crate::chainstate_journal::JOURNAL_DIR_NAME;
+pub(crate) const CHAINSTATE_JOURNAL_DIR: &str =
+    bitcoin_rs_storage::chainstate_journal::JOURNAL_DIR_NAME;
 
 pub(super) fn requires_full_revalidation(data_dir: &Path) -> bool {
     data_dir
         .join(CHAINSTATE_JOURNAL_DIR)
-        .join(crate::chainstate_journal::FULL_REVALIDATION_MARKER)
+        .join(bitcoin_rs_storage::chainstate_journal::FULL_REVALIDATION_MARKER)
         .is_file()
 }
 

@@ -721,7 +721,7 @@ pub(super) fn map_block_change_error(error: &BlockChangeError) -> ApplyError {
 /// after the durable head batch — the journal may lag the head, never lead
 /// it.
 pub(super) type BuiltJournalRecord =
-    Option<core::result::Result<crate::chainstate_journal::JournalRecord, String>>;
+    Option<core::result::Result<bitcoin_rs_storage::chainstate_journal::JournalRecord, String>>;
 
 fn build_journal_record(
     block: &Block,
@@ -735,15 +735,15 @@ fn build_journal_record(
     if height == 0 {
         return None;
     }
-    let undo_coins = undo
-        .restores()
-        .iter()
-        .map(|add| crate::chainstate_journal::Coin {
-            outpoint: add.outpoint,
-            txout: add.txout.clone(),
-            height: add.height,
-            coinbase: add.coinbase,
-        });
+    let undo_coins =
+        undo.restores()
+            .iter()
+            .map(|add| bitcoin_rs_storage::chainstate_journal::Coin {
+                outpoint: add.outpoint,
+                txout: add.txout.clone(),
+                height: add.height,
+                coinbase: add.coinbase,
+            });
     let record = crate::chainstate_journal::journal_record_for_block(
         crate::chainstate_journal::BlockDeltaInputs {
             height,
