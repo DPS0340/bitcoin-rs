@@ -235,8 +235,12 @@ state (`crates/mempool/src/orphan.rs`).
 - `crates/node/src/apply.rs` (inline tests, `chain_generation_tests` module):
   `stable_generation_is_even_before_and_after_connect`,
   `stable_generation_is_even_after_disconnect`.
-- `crates/node/src/sync.rs`: clean reorg retry preserves branch and download
-  ownership; partial and fatal reorgs preserve generation fencing.
+- `crates/node/src/sync/tests/transitions_3.rs`,
+  `crates/node/src/sync/tests/transitions_5.rs`,
+  `crates/node/src/sync/tests/transitions_6.rs`, and
+  `crates/node/src/sync/tests/transitions_7.rs`: generation fencing on window
+  settlement; operational and permanent reorg failures preserve generation
+  fencing, and partial and fatal reorgs preserve readmission semantics.
 - `crates/node/src/apply.rs`: RPC body preflight, mid-rollback body loss and
   clean disconnect refusal permit retry from their coherent committed state.
 - `crates/node/src/reorg/tests.rs`: possibly torn UTXO commits retain the
@@ -300,8 +304,7 @@ state (`crates/mempool/src/orphan.rs`).
   `mempool_event_payloads_carry_reversed_txid_label_and_le_sequence`,
   `sequence_event_payload_uses_core_hash_orientation_and_label`.
 - `crates/mining/src/generation_signal/tests.rs`:
-  `attached_signal_forwards_sequence_wake_without_mempool_lock`,
-  `sequence_wake_falls_back_when_not_attached`.
+  `attached_signal_forwards_sequence_wake_without_mempool_lock`.
 - `crates/node/tests/mining.rs`:
   `publish_generation_from_does_not_take_mempool_lock`,
   `concurrent_publish_generation_paths_do_not_deadlock`,

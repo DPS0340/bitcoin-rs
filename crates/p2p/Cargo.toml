@@ -42,6 +42,7 @@ criterion.workspace = true
 proptest.workspace = true
 tempfile = ">=3.20.0, <4"
 serde_json.workspace = true
+bitcoin-rs-consensus.workspace = true
 
 [[bench]]
 name = "write_message"
