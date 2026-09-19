@@ -233,13 +233,6 @@ pub fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(), Evid
     )
 }
 
-/// Reads the most recent valid rollback marker (current, then `.prev`).
-pub fn read_marker(dir: &Path, genesis_hash: &str) -> Option<ChainRollbackEvent> {
-    read_sidecar(dir, MARKER_FILE, |data| {
-        ChainRollbackEvent::decode(data, genesis_hash)
-    })
-}
-
 /// Publishes a rollback marker atomically. Last-event-wins.
 pub fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
     write_sidecar(dir, MARKER_FILE, &serde_json::to_string(event)?, |data| {

@@ -286,21 +286,6 @@ Owners:
     backend feature forwarding is confined to operator tiers and service
     adapters, and rejects empty backend markers on crates that do not own an
     engine.
-  - `workspace_single_writer_boundaries_are_respected`: walks all production
-    `.rs` files under workspace member `src/` directories and confirms the
-    single-writer boundaries: mempool mutations go through the `MempoolGateway`,
-    derived-index capability selection stays with its owners (`crates/index`,
-    the node txindex runtime, and the node state config projection), peer
-    registration/cancellation stays with `crates/p2p`, and chainstate
-    transition promotion (`lock_transition`, `begin_transition_locked`) stays
-    inside `crates/node/src/`.
-- `bin/bitcoin-rs/tests/overhaul_ownership.rs`:
-  - `transaction_consumers_can_depend_on_mempool` and
-    `mempool_cannot_depend_on_transaction_consumers` exercise the allowed and
-    forbidden consumer directions.
-  - `synthetic_same_layer_cycle_fails` demonstrates the acyclicity check.
-  - `chainstate_transition_scan_passes` demonstrates the chainstate transition
-    promotion boundary stays inside `crates/node/src/`.
 - Manifest enforcement:
   - Root `Cargo.toml`: workspace member list and package versions.
   - `crates/storage/Cargo.toml`: engine dependency definitions.

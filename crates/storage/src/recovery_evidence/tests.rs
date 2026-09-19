@@ -19,6 +19,15 @@ fn marker_file(dir: &Path) -> PathBuf {
     dir.join(MARKER_FILE)
 }
 
+/// Reads back the most recent valid marker event. The runtime never reads
+/// the marker (it is write-only audit evidence at runtime); these tests pin
+/// the write protocol, so the oracle lives here instead of production.
+fn read_marker(dir: &Path, genesis_hash: &str) -> Option<ChainRollbackEvent> {
+    read_sidecar(dir, MARKER_FILE, |data| {
+        ChainRollbackEvent::decode(data, genesis_hash)
+    })
+}
+
 fn fallback_event(genesis: &str, epoch: u64, time: u64) -> ChainRollbackEvent {
     ChainRollbackEvent::new(
         genesis,
