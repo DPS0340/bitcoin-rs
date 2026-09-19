@@ -509,6 +509,7 @@ pub(crate) fn wait_for_server(address: SocketAddr) -> Result<(), HttpError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod decoder_refusal_tests {
     use std::net::TcpListener;
 
@@ -518,7 +519,8 @@ mod decoder_refusal_tests {
     /// pin: exact version, three ASCII digits, one reason separator.
     #[test]
     fn status_line_table() {
-        let (_, status, reason) = parse_status_line("HTTP/1.1 200 OK").unwrap();
+        let (_, status, reason) =
+            parse_status_line("HTTP/1.1 200 OK").expect("valid status line parses");
         assert_eq!((status, reason.as_str()), (200, "OK"));
         for bad in [
             "HTTP/1.0 200 OK",
@@ -541,14 +543,19 @@ mod decoder_refusal_tests {
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(parse_content_length(&[], 204).unwrap(), 0);
         assert_eq!(
-            parse_content_length(&headers(&[("content-length", "0")]), 204).unwrap(),
+            parse_content_length(&[], 204).expect("absent 204 length parses"),
+            0
+        );
+        assert_eq!(
+            parse_content_length(&headers(&[("content-length", "0")]), 204)
+                .expect("zero 204 length parses"),
             0
         );
         assert!(parse_content_length(&headers(&[("content-length", "5")]), 204).is_err());
         assert_eq!(
-            parse_content_length(&headers(&[("content-length", "12")]), 200).unwrap(),
+            parse_content_length(&headers(&[("content-length", "12")]), 200)
+                .expect("decimal length parses"),
             12
         );
         for bad in [
@@ -571,11 +578,13 @@ mod decoder_refusal_tests {
     /// A response with no outstanding request is refused before any read.
     #[test]
     fn response_without_outstanding_request_is_refused() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let address = listener.local_addr().expect("bound socket has an address");
         std::thread::spawn(move || listener.accept().ok());
-        let mut connection = Connection::connect(address).unwrap();
-        let error = connection.read_response().unwrap_err();
+        let mut connection = Connection::connect(address).expect("loopback connects");
+        let error = connection
+            .read_response()
+            .expect_err("unsolicited response is refused");
         assert!(matches!(error, HttpError::Framing(_)));
     }
 }
