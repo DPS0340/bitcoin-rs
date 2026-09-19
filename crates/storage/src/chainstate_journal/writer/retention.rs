@@ -11,6 +11,7 @@ use crate::KvStore;
 use std::time::Instant;
 
 impl<S: KvStore> JournalWriter<S> {
+    /// Applies non-zero runtime batching, rotation, retention, and lag limits.
     pub fn configure(&mut self, policy: super::JournalPolicy) -> Result<(), JournalWriterError> {
         let super::JournalPolicy {
             batch_blocks,

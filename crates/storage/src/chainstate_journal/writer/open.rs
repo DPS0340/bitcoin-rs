@@ -34,6 +34,7 @@ impl<S: KvStore> JournalWriter<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Creates a journal with a new checkpoint base and durable head.
     pub fn initialize(
         dir: cap_std::fs::Dir,
         store: std::sync::Arc<S>,

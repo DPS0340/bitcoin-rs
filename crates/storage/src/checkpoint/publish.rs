@@ -2,9 +2,14 @@ use super::format::{
     generation_name, valid_current_temp_name, valid_generation_name, valid_staging_name,
 };
 use super::fs::{CheckpointRoot, create_file, remove_known_dir};
-use super::io::{
-    rename_current, rename_generation, sync_checkpoint_dir, sync_file, sync_root, write_file,
-};
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+use super::io::rename_generation;
+use super::io::{rename_current, sync_checkpoint_dir, sync_file, sync_root, write_file};
 use super::load::read_current;
 use super::{
     CHECKPOINT_ROOT, CURRENT_FORMAT, CURRENT_VERSION, CheckpointError, CheckpointFailpoint,
@@ -14,10 +19,14 @@ use cap_std::fs::Dir;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 
+/// Size and SHA-256 digest produced while writing one checkpoint artifact.
 pub struct ArtifactDigest {
+    /// Number of artifact bytes written.
     pub bytes: u64,
+    /// SHA-256 digest of the written bytes.
     pub sha256: [u8; 32],
 }
+/// Capability-scoped staging state for one checkpoint generation.
 pub struct CheckpointStage {
     pub(crate) root: CheckpointRoot,
     pub(crate) staging: Dir,
@@ -26,9 +35,11 @@ pub struct CheckpointStage {
     pub(crate) failpoint: Option<CheckpointFailpoint>,
 }
 impl CheckpointStage {
+    /// Returns the generation reserved by this staging transaction.
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    /// Writes, hashes, and synchronizes one staged artifact.
     pub fn write_artifact<T, E: From<CheckpointError>>(
         &self,
         name: &str,
@@ -47,6 +58,7 @@ impl CheckpointStage {
         Ok((value, ArtifactDigest { bytes, sha256 }))
     }
 }
+/// Reserves a new generation directory and opens its staging transaction.
 pub fn begin_publication(
     data_dir: &Dir,
     failpoint: Option<CheckpointFailpoint>,

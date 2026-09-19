@@ -1,3 +1,4 @@
+//! Durable chainstate journal records, append policy, and committed-range replay.
 mod emit;
 mod record;
 mod replay;

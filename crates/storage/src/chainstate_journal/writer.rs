@@ -42,13 +42,20 @@ use std::time::Duration;
 use std::time::Instant;
 use thiserror::Error;
 
+/// Runtime thresholds controlling journal batching, rotation, and backpressure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalPolicy {
+    /// Flush after this many blocks, unless another limit fires first.
     pub batch_blocks: u32,
+    /// Flush after this duration, unless another limit fires first.
     pub batch_seconds: Duration,
+    /// Rotate a segment after this many mebibytes.
     pub rotate_mib: u64,
+    /// Maximum total journal size in mebibytes.
     pub max_journal_mib: u64,
+    /// Maximum unapplied block lag before backpressure.
     pub max_lag_blocks: u32,
+    /// Maximum unapplied time lag before backpressure.
     pub max_lag_seconds: Duration,
 }
 
@@ -69,6 +76,7 @@ const HEAD_MAGIC: [u8; 4] = *b"JRNH";
 const HEAD_VERSION: u8 = 1;
 const MAX_HEAD_BYTES: u64 = 4 * 1024;
 const SEGMENT_NAME_MAX: usize = 32;
+/// Marker filename that forces cold validation until checkpoint replacement.
 pub const FULL_REVALIDATION_MARKER: &str = "full-revalidation";
 /// Directory name under the node data dir that owns journal files and the
 /// sticky full-revalidation marker.
@@ -171,28 +179,58 @@ pub(crate) enum JournalWriterFailpoint {
     RewindTruncate,
 }
 
+/// Failures raised while appending, flushing, or recovering the journal.
 #[derive(Debug, Error)]
 pub enum JournalWriterError {
+    /// Journal filesystem operation failed.
     #[error("chainstate journal writer io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The backing store could not flush before journal publication.
     #[error("chainstate journal storage flush failed: {0}")]
     StorageFlush(String),
+    /// The writer state does not permit appends.
     #[error("chainstate journal writer is not open for appends: {state}")]
-    NotOpen { state: &'static str },
+    NotOpen {
+        /// Current writer state.
+        state: &'static str,
+    },
+    /// A record height did not follow the durable frontier.
     #[error("chainstate journal append out of order: got {got}, expected {expected}")]
-    OutOfOrder { got: u32, expected: u32 },
+    OutOfOrder {
+        /// Height supplied by the caller.
+        got: u32,
+        /// Next height required by the journal.
+        expected: u32,
+    },
     /// A live block advanced after its journal append failed. Further applies
     /// must stop until restart recovery discards the partial tail.
     #[error("chainstate journal has an untracked append gap at height {height}")]
-    AppendGap { height: u32 },
+    AppendGap {
+        /// Height at which the append gap occurred.
+        height: u32,
+    },
+    /// The durable head marker cannot be decoded or authenticated.
     #[error("chainstate journal head marker is unreadable: {0}")]
     HeadUnreadable(String),
+    /// The in-memory cursor disagrees with the durable journal cursor.
     #[error("chainstate journal cursor mismatch: {0}")]
     CursorMismatch(String),
+    /// Journal bytes exceed the configured retention limit.
     #[error("chainstate journal size {bytes} bytes reached configured limit {limit} bytes")]
-    RetentionLimit { bytes: u64, limit: u64 },
+    RetentionLimit {
+        /// Current journal size in bytes.
+        bytes: u64,
+        /// Configured journal size limit in bytes.
+        limit: u64,
+    },
+    /// A rewind requested a height below the checkpoint base.
     #[error("journal fork height {fork_height} is below checkpoint base {base_height}")]
-    ForkBelowBase { fork_height: u32, base_height: u32 },
+    ForkBelowBase {
+        /// Requested fork height.
+        fork_height: u32,
+        /// Checkpoint base height.
+        base_height: u32,
+    },
 }
 
 /// Durable head marker payload (`head.json`, plan §2.1).

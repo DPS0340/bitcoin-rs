@@ -17,7 +17,9 @@ use crate::KvStore;
 use super::record::JournalRecord;
 use super::writer::{JournalWriter, JournalWriterError};
 
+/// Type-erased operations used by the live apply path to maintain the journal.
 pub trait JournalEmit: Send + Sync {
+    /// Checks that the writer can append the next block.
     fn prepare_for_apply(&mut self) -> Result<(), JournalWriterError>;
 
     /// The current apply records an append error, but the writer then enters a
@@ -34,8 +36,10 @@ pub trait JournalEmit: Send + Sync {
     /// segment fsync, atomic `head.json` publish — in that order.
     fn flush_through(&mut self, height: u32) -> Result<(), JournalWriterError>;
 
+    /// Flushes buffered records when the configured batch deadline expires.
     fn flush_due(&mut self) -> Result<(), JournalWriterError>;
 
+    /// Reports whether journal retention requires checkpoint compaction.
     fn requires_compaction(&self) -> Result<bool, JournalWriterError>;
 
     /// Durably rewrites the canonical journal frontier to a reorg fork.
@@ -47,8 +51,10 @@ pub trait JournalEmit: Send + Sync {
         chain_tx_count: u64,
     ) -> Result<(), JournalWriterError>;
 
+    /// Freezes appends while a checkpoint publication consumes the journal.
     fn freeze(&mut self) -> Result<(), JournalWriterError>;
 
+    /// Replaces the journal base with a committed checkpoint tip.
     fn compact_to_checkpoint(
         &mut self,
         checkpoint_generation: u64,
@@ -58,6 +64,7 @@ pub trait JournalEmit: Send + Sync {
         chain_tx_count: u64,
     ) -> Result<(), JournalWriterError>;
 
+    /// Resumes appends after checkpoint publication completes.
     fn resume(&mut self) -> Result<(), JournalWriterError>;
 }
 
@@ -124,8 +131,10 @@ impl<S: KvStore> JournalEmit for JournalWriter<S> {
     }
 }
 
+/// Thread-safe erased journal writer shared by the apply and publication paths.
 pub type SharedJournalWriter = Arc<Mutex<dyn JournalEmit>>;
 
+/// Wraps a concrete writer for sharing through the apply-path trait object.
 pub fn shared_journal_writer<S: KvStore + 'static>(
     writer: JournalWriter<S>,
 ) -> SharedJournalWriter {

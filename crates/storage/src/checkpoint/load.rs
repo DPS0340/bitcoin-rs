@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// Maps checkpoint errors into corruption or ordinary I/O load failures.
 pub fn classify_checkpoint_error(error: CheckpointError) -> CheckpointLoadError {
     match error {
         CheckpointError::Io(error) => classify_checkpoint_io(error),
@@ -31,6 +32,7 @@ pub(crate) fn checkpoint_file_error(name: &str, error: std::io::Error) -> Checkp
         CheckpointError::Io(error)
     }
 }
+/// Classifies checkpoint filesystem errors as corruption or ordinary I/O.
 pub fn classify_checkpoint_io(error: std::io::Error) -> CheckpointLoadError {
     if is_checkpoint_corruption(&error) {
         corrupt_checkpoint(error.to_string())
@@ -38,6 +40,7 @@ pub fn classify_checkpoint_io(error: std::io::Error) -> CheckpointLoadError {
         CheckpointLoadError::Io(error)
     }
 }
+/// Wraps a validation reason as a fail-closed checkpoint corruption error.
 pub fn corrupt_checkpoint(reason: impl Into<String>) -> CheckpointLoadError {
     CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid {
         reason: reason.into(),
@@ -85,6 +88,7 @@ pub(crate) fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, C
     Ok(Some(current))
 }
 
+/// Reads and authenticates the manifest against `CURRENT` and the configured identity.
 pub fn read_manifest(
     generation_dir: &Dir,
     current: &CurrentV1,
@@ -144,6 +148,7 @@ pub(crate) fn open_regular_file(
     }
     Ok(file)
 }
+/// Verifies an artifact's exact length and SHA-256 digest before rewinding it.
 pub fn verify_artifact(
     dir: &Dir,
     name: &str,
@@ -181,6 +186,7 @@ pub fn verify_artifact(
         .map_err(|e| checkpoint_file_error(name, e))?;
     Ok(file)
 }
+/// Rejects path components and names that differ from the expected artifact.
 pub fn require_filename(actual: &str, expected: &str) -> Result<(), CheckpointError> {
     if actual != expected || Path::new(actual).components().count() != 1 {
         return Err(CheckpointError::Invalid(format!(
@@ -189,6 +195,7 @@ pub fn require_filename(actual: &str, expected: &str) -> Result<(), CheckpointEr
     }
     Ok(())
 }
+/// Validates the fixed 820-byte `CoinStats` envelope and returns its payload.
 pub fn coinstats_artifact_payload(bytes: &[u8]) -> Result<&[u8], CheckpointError> {
     if u64::try_from(bytes.len()).ok() != Some(COINSTATS_ARTIFACT_LEN) {
         return Err(CheckpointError::Invalid(
@@ -220,13 +227,19 @@ pub fn coinstats_artifact_payload(bytes: &[u8]) -> Result<&[u8], CheckpointError
     Ok(&bytes[16..])
 }
 
+/// Result of probing the data directory for a committed checkpoint.
 pub enum CheckpointOpen {
+    /// No checkpoint has committed; the node must start cold.
     Cold,
+    /// CURRENT identifies an authenticated generation directory.
     Current {
+        /// Open generation directory capability.
         generation_dir: Dir,
+        /// Parsed and validated CURRENT pointer.
         current: CurrentV1,
     },
 }
+/// Opens and validates the checkpoint named by the data directory's CURRENT.
 pub fn open_current_checkpoint(data_dir: &Dir) -> Result<CheckpointOpen, CheckpointLoadError> {
     let root = match CheckpointRoot::open_existing(data_dir, super::CHECKPOINT_ROOT) {
         Ok(Some(root)) => root,
