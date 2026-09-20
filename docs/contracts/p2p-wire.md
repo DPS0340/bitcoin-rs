@@ -131,10 +131,13 @@ This page assigns ownership and cites proof under the
   The download cursor is a scan hint. An unowned frontier behind that hint
   becomes requestable again, including an applied rollback with unchanged
   headers. Existing pending and staged bodies retain their ownership.
-- A known-header gap with no body work triggers a header probe from the
-  applied chain. Only a subsequent accepted active-branch announcement grants
-  body capability. Losing the last credited peer must not require restart or
-  an unsolicited announcement from a surviving peer.
+- A known-header gap whose apply-frontier block is neither in flight nor
+  staged triggers a header probe from the applied chain; staged successors
+  behind an unowned frontier are stuck inventory, not progress. Beyond the
+  initial handshake capability (P2P-03), only a subsequent accepted
+  active-branch announcement grants body capability. Losing the last credited
+  peer must not require restart or an unsolicited announcement from a
+  surviving peer.
 - The existing header request and timeout pace discovery. Empty responses
   preserve that deadline; expiry rotates among connected full witness peers.
   Nonempty responses consume their matching request even when rejected.
@@ -147,8 +150,9 @@ This page assigns ownership and cites proof under the
   evidence. A header ahead of the applied chain is not evidence that the
   applied-chain `getblockhash` RPC should return it.
 
-Proof: `sync/tests/frontier_recovery.rs` covers applied rollback, duplicate
-request suppression, empty-response pacing/rotation and cancelled readiness
-under contention. `sync/tests/witness_staging_gate.rs` covers bad delivery,
+Proof: `crates/p2p/src/sync/tests/frontier_recovery.rs` covers applied
+rollback, duplicate request suppression, empty-response pacing/rotation and
+cancelled readiness under contention.
+`crates/p2p/src/sync/tests/witness_staging_gate.rs` covers bad delivery,
 peer replacement, relearned capability and eventual application. Existing
 branch-plan, attribution, timeout and bounded-staging suites remain required.
