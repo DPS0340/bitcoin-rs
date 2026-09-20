@@ -304,7 +304,8 @@ Owners:
   `proposal_omits_proof_of_work`: the facade copies published tips without
   reserving generation, connect/finish through `ChainTransition` is the
   mutation path, and BIP22 proposal reuses the apply gates without persistence.
-- `crates/node/src/apply.rs` tests `apply_block_publishes_rawtx_bytes_in_block_order`,
+- `crates/node/tests/unit/apply/consensus_rule_tests/` tests
+  `apply_block_publishes_rawtx_bytes_in_block_order`,
   `connected_sequence_event_observes_the_published_applied_tip`,
   `connect_and_disconnect_wake_the_mining_generation`,
   `follower_dispatch_holds_the_chain_transition`: apply returns a committed outcome;
