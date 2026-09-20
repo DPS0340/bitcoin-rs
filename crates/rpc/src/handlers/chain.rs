@@ -1,6 +1,5 @@
 use alloc::sync::Arc;
 use core::str::FromStr as _;
-use core::{fmt, fmt::Write as _};
 
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
@@ -16,8 +15,8 @@ use sonic_rs::{JsonContainerTrait as _, JsonValueMutTrait as _, JsonValueTrait, 
 
 use super::util::{descriptor_checksum, strip_addr_wrapper};
 use crate::compat::convert::{
-    self, compact_target_hex, i32_saturated, i64_saturated, i64_saturated_len, sat_to_btc,
-    typed_to_sonic, typed_to_sonic_omitting_nulls,
+    self, compact_target_hex, hex_encode, i32_saturated, i64_saturated, i64_saturated_len,
+    sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
 };
 use crate::context::{ChainControlError, Context, TxQueryError};
 use crate::error::RpcError;
@@ -158,14 +157,6 @@ fn i64_to_f64(value: i64) -> f64 {
     if value < 0 { -magnitude } else { magnitude }
 }
 
-/// Lowercase hex encoding for arbitrary byte slices.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _: fmt::Result = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
 pub(crate) fn getdifficulty(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let difficulty = {

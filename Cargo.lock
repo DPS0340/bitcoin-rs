@@ -259,8 +259,6 @@ dependencies = [
  "slab",
  "tempfile",
  "thiserror",
- "tracing",
- "zerocopy",
 ]
 
 [[package]]
@@ -281,7 +279,6 @@ dependencies = [
  "sha2 0.11.0",
  "sonic-rs",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -295,7 +292,6 @@ dependencies = [
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
  "bitcoin_slices",
- "bytemuck",
  "compact_str",
  "criterion",
  "crossbeam-channel",
@@ -316,7 +312,6 @@ dependencies = [
 name = "bitcoin-rs-mempool"
 version = "0.7.0"
 dependencies = [
- "arc-swap",
  "bitcoin",
  "bitcoin-rs-consensus",
  "bitcoin-rs-mempool",
@@ -329,7 +324,6 @@ dependencies = [
  "parking_lot",
  "sha2 0.11.0",
  "slab",
- "smallvec",
  "tempfile",
  "thiserror",
  "tracing",
@@ -378,7 +372,6 @@ dependencies = [
  "compact_str",
  "criterion",
  "crossbeam-channel",
- "crossbeam-utils",
  "hashbrown 0.17.1",
  "metrics",
  "metrics-exporter-prometheus",
@@ -391,7 +384,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "signal-hook",
- "smallvec",
  "sonic-rs",
  "tempfile",
  "thiserror",
@@ -411,7 +403,6 @@ dependencies = [
  "bitcoin-rs-mempool",
  "bitcoin-rs-primitives",
  "bitcoin-rs-storage",
- "bytemuck",
  "bytes",
  "criterion",
  "crossbeam-channel",
@@ -424,9 +415,7 @@ dependencies = [
  "smallvec",
  "tempfile",
  "thiserror",
- "tinyvec",
  "tracing",
- "zerocopy",
 ]
 
 [[package]]
@@ -486,12 +475,8 @@ dependencies = [
  "bitcoin-rs-consensus",
  "bitcoin-rs-primitives",
  "bitcoin_hashes",
- "bytemuck",
- "parking_lot",
  "proptest",
- "rayon",
  "secp256k1",
- "serde",
  "serde_json",
  "sha2 0.11.0",
  "smallvec",
@@ -505,11 +490,9 @@ version = "0.7.0"
 dependencies = [
  "arc-swap",
  "bitcoin-rs-primitives",
- "bytemuck",
  "bytes",
  "cap-fs-ext",
  "cap-std",
- "crossbeam-channel",
  "fjall",
  "hashbrown 0.17.1",
  "metrics",
@@ -533,11 +516,9 @@ dependencies = [
  "bitcoin",
  "bitcoin-rs-primitives",
  "bitcoin-rs-storage",
- "bytemuck",
  "criterion",
  "crossbeam-utils",
  "hashbrown 0.17.1",
- "lz4_flex",
  "metrics",
  "mimalloc",
  "nohash-hasher",
@@ -550,7 +531,6 @@ dependencies = [
  "smallvec",
  "tempfile",
  "thiserror",
- "tinyvec",
  "tracing",
  "zerocopy",
 ]

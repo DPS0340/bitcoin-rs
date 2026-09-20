@@ -17,6 +17,7 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_primitives::{Amount, CompactTarget, LockTime, Script, Sequence, Witness};
 use sonic_rs::{JsonValueTrait as _, Value, json};
 
+use crate::compat::convert::hex_encode;
 use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::chain::getblockchaininfo;
@@ -784,16 +785,6 @@ fn sonic_bytes(value: &Value) -> Vec<u8> {
     sonic_rs::to_string(value)
         .unwrap_or_else(|_| "null".to_owned())
         .into_bytes()
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }
 
 fn hex_decode(hex: &str) -> Vec<u8> {

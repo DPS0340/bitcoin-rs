@@ -34,6 +34,7 @@ mod rewind;
 
 #[cfg(test)]
 use super::record::JournalRecord;
+use super::record::crc32c;
 #[cfg(test)]
 use super::record::encode_record;
 use crate::KvStore;
@@ -256,23 +257,11 @@ pub(crate) struct HeadMarker {
 }
 
 impl HeadMarker {
-    fn crc32c(bytes: &[u8]) -> u32 {
-        let mut crc = u32::MAX;
-        for byte in bytes {
-            crc ^= u32::from(*byte);
-            for _ in 0..8 {
-                let mask = 0_u32.wrapping_sub(crc & 1);
-                crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
-            }
-        }
-        !crc
-    }
-
     fn serialize(&self) -> Result<Vec<u8>, JournalWriterError> {
         let payload = serde_json::to_vec(self).map_err(|error| {
             JournalWriterError::HeadUnreadable(format!("marker serialization failed: {error}"))
         })?;
-        let checksum = Self::crc32c(&payload);
+        let checksum = crc32c(&payload);
         let mut bytes = Vec::with_capacity(payload.len() + 9);
         bytes.extend_from_slice(&HEAD_MAGIC);
         bytes.push(HEAD_VERSION);
@@ -302,7 +291,7 @@ impl HeadMarker {
             JournalWriterError::HeadUnreadable("marker frame header is short".to_owned())
         })?);
         let payload = &bytes[9..];
-        let found = Self::crc32c(payload);
+        let found = crc32c(payload);
         if found != expected {
             return Err(JournalWriterError::HeadUnreadable(format!(
                 "marker checksum mismatch: expected {expected:#010x}, found {found:#010x}"

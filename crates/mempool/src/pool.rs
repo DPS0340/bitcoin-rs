@@ -116,8 +116,7 @@ pub struct PrioritisedTransaction {
 /// In-memory transaction pool with txid, funding, spending, and fee-priority indexes.
 #[derive(Debug)]
 pub struct Mempool {
-    /// Entry arena. Public ids are slot indices represented as `u32`; the
-    /// arena's generation counters make recycled slots detectable.
+    /// Entry arena. Public ids are reusable slot indices represented as `u32`.
     pub(crate) entries: EntryArena,
     /// Tx id to entry id and acceptance sequence. Owned by this module; reach it
     /// through `contains_txid`, `entry_id_by_txid`, and `entry_by_txid`.
@@ -196,30 +195,6 @@ struct IndexedEntry {
     id: EntryId,
     admitted_sequence: u64,
 }
-/// One slot of the generational entry arena.
-///
-/// The generation lives beside the payload, not inside it: vacating a slot
-/// must bump the counter that stale handles are checked against, and a
-/// counter inside the taken value would be bumped on a moved-out copy.
-#[derive(Debug)]
-struct EntrySlot {
-    /// Bumped every time the slot is vacated. A handle stamped with the
-    /// previous generation no longer resolves, so a recycled slot cannot
-    /// hand a stale reference a new resident.
-    generation: u32,
-    live: Option<LiveEntry>,
-}
-
-impl EntrySlot {
-    fn entry(&self) -> Option<&MempoolEntry> {
-        self.live.as_ref().map(|live| &live.entry)
-    }
-
-    fn entry_mut(&mut self) -> Option<&mut MempoolEntry> {
-        self.live.as_mut().map(|live| &mut live.entry)
-    }
-}
-
 /// The live payload of an occupied slot.
 #[derive(Debug)]
 struct LiveEntry {
@@ -229,14 +204,6 @@ struct LiveEntry {
     links: GraphLinks,
     entry: MempoolEntry,
 }
-/// A removed entry, carrying the graph state the pool still has to unwind:
-/// its component (to decay and possibly split) and its links (to unlink).
-struct RetiredEntry {
-    entry: MempoolEntry,
-    component: u32,
-    links: GraphLinks,
-}
-
 /// Parent and child entry ids of one pooled transaction.
 ///
 /// The spend indexes answer "who funds this script" and "who spends this
@@ -261,33 +228,11 @@ struct ComponentSummary {
     weight: u64,
 }
 
-/// A generation-stamped reference to one arena slot.
-///
-/// Raw `EntryId`s are slot indices: a removal recycles the slot, and an id
-/// captured before the removal names whatever occupies it next. Handles are
-/// what cached graph state and tests resolve through; a stale handle
-/// resolves to `None` instead of the new resident. The mutation paths never
-/// mint one — graph state is slot-parallel and unlinked symmetrically — so
-/// the type is constructed only by the test fixtures that pin the
-/// stale-reference contract.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct EntryHandle {
-    id: EntryId,
-    generation: u32,
-}
-
-/// Generational entry arena.
-///
-/// `slab::Slab` recycles slot indices on removal, which is exactly right
-/// for the raw-id API and exactly wrong for cached graph state keyed by
-/// those ids. Wrapping each slot with a generation counter makes the reuse
-/// detectable: [`EntryArena::resolve`] returns `None` for a handle whose
-/// generation no longer matches. The method set mirrors `Slab`'s so the
-/// existing accessors keep their shape.
+/// Entry slots with LIFO reuse. The pool unlinks indexes and graph edges
+/// before a vacated slot can acquire a new occupant.
 #[derive(Debug)]
 pub(crate) struct EntryArena {
-    slots: Vec<EntrySlot>,
+    slots: Vec<Option<LiveEntry>>,
     /// Vacated slot indices, most recent last: the next `insert` reuses
     /// them, matching `Slab`'s vacancy stack.
     free: Vec<usize>,
@@ -319,53 +264,40 @@ impl EntryArena {
             let Some(slot) = self.slots.get_mut(index) else {
                 panic!("vacancy stack names a live slot");
             };
-            slot.live = Some(live);
+            *slot = Some(live);
             return index;
         }
-        self.slots.push(EntrySlot {
-            generation: 0,
-            live: Some(live),
-        });
+        self.slots.push(Some(live));
         self.slots.len() - 1
     }
 
-    fn remove(&mut self, id: EntryId) -> Option<RetiredEntry> {
+    fn remove(&mut self, id: EntryId) -> Option<LiveEntry> {
         let index = slot_index(id)?;
         let slot = self.slots.get_mut(index)?;
-        let live = slot.live.take()?;
-        slot.generation = slot.generation.wrapping_add(1);
+        let live = slot.take()?;
         self.live -= 1;
         self.free.push(index);
-        Some(RetiredEntry {
-            entry: live.entry,
-            component: live.component,
-            links: live.links,
-        })
+        Some(live)
     }
 
     fn get(&self, id: EntryId) -> Option<&MempoolEntry> {
-        self.slots.get(slot_index(id)?)?.entry()
+        self.slot(id).map(|live| &live.entry)
     }
 
     fn get_mut(&mut self, id: EntryId) -> Option<&mut MempoolEntry> {
-        self.slots.get_mut(slot_index(id)?)?.entry_mut()
+        self.slot_mut(id).map(|live| &mut live.entry)
     }
 
     fn slot(&self, id: EntryId) -> Option<&LiveEntry> {
-        self.slots.get(slot_index(id)?)?.live.as_ref()
+        self.slots.get(slot_index(id)?)?.as_ref()
     }
 
     fn slot_mut(&mut self, id: EntryId) -> Option<&mut LiveEntry> {
-        self.slots.get_mut(slot_index(id)?)?.live.as_mut()
+        self.slots.get_mut(slot_index(id)?)?.as_mut()
     }
 
     fn contains(&self, id: EntryId) -> bool {
-        let Some(index) = slot_index(id) else {
-            return false;
-        };
-        self.slots
-            .get(index)
-            .is_some_and(|slot| slot.live.is_some())
+        self.slot(id).is_some()
     }
 
     fn len(&self) -> usize {
@@ -388,8 +320,7 @@ impl EntryArena {
 
     fn clear(&mut self) {
         for slot in &mut self.slots {
-            slot.live = None;
-            slot.generation = slot.generation.wrapping_add(1);
+            *slot = None;
         }
         self.free.clear();
         self.free.extend((0..self.slots.len()).rev());
@@ -400,32 +331,13 @@ impl EntryArena {
         self.slots
             .iter()
             .enumerate()
-            .filter_map(|(index, slot)| slot.entry().map(|entry| (index, entry)))
+            .filter_map(|(index, slot)| slot.as_ref().map(|live| (index, &live.entry)))
     }
 
     fn iter_links(&self) -> impl Iterator<Item = &GraphLinks> {
         self.slots
             .iter()
-            .filter_map(|slot| slot.live.as_ref().map(|live| &live.links))
-    }
-
-    #[cfg(test)]
-    fn handle_at(&self, id: EntryId) -> Option<EntryHandle> {
-        let slot = self.slots.get(slot_index(id)?)?;
-        slot.live.as_ref()?;
-        Some(EntryHandle {
-            id,
-            generation: slot.generation,
-        })
-    }
-
-    #[allow(dead_code)]
-    fn resolve(&self, handle: EntryHandle) -> Option<&MempoolEntry> {
-        let slot = self.slots.get(slot_index(handle.id)?)?;
-        if slot.generation != handle.generation {
-            return None;
-        }
-        slot.entry()
+            .filter_map(|slot| slot.as_ref().map(|live| &live.links))
     }
 }
 
@@ -1248,7 +1160,7 @@ impl Mempool {
         // entry's payload really is gone.
         let arena = u64::try_from(self.entries.capacity())
             .unwrap_or(u64::MAX)
-            .saturating_mul(u64::try_from(size_of::<EntrySlot>()).unwrap_or(0));
+            .saturating_mul(u64::try_from(size_of::<Option<LiveEntry>>()).unwrap_or(0));
 
         let transactions = self
             .entries
@@ -5549,6 +5461,49 @@ mod graph_tests {
     }
 
     #[test]
+    fn recycled_slots_do_not_inherit_links_or_transaction_indexes() {
+        let mut pool = fuzzer_pool();
+        let parent = insert_ok(&mut pool, 1, &[], 100);
+        let child = insert_ok(&mut pool, 2, &[OutPoint::new(parent, 0)], 100);
+        let leaf = insert_ok(&mut pool, 3, &[OutPoint::new(child, 0)], 100);
+        let child_id = pool.entry_id_by_txid(&child).expect("pooled child");
+        let child_wtxid = pool.entry(child_id).expect("pooled child").wtxid;
+        pool.remove_entries_with_reasons(
+            &[(child_id, RemovalReason::PolicyEviction)],
+            &mut Vec::new(),
+        );
+
+        let replacement = insert_ok(&mut pool, 4, &[], 100);
+        assert_eq!(pool.entry_id_by_txid(&replacement), Some(child_id));
+        assert!(pool.entry_by_txid(&child).is_none());
+        assert!(pool.entry_by_wtxid(&child_wtxid).is_none());
+        let links = pool.links(child_id).expect("reused slot");
+        assert!(links.parents.is_empty());
+        assert!(links.children.is_empty());
+        let parent_id = pool.entry_id_by_txid(&parent).expect("pooled parent");
+        let leaf_id = pool.entry_id_by_txid(&leaf).expect("pooled leaf");
+        assert!(
+            pool.links(parent_id)
+                .expect("parent links")
+                .children
+                .is_empty()
+        );
+        assert!(pool.links(leaf_id).expect("leaf links").parents.is_empty());
+        assert_graph_exact(&pool);
+
+        let retained_slots = pool.entries.capacity();
+        let _ = pool.clear();
+        assert_eq!(pool.entries.capacity(), retained_slots);
+        let fresh = insert_ok(&mut pool, 5, &[], 100);
+        assert_eq!(pool.entry_id_by_txid(&fresh), Some(0));
+        assert_eq!(pool.tx_count(), 1);
+        for retired in [parent, leaf, replacement] {
+            assert!(pool.entry_by_txid(&retired).is_none());
+        }
+        assert_graph_exact(&pool);
+    }
+
+    #[test]
     fn wtxid_lookups_track_mutations() {
         let mut pool = fuzzer_pool();
         let first = insert_ok(&mut pool, 1, &[], 100);
@@ -5719,11 +5674,11 @@ mod graph_tests {
     }
 
     /// Fuzzer insert: tolerated to fail (a full cluster, an evicted parent),
-    /// records the handle and the tx body when it commits.
+    /// records the slot identity and the tx body when it commits.
     fn try_insert_tracked(
         pool: &mut Mempool,
         txs: &mut Vec<Tx>,
-        history: &mut Vec<(EntryHandle, Txid)>,
+        history: &mut Vec<(EntryId, Txid)>,
         nonce: u32,
         inputs: &[OutPoint],
         vsize: u32,
@@ -5740,7 +5695,7 @@ mod graph_tests {
         outcome.ok()?;
         txs.push(tx);
         let id = pool.entry_id_by_txid(&txid)?;
-        history.push((pool.entries.handle_at(id)?, txid));
+        history.push((id, txid));
         Some(txid)
     }
 
@@ -5752,8 +5707,8 @@ mod graph_tests {
             let mut rng = XorShift::new(seed);
             let mut nonce = 0_u32;
             let mut txs: Vec<Tx> = Vec::new();
-            // Every entry ever committed, for the stale-reference contract.
-            let mut history: Vec<(EntryHandle, Txid)> = Vec::new();
+            // Every committed slot identity, including slots since recycled.
+            let mut history: Vec<(EntryId, Txid)> = Vec::new();
 
             for _round in 0..350 {
                 let live = pool.iter_txids();
@@ -5843,10 +5798,7 @@ mod graph_tests {
                         pool.remove_entries_with_reasons(&removals, &mut changes);
                         let _committed = pool.commit_insert(prepared);
                         if let Some(id) = pool.entry_id_by_txid(&candidate.txid()) {
-                            history.push((
-                                pool.entries.handle_at(id).expect("live slot"),
-                                candidate.txid(),
-                            ));
+                            history.push((id, candidate.txid()));
                         }
                     }
                     9 if pool.tx_count() > 8 => {
@@ -5864,12 +5816,12 @@ mod graph_tests {
                     "walk budget exceeded: {}",
                     graph_steps(&pool)
                 );
-                for (handle, txid) in &history {
+                for (id, txid) in &history {
                     let live_now = pool.contains_txid(txid);
                     assert_eq!(
-                        pool.entries.resolve(*handle).is_some(),
+                        pool.entry(*id).is_some_and(|entry| entry.txid == *txid),
                         live_now,
-                        "handle for {txid:?} must track liveness exactly"
+                        "slot identity for {txid:?} must track liveness exactly"
                     );
                 }
                 assert_graph_exact(&pool);

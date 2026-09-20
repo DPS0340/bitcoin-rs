@@ -14,6 +14,7 @@ use bitcoin_rs_script::script::{
     instructions, is_op_return, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
 };
 
+use crate::compat::convert::hex_encode;
 use crate::context::{Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError};
 use crate::rest::Response;
 
@@ -555,16 +556,6 @@ impl<'a> Projection<'a> {
             Network::Regtest => BitcoinNetwork::Regtest,
         }
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut text = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        text.push(char::from(HEX[usize::from(byte >> 4)]));
-        text.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    text
 }
 
 fn script_asm(script: &[u8]) -> String {

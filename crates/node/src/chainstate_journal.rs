@@ -34,52 +34,12 @@ pub(crate) enum JournalDeltaError {
     UnmatchedRestore(bitcoin_rs_primitives::OutPoint),
 }
 
-/// Inputs for one fully applied block's semantic-delta record.
-///
-/// Groups the header/identity fields so the emission call site stays readable
-/// and the mapping function keeps a short parameter list.
-#[derive(Clone, Copy)]
-pub(crate) struct BlockDeltaInputs {
-    /// Applied block height.
-    pub height: u32,
-    /// Applied block hash.
-    pub block_hash: [u8; 32],
-    /// Parent hash (`block.header.prev_blockhash`).
-    pub prev_hash: [u8; 32],
-    /// Number of transactions in this block.
-    pub block_tx_count: u64,
-    /// Net coin-stats height delta for this block.
-    pub coin_stats_height_delta: i64,
-    /// The block's 80-byte consensus header (journal-carried `TipSnapshot`
-    /// reconstruction, plan rev 5).
-    pub raw_header: [u8; 80],
-}
-
-/// Builds the semantic-delta record for one fully applied block.
+/// Extracts the ordered journal mutations for one fully applied block.
 ///
 /// `undo_coins` supplies the full preimage of each spent or overwritten
 /// outpoint. Records are matched by outpoint, not by input order. Creates and
 /// overwrites precede spends; same-block spends are already netted out.
-pub(crate) fn journal_record_for_block(
-    inputs: BlockDeltaInputs,
-    changes: &BorrowedBlockChanges<'_>,
-    undo_coins: impl IntoIterator<Item = Coin>,
-) -> Result<JournalRecord, JournalDeltaError> {
-    Ok(JournalRecord {
-        height: inputs.height,
-        block_hash: inputs.block_hash,
-        prev_hash: inputs.prev_hash,
-        block_tx_count: inputs.block_tx_count,
-        coin_stats_height_delta: inputs.coin_stats_height_delta,
-        raw_header: inputs.raw_header,
-        mutations: mutations_for_block(changes, undo_coins)?,
-    })
-}
-
-/// Extracts the ordered mutation list from the apply path's change set.
-///
-/// See the module docs for the mapping contract.
-fn mutations_for_block(
+pub(crate) fn mutations_for_block(
     changes: &BorrowedBlockChanges<'_>,
     undo_coins: impl IntoIterator<Item = Coin>,
 ) -> Result<Vec<Mutation>, JournalDeltaError> {
@@ -115,12 +75,6 @@ fn mutations_for_block(
     Ok(mutations)
 }
 
-/// Classification of a boot replay attempt.
-pub(crate) enum ReplayOutcome {
-    Replayed(Box<ReplayedState>),
-    Fallback(JournalReplayError),
-}
-
 /// State reconstructed by a successful replay.
 pub(crate) struct ReplayedState {
     pub tree: BlockTree,
@@ -139,15 +93,11 @@ pub(crate) fn replay_from_journal(
     coin_stats: bitcoin_rs_utxo::stats::CoinStats,
     base_tip: bitcoin_rs_chain::TipSnapshot,
     base_chain_tx_count: u64,
-) -> ReplayOutcome {
+) -> Result<Box<ReplayedState>, JournalReplayError> {
     let base_tip_hash = base_tip.hash.to_le_bytes();
     let base_tip_height = base_tip.height;
-    let mut replay =
-        match ReplayAccumulator::new(tree, utxo, coin_stats, base_tip, base_chain_tx_count) {
-            Ok(replay) => replay,
-            Err(error) => return ReplayOutcome::Fallback(error),
-        };
-    let head = match replay_committed_range(
+    let mut replay = ReplayAccumulator::new(tree, utxo, coin_stats, base_tip, base_chain_tx_count)?;
+    let head = replay_committed_range(
         dir,
         JournalReplayBase {
             generation: base_generation,
@@ -156,20 +106,15 @@ pub(crate) fn replay_from_journal(
             chain_tx_count: base_chain_tx_count,
         },
         |record| replay.apply(record),
-    ) {
-        Ok(head) => head,
-        Err(error) => return ReplayOutcome::Fallback(error),
-    };
+    )?;
     let state = replay.finish();
-    if let Err(error) = validate_replayed_head(&state, head.height, head.block_hash) {
-        return ReplayOutcome::Fallback(error);
-    }
+    validate_replayed_head(&state, head.height, head.block_hash)?;
     if state.chain_tx_count != head.chain_tx_count {
-        return ReplayOutcome::Fallback(JournalReplayError::CommittedRangeInvalid(
+        return Err(JournalReplayError::CommittedRangeInvalid(
             "chain transaction count does not match head marker".to_owned(),
         ));
     }
-    ReplayOutcome::Replayed(Box::new(state))
+    Ok(Box::new(state))
 }
 
 fn validate_replayed_head(

@@ -172,7 +172,7 @@ impl Reconstruction {
         if missing.is_empty() {
             return Outcome::Complete(Block {
                 header,
-                txs: filled.into_txs(),
+                txs: filled.into_iter().flatten().collect(),
             });
         }
         if missing.len() > MAX_REQUESTED_MISSING {
@@ -238,10 +238,9 @@ impl Reconstruction {
         let Some(entry) = self.pending.remove(&hash) else {
             return Outcome::Idle;
         };
-        let txs = entry.filled.into_txs();
         Outcome::Complete(Block {
             header: entry.header,
-            txs,
+            txs: entry.filled.into_iter().flatten().collect(),
         })
     }
 
@@ -334,18 +333,6 @@ fn place_prefills(compact: &HeaderAndShortIds, total: usize) -> Option<Vec<Optio
         position = slot + 1;
     }
     Some(filled)
-}
-
-/// Consumes the slots into transaction bodies. Callers must have verified
-/// completeness first (no `None` slots); the flatten is then lossless.
-trait FilledSlots {
-    fn into_txs(self) -> Vec<Tx>;
-}
-
-impl FilledSlots for Vec<Option<Tx>> {
-    fn into_txs(self) -> Vec<Tx> {
-        self.into_iter().flatten().collect()
-    }
 }
 
 fn native_header(reg: &bitcoin::blockdata::block::Header) -> Option<Header> {

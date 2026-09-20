@@ -20,13 +20,11 @@ redb = ["dep:redb"]
 [dependencies]
 arc-swap.workspace = true
 bitcoin-rs-primitives.workspace = true
-bytemuck.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 bytes.workspace = true
-crossbeam-channel.workspace = true
 hashbrown.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true

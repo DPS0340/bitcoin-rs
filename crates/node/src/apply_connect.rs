@@ -959,25 +959,26 @@ fn build_journal_record(
                 height: add.height,
                 coinbase: add.coinbase,
             });
-    let record = crate::chainstate_journal::journal_record_for_block(
-        crate::chainstate_journal::BlockDeltaInputs {
-            height,
-            block_hash: block_hash.to_le_bytes(),
-            prev_hash: prev_hash.to_le_bytes(),
-            block_tx_count: tx_count_delta_for(block),
-            coin_stats_height_delta,
-            raw_header: {
-                let mut header_bytes = [0u8; 80];
-                let encoded = bitcoin_rs_primitives::consensus_bytes(&block.header);
-                debug_assert_eq!(encoded.len(), 80, "header consensus encoding is 80 bytes");
-                header_bytes.copy_from_slice(&encoded);
-                header_bytes
-            },
-        },
-        changes,
-        undo_coins,
-    );
-    Some(record.map_err(|error| error.to_string()))
+    let block_tx_count = tx_count_delta_for(block);
+    let mut raw_header = [0u8; 80];
+    let encoded = bitcoin_rs_primitives::consensus_bytes(&block.header);
+    debug_assert_eq!(encoded.len(), 80, "header consensus encoding is 80 bytes");
+    raw_header.copy_from_slice(&encoded);
+    Some(
+        crate::chainstate_journal::mutations_for_block(changes, undo_coins)
+            .map(
+                |mutations| bitcoin_rs_storage::chainstate_journal::JournalRecord {
+                    height,
+                    block_hash: block_hash.to_le_bytes(),
+                    prev_hash: prev_hash.to_le_bytes(),
+                    block_tx_count,
+                    coin_stats_height_delta,
+                    raw_header,
+                    mutations,
+                },
+            )
+            .map_err(|error| error.to_string()),
+    )
 }
 
 /// Emits one built journal record, best-effort.

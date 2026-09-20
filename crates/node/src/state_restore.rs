@@ -190,7 +190,7 @@ pub(super) fn prepare_initial_chainstate(
     metrics::histogram!("node.chainstate_journal.replay_seconds").record(replay_seconds);
     drop(journal_dir);
     match replay {
-        crate::chainstate_journal::ReplayOutcome::Replayed(replayed) => {
+        Ok(replayed) => {
             let replayed_records = replayed.applied_tip.height.saturating_sub(base_height);
             let (restore_source, resume_source) = if replayed_records == 0 {
                 ("checkpoint", ResumeSource::Checkpoint)
@@ -227,7 +227,7 @@ pub(super) fn prepare_initial_chainstate(
                 journal_bootstrap: Some(bootstrap),
             })
         }
-        crate::chainstate_journal::ReplayOutcome::Fallback(error) => {
+        Err(error) => {
             let reason = error.reason();
             metrics::counter!(
                 "node.chainstate_journal.fallback_total",

@@ -6,6 +6,7 @@
 use bitcoin_rs_primitives::{Block, Header, Network, consensus_bytes};
 use sonic_rs::{Value, json};
 
+use crate::compat::convert::hex_encode;
 use crate::tx_render::transaction_json;
 
 /// Applied-chain facts required to project a header or block.
@@ -119,14 +120,4 @@ fn header_common_json(header: &Header, chain: &BlockChainContext) -> Value {
         let _ = value.insert("nextblockhash", json!(next.to_string()));
     }
     value
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }

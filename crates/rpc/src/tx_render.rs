@@ -18,6 +18,8 @@ use bitcoin_rs_script::{
     is_multisig, is_op_return, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
 };
 
+use crate::compat::convert::hex_encode;
+
 /// Optional confirmed-chain fields projected beside a transaction object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TransactionChainContext {
@@ -279,18 +281,6 @@ fn classify_script(script: &[u8]) -> &'static str {
     } else {
         "nonstandard"
     }
-}
-
-/// Encodes `bytes` as lowercase hexadecimal.
-#[must_use]
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }
 
 #[cfg(test)]

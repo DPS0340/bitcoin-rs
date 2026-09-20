@@ -6,7 +6,7 @@ use bitcoin_rs_primitives::{Tx, Txid, Wtxid};
 use bitcoin_rs_primitives::{Amount, LockTime, Script, Witness};
 use bitcoin_rs_script::count_tx_legacy;
 
-/// Stable mempool entry identifier.
+/// Slot index for a pooled transaction. Removal allows the slot to be reused.
 pub type EntryId = u32;
 
 /// Transaction plus policy accounting used by mempool ordering and limits.
