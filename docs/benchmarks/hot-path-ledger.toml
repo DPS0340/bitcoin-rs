@@ -1,5 +1,6 @@
 # bitcoin-rs product hot-path ledger. Owner: docs/contracts/hot-path-attribution.md.
-# Schema is parsed by bin/bitcoin-rs/tests/gates/g18_hot_path_ledger.rs.
+# Ledger parse/record and inventory review live in crates/node/benches/evidence.rs
+# (HPA-05: the evidence tool validates accounting, not declared-path names).
 schema = "bitcoin-rs-hot-path-ledger-v2"
 
 contract = "docs/contracts/hot-path-attribution.md"

@@ -26,11 +26,15 @@ contract.
 ### `DEP-02`: One copy of each consensus-stack crate
 
 - **Owner**: `deny.toml` `[bans]`.
-- **Scope**: the fully-featured resolve (`cargo metadata --all-features`)
-  for `bitcoin`, `bitcoin_hashes`, `secp256k1`, and `secp256k1-sys`.
-- Each of those crates must appear as exactly one package id. `deny.toml`
-  `multiple-versions = "deny"` is the graph-wide companion; those four
-  names must not gain a `[bans].skip` entry, including `crate@version`.
+- **Scope**: the resolved graph of each DEP-01 lane — the minimal lane's
+  `--all-features` resolve and the maximum lane's default-feature
+  resolve — for `bitcoin`, `bitcoin_hashes`, `secp256k1`, and
+  `secp256k1-sys`.
+- Each of those crates resolves to exactly one version per graph:
+  `deny.toml` `multiple-versions = "deny"` fails any second version of
+  any crate, and those four names must not gain a `[bans].skip` entry,
+  including `crate@version`. Package-id cardinality beyond one version
+  per name is not mechanically checked; lockfile review pins it.
 - Range-endpoint graphs are in scope: `cargo deny check bans` runs after
   each DEP-01 resolve. Missing cargo-deny is a failed prerequisite, not a skip.
 

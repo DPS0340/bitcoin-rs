@@ -104,6 +104,28 @@ class ModelEvidenceTests(unittest.TestCase):
                 with patch.dict(os.environ, {"APALACHE_HOME": str(self.home)}):
                     self.assertEqual(check_models.main(), 11)
 
+    def test_malformed_tool_pin_missing_version_is_a_tool_identity_failure(self) -> None:
+        # A pin missing one of the name/version/jar_sha256 keys cannot name a
+        # tool: main() must report the tool-identity code, 11, never the
+        # generic KeyError code 14.
+        pin = self.root / "docs/api/core-compat.toml"
+        text = pin.read_text(encoding="utf-8")
+        pin.write_text(text.replace('version = "0.62.2"\n', ""), encoding="utf-8")
+        with patch.object(check_models, "ROOT", self.root):
+            with patch.object(sys, "argv", ["check_models.py", "--check-only"]):
+                with patch.dict(os.environ, {"APALACHE_HOME": str(self.home)}):
+                    self.assertEqual(check_models.main(), 11)
+
+    def test_deleted_register_is_an_inventory_identity_failure(self) -> None:
+        # A deleted custody register cannot settle model identity: main()
+        # must report the inventory code, 15, never the generic
+        # FileNotFoundError code 14.
+        (self.root / "CONSTRAINTS.md").unlink()
+        with patch.object(check_models, "ROOT", self.root):
+            with patch.object(sys, "argv", ["check_models.py", "--check-only"]):
+                with patch.dict(os.environ, {"APALACHE_HOME": str(self.home)}):
+                    self.assertEqual(check_models.main(), 15)
+
     def test_temporal_lane_writes_under_temporal_directory(self) -> None:
         model = check_models.models(self.root)[0]
         check_models.run_model(
@@ -165,10 +187,30 @@ class ModelEvidenceTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 14)
                 self.assertEqual(self.newest_result()["evidence_rc"], 14)
 
-    def test_timeout_is_recorded_as_unavailable(self) -> None:
-        self.write_tool("time.sleep(60)")
+    def test_timeout_kills_the_whole_tool_session(self) -> None:
+        # The fake tool is a real process tree: the python child spawns a
+        # `sleep 300` descendant, records its pid on disk, and waits for it.
+        # A plain sleep would leave the os.killpg branch unproven, so after
+        # run_model times out the test asserts the recorded descendant is
+        # gone (the whole group died, not just the launcher).
+        body = (
+            "import os, subprocess, sys\n"
+            "if sys.argv[1] == 'check':\n"
+            "    child = subprocess.Popen(['sleep', '300'], start_new_session=False)\n"
+            "    with open('descendant.pid', 'w') as sink:\n"
+            "        sink.write(str(child.pid))\n"
+            "    os.wait()\n"
+        )
+        self.write_tool(body)
+        # cwd=run_dir for the tool, so the pid file lands beside output.log.
         with self.assertRaises(check_models.EvidenceError) as error:
             self.run_check(timeout=1)
+        # Descendant liveness first: os.killpg must have reached the whole
+        # tool session before any recorded outcome can be asserted.
+        pid_file = next(self.root.glob("target/apalache/**/descendant.pid"))
+        descendant = int(pid_file.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(descendant, 0)
         self.assertEqual(error.exception.code, 14)
         result = next(self.root.glob("target/apalache/**/result.json"))
         self.assertEqual(json.loads(result.read_text()), {"native_rc": None, "evidence_rc": 14})

@@ -70,7 +70,14 @@ def cfg_constants(path: Path) -> str:
 
 
 def models(root: Path) -> tuple[Model, ...]:
-    register = (root / "CONSTRAINTS.md").read_text(encoding="utf-8")
+    try:
+        register = (root / "CONSTRAINTS.md").read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError) as error:
+        # A missing or unreadable custody register is a model-identity
+        # failure on the inventory lane, not an unavailable run.
+        raise EvidenceError(
+            15, f"proof inventory register is unreadable: {error.filename or error}"
+        ) from error
     inventory: dict[str, Model] = {}
     for line in register.splitlines():
         cells = [cell.strip() for cell in line.split("|")]
@@ -96,6 +103,8 @@ def models(root: Path) -> tuple[Model, ...]:
 def tool(root: Path) -> Path:
     with (root / "docs/api/core-compat.toml").open("rb") as stream:
         identity = tomllib.load(stream)["reference"]["formal_tool"]
+    if any(key not in identity for key in ("name", "version", "jar_sha256")):
+        raise EvidenceError(11, "formal tool identity is malformed")
     name, version, jar_hash = (identity[key] for key in ("name", "version", "jar_sha256"))
     if name != "apalache-mc" or not isinstance(version, str) or not isinstance(jar_hash, str):
         raise EvidenceError(11, "formal tool identity is malformed")

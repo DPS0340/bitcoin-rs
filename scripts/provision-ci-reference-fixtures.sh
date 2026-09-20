@@ -54,8 +54,31 @@ else
   binary="$install/bin/apalache-mc"
   # Hosted runners expose the pinned Java major here; local runs may use an
   # explicitly selected JAVA_HOME instead. Never require Java for Core tests.
+  # WHY JAVA_HOME_25_X64: legacy variable name; whatever JDK it selects must
+  # still match the register's observed-Java row below.
   export JAVA_HOME="${JAVA_HOME_25_X64:-${JAVA_HOME:?set JAVA_HOME for the formal lane}}"
   [[ -x "$JAVA_HOME/bin/java" ]] || { echo "Java executable missing" >&2; exit 1; }
+  # The register records what java -version actually printed (CONSTRAINTS.md
+  # "Java | ... Java <version>"); a JDK that no longer matches that
+  # observation invalidates the formal lane's tool identity, before PATH
+  # export so nothing downstream runs against the wrong JVM.
+  observed="$("$JAVA_HOME/bin/java" -version 2>&1)" || {
+    printf '%s\n' "$observed" >&2
+    printf '%s\n' "Java version probe failed" >&2
+    exit 1
+  }
+  # The banner's label varies by vendor (openjdk, java, Temurin's java);
+  # only the quoted version token is identity.
+  observed_version="$(printf '%s\n' "$observed" | sed -n '1s/^[[:space:]]*[a-z][a-z]*[[:space:]]\+version[[:space:]]\+"\([^"]*\)".*/\1/p')"
+  register_version="$(sed -n 's/^| Java |.*[[:space:]]Java \([0-9.][0-9.]*\)[[:space:]]*|[[:space:]]*$/\1/p' CONSTRAINTS.md)"
+  [[ -n "$observed_version" && -n "$register_version" ]] || {
+    printf '%s\n' "Java identity missing: observed '${observed_version:-none}' vs register '${register_version:-none}'" >&2
+    exit 1
+  }
+  [[ "$observed_version" == "$register_version" ]] || {
+    printf '%s\n' "Java version mismatch: selected JDK ${observed_version}, register ${register_version}" >&2
+    exit 1
+  }
   export PATH="$JAVA_HOME/bin:$PATH"
   if [[ -n "${GITHUB_ENV:-}" ]]; then
     printf 'JAVA_HOME=%s\n' "$JAVA_HOME" >> "$GITHUB_ENV"
