@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import contextlib
 import io
 import json
@@ -174,6 +175,40 @@ class RuntimeStallTests(unittest.TestCase):
         self.assertEqual(result["pid"], identity.pid)
         self.assertEqual(result["start_ticks"], identity.start_ticks)
         self.assertIn("kernel snapshot", result["reason"])
+
+    def test_kernel_snapshot_pulls_exactly_257_entries_and_truncates_the_snapshot(self) -> None:
+        identity = watchdog.process(os.getpid())
+        assert identity is not None
+        executable = self.root / "fake-gdb"
+        text = "Thread 1 (LWP 1):\n#0  main () at src/main.rs:12\n"
+        executable.write_text(f"#!{sys.executable}\nprint({text!r})\nraise SystemExit(0)\n")
+        executable.chmod(0o755)
+        task_dir = Path(f"/proc/{identity.pid}/task")
+        fake_tasks = [Path(f"{task_dir}/{index}") for index in range(300)]
+        pulls: list[Path] = []
+        real_iterdir = Path.iterdir
+
+        def fake_iterdir(self: Path) -> Iterator[Path]:
+            if self != task_dir:
+                return real_iterdir(self)
+            def pulled() -> Iterator[Path]:
+                # Count on every next() so the recorded total is exactly the
+                # number of entries production consumes, not the fake size.
+                for task in fake_tasks:
+                    pulls.append(task)
+                    yield task
+            return pulled()
+
+        with patch.object(watchdog, "process", return_value=identity), \
+             patch.object(Path, "iterdir", fake_iterdir), \
+             self.assertRaises(RuntimeError):
+            watchdog.capture(identity, self.log, self.root, str(executable))
+        # 256 recorded tasks plus one lookahead pull that proves more
+        # entries exist; an unbounded enumeration would pull all 300.
+        self.assertEqual(len(pulls), 257)
+        waits = next(self.root.glob("stall-*/kernel-waits.txt")).read_text()
+        self.assertIn("Thread snapshot truncated at 256 threads.\n", waits)
+        self.assertEqual(waits.count("/comm: unavailable"), 256)
 
     def test_identity_change_after_attach_forces_an_incomplete_result(self) -> None:
         identity = watchdog.process(os.getpid())
