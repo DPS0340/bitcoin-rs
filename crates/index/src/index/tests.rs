@@ -8,7 +8,8 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_storage::{ColumnFamily, KvStore, RocksDbStore, WriteBatch};
 
 use super::{BlockSource, IndexError, IndexWriter, Indexer};
-use crate::{ScriptHash, ScriptHashRow, ScriptHistoryEntry, SpendingPrefixRow, TxidRow};
+use crate::types::TxidRow;
+use crate::{ScriptHash, ScriptHashRow, ScriptHistoryEntry, SpendingPrefixRow};
 
 type StoredRows = Vec<(ColumnFamily, Vec<u8>)>;
 
