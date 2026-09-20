@@ -122,7 +122,12 @@ def write_result(directory: Path, identity: Process, log: Path, debugger_argv: l
 def preflight_attach(identity: Process, debugger: str) -> None:
     """Probe attach permission now: a ptrace-denying host would otherwise burn
     the whole --timeout before the real capture failed. The dry attach
-    momentarily pauses the target once more before the diagnostic run."""
+    momentarily pauses the target once more before the diagnostic run. The
+    target identity is checked around the probe so a recycled PID is never
+    attached."""
+    if process(identity.pid) != identity:
+        raise ProcessLookupError(
+            f"target exited or PID was reused before attach preflight (PID {identity.pid})")
     handle, name = tempfile.mkstemp(prefix=f"stall-preflight-{identity.pid}-", suffix=".gdb")
     commands = Path(name)
     try:
@@ -134,11 +139,18 @@ def preflight_attach(identity: Process, debugger: str) -> None:
              "-iex", "set auto-load off", "-iex", "set debuginfod enabled off",
              "-x", str(commands)],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=GDB_TIMEOUT)
+        if process(identity.pid) != identity:
+            raise ProcessLookupError(
+                f"target exited or PID was reused during attach preflight (PID {identity.pid})")
         output = probe.stdout + probe.stderr
-        if probe.returncode != 0 or "Operation not permitted" in output or "ptrace: " in output:
+        if "Operation not permitted" in output or "ptrace: " in output:
             raise RuntimeError(
                 "ptrace denied during attach preflight; grant GDB permission through "
                 "kernel.yama.ptrace_scope or CAP_SYS_PTRACE before starting the watchdog: "
+                + output.strip()[-300:])
+        if probe.returncode != 0:
+            raise RuntimeError(
+                "dry attach failed during attach preflight; inspect the debugger output: "
                 + output.strip()[-300:])
     finally:
         commands.unlink(missing_ok=True)
@@ -202,6 +214,7 @@ def capture(identity: Process, log: Path, output: Path, debugger: str) -> Path:
             "-iex", "set auto-load off", "-iex", "set debuginfod enabled off",
             "-x", str(commands)]
     native: int | None = None
+    interrupted: KeyboardInterrupt | None = None
     with (directory / "threads.txt").open("xb") as stream:
         with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stream,
                               stderr=subprocess.STDOUT, start_new_session=True,
@@ -210,6 +223,8 @@ def capture(identity: Process, log: Path, output: Path, debugger: str) -> Path:
                 native = child.wait(timeout=GDB_TIMEOUT)
             except subprocess.TimeoutExpired:
                 pass  # Native None records an incomplete diagnostic.
+            except KeyboardInterrupt as error:
+                interrupted = error
             finally:
                 if child.poll() is None:
                     child.terminate()
@@ -218,6 +233,10 @@ def capture(identity: Process, log: Path, output: Path, debugger: str) -> Path:
                     except subprocess.TimeoutExpired:
                         child.kill()
                         child.wait()
+    if interrupted is not None:
+        write_result(directory, identity, log, argv, None, False,
+                     "capture stopped after operator interrupt before the debugger finished")
+        raise interrupted
     # Re-read identity only after the child exits: PID recycling between
     # attach and dump must not pass as a complete capture of the original
     # start_ticks, so a changed identity forces an incomplete result.
@@ -230,11 +249,14 @@ def capture(identity: Process, log: Path, output: Path, debugger: str) -> Path:
         threads = stream.read()
     lines = threads.splitlines()
     # `-c` continues past per-thread errors, so an aborted sweep still prints
-    # the marker with fewer top frames than thread headers; and an unresolved
-    # top frame violates the documented matching-symbols precondition.
-    headers = sum(1 for line in lines if line.startswith(b"Thread "))
+    # the marker with fewer top frames than thread headers. Only
+    # `Thread N (LWP x):` lines count as thread-apply block headers; an
+    # attach-time notification is not a block. Any unresolved frame violates
+    # the documented matching-symbols precondition.
+    headers = sum(1 for line in lines
+                  if line.startswith(b"Thread ") and b" (LWP " in line)
     top_frames = sum(1 for line in lines if line.startswith(b"#0 "))
-    unresolved = any(line.startswith(b"#0 ") and b" in ?? ()" in line for line in lines)
+    unresolved = any(line.startswith(b"#") and b" in ?? ()" in line for line in lines)
     complete = (native == 0 and b"STALL_CAPTURE_COMPLETE" in threads
                 and headers >= 1 and headers == top_frames
                 and not unresolved and not identity_changed)

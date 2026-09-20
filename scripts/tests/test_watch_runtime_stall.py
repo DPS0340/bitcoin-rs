@@ -207,11 +207,131 @@ class RuntimeStallTests(unittest.TestCase):
         executable.write_text(
             f"#!{sys.executable}\nprint('ptrace: Operation not permitted.')\nraise SystemExit(0)\n")
         executable.chmod(0o755)
-        with self.assertRaises(RuntimeError):
+        with patch.object(watchdog, "process", return_value=identity), \
+             self.assertRaises(RuntimeError):
             watchdog.preflight_attach(identity, str(executable))
         executable.write_text(f"#!{sys.executable}\nraise SystemExit(0)\n")
         executable.chmod(0o755)
-        watchdog.preflight_attach(identity, str(executable))
+        with patch.object(watchdog, "process", return_value=identity):
+            watchdog.preflight_attach(identity, str(executable))
+
+    def test_preflight_rejects_identity_change_before_the_dry_attach(self) -> None:
+        identity = watchdog.Process(99, "100")
+        replacement = watchdog.Process(99, "101")
+        with patch.object(watchdog, "process", return_value=replacement), \
+             patch.object(watchdog.subprocess, "run") as run:
+            with self.assertRaises(ProcessLookupError) as raised:
+                watchdog.preflight_attach(identity, "/not-a-debugger")
+        run.assert_not_called()
+        self.assertIn("PID was reused", str(raised.exception))
+
+    def test_preflight_rejects_identity_change_after_the_dry_attach(self) -> None:
+        identity = watchdog.Process(99, "100")
+        replacement = watchdog.Process(99, "101")
+        probe = watchdog.subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(watchdog, "process",
+                          side_effect=[identity, replacement]), \
+             patch.object(watchdog.subprocess, "run", return_value=probe) as run:
+            with self.assertRaises(ProcessLookupError) as raised:
+                watchdog.preflight_attach(identity, "/not-a-debugger")
+        run.assert_called_once()
+        self.assertIn("PID was reused", str(raised.exception))
+
+    def test_preflight_scopes_denial_diagnosis_to_ptrace_output(self) -> None:
+        identity = watchdog.Process(99, "100")
+        executable = self.root / "fake-gdb"
+
+        def probe(output: str) -> str:
+            executable.write_text(
+                f"#!{sys.executable}\nprint({output!r})\nraise SystemExit(1)\n")
+            executable.chmod(0o755)
+            with patch.object(watchdog, "process", return_value=identity), \
+                 self.assertRaises(RuntimeError) as raised:
+                watchdog.preflight_attach(identity, str(executable))
+            return str(raised.exception)
+
+        for output in ("libthread_db load failure from 1", ""):
+            with self.subTest(output=output):
+                message = probe(output)
+                self.assertIn("dry attach", message)
+                self.assertNotIn("ptrace", message)
+        executable.write_text(
+            f"#!{sys.executable}\nprint('ptrace: Operation not permitted.')\nraise SystemExit(1)\n")
+        executable.chmod(0o755)
+        with patch.object(watchdog, "process", return_value=identity), \
+             self.assertRaises(RuntimeError) as raised:
+            watchdog.preflight_attach(identity, str(executable))
+        self.assertIn("ptrace", str(raised.exception))
+
+    def test_sweep_header_count_requires_thread_apply_block_shape(self) -> None:
+        identity = watchdog.process(os.getpid())
+        assert identity is not None
+        executable = self.root / "fake-gdb"
+        notification = 'Thread 1 "node" received signal SIGSTOP'
+        sweep = "Thread 1 (LWP 1):\n#0  main () at src/main.rs:12\nSTALL_CAPTURE_COMPLETE"
+        # The headers == top_frames count treats an attach-time notification
+        # as a second thread-apply block and rejects a sweep that covered its
+        # only real block.
+        notification_first = notification + "\n" + sweep
+        # A notification whose thread-apply block never appeared must keep
+        # the capture incomplete instead of standing in for coverage.
+        notification_only = notification + "\nSTALL_CAPTURE_COMPLETE"
+        cases = ((notification_first, True), (notification_only, False))
+        for text, expected_complete in cases:
+            with self.subTest(text=text):
+                executable.write_text(f"#!{sys.executable}\nprint({text!r})\nraise SystemExit(0)\n")
+                executable.chmod(0o755)
+                if expected_complete:
+                    watchdog.capture(identity, self.log, self.root, str(executable))
+                else:
+                    with self.assertRaises(RuntimeError):
+                        watchdog.capture(identity, self.log, self.root, str(executable))
+
+    def test_unresolved_frame_at_any_depth_blocks_completion(self) -> None:
+        identity = watchdog.process(os.getpid())
+        assert identity is not None
+        executable = self.root / "fake-gdb"
+        text = ("Thread 1 (LWP 1):\n#0  main () at src/main.rs:12\n"
+                "#1  0x00007f9b4000 in ?? ()\nSTALL_CAPTURE_COMPLETE")
+        executable.write_text(f"#!{sys.executable}\nprint({text!r})\nraise SystemExit(0)\n")
+        executable.chmod(0o755)
+        with self.assertRaises(RuntimeError):
+            watchdog.capture(identity, self.log, self.root, str(executable))
+        result = json.loads(next(self.root.glob("stall-*/result.json")).read_text())
+        self.assertFalse(result["complete"])
+
+    def test_keyboard_interrupt_during_gdb_wait_persists_incomplete_result(self) -> None:
+        identity = watchdog.process(os.getpid())
+        assert identity is not None
+        executable = self.root / "fake-gdb"
+        executable.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
+        executable.chmod(0o755)
+        real_process = watchdog.process
+        real_wait = watchdog.subprocess.Popen.wait
+
+        def fake_process(pid: int) -> watchdog.Process | None:
+            if pid == os.getpid():
+                return identity
+            return real_process(pid)
+
+        def raise_interrupt_once(self: watchdog.subprocess.Popen,
+                                 timeout: float | None = None) -> int:
+            if raise_interrupt_once.raised:
+                return real_wait(self, timeout)
+            raise_interrupt_once.raised = True
+            raise KeyboardInterrupt
+
+        raise_interrupt_once.raised = False
+
+        with patch.object(watchdog, "process", fake_process), \
+             patch.object(watchdog.subprocess.Popen, "wait", raise_interrupt_once):
+            with self.assertRaises(KeyboardInterrupt):
+                watchdog.capture(identity, self.log, self.root, str(executable))
+        result = json.loads(next(self.root.glob("stall-*/result.json")).read_text())
+        self.assertFalse(result["complete"])
+        self.assertIn("interrupt", result["reason"])
+        self.assertIn("operator", result["reason"])
+        self.assertIsNone(result["returncode"])
 
 
 if __name__ == "__main__":
