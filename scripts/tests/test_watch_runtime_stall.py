@@ -52,6 +52,44 @@ class RuntimeStallTests(unittest.TestCase):
         _, fresh = watchdog.read_progress(self.log, cursor)
         self.assertTrue(fresh)
 
+    def test_copy_truncate_regrowth_rescans_instead_of_resuming(self) -> None:
+        cursor, _ = watchdog.read_progress(self.log, None)
+        with self.log.open("ab") as stream:
+            stream.write(b"sync pro")
+        cursor, fresh = watchdog.read_progress(self.log, cursor)
+        self.assertFalse(fresh)
+        self.assertNotEqual(cursor.suffix, b"")
+        # Steady state: unchanged bytes under the carried suffix keep the
+        # cursor in place instead of resetting it to a full rescan.
+        steady, fresh = watchdog.read_progress(self.log, cursor)
+        self.assertFalse(fresh)
+        self.assertEqual(steady.offset, cursor.offset)
+        self.assertEqual(steady.suffix, cursor.suffix)
+        # A plain append past the carried suffix resumes instead of
+        # rescanning; a rescan would re-read the old complete progress line
+        # and report it as fresh.
+        with self.log.open("ab") as stream:
+            stream.write(b"other work\n")
+        cursor, fresh = watchdog.read_progress(self.log, cursor)
+        self.assertFalse(fresh)
+        self.assertGreater(cursor.offset, steady.offset)
+        # Re-arm a partial tail so the truncation poll has a suffix to
+        # verify.
+        with self.log.open("ab") as stream:
+            stream.write(b"sync pro")
+        cursor, fresh = watchdog.read_progress(self.log, cursor)
+        self.assertFalse(fresh)
+        self.assertNotEqual(cursor.suffix, b"")
+        # Copy-truncate refills the same inode up to the previous offset and
+        # drops the partial tail; resuming at the stale offset would read
+        # nothing and miss the fresh progress line.
+        with self.log.open("r+b") as stream:
+            stream.truncate(0)
+            stream.write(b"sync progress\n" + b"x" * (cursor.offset - len(b"sync progress\n")))
+        self.assertGreaterEqual(self.log.stat().st_size, cursor.offset)
+        cursor, fresh = watchdog.read_progress(self.log, cursor)
+        self.assertTrue(fresh)
+
     def test_missing_cadence_expires_without_rpc_or_node_locks(self) -> None:
         identity = watchdog.Process(99, "100")
         with patch.object(watchdog, "process", return_value=identity), \

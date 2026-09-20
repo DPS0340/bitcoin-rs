@@ -67,7 +67,18 @@ def read_progress(log: Path, cursor: Cursor | None) -> tuple[Cursor | None, bool
             # Old log lines cannot masquerade as fresh progress.
             return Cursor(stat.st_dev, stat.st_ino, stat.st_size), False
         offset, suffix = cursor.offset, cursor.suffix
-        if (cursor.device, cursor.inode) != (stat.st_dev, stat.st_ino) or stat.st_size < offset:
+        same_file = (cursor.device, cursor.inode) == (stat.st_dev, stat.st_ino)
+        truncated = not same_file or stat.st_size < offset
+        if not truncated and suffix:
+            # Copy-truncate can refill the log past the previous offset
+            # before the next poll: (device, inode) and the size then look
+            # unchanged while the bytes under the carried partial line have
+            # been replaced, and resuming at the stale offset would skip
+            # fresh progress lines. A normal append never rewrites bytes
+            # below the previous end of file, so a mismatch means rewrite.
+            stream.seek(offset - len(suffix))
+            truncated = stream.read(len(suffix)) != suffix
+        if truncated:
             offset, suffix = 0, b""
         if stat.st_size - offset > READ_LIMIT:
             offset, suffix = stat.st_size - READ_LIMIT, b""
