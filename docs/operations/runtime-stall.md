@@ -9,11 +9,12 @@ supported. The default 180 seconds allows three 60-second intervals.
 ## Requirements and cost
 
 Use Linux, Python 3.11 or newer, GDB, and the matching executable and debug
-symbols. GDB must have permission to attach. Configure that permission through
-the deployment's normal debugging policy; this tool never changes ptrace
-settings, privileges, or node configuration. Keep the log exclusive to this
-node and enable INFO telemetry. An unrelated log or disabled INFO output cannot
-prove this node's liveness.
+symbols. GDB must have permission to attach; before watching, the watchdog
+verifies it with one dry attach that momentarily pauses the target. Configure
+that permission through the deployment's normal debugging policy; this tool
+never changes ptrace settings, privileges, or node configuration. Keep the log
+exclusive to this node and enable INFO telemetry. An unrelated log or disabled
+INFO output cannot prove this node's liveness.
 
 **GDB pauses the target during capture.** Invocation authorizes one diagnostic
 attach, not passive monitoring. The watchdog limits GDB to 30 seconds plus five

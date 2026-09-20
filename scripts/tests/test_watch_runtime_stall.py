@@ -82,10 +82,15 @@ class RuntimeStallTests(unittest.TestCase):
         assert identity is not None
         executable = self.root / "fake-gdb"
         for rc, text, complete in (
-            (0, "Thread 1\n#0 blocking_call ()\nSTALL_CAPTURE_COMPLETE", True),
+            (0, "Thread 1 (LWP 1):\n#0  main () at src/main.rs:12\nSTALL_CAPTURE_COMPLETE", True),
             (1, "permission denied", False),
             (0, "partial", False),
             (0, "ptrace: Operation not permitted.\nNo threads.\nSTALL_CAPTURE_COMPLETE", False),
+            (0, "Thread 1 (LWP 1):\n#0  main () at src/main.rs:12\n"
+                "Thread 2 (LWP 2):\nerror reading frames\nSTALL_CAPTURE_COMPLETE", False),
+            (0, "Thread 1 (LWP 1):\n#0  0x00007f9b4000 in ?? ()\nSTALL_CAPTURE_COMPLETE", False),
+            (0, "Thread 1 (LWP 1):\nThread " + "x" * (2 * watchdog.READ_LIMIT) + "\n"
+                "Thread 2 (LWP 2):\n#0  main () at src/main.rs:12\nSTALL_CAPTURE_COMPLETE", False),
         ):
             with self.subTest(rc=rc, text=text):
                 executable.write_text(f"#!{sys.executable}\nprint({text!r})\nraise SystemExit({rc})\n")
@@ -100,8 +105,47 @@ class RuntimeStallTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         watchdog.capture(identity, self.log, self.root, str(executable))
         results = [json.loads(path.read_text()) for path in self.root.glob("stall-*/result.json")]
-        self.assertEqual(len(results), 4)
+        self.assertEqual(len(results), 7)
         self.assertEqual(sum(result["complete"] for result in results), 1)
+
+    def test_pre_attach_exit_writes_an_incomplete_result(self) -> None:
+        identity = watchdog.process(os.getpid())
+        assert identity is not None
+        with patch.object(watchdog, "process", side_effect=[identity, None]):
+            with self.assertRaises(ProcessLookupError):
+                watchdog.capture(identity, self.log, self.root, "/not-a-debugger")
+        result = json.loads(next(self.root.glob("stall-*/result.json")).read_text())
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["pid"], identity.pid)
+        self.assertEqual(result["start_ticks"], identity.start_ticks)
+        self.assertIn("exited", result["reason"])
+
+    def test_identity_change_after_attach_forces_an_incomplete_result(self) -> None:
+        identity = watchdog.process(os.getpid())
+        assert identity is not None
+        executable = self.root / "fake-gdb"
+        text = "Thread 1 (LWP 1):\n#0  main () at src/main.rs:12\nSTALL_CAPTURE_COMPLETE"
+        executable.write_text(f"#!{sys.executable}\nprint({text!r})\nraise SystemExit(0)\n")
+        executable.chmod(0o755)
+        replacement = watchdog.Process(identity.pid, "1")
+        with patch.object(watchdog, "process", side_effect=[identity, identity, replacement]):
+            with self.assertRaises(RuntimeError):
+                watchdog.capture(identity, self.log, self.root, str(executable))
+        result = json.loads(next(self.root.glob("stall-*/result.json")).read_text())
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["identity_changed_after_attach"])
+
+    def test_attach_preflight_fails_fast_when_ptrace_is_denied(self) -> None:
+        identity = watchdog.Process(99, "100")
+        executable = self.root / "fake-gdb"
+        executable.write_text(
+            f"#!{sys.executable}\nprint('ptrace: Operation not permitted.')\nraise SystemExit(0)\n")
+        executable.chmod(0o755)
+        with self.assertRaises(RuntimeError):
+            watchdog.preflight_attach(identity, str(executable))
+        executable.write_text(f"#!{sys.executable}\nraise SystemExit(0)\n")
+        executable.chmod(0o755)
+        watchdog.preflight_attach(identity, str(executable))
 
 
 if __name__ == "__main__":

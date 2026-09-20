@@ -93,6 +93,46 @@ def wait_for_stall(identity: Process, log: Path, timeout: float) -> bool:
     return False
 
 
+def write_result(directory: Path, identity: Process, log: Path, debugger_argv: list[str] | None,
+                 returncode: int | None, complete: bool, reason: str,
+                 identity_changed_after_attach: bool = False) -> None:
+    """Every terminal capture outcome records the same auditable identity."""
+    payload: dict[str, object] = {
+        "pid": identity.pid, "start_ticks": identity.start_ticks,
+        "log": str(log), "debugger_argv": debugger_argv, "returncode": returncode,
+        "complete": complete, "reason": reason,
+        "interpretation": "Capture is evidence to inspect, not a deadlock verdict or automatic lock-owner attribution.",
+    }
+    if identity_changed_after_attach:
+        payload["identity_changed_after_attach"] = True
+    (directory / "result.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def preflight_attach(identity: Process, debugger: str) -> None:
+    """Probe attach permission now: a ptrace-denying host would otherwise burn
+    the whole --timeout before the real capture failed. The dry attach
+    momentarily pauses the target once more before the diagnostic run."""
+    handle, name = tempfile.mkstemp(prefix=f"stall-preflight-{identity.pid}-", suffix=".gdb")
+    commands = Path(name)
+    try:
+        with os.fdopen(handle, "w") as stream:
+            stream.write(f"set pagination off\nset confirm off\nattach {identity.pid}\ndetach\n")
+        # Command-file errors stop the batch, unlike separate -ex commands.
+        probe = subprocess.run(
+            [debugger, "--batch", "--nx", "--nh",
+             "-iex", "set auto-load off", "-iex", "set debuginfod enabled off",
+             "-x", str(commands)],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=GDB_TIMEOUT)
+        output = probe.stdout + probe.stderr
+        if probe.returncode != 0 or "Operation not permitted" in output or "ptrace: " in output:
+            raise RuntimeError(
+                "ptrace denied during attach preflight; grant GDB permission through "
+                "kernel.yama.ptrace_scope or CAP_SYS_PTRACE before starting the watchdog: "
+                + output.strip()[-300:])
+    finally:
+        commands.unlink(missing_ok=True)
+
+
 def capture(identity: Process, log: Path, output: Path, debugger: str) -> Path:
     if process(identity.pid) != identity:
         raise ProcessLookupError("target exited or PID was reused before capture")
@@ -119,6 +159,10 @@ def capture(identity: Process, log: Path, output: Path, debugger: str) -> Path:
                     value = f"unavailable: {error}"
                 stream.write(f"\n{task.name}/{name}: {value}\n")
     if process(identity.pid) != identity:
+        # The partial directory already holds evidence; an unaudited raise
+        # would strand it without a result.json explaining the early exit.
+        write_result(directory, identity, log, None, None, False,
+                     "target exited during kernel snapshot, before debugger attach")
         raise ProcessLookupError(f"target exited before debugger attach; partial evidence: {directory}")
     commands = directory / "capture.gdb"
     # A command-file error stops execution. Separate -ex commands can keep
@@ -148,17 +192,29 @@ def capture(identity: Process, log: Path, output: Path, debugger: str) -> Path:
                     except subprocess.TimeoutExpired:
                         child.kill()
                         child.wait()
+    # Re-read identity only after the child exits: PID recycling between
+    # attach and dump must not pass as a complete capture of the original
+    # start_ticks, so a changed identity forces an incomplete result.
+    identity_changed = process(identity.pid) != identity
     # Preserve failure output. A refused attach or timeout is not a capture.
+    # Count over the whole file: the child is capped at 16 MiB by
+    # RLIMIT_FSIZE, while a 1 MiB tail would scroll early thread blocks out
+    # of view and hide a thread whose backtrace errored.
     with (directory / "threads.txt").open("rb") as stream:
-        stream.seek(max(0, stream.seek(0, os.SEEK_END) - READ_LIMIT))
-        tail = stream.read(READ_LIMIT)
-        complete = native == 0 and b"STALL_CAPTURE_COMPLETE" in tail and b"\n#0 " in tail
-    (directory / "result.json").write_text(json.dumps({
-        "pid": identity.pid, "start_ticks": identity.start_ticks,
-        "log": str(log), "debugger_argv": argv, "returncode": native,
-        "complete": complete, "reason": "sync telemetry missed its monotonic deadline",
-        "interpretation": "Capture is evidence to inspect, not a deadlock verdict or automatic lock-owner attribution.",
-    }, indent=2) + "\n")
+        threads = stream.read()
+    lines = threads.splitlines()
+    # `-c` continues past per-thread errors, so an aborted sweep still prints
+    # the marker with fewer top frames than thread headers; and an unresolved
+    # top frame violates the documented matching-symbols precondition.
+    headers = sum(1 for line in lines if line.startswith(b"Thread "))
+    top_frames = sum(1 for line in lines if line.startswith(b"#0 "))
+    unresolved = any(line.startswith(b"#0 ") and b" in ?? ()" in line for line in lines)
+    complete = (native == 0 and b"STALL_CAPTURE_COMPLETE" in threads
+                and headers >= 1 and headers == top_frames
+                and not unresolved and not identity_changed)
+    write_result(directory, identity, log, argv, native, complete,
+                 "sync telemetry missed its monotonic deadline",
+                 identity_changed_after_attach=identity_changed)
     if not complete:
         raise RuntimeError(f"debugger capture incomplete; inspect {directory}")
     return directory
@@ -184,6 +240,9 @@ def main() -> int:
         identity = process(args.pid)
         if identity is None:
             raise ProcessLookupError(args.pid)
+        # WHY: the dry attach trades one momentary pause for failing on a
+        # ptrace-denying host before the stall deadline instead of after it.
+        preflight_attach(identity, debugger)
         print(f"Watching PID {identity.pid}; one missed-telemetry capture, then exit.", flush=True)
         if not wait_for_stall(identity, args.log, args.timeout):
             print("Original target exited; no debugger attached.")
