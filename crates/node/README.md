@@ -42,8 +42,8 @@ Data-directory storage evidence is an explicit command, not a node service:
 `bitcoin-rs --measure-storage` emits the logical and physical ledgers defined
 in [storage-footprint.md](../../docs/contracts/storage-footprint.md).
 
-The node crate registers `benches/sync_pipeline.rs` and
-`benches/chainstate_journal.rs` as Criterion benchmarks.
+The node crate registers `benches/sync_pipeline.rs` as a Criterion benchmark and
+`benches/chainstate_journal.rs` as a harness-less replay gate (its own `main`).
 Large corpus/replay/evidence harnesses are intentionally not shipped by this
 runtime crate.
 
