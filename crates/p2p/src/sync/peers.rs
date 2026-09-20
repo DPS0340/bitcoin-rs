@@ -88,8 +88,7 @@ pub(super) fn body_capability_height(
 
 impl BlockSync {
     /// Clears leftover address-scoped scheduler state for a newly ready
-    /// connection. Stale sources are ignored; see
-    /// `docs/solutions/architecture-patterns/p2p-owns-peer-lifecycle.md`.
+    /// connection. Stale sources are ignored per P2P-02.
     pub fn on_peer_ready(&self, source: crate::PeerSource) {
         // Table before window, as in request publication. Validating again
         // under the window can deadlock behind a queued table writer while

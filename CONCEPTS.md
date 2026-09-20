@@ -118,8 +118,7 @@ helpers. Ready snapshots carry `PeerSource`, and identity-checked table
 methods are what authorize a mutation. Address equality alone never does.
 `BlockSync` drives the P2P-owned [`DownloadWindow`] and [`BlockStager`] and may
 call identity-checked [`PeerTable`] methods directly. `P2pService` does not
-hold a second window. See
-`docs/solutions/architecture-patterns/p2p-owns-peer-lifecycle.md`.
+hold a second window. See `P2P-02` in `docs/contracts/p2p-wire.md`.
 
 ### assumevalid
 Skipping script-signature verification for blocks at or below a trusted height while performing every other consensus check. Mainnet defaults to the hash-pinned anchor below; other networks default to height 0. `--assume-valid-height 0` requests full verification; a custom nonzero height skips without hash gating.

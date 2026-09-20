@@ -244,14 +244,6 @@ Owners:
   transactions during reorg handling.
 
 ## Live gaps
-- **Node architecture reset (#1085)**: the `crates/node` ownership baseline is
-  being re-derived from the current call graph. The Phase-1 inventory lives in
-  [../node-ownership-inventory.md](../node-ownership-inventory.md) and
-  supersedes the intermediate assumptions of #1038, #1073, and #1075.
-  Ownership moves follow the inventory's phase sequencing: low-risk deletions with
-  no upstream dependency have already landed (e.g. #1090); items the inventory marks
-  as contingent (e.g. `metrics/evidence/*`) are gated on their named preconditions
-  (respectively #1084); Phase 4 proceeds via the MOVE ledger.
 - **Node slimming and extraction (#217)**: Peer connection session and lease
   ownership has moved to `PeerTable` / `P2pService` in `crates/p2p` (#215,
   #217, #218). BIP9/softfork lookups, P2P chain serving, txindex status
@@ -312,17 +304,18 @@ Owners:
   `proposal_omits_proof_of_work`: the facade copies published tips without
   reserving generation, connect/finish through `ChainTransition` is the
   mutation path, and BIP22 proposal reuses the apply gates without persistence.
-- `crates/node/src/apply.rs` tests `apply_block_publishes_rawtx_bytes_in_block_order`,
+- `crates/node/tests/unit/apply/consensus_rule_tests/` tests
+  `apply_block_publishes_rawtx_bytes_in_block_order`,
   `connected_sequence_event_observes_the_published_applied_tip`,
   `connect_and_disconnect_wake_the_mining_generation`,
-  `follower_dispatch_holds_the_chain_transition`,
-  `with_zmq_publisher_swaps_handle`: apply returns a committed outcome;
+  `follower_dispatch_holds_the_chain_transition`: apply returns a committed outcome;
   `ChainFollowers` consume it after the tip is published and while the
   transition is still held; ZMQ publishers are configured outside apply.
 - `crates/node/src/chain_effects.rs` tests `noop_asks_for_no_payloads`,
   `connect_then_disconnect_rewinds_the_rpc_log_and_emits_in_order`,
   `disconnect_does_not_pop_a_different_tail`: post-commit RPC/ZMQ work is
-  owned by `ChainEffects`, not by apply.
+  owned by `ChainEffects`, not by apply; the connect/disconnect test also
+  proves that the configured ZMQ publisher receives the committed effects.
 - `crates/node/src/config.rs` test `user_config_overlay_lets_set_fields_win`:
   later `UserConfig` layers win on set fields, including nested
   `ChainstateJournalOverrides` (`ARCH-05`).

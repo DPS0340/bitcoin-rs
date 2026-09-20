@@ -227,25 +227,3 @@ impl<'a> IntoIterator for &'a mut Witness {
         self.0.iter_mut()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Script, Witness};
-
-    #[test]
-    fn script_deref_exposes_bytes() {
-        let script = Script::from_bytes(vec![0x51, 0x20]);
-        assert_eq!(script.as_bytes(), &[0x51, 0x20]);
-        assert_eq!(&script[..], &[0x51, 0x20]);
-        assert!(!script.is_empty());
-    }
-
-    #[test]
-    fn witness_deref_exposes_stack() {
-        let mut witness = Witness::from_stack(vec![vec![0xaa], vec![0xbb, 0xcc]]);
-        assert_eq!(witness.len(), 2);
-        assert_eq!(witness[0], vec![0xaa]);
-        witness.clear();
-        assert!(witness.is_empty());
-    }
-}

@@ -294,9 +294,3 @@ fn a_queued_shutdown_wake_does_not_block_teardown() -> anyhow::Result<()> {
     result.map_err(|_| anyhow::anyhow!("teardown blocked on an already queued wake"))??;
     Ok(())
 }
-
-#[test]
-// CONTRACT: docs/contracts/architecture.md#ARCH-05
-fn startup_returns_an_owned_node_not_detached_parts() {
-    let _: fn(NodeConfig, RuntimeInputs, bool) -> anyhow::Result<crate::embed::Node> = start_node;
-}

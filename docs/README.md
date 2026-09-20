@@ -34,10 +34,9 @@ Treat [core-compat.toml](api/core-compat.toml),
 
 ## Evidence and implementation status
 
-[Benchmarks](benchmarks/) retain methods, measurements, and decisions.
-[Solutions](solutions/) are historical context, not current implementation
-promises. The [hot-path contract](contracts/hot-path-attribution.md) owns ledger
-interpretation. `UNMEASURED`, `planned`, and `BLOCKED` are not successful results.
+[Benchmarks](benchmarks/) retain methods, measurements, and decisions. The
+[hot-path contract](contracts/hot-path-attribution.md) owns ledger interpretation.
+`UNMEASURED`, `planned`, and `BLOCKED` are not successful results.
 
 [Formal models](models/) and their configurations remain subject to the
 [constraint register](../CONSTRAINTS.md). A compiled build is not proof of a
