@@ -301,3 +301,109 @@ fn failed_probe_send_excludes_dead_highest_peer_from_header_fallback()
     assert!(live_rx.try_recv().is_err());
     Ok(())
 }
+
+#[test]
+fn reorg_probe_anchors_locator_on_active_chain_at_applied_height()
+-> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block();
+    let mut tree = BlockTree::new();
+    let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+
+    let common =
+        mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
+    let common_id = tree.insert_node(Some(genesis_id), common.header, NodeStatus::HeaderValid)?;
+
+    let losing_2 = mined_block_with_prev_hash(
+        common.block_hash(),
+        2,
+        vec![coinbase_transaction(2_002)],
+    );
+    let losing_2_id =
+        tree.insert_node(Some(common_id), losing_2.header, NodeStatus::HeaderValid)?;
+    let losing_3 = mined_block_with_prev_hash(
+        losing_2.block_hash(),
+        3,
+        vec![coinbase_transaction(2_003)],
+    );
+    let losing_3_id =
+        tree.insert_node(Some(losing_2_id), losing_3.header, NodeStatus::HeaderValid)?;
+
+    let winning_2 = mined_block_with_prev_hash(
+        common.block_hash(),
+        2,
+        vec![coinbase_transaction(1_002)],
+    );
+    let winning_2_id =
+        tree.insert_node(Some(common_id), winning_2.header, NodeStatus::HeaderValid)?;
+    let winning_3 = mined_block_with_prev_hash(
+        winning_2.block_hash(),
+        3,
+        vec![coinbase_transaction(1_003)],
+    );
+    let winning_3_id =
+        tree.insert_node(Some(winning_2_id), winning_3.header, NodeStatus::HeaderValid)?;
+    let winning_4 = mined_block_with_prev_hash(
+        winning_3.block_hash(),
+        4,
+        vec![coinbase_transaction(1_004)],
+    );
+    let winning_4_id =
+        tree.insert_node(Some(winning_3_id), winning_4.header, NodeStatus::HeaderValid)?;
+
+    let active_tip = tree.tip().ok_or("missing active tip")?;
+    assert_eq!(active_tip.tip_id, winning_4_id);
+    let active_anchor = tree
+        .node_at_height_from(winning_4_id, 3)
+        .ok_or("missing active height-3 anchor")?;
+    assert_eq!(active_anchor, winning_3_id);
+    let active_anchor_hash = tree.node(active_anchor)?.hash;
+    let losing_tip = tree.node(losing_3_id)?;
+    let losing_snapshot = TipSnapshot {
+        tip_id: losing_3_id,
+        height: losing_tip.height,
+        chainwork: losing_tip.chainwork,
+        hash: losing_tip.hash,
+    };
+
+    let chain_tip = tree.tip_handle();
+    let block_tree = Arc::new(RwLock::new(tree));
+    let applied_tip = Arc::new(ArcSwapOption::empty());
+    applied_tip.store(Some(Arc::new(losing_snapshot)));
+
+    let peers = Arc::new(PeerTable::new());
+    let (_headers_tx, headers_rx) = unbounded::<InboundHeaders>();
+    let (_blocks_tx, blocks_rx) = unbounded::<crate::InboundBlock>();
+    let chain = Arc::new(TestChain::new(
+        chain_tip,
+        Arc::clone(&applied_tip),
+        Arc::clone(&block_tree),
+    ));
+    let sync = BlockSync::new(
+        chain,
+        Arc::clone(&peers),
+        Arc::new(Mutex::new(headers_rx)),
+        Arc::new(Mutex::new(blocks_rx)),
+    );
+
+    let peer = test_addr(9765, 0)?;
+    let outbound = connect_peer(&peers, eligible_peer(peer, 0));
+    sync.tick();
+
+    let probe = next_getheaders(&outbound)?;
+    let locator_tip = probe
+        .locator_hashes
+        .first()
+        .ok_or("probe locator is empty")?;
+    assert_eq!(
+        *locator_tip.as_byte_array(),
+        *active_anchor_hash.as_bytes(),
+        "idle recovery must anchor at the active-chain node at applied height",
+    );
+    assert_ne!(
+        *locator_tip.as_byte_array(),
+        *losing_3.block_hash().as_bytes(),
+        "the losing applied tip must never anchor a deep-reorg recovery probe",
+    );
+    Ok(())
+}
+
