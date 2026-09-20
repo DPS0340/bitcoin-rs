@@ -12,18 +12,19 @@ is derived and reconciles to it.
 
 Owners:
 - Authoritative durable root and ordered commit protocol:
-  `crates/node/src/apply/` (`connect.rs`, `disconnect.rs`)
-- Recovery and schema admission: `crates/node/src/state/` (`open.rs`;
-  tests in `state/tests/`)
+  `crates/node/src/apply_connect.rs` and `crates/node/src/apply_disconnect.rs`
+- Recovery and schema admission: `crates/node/src/state_open.rs`;
+  tests in `crates/node/tests/unit/state/tests/`
 - Persistent coin transition boundary: `crates/utxo/src/set.rs`
   (transition types); durable form in
   `crates/storage/src/durable_head.rs`
 - Crash and lost-write fault tests:
   `crates/node/tests/crash_recovery.rs`
-- Reorg and disconnect: `crates/node/src/reorg/` and
-  `crates/node/src/apply/disconnect.rs`
+- Reorg and disconnect: `crates/node/src/reorg.rs` and
+  `crates/node/src/apply_disconnect.rs`
 - Checkpoint publication and recovery:
-  `crates/node/src/checkpoint/` and `crates/storage/src/checkpoint/`
+  `crates/node/src/checkpoint.rs`, its `checkpoint_*.rs` companions,
+  and `crates/storage/src/checkpoint/`
 - Index worker recovery: `crates/index/src/runtime/recovery_tests.rs`
 - Policy: `docs/policies/db-migration.md`
 
@@ -301,7 +302,7 @@ state is harmless and keeps the node operating until replay closes the gap.
 
 ## Proven by
 
-- `crates/node/src/apply/durable.rs` (existing): owns the durable-head
+- `crates/node/src/apply_durable.rs` (existing): owns the durable-head
   advance for connect, group, and disconnect commits, the lineage fence, and
   the boot reconciliation of the stored head. `reconcile_at_boot` replays a
   committed-but-unpublished gap from the durable bodies the stored head
@@ -309,7 +310,7 @@ state is harmless and keeps the node operating until replay closes the gap.
   commit path with the head suppressed (`PublishMode::Replay`), publishing
   only the state the head already certifies — and fails startup closed on a
   gap that is not an ancestor prefix of stored bodies (`RCV-02`, `RCV-04`).
-- `crates/node/src/state/tests/recovery.rs` (#655):
+- `crates/node/tests/unit/state/tests/recovery.rs` (#655):
   - `boot_replays_the_committed_gap_without_recommitting_the_head`,
     `boot_replays_from_every_committed_ancestor`: restart on the gap left by
     a lost publication lands exactly on the stored head with its
@@ -317,8 +318,8 @@ state is harmless and keeps the node operating until replay closes the gap.
     restart replays nothing;
   - `boot_refuses_a_gap_whose_body_is_gone`: a gap whose durable facts are
     gone fails startup closed instead of publishing a fabricated history.
-- `crates/node/src/apply/connect.rs` and
-  `crates/node/src/apply/disconnect.rs` (existing): run the `RCV-02` tail —
+- `crates/node/src/apply_connect.rs` and
+  `crates/node/src/apply_disconnect.rs` (existing): run the `RCV-02` tail —
   sync, one atomic batch, derived journal emission, then publication — and
   retire the planned `crates/chainstate/src/transition.rs` row; the durable
   root is owned where the mutation authority lives (`ARCH-07`).
@@ -337,13 +338,13 @@ state is harmless and keeps the node operating until replay closes the gap.
 - `crates/node/tests/crash_recovery.rs` (existing): the `RCV-04` crash
   points — SIGKILL restart across journal, reorg, and publication scenarios,
   partial-write handling, and upgrade-matrix fallback.
-- `crates/node/src/reorg/` and `crates/node/src/apply/disconnect.rs`
+- `crates/node/src/reorg.rs` and `crates/node/src/apply_disconnect.rs`
   (existing): cover `RCV-05` and bounded disconnect and reorg memory;
   `RCV-08`'s bounded descriptors and committed-ancestor restarts are proven
   by `crates/node/src/reorg` (bounded stream windows, retention leases) and
   the #655 boot-replay tests above.
 - Checkpoint publication and recovery (existing):
-  `crates/node/src/checkpoint/tests/` covers consensus-valid active-chain
+  `crates/node/tests/unit/checkpoint/tests/` covers consensus-valid active-chain
   replay, applied-ancestry selection, competing-fork rejection, and
   immutable-generation resume; `crates/storage/src/checkpoint/tests.rs`
   covers generation publication, failpoint preservation, and

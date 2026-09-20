@@ -36,7 +36,7 @@ impl NodeState {
         let publisher = self.checkpoint_publisher().map_err(anyhow::Error::new)?;
         Ok(spawn_chainstate_maintenance_worker(
             publisher,
-            Arc::clone(&self.shutdown()),
+            self.shutdown(),
         )?)
     }
 }

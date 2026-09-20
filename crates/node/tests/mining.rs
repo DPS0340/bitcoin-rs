@@ -825,6 +825,55 @@ fn submit_header_admits_a_mined_child_and_is_idempotent() -> anyhow::Result<()> 
 }
 
 #[test]
+fn submit_header_accepts_duplicate_genesis_without_a_parent() -> anyhow::Result<()> {
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = coordinator(&state);
+    let genesis = Network::Regtest.genesis_block();
+    let before = state.chainstate().snapshot();
+
+    mining.submit_header(genesis.header)?;
+    mining.submit_header(genesis.header)?;
+
+    let after = state.chainstate().snapshot();
+    assert_eq!(after.chain_tx_count, before.chain_tx_count);
+    assert_eq!(
+        after.applied.map(|tip| tip.hash),
+        Some(genesis.block_hash().into())
+    );
+    Ok(())
+}
+
+#[test]
+fn submit_header_rejects_an_invalid_parent_without_inserting_child() -> anyhow::Result<()> {
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = coordinator(&state);
+    let genesis = Network::Regtest.genesis_block();
+    let invalid = mined_child(genesis.block_hash())?;
+    let child = mined_child(invalid.block_hash())?;
+    let tree = state.block_tree();
+    {
+        let mut tree = tree.write();
+        let genesis_id = tree
+            .lookup(genesis.block_hash().into())
+            .ok_or_else(|| anyhow::anyhow!("missing genesis"))?;
+        tree.insert_node(
+            Some(genesis_id),
+            invalid.header,
+            bitcoin_rs_chain::NodeStatus::Invalid,
+        )?;
+    }
+
+    match mining.submit_header(child.header) {
+        Err(MiningControlError::Rejected(reason)) => assert_eq!(reason.as_str(), "bad-prevblk"),
+        other => panic!("expected invalid-parent rejection, got {other:?}"),
+    }
+    assert!(tree.read().lookup(child.block_hash().into()).is_none());
+    Ok(())
+}
+
+#[test]
 fn submit_header_requires_the_previous_header() -> anyhow::Result<()> {
     let state = open_regtest()?;
     apply_genesis(&state)?;

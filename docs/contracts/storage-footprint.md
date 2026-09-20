@@ -133,7 +133,7 @@ Owners:
   - `symlink_is_rejected`;
   - `high_water_below_snapshot_is_rejected`;
   - `ledgers_are_not_summed_by_the_physical_total`.
-- `crates/node/src/storage_footprint/tests.rs` contract tests (see the clause map at the top of that module):
+- `crates/node/tests/unit/storage_footprint/tests.rs` contract tests (see the clause map at the top of that module):
   - `default_regtest_record_is_inapplicable_to_the_mainnet_budget`;
   - `conservative_high_water_can_pass_the_default_mainnet_budget`;
   - `snapshot_of_default_mainnet_is_insufficient_for_the_peak_gate`;

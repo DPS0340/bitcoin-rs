@@ -17,7 +17,7 @@ use core::mem::size_of;
 
 use hashbrown::HashMap;
 
-use super::{events::*, index::*, restore::*};
+use super::{events::*, restore::*};
 
 use std::{
     sync::{Arc, atomic::Ordering},

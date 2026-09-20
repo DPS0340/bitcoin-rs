@@ -165,4 +165,5 @@ fn unix_time_secs() -> u64 {
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "../tests/unit/tx_ingress/tests.rs"]
 mod tests;

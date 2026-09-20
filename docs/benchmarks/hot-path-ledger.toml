@@ -255,8 +255,8 @@ concurrency_group = "lifecycle"
 domains = ["offline", "p2p", "muhash"]
 seams = [
   "crates/node/src/checkpoint.rs",
-  "crates/node/src/checkpoint/publisher.rs",
-  "crates/node/src/state/maintenance.rs",
+  "crates/node/src/checkpoint_publisher.rs",
+  "crates/node/src/state_maintenance.rs",
   "crates/node/src/chainstate_journal.rs",
 ]
 disposition = "blocked"

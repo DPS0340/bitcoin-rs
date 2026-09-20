@@ -327,4 +327,5 @@ impl SyncChain for NodeSyncChain {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/sync/tests/mod.rs"]
 mod tests;
