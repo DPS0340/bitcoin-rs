@@ -25,10 +25,7 @@ use bitcoin_rs_primitives::{
     deserialize,
 };
 
-use bitcoin_rs_storage::{
-    RocksDbStore,
-    block_file::{BlockFilePosition, FlatFileBlockStore},
-};
+use bitcoin_rs_storage::{BlockFilePosition, FlatFileBlockStore, RocksDbStore};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
