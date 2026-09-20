@@ -5,12 +5,12 @@
 #   scripts/check-dep-range.sh minimal
 #     cargo +nightly update -Zdirect-minimal-versions
 #     then cargo +nightly check --workspace --all-targets --all-features
-#     then G20 (+ cargo deny check bans when cargo-deny is on PATH)
+#     then cargo deny check bans (cargo-deny must be installed)
 #
 #   scripts/check-dep-range.sh maximum
 #     cargo update (newest versions still inside the declared ranges)
 #     then cargo check --workspace --all-targets
-#     then G20 (+ cargo deny check bans when cargo-deny is on PATH)
+#     then cargo deny check bans (cargo-deny must be installed)
 #
 # Mutates Cargo.lock. CI checks out a throwaway tree. Locally, the original
 # lockfile is restored on exit unless KEEP_LOCK=1.

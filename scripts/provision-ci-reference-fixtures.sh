@@ -59,6 +59,8 @@ else
   export PATH="$JAVA_HOME/bin:$PATH"
   if [[ -n "${GITHUB_ENV:-}" ]]; then
     printf 'JAVA_HOME=%s\n' "$JAVA_HOME" >> "$GITHUB_ENV"
+  fi
+  if [[ -n "${GITHUB_PATH:-}" ]]; then
     printf '%s\n' "$JAVA_HOME/bin" >> "$GITHUB_PATH"
   fi
 fi
@@ -73,9 +75,17 @@ if [[ "$mode" == core ]]; then
   printf '%s  %s\n' "$binary_hash" "$binary" | sha256sum --check --strict
   probe="$(mktemp -d target/ci-reference-downloads/core-version.XXXXXX)"
   trap 'rm -rf -- "$probe"' EXIT
-  actual_version="$("$binary" "-datadir=$probe" -version)"
+  # The probe result is the version report, so capture stderr too; without a
+  # failure branch set -e would exit silently with the child code.
+  actual_version="$("$binary" "-datadir=$probe" -version 2>&1)" || {
+    printf '%s\n' "$actual_version" >&2
+    printf '%s\n' "Core version probe failed" >&2
+    exit 1
+  }
   [[ "${actual_version%%$'\n'*}" == "$expected_version" ]] || {
-    echo "Core version mismatch" >&2; exit 1;
+    printf '%s\n' "Core version mismatch" >&2
+    printf '%s\n' "$actual_version" >&2
+    exit 1;
   }
 else
   mkdir -p "$(dirname "$install")"

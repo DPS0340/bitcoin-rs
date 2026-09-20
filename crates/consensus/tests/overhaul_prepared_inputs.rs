@@ -64,11 +64,8 @@ fn two_input_tx() -> (Tx, Coins) {
 /// VAL-02: a missing prevout is not a script failure or an empty coin.
 #[test]
 fn missing_prevout_fails_closed() {
-    let (mut tx, mut view) = two_input_tx();
+    let (mut tx, view) = two_input_tx();
     tx.inputs[1].previous_output = outpoint(0xEE);
-    view.utxos
-        .remove(&outpoint(2))
-        .expect("coin present before");
     let flags = bitcoin_rs_script::VerifyFlags::MANDATORY;
     let verdict = bitcoin_rs_consensus::verify_transaction(&tx, &view, 0, 0, flags);
     assert!(matches!(

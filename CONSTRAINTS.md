@@ -1,8 +1,9 @@
 # CONSTRAINTS.md
 
 The repository guard register. It records the constraint ledger (CL-01..CL-23),
-the formal model tool identity, and the proof inventory that gate `g20` and the
-owner gates read. It references normative owners (`docs/contracts/`,
+the formal model tool identity, and the proof inventory that
+`python3 scripts/check_models.py` reads. It references normative owners
+(`docs/contracts/`,
 `docs/policies/`, `.outline/waterfall/BLUEPRINT.md` invariants INV-01..INV-12,
 owner constants in code) and is never a second policy. When a row and its owner
 disagree, the owner governs and the gate blocks until the row is corrected.

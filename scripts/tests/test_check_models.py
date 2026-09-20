@@ -24,10 +24,15 @@ class ModelEvidenceTests(unittest.TestCase):
         directory.mkdir(parents=True)
         rows: list[str] = []
         for name in check_models.MODELS:
-            for suffix in ("tla", "cfg"):
-                (directory / f"{name}.{suffix}").write_text("fixture\n", encoding="utf-8")
-            digest = hashlib.sha256(b"fixture\n").hexdigest()
-            rows.append(f"| {name} | {digest} | {digest} | N=1 | 128 | BLOCKED | - | - |")
+            tla = (directory / f"{name}.tla")
+            tla.write_text("fixture\n", encoding="utf-8")
+            cfg = (directory / f"{name}.cfg")
+            cfg.write_text("CONSTANTS\nN = 1\nINIT Init\nNEXT Next\n", encoding="utf-8")
+            digest = hashlib.sha256(tla.read_bytes()).hexdigest()
+            cfg_digest = hashlib.sha256(cfg.read_bytes()).hexdigest()
+            rows.append(
+                f"| {name} | {digest} | {cfg_digest} | N=1 | 128 | BLOCKED | - | - |"
+            )
         (self.root / "CONSTRAINTS.md").write_text("\n".join(rows), encoding="utf-8")
         self.home = self.root / "tool"
         (self.home / "bin").mkdir(parents=True)
@@ -80,6 +85,48 @@ class ModelEvidenceTests(unittest.TestCase):
                 check_models.tool(self.root)
             self.assertEqual(error.exception.code, 11)
 
+    def test_missing_model_file_is_a_model_identity_failure(self) -> None:
+        # A missing model file is a custody failure on the model lane, not an
+        # unavailable run: main() must report the model-identity code, 15,
+        # never the generic FileNotFoundError mapped to 14.
+        (self.root / "docs/models/PeerLeases.tla").unlink()
+        with patch.object(check_models, "ROOT", self.root):
+            with patch.object(sys, "argv", ["check_models.py", "--check-only"]):
+                with patch.dict(os.environ, {"APALACHE_HOME": str(self.home)}):
+                    self.assertEqual(check_models.main(), 15)
+
+    def test_missing_jar_is_a_tool_identity_failure(self) -> None:
+        # A missing JAR is a tool-lane custody failure: main() must report the
+        # tool-identity code, 11, never the generic FileNotFoundError code 14.
+        (self.home / "lib/apalache.jar").unlink()
+        with patch.object(check_models, "ROOT", self.root):
+            with patch.object(sys, "argv", ["check_models.py", "--check-only"]):
+                with patch.dict(os.environ, {"APALACHE_HOME": str(self.home)}):
+                    self.assertEqual(check_models.main(), 11)
+
+    def test_temporal_lane_writes_under_temporal_directory(self) -> None:
+        model = check_models.models(self.root)[0]
+        check_models.run_model(
+            self.root, self.executable, model, check_models.PROPERTIES[1], 5
+        )
+        results = list(self.root.glob("target/apalache/**/result.json"))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(json.loads(results[0].read_text()), {"native_rc": 0, "evidence_rc": 0})
+        # Identity is recorded inside the fresh run directory itself.
+        self.assertTrue(results[0].with_name("identity.json").is_file())
+        temporal = self.root / "target/apalache" / model.name / "temporal"
+        self.assertEqual(results[0].parent.parent, temporal)
+
+    def test_inherited_smt_solver_cannot_override_the_pinned_prover(self) -> None:
+        # The solver is part of the recorded evidence identity; a variable
+        # inherited from the caller's shell must not swap the pinned prover.
+        with patch.dict(os.environ, {"SMT_SOLVER": "boo"}):
+            self.run_check()
+        results = list(self.root.glob("target/apalache/**/result.json"))
+        self.assertEqual(len(results), 1)
+        identity = json.loads(results[0].with_name("identity.json").read_text())
+        self.assertEqual(identity["solver"], "z3")
+
     def test_complete_success_retains_identity_and_outcome(self) -> None:
         self.run_check()
         results = list(self.root.glob("target/apalache/**/result.json"))
@@ -88,7 +135,15 @@ class ModelEvidenceTests(unittest.TestCase):
         identity = json.loads(results[0].with_name("identity.json").read_text())
         self.assertIn("--length=128", identity["argv"])
         self.assertIn("--inv=TypeOK,Safety,TransitionSafety", identity["argv"])
-        self.assertEqual(identity["constants"], "N=1")
+        self.assertEqual(identity["constants"], "N = 1")
+
+    def newest_result(self) -> dict[str, object]:
+        # Each subtest spawns a fresh run directory, so the newest result.json
+        # under the model's run tree records that subtest's verdict.
+        results = sorted(self.root.glob("target/apalache/**/result.json"),
+                         key=lambda path: path.stat().st_mtime)
+        self.assertTrue(results, "no result.json recorded")
+        return json.loads(results[-1].read_text())
 
     def test_native_failures_keep_their_meaning(self) -> None:
         for native, expected in ((150, 12), (120, 12), (12, 13), (255, 14)):
@@ -97,6 +152,9 @@ class ModelEvidenceTests(unittest.TestCase):
                 with self.assertRaises(check_models.EvidenceError) as error:
                     self.run_check()
                 self.assertEqual(error.exception.code, expected)
+                result = self.newest_result()
+                self.assertEqual(result["native_rc"], native)
+                self.assertEqual(result["evidence_rc"], expected)
 
     def test_zero_exit_without_complete_outcome_is_not_a_proof(self) -> None:
         for text in ("", "The outcome is: NoError", "EXITCODE: OK"):
@@ -105,6 +163,7 @@ class ModelEvidenceTests(unittest.TestCase):
                 with self.assertRaises(check_models.EvidenceError) as error:
                     self.run_check()
                 self.assertEqual(error.exception.code, 14)
+                self.assertEqual(self.newest_result()["evidence_rc"], 14)
 
     def test_timeout_is_recorded_as_unavailable(self) -> None:
         self.write_tool("time.sleep(60)")

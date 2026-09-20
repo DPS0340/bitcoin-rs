@@ -290,6 +290,7 @@ mod tests {
     fn evidence_without_an_identity_is_refused() {
         for field in [
             "binary_sha256",
+            "version",
             "config_sha256",
             "backend",
             "durability",
@@ -369,6 +370,21 @@ mod tests {
     #[test]
     fn repeated_samples_and_empty_cells_survive_a_round_trip() {
         let mut ledger = Ledger::parse(LEDGER_TOML).expect("checked-in ledger");
+        // The checked-in ledger accumulates samples over time, so the test
+        // pins only its own deltas: the cell under test and the surviving
+        // empty cells, never the absolute measured-cell count.
+        let measured_before = ledger
+            .cells
+            .iter()
+            .filter(|cell| !cell.samples.is_empty())
+            .count();
+        let samples_before = ledger
+            .cells
+            .iter()
+            .find(|cell| cell.id == CELL)
+            .expect("cell under test")
+            .samples
+            .len();
         ledger.record(CELL, sample(0, 10)).expect("first run");
         ledger
             .record(CELL, sample(0, 10))
@@ -382,13 +398,21 @@ mod tests {
 
         let reparsed = Ledger::parse(&ledger.render().expect("render")).expect("round trip");
         assert_eq!(reparsed, ledger);
-        let measured: Vec<&Cell> = reparsed
+        let cell = reparsed
+            .cells
+            .iter()
+            .find(|cell| cell.id == CELL)
+            .expect("cell under test");
+        assert_eq!(cell.samples.len(), samples_before + 2);
+        let measured_after = reparsed
             .cells
             .iter()
             .filter(|cell| !cell.samples.is_empty())
-            .collect();
-        assert_eq!(measured.len(), 1);
-        assert_eq!(measured[0].samples.len(), 2);
+            .count();
+        assert_eq!(
+            measured_after,
+            measured_before + usize::from(samples_before == 0)
+        );
         assert_eq!(reparsed.cells.len(), ledger.cells.len());
     }
 }

@@ -38,12 +38,35 @@ class Model:
     name: str
     tla_sha256: str
     cfg_sha256: str
-    constants: str
 
 
 def sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+# Apalache section headers; constants are recorded from the pinned cfg
+# itself, not from the register's transcribed row.
+CFG_SECTION = re.compile(
+    r"^(INIT|NEXT|PROPERTY|PROPERTIES|INVARIANT|SPECIFICATION"
+    r"|TEMPORAL PROPERTIES|CONSTANTS)(\s|$)"
+)
+
+
+def cfg_constants(path: Path) -> str:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for start, line in enumerate(lines):
+        if line.strip() == "CONSTANTS":
+            break
+    else:
+        return ""
+    names: list[str] = []
+    for line in lines[start + 1:]:
+        if CFG_SECTION.match(line):
+            break
+        if name := line.strip():
+            names.append(name)
+    return ", ".join(names)
 
 
 def models(root: Path) -> tuple[Model, ...]:
@@ -53,14 +76,18 @@ def models(root: Path) -> tuple[Model, ...]:
         cells = [cell.strip() for cell in line.split("|")]
         if len(cells) < 10 or cells[1] not in MODELS:
             continue
-        name, tla, cfg, constants, bound = cells[1:6]
+        name, tla, cfg, _, bound = cells[1:6]
         if name in inventory or bound != "128":
             raise EvidenceError(15, f"{name}: duplicate inventory or incorrect bound")
         for suffix, expected in (("tla", tla), ("cfg", cfg)):
             path = root / "docs/models" / f"{name}.{suffix}"
-            if not re.fullmatch(r"[0-9a-f]{64}", expected) or sha256(path) != expected:
+            try:
+                actual = sha256(path)
+            except FileNotFoundError:
+                actual = ""
+            if not re.fullmatch(r"[0-9a-f]{64}", expected) or actual != expected:
                 raise EvidenceError(15, f"{path}: model identity differs from proof inventory")
-        inventory[name] = Model(name, tla, cfg, constants)
+        inventory[name] = Model(name, tla, cfg)
     if set(inventory) != set(MODELS):
         raise EvidenceError(15, "proof inventory is incomplete")
     return tuple(inventory[name] for name in MODELS)
@@ -76,7 +103,8 @@ def tool(root: Path) -> Path:
     executable = (home / "bin" / name).resolve()
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise EvidenceError(11, f"missing executable: {executable}")
-    if sha256(home / "lib/apalache.jar") != jar_hash:
+    jar = home / "lib/apalache.jar"
+    if not jar.is_file() or sha256(jar) != jar_hash:
         raise EvidenceError(11, "Apalache JAR checksum mismatch")
     result = subprocess.run(
         [str(executable), "version"], capture_output=True, text=True, timeout=30, check=False
@@ -102,10 +130,12 @@ def run_model(root: Path, executable: Path, model: Model, property_arg: str, tim
     ]
     env = dict(os.environ)
     env.setdefault("JVM_ARGS", "-Xmx4096m")
-    env.setdefault("SMT_SOLVER", "z3")
+    # Solver identity is part of the recorded evidence; an inherited
+    # SMT_SOLVER would silently swap the pinned prover.
+    env["SMT_SOLVER"] = "z3"
     metadata = {
         "argv": argv, "tla_sha256": model.tla_sha256, "cfg_sha256": model.cfg_sha256,
-        "constants": model.constants,
+        "constants": cfg_constants(root / "docs/models" / f"{model.name}.cfg"),
         "reference_manifest_sha256": sha256(root / "docs/api/core-compat.toml"),
         "jvm_args": env["JVM_ARGS"], "solver": env["SMT_SOLVER"],
     }

@@ -5,7 +5,8 @@ applied chain. The contract orders durable commit, mempool reconciliation,
 stable generation publication, and best-effort observer delivery.
 
 Owners:
-- Durable commit and stable publication: `crates/chainstate/src/transition.rs`
+- Durable commit and stable publication:
+  `crates/node/src/apply.rs` and its connect/disconnect/window modules
 - Mempool reconciliation and canonical lifecycle:
   `crates/mempool/src/gateway.rs`, `crates/mempool/src/mutation.rs`
 - Bounded observer delivery and gap accounting:
@@ -89,7 +90,8 @@ Owners:
 ## Startup crash recovery
 
 On daemon start, `NodeState::open` recovers the durable root from
-`crates/chainstate` and reconciles to the committed applied tip. Chain-event
+`crates/node/src/state_open.rs` and `crates/node/src/state_restore.rs`, and
+reconciles to the committed applied tip. Chain-event
 consumers therefore reconcile against the durable applied tip. System-level
 convergence after crash, lost write, and reorg is owned by
 [recovery.md](recovery.md). The recovery path does not restore an authenticated

@@ -76,8 +76,9 @@ The 2.0x speed gate and the 36-cell denominator live in issues #33 and
   measured product hot paths, cost classes, known levers, and forbidden
   probes.
 - Every recorded `Sample.path` must exactly match a declared `paths.id`.
-  G18 rejects empty or undeclared paths in every cell history. The
-  declared inventory may extend the gate's required minimum; validating
+  Declared-path membership is owned by inventory review: the evidence tool
+  validates accounting (identities, intervals, declared cells), not path
+  names. The declared inventory may extend the reviewed minimum; validating
   membership never deduplicates samples or removes empty cells.
 - A row records applicability, custody, wall contribution,
   disable/neutralize delta, overlap, affected cells, and disposition.
@@ -150,8 +151,8 @@ posture.
 ### `HPA-12`: Evidence identity per sample
 
 - The evidence `Ledger` schema is implemented in
-  `crates/node/benches/evidence.rs` and shared by the gate and hot-path
-  ledger.
+  `crates/node/benches/evidence.rs` and shared by the benchmark evidence
+  tests and the hot-path ledger.
 - Every sample in the evidence ledger carries an identity tuple:
   artifact (binary or library hash), configuration (feature set,
   backend, network, cache budget), corpus (stop hash, block count,
