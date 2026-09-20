@@ -12,9 +12,8 @@ const STATS_INTERVAL: u64 = 1024;
 const MEMPOOL_TICK: Duration = Duration::from_secs(1);
 const METRICS_TICK: Duration = Duration::from_secs(10);
 const SYNC_TICK: Duration = Duration::from_secs(1);
-/// How often (in sync ticks) the event loop emits a sync-progress summary.
-/// At the 1-second sync tick this is once per minute during IBD.
-const SYNC_PROGRESS_INTERVAL: u64 = 60;
+/// Elapsed time owns telemetry cadence, independently of inbound wake volume.
+const SYNC_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Central v1 event loop for process-level tick coordination.
 ///
@@ -61,6 +60,7 @@ impl EventLoop {
         let mut mempool_ticks: u64 = 0;
         let mut metrics_scrapes: u64 = 0;
         let mut sync_ticks: u64 = 0;
+        let mut last_progress = Instant::now();
         while !shutdown.load(Ordering::Acquire) {
             iterations += 1;
             if iterations.is_multiple_of(STATS_INTERVAL) {
@@ -94,9 +94,6 @@ impl EventLoop {
                     if ticked.is_ok() {
                         sync_ticks += 1;
                         self.on_sync_tick();
-                        if sync_ticks.is_multiple_of(SYNC_PROGRESS_INTERVAL) {
-                            self.sync.emit_sync_progress();
-                        }
                     }
                 }
                 recv(self.sync_wake) -> woke => {
@@ -106,6 +103,11 @@ impl EventLoop {
                         self.on_sync_tick();
                     }
                 }
+            }
+            let now = Instant::now();
+            if progress_due(last_progress, now) {
+                self.sync.emit_sync_progress();
+                last_progress = now;
             }
         }
         shutdown::notify_drained();
@@ -131,5 +133,28 @@ impl EventLoop {
         metrics::counter!("node.event_loop.sync_ticks").increment(1);
         self.sync.tick();
         metrics::histogram!("node.event_loop.tick_seconds").record(started.elapsed().as_secs_f64());
+    }
+}
+
+fn progress_due(last: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last) >= SYNC_PROGRESS_INTERVAL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_uses_elapsed_time_not_wake_count() {
+        let start = Instant::now();
+        for _ in 0..120 {
+            assert!(!progress_due(start, start + Duration::from_secs(59)));
+        }
+        assert!(progress_due(start, start + Duration::from_secs(60)));
+        assert!(progress_due(start, start + Duration::from_secs(61)));
+        assert!(!progress_due(
+            start + Duration::from_secs(60),
+            start + Duration::from_secs(61)
+        ));
     }
 }
