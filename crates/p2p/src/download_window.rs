@@ -174,8 +174,6 @@ pub struct SyncPeer {
 /// The set of peers chosen for the current sync cycle.
 #[derive(Clone, Debug, Default)]
 pub struct SyncPeerSelection {
-    /// Peer used for header-first sync.
-    pub header_peer: Option<SyncPeer>,
     /// Peers used for block-body requests.
     pub request_peers: Vec<SyncPeer>,
     /// Peers used for cold-front prefix probes.
@@ -1636,6 +1634,21 @@ impl DownloadWindow {
         let mut entries = self.expired_request_entries(expired, batch_limit, &mut byte_capacity);
         let selected_hashes = SelectedHashes::from_entries(&entries);
 
+        // The current chain frontier outranks the forward-scan hint. A
+        // disconnect can move it backwards without changing the header tip.
+        // Rewind only an unowned frontier; retain live pending/staged work.
+        if request_start_height < self.next_request_height
+            && tree
+                .node_at_height_from(chain_tip.tip_id, request_start_height)
+                .and_then(|id| tree.node(id).ok())
+                .is_some_and(|node| {
+                    !self.pending.contains_key(&node.hash)
+                        && !self.received.contains_key(&node.hash)
+                })
+        {
+            self.next_request_height = request_start_height;
+            metrics::counter!("node.sync.frontier_rewinds").increment(1);
+        }
         let height = request_start_height.max(self.next_request_height);
         let mut next_request_height = self.next_request_height;
         let request_tip_height = chain_tip.height.min(peer_best_height);
@@ -2100,7 +2113,8 @@ impl DownloadWindow {
     }
 
     /// Marks a block as applied and removes it from pending. Test-only.
-    pub fn mark_applied(&mut self, hash: &Hash256) {
+    #[cfg(test)]
+    fn mark_applied(&mut self, hash: &Hash256) {
         self.mark_received_applied(hash);
         self.remove_pending(hash);
     }

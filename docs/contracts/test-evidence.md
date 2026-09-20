@@ -19,7 +19,7 @@ old module layout.
 | Chain and UTXO | `RCV-01`..`RCV-11`; ancestry, branch selection, coin state, connect/disconnect and crash outcomes | Keep behavioral, differential and property tests. Do not replace corruption refusals with fixture round trips. |
 | Storage and index | `IDX-01`..`IDX-08`, `FP-01`..`FP-04`, recovery; backend persistence, capability errors, cursor/reorg recovery | Keep. Backend and restart tests cannot be replaced by in-memory mocks. |
 | Mempool | `MPL-01`..`MPL-04`, `POL-01`..`POL-06`; admission, replacement, dependencies, sequence, fencing and bounded orphans | Keep mutation and concurrency scenarios; reorg admission must use the same current-chain evaluator. |
-| P2P | `P2P-01`..`P2P-04`; independent wire envelopes, live peer identity, budgets, body attribution, stalled requests and branch recovery | Keep. Assert peer-visible requests and eventual application, not incidental message ordering. |
+| P2P | `P2P-01`..`P2P-05`; independent wire envelopes, live peer identity, budgets, body attribution, stalled requests and branch recovery | Keep. Assert peer-visible requests and eventual application, not incidental message ordering. |
 | Mining | External miner/API clauses, coherent template generations and invalid candidates | Keep independently valid blocks and public submission behavior. |
 | RPC | `API-*`, `WF-*`, `MRPC-*`; requests, errors, values, capability refusal and coherent views | Keep public-boundary and pinned Core comparisons. A method inventory is not a successful call. |
 | Node and binary | `EMB-*`, `EVT-*`, recovery; public process startup, shutdown, persistence, reorg and observer ordering | Keep process and durability scenarios. A successful `--help` exit does not prove lifecycle behavior. |
@@ -43,6 +43,11 @@ old module layout.
 | Exact input lookup counters | Delete both the integration assertion and duplicate inline counting-view test. Keep multi-input verification, missing-coin and duplicate-input errors. |
 | `prepared_facts_survive_source_record_replacement` | Delete: it dropped a view and re-parsed a transaction, never testing record replacement. It supplied no lifetime evidence. |
 | `sighash_variants_match_reference_oracle` | Rename to the transaction-identity behavior it actually checks. Signed-spend/Core suites, not this fixture, own sighash evidence. |
+
+The sync recovery cut also replaces four fake-application fixture paths
+with delivered blocks through the ordinary binding/apply path. The old
+`DownloadWindow::mark_applied` shortcut is private to its unit tests and no
+longer a production API.
 
 ## Evidence still required
 

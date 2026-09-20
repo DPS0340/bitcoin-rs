@@ -568,12 +568,11 @@ fn unsolicited_stale_block_retries_from_resolved_header_height()
         std::vec![block1_hash, expected_hash]
     );
     let _headers = rx.try_recv()?;
-    {
-        let mut body_sync = sync.body_sync.lock();
-        let window = &mut body_sync.window;
-        window.mark_applied(&Hash256::from_le_bytes(block1_hash.as_bytes()));
-        window.mark_applied(&Hash256::from_le_bytes(expected_hash.as_bytes()));
-    }
+    apply_fixture_block(&sync, block1)?;
+    sync.body_sync
+        .lock()
+        .window
+        .drop_for_retry(&Hash256::from(expected_hash));
 
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block2))?;
     sync.drain_inbound_blocks();
@@ -1088,6 +1087,26 @@ fn stage_body(sync: &BlockSync, block: &Block) {
 
 fn cache_snapshot(sync: &BlockSync) -> Option<super::ExpectedApplyCache> {
     sync.expected_apply_cache.lock().clone()
+}
+
+/// Commit a delivered fixture through the ordinary binding and apply path.
+/// Scheduler tests must not fake application by only erasing a window slot.
+fn apply_fixture_block(sync: &BlockSync, block: Block) -> Result<(), Box<dyn std::error::Error>> {
+    let hash = Hash256::from(block.block_hash());
+    sync.buffer_received_block_chunk(
+        &mut vec![crate::InboundBlock::from_decoded(block)],
+        Some(hash),
+    );
+    assert_eq!(sync.apply_buffered_blocks(Some(hash)), (1, 0));
+    assert_eq!(
+        sync.chain
+            .applied_tip()
+            .load_full()
+            .ok_or("missing applied tip")?
+            .hash,
+        hash
+    );
+    Ok(())
 }
 
 type SyncFixture = (
@@ -1830,3 +1849,5 @@ mod validation_1;
 
 #[cfg(test)]
 mod witness_staging_gate;
+
+mod frontier_recovery;

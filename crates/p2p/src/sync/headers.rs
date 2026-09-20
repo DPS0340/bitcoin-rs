@@ -2,6 +2,7 @@
 
 use super::BlockSync;
 use super::HEADER_REQUEST_TIMEOUT;
+use super::IdleFrontierProbeOutcome;
 use super::LOCATOR_MAX_ENTRIES;
 use super::PROTOCOL_VERSION;
 use super::PendingHeaderRequest;
@@ -29,9 +30,10 @@ impl BlockSync {
             let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
 
-            // A response consumes the current peer's request even when header
-            // acceptance rejects it; otherwise sync stalls until timeout.
-            if let Some(source) = source {
+            // A nonempty response consumes the request even when rejected.
+            // An empty response supplies no new capability: retain its
+            // deadline so idle discovery is paced and rotates to another peer.
+            if let Some(source) = source.filter(|_| !headers.is_empty()) {
                 if self.peer_table.is_current(source) {
                     let mut pending = self.pending_getheaders.lock();
                     if pending.is_some_and(|request| request.peer_addr == source.addr) {
@@ -133,54 +135,151 @@ impl BlockSync {
     /// Requests the next header batch from the highest peer above the applied
     /// tip, using a locator taken after `drain_inbound_headers` so it reflects
     /// headers accepted this tick.
-    ///
-    /// Called at the end of `tick`, after the getdata fan-out. Position is
-    /// deliberate: peers observe getdata before getheaders within a tick, which
-    /// several sync tests assert. Ordering carries no protocol meaning, but
-    /// both messages leave in the same tick either way, so there is no
-    /// throughput reason to prefer the other order.
-    pub(super) fn request_headers_from_best_peer(&self) {
+    /// `exclude` carries the source whose probe send failed while its
+    /// cancelled session remains table-resident until asynchronous teardown.
+    pub(super) fn request_headers_from_best_peer(&self, exclude: Option<PeerSource>) {
         let applied_tip = self.chain.applied_tip().load_full();
         let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
         let chain_tip = self.chain.chain_tip().load_full();
         let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
-        let mut header_peer: Option<SyncPeer> = None;
-        for peer in self.peer_table.infos() {
-            let Some(candidate) = sync_peer_candidate(&peer, applied_height) else {
+        let mut header_peer: Option<(PeerSource, SyncPeer)> = None;
+        for session in self.peer_table.sessions() {
+            let Some(info) = session.info.as_ref() else {
                 continue;
             };
-            if header_peer.is_none_or(|current| outranks(current, candidate)) {
-                header_peer = Some(candidate);
+            let Some(candidate) = sync_peer_candidate(info, applied_height) else {
+                continue;
+            };
+            let source = session.lease.source(session.addr);
+            if exclude.is_some_and(|excluded| excluded == source) {
+                continue;
+            }
+            if header_peer
+                .as_ref()
+                .is_none_or(|(_, current)| outranks(*current, candidate))
+            {
+                header_peer = Some((source, candidate));
             }
         }
-        if let Some(peer) = header_peer {
+        if let Some((source, peer)) = header_peer {
             let peer_best_height = u32::try_from(peer.best_known_height).unwrap_or(0);
             if peer_best_height > header_height {
-                self.send_getheaders(peer.addr, header_height, peer.best_known_height);
+                self.send_getheaders(
+                    source,
+                    header_height,
+                    peer.best_known_height,
+                    self.build_locator(),
+                );
             }
+        }
+    }
+
+    /// P2P-05: learn current peer capability when the known-header gap has no
+    /// body work on the apply frontier: the probe fires only when the
+    /// apply-frontier block itself is neither in flight nor staged. Staged
+    /// successors behind an unowned or rejected frontier are stuck inventory
+    /// awaiting the staged-body timeout, not progress. Start at the applied
+    /// chain so a peer at our header tip returns branch evidence. Reuse the
+    /// existing header-request deadline.
+    pub(super) fn probe_idle_frontier(&self, now: Instant) -> IdleFrontierProbeOutcome {
+        let (Some(applied), Some(headers)) = (
+            self.chain.applied_tip().load_full(),
+            self.chain.chain_tip().load_full(),
+        ) else {
+            return IdleFrontierProbeOutcome::NotSent;
+        };
+        if applied.hash == headers.hash
+            || self.apply_halted.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return IdleFrontierProbeOutcome::NotSent;
+        }
+        // The frontier hash is derived under a short tree read; body_sync is
+        // taken only after the guard drops (tree before body_sync is the
+        // codebase's lock order). An unresolvable frontier is conservative:
+        // no probe.
+        let frontier_hash = {
+            let tree = self.chain.block_tree().read();
+            Self::first_connect_height(&tree, applied.hash, headers.tip_id)
+                .and_then(|height| tree.node_at_height_from(headers.tip_id, height))
+                .and_then(|frontier_id| tree.node(frontier_id).ok().map(|node| node.hash))
+        };
+        let Some(frontier_hash) = frontier_hash else {
+            return IdleFrontierProbeOutcome::NotSent;
+        };
+        {
+            let state = self.body_sync.lock();
+            if state.window.contains_pending(&frontier_hash)
+                || state.stager.contains(&frontier_hash)
+            {
+                return IdleFrontierProbeOutcome::NotSent;
+            }
+        }
+        let pending = *self.pending_getheaders.lock();
+        if pending.is_some_and(|request| {
+            now.saturating_duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT
+                && self.peer_table.ready_source(request.peer_addr).is_some()
+        }) {
+            return IdleFrontierProbeOutcome::Sent;
+        }
+        let required = bitcoin::p2p::ServiceFlags::NETWORK.to_u64()
+            | bitcoin::p2p::ServiceFlags::WITNESS.to_u64();
+        let sessions = self.peer_table.sessions();
+        let eligible = || {
+            sessions.iter().filter(|session| {
+                session
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| info.services & required == required)
+            })
+        };
+        // Rotate after the existing request expires, without a second queue.
+        let session = eligible()
+            .filter(|session| pending.is_none_or(|request| session.addr > request.peer_addr))
+            .min_by_key(|session| session.addr)
+            .or_else(|| eligible().min_by_key(|session| session.addr));
+        let Some(session) = session else {
+            return IdleFrontierProbeOutcome::NotSent;
+        };
+        let source = session.lease.source(session.addr);
+        let locator = self
+            .chain
+            .block_tree()
+            .read()
+            .block_locator(applied.tip_id, LOCATOR_MAX_ENTRIES);
+        let sent = self.send_getheaders(
+            source,
+            applied.height,
+            i32::try_from(headers.height).unwrap_or(i32::MAX),
+            locator,
+        );
+        if sent {
+            metrics::counter!("node.sync.idle_frontier_probes").increment(1);
+            IdleFrontierProbeOutcome::Sent
+        } else {
+            IdleFrontierProbeOutcome::SendFailed(source)
         }
     }
 
     pub(super) fn send_getheaders(
         &self,
-        sync_peer_addr: SocketAddr,
+        source: crate::PeerSource,
         our_height: u32,
         target_height: i32,
-    ) {
-        let locator = self.build_locator();
+        locator: Vec<Hash256>,
+    ) -> bool {
         let Some(locator_tip_hash) = locator.first().copied() else {
-            return;
+            return false;
         };
         let target_height = u32::try_from(target_height).unwrap_or(0);
         let now = Instant::now();
-        if self.has_pending_getheaders(sync_peer_addr, locator_tip_hash, target_height, now) {
+        if self.has_pending_getheaders(source.addr, locator_tip_hash, target_height, now) {
             tracing::trace!(
-                peer_addr = %sync_peer_addr,
+                peer_addr = %source.addr,
                 our_height,
                 target_height,
                 "block sync: getheaders already pending",
             );
-            return;
+            return false;
         }
         let locator_hashes: Vec<bitcoin::BlockHash> = locator
             .into_iter()
@@ -190,34 +289,41 @@ impl BlockSync {
             locator_hashes,
             bitcoin::BlockHash::all_zeros(),
         ));
-        let tx = self.peer_table.lease(sync_peer_addr);
+        let tx = self.peer_table.lease_source(source);
         let Some(tx) = tx else {
             tracing::warn!(
-                peer_addr = %sync_peer_addr,
+                peer_addr = %source.addr,
                 "block sync: target peer no longer has outbound channel"
             );
-            return;
+            return false;
         };
-        if tx.send(msg).is_err() {
+        let mut sent = false;
+        self.peer_table.with_current(source, || {
+            if tx.send(msg).is_ok() {
+                *self.pending_getheaders.lock() = Some(PendingHeaderRequest {
+                    peer_addr: source.addr,
+                    locator_tip_hash,
+                    target_height,
+                    requested_at: now,
+                });
+                sent = true;
+            }
+        });
+        if !sent {
             tracing::warn!(
-                peer_addr = %sync_peer_addr,
+                peer_addr = %source.addr,
                 "block sync: outbound channel disconnected"
             );
-            return;
+            return false;
         }
-        *self.pending_getheaders.lock() = Some(PendingHeaderRequest {
-            peer_addr: sync_peer_addr,
-            locator_tip_hash,
-            target_height,
-            requested_at: now,
-        });
         tracing::debug!(
-            peer_addr = %sync_peer_addr,
+            peer_addr = %source.addr,
             our_height,
             target_height,
             protocol_version = PROTOCOL_VERSION,
             "block sync: sent getheaders"
         );
+        true
     }
 
     pub(super) fn has_pending_getheaders(

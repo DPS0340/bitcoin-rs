@@ -1175,7 +1175,7 @@ fn handle_compact_outcome(
     match outcome {
         crate::compact_blocks::Outcome::Complete(block) => {
             let serialized = bitcoin_rs_primitives::consensus_bytes(&block);
-            tracing::info!(peer_addr = %peer_addr, "p2p compact block reconstructed");
+            tracing::info!(peer_addr = %peer_addr, hash = %block.block_hash(), "p2p compact block reconstructed");
             inbound_sync_sinks.send_block(lease.source(peer_addr), block, serialized.into());
         }
         crate::compact_blocks::Outcome::RequestMissing(request) => {
