@@ -156,9 +156,24 @@ def capture(identity: Process, log: Path, output: Path, debugger: str) -> Path:
     except FileNotFoundError:
         (directory / "telemetry-tail.log").write_text("Log unavailable during rotation.\n")
     proc = Path(f"/proc/{identity.pid}")
+    try:
+        tasks = []
+        for task in (proc / "task").iterdir():
+            tasks.append(task)
+            if len(tasks) == 257:
+                break
+    except FileNotFoundError as error:
+        # The identity check just passed, so a vanished task directory means
+        # the target exited in the gap before the kernel snapshot; the
+        # partial directory already holds the telemetry tail and must stay
+        # audited instead of stranding an unaudited raise.
+        write_result(directory, identity, log, None, None, False,
+                     "target exited before kernel snapshot")
+        raise ProcessLookupError(
+            f"target exited before kernel snapshot; partial evidence: {directory}") from error
     with (directory / "kernel-waits.txt").open("x") as stream:
         stream.write("Kernel waits are not userspace mutex-owner backtraces.\n")
-        for index, task in enumerate((proc / "task").iterdir()):
+        for index, task in enumerate(tasks):
             if index == 256:
                 stream.write("Thread snapshot truncated at 256 threads.\n")
                 break

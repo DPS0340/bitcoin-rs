@@ -158,6 +158,21 @@ class RuntimeStallTests(unittest.TestCase):
         self.assertEqual(result["start_ticks"], identity.start_ticks)
         self.assertIn("exited", result["reason"])
 
+    def test_exit_before_kernel_snapshot_writes_an_incomplete_result(self) -> None:
+        identity = watchdog.process(os.getpid())
+        assert identity is not None
+        with patch.object(watchdog, "process", return_value=identity), \
+             patch.object(Path, "iterdir", side_effect=FileNotFoundError):
+            with self.assertRaises(ProcessLookupError) as raised:
+                watchdog.capture(identity, self.log, self.root, "/not-a-debugger")
+        directory = next(self.root.glob("stall-*"))
+        self.assertIn(str(directory), str(raised.exception))
+        result = json.loads((directory / "result.json").read_text())
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["pid"], identity.pid)
+        self.assertEqual(result["start_ticks"], identity.start_ticks)
+        self.assertIn("kernel snapshot", result["reason"])
+
     def test_identity_change_after_attach_forces_an_incomplete_result(self) -> None:
         identity = watchdog.process(os.getpid())
         assert identity is not None
