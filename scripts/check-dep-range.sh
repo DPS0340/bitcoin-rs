@@ -5,12 +5,12 @@
 #   scripts/check-dep-range.sh minimal
 #     cargo +nightly update -Zdirect-minimal-versions
 #     then cargo +nightly check --workspace --all-targets --all-features
-#     then G20 (+ cargo deny check bans when cargo-deny is on PATH)
+#     then cargo deny check bans (cargo-deny must be installed)
 #
 #   scripts/check-dep-range.sh maximum
 #     cargo update (newest versions still inside the declared ranges)
 #     then cargo check --workspace --all-targets
-#     then G20 (+ cargo deny check bans when cargo-deny is on PATH)
+#     then cargo deny check bans (cargo-deny must be installed)
 #
 # Mutates Cargo.lock. CI checks out a throwaway tree. Locally, the original
 # lockfile is restored on exit unless KEEP_LOCK=1.
@@ -90,17 +90,8 @@ case "${RANGE}" in
     ;;
 esac
 
-# G20 reads Cargo.lock via cargo metadata; it must run while the mutated
-# lockfile is still in place.
-log "G20 uniqueness on the resolved graph"
-"${CARGO[@]}" test -p bitcoin-rs --test g20_unique_consensus_crates \
-  --no-default-features --features fjall
-
-if command -v cargo-deny >/dev/null 2>&1; then
-  log "cargo deny check bans on the resolved graph"
-  cargo deny check bans
-else
-  log "cargo-deny not on PATH; skip bans (CI installs it)"
-fi
+# The existing cargo-deny policy owns uniqueness for the resolved graph.
+log "cargo deny check bans on the resolved graph"
+cargo deny check bans
 
 log "ok"

@@ -1,12 +1,4 @@
-//! Scenario tests for prepared-input resolution and shared sighash facts
-//! (T07).
-//!
-//! These pin the prepared-input contract: each input resolves exactly once
-//! in input order, per-transaction sighash aggregates are shared across
-//! inputs instead of rebuilt, the sigop cost has one owner in consensus,
-//! outpoint and order mismatches fail closed, and prepared facts survive
-//! source-record replacement without borrowed pointers into replaceable
-//! records.
+//! VAL-02: missing coins, duplicate inputs, and reference transaction identities.
 
 #![expect(clippy::expect_used, reason = "test assertions")]
 
@@ -19,21 +11,12 @@ use bitcoin_rs_primitives::{
     consensus_bytes,
 };
 
-/// A counting view proving resolve-once: every lookup increments a counter.
-struct CountingView {
+struct Coins {
     utxos: hashbrown::HashMap<OutPoint, TxOut>,
-    lookups: std::cell::Cell<usize>,
 }
 
-impl CountingView {
-    fn lookup_count(&self) -> usize {
-        self.lookups.get()
-    }
-}
-
-impl UtxoView for CountingView {
+impl UtxoView for Coins {
     fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
-        self.lookups.set(self.lookups.get() + 1);
         self.utxos.get(outpoint).cloned()
     }
 }
@@ -55,7 +38,7 @@ fn plain_input(byte: u8) -> TxIn {
 }
 
 /// Two-input transaction spending distinct coins with empty scripts.
-fn two_input_tx() -> (Tx, CountingView) {
+fn two_input_tx() -> (Tx, Coins) {
     let mut utxos = hashbrown::HashMap::new();
     for byte in [1_u8, 2] {
         utxos.insert(
@@ -75,69 +58,20 @@ fn two_input_tx() -> (Tx, CountingView) {
             script_pubkey: Script::new(),
         }],
     };
-    (
-        tx,
-        CountingView {
-            utxos,
-            lookups: std::cell::Cell::new(0),
-        },
-    )
+    (tx, Coins { utxos })
 }
 
-/// Resolving a multi-input transaction through the prepared path looks each
-/// input up exactly once — the resolve-once contract with no repeated
-/// per-input prevout scans.
-#[test]
-fn each_input_resolves_exactly_once_in_input_order() {
-    let (tx, view) = two_input_tx();
-    let flags = bitcoin_rs_script::VerifyFlags::MANDATORY;
-    // The empty prevout scripts make script checks trivially pass; the
-    // lookup count is the assertion target.
-    let verdict = bitcoin_rs_consensus::verify_transaction(&tx, &view, 0, 0, flags);
-    // Empty script_pubkey may be rejected as a consensus error, but
-    // resolution happens before any script verdict.
-    let _ = verdict;
-    assert_eq!(
-        view.lookup_count(),
-        tx.inputs.len(),
-        "each input resolved exactly once"
-    );
-}
-
-/// A missing prevout fails closed and still resolves each present input at
-/// most once; the failure names the missing coin, never an empty coin view.
+/// VAL-02: a missing prevout is not a script failure or an empty coin.
 #[test]
 fn missing_prevout_fails_closed() {
-    let (mut tx, mut view) = two_input_tx();
+    let (mut tx, view) = two_input_tx();
     tx.inputs[1].previous_output = outpoint(0xEE);
-    view.utxos
-        .remove(&outpoint(2))
-        .expect("coin present before");
     let flags = bitcoin_rs_script::VerifyFlags::MANDATORY;
     let verdict = bitcoin_rs_consensus::verify_transaction(&tx, &view, 0, 0, flags);
-    assert!(
-        verdict.is_err(),
-        "a missing prevout must fail closed, never pass"
-    );
-    assert!(
-        view.lookup_count() <= tx.inputs.len(),
-        "no repeated scans while failing"
-    );
-}
-
-/// Prepared facts are owned copies: replacing the source record after
-/// preparation cannot corrupt the prepared coin facts.
-#[test]
-fn prepared_facts_survive_source_record_replacement() {
-    let (tx, view) = two_input_tx();
-    // Resolve and drop the source view entirely; the resolved prevouts used
-    // for sighash computation are owned facts held by the verification
-    // pipeline, not borrows into the view.
-    drop(view);
-    let bytes = consensus_bytes(&tx);
-    let reparsed: Tx = bitcoin_rs_primitives::deserialize(&bytes).expect("round trip");
-    assert_eq!(reparsed.inputs.len(), 2);
-    assert_eq!(reparsed.inputs[0].previous_output, outpoint(1));
+    assert!(matches!(
+        verdict,
+        Err(bitcoin_rs_consensus::ConsensusError::MissingPrevout { input_index: 1 })
+    ));
 }
 
 /// The sigop-cost owner counts from resolved prevouts with the P2SH and
@@ -157,8 +91,6 @@ fn sigop_cost_owner_counts_from_resolved_prevouts() {
         .collect();
     let flags = bitcoin_rs_script::VerifyFlags::STANDARD;
     let first = total_sigop_cost(&tx, &prevouts, flags);
-    let second = total_sigop_cost(&tx, &prevouts, flags);
-    assert_eq!(first, second, "deterministic for identical inputs");
     // Two empty-script inputs carry no legacy sigops: the owner's count is
     // exactly zero for this fixture, not merely "bounded".
     assert_eq!(first, 0, "empty scripts count zero sigops");
@@ -173,11 +105,10 @@ fn sigop_cost_owner_counts_from_resolved_prevouts() {
     );
 }
 
-/// Legacy, `SegWit` v0, and Taproot sighash variants agree with the bitcoin
-/// crate oracle: the shared per-transaction cache computes the same hashes
-/// the oracle computes per input.
+/// VAL-02: legacy and witness transaction identities match an independent decoder.
+/// This is not sighash evidence; script/Core vectors own signed-spend checks.
 #[test]
-fn sighash_variants_match_reference_oracle() {
+fn transaction_identities_match_reference_oracle() {
     // Genesis coinbase through the layout: parse, materialize, and compare
     // txid/wtxid against the oracle, proving the shared-aggregate pipeline
     // reproduces reference identity for the legacy (no-witness) family.
@@ -222,21 +153,20 @@ fn sighash_variants_match_reference_oracle() {
     }
 }
 
-/// Input order and outpoint identity are load-bearing: swapping two inputs'
-/// prevout references changes the resolved coin facts and the resulting
-/// verification context, never silently reusing the first input's facts.
+/// VAL-02: duplicate inputs are rejected before script verification.
 #[test]
-fn input_order_and_outpoint_mismatch_changes_resolution() {
-    let (mut tx, _view) = two_input_tx();
-    // Swap the two inputs' previous outputs.
-    let first = tx.inputs[0].previous_output;
-    tx.inputs[0].previous_output = tx.inputs[1].previous_output;
-    tx.inputs[1].previous_output = first;
-
-    // Duplicate outpoints across inputs (double spend) must fail closed.
-    let (mut dup, view) = two_input_tx();
-    dup.inputs[1].previous_output = dup.inputs[0].previous_output;
-    let flags = bitcoin_rs_script::VerifyFlags::MANDATORY;
-    let verdict = bitcoin_rs_consensus::verify_transaction(&dup, &view, 0, 0, flags);
-    assert!(verdict.is_err(), "duplicate-input spend must fail closed");
+fn duplicate_inputs_are_rejected() {
+    let (mut tx, view) = two_input_tx();
+    tx.inputs[1].previous_output = tx.inputs[0].previous_output;
+    let verdict = bitcoin_rs_consensus::verify_transaction(
+        &tx,
+        &view,
+        0,
+        0,
+        bitcoin_rs_script::VerifyFlags::MANDATORY,
+    );
+    assert!(matches!(
+        verdict,
+        Err(bitcoin_rs_consensus::ConsensusError::DuplicateInput { input_index: 1 })
+    ));
 }

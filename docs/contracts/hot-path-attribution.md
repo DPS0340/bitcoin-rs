@@ -7,8 +7,7 @@ This page does not record measured seconds.
 Owners:
 - Method: this page (`HPA-01`..`HPA-13`)
 - Inventory and dispositions: `docs/benchmarks/hot-path-ledger.toml`
-- Proof: `bin/bitcoin-rs/tests/gates/g18_hot_path_ledger.rs` and
-  `bin/bitcoin-rs/tests/overhaul_evidence.rs`
+- Evidence tooling: `crates/node/benches/evidence.rs` and `tools/benchmark-campaign/`
 
 The 2.0x speed gate and the 36-cell denominator live in issues #33 and
 #45. This contract does not change the 36-cell count.
@@ -77,8 +76,9 @@ The 2.0x speed gate and the 36-cell denominator live in issues #33 and
   measured product hot paths, cost classes, known levers, and forbidden
   probes.
 - Every recorded `Sample.path` must exactly match a declared `paths.id`.
-  G18 rejects empty or undeclared paths in every cell history. The
-  declared inventory may extend the gate's required minimum; validating
+  Declared-path membership is owned by inventory review: the evidence tool
+  validates accounting (identities, intervals, declared cells), not path
+  names. The declared inventory may extend the reviewed minimum; validating
   membership never deduplicates samples or removes empty cells.
 - A row records applicability, custody, wall contribution,
   disable/neutralize delta, overlap, affected cells, and disposition.
@@ -151,8 +151,8 @@ posture.
 ### `HPA-12`: Evidence identity per sample
 
 - The evidence `Ledger` schema is implemented in
-  `crates/node/benches/evidence.rs` and shared by the gate and hot-path
-  ledger.
+  `crates/node/benches/evidence.rs` and shared by the benchmark evidence
+  tests and the hot-path ledger.
 - Every sample in the evidence ledger carries an identity tuple:
   artifact (binary or library hash), configuration (feature set,
   backend, network, cache budget), corpus (stop hash, block count,
@@ -184,17 +184,16 @@ posture.
 - A microbenchmark and a product benchmark answer different questions.
   Only the product benchmark can fill a product cell.
 
-## Proven by
+## Evidence and checks
 
-- `bin/bitcoin-rs/tests/gates/g18_hot_path_ledger.rs`
-  (`cargo test -p bitcoin-rs --test g18_hot_path_ledger`), including
-  `declared_sample_paths_preserve_repetitions_and_empty_cells`,
-  `additional_declared_sample_paths_are_allowed`, and
-  `undeclared_sample_paths_are_rejected_in_later_histories` for HPA-05.
-- `bin/bitcoin-rs/tests/overhaul_evidence.rs` (planned): rejects evidence
-  missing binary, corpus, configuration, or durability identity; rejects
-  summing nested or concurrent intervals; retains repeated samples and
-  empty or missing cells.
+- `cargo test --locked -p bitcoin-rs-node --no-default-features --features fjall --bench evidence`
+  checks missing identities, interval overlap and repeated-sample retention.
+  It is a benchmark-tool test, not node correctness or a measurement.
+- `tools/benchmark-campaign/` owns measured runs and product comparisons.
+  Its tests validate evidence accounting; only actual runs populate cells.
+- Inventory review owns the declared matrix and attribution paths. Normal
+  Rust tests do not freeze path names, candidate lists or unmeasured cells.
+  Removing those gates does not relax the measurement requirements above.
 
 ## Vocabulary
 

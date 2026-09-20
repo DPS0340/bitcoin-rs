@@ -1,6 +1,6 @@
 # Native validation default: promotion record
 
-This document is the promotion record for the native strict-Rust validation default. The owner of the default is [`docs/contracts/validation-default.md`](../contracts/validation-default.md), proven by `g19_validation_default`. The end-state decision is recorded here after T16 and T17 run; until then the recorded verdict stays `KeepKernel` and this page states the contract only.
+This document is the promotion record for the native strict-Rust validation default. The owner of the default is [`docs/contracts/validation-default.md`](../contracts/validation-default.md), proven by feature-matrix builds, Core vectors, and measured promotion evidence. The end-state decision is recorded here after T16 and T17 run; until then the recorded verdict stays `KeepKernel` and this page states the contract only.
 
 ## Decision it owns
 
@@ -10,7 +10,7 @@ Whether `bitcoin-rs-consensus`, `bitcoin-rs-node`, `bin/bitcoin-rs` and the cont
 
 1. T16 (strict-Rust cryptography lane) must pass first. The verifier is one general BIP340 operation composed over maintained `k256 0.14.0` arithmetic and ECDSA primitives. The `k256` high-level Schnorr signature type is withdrawn because its `Signature` stores a `NonZeroScalar` and cannot represent the whole BIP340 input domain. No custom field or group arithmetic. Overflowing TapTweak is canonically rejected, never reduced. Hybrid-key parity and historical DER and high-S rules are preserved.
 2. T17 then measures the actual final strict artifact. Earlier candidate measurements, including every number in the prior-evidence section, are not promotion proof.
-3. Promotion happens in one changeset: flip `RECORDED_VERDICT` in `g19_validation_default`, drop `kernel` from the two library defaults, update `Dockerfile`, and prove kernel-free transitive closure in `bin/bitcoin-rs/tests/overhaul_default_closure.rs`.
+3. Promotion happens in one changeset: complete the measured end-state cells below, drop `kernel` from the two library defaults, update `Dockerfile`, and prove kernel-free transitive closure in `bin/bitcoin-rs/tests/overhaul_default_closure.rs`.
 
 ## End-state cells
 
@@ -107,9 +107,8 @@ not flip the default.
 
 Until the gates pass, the library crates and the image keep `kernel`. The
 binary already builds native so a default `cargo build -p bitcoin-rs` needs
-no C++ toolchain. Promoting native is one coordinated change: flip
-`RECORDED_VERDICT` in `g19_validation_default` and drop `kernel` from the
-two library defaults in the same commit.
+no C++ toolchain. Promoting native is one coordinated change: drop
+`kernel` from the two library defaults in the same commit.
 
 ### Measured observations
 

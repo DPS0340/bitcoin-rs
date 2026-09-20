@@ -62,8 +62,14 @@ cannot drift:
 Plain `cargo test --workspace` and `cargo clippy --workspace` also enable the
 library defaults and therefore build the C++ kernel. The script passes the
 kernel-free feature selection. The binary and workspace test lanes expect the
-pinned Core and Apalache fixtures:
-`bash scripts/provision-ci-reference-fixtures.sh`.
+pinned Core fixture:
+`bash scripts/provision-ci-reference-fixtures.sh core`.
+
+Formal evidence has its own lane: provision with
+`bash scripts/provision-ci-reference-fixtures.sh formal`, then run
+`python3 scripts/check_models.py`. A `--check-only` invocation checks custody,
+not model properties. Benchmark evidence checks run with
+`cargo test --locked -p bitcoin-rs-node --no-default-features --features fjall --bench evidence`.
 
 The [pre-commit configuration](.pre-commit-config.yaml) runs the same script,
 so local hooks are the kernel-free PR gate, not the C++ full-node lane.
@@ -174,8 +180,9 @@ scripts/check-dep-range.sh maximum
 ```
 
 The original `Cargo.lock` is restored on exit unless `KEEP_LOCK=1`.
-Each lane also runs G20 against the mutated lockfile. Optional native
-storage backends are owned by the named feature matrix, not this script.
+Each lane also runs `cargo deny check bans` against the mutated lockfile.
+Optional native storage backends are owned by the named feature matrix, not
+this script.
 
 ### Bitcoin Core differential
 

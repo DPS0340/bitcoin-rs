@@ -94,7 +94,7 @@ jobs:
         with:
           cache-on-failure: true
       # The consensus, node, and rpc profiles are fixture-free: only the
-      # binary's tests read the pinned Core/Apalache fixtures.
+      # binary's tests read the pinned Core fixtures.
       - run: ./scripts/ci-pr.sh test-crates
 
   test-binary:
@@ -105,8 +105,8 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
-      - name: Provision pinned Core and Apalache fixtures
-        run: bash scripts/provision-ci-reference-fixtures.sh
+      - name: Provision pinned Core
+        run: bash scripts/provision-ci-reference-fixtures.sh core
       - run: ./scripts/ci-pr.sh test-binary
       - name: Preserve public process compatibility evidence
         if: ${{ always() }}
@@ -128,8 +128,8 @@ jobs:
       # bin/bitcoin-rs is a workspace member, so the kernel-free workspace
       # pass runs its default-feature test binaries, including the
       # process-harness suite that launches the pinned bitcoind.
-      - name: Provision pinned Core and Apalache fixtures
-        run: bash scripts/provision-ci-reference-fixtures.sh
+      - name: Provision pinned Core
+        run: bash scripts/provision-ci-reference-fixtures.sh core
       - run: ./scripts/ci-pr.sh test-workspace
       - name: Preserve public process compatibility evidence
         if: ${{ always() }}

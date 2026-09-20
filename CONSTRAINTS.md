@@ -1,8 +1,9 @@
 # CONSTRAINTS.md
 
 The repository guard register. It records the constraint ledger (CL-01..CL-23),
-the formal model tool identity, and the proof inventory that gate `g20` and the
-owner gates read. It references normative owners (`docs/contracts/`,
+the formal model tool identity, and the proof inventory that
+`python3 scripts/check_models.py` reads. It references normative owners
+(`docs/contracts/`,
 `docs/policies/`, `.outline/waterfall/BLUEPRINT.md` invariants INV-01..INV-12,
 owner constants in code) and is never a second policy. When a row and its owner
 disagree, the owner governs and the gate blocks until the row is corrected.
@@ -55,7 +56,7 @@ antecedent of `ConditionalProgress`, never inside `Next`.
 | PeerLeases | b3a50f1e4f95e635bfd992ffcacb2f17899ce3a3377b38fc7c11ad2051482d9a | 3b23777fb2dcdcee61ac81f29c06b99a33d140cef01fc5be8e1d5c71104aa7ea | Peer=P, S0, S1, G0, G1, R0, R1, F0, F1, D0, D1, CtrlCap=1, DataCap=1, InCap=1, OutCap=1, ExternalBudget=12 | 128 | temporal (ConditionalProgress) rc255 after 32248s: JVM ran out of heap space (max JVM memory 17179869184 = -Xmx16384m from detached-checks.sh) at Step 5 of --length=128 — tool resource exhaustion, NOT a counterexample and NOT a verified pass; outcome unverified per honest-failure rule; peer-safety (State 7) and chain-side runs still in flight | 255 | 14 |
 | ProjectionMining | 1ffc603ff9a12de825ac663478d4c859215ebe842aef092208e42ed431dc2e43 | f4d7dacc59d1d9c7bd87328bb0114a74d4b133f3a7a2bfa2b519aa127e1939c4 | O, A, B, TxLookup, ScriptLive, ScriptHistory, J0, J1, Rw0..Rw2, X0, X1, ExternalBudget=12 | 128 | temporal (ConditionalProgress) rc255 after 7540s at 32 GiB: JVM ran out of heap space during Step-1 search (invariant checks passing at State 1) — tool resource exhaustion, NOT a counterexample and NOT a verified pass; heap rungs 16g and 32g falsified, higher rungs untested. proj-safety still in flight (.outline/formal-runs-20260910) | 255 | 14 |
 
-Gate `g20` (`bin/bitcoin-rs/tests/gates/g20_formal_models.rs`) runs six
+`python3 scripts/check_models.py` runs six
 invocations per pass, three safety and three temporal:
 
 ```
@@ -65,9 +66,9 @@ apalache-mc check --config=docs/models/<M>.cfg --temporal=ConditionalProgress --
 
 Lane: the solver run is owned by the operator-invoked `model-check-manual`
 lane at K=128 unchanged (workflow_dispatch only; no schedule until a runner
-exists that can finish K=128). PR (`ci-pr.sh`) and main-push (`main.yml`
-full-node) lanes skip `all_model_specs_check_with_apalache` and run only the
-two cheap pin tests. Inventory rows above stay BLOCKED until a manual run
+exists that can finish K=128). Normal Cargo suites neither invoke nor skip the external checker.
+`python3 scripts/check_models.py --check-only` verifies input identity, not
+model properties, and cannot turn a BLOCKED proof into a pass. Inventory rows above stay BLOCKED until a manual run
 returns rc 0. Measured 2026-09-12: ChainAdmission Safety needs ~30h+ at the
 pinned 4g heap, so no `ubuntu-latest` job (360-min cap) can return rc 0; the
 manual lane exercises the harness and preserves evidence but is not expected
@@ -113,10 +114,10 @@ candidate baselines before production edits; owner gates append final values.
 | CL-17 | Durable order | Append body/undo, sync, batch, durable completion, publication. `submitblock` succeeds only after durability; I/O failure never means success. `DurableHead.commit_id` is monotonic; backend atomicity and crash evidence are mandatory. | `cargo test --locked -p bitcoin-rs-node --no-default-features --features fjall --test overhaul_durable_head -- --nocapture` | G4; T02 baseline | Diff: durable write and publication surfaces; T09, T11, T12 | Required true; INV-04/INV-06 | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
 | CL-18 | Exact inverse | Disconnect restores pre-connect coins, bookkeeping, and identity; missing undo fails closed. Streaming reorg and pruning leases preserve boundedness and the existing I/O baseline. | `cargo test --locked -p bitcoin-rs-node --no-default-features --features fjall --test overhaul_streaming_reorg -- --nocapture` | G4; T02 baseline | Diff: disconnect and reorg; T13 | Required true; INV-07, T13 | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
 | CL-19 | Performance gain | Promotion requires median gain >= 1.05x, at least 3 alternating runs, each arm within 5% stability, improvement exceeding host noise, and identical result hashes. Capture original `sync_pipeline`, `chainstate_journal`, and `merkle` controls at T02; include microbenchmarks and full E2E product workloads. | `cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_resource_bounds -- --nocapture` | G1/T02; G10/T37 and T38 versus frozen controls | Diff: proposed optimizations and affected product paths; T02, T37, T38 | Gain threshold plus all non-regression predicates; Verification 6, R064 | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| CL-20 | No regression | Every applicable apply-latency, cost, RSS, retained-byte, storage, p99, and throughput cell satisfies its baseline direction; preserve Boolean contracts. Hold script backend constant. 3% median and 5% p99 outer rejection caps never authorize degradation; uncertain noise comparisons remain blocked. | `cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_evidence -- --nocapture` | G1/T02; G3/G4/G10/G11; T14/T37/T38/T39 versus T02 | Diff: every affected measured surface; T02, T06, T08, T14, T37, T38, T39 | Cost/latency/bytes <= baseline; throughput >= baseline; R005/R064, Verification 6 | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
+| CL-20 | No regression | Every applicable apply-latency, cost, RSS, retained-byte, storage, p99, and throughput cell satisfies its baseline direction; preserve Boolean contracts. Hold script backend constant. 3% median and 5% p99 outer rejection caps never authorize degradation; uncertain noise comparisons remain blocked. | `cargo test --locked -p bitcoin-rs-node --no-default-features --features fjall --bench evidence` | G1/T02; G3/G4/G10/G11; T14/T37/T38/T39 versus T02 | Diff: every affected measured surface; T02, T06, T08, T14, T37, T38, T39 | Cost/latency/bytes <= baseline; throughput >= baseline; R005/R064, Verification 6 | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
 | CL-21 | No unapproved surface | A public boundary outside Approval effects stops the cut pending separate human approval. No unapproved limit, config, or crate beyond approved `crates/chainstate`. No writes to operator data; test and replay writes are confined to disposable isolated fixtures. | `enforcement removed with the ownership scan (#1083/#1084); Rust visibility and crate boundaries own this boundary` | Every cut | Diff: all changed boundaries, dependencies, configuration and I/O | Required true; Approval effects | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
 | CL-22 | Version/lock discipline | Approved workspace 0.4.0 to 0.5.0 release change and `Cargo.lock` update are atomic. Schema and projection versions stay owner-local; disposable projections never dictate authoritative schema. Commands use `--locked`. | `cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_release_profiles -- --nocapture` | G7, G11 | Diff: owner-local versions; project-wide release, lock, and dependency closure; T40 | Required true; `docs/policies/source-compatibility.md` section 4 | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
-| CL-23 | Honest failure | Unavailable is not empty; unverified is not supported; unknown is not false. Skipped or unavailable proof blocks its gate with the missing identity recorded; numeric and Boolean fields remain UNMEASURED until measured. | `cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_evidence -- --nocapture` | All applicable gates | Diff: affected evidence and failure surfaces across all tasks | Required true; typed `Unavailable`/`BLOCKED`, INV-11, Verification 0 | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
+| CL-23 | Honest failure | Unavailable is not empty; unverified is not supported; unknown is not false. Skipped or unavailable proof blocks its gate with the missing identity recorded; numeric and Boolean fields remain UNMEASURED until measured. | `cargo test --locked -p bitcoin-rs-node --no-default-features --features fjall --bench evidence` | All applicable gates | Diff: affected evidence and failure surfaces across all tasks | Required true; typed `Unavailable`/`BLOCKED`, INV-11, Verification 0 | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED |
 
 ## Record discipline
 
