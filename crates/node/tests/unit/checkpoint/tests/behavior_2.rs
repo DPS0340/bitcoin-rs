@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn checkpoint_transaction_counts_must_agree_when_known() -> Result<(), Box<dyn std::error::Error>> {
+    for chain_tx_count in [0, 1] {
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        let tree = RwLock::new(tree);
+        let mut stats = CoinStats::new();
+        stats.finish_block(0, 1);
+        let data_dir = super::super::open_data_dir(dir.path())?;
+        super::super::write_checkpoint_from_dir(
+            &data_dir,
+            config(),
+            &tree,
+            &UtxoSet::new(),
+            &CoinStatsListener::new(stats),
+            Some(&applied_tip),
+            chain_tx_count,
+        )?;
+        let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
+            return Err("valid checkpoint did not load".into());
+        };
+        assert_eq!(restored.chain_tx_count, chain_tx_count);
+        assert_eq!(restored.coin_stats.tx_count, 1);
+
+        mutate_authenticated_manifest(dir.path(), |manifest| {
+            manifest.applied_tip.chain_tx_count = 2;
+        })?;
+        let Err(error) = load_checkpoint(dir.path(), config()) else {
+            return Err("inconsistent authenticated transaction counts were restored".into());
+        };
+        assert!(error.to_string().contains("transaction count"));
+        assert!(error.to_string().contains("full resync"));
+    }
+    Ok(())
+}
+
+#[test]
+fn checkpoint_writer_refuses_inconsistent_transaction_counts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+    let applied_tip = tip_snapshot(&tree, applied)?;
+    let data_dir = super::super::open_data_dir(dir.path())?;
+    let result = super::super::write_checkpoint_from_dir(
+        &data_dir,
+        config(),
+        &RwLock::new(tree),
+        &UtxoSet::new(),
+        &CoinStatsListener::new(CoinStats::new()),
+        Some(&applied_tip),
+        2,
+    );
+    let Err(error) = result else {
+        return Err("inconsistent transaction counts were published".into());
+    };
+    assert!(error.to_string().contains("transaction count"));
+    assert!(!dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE).exists());
+    Ok(())
+}
+
+#[test]
 fn authenticated_header_semantics_require_resync() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let (tree, _, applied) = chain_with_applied_height(2, 0)?;
