@@ -417,4 +417,5 @@ pub(crate) fn test_recorder() -> metrics::NoopRecorder {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/metrics/tests.rs"]
 mod tests;

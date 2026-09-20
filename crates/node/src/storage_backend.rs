@@ -126,53 +126,29 @@ fn unsupported(namespace: &str, backend: StorageBackend) -> StorageError {
 
 #[cfg(test)]
 mod tests {
-    const RUNTIME_CONSUMERS: &[(&str, &str, Option<&str>)] = &[
-        ("state.rs", include_str!("state.rs"), None),
-        (
-            "state/checkpoint.rs",
-            include_str!("state/checkpoint.rs"),
-            None,
-        ),
-        ("state/events.rs", include_str!("state/events.rs"), None),
-        ("state/index.rs", include_str!("state/index.rs"), None),
-        ("state/open.rs", include_str!("state/open.rs"), None),
-        ("state/prune.rs", include_str!("state/prune.rs"), None),
-        ("state/restore.rs", include_str!("state/restore.rs"), None),
-        ("state/storage.rs", include_str!("state/storage.rs"), None),
-        (
-            "storage_footprint.rs",
-            include_str!("storage_footprint.rs"),
-            None,
-        ),
-        (
-            "storage_footprint/identity.rs",
-            include_str!("storage_footprint/identity.rs"),
-            None,
-        ),
-        (
-            "storage_footprint/scan.rs",
-            include_str!("storage_footprint/scan.rs"),
-            None,
-        ),
+    const RUNTIME_CONSUMERS: &[(&str, &str)] = &[
+        ("state.rs", include_str!("state.rs")),
+        ("state_events.rs", include_str!("state_events.rs")),
+        ("state_open.rs", include_str!("state_open.rs")),
+        ("state_prune.rs", include_str!("state_prune.rs")),
+        ("state_restore.rs", include_str!("state_restore.rs")),
+        ("state_storage.rs", include_str!("state_storage.rs")),
+        ("storage_footprint.rs", include_str!("storage_footprint.rs")),
         (
             "index/runtime.rs",
             include_str!("../../index/src/runtime.rs"),
-            None,
         ),
         (
             "index/runtime/startup.rs",
             include_str!("../../index/src/runtime/startup.rs"),
-            None,
         ),
         (
             "index/runtime/lifecycle.rs",
             include_str!("../../index/src/runtime/lifecycle.rs"),
-            None,
         ),
         (
             "index/runtime/query.rs",
             include_str!("../../index/src/runtime/query.rs"),
-            None,
         ),
     ];
 
@@ -184,24 +160,14 @@ mod tests {
     ];
 
     // ARCH-03 in docs/contracts/architecture.md makes storage_backend.rs the
-    // sole owner of concrete backend construction. The consumers, test-module
-    // boundaries, and forbidden constructor tokens scanned here are the
-    // executable form of that architecture contract.
+    // sole owner of concrete backend construction. These consumers must only
+    // request capabilities from that owner, never open a backend themselves.
     #[test]
     fn runtime_backend_construction_has_one_owner() {
-        for (name, source, test_module) in RUNTIME_CONSUMERS {
-            let production = match test_module {
-                Some(boundary) => {
-                    let start = source
-                        .find(boundary)
-                        .unwrap_or_else(|| panic!("{name} lost its expected test-module boundary"));
-                    &source[..start]
-                }
-                None => source,
-            };
+        for (name, source) in RUNTIME_CONSUMERS {
             for token in CONCRETE_OPEN_TOKENS {
                 assert!(
-                    !production.contains(token),
+                    !source.contains(token),
                     "{name} constructs a concrete backend with {token}; move it to storage_backend.rs"
                 );
             }

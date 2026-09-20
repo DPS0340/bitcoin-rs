@@ -794,4 +794,5 @@ impl RuntimeInputs {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/config/tests.rs"]
 mod tests;

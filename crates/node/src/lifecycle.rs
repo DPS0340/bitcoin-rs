@@ -594,4 +594,5 @@ fn cap_global_thread_pool() {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/lifecycle/tests.rs"]
 mod tests;

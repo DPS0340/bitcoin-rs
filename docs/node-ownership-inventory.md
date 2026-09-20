@@ -310,9 +310,9 @@ teardown + clean-checkpoint gate; startup is the sole composer; rpc.rs is the
 single seam building the RPC `Context` and the only bridge of
 `reorg::invalidate_block` into `ChainControl`). `mining` KEEP — the
 coordinator owns the transition-lock header admission
-(`accept_submitted_header`, mining.rs:104-128), the submit-side apply gate
-verifying the published tip (submission.rs:60-93), the BIP22 reject vocabulary
-(API-18/30), and the mempool→template wake seam (mining.rs:188-197);
+(`MiningControl::submit_header` in `mining.rs`), the submit-side apply gate
+verifying the published tip (`MiningCoordinator::submit`), the BIP22 reject
+vocabulary (API-18/30), and the mempool→template wake seam;
 `bitcoin_rs_mining` provides none of these. `tx_ingress` KEEP (p2p→mempool
 routing + relay/mining dispatch). `import.rs` DELETE — 49-line skeleton whose
 only callers are its own tests **[verified]**. `event_loop`/`run`/`signal`/

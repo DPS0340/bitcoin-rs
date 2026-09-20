@@ -235,15 +235,15 @@ state (`crates/mempool/src/orphan.rs`).
 - `crates/node/src/apply.rs` (inline tests, `chain_generation_tests` module):
   `stable_generation_is_even_before_and_after_connect`,
   `stable_generation_is_even_after_disconnect`.
-- `crates/node/src/sync/tests/transitions_3.rs`,
-  `crates/node/src/sync/tests/transitions_5.rs`,
-  `crates/node/src/sync/tests/transitions_6.rs`, and
-  `crates/node/src/sync/tests/transitions_7.rs`: generation fencing on window
+- `crates/node/tests/unit/sync/tests/transitions_3.rs`,
+  `crates/node/tests/unit/sync/tests/transitions_5.rs`,
+  `crates/node/tests/unit/sync/tests/transitions_6.rs`, and
+  `crates/node/tests/unit/sync/tests/transitions_7.rs`: generation fencing on window
   settlement; operational and permanent reorg failures preserve generation
   fencing, and partial and fatal reorgs preserve readmission semantics.
 - `crates/node/src/apply.rs`: RPC body preflight, mid-rollback body loss and
   clean disconnect refusal permit retry from their coherent committed state.
-- `crates/node/src/reorg/tests.rs`: possibly torn UTXO commits retain the
+- `crates/node/tests/unit/reorg/tests.rs`: possibly torn UTXO commits retain the
   fence and checkpoint debt; failed generation settlement preserves its
   original cause and requests shutdown.
 - `crates/rpc/src/handlers/tx.rs` (inline tests):

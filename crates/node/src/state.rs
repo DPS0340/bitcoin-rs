@@ -1,32 +1,30 @@
 //! Shared node runtime state and capability handles.
 //!
-//! Construction, recovery, persistence, event publication, pruning, and index
-//! lifecycle are isolated below; this facade retains the public handle API.
-
-mod checkpoint;
-mod events;
-mod index;
-pub(crate) mod maintenance;
-mod open;
-mod prune;
-mod restore;
-mod storage;
-
-#[cfg(test)]
-pub(crate) use restore::ResumeSource;
+//! Shared handles, checkpoint publication, and index lifecycle live with
+//! `NodeState`. Construction, recovery, storage, events, and pruning retain
+//! separate private implementations.
 
 use crate::ApplyError;
 use crate::NodeConfig;
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::bail;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::block_log::BlockLog;
+use bitcoin_rs_index::runtime::DEFAULT_BATCH_LIMITS;
+use bitcoin_rs_index::runtime::OpenDerivedIndex;
+use bitcoin_rs_index::runtime::REDB_BATCH_LIMITS;
+use bitcoin_rs_index::runtime::open_derived_index_store_on_worker;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::Txid;
 use bitcoin_rs_rpc::context::NetworkState;
 use bitcoin_rs_rpc::context::PruneService;
+use bitcoin_rs_storage::KvStore;
+use bitcoin_rs_storage::StorageBackend;
 use bitcoin_rs_utxo::UtxoSet;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
@@ -35,18 +33,33 @@ pub use events::ChainEventPublisher;
 pub use events::ChainSnapshot;
 pub use events::HintKind;
 use hashbrown::HashMap;
-use index::TxIndexSpawn;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 pub use prune::NodePruneService;
+#[cfg(test)]
+pub(crate) use restore::ResumeSource;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 use storage::NodeStorage;
 use storage::StoredBlockBodySource;
+
+#[path = "state_events.rs"]
+mod events;
+#[path = "state_maintenance.rs"]
+pub(crate) mod maintenance;
+#[path = "state_open.rs"]
+mod open;
+#[path = "state_prune.rs"]
+mod prune;
+#[path = "state_restore.rs"]
+mod restore;
+#[path = "state_storage.rs"]
+mod storage;
 
 // One active generation of outbound requests is enough to keep the drain fed;
 // extra backlog is overload and must fail fast at producers.
@@ -368,7 +381,273 @@ impl NodeState {
         let outcome = self.followers.apply_connect(&self.apply_handles, block)?;
         Ok(outcome.tip)
     }
+
+    /// Publishes a durable clean checkpoint and returns the published
+    /// generation, or an error if there is no applied tip.
+    ///
+    /// This is the public boundary for the private checkpoint machinery; it
+    /// keeps `CheckpointWrite`, `CheckpointError`, and the checkpoint module
+    /// internal to the crate.
+    pub fn publish_checkpoint(&self) -> Result<u64> {
+        match self.write_clean_checkpoint()? {
+            crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => {
+                bail!("checkpoint refused: no applied tip to publish")
+            }
+            crate::checkpoint::CheckpointWrite::Published { generation } => Ok(generation),
+        }
+    }
+
+    /// Creates a [`crate::checkpoint::publisher::CheckpointPublisher`] from
+    /// this state's shared handles, for the maintenance and publication
+    /// paths that move it into a background thread.
+    ///
+    /// The publisher owns its own `Dir` handle (reopened from the data-dir
+    /// path) and cloned `Arc`s, so it can be moved into a background thread
+    /// without borrowing from `self`.
+    pub(crate) fn checkpoint_publisher(
+        &self,
+    ) -> core::result::Result<
+        crate::checkpoint::publisher::CheckpointPublisher,
+        crate::checkpoint::CheckpointError,
+    > {
+        Ok(crate::checkpoint::publisher::CheckpointPublisher {
+            admission: Arc::clone(&self.apply_handles.admission),
+            undo_store: Arc::clone(&self.apply_handles.undo_store),
+            durable_head: Arc::clone(&self.apply_handles.durable_head),
+            block_body_store: Arc::clone(&self.block_body_store),
+            applied_tip: Arc::clone(&self.applied_tip),
+            checkpoint_data_dir: bitcoin_rs_storage::checkpoint::fs::open_data_dir(&self.data_dir)
+                .map_err(crate::checkpoint::CheckpointError::Io)?,
+            network: self.config.network,
+            genesis_hash: self.config.network.genesis_block_hash(),
+            block_tree: Arc::clone(&self.block_tree),
+            utxo: Arc::clone(&self.utxo),
+            coin_stats: Arc::clone(&self.coin_stats),
+            chain_tx_count: Arc::clone(&self.chain_tx_count),
+            journal: self.apply_handles.journal.clone(),
+            data_dir: self.data_dir.clone(),
+            chain_events: Arc::clone(&self.chain_events),
+            durable_tip_height: Arc::clone(&self.durable_tip_height),
+        })
+    }
+
+    pub(crate) fn write_clean_checkpoint(
+        &self,
+    ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
+    {
+        self.checkpoint_publisher()?.publish()
+    }
+
+    /// Returns the node-owned complete transaction-index query adapter.
+    #[must_use]
+    pub fn derived_index_query(
+        &self,
+    ) -> Option<Arc<dyn bitcoin_rs_rpc::context::DerivedIndexQuery>> {
+        if !self.config.indexes.txindex {
+            return None;
+        }
+        self.derived_index_adapter.as_ref().map(|adapter| {
+            let q: Arc<dyn bitcoin_rs_rpc::context::DerivedIndexQuery> = adapter.clone();
+            q
+        })
+    }
+
+    /// Returns transaction lookup for internal Esplora projections.
+    ///
+    /// `--scriptindex` builds this dependency as well, but that does not
+    /// enable or advertise the Core `--txindex` contract.
+    #[must_use]
+    pub fn esplora_derived_index_query(
+        &self,
+    ) -> Option<Arc<dyn bitcoin_rs_rpc::context::DerivedIndexQuery>> {
+        self.derived_index_adapter.as_ref().map(|adapter| {
+            let q: Arc<dyn bitcoin_rs_rpc::context::DerivedIndexQuery> = adapter.clone();
+            q
+        })
+    }
+
+    /// Returns the node-owned complete generic script-index query adapter.
+    #[must_use]
+    pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
+        if !self.config.indexes.script_index.is_enabled() {
+            return None;
+        }
+        self.derived_index_adapter.as_ref().map(|adapter| {
+            let q: Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery> = adapter.clone();
+            q
+        })
+    }
+
+    /// Starts the derived-index workers. Call only once the applied tip is
+    /// authoritative — after crash recovery — so the index reconciles against
+    /// the real chainstate and never mistakes a recovered gap for a stale branch.
+    pub fn start_index_workers(&mut self) -> anyhow::Result<()> {
+        let Some(spawn) = self.derived_index_spawn.take() else {
+            return Ok(());
+        };
+        let runtime = self
+            .derived_index_runtime
+            .as_ref()
+            .context("txindex runtime missing for a pending worker spawn")?;
+        let lifecycle = self
+            .derived_index_lifecycle
+            .as_ref()
+            .context("txindex lifecycle missing for a pending worker spawn")?;
+        let worker = bitcoin_rs_index::runtime::DerivedIndexWorker::spawn_with_open(
+            Arc::clone(runtime),
+            spawn.spec,
+            Arc::clone(lifecycle),
+            spawn.generation,
+            Arc::clone(&self.applied_tip),
+            Arc::clone(&self.block_tree),
+            Some(Arc::clone(&self.block_body_store)),
+            spawn.block_source,
+            Some(spawn.body_source),
+            self.chain_events.clone(),
+            spawn.recovery_reporter,
+            Arc::clone(&self.apply_handles.shutdown),
+            spawn.wake_rx,
+        )
+        .context("spawn txindex worker")?;
+        self.derived_index_worker = Some(worker);
+        Ok(())
+    }
+
+    /// Returns the live txindex status source for `getcapabilities`.
+    #[must_use]
+    pub fn derived_index_status(
+        &self,
+    ) -> Arc<dyn bitcoin_rs_rpc::capabilities::DerivedIndexCapabilitySource> {
+        self.derived_index_status.clone()
+    }
+
+    /// Bounded txindex-worker shutdown: requests the worker shutdown, waits up
+    /// to `deadline` for a clean join, and detaches on
+    /// expiry. On detach, revokes the generation token and publishes
+    /// `ShutdownAbandoned` so queries return typed `Unavailable` instead of
+    /// hitting a torn reader.
+    pub(crate) fn bounded_index_shutdown(&mut self, deadline: Duration) {
+        let start = std::time::Instant::now();
+        if let Some(runtime) = &self.derived_index_runtime {
+            runtime.request_shutdown();
+        }
+        // Take the worker out of self so we can join it without holding self
+        // mutably across the wait.
+        let derived_index_worker = self.derived_index_worker.take();
+        let tx_deadline = start + deadline;
+        if let Some(mut worker) = derived_index_worker {
+            while std::time::Instant::now() < tx_deadline {
+                if worker.is_finished() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                worker.join();
+            } else {
+                tracing::warn!("txindex worker still blocked; abandoning join");
+                // Revoke the generation token so late publication is a no-op.
+                if let Some(generation_token) = &worker.generation {
+                    generation_token.revoke();
+                }
+                if let Some(lifecycle) = &self.derived_index_lifecycle {
+                    lifecycle.store(Arc::new(
+                        bitcoin_rs_index::runtime::DerivedIndexLifecycle::ShutdownAbandoned,
+                    ));
+                }
+                // Poison the namespace so it cannot be reclaimed in this process.
+                worker.poison_namespace();
+                // Detach the join handle so Drop does not block on join.
+                // The worker thread continues running but will exit after
+                // shutdown is observed; Drop is a no-op for the handle.
+                worker.detach();
+            }
+        }
+    }
+}
+
+fn derived_index_capabilities(config: &NodeConfig) -> bitcoin_rs_index::IndexCapabilities {
+    bitcoin_rs_index::IndexCapabilities {
+        // Full ScriptIndex-backed Esplora responses need exact historical
+        // transactions to render prevouts and calculate fees. `utxo` owns
+        // only the compact live-output view and must not pay for TxLookup.
+        // `derived_index_query` still exposes TxLookup to Core RPCs only for an
+        // explicit --txindex configuration.
+        tx_lookup: config.indexes.txindex || config.indexes.script_index.keeps_history(),
+        script_history: config.indexes.script_index.keeps_history(),
+        script_live: config.indexes.script_index.is_enabled(),
+    }
+}
+
+fn build_derived_index_open_spec(
+    config: &NodeConfig,
+    txindex_cache_bytes: u64,
+    epoch: u64,
+) -> Result<Option<bitcoin_rs_index::runtime::DerivedIndexOpenSpec>> {
+    let enabled = derived_index_capabilities(config);
+    if enabled.is_empty() {
+        return Ok(None);
+    }
+    if config.storage.prune_target_mb > 0 {
+        bail!("transaction and script indexing are not compatible with -prune");
+    }
+    let canonical_data_root = config
+        .data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config.data_dir.clone());
+    let backend = config.storage.backend;
+    let cache_bytes = txindex_cache_bytes;
+    Ok(Some(bitcoin_rs_index::runtime::DerivedIndexOpenSpec {
+        data_dir: config.data_dir.clone(),
+        namespace: "txindex",
+        storage_backend: config.storage.backend,
+        epoch,
+        enabled,
+        rollback_rebuild_cutover: bitcoin_rs_index::runtime::DEFAULT_ROLLBACK_REBUILD_CUTOVER,
+        canonical_data_root,
+        open_store: Arc::new(move |dir| {
+            crate::storage_backend::open_txindex(
+                backend,
+                dir,
+                Some(cache_bytes),
+                DerivedIndexComposer { backend, epoch },
+            )
+        }),
+        utxo: None,
+        chain_transition: None,
+    }))
+}
+
+struct DerivedIndexComposer {
+    backend: StorageBackend,
+    epoch: u64,
+}
+
+impl crate::storage_backend::StoreConsumer for DerivedIndexComposer {
+    type Output = OpenDerivedIndex;
+    type Error = bitcoin_rs_index::runtime::DerivedIndexWorkerError;
+
+    fn consume<S>(self, store: Arc<S>) -> Result<Self::Output, Self::Error>
+    where
+        S: KvStore,
+    {
+        let batch_limits = match self.backend {
+            StorageBackend::RocksDb | StorageBackend::Fjall => DEFAULT_BATCH_LIMITS,
+            StorageBackend::Redb => REDB_BATCH_LIMITS,
+        };
+        open_derived_index_store_on_worker(store, batch_limits, self.epoch)
+    }
+}
+
+struct TxIndexSpawn {
+    spec: bitcoin_rs_index::runtime::DerivedIndexOpenSpec,
+    generation: bitcoin_rs_index::runtime::Generation,
+    block_source: bitcoin_rs_index::runtime::IndexBlockSource,
+    body_source: Arc<dyn BlockBodySource>,
+    wake_rx: Receiver<()>,
+    recovery_reporter: Arc<crate::recovery_reporter::RecoveryReporter>,
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/state/tests/mod.rs"]
 mod tests;

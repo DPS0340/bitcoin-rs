@@ -104,8 +104,8 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 
 
 - **Owner**: `MiningControl::generate` in `crates/mining/src/control.rs`,
-  implemented by `MiningCoordinator::generate_blocks` in
-  `crates/node/src/mining/candidate.rs`, which assembles each block through
+  implemented by `MiningCoordinator::generate` in
+  `crates/node/src/mining.rs`, which assembles each block through
   `MiningService::assemble_fresh` in `crates/mining/src/coordinator.rs`.
 - The operation assembles a fresh candidate (no GBT cache). `generateblock`
   validates the unsolved block first (`API-30`), then both generate paths
@@ -318,7 +318,7 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 
 - **Owner**: `update_uncommitted_block_structures` in
   `crates/mining/src/coinbase.rs`, called from
-  `MiningCoordinator::submit_block` in `crates/node/src/mining/control.rs`.
+  `MiningCoordinator::submit_block` in `crates/node/src/mining.rs`.
 - When the previous header is known, SegWit is active for the submitted
   height, the coinbase already has a BIP141 commitment output, and the
   coinbase witness is empty, `submitblock` inserts the 32-byte reserved
@@ -330,7 +330,7 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 
 
 - **Owner**: `MiningCoordinator::known_block_result` in
-  `crates/node/src/mining/submission.rs`.
+  `crates/node/src/mining.rs`.
 - GBT proposal looks the block hash up first, matching Core
   `LookupBlockIndex`: a node whose body is connected (scripts-valid) is
   `duplicate`, `Invalid` is `duplicate-invalid`, and any other tree entry
@@ -342,7 +342,7 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 ### `API-19`: BIP22 reject reasons
 
 
-- **Owner**: `bip22_reject_reason` in `crates/node/src/mining/submission.rs`
+- **Owner**: `bip22_reject_reason` in `crates/node/src/mining.rs`
   for the `ApplyError` arms, delegating to `consensus_reject_reason` and
   `chain_reject_reason` in `crates/mining/src/bip22.rs`.
 - Proposal and `submitblock` project apply/consensus failures as Core
@@ -480,8 +480,8 @@ owned by [wallet-facing.md](wallet-facing.md).
 
 ### `API-30`: `generateblock` `TestBlockValidity` before solve
 
-- **Owner**: `MiningCoordinator::generate_blocks` in
-  `crates/node/src/mining/candidate.rs`.
+- **Owner**: `MiningCoordinator::generate` in
+  `crates/node/src/mining.rs`.
 - Core v31 `generateblock` runs `TestBlockValidity` with
   `check_pow = false` and `check_merkle_root = false` before
   `GenerateBlock`. Failure is Core `-25`
@@ -632,7 +632,7 @@ owned by [wallet-facing.md](wallet-facing.md).
 - `API-19`:
   - `crates/mining/src/bip22/tests.rs` tests
     `consensus_failures_use_core_bip22_reasons`, `header_failures_use_core_bip22_reasons`;
-    `crates/node/src/mining/apply_error_tests.rs` test
+    `crates/node/tests/unit/mining/apply_error_tests.rs` test
     `apply_errors_delegate_consensus_and_chain_reasons`
   - `crates/node/tests/mining.rs` tests `proposal_without_coinbase_is_bad_cb_missing`,
     `proposal_merkle_mismatch_is_bad_txnmrklroot`,
@@ -704,7 +704,7 @@ owned by [wallet-facing.md](wallet-facing.md).
     `generateblock_rejects_invalid_supplied_checksums`
 
 - `API-30`:
-  - `crates/node/src/mining/apply_error_tests.rs` tests
+  - `crates/node/tests/unit/mining/apply_error_tests.rs` tests
     `generateblock_validity_wraps_bip22_reason`,
     `generateblock_validity_keeps_shutdown_operational`
   - `crates/node/tests/mining.rs` test

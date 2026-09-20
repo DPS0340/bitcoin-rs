@@ -3,16 +3,15 @@
 //! Header admission and proposal/submission projection over the authoritative
 //! chainstate. Candidate lifecycle lives in `bitcoin_rs_mining`.
 
-mod candidate;
-mod control;
-mod submission;
-
+use crate::ApplyError;
 use crate::apply::Chainstate;
 use crate::chain_effects::ChainFollowers;
+use crate::checkpoint::hex_encode;
 use alloc::sync::Arc;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::ChainError;
+use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::accept_headers;
 use bitcoin_rs_chain::current_unix_seconds;
@@ -21,23 +20,37 @@ use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolMiningSnapshot;
 use bitcoin_rs_mining::AppliedTipSource;
 use bitcoin_rs_mining::AvailableMiningRule;
+use bitcoin_rs_mining::BlockTemplateMode;
+use bitcoin_rs_mining::BlockTemplateRequest;
+use bitcoin_rs_mining::BlockTemplateResult;
+use bitcoin_rs_mining::BlockValidationResult;
 use bitcoin_rs_mining::ChainContextSource;
+use bitcoin_rs_mining::GenerateRequest;
 use bitcoin_rs_mining::GenerateSelection;
+use bitcoin_rs_mining::GeneratedBlock;
 use bitcoin_rs_mining::MempoolSequenceWake;
 use bitcoin_rs_mining::MempoolSnapshotSource;
 use bitcoin_rs_mining::MiningChainContext;
+use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_mining::MiningControlError;
 pub use bitcoin_rs_mining::MiningGenerationSignal;
+use bitcoin_rs_mining::MiningInfo;
 use bitcoin_rs_mining::MiningRule;
 use bitcoin_rs_mining::MiningService;
 use bitcoin_rs_mining::header_reject_reason;
 use bitcoin_rs_mining::snapshot_for_selection;
+use bitcoin_rs_mining::solve_block;
+use bitcoin_rs_mining::update_uncommitted_block_structures;
+use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::CompactTarget;
+use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
 use bitcoin_rs_primitives::Network;
+use bitcoin_rs_primitives::consensus_bytes;
 use compact_str::CompactString;
 use parking_lot::RwLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 /// Production mining coordinator owned by the node process.
 pub struct MiningCoordinator {
@@ -95,44 +108,86 @@ impl MiningCoordinator {
         self.service.notify_shutdown();
     }
 
-    /// Admits `header` through [`accept_headers`], the same gate inbound P2P uses.
-    fn accept_submitted_header(&self, header: Header) -> Result<(), MiningControlError> {
-        let _transition = self.apply_handles.lock_transition().map_err(|error| {
-            MiningControlError::Unavailable(CompactString::from(error.to_string()))
-        })?;
-        let mut tree = self.block_tree.write();
-        // Preserve accept_headers' idempotent duplicate path, including genesis.
-        if tree.lookup(header.compute_hash().into()).is_some() {
-            return accept_headers(
-                &mut tree,
-                std::slice::from_ref(&header),
-                self.network,
-                current_unix_seconds(),
-            )
-            .map(|_| ())
-            .map_err(header_reject_reason);
+    fn propose(&self, block: &Block) -> BlockValidationResult {
+        // Core GBT proposal looks the hash up before TestBlockValidity.
+        if let Some(known) = self.known_block_result(block.block_hash().into()) {
+            return known;
         }
-        let parent = tree.lookup(header.prev_blockhash.into()).ok_or_else(|| {
-            header_reject_reason(ChainError::MissingParent {
-                prev_hash: header.prev_blockhash.into(),
-            })
-        })?;
-        if tree
-            .node(parent)
-            .is_ok_and(|node| node.status == bitcoin_rs_chain::NodeStatus::Invalid)
-        {
-            return Err(MiningControlError::Rejected(CompactString::from(
-                "bad-prevblk",
-            )));
+        match self.apply_handles.validate_block(block) {
+            Ok(()) => BlockValidationResult::Accepted,
+            Err(error) => map_apply_error(error),
         }
-        accept_headers(
-            &mut tree,
-            std::slice::from_ref(&header),
-            self.network,
-            current_unix_seconds(),
-        )
-        .map(|_| ())
-        .map_err(header_reject_reason)
+    }
+
+    /// Core `LookupBlockIndex` / BIP22 proposal vocabulary.
+    ///
+    /// A node on the applied chain has had its body connected (Core
+    /// `BLOCK_VALID_SCRIPTS`). `Invalid` is `BLOCK_FAILED_VALID`. Any other
+    /// tree entry, including a header-only `Active` tip, is still
+    /// inconclusive — `NodeStatus::Active` is the header chain, not scripts.
+    fn known_block_result(&self, block_hash: Hash256) -> Option<BlockValidationResult> {
+        let tree = self.block_tree.read();
+        let node_id = tree.lookup(block_hash)?;
+        let node = tree.node(node_id).ok()?;
+        if node.status == NodeStatus::Invalid {
+            return Some(BlockValidationResult::DuplicateInvalid);
+        }
+        let on_applied = self
+            .applied_tip
+            .load_full()
+            .is_some_and(|tip| tree.node_at_height_from(tip.tip_id, node.height) == Some(node_id));
+        if on_applied || node.chain_tx_count != 0 {
+            return Some(BlockValidationResult::Duplicate);
+        }
+        Some(BlockValidationResult::DuplicateInconclusive)
+    }
+
+    /// Core `submitblock` fills the coinbase reserved nonce when the block
+    /// already has a BIP141 commitment but no coinbase witness. Proposal skips this.
+    fn fill_uncommitted_witness(&self, block: &mut Block) {
+        let tree = self.block_tree.read();
+        let Some(prev_id) = tree.lookup(block.header.prev_blockhash.into()) else {
+            return;
+        };
+        let Ok(prev) = tree.node(prev_id) else {
+            return;
+        };
+        let height = prev.height.saturating_add(1);
+        let segwit_active = self.network.is_segwit_active(height);
+        drop(tree);
+        update_uncommitted_block_structures(block, segwit_active);
+    }
+
+    fn submit(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
+        let block_hash: Hash256 = block.block_hash().into();
+        // Core v31 `submitblock` dropped the index pre-check. `ProcessNewBlock`
+        // returns `duplicate` only when the block was already accepted
+        // (`!new_block && accepted`). A header-only tree entry must still
+        // receive the body so `submitheader` then `submitblock` works.
+        if matches!(
+            self.known_block_result(block_hash),
+            Some(BlockValidationResult::Duplicate)
+        ) {
+            return Ok(BlockValidationResult::Duplicate);
+        }
+
+        match self.followers.apply_connect(&self.apply_handles, block) {
+            Ok(outcome) => {
+                let tip = outcome.tip;
+                let visible = self.applied_tip.load_full().ok_or_else(|| {
+                    MiningControlError::Failed(CompactString::from(
+                        "applied tip missing after accepted submission",
+                    ))
+                })?;
+                if visible.hash != tip.hash {
+                    return Err(MiningControlError::Failed(CompactString::from(
+                        "applied tip was not published before submit_block returned",
+                    )));
+                }
+                Ok(BlockValidationResult::Accepted)
+            }
+            Err(error) => Ok(map_apply_error(error)),
+        }
     }
 }
 
@@ -226,5 +281,205 @@ impl MempoolSequenceWake for MiningCoordinator {
     }
 }
 
+impl MiningControl for MiningCoordinator {
+    fn get_block_template(
+        &self,
+        request: BlockTemplateRequest,
+    ) -> Result<BlockTemplateResult, MiningControlError> {
+        match request.mode {
+            BlockTemplateMode::Proposal(block) => {
+                Ok(BlockTemplateResult::Proposal(self.propose(&block)))
+            }
+            BlockTemplateMode::Template => Ok(BlockTemplateResult::Template(
+                self.service
+                    .get_block_template(request.long_poll_id.as_deref())?,
+            )),
+        }
+    }
+
+    fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
+        let tip = self.applied_tip.load_full();
+        let network_hashes_per_second = {
+            let tree = self.block_tree.read();
+            tip.as_ref().map_or(0.0, |tip| {
+                bitcoin_rs_mining::estimate_network_hashps(
+                    &tree,
+                    Some(tip.tip_id),
+                    120,
+                    self.network,
+                )
+            })
+        };
+        let warnings = Vec::new();
+        self.service
+            .mining_info(network_hashes_per_second, warnings, tip.as_deref())
+    }
+
+    fn network_hash_ps(&self, lookup: i64, height: i64) -> Result<f64, MiningControlError> {
+        let tree = self.block_tree.read();
+        let tip = self.applied_tip.load_full();
+        bitcoin_rs_mining::network_hash_ps(&tree, tip.as_deref(), lookup, height, self.network)
+    }
+
+    fn submit_block(&self, mut block: Block) -> Result<BlockValidationResult, MiningControlError> {
+        self.fill_uncommitted_witness(&mut block);
+        self.submit(&block)
+    }
+
+    /// Admits `header` through [`accept_headers`], the same gate inbound P2P uses.
+    fn submit_header(&self, header: Header) -> Result<(), MiningControlError> {
+        let _transition = self.apply_handles.lock_transition().map_err(|error| {
+            MiningControlError::Unavailable(CompactString::from(error.to_string()))
+        })?;
+        let mut tree = self.block_tree.write();
+        // Preserve accept_headers' idempotent duplicate path, including genesis.
+        if tree.lookup(header.compute_hash().into()).is_none() {
+            let parent = tree.lookup(header.prev_blockhash.into()).ok_or_else(|| {
+                header_reject_reason(ChainError::MissingParent {
+                    prev_hash: header.prev_blockhash.into(),
+                })
+            })?;
+            if tree
+                .node(parent)
+                .is_ok_and(|node| node.status == NodeStatus::Invalid)
+            {
+                return Err(MiningControlError::Rejected(CompactString::from(
+                    "bad-prevblk",
+                )));
+            }
+        }
+        accept_headers(
+            &mut tree,
+            std::slice::from_ref(&header),
+            self.network,
+            current_unix_seconds(),
+        )
+        .map(|_| ())
+        .map_err(header_reject_reason)
+    }
+
+    fn publish_generation(&self) {
+        self.service.publish_generation();
+    }
+
+    /// Assemble, solve, and optionally persist `request.count` blocks (`API-05`).
+    ///
+    /// `generateblock` (`GenerateSelection::Ordered`) runs Core's
+    /// `TestBlockValidity` before the nonce search (`API-30`).
+    /// `generatetoaddress` (`Mempool`) does not. Each submitted block is
+    /// applied through [`ChainFollowers::apply_connect`] before the next iteration; that
+    /// is the commit point (`ARCH-07`). Failure after *N* accepted submissions
+    /// leaves those *N* blocks durable at the applied tip. `submit = false`
+    /// dry-validates through [`Chainstate::validate_block`] and does not persist.
+    /// The result vector grows one block at a time, so `count` cannot force a
+    /// large allocation up front. Callers own retry after inspecting the tip.
+    /// [`MiningControlError::InvalidRequest`] is not retriable without changing
+    /// the request; `Unavailable` and `Failed` may be retried.
+    fn generate(
+        &self,
+        request: GenerateRequest,
+    ) -> Result<Vec<GeneratedBlock>, MiningControlError> {
+        if request.count == 0 {
+            return Ok(Vec::new());
+        }
+        if !request.submit && request.count != 1 {
+            return Err(MiningControlError::InvalidRequest(CompactString::from(
+                "submit=false requires nblocks=1",
+            )));
+        }
+        let mut generated = Vec::new();
+        for _ in 0..request.count {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(MiningControlError::Unavailable(CompactString::from(
+                    "node is shutting down",
+                )));
+            }
+            let candidate = self
+                .service
+                .assemble_fresh(&request.payout, &request.selection)?;
+            let mut block = candidate.into_unsolved_block();
+            if matches!(request.selection, GenerateSelection::Ordered(_)) {
+                // CONTRACT: docs/contracts/external-api.md#API-30
+                self.apply_handles
+                    .validate_block(&block)
+                    .map_err(test_block_validity_error)?;
+            }
+            solve_block(&mut block, request.max_tries).map_err(|error| {
+                MiningControlError::Failed(CompactString::from(error.to_string()))
+            })?;
+            if request.submit {
+                match self.submit(&block)? {
+                    BlockValidationResult::Accepted => {}
+                    other => {
+                        return Err(MiningControlError::Failed(CompactString::from(format!(
+                            "generated block was not accepted: {other:?}"
+                        ))));
+                    }
+                }
+            } else {
+                let validation = self.propose(&block);
+                if validation != BlockValidationResult::Accepted {
+                    return Err(MiningControlError::Failed(CompactString::from(format!(
+                        "generated block failed validation: {validation:?}"
+                    ))));
+                }
+            }
+            generated.push(GeneratedBlock {
+                hash: block.block_hash(),
+                hex: hex_encode(&consensus_bytes(&block)),
+            });
+        }
+        Ok(generated)
+    }
+}
+
+fn map_apply_error(error: ApplyError) -> BlockValidationResult {
+    match error {
+        ApplyError::Shutdown | ApplyError::JournalBackpressure(_) => {
+            BlockValidationResult::Inconclusive
+        }
+        other => BlockValidationResult::Rejected(bip22_reject_reason(&other)),
+    }
+}
+
+/// Core `JSONRPCError(RPC_VERIFY_ERROR, "TestBlockValidity failed: %s")`.
+///
+/// Shutdown and journal backpressure stay operational; they are not wrapped
+/// as `TestBlockValidity`. CONTRACT: docs/contracts/external-api.md#API-30
+fn test_block_validity_error(error: ApplyError) -> MiningControlError {
+    match error {
+        error @ (ApplyError::Shutdown | ApplyError::JournalBackpressure(_)) => {
+            MiningControlError::Unavailable(CompactString::from(error.to_string()))
+        }
+        other => MiningControlError::Rejected(CompactString::from(format!(
+            "TestBlockValidity failed: {}",
+            bip22_reject_reason(&other)
+        ))),
+    }
+}
+
+/// Core `GetRejectReason` strings used by `BIP22ValidationResult`.
+fn bip22_reject_reason(error: &ApplyError) -> CompactString {
+    match error {
+        ApplyError::ProofOfWork { .. } => CompactString::from("high-hash"),
+        ApplyError::PrevHashMismatch { .. } => CompactString::from("inconclusive-not-best-prevblk"),
+        ApplyError::TargetAboveLimit | ApplyError::NbitsNonRetargetMismatch { .. } => {
+            CompactString::from("bad-diffbits")
+        }
+        ApplyError::BlockOutputsExceedInputs | ApplyError::BlockValueOverflow => {
+            CompactString::from("bad-cb-amount")
+        }
+        ApplyError::UndoPrevoutMissing { .. } => {
+            CompactString::from("bad-txns-inputs-missingorspent")
+        }
+        // A consensus-rule failure inside block apply.
+        ApplyError::Consensus(consensus) => bitcoin_rs_mining::consensus_reject_reason(consensus),
+        // A header/chain admission failure inside block apply.
+        ApplyError::Chain(chain) => bitcoin_rs_mining::chain_reject_reason(chain),
+        other => CompactString::from(other.to_string()),
+    }
+}
+
 #[cfg(test)]
+#[path = "../tests/unit/mining/apply_error_tests.rs"]
 mod apply_error_tests;
