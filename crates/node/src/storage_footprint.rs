@@ -108,7 +108,7 @@ impl crate::storage_backend::StoreConsumer for LogicalScan<'_> {
 struct TxIndexScan;
 
 impl crate::storage_backend::StoreConsumer for TxIndexScan {
-    type Output = (Vec<LogicalOwner>, Option<IndexWatermarkEvidence>);
+    type Output = (Vec<LogicalOwner>, IndexWatermarkEvidence);
     type Error = anyhow::Error;
 
     fn consume<S>(self, store: Arc<S>) -> Result<Self::Output>
@@ -116,10 +116,11 @@ impl crate::storage_backend::StoreConsumer for TxIndexScan {
         S: bitcoin_rs_storage::KvStore,
     {
         let owners = logical_store_owners(&*store, "txindex")?;
-        let watermarks = Indexer::new(store)
-            .watermarks()
-            .ok()
-            .map(watermark_evidence);
+        let watermarks = watermark_evidence(
+            Indexer::new(store)
+                .watermarks()
+                .context("read txindex watermarks")?,
+        );
         Ok((owners, watermarks))
     }
 }
@@ -303,9 +304,7 @@ fn collect_logical(
             for owner in owners {
                 logical.push(owner);
             }
-            if let Some(found) = found {
-                watermarks = found;
-            }
+            watermarks = found;
         }
     }
     Ok((logical, watermarks))
