@@ -91,19 +91,16 @@ impl BlockSync {
     /// connection. Stale sources are ignored; see
     /// `docs/solutions/architecture-patterns/p2p-owns-peer-lifecycle.md`.
     pub fn on_peer_ready(&self, source: crate::PeerSource) {
-        // Window before table, matching `tick` / `send_getdata_for_pending_blocks`.
-        let mut body_sync = self.body_sync.lock();
-        if !self.peer_table.is_current(source) {
-            return;
-        }
-        body_sync.window.forget_peer(source.addr);
-        drop(body_sync);
-        let mut pending = self.pending_getheaders.lock();
-        if pending.is_some_and(|request| request.peer_addr == source.addr)
-            && self.peer_table.is_current(source)
-        {
-            *pending = None;
-        }
+        // Table before window, as in request publication. Validating again
+        // under the window can deadlock behind a queued table writer while
+        // an existing table reader waits for this window.
+        self.peer_table.with_current(source, || {
+            self.body_sync.lock().window.forget_peer(source.addr);
+            let mut pending = self.pending_getheaders.lock();
+            if pending.is_some_and(|request| request.peer_addr == source.addr) {
+                *pending = None;
+            }
+        });
     }
 
     pub(super) fn reconcile_peer_sessions(&self) {
@@ -125,7 +122,6 @@ impl BlockSync {
     }
 
     pub(super) fn sync_peer_selection(&self, our_height: u32, now: Instant) -> SyncPeerSelection {
-        let mut header_peer: Option<SyncPeer> = None;
         let mut candidates: Vec<FanoutCandidate> = Vec::new();
         let sessions = self.peer_table.sessions();
         let tree = self.chain.block_tree().read();
@@ -144,12 +140,6 @@ impl BlockSync {
             // otherwise become ineligible for every newly announced block
             // (#617). Per-request truncation by `peer_best_height` still
             // bounds the damage of a stale value.
-            let Some(sync_peer) = sync_peer_candidate(&peer, our_height) else {
-                continue;
-            };
-            if header_peer.is_none_or(|current| outranks(current, sync_peer)) {
-                header_peer = Some(sync_peer);
-            }
             let Some(active_height) =
                 body_capability_height(&peer, &tree, active_tip, &session.demonstrated_tips)
             else {
@@ -209,27 +199,23 @@ impl BlockSync {
             // honest peer and re-acquire the window front (RE-ADV-2 /
             // first-audit ADV-2).
             let mut preferred: Option<SyncPeer> = None;
+            let allow_soft = candidates.iter().all(|candidate| candidate.soft_blocked);
             for candidate in candidates
                 .iter()
-                .filter(|candidate| !candidate.soft_blocked)
+                .filter(|candidate| allow_soft || !candidate.soft_blocked)
             {
                 // First-wins on equal heights, matching the header-peer fold.
                 if preferred.is_none_or(|current| outranks(current, candidate.peer)) {
                     preferred = Some(candidate.peer);
                 }
             }
-            preferred
-                .or(header_peer)
-                .into_iter()
-                .take(request_peer_limit)
-                .collect()
+            preferred.into_iter().take(request_peer_limit).collect()
         };
         if request_peers.len() > 1 {
             request_peers.sort_by_key(|peer| std::cmp::Reverse(peer.best_known_height));
         }
         request_peers.truncate(request_peer_limit);
         SyncPeerSelection {
-            header_peer,
             request_peers,
             probe_peers,
         }

@@ -266,3 +266,64 @@ fn correct_body_staged_then_malformed_duplicate_is_ignored()
 
     Ok(())
 }
+
+/// P2P-05: losing the only credited body peer must not require restart or a
+/// spontaneous announcement from a surviving, long-lived connection.
+#[test]
+fn idle_frontier_relearns_stale_peer_credit_after_rejected_body()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sync, hash, correct, stripped) = segwit_sync_fixture()?;
+    let bad = test_addr(9765, 0)?;
+    let good = test_addr(9765, 1)?;
+    let bad_rx = connect_peer(&sync.peer_table, eligible_peer(bad, 1));
+    let good_rx = connect_peer(&sync.peer_table, eligible_peer(good, 0));
+    let (headers_tx, headers_rx) = unbounded();
+    *sync.inbound_headers_rx.lock() = headers_rx;
+    sync.tick();
+    assert_eq!(
+        witness_block_inventory(next_getdata(&bad_rx)?)?,
+        vec![BlockHash(hash)]
+    );
+    let mut malformed = InboundBlock::from_decoded(stripped);
+    malformed.source = Some(current_source(&sync.peer_table, bad));
+    sync.buffer_received_block_chunk(&mut vec![malformed], Some(hash));
+    sync.tick();
+
+    let Message::GetHeaders(request) = good_rx.try_recv()? else {
+        return Err("idle recovery must discover headers before assuming body capability".into());
+    };
+    let genesis = Network::Regtest.genesis_block().block_hash();
+    assert_eq!(
+        request.locator_hashes.first().map(|h| *h.as_byte_array()),
+        Some(*genesis.as_bytes())
+    );
+    sync.tick();
+    assert!(
+        good_rx.try_recv().is_err(),
+        "one pending probe suppresses duplicate work"
+    );
+
+    headers_tx.send(InboundHeaders {
+        headers: vec![correct.header],
+        source: Some(current_source(&sync.peer_table, good)),
+    })?;
+    sync.tick();
+    assert_eq!(
+        witness_block_inventory(next_getdata(&good_rx)?)?,
+        vec![BlockHash(hash)]
+    );
+    let mut delivered = InboundBlock::from_decoded(correct);
+    delivered.source = Some(current_source(&sync.peer_table, good));
+    sync.buffer_received_block_chunk(&mut vec![delivered], Some(hash));
+    sync.tick();
+    assert_eq!(
+        sync.chain
+            .applied_tip()
+            .load_full()
+            .ok_or("missing applied tip")?
+            .hash,
+        hash
+    );
+    assert_no_getdata(&good_rx)?;
+    Ok(())
+}

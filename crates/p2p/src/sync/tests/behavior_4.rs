@@ -58,10 +58,7 @@ fn tick_fills_mixed_retry_and_new_height_batch() -> Result<(), Box<dyn std::erro
     };
     assert_eq!(witness_block_inventory(first)?, expected[..3]);
     let _headers = rx.try_recv()?;
-    sync.body_sync
-        .lock()
-        .window
-        .mark_applied(&Hash256::from_le_bytes(expected[0].as_bytes()));
+    apply_fixture_block(&sync, header_chain_block(&expected, 1)?)?;
 
     sync.tick();
 

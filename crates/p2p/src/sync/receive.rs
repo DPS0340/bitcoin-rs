@@ -201,7 +201,20 @@ impl BlockSync {
                 // to the header before it can occupy that slot.
                 if let Err(error) = binding_result {
                     metrics::counter!("node.sync.body_binding_drops").increment(1);
-                    tracing::warn!(%hash, %error, "block sync: body/header binding failed; rejecting delivery");
+                    let witness = inbound
+                        .block
+                        .txs
+                        .first()
+                        .and_then(|tx| tx.inputs.first())
+                        .map(|input| &input.witness);
+                    tracing::warn!(
+                        %hash, %error, ?source,
+                        serialized_bytes = inbound.serialized.len(),
+                        transactions = inbound.block.txs.len(),
+                        coinbase_witness_items = witness.map_or(0, bitcoin_rs_primitives::Witness::len),
+                        coinbase_witness_first_bytes = witness.and_then(|stack| stack.first()).map_or(0, Vec::len),
+                        "block sync: body/header binding failed; rejecting delivery"
+                    );
                     reject_deliveries.push((hash, source));
                     continue;
                 }

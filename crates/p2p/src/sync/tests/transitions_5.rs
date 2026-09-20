@@ -289,10 +289,10 @@ fn tick_preserves_partial_window_order_across_pending_gap() -> Result<(), Box<dy
     };
     assert_eq!(witness_block_inventory(first)?, expected[..4]);
     let _headers = rx.try_recv()?;
+    apply_fixture_block(&sync, header_chain_block(&expected, 1)?)?;
     {
         let mut body_sync = sync.body_sync.lock();
         let window = &mut body_sync.window;
-        window.mark_applied(&Hash256::from_le_bytes(expected[0].as_bytes()));
         window.drop_for_retry(&Hash256::from_le_bytes(expected[1].as_bytes()));
     }
 

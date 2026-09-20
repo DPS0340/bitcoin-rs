@@ -206,10 +206,6 @@ impl BlockSync {
         }
         self.reconcile_peer_sessions();
         let sync_peer_selection = self.sync_peer_selection(applied_height, now);
-        if sync_peer_selection.header_peer.is_none() {
-            tracing::trace!(applied_height, "block sync: no peer above current height");
-            return;
-        }
         let mut sent_getdata = false;
         let request_peer_count = sync_peer_selection.request_peers.len();
         for (peer_idx, peer) in sync_peer_selection.request_peers.into_iter().enumerate() {
@@ -230,7 +226,9 @@ impl BlockSync {
             }
         }
         self.send_prefix_probes(&sync_peer_selection.probe_peers, now);
-        self.request_headers_from_best_peer();
+        if !self.probe_idle_frontier(now) {
+            self.request_headers_from_best_peer();
+        }
         if sent_getdata {
             self.record_pending_sync_metrics();
         }

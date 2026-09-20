@@ -124,3 +124,31 @@ This page assigns ownership and cites proof under the
   `a_timed_out_refill_does_not_replay_consumed_bytes`: one kernel delivery of
   two v1 frames decodes both without a second socket read, and a timed-out
   refill does not replay consumed bytes (`P2P-01`).
+
+### `P2P-05`: Canonical frontier recovery without invented peer credit
+
+- The applied chain and selected header ancestry own the next required body.
+  The download cursor is a scan hint. An unowned frontier behind that hint
+  becomes requestable again, including an applied rollback with unchanged
+  headers. Existing pending and staged bodies retain their ownership.
+- A known-header gap with no body work triggers a header probe from the
+  applied chain. Only a subsequent accepted active-branch announcement grants
+  body capability. Losing the last credited peer must not require restart or
+  an unsolicited announcement from a surviving peer.
+- The existing header request and timeout pace discovery. Empty responses
+  preserve that deadline; expiry rotates among connected full witness peers.
+  Nonempty responses consume their matching request even when rejected.
+- Session validation and request publication hold the peer table before
+  download or header-request state. A cancelled ready event does not wait for
+  the download writer or modify its replacement's state.
+- Body/header binding failures reject the delivery, not the header branch.
+  Rejection logs carry source, byte/transaction counts and coinbase witness
+  shape. Compact reconstruction logs include the same block hash for joining
+  evidence. A header ahead of the applied chain is not evidence that the
+  applied-chain `getblockhash` RPC should return it.
+
+Proof: `sync/tests/frontier_recovery.rs` covers applied rollback, duplicate
+request suppression, empty-response pacing/rotation and cancelled readiness
+under contention. `sync/tests/witness_staging_gate.rs` covers bad delivery,
+peer replacement, relearned capability and eventual application. Existing
+branch-plan, attribution, timeout and bounded-staging suites remain required.
