@@ -546,13 +546,13 @@ pub(crate) fn write_checkpoint_from_dir(
     )?;
     let (trailer, accumulator) = utxo_result;
     let listener_stats = coin_stats.snapshot();
-    validate_chain_tx_count(chain_tx_count, &listener_stats)?;
     if listener_stats.height != applied_tip.height {
         return Err(CheckpointError::Store(StoreError::Invalid(format!(
             "CoinStats height {} does not match applied height {}",
             listener_stats.height, applied_tip.height
         ))));
     }
+    validate_chain_tx_count(chain_tx_count, &listener_stats)?;
     let mut fused_stats = accumulator.into_stats();
     fused_stats.tx_count = listener_stats.tx_count;
     let record_count = utxo.record_count();
