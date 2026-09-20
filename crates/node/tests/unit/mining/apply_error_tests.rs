@@ -12,9 +12,46 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Txid;
 use compact_str::CompactString;
 
+#[test]
+fn operational_failures_are_not_block_rejections() {
+    fn failures() -> Vec<ApplyError> {
+        use bitcoin_rs_storage::StorageError;
+        vec![
+            ApplyError::UtxoCommit(bitcoin_rs_utxo::UtxoError::CorruptRecord),
+            ApplyError::BlockBodyPersistence(StorageError::InvalidOperation("body write failed")),
+            ApplyError::UndoPersistence(StorageError::InvalidOperation("undo write failed")),
+            ApplyError::DurableHeadCommit(StorageError::InvalidOperation("head write failed")),
+            ApplyError::DurableHeadLineage {
+                head: Hash256::default(),
+                prev: Hash256::from_le_bytes(&[1; 32]),
+            },
+            ApplyError::Consensus(ConsensusError::Kernel("verifier unavailable".to_owned())),
+            ApplyError::Consensus(ConsensusError::PrevoutMatrixSize {
+                expected: 1,
+                actual: 0,
+            }),
+        ]
+    }
+
+    for error in failures() {
+        let result = map_apply_error(error);
+        assert!(
+            matches!(result, Err(MiningControlError::Failed(_))),
+            "operational failure became a block verdict: {result:?}"
+        );
+    }
+    for error in failures() {
+        let result = test_block_validity_error(&error);
+        assert!(
+            matches!(result, MiningControlError::Failed(_)),
+            "generateblock hid an operational error: {result:?}"
+        );
+    }
+}
+
 fn rejected(error: ApplyError) -> CompactString {
     match map_apply_error(error) {
-        BlockValidationResult::Rejected(reason) => reason,
+        Ok(BlockValidationResult::Rejected(reason)) => reason,
         other => panic!("expected rejected, got {other:?}"),
     }
 }
@@ -23,14 +60,14 @@ fn rejected(error: ApplyError) -> CompactString {
 fn journal_backpressure_is_operational() {
     assert!(matches!(
         map_apply_error(ApplyError::JournalBackpressure("test pressure".to_owned())),
-        BlockValidationResult::Inconclusive
+        Ok(BlockValidationResult::Inconclusive)
     ));
 }
 
 // CONTRACT: docs/contracts/external-api.md#API-30
 #[test]
 fn generateblock_validity_wraps_bip22_reason() {
-    let error = test_block_validity_error(ApplyError::UndoPrevoutMissing {
+    let error = test_block_validity_error(&ApplyError::UndoPrevoutMissing {
         txid: Txid::from(Hash256::from_le_bytes(&[0x11; 32])),
         vout: 0,
     });
@@ -49,11 +86,11 @@ fn generateblock_validity_wraps_bip22_reason() {
 #[test]
 fn generateblock_validity_keeps_shutdown_operational() {
     assert!(matches!(
-        test_block_validity_error(ApplyError::Shutdown),
+        test_block_validity_error(&ApplyError::Shutdown),
         MiningControlError::Unavailable(_)
     ));
     assert!(matches!(
-        test_block_validity_error(ApplyError::JournalBackpressure("test pressure".to_owned())),
+        test_block_validity_error(&ApplyError::JournalBackpressure("test pressure".to_owned())),
         MiningControlError::Unavailable(_)
     ));
 }

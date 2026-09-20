@@ -296,6 +296,7 @@ fn load_payloads(
 ) -> Result<RestoredChainstate, CheckpointError> {
     let chain_tx_count = manifest.applied_tip.chain_tx_count;
     let (utxo, coin_stats) = load_payloads_inner(generation_dir, manifest, &headers)?;
+    validate_chain_tx_count(chain_tx_count, &coin_stats)?;
     // Header reconstruction initializes counts to zero. Restore the exact
     // cumulative count on the applied tip; ancestor counts remain unknown.
     let mut cursor = Some(headers.applied_tip_id);
@@ -334,6 +335,16 @@ fn load_payloads(
         chain_tx_count,
     })
 }
+fn validate_chain_tx_count(chain_tx_count: u64, stats: &CoinStats) -> Result<(), CheckpointError> {
+    // Zero is the existing unknown-chain-count sentinel, not a second known total.
+    if chain_tx_count != 0 && chain_tx_count != stats.tx_count {
+        return Err(CheckpointError::Store(StoreError::Invalid(
+            "chain transaction count does not match CoinStats".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
 fn load_payloads_inner(
     generation_dir: &Dir,
     manifest: &CheckpointManifestV1,
@@ -541,6 +552,7 @@ pub(crate) fn write_checkpoint_from_dir(
             listener_stats.height, applied_tip.height
         ))));
     }
+    validate_chain_tx_count(chain_tx_count, &listener_stats)?;
     let mut fused_stats = accumulator.into_stats();
     fused_stats.tx_count = listener_stats.tx_count;
     let record_count = utxo.record_count();

@@ -108,13 +108,13 @@ impl MiningCoordinator {
         self.service.notify_shutdown();
     }
 
-    fn propose(&self, block: &Block) -> BlockValidationResult {
+    fn propose(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
         // Core GBT proposal looks the hash up before TestBlockValidity.
         if let Some(known) = self.known_block_result(block.block_hash().into()) {
-            return known;
+            return Ok(known);
         }
         match self.apply_handles.validate_block(block) {
-            Ok(()) => BlockValidationResult::Accepted,
+            Ok(()) => Ok(BlockValidationResult::Accepted),
             Err(error) => map_apply_error(error),
         }
     }
@@ -160,6 +160,12 @@ impl MiningCoordinator {
 
     fn submit(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
         let block_hash: Hash256 = block.block_hash().into();
+        // Duplicate classification and apply observe the same serialized chain state.
+        // Reserve a generation only after ruling out an already accepted body.
+        let lock = match self.apply_handles.lock_transition() {
+            Ok(lock) => lock,
+            Err(error) => return map_apply_error(error),
+        };
         // Core v31 `submitblock` dropped the index pre-check. `ProcessNewBlock`
         // returns `duplicate` only when the block was already accepted
         // (`!new_block && accepted`). A header-only tree entry must still
@@ -171,22 +177,45 @@ impl MiningCoordinator {
             return Ok(BlockValidationResult::Duplicate);
         }
 
-        match self.followers.apply_connect(&self.apply_handles, block) {
+        let transition = match self.apply_handles.begin_transition_locked(lock) {
+            Ok(transition) => transition,
+            Err(error) => return map_apply_error(error),
+        };
+        match transition.connect(block) {
             Ok(outcome) => {
+                self.followers.connected(block, &outcome);
                 let tip = outcome.tip;
-                let visible = self.applied_tip.load_full().ok_or_else(|| {
-                    MiningControlError::Failed(CompactString::from(
+                let Some(visible) = self.applied_tip.load_full() else {
+                    self.apply_handles.fail_closed_for_recovery();
+                    return Err(MiningControlError::Failed(CompactString::from(
                         "applied tip missing after accepted submission",
-                    ))
-                })?;
+                    )));
+                };
                 if visible.hash != tip.hash {
+                    self.apply_handles.fail_closed_for_recovery();
                     return Err(MiningControlError::Failed(CompactString::from(
                         "applied tip was not published before submit_block returned",
                     )));
                 }
+                if let Err(error) = transition.finish() {
+                    return Err(MiningControlError::Failed(CompactString::from(
+                        error.to_string(),
+                    )));
+                }
                 Ok(BlockValidationResult::Accepted)
             }
-            Err(error) => Ok(map_apply_error(error)),
+            Err(error) => {
+                if crate::apply::window::classify_apply_error(&error)
+                    == crate::apply::WindowApplyDisposition::Fatal
+                {
+                    self.apply_handles.fail_closed_for_recovery();
+                } else if let Err(finish_error) = transition.finish() {
+                    return Err(MiningControlError::Failed(CompactString::from(
+                        finish_error.to_string(),
+                    )));
+                }
+                map_apply_error(error)
+            }
         }
     }
 }
@@ -288,7 +317,7 @@ impl MiningControl for MiningCoordinator {
     ) -> Result<BlockTemplateResult, MiningControlError> {
         match request.mode {
             BlockTemplateMode::Proposal(block) => {
-                Ok(BlockTemplateResult::Proposal(self.propose(&block)))
+                Ok(BlockTemplateResult::Proposal(self.propose(&block)?))
             }
             BlockTemplateMode::Template => Ok(BlockTemplateResult::Template(
                 self.service
@@ -367,14 +396,15 @@ impl MiningControl for MiningCoordinator {
     /// `generateblock` (`GenerateSelection::Ordered`) runs Core's
     /// `TestBlockValidity` before the nonce search (`API-30`).
     /// `generatetoaddress` (`Mempool`) does not. Each submitted block is
-    /// applied through [`ChainFollowers::apply_connect`] before the next iteration; that
-    /// is the commit point (`ARCH-07`). Failure after *N* accepted submissions
+    /// applied and dispatched to [`ChainFollowers`] under one chain transition
+    /// before the next iteration (`ARCH-07`). Failure after *N* accepted submissions
     /// leaves those *N* blocks durable at the applied tip. `submit = false`
     /// dry-validates through [`Chainstate::validate_block`] and does not persist.
     /// The result vector grows one block at a time, so `count` cannot force a
     /// large allocation up front. Callers own retry after inspecting the tip.
     /// [`MiningControlError::InvalidRequest`] is not retriable without changing
-    /// the request; `Unavailable` and `Failed` may be retried.
+    /// the request. Operational failures require checking node state before retrying;
+    /// a failed durable commit requires recovery.
     fn generate(
         &self,
         request: GenerateRequest,
@@ -402,7 +432,7 @@ impl MiningControl for MiningCoordinator {
                 // CONTRACT: docs/contracts/external-api.md#API-30
                 self.apply_handles
                     .validate_block(&block)
-                    .map_err(test_block_validity_error)?;
+                    .map_err(|error| test_block_validity_error(&error))?;
             }
             solve_block(&mut block, request.max_tries).map_err(|error| {
                 MiningControlError::Failed(CompactString::from(error.to_string()))
@@ -417,7 +447,7 @@ impl MiningControl for MiningCoordinator {
                     }
                 }
             } else {
-                let validation = self.propose(&block);
+                let validation = self.propose(&block)?;
                 if validation != BlockValidationResult::Accepted {
                     return Err(MiningControlError::Failed(CompactString::from(format!(
                         "generated block failed validation: {validation:?}"
@@ -433,34 +463,31 @@ impl MiningControl for MiningCoordinator {
     }
 }
 
-fn map_apply_error(error: ApplyError) -> BlockValidationResult {
+fn map_apply_error(error: ApplyError) -> Result<BlockValidationResult, MiningControlError> {
     match error {
         ApplyError::Shutdown | ApplyError::JournalBackpressure(_) => {
-            BlockValidationResult::Inconclusive
+            Ok(BlockValidationResult::Inconclusive)
         }
-        other => BlockValidationResult::Rejected(bip22_reject_reason(&other)),
+        other => bip22_reject_reason(&other).map(BlockValidationResult::Rejected),
     }
 }
 
 /// Core `JSONRPCError(RPC_VERIFY_ERROR, "TestBlockValidity failed: %s")`.
 ///
-/// Shutdown and journal backpressure stay operational; they are not wrapped
-/// as `TestBlockValidity`. CONTRACT: docs/contracts/external-api.md#API-30
-fn test_block_validity_error(error: ApplyError) -> MiningControlError {
-    match error {
-        error @ (ApplyError::Shutdown | ApplyError::JournalBackpressure(_)) => {
-            MiningControlError::Unavailable(CompactString::from(error.to_string()))
-        }
-        other => MiningControlError::Rejected(CompactString::from(format!(
-            "TestBlockValidity failed: {}",
-            bip22_reject_reason(&other)
+/// Runtime failures remain operational, without a `TestBlockValidity` prefix.
+/// CONTRACT: docs/contracts/external-api.md#API-30
+fn test_block_validity_error(error: &ApplyError) -> MiningControlError {
+    match bip22_reject_reason(error) {
+        Ok(reason) => MiningControlError::Rejected(CompactString::from(format!(
+            "TestBlockValidity failed: {reason}"
         ))),
+        Err(error) => error,
     }
 }
 
 /// Core `GetRejectReason` strings used by `BIP22ValidationResult`.
-fn bip22_reject_reason(error: &ApplyError) -> CompactString {
-    match error {
+fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningControlError> {
+    let reason = match error {
         ApplyError::ProofOfWork { .. } => CompactString::from("high-hash"),
         ApplyError::PrevHashMismatch { .. } => CompactString::from("inconclusive-not-best-prevblk"),
         ApplyError::TargetAboveLimit | ApplyError::NbitsNonRetargetMismatch { .. } => {
@@ -472,12 +499,55 @@ fn bip22_reject_reason(error: &ApplyError) -> CompactString {
         ApplyError::UndoPrevoutMissing { .. } => {
             CompactString::from("bad-txns-inputs-missingorspent")
         }
-        // A consensus-rule failure inside block apply.
+        ApplyError::Consensus(_)
+            if crate::apply::window::classify_apply_error(error)
+                == crate::apply::WindowApplyDisposition::Operational =>
+        {
+            return Err(MiningControlError::Failed(CompactString::from(
+                error.to_string(),
+            )));
+        }
         ApplyError::Consensus(consensus) => bitcoin_rs_mining::consensus_reject_reason(consensus),
-        // A header/chain admission failure inside block apply.
-        ApplyError::Chain(chain) => bitcoin_rs_mining::chain_reject_reason(chain),
-        other => CompactString::from(other.to_string()),
-    }
+        ApplyError::Chain(
+            chain @ (ChainError::MissingParent { .. }
+            | ChainError::NonContinuousHeader { .. }
+            | ChainError::ZeroTarget { .. }
+            | ChainError::TargetExceedsLimit { .. }
+            | ChainError::InvalidPow { .. }
+            | ChainError::NbitsMismatch { .. }
+            | ChainError::TimestampTooEarly { .. }
+            | ChainError::TimestampTooFarAhead { .. }),
+        ) => bitcoin_rs_mining::chain_reject_reason(chain),
+        ApplyError::Shutdown | ApplyError::JournalBackpressure(_) => {
+            return Err(MiningControlError::Unavailable(CompactString::from(
+                error.to_string(),
+            )));
+        }
+        ApplyError::HeightOverflow(_)
+        | ApplyError::Chain(
+            ChainError::NodeIdOverflow { .. }
+            | ChainError::UnknownNode { .. }
+            | ChainError::DuplicateHeader { .. }
+            | ChainError::ChainworkOverflow { .. }
+            | ChainError::HeightOverflow { .. }
+            | ChainError::NoCommonAncestor { .. },
+        )
+        | ApplyError::UtxoCommit(_)
+        | ApplyError::BlockBodyPersistence(_)
+        | ApplyError::UndoPersistence(_)
+        | ApplyError::UndoLoad(_)
+        | ApplyError::DisconnectNotTip { .. }
+        | ApplyError::DisconnectBodyMismatch { .. }
+        | ApplyError::DurableHeadCommit(_)
+        | ApplyError::DurableHeadLineage { .. }
+        | ApplyError::DurableHeadGapUnrecoverable { .. }
+        | ApplyError::CoinStatsRewind(_) => {
+            return Err(MiningControlError::Failed(CompactString::from(
+                error.to_string(),
+            )));
+        }
+    };
+    Ok(reason)
 }
 
 #[cfg(test)]

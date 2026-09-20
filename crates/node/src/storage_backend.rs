@@ -127,8 +127,18 @@ fn unsupported(namespace: &str, backend: StorageBackend) -> StorageError {
 #[cfg(test)]
 mod tests {
     const RUNTIME_CONSUMERS: &[(&str, &str)] = &[
+        ("checkpoint.rs", include_str!("checkpoint.rs")),
+        (
+            "checkpoint_headers.rs",
+            include_str!("checkpoint_headers.rs"),
+        ),
+        (
+            "checkpoint_publisher.rs",
+            include_str!("checkpoint_publisher.rs"),
+        ),
         ("state.rs", include_str!("state.rs")),
         ("state_events.rs", include_str!("state_events.rs")),
+        ("state_maintenance.rs", include_str!("state_maintenance.rs")),
         ("state_open.rs", include_str!("state_open.rs")),
         ("state_prune.rs", include_str!("state_prune.rs")),
         ("state_restore.rs", include_str!("state_restore.rs")),

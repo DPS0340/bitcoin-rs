@@ -245,12 +245,12 @@ pub enum ReorgError {
     ///
     /// Every block before this one committed fully. A refusal before the UTXO
     /// commit leaves a consistent prefix of the target branch; a
-    /// [`ApplyError::UtxoCommit`] failure may leave partial coin changes and
-    /// requires recovery with admission closed. The switch is abandoned
+    /// [`ApplyError::UtxoCommit`] or durable-head failure may leave partial
+    /// or unconfirmed state and requires recovery with admission closed. The switch is abandoned
     /// rather than rolled back — undoing the prefix means disconnecting blocks that just
     /// applied, which can fail Fatal and turn a recoverable stop into an
     /// unrecoverable one. A later switch can continue from a coherent prefix;
-    /// a failed UTXO commit must first recover its authoritative state.
+    /// a failed UTXO or durable-head commit must first recover its authoritative state.
     ///
     /// When the failure is permanently branch-invalid (`PoW`, `nBits`, or
     /// non-mutation consensus),
@@ -327,7 +327,8 @@ impl ReorgError {
         match self {
             Self::Fatal(_) | Self::TransitionSettlement { .. } => true,
             Self::ConnectFailed { source, .. } => {
-                matches!(source.as_ref(), ApplyError::UtxoCommit(_))
+                crate::apply::window::classify_apply_error(source)
+                    == crate::apply::WindowApplyDisposition::Fatal
             }
             Self::UnknownBlock(_)
             | Self::CannotInvalidateGenesis
@@ -835,15 +836,12 @@ fn settle_reorg_transition(
     transition: ChainTransition<'_>,
     outcome: core::result::Result<(), ReorgError>,
 ) -> core::result::Result<(), ReorgError> {
+    let handles = transition.chainstate();
     if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
+        handles.fail_closed_for_recovery();
         return outcome;
     }
-    let handles = transition.chainstate();
     if let Err(source) = transition.finish() {
-        handles.admission.close_permanently();
-        handles
-            .shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
         tracing::error!(
             original = ?outcome,
             finish = %source,

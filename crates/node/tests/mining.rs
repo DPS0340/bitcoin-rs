@@ -1124,6 +1124,47 @@ fn duplicate_submit_returns_duplicate() -> anyhow::Result<()> {
 }
 
 #[test]
+fn concurrent_duplicate_submissions_leave_admission_open() -> anyhow::Result<()> {
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = coordinator(&state);
+    let child = mined_child(Network::Regtest.genesis_block().block_hash())?;
+    let start = std::sync::Barrier::new(3);
+    let outcomes = thread::scope(|scope| {
+        let submit = || {
+            start.wait();
+            mining.submit_block(child.clone())
+        };
+        let first = scope.spawn(submit);
+        let second = scope.spawn(submit);
+        start.wait();
+        [
+            first
+                .join()
+                .unwrap_or_else(|error| std::panic::resume_unwind(error)),
+            second
+                .join()
+                .unwrap_or_else(|error| std::panic::resume_unwind(error)),
+        ]
+    });
+    let [first, second] = outcomes;
+    let results = [first?, second?];
+    assert!(results.contains(&BlockValidationResult::Accepted));
+    assert!(results.contains(&BlockValidationResult::Duplicate));
+    assert!(state.mempool_gateway().stable_generation().is_some());
+    assert_eq!(state.active_chain_snapshot().tip_height, 1);
+    let mut next = mined_child_labeled(child.block_hash(), 2)?;
+    next.header.time = child.header.time + 1;
+    mine_block_to_regtest_target(&mut next)?;
+    assert_eq!(
+        mining.submit_block(next)?,
+        BlockValidationResult::Accepted,
+        "a racing duplicate must not poison the next valid submission"
+    );
+    Ok(())
+}
+
+#[test]
 fn unsolved_pow_is_rejected_by_proposal_and_submit() -> anyhow::Result<()> {
     let state = open_regtest()?;
     apply_genesis(&state)?;
@@ -1154,6 +1195,11 @@ fn unsolved_pow_is_rejected_by_proposal_and_submit() -> anyhow::Result<()> {
         }
         other => panic!("expected submit high-hash, got {other:?}"),
     }
+    assert!(
+        state.mempool_gateway().stable_generation().is_some(),
+        "a clean block rejection must settle the chain generation"
+    );
+    assert!(!state.shutdown().load(Ordering::Acquire));
     Ok(())
 }
 

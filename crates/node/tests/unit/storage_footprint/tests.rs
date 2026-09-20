@@ -314,3 +314,83 @@ fn logical_chainstate_rows_are_named_owners() -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(feature = "fjall")]
+#[test]
+fn corrupt_txindex_watermarks_are_errors_not_missing_evidence() -> Result<()> {
+    use bitcoin_rs_storage::{ColumnFamily, FjallStore, KvStore, WriteBatch};
+
+    // Durable capability keys from index/capability.rs, not candidate-generated values.
+    for key in [b"\0T", b"\0S", b"\0L"] {
+        let dir = tempdir()?;
+        let txindex = dir.path().join("txindex");
+        std::fs::create_dir(&txindex)?;
+        let store = FjallStore::open(&txindex)?;
+        let mut batch = store.new_batch();
+        batch.put(ColumnFamily::UtxoMeta, key, b"broken");
+        store.write(batch)?;
+        drop(store);
+        let mut config = NodeConfig::default_for_network(Network::Regtest);
+        config.data_dir = dir.path().to_path_buf();
+        config.p2p.listen.clear();
+        let result = measure_storage_footprint(&config, &MeasureStorageRequest::default());
+        let Err(error) = result else {
+            anyhow::bail!("corrupt watermark {key:?} became valid storage evidence");
+        };
+        assert!(matches!(
+            error.downcast_ref::<bitcoin_rs_index::IndexError>(),
+            Some(bitcoin_rs_index::IndexError::InvalidWatermark)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn absent_and_valid_txindex_watermarks_remain_distinct() -> Result<()> {
+    use bitcoin_rs_storage::{ColumnFamily, FjallStore, KvStore, WriteBatch};
+
+    let dir = tempdir()?;
+    let mut config = NodeConfig::default_for_network(Network::Regtest);
+    config.data_dir = dir.path().to_path_buf();
+    config.p2p.listen.clear();
+    let txindex = dir.path().join("txindex");
+    for create_empty_namespace in [false, true] {
+        if create_empty_namespace {
+            std::fs::create_dir(&txindex)?;
+        }
+        let evidence = measure_storage_footprint(&config, &MeasureStorageRequest::default())?;
+        let watermarks = evidence.identity.index_watermarks;
+        assert!(watermarks.tx_lookup.is_none());
+        assert!(watermarks.script_history.is_none());
+        assert!(watermarks.script_live.is_none());
+        if create_empty_namespace {
+            assert!(std::fs::read_dir(&txindex)?.next().is_none());
+        } else {
+            assert!(!txindex.exists());
+        }
+    }
+
+    let store = FjallStore::open(&txindex)?;
+    let mut batch = store.new_batch();
+    for (key, height, marker) in [(b"\0T", 7_u32, 0xa1), (b"\0S", 8, 0xb2), (b"\0L", 9, 0xc3)] {
+        // Independent fixture for the durable 4-byte LE height followed by 32 hash bytes.
+        let mut encoded = [marker; 36];
+        encoded[..4].copy_from_slice(&height.to_le_bytes());
+        batch.put(ColumnFamily::UtxoMeta, key, &encoded);
+    }
+    store.write(batch)?;
+    drop(store);
+    let evidence = measure_storage_footprint(&config, &MeasureStorageRequest::default())?;
+    let watermarks = evidence.identity.index_watermarks;
+    for (watermark, height, hash) in [
+        (watermarks.tx_lookup, 7, "a1"),
+        (watermarks.script_history, 8, "b2"),
+        (watermarks.script_live, 9, "c3"),
+    ] {
+        let watermark = watermark.ok_or_else(|| anyhow::anyhow!("missing persisted watermark"))?;
+        assert_eq!(watermark.height, height);
+        assert_eq!(watermark.hash, hash.repeat(32));
+    }
+    Ok(())
+}
