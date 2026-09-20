@@ -836,15 +836,12 @@ fn settle_reorg_transition(
     transition: ChainTransition<'_>,
     outcome: core::result::Result<(), ReorgError>,
 ) -> core::result::Result<(), ReorgError> {
+    let handles = transition.chainstate();
     if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
+        handles.fail_closed_for_recovery();
         return outcome;
     }
-    let handles = transition.chainstate();
     if let Err(source) = transition.finish() {
-        handles.admission.close_permanently();
-        handles
-            .shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
         tracing::error!(
             original = ?outcome,
             finish = %source,

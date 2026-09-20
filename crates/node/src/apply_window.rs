@@ -366,6 +366,10 @@ pub(super) fn invalidate_failed_subtree(
 /// Body-binding failures do not prove the header invalid: a different body
 /// can have the same header hash. Operational failures also invalidate nothing.
 ///
+/// Fatal failures mean mutation or durable-head state may already have changed
+/// without a reliable commit receipt. They leave generation odd and require
+/// restart-time recovery; callers must not retry them in-process.
+///
 /// Kernel-backed script verification failures are classified Operational
 /// because `bitcoinkernel` can reject a valid block depending on process
 /// state (issue #618): the same block applies successfully after restart.

@@ -28,6 +28,11 @@ fn durable_head_window_failures_do_not_finish_generation() -> Result<(), Box<dyn
             crate::apply::WindowApplyDisposition::Fatal
         );
         assert_eq!(handles.mempool_gateway.stable_generation(), None);
+        assert!(handles.shutdown.load(std::sync::atomic::Ordering::Acquire));
+        assert!(matches!(
+            handles.lock_transition(),
+            Err(crate::ApplyError::Shutdown)
+        ));
     }
     Ok(())
 }
@@ -58,6 +63,11 @@ fn utxo_commit_failure_keeps_mempool_generation_odd() -> Result<(), Box<dyn std:
         None,
         "a possibly torn UTXO commit must keep admission closed"
     );
+    assert!(handles.shutdown.load(std::sync::atomic::Ordering::Acquire));
+    assert!(matches!(
+        handles.lock_transition(),
+        Err(crate::ApplyError::Shutdown)
+    ));
     Ok(())
 }
 
@@ -97,6 +107,7 @@ fn settle_window_failure_finish_failure_is_fatal() -> Result<(), Box<dyn std::er
         None,
         "generation must stay odd after a failed finish"
     );
+    assert!(handles.shutdown.load(std::sync::atomic::Ordering::Acquire));
     Ok(())
 }
 
@@ -168,5 +179,6 @@ fn settle_window_success_finish_failure_is_fatal() -> Result<(), Box<dyn std::er
         None,
         "generation must stay odd after a failed finish"
     );
+    assert!(handles.shutdown.load(std::sync::atomic::Ordering::Acquire));
     Ok(())
 }

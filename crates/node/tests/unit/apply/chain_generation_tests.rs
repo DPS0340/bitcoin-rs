@@ -417,27 +417,21 @@ fn a_window_spans_multiple_durable_groups_in_order() {
 }
 
 #[test]
-fn chain_change_proof_finish_restores_even_generation() {
+fn chain_transition_finish_restores_even_generation() {
     let (handles, _genesis, _genesis_hash) = setup_regtest_with_genesis();
-
     let transition = handles
-        .lock_transition()
-        .unwrap_or_else(|error| panic!("transition: {error}"));
-    let guard = handles
-        .mempool_gateway
-        .begin_chain_change()
-        .unwrap_or_else(|error| panic!("begin chain change: {error}"));
-    let proof = super::ChainChangeProof::new(transition, guard);
+        .begin_transition()
+        .unwrap_or_else(|error| panic!("begin transition: {error}"));
 
-    assert_eq!(proof.odd_generation(), 1);
-    assert_eq!(proof.reserved_even(), 2);
+    assert_eq!(transition.proof().odd_generation(), 1);
+    assert_eq!(transition.proof().reserved_even(), 2);
     assert_eq!(
         handles.mempool_gateway.stable_generation(),
         None,
         "odd while proof is held"
     );
 
-    proof
+    transition
         .finish()
         .unwrap_or_else(|error| panic!("finish restores even: {error}"));
     assert_eq!(

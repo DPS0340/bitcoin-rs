@@ -226,10 +226,6 @@ fn begin_chain_transition<'a>(
 /// entry points finish on success and drop on refusal so the gateway stays
 /// fail-closed.
 pub(crate) struct ChainChangeProof<'a> {
-    #[expect(
-        dead_code,
-        reason = "carried for unforgeability: holding the proof proves both tokens were acquired"
-    )]
     transition: TransitionLock<'a>,
     guard: ChainChangeGuard,
 }
@@ -253,13 +249,6 @@ impl<'a> ChainChangeProof<'a> {
     #[cfg(test)]
     pub(crate) fn reserved_even(&self) -> u64 {
         self.guard.reserved_even()
-    }
-
-    /// Finishes the chain change, storing the reserved even value.
-    ///
-    /// Consumes the proof so it cannot be used after finish.
-    pub(crate) fn finish(self) -> core::result::Result<(), ApplyError> {
-        self.guard.finish().map_err(|_| ApplyError::Shutdown)
     }
 }
 
@@ -668,13 +657,31 @@ impl<'a> ChainTransition<'a> {
     /// prefix is already in place and whose failing block was refused before
     /// the UTXO commit-of-record (`utxo.commit_borrowed_block`). Drop on a
     /// `UtxoCommit` refusal, panic, or torn state leaves generation odd until
-    /// recovery establishes a consistent chainstate.
+    /// recovery establishes a consistent chainstate. A failed generation CAS
+    /// closes admission and requests shutdown before releasing the transition
+    /// lock, so no waiting mutation can enter the unrecoverable state.
     pub fn finish(self) -> core::result::Result<(), ApplyError> {
-        self.proof.finish()
+        let Self { chainstate, proof } = self;
+        let ChainChangeProof { transition, guard } = proof;
+        let result = guard.finish().map_err(|_| ApplyError::Shutdown);
+        if result.is_err() {
+            chainstate.fail_closed_for_recovery();
+        }
+        drop(transition);
+        result
     }
 }
 
 impl Chainstate {
+    /// Permanently closes chain mutation and asks the process to shut down.
+    ///
+    /// Call only when the current chainstate may require restart-time recovery;
+    /// retrying or continuing to serve a mutable process state is unsafe.
+    pub(crate) fn fail_closed_for_recovery(&self) {
+        self.admission.close_permanently();
+        self.shutdown.store(true, Ordering::Release);
+    }
+
     /// `Fast` trusts a block only when it is the node at `height` on the
     /// best header tip's own chain, so a block on a competing branch never
     /// borrows that trust. The tip is read from the tree under the same read
@@ -962,8 +969,12 @@ impl Chainstate {
         })?;
         let committed = transition.connect_window(blocks, serialized)?;
         if let Err(source) = transition.finish() {
-            self.admission.close_permanently();
-            self.shutdown.store(true, Ordering::Release);
+            tracing::error!(
+                committed = committed.len(),
+                finish = %source,
+                "chain transition could not be settled after a committed window; \
+                 admission is permanently closed and shutdown requested"
+            );
             return Err(WindowApplyError {
                 applied: committed.len(),
                 committed,

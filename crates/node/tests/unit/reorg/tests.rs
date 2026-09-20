@@ -55,7 +55,11 @@ fn durable_head_failures_preserve_odd_generation_and_disconnect_debt() -> anyhow
         handles
             .undo_store
             .complete_disconnect(marker.height, marker.hash)?;
-        let original = source.to_string();
+        let expected = match &source {
+            ApplyError::DurableHeadCommit(_) => 0_u8,
+            ApplyError::DurableHeadLineage { .. } => 1,
+            other => anyhow::bail!("unexpected durable test source: {other:?}"),
+        };
         let transition = handles.begin_transition()?;
         let outcome = settle_reorg_transition(transition, Err(connect_failure(source)));
         let Err(ReorgError::ConnectFailed {
@@ -68,9 +72,28 @@ fn durable_head_failures_preserve_odd_generation_and_disconnect_debt() -> anyhow
         else {
             anyhow::bail!("durable failure must retain its committed progress: {outcome:?}");
         };
-        assert_eq!(source.to_string(), original);
+        match expected {
+            0 => assert!(matches!(
+                source.as_ref(),
+                ApplyError::DurableHeadCommit(bitcoin_rs_storage::StorageError::InvalidOperation(
+                    "lost durability receipt"
+                ))
+            )),
+            1 => assert!(matches!(
+                source.as_ref(),
+                ApplyError::DurableHeadLineage { head, prev }
+                    if *head == Hash256::from_le_bytes(&[0x71; 32])
+                        && *prev == Hash256::from_le_bytes(&[0x72; 32])
+            )),
+            _ => unreachable!(),
+        }
         assert_eq!(disposition, crate::apply::WindowApplyDisposition::Fatal);
         assert_eq!(handles.mempool_gateway.stable_generation(), None);
+        assert!(handles.shutdown.load(Ordering::Acquire));
+        assert!(matches!(
+            handles.lock_transition(),
+            Err(ApplyError::Shutdown)
+        ));
         assert_eq!(handles.undo_store.load_disconnect_marker()?, Some(marker));
     }
     Ok(())
@@ -128,6 +151,11 @@ fn utxo_commit_failure_preserves_odd_generation_and_disconnect_debt() -> anyhow:
             ApplyError::UtxoCommit(bitcoin_rs_utxo::UtxoError::CorruptRecord)
         ));
         assert_eq!(handles.mempool_gateway.stable_generation(), None);
+        assert!(handles.shutdown.load(Ordering::Acquire));
+        assert!(matches!(
+            handles.lock_transition(),
+            Err(ApplyError::Shutdown)
+        ));
         assert_eq!(
             handles.undo_store.load_disconnect_marker()?,
             Some(marker),
