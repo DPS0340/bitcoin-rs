@@ -104,9 +104,10 @@ impl EventLoop {
                     }
                 }
             }
-            if progress_due(last_progress, Instant::now()) {
+            let now = Instant::now();
+            if progress_due(last_progress, now) {
                 self.sync.emit_sync_progress();
-                last_progress = Instant::now();
+                last_progress = now;
             }
         }
         shutdown::notify_drained();
