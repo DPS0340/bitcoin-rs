@@ -307,14 +307,14 @@ Owners:
 - `crates/node/src/apply.rs` tests `apply_block_publishes_rawtx_bytes_in_block_order`,
   `connected_sequence_event_observes_the_published_applied_tip`,
   `connect_and_disconnect_wake_the_mining_generation`,
-  `follower_dispatch_holds_the_chain_transition`,
-  `with_zmq_publisher_swaps_handle`: apply returns a committed outcome;
+  `follower_dispatch_holds_the_chain_transition`: apply returns a committed outcome;
   `ChainFollowers` consume it after the tip is published and while the
   transition is still held; ZMQ publishers are configured outside apply.
 - `crates/node/src/chain_effects.rs` tests `noop_asks_for_no_payloads`,
   `connect_then_disconnect_rewinds_the_rpc_log_and_emits_in_order`,
   `disconnect_does_not_pop_a_different_tail`: post-commit RPC/ZMQ work is
-  owned by `ChainEffects`, not by apply.
+  owned by `ChainEffects`, not by apply; the connect/disconnect test also
+  proves that the configured ZMQ publisher receives the committed effects.
 - `crates/node/src/config.rs` test `user_config_overlay_lets_set_fields_win`:
   later `UserConfig` layers win on set fields, including nested
   `ChainstateJournalOverrides` (`ARCH-05`).
