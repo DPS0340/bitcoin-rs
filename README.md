@@ -12,11 +12,6 @@ node-owned indexing, and familiar Bitcoin interfaces.
 [Contributing](CONTRIBUTING.md) ·
 [Benchmarks and limitations](docs/benchmarks/end-to-end-sync.md)
 
-Start with local developer evaluation, not production migration. A successful
-startup or RPC response is not a consensus-equivalence, recovery, or security
-certification. Use disposable test data and never publish credentials or
-identifying wallet queries.
-
 [![CI](https://github.com/gosuda/bitcoin-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/gosuda/bitcoin-rs/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
