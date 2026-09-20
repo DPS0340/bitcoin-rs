@@ -7,7 +7,7 @@ version.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "bitcoin-rs :: node"
-# benches/evidence.rs is a shared module, not a bench target.
+# Benchmark targets are explicit, including the evidence-tool unit tests.
 autobenches = false
 
 [lints]
@@ -107,3 +107,7 @@ harness = false
 [[bench]]
 name = "chainstate_journal"
 harness = false
+
+[[bench]]
+name = "evidence"
+harness = true

@@ -84,7 +84,7 @@ clippy_profiles() {
 
 test_crates_profiles() {
   # Fixture-free per-crate profiles; only the binary's tests read the pinned
-  # Core and Apalache fixtures. Smallest first.
+  # Core fixture. Smallest first.
   "$1" "test: bitcoin-rs-consensus (native)" \
     cargo test --locked -p bitcoin-rs-consensus --no-default-features --no-fail-fast
   "$1" "test: bitcoin-rs-node (fjall,zmq)" \
@@ -96,26 +96,19 @@ test_crates_profiles() {
 }
 
 test_binary_profiles() {
-  # Expects the pinned Core and Apalache fixtures:
-  # bash scripts/provision-ci-reference-fixtures.sh
-  # The formal solver run lives in the operator-invoked model-check-manual
-  # lane (K=128 needs ~30h+, measured); every CI lane skips it and runs
-  # only the cheap pin tests.
+  # Requires the pinned Core fixture. Formal checks have their own workflow.
   "$1" "test: bitcoin-rs binary (rocksdb,fjall,redb)" \
     cargo test --locked -p bitcoin-rs --no-fail-fast \
-      --no-default-features --features "rocksdb,fjall,redb" \
-      -- --exact --skip all_model_specs_check_with_apalache
+      --no-default-features --features "rocksdb,fjall,redb"
 }
 
 test_workspace_profiles() {
   # Also expects the pinned fixtures: bin/bitcoin-rs is a workspace member,
   # so this profile runs its default-feature (fjall,redb,zmq) test binaries,
   # including the process-harness suite that launches the pinned bitcoind.
-  # Same solver skip as the binary profile.
   "$1" "test: workspace (kernel-free)" \
     cargo test --locked --workspace --no-fail-fast \
-      --exclude bitcoin-rs-consensus --exclude bitcoin-rs-node \
-      -- --skip all_model_specs_check_with_apalache
+      --exclude bitcoin-rs-consensus --exclude bitcoin-rs-node
 }
 
 case "$1" in

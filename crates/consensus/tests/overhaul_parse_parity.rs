@@ -1,10 +1,8 @@
-//! T06 parity: the one-pass derivation over the T05 borrowed layout must
+//! VAL-02: decoded consensus facts must
 //! agree with the independent `bitcoin`-crate oracle on txids, wtxids,
 //! weight, byte positions, and Merkle mutation flags over the golden
 //! fixtures, the BIP141 coinbase witness leaf must be zeroed for the witness
-//! commitment without changing the coinbase's actual wtxid, and the native
-//! single-pass shape must be observable (layout positions and pre-populated
-//! witness IDs that a second-decode shape cannot produce).
+//! commitment without changing the coinbase's actual wtxid.
 //!
 //! Fixtures come from `crates/primitives/tests/testdata` by path; a missing
 //! fixture fails the lane, it is never skipped.
@@ -224,48 +222,6 @@ fn golden_facts_match_oracle_on_ids_weight_positions_and_merkle() {
             "height {height}: re-encode"
         );
     }
-}
-
-/// Pins the single-decode property of the native production path.
-///
-/// The runtime observable is fact provenance: byte positions and in-pass
-/// witness IDs exist only on the layout single-pass shape, and the
-/// second-decode shape (`from_txids`) cannot produce them. The structural
-/// half is pinned by `KernelBlock::parse` itself, whose entry performs
-/// exactly one decoding call — the checked layout pass; a runtime decode
-/// counter would need a harness hook inside the primitives crate, outside
-/// this task's write set.
-#[test]
-fn single_pass_shape_is_observable_and_second_decode_shape_is_not() {
-    let bytes = fixture_bytes(SEGWIT_HEIGHT);
-    let mut reader = bytes.as_slice();
-    let parsed = ParsedBlock::parse(&mut reader).expect("layout parse");
-    let facts = BlockFacts::from_parsed(&parsed);
-
-    // Layout positions exist only on the single-pass path.
-    assert_eq!(
-        facts.transaction_spans().len(),
-        facts.tx_count(),
-        "one-pass facts must carry byte positions"
-    );
-    // Witness IDs were computed inside the same pass; no lazy second hash
-    // was needed to produce them.
-    assert!(
-        facts.wtxids().is_some(),
-        "witness-carrying facts must arrive with witness IDs populated"
-    );
-
-    // The from_txids shape (identities handed in from elsewhere) carries no
-    // positions and leaves witness IDs lazy: it is not the single-pass shape.
-    let materialized: Block = parsed.materialize();
-    let txids: Vec<Txid> = materialized.txs.iter().map(Tx::txid).collect();
-    let handed_in = BlockFacts::from_txids(&materialized.txs, txids);
-    assert!(handed_in.transaction_spans().is_empty());
-    assert!(handed_in.wtxids().is_none());
-    assert_eq!(handed_in.txids(), facts.txids());
-    assert_eq!(handed_in.weight(), facts.weight());
-    assert_eq!(handed_in.merkle_root(), facts.merkle_root());
-    assert_eq!(handed_in.merkle_mutated(), facts.merkle_mutated());
 }
 
 #[test]

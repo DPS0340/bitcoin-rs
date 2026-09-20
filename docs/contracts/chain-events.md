@@ -97,17 +97,16 @@ checkpoint or replay a journal as an authority.
 
 ## Proven by
 
-- `crates/chainstate/src/transition.rs` (planned): owns the ordered commit
-  protocol and stable publication.
-- `crates/mempool/src/gateway.rs` and `crates/mempool/src/mutation.rs`
-  (planned): own the canonical mempool lifecycle and bounded observer delivery.
+- `crates/node/src/apply.rs` and its connect/disconnect/window modules own
+  the ordered commit protocol and stable publication.
+- `crates/mempool/src/gateway.rs` and `crates/mempool/src/mutation.rs`: own the canonical mempool lifecycle and bounded observer delivery.
 - `crates/node/tests/overhaul_mempool_lifecycle.rs` (planned): tests that
   canonical estimator accounting stays inside the lifecycle, that slow
   observers never hold the pool writer, and that queue overflow produces gap
   counters and a reconcile signal with bounded memory.
 - `crates/node/tests/overhaul_durable_head.rs` (planned): tests that a new
   durable head is published only after mempool alignment.
-- `bin/bitcoin-rs/tests/gates/g20_formal_models.rs` (planned): checks the
+- `scripts/check_models.py` (manual evidence lane): checks the
   `ChainAdmission` TLA+ model, which covers the durable commit, mempool
   reconciliation, and stable publication ordering.
 - `crates/node/src/apply.rs` existing tests:

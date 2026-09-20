@@ -49,9 +49,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - name: Provision pinned Core and Apalache fixtures
+      - name: Provision pinned Core
         id: fixtures
-        run: bash scripts/provision-ci-reference-fixtures.sh
+        run: bash scripts/provision-ci-reference-fixtures.sh core
       # Keep checks independent and run them before the long binary/formal
       # suite. No failure is tolerated, but one must not conceal later ones.
       # Consensus fixture corpus includes the large deterministic vectors.
@@ -74,16 +74,12 @@ jobs:
       - name: Kernel consensus Clippy
         if: ${{ !cancelled() && steps.native_deps.outcome == 'success' && steps.toolchain.outcome == 'success' }}
         run: cargo clippy --locked -p bitcoin-rs-consensus --all-targets -- -D warnings
-      # Run every binary test except the formal model gate: g20 needs ~30h+
-      # at K=128 (measured) and lives in the operator-invoked model-checker
-      # lane, so a main push does not spend days in the model checker. The
-      # two cheap g20 pin tests still run here; only the solver run is skipped.
+      # Formal checks run independently in model-check-manual.
       - name: Full-node binary tests
         if: ${{ !cancelled() && steps.native_deps.outcome == 'success' && steps.toolchain.outcome == 'success' && steps.fixtures.outcome == 'success' }}
         run: |
           cargo test --locked -p bitcoin-rs --no-fail-fast \
-            --no-default-features --features "${FULL_NODE_FEATURES}" \
-            -- --skip all_model_specs_check_with_apalache
+            --no-default-features --features "${FULL_NODE_FEATURES}"
       - name: Preserve public process compatibility evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -127,6 +123,8 @@ jobs:
       - run: |
           cargo bench --locked -p bitcoin-rs-node --no-run \
             --no-default-features --features fjall --bench chainstate_journal
+      - name: Benchmark evidence validation
+        run: cargo test --locked -p bitcoin-rs-node --no-default-features --features fjall --bench evidence
       # Retained crate-level benchmarks without kernel (this job's previous
       # whole content): merkle, utxo_commit under fjall, sync_pipeline, and
       # the mining candidate are not covered by the compiles above.

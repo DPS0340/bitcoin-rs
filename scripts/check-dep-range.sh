@@ -90,17 +90,8 @@ case "${RANGE}" in
     ;;
 esac
 
-# G20 reads Cargo.lock via cargo metadata; it must run while the mutated
-# lockfile is still in place.
-log "G20 uniqueness on the resolved graph"
-"${CARGO[@]}" test -p bitcoin-rs --test g20_unique_consensus_crates \
-  --no-default-features --features fjall
-
-if command -v cargo-deny >/dev/null 2>&1; then
-  log "cargo deny check bans on the resolved graph"
-  cargo deny check bans
-else
-  log "cargo-deny not on PATH; skip bans (CI installs it)"
-fi
+# The existing cargo-deny policy owns uniqueness for the resolved graph.
+log "cargo deny check bans on the resolved graph"
+cargo deny check bans
 
 log "ok"

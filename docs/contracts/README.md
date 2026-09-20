@@ -16,7 +16,7 @@ When code and a contract disagree, fix the drift in the same change. Do not dupl
 | Contract | Clauses | Scope | Primary proof |
 | --- | --- | --- | --- |
 | [architecture.md](architecture.md) | `ARCH-01`–`ARCH-08` | Layering, storage confinement, composition, chainstate authority, single mutation owners | `g17_dependency_direction`; node apply/effects tests |
-| [validation-default.md](validation-default.md) | `VAL-01`–`VAL-03` | Kernel/native default decision and portable validation | `g19_validation_default`; Core-vector and kernel parity tests |
+| [validation-default.md](validation-default.md) | `VAL-01`–`VAL-03` | Kernel/native default decision and portable validation | feature-matrix builds; Core vectors; measured promotion evidence |
 | [indexing.md](indexing.md) | `IDX-01`–`IDX-08` | Capability gating, coherent reads, reset/rebuild, reorg reconciliation, worker scheduling | txindex worker recovery/query/lifecycle/scheduling suites; RPC capability tests |
 | [recovery.md](recovery.md) | `RCV-01`–`RCV-11` | Durable root, ordered commits, crash outcomes, reorgs, schema refusal | storage durability tests; txindex recovery tests; planned chainstate crash/reorg suites |
 | [chain-events.md](chain-events.md) | `EVT-01`–`EVT-05` | Applied-chain event seam and consumer cursors | state/apply/txindex recovery tests |
@@ -29,18 +29,20 @@ When code and a contract disagree, fix the drift in the same change. Do not dupl
 | [campaign-corpora.md](campaign-corpora.md) | `CORP-01`–`CORP-05` | C150/Cmodern custody and Core-framed corpus format | `tools/campaign-corpus/test_corpus.py` |
 | [muhash-rpc.md](muhash-rpc.md) | `MRPC-01`–`MRPC-03` | MuHash RPC arity and benchmark custody | RPC arity and benchmark-campaign tests |
 | [embedding.md](embedding.md) | `EMB-01`–`EMB-08` | Embedded lifecycle and shared node services | `crates/node/tests/embed.rs`; daemon teardown test |
-| [storage-footprint.md](storage-footprint.md) | `FP-01`–`FP-04` | Logical/physical storage accounting and 1-TB gate | storage/node footprint tests and CLI help |
-| [hot-path-attribution.md](hot-path-attribution.md) | `HPA-01`–`HPA-13` | Product cells, overlap accounting, evidence identity, promotion thresholds | `g18_hot_path_ledger`; `overhaul_evidence` |
-| [dependency-range.md](dependency-range.md) | `DEP-01`–`DEP-02` | Declared Cargo ranges compile at their minimum and maximum resolvable versions; one copy each of `bitcoin`, `bitcoin_hashes`, `secp256k1`, `secp256k1-sys` | `scripts/check-dep-range.sh`; `g20_unique_consensus_crates`; `cargo deny check` |
+| [storage-footprint.md](storage-footprint.md) | `FP-01`–`FP-04` | Logical/physical storage accounting and 1-TB gate | storage/node footprint behavior tests |
+| [hot-path-attribution.md](hot-path-attribution.md) | `HPA-01`–`HPA-13` | Product cells, overlap accounting, evidence identity, promotion thresholds | benchmark evidence tests and measured campaign artifacts |
+| [dependency-range.md](dependency-range.md) | `DEP-01`–`DEP-02` | Declared Cargo ranges compile at their minimum and maximum resolvable versions; one copy each of `bitcoin`, `bitcoin_hashes`, `secp256k1`, `secp256k1-sys` | `scripts/check-dep-range.sh`; `cargo deny check bans` |
 | [feature-matrix.md](feature-matrix.md) | `FEAT-01`–`FEAT-02` | Named supported feature combinations; no empty backend markers on crates that do not own storage | `scripts/check-feature-matrix.sh`; `g17_dependency_direction` |
 | [reference-set.md](reference-set.md) | `REF-01`–`REF-07` | Released Core, kernel, corpus, and formal-tool identities | compatibility manifest and `overhaul_reference_set` |
 
 ## Permanent suite traceability
 
-The overhaul suites map to current contracts, not task numbers:
+Tests map to current contracts, not task numbers. [test-evidence.md](test-evidence.md) records
+reviewed deletions, surviving proof owners and outstanding coverage gaps.
+
+Representative retained suites:
 
 - `bin/bitcoin-rs/tests/overhaul_process_harness.rs` → `REF-02`, `REF-07`
-- `bin/bitcoin-rs/tests/overhaul_evidence.rs` → `HPA-12`
 - `bin/bitcoin-rs/tests/overhaul_external_miner.rs` → `API-14`, `API-15`
 - `crates/consensus/tests/overhaul_parse_parity.rs` → `VAL-02`
 - `crates/consensus/tests/overhaul_prepared_inputs.rs` → `POL-03`, `VAL-02`

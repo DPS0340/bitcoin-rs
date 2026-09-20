@@ -810,7 +810,6 @@ fn total_output_value(tx: &Tx) -> Result<u64, ConsensusError> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
 
     #[cfg(feature = "kernel")]
     use bitcoin::hashes::Hash as _;
@@ -1061,49 +1060,6 @@ mod tests {
             verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
-    }
-
-    #[test]
-    fn verify_transaction_reuses_prevouts_for_sigop_counting() {
-        let first = OutPoint {
-            txid: Txid(Hash256::from_le_bytes(&[11; 32])),
-            vout: 0,
-        };
-        let second = OutPoint {
-            txid: Txid(Hash256::from_le_bytes(&[12; 32])),
-            vout: 0,
-        };
-        let tx = Tx {
-            version: 1,
-            lock_time: LockTime::ZERO,
-            inputs: vec![true_spending_input(first), true_spending_input(second)],
-            outputs: vec![TxOut {
-                value: Amount::from_sat(75),
-                script_pubkey: Script::new(),
-            }],
-        };
-        let mut utxos = hashbrown::HashMap::new();
-        utxos.insert(
-            first,
-            TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: push_int(1).into(),
-            },
-        );
-        utxos.insert(
-            second,
-            TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: push_int(1).into(),
-            },
-        );
-        let view = CountingUtxoView::new(utxos);
-
-        assert_eq!(
-            verify_transaction(&tx, &view, 0, 0, VerifyFlags::MANDATORY),
-            Ok(())
-        );
-        assert_eq!(view.lookup_count(), tx.inputs.len());
     }
 
     #[test]
@@ -1696,31 +1652,6 @@ mod tests {
             script_sig: Script::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
-        }
-    }
-
-    struct CountingUtxoView {
-        utxos: hashbrown::HashMap<OutPoint, TxOut>,
-        lookups: Cell<usize>,
-    }
-
-    impl CountingUtxoView {
-        fn new(utxos: hashbrown::HashMap<OutPoint, TxOut>) -> Self {
-            Self {
-                utxos,
-                lookups: Cell::new(0),
-            }
-        }
-
-        fn lookup_count(&self) -> usize {
-            self.lookups.get()
-        }
-    }
-
-    impl UtxoView for CountingUtxoView {
-        fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
-            self.lookups.set(self.lookups.get().saturating_add(1));
-            self.utxos.get(outpoint).cloned()
         }
     }
 

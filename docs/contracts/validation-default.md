@@ -1,12 +1,11 @@
 # Validation default contract
 
 The owner of which script engine the production path uses, and of the
-recorded #213 promotion verdict that is allowed to change it.
+measured decision that is required to change it. A Rust constant is not promotion evidence.
 
 Owners:
 - `crates/consensus/Cargo.toml`, `crates/node/Cargo.toml`,
   `bin/bitcoin-rs/Cargo.toml`
-- Gate: `bin/bitcoin-rs/tests/gates/g19_validation_default.rs`
 - Decision evidence: `docs/benchmarks/native-validation-default.md`
 
 ## Clauses
@@ -14,10 +13,8 @@ Owners:
 ### `VAL-01`: Library default stays on `kernel` until promotion
 
 - `bitcoin-rs-consensus` and `bitcoin-rs-node` default features include
-  `kernel` while the recorded verdict in `g19_validation_default.rs` is
-  `KeepKernel`.
-- The verdict may move to `PromoteNative` only together with those two
-  manifests dropping `kernel` from `default`, and only after the
+  `kernel` until the promotion evidence below is complete.
+- Promoting native changes those two manifests together, only after the
   measurement gates in
   [`docs/benchmarks/native-validation-default.md`](../benchmarks/native-validation-default.md)
   all pass: Core-vector parity, signed-spend **apply-path** native median
@@ -28,7 +25,7 @@ Owners:
 - The signed-spend Criterion target times `NodeState::apply_block`. It is
   the in-tree engine comparison that can run without the held corpus. It
   is not a CLI/P2P wall and does not substitute for the missing replay
-  cell. A failed or unstable measurement leaves `KeepKernel` in place.
+  cell. A failed, unavailable or unstable measurement leaves the current default in place.
 
 ### `VAL-02`: Native interpreter is the complete portable engine
 
@@ -58,12 +55,8 @@ Owners:
 
 ## Proven by
 
-- `bin/bitcoin-rs/tests/gates/g19_validation_default.rs`:
-  `library_defaults_match_recorded_verdict`,
-  `binary_default_excludes_kernel`,
-  `kernel_feature_exists_on_each_manifest`,
-  `alias_and_dep_forwarding_count_as_kernel`,
-  `crate_feature_forwarding_counts_as_kernel`.
+- `scripts/check-feature-matrix.sh` builds the declared feature combinations.
+  Source review owns the manifest default; measurements own engine promotion.
 - `crates/script/tests/core_vectors.rs`: `script_tests_native_column`,
   `tx_valid_native_column`, `tx_invalid_native_column`
   (`NATIVE_*_FAILURES = 0`, pinned skip counts and skip-reason allow-lists).
