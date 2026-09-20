@@ -44,7 +44,6 @@ sha2.workspace = true
 bitcoin_slices.workspace = true
 hashbrown.workspace = true
 zerocopy.workspace = true
-bytemuck.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

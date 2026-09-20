@@ -109,14 +109,6 @@ hashbrown = { version = ">=0.17.1, <0.18", default-features = false, features = 
     "inline-more", "default-hasher", "allocator-api2",
 ] }
 
-# bumpalo: `+default = [allocator-api2]`. Add `collections` for arena Vec/String.
-bumpalo = { version = ">=3.20, <4", default-features = false, features = [
-    "collections", "allocator-api2",
-] }
-
-# self_cell: proc-macro-free. No features needed.
-self_cell = { version = ">=1.2.2, <2", default-features = false }
-
 # ruint: 256-bit chainwork. `default = [std]`.
 ruint = { version = ">=1.17, <2", default-features = false, features = [
     "alloc",
@@ -143,11 +135,7 @@ crossbeam-utils    = { version = ">=0.8.21, <0.9", default-features = false, fea
 rayon = { version = ">=1.12, <2" }
 
 # --- Hashing ------------------------------------------------------------------
-foldhash      = { version = ">=0.2, <0.3", default-features = false, features = ["std"] }
-gxhash        = { version = ">=3.5, <4",   default-features = false, features = ["std", "hybrid"] }
 nohash-hasher = { version = ">=0.2, <0.3", default-features = false, features = ["std"] }
-# Dev-only bench dep. `default = [std]`.
-rapidhash     = { version = ">=4.4, <5",   default-features = false, features = ["std"] }
 
 # --- Small vectors / strings --------------------------------------------------
 # tinyvec: no default features; explicitly enable alloc.
@@ -162,7 +150,6 @@ compact_str = { version = ">=0.9, <1", default-features = false, features = ["st
 bytemuck = { version = ">=1.25, <2", default-features = false, features = ["derive"] }
 bytes    = { version = ">=1.11, <2", default-features = false }
 zerocopy = { version = ">=0.8, <0.9", default-features = false, features = ["derive", "std"] }
-lz4_flex = { version = ">=0.13, <0.14", default-features = false, features = ["std", "frame"] }
 
 # --- Storage backends ---------------------------------------------------------
 # rust-rocksdb 0.50 line.
@@ -212,9 +199,6 @@ signal-hook = { version = ">=0.4.4, <0.5", default-features = false }
 thiserror = { version = ">=2.0.18, <3",       default-features = false, features = ["std"] }
 anyhow    = { version = ">=1.0.100, <2",  default-features = false, features = ["std"] }
 zmq       = { version = ">=0.10, <0.11", default-features = false }
-
-# --- Atomics ------------------------------------------------------------------
-portable-atomic = { version = ">=1.13, <2", default-features = false, features = ["std", "fallback"] }
 
 # --- Test / bench -------------------------------------------------------------
 proptest        = { version = ">=1.11, <2",    default-features = false, features = ["std"] }
