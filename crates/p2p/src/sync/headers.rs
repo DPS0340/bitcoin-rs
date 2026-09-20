@@ -241,11 +241,19 @@ impl BlockSync {
             return IdleFrontierProbeOutcome::NotSent;
         };
         let source = session.lease.source(session.addr);
-        let locator = self
-            .chain
-            .block_tree()
-            .read()
-            .block_locator(applied.tip_id, LOCATOR_MAX_ENTRIES);
+        // Anchor on the active chain at the applied height, not on the
+        // applied tip's branch. During a deep header-first reorg the applied
+        // tip may still sit on the losing branch. A locator from that branch
+        // can match only at a common ancestor more than the 2,000-header wire
+        // page behind us, so every probe repeats the same insufficient page
+        // and never demonstrates a height above the applied tip.
+        let locator = {
+            let tree = self.chain.block_tree().read();
+            let Some(active_anchor) = tree.node_at_height_from(headers.tip_id, applied.height) else {
+                return IdleFrontierProbeOutcome::NotSent;
+            };
+            tree.block_locator(active_anchor, LOCATOR_MAX_ENTRIES)
+        };
         let sent = self.send_getheaders(
             source,
             applied.height,
