@@ -249,7 +249,8 @@ impl BlockSync {
         // and never demonstrates a height above the applied tip.
         let locator = {
             let tree = self.chain.block_tree().read();
-            let Some(active_anchor) = tree.node_at_height_from(headers.tip_id, applied.height) else {
+            let Some(active_anchor) = tree.node_at_height_from(headers.tip_id, applied.height)
+            else {
                 return IdleFrontierProbeOutcome::NotSent;
             };
             tree.block_locator(active_anchor, LOCATOR_MAX_ENTRIES)
