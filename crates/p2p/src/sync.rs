@@ -38,6 +38,7 @@ use telemetry::metric_count;
 use crate::BlockStager;
 use crate::InboundHeaders;
 use crate::PeerTable;
+use crate::PeerSource;
 #[cfg(test)]
 use crate::download_window::BLOCK_STALLING_TIMEOUT;
 use crate::download_window::DownloadWindow;
@@ -118,6 +119,13 @@ struct PendingHeaderRequest {
     locator_tip_hash: Hash256,
     target_height: u32,
     requested_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleFrontierProbeOutcome {
+    Sent,
+    NotSent,
+    SendFailed(PeerSource),
 }
 
 #[derive(Clone, Debug)]
@@ -226,8 +234,12 @@ impl BlockSync {
             }
         }
         self.send_prefix_probes(&sync_peer_selection.probe_peers, now);
-        if !self.probe_idle_frontier(now) {
-            self.request_headers_from_best_peer();
+        match self.probe_idle_frontier(now) {
+            IdleFrontierProbeOutcome::Sent => {}
+            IdleFrontierProbeOutcome::NotSent => self.request_headers_from_best_peer(None),
+            IdleFrontierProbeOutcome::SendFailed(source) => {
+                self.request_headers_from_best_peer(Some(source));
+            }
         }
         if sent_getdata {
             self.record_pending_sync_metrics();

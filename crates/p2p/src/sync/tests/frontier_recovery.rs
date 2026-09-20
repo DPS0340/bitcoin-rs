@@ -222,6 +222,13 @@ fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick()
     let high_rx = connect_peer(&peers, eligible_peer(high, 5));
 
     sync.tick();
+    assert!(
+        peers
+            .sessions()
+            .iter()
+            .any(|session| session.addr == low && session.lease.is_cancelled()),
+        "the failed probe source remains table-resident while its lease tears down"
+    );
 
     // The failed probe must hand off to request_headers_from_best_peer in the
     // same tick, which sends to the live higher peer.
@@ -246,5 +253,51 @@ fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick()
         "the fallback owner must hold the pending request"
     );
     assert!(high_rx.try_recv().is_err());
+
+    Ok(())
+}
+
+#[test]
+fn failed_probe_send_excludes_dead_highest_peer_from_header_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sync, peers, _, _, expected) = sync_with_header_chain(1)?;
+    install_budget(
+        &sync,
+        super::super::SyncBudget {
+            max_pending_bytes: 0,
+            max_received_bytes: 0,
+            ..super::super::default_sync_budget()
+        },
+    );
+    let dead = test_addr(9764, 0)?;
+    let live = test_addr(9764, 1)?;
+    // The lowest address is selected for the probe and has the highest
+    // advertised height, but its disconnected queue makes the send fail.
+    let dead_rx = connect_peer(&peers, eligible_peer(dead, 5));
+    drop(dead_rx);
+    let live_rx = connect_peer(&peers, eligible_peer(live, 3));
+
+    sync.tick();
+
+    // Without the failed-source exclusion, normal selection retries the dead
+    // highest peer and masks the lower live peer in this same tick.
+    let request = next_getheaders(&live_rx)?;
+    assert_eq!(
+        request
+            .locator_hashes
+            .first()
+            .map(|hash| *hash.as_byte_array()),
+        Some(*expected[0].as_bytes()),
+        "the fallback request must start at the header tip"
+    );
+    assert_eq!(
+        sync.pending_getheaders
+            .lock()
+            .as_ref()
+            .map(|request| request.peer_addr),
+        Some(live),
+        "the lower live peer must own the fallback request"
+    );
+    assert!(live_rx.try_recv().is_err());
     Ok(())
 }

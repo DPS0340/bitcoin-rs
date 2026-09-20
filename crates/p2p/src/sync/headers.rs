@@ -1,6 +1,7 @@
 //! Header request ownership, locator construction, and inbound header admission.
 
 use super::BlockSync;
+use super::IdleFrontierProbeOutcome;
 use super::HEADER_REQUEST_TIMEOUT;
 use super::LOCATOR_MAX_ENTRIES;
 use super::PROTOCOL_VERSION;
@@ -134,7 +135,9 @@ impl BlockSync {
     /// Requests the next header batch from the highest peer above the applied
     /// tip, using a locator taken after `drain_inbound_headers` so it reflects
     /// headers accepted this tick.
-    pub(super) fn request_headers_from_best_peer(&self) {
+    /// `exclude` carries the source whose probe send failed while its
+    /// cancelled session remains table-resident until asynchronous teardown.
+    pub(super) fn request_headers_from_best_peer(&self, exclude: Option<PeerSource>) {
         let applied_tip = self.chain.applied_tip().load_full();
         let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
         let chain_tip = self.chain.chain_tip().load_full();
@@ -147,11 +150,15 @@ impl BlockSync {
             let Some(candidate) = sync_peer_candidate(info, applied_height) else {
                 continue;
             };
+            let source = session.lease.source(session.addr);
+            if exclude.is_some_and(|excluded| excluded == source) {
+                continue;
+            }
             if header_peer
                 .as_ref()
                 .is_none_or(|(_, current)| outranks(*current, candidate))
             {
-                header_peer = Some((session.lease.source(session.addr), candidate));
+                header_peer = Some((source, candidate));
             }
         }
         if let Some((source, peer)) = header_peer {
@@ -174,17 +181,17 @@ impl BlockSync {
     /// awaiting the staged-body timeout, not progress. Start at the applied
     /// chain so a peer at our header tip returns branch evidence. Reuse the
     /// existing header-request deadline.
-    pub(super) fn probe_idle_frontier(&self, now: Instant) -> bool {
+    pub(super) fn probe_idle_frontier(&self, now: Instant) -> IdleFrontierProbeOutcome {
         let (Some(applied), Some(headers)) = (
             self.chain.applied_tip().load_full(),
             self.chain.chain_tip().load_full(),
         ) else {
-            return false;
+            return IdleFrontierProbeOutcome::NotSent;
         };
         if applied.hash == headers.hash
             || self.apply_halted.load(std::sync::atomic::Ordering::Acquire)
         {
-            return false;
+            return IdleFrontierProbeOutcome::NotSent;
         }
         // The frontier hash is derived under a short tree read; body_sync is
         // taken only after the guard drops (tree before body_sync is the
@@ -197,14 +204,14 @@ impl BlockSync {
                 .and_then(|frontier_id| tree.node(frontier_id).ok().map(|node| node.hash))
         };
         let Some(frontier_hash) = frontier_hash else {
-            return false;
+            return IdleFrontierProbeOutcome::NotSent;
         };
         {
             let state = self.body_sync.lock();
             if state.window.contains_pending(&frontier_hash)
                 || state.stager.contains(&frontier_hash)
             {
-                return false;
+                return IdleFrontierProbeOutcome::NotSent;
             }
         }
         let pending = *self.pending_getheaders.lock();
@@ -212,7 +219,7 @@ impl BlockSync {
             now.saturating_duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT
                 && self.peer_table.ready_source(request.peer_addr).is_some()
         }) {
-            return true;
+            return IdleFrontierProbeOutcome::Sent;
         }
         let required = bitcoin::p2p::ServiceFlags::NETWORK.to_u64()
             | bitcoin::p2p::ServiceFlags::WITNESS.to_u64();
@@ -231,23 +238,26 @@ impl BlockSync {
             .min_by_key(|session| session.addr)
             .or_else(|| eligible().min_by_key(|session| session.addr));
         let Some(session) = session else {
-            return false;
+            return IdleFrontierProbeOutcome::NotSent;
         };
+        let source = session.lease.source(session.addr);
         let locator = self
             .chain
             .block_tree()
             .read()
             .block_locator(applied.tip_id, LOCATOR_MAX_ENTRIES);
         let sent = self.send_getheaders(
-            session.lease.source(session.addr),
+            source,
             applied.height,
             i32::try_from(headers.height).unwrap_or(i32::MAX),
             locator,
         );
         if sent {
             metrics::counter!("node.sync.idle_frontier_probes").increment(1);
+            IdleFrontierProbeOutcome::Sent
+        } else {
+            IdleFrontierProbeOutcome::SendFailed(source)
         }
-        sent
     }
 
     pub(super) fn send_getheaders(
