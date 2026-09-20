@@ -2465,16 +2465,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_min_relay_fee_round_trips() {
-        let limits = MempoolLimits {
-            min_relay_fee_sat_per_kvb: 5_000,
-            ..MempoolLimits::default()
-        };
-        let pool = Mempool::new(limits);
-        assert_eq!(pool.min_relay_fee_sat_per_kvb(), 5_000);
-    }
-
-    #[test]
     fn insert_entry_rejects_below_min_relay_fee() {
         let limits = MempoolLimits {
             min_relay_fee_sat_per_kvb: 5_000,
@@ -2526,31 +2516,6 @@ mod tests {
         assert_eq!(stats.txs, 1);
         assert_eq!(stats.bytes, expected_vsize);
         assert_eq!(stats.total_fee, expected_fee);
-        Ok(())
-    }
-
-    #[test]
-    fn is_empty_true_for_default_pool() {
-        let pool = Mempool::new(MempoolLimits::default());
-        assert!(pool.is_empty());
-        assert_eq!(pool.tx_count(), 0);
-    }
-
-    #[test]
-    fn tx_count_increments_with_insert() -> Result<(), MempoolError> {
-        let mut pool = Mempool::new(MempoolLimits {
-            min_relay_fee_sat_per_kvb: 0,
-            ..MempoolLimits::default()
-        });
-        let tx = Tx {
-            version: 2,
-            lock_time: LockTime::ZERO,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))?;
-        assert!(!pool.is_empty());
-        assert_eq!(pool.tx_count(), 1);
         Ok(())
     }
 

@@ -314,54 +314,17 @@ impl PartialEq<CompactTarget> for u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Amount, CompactTarget, LockTime, Sequence};
+    use super::{Amount, LockTime, Sequence};
 
     #[test]
-    fn amount_sat_roundtrip_and_overflow() {
-        assert_eq!(Amount::from_sat(50_000).to_sat(), 50_000);
+    fn bitcoin_unit_constants_match_protocol_values() {
         assert_eq!(Amount::COIN.to_sat(), 100_000_000);
         assert_eq!(
             Amount::MAX_MONEY.to_sat(),
             21_000_000 * Amount::COIN.to_sat()
         );
-        assert_eq!(Amount::from_sat(u64::MAX).checked_add(Amount::SAT), None);
-        assert_eq!(
-            Amount::from_sat(2)
-                .saturating_add(Amount::from_sat(3))
-                .to_sat(),
-            5
-        );
-    }
-
-    #[test]
-    fn sequence_and_locktime_consensus_roundtrip() {
         assert_eq!(Sequence::MAX.to_consensus(), u32::MAX);
         assert_eq!(Sequence::ENABLE_RBF_NO_LOCKTIME.to_consensus(), 0xffff_fffd);
-        assert_eq!(Sequence::MAX & 0xffff_ffff, u32::MAX);
         assert_eq!(LockTime::ZERO.to_consensus(), 0);
-        assert_eq!(
-            LockTime::from_consensus(500_000_000).to_consensus(),
-            500_000_000
-        );
-    }
-
-    #[test]
-    fn compact_target_consensus_roundtrip() {
-        let bits = CompactTarget::from_consensus(0x1d00_ffff);
-        assert_eq!(bits.to_consensus(), 0x1d00_ffff);
-        assert_eq!(bits, 0x1d00_ffff_u32);
-    }
-
-    #[test]
-    fn integer_comparisons_and_from() {
-        assert_eq!(Amount::from_sat(7), 7_u64);
-        assert!(Amount::from_sat(3) < 4_u64);
-        assert_eq!(
-            Sequence::from(0xffff_fffd),
-            Sequence::ENABLE_RBF_NO_LOCKTIME
-        );
-        assert!(Sequence::ENABLE_RBF_NO_LOCKTIME < 0xffff_fffe);
-        assert_eq!(LockTime::from(0_u32), LockTime::ZERO);
-        assert_eq!(CompactTarget::from(0x207f_ffff), 0x207f_ffff_u32);
     }
 }

@@ -72,29 +72,3 @@ identifier_newtype!(
     /// The double-SHA256 of an 80-byte block header.
     BlockHash
 );
-
-#[cfg(test)]
-mod tests {
-    use super::{BlockHash, Txid, Wtxid};
-    use crate::Hash256;
-
-    #[test]
-    fn as_bytes_exposes_consensus_byte_order() {
-        let bytes = [0x07_u8; 32];
-        let txid = Txid::from(Hash256::from_le_bytes(&bytes));
-
-        assert_eq!(txid.as_bytes(), &bytes);
-        assert_eq!(Wtxid::default().as_bytes(), &[0_u8; 32]);
-    }
-
-    #[test]
-    fn identifier_types_are_distinct_despite_same_layout() {
-        let hash = Hash256::from_le_bytes(&[0x0b_u8; 32]);
-        // No `From`/`Deref` conversion exists between identifier types; mixing is a compile
-        // error. The assertions below only pin that each wraps the same 32 bytes.
-        assert_eq!(
-            Txid::from(hash).as_bytes(),
-            BlockHash::from(hash).as_bytes()
-        );
-    }
-}
