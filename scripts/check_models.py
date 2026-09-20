@@ -108,7 +108,7 @@ def tool(root: Path) -> Path:
     name, version, jar_hash = (identity[key] for key in ("name", "version", "jar_sha256"))
     if name != "apalache-mc" or not isinstance(version, str) or not isinstance(jar_hash, str):
         raise EvidenceError(11, "formal tool identity is malformed")
-    home = Path(os.environ.get("APALACHE_HOME", root / "target/tools" / f"apalache-{version}"))
+    home = Path(os.environ.get("APALACHE_HOME") or root / "target/tools" / f"apalache-{version}")
     executable = (home / "bin" / name).resolve()
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise EvidenceError(11, f"missing executable: {executable}")

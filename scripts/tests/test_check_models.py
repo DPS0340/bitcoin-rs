@@ -85,6 +85,17 @@ class ModelEvidenceTests(unittest.TestCase):
                 check_models.tool(self.root)
             self.assertEqual(error.exception.code, 11)
 
+    def test_empty_apalache_home_uses_default_location(self) -> None:
+        default = (
+            self.root / "target/tools" / "apalache-0.62.2" / "bin" / "apalache-mc"
+        ).resolve()
+        with patch.dict(os.environ, {"APALACHE_HOME": ""}):
+            with self.assertRaises(check_models.EvidenceError) as error:
+                check_models.tool(self.root)
+        self.assertEqual(error.exception.code, 11)
+        self.assertEqual(str(error.exception), f"missing executable: {default}")
+
+
     def test_missing_model_file_is_a_model_identity_failure(self) -> None:
         # A missing model file is a custody failure on the model lane, not an
         # unavailable run: main() must report the model-identity code, 15,
@@ -205,12 +216,19 @@ class ModelEvidenceTests(unittest.TestCase):
         # cwd=run_dir for the tool, so the pid file lands beside output.log.
         with self.assertRaises(check_models.EvidenceError) as error:
             self.run_check(timeout=1)
-        # Descendant liveness first: os.killpg must have reached the whole
-        # tool session before any recorded outcome can be asserted.
+        # Descendant state first: os.killpg must have reached the whole tool
+        # session before any recorded outcome can be asserted.  A killed
+        # descendant may remain as a zombie until its parent is reaped, so
+        # os.kill(pid, 0) alone does not prove that it is no longer running.
         pid_file = next(self.root.glob("target/apalache/**/descendant.pid"))
         descendant = int(pid_file.read_text())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(descendant, 0)
+        try:
+            stat = Path(f"/proc/{descendant}/stat").read_text(encoding="ascii")
+        except (ProcessLookupError, FileNotFoundError):
+            stat = None
+        if stat is not None:
+            state = stat[stat.rfind(")") + 1 :].split(maxsplit=1)[0]
+            self.assertEqual(state, "Z")
         self.assertEqual(error.exception.code, 14)
         result = next(self.root.glob("target/apalache/**/result.json"))
         self.assertEqual(json.loads(result.read_text()), {"native_rc": None, "evidence_rc": 14})
