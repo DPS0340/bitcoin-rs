@@ -338,6 +338,8 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 - `submitblock` matches Core v31 `ProcessNewBlock`: a previously connected
   body (scripts-valid), including after a later reorg, is `duplicate`. A
   header admitted by `submitheader` still receives the body.
+- Duplicate classification holds the chain-transition lock through apply, so
+  concurrent submissions of one body cannot race into a previous-tip refusal.
 
 ### `API-19`: BIP22 reject reasons
 
@@ -349,6 +351,9 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
   `GetRejectReason` strings (`bad-cb-missing`, `bad-txnmrklroot`,
   `bad-cb-amount`, `high-hash`, `time-too-old`, …). Operational apply
   refusals (`Shutdown`, journal backpressure) stay `inconclusive`.
+- Storage, UTXO, durable-head, and internal verifier failures propagate as
+  `MiningControlError::Failed`, never as a BIP22 block rejection. The same
+  distinction applies to `generateblock` prevalidation.
 - Consensus crate Display remains log text. This mapping is the BIP22
   wire owner.
 
