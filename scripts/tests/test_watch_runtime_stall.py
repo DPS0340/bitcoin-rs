@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -187,6 +189,17 @@ class RuntimeStallTests(unittest.TestCase):
         result = json.loads(next(self.root.glob("stall-*/result.json")).read_text())
         self.assertFalse(result["complete"])
         self.assertTrue(result["identity_changed_after_attach"])
+
+    def test_main_rejects_python_below_3_11(self) -> None:
+        argv = [sys.argv[0], "--pid", "1", "--log", str(self.log), "--output", str(self.root)]
+        stderr = io.StringIO()
+        with patch.object(sys, "argv", argv), \
+             patch.object(sys, "version_info", (3, 10, 0)), \
+             contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                watchdog.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("3.11", stderr.getvalue())
 
     def test_attach_preflight_fails_fast_when_ptrace_is_denied(self) -> None:
         identity = watchdog.Process(99, "100")

@@ -253,6 +253,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True, help="existing private evidence directory")
     parser.add_argument("--timeout", type=float, default=180, help="seconds without sync progress")
     args = parser.parse_args()
+    if sys.version_info < (3, 11):
+        found = ".".join(str(part) for part in sys.version_info[:3])
+        parser.error(f"requires Python 3.11 or newer, found {found}")
     if not sys.platform.startswith("linux") or args.pid <= 0 or not 1 <= args.timeout <= 86400:
         parser.error("requires Linux, a positive PID and timeout from 1 to 86400 seconds")
     try:
