@@ -12,7 +12,9 @@ use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value, json};
 
 use corepc_types::v31;
 
-use crate::compat::convert::{self, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls};
+use crate::compat::convert::{
+    self, hex_encode, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
+};
 use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::{
@@ -29,16 +31,6 @@ const ESTIMATE_SMART_FEE_MODE_ERROR: &str =
 
 fn conf_target_blocks(conf_target: u64) -> u32 {
     u32::try_from(conf_target).unwrap_or(u32::MAX)
-}
-
-fn to_lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }
 
 fn btc_amount_json(satoshis: u64) -> Value {
@@ -232,11 +224,11 @@ pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     };
 
     let script = address.script_pubkey();
-    let script_hex = to_lower_hex(script.as_bytes());
+    let script_hex = hex_encode(script.as_bytes());
     let witness_version = script.witness_version();
     let witness_program = witness_version
         .filter(|_| script.as_bytes().len() >= 2)
-        .map(|_| to_lower_hex(&script.as_bytes()[2..]));
+        .map(|_| hex_encode(&script.as_bytes()[2..]));
     typed_to_sonic(&v31::ValidateAddress {
         is_valid: true,
         address: address.to_string(),

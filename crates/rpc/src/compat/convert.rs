@@ -366,8 +366,22 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod compact_target_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn hex_encoding_matches_standard_formatting_for_every_byte() -> core::fmt::Result {
+        use core::fmt::Write as _;
+
+        let bytes: Vec<u8> = (u8::MIN..=u8::MAX).collect();
+        let mut expected = String::new();
+        for byte in &bytes {
+            write!(&mut expected, "{byte:02x}")?;
+        }
+        assert_eq!(hex_encode(&bytes), expected);
+        assert_eq!(hex_encode(&[]), "");
+        Ok(())
+    }
 
     #[test]
     fn compact_target_places_mantissa_bytes_core_style() {

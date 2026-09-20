@@ -18,6 +18,8 @@ use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
 
+use crate::compat::convert::hex_encode;
+
 #[cfg(test)]
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 
@@ -37,17 +39,6 @@ pub const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 /// Full-block REST responses materialize the block and a response buffer.
 /// Bound concurrent materializations independently of socket connections.
 const MAX_CONCURRENT_REST_BLOCK_RENDERS: usize = 2;
-
-/// Encodes `bytes` as lowercase hexadecimal.
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}
 
 #[derive(Debug)]
 struct RestRenderBudget {
