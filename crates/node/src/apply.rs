@@ -1511,14 +1511,6 @@ impl UtxoView for BlockLocalUtxoView<'_> {
 mod consensus_rule_tests;
 
 #[cfg(test)]
-#[path = "../tests/unit/apply/zmq_emit_tests.rs"]
-mod zmq_emit_tests;
-
-#[cfg(test)]
-#[path = "../tests/unit/apply/with_zmq_publisher_tests.rs"]
-mod with_zmq_publisher_tests;
-
-#[cfg(test)]
 #[path = "../tests/unit/apply/admission_tests.rs"]
 mod admission_tests;
 

@@ -1,6 +1,6 @@
 # Contracts
 
-`docs/contracts/` owns current normative behavior. Each page names its owners and executable proof. `CONCEPTS.md` owns vocabulary; `docs/solutions/` and `docs/benchmarks/` hold historical or measured evidence.
+`docs/contracts/` owns current normative behavior. Each page names its owners and executable proof. `CONCEPTS.md` owns vocabulary; `docs/benchmarks/` holds measured evidence.
 
 ## Precedence
 
@@ -46,7 +46,6 @@ Representative retained suites:
 - `bin/bitcoin-rs/tests/overhaul_external_miner.rs` → `API-14`, `API-15`
 - `crates/consensus/tests/overhaul_parse_parity.rs` → `VAL-02`
 - `crates/consensus/tests/overhaul_prepared_inputs.rs` → `POL-03`, `VAL-02`
-- `crates/node/tests/overhaul_config_status.rs` → `ARCH-05`, `IDX-02`
 - `crates/node/tests/overhaul_fee_history.rs` → `API-26`, `EVT-02`, `RCV-11`
 - `crates/primitives/tests/overhaul_layout.rs` → `ARCH-01`
 

@@ -168,7 +168,6 @@ fn permanent_reorg_failure_invalidates_descendants() -> Result<(), Box<dyn std::
 }
 
 /// Generation settlement: MPL-04 in docs/contracts/mempool-mutations.md.
-/// Prefix and body ownership: docs/solutions/architecture-patterns/node-reorg-execution-design.md.
 #[test]
 fn operational_reorg_failure_preserves_branch_and_retries_without_restart()
 -> Result<(), Box<dyn std::error::Error>> {

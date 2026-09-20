@@ -244,14 +244,6 @@ Owners:
   transactions during reorg handling.
 
 ## Live gaps
-- **Node architecture reset (#1085)**: the `crates/node` ownership baseline is
-  being re-derived from the current call graph. The Phase-1 inventory lives in
-  [../node-ownership-inventory.md](../node-ownership-inventory.md) and
-  supersedes the intermediate assumptions of #1038, #1073, and #1075.
-  Ownership moves follow the inventory's phase sequencing: low-risk deletions with
-  no upstream dependency have already landed (e.g. #1090); items the inventory marks
-  as contingent (e.g. `metrics/evidence/*`) are gated on their named preconditions
-  (respectively #1084); Phase 4 proceeds via the MOVE ledger.
 - **Node slimming and extraction (#217)**: Peer connection session and lease
   ownership has moved to `PeerTable` / `P2pService` in `crates/p2p` (#215,
   #217, #218). BIP9/softfork lookups, P2P chain serving, txindex status

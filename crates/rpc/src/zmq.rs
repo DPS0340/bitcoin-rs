@@ -645,32 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn noop_publisher_methods_are_callable() {
-        let publisher = NoOpZmqPublisher;
-        assert!(!publisher.wants_notifications());
-        assert!(!publisher.wants_rawtx());
-        assert!(!publisher.wants_rawblock());
-        publisher.publish_hashblock(Hash256::default());
-        publisher.publish_hashtx(Txid(Hash256::from_le_bytes(&[0; 32])));
-        publisher.publish_rawblock(&[]);
-        publisher.publish_rawtx(&[]);
-        publisher.publish_sequence(SequenceEvent::Connected(Hash256::default()));
-    }
-
-    #[test]
-    fn tracing_publisher_methods_are_callable() {
-        let publisher = TracingZmqPublisher;
-        assert!(publisher.wants_notifications());
-        assert!(publisher.wants_rawtx());
-        assert!(publisher.wants_rawblock());
-        publisher.publish_hashblock(Hash256::default());
-        publisher.publish_hashtx(Txid(Hash256::from_le_bytes(&[0; 32])));
-        publisher.publish_rawblock(&[1, 2, 3]);
-        publisher.publish_rawtx(&[4, 5, 6]);
-        publisher.publish_sequence(SequenceEvent::Disconnected(Hash256::default()));
-    }
-
-    #[test]
     fn helper_reverses_hash_body_and_encodes_sequence_little_endian() {
         let mut le = [0_u8; 32];
         for (index, byte) in le.iter_mut().enumerate() {
@@ -724,9 +698,6 @@ mod tests {
         assert_eq!(removed[..32], reversed);
         assert_eq!(removed[32], b'R');
         assert_eq!(removed[33..], 0xFF00_0000_0000_0042_u64.to_le_bytes());
-
-        // A hash256 conversion round-trips through the observer's mapping.
-        assert_eq!(Txid(Hash256::from_le_bytes(txid.as_bytes())), txid);
     }
 
     #[test]

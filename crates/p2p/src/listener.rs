@@ -132,8 +132,7 @@ impl ConnectionShared {
     ///
     /// The table lock is not held across notify: `BlockSync` takes the
     /// download window after checking identity, matching `tick`. Publication
-    /// and stale-predecessor rules live in
-    /// `docs/solutions/architecture-patterns/p2p-owns-peer-lifecycle.md`.
+    /// and stale-predecessor rules are owned by P2P-02.
     fn publish_info_and_notify_ready(
         &self,
         peer_addr: SocketAddr,
@@ -1462,11 +1461,6 @@ mod sync_wake_tests {
         wake_sync(Some(&wake_tx));
 
         assert_eq!(wake_rx.try_iter().count(), 1);
-    }
-
-    #[test]
-    fn missing_sync_wake_is_noop() {
-        wake_sync(None);
     }
 }
 

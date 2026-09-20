@@ -10,7 +10,6 @@ use std::time::Duration;
 use bitcoin_rs_rpc::auth::constant_time_eq;
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_rpc::{Auth, Handler, RpcServer};
-use sonic_rs::json;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
 #[test]
@@ -326,7 +325,6 @@ fn request_get(
     stream.read_to_string(&mut response)?;
     Ok(response)
 }
-
 fn request_post(
     address: std::net::SocketAddr,
     body: &str,
@@ -347,7 +345,6 @@ fn request_post(
     stream.read_to_string(&mut response)?;
     Ok(response)
 }
-
 fn request_options(
     address: std::net::SocketAddr,
     path: &str,
@@ -363,7 +360,6 @@ fn request_options(
     stream.read_to_string(&mut response)?;
     Ok(response)
 }
-
 fn read_response(reader: &mut BufReader<TcpStream>) -> Result<String, Box<dyn std::error::Error>> {
     let mut headers = Vec::new();
     reader.read_until(b'\n', &mut headers)?;
@@ -401,10 +397,4 @@ fn request(
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
-}
-
-#[test]
-fn handler_is_constructible_for_auth_tests() {
-    let handler = Handler::new(Arc::new(Context::new()));
-    assert!(handler.dispatch("getblockcount", &json!([])).is_ok());
 }

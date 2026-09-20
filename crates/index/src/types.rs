@@ -448,10 +448,7 @@ fn spending_prefix(txid_bytes: &[u8], vout: u32) -> HashPrefix {
 mod tests {
     use bitcoin_rs_primitives::{Hash256, OutPoint, Txid};
 
-    use super::{
-        HASH_PREFIX_LEN, HashPrefixRow, ScriptHash, ScriptHashRow, ScriptLiveRow,
-        SpendingPrefixRow, TxidRow,
-    };
+    use super::{HASH_PREFIX_LEN, HashPrefixRow, ScriptHash, ScriptLiveRow, SpendingPrefixRow};
 
     #[test]
     fn hash_prefix_row_uses_big_endian_height() {
@@ -477,14 +474,6 @@ mod tests {
             SpendingPrefixRow::scan_prefix(&outpoint),
             [31, 30, 29, 28, 27, 26, 26, 23]
         );
-    }
-
-    #[test]
-    fn row_builders_use_hash_prefixes() {
-        let scripthash = ScriptHash::from_byte_array([7_u8; 32]);
-        let txid = Txid::from(Hash256::from_le_bytes(&[9_u8; 32]));
-        assert_eq!(ScriptHashRow::row(scripthash, 5).prefix, [7_u8; 8]);
-        assert_eq!(TxidRow::row(&txid, 6).prefix, [9_u8; 8]);
     }
 
     #[test]

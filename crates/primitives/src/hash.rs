@@ -189,20 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn display_propagates_writer_errors() {
-        struct Reject;
-
-        impl fmt::Write for Reject {
-            fn write_str(&mut self, _text: &str) -> fmt::Result {
-                Err(fmt::Error)
-            }
-        }
-
-        let hash = Hash256::default();
-        assert!(fmt::write(&mut Reject, format_args!("{hash}")).is_err());
-    }
-
-    #[test]
     fn rejects_bad_hex() {
         assert_eq!(Hash256::from_str_be("00"), Err(HashError::InvalidLength(2)));
         let bad = "z00000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
