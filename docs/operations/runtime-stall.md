@@ -16,8 +16,9 @@ never changes ptrace settings, privileges, or node configuration. Keep the log
 exclusive to this node and enable INFO telemetry. An unrelated log or disabled
 INFO output cannot prove this node's liveness.
 
-**GDB pauses the target during capture.** Invocation authorizes one diagnostic
-attach, not passive monitoring. The watchdog limits GDB to 30 seconds plus five
+**GDB pauses the target twice.** A watch takes two short pauses — the
+preflight dry attach plus the capture attach — diagnostic capture, not passive
+monitoring. The watchdog limits GDB to 30 seconds plus five
 seconds for termination, 32 frames per thread, and 16 MiB of output. Kernel
 snapshots cover at most 256 threads and 4 KiB per field; the retained log tail
 is at most 1 MiB. These are work/output bounds, not hard real-time guarantees
