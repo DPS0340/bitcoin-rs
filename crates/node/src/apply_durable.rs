@@ -57,7 +57,7 @@ pub(super) fn sync_appended_blocks(handles: &Chainstate) -> Result<(), ApplyErro
     let Some(store) = handles.block_body_store.as_ref() else {
         return Ok(());
     };
-    store.sync().map_err(ApplyError::BlockBodyPersistence)
+    store.sync().map_err(ApplyError::DurableHeadCommit)
 }
 
 /// Advances the durable head for one connected block.
@@ -118,7 +118,7 @@ pub(super) fn stored_body_row(
     };
     Ok(store
         .block_position(height, hash)
-        .map_err(ApplyError::BlockBodyPersistence)?
+        .map_err(ApplyError::DurableHeadCommit)?
         .map(|position| (height, hash, position)))
 }
 

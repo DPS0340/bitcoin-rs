@@ -265,12 +265,8 @@ pub(super) fn apply_window_admitted(
             // flushed copy published below carries the group's id.
             Ok(_) => {}
             Err(source) => {
-                if matches!(
-                    source,
-                    ApplyError::UtxoCommit(_)
-                        | ApplyError::DurableHeadCommit(_)
-                        | ApplyError::DurableHeadLineage { .. }
-                ) {
+                let disposition = classify_apply_error(&source);
+                if disposition == WindowApplyDisposition::Fatal {
                     // Torn or unreconcilable: the staged prefix was never
                     // published, and retrying it here would build on state
                     // recovery has to rebuild first.
@@ -283,7 +279,6 @@ pub(super) fn apply_window_admitted(
                         invalidated: Box::default(),
                     });
                 }
-                let disposition = classify_apply_error(&source);
                 let invalidated = invalidate_failed_subtree(handles, block, disposition);
                 // The prefix that committed in memory stays committed: flush
                 // its durable group before reporting, so the durable head
@@ -380,9 +375,13 @@ pub(super) fn invalidate_failed_subtree(
 /// `ConsensusError::Script` remains Permanent.
 ///
 pub(crate) fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
-    use WindowApplyDisposition::{BodyMutated, Operational, Permanent};
+    use WindowApplyDisposition::{BodyMutated, Fatal, Operational, Permanent};
     use bitcoin_rs_consensus::ConsensusError;
     match error {
+        ApplyError::UtxoCommit(_)
+        | ApplyError::DurableHeadCommit(_)
+        | ApplyError::DurableHeadLineage { .. }
+        | ApplyError::DurableHeadGapUnrecoverable { .. } => Fatal,
         ApplyError::ProofOfWork { .. }
         | ApplyError::TargetAboveLimit
         | ApplyError::NbitsNonRetargetMismatch { .. } => Permanent,

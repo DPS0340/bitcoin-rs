@@ -109,6 +109,10 @@ pub enum ApplyError {
     },
     /// Advancing the durable head failed.
     ///
+    /// Includes body sync and locator reads after UTXO mutation but before
+    /// the head batch. Unlike a pre-mutation body-write refusal, these
+    /// failures cannot be retried against the published tip.
+    ///
     /// Fatal for the attempt, like a `UtxoCommit` refusal: the atomic batch
     /// may have applied before its durability receipt failed or was lost,
     /// and [`StorageError`] does not classify that phase. The caller must

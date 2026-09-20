@@ -928,6 +928,9 @@ impl Chainstate {
     /// generation odd; callers that need to retry a clean refusal should use
     /// [`ChainTransition::connect_window`] directly and finish explicitly.
     ///
+    /// A finish failure returns a fatal error carrying the committed prefix,
+    /// closes admission, and requests shutdown instead of reporting success.
+    ///
     /// Persistence matches [`ChainTransition::connect_window`].
     #[allow(clippy::result_large_err)]
     pub fn apply_window(
@@ -957,11 +960,19 @@ impl Chainstate {
             disposition: WindowApplyDisposition::Operational,
             invalidated: Box::default(),
         })?;
-        let result = transition.connect_window(blocks, serialized);
-        if result.is_ok() {
-            let _ = transition.finish();
+        let committed = transition.connect_window(blocks, serialized)?;
+        if let Err(source) = transition.finish() {
+            self.admission.close_permanently();
+            self.shutdown.store(true, Ordering::Release);
+            return Err(WindowApplyError {
+                applied: committed.len(),
+                committed,
+                source,
+                disposition: WindowApplyDisposition::Fatal,
+                invalidated: Box::default(),
+            });
         }
-        result
+        Ok(committed)
     }
 
     /// See `ARCH-07` in `docs/contracts/architecture.md`.

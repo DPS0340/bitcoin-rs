@@ -51,7 +51,10 @@ pub(crate) fn settle_window_failure(
     transition: crate::apply::ChainTransition<'_>,
     mut error: crate::apply::WindowApplyError,
 ) -> crate::apply::WindowApplyError {
-    if matches!(error.source, crate::apply::error::ApplyError::UtxoCommit(_)) {
+    if error.disposition == crate::apply::WindowApplyDisposition::Fatal
+        || crate::apply::window::classify_apply_error(&error.source)
+            == crate::apply::WindowApplyDisposition::Fatal
+    {
         error.disposition = crate::apply::WindowApplyDisposition::Fatal;
     } else if let Err(finish_source) = transition.finish() {
         tracing::error!(

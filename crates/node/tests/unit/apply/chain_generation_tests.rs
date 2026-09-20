@@ -57,6 +57,139 @@ fn setup_regtest_with_genesis() -> (Chainstate, bitcoin_rs_primitives::Block, Bl
     (handles, genesis, genesis_hash)
 }
 
+#[test]
+fn apply_window_finish_failure_retains_the_committed_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bitcoin_rs_storage::{CommitRecords, DurableHead, DurableHeadStore, StorageError};
+
+    struct MoveGenerationOnCommit {
+        inner: Arc<dyn DurableHeadStore>,
+        gateway: Arc<bitcoin_rs_mempool::MempoolGateway>,
+    }
+    impl DurableHeadStore for MoveGenerationOnCommit {
+        fn load(&self) -> Result<Option<DurableHead>, StorageError> {
+            self.inner.load()
+        }
+
+        fn commit(
+            &self,
+            expected: Option<&DurableHead>,
+            next: &DurableHead,
+            records: &CommitRecords<'_>,
+        ) -> Result<(), StorageError> {
+            self.inner.commit(expected, next, records)?;
+            self.gateway.force_chain_generation(3);
+            Ok(())
+        }
+    }
+
+    let (mut handles, genesis, _) = setup_regtest_with_genesis();
+    assert_eq!(handles.mempool_gateway.stable_generation(), Some(0));
+    handles.durable_head = Arc::new(MoveGenerationOnCommit {
+        inner: Arc::clone(&handles.durable_head),
+        gateway: Arc::clone(&handles.mempool_gateway),
+    });
+    let block = mined_block_with_prev_hash_and_transactions(
+        genesis.block_hash(),
+        vec![coinbase_transaction(1)],
+    )?;
+    let serialized = bytes::Bytes::from(bitcoin_rs_primitives::consensus_bytes(&block));
+    let result = handles.apply_window(&[&block], &[serialized]);
+    let Err(error) = result else {
+        return Err("a failed finish must not report a successful window".into());
+    };
+    assert_eq!(error.disposition, super::WindowApplyDisposition::Fatal);
+    assert!(matches!(error.source, super::ApplyError::Shutdown));
+    assert_eq!(error.applied, 1);
+    assert_eq!(error.committed.len(), 1);
+    assert_eq!(
+        error.committed[0].tip.hash,
+        Hash256::from(block.block_hash())
+    );
+    assert_eq!(
+        handles.snapshot().applied.map(|tip| tip.hash),
+        Some(Hash256::from(block.block_hash()))
+    );
+    assert_eq!(handles.mempool_gateway.stable_generation(), None);
+    assert!(handles.shutdown.load(Ordering::Acquire));
+    assert!(matches!(
+        handles.lock_transition(),
+        Err(super::ApplyError::Shutdown)
+    ));
+    Ok(())
+}
+
+/// RCV-02: failures after mutation require recovery even before the head batch starts.
+#[test]
+fn body_durability_failures_after_utxo_commit_require_recovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bitcoin_rs_storage::{BlockFilePosition, StorageError, block_body::BlockBodyStore};
+
+    struct FailDurability {
+        during_sync: bool,
+    }
+    impl BlockBodyStore for FailDurability {
+        fn persist_block_body(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+            _body: &[u8],
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn load_block_body(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, StorageError> {
+            Ok(None)
+        }
+        fn sync(&self) -> Result<(), StorageError> {
+            if self.during_sync {
+                Err(StorageError::InvalidOperation("body sync failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn block_position(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<Option<BlockFilePosition>, StorageError> {
+            Err(StorageError::InvalidOperation("body locator failed"))
+        }
+    }
+
+    for during_sync in [true, false] {
+        let (mut handles, genesis, _) = setup_regtest_with_genesis();
+        handles.block_body_store = Some(Arc::new(FailDurability { during_sync }));
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let before = handles.utxo.record_count();
+        let result = handles.apply_block(&block);
+        let Err(error) = result else {
+            return Err("body durability failure was reported as a committed block".into());
+        };
+        assert!(
+            handles.utxo.record_count() > before,
+            "fixture must fail after UTXO mutation"
+        );
+        assert!(
+            matches!(error, super::ApplyError::DurableHeadCommit(_)),
+            "post-mutation error was retryable: {error:?}"
+        );
+        assert_eq!(
+            super::window::classify_apply_error(&error),
+            super::WindowApplyDisposition::Fatal
+        );
+        assert_eq!(handles.mempool_gateway.stable_generation(), None);
+        assert_eq!(handles.snapshot().applied.map(|tip| tip.height), Some(0));
+    }
+    Ok(())
+}
+
 /// `ARCH-07`: snapshot copies published cells without reserving generation.
 #[test]
 fn snapshot_reads_applied_tip_without_taking_a_transition() {

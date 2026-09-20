@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn durable_head_window_failures_do_not_finish_generation() -> Result<(), Box<dyn std::error::Error>>
+{
+    for source in [
+        crate::ApplyError::DurableHeadCommit(bitcoin_rs_storage::StorageError::InvalidOperation(
+            "lost durability receipt",
+        )),
+        crate::ApplyError::DurableHeadLineage {
+            head: Hash256::from_le_bytes(&[0x71; 32]),
+            prev: Hash256::from_le_bytes(&[0x72; 32]),
+        },
+    ] {
+        let (_sync, handles, _followers, _peers, _block_tree, _applied_tip, _expected) =
+            sync_with_header_chain(1)?;
+        let transition = handles.begin_transition()?;
+        let error = crate::apply::WindowApplyError {
+            applied: 0,
+            committed: Vec::new(),
+            source,
+            disposition: crate::apply::WindowApplyDisposition::Fatal,
+            invalidated: Box::default(),
+        };
+        let error = super::super::settle_window_failure(transition, error);
+        assert_eq!(
+            error.disposition,
+            crate::apply::WindowApplyDisposition::Fatal
+        );
+        assert_eq!(handles.mempool_gateway.stable_generation(), None);
+    }
+    Ok(())
+}
+
+#[test]
 fn utxo_commit_failure_keeps_mempool_generation_odd() -> Result<(), Box<dyn std::error::Error>> {
     let (_sync, handles, _followers, _peers, _block_tree, _applied_tip, _expected) =
         sync_with_header_chain(1)?;
