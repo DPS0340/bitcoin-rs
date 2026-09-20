@@ -72,6 +72,24 @@ the first embedder — there is one lifecycle implementation, not two.
 
 ## Startup failure and cancellation
 
+### `EMB-10`: Independent runtime-stall evidence
+
+Sync telemetry cadence is elapsed monotonic time, not the number or origin of
+sync wakes. `scripts/watch_runtime_stall.py` is an explicit operator-owned
+process, independent of node locks, RPC and logging. It records one missed
+cadence and bounded debugger/kernel/log evidence, then exits; it never changes
+chainstate, retries mutation, or infers a deadlock from a missing log line.
+Debugger attachment pauses the target and requires deployment-approved access.
+Requirements and evidence limits are in
+[../operations/runtime-stall.md](../operations/runtime-stall.md).
+
+Proof: `event_loop::tests::telemetry_uses_elapsed_time_not_wake_count`;
+`scripts/tests/test_watch_runtime_stall.py` covers log rotation, bounded reads,
+monotonic expiry, process identity changes, and incomplete debugger output.
+Synthetic runner checks cannot identify the historical stall's lock holder.
+
+### Startup ownership
+
 `start_node` records every worker, socket owner, and channel end in a
 startup guard the moment it exists. A failure at any later bootstrap step
 (configuration validation, storage open, crash recovery, RPC bind,
