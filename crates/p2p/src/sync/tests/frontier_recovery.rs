@@ -309,46 +309,36 @@ fn reorg_probe_anchors_locator_on_active_chain_at_applied_height()
     let mut tree = BlockTree::new();
     let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
 
-    let common =
-        mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
+    let common = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
     let common_id = tree.insert_node(Some(genesis_id), common.header, NodeStatus::HeaderValid)?;
 
-    let losing_2 = mined_block_with_prev_hash(
-        common.block_hash(),
-        2,
-        vec![coinbase_transaction(2_002)],
-    );
+    let losing_2 =
+        mined_block_with_prev_hash(common.block_hash(), 2, vec![coinbase_transaction(2_002)]);
     let losing_2_id =
         tree.insert_node(Some(common_id), losing_2.header, NodeStatus::HeaderValid)?;
-    let losing_3 = mined_block_with_prev_hash(
-        losing_2.block_hash(),
-        3,
-        vec![coinbase_transaction(2_003)],
-    );
+    let losing_3 =
+        mined_block_with_prev_hash(losing_2.block_hash(), 3, vec![coinbase_transaction(2_003)]);
     let losing_3_id =
         tree.insert_node(Some(losing_2_id), losing_3.header, NodeStatus::HeaderValid)?;
 
-    let winning_2 = mined_block_with_prev_hash(
-        common.block_hash(),
-        2,
-        vec![coinbase_transaction(1_002)],
-    );
+    let winning_2 =
+        mined_block_with_prev_hash(common.block_hash(), 2, vec![coinbase_transaction(1_002)]);
     let winning_2_id =
         tree.insert_node(Some(common_id), winning_2.header, NodeStatus::HeaderValid)?;
-    let winning_3 = mined_block_with_prev_hash(
-        winning_2.block_hash(),
-        3,
-        vec![coinbase_transaction(1_003)],
-    );
-    let winning_3_id =
-        tree.insert_node(Some(winning_2_id), winning_3.header, NodeStatus::HeaderValid)?;
-    let winning_4 = mined_block_with_prev_hash(
-        winning_3.block_hash(),
-        4,
-        vec![coinbase_transaction(1_004)],
-    );
-    let winning_4_id =
-        tree.insert_node(Some(winning_3_id), winning_4.header, NodeStatus::HeaderValid)?;
+    let winning_3 =
+        mined_block_with_prev_hash(winning_2.block_hash(), 3, vec![coinbase_transaction(1_003)]);
+    let winning_3_id = tree.insert_node(
+        Some(winning_2_id),
+        winning_3.header,
+        NodeStatus::HeaderValid,
+    )?;
+    let winning_4 =
+        mined_block_with_prev_hash(winning_3.block_hash(), 4, vec![coinbase_transaction(1_004)]);
+    let winning_4_id = tree.insert_node(
+        Some(winning_3_id),
+        winning_4.header,
+        NodeStatus::HeaderValid,
+    )?;
 
     let active_tip = tree.tip().ok_or("missing active tip")?;
     assert_eq!(active_tip.tip_id, winning_4_id);
@@ -396,7 +386,7 @@ fn reorg_probe_anchors_locator_on_active_chain_at_applied_height()
         .ok_or("probe locator is empty")?;
     assert_eq!(
         *locator_tip.as_byte_array(),
-        *active_anchor_hash.as_bytes(),
+        active_anchor_hash.to_le_bytes(),
         "idle recovery must anchor at the active-chain node at applied height",
     );
     assert_ne!(
@@ -406,4 +396,3 @@ fn reorg_probe_anchors_locator_on_active_chain_at_applied_height()
     );
     Ok(())
 }
-
