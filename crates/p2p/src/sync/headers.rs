@@ -1,8 +1,8 @@
 //! Header request ownership, locator construction, and inbound header admission.
 
 use super::BlockSync;
-use super::IdleFrontierProbeOutcome;
 use super::HEADER_REQUEST_TIMEOUT;
+use super::IdleFrontierProbeOutcome;
 use super::LOCATOR_MAX_ENTRIES;
 use super::PROTOCOL_VERSION;
 use super::PendingHeaderRequest;

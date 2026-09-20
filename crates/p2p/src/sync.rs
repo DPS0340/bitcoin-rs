@@ -37,8 +37,8 @@ use telemetry::metric_count;
 
 use crate::BlockStager;
 use crate::InboundHeaders;
-use crate::PeerTable;
 use crate::PeerSource;
+use crate::PeerTable;
 #[cfg(test)]
 use crate::download_window::BLOCK_STALLING_TIMEOUT;
 use crate::download_window::DownloadWindow;
