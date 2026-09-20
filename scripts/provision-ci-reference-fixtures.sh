@@ -106,7 +106,7 @@ if [[ "$mode" == core ]]; then
     exit 1
   }
   [[ "${actual_version%%$'\n'*}" == "$expected_version" ]] || {
-    printf '%s\n' "Core version mismatch" >&2
+    printf '%s\n' "Core version mismatch: expected ${expected_version}, got:" >&2
     printf '%s\n' "$actual_version" >&2
     exit 1;
   }
