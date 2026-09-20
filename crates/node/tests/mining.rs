@@ -1195,6 +1195,11 @@ fn unsolved_pow_is_rejected_by_proposal_and_submit() -> anyhow::Result<()> {
         }
         other => panic!("expected submit high-hash, got {other:?}"),
     }
+    assert!(
+        state.mempool_gateway().stable_generation().is_some(),
+        "a clean block rejection must settle the chain generation"
+    );
+    assert!(!state.shutdown().load(Ordering::Acquire));
     Ok(())
 }
 

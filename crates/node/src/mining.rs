@@ -185,26 +185,37 @@ impl MiningCoordinator {
             Ok(outcome) => {
                 self.followers.connected(block, &outcome);
                 let tip = outcome.tip;
-                let visible = self.applied_tip.load_full().ok_or_else(|| {
-                    MiningControlError::Failed(CompactString::from(
+                let Some(visible) = self.applied_tip.load_full() else {
+                    self.apply_handles.fail_closed_for_recovery();
+                    return Err(MiningControlError::Failed(CompactString::from(
                         "applied tip missing after accepted submission",
-                    ))
-                })?;
+                    )));
+                };
                 if visible.hash != tip.hash {
+                    self.apply_handles.fail_closed_for_recovery();
                     return Err(MiningControlError::Failed(CompactString::from(
                         "applied tip was not published before submit_block returned",
                     )));
                 }
                 if let Err(error) = transition.finish() {
-                    self.apply_handles.admission.close_permanently();
-                    self.shutdown.store(true, Ordering::Release);
                     return Err(MiningControlError::Failed(CompactString::from(
                         error.to_string(),
                     )));
                 }
                 Ok(BlockValidationResult::Accepted)
             }
-            Err(error) => map_apply_error(error),
+            Err(error) => {
+                if crate::apply::window::classify_apply_error(&error)
+                    == crate::apply::WindowApplyDisposition::Fatal
+                {
+                    self.apply_handles.fail_closed_for_recovery();
+                } else if let Err(finish_error) = transition.finish() {
+                    return Err(MiningControlError::Failed(CompactString::from(
+                        finish_error.to_string(),
+                    )));
+                }
+                map_apply_error(error)
+            }
         }
     }
 }
