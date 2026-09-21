@@ -22,6 +22,15 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import p2p_loopback
+from evidence import (
+    MAX_JSON_DEPTH,
+    ContractError,
+    _percentile,
+    _publish_result,
+    canonical_bytes,
+    canonical_sha256,
+    summarize,
+)
 from p2p_loopback import (
     _MAX_PENDING_CANDIDATES,
     CONFIG_SCHEMA,
@@ -32,14 +41,12 @@ from p2p_loopback import (
     MAX_CORPUS_BYTES,
     MAX_FRAME_BYTES,
     MAX_IO_TIMEOUT_NS,
-    MAX_JSON_DEPTH,
     MAX_STATE_BYTES,
     PAIR_COUNT,
     RESULT_SCHEMA,
     ArmObservation,
     ArmProcess,
     Config,
-    ContractError,
     PeerObservation,
     ProcessGeneration,
     ProcessIdentity,
@@ -52,10 +59,8 @@ from p2p_loopback import (
     _hash_file,
     _host_child_generations,
     _load_json,
-    _percentile,
     _process_start_time,
     _public_argv,
-    _publish_result,
     _require_comparable,
     _self_generation,
     _send_paced,
@@ -63,13 +68,10 @@ from p2p_loopback import (
     _state,
     _verified_copy,
     _verify_copy_digest,
-    canonical_bytes,
-    canonical_sha256,
     load_config,
     main,
     parse_config,
     run_campaign,
-    summarize,
 )
 
 JsonObject = dict[str, object]
@@ -1010,7 +1012,7 @@ class MagicGateTests(unittest.TestCase):
         cancel.set()
         reader.join(2.0)
         self.assertFalse(reader.is_alive())
-        self.assertIsInstance(outcome.get("error"), p2p_loopback.ContractError)
+        self.assertIsInstance(outcome.get("error"), ContractError)
         silent.settimeout(2.0)
         self.assertEqual(silent.recv(1), b"")
         silent.close()

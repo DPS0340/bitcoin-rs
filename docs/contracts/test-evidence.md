@@ -32,6 +32,8 @@ old module layout.
 
 | Former test | Decision and replacement |
 | --- | --- |
+| `test_comp_lanes.py` and its fixture-only `comp_lanes.py` runner | Retire the wrapper as a whole. Direct P2P, offline-validation, and MuHash comparator suites own their CLI, custody, and error behavior. Historical fixture measurements remain archived; no live-product evidence is removed. |
+| Offline `NonVacuityProofs` | Delete assertions that expect another assertion to fail on a deliberately wrong literal. Direct CLI tests still verify the actual schema, 14-arm count, result digest, rejection paths, and publication. |
 | Per-engine `*_equivalence_hash` tests | Consolidate into `portable_backends_have_identical_aggregate_hashes`. Every enabled backend still runs the complete behavioral suite; multi-backend builds compare the resulting hashes without running each engine twice. Two-backend builds now compare too. |
 | Separate peer-constructor direction tests | Consolidate into `constructors_preserve_direction_and_handshake_metadata`. Check both directions, shared metadata, negotiation defaults, and a version-receipt time distinct from handshake completion. |
 | `g18_hot_path_ledger` | Delete historical matrix/path/disposition gates. The declared benchmark ledger and actual campaign artifacts remain. |

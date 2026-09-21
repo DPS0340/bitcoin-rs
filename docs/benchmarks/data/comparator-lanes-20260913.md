@@ -1,5 +1,9 @@
 # Product-cell comparator lanes: fixture stability and live-arm capability (#650)
 
+Historical record: the fixture-only `comp_lanes.py` runner is retired. The
+direct comparator suites now own harness validation; the measurements below
+remain tied to their original source revision and are not product results.
+
 Residual-leg record for the comparator lanes the hot-path ledger names as
 `residual_blocker`: #34 offline full validation, #35 P2P loopback, #41
 MuHash RPC. Worktree `.outline/worktree/i650-comparators`, branch
