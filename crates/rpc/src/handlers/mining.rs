@@ -101,28 +101,22 @@ pub(crate) fn submitblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
         }
     }
     let hex = required_str(params, 0, "block hex is required")?;
-    let bytes = decode_block_hex(hex)?;
-    // Decode here for the BIP22 dummy/length-independent error contract
-    // (API-15), but submit the exact submitted bytes so the apply path parses
-    // once from them instead of re-serializing the tree (issue #627).
-    let mut reader: &[u8] = &bytes;
-    let block = <Block as ConsensusDecode>::consensus_decode(&mut reader)
-        .map_err(|_| block_decode_failed())?;
+    let (block, bytes) = decode_submitted_block(hex)?;
     match control.submit_block_with_bytes(block, bytes) {
         Ok(result) => Ok(render_validation_result(result)),
         Err(error) => Err(map_mining_control_error(error)),
     }
 }
 
-fn decode_block_hex(hex: &str) -> Result<Vec<u8>, RpcError> {
-    from_hex(hex).map_err(|()| block_decode_failed())
-}
-
-fn decode_submitted_block(hex: &str) -> Result<Block, RpcError> {
-    let bytes = decode_block_hex(hex)?;
+fn decode_submitted_block(hex: &str) -> Result<(Block, Vec<u8>), RpcError> {
+    let mut bytes = from_hex(hex).map_err(|()| block_decode_failed())?;
     // See the API-15 contract for DecodeHexBlk compatibility behavior.
     let mut reader: &[u8] = &bytes;
-    <Block as ConsensusDecode>::consensus_decode(&mut reader).map_err(|_| block_decode_failed())
+    let block = <Block as ConsensusDecode>::consensus_decode(&mut reader)
+        .map_err(|_| block_decode_failed())?;
+    let consumed = bytes.len() - reader.len();
+    bytes.truncate(consumed);
+    Ok((block, bytes))
 }
 
 fn block_decode_failed() -> RpcError {
@@ -485,8 +479,9 @@ fn parse_block_template_request(params: &Value) -> Result<BlockTemplateRequest, 
                 .ok_or(RpcError::InvalidType(
                     "Missing data String key for proposal",
                 ))?;
+        let (block, _) = decode_submitted_block(data)?;
         return Ok(BlockTemplateRequest {
-            mode: BlockTemplateMode::Proposal(decode_submitted_block(data)?),
+            mode: BlockTemplateMode::Proposal(block),
             capabilities: Vec::new(),
             rules: Vec::new(),
             long_poll_id: None,
@@ -873,6 +868,15 @@ mod tests {
                 return Err(error);
             }
             Ok(self.submit.lock().clone())
+        }
+
+        fn submit_block_with_bytes(
+            &self,
+            block: Block,
+            raw: Vec<u8>,
+        ) -> Result<BlockValidationResult, MiningControlError> {
+            assert_eq!(raw, consensus_bytes(&block));
+            self.submit_block(block)
         }
 
         fn submit_header(

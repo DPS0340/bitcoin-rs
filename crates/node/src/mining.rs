@@ -5,6 +5,7 @@
 
 use crate::ApplyError;
 use crate::apply::Chainstate;
+use crate::apply::prepare::bytes_are_block;
 use crate::chain_effects::ChainFollowers;
 use crate::checkpoint::hex_encode;
 use alloc::sync::Arc;
@@ -47,7 +48,6 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_primitives::consensus_bytes;
-use bitcoin_rs_primitives::deserialize;
 use compact_str::CompactString;
 use parking_lot::RwLock;
 use std::sync::atomic::AtomicBool;
@@ -145,38 +145,32 @@ impl MiningCoordinator {
 
     /// Core `submitblock` fills the coinbase reserved nonce when the block
     /// already has a BIP141 commitment but no coinbase witness. Proposal skips this.
-    fn fill_uncommitted_witness(&self, block: &mut Block) {
+    fn fill_uncommitted_witness(&self, block: &mut Block) -> bool {
         let tree = self.block_tree.read();
         let Some(prev_id) = tree.lookup(block.header.prev_blockhash.into()) else {
-            return;
+            return false;
         };
         let Ok(prev) = tree.node(prev_id) else {
-            return;
+            return false;
         };
         let height = prev.height.saturating_add(1);
         let segwit_active = self.network.is_segwit_active(height);
         drop(tree);
+        let witness_len = block
+            .txs
+            .first()
+            .and_then(|tx| tx.inputs.first())
+            .map(|input| input.witness.len());
         update_uncommitted_block_structures(block, segwit_active);
+        witness_len
+            != block
+                .txs
+                .first()
+                .and_then(|tx| tx.inputs.first())
+                .map(|input| input.witness.len())
     }
 
-    fn submit(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
-        self.submit_inner(block, None)
-    }
-
-    /// Shared connect-and-publish body. `serialized`, when present, is the
-    /// exact consensus serialization of `block` and is threaded through
-    /// `connect_serialized` so the apply path parses once from the bytes
-    /// instead of re-serializing the decoded tree — the same path P2P and
-    /// reorg bodies already use (issue #627, slice A).
-    fn submit_with_serialized(
-        &self,
-        block: &Block,
-        serialized: bytes::Bytes,
-    ) -> Result<BlockValidationResult, MiningControlError> {
-        self.submit_inner(block, Some(serialized))
-    }
-
-    fn submit_inner(
+    fn submit(
         &self,
         block: &Block,
         serialized: Option<bytes::Bytes>,
@@ -336,22 +330,6 @@ impl MempoolSequenceWake for MiningCoordinator {
     }
 }
 
-/// Resolves the API-15 accepted prefix of `raw`: walks the checked layout
-/// once to find the one complete block `submitblock` accepts, tolerating
-/// trailing bytes. The returned slice is the exact image the apply path's
-/// `bytes_are_block` gate requires.
-fn submitted_prefix(raw: &[u8]) -> Result<&[u8], MiningControlError> {
-    use bitcoin_rs_primitives::layout::ParsedBlock;
-    let mut cursor: &[u8] = raw;
-    let parsed = ParsedBlock::parse(&mut cursor)
-        .map_err(|error| MiningControlError::Rejected(CompactString::from(error.to_string())))?;
-    raw.get(..parsed.consumed_len()).ok_or_else(|| {
-        MiningControlError::Rejected(CompactString::from(
-            "submitted bytes are not the serialization of the submitted block",
-        ))
-    })
-}
-
 impl MiningControl for MiningCoordinator {
     fn get_block_template(
         &self,
@@ -394,7 +372,7 @@ impl MiningControl for MiningCoordinator {
 
     fn submit_block(&self, mut block: Block) -> Result<BlockValidationResult, MiningControlError> {
         self.fill_uncommitted_witness(&mut block);
-        self.submit(&block)
+        self.submit(&block, None)
     }
 
     fn submit_block_with_bytes(
@@ -402,33 +380,18 @@ impl MiningControl for MiningCoordinator {
         mut block: Block,
         raw: Vec<u8>,
     ) -> Result<BlockValidationResult, MiningControlError> {
-        // `fill_uncommitted_witness` mutates `block` (inserts the 32-byte
-        // reserved nonce) when the submitted height is SegWit-active and the
-        // coinbase carries a commitment but no witness. The submitted bytes
-        // encode the pre-fill image, so the byte check runs before the fill;
-        // after the fill the block is re-checked (see below).
-        let prefix = submitted_prefix(&raw)?;
-        let canonical = deserialize::<Block>(prefix).map_err(|error| {
-            MiningControlError::Rejected(CompactString::from(error.to_string()))
-        })?;
-        if canonical != block {
+        if !bytes_are_block(&raw, &block) {
             return Err(MiningControlError::Rejected(CompactString::from(
                 "submitted bytes are not the serialization of the submitted block",
             )));
         }
-        self.fill_uncommitted_witness(&mut block);
-        if block == canonical {
-            // Fill was a no-op: `prefix` is the exact image of `block`, so
-            // thread it into the serialized apply path (parse once).
-            // The tail is dropped, not forwarded: RPC `submitblock` tolerates
-            // trailing bytes (API-15) but the apply path's `bytes_are_block`
-            // gate requires the exact image.
-            return self.submit_with_serialized(&block, bytes::Bytes::copy_from_slice(prefix));
-        }
-        // The fill inserted the reserved nonce, so the submitted bytes are
-        // stale. Re-serialize the filled block — the same single serialize
-        // the decode-only path always paid — and thread that.
-        self.submit_with_serialized(&block, bytes::Bytes::from(consensus_bytes(&block)))
+        let filled = self.fill_uncommitted_witness(&mut block);
+        let serialized = if filled {
+            bytes::Bytes::from(consensus_bytes(&block))
+        } else {
+            bytes::Bytes::from(raw)
+        };
+        self.submit(&block, Some(serialized))
     }
 
     /// Admits `header` through [`accept_headers`], the same gate inbound P2P uses.
@@ -514,7 +477,7 @@ impl MiningControl for MiningCoordinator {
                 MiningControlError::Failed(CompactString::from(error.to_string()))
             })?;
             if request.submit {
-                match self.submit(&block)? {
+                match self.submit(&block, None)? {
                     BlockValidationResult::Accepted => {}
                     other => {
                         return Err(MiningControlError::Failed(CompactString::from(format!(
