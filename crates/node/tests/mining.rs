@@ -783,10 +783,10 @@ fn submit_block_with_bytes_takes_the_serialized_apply_path() -> anyhow::Result<(
     Ok(())
 }
 
-/// RED: `raw` that is not this block's serialization must be refused, not
-/// applied. The mutation below touches only the witness, so every txid and
-/// the transaction count still match — the exact hole a count-only check
-/// would leave open.
+/// RED: `raw` that is not this block's serialization must be refused by the
+/// bytes gate with the gate's reason, not a downstream consensus reason. The
+/// mutation below touches only the witness, so every txid and the transaction
+/// count still match — the exact hole a count-only check would leave open.
 #[test]
 fn submit_block_with_bytes_refuses_foreign_bytes() -> anyhow::Result<()> {
     use bitcoin_rs_primitives::{Tx, consensus_bytes};
@@ -811,12 +811,16 @@ fn submit_block_with_bytes_refuses_foreign_bytes() -> anyhow::Result<()> {
             .collect::<Vec<_>>(),
         "the witness swap must not move a txid, or this proves nothing"
     );
-    let Err(error) = mining.submit_block_with_bytes(block, honest) else {
+    let Err(error) = mining.submit_block_with_bytes(block.clone(), honest) else {
         panic!("foreign bytes must be refused");
     };
-    assert!(
-        matches!(error, MiningControlError::Rejected(_)),
-        "foreign bytes must reject, got: {error:?}"
+    let MiningControlError::Rejected(reason) = error else {
+        panic!("foreign bytes must fail at the bytes gate, got: {error:?}");
+    };
+    assert_eq!(
+        reason.as_str(),
+        "submitted bytes are not the serialization of the submitted block",
+        "foreign bytes must fail at the bytes gate"
     );
     Ok(())
 }
