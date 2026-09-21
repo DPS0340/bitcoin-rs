@@ -6,7 +6,7 @@ use crate::{ColumnFamily, WriteBatch};
 #[derive(Default)]
 pub struct BufferedWriteBatch {
     pub(crate) ops: Vec<BatchOp>,
-    /// Key and value bytes counted by the existing write-path metrics.
+    /// Supplied key, value, and range-bound bytes, not physical engine I/O.
     pub(crate) encoded_bytes: usize,
 }
 
@@ -33,6 +33,10 @@ impl WriteBatch for BufferedWriteBatch {
     }
 
     fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
+        self.encoded_bytes = self
+            .encoded_bytes
+            .saturating_add(start.len())
+            .saturating_add(end.len());
         self.ops.push(BatchOp::DeleteRange {
             cf,
             start: start.to_vec(),
@@ -56,4 +60,19 @@ pub(crate) enum BatchOp {
         start: Vec<u8>,
         end: Vec<u8>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_metric_counts_range_bounds_and_mixed_operations() {
+        let mut batch = BufferedWriteBatch::default();
+        batch.delete_range(ColumnFamily::BlockBodies, b"a", b"zz");
+        assert_eq!(batch.encoded_bytes, 3);
+        batch.put(ColumnFamily::BlockBodies, b"key", b"value");
+        batch.delete(ColumnFamily::BlockBodies, b"gone");
+        assert_eq!(batch.encoded_bytes, 15);
+    }
 }
