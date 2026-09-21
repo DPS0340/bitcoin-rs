@@ -11,56 +11,11 @@ const MAX_PRIME_DIFF: u64 = 1_103_717;
 
 type U3072 = Uint<3072, LIMBS>;
 
-const MODULUS: U3072 = U3072::from_limbs([
-    18_446_744_073_708_447_899,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-    u64::MAX,
-]);
+const MODULUS: U3072 = {
+    let mut limbs = [u64::MAX; LIMBS];
+    limbs[0] -= MAX_PRIME_DIFF - 1;
+    U3072::from_limbs(limbs)
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Num3072 {

@@ -344,7 +344,7 @@ fn build_utxo_changes_excludes_op_return_outputs() -> Result<(), Box<dyn std::er
     )?;
     let utxo = UtxoSet::new();
 
-    utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x72; 32]))?;
+    utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0x72; 32]))?;
 
     assert!(utxo.get(&OutPoint::new(txid, 0)).is_some());
     assert!(utxo.get(&OutPoint::new(txid, 1)).is_none());
@@ -386,7 +386,7 @@ fn build_utxo_changes_nets_same_block_created_then_spent_outputs()
         1,
         "only the external spend is restorable; the same-block spend never entered the set"
     );
-    utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x63; 32]))?;
+    utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0x63; 32]))?;
 
     assert!(utxo.get(&base_prevout).is_none());
     assert!(utxo.get(&funding_outpoint).is_none());

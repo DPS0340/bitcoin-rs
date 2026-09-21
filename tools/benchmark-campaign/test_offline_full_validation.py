@@ -17,22 +17,24 @@ from typing import TypeIs
 sys.path.insert(0, str(Path(__file__).parent))
 
 import offline_full_validation as offline
+from evidence import (
+    ContractError,
+    canonical_bytes,
+    canonical_sha256,
+    summarize,
+)
 from offline_full_validation import (
     CONFIG_SCHEMA,
     MANIFEST_SCHEMA,
     PAIR_COUNT,
     RESULT_SCHEMA,
     CertifiedState,
-    ContractError,
-    canonical_bytes,
-    canonical_sha256,
     header_hash,
     load_config,
     main,
     parse_config,
     run_campaign,
     state_json,
-    summarize,
 )
 
 JsonObject = dict[str, object]
@@ -541,28 +543,6 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(summary["samples"], 7)
         self.assertEqual(summary["p50_ns"], 40)
         self.assertEqual(summary["max_ns"], 70)
-
-
-class NonVacuityProofs(unittest.TestCase):
-    def test_RED_wrong_schema_is_caught(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="offline-red-schema-"))
-        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
-        config_path, _ = _build_workspace(root)
-        output = root / OUTPUT_NAME
-        main(["--config", str(config_path), "--output", str(output)])
-        result = json.loads(output.read_bytes())
-        with self.assertRaises(AssertionError):
-            self.assertEqual(result["schema"], "offline-full-validation-result-v0")
-
-    def test_RED_wrong_arm_count_is_caught(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="offline-red-arms-"))
-        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
-        config_path, _ = _build_workspace(root)
-        output = root / OUTPUT_NAME
-        main(["--config", str(config_path), "--output", str(output)])
-        result = json.loads(output.read_bytes())
-        with self.assertRaises(AssertionError):
-            self.assertEqual(result["arm_count"], 12)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, TxOut, Txid};
-use bitcoin_rs_utxo::{BorrowedBlockChanges, BorrowedUtxoAdd};
+use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 
 use super::{Coin, Mutation, mutations_for_block};
 
@@ -22,8 +22,8 @@ fn classifies_bip30_restore_as_overwrite_before_spends() -> Result<(), super::Jo
     new.height = 100;
     new.txout.value = Amount::from_sat(25);
     let spent = coin(2, 20, 12);
-    let mut changes = BorrowedBlockChanges::with_capacity(1, 1);
-    changes.add(BorrowedUtxoAdd::new(
+    let mut changes = BlockChanges::with_capacity(1, 1);
+    changes.add(UtxoAdd::new(
         new.outpoint,
         &new.txout,
         new.coinbase,

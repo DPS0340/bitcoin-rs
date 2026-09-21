@@ -2,9 +2,9 @@
 
 ## 1. Reference and selected settings
 
-The reference is released Bitcoin Core **31.1**, commit
-`9be056a8a72b624dae9623b2f7bded92c2a21c91`. The binary and source identities
-are pinned in [core-compat.toml](../api/core-compat.toml).
+The [policy contract](../contracts/mempool-policy.md) owns the rules below;
+this page maps them to evidence and intentional compatibility differences.
+[core-compat.toml](../api/core-compat.toml) owns the Core source and binary pins.
 
 The process policy tests explicitly configure Core with
 `-acceptnonstdtxn=0 -minrelaytxfee=0.00001000
@@ -16,25 +16,11 @@ Both processes run isolated regtest chains funded by identical block bytes.
 
 ## 2. Ownership and commit
 
-`MempoolGateway` owns RPC and peer admission. It captures chain generation,
-public membership sequence, policy settings and a private fee-delta sequence.
-Fee-only changes invalidate prepared work without publishing a membership event.
-Chain reads, script verification and fee-diagram solving run outside pool write
-locks. The writer rechecks the captured state before committing.
-
-`Mempool` owns admitted entries, dependency links, connected-component membership
-and cached component count/weight. Immutable projections of those links supply
-replacement, package preview, mining and eviction. There is no second mutable
-transaction graph. Mining and capacity eviction consume the same fee chunks.
-
-Replacement collects direct conflicts and their descendants, checks the projected
-post-removal graph, computes any necessary capacity removals and verifies the
-complete affected before/after fee diagrams. The affected set includes surviving
-relatives and newly joined parent clusters. The writer removes victims, installs
-the candidate and records one ordered mutation. A candidate that would itself be
-trimmed rejects before mutation. Rejection preserves membership, fee deltas,
-estimator inputs and publication sequence. Ordinary successful insertion retains
-its accepted-before-capacity-removals event order.
+`POL-02` and `POL-03` own admission, preparation stamps, and atomic refusal.
+[Mempool mutations](../contracts/mempool-mutations.md) owns publication order:
+replacement removes victims before publishing acceptance; ordinary insertion
+keeps its accepted-before-capacity-removals event order. This page does not
+define another graph, mutation owner, or commit protocol.
 
 ## 3. Policy matrix
 

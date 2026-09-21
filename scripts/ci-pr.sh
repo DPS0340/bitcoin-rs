@@ -1,20 +1,7 @@
 #!/usr/bin/env bash
-# Single owner of the pull-request gate commands.
-#
-# The CI jobs (.github/workflows/ci.yml), the pre-commit hooks, and
-# CONTRIBUTING.md invoke this script. Do not restate these commands anywhere
-# else: the copies drift (the pre-commit config kept referencing the removed
-# mdbx backend after its deletion).
-#
-# Compile and test profiles are kernel-free and need no CMake or Boost. The
-# deny profile selects `kernel` only for metadata resolution; cargo-deny does
-# not compile that graph.
-#
-# The pull-request lanes fail fast (issue #1081): clippy and every test lane
-# stop at the first failing profile so the author sees the first actionable
-# failure without paying for the remaining profiles. The deep lane keeps the
-# collect-all behavior (one failing profile must not hide the diagnostics of
-# the profiles after it) for local diagnosis.
+# Gate commands shared by CI, pre-commit, and CONTRIBUTING.md.
+# PR lanes fail fast; deep collects every failure. Build/test lanes are
+# kernel-free; deny resolves the kernel graph without compiling it.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -26,24 +13,8 @@ usage() {
 
 [[ $# -eq 1 ]] || usage
 
-# Fail-fast runner for the pull-request lanes: the first failing command
-# aborts the lane immediately. The FAILED marker keeps the log contract
-# shared with the collect runner, so failure latency stays measurable by
-# grepping the ==> markers in either mode (issue #1081).
-failfast() {
-  local label="$1"
-  shift
-  echo "==> ${label}"
-  if "$@"; then
-    echo "==> ok: ${label}"
-  else
-    echo "==> FAILED: ${label}" >&2
-    exit 1
-  fi
-}
-
-# Collect-all runner for the deep lane.
 failures=0
+collect_failures=false
 
 profile() {
   local label="$1"
@@ -54,6 +25,7 @@ profile() {
   else
     echo "==> FAILED: ${label}" >&2
     failures=$((failures + 1))
+    [[ "$collect_failures" == true ]] || exit 1
   fi
 }
 
@@ -64,20 +36,17 @@ finish() {
   fi
 }
 
-# Each profile command list exists once; the runner argument (failfast for
-# the pull-request lanes, profile for deep) selects the failure behavior, so
-# the two modes cannot drift apart.
 clippy_profiles() {
   # Three kernel-free all-target profiles; consensus and node have
   # kernel-enabled defaults, so they are checked separately without it.
-  "$1" "clippy: workspace (kernel-free)" \
+  profile "clippy: workspace (kernel-free)" \
     cargo clippy --locked --workspace --all-targets \
       --exclude bitcoin-rs-consensus --exclude bitcoin-rs-node \
       -- -D warnings
-  "$1" "clippy: bitcoin-rs-consensus (native)" \
+  profile "clippy: bitcoin-rs-consensus (native)" \
     cargo clippy --locked -p bitcoin-rs-consensus \
       --no-default-features --all-targets -- -D warnings
-  "$1" "clippy: bitcoin-rs-node (fjall,zmq)" \
+  profile "clippy: bitcoin-rs-node (fjall,zmq)" \
     cargo clippy --locked -p bitcoin-rs-node \
       --no-default-features --features fjall,zmq --all-targets -- -D warnings
 }
@@ -85,19 +54,19 @@ clippy_profiles() {
 test_crates_profiles() {
   # Fixture-free per-crate profiles; only the binary's tests read the pinned
   # Core fixture. Smallest first.
-  "$1" "test: bitcoin-rs-consensus (native)" \
+  profile "test: bitcoin-rs-consensus (native)" \
     cargo test --locked -p bitcoin-rs-consensus --no-default-features --no-fail-fast
-  "$1" "test: bitcoin-rs-node (fjall,zmq)" \
+  profile "test: bitcoin-rs-node (fjall,zmq)" \
     cargo test --locked -p bitcoin-rs-node \
       --no-default-features --features fjall,zmq --no-fail-fast
   # Isolated so node's default zmq feature cannot unify this package on.
-  "$1" "test: bitcoin-rs-rpc (no default features)" \
+  profile "test: bitcoin-rs-rpc (no default features)" \
     cargo test --locked -p bitcoin-rs-rpc --no-default-features --no-fail-fast
 }
 
 test_binary_profiles() {
   # Requires the pinned Core fixture. Formal checks have their own workflow.
-  "$1" "test: bitcoin-rs binary (rocksdb,fjall,redb)" \
+  profile "test: bitcoin-rs binary (rocksdb,fjall,redb)" \
     cargo test --locked -p bitcoin-rs --no-fail-fast \
       --no-default-features --features "rocksdb,fjall,redb"
 }
@@ -106,7 +75,7 @@ test_workspace_profiles() {
   # Also expects the pinned fixtures: bin/bitcoin-rs is a workspace member,
   # so this profile runs its default-feature (fjall,redb,zmq) test binaries,
   # including the process-harness suite that launches the pinned bitcoind.
-  "$1" "test: workspace (kernel-free)" \
+  profile "test: workspace (kernel-free)" \
     cargo test --locked --workspace --no-fail-fast \
       --exclude bitcoin-rs-consensus --exclude bitcoin-rs-node
 }
@@ -117,19 +86,19 @@ case "$1" in
     ;;
 
   clippy)
-    clippy_profiles failfast
+    clippy_profiles
     ;;
 
   test-crates)
-    test_crates_profiles failfast
+    test_crates_profiles
     ;;
 
   test-binary)
-    test_binary_profiles failfast
+    test_binary_profiles
     ;;
 
   test-workspace)
-    test_workspace_profiles failfast
+    test_workspace_profiles
     ;;
 
   test)
@@ -150,12 +119,11 @@ case "$1" in
     ;;
 
   deep)
-    # Collect-all variant: every clippy and test profile runs to completion
-    # even after one fails, maximizing diagnostics per invocation.
-    clippy_profiles profile
-    test_crates_profiles profile
-    test_binary_profiles profile
-    test_workspace_profiles profile
+    collect_failures=true
+    clippy_profiles
+    test_crates_profiles
+    test_binary_profiles
+    test_workspace_profiles
     finish
     ;;
 

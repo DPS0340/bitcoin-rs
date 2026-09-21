@@ -23,25 +23,14 @@ fn tick_sends_getdata_from_next_applied_height_when_gap_exceeds_batch()
         }
     }
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+    } = SyncHarness::new(tree);
     install_budget(
         &sync,
         super::super::SyncBudget {
@@ -87,25 +76,14 @@ fn second_tick_does_not_re_request_already_pending_blocks() -> Result<(), Box<dy
         tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
     }
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+    } = SyncHarness::new(tree);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 

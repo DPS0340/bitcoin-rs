@@ -15,25 +15,14 @@ fn tick_sends_getdata_for_headers_above_applied_tip() -> Result<(), Box<dyn std:
         expected.push(BlockHash::from(tree.node(tip_id)?.hash));
     }
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+    } = SyncHarness::new(tree);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
@@ -97,26 +86,15 @@ fn tick_fetches_new_tip_headers_from_at_tip_peers() -> Result<(), Box<dyn std::e
     let announced_header = test_header(BlockHash::from(tree.node(tip_id)?.hash), 3);
     let expected = announced_header.compute_hash();
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
+    let SyncHarness {
+        sync,
+        peers,
+        applied_tip,
+        inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
     applied_tip.store(Some(Arc::new(applied)));
-    let peers = Arc::new(PeerTable::new());
-    let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
     // The peer's handshake height equals the applied height: it connected
     // while the node was at the tip, before the new block existed.
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -187,25 +165,15 @@ fn tick_fetches_reorg_fork_announced_by_at_tip_peer() -> Result<(), Box<dyn std:
         .map(|header| header.compute_hash().into())
         .collect();
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
+    let SyncHarness {
+        sync,
+        peers,
+        applied_tip,
+        inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
     applied_tip.store(Some(Arc::new(applied)));
-    let peers = Arc::new(PeerTable::new());
-    let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let sync = BlockSync::new(
-        std::sync::Arc::new(TestChain::new(
-            chain_tip,
-            Arc::clone(&applied_tip),
-            Arc::clone(&block_tree),
-        )),
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
     // The peer's handshake height equals the applied height: it
     // connected at the losing tip, and only the fork announcement it
     // delivers demonstrates anything beyond that.
@@ -276,25 +244,15 @@ fn losing_fork_credit_survives_winner_disconnect() -> Result<(), Box<dyn std::er
         .map(|header| header.compute_hash().into())
         .collect();
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
+    let SyncHarness {
+        sync,
+        peers,
+        applied_tip,
+        inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
     applied_tip.store(Some(Arc::new(applied)));
-    let peers = Arc::new(PeerTable::new());
-    let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let sync = BlockSync::new(
-        std::sync::Arc::new(TestChain::new(
-            chain_tip,
-            Arc::clone(&applied_tip),
-            Arc::clone(&block_tree),
-        )),
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
 
     let peer_a = test_addr(8333, 0)?;
     let peer_b = test_addr(8333, 1)?;

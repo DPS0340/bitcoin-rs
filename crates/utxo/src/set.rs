@@ -1,4 +1,4 @@
-use std::{io, time::Instant};
+use std::{borrow::Borrow, io, time::Instant};
 
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -351,23 +351,23 @@ where
     }
 }
 
-/// One UTXO output to add to the set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UtxoAdd {
+/// One UTXO output to add, owning a `TxOut` or borrowing it from a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UtxoAdd<T = TxOut> {
     /// Outpoint being created.
     pub outpoint: OutPoint,
     /// Output payload.
-    pub txout: TxOut,
+    pub txout: T,
     /// Whether the creating transaction is coinbase.
     pub coinbase: bool,
     /// Creating block height.
     pub height: u32,
 }
 
-impl UtxoAdd {
+impl<T> UtxoAdd<T> {
     /// Constructs an add operation.
     #[must_use]
-    pub const fn new(outpoint: OutPoint, txout: TxOut, coinbase: bool, height: u32) -> Self {
+    pub const fn new(outpoint: OutPoint, txout: T, coinbase: bool, height: u32) -> Self {
         Self {
             outpoint,
             txout,
@@ -377,83 +377,15 @@ impl UtxoAdd {
     }
 }
 
-/// One borrowed UTXO output to add to the set.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BorrowedUtxoAdd<'a> {
-    /// Outpoint being created.
-    pub outpoint: OutPoint,
-    /// Output payload borrowed from the connected block.
-    pub txout: &'a TxOut,
-    /// Whether the creating transaction is coinbase.
-    pub coinbase: bool,
-    /// Creating block height.
-    pub height: u32,
-}
-
-impl<'a> BorrowedUtxoAdd<'a> {
-    /// Constructs a borrowed add operation.
-    #[must_use]
-    pub const fn new(outpoint: OutPoint, txout: &'a TxOut, coinbase: bool, height: u32) -> Self {
-        Self {
-            outpoint,
-            txout,
-            coinbase,
-            height,
-        }
-    }
-}
-
-pub(crate) trait UtxoAddView {
-    fn outpoint(&self) -> &OutPoint;
-    fn txout(&self) -> &TxOut;
-    fn coinbase(&self) -> bool;
-    fn height(&self) -> u32;
-
-    fn payload(&self) -> BuildPayload<'_> {
+impl<T: Borrow<TxOut>> UtxoAdd<T> {
+    pub(crate) fn payload(&self) -> BuildPayload<'_> {
         BuildPayload {
-            outpoint: self.outpoint(),
-            vout: self.outpoint().vout,
-            txout: self.txout(),
-            coinbase: self.coinbase(),
-            height: self.height(),
+            outpoint: &self.outpoint,
+            vout: self.outpoint.vout,
+            txout: self.txout.borrow(),
+            coinbase: self.coinbase,
+            height: self.height,
         }
-    }
-}
-
-impl UtxoAddView for UtxoAdd {
-    fn outpoint(&self) -> &OutPoint {
-        &self.outpoint
-    }
-
-    fn txout(&self) -> &TxOut {
-        &self.txout
-    }
-
-    fn coinbase(&self) -> bool {
-        self.coinbase
-    }
-
-    fn height(&self) -> u32 {
-        self.height
-    }
-}
-
-impl UtxoAddView for BorrowedUtxoAdd<'_> {
-    fn outpoint(&self) -> &OutPoint {
-        &self.outpoint
-    }
-
-    fn txout(&self) -> &TxOut {
-        self.txout
-    }
-
-    fn coinbase(&self) -> bool {
-        self.coinbase
-    }
-
-    fn height(&self) -> u32 {
-        self.height
     }
 }
 
@@ -479,14 +411,20 @@ pub struct UtxoScan {
     pub unspents: Vec<ScannedUtxo>,
 }
 
-/// UTXO mutations produced by one connected block.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BlockChanges {
-    adds: Vec<UtxoAdd>,
+/// UTXO mutations with owned or borrowed output payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockChanges<T = TxOut> {
+    adds: Vec<UtxoAdd<T>>,
     removes: Vec<OutPoint>,
 }
 
-impl BlockChanges {
+impl<T> Default for BlockChanges<T> {
+    fn default() -> Self {
+        Self::with_capacity(0, 0)
+    }
+}
+
+impl<T> BlockChanges<T> {
     /// Creates an empty change set with storage reserved for known operation counts.
     #[must_use]
     pub fn with_capacity(adds: usize, removes: usize) -> Self {
@@ -497,54 +435,7 @@ impl BlockChanges {
     }
 
     /// Appends an output creation.
-    pub fn add(&mut self, add: UtxoAdd) {
-        self.adds.push(add);
-    }
-
-    /// Appends an output spend.
-    pub fn remove(&mut self, outpoint: OutPoint) {
-        self.removes.push(outpoint);
-    }
-
-    /// Returns true when there are no additions or removals.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.adds.is_empty() && self.removes.is_empty()
-    }
-
-    /// Returns the number of add operations.
-    #[must_use]
-    pub const fn add_count(&self) -> usize {
-        self.adds.len()
-    }
-
-    /// Returns the number of remove operations.
-    #[must_use]
-    pub const fn remove_count(&self) -> usize {
-        self.removes.len()
-    }
-}
-
-/// Borrowed UTXO mutations produced by one connected block.
-#[doc(hidden)]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BorrowedBlockChanges<'a> {
-    adds: Vec<BorrowedUtxoAdd<'a>>,
-    removes: Vec<OutPoint>,
-}
-
-impl<'a> BorrowedBlockChanges<'a> {
-    /// Creates an empty borrowed change set with storage reserved for known operation counts.
-    #[must_use]
-    pub fn with_capacity(adds: usize, removes: usize) -> Self {
-        Self {
-            adds: Vec::with_capacity(adds),
-            removes: Vec::with_capacity(removes),
-        }
-    }
-
-    /// Appends an output creation.
-    pub fn add(&mut self, add: BorrowedUtxoAdd<'a>) {
+    pub fn add(&mut self, add: UtxoAdd<T>) {
         self.adds.push(add);
     }
 
@@ -571,9 +462,9 @@ impl<'a> BorrowedBlockChanges<'a> {
         self.removes.len()
     }
 
-    /// Iterates the borrowed add operations in commit order.
+    /// Returns output creations in commit order.
     #[must_use]
-    pub fn adds(&self) -> &[BorrowedUtxoAdd<'a>] {
+    pub fn adds(&self) -> &[UtxoAdd<T>] {
         &self.adds
     }
 
@@ -823,23 +714,12 @@ impl UtxoSet {
     }
 
     /// Applies all UTXO changes for a connected block.
-    pub fn commit_block(
+    pub fn commit_block<T: Borrow<TxOut>>(
         &self,
-        changes: &BlockChanges,
+        changes: &BlockChanges<T>,
         block_hash: &Hash256,
     ) -> Result<(), UtxoError> {
         tracing::trace!(%block_hash, adds = changes.adds.len(), removes = changes.removes.len(), "commit utxo block");
-        self.commit_adds_and_removes(&changes.adds, &changes.removes)
-    }
-
-    /// Applies borrowed UTXO changes for a connected block.
-    #[doc(hidden)]
-    pub fn commit_borrowed_block(
-        &self,
-        changes: &BorrowedBlockChanges<'_>,
-        block_hash: &Hash256,
-    ) -> Result<(), UtxoError> {
-        tracing::trace!(%block_hash, adds = changes.adds.len(), removes = changes.removes.len(), "commit borrowed utxo block");
         self.commit_adds_and_removes(&changes.adds, &changes.removes)
     }
 
@@ -921,9 +801,9 @@ impl UtxoSet {
         self.shards[usize::from(key.shard())].insert_owned_record(key, txid, outputs)
     }
 
-    fn commit_adds_and_removes<A: UtxoAddView>(
+    fn commit_adds_and_removes<T: Borrow<TxOut>>(
         &self,
-        adds: &[A],
+        adds: &[UtxoAdd<T>],
         removes: &[OutPoint],
     ) -> Result<(), UtxoError> {
         let mut add_counts = [0_usize; UtxoKey::SHARD_COUNT];
@@ -931,7 +811,7 @@ impl UtxoSet {
 
         for add in adds {
             validate_add(add)?;
-            let key = UtxoKey::from_txid(&add.outpoint().txid);
+            let key = UtxoKey::from_txid(&add.outpoint.txid);
             let shard_idx = usize::from(key.shard());
             add_counts[shard_idx] = add_counts[shard_idx].saturating_add(1);
         }
@@ -1081,9 +961,9 @@ impl UtxoSet {
         Ok(())
     }
 
-    fn commit_single_shard<A: UtxoAddView>(
+    fn commit_single_shard<T: Borrow<TxOut>>(
         &self,
-        adds: &[A],
+        adds: &[UtxoAdd<T>],
         removes: &[OutPoint],
         shard_idx: usize,
     ) -> Result<(), UtxoError> {
@@ -1103,8 +983,8 @@ impl Default for UtxoSet {
     }
 }
 
-fn validate_add(add: &impl UtxoAddView) -> Result<(), UtxoError> {
-    let script_len = add.txout().script_pubkey.len();
+fn validate_add<T: Borrow<TxOut>>(add: &UtxoAdd<T>) -> Result<(), UtxoError> {
+    let script_len = add.txout.borrow().script_pubkey.len();
     let _fits =
         u16::try_from(script_len).map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
     Ok(())
@@ -1156,8 +1036,8 @@ impl<T> ShardBucketSide<T> {
 }
 
 impl<'a> ShardCommitBuckets<'a> {
-    fn new<A: UtxoAddView>(
-        adds: &'a [A],
+    fn new<T: Borrow<TxOut>>(
+        adds: &'a [UtxoAdd<T>],
         removes: &'a [OutPoint],
         add_counts: &[usize; UtxoKey::SHARD_COUNT],
         remove_counts: &[usize; UtxoKey::SHARD_COUNT],
@@ -1206,8 +1086,8 @@ impl<T> ShardBucketSide<T> {
     }
 }
 
-fn build_add_side<'a, A: UtxoAddView>(
-    adds: &'a [A],
+fn build_add_side<'a, T: Borrow<TxOut>>(
+    adds: &'a [UtxoAdd<T>],
     counts: &[usize; UtxoKey::SHARD_COUNT],
 ) -> ShardBucketSide<AddPayload<'a>> {
     match bucket_shape(counts) {
@@ -1281,12 +1161,12 @@ fn bucket_shape(counts: &[usize; UtxoKey::SHARD_COUNT]) -> BucketShape {
     active.map_or(BucketShape::Empty, BucketShape::Single)
 }
 
-fn direct_adds<A: UtxoAddView>(adds: &[A], shard_idx: usize) -> Vec<AddPayload<'_>> {
+fn direct_adds<T: Borrow<TxOut>>(adds: &[UtxoAdd<T>], shard_idx: usize) -> Vec<AddPayload<'_>> {
     let mut payloads = Vec::with_capacity(adds.len());
     for add in adds {
-        let key = UtxoKey::from_txid(&add.outpoint().txid);
+        let key = UtxoKey::from_txid(&add.outpoint.txid);
         debug_assert_eq!(usize::from(key.shard()), shard_idx);
-        payloads.push((key, add.outpoint().txid.into(), add.payload()));
+        payloads.push((key, add.outpoint.txid.into(), add.payload()));
     }
     payloads
 }
@@ -1301,8 +1181,8 @@ fn direct_removes(removes: &[OutPoint], shard_idx: usize) -> Vec<SpendPayload<'_
     payloads
 }
 
-fn scattered_adds<'a, A: UtxoAddView>(
-    adds: &'a [A],
+fn scattered_adds<'a, T: Borrow<TxOut>>(
+    adds: &'a [UtxoAdd<T>],
     counts: &[usize; UtxoKey::SHARD_COUNT],
 ) -> ([(usize, usize); UtxoKey::SHARD_COUNT], Vec<AddPayload<'a>>) {
     let (ranges, mut cursors) = shard_ranges(counts);
@@ -1310,10 +1190,10 @@ fn scattered_adds<'a, A: UtxoAddView>(
         .take(adds.len())
         .collect::<Vec<Option<AddPayload<'a>>>>();
     for add in adds {
-        let key = UtxoKey::from_txid(&add.outpoint().txid);
+        let key = UtxoKey::from_txid(&add.outpoint.txid);
         let shard_idx = usize::from(key.shard());
         let cursor = &mut cursors[shard_idx];
-        slots[*cursor] = Some((key, add.outpoint().txid.into(), add.payload()));
+        slots[*cursor] = Some((key, add.outpoint.txid.into(), add.payload()));
         *cursor = cursor.saturating_add(1);
     }
     debug_assert_eq!(cursors, range_ends(&ranges));

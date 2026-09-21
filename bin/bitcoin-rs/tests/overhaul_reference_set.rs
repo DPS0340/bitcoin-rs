@@ -4,11 +4,12 @@
 
 #![expect(clippy::expect_used, reason = "reference identity rejection tests")]
 
-mod support;
+#[path = "support/reference_set.rs"]
+mod reference_set;
 
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin_rs_rpc::compat_manifest::{MANIFEST_TOML, Status};
-use support::reference_set::{CorpusCustody, ReferenceError, load_reference_set, reference_set};
+use reference_set::{CorpusCustody, ReferenceError, load_reference_set, reference_set};
 
 fn edit_reference(section: Option<&str>, edit: impl FnOnce(&mut toml::Table)) -> String {
     let mut manifest: toml::Table = toml::from_str(MANIFEST_TOML).expect("manifest parses");

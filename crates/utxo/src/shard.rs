@@ -1,3 +1,5 @@
+use std::borrow::Borrow;
+
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, Script, TxOut};
 use crossbeam_utils::CachePadded;
 use hashbrown::HashTable;
@@ -8,7 +10,7 @@ use crate::{
     UtxoError, UtxoKey,
     record::{OutputParts, OwnedUtxoOut, RemovedRecord, UtxoRecord},
     set::{
-        BuildPayload, ScannedUtxo, SpendPayload, UtxoAddView, UtxoChangeEvents, UtxoChangeListener,
+        BuildPayload, ScannedUtxo, SpendPayload, UtxoAdd, UtxoChangeEvents, UtxoChangeListener,
         UtxoInserted, UtxoRemoved, UtxoScan,
     },
 };
@@ -119,9 +121,9 @@ impl Shard {
         commit_batch_collect_events(&mut table, adds, removes)
     }
 
-    pub(crate) fn commit_single_shard_batch<A: UtxoAddView>(
+    pub(crate) fn commit_single_shard_batch<T: Borrow<TxOut>>(
         &self,
-        adds: &[A],
+        adds: &[UtxoAdd<T>],
         removes: &[OutPoint],
         shard_idx: usize,
     ) -> Result<(), UtxoError> {
@@ -129,9 +131,9 @@ impl Shard {
         commit_single_shard_coalesced(&mut table, adds, removes, shard_idx)
     }
 
-    pub(crate) fn commit_single_shard_batch_with_listener<A: UtxoAddView>(
+    pub(crate) fn commit_single_shard_batch_with_listener<T: Borrow<TxOut>>(
         &self,
-        adds: &[A],
+        adds: &[UtxoAdd<T>],
         removes: &[OutPoint],
         shard_idx: usize,
         listener: &(dyn UtxoChangeListener + Send + Sync),
@@ -365,9 +367,9 @@ fn commit_batch_coalesced(
     )
 }
 
-fn commit_single_shard_coalesced<A: UtxoAddView>(
+fn commit_single_shard_coalesced<T: Borrow<TxOut>>(
     table: &mut ShardTable,
-    adds: &[A],
+    adds: &[UtxoAdd<T>],
     removes: &[OutPoint],
     shard_idx: usize,
 ) -> Result<(), UtxoError> {
@@ -375,7 +377,7 @@ fn commit_single_shard_coalesced<A: UtxoAddView>(
         (UtxoKey::from_txid(&remove.txid), remove.txid.into())
     });
     let add_spans = sorted_run_spans(adds, |add| {
-        let txid = add.outpoint().txid;
+        let txid = add.outpoint.txid;
         (UtxoKey::from_txid(&txid), txid.into())
     });
     if cfg!(debug_assertions) {
@@ -507,9 +509,9 @@ fn merge_commit_runs<'src>(
     Ok(())
 }
 
-fn commit_single_shard_with_listener<A: UtxoAddView>(
+fn commit_single_shard_with_listener<T: Borrow<TxOut>>(
     table: &mut ShardTable,
-    adds: &[A],
+    adds: &[UtxoAdd<T>],
     removes: &[OutPoint],
     shard_idx: usize,
     listener: &(dyn UtxoChangeListener + Send + Sync),
@@ -531,18 +533,18 @@ fn commit_single_shard_with_listener<A: UtxoAddView>(
     reserve_add_runs(table, utxo_add_run_count(adds));
     let mut remaining_adds = adds;
     while let Some((first, rest)) = remaining_adds.split_first() {
-        let key = UtxoKey::from_txid(&first.outpoint().txid);
+        let key = UtxoKey::from_txid(&first.outpoint.txid);
         debug_assert_eq!(usize::from(key.shard()), shard_idx);
         let run_len = rest
             .iter()
-            .take_while(|add| add.outpoint().txid == first.outpoint().txid)
+            .take_while(|add| add.outpoint.txid == first.outpoint.txid)
             .count()
             .saturating_add(1);
         let payloads = build_payloads(&remaining_adds[..run_len]);
         apply_add_payload_run_with_listener(
             table,
             key,
-            first.outpoint().txid.into(),
+            first.outpoint.txid.into(),
             &payloads,
             listener,
         )?;
@@ -576,13 +578,13 @@ fn coalesced_add_run_count(adds: &[(UtxoKey, Hash256, BuildPayload<'_>)]) -> usi
     run_count
 }
 
-fn utxo_add_run_count<A: UtxoAddView>(adds: &[A]) -> usize {
+fn utxo_add_run_count<T: Borrow<TxOut>>(adds: &[UtxoAdd<T>]) -> usize {
     let mut run_count = 0usize;
     let mut remaining_adds = adds;
     while let Some((first, rest)) = remaining_adds.split_first() {
         let run_len = rest
             .iter()
-            .take_while(|add| add.outpoint().txid == first.outpoint().txid)
+            .take_while(|add| add.outpoint.txid == first.outpoint.txid)
             .count()
             .saturating_add(1);
         run_count = run_count.saturating_add(1);
@@ -606,7 +608,7 @@ fn spend_payloads(removes: &[OutPoint]) -> Vec<SpendPayload<'_>> {
         .collect()
 }
 
-fn build_payloads<A: UtxoAddView>(adds: &[A]) -> Vec<BuildPayload<'_>> {
+fn build_payloads<T: Borrow<TxOut>>(adds: &[UtxoAdd<T>]) -> Vec<BuildPayload<'_>> {
     adds.iter().map(|add| add.payload()).collect()
 }
 

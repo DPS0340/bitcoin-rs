@@ -58,12 +58,6 @@ pub struct PeerInfo {
 }
 
 impl PeerInfo {
-    fn time_offset(version: &VersionMessage, version_received_time: u64) -> i64 {
-        version
-            .timestamp
-            .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX))
-    }
-
     /// Constructs a `PeerInfo` for an inbound peer from the captured remote `VersionMessage`.
     #[must_use]
     pub fn inbound_from_version(
@@ -75,23 +69,15 @@ impl PeerInfo {
         counters: Arc<PeerCounters>,
     ) -> Self {
         Self {
-            addr,
-            version: version.version,
-            wtxid_relay: false,
-            compact_block_relay: false,
-            services: version.services.to_u64(),
-            user_agent: version.user_agent.clone(),
-            start_height: version.start_height,
-            best_known_height: version.start_height,
-            conn_time,
             inbound: true,
-            addr_bind,
-            // The peer states its own clock in the version message. Core takes
-            // the difference against local time at that moment and never
-            // revisits it, so a long-lived connection reports the offset as it
-            // was at handshake.
-            time_offset: Self::time_offset(version, version_received_time),
-            counters,
+            ..Self::outbound_from_version(
+                addr,
+                addr_bind,
+                version,
+                conn_time,
+                version_received_time,
+                counters,
+            )
         }
     }
 
@@ -117,11 +103,10 @@ impl PeerInfo {
             conn_time,
             inbound: false,
             addr_bind,
-            // The peer states its own clock in the version message. Core takes
-            // the difference against local time at that moment and never
-            // revisits it, so a long-lived connection reports the offset as it
-            // was at handshake.
-            time_offset: Self::time_offset(version, version_received_time),
+            // Freeze the offset at version receipt, not handshake completion.
+            time_offset: version
+                .timestamp
+                .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX)),
             counters,
         }
     }
@@ -131,31 +116,18 @@ impl PeerInfo {
     /// Order follows Bitcoin Core's bit assignment. Unrecognized bits are dropped.
     #[must_use]
     pub fn services_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<&'static str> = Vec::new();
-
-        if self.services & 1_u64 != 0 {
-            names.push("NETWORK");
-        }
-        if self.services & (1_u64 << 1) != 0 {
-            names.push("GETUTXO");
-        }
-        if self.services & (1_u64 << 2) != 0 {
-            names.push("BLOOM");
-        }
-        if self.services & (1_u64 << 3) != 0 {
-            names.push("WITNESS");
-        }
-        if self.services & (1_u64 << 6) != 0 {
-            names.push("COMPACT_FILTERS");
-        }
-        if self.services & (1_u64 << 10) != 0 {
-            names.push("NETWORK_LIMITED");
-        }
-        if self.services & (1_u64 << 11) != 0 {
-            names.push("P2P_V2");
-        }
-
-        names
+        [
+            (0, "NETWORK"),
+            (1, "GETUTXO"),
+            (2, "BLOOM"),
+            (3, "WITNESS"),
+            (6, "COMPACT_FILTERS"),
+            (10, "NETWORK_LIMITED"),
+            (11, "P2P_V2"),
+        ]
+        .into_iter()
+        .filter_map(|(bit, name)| (self.services & (1_u64 << bit) != 0).then_some(name))
+        .collect()
     }
 }
 #[cfg(test)]
@@ -189,20 +161,10 @@ mod tests {
     }
 
     fn peer_info_with_services(services: u64) -> PeerInfo {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         PeerInfo {
-            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333),
-            version: 70_016,
-            wtxid_relay: false,
-            compact_block_relay: false,
             services,
-            user_agent: String::new(),
-            start_height: 0,
-            best_known_height: 0,
-            conn_time: 0,
-            inbound: false,
-            addr_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333),
-            time_offset: 0,
-            counters: counters(),
+            ..PeerInfo::outbound_from_version(addr, addr, &fake_version(), 0, 0, counters())
         }
     }
 
@@ -252,21 +214,28 @@ mod tests {
     }
 
     #[test]
-    fn outbound_from_version_sets_inbound_false() {
+    fn constructors_preserve_direction_and_handshake_metadata() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let version = fake_version();
-        let info = PeerInfo::outbound_from_version(addr, addr, &version, 100, 0, counters());
-        assert!(!info.inbound);
-        assert_eq!(info.start_height, 7);
-        assert_eq!(info.conn_time, 100);
-    }
-
-    #[test]
-    fn inbound_from_version_sets_inbound_true() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
-        let version = fake_version();
-        let info = PeerInfo::inbound_from_version(addr, addr, &version, 100, 0, counters());
-        assert!(info.inbound);
+        let counters = counters();
+        let inbound =
+            PeerInfo::inbound_from_version(addr, addr, &version, 100, 50, Arc::clone(&counters));
+        let outbound = PeerInfo::outbound_from_version(addr, addr, &version, 100, 50, counters);
+        assert!(inbound.inbound);
+        assert!(!outbound.inbound);
+        assert_eq!(outbound.start_height, 7);
+        assert_eq!(outbound.best_known_height, 7);
+        assert_eq!(outbound.conn_time, 100);
+        assert_eq!(outbound.time_offset, -50);
+        assert!(!outbound.wtxid_relay);
+        assert!(!outbound.compact_block_relay);
+        assert_eq!(
+            PeerInfo {
+                inbound: false,
+                ..inbound
+            },
+            outbound
+        );
     }
 
     #[test]

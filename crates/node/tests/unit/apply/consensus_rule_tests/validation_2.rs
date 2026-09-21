@@ -28,7 +28,7 @@ fn build_utxo_changes_excludes_oversized_scripts() -> Result<(), Box<dyn std::er
     )?;
     let utxo = UtxoSet::new();
 
-    utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x73; 32]))?;
+    utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0x73; 32]))?;
 
     assert!(utxo.get(&OutPoint::new(txid, 0)).is_some());
     assert!(utxo.get(&OutPoint::new(txid, 1)).is_some());

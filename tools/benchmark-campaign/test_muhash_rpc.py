@@ -2138,7 +2138,8 @@ class CampaignControllerTests(unittest.TestCase):
             evict=evict,
         )
         workspace = root / "work"
-        workspace.mkdir()
+        # Receipt publication requires a private parent regardless of umask.
+        workspace.mkdir(mode=0o700)
         code = module.main(
             [
                 "campaign",

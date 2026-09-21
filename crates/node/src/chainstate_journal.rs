@@ -15,8 +15,8 @@ use bitcoin_rs_storage::chainstate_journal::JournalReplayBase;
 use bitcoin_rs_storage::chainstate_journal::JournalReplayError;
 use bitcoin_rs_storage::chainstate_journal::Mutation;
 use bitcoin_rs_storage::chainstate_journal::replay_committed_range;
-use bitcoin_rs_utxo::BorrowedBlockChanges;
-use bitcoin_rs_utxo::BorrowedUtxoAdd;
+use bitcoin_rs_utxo::BlockChanges;
+use bitcoin_rs_utxo::UtxoAdd;
 use bitcoin_rs_utxo::UtxoSet;
 use hashbrown::HashMap;
 use thiserror::Error;
@@ -40,7 +40,7 @@ pub(crate) enum JournalDeltaError {
 /// outpoint. Records are matched by outpoint, not by input order. Creates and
 /// overwrites precede spends; same-block spends are already netted out.
 pub(crate) fn mutations_for_block(
-    changes: &BorrowedBlockChanges<'_>,
+    changes: &BlockChanges<&'_ bitcoin_rs_primitives::TxOut>,
     undo_coins: impl IntoIterator<Item = Coin>,
 ) -> Result<Vec<Mutation>, JournalDeltaError> {
     let mut restores = HashMap::new();
@@ -291,8 +291,7 @@ fn apply_record_mutations(
     utxo: &UtxoSet,
     record: &JournalRecord,
 ) -> Result<(), JournalReplayError> {
-    let mut changes =
-        BorrowedBlockChanges::with_capacity(record.mutations.len(), record.mutations.len());
+    let mut changes = BlockChanges::with_capacity(record.mutations.len(), record.mutations.len());
     for mutation in &record.mutations {
         match mutation {
             Mutation::Create { coin } => {
@@ -302,7 +301,7 @@ fn apply_record_mutations(
                         record.height
                     )));
                 }
-                changes.add(BorrowedUtxoAdd::new(
+                changes.add(UtxoAdd::new(
                     coin.outpoint,
                     &coin.txout,
                     coin.coinbase,
@@ -321,7 +320,7 @@ fn apply_record_mutations(
                         record.height
                     )));
                 }
-                changes.add(BorrowedUtxoAdd::new(
+                changes.add(UtxoAdd::new(
                     new_coin.outpoint,
                     &new_coin.txout,
                     new_coin.coinbase,
@@ -330,7 +329,7 @@ fn apply_record_mutations(
             }
         }
     }
-    utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&record.block_hash))
+    utxo.commit_block(&changes, &Hash256::from_le_bytes(&record.block_hash))
         .map_err(|error| {
             JournalReplayError::CommittedRangeInvalid(format!(
                 "height {}: utxo commit failed: {error}",

@@ -5,6 +5,11 @@
 //! and backend feature-forwarding rules described in
 //! `docs/contracts/architecture.md`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "malformed Cargo metadata is a test failure"
+)]
+
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -54,13 +59,8 @@ pub(crate) fn approved_layer(crate_name: &str) -> u8 {
     match crate_name {
         "bitcoin-rs-primitives" | "bitcoin-rs-script" | "bitcoin-rs-consensus" => 0,
         STORAGE_CRATE => 1,
-        "bitcoin-rs-chain"
-        | "bitcoin-rs-chainstate"
-        | "bitcoin-rs-utxo"
-        | "bitcoin-rs-p2p"
-        | "bitcoin-rs-mempool"
-        | "bitcoin-rs-index"
-        | "bitcoin-rs-mining" => 2,
+        "bitcoin-rs-chain" | "bitcoin-rs-utxo" | "bitcoin-rs-p2p" | "bitcoin-rs-mempool"
+        | "bitcoin-rs-index" | "bitcoin-rs-mining" => 2,
         RPC_CRATE => 3,
         NODE_CRATE | BIN_CRATE => 4,
         other => panic!("unclassified workspace crate `{other}`: add it to the layer table"),
@@ -87,12 +87,8 @@ pub(crate) struct WorkspaceGraph {
 pub(crate) struct Validation {
     /// Number of normal internal dependency edges checked.
     pub checked_edges: usize,
-    /// Number of engine-dependency assertions checked.
-    pub checked_engine_edges: usize,
     /// Number of feature assertions checked.
     pub checked_features: usize,
-    /// Number of crate packages classified.
-    pub classified: usize,
     /// Number of crate packages checked for dependency cycles.
     pub cycle_checked_crates: usize,
     /// Human-readable summary.
@@ -300,9 +296,7 @@ impl WorkspaceGraph {
         if violations.is_empty() {
             Ok(Validation {
                 checked_edges,
-                checked_engine_edges,
                 checked_features,
-                classified: self.classified,
                 cycle_checked_crates,
                 summary: format!(
                     "dependency direction: {checked_edges} edges; \

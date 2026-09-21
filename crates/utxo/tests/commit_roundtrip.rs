@@ -1,10 +1,7 @@
 //! Public commit/get coverage for the UTXO set.
 
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, Script, TxOut, varint};
-use bitcoin_rs_utxo::{
-    BlockChanges, UtxoAdd, UtxoError, UtxoSet, hash_serialized_3,
-    set::{BorrowedBlockChanges, BorrowedUtxoAdd},
-};
+use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoError, UtxoSet, hash_serialized_3};
 use sha2::{Digest, Sha256};
 
 fn txid(seed: u64) -> Hash256 {
@@ -84,15 +81,63 @@ fn expected_hash_serialized_3(
 fn borrowed_changes<'a>(
     adds: &'a [(OutPoint, TxOut, bool, u32)],
     removes: &[OutPoint],
-) -> BorrowedBlockChanges<'a> {
-    let mut changes = BorrowedBlockChanges::with_capacity(adds.len(), removes.len());
+) -> BlockChanges<&'a bitcoin_rs_primitives::TxOut> {
+    let mut changes = BlockChanges::with_capacity(adds.len(), removes.len());
     for remove in removes {
         changes.remove(*remove);
     }
     for (outpoint, txout, coinbase, height) in adds {
-        changes.add(BorrowedUtxoAdd::new(*outpoint, txout, *coinbase, *height));
+        changes.add(UtxoAdd::new(*outpoint, txout, *coinbase, *height));
     }
     changes
+}
+
+#[test]
+fn owned_and_borrowed_commits_match_independent_state_hashes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
+
+    for shard_count in [1_u8, 20] {
+        for with_listener in [false, true] {
+            let mut owned = UtxoSet::new();
+            let mut borrowed = UtxoSet::new();
+            if with_listener {
+                owned.set_listener(Box::new(CoinStatsListener::new(CoinStats::new())));
+                borrowed.set_listener(Box::new(CoinStatsListener::new(CoinStats::new())));
+            }
+            let mut entries: Vec<_> = (0_u8..64)
+                .map(|index| {
+                    let outpoint = OutPoint::new(
+                        txid_in_shard(index % shard_count, u64::from(index)).into(),
+                        u32::from(index),
+                    );
+                    (outpoint, txout(u64::from(index)), index % 2 == 0, 100)
+                })
+                .collect();
+            let mut removes = Vec::new();
+            for round in 0..2 {
+                let mut changes = BlockChanges::with_capacity(entries.len(), removes.len());
+                for &outpoint in &removes {
+                    changes.remove(outpoint);
+                }
+                for (outpoint, txout, coinbase, height) in &entries {
+                    changes.add(UtxoAdd::new(*outpoint, txout.clone(), *coinbase, *height));
+                }
+                owned.commit_block(&changes, &txid(round))?;
+                borrowed.commit_block(&borrowed_changes(&entries, &removes), &txid(round))?;
+                let expected = expected_hash_serialized_3(&entries)?;
+                assert_eq!(hash_serialized_3(&owned)?, expected);
+                assert_eq!(hash_serialized_3(&borrowed)?, expected);
+                removes = entries.drain(..16).map(|entry| entry.0).collect();
+                for (_, txout, coinbase, height) in &mut entries {
+                    txout.value = Amount::from_sat(77);
+                    *coinbase = !*coinbase;
+                    *height += 1;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -198,13 +243,13 @@ fn has_live_outputs_for_txid_tracks_any_remaining_vout() -> Result<(), Box<dyn s
     assert!(set.has_live_outputs_for_txid(&live_txid));
     assert!(!set.has_live_outputs_for_txid(&txid(79)));
 
-    let mut first_spend = BlockChanges::default();
+    let mut first_spend: BlockChanges = BlockChanges::default();
     first_spend.remove(OutPoint::new(live_txid.into(), 1));
     set.commit_block(&first_spend, &txid(80))?;
 
     assert!(set.has_live_outputs_for_txid(&live_txid));
 
-    let mut final_spend = BlockChanges::default();
+    let mut final_spend: BlockChanges = BlockChanges::default();
     final_spend.remove(OutPoint::new(live_txid.into(), 2));
     set.commit_block(&final_spend, &txid(81))?;
 
@@ -233,7 +278,7 @@ fn borrowed_commit_preserves_invalid_add_atomicity() -> Result<(), Box<dyn std::
     )];
     let invalid = borrowed_changes(&invalid_adds, &[retained]);
 
-    let error = match set.commit_borrowed_block(&invalid, &txid(8_013)) {
+    let error = match set.commit_block(&invalid, &txid(8_013)) {
         Ok(()) => return Err("oversized borrowed script unexpectedly committed".into()),
         Err(error) => error,
     };
@@ -277,7 +322,7 @@ fn vout_64_roundtrips_through_public_utxo_api() -> Result<(), Box<dyn std::error
     assert_eq!(scan.unspents.len(), 1);
     assert_eq!(scan.unspents[0].outpoint, high);
 
-    let mut high_spend = BlockChanges::default();
+    let mut high_spend: BlockChanges = BlockChanges::default();
     high_spend.remove(high);
     set.commit_block(&high_spend, &txid(91))?;
 
@@ -285,7 +330,7 @@ fn vout_64_roundtrips_through_public_utxo_api() -> Result<(), Box<dyn std::error
     assert_eq!(set.get(&low), Some(low_txout));
     assert!(set.has_live_outputs_for_txid(&live_txid));
 
-    let mut low_spend = BlockChanges::default();
+    let mut low_spend: BlockChanges = BlockChanges::default();
     low_spend.remove(low);
     set.commit_block(&low_spend, &txid(92))?;
 
@@ -300,7 +345,7 @@ fn high_vout_full_record_delete_removes_all_outputs_in_one_commit()
     let set = UtxoSet::new();
     let live_txid = txid(93);
     let mut preload = BlockChanges::default();
-    let mut spend = BlockChanges::default();
+    let mut spend: BlockChanges = BlockChanges::default();
 
     for vout in 64_u32..128 {
         let outpoint = OutPoint::new(live_txid.into(), vout);
@@ -370,7 +415,7 @@ fn same_prefix_txids_do_not_collide_in_get_or_remove_paths()
     assert_eq!(set.get(&first), Some(first_txout));
     assert_eq!(set.get(&second), Some(second_txout.clone()));
 
-    let mut spend = BlockChanges::default();
+    let mut spend: BlockChanges = BlockChanges::default();
     spend.remove(first);
     set.commit_block(&spend, &txid(301))?;
 
@@ -392,7 +437,7 @@ fn full_record_delete_uses_full_txid_and_preserves_collision_peer()
     changes.add(UtxoAdd::new(second, second_txout.clone(), false, 1));
     set.commit_block(&changes, &txid(300))?;
 
-    let mut spend = BlockChanges::default();
+    let mut spend: BlockChanges = BlockChanges::default();
     spend.remove(first);
     set.commit_block(&spend, &txid(301))?;
 
@@ -416,7 +461,7 @@ fn duplicate_remove_does_not_fast_delete_unspent_vout() -> Result<(), Box<dyn st
     changes.add(UtxoAdd::new(retained, retained_txout.clone(), false, 1));
     set.commit_block(&changes, &txid(702))?;
 
-    let mut duplicate_spend = BlockChanges::default();
+    let mut duplicate_spend: BlockChanges = BlockChanges::default();
     duplicate_spend.remove(removed);
     duplicate_spend.remove(removed);
     set.commit_block(&duplicate_spend, &txid(703))?;
@@ -478,7 +523,7 @@ fn vout_u32_max_roundtrips_and_spends() -> Result<(), Box<dyn std::error::Error>
     assert_eq!(entry.height, 500);
     assert!(set.has_live_outputs_for_txid(&live_txid));
 
-    let mut spend = BlockChanges::default();
+    let mut spend: BlockChanges = BlockChanges::default();
     spend.remove(max_vout_op);
     set.commit_block(&spend, &txid(812))?;
 

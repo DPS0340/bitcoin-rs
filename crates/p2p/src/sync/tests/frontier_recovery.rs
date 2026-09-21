@@ -355,25 +355,15 @@ fn reorg_probe_anchors_locator_on_active_chain_at_applied_height()
         hash: losing_tip.hash,
     };
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
+    let SyncHarness {
+        sync,
+        peers,
+        applied_tip,
+        inbound_headers_tx: _headers_tx,
+        inbound_blocks_tx: _blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
     applied_tip.store(Some(Arc::new(losing_snapshot)));
-
-    let peers = Arc::new(PeerTable::new());
-    let (_headers_tx, headers_rx) = unbounded::<InboundHeaders>();
-    let (_blocks_tx, blocks_rx) = unbounded::<crate::InboundBlock>();
-    let chain = Arc::new(TestChain::new(
-        chain_tip,
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        chain,
-        Arc::clone(&peers),
-        Arc::new(Mutex::new(headers_rx)),
-        Arc::new(Mutex::new(blocks_rx)),
-    );
 
     let peer = test_addr(9765, 0)?;
     let outbound = connect_peer(&peers, eligible_peer(peer, 0));

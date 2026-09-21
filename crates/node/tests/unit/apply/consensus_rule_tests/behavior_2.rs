@@ -74,7 +74,7 @@ fn every_validation_context_mismatch_rebuilds_from_live_utxo()
             }
         }
 
-        let mut remove = BlockChanges::default();
+        let mut remove: BlockChanges = BlockChanges::default();
         remove.remove(prevout);
         utxo.commit_block(&remove, &Hash256::from_le_bytes(&[0x83; 32]))?;
 
