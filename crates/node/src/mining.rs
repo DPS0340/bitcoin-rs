@@ -15,6 +15,7 @@ use bitcoin_rs_chain::current_unix_seconds;
 use bitcoin_rs_chain::signalling_deployments;
 use bitcoin_rs_chainstate::ApplyError;
 use bitcoin_rs_chainstate::Chainstate;
+use bitcoin_rs_chainstate::bytes_are_block;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolMiningSnapshot;
 use bitcoin_rs_mining::AppliedTipSource;
@@ -138,21 +139,36 @@ impl MiningCoordinator {
 
     /// Core `submitblock` fills the coinbase reserved nonce when the block
     /// already has a BIP141 commitment but no coinbase witness. Proposal skips this.
-    fn fill_uncommitted_witness(&self, block: &mut Block) {
+    fn fill_uncommitted_witness(&self, block: &mut Block) -> bool {
         let tree = self.chainstate.block_tree().read();
         let Some(prev_id) = tree.lookup(block.header.prev_blockhash.into()) else {
-            return;
+            return false;
         };
         let Ok(prev) = tree.node(prev_id) else {
-            return;
+            return false;
         };
         let height = prev.height.saturating_add(1);
         let segwit_active = self.chainstate.network().is_segwit_active(height);
         drop(tree);
+        let witness_len = block
+            .txs
+            .first()
+            .and_then(|tx| tx.inputs.first())
+            .map(|input| input.witness.len());
         update_uncommitted_block_structures(block, segwit_active);
+        witness_len
+            != block
+                .txs
+                .first()
+                .and_then(|tx| tx.inputs.first())
+                .map(|input| input.witness.len())
     }
 
-    fn submit(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
+    fn submit(
+        &self,
+        block: &Block,
+        serialized: Option<bytes::Bytes>,
+    ) -> Result<BlockValidationResult, MiningControlError> {
         let block_hash: Hash256 = block.block_hash().into();
         // Duplicate classification and apply observe the same serialized chain state.
         // Reserve a generation only after ruling out an already accepted body.
@@ -176,7 +192,11 @@ impl MiningCoordinator {
             Err(error) => return map_apply_error(error),
         };
         let transition = self.chainstate.begin_transition_locked(lock);
-        match transition.connect(block) {
+        let connect = match serialized {
+            Some(raw) => transition.connect_serialized(block, raw),
+            None => transition.connect(block),
+        };
+        match connect {
             Ok(outcome) => {
                 self.followers.committed_connect(block, &outcome);
                 let tip = outcome.tip;
@@ -363,7 +383,26 @@ impl MiningControl for MiningCoordinator {
 
     fn submit_block(&self, mut block: Block) -> Result<BlockValidationResult, MiningControlError> {
         self.fill_uncommitted_witness(&mut block);
-        self.submit(&block)
+        self.submit(&block, None)
+    }
+
+    fn submit_block_with_bytes(
+        &self,
+        mut block: Block,
+        raw: Vec<u8>,
+    ) -> Result<BlockValidationResult, MiningControlError> {
+        if !bytes_are_block(&raw, &block) {
+            return Err(MiningControlError::Rejected(CompactString::from(
+                "submitted bytes are not the serialization of the submitted block",
+            )));
+        }
+        let filled = self.fill_uncommitted_witness(&mut block);
+        let serialized = if filled {
+            bytes::Bytes::from(consensus_bytes(&block))
+        } else {
+            bytes::Bytes::from(raw)
+        };
+        self.submit(&block, Some(serialized))
     }
 
     /// Admits `header` through [`accept_headers`], the same gate inbound P2P uses.
@@ -449,7 +488,7 @@ impl MiningControl for MiningCoordinator {
                 MiningControlError::Failed(CompactString::from(error.to_string()))
             })?;
             if request.submit {
-                match self.submit(&block)? {
+                match self.submit(&block, None)? {
                     BlockValidationResult::Accepted => {}
                     other => {
                         return Err(MiningControlError::Failed(CompactString::from(format!(
