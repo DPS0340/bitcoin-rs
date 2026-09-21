@@ -121,6 +121,8 @@ mod trait_;
 /// Per-block UTXO undo records and the in-flight disconnect marker.
 pub mod undo;
 
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
+mod batch;
 #[cfg(feature = "fjall")]
 mod fjall_impl;
 #[cfg(feature = "redb")]

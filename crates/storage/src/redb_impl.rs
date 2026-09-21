@@ -1,11 +1,11 @@
+use crate::batch::{BatchOp, BufferedWriteBatch};
 use std::path::{Path, PathBuf};
 
-use bytes::Bytes;
 use redb::{
     Database, Durability, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
 };
 
-use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
+use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteCondition};
 
 type ByteTable = TableDefinition<'static, &'static [u8], &'static [u8]>;
 type FixedTable<const N: usize> = TableDefinition<'static, &'static [u8; N], ()>;
@@ -78,7 +78,7 @@ impl RedbStore {
 
     fn write_with_durability(
         &self,
-        batch: RedbWriteBatch,
+        batch: BufferedWriteBatch,
         durability: Durability,
     ) -> Result<(), StorageError> {
         validate_redb_store_batch(&batch)?;
@@ -130,7 +130,7 @@ impl RedbStore {
 }
 
 impl KvStore for RedbStore {
-    type WriteBatch = RedbWriteBatch;
+    type WriteBatch = BufferedWriteBatch;
 
     fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         let read_txn = self.db.begin_read().map_err(StorageError::backend)?;
@@ -164,7 +164,7 @@ impl KvStore for RedbStore {
     }
 
     fn new_batch(&self) -> Self::WriteBatch {
-        RedbWriteBatch::default()
+        BufferedWriteBatch::default()
     }
 
     fn put(&self, cf: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
@@ -196,7 +196,7 @@ impl KvStore for RedbStore {
     fn write_durable_if(
         &self,
         conditions: &[WriteCondition<'_>],
-        batch: RedbWriteBatch,
+        batch: BufferedWriteBatch,
     ) -> Result<bool, StorageError> {
         validate_redb_store_batch(&batch)?;
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
@@ -360,7 +360,7 @@ impl RedbTxIndexStore {
 
     fn write_with_durability(
         &self,
-        batch: RedbWriteBatch,
+        batch: BufferedWriteBatch,
         durability: Durability,
     ) -> Result<(), StorageError> {
         let durability_label = match durability {
@@ -409,7 +409,7 @@ impl RedbTxIndexStore {
 }
 
 impl KvStore for RedbTxIndexStore {
-    type WriteBatch = RedbWriteBatch;
+    type WriteBatch = BufferedWriteBatch;
 
     fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         let read_txn = self.db.begin_read().map_err(StorageError::backend)?;
@@ -454,7 +454,7 @@ impl KvStore for RedbTxIndexStore {
     }
 
     fn new_batch(&self) -> Self::WriteBatch {
-        RedbWriteBatch::default()
+        BufferedWriteBatch::default()
     }
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
@@ -472,7 +472,7 @@ impl KvStore for RedbTxIndexStore {
     fn write_durable_if(
         &self,
         conditions: &[WriteCondition<'_>],
-        batch: RedbWriteBatch,
+        batch: BufferedWriteBatch,
     ) -> Result<bool, StorageError> {
         // Width and family validation happens before any transaction begins so an
         // invalid request never opens (and aborts) a write transaction. Every
@@ -576,62 +576,6 @@ pub fn open_redb_tx_index_store_with_cache(
     metrics::gauge!("storage.cache_capacity_bytes", "backend" => "redb-txindex")
         .set(crate::metric_f64(cache_bytes));
     RedbTxIndexStore::open_with_cache(path, cache_bytes)
-}
-
-/// redb write-batch adapter.
-#[derive(Default)]
-pub struct RedbWriteBatch {
-    ops: Vec<BatchOp>,
-    /// Sum of key and value lengths across ops, for write-path metrics.
-    encoded_bytes: usize,
-}
-
-impl WriteBatch for RedbWriteBatch {
-    fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) {
-        self.put_value(cf, key, Bytes::copy_from_slice(value));
-    }
-
-    fn put_value(&mut self, cf: ColumnFamily, key: &[u8], value: Bytes) {
-        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len() + value.len());
-        self.ops.push(BatchOp::Put {
-            cf,
-            key: key.to_vec(),
-            value,
-        });
-    }
-
-    fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
-        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len());
-        self.ops.push(BatchOp::Delete {
-            cf,
-            key: key.to_vec(),
-        });
-    }
-
-    fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
-        self.ops.push(BatchOp::DeleteRange {
-            cf,
-            start: start.to_vec(),
-            end: end.to_vec(),
-        });
-    }
-}
-
-enum BatchOp {
-    Put {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-        value: Bytes,
-    },
-    Delete {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-    },
-    DeleteRange {
-        cf: ColumnFamily,
-        start: Vec<u8>,
-        end: Vec<u8>,
-    },
 }
 
 impl BatchOp {
@@ -933,7 +877,7 @@ fn validate_script_live_put(key: &[u8], value: &[u8]) -> Result<(), StorageError
 /// Validates `ScriptLive` puts in a generic [`RedbStore`] batch before a
 /// transaction begins, matching the dedicated txindex store's reject-first
 /// contract.
-fn validate_redb_store_batch(batch: &RedbWriteBatch) -> Result<(), StorageError> {
+fn validate_redb_store_batch(batch: &BufferedWriteBatch) -> Result<(), StorageError> {
     batch.ops.iter().try_for_each(|op| match op {
         BatchOp::Put { cf, key, value } if *cf == ColumnFamily::ScriptLive => {
             validate_script_live_put(key, value)
@@ -1344,7 +1288,7 @@ fn apply_byte_run(
 
 /// Validates every batch operation's family and widths before any transaction
 /// begins, mirroring exactly what the apply path would reject mid-transaction.
-fn validate_txindex_batch(batch: &RedbWriteBatch) -> Result<(), StorageError> {
+fn validate_txindex_batch(batch: &BufferedWriteBatch) -> Result<(), StorageError> {
     batch.ops.iter().try_for_each(|op| match op {
         BatchOp::Put { cf, key, value } => {
             if matches!(cf, ColumnFamily::BlockHeaders | ColumnFamily::ScriptLive)

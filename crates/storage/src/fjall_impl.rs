@@ -1,10 +1,10 @@
+use crate::batch::{BatchOp, BufferedWriteBatch};
 use std::path::Path;
 
-use bytes::Bytes;
 use fjall::config::CompressionPolicy;
 use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
-use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
+use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteCondition};
 
 /// Fjall's default block-cache capacity for unbudgeted opens.
 const FJALL_DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
@@ -87,7 +87,7 @@ impl FjallStore {
 
     fn write_with_durability(
         &self,
-        batch: FjallWriteBatch,
+        batch: BufferedWriteBatch,
         durability: Option<PersistMode>,
     ) -> Result<(), StorageError> {
         let durability_label = match durability {
@@ -172,7 +172,7 @@ impl FjallStore {
 }
 
 impl KvStore for FjallStore {
-    type WriteBatch = FjallWriteBatch;
+    type WriteBatch = BufferedWriteBatch;
 
     fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         self.keyspace(cf)?
@@ -196,7 +196,7 @@ impl KvStore for FjallStore {
     }
 
     fn new_batch(&self) -> Self::WriteBatch {
-        FjallWriteBatch::default()
+        BufferedWriteBatch::default()
     }
 
     fn put(&self, cf: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
@@ -219,7 +219,7 @@ impl KvStore for FjallStore {
     fn write_durable_if(
         &self,
         conditions: &[WriteCondition<'_>],
-        batch: FjallWriteBatch,
+        batch: BufferedWriteBatch,
     ) -> Result<bool, StorageError> {
         let _guard = self.write_lock.lock();
         let mut keyspaces = [None; ColumnFamily::ALL.len()];
@@ -276,62 +276,6 @@ fn cached_keyspace<'store>(
 fn prefix_ops(ops: Vec<BatchOp>) -> impl Iterator<Item = BatchOp> {
     let split = ops.len().div_ceil(2).max(1).min(ops.len());
     ops.into_iter().take(split)
-}
-
-/// Fjall write-batch adapter.
-#[derive(Default)]
-pub struct FjallWriteBatch {
-    ops: Vec<BatchOp>,
-    /// Sum of key and value lengths across ops, for write-path metrics.
-    encoded_bytes: usize,
-}
-
-impl WriteBatch for FjallWriteBatch {
-    fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) {
-        self.put_value(cf, key, Bytes::copy_from_slice(value));
-    }
-
-    fn put_value(&mut self, cf: ColumnFamily, key: &[u8], value: Bytes) {
-        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len() + value.len());
-        self.ops.push(BatchOp::Put {
-            cf,
-            key: key.to_vec(),
-            value,
-        });
-    }
-
-    fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
-        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len());
-        self.ops.push(BatchOp::Delete {
-            cf,
-            key: key.to_vec(),
-        });
-    }
-
-    fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
-        self.ops.push(BatchOp::DeleteRange {
-            cf,
-            start: start.to_vec(),
-            end: end.to_vec(),
-        });
-    }
-}
-
-enum BatchOp {
-    Put {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-        value: Bytes,
-    },
-    Delete {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-    },
-    DeleteRange {
-        cf: ColumnFamily,
-        start: Vec<u8>,
-        end: Vec<u8>,
-    },
 }
 
 struct FjallSnapshot<'a> {

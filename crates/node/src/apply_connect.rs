@@ -574,7 +574,7 @@ pub(super) fn apply_block_admitted<'b>(
         block_bytes,
         raw_txs,
     };
-    match publication {
+    let commit_id = match publication {
         PublishMode::Now => {
             // RCV-02 steps 3–4: certify, then commit. `sync` makes the
             // appended body bytes, the blocks directory, and every deferred
@@ -610,45 +610,14 @@ pub(super) fn apply_block_admitted<'b>(
             )?;
             metrics::histogram!("node.apply_block.durable_commit_seconds")
                 .record(durable_commit_started.elapsed().as_secs_f64());
-            // The journal is derived from the durable head: it may lag the
-            // batch, never lead it, so a kill between the two leaves the
-            // head as the high-water mark of committed state.
-            emit_journal_record(
-                handles,
-                build_journal_record(
-                    block,
-                    height,
-                    block_hash,
-                    prev_hash,
-                    &undo,
-                    &changes,
-                    coin_stats_height_delta,
-                ),
-                height,
-            );
-            publish_connect(handles, &tip, tx_count_delta);
-            outcome.commit_id = commit_id;
+            commit_id
         }
         PublishMode::Replay { commit_id } => {
             // The gap block's durable batch committed before the crash: the
             // stored head receipt covers its body, undo, and locator rows.
             // Replay redoes only what publication owed — the journal tail
             // and the coherent tip — and carries the receipt's commit id.
-            emit_journal_record(
-                handles,
-                build_journal_record(
-                    block,
-                    height,
-                    block_hash,
-                    prev_hash,
-                    &undo,
-                    &changes,
-                    coin_stats_height_delta,
-                ),
-                height,
-            );
-            publish_connect(handles, &tip, tx_count_delta);
-            outcome.commit_id = commit_id;
+            commit_id
         }
         PublishMode::Grouped(group) => {
             // The window buffers the durable work: facts ride in the group
@@ -674,8 +643,26 @@ pub(super) fn apply_block_admitted<'b>(
                 prev_hash,
                 journal_record,
             });
+            return Ok(ApplyFinish::Committed(outcome));
         }
-    }
+    };
+    // The journal may lag the durable head, never lead it. Fresh commits and
+    // replayed receipts share publication; grouped commits publish later.
+    emit_journal_record(
+        handles,
+        build_journal_record(
+            block,
+            height,
+            block_hash,
+            prev_hash,
+            &undo,
+            &changes,
+            coin_stats_height_delta,
+        ),
+        height,
+    );
+    publish_connect(handles, &tip, tx_count_delta);
+    outcome.commit_id = commit_id;
     Ok(ApplyFinish::Committed(outcome))
 }
 

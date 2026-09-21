@@ -1,12 +1,12 @@
+use crate::batch::{BatchOp, BufferedWriteBatch};
 use std::path::Path;
 
-use bytes::Bytes;
 use rust_rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
     Options, ReadOptions, WriteBatch as RocksWriteBatch, WriteOptions,
 };
 
-use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
+use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteCondition};
 
 const BLOCK_SIZE: usize = 4 * 1024 * 1024;
 /// `RocksDB`'s block-cache capacity for unbudgeted opens.
@@ -81,8 +81,8 @@ impl RocksDbStore {
             .ok_or(StorageError::UnknownColumnFamily(cf))
     }
 
-    /// Translates a portable [`RocksDbWriteBatch`] into a native `RocksDB` write batch.
-    fn rocks_batch(&self, batch: RocksDbWriteBatch) -> Result<RocksWriteBatch, StorageError> {
+    /// Translates a portable [`BufferedWriteBatch`] into a native `RocksDB` write batch.
+    fn rocks_batch(&self, batch: BufferedWriteBatch) -> Result<RocksWriteBatch, StorageError> {
         let mut rocks_batch = RocksWriteBatch::default();
         let mut handles = [None; ColumnFamily::ALL.len()];
         for op in batch.ops {
@@ -109,7 +109,7 @@ impl RocksDbStore {
     /// label, so each write is counted exactly once.
     fn write_with_durability(
         &self,
-        batch: RocksDbWriteBatch,
+        batch: BufferedWriteBatch,
         durability: &'static str,
         sync: bool,
     ) -> Result<(), StorageError> {
@@ -144,7 +144,7 @@ impl RocksDbStore {
 }
 
 impl KvStore for RocksDbStore {
-    type WriteBatch = RocksDbWriteBatch;
+    type WriteBatch = BufferedWriteBatch;
 
     fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         self.db
@@ -178,7 +178,7 @@ impl KvStore for RocksDbStore {
     }
 
     fn new_batch(&self) -> Self::WriteBatch {
-        RocksDbWriteBatch::default()
+        BufferedWriteBatch::default()
     }
 
     fn put(&self, cf: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
@@ -206,7 +206,7 @@ impl KvStore for RocksDbStore {
     fn write_durable_if(
         &self,
         conditions: &[WriteCondition<'_>],
-        batch: RocksDbWriteBatch,
+        batch: BufferedWriteBatch,
     ) -> Result<bool, StorageError> {
         let _guard = self.write_lock.lock();
         let mut handles = [None; ColumnFamily::ALL.len()];
@@ -262,62 +262,6 @@ fn cached_cf_handle<'store>(
         *slot = Some(store.cf_handle(cf)?);
     }
     slot.ok_or(StorageError::UnknownColumnFamily(cf))
-}
-
-/// `RocksDB` write-batch adapter.
-#[derive(Default)]
-pub struct RocksDbWriteBatch {
-    ops: Vec<BatchOp>,
-    /// Sum of key and value lengths across ops, for write-path metrics.
-    encoded_bytes: usize,
-}
-
-impl WriteBatch for RocksDbWriteBatch {
-    fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) {
-        self.put_value(cf, key, Bytes::copy_from_slice(value));
-    }
-
-    fn put_value(&mut self, cf: ColumnFamily, key: &[u8], value: Bytes) {
-        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len() + value.len());
-        self.ops.push(BatchOp::Put {
-            cf,
-            key: key.to_vec(),
-            value,
-        });
-    }
-
-    fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
-        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len());
-        self.ops.push(BatchOp::Delete {
-            cf,
-            key: key.to_vec(),
-        });
-    }
-
-    fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
-        self.ops.push(BatchOp::DeleteRange {
-            cf,
-            start: start.to_vec(),
-            end: end.to_vec(),
-        });
-    }
-}
-
-enum BatchOp {
-    Put {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-        value: Bytes,
-    },
-    Delete {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-    },
-    DeleteRange {
-        cf: ColumnFamily,
-        start: Vec<u8>,
-        end: Vec<u8>,
-    },
 }
 
 struct RocksDbSnapshot<'a> {

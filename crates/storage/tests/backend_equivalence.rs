@@ -287,42 +287,6 @@ fn collect_iter(iterator: KvIter<'_>) -> Result<Vec<KvPair>, StorageError> {
     iterator.collect()
 }
 
-fn hash_hex(hash: &[u8; 32]) -> String {
-    let mut hex = String::with_capacity(64);
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-#[cfg(feature = "rocksdb")]
-#[test]
-fn rocksdb_equivalence_hash() -> TestResult<()> {
-    let temp = tempfile::TempDir::new()?;
-    let hash = run_equivalence_suite(bitcoin_rs_storage::RocksDbStore::open(temp.path())?)?;
-    eprintln!("rocksdb aggregate hash: {}", hash_hex(&hash));
-    Ok(())
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_equivalence_hash() -> TestResult<()> {
-    let temp = tempfile::TempDir::new()?;
-    let hash = run_equivalence_suite(bitcoin_rs_storage::FjallStore::open(temp.path())?)?;
-    eprintln!("fjall aggregate hash: {}", hash_hex(&hash));
-    Ok(())
-}
-
-#[cfg(feature = "redb")]
-#[test]
-fn redb_equivalence_hash() -> TestResult<()> {
-    let temp = tempfile::TempDir::new()?;
-    let hash = run_equivalence_suite(bitcoin_rs_storage::RedbStore::open(temp.path())?)?;
-    eprintln!("redb aggregate hash: {}", hash_hex(&hash));
-    Ok(())
-}
-
 #[cfg(feature = "redb")]
 #[test]
 fn redb_flush_persists_deferred_write_after_reopen() -> TestResult<()> {
@@ -351,24 +315,37 @@ fn redb_flush_persists_deferred_write_after_reopen() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "rocksdb", feature = "fjall", feature = "redb"))]
+#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
 #[test]
 fn portable_backends_have_identical_aggregate_hashes() -> TestResult<()> {
-    let rocks_temp = tempfile::TempDir::new()?;
-    let fjall_temp = tempfile::TempDir::new()?;
-    let redb_temp = tempfile::TempDir::new()?;
-
-    let rocksdb =
-        run_equivalence_suite(bitcoin_rs_storage::RocksDbStore::open(rocks_temp.path())?)?;
-    let fjall = run_equivalence_suite(bitcoin_rs_storage::FjallStore::open(fjall_temp.path())?)?;
-    let redb = run_equivalence_suite(bitcoin_rs_storage::RedbStore::open(redb_temp.path())?)?;
-
-    eprintln!("rocksdb aggregate hash: {}", hash_hex(&rocksdb));
-    eprintln!("fjall aggregate hash: {}", hash_hex(&fjall));
-    eprintln!("redb aggregate hash: {}", hash_hex(&redb));
-
-    assert_eq!(rocksdb, fjall);
-    assert_eq!(rocksdb, redb);
+    // Exercise each enabled engine once, including single-engine builds.
+    // Multi-engine builds compare the same behavioral suite's final state.
+    let hashes = [
+        #[cfg(feature = "rocksdb")]
+        {
+            let temp = tempfile::TempDir::new()?;
+            let store = bitcoin_rs_storage::RocksDbStore::open(temp.path())?;
+            ("rocksdb", run_equivalence_suite(store)?)
+        },
+        #[cfg(feature = "fjall")]
+        {
+            let temp = tempfile::TempDir::new()?;
+            let store = bitcoin_rs_storage::FjallStore::open(temp.path())?;
+            ("fjall", run_equivalence_suite(store)?)
+        },
+        #[cfg(feature = "redb")]
+        {
+            let temp = tempfile::TempDir::new()?;
+            let store = bitcoin_rs_storage::RedbStore::open(temp.path())?;
+            ("redb", run_equivalence_suite(store)?)
+        },
+    ];
+    for (backend, hash) in &hashes {
+        eprintln!("{backend} aggregate hash: {hash:02x?}");
+    }
+    for ((left_backend, left), (right_backend, right)) in hashes.iter().zip(hashes.iter().skip(1)) {
+        assert_eq!(left, right, "{left_backend} and {right_backend} differ");
+    }
     Ok(())
 }
 

@@ -2,11 +2,11 @@
 
 The repository guard register. It records the constraint ledger (CL-01..CL-23),
 the formal model tool identity, and the proof inventory that
-`python3 scripts/check_models.py` reads. It references normative owners
-(`docs/contracts/`,
-`docs/policies/`, `.outline/waterfall/BLUEPRINT.md` invariants INV-01..INV-12,
-owner constants in code) and is never a second policy. When a row and its owner
-disagree, the owner governs and the gate blocks until the row is corrected.
+`python3 scripts/check_models.py` reads. It references the normative owners in
+`docs/contracts/`, `docs/policies/`, and code; it is not a second policy.
+Historical task and invariant IDs below identify the original evidence plan.
+When a row and its owner disagree, the owner governs and the gate blocks until
+the row is corrected.
 
 Every measurement cell below is `UNMEASURED`. Target values are contracts, not
 results. Unknown is not false; a missing measurement blocks the owning task.
@@ -52,9 +52,9 @@ antecedent of `ConditionalProgress`, never inside `Next`.
 
 | model | .tla sha256 | .cfg sha256 | CONSTANT values | K | last recorded outcome | native rc | skill rc |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| ChainAdmission | e82138365787f075f1ebe232e4c609cec47b515d29cd11d29fe7d35c6f522d83 | d9019ce0f244bde70e6fea34c99aff76c3f383bf9268630cab80e3f87506ce67 | EventBudget=12, JobSlots=12, MaxAttempts=4, CounterBound=1024, FrameBound=72, FactBound=36, ReqSlots=12 | 128 | temporal (ConditionalProgress): 16g and 64g rungs died of heap space in TemporalPass rewriting (64g: rc255 after 1893s, before State 0) — tool resource exhaustion, NOT a counterexample and NOT a verified pass. The 96g rung was killed at 82 GiB RSS by a stale v2 guard loop's obsolete 80 GiB trigger (avail 248 GiB; no genuine pressure) 16m before its comparison mark — UNTESTED, not falsified; relaunch in flight. chain-safety still in flight | 255 | 14 |
-| PeerLeases | b3a50f1e4f95e635bfd992ffcacb2f17899ce3a3377b38fc7c11ad2051482d9a | 3b23777fb2dcdcee61ac81f29c06b99a33d140cef01fc5be8e1d5c71104aa7ea | Peer=P, S0, S1, G0, G1, R0, R1, F0, F1, D0, D1, CtrlCap=1, DataCap=1, InCap=1, OutCap=1, ExternalBudget=12 | 128 | temporal (ConditionalProgress) rc255 after 32248s: JVM ran out of heap space (max JVM memory 17179869184 = -Xmx16384m from detached-checks.sh) at Step 5 of --length=128 — tool resource exhaustion, NOT a counterexample and NOT a verified pass; outcome unverified per honest-failure rule; peer-safety (State 7) and chain-side runs still in flight | 255 | 14 |
-| ProjectionMining | 1ffc603ff9a12de825ac663478d4c859215ebe842aef092208e42ed431dc2e43 | f4d7dacc59d1d9c7bd87328bb0114a74d4b133f3a7a2bfa2b519aa127e1939c4 | O, A, B, TxLookup, ScriptLive, ScriptHistory, J0, J1, Rw0..Rw2, X0, X1, ExternalBudget=12 | 128 | temporal (ConditionalProgress) rc255 after 7540s at 32 GiB: JVM ran out of heap space during Step-1 search (invariant checks passing at State 1) — tool resource exhaustion, NOT a counterexample and NOT a verified pass; heap rungs 16g and 32g falsified, higher rungs untested. proj-safety still in flight (.outline/formal-runs-20260910) | 255 | 14 |
+| ChainAdmission | e82138365787f075f1ebe232e4c609cec47b515d29cd11d29fe7d35c6f522d83 | d9019ce0f244bde70e6fea34c99aff76c3f383bf9268630cab80e3f87506ce67 | EventBudget=12, JobSlots=12, MaxAttempts=4, CounterBound=1024, FrameBound=72, FactBound=36, ReqSlots=12 | 128 | temporal (ConditionalProgress): 16g and 64g rungs died of heap space in TemporalPass rewriting (64g: rc255 after 1893s, before State 0) — tool resource exhaustion, NOT a counterexample and NOT a verified pass. The 96g rung was killed at 82 GiB RSS by a stale v2 guard loop's obsolete 80 GiB trigger (avail 248 GiB; no genuine pressure) 16m before its comparison mark — UNTESTED, not falsified. No completed safety proof recorded | 255 | 14 |
+| PeerLeases | b3a50f1e4f95e635bfd992ffcacb2f17899ce3a3377b38fc7c11ad2051482d9a | 3b23777fb2dcdcee61ac81f29c06b99a33d140cef01fc5be8e1d5c71104aa7ea | Peer=P, S0, S1, G0, G1, R0, R1, F0, F1, D0, D1, CtrlCap=1, DataCap=1, InCap=1, OutCap=1, ExternalBudget=12 | 128 | temporal (ConditionalProgress) rc255 after 32248s: JVM ran out of heap space (max JVM memory 17179869184 = -Xmx16384m from detached-checks.sh) at Step 5 of --length=128 — tool resource exhaustion, NOT a counterexample and NOT a verified pass; outcome unverified per honest-failure rule; peer-safety was last recorded at State 7 without a completed proof | 255 | 14 |
+| ProjectionMining | 1ffc603ff9a12de825ac663478d4c859215ebe842aef092208e42ed431dc2e43 | f4d7dacc59d1d9c7bd87328bb0114a74d4b133f3a7a2bfa2b519aa127e1939c4 | O, A, B, TxLookup, ScriptLive, ScriptHistory, J0, J1, Rw0..Rw2, X0, X1, ExternalBudget=12 | 128 | temporal (ConditionalProgress) rc255 after 7540s at 32 GiB: JVM ran out of heap space during Step-1 search (invariant checks passing at State 1) — tool resource exhaustion, NOT a counterexample and NOT a verified pass; heap rungs 16g and 32g falsified, higher rungs untested. No completed projection-safety proof recorded | 255 | 14 |
 
 `python3 scripts/check_models.py` runs six
 invocations per pass, three safety and three temporal:
@@ -72,8 +72,8 @@ model properties, and cannot turn a BLOCKED proof into a pass. Inventory rows ab
 returns rc 0. Measured 2026-09-12: ChainAdmission Safety needs ~30h+ at the
 pinned 4g heap, so no `ubuntu-latest` job (360-min cap) can return rc 0; the
 manual lane exercises the harness and preserves evidence but is not expected
-to go green on hosted runners. Revisit on a self-hosted/unbounded runner or
-a replacement validator (see research/formal-validator-replacement.md).
+to go green on hosted runners. A successful proof requires a runner with sufficient resources or a separately
+reviewed replacement validator.
 
 Native to skill rc mapping, native rc preserved verbatim: `0 -> 0`; `150`
 parse and `120` typecheck `-> 12`; `12` counterexample `-> 13`; `75`
@@ -82,9 +82,9 @@ inventory `-> 15`; tool identity mismatch `-> 11`. Evidence is rc 0 for all six
 invocations plus the explicit property lists, model and config hashes, pin,
 constants, K, argv, and outcome line. Anything less is `BLOCKED`.
 
-Model to implementer gates: ChainAdmission gates T08, T11, T18; PeerLeases
-gates T24; ProjectionMining gates T29, T35. A red model blocks the task, never
-the reverse.
+ChainAdmission gates T08, T11, T18; PeerLeases gates T24; ProjectionMining
+gates T29, T35. These are historical task IDs, not active local work queues.
+Missing model evidence still blocks the corresponding implementation proof.
 
 ## Constraint ledger
 

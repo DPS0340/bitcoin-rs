@@ -9,38 +9,15 @@ Owners:
 
 ## Layer model
 
-```text
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ Layer 4: Compose                                                        │
-  │   bitcoin-rs-node, bitcoin-rs                                           │
-  │   - Lifecycle orchestration, runtime assembly, config, cache allocation │
-  └────────────────────────────────────┬────────────────────────────────────┘
-                                       ▼
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ Layer 3: Surface                                                        │
-  │   bitcoin-rs-rpc                                                       │
-  │   - Protocol boundaries and RPC dispatch                               │
-  └────────────────────────────────────┬────────────────────────────────────┘
-                                       ▼
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ Layer 2: Services                                                       │
-  │   bitcoin-rs-chain, bitcoin-rs-utxo, bitcoin-rs-p2p,                    │
-  │   bitcoin-rs-mempool, bitcoin-rs-index, bitcoin-rs-mining               │
-  │   - Domain capabilities, index query runtimes, network protocol state   │
-  └────────────────────────────────────┬────────────────────────────────────┘
-                                       ▼
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ Layer 1: Storage                                                        │
-  │   bitcoin-rs-storage                                                    │
-  │   - Storage abstractions (KvStore), exclusive owner of engine deps      │
-  └────────────────────────────────────┬────────────────────────────────────┘
-                                       ▼
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ Layer 0: Core                                                           │
-  │   bitcoin-rs-primitives, bitcoin-rs-script, bitcoin-rs-consensus          │
-  │   - Protocol types, script validation, consensus rules; zero storage/IO │
-  └─────────────────────────────────────────────────────────────────────────┘
-```
+| Layer | Crates | Responsibility |
+| --- | --- | --- |
+| 4: Compose | `node`, `bitcoin-rs` | Runtime assembly and lifecycle |
+| 3: Surface | `rpc` | External protocol boundaries |
+| 2: Services | `chain`, `utxo`, `p2p`, `mempool`, `index`, `mining` | Domain state and services |
+| 1: Storage | `storage` | Storage contracts and engine drivers |
+| 0: Core | `primitives`, `script`, `consensus` | Protocol types and validation, without storage or I/O |
+
+Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
 
 ## Clauses
 
@@ -59,7 +36,7 @@ Owners:
     network, or filesystem I/O.
   - **Layer 1 (Storage)**: `bitcoin-rs-storage`. Key-value storage abstractions,
     batching primitives, and backend engine drivers.
-  - **Layer 2 (Services)**: `bitcoin-rs-chain`, `bitcoin-rs-chainstate`, `bitcoin-rs-utxo`,
+  - **Layer 2 (Services)**: `bitcoin-rs-chain`, `bitcoin-rs-utxo`,
     `bitcoin-rs-p2p`, `bitcoin-rs-mempool`, `bitcoin-rs-index`,
     `bitcoin-rs-mining`. Domain services and capability runtimes.
     `chain` and `utxo` sit in Layer 2 because they depend on `storage` for
@@ -182,7 +159,7 @@ Owners:
   `getzmqnotifications`; node does not keep a parallel notifier metadata model.
   The `g17_dependency_direction` gate pins the external `zmq` dependency to the
   surface crate and permits node only to forward `bitcoin-rs-rpc/zmq`.
-- The composition root (`NodeState`, `BlockSync`, reorg logic, mining) dispatches `ChainFollowers` while the `ChainTransition` is still held, then calls `finish` to release the chain transition reservation. Convenience methods that finish before returning (`apply_block`, `disconnect_block`) do not dispatch followers. RPC, `BlockLog`, hash/zmq, `TxIndex` wake, sequence `C`/`D`, mining generation, and admission run from that dispatch. Mempool eviction stays inside `apply`.
+- `ARCH-07` owns transition reservation and post-commit follower dispatch.
 - `UserConfig::overlay` applies a later layer field-wise: a set field replaces
   the earlier value; an unset field leaves it. Nested override structs merge
   the same way, including `ChainstateJournalOverrides` and `MiningOverrides`. Proof:
@@ -243,41 +220,14 @@ Owners:
   `CORE_REORG_SAFETY_MARGIN`; this protects reconsideration of disconnected
   transactions during reorg handling.
 
-## Live gaps
-- **Node slimming and extraction (#217)**: Peer connection session and lease
-  ownership has moved to `PeerTable` / `P2pService` in `crates/p2p` (#215,
-  #217, #218). BIP9/softfork lookups, P2P chain serving, txindex status
-  projection, mempool mutation consumers, and block-body access live with their
-  owner crates (#272). Applied-tip mutation goes through the `Chainstate`
-  / `ChainTransition` facade (`ARCH-07`). Derived consumers live in
-  `ChainFollowers` / `ChainEffects` and are dispatched after commit
-  while the `ChainTransition` is still held; `Chainstate` does not hold
-  them. `crates/p2p` owns `DownloadWindow`, `BlockStager`, and `SyncPlanner`.
-  Fee-history persistence, the mining wake seam, hash-rate estimation, and
-  the BIP22 reject vocabulary now live in `crates/mempool`/`crates/mining`;
-  node keeps the `MiningCoordinator` facade and the `tx_ingress` consumer as
-  composition.
-  `crates/utxo` owns UTXO undo persistence, the marker-fenced block rollback,
-  and the apply-side window prevout overlay (`WindowOverlay`); `crates/node`
-  calls `persist_block_undo`, `load_block_undo`, and `rollback_block` and keeps
-  only the ordering of that rollback against the journal, durable head, and
-  tip publication.
-  The block-download executor lives in `crates/p2p/src/sync.rs` behind
-  `SyncChain`; node retains the seam implementation for header admission,
-  body binding, window commit, branch switch, and genesis bootstrap.
-  `crates/node` still carries leftover domain mechanics: direct backend
-  construction and cache share dispatch (`state.rs`). `P2pService` no longer
-  holds a second download window. Durable recovery evidence (witness/marker sidecars, warning snapshot) and the storage-footprint evidence format/budget verdict live in `crates/storage` (`recovery_evidence`, `footprint::evidence`); node keeps `RecoveryReporter` as the `IndexAheadSink`/`RollbackWarningSource` adapter and as the checkpoint-fallback publication path into the storage publisher, plus `measure_storage_footprint` orchestration. Relocating leftover node mechanics into
-  `crates/utxo`, `crates/storage`, and `crates/p2p` remains tracked under #217
-  (open). A
-  dedicated `crates/chainstate` waits until `ChainEventPublisher` and the
-  node-side chain/UTXO payload codecs leave node. Implemented — journal record
-  codec/writer/retention/replay streaming and checkpoint fs/format/atomic
-  publication/authenticated load now live in `bitcoin-rs-storage`
-  (`chainstate_journal`, `checkpoint`); node keeps chain/UTXO payload codecs
-  (`checkpoint/headers.rs`, `load_payloads`, `write_checkpoint_from_dir`),
-  `ReplayAccumulator`, `delta.rs`, and `CheckpointPublisher` orchestration.
-  `crates/node` is the composition layer, but is not yet fully slim.
+## Remaining composition boundary
+
+Authoritative apply and chain/UTXO checkpoint payloads remain in `crates/node`
+because they compose several domain owners. Storage owns the journal and
+checkpoint formats, filesystem operations, and durability; node owns payload
+assembly and runtime sequencing. Backend construction stays at the
+`ARCH-03` composition seam. There is no `crates/chainstate` workspace member;
+introducing one requires the `ARCH-06` review, not a speculative layer.
 
 ## Proven by
 
@@ -323,4 +273,3 @@ Owners:
   and `crates/node/tests/config_layered.rs` test
   `mining_payout_address_decodes_after_all_layers`: watch-only mining payout is
   decoded once after overlay, against the resolved network (`ARCH-05`).
-// weave: run 'weave explain docs/contracts/architecture.md' for per-hunk detail, 'weave check' to verify your resolution
