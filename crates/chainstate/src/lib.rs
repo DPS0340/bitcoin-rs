@@ -206,12 +206,10 @@ impl ApplyAdmission {
     }
 }
 
-/// Proof that admission and the chain-transition lock are both held.
+/// Admission plus the chain-transition lock.
 ///
-/// [`begin_chain_transition`] is the only constructor. Field order releases
-/// the transition lock before the permit. This is the lock token only; the
-/// caller-facing mutation capability is [`ChainTransition`].
-pub struct TransitionLock<'a> {
+/// Field order releases the transition lock before the admission permit.
+struct TransitionGuard<'a> {
     _transition: MutexGuard<'a, ()>,
     _admission: RwLockReadGuard<'a, ()>,
 }
@@ -219,14 +217,34 @@ pub struct TransitionLock<'a> {
 fn begin_chain_transition<'a>(
     admission: &'a ApplyAdmission,
     chain_transition: &'a Mutex<()>,
-) -> core::result::Result<TransitionLock<'a>, ApplyError> {
+) -> core::result::Result<TransitionGuard<'a>, ApplyError> {
     let admission_guard = admission.enter()?;
     let transition = chain_transition.lock();
     admission.ensure_open()?;
-    Ok(TransitionLock {
+    Ok(TransitionGuard {
         _transition: transition,
         _admission: admission_guard,
     })
+}
+
+/// Proof that this chainstate's admission and transition lock are both held.
+///
+/// The issuing [`Chainstate`] is captured in the token. Promotion consumes the
+/// token, so a lock from one service cannot authorize mutation of another.
+pub struct TransitionLock<'a> {
+    chainstate: &'a Chainstate,
+    guard: TransitionGuard<'a>,
+}
+
+impl<'a> TransitionLock<'a> {
+    /// Promotes this owner-bound lock into the authoritative mutation capability.
+    #[must_use]
+    pub fn into_transition(self) -> ChainTransition<'a> {
+        ChainTransition {
+            chainstate: self.chainstate,
+            _lock: self.guard,
+        }
+    }
 }
 
 /// Chain-mutation authority required by destructive block-body pruning.
@@ -249,7 +267,7 @@ impl PruneAuthority {
 
 /// Proof that pruning owns chain mutation and may read the authoritative tip.
 pub struct PruneGuard<'a> {
-    _transition: TransitionLock<'a>,
+    _transition: TransitionGuard<'a>,
     applied_tip: &'a ArcSwapOption<TipSnapshot>,
 }
 
@@ -565,7 +583,7 @@ pub struct AdmissionGuard<'a> {
 ///
 pub struct ChainTransition<'a> {
     chainstate: &'a Chainstate,
-    _lock: TransitionLock<'a>,
+    _lock: TransitionGuard<'a>,
 }
 
 impl<'a> ChainTransition<'a> {
@@ -690,7 +708,11 @@ impl Chainstate {
         self.shutdown.store(true, Ordering::Release);
     }
 
-    /// Blocks new authoritative mutations until the returned guard is dropped.
+    /// Permanently closes mutation admission and waits for in-flight mutations.
+    ///
+    /// Dropping the returned guard releases only the exclusive drain lock;
+    /// admission remains closed. Use this for orderly shutdown, not a scoped
+    /// maintenance pause.
     #[must_use]
     pub fn close(&self) -> AdmissionGuard<'_> {
         AdmissionGuard {
@@ -874,32 +896,25 @@ impl Chainstate {
     /// Used for read-consistent planning that may abort without mutating
     /// (reorg replans, `validate_block`, pruning) and for header admission,
     /// which moves the header tip without touching chainstate. Mutation requires
-    /// [`Self::begin_transition`] or [`Self::begin_transition_locked`].
+    /// [`Self::begin_transition`] or promotion through
+    /// [`TransitionLock::into_transition`].
     pub fn lock_transition(&self) -> core::result::Result<TransitionLock<'_>, ApplyError> {
-        begin_chain_transition(&self.admission, &self.chain_transition)
-    }
-
-    /// Completes a held lock into a mutation capability.
-    pub fn begin_transition_locked<'a>(&'a self, lock: TransitionLock<'a>) -> ChainTransition<'a> {
-        ChainTransition {
+        let guard = begin_chain_transition(&self.admission, &self.chain_transition)?;
+        Ok(TransitionLock {
             chainstate: self,
-            _lock: lock,
-        }
+            guard,
+        })
     }
 
     /// Begins an admitted authoritative-chain mutation.
     ///
-    /// The returned capability is the only way to connect or disconnect. Finish
-    /// it once the attempt reaches a consistent chainstate: a successful
-    /// return, or a clean refusal whose committed prefix is already in place
-    /// and whose failing block was refused before the UTXO commit-of-record
-    /// (`utxo.commit_block`). Drop on a `UtxoCommit` refusal, panic,
-    /// or torn state leaves generation odd until recovery establishes a
-    /// consistent chainstate. Failure before this method returns a capability
-    /// acquires no transition and therefore makes no generation postcondition.
+    /// The returned capability holds admission and the exclusive transition
+    /// lock until it is dropped. A clean refusal releases those locks normally;
+    /// fatal mutation failures retain their documented recovery semantics.
+    /// Mempool generation settlement is node-owned and is not part of this
+    /// chainstate capability.
     pub fn begin_transition(&self) -> core::result::Result<ChainTransition<'_>, ApplyError> {
-        let lock = self.lock_transition()?;
-        Ok(self.begin_transition_locked(lock))
+        Ok(self.lock_transition()?.into_transition())
     }
 
     /// Builds a chainstate facade for tests and composition that do not go
@@ -1045,11 +1060,9 @@ impl Chainstate {
         }
     }
 
-    /// Admits a transition, connects `block`, and finishes on success. Failure
-    /// before admission acquires no transition and does not change generation.
-    /// A refusal after admission drops the transition and leaves generation
-    /// odd; callers that need to retry a clean refusal should use
-    /// [`ChainTransition`] directly and finish it explicitly.
+    /// Admits a transition, connects `block`, then releases the transition lock.
+    /// A refusal releases the same chainstate locks; retry semantics come from
+    /// [`ChainTransition::connect`].
     ///
     /// Persistence matches [`ChainTransition::connect`]. Derived consumers are
     /// not invoked. Production paths with followers must dispatch while the
@@ -1059,8 +1072,8 @@ impl Chainstate {
         apply_block_inner(self, block, None, BlockProvenance::Network)
     }
 
-    /// Admits a transition, connects `block` from preserved bytes, and finishes
-    /// on success.
+    /// Admits a transition, connects `block` from preserved bytes, then releases
+    /// the transition lock.
     ///
     /// Persistence matches [`ChainTransition::connect`].
     pub fn apply_block_with_serialized(
@@ -1071,8 +1084,8 @@ impl Chainstate {
         apply_block_inner(self, block, Some(serialized), BlockProvenance::Network)
     }
 
-    /// Admits a transition, replays a locally persisted body, and finishes on
-    /// success.
+    /// Admits a transition, replays a locally persisted body, then releases the
+    /// transition lock.
     ///
     /// Persistence matches [`ChainTransition::replay_local`].
     pub fn replay_local_block(
@@ -1083,11 +1096,9 @@ impl Chainstate {
         apply_block_inner(self, block, Some(serialized), BlockProvenance::LocalReplay)
     }
 
-    /// Admits a transition, disconnects `block`, and finishes on success.
-    /// Failure before admission acquires no transition and does not change
-    /// generation. A refusal after admission drops the transition and leaves
-    /// generation odd; callers that need to retry should use [`ChainTransition`]
-    /// directly.
+    /// Admits a transition, disconnects `block`, then releases the transition
+    /// lock. Refusal and fatal-recovery semantics are defined by
+    /// [`ChainTransition::disconnect`].
     ///
     /// Persistence matches [`ChainTransition::disconnect`]. An admission
     /// failure is `DisconnectError::Refused`. Derived consumers are not
@@ -1104,10 +1115,8 @@ impl Chainstate {
         result
     }
 
-    /// Admits a transition, applies consecutive blocks, and finishes on success.
-    /// Failure before admission acquires no transition and does not change
-    /// generation. A refusal after admission drops the transition and leaves
-    /// Persistence matches [`ChainTransition::connect_window`].
+    /// Admits a transition, applies consecutive blocks, then releases the
+    /// transition lock. Persistence matches [`ChainTransition::connect_window`].
     #[allow(clippy::result_large_err)]
     pub fn apply_window(
         &self,
@@ -1277,9 +1286,8 @@ pub struct WindowApplyError {
     /// How the caller must treat this failure: `Permanent` failures poisoned
     /// the failed block's header subtree while the chain transition was still
     /// held; `BodyMutated` discards only the delivered body; `Operational`
-    /// failures poisoned nothing; `Fatal` means the
-    /// transition itself could not be settled (the reserved even generation
-    /// could not be published), so admission stays closed until recovery.
+    /// failures poisoned nothing; `Fatal` means mutation or durable-head
+    /// state may be torn, so recovery must run before another mutation.
     pub disposition: WindowApplyDisposition,
     /// Hashes marked invalid under the held transition when `disposition` is
     /// [`WindowApplyDisposition::Permanent`]: the failed block and every
@@ -1335,12 +1343,10 @@ pub enum WindowApplyDisposition {
     /// Transient failure (storage, UTXO commit, shutdown). Nothing was
     /// invalidated; the failed block and its tail stay retryable.
     Operational,
-    /// The transition could not be concluded: the reserved even generation
-    /// could not be published (`ChainChangeGuard::finish` failed /
-    /// `GenerationMoved`). Mempool admission stays closed; a retry cannot
-    /// begin until recovery or restart re-establishes a consistent gateway.
-    /// Nothing about the blocks is invalid — committed blocks stay applied
-    /// and nothing is purged.
+    /// Mutation or durable-head state may already have changed without a
+    /// reliable commit receipt. Do not retry in-process; recovery must
+    /// re-establish authoritative chainstate first. Nothing about the blocks is
+    /// necessarily invalid, so no header subtree is purged.
     Fatal,
 }
 

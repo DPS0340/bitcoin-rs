@@ -451,7 +451,7 @@ where
             continue;
         }
 
-        let transition = handles.begin_transition_locked(lock);
+        let transition = lock.into_transition();
         let (progress, outcome) = execute_streamed_plan(
             &transition,
             observer,

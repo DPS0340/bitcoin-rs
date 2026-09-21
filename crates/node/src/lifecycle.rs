@@ -66,6 +66,7 @@ fn bind_rpc(
         chain: ChainHandles {
             chain_tip: chainstate.chain_tip_handle(),
             applied_tip: chainstate.applied_tip_handle(),
+            chain_tx_count: chainstate.chain_tx_count_handle(),
             blocks: state.blocks(),
             transactions: state.transactions(),
             utxo: chainstate.utxo_handle(),

@@ -240,6 +240,8 @@ pub struct ChainHandles {
     pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Best fully-applied block tip.
     pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Cumulative transaction count for the fully-applied chain.
+    pub chain_tx_count: Arc<core::sync::atomic::AtomicU64>,
     /// Applied block metadata log.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Transactions retained for direct RPC lookup.
@@ -603,6 +605,7 @@ impl Context {
                 ChainHandles {
                     chain_tip,
                     applied_tip,
+                    chain_tx_count,
                     blocks,
                     transactions,
                     utxo,
@@ -632,7 +635,7 @@ impl Context {
             chain_tip,
             applied_tip,
             chain_transition: Arc::new(Mutex::new(())),
-            chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
+            chain_tx_count,
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool,
             blocks,
@@ -1380,11 +1383,12 @@ mod tests {
     }
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
-    fn from_handles_shares_tip_handles_with_caller() {
+    fn from_handles_shares_chain_handles_with_caller() {
         use alloc::sync::Arc;
 
         let chain_tip = Arc::new(ArcSwapOption::empty());
         let applied_tip = Arc::new(ArcSwapOption::empty());
+        let chain_tx_count = Arc::new(core::sync::atomic::AtomicU64::new(1));
         let utxo = Arc::new(bitcoin_rs_utxo::UtxoSet::new());
         let coin_stats = Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
             bitcoin_rs_utxo::stats::CoinStats::default(),
@@ -1397,6 +1401,7 @@ mod tests {
             chain: ChainHandles {
                 chain_tip: Arc::clone(&chain_tip),
                 applied_tip: Arc::clone(&applied_tip),
+                chain_tx_count: Arc::clone(&chain_tx_count),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
                 transactions: Arc::new(RwLock::new(HashMap::new())),
                 utxo: Arc::clone(&utxo),
@@ -1434,6 +1439,9 @@ mod tests {
             Arc::ptr_eq(&ctx.applied_tip, &applied_tip),
             "applied_tip must be shared with caller"
         );
+        assert_eq!(ctx.chain_tx_count(), Some(1));
+        chain_tx_count.store(42, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(ctx.chain_tx_count(), Some(42));
         assert!(
             Arc::ptr_eq(&ctx.utxo, &utxo),
             "utxo must be shared with caller"

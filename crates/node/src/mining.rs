@@ -191,7 +191,7 @@ impl MiningCoordinator {
             Ok(change) => change,
             Err(error) => return map_apply_error(error),
         };
-        let transition = self.chainstate.begin_transition_locked(lock);
+        let transition = lock.into_transition();
         let connect = match serialized {
             Some(raw) => transition.connect_serialized(block, raw),
             None => transition.connect(block),
