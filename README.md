@@ -13,7 +13,7 @@ node-owned indexing, and familiar Bitcoin interfaces.
 [Benchmarks and limitations](docs/benchmarks/end-to-end-sync.md)
 
 [![CI](https://github.com/gosuda/bitcoin-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/gosuda/bitcoin-rs/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
 ## Why bitcoin-rs
@@ -231,5 +231,4 @@ verification commands, CI workflows, and crate architecture conventions.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). See
-[LICENSE](LICENSE) for full details.
+Licensed under [Apache-2.0](LICENSE).
