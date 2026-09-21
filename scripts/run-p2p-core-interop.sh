@@ -131,7 +131,7 @@ CORE_STOPPED=0
 core_rpc() {
   local method=$1
   shift
-  local cookie params=""
+  local cookie params="" max_time=10
   cookie=$(cat "${CORE_COOKIE_FILE}")
   if (($# > 0)); then
     # $* must join as a JSON array (commas), not on the default IFS space;
@@ -139,14 +139,21 @@ core_rpc() {
     local IFS=,
     params=,"\"params\":[${*}]"
   fi
-  curl -sS --max-time 10 --user "${cookie}" -H 'content-type: text/plain' \
+  case "${method}" in
+    generatetoaddress|generateblock)
+      max_time=${TIMEOUT_SECONDS}
+      ;;
+  esac
+  curl -sS --max-time "${max_time}" --user "${cookie}" -H 'content-type: text/plain' \
     --data "{\"jsonrpc\":\"1.0\",\"id\":\"interop\",\"method\":\"${method}\"${params}}" \
     "http://127.0.0.1:${CORE_RPC_PORT}"
 }
 
 # Prints only the "result" member of a Core RPC response.
 core_result() {
-  core_rpc "$@" | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["result"]))'
+  local response
+  response=$(core_rpc "$@") || return
+  python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["result"]))' <<<"${response}"
 }
 
 rs_rpc() {
@@ -174,7 +181,9 @@ json_field() {
 
 # Prints the bitcoin-rs chain tip height, failing loudly on RPC errors.
 rs_height() {
-  rs_rpc getblockcount | python3 -c 'import json, sys; print(json.load(sys.stdin)["result"])'
+  local response
+  response=$(rs_rpc getblockcount) || return
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["result"])' <<<"${response}"
 }
 
 poll_until() {
@@ -608,7 +617,8 @@ echo "evidence written to ${EVIDENCE}"
 if [[ "${SKIP_VERIFIER}" -ne 1 ]]; then
   echo "==> running the ignored verifier test"
   P2P_CORE_INTEROP_EVIDENCE="${EVIDENCE}" env -u RUSTC_WRAPPER -u CARGO_BUILD_BUILD_DIR \
-    cargo test -p bitcoin-rs-p2p --test core_interop_live -- --ignored --nocapture
+    cargo test --locked --profile quickstart -p bitcoin-rs-p2p \
+      --test core_interop_live -- --ignored --nocapture
 fi
 
 echo "==> Core differential: PASS"

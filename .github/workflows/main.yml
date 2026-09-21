@@ -374,6 +374,4 @@ jobs:
         run: |
           scripts/run-p2p-core-interop.sh \
             --bitcoind-command "$(scripts/install-bitcoind.sh --print-path)" \
-            --bitcoin-rs-command target/quickstart/bitcoin-rs \
-            --blocks 241 \
-            --catchup-blocks 5
+            --bitcoin-rs-command target/quickstart/bitcoin-rs
