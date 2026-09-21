@@ -3,7 +3,7 @@ use bitcoin_rs_primitives::{
     Amount, BlockHash, CompactTarget, Hash256, Header, OutPoint, TxOut, Txid, consensus_bytes,
 };
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use bitcoin_rs_utxo::{BorrowedBlockChanges, BorrowedUtxoAdd, UtxoSet};
+use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 
 use super::{JournalRecord, JournalReplayError, Mutation, replay_records, validate_replayed_head};
 use bitcoin_rs_storage::chainstate_journal::Coin;
@@ -61,14 +61,14 @@ fn base_state() -> TestResult<BaseState> {
     let listener = CoinStatsListener::new(CoinStats::default());
     let mut utxo = UtxoSet::new();
     utxo.set_listener(Box::new(listener.clone()));
-    let mut changes = BorrowedBlockChanges::with_capacity(1, 0);
-    changes.add(BorrowedUtxoAdd::new(
+    let mut changes = BlockChanges::with_capacity(1, 0);
+    changes.add(UtxoAdd::new(
         base_coin.outpoint,
         &base_coin.txout,
         base_coin.coinbase,
         base_coin.height,
     ));
-    utxo.commit_borrowed_block(&changes, &base_tip.hash)?;
+    utxo.commit_block(&changes, &base_tip.hash)?;
     listener.finish_block(0, 1);
     Ok((tree, utxo, listener.snapshot(), base_tip, base_coin))
 }

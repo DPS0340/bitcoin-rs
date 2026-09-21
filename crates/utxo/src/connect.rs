@@ -2,13 +2,13 @@
 //!
 //! The node crate coordinates *when* to connect a block and *what* resolved
 //! prevouts to pass; this module owns the mechanics of walking the block's
-//! transactions to produce the [`BorrowedBlockChanges`], [`UndoBatch`], and
+//! transactions to produce the [`BlockChanges`], [`UndoBatch`], and
 //! [`BlockValueTotals`] that the [`UtxoSet`] consumes.
 
 use bitcoin_rs_primitives::{Block, OutPoint, Tx, Txid};
 use hashbrown::HashSet;
 
-use crate::set::{BorrowedBlockChanges, BorrowedUtxoAdd, UndoBatch};
+use crate::set::{BlockChanges, UndoBatch};
 use crate::{UtxoAdd, UtxoSet, shard::LiveOutput};
 
 /// Returns true when `tx` is a coinbase: one input with the null outpoint.
@@ -106,19 +106,26 @@ pub fn build_block_changes<'a>(
     resolved: &impl SpentOutputLookup,
     overwritten: Option<&UtxoSet>,
     max_script_size: usize,
-) -> Result<(BorrowedBlockChanges<'a>, UndoBatch, BlockValueTotals), BlockChangeError> {
+) -> Result<
+    (
+        BlockChanges<&'a bitcoin_rs_primitives::TxOut>,
+        UndoBatch,
+        BlockValueTotals,
+    ),
+    BlockChangeError,
+> {
     // Bitcoin Core indexes genesis but does not connect its transactions into
     // CoinsView; its coinbase is unspendable and absent from UTXO/MuHash state.
     if height == 0 {
         return Ok((
-            BorrowedBlockChanges::default(),
+            BlockChanges::default(),
             UndoBatch::default(),
             BlockValueTotals::default(),
         ));
     }
 
     let net_same_block_spends = same_block_spent.is_some_and(|s| !s.is_empty());
-    let mut changes = BorrowedBlockChanges::with_capacity(add_capacity, remove_capacity);
+    let mut changes = BlockChanges::with_capacity(add_capacity, remove_capacity);
     let mut undo = UndoBatch::default();
     let mut totals = BlockValueTotals::default();
     for (tx, txid) in block.txs.iter().zip(txids) {
@@ -156,7 +163,7 @@ pub fn build_block_changes<'a>(
             // rather than creating one. `overwritten` is `Some` only at those
             // two mainnet heights, so every other block pays no lookup.
             let replaced = overwritten.and_then(|set| set.get_entry(&outpoint));
-            changes.add(BorrowedUtxoAdd::new(outpoint, txout, coinbase, height));
+            changes.add(UtxoAdd::new(outpoint, txout, coinbase, height));
             match replaced {
                 // The inverse of overwriting is writing the old coin back, not
                 // deleting the outpoint. Emitting a remove as well would depend

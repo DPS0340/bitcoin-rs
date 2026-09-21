@@ -498,7 +498,7 @@ pub(super) fn apply_block_admitted<'b>(
         .record(block_tree_insert_dur.as_secs_f64());
 
     let utxo_commit_started = quanta::Instant::now();
-    let utxo_commit_result = handles.utxo.commit_borrowed_block(&changes, &block_hash);
+    let utxo_commit_result = handles.utxo.commit_block(&changes, &block_hash);
     let utxo_commit_dur = utxo_commit_started.elapsed();
     metrics::histogram!("node.apply_block.utxo_commit_seconds")
         .record(utxo_commit_dur.as_secs_f64());
@@ -931,7 +931,7 @@ fn build_journal_record(
     block_hash: Hash256,
     prev_hash: Hash256,
     undo: &bitcoin_rs_utxo::UndoBatch,
-    changes: &bitcoin_rs_utxo::BorrowedBlockChanges<'_>,
+    changes: &bitcoin_rs_utxo::BlockChanges<&'_ bitcoin_rs_primitives::TxOut>,
     coin_stats_height_delta: i64,
 ) -> BuiltJournalRecord {
     if height == 0 {

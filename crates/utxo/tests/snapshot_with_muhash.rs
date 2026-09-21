@@ -52,7 +52,7 @@ fn snapshot_trailer_tracks_listener_after_removal() -> Result<(), Box<dyn std::e
     set.commit_block(&adds, &txid(100))?;
     let before_removal = listener.snapshot();
 
-    let mut removes = BlockChanges::default();
+    let mut removes: BlockChanges = BlockChanges::default();
     removes.remove(removed_outpoint);
     set.commit_block(&removes, &txid(101))?;
 

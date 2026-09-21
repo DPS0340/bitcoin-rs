@@ -217,7 +217,7 @@ fn begin_chain_transition<'a>(
 /// fails to compile. Build one proof per single operation, whole window, or
 /// whole reorg. Finish it once the operation reaches a consistent chainstate:
 /// a successful return, or a clean refusal whose failing block was refused
-/// before the UTXO commit-of-record (`utxo.commit_borrowed_block`). Every
+/// before the UTXO commit-of-record (`utxo.commit_block`). Every
 /// failure before that point touches only idempotent derived state (undo,
 /// block body, header tree) that a retry overwrites; a `UtxoCommit` refusal
 /// may tear the UTXO set, so the transition must be dropped and left odd
@@ -556,7 +556,7 @@ pub struct Chainstate {
 /// persist chainstate. Call it once the window attempt concludes on a
 /// consistent chainstate: a successful return, or a failure whose committed
 /// prefix is already in place and whose failing block was refused before the
-/// UTXO commit-of-record (`utxo.commit_borrowed_block`). Every failure before
+/// UTXO commit-of-record (`utxo.commit_block`). Every failure before
 /// that point touches only idempotent derived state (undo, block body, header
 /// tree) that a retry overwrites. A `UtxoCommit` refusal is different: the
 /// per-shard commit is not all-or-nothing across runs, so the UTXO set may be
@@ -655,7 +655,7 @@ impl<'a> ChainTransition<'a> {
     /// persist chainstate. Call it once the attempt has reached a consistent
     /// chainstate — a successful return, or a clean refusal whose committed
     /// prefix is already in place and whose failing block was refused before
-    /// the UTXO commit-of-record (`utxo.commit_borrowed_block`). Drop on a
+    /// the UTXO commit-of-record (`utxo.commit_block`). Drop on a
     /// `UtxoCommit` refusal, panic, or torn state leaves generation odd until
     /// recovery establishes a consistent chainstate. A failed generation CAS
     /// closes admission and requests shutdown before releasing the transition
@@ -757,7 +757,7 @@ impl Chainstate {
     /// it once the attempt reaches a consistent chainstate: a successful
     /// return, or a clean refusal whose committed prefix is already in place
     /// and whose failing block was refused before the UTXO commit-of-record
-    /// (`utxo.commit_borrowed_block`). Drop on a `UtxoCommit` refusal, panic,
+    /// (`utxo.commit_block`). Drop on a `UtxoCommit` refusal, panic,
     /// or torn state leaves generation odd until recovery establishes a
     /// consistent chainstate. Failure before this method returns a capability
     /// acquires no transition and therefore makes no generation postcondition.
