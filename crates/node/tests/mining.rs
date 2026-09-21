@@ -762,6 +762,66 @@ fn accepted_submission_is_visible_before_return() -> anyhow::Result<()> {
 }
 
 #[test]
+fn submit_block_with_bytes_takes_the_serialized_apply_path() -> anyhow::Result<()> {
+    use bitcoin_rs_primitives::consensus_bytes;
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = coordinator(&state);
+    mining.publish_generation();
+    let genesis = Network::Regtest.genesis_block();
+    let child = mined_child(genesis.block_hash())?;
+    let child_hash = Hash256::from(child.block_hash());
+    let raw = consensus_bytes(&child);
+    let result = mining.submit_block_with_bytes(child, raw)?;
+    assert_eq!(result, BlockValidationResult::Accepted);
+    let tip = state
+        .applied_tip()
+        .load_full()
+        .unwrap_or_else(|| panic!("applied tip missing after submit"));
+    assert_eq!(tip.hash, child_hash);
+    assert_eq!(tip.height, 1);
+    Ok(())
+}
+
+/// RED: `raw` that is not this block's serialization must be refused, not
+/// applied. The mutation below touches only the witness, so every txid and
+/// the transaction count still match — the exact hole a count-only check
+/// would leave open.
+#[test]
+fn submit_block_with_bytes_refuses_foreign_bytes() -> anyhow::Result<()> {
+    use bitcoin_rs_primitives::{Tx, consensus_bytes};
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = coordinator(&state);
+    mining.publish_generation();
+    let genesis = Network::Regtest.genesis_block();
+    let mut block = mined_child(genesis.block_hash())?;
+    let honest = consensus_bytes(&block);
+    // Swap only the witness: txids, counts, and header are untouched.
+    let Some(input) = block.txs.first_mut().and_then(|tx| tx.inputs.first_mut()) else {
+        panic!("coinbase has no input");
+    };
+    input.witness.push(vec![0xab_u8; 32]);
+    assert_eq!(
+        block.txs.iter().map(Tx::txid).collect::<Vec<_>>(),
+        bitcoin_rs_primitives::deserialize::<Block>(&honest)?
+            .txs
+            .iter()
+            .map(Tx::txid)
+            .collect::<Vec<_>>(),
+        "the witness swap must not move a txid, or this proves nothing"
+    );
+    let Err(error) = mining.submit_block_with_bytes(block, honest) else {
+        panic!("foreign bytes must be refused");
+    };
+    assert!(
+        matches!(error, MiningControlError::Rejected(_)),
+        "foreign bytes must reject, got: {error:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn submit_block_fills_omitted_coinbase_witness() -> anyhow::Result<()> {
     let state = open_regtest()?;
     apply_genesis(&state)?;

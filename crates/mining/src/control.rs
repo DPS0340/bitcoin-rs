@@ -286,6 +286,23 @@ pub trait MiningControl: Send + Sync {
     /// Synchronously validates and applies a solved block.
     fn submit_block(&self, block: Block) -> Result<BlockValidationResult, MiningControlError>;
 
+    /// Synchronously validates and applies a solved block with its exact wire
+    /// bytes, so the apply path can parse once from `raw` instead of decoding
+    /// `block` and re-serializing it.
+    ///
+    /// `raw` must be the consensus serialization of `block`. The default
+    /// implementation ignores `raw` and delegates to [`Self::submit_block`];
+    /// the node overrides it to thread `raw` through the serialized apply
+    /// path.
+    fn submit_block_with_bytes(
+        &self,
+        block: Block,
+        raw: Vec<u8>,
+    ) -> Result<BlockValidationResult, MiningControlError> {
+        let _ = raw;
+        self.submit_block(block)
+    }
+
     /// Admits a header through the same tree path as inbound P2P headers.
     ///
     /// The previous header must already be in the tree. Duplicates succeed.

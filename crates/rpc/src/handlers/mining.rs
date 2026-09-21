@@ -101,15 +101,25 @@ pub(crate) fn submitblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
         }
     }
     let hex = required_str(params, 0, "block hex is required")?;
-    let block = decode_submitted_block(hex)?;
-    match control.submit_block(block) {
+    let bytes = decode_block_hex(hex)?;
+    // Decode here for the BIP22 dummy/length-independent error contract
+    // (API-15), but submit the exact submitted bytes so the apply path parses
+    // once from them instead of re-serializing the tree (issue #627).
+    let mut reader: &[u8] = &bytes;
+    let block = <Block as ConsensusDecode>::consensus_decode(&mut reader)
+        .map_err(|_| block_decode_failed())?;
+    match control.submit_block_with_bytes(block, bytes) {
         Ok(result) => Ok(render_validation_result(result)),
         Err(error) => Err(map_mining_control_error(error)),
     }
 }
 
+fn decode_block_hex(hex: &str) -> Result<Vec<u8>, RpcError> {
+    from_hex(hex).map_err(|()| block_decode_failed())
+}
+
 fn decode_submitted_block(hex: &str) -> Result<Block, RpcError> {
-    let bytes = from_hex(hex).map_err(|()| block_decode_failed())?;
+    let bytes = decode_block_hex(hex)?;
     // See the API-15 contract for DecodeHexBlk compatibility behavior.
     let mut reader: &[u8] = &bytes;
     <Block as ConsensusDecode>::consensus_decode(&mut reader).map_err(|_| block_decode_failed())

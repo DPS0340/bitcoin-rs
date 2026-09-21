@@ -47,6 +47,7 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_primitives::consensus_bytes;
+use bitcoin_rs_primitives::deserialize;
 use compact_str::CompactString;
 use parking_lot::RwLock;
 use std::sync::atomic::AtomicBool;
@@ -159,6 +160,27 @@ impl MiningCoordinator {
     }
 
     fn submit(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
+        self.submit_inner(block, None)
+    }
+
+    /// Shared connect-and-publish body. `serialized`, when present, is the
+    /// exact consensus serialization of `block` and is threaded through
+    /// `connect_serialized` so the apply path parses once from the bytes
+    /// instead of re-serializing the decoded tree — the same path P2P and
+    /// reorg bodies already use (issue #627, slice A).
+    fn submit_with_serialized(
+        &self,
+        block: &Block,
+        serialized: bytes::Bytes,
+    ) -> Result<BlockValidationResult, MiningControlError> {
+        self.submit_inner(block, Some(serialized))
+    }
+
+    fn submit_inner(
+        &self,
+        block: &Block,
+        serialized: Option<bytes::Bytes>,
+    ) -> Result<BlockValidationResult, MiningControlError> {
         let block_hash: Hash256 = block.block_hash().into();
         // Duplicate classification and apply observe the same serialized chain state.
         // Reserve a generation only after ruling out an already accepted body.
@@ -181,7 +203,11 @@ impl MiningCoordinator {
             Ok(transition) => transition,
             Err(error) => return map_apply_error(error),
         };
-        match transition.connect(block) {
+        let connect = match serialized {
+            Some(raw) => transition.connect_serialized(block, raw),
+            None => transition.connect(block),
+        };
+        match connect {
             Ok(outcome) => {
                 self.followers.connected(block, &outcome);
                 let tip = outcome.tip;
@@ -353,6 +379,45 @@ impl MiningControl for MiningCoordinator {
     fn submit_block(&self, mut block: Block) -> Result<BlockValidationResult, MiningControlError> {
         self.fill_uncommitted_witness(&mut block);
         self.submit(&block)
+    }
+
+    fn submit_block_with_bytes(
+        &self,
+        mut block: Block,
+        raw: Vec<u8>,
+    ) -> Result<BlockValidationResult, MiningControlError> {
+        // Core `UpdateUncommittedBlockStructures` mutates `block` (inserts the
+        // 32-byte reserved nonce). The only legal mutation is that insertion,
+        // so `raw` must match `block` either before or after the fill. Anything
+        // else means `raw` is not this block's serialization and `submit`'s
+        // byte-equality gate must refuse it, not accept a neighbour's bytes.
+        self.fill_uncommitted_witness(&mut block);
+        // `deserialize` rejects trailing bytes (exact-image rule), while RPC
+        // `submitblock` tolerates them (API-15). Walk the layout once to find
+        // the accepted prefix, then enforce the exact-image rule on that
+        // prefix and check it really encodes this block.
+        let consumed = {
+            use bitcoin_rs_primitives::layout::ParsedBlock;
+            let mut cursor: &[u8] = &raw;
+            let parsed = ParsedBlock::parse(&mut cursor).map_err(|error| {
+                MiningControlError::Rejected(CompactString::from(error.to_string()))
+            })?;
+            parsed.consumed_len()
+        };
+        let prefix: &[u8] = raw.get(..consumed).ok_or_else(|| {
+            MiningControlError::Rejected(CompactString::from(
+                "submitted bytes are not the serialization of the submitted block",
+            ))
+        })?;
+        let canonical = deserialize::<Block>(prefix).map_err(|error| {
+            MiningControlError::Rejected(CompactString::from(error.to_string()))
+        })?;
+        if canonical != block {
+            return Err(MiningControlError::Rejected(CompactString::from(
+                "submitted bytes are not the serialization of the submitted block",
+            )));
+        }
+        self.submit_with_serialized(&block, bytes::Bytes::from(raw))
     }
 
     /// Admits `header` through [`accept_headers`], the same gate inbound P2P uses.
