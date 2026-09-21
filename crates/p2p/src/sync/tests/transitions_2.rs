@@ -148,18 +148,14 @@ fn outweighed_branch_target_accepts_shorter_higher_work_branch()
     assert!(winning.height < applied.height);
     assert!(winning.chainwork > applied.chainwork);
 
-    let chain_tip = tree.tip_handle();
-    let applied_tip = Arc::new(ArcSwapOption::empty());
+    let SyncHarness {
+        sync,
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
     applied_tip.store(Some(Arc::new(applied)));
-    let block_tree = Arc::new(RwLock::new(tree));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let sync = BlockSync::new(
-        std::sync::Arc::new(TestChain::new(chain_tip, applied_tip, block_tree)),
-        Arc::new(PeerTable::new()),
-        Arc::new(Mutex::new(inbound_headers_rx_raw)),
-        Arc::new(Mutex::new(inbound_blocks_rx_raw)),
-    );
 
     assert_eq!(sync.outweighed_branch_target(), Some(high_work_id));
     Ok(())

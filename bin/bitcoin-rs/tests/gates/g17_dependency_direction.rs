@@ -1,56 +1,9 @@
-//! G17 — One-way crate dependency direction.
-//!
-//! **G17 — Dependency direction.** The workspace crates form a one-way,
-//! acyclic layer model; `cargo metadata` proves every edge points the
-//! approved way, `bitcoin-rs-mempool` never depends on its transaction
-//! consumers, no crate outside `bitcoin-rs-storage` names a storage-engine
-//! dependency (`rust-rocksdb`, `fjall`, `redb`), and the RPC crate names no
-//! storage backend at all.
-//!
-//! Approved layer direction (a crate may depend only on crates in the same or
-//! a strictly lower layer):
-//!
-//! ```text
-//!   layer 0  core       consensus, script, primitives
-//!   layer 1  storage    storage
-//!   layer 2  services   chain, chainstate, utxo, p2p, mempool, index, mining
-//!   layer 3  surface    rpc
-//!   layer 4  compose    node, bin (bitcoin-rs)
-//! ```
-//!
-//! Notes that keep this model honest rather than aspirational:
-//! - `chain` and `utxo` depend on `storage` (undo records, snapshots), so they
-//!   sit in the services layer, not core.
-//! - `mining` depends on `mempool` and `chain`; all three live in services.
-//! - `chain` depends on `consensus` for BIP9 parameters and the BIP113 cutoff.
-//! - `rpc` may consume node capabilities (`index`, `mining`, `mempool`,
-//!   `chain`, `utxo`, `p2p`) but never `node` or the binary, and never names a
-//!   storage backend.
-//! - `mempool` must not depend on `p2p`, `rpc`, `node`, or the binary:
-//!   consumers and composition depend on the mempool, not the reverse.
-//! - The engine rule is the storage-boundary rule: only the storage crate may
-//!   name a backend engine. Everything above talks to the `KvStore` facade.
-//! - Backend *feature* forwarding is confined to the operator-facing tiers
-//!   (node, binary) and the services-tier adapters that actually select an
-//!   engine; rpc, consensus, script, mempool, and mining define none.
-//!
-//! The gate fails loudly, naming the offending edge or source site, when any
-//! assertion does not hold.
-//!
-//! Contract: `docs/contracts/architecture.md` —
-//! `workspace_dependency_direction_is_one_way` pins `ARCH-01` (one-way,
-//! acyclic layer edges and mempool consumer direction), `ARCH-02` (engine-crate
-//! exclusivity), `ARCH-03` (backend feature-forwarding confinement), and
-//! `ARCH-04` (RPC storage independence).
-//!
-//! The layer table, metadata parser, and validation rules live in exactly one
-//! place — `tests/support/dependency_graph.rs` — and this gate drives the
-//! shared validator over the live workspace metadata.
+//! ARCH-01..ARCH-04: check the live Cargo graph against the architecture contract.
 
-#[path = "../support/mod.rs"]
-mod support;
+#[path = "../support/dependency_graph.rs"]
+mod dependency_graph;
 
-use support::dependency_graph::WorkspaceGraph;
+use dependency_graph::WorkspaceGraph;
 
 #[test]
 fn workspace_dependency_direction_is_one_way() {

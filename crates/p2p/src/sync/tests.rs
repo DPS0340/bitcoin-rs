@@ -527,25 +527,14 @@ fn unsolicited_stale_block_retries_from_resolved_header_height()
     let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
     let block1_id = tree.insert_node(Some(genesis_id), block1.header, NodeStatus::HeaderValid)?;
     tree.insert_node(Some(block1_id), block2.header, NodeStatus::HeaderValid)?;
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx: _inbound_headers_tx,
+    } = SyncHarness::new(tree);
     install_budget(
         &sync,
         super::SyncBudget {
@@ -865,25 +854,14 @@ fn staging_exhaustion_fixture() -> Result<ExhaustionFixture, Box<dyn std::error:
     let block2_id = tree.insert_node(Some(block1_id), block2.header, NodeStatus::HeaderValid)?;
     tree.insert_node(Some(block2_id), block3.header, NodeStatus::HeaderValid)?;
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx: _inbound_headers_tx,
+    } = SyncHarness::new(tree);
     // Staging byte budget that exactly one staged block exhausts.
     install_budget(
         &sync,
@@ -943,47 +921,18 @@ struct DeterministicProxyFixture {
 }
 
 fn deterministic_proxy_fixture() -> Result<DeterministicProxyFixture, Box<dyn std::error::Error>> {
-    let genesis = Network::Regtest.genesis_block();
-    let mut tree = BlockTree::new();
-    let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
-    let mut tip_id = genesis_id;
-    let mut prev_hash = genesis.block_hash();
-    let mut blocks = Vec::with_capacity(DETERMINISTIC_PROXY_BLOCKS);
-
-    for height in 1_u32..=DETERMINISTIC_PROXY_TIP_HEIGHT {
-        let block =
-            mined_block_with_prev_hash(prev_hash, height, vec![coinbase_transaction(height)]);
-        tip_id = tree.insert_node(Some(tip_id), block.header, NodeStatus::HeaderValid)?;
-        prev_hash = block.block_hash();
-        blocks.push(block);
-    }
-    for height in
-        DETERMINISTIC_PROXY_TIP_HEIGHT.saturating_add(1)..=DETERMINISTIC_PROXY_HEADER_HEIGHT
-    {
-        let header = test_header(prev_hash, height);
-        tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
-        prev_hash = header.compute_hash();
-    }
-
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let (tree, blocks) = mined_chain(
+        DETERMINISTIC_PROXY_TIP_HEIGHT,
+        DETERMINISTIC_PROXY_HEADER_HEIGHT - DETERMINISTIC_PROXY_TIP_HEIGHT,
+    )?;
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx: _inbound_headers_tx,
+    } = SyncHarness::new(tree);
     install_budget(
         &sync,
         super::SyncBudget {
@@ -1025,40 +974,16 @@ fn apply_cache_fixture(
     body_height: u32,
     header_only: u32,
 ) -> Result<ApplyCacheFixture, Box<dyn std::error::Error>> {
-    let genesis = Network::Regtest.genesis_block();
-    let mut tree = BlockTree::new();
-    let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
-    let mut tip_id = genesis_id;
-    let mut prev_hash = genesis.block_hash();
-    let mut blocks = Vec::with_capacity(usize::try_from(body_height)?);
-
-    for height in 1..=body_height {
-        let block =
-            mined_block_with_prev_hash(prev_hash, height, vec![coinbase_transaction(height)]);
-        tip_id = tree.insert_node(Some(tip_id), block.header, NodeStatus::HeaderValid)?;
-        prev_hash = block.block_hash();
-        blocks.push(block);
-    }
-    for height in body_height.saturating_add(1)..=body_height.saturating_add(header_only) {
-        let header = test_header(prev_hash, height);
-        tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
-        prev_hash = header.compute_hash();
-    }
-
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let chain: Arc<dyn SyncChain> = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
+    let (tree, blocks) = mined_chain(body_height, header_only)?;
+    let SyncHarness {
+        sync,
         block_tree,
-    ));
-    let sync = BlockSync::new(chain, peers, inbound_headers_rx, inbound_blocks_rx);
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
+    let chain_tip = block_tree.read().tip_handle();
     // Apply genesis so the applied tip starts at height 0; no block bodies
     // are staged yet, leaving every round below to drive cache state.
     sync.chain.bootstrap_genesis();
@@ -1109,6 +1034,71 @@ fn apply_fixture_block(sync: &BlockSync, block: Block) -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// Shared executor wiring; callers keep or drop each sender explicitly.
+struct SyncHarness {
+    sync: BlockSync,
+    peers: Arc<PeerTable>,
+    block_tree: Arc<RwLock<BlockTree>>,
+    applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    inbound_headers_tx: crossbeam_channel::Sender<InboundHeaders>,
+    inbound_blocks_tx: InboundBlockSender,
+}
+
+impl SyncHarness {
+    fn new(tree: BlockTree) -> Self {
+        let chain_tip = tree.tip_handle();
+        let block_tree = Arc::new(RwLock::new(tree));
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let peers = Arc::new(PeerTable::new());
+        let (inbound_headers_tx, inbound_headers_rx) = unbounded();
+        let (inbound_blocks_tx, inbound_blocks_rx) = unbounded();
+        let chain = Arc::new(TestChain::new(
+            chain_tip,
+            Arc::clone(&applied_tip),
+            Arc::clone(&block_tree),
+        ));
+        let sync = BlockSync::new(
+            chain,
+            Arc::clone(&peers),
+            Arc::new(Mutex::new(inbound_headers_rx)),
+            Arc::new(Mutex::new(inbound_blocks_rx)),
+        );
+        Self {
+            sync,
+            peers,
+            block_tree,
+            applied_tip,
+            inbound_headers_tx,
+            inbound_blocks_tx,
+        }
+    }
+}
+
+/// Mine real bodies, then extend their header chain without applying anything.
+fn mined_chain(
+    body_height: u32,
+    header_only: u32,
+) -> Result<(BlockTree, Vec<Block>), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block();
+    let mut tree = BlockTree::new();
+    let mut tip_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+    let mut prev_hash = genesis.block_hash();
+    let mut blocks = Vec::with_capacity(usize::try_from(body_height)?);
+    for height in 1..=body_height {
+        let block =
+            mined_block_with_prev_hash(prev_hash, height, vec![coinbase_transaction(height)]);
+        tip_id = tree.insert_node(Some(tip_id), block.header, NodeStatus::HeaderValid)?;
+        prev_hash = block.block_hash();
+        blocks.push(block);
+    }
+    for height in body_height.saturating_add(1)..=body_height.saturating_add(header_only) {
+        let header = test_header(prev_hash, height);
+        tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
+        prev_hash = header.compute_hash();
+    }
+    Ok((tree, blocks))
+}
+
 type SyncFixture = (
     BlockSync,
     Arc<PeerTable>,
@@ -1129,42 +1119,16 @@ fn sync_with_header_chain(height: u32) -> Result<SyncFixture, Box<dyn std::error
 fn sync_with_header_chain_and_blocks(
     height: u32,
 ) -> Result<(SyncFixture, InboundBlockSender), Box<dyn std::error::Error>> {
-    let mut tree = BlockTree::new();
-    let genesis = genesis_header();
-    let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-    let mut tip_id = genesis_id;
-    let mut expected = Vec::new();
-
-    for height in 1_u32..=height {
-        let parent_hash = BlockHash::from(tree.node(tip_id)?.hash);
-        // Headers whose merkle root commits to a deterministic real body,
-        // so blocks delivered through the inbound channel pass the staging
-        // gate's txid-merkle binding check (issue #1070).
-        let block =
-            mined_block_with_prev_hash(parent_hash, height, vec![coinbase_transaction(height)]);
-        tip_id = tree.insert_node(Some(tip_id), block.header, NodeStatus::HeaderValid)?;
-        expected.push(BlockHash::from(tree.node(tip_id)?.hash));
-    }
-
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let (tree, blocks) = mined_chain(height, 0)?;
+    let expected = blocks.iter().map(Block::block_hash).collect();
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx: _inbound_headers_tx,
+    } = SyncHarness::new(tree);
 
     Ok((
         (sync, peers, block_tree, applied_tip, expected),
@@ -1184,40 +1148,15 @@ type MinedChainFixture = (
 /// mined regtest blocks (coinbase-bearing, PoW-valid), so tests can drive
 /// real apply progress through the inbound channel.
 fn sync_with_mined_chain(count: u32) -> Result<MinedChainFixture, Box<dyn std::error::Error>> {
-    let genesis = Network::Regtest.genesis_block();
-    let mut tree = BlockTree::new();
-    let mut node_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
-    let mut prev_hash = genesis.block_hash();
-    let mut blocks = Vec::with_capacity(usize::try_from(count)?);
-    for height in 1..=count {
-        let block =
-            mined_block_with_prev_hash(prev_hash, height, vec![coinbase_transaction(height)]);
-        node_id = tree.insert_node(Some(node_id), block.header, NodeStatus::HeaderValid)?;
-        prev_hash = block.block_hash();
-        blocks.push(block);
-    }
-
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
-    // `node_id` ends as the chain tip; it only exists to thread parents.
-    let _ = node_id;
+    let (tree, blocks) = mined_chain(count, 0)?;
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree: _,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx: _inbound_headers_tx,
+    } = SyncHarness::new(tree);
 
     Ok((sync, peers, applied_tip, blocks, inbound_blocks_tx))
 }
@@ -1605,21 +1544,13 @@ fn header_sync_with_genesis() -> Result<HeaderSyncFixture, Box<dyn std::error::E
     let mut tree = BlockTree::new();
     let genesis = genesis_header();
     tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(chain_tip, applied_tip, block_tree));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
     install_budget(
         &sync,
         super::SyncBudget {

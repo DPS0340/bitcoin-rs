@@ -82,25 +82,14 @@ fn tick_applies_contiguous_blocks_before_requesting_more() -> Result<(), Box<dyn
     let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::HeaderValid)?;
     let expected = BlockHash::from(tree.node(child_id)?.hash);
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx,
+    } = SyncHarness::new(tree);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(genesis))?;
@@ -129,25 +118,14 @@ fn oversized_received_block_releases_pending_budget_for_retry()
     let block_id = tree.insert_node(Some(genesis_id), block.header, NodeStatus::HeaderValid)?;
     let expected_hash = BlockHash::from(tree.node(block_id)?.hash);
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx,
+    } = SyncHarness::new(tree);
     install_budget(
         &sync,
         super::super::SyncBudget {
@@ -208,25 +186,14 @@ fn staging_byte_exhaustion_backpressures_requests_then_recovers()
     let block2_id = tree.insert_node(Some(block1_id), block2.header, NodeStatus::HeaderValid)?;
     tree.insert_node(Some(block2_id), block3.header, NodeStatus::HeaderValid)?;
 
-    let chain_tip = tree.tip_handle();
-    let block_tree = Arc::new(RwLock::new(tree));
-    let applied_tip = Arc::new(ArcSwapOption::empty());
-    let peers = Arc::new(PeerTable::new());
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
-    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-    let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
-    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-    let handles = std::sync::Arc::new(TestChain::new(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&block_tree),
-    ));
-    let sync = BlockSync::new(
-        handles,
-        Arc::clone(&peers),
-        inbound_headers_rx,
-        inbound_blocks_rx,
-    );
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx,
+    } = SyncHarness::new(tree);
     // Staging byte budget that exactly one staged block exhausts.
     install_budget(
         &sync,
