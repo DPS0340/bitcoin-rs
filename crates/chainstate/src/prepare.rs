@@ -11,7 +11,7 @@ use super::PreparedApply;
 use super::ResolvedUtxoView;
 use super::WitnessPresence;
 use super::scratch::SameBlockSpentSet;
-use crate::apply::error::ApplyError;
+use crate::error::ApplyError;
 use bitcoin_rs_consensus::rust_path::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::ConsensusEncode;
@@ -25,7 +25,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 /// Returns true iff `raw` is exactly the consensus serialization of `block`.
-pub(crate) fn bytes_are_block(raw: &[u8], block: &Block) -> bool {
+pub fn bytes_are_block(raw: &[u8], block: &Block) -> bool {
     let mut sink = ByteEquality {
         expected: raw,
         offset: 0,

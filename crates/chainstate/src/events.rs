@@ -70,20 +70,9 @@ pub struct ChainEventPublisher {
     snapshot: RwLock<ChainSnapshot>,
 }
 
-impl bitcoin_rs_index::reconcile::ChainCursorSource for ChainEventPublisher {
-    fn cursor(&self) -> bitcoin_rs_index::reconcile::ConsumerCursor {
-        let snapshot = self.snapshot();
-        bitcoin_rs_index::reconcile::ConsumerCursor {
-            epoch: snapshot.epoch,
-            sequence: snapshot.sequence,
-            height: snapshot.tip_height,
-            hash: snapshot.tip_hash,
-        }
-    }
-}
-
 impl ChainEventPublisher {
-    pub(super) fn new(epoch: u64, initial: ChainSnapshot) -> Self {
+    /// Creates a publisher anchored at `initial` for one process epoch.
+    pub fn new(epoch: u64, initial: ChainSnapshot) -> Self {
         Self {
             epoch,
             sequence: AtomicU64::new(0),
@@ -182,7 +171,7 @@ fn load_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
 /// The epoch itself lives outside the re-writable checkpoint tree, so a
 /// checkpoint wipe or resync can never regress it. A crash before the rename
 /// may leave a temporary file; gaps are fine, but reuse is not.
-pub(super) fn allocate_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
+pub fn allocate_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
     use cap_fs_ext::FollowSymlinks;
     use cap_fs_ext::OpenOptionsFollowExt as _;
     use cap_fs_ext::OpenOptionsSyncExt as _;
@@ -240,4 +229,13 @@ pub(super) fn allocate_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
     // barrier above. Dropping it here releases the cross-process transaction.
     drop(lock);
     Ok(epoch)
+}
+
+/// Validates the chainstate data-directory schema and allocates this process epoch.
+pub fn initialize_data_dir(path: &std::path::Path) -> Result<u64> {
+    let dir = bitcoin_rs_storage::checkpoint::fs::open_data_dir(path)
+        .with_context(|| format!("open data_dir {}", path.display()))?;
+    bitcoin_rs_storage::checkpoint::fs::ensure_current_schema(&dir)
+        .with_context(|| format!("validate CURRENT_SCHEMA for datadir {}", path.display()))?;
+    allocate_process_epoch(&dir)
 }

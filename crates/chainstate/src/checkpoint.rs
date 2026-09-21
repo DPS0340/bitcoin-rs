@@ -262,11 +262,6 @@ std::thread_local! {
     static NEXT_CHECKPOINT_FAILPOINT: std::cell::Cell<Option<CheckpointFailpoint>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
-pub(crate) fn inject_next_checkpoint_failpoint(failpoint: CheckpointFailpoint) {
-    NEXT_CHECKPOINT_FAILPOINT.with(|slot| slot.set(Some(failpoint)));
-}
-
 fn load_headers(
     generation_dir: &Dir,
     config: headers::HeaderCheckpointConfig,

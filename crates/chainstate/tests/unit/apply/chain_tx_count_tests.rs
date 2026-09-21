@@ -5,7 +5,17 @@
 use super::*;
 
 fn handles() -> Chainstate {
-    super::consensus_rule_tests::empty_apply_handles()
+    Chainstate::new(
+        Network::Mainnet,
+        Arc::new(ArcSwapOption::empty()),
+        Arc::new(ArcSwapOption::empty()),
+        Arc::new(RwLock::new(BlockTree::new())),
+        Arc::new(UtxoSet::new()),
+        Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
+        )),
+        Arc::new(crate::events::ChainEventPublisher::detached(0)),
+    )
 }
 
 #[test]

@@ -224,7 +224,9 @@ remove another script's output.
   checkpoints, block bodies, and derived indexes is normative in
   [recovery.md](recovery.md) (`RCV-01`–`RCV-04`); a `kill -9` gate that
   re-applies real block bodies through it is not yet exercised.
-- **Deep reorg memory bounding**: Disconnect planning preloads branch block bodies into memory; streaming bounded-memory disconnect is tracked under #206 (open).
+- **Deep reorg memory bounding**: authoritative reorg execution streams
+  disconnect bodies in bounded windows under a retention lease; it does not
+  preload the departed branch.
 ## Proven by
 
 - `crates/index/tests/index_roundtrip.rs`
@@ -243,8 +245,8 @@ remove another script's output.
   consistency, and revision ABA detection tests.
 - `crates/index/src/runtime/block_source_tests.rs`: confirmed-body
   serving by height/hash (`IDX-03`, `RCV-01`).
-- `crates/node/src/apply.rs`:
-  `txindex_worker_failure_makes_queries_unavailable_without_blocking_apply`.
+- node/index integration tests cover worker failure and query unavailability
+  without making authoritative chainstate progress depend on the index.
 - `crates/rpc/src/capabilities.rs` tests `missing_source_is_the_disabled_txindex_row`,
   `attached_source_is_the_worker_row`: `getcapabilities` advertises one
   txindex row from `derived_index_status` (`IDX-02`).

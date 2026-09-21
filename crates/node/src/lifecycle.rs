@@ -34,7 +34,7 @@ const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct RpcChainControl {
-    handles: crate::apply::Chainstate,
+    handles: Arc<bitcoin_rs_chainstate::Chainstate>,
     followers: crate::chain_effects::ChainFollowers,
 }
 
@@ -61,15 +61,16 @@ fn bind_rpc(
     block_body_source: Arc<dyn BlockBodySource>,
 ) -> Result<(Arc<Context>, RpcServer)> {
     let rpc_auth = Arc::new(state.config().rpc.auth.to_rpc_auth()?);
+    let chainstate = state.chainstate();
     let mut context = Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: state.chain_tip(),
-            applied_tip: state.applied_tip(),
+            chain_tip: chainstate.chain_tip_handle(),
+            applied_tip: chainstate.applied_tip_handle(),
             blocks: state.blocks(),
             transactions: state.transactions(),
-            utxo: state.utxo(),
-            coin_stats: state.coin_stats(),
-            block_tree: state.block_tree(),
+            utxo: chainstate.utxo_handle(),
+            coin_stats: chainstate.coin_stats_handle(),
+            block_tree: chainstate.block_tree_handle(),
             chain_network: state.config().network,
         },
         mempool: MempoolHandles {
@@ -94,13 +95,13 @@ fn bind_rpc(
     })
     .with_esplora_derived_index(state.esplora_derived_index_query())
     .with_block_body_source(block_body_source)
-    .with_chain_transition(Arc::clone(&state.chainstate().chain_transition));
+    .with_chain_transition(chainstate.transition_barrier());
     if let Some(prune_service) = state.prune_service() {
         context = context.with_prune_service(prune_service);
     }
     context = context
         .with_chain_control(Arc::new(RpcChainControl {
-            handles: state.chainstate(),
+            handles: chainstate,
             followers: state.chain_followers(),
         }))
         .with_zmq_publisher(state.zmq_publisher())
@@ -274,7 +275,7 @@ impl NodeServices {
         if let Some(state) = state {
             // P2P core worker join failure.
             if let Err(error) = state.p2p().join_core_workers() {
-                set_first_error(first_error, anyhow::Error::new(error));
+                set_first_error(first_error, error.into());
             }
         }
         if let Some(handle) = self.tx_ingress.take() {
@@ -357,16 +358,16 @@ fn publish_clean_checkpoint_if_eligible(
 ) {
     if let (Some(state), TeardownMode::CleanShutdown, None) = (state, mode, first_error.as_ref()) {
         match state.write_clean_checkpoint() {
-            Ok(crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip) => {
+            Ok(None) => {
                 tracing::info!("no applied tip; clean checkpoint publication skipped");
             }
-            Ok(crate::checkpoint::CheckpointWrite::Published { generation }) => {
+            Ok(Some(generation)) => {
                 tracing::info!(generation, "published clean chainstate checkpoint");
             }
             // Checkpoint write failure suppresses the clean-shutdown report.
             Err(error) => {
                 tracing::error!(%error, "clean checkpoint publication failed");
-                set_first_error(first_error, anyhow::Error::new(error));
+                set_first_error(first_error, error);
             }
         }
     } else {
@@ -485,9 +486,10 @@ pub(crate) fn start_node(
         (rx, Some(tx))
     };
     guard.services.event_loop_signal = event_loop_signal;
-    let block_body_source = state.block_body_source();
+    let block_body_source = state.block_body_source()?;
+    let chainstate = state.chainstate();
     let p2p_chain_query: Arc<dyn bitcoin_rs_p2p::ChainQuery> = Arc::new(
-        bitcoin_rs_p2p::ActiveChainQuery::new(state.block_tree())
+        bitcoin_rs_p2p::ActiveChainQuery::new(chainstate.block_tree_handle())
             .with_block_body_source(Arc::clone(&block_body_source)),
     );
     let (sync_wake_tx, sync_wake_rx) = bounded(1);
@@ -495,14 +497,10 @@ pub(crate) fn start_node(
     let peer_ready_sync = Arc::clone(&sync);
     let loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
     let coordinator = Arc::new(crate::MiningCoordinator::new(
-        state.config().network,
-        state.applied_tip(),
-        state.block_tree(),
         state.mempool(),
-        state.chainstate(),
+        Arc::clone(&chainstate),
         state.chain_followers(),
         state.config().mining.payout_script.clone(),
-        Arc::clone(&shutdown),
     ));
     let sequence_wake: Arc<dyn bitcoin_rs_mining::MempoolSequenceWake> = coordinator.clone();
     let mining_control: Arc<dyn bitcoin_rs_mining::MiningControl> = coordinator;

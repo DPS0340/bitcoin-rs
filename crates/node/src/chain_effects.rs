@@ -10,8 +10,10 @@ use bitcoin_rs_index::block_log::{BlockLog, BlockRecord};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Txid};
 use parking_lot::RwLock;
 
-use crate::apply::{ConnectOutcome, DisconnectOutcome};
+use bitcoin_rs_chainstate::{ConnectOutcome, DisconnectOutcome};
 use bitcoin_rs_index::runtime::DerivedIndexRuntime;
+use bitcoin_rs_mempool::AdmissionOrigin;
+use bitcoin_rs_mempool::ChainChangeGuard;
 use bitcoin_rs_mempool::MempoolGateway;
 use bitcoin_rs_rpc::zmq::{SequenceEvent, ZmqPublisher};
 
@@ -196,6 +198,51 @@ pub struct ChainFollowers {
 }
 
 impl ChainFollowers {
+    pub(crate) fn begin_mempool_change(
+        &self,
+    ) -> core::result::Result<Option<ChainChangeGuard>, bitcoin_rs_chainstate::ApplyError> {
+        self.mempool
+            .as_ref()
+            .map(|gateway| {
+                gateway
+                    .begin_chain_change()
+                    .map_err(|_| bitcoin_rs_chainstate::ApplyError::Shutdown)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn finish_transition(
+        handles: &bitcoin_rs_chainstate::Chainstate,
+        transition: bitcoin_rs_chainstate::ChainTransition<'_>,
+        mempool_change: Option<ChainChangeGuard>,
+    ) -> core::result::Result<(), bitcoin_rs_chainstate::ApplyError> {
+        if let Some(change) = mempool_change
+            && change.finish().is_err()
+        {
+            handles.fail_closed_for_recovery();
+            return Err(bitcoin_rs_chainstate::ApplyError::Shutdown);
+        }
+        drop(transition);
+        Ok(())
+    }
+
+    pub(crate) fn mempool_gateway(&self) -> Option<&Arc<MempoolGateway>> {
+        self.mempool.as_ref()
+    }
+
+    pub(crate) fn committed_connect(&self, block: &Block, outcome: &ConnectOutcome) {
+        if let Some(gateway) = &self.mempool {
+            let block_txs: Vec<&bitcoin_rs_primitives::Tx> = block.txs.iter().collect();
+            gateway.remove_for_block(
+                AdmissionOrigin::Block,
+                &block_txs,
+                &outcome.txids,
+                outcome.height,
+            );
+        }
+        self.connected(block, outcome);
+    }
+
     /// Production follower set.
     #[must_use]
     pub fn new(
@@ -264,17 +311,18 @@ impl ChainFollowers {
     /// Connects `block` and dispatches this set before the transition ends.
     ///
     /// See `ARCH-07`: production single-block paths must not finish the
-    /// [`crate::apply::ChainTransition`] and then dispatch, or a later
+    /// [`bitcoin_rs_chainstate::ChainTransition`] and then dispatch, or a later
     /// connect or disconnect can publish derived effects first.
     pub fn apply_connect(
         &self,
-        handles: &crate::apply::Chainstate,
+        handles: &bitcoin_rs_chainstate::Chainstate,
         block: &Block,
-    ) -> core::result::Result<ConnectOutcome, crate::ApplyError> {
+    ) -> core::result::Result<ConnectOutcome, bitcoin_rs_chainstate::ApplyError> {
         let transition = handles.begin_transition()?;
+        let mempool_change = self.begin_mempool_change()?;
         let outcome = transition.connect(block)?;
-        self.connected(block, &outcome);
-        let _ = transition.finish();
+        self.committed_connect(block, &outcome);
+        Self::finish_transition(handles, transition, mempool_change)?;
         Ok(outcome)
     }
 
@@ -283,15 +331,24 @@ impl ChainFollowers {
     /// See `ARCH-07`. An admission failure is `DisconnectError::Refused`.
     pub fn apply_disconnect(
         &self,
-        handles: &crate::apply::Chainstate,
+        handles: &bitcoin_rs_chainstate::Chainstate,
         block: &Block,
-    ) -> core::result::Result<DisconnectOutcome, crate::DisconnectError> {
+    ) -> core::result::Result<DisconnectOutcome, bitcoin_rs_chainstate::DisconnectError> {
         let transition = handles
             .begin_transition()
-            .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
+            .map_err(|error| bitcoin_rs_chainstate::DisconnectError::Refused(Box::new(error)))?;
+        let mempool_change = self
+            .begin_mempool_change()
+            .map_err(|error| bitcoin_rs_chainstate::DisconnectError::Refused(Box::new(error)))?;
         let outcome = transition.disconnect(block)?;
         self.disconnected(&outcome);
-        let _ = transition.finish();
+        Self::finish_transition(handles, transition, mempool_change).map_err(|error| {
+            bitcoin_rs_chainstate::DisconnectError::Fatal {
+                hash: outcome.hash,
+                height: outcome.parent_tip.height.saturating_add(1),
+                source: Box::new(error),
+            }
+        })?;
         Ok(outcome)
     }
 }

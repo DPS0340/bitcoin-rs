@@ -1,101 +1,49 @@
 //! Authoritative chainstate mutation: connect, disconnect, and window apply.
 //!
 //! Ownership, admission, and the `Chainstate` / `ChainTransition` boundary
-//! are specified by `ARCH-07` in `docs/contracts/architecture.md`. Apply
+//! are specified by `ARCH-07` in `docs/contracts/architecture.md`. Chainstate
 //! publishes the tip and returns a concrete connect or disconnect outcome.
-//! [`crate::chain_effects`] consumes that outcome after the commit.
+//! Higher layers consume those outcomes after the authoritative commit.
 
-use crate::apply::error::ApplyError;
-use crate::config::ValidationMode;
+pub use crate::error::{ApplyError, DisconnectError};
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::TipSnapshot;
-#[cfg(test)]
-use bitcoin_rs_chain::compact_is_met_by;
-#[cfg(test)]
-use bitcoin_rs_consensus::MAX_SCRIPT_SIZE;
 use bitcoin_rs_consensus::rust_path::UtxoView;
-use bitcoin_rs_mempool::ChainChangeGuard;
-use bitcoin_rs_mempool::Mempool;
-use bitcoin_rs_mempool::MempoolGateway;
-#[cfg(test)]
-use bitcoin_rs_primitives::Amount;
 use bitcoin_rs_primitives::Block;
-#[cfg(test)]
-use bitcoin_rs_primitives::CompactTarget;
 use bitcoin_rs_primitives::Hash256;
-#[cfg(test)]
-use bitcoin_rs_primitives::LockTime;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_primitives::OutPoint;
-#[cfg(test)]
-use bitcoin_rs_primitives::Script;
-#[cfg(test)]
-use bitcoin_rs_primitives::Sequence;
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::TxOut;
 use bitcoin_rs_primitives::Txid;
-#[cfg(test)]
-use bitcoin_rs_primitives::Witness;
-#[cfg(test)]
-use bitcoin_rs_primitives::consensus_bytes;
-#[cfg(test)]
-use bitcoin_rs_storage::DisconnectMarker;
-pub(crate) use bitcoin_rs_storage::DisconnectPhase;
+pub use bitcoin_rs_storage::DisconnectPhase;
 use bitcoin_rs_storage::DurableHeadStore;
 use bitcoin_rs_storage::InMemoryUndoStore;
-pub(crate) use bitcoin_rs_storage::KvUndoStore;
-#[cfg(test)]
-use bitcoin_rs_storage::StorageError;
-pub(crate) use bitcoin_rs_storage::UndoStore;
+pub use bitcoin_rs_storage::KvUndoStore;
+pub use bitcoin_rs_storage::UndoStore;
 use bitcoin_rs_storage::block_body::BlockBodyStore;
 use bitcoin_rs_utxo::LiveOutput;
 use bitcoin_rs_utxo::LiveOutputMeta;
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::connect::SpentOutputLookup;
-#[cfg(test)]
-use bitcoin_rs_utxo::connect::build_block_changes;
 use bitcoin_rs_utxo::is_coinbase_tx;
-#[cfg(test)]
-use connect::applied_header_tip;
-#[cfg(test)]
-use connect::applied_predecessor;
 use connect::apply_block_admitted;
 use connect::apply_block_inner;
 use connect::apply_block_with_serialized_admitted;
 use connect::apply_committed_block_admitted;
-#[cfg(test)]
-use connect::check_bip30_and_bip34;
-#[cfg(test)]
-use connect::check_bip68_sequence_locks;
-#[cfg(test)]
-use connect::check_coinbase_maturity;
 use disconnect::disconnect_block_admitted;
-pub(crate) use durable::reconcile_at_boot;
+pub use durable::reconcile_at_boot;
 use hashbrown::HashMap;
-#[cfg(test)]
-use hashbrown::HashSet;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
 use parking_lot::RwLock;
 use parking_lot::RwLockReadGuard;
 use parking_lot::RwLockWriteGuard;
 #[cfg(test)]
-use prepare::bytes_are_block;
-#[cfg(test)]
-use prepare::parse_block_for_apply;
-#[cfg(test)]
-use prepare::plan_block_transactions;
-#[cfg(test)]
-use prepare::verify_block_transactions;
-#[cfg(test)]
 use publication::advance_chain_tx_count;
 #[cfg(test)]
 use publication::rewind_chain_tx_count;
-#[cfg(test)]
-use rayon::prelude::*;
-#[cfg(test)]
-use scratch::ApplyScratch;
 use scratch::ApplyScratchCapacities;
 use scratch::SameBlockSpentSet;
 use std::sync::Arc;
@@ -106,29 +54,103 @@ pub use window::DURABLE_HEAD_GROUP_BLOCKS;
 pub use window::DURABLE_HEAD_GROUP_MAX_BYTES;
 use window::PublishMode;
 use window::apply_window_admitted;
-#[cfg(test)]
-use window::classify_apply_error;
-#[cfg(test)]
-use window::prove_window;
 
-#[path = "apply_connect.rs"]
 mod connect;
-#[path = "apply_disconnect.rs"]
 mod disconnect;
-#[path = "apply_durable.rs"]
 mod durable;
-#[path = "apply_prepare.rs"]
-pub(crate) mod prepare;
-#[path = "apply_publication.rs"]
+mod prepare;
 mod publication;
-#[path = "apply_window.rs"]
-pub(crate) mod window;
+mod window;
+pub use prepare::bytes_are_block;
+pub use window::classify_apply_error;
 
+mod checkpoint;
 /// Typed chainstate mutation failures.
-#[path = "apply_error.rs"]
 pub mod error;
-#[path = "apply_scratch.rs"]
+pub mod events;
+pub mod journal;
+mod maintenance;
+pub mod recovery;
+pub mod reorg;
 mod scratch;
+
+/// Historical script-verification policy owned by authoritative chainstate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ValidationMode {
+    /// Every script executes; assume-valid settings are ignored.
+    Full,
+    /// Skip scripts through a pinned assume-valid anchor.
+    #[default]
+    AssumeValid,
+    /// Skip scripts below the best header tip.
+    Fast,
+}
+
+impl ValidationMode {
+    /// Parses a configuration spelling, case-insensitively.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "assume-valid" | "assume_valid" | "assumevalid" => Some(Self::AssumeValid),
+            "fast" => Some(Self::Fast),
+            _ => None,
+        }
+    }
+}
+
+/// Chainstate journal durability and retention policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChainstateJournalConfig {
+    /// Whether journal recovery is enabled.
+    pub enabled: bool,
+    /// Maximum blocks between durability boundaries.
+    pub blocks: u32,
+    /// Maximum seconds between durability boundaries.
+    pub seconds: u64,
+    /// Active segment rotation threshold in MiB.
+    pub rotate_mib: u64,
+    /// Total journal retention bound in MiB.
+    pub max_journal_mib: u64,
+    /// Maximum blocks the applied tip may lead the durable head.
+    pub max_lag_blocks: u32,
+    /// Maximum seconds the applied tip may lead the durable head.
+    pub max_lag_seconds: u64,
+}
+
+impl Default for ChainstateJournalConfig {
+    fn default() -> Self {
+        let policy = bitcoin_rs_storage::chainstate_journal::JournalPolicy::default();
+        Self {
+            enabled: true,
+            blocks: policy.batch_blocks,
+            seconds: policy.batch_seconds.as_secs(),
+            rotate_mib: policy.rotate_mib,
+            max_journal_mib: policy.max_journal_mib,
+            max_lag_blocks: policy.max_lag_blocks,
+            max_lag_seconds: policy.max_lag_seconds.as_secs(),
+        }
+    }
+}
+
+/// Inputs required to open a chainstate journal writer.
+#[derive(Clone, Copy)]
+pub struct JournalBootstrap {
+    /// Whether to open an existing journal instead of initializing one.
+    pub open_existing: bool,
+    /// Full-checkpoint generation the journal extends.
+    pub base_generation: u64,
+    /// Durable base height.
+    pub height: u32,
+    /// Durable base block hash.
+    pub block_hash: [u8; 32],
+    /// Parent hash of the durable base.
+    pub prev_hash: [u8; 32],
+    /// Cumulative transaction count through the durable base.
+    pub chain_tx_count: u64,
+    /// Journal policy.
+    pub config: ChainstateJournalConfig,
+}
 
 const LOCAL_OVERLAY_TXID_SET_THRESHOLD: usize = 8;
 
@@ -189,7 +211,7 @@ impl ApplyAdmission {
 /// [`begin_chain_transition`] is the only constructor. Field order releases
 /// the transition lock before the permit. This is the lock token only; the
 /// caller-facing mutation capability is [`ChainTransition`].
-pub(crate) struct TransitionLock<'a> {
+pub struct TransitionLock<'a> {
     _transition: MutexGuard<'a, ()>,
     _admission: RwLockReadGuard<'a, ()>,
 }
@@ -207,61 +229,17 @@ fn begin_chain_transition<'a>(
     })
 }
 
-/// Unforgeable proof that a chain change is active: holds both the
-/// admission/transition lock ([`TransitionLock`]) and the gateway's
-/// [`ChainChangeGuard`] (odd generation).
-///
-/// Fields and constructor are private to this module. The admitted helpers
-/// accept `&ChainChangeProof`, not independent `&TransitionLock` and
-/// `&ChainChangeGuard` arguments, so a call without an active odd generation
-/// fails to compile. Build one proof per single operation, whole window, or
-/// whole reorg. Finish it once the operation reaches a consistent chainstate:
-/// a successful return, or a clean refusal whose failing block was refused
-/// before the UTXO commit-of-record (`utxo.commit_block`). Every
-/// failure before that point touches only idempotent derived state (undo,
-/// block body, header tree) that a retry overwrites; a `UtxoCommit` refusal
-/// may tear the UTXO set, so the transition must be dropped and left odd
-/// until recovery establishes a consistent chainstate. Callers that own the
-/// retry loop (e.g. [`BlockSync`]) may finish on a clean refusal; convenience
-/// entry points finish on success and drop on refusal so the gateway stays
-/// fail-closed.
-pub(crate) struct ChainChangeProof<'a> {
-    transition: TransitionLock<'a>,
-    guard: ChainChangeGuard,
-}
-
-impl<'a> ChainChangeProof<'a> {
-    /// Constructs the combined proof from its two halves.
-    ///
-    /// Private to this module: only the entry-point functions that begin a
-    /// chain change call this.
-    pub(crate) fn new(transition: TransitionLock<'a>, guard: ChainChangeGuard) -> Self {
-        Self { transition, guard }
-    }
-
-    /// Returns the exact odd generation this proof reserved.
-    #[cfg(test)]
-    pub(crate) fn odd_generation(&self) -> u64 {
-        self.guard.odd_generation()
-    }
-
-    /// Returns the reserved even value.
-    #[cfg(test)]
-    pub(crate) fn reserved_even(&self) -> u64 {
-        self.guard.reserved_even()
-    }
-}
-
 /// Chain-mutation authority required by destructive block-body pruning.
 #[derive(Clone)]
-pub(crate) struct PruneAuthority {
+pub struct PruneAuthority {
     admission: Arc<ApplyAdmission>,
     chain_transition: Arc<Mutex<()>>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
 }
 
 impl PruneAuthority {
-    pub(crate) fn begin(&self) -> core::result::Result<PruneGuard<'_>, ApplyError> {
+    /// Acquires exclusive chain-mutation authority for one pruning pass.
+    pub fn begin(&self) -> core::result::Result<PruneGuard<'_>, ApplyError> {
         Ok(PruneGuard {
             _transition: begin_chain_transition(&self.admission, &self.chain_transition)?,
             applied_tip: &self.applied_tip,
@@ -270,14 +248,15 @@ impl PruneAuthority {
 }
 
 /// Proof that pruning owns chain mutation and may read the authoritative tip.
-pub(crate) struct PruneGuard<'a> {
+pub struct PruneGuard<'a> {
     _transition: TransitionLock<'a>,
     applied_tip: &'a ArcSwapOption<TipSnapshot>,
 }
 
 impl PruneGuard<'_> {
     #[must_use]
-    pub(crate) fn applied_tip_height(&self) -> Option<u32> {
+    /// Returns the authoritative applied-tip height while pruning owns the transition.
+    pub fn applied_tip_height(&self) -> Option<u32> {
         self.applied_tip.load().as_ref().map(|tip| tip.height)
     }
 }
@@ -469,19 +448,7 @@ pub struct Chainstate {
     pub(crate) block_tree: Arc<RwLock<BlockTree>>,
     pub(crate) utxo: Arc<UtxoSet>,
     pub(crate) coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
-    /// Read-only pool handle shared with `NodeState`. Apply mutates through
-    /// `mempool_gateway`. Tests inspect this cell; production apply does not.
-    #[allow(
-        dead_code,
-        reason = "shared with NodeState and tests; apply uses mempool_gateway"
-    )]
-    pub(crate) mempool: Arc<RwLock<Mempool>>,
-    /// Strong gateway handle for production mempool mutation. Apply and reorg
-    /// call this directly; they never call `MempoolGateway::shared` or recover
-    /// from the weak registry. The raw `mempool` field stays for read-only
-    /// node code that still needs the pool.
-    pub(crate) mempool_gateway: Arc<MempoolGateway>,
-    pub(crate) chain_events: Arc<crate::state::ChainEventPublisher>,
+    pub(crate) chain_events: Arc<crate::events::ChainEventPublisher>,
     pub(crate) block_body_store: Option<Arc<dyn BlockBodyStore>>,
     pub(crate) undo_store: Arc<dyn UndoStore>,
     /// Owner of the durable-head row: the chain's durable commit point,
@@ -522,12 +489,56 @@ pub struct Chainstate {
     pub(crate) retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
 }
 
+/// Construction inputs for one authoritative chainstate service.
+///
+/// Every field is an owned lower-layer capability. Process composition belongs
+/// to the node crate; mutation ownership starts here.
+pub struct ChainstateParts {
+    /// Consensus network.
+    pub network: Network,
+    /// Best-work header-tip publication cell.
+    pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Authoritative applied-tip publication cell.
+    pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Cumulative transaction count through the applied tip.
+    pub chain_tx_count: Arc<AtomicU64>,
+    /// Shared header/block tree.
+    pub block_tree: Arc<RwLock<BlockTree>>,
+    /// Authoritative UTXO set.
+    pub utxo: Arc<UtxoSet>,
+    /// Coin-statistics listener attached to the UTXO set.
+    pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
+    /// Applied-chain event publisher.
+    pub chain_events: Arc<crate::events::ChainEventPublisher>,
+    /// Durable canonical block-body store, when configured.
+    pub block_body_store: Option<Arc<dyn BlockBodyStore>>,
+    /// Durable undo store.
+    pub undo_store: Arc<dyn UndoStore>,
+    /// Durable applied-head store.
+    pub durable_head: Arc<dyn DurableHeadStore>,
+    /// Process shutdown signal.
+    pub shutdown: Arc<AtomicBool>,
+    /// Highest assume-valid height.
+    pub assume_valid_height: u32,
+    /// Historical script-verification policy.
+    pub validation_mode: ValidationMode,
+    /// Chainstate journal writer, when journal recovery is enabled.
+    pub journal: Option<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter>,
+    /// Whether connects retain raw transaction bytes for node-owned consumers.
+    pub capture_rawtx: bool,
+    /// Whether connects retain canonical block bytes for node-owned consumers.
+    pub capture_block_bytes: bool,
+}
+
+/// Held while new chain mutations are blocked.
+pub struct AdmissionGuard<'a> {
+    _guard: RwLockWriteGuard<'a, ()>,
+}
+
 /// One admitted chain mutation.
 ///
-/// Owns admission, the exclusive transition lock, and mempool generation.
+/// Owns admission and the exclusive authoritative-chain transition lock.
 /// Connect, window-connect, and disconnect run only through this type.
-/// Dropping without [`Self::finish`] leaves generation odd by design.
-///
 /// # Persistence
 ///
 /// Every connect follows the ordered durable protocol (`RCV-02` in
@@ -552,20 +563,9 @@ pub struct Chainstate {
 /// retryable unless the failure was fatal (`UtxoCommit`, durable-head
 /// commit), in which case recovery owns reconciliation.
 ///
-/// [`Self::finish`] stores the reserved even mempool generation. It does not
-/// persist chainstate. Call it once the window attempt concludes on a
-/// consistent chainstate: a successful return, or a failure whose committed
-/// prefix is already in place and whose failing block was refused before the
-/// UTXO commit-of-record (`utxo.commit_block`). Every failure before
-/// that point touches only idempotent derived state (undo, block body, header
-/// tree) that a retry overwrites. A `UtxoCommit` refusal is different: the
-/// per-shard commit is not all-or-nothing across runs, so the UTXO set may be
-/// torn; drop the transition and leave generation odd until recovery
-/// establishes a consistent chainstate. A drop on crash, panic, or any torn
-/// state does the same.
 pub struct ChainTransition<'a> {
     chainstate: &'a Chainstate,
-    proof: ChainChangeProof<'a>,
+    _lock: TransitionLock<'a>,
 }
 
 impl<'a> ChainTransition<'a> {
@@ -580,7 +580,6 @@ impl<'a> ChainTransition<'a> {
             None,
             None,
             BlockProvenance::Network,
-            &self.proof,
             PublishMode::Now,
         )
     }
@@ -593,7 +592,7 @@ impl<'a> ChainTransition<'a> {
         block: &Block,
         serialized: bytes::Bytes,
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        apply_block_with_serialized_admitted(self.chainstate, block, serialized, &self.proof)
+        apply_block_with_serialized_admitted(self.chainstate, block, serialized)
     }
 
     /// Re-applies a body this node already validated and persisted before a crash.
@@ -611,7 +610,6 @@ impl<'a> ChainTransition<'a> {
             Some(serialized),
             None,
             BlockProvenance::LocalReplay,
-            &self.proof,
             PublishMode::Now,
         )
     }
@@ -624,7 +622,7 @@ impl<'a> ChainTransition<'a> {
         &self,
         block: &Block,
     ) -> core::result::Result<DisconnectOutcome, crate::DisconnectError> {
-        disconnect_block_admitted(self.chainstate, block, &self.proof)
+        disconnect_block_admitted(self.chainstate, block)
     }
 
     /// Applies consecutive blocks under this one transition.
@@ -638,48 +636,193 @@ impl<'a> ChainTransition<'a> {
         blocks: &[&Block],
         serialized: &[bytes::Bytes],
     ) -> core::result::Result<Vec<ConnectOutcome>, WindowApplyError> {
-        apply_window_admitted(self.chainstate, blocks, serialized, &self.proof)
+        apply_window_admitted(self.chainstate, blocks, serialized)
     }
 
-    pub(crate) fn proof(&self) -> &ChainChangeProof<'a> {
-        &self.proof
-    }
-
-    pub(crate) fn chainstate(&self) -> &'a Chainstate {
+    /// Returns the chainstate service owning this transition.
+    pub fn chainstate(&self) -> &'a Chainstate {
         self.chainstate
-    }
-
-    /// Finishes the chain change, storing the reserved even generation.
-    ///
-    /// Consumes the capability so it cannot be used after finish. Does not
-    /// persist chainstate. Call it once the attempt has reached a consistent
-    /// chainstate — a successful return, or a clean refusal whose committed
-    /// prefix is already in place and whose failing block was refused before
-    /// the UTXO commit-of-record (`utxo.commit_block`). Drop on a
-    /// `UtxoCommit` refusal, panic, or torn state leaves generation odd until
-    /// recovery establishes a consistent chainstate. A failed generation CAS
-    /// closes admission and requests shutdown before releasing the transition
-    /// lock, so no waiting mutation can enter the unrecoverable state.
-    pub fn finish(self) -> core::result::Result<(), ApplyError> {
-        let Self { chainstate, proof } = self;
-        let ChainChangeProof { transition, guard } = proof;
-        let result = guard.finish().map_err(|_| ApplyError::Shutdown);
-        if result.is_err() {
-            chainstate.fail_closed_for_recovery();
-        }
-        drop(transition);
-        result
     }
 }
 
 impl Chainstate {
+    /// Creates the production service from lower-layer capabilities.
+    #[must_use]
+    pub fn from_parts(parts: ChainstateParts) -> Self {
+        let assume_valid_gate = Arc::new(AssumeValidGate::new(
+            parts.network,
+            parts.assume_valid_height,
+        ));
+        assume_valid_gate.evaluate(&parts.block_tree.read());
+        Self {
+            network: parts.network,
+            chain_tip: parts.chain_tip,
+            applied_tip: parts.applied_tip,
+            chain_tx_count: parts.chain_tx_count,
+            applied_seq: Arc::new(AtomicU64::new(0)),
+            block_tree: parts.block_tree,
+            utxo: parts.utxo,
+            coin_stats: parts.coin_stats,
+            chain_events: parts.chain_events,
+            block_body_store: parts.block_body_store,
+            undo_store: parts.undo_store,
+            durable_head: parts.durable_head,
+            admission: Arc::new(ApplyAdmission::new()),
+            shutdown: parts.shutdown,
+            chain_transition: Arc::new(Mutex::new(())),
+            assume_valid_height: parts.assume_valid_height,
+            assume_valid_gate,
+            validation_mode: parts.validation_mode,
+            journal: parts.journal,
+            checkpoint_publisher: None,
+            capture_rawtx: parts.capture_rawtx,
+            capture_block_bytes: parts.capture_block_bytes,
+            retention: Arc::new(bitcoin_rs_storage::RetentionRegistry::new()),
+        }
+    }
+
     /// Permanently closes chain mutation and asks the process to shut down.
     ///
     /// Call only when the current chainstate may require restart-time recovery;
     /// retrying or continuing to serve a mutable process state is unsafe.
-    pub(crate) fn fail_closed_for_recovery(&self) {
+    pub fn fail_closed_for_recovery(&self) {
         self.admission.close_permanently();
         self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Blocks new authoritative mutations until the returned guard is dropped.
+    #[must_use]
+    pub fn close(&self) -> AdmissionGuard<'_> {
+        AdmissionGuard {
+            _guard: self.admission.close(),
+        }
+    }
+
+    /// Returns the consensus network.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.network
+    }
+
+    /// Returns the best-work header-tip cell.
+    #[must_use]
+    pub fn chain_tip(&self) -> &ArcSwapOption<TipSnapshot> {
+        &self.chain_tip
+    }
+
+    /// Clones the best-work header-tip handle for node-owned readers.
+    #[must_use]
+    pub fn chain_tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
+        Arc::clone(&self.chain_tip)
+    }
+
+    /// Returns the authoritative applied-tip cell.
+    #[must_use]
+    pub fn applied_tip(&self) -> &ArcSwapOption<TipSnapshot> {
+        &self.applied_tip
+    }
+
+    /// Returns the shared applied-tip handle for node-owned readers.
+    #[must_use]
+    pub fn applied_tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
+        Arc::clone(&self.applied_tip)
+    }
+
+    /// Returns the shared block tree.
+    #[must_use]
+    pub fn block_tree(&self) -> &RwLock<BlockTree> {
+        &self.block_tree
+    }
+
+    /// Clones the shared block-tree handle for node-owned readers.
+    #[must_use]
+    pub fn block_tree_handle(&self) -> Arc<RwLock<BlockTree>> {
+        Arc::clone(&self.block_tree)
+    }
+
+    /// Returns the authoritative UTXO set.
+    #[must_use]
+    pub fn utxo(&self) -> &UtxoSet {
+        &self.utxo
+    }
+
+    /// Clones the authoritative UTXO handle for node-owned readers.
+    #[must_use]
+    pub fn utxo_handle(&self) -> Arc<UtxoSet> {
+        Arc::clone(&self.utxo)
+    }
+
+    /// Clones the coin-statistics listener handle.
+    #[must_use]
+    pub fn coin_stats_handle(&self) -> Arc<bitcoin_rs_utxo::stats::CoinStatsListener> {
+        Arc::clone(&self.coin_stats)
+    }
+
+    /// Clones the cumulative chain transaction-count handle.
+    #[must_use]
+    pub fn chain_tx_count_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.chain_tx_count)
+    }
+
+    /// Clones the authoritative chain-event publisher.
+    #[must_use]
+    pub fn chain_events_handle(&self) -> Arc<crate::events::ChainEventPublisher> {
+        Arc::clone(&self.chain_events)
+    }
+
+    /// Returns the current coherent applied-chain event snapshot.
+    #[must_use]
+    pub fn chain_snapshot(&self) -> crate::events::ChainSnapshot {
+        self.chain_events.snapshot()
+    }
+
+    /// Returns the durable block-body store when configured.
+    #[must_use]
+    pub fn block_body_store(&self) -> Option<&Arc<dyn BlockBodyStore>> {
+        self.block_body_store.as_ref()
+    }
+
+    /// Clones the durable block-body store when configured.
+    #[must_use]
+    pub fn block_body_store_handle(&self) -> Option<Arc<dyn BlockBodyStore>> {
+        self.block_body_store.clone()
+    }
+
+    /// Clones the process shutdown signal.
+    #[must_use]
+    pub fn shutdown_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
+    }
+
+    /// Clones the pruning retention registry.
+    #[must_use]
+    pub fn retention_handle(&self) -> Arc<bitcoin_rs_storage::RetentionRegistry> {
+        Arc::clone(&self.retention)
+    }
+
+    /// Returns the read barrier used by lower-layer live-view consumers.
+    ///
+    /// Locking this mutex prevents an authoritative transition from starting;
+    /// it does not grant mutation capability.
+    #[must_use]
+    pub fn transition_barrier(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.chain_transition)
+    }
+
+    /// Sets which committed wire payloads must be retained for node-owned followers.
+    pub fn set_capture_flags(&mut self, rawtx: bool, block_bytes: bool) {
+        self.capture_rawtx = rawtx;
+        self.capture_block_bytes = block_bytes;
+    }
+
+    /// Re-evaluates the assume-valid anchor against the current active header chain.
+    pub fn reevaluate_assume_valid(&self) {
+        self.assume_valid_gate.evaluate(&self.block_tree.read());
+    }
+
+    /// Re-evaluates the assume-valid anchor against an already locked tree.
+    pub fn reevaluate_assume_valid_with(&self, tree: &BlockTree) {
+        self.assume_valid_gate.evaluate(tree);
     }
 
     /// `Fast` trusts a block only when it is the node at `height` on the
@@ -717,7 +860,8 @@ impl Chainstate {
         }
     }
 
-    pub(crate) fn prune_authority(&self) -> PruneAuthority {
+    /// Returns pruning authority coupled to this chainstate transition lock.
+    pub fn prune_authority(&self) -> PruneAuthority {
         PruneAuthority {
             admission: Arc::clone(&self.admission),
             chain_transition: Arc::clone(&self.chain_transition),
@@ -731,27 +875,19 @@ impl Chainstate {
     /// (reorg replans, `validate_block`, pruning) and for header admission,
     /// which moves the header tip without touching chainstate. Mutation requires
     /// [`Self::begin_transition`] or [`Self::begin_transition_locked`].
-    pub(crate) fn lock_transition(&self) -> core::result::Result<TransitionLock<'_>, ApplyError> {
+    pub fn lock_transition(&self) -> core::result::Result<TransitionLock<'_>, ApplyError> {
         begin_chain_transition(&self.admission, &self.chain_transition)
     }
 
-    /// Completes a held lock into a mutation capability by reserving mempool generation.
-    pub(crate) fn begin_transition_locked<'a>(
-        &'a self,
-        lock: TransitionLock<'a>,
-    ) -> core::result::Result<ChainTransition<'a>, ApplyError> {
-        let guard = self
-            .mempool_gateway
-            .begin_chain_change()
-            .map_err(|_| ApplyError::Shutdown)?;
-        Ok(ChainTransition {
+    /// Completes a held lock into a mutation capability.
+    pub fn begin_transition_locked<'a>(&'a self, lock: TransitionLock<'a>) -> ChainTransition<'a> {
+        ChainTransition {
             chainstate: self,
-            proof: ChainChangeProof::new(lock, guard),
-        })
+            _lock: lock,
+        }
     }
 
-    /// Begins an admitted chain mutation: admission, the transition lock, and
-    /// the mempool generation reservation.
+    /// Begins an admitted authoritative-chain mutation.
     ///
     /// The returned capability is the only way to connect or disconnect. Finish
     /// it once the attempt reaches a consistent chainstate: a successful
@@ -763,7 +899,7 @@ impl Chainstate {
     /// acquires no transition and therefore makes no generation postcondition.
     pub fn begin_transition(&self) -> core::result::Result<ChainTransition<'_>, ApplyError> {
         let lock = self.lock_transition()?;
-        self.begin_transition_locked(lock)
+        Ok(self.begin_transition_locked(lock))
     }
 
     /// Builds a chainstate facade for tests and composition that do not go
@@ -781,9 +917,7 @@ impl Chainstate {
         block_tree: Arc<RwLock<BlockTree>>,
         utxo: Arc<UtxoSet>,
         coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
-        mempool: Arc<RwLock<Mempool>>,
-        mempool_gateway: Arc<MempoolGateway>,
-        chain_events: Arc<crate::state::ChainEventPublisher>,
+        chain_events: Arc<crate::events::ChainEventPublisher>,
     ) -> Self {
         Self {
             network,
@@ -794,8 +928,6 @@ impl Chainstate {
             block_tree,
             utxo,
             coin_stats,
-            mempool,
-            mempool_gateway,
             chain_events,
             block_body_store: None,
             undo_store: Arc::new(InMemoryUndoStore::default()),
@@ -858,12 +990,58 @@ impl Chainstate {
     /// Returns `Ok(true)` when a checkpoint was written, `Ok(false)` when
     /// there was no debt or no publisher. A publication failure leaves the
     /// `RolledBack` marker in place.
-    pub(crate) fn checkpoint(
-        &self,
-    ) -> core::result::Result<bool, crate::checkpoint::CheckpointError> {
+    pub fn settle_disconnect_debt(&self) -> anyhow::Result<bool> {
         match &self.checkpoint_publisher {
-            Some(publisher) => publisher.settle_disconnect_debt(),
+            Some(publisher) => publisher
+                .settle_disconnect_debt()
+                .map_err(anyhow::Error::new),
             None => Ok(false),
+        }
+    }
+
+    /// Installs the checkpoint publisher used by maintenance and disconnect settlement.
+    pub fn configure_checkpointing(
+        &mut self,
+        data_dir: &std::path::Path,
+        durable_tip_height: Arc<std::sync::atomic::AtomicU32>,
+    ) -> anyhow::Result<()> {
+        let checkpoint_data_dir = bitcoin_rs_storage::checkpoint::fs::open_data_dir(data_dir)
+            .map_err(anyhow::Error::new)?;
+        let block_body_store = self
+            .block_body_store
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("checkpointing requires a block body store"))?;
+        self.checkpoint_publisher = Some(Arc::new(
+            crate::checkpoint::publisher::CheckpointPublisher {
+                admission: Arc::clone(&self.admission),
+                undo_store: Arc::clone(&self.undo_store),
+                durable_head: Arc::clone(&self.durable_head),
+                block_body_store,
+                applied_tip: Arc::clone(&self.applied_tip),
+                checkpoint_data_dir,
+                network: self.network,
+                genesis_hash: self.network.genesis_block_hash(),
+                block_tree: Arc::clone(&self.block_tree),
+                utxo: Arc::clone(&self.utxo),
+                coin_stats: Arc::clone(&self.coin_stats),
+                chain_tx_count: Arc::clone(&self.chain_tx_count),
+                journal: self.journal.clone(),
+                data_dir: data_dir.to_path_buf(),
+                chain_events: Arc::clone(&self.chain_events),
+                durable_tip_height,
+            },
+        ));
+        Ok(())
+    }
+
+    /// Publishes one full maintenance checkpoint.
+    pub fn publish_checkpoint(&self) -> anyhow::Result<Option<u64>> {
+        let Some(publisher) = &self.checkpoint_publisher else {
+            return Ok(None);
+        };
+        match publisher.publish().map_err(anyhow::Error::new)? {
+            crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => Ok(None),
+            crate::checkpoint::CheckpointWrite::Published { generation } => Ok(Some(generation)),
         }
     }
 
@@ -875,9 +1053,8 @@ impl Chainstate {
     ///
     /// Persistence matches [`ChainTransition::connect`]. Derived consumers are
     /// not invoked. Production paths with followers must dispatch while the
-    /// [`ChainTransition`] is still held, then [`ChainTransition::finish`]
-    /// (`ARCH-07`); [`crate::chain_effects::ChainFollowers::apply_connect`]
-    /// is that sequence.
+    /// the chain transition is still held (`ARCH-07`). Node-owned followers
+    /// consume the returned outcome outside this crate.
     pub fn apply_block(&self, block: &Block) -> core::result::Result<ConnectOutcome, ApplyError> {
         apply_block_inner(self, block, None, BlockProvenance::Network)
     }
@@ -914,7 +1091,7 @@ impl Chainstate {
     ///
     /// Persistence matches [`ChainTransition::disconnect`]. An admission
     /// failure is `DisconnectError::Refused`. Derived consumers are not
-    /// invoked; see [`crate::chain_effects::ChainFollowers::apply_disconnect`].
+    /// invoked; node-owned followers consume the returned outcome.
     pub fn disconnect_block(
         &self,
         block: &Block,
@@ -923,21 +1100,13 @@ impl Chainstate {
             .begin_transition()
             .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
         let result = transition.disconnect(block);
-        if result.is_ok() {
-            let _ = transition.finish();
-        }
+        drop(transition);
         result
     }
 
     /// Admits a transition, applies consecutive blocks, and finishes on success.
     /// Failure before admission acquires no transition and does not change
     /// generation. A refusal after admission drops the transition and leaves
-    /// generation odd; callers that need to retry a clean refusal should use
-    /// [`ChainTransition::connect_window`] directly and finish explicitly.
-    ///
-    /// A finish failure returns a fatal error carrying the committed prefix,
-    /// closes admission, and requests shutdown instead of reporting success.
-    ///
     /// Persistence matches [`ChainTransition::connect_window`].
     #[allow(clippy::result_large_err)]
     pub fn apply_window(
@@ -968,21 +1137,7 @@ impl Chainstate {
             invalidated: Box::default(),
         })?;
         let committed = transition.connect_window(blocks, serialized)?;
-        if let Err(source) = transition.finish() {
-            tracing::error!(
-                committed = committed.len(),
-                finish = %source,
-                "chain transition could not be settled after a committed window; \
-                 admission is permanently closed and shutdown requested"
-            );
-            return Err(WindowApplyError {
-                applied: committed.len(),
-                committed,
-                source,
-                disposition: WindowApplyDisposition::Fatal,
-                invalidated: Box::default(),
-            });
-        }
+        drop(transition);
         Ok(committed)
     }
 
@@ -1285,20 +1440,6 @@ impl bitcoin_rs_primitives::Sink for ByteEquality<'_> {
     }
 }
 
-/// Transaction IDs of an already-decoded block, hashed exactly once.
-///
-/// Blocks beyond the threshold the window verifier uses fan the hashing out;
-/// below it, serial iteration wins because dispatch costs more than the
-/// per-transaction double SHA256.
-#[cfg(test)]
-fn block_txids(block: &Block) -> Vec<Txid> {
-    if block.txs.len() > 32 {
-        block.txs.par_iter().map(Tx::txid).collect()
-    } else {
-        block.txs.iter().map(Tx::txid).collect()
-    }
-}
-
 struct BlockTxPlan {
     only_coinbase: bool,
     needs_local_utxo_overlay: bool,
@@ -1403,13 +1544,6 @@ impl ResolvedUtxoView {
                 .collect(),
         }
     }
-    #[cfg(test)]
-    fn empty() -> Self {
-        Self {
-            external: HashMap::new(),
-        }
-    }
-
     fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
         self.external.get(outpoint).map(|entry| entry.txout.clone())
     }
@@ -1507,17 +1641,9 @@ impl UtxoView for BlockLocalUtxoView<'_> {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/apply/consensus_rule_tests/mod.rs"]
-mod consensus_rule_tests;
-
-#[cfg(test)]
 #[path = "../tests/unit/apply/admission_tests.rs"]
 mod admission_tests;
 
 #[cfg(test)]
 #[path = "../tests/unit/apply/chain_tx_count_tests.rs"]
 mod chain_tx_count_tests;
-
-#[cfg(test)]
-#[path = "../tests/unit/apply/chain_generation_tests.rs"]
-mod chain_generation_tests;

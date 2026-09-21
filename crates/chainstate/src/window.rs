@@ -3,7 +3,6 @@
 use super::BlockProvenance;
 use super::BlockValidationContext;
 use super::BlockValidationProof;
-use super::ChainChangeProof;
 use super::Chainstate;
 use super::ConnectOutcome;
 use super::PreparedApply;
@@ -20,7 +19,7 @@ use super::prepare::parse_block_for_apply;
 use super::prepare::plan_block_transactions;
 use super::prepare::resolve_block_prevouts;
 use super::publication::publish_connect;
-use crate::apply::error::ApplyError;
+use crate::error::ApplyError;
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
@@ -233,7 +232,6 @@ pub(super) fn apply_window_admitted(
     handles: &Chainstate,
     blocks: &[&Block],
     serialized: &[bytes::Bytes],
-    proof: &ChainChangeProof<'_>,
 ) -> core::result::Result<Vec<ConnectOutcome>, WindowApplyError> {
     if blocks.len() != serialized.len() {
         return Err(WindowApplyError {
@@ -258,7 +256,6 @@ pub(super) fn apply_window_admitted(
             Some(raw.clone()),
             proven.next(),
             BlockProvenance::Network,
-            proof,
             PublishMode::Grouped(&mut group),
         ) {
             // The staged outcome sits in the group with commit id 0; the
@@ -378,7 +375,7 @@ pub(super) fn invalidate_failed_subtree(
 /// interpreter path does not produce this spurious failure, so its
 /// `ConsensusError::Script` remains Permanent.
 ///
-pub(crate) fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
+pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
     use WindowApplyDisposition::{BodyMutated, Fatal, Operational, Permanent};
     use bitcoin_rs_consensus::ConsensusError;
     match error {

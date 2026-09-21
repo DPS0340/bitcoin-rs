@@ -7,7 +7,6 @@ use super::BlockLocalUtxoView;
 use super::BlockProvenance;
 use super::BlockTxPlan;
 use super::BlockValidationContext;
-use super::ChainChangeProof;
 use super::Chainstate;
 use super::ConnectOutcome;
 use super::PreparedApply;
@@ -24,15 +23,13 @@ use super::publication::publish_connect;
 use super::publication::tx_count_delta_for;
 use super::scratch::ApplyScratch;
 use super::window::{PendingBlockCommit, PublishMode};
-use crate::apply::error::ApplyError;
+use crate::error::ApplyError;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::node::NodeId;
 use bitcoin_rs_consensus::MAX_SCRIPT_SIZE;
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
-use bitcoin_rs_mempool::AdmissionOrigin;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::Txid;
 use bitcoin_rs_primitives::consensus_bytes;
 use bitcoin_rs_storage::CommitRecords;
@@ -50,7 +47,6 @@ pub(super) fn apply_block_with_serialized_admitted(
     handles: &Chainstate,
     block: &Block,
     serialized: bytes::Bytes,
-    proof: &ChainChangeProof<'_>,
 ) -> core::result::Result<ConnectOutcome, ApplyError> {
     apply_committed_block_admitted(
         handles,
@@ -58,7 +54,6 @@ pub(super) fn apply_block_with_serialized_admitted(
         Some(serialized),
         None,
         BlockProvenance::Network,
-        proof,
         PublishMode::Now,
     )
 }
@@ -76,24 +71,19 @@ pub(super) fn apply_block_inner(
         provided_serialized,
         None,
         provenance,
-        transition.proof(),
         PublishMode::Now,
     );
-    if result.is_ok() {
-        let _ = transition.finish();
-    }
+    drop(transition);
     result
 }
 
-/// Commit path: requires a [`ChainChangeProof`] so connect cannot run without
-/// holding admission, the transition lock, and mempool generation.
+/// Commit path. Callers reach this only through an admitted chain transition.
 pub(super) fn apply_committed_block_admitted<'b>(
     handles: &Chainstate,
     block: &'b Block,
     provided_serialized: Option<bytes::Bytes>,
     proven: Option<ProvenApply<'b>>,
     provenance: BlockProvenance,
-    _proof: &ChainChangeProof<'_>,
     publication: PublishMode<'_>,
 ) -> core::result::Result<ConnectOutcome, ApplyError> {
     match apply_block_admitted(
@@ -517,25 +507,6 @@ pub(super) fn apply_block_admitted<'b>(
          its header would be unrecoverable",
         block_hash.to_string_be()
     );
-    let mempool_evict_started = quanta::Instant::now();
-    {
-        let block_txids = scratch.txids();
-        debug_assert_eq!(
-            block_txids.len(),
-            block.txs.len(),
-            "block transactions and validated txids must stay aligned"
-        );
-        let block_txs: Vec<&Tx> = block.txs.iter().collect();
-        handles.mempool_gateway.remove_for_block(
-            AdmissionOrigin::Block,
-            &block_txs,
-            block_txids,
-            height,
-        );
-    }
-    let mempool_evict_dur = mempool_evict_started.elapsed();
-    metrics::histogram!("node.apply_block.mempool_evict_seconds")
-        .record(mempool_evict_dur.as_secs_f64());
     let tx_count_delta = tx_count_delta_for(block);
     let coin_stats_started = quanta::Instant::now();
     handles.coin_stats.finish_block(height, tx_count_delta);
@@ -559,7 +530,6 @@ pub(super) fn apply_block_admitted<'b>(
         utxo_commit_us = utxo_commit_dur.as_micros(),
         block_body_persist_us = block_body_persist_dur.as_micros(),
         block_tree_insert_us = block_tree_insert_dur.as_micros(),
-        mempool_evict_us = mempool_evict_dur.as_micros(),
         coin_stats_us = coin_stats_dur.as_micros(),
         total_us = total_dur.as_micros(),
         "apply_block: profile"
@@ -952,7 +922,7 @@ fn build_journal_record(
     debug_assert_eq!(encoded.len(), 80, "header consensus encoding is 80 bytes");
     raw_header.copy_from_slice(&encoded);
     Some(
-        crate::chainstate_journal::mutations_for_block(changes, undo_coins)
+        crate::journal::mutations_for_block(changes, undo_coins)
             .map(
                 |mutations| bitcoin_rs_storage::chainstate_journal::JournalRecord {
                     height,

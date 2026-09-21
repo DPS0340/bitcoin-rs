@@ -32,9 +32,9 @@ use bitcoin_rs_utxo::{UtxoSet, stats::CoinStatsListener};
 use bitcoin_rs_storage::recovery_evidence::{AppliedTipWitness, write_witness};
 
 use crate::{
-    apply::{ApplyAdmission, UndoStore},
+    ApplyAdmission, UndoStore,
     checkpoint::{self, CheckpointError, CheckpointWrite},
-    state::ChainEventPublisher,
+    events::ChainEventPublisher,
 };
 
 use parking_lot::RwLock;
@@ -153,7 +153,7 @@ impl CheckpointPublisher {
         let Some(marker) = self.undo_store.load_disconnect_marker()? else {
             return Ok(false);
         };
-        if marker.phase == crate::apply::DisconnectPhase::InFlight {
+        if marker.phase == crate::DisconnectPhase::InFlight {
             return Ok(false);
         }
         self.publish()?;
@@ -185,7 +185,7 @@ impl CheckpointPublisher {
         chain_tx_count: u64,
     ) -> core::result::Result<CheckpointWrite, CheckpointError> {
         if let Some(marker) = self.undo_store.load_disconnect_marker()?
-            && marker.phase == crate::apply::DisconnectPhase::InFlight
+            && marker.phase == crate::DisconnectPhase::InFlight
         {
             return Err(CheckpointError::DisconnectInFlight {
                 hash: marker.hash,

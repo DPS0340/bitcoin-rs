@@ -17,7 +17,7 @@ pub(super) fn publish_connect(handles: &Chainstate, tip: &TipSnapshot, tx_count_
     handles.applied_tip.store(Some(Arc::new(tip.clone())));
     handles
         .chain_events
-        .record(crate::state::HintKind::Connected, tip.height, tip.hash);
+        .record(crate::events::HintKind::Connected, tip.height, tip.hash);
     advance_chain_tx_count(handles, tip.height, tx_count_delta);
 }
 

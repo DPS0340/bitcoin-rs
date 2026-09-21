@@ -9,8 +9,6 @@
 //! `docs/contracts/recovery.md`: the durable root, not the checkpoint, is
 //! the recovery authority).
 
-use super::NodeState;
-use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -18,28 +16,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::checkpoint::CheckpointError;
-use crate::checkpoint::CheckpointWrite;
 use crate::checkpoint::publisher::CheckpointPublisher;
+use crate::checkpoint::{CheckpointError, CheckpointWrite};
 /// Poll interval for the maintenance loop. Short enough to flush soon after
 /// a journal boundary passes and to drain retention pressure soon after it
 /// appears; long enough to avoid busy-waiting.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-impl NodeState {
-    /// Spawns the chainstate maintenance worker.
-    ///
-    /// The worker owns idle journal durability and retention for the whole
-    /// node lifetime; it performs no interval-driven publication. The
-    /// worker exits when the node's shutdown flag is set.
-    pub fn start_chainstate_maintenance(&self) -> Result<JoinHandle<()>> {
-        let publisher = self.checkpoint_publisher().map_err(anyhow::Error::new)?;
-        Ok(spawn_chainstate_maintenance_worker(
-            publisher,
-            self.shutdown(),
-        )?)
-    }
-}
 
 /// Spawns the chainstate maintenance worker thread.
 ///
@@ -49,8 +31,8 @@ impl NodeState {
 /// `DisconnectInFlight` refusal or an in-flight publication error is
 /// logged and retried on the next tick. The worker exits when `shutdown`
 /// is set.
-pub(crate) fn spawn_chainstate_maintenance_worker(
-    publisher: CheckpointPublisher,
+fn spawn_chainstate_maintenance_worker(
+    publisher: Arc<CheckpointPublisher>,
     shutdown: Arc<AtomicBool>,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
@@ -96,7 +78,7 @@ fn maintenance_loop(publisher: &CheckpointPublisher, shutdown: &AtomicBool) {
 /// Idle journal durability and retention inspection: flushes records whose
 /// batch boundary has passed and reports whether segment retention
 /// requires compaction.
-pub(crate) fn idle_journal_maintenance(publisher: &CheckpointPublisher) -> bool {
+fn idle_journal_maintenance(publisher: &CheckpointPublisher) -> bool {
     let Some(journal) = publisher.journal.as_ref() else {
         return false;
     };
@@ -117,7 +99,7 @@ pub(crate) fn idle_journal_maintenance(publisher: &CheckpointPublisher) -> bool 
 
 /// Sleeps for `duration` unless `shutdown` is set, returning `true` if the
 /// worker should exit.
-pub(crate) fn wait_for_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
+fn wait_for_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < duration {
         if shutdown.load(Ordering::Relaxed) {
@@ -129,4 +111,16 @@ pub(crate) fn wait_for_shutdown(shutdown: &AtomicBool, duration: Duration) -> bo
         std::thread::sleep(Duration::from_millis(200).min(remaining));
     }
     shutdown.load(Ordering::Relaxed)
+}
+
+impl crate::Chainstate {
+    /// Spawns chainstate journal and retention maintenance.
+    pub fn start_maintenance(&self) -> anyhow::Result<JoinHandle<()>> {
+        let publisher = self
+            .checkpoint_publisher
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("maintenance requires checkpoint configuration"))?;
+        spawn_chainstate_maintenance_worker(publisher, self.shutdown_handle())
+            .map_err(anyhow::Error::new)
+    }
 }

@@ -2,28 +2,26 @@
 
 How the node recovers an authoritative chainstate after a crash, a lost
 write, a reorganization, or an incompatible datadir. The chainstate is
-the single durable authority. It is not yet extracted: the
-`crates/chainstate` crate has not landed, so commit ordering today is owned
-by the `crates/node/src/apply` commit protocol over the storage durable
-head. That head certifies ordering and high-water bounds, not coin contents:
+the single durable authority. `crates/chainstate` owns the ordered commit
+protocol over the storage durable head. That head certifies ordering and high-water bounds, not coin contents:
 without a restored checkpoint the node starts with an empty chainstate
 (`reconcile_at_boot` warns and continues). Every other persisted component
 is derived and reconciles to it.
 
 Owners:
 - Authoritative durable root and ordered commit protocol:
-  `crates/node/src/apply_connect.rs` and `crates/node/src/apply_disconnect.rs`
-- Recovery and schema admission: `crates/node/src/state_open.rs`;
-  tests in `crates/node/tests/unit/state/tests/`
+  `crates/chainstate/src/connect.rs`, `disconnect.rs`, and `durable.rs`
+- Recovery and schema admission: `crates/chainstate/src/recovery.rs`;
+  process-composition tests remain in `crates/node/tests/unit/state/tests/`
 - Persistent coin transition boundary: `crates/utxo/src/set.rs`
   (transition types); durable form in
   `crates/storage/src/durable_head.rs`
 - Crash and lost-write fault tests:
   `crates/node/tests/crash_recovery.rs`
-- Reorg and disconnect: `crates/node/src/reorg.rs` and
-  `crates/node/src/apply_disconnect.rs`
+- Reorg and disconnect: `crates/chainstate/src/reorg.rs` and
+  `crates/chainstate/src/disconnect.rs`
 - Checkpoint publication and recovery:
-  `crates/node/src/checkpoint.rs`, its `checkpoint_*.rs` companions,
+  `crates/chainstate/src/checkpoint.rs`, its checkpoint companions,
   and `crates/storage/src/checkpoint/`
 - Index worker recovery: `crates/index/src/runtime/recovery_tests.rs`
 - Policy: `docs/policies/db-migration.md`
@@ -66,10 +64,9 @@ struct DurableHead {
 ```
 
 The row carries a format version byte and a checksum over its payload; any
-malformed row fails closed at load instead of decoding to absence. The owner
-decision for this slice: the head record lives in the chainstate key-value
-store and the protocol lives in `crates/node/src/apply` — the planned
-`crates/chainstate` extraction is not forced by it.
+malformed row fails closed at load instead of decoding to absence. The head
+record lives in the chainstate key-value store and the ordered protocol is
+owned by `crates/chainstate`.
 
 One connect or disconnect commits one atomic named-family batch whose
 `write_durable_if` receipt covers the head row, the block's undo row, and its
@@ -85,10 +82,9 @@ strictly monotonic on disconnect as well as on connect: a reorg lowers
 
 ### `RCV-01`: Authority and identity
 
-- The chainstate is the only authoritative position. Until the
-  `crates/chainstate` extraction lands, that position is held by the
-  `crates/node/src/apply` commit protocol. Block bodies, `txindex`,
-  `scriptindex`, and undo or lookup metadata are derived.
+- The chainstate is the only authoritative position. `crates/chainstate`
+  owns that position and its commit/recovery protocol. Block bodies,
+  `txindex`, `scriptindex`, and undo or lookup metadata are derived.
 - Every derived position is a `(height, block_hash)` pair, not height alone.
 - Off the active chain: stale `(height, block_hash)` pairs are rewound to the
   common ancestor, not to a height.
@@ -215,6 +211,11 @@ tests.
   intermediate committed ancestor is valid.
 - Streaming reorg uses bounded descriptors, before-images, and committed
   ancestors with exact inverse transitions; no whole-branch preload.
+- Chainstate owns planning, body retention/loading, mutation, invalidation, and
+  disconnect-debt settlement. Node-owned observers receive each committed
+  connect/disconnect to reconcile mempool, mining, RPC/ZMQ, and index wakes.
+  Those observers are not recovery authority and cannot widen chainstate's
+  dependency graph.
 
 ### `RCV-09`: Fresh replay and schema refusal
 
@@ -238,8 +239,7 @@ tests.
 
 ### `RCV-10`: Checkpoint-worker removal
 
-- Normal full-checkpoint publication is removed as a recovery authority
-  after the candidate `crates/chainstate` gates pass.
+- Full-checkpoint publication is not recovery authority.
 - The durable root and the ordered commit protocol are the only recovery
   authority. Checkpoints may remain as a maintenance and export command,
   but no code path treats a checkpoint as an authority for chainstate.
@@ -302,7 +302,7 @@ state is harmless and keeps the node operating until replay closes the gap.
 
 ## Proven by
 
-- `crates/node/src/apply_durable.rs` (existing): owns the durable-head
+- `crates/chainstate/src/durable.rs`: owns the durable-head
   advance for connect, group, and disconnect commits, the lineage fence, and
   the boot reconciliation of the stored head. `reconcile_at_boot` replays a
   committed-but-unpublished gap from the durable bodies the stored head
@@ -318,11 +318,10 @@ state is harmless and keeps the node operating until replay closes the gap.
     restart replays nothing;
   - `boot_refuses_a_gap_whose_body_is_gone`: a gap whose durable facts are
     gone fails startup closed instead of publishing a fabricated history.
-- `crates/node/src/apply_connect.rs` and
-  `crates/node/src/apply_disconnect.rs` (existing): run the `RCV-02` tail —
+- `crates/chainstate/src/connect.rs` and
+  `crates/chainstate/src/disconnect.rs`: run the `RCV-02` tail —
   sync, one atomic batch, derived journal emission, then publication — and
-  retire the planned `crates/chainstate/src/transition.rs` row; the durable
-  root is owned where the mutation authority lives (`ARCH-07`).
+  keep the durable root with the mutation authority (`ARCH-07`).
 - `crates/storage/src/durable_head.rs` (existing): owns the head record
   codec, the encoded-head fence, and the atomic batch contents.
 - `crates/node/tests/overhaul_durable_head.rs` (existing): the `RCV-04`
@@ -333,18 +332,17 @@ state is harmless and keeps the node operating until replay closes the gap.
   the real block files.
 - `crates/storage/tests/durable_head_store.rs` (existing): backend-level
   reopen, fence, and fault laws for the head store.
-- `crates/chainstate/src/recovery.rs` (planned): owns schema admission,
+- `crates/chainstate/src/recovery.rs`: owns schema admission,
   `incompatible_schema` refusal, and `CURRENT_SCHEMA` increment logic.
 - `crates/node/tests/crash_recovery.rs` (existing): the `RCV-04` crash
   points — SIGKILL restart across journal, reorg, and publication scenarios,
   partial-write handling, and upgrade-matrix fallback.
-- `crates/node/src/reorg.rs` and `crates/node/src/apply_disconnect.rs`
-  (existing): cover `RCV-05` and bounded disconnect and reorg memory;
-  `RCV-08`'s bounded descriptors and committed-ancestor restarts are proven
-  by `crates/node/src/reorg` (bounded stream windows, retention leases) and
-  the #655 boot-replay tests above.
-- Checkpoint publication and recovery (existing):
-  `crates/node/tests/unit/checkpoint/tests/` covers consensus-valid active-chain
+- `crates/chainstate/src/reorg.rs` and `crates/chainstate/src/disconnect.rs`
+  cover `RCV-05` and bounded disconnect/reorg memory; `RCV-08`'s bounded
+  stream windows and retention leases are exercised by the node sync/recovery
+  scenarios together with the #655 boot-replay tests above.
+- Checkpoint publication and recovery:
+  `crates/chainstate/tests/unit/checkpoint/tests/` covers consensus-valid active-chain
   replay, applied-ancestry selection, competing-fork rejection, and
   immutable-generation resume; `crates/storage/src/checkpoint/tests.rs`
   covers generation publication, failpoint preservation, and

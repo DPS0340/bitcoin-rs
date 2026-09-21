@@ -187,7 +187,7 @@ const REPLAY_GAP_BLOCK_LIMIT: usize = super::window::DURABLE_HEAD_GROUP_BLOCKS;
 /// head suppressed, and publishes — so ordinary operation never starts on a
 /// state the head does not certify. A gap that is not an ancestor prefix of
 /// stored bodies fails closed: no partial success publishes.
-pub(crate) fn reconcile_at_boot(handles: &Chainstate) -> Result<(), ApplyError> {
+pub fn reconcile_at_boot(handles: &Chainstate) -> Result<(), ApplyError> {
     let stored = handles
         .durable_head
         .load()
@@ -291,7 +291,6 @@ fn replay_committed_gap(
             Some(bytes::Bytes::from(bytes)),
             None,
             BlockProvenance::LocalReplay,
-            transition.proof(),
             PublishMode::Replay {
                 commit_id: head.commit_id,
             },
@@ -304,10 +303,10 @@ fn replay_committed_gap(
         (tip.hash, tip.height, commit_id) == (head.tip, head.height, head.commit_id)
     });
     if !landed {
-        transition.finish().ok();
+        drop(transition);
         return Err(unrecoverable("replay finished short of the stored head"));
     }
-    transition.finish()?;
+    drop(transition);
     metrics::counter!("node.durable_head.recovery_gaps_replayed").increment(replayed_blocks);
     metrics::counter!("node.durable_head.recovery_gaps").increment(1);
     tracing::info!(

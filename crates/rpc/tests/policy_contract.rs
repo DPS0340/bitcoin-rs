@@ -1421,7 +1421,7 @@ const REORG_SPEND_FEE_SATS: u64 = 10_000;
 
 /// Routes `invalidateblock` through the production reorg path.
 struct NodeInvalidator {
-    handles: bitcoin_rs_node::apply::Chainstate,
+    handles: Arc<bitcoin_rs_chainstate::Chainstate>,
     followers: bitcoin_rs_node::ChainFollowers,
 }
 
@@ -1617,7 +1617,7 @@ fn reorg_mine_and_apply(
 }
 
 fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>> {
-    let applied = state.applied_tip();
+    let applied = state.chainstate().applied_tip_handle();
     let Some(tip) = applied.load_full() else {
         return Err("applied tip must exist".into());
     };
@@ -1625,16 +1625,17 @@ fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>>
 }
 
 fn invalidation_handler(state: &NodeState) -> Handler {
+    let chainstate = state.chainstate();
     Handler::new(Arc::new(
         Context::from_handles(ContextHandles {
             chain: ChainHandles {
-                chain_tip: state.chain_tip(),
-                applied_tip: state.applied_tip(),
+                chain_tip: chainstate.chain_tip_handle(),
+                applied_tip: chainstate.applied_tip_handle(),
                 blocks: state.blocks(),
                 transactions: state.transactions(),
-                utxo: state.utxo(),
-                coin_stats: state.coin_stats(),
-                block_tree: state.block_tree(),
+                utxo: chainstate.utxo_handle(),
+                coin_stats: chainstate.coin_stats_handle(),
+                block_tree: chainstate.block_tree_handle(),
                 chain_network: Network::Regtest,
             },
             mempool: MempoolHandles {
@@ -1658,7 +1659,7 @@ fn invalidation_handler(state: &NodeState) -> Handler {
             derived_index_status: None,
         })
         .with_chain_control(Arc::new(NodeInvalidator {
-            handles: state.chainstate(),
+            handles: chainstate,
             followers: state.chain_followers(),
         })),
     ))

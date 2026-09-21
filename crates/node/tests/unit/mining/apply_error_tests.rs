@@ -2,9 +2,9 @@
 // mining validation/submission projection; `map_apply_error` is the in-code
 // mapping contract from chainstate refusal to BIP22/BIP23 validation results.
 use super::{map_apply_error, test_block_validity_error};
-use crate::apply::error::ApplyError;
 use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::ChainWork;
+use bitcoin_rs_chainstate::ApplyError;
 use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_mining::BlockValidationResult;
 use bitcoin_rs_mining::MiningControlError;

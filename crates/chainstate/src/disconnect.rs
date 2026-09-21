@@ -1,7 +1,6 @@
 //! Orders [`bitcoin_rs_utxo::rollback_block`] against the journal, the
 //! durable head, and publication.
 
-use super::ChainChangeProof;
 use super::Chainstate;
 use super::DisconnectOutcome;
 use super::DisconnectPlan;
@@ -10,7 +9,7 @@ use super::publication::begin_applied_publication;
 use super::publication::rewind_chain_tx_count;
 use super::publication::rewound_chain_tx_count;
 use super::publication::tx_count_delta_for;
-use crate::apply::error::ApplyError;
+use crate::error::ApplyError;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
@@ -95,7 +94,6 @@ pub(super) fn plan_disconnect(
 pub(super) fn disconnect_block_admitted(
     handles: &Chainstate,
     block: &Block,
-    _proof: &ChainChangeProof<'_>,
 ) -> core::result::Result<DisconnectOutcome, crate::DisconnectError> {
     let block_hash = block.block_hash().0;
     let DisconnectPlan {
@@ -177,7 +175,7 @@ pub(super) fn disconnect_block_admitted(
             .applied_tip
             .store(Some(Arc::new(parent_tip.clone())));
         handles.chain_events.record(
-            crate::state::HintKind::Disconnected,
+            crate::events::HintKind::Disconnected,
             parent_tip.height,
             parent_tip.hash,
         );

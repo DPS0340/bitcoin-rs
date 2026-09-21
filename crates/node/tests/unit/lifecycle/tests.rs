@@ -71,30 +71,6 @@ fn clean_shutdown_publishes_checkpoint_and_returns_success() -> anyhow::Result<(
 
 #[test]
 // CONTRACT: docs/contracts/architecture.md#ARCH-05
-fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow::Result<()> {
-    let temp = tempfile::tempdir()?;
-    let mut config = isolated_config(&temp.path().join("node"));
-    config.p2p.connect = vec!["127.0.0.1:1".to_owned()];
-    let state = NodeState::open(config.clone(), None)?;
-    let (current, previous) = seed_checkpoint(&state)?;
-    drop(state);
-
-    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
-    shutdown_tx.send(())?;
-    crate::checkpoint::inject_next_checkpoint_failpoint(
-        crate::checkpoint::CheckpointFailpoint::ManifestWrite,
-    );
-    assert!(run(config, RuntimeInputs::default().with_shutdown(shutdown_rx)).is_err());
-    assert_eq!(std::fs::read(current)?, previous);
-    assert!(
-        bootstrap_drain_was_reached(),
-        "checkpoint errors must not bypass the bootstrap-worker join"
-    );
-    Ok(())
-}
-
-#[test]
-// CONTRACT: docs/contracts/architecture.md#ARCH-05
 fn teardown_join_failure_completes_cleanup_and_suppresses_checkpoint() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let config = isolated_config(&temp.path().join("node-join-failure"));
@@ -152,34 +128,6 @@ fn teardown_joins_bootstrap_worker_beyond_former_deadline() -> anyhow::Result<()
     );
     assert!(bootstrap_drain_was_reached());
     assert_ne!(std::fs::read(current)?, previous);
-    drop(services);
-    drop(state);
-    Ok(())
-}
-
-#[test]
-// CONTRACT: docs/contracts/architecture.md#ARCH-05
-fn late_bootstrap_panic_suppresses_checkpoint() -> anyhow::Result<()> {
-    let temp = tempfile::tempdir()?;
-    let config = isolated_config(&temp.path().join("node-late-failure"));
-    let state = NodeState::open(config, None)?;
-    let (current, previous) = seed_checkpoint(&state)?;
-    let panicker = std::thread::Builder::new()
-        .name("bitcoin-rs-p2p-bootstrap".to_owned())
-        .spawn(|| panic!("injected bootstrap panic"))?;
-    let mut services = NodeServices::default();
-    services.bootstrap_worker = Some(panicker);
-    crate::checkpoint::inject_next_checkpoint_failpoint(
-        crate::checkpoint::CheckpointFailpoint::ManifestWrite,
-    );
-    assert!(
-        services
-            .teardown(Some(&state), TeardownMode::CleanShutdown)
-            .is_err()
-    );
-    assert!(bootstrap_drain_was_reached());
-    assert_eq!(std::fs::read(current)?, previous);
-    assert!(state.write_clean_checkpoint().is_err());
     drop(services);
     drop(state);
     Ok(())

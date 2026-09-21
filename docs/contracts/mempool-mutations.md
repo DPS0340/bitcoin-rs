@@ -232,20 +232,20 @@ state (`crates/mempool/src/orphan.rs`).
   `stable_generation_reads_even_values`,
   `reconsider_disconnected_admits_in_order_once_per_candidate`,
   `reconsider_disconnected_withholds_descendants_of_a_refused_parent`.
-- `crates/node/src/apply.rs` (inline tests, `chain_generation_tests` module):
-  `stable_generation_is_even_before_and_after_connect`,
-  `stable_generation_is_even_after_disconnect`.
-- `crates/node/tests/unit/sync/tests/transitions_3.rs`,
-  `crates/node/tests/unit/sync/tests/transitions_5.rs`,
-  `crates/node/tests/unit/sync/tests/transitions_6.rs`, and
-  `crates/node/tests/unit/sync/tests/transitions_7.rs`: generation fencing on window
-  settlement; operational and permanent reorg failures preserve generation
-  fencing, and partial and fatal reorgs preserve readmission semantics.
-- `crates/node/src/apply.rs`: RPC body preflight, mid-rollback body loss and
-  clean disconnect refusal permit retry from their coherent committed state.
-- `crates/node/tests/unit/reorg/tests.rs`: possibly torn UTXO commits retain the
-  fence and checkpoint debt; failed generation settlement preserves its
-  original cause and requests shutdown.
+- `crates/node/src/chain_effects.rs`:
+  `connect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`
+  and
+  `disconnect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`
+  prove that committed chain changes run the mempool chain-change lifecycle
+  even when the pool itself has no removal/insertion.
+- `crates/node/tests/unit/sync/tests/transitions_3.rs` and
+  `transitions_7.rs`: operational, permanent, and mutated-body reorg
+  outcomes preserve the committed-prefix and invalidation semantics while the
+  node owns mempool/follower coordination.
+- `crates/chainstate/src/reorg.rs` owns body preflight, bounded mid-rollback
+  body reads, exact disconnect/connect, and typed coherent-vs-recovery
+  outcomes. Node's reorg observer owns mempool reconsideration and generation
+  settlement.
 - `crates/rpc/src/handlers/tx.rs` (inline tests):
   admission retry rebuilds context after a transient rejection.
 - `crates/mempool/src/admission.rs` (inline tests):
