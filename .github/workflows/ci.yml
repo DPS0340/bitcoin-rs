@@ -105,6 +105,12 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
+      # The rocksdb feature compiles rust-librocksdb-sys, whose build runs
+      # bindgen via clang-sys and needs libclang; the runner image ships none,
+      # so a cold dependency cache (e.g. any lockfile update inside that
+      # subtree) fails without this.
+      - name: Install libclang for bindgen
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - name: Provision pinned Core
         run: bash scripts/provision-ci-reference-fixtures.sh core
       - run: ./scripts/ci-pr.sh test-binary
