@@ -336,6 +336,22 @@ impl MempoolSequenceWake for MiningCoordinator {
     }
 }
 
+/// Resolves the API-15 accepted prefix of `raw`: walks the checked layout
+/// once to find the one complete block `submitblock` accepts, tolerating
+/// trailing bytes. The returned slice is the exact image the apply path's
+/// `bytes_are_block` gate requires.
+fn submitted_prefix(raw: &[u8]) -> Result<&[u8], MiningControlError> {
+    use bitcoin_rs_primitives::layout::ParsedBlock;
+    let mut cursor: &[u8] = raw;
+    let parsed = ParsedBlock::parse(&mut cursor)
+        .map_err(|error| MiningControlError::Rejected(CompactString::from(error.to_string())))?;
+    raw.get(..parsed.consumed_len()).ok_or_else(|| {
+        MiningControlError::Rejected(CompactString::from(
+            "submitted bytes are not the serialization of the submitted block",
+        ))
+    })
+}
+
 impl MiningControl for MiningCoordinator {
     fn get_block_template(
         &self,
@@ -386,29 +402,12 @@ impl MiningControl for MiningCoordinator {
         mut block: Block,
         raw: Vec<u8>,
     ) -> Result<BlockValidationResult, MiningControlError> {
-        // Core `UpdateUncommittedBlockStructures` mutates `block` (inserts the
-        // 32-byte reserved nonce). The only legal mutation is that insertion,
-        // so `raw` must match `block` either before or after the fill. Anything
-        // else means `raw` is not this block's serialization and `submit`'s
-        // byte-equality gate must refuse it, not accept a neighbour's bytes.
-        self.fill_uncommitted_witness(&mut block);
-        // `deserialize` rejects trailing bytes (exact-image rule), while RPC
-        // `submitblock` tolerates them (API-15). Walk the layout once to find
-        // the accepted prefix, then enforce the exact-image rule on that
-        // prefix and check it really encodes this block.
-        let consumed = {
-            use bitcoin_rs_primitives::layout::ParsedBlock;
-            let mut cursor: &[u8] = &raw;
-            let parsed = ParsedBlock::parse(&mut cursor).map_err(|error| {
-                MiningControlError::Rejected(CompactString::from(error.to_string()))
-            })?;
-            parsed.consumed_len()
-        };
-        let prefix: &[u8] = raw.get(..consumed).ok_or_else(|| {
-            MiningControlError::Rejected(CompactString::from(
-                "submitted bytes are not the serialization of the submitted block",
-            ))
-        })?;
+        // `fill_uncommitted_witness` mutates `block` (inserts the 32-byte
+        // reserved nonce) when the submitted height is SegWit-active and the
+        // coinbase carries a commitment but no witness. The submitted bytes
+        // encode the pre-fill image, so the byte check runs before the fill;
+        // after the fill the block is re-checked (see below).
+        let prefix = submitted_prefix(&raw)?;
         let canonical = deserialize::<Block>(prefix).map_err(|error| {
             MiningControlError::Rejected(CompactString::from(error.to_string()))
         })?;
@@ -417,7 +416,19 @@ impl MiningControl for MiningCoordinator {
                 "submitted bytes are not the serialization of the submitted block",
             )));
         }
-        self.submit_with_serialized(&block, bytes::Bytes::from(raw))
+        self.fill_uncommitted_witness(&mut block);
+        if block == canonical {
+            // Fill was a no-op: `prefix` is the exact image of `block`, so
+            // thread it into the serialized apply path (parse once).
+            // The tail is dropped, not forwarded: RPC `submitblock` tolerates
+            // trailing bytes (API-15) but the apply path's `bytes_are_block`
+            // gate requires the exact image.
+            return self.submit_with_serialized(&block, bytes::Bytes::copy_from_slice(prefix));
+        }
+        // The fill inserted the reserved nonce, so the submitted bytes are
+        // stale. Re-serialize the filled block — the same single serialize
+        // the decode-only path always paid — and thread that.
+        self.submit_with_serialized(&block, bytes::Bytes::from(consensus_bytes(&block)))
     }
 
     /// Admits `header` through [`accept_headers`], the same gate inbound P2P uses.

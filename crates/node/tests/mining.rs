@@ -821,6 +821,32 @@ fn submit_block_with_bytes_refuses_foreign_bytes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Trailing bytes are tolerated on the RPC shape (API-15) but must not reach
+/// the apply path's exact-image gate: the accepted prefix is threaded into
+/// `connect_serialized`, the tail is dropped.
+#[test]
+fn submit_block_with_bytes_drops_trailing_tail() -> anyhow::Result<()> {
+    use bitcoin_rs_primitives::consensus_bytes;
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = coordinator(&state);
+    mining.publish_generation();
+    let genesis = Network::Regtest.genesis_block();
+    let child = mined_child(genesis.block_hash())?;
+    let child_hash = Hash256::from(child.block_hash());
+    let mut raw = consensus_bytes(&child);
+    raw.extend_from_slice(&[0xff, 0xff]);
+    let result = mining.submit_block_with_bytes(child, raw)?;
+    assert_eq!(result, BlockValidationResult::Accepted);
+    let tip = state
+        .applied_tip()
+        .load_full()
+        .unwrap_or_else(|| panic!("applied tip missing after submit"));
+    assert_eq!(tip.hash, child_hash);
+    assert_eq!(tip.height, 1);
+    Ok(())
+}
+
 #[test]
 fn submit_block_fills_omitted_coinbase_witness() -> anyhow::Result<()> {
     let state = open_regtest()?;
@@ -850,6 +876,49 @@ fn submit_block_fills_omitted_coinbase_witness() -> anyhow::Result<()> {
     );
     let block_hash = block.block_hash();
     assert_eq!(mining.submit_block(block)?, BlockValidationResult::Accepted);
+    let tip = state
+        .applied_tip()
+        .load_full()
+        .unwrap_or_else(|| panic!("applied tip missing after submit"));
+    assert_eq!(tip.hash, Hash256::from(block_hash));
+    Ok(())
+}
+
+/// The reserved-nonce fill must not reject the valid pre-fill image: on a
+/// SegWit-active height the submitted bytes encode the block without the
+/// nonce, the fill inserts it, and the filled block still applies.
+#[test]
+fn submit_block_with_bytes_accepts_prefill_image_when_fill_applies() -> anyhow::Result<()> {
+    use bitcoin_rs_primitives::consensus_bytes;
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = coordinator(&state);
+    mining.publish_generation();
+    let template = expect_template(mining.get_block_template(template_request(None))?);
+    let mut block = template
+        .candidate
+        .solve(1_000_000)
+        .map_err(|error| anyhow::anyhow!("solve template candidate: {error}"))?;
+    let Some(input) = block.txs.first_mut().and_then(|tx| tx.inputs.first_mut()) else {
+        panic!("solved candidate missing coinbase input");
+    };
+    assert!(
+        !input.witness.is_empty(),
+        "assembled candidate must carry the reserved nonce"
+    );
+    input.witness.clear();
+    let has_commitment = block.txs[0]
+        .outputs
+        .iter()
+        .any(|output| is_witness_commitment(&output.script_pubkey));
+    assert!(
+        has_commitment,
+        "assembled candidate must carry a BIP141 commitment"
+    );
+    let raw = consensus_bytes(&block);
+    let block_hash = block.block_hash();
+    let result = mining.submit_block_with_bytes(block, raw)?;
+    assert_eq!(result, BlockValidationResult::Accepted);
     let tip = state
         .applied_tip()
         .load_full()
