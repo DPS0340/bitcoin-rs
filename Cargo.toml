@@ -16,6 +16,7 @@ members = [
     "crates/rpc",
     "crates/node",
     "bin/bitcoin-rs",
+    "e2e",
 ]
 
 [workspace.package]

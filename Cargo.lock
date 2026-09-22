@@ -308,6 +308,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoin-rs-e2e"
+version = "0.7.0"
+dependencies = [
+ "bitcoin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
 name = "bitcoin-rs-index"
 version = "0.7.0"
 dependencies = [
@@ -349,7 +361,6 @@ dependencies = [
  "metrics",
  "parking_lot",
  "sha2",
- "slab",
  "tempfile",
  "thiserror",
  "tracing",

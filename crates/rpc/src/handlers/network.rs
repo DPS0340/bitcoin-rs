@@ -470,11 +470,29 @@ pub(crate) fn getconnectioncount(ctx: &Arc<Context>, params: &Value) -> Result<V
 
 pub(crate) fn getnettotals(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    let network = ctx.network.read();
+    // The per-connection `PeerCounters` atomics are the only measured traffic
+    // counters the node keeps; `NetworkState` exists as the aggregate slot but
+    // nothing populates it. Summing the live peer table reports traffic the
+    // node can actually account for. Core's totals instead persist across
+    // disconnections, so the two diverge after churn: a departed peer's bytes
+    // disappear from this sum but stay in Core's lifetime total.
+    let (total_bytes_received, total_bytes_sent) =
+        ctx.peer_table
+            .infos()
+            .iter()
+            .fold((0_u64, 0_u64), |(recv, sent), peer| {
+                (
+                    recv.saturating_add(peer.counters.bytes_recv()),
+                    sent.saturating_add(peer.counters.bytes_sent()),
+                )
+            });
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     typed_to_sonic(&v31::GetNetTotals {
-        total_bytes_received: network.bytes_recv,
-        total_bytes_sent: network.bytes_sent,
-        time_millis: network.timestamp,
+        total_bytes_received,
+        total_bytes_sent,
+        time_millis: now,
         upload_target: v31::UploadTarget {
             timeframe: 0,
             target: 0,

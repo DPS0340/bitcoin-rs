@@ -50,8 +50,10 @@ impl RpcServer {
         idle_timeout: Duration,
         rest_enabled: bool,
     ) -> io::Result<Self> {
+        let listener = TcpListener::bind(address)?;
+        crate::handlers::util::mark_server_start();
         Ok(Self {
-            listener: TcpListener::bind(address)?,
+            listener,
             auth,
             handler,
             max_connections,

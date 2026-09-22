@@ -812,7 +812,7 @@ impl Context {
             headers,
             best_block_hash: applied_tip
                 .as_ref()
-                .map_or_else(Hash256::default, |tip| tip.hash),
+                .map_or_else(|| self.chain_network.genesis_block_hash(), |tip| tip.hash),
             difficulty,
             time,
             median_time,
@@ -1013,19 +1013,25 @@ impl Context {
     }
 
     /// Returns the current best-applied-block hash.
+    ///
+    /// Before the first applied tip is published the canonical chain is the
+    /// genesis-only chain, exactly as `applied_height` already reports `0` and
+    /// `block_hash_at_height(0)` answers the genesis hash — callers must never
+    /// see an all-zero tip for a chain that always has a height-0 block.
     #[must_use]
     pub fn applied_hash(&self) -> Hash256 {
         self.applied_tip
             .load_full()
-            .map_or_else(Hash256::default, |tip| tip.hash)
+            .map_or_else(|| self.chain_network.genesis_block_hash(), |tip| tip.hash)
     }
 
-    /// Returns the current best block hash, or all-zero before initial sync.
+    /// Returns the current best block hash, or the genesis hash before the
+    /// header tree publishes its first tip — genesis is always that base.
     #[must_use]
     pub(crate) fn best_hash(&self) -> Hash256 {
         self.chain_tip
             .load_full()
-            .map_or_else(Hash256::default, |tip| tip.hash)
+            .map_or_else(|| self.chain_network.genesis_block_hash(), |tip| tip.hash)
     }
 
     /// Returns the current best-chain chainwork as a 64-character lowercase
