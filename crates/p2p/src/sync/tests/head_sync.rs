@@ -84,8 +84,13 @@ fn body_arriving_ahead_of_its_header_chain_requests_the_gap()
         mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(2)]);
     let block3 = mined_block_with_prev_hash(block2.block_hash(), 3, vec![coinbase_transaction(3)]);
     // Only the tip-of-gap body arrives — its parent's header is unknown.
+    // Draining twice isolates the ancestry request: the first buffers the
+    // body, the second's staged-header retry must emit the only possible
+    // `getheaders` on this connection (a `tick` tail could also queue one
+    // via `request_headers_from_best_peer` and mask a regression).
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block3.clone()))?;
-    sync.tick();
+    sync.drain_inbound_blocks();
+    sync.drain_inbound_blocks();
     next_getheaders(&rx)?;
 
     // The ancestry fill lands: the gap headers admit, both bodies stage,

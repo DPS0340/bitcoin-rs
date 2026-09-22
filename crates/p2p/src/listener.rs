@@ -1171,23 +1171,25 @@ fn process_compact_wire_message(
     peer_addr: SocketAddr,
     inbound_sync_sinks: &InboundSyncSinks,
 ) {
-    if let crate::Message::CmpctBlock(cmpct) = message
-        && let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
-    {
-        inbound_sync_sinks.send_headers(lease.source(peer_addr), vec![header]);
-    }
     let identity_version =
         local_compact_version.unwrap_or(crate::compact_blocks::COMPACT_BLOCK_VERSION);
-    process_compact_message(
+    let outcome = process_compact_message(
         compact_reconstruction,
         message,
         identity_version,
         compact_hints,
-        lease,
-        peer_addr,
-        inbound_sync_sinks,
         Instant::now(),
     );
+    // A compact announcement is itself a tip announcement: when the outcome
+    // emits no body (`Complete` already forwards its header via `send_block`),
+    // this forward is the only path the embedded header takes to admission.
+    if let crate::Message::CmpctBlock(cmpct) = message
+        && !matches!(outcome, crate::compact_blocks::Outcome::Complete(_))
+        && let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
+    {
+        inbound_sync_sinks.send_headers(lease.source(peer_addr), vec![header]);
+    }
+    handle_compact_outcome(outcome, lease, peer_addr, inbound_sync_sinks);
 }
 
 /// Applies one BIP152 receive-side outcome: a finished block enters the
@@ -1230,18 +1232,15 @@ fn handle_compact_outcome(
 }
 
 /// Feeds one receive-side BIP152 message into the loop's reconstruction
-/// state and applies the outcome.
+/// state and returns the outcome.
 fn process_compact_message(
     reconstruction: &mut crate::compact_blocks::Reconstruction,
     message: &crate::Message,
     identity_version: u64,
     compact_hints: Option<&dyn crate::compact_blocks::CompactBlockHints>,
-    lease: &crate::PeerLease,
-    peer_addr: SocketAddr,
-    inbound_sync_sinks: &InboundSyncSinks,
     now: std::time::Instant,
-) {
-    let outcome = match message {
+) -> crate::compact_blocks::Outcome {
+    match message {
         crate::Message::CmpctBlock(cmpct) => match compact_hints {
             Some(hints) => reconstruction.receive_cmpctblock(cmpct, identity_version, hints, now),
             None => crate::compact_blocks::Outcome::Fallback(
@@ -1249,9 +1248,8 @@ fn process_compact_message(
             ),
         },
         crate::Message::BlockTxn(txns) => reconstruction.receive_blocktxn(txns, now),
-        _ => return,
-    };
-    handle_compact_outcome(outcome, lease, peer_addr, inbound_sync_sinks);
+        _ => crate::compact_blocks::Outcome::Idle,
+    }
 }
 
 /// Spawns a per-connection writer thread that drains queued outbound messages
