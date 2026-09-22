@@ -534,9 +534,34 @@ impl ProcessNode {
         }
     }
 
+    /// Ensures `rpc_conn` holds a socket the peer has not already closed:
+    /// connects when absent, probes a reused socket for an idle close before
+    /// any request bytes leave the client (`Stale` ⇒ safe to reconnect).
+    fn live_conn(&mut self, deadline: Instant) -> Result<(), ConnFail> {
+        let fresh = if self.rpc_conn.is_none() {
+            let stream = TcpStream::connect_timeout(
+                &self.addr,
+                remaining_time(deadline, Instant::now(), "RPC deadline reached")
+                    .map_err(ConnFail::Error)?
+                    .min(Duration::from_secs(1)),
+            )
+            .map_err(|_| ConnFail::Stale)?;
+            self.rpc_conn = Some(BufReader::new(stream));
+            true
+        } else {
+            false
+        };
+        if !fresh && conn_stale(self.rpc_conn.as_ref().ok_or(ConnFail::Stale)?.get_ref()) {
+            return Err(ConnFail::Stale);
+        }
+        Ok(())
+    }
+
     /// One request/response round trip on `rpc_conn`. `Stale` marks a
     /// socket that closed or broke before the request could have been
     /// dispatched (idle close, dead peer), so re-sending once is safe.
+    /// EOF discovered after bytes were written is not `Stale`: the request
+    /// may already have been dispatched and must not be replayed.
     fn try_persistent(
         &mut self,
         wire: &[u8],
@@ -547,12 +572,7 @@ impl ProcessNode {
             remaining_time(deadline, Instant::now(), "RPC deadline reached")
                 .map_err(ConnFail::Error)
         };
-        if self.rpc_conn.is_none() {
-            let stream =
-                TcpStream::connect_timeout(&self.addr, remaining()?.min(Duration::from_secs(1)))
-                    .map_err(|_| ConnFail::Stale)?;
-            self.rpc_conn = Some(BufReader::new(stream));
-        }
+        self.live_conn(deadline)?;
         let conn = self.rpc_conn.as_mut().ok_or(ConnFail::Stale)?;
         conn.get_ref()
             .set_write_timeout(Some(remaining()?))
@@ -579,17 +599,13 @@ impl ProcessNode {
                 .map_err(HarnessError::Io)
                 .map_err(ConnFail::Error)?;
             if count == 0 {
-                // No response bytes on a previously open socket means the
-                // peer closed before dispatch (idle close): retry is safe.
-                // Mid-headers the request may have been processed — surface
-                // the failure instead of resending a mutating call.
-                return Err(if head.is_empty() {
-                    ConnFail::Stale
-                } else {
-                    ConnFail::Error(HarnessError::Protocol(
-                        "connection closed mid-headers".into(),
-                    ))
-                });
+                // EOF after the request left the client is ambiguous: the
+                // peer may have processed the call before closing, so the
+                // request is never resent. Idle closes on reused sockets
+                // are caught by the pre-write probe instead.
+                return Err(ConnFail::Error(HarnessError::Protocol(
+                    "connection closed before response".into(),
+                )));
             }
             head.extend_from_slice(&line);
             if head.len() > MAX_RESPONSE {
@@ -795,6 +811,24 @@ pub(crate) fn exchange(
     deadline: Instant,
 ) -> Result<Value, HarnessError> {
     exchange_http(addr, Some(request), "/", deadline)
+}
+
+/// Reports whether a kept-alive socket was already closed (or desynced) on
+/// the peer side. A non-blocking peek sees the close before any request
+/// bytes are sent, which makes reconnecting unambiguously safe — unlike an
+/// EOF discovered after a write, which cannot rule out a processed request.
+fn conn_stale(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let stale = !matches!(
+        stream.peek(&mut [0_u8; 1]),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    );
+    if stream.set_nonblocking(false).is_err() {
+        return true;
+    }
+    stale
 }
 
 /// Builds one HTTP/1.1 request body wire block. `keep-alive` asks the

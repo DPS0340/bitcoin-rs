@@ -619,7 +619,9 @@ impl Client {
 
     /// One request/response round trip. The error flag marks failures the
     /// retry wrapper may resend: the socket never delivered the request
-    /// (connect refused, broken write, peer closed before any reply byte).
+    /// (connect refused, broken write, or an idle close probed before the
+    /// request went out). EOF after bytes were sent is not retryable: the
+    /// request may already have been processed.
     fn exchange_once(
         &self,
         slot: &mut Option<BufReader<TcpStream>>,
@@ -628,7 +630,7 @@ impl Client {
         authorization: Option<&str>,
         body: &[u8],
     ) -> Result<HttpResponse, (Box<dyn Error>, bool)> {
-        if slot.is_none() {
+        let fresh = if slot.is_none() {
             let stream = TcpStream::connect_timeout(&self.addr, REQUEST_TIMEOUT)
                 .map_err(|error| (error.into(), true))?;
             stream
@@ -638,10 +640,19 @@ impl Client {
                 .set_write_timeout(Some(REQUEST_TIMEOUT))
                 .map_err(|error| (error.into(), true))?;
             *slot = Some(BufReader::new(stream));
-        }
+            true
+        } else {
+            false
+        };
         let reader = slot
             .as_mut()
             .ok_or_else(|| ("missing http connection".into(), true))?;
+        // Probe a reused socket for a peer close before any request bytes
+        // leave the client; an idle close caught here is provably safe to
+        // reconnect, unlike EOF discovered after a write.
+        if !fresh && conn_stale(reader.get_ref()) {
+            return Err(("peer closed the kept-alive connection".into(), true));
+        }
         let auth_line = authorization
             .map(|token| format!("Authorization: Basic {token}\r\n"))
             .unwrap_or_default();
@@ -678,10 +689,32 @@ impl Client {
             .read_line(&mut status_line)
             .map_err(|error| (error.into(), false))?;
         if count == 0 {
-            return Err(("connection closed before response".into(), true));
+            // The request already left the client; EOF here is ambiguous
+            // (the call may have been processed), so it must not be
+            // replayed. Idle closes on reused sockets are caught by the
+            // pre-write probe instead.
+            return Err(("connection closed before response".into(), false));
         }
         read_http_response(reader, &status_line).map_err(|error| (error, false))
     }
+}
+
+/// Reports whether a kept-alive socket was already closed (or desynced) on
+/// the peer side. A non-blocking peek sees the close before any request
+/// bytes are sent, which makes reconnecting unambiguously safe — unlike an
+/// EOF discovered after a write, which cannot rule out a processed request.
+fn conn_stale(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let stale = !matches!(
+        stream.peek(&mut [0_u8; 1]),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    );
+    if stream.set_nonblocking(false).is_err() {
+        return true;
+    }
+    stale
 }
 
 fn p2wpkh_script() -> ScriptBuf {
