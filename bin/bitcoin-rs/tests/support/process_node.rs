@@ -205,11 +205,30 @@ fn executable(binary: NodeBinary) -> Result<PathBuf, HarnessError> {
     }
 }
 
+/// Launches retried after a child died only on the reserve-release port
+/// race: the loopback port bound for selection can be grabbed by a parallel
+/// runner in the release-to-bind window, which fd-less spawning cannot
+/// close. The retry is bound to that failure signature only.
+const PORT_BIND_ATTEMPTS: u8 = 3;
+
 // Keep both ports during setup. The child binds them after release.
 fn loopback_addresses() -> Result<(TcpListener, TcpListener), HarnessError> {
     let rpc = TcpListener::bind("127.0.0.1:0")?;
     let p2p = TcpListener::bind("127.0.0.1:0")?;
     Ok((rpc, p2p))
+}
+
+/// Whether a dead child's stderr reports losing the port-bind race (either
+/// daemon's phrasing), and nothing else — any other startup failure returns
+/// its `ChildExit` untouched.
+fn exited_on_busy_port(evidence: &std::path::Path) -> bool {
+    let Ok(stderr) = fs::read_to_string(evidence.join("stderr.log")) else {
+        return false;
+    };
+    stderr.contains("Address already in use")
+        || stderr.contains("os error 98")
+        || stderr.contains("Unable to bind")
+        || stderr.contains("Failed to bind")
 }
 
 pub(crate) fn remaining_time(
@@ -312,11 +331,34 @@ impl ProcessNode {
     /// Restart scenarios move the `TempDir` out of a stopped process with
     /// [`Self::take_datadir`] and hand it here, so custody of the directory
     /// never leaves the harness and cleanup stays bound to the last owner.
+    /// A launch whose child died only on the reserve-release port race is
+    /// retried with fresh ports; anything else fails immediately.
     pub(crate) fn start_with_datadir(
         binary: NodeBinary,
         extra_args: &[&str],
         timeout: Duration,
         datadir: TempDir,
+    ) -> Result<Self, HarnessError> {
+        let mut attempt = 0_u8;
+        loop {
+            attempt += 1;
+            match Self::launch_once(binary, extra_args, timeout, &datadir) {
+                Ok(mut node) => {
+                    node.datadir = Some(datadir);
+                    return Ok(node);
+                }
+                Err(HarnessError::ChildExit { ref evidence, .. })
+                    if attempt < PORT_BIND_ATTEMPTS && exited_on_busy_port(evidence) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn launch_once(
+        binary: NodeBinary,
+        extra_args: &[&str],
+        timeout: Duration,
+        datadir: &TempDir,
     ) -> Result<Self, HarnessError> {
         let evidence_root = workspace().join("target/process-harness");
         fs::create_dir_all(&evidence_root)?;
@@ -371,7 +413,7 @@ impl ProcessNode {
         // Establish drop custody before taking the pipes or starting readers.
         let mut node = Self {
             child,
-            datadir: Some(datadir),
+            datadir: None,
             addr,
             binary,
             p2p_addr,
