@@ -24,5 +24,6 @@ runs:
           echo "66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e  $tmp/nextest.tar.gz" \
             | sha256sum --check
           tar xzf "$tmp/nextest.tar.gz" -C "$tmp"
+          mkdir -p "$HOME/.cargo/bin"
           install -m 0755 "$tmp/cargo-nextest" "$HOME/.cargo/bin/cargo-nextest"
         fi
