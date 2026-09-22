@@ -357,6 +357,21 @@ pub enum ReorgError {
         /// body mutation and operational failures.
         invalidated: Vec<Hash256>,
     },
+    /// Marking a permanently-invalid subtree `Invalid` or republishing the
+    /// tip failed after a connect already failed.
+    ///
+    /// The tree may be partially marked, so the tip was republished from
+    /// whatever it still names before this surfaced. The causal connect
+    /// error and committed progress stay in `original` so callers keep both
+    /// signals.
+    #[error("post-connect invalidation failed: {source}; original: {original}")]
+    Invalidation {
+        /// `UnknownBlock`/`Plan`/`NoValidTip` from the invalidation attempt.
+        #[source]
+        source: Box<Self>,
+        /// The connect failure that triggered the invalidation.
+        original: Box<Self>,
+    },
     /// A disconnect died partway. The chainstate is torn.
     ///
     /// Propagated immediately and never continued past: applying the new branch
@@ -438,6 +453,7 @@ impl ReorgError {
             | Self::DisconnectBodyLost { .. }
             | Self::ConnectBodyLost { .. }
             | Self::NoAppliedTip
+            | Self::Invalidation { .. }
             | Self::Reconsideration { .. }
             | Self::CheckpointSettlement { .. }
             | Self::RetentionUnavailable { .. } => false,
@@ -457,7 +473,8 @@ impl ReorgError {
             | Self::CheckpointSettlement {
                 original: Some(original),
                 ..
-            } => original.reconsideration_failed(),
+            }
+            | Self::Invalidation { original, .. } => original.reconsideration_failed(),
             _ => false,
         }
     }
@@ -959,7 +976,32 @@ where
             // an empty `invalidated` on a failed invalidation would let the
             // next switch retry the same block.
             let invalidated = if disposition == crate::WindowApplyDisposition::Permanent {
-                invalidate_and_republish(transition.chainstate(), body.hash)?
+                match invalidate_and_republish(transition.chainstate(), body.hash) {
+                    Ok(invalidated) => invalidated,
+                    Err(invalidation) => {
+                        // The tree may be partially marked; republish
+                        // whatever tip it still names so `chain_tip` cannot
+                        // keep pointing at the invalidated branch, then
+                        // surface both failures.
+                        let handles = transition.chainstate();
+                        let tree = handles.block_tree().read();
+                        handles.chain_tip().store(tree.tip());
+                        handles.reevaluate_assume_valid_with(&tree);
+                        drop(tree);
+                        return Err(ReorgError::Invalidation {
+                            source: Box::new(invalidation),
+                            original: Box::new(ReorgError::ConnectFailed {
+                                disconnected: progress.disconnected,
+                                connected: progress.connected,
+                                hash: body.hash,
+                                stopped_at: body.height.saturating_sub(1),
+                                source: Box::new(source),
+                                disposition,
+                                invalidated: Vec::new(),
+                            }),
+                        });
+                    }
+                }
             } else {
                 Vec::new()
             };
