@@ -27,6 +27,7 @@ struct NodeReorgObserver<'a> {
     disconnected: Vec<Arc<Tx>>,
     disconnected_bytes: usize,
     disconnected_full: bool,
+    disconnected_blocks: usize,
 }
 
 impl<'a> NodeReorgObserver<'a> {
@@ -38,12 +39,14 @@ impl<'a> NodeReorgObserver<'a> {
             disconnected: Vec::new(),
             disconnected_bytes: 0,
             disconnected_full: false,
+            disconnected_blocks: 0,
         }
     }
 }
 
 impl ReorgObserver for NodeReorgObserver<'_> {
     fn disconnected(&mut self, outcome: &DisconnectOutcome) {
+        self.disconnected_blocks += 1;
         self.followers.disconnected(outcome);
     }
 
@@ -65,9 +68,6 @@ impl ReorgObserver for NodeReorgObserver<'_> {
             }
             let tx_size = tx.total_size();
             if self.disconnected_bytes + tx_size > MAX_DISCONNECTED_TX_BYTES {
-                // See MAX_DISCONNECTED_TX_BYTES: stop collecting for the
-                // rest of the reorg; dropped descendants fail admission as
-                // missing inputs.
                 self.disconnected_full = true;
                 return;
             }
@@ -77,6 +77,10 @@ impl ReorgObserver for NodeReorgObserver<'_> {
     }
 }
 
+/// Settles one reorg outcome while the mempool fence is held. A settle that
+/// disconnected nothing leaves the pool untouched: `switch_to_branch` is
+/// polled while a heavier branch is still downloading, and the resident
+/// sweep costs a chain snapshot per resident entry.
 fn settle_node_reorg(
     handles: &Chainstate,
     observer: &mut NodeReorgObserver<'_>,
@@ -89,6 +93,11 @@ fn settle_node_reorg(
     }
 
     let settlement_failed = (|| {
+        if observer.disconnected_blocks == 0 {
+            return mempool_change
+                .take()
+                .is_some_and(|change| change.finish().is_err());
+        }
         if let (Some(change), Some(gateway)) = (
             mempool_change.as_ref(),
             observer.followers.mempool_gateway(),
