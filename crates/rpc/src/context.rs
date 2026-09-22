@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::compat::convert::hex_encode;
 
@@ -463,6 +464,11 @@ pub struct Context {
     pub banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     /// Persisted `addnode add` entries.
     pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
+    /// Instant this context's RPC listener bound, set by `RpcServer::bind`
+    /// and read by `uptime`. Kept per context rather than process-global so
+    /// two servers in one process report their own epochs; `None` (never
+    /// bound, e.g. unit tests) makes `uptime` measure from its first call.
+    server_bound_at: Mutex<Option<Instant>>,
     /// Live ZMQ publisher, also the source of active notifier metadata.
     pub zmq_publisher: Arc<dyn crate::zmq::ZmqPublisher>,
     /// Configured node debug-log path for `getrpcinfo`.
@@ -539,6 +545,7 @@ impl Context {
             p2p_outbound_sender: None,
             banned: Arc::new(RwLock::new(Vec::new())),
             added_nodes: Arc::new(RwLock::new(Vec::new())),
+            server_bound_at: Mutex::new(None),
             zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
@@ -591,6 +598,7 @@ impl Context {
             p2p_outbound_sender: None,
             banned: Arc::new(RwLock::new(Vec::new())),
             added_nodes: Arc::new(RwLock::new(Vec::new())),
+            server_bound_at: Mutex::new(None),
             zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
@@ -658,11 +666,24 @@ impl Context {
             prune_service: None,
             chain_control: None,
             mining_control,
+            server_bound_at: Mutex::new(None),
             zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
             rollback_warnings: None,
         }
+    }
+
+    /// Marks the instant this context's RPC listener bound. A rebind
+    /// overwrites the epoch so `uptime` measures the live server.
+    pub(crate) fn mark_server_bound(&self) {
+        *self.server_bound_at.lock() = Some(Instant::now());
+    }
+
+    /// Uptime epoch for `uptime`: the recorded bind instant, or — for a
+    /// context that never binds a server — the first call's instant.
+    pub(crate) fn server_start(&self) -> Instant {
+        *self.server_bound_at.lock().get_or_insert_with(Instant::now)
     }
 
     /// Attaches the internal transaction lookup required for Esplora output
@@ -812,7 +833,7 @@ impl Context {
             headers,
             best_block_hash: applied_tip
                 .as_ref()
-                .map_or_else(Hash256::default, |tip| tip.hash),
+                .map_or_else(|| self.chain_network.genesis_block_hash(), |tip| tip.hash),
             difficulty,
             time,
             median_time,
@@ -1013,19 +1034,25 @@ impl Context {
     }
 
     /// Returns the current best-applied-block hash.
+    ///
+    /// Before the first applied tip is published the canonical chain is the
+    /// genesis-only chain, exactly as `applied_height` already reports `0` and
+    /// `block_hash_at_height(0)` answers the genesis hash — callers must never
+    /// see an all-zero tip for a chain that always has a height-0 block.
     #[must_use]
     pub fn applied_hash(&self) -> Hash256 {
         self.applied_tip
             .load_full()
-            .map_or_else(Hash256::default, |tip| tip.hash)
+            .map_or_else(|| self.chain_network.genesis_block_hash(), |tip| tip.hash)
     }
 
-    /// Returns the current best block hash, or all-zero before initial sync.
+    /// Returns the current best block hash, or the genesis hash before the
+    /// header tree publishes its first tip — genesis is always that base.
     #[must_use]
     pub(crate) fn best_hash(&self) -> Hash256 {
         self.chain_tip
             .load_full()
-            .map_or_else(Hash256::default, |tip| tip.hash)
+            .map_or_else(|| self.chain_network.genesis_block_hash(), |tip| tip.hash)
     }
 
     /// Returns the current best-chain chainwork as a 64-character lowercase

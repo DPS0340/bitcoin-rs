@@ -1396,14 +1396,15 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_each_class() -> Result<(), 
 }
 
 #[test]
-fn decode_failures_reject_with_invalid_params() -> Result<(), Box<dyn Error>> {
+fn decode_failures_reject_with_deserialization_error() -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
     let handler = Handler::new(Arc::clone(&ctx));
     let error = handler
         .dispatch("sendrawtransaction", &json!(["zznotahexzz"]))
         .err()
         .ok_or("expected a decode rejection")?;
-    assert_eq!(error.code(), RpcError::INVALID_PARAMS);
+    // Core answers -22 (RPC_DESERIALIZATION_ERROR) for undecodable hex.
+    assert_eq!(error.code(), -22);
     Ok(())
 }
 

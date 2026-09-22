@@ -470,11 +470,17 @@ pub(crate) fn getconnectioncount(ctx: &Arc<Context>, params: &Value) -> Result<V
 
 pub(crate) fn getnettotals(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    let network = ctx.network.read();
+    // `PeerTable` is the single owner of traffic accounting: it measures each
+    // live connection and folds in the counters of every connection it drops,
+    // so the totals — like Core's — never decrease across disconnects.
+    let (total_bytes_received, total_bytes_sent) = ctx.peer_table.traffic_totals();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     typed_to_sonic(&v31::GetNetTotals {
-        total_bytes_received: network.bytes_recv,
-        total_bytes_sent: network.bytes_sent,
-        time_millis: network.timestamp,
+        total_bytes_received,
+        total_bytes_sent,
+        time_millis: now,
         upload_target: v31::UploadTarget {
             timeframe: 0,
             target: 0,
