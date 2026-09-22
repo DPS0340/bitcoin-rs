@@ -607,10 +607,13 @@ impl Client {
         match self.exchange_once(&mut slot, method, path, authorization, body) {
             Ok(response) => Ok(response),
             Err((first, retryable)) => {
+                // A hard failure may leave an in-flight request or a
+                // desynced response on the socket: drop it so a later call
+                // cannot be pipelined or answered with the wrong response.
+                *slot = None;
                 if !retryable {
                     return Err(first);
                 }
-                *slot = None;
                 self.exchange_once(&mut slot, method, path, authorization, body)
                     .map_err(|(error, _)| error)
             }
@@ -618,10 +621,10 @@ impl Client {
     }
 
     /// One request/response round trip. The error flag marks failures the
-    /// retry wrapper may resend: the socket never delivered the request
-    /// (connect refused, broken write, or an idle close probed before the
-    /// request went out). EOF after bytes were sent is not retryable: the
-    /// request may already have been processed.
+    /// retry wrapper may resend: the socket never delivered the request to
+    /// dispatch (connect refused, broken write, idle close, or a close
+    /// before any response byte — `serve_connection` always writes a response
+    /// before it closes, so zero response bytes prove non-dispatch).
     fn exchange_once(
         &self,
         slot: &mut Option<BufReader<TcpStream>>,
@@ -685,15 +688,19 @@ impl Client {
             .and_then(|()| reader.get_mut().flush())
             .map_err(|error| (error.into(), false))?;
         let mut status_line = String::new();
-        let count = reader
-            .read_line(&mut status_line)
-            .map_err(|error| (error.into(), false))?;
+        let count = match reader.read_line(&mut status_line) {
+            Ok(count) => count,
+            Err(error) => {
+                let closed = is_conn_closed(&error);
+                return Err((error.into(), closed));
+            }
+        };
         if count == 0 {
-            // The request already left the client; EOF here is ambiguous
-            // (the call may have been processed), so it must not be
-            // replayed. Idle closes on reused sockets are caught by the
-            // pre-write probe instead.
-            return Err(("connection closed before response".into(), false));
+            // serve_connection writes a response before every close it
+            // initiates, so zero response bytes prove this request never
+            // reached dispatch: re-sending once is safe (a dead daemon
+            // fails the reconnect instead).
+            return Err(("connection closed before response".into(), true));
         }
         read_http_response(reader, &status_line).map_err(|error| (error, false))
     }
@@ -715,6 +722,20 @@ fn conn_stale(stream: &TcpStream) -> bool {
         return true;
     }
     stale
+}
+
+/// Socket-close errors proving the peer tore the connection down.
+/// WouldBlock/TimedOut are absent: an alive-but-slow peer means the request
+/// may still be in flight server-side, so those stay non-retryable.
+fn is_conn_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 fn p2wpkh_script() -> ScriptBuf {

@@ -511,7 +511,7 @@ impl ProcessNode {
 
     /// Sends one request on the cached keep-alive connection, reconnecting
     /// once when the socket is stale (idle close) or the exchange never
-    /// left the client. A request that reached the server is never resent:
+    /// reached dispatch. A request that reached the server is never resent:
     /// admission calls are not idempotent from the caller's view.
     fn persistent_exchange(
         &mut self,
@@ -530,7 +530,13 @@ impl ProcessNode {
                         ConnFail::Error(error) => error,
                     })
             }
-            Err(ConnFail::Error(error)) => Err(error),
+            Err(ConnFail::Error(error)) => {
+                // A hard failure may leave an in-flight request on the
+                // socket: drop it so a later call cannot be pipelined or
+                // answered with the wrong response.
+                self.rpc_conn = None;
+                Err(error)
+            }
         }
     }
 
@@ -560,8 +566,6 @@ impl ProcessNode {
     /// One request/response round trip on `rpc_conn`. `Stale` marks a
     /// socket that closed or broke before the request could have been
     /// dispatched (idle close, dead peer), so re-sending once is safe.
-    /// EOF discovered after bytes were written is not `Stale`: the request
-    /// may already have been dispatched and must not be replayed.
     fn try_persistent(
         &mut self,
         wire: &[u8],
@@ -594,18 +598,26 @@ impl ProcessNode {
                 .set_read_timeout(Some(remaining()?))
                 .map_err(HarnessError::Io)
                 .map_err(ConnFail::Error)?;
-            let count = conn
-                .read_until(b'\n', &mut line)
-                .map_err(HarnessError::Io)
-                .map_err(ConnFail::Error)?;
+            let count = conn.read_until(b'\n', &mut line).map_err(|error| {
+                if head.is_empty() && is_conn_closed(&error) {
+                    ConnFail::Stale
+                } else {
+                    ConnFail::Error(HarnessError::Io(error))
+                }
+            })?;
             if count == 0 {
-                // EOF after the request left the client is ambiguous: the
-                // peer may have processed the call before closing, so the
-                // request is never resent. Idle closes on reused sockets
-                // are caught by the pre-write probe instead.
-                return Err(ConnFail::Error(HarnessError::Protocol(
-                    "connection closed before response".into(),
-                )));
+                // serve_connection writes a response before every close it
+                // initiates, so zero response bytes prove this request never
+                // reached dispatch: re-sending once is safe (a dead daemon
+                // fails the reconnect instead). Mid-headers EOF is
+                // ambiguous and is never retried.
+                return Err(if head.is_empty() {
+                    ConnFail::Stale
+                } else {
+                    ConnFail::Error(HarnessError::Protocol(
+                        "connection closed mid-headers".into(),
+                    ))
+                });
             }
             head.extend_from_slice(&line);
             if head.len() > MAX_RESPONSE {
@@ -815,8 +827,7 @@ pub(crate) fn exchange(
 
 /// Reports whether a kept-alive socket was already closed (or desynced) on
 /// the peer side. A non-blocking peek sees the close before any request
-/// bytes are sent, which makes reconnecting unambiguously safe — unlike an
-/// EOF discovered after a write, which cannot rule out a processed request.
+/// bytes are sent, which makes reconnecting unambiguously safe.
 fn conn_stale(stream: &TcpStream) -> bool {
     if stream.set_nonblocking(true).is_err() {
         return true;
@@ -829,6 +840,20 @@ fn conn_stale(stream: &TcpStream) -> bool {
         return true;
     }
     stale
+}
+
+/// Socket-close errors proving the peer tore the connection down.
+/// WouldBlock/TimedOut are absent: an alive-but-slow peer means the request
+/// may still be in flight server-side, so those stay non-retryable.
+fn is_conn_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 /// Builds one HTTP/1.1 request body wire block. `keep-alive` asks the
