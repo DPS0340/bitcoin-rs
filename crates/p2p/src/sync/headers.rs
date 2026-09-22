@@ -135,8 +135,8 @@ impl BlockSync {
     /// Requests the next header batch from the highest peer above the applied
     /// tip, using a locator taken after `drain_inbound_headers` so it reflects
     /// headers accepted this tick.
-    /// `exclude` carries the source whose probe send failed while its
-    /// cancelled session remains table-resident until asynchronous teardown.
+    /// `exclude` carries the source whose probe send failed this tick, so the
+    /// same-tick fallback cannot retry it.
     pub(super) fn request_headers_from_best_peer(&self, exclude: Option<PeerSource>) {
         let applied_tip = self.chain.applied_tip().load_full();
         let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
@@ -144,6 +144,12 @@ impl BlockSync {
         let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
         let mut header_peer: Option<(PeerSource, SyncPeer)> = None;
         for session in self.peer_table.sessions() {
+            // A session whose lease already cancelled is dead regardless of
+            // its published metadata; picking it wastes the tick on a failed
+            // send and can wedge the fetch loop.
+            if session.lease.is_cancelled() {
+                continue;
+            }
             let Some(info) = session.info.as_ref() else {
                 continue;
             };
@@ -226,10 +232,13 @@ impl BlockSync {
         let sessions = self.peer_table.sessions();
         let eligible = || {
             sessions.iter().filter(|session| {
-                session
-                    .info
-                    .as_ref()
-                    .is_some_and(|info| info.services & required == required)
+                // Same guard as the height-ranked selection: a cancelled lease
+                // is a dead send target.
+                !session.lease.is_cancelled()
+                    && session
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| info.services & required == required)
             })
         };
         // Rotate after the existing request expires, without a second queue.
@@ -323,6 +332,18 @@ impl BlockSync {
                 peer_addr = %source.addr,
                 "block sync: outbound channel disconnected"
             );
+            // The send failure means this connection is gone: evict it so the
+            // scheduler cannot re-pick a dead peer every tick. The identity
+            // check inside `disconnect_source` keeps a same-address
+            // replacement untouched, and only then is a pending request keyed
+            // to this address dropped so a fast reconnect does not inherit a
+            // stale deadline gate.
+            if self.peer_table.disconnect_source(source) {
+                let mut pending = self.pending_getheaders.lock();
+                if pending.is_some_and(|request| request.peer_addr == source.addr) {
+                    *pending = None;
+                }
+            }
             return false;
         }
         tracing::debug!(
