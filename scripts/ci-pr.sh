@@ -44,7 +44,7 @@ finish() {
 # nextest (local, pre-commit) fall back to `cargo test --no-fail-fast`.
 cargo_test() {
   if command -v cargo-nextest >/dev/null 2>&1; then
-    cargo nextest run --locked "$@"
+    cargo nextest run --locked --no-fail-fast "$@"
   else
     cargo test --locked --no-fail-fast "$@"
   fi
