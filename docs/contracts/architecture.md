@@ -260,9 +260,10 @@ composition seam.
   - `crates/rpc/Cargo.toml`: zero storage backend dependencies or features.
   - `crates/node/Cargo.toml` and `bin/bitcoin-rs/Cargo.toml`: confined
     operator-tier backend feature flags.
-- `crates/chainstate/src/lib.rs` unit tests cover admission shutdown and
-  coherent chain transaction-count publication. Checkpoint and journal tests
-  moved with their owner under `crates/chainstate/tests/unit/`.
+- `crates/chainstate/tests/unit/apply/admission_tests.rs` and
+  `crates/chainstate/tests/unit/apply/chain_tx_count_tests.rs` cover admission
+  shutdown and coherent chain transaction-count publication. Checkpoint and
+  journal tests moved with their owner under `crates/chainstate/tests/unit/`.
 - `crates/node/src/chain_effects.rs` and node mining/sync/reorg integration
   tests prove that mempool/follower work consumes committed chainstate outcomes
   without making chainstate depend on those consumers.

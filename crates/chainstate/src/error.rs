@@ -115,7 +115,7 @@ pub enum ApplyError {
     ///
     /// Fatal for the attempt, like a `UtxoCommit` refusal: the atomic batch
     /// may have applied before its durability receipt failed or was lost,
-    /// and [`StorageError`] does not classify that phase. The caller must
+    /// and [`bitcoin_rs_storage::StorageError`] does not classify that phase. The caller must
     /// reconcile through recovery instead of retrying the block.
     #[error("durable head commit: {0}")]
     DurableHeadCommit(#[source] bitcoin_rs_storage::StorageError),

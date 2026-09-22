@@ -2,7 +2,7 @@
 //!
 //! `CheckpointPublisher` owns the full-checkpoint write path shared by the
 //! clean-shutdown publication, retention-pressure compaction
-//! ([`crate::state::maintenance`]), and manual export. A checkpoint is a
+//! ([`crate::maintenance`]), and manual export. A checkpoint is a
 //! maintenance artifact, not a recovery authority (`RCV-10` in
 //! `docs/contracts/recovery.md`): the durable root and the ordered commit
 //! protocol make every committed tip recoverable, boot replays the journal
@@ -58,11 +58,11 @@ fn retire_full_revalidation_marker(data_dir: &std::path::Path) -> Result<(), Che
 }
 
 /// All the shared handles needed to publish a checkpoint from a background
-/// thread, without holding a reference to [`crate::state::NodeState`].
+/// thread without retaining the full [`crate::Chainstate`].
 ///
-/// Created once from `NodeState`'s Arc fields and moved into the worker
+/// Created once from chainstate's shared handles and moved into the worker
 /// thread. The `checkpoint_data_dir` is reopened from the data-dir path
-/// (a cheap `openat`) so the worker does not borrow from `NodeState`.
+/// (a cheap `openat`) so the worker does not borrow the service.
 pub(crate) struct CheckpointPublisher {
     pub(crate) admission: Arc<ApplyAdmission>,
     pub(crate) undo_store: Arc<dyn UndoStore>,
@@ -84,8 +84,8 @@ pub(crate) struct CheckpointPublisher {
 }
 
 impl CheckpointPublisher {
-    /// Publishes a durable checkpoint, mirroring
-    /// [`crate::state::NodeState::write_clean_checkpoint`].
+    /// Publishes the same durable checkpoint exposed by
+    /// [`crate::Chainstate::publish_checkpoint`].
     ///
     /// Both clean and periodic callers use this exact freeze → publish →
     /// compact → resume sequence.

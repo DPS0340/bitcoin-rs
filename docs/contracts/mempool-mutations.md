@@ -232,12 +232,6 @@ state (`crates/mempool/src/orphan.rs`).
   `stable_generation_reads_even_values`,
   `reconsider_disconnected_admits_in_order_once_per_candidate`,
   `reconsider_disconnected_withholds_descendants_of_a_refused_parent`.
-- `crates/node/src/chain_effects.rs`:
-  `connect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`
-  and
-  `disconnect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`
-  prove that committed chain changes run the mempool chain-change lifecycle
-  even when the pool itself has no removal/insertion.
 - `crates/node/tests/unit/sync/tests/transitions_3.rs` and
   `transitions_7.rs`: operational, permanent, and mutated-body reorg
   outcomes preserve the committed-prefix and invalidation semantics while the
@@ -293,7 +287,9 @@ state (`crates/mempool/src/orphan.rs`).
   `bip141_sigops_are_preserved_from_restored_coins_and_offered_outputs`.
 - `crates/node/src/chain_effects.rs` (inline tests):
   `connect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`,
-  `disconnect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`.
+  `disconnect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`:
+  committed chain changes run the mempool chain-change lifecycle even when the
+  pool itself has no removal/insertion.
 - `crates/node/src/tx_ingress.rs` (inline tests):
   `retry_poll_evicts_an_orphan_after_its_connection_is_gone`.
 - `crates/rpc/src/zmq.rs`:

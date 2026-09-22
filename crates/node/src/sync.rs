@@ -314,7 +314,7 @@ impl SyncChain for NodeSyncChain {
                 Err(BranchSwitchError::TransitionSettlement(Box::new(error)))
             }
             // The checkpoint settlement failed after reorg mutation.
-            Err(error @ crate::reorg::ReorgError::CheckpointSettlement(_)) => {
+            Err(error @ crate::reorg::ReorgError::CheckpointSettlement { .. }) => {
                 Err(BranchSwitchError::CheckpointSettlement(Box::new(error)))
             }
             // A target-branch body failed while connecting the branch.

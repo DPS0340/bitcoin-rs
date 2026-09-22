@@ -332,8 +332,9 @@ state is harmless and keeps the node operating until replay closes the gap.
   the real block files.
 - `crates/storage/tests/durable_head_store.rs` (existing): backend-level
   reopen, fence, and fault laws for the head store.
-- `crates/chainstate/src/recovery.rs`: owns schema admission,
-  `incompatible_schema` refusal, and `CURRENT_SCHEMA` increment logic.
+- `crates/chainstate/src/recovery.rs` orchestrates restart recovery and invokes
+  schema admission; `crates/storage/src/checkpoint/fs.rs` owns the
+  `incompatible_schema` refusal and the `CURRENT_SCHEMA` gate.
 - `crates/node/tests/crash_recovery.rs` (existing): the `RCV-04` crash
   points — SIGKILL restart across journal, reorg, and publication scenarios,
   partial-write handling, and upgrade-matrix fallback.
@@ -344,7 +345,11 @@ state is harmless and keeps the node operating until replay closes the gap.
 - Checkpoint publication and recovery:
   `crates/chainstate/tests/unit/checkpoint/tests/` covers consensus-valid active-chain
   replay, applied-ancestry selection, competing-fork rejection, and
-  immutable-generation resume; `crates/storage/src/checkpoint/tests.rs`
+  immutable-generation resume, including
+  `failed_publication_preserves_current`; `crates/node/tests/unit/lifecycle/tests.rs`
+  `shutdown_checkpoint_io_failure_is_returned_and_preserves_current` proves
+  clean-shutdown publication errors propagate through `run` without skipping
+  worker teardown; `crates/storage/src/checkpoint/tests.rs`
   covers generation publication, failpoint preservation, and
   manifest/artifact validation. This replaces the retired `overhaul_*`
   checkpoint-independence row.

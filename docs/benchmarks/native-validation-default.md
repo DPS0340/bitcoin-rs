@@ -4,13 +4,21 @@ This document is the promotion record for the native strict-Rust validation defa
 
 ## Decision it owns
 
-Whether `bitcoin-rs-consensus`, `bitcoin-rs-node`, `bin/bitcoin-rs` and the container image ship strict-Rust validation as their default. The decision is one coordinated cut across binary, library and image with matching manifests and packaging. `bitcoinkernel` remains an explicit opt-in oracle only. It is never a silent fallback and it is never the default after promotion.
+Whether `bitcoin-rs-consensus`, `bitcoin-rs-chainstate`, `bitcoin-rs-node`,
+`bin/bitcoin-rs` and the container image ship strict-Rust validation as their
+default. The decision is one coordinated cut across binary, library and image
+with matching manifests and packaging. `bitcoinkernel` remains an explicit
+opt-in oracle only. It is never a silent fallback and it is never the default
+after promotion.
 
 ## Ordering
 
 1. T16 (strict-Rust cryptography lane) must pass first. The verifier is one general BIP340 operation composed over maintained `k256 0.14.0` arithmetic and ECDSA primitives. The `k256` high-level Schnorr signature type is withdrawn because its `Signature` stores a `NonZeroScalar` and cannot represent the whole BIP340 input domain. No custom field or group arithmetic. Overflowing TapTweak is canonically rejected, never reduced. Hybrid-key parity and historical DER and high-S rules are preserved.
 2. T17 then measures the actual final strict artifact. Earlier candidate measurements, including every number in the prior-evidence section, are not promotion proof.
-3. Promotion happens in one changeset: complete the measured end-state cells below, drop `kernel` from the two library defaults, update `Dockerfile`, and prove kernel-free transitive closure in `bin/bitcoin-rs/tests/overhaul_default_closure.rs`.
+3. Promotion happens in one changeset: complete the measured end-state cells
+   below, drop `kernel` from all three validation-library defaults, update
+   `Dockerfile`, and prove kernel-free transitive closure in
+   `bin/bitcoin-rs/tests/overhaul_default_closure.rs`.
 
 ## End-state cells
 
@@ -70,7 +78,8 @@ requires every gate in the issue, not a subset.
 
 ### Decision
 
-Keep `kernel` as the `bitcoin-rs-consensus` and `bitcoin-rs-node` default,
+Keep `kernel` as the `bitcoin-rs-consensus`, `bitcoin-rs-chainstate`, and
+`bitcoin-rs-node` default,
 and in the Compose image. Leave `bin/bitcoin-rs` kernel-free. The native
 interpreter is a complete consensus script engine; it is not yet the
 measured winner. Recorded verdict: `KeepKernel`.
@@ -102,13 +111,13 @@ not flip the default.
 | Surface | Script engine |
 |---|---|
 | `bin/bitcoin-rs` default features (`fjall,redb,zmq`) | Native interpreter |
-| `bitcoin-rs-consensus` / `bitcoin-rs-node` crate defaults | `kernel` (`libbitcoinkernel`) |
+| `bitcoin-rs-consensus` / `bitcoin-rs-chainstate` / `bitcoin-rs-node` crate defaults | `kernel` (`libbitcoinkernel`) |
 | Compose image (`Dockerfile --features fjall,kernel`) | `kernel` |
 
 Until the gates pass, the library crates and the image keep `kernel`. The
 binary already builds native so a default `cargo build -p bitcoin-rs` needs
 no C++ toolchain. Promoting native is one coordinated change: drop
-`kernel` from the two library defaults in the same commit.
+`kernel` from all three validation-library defaults in the same commit.
 
 ### Measured observations
 

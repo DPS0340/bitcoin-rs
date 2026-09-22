@@ -1145,9 +1145,22 @@ impl Chainstate {
             disposition: WindowApplyDisposition::Operational,
             invalidated: Box::default(),
         })?;
-        let committed = transition.connect_window(blocks, serialized)?;
-        drop(transition);
-        Ok(committed)
+        match transition.connect_window(blocks, serialized) {
+            Ok(committed) => {
+                drop(transition);
+                Ok(committed)
+            }
+            Err(mut error) => {
+                if error.disposition == WindowApplyDisposition::Fatal
+                    || classify_apply_error(&error.source) == WindowApplyDisposition::Fatal
+                {
+                    error.disposition = WindowApplyDisposition::Fatal;
+                    self.fail_closed_for_recovery();
+                }
+                drop(transition);
+                Err(error)
+            }
+        }
     }
 
     /// See `ARCH-07` in `docs/contracts/architecture.md`.

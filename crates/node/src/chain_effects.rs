@@ -320,10 +320,34 @@ impl ChainFollowers {
     ) -> core::result::Result<ConnectOutcome, bitcoin_rs_chainstate::ApplyError> {
         let transition = handles.begin_transition()?;
         let mempool_change = self.begin_mempool_change()?;
-        let outcome = transition.connect(block)?;
-        self.committed_connect(block, &outcome);
-        Self::finish_transition(handles, transition, mempool_change)?;
-        Ok(outcome)
+        match transition.connect(block) {
+            Ok(outcome) => {
+                self.committed_connect(block, &outcome);
+                Self::finish_transition(handles, transition, mempool_change)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                if bitcoin_rs_chainstate::classify_apply_error(&error)
+                    == bitcoin_rs_chainstate::WindowApplyDisposition::Fatal
+                {
+                    handles.fail_closed_for_recovery();
+                    drop(mempool_change);
+                    drop(transition);
+                    return Err(error);
+                }
+                if let Err(settlement) =
+                    Self::finish_transition(handles, transition, mempool_change)
+                {
+                    tracing::error!(
+                        original = %error,
+                        finish = %settlement,
+                        "chain transition could not be settled after connect refusal"
+                    );
+                    return Err(settlement);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Disconnects `block` and dispatches this set before the transition ends.
@@ -340,16 +364,47 @@ impl ChainFollowers {
         let mempool_change = self
             .begin_mempool_change()
             .map_err(|error| bitcoin_rs_chainstate::DisconnectError::Refused(Box::new(error)))?;
-        let outcome = transition.disconnect(block)?;
-        self.disconnected(&outcome);
-        Self::finish_transition(handles, transition, mempool_change).map_err(|error| {
-            bitcoin_rs_chainstate::DisconnectError::Fatal {
-                hash: outcome.hash,
-                height: outcome.parent_tip.height.saturating_add(1),
-                source: Box::new(error),
+        match transition.disconnect(block) {
+            Ok(outcome) => {
+                self.disconnected(&outcome);
+                Self::finish_transition(handles, transition, mempool_change).map_err(|error| {
+                    bitcoin_rs_chainstate::DisconnectError::Fatal {
+                        hash: outcome.hash,
+                        height: outcome.parent_tip.height.saturating_add(1),
+                        source: Box::new(error),
+                    }
+                })?;
+                Ok(outcome)
             }
-        })?;
-        Ok(outcome)
+            Err(error @ bitcoin_rs_chainstate::DisconnectError::Refused(_)) => {
+                let hash = Hash256::from(block.block_hash());
+                let height = handles
+                    .applied_tip()
+                    .load_full()
+                    .map_or(0, |tip| tip.height);
+                if let Err(settlement) =
+                    Self::finish_transition(handles, transition, mempool_change)
+                {
+                    tracing::error!(
+                        original = %error,
+                        finish = %settlement,
+                        "chain transition could not be settled after disconnect refusal"
+                    );
+                    return Err(bitcoin_rs_chainstate::DisconnectError::Fatal {
+                        hash,
+                        height,
+                        source: Box::new(settlement),
+                    });
+                }
+                Err(error)
+            }
+            Err(error) => {
+                handles.fail_closed_for_recovery();
+                drop(mempool_change);
+                drop(transition);
+                Err(error)
+            }
+        }
     }
 }
 

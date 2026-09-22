@@ -182,7 +182,7 @@ const REPLAY_GAP_BLOCK_LIMIT: usize = super::window::DURABLE_HEAD_GROUP_BLOCKS;
 /// An unreadable head fails startup (`P5`: corruption inside the commit
 /// point never degrades silently). A head ahead of the restored tip names a
 /// committed-but-unpublished gap: the crash landed the batch but not the
-/// publication. [`replay_committed_gap`] walks the durable bodies down from
+/// publication. The internal replay path walks the durable bodies down from
 /// the stored tip, re-applies them through the ordinary commit path with the
 /// head suppressed, and publishes — so ordinary operation never starts on a
 /// state the head does not certify. A gap that is not an ancestor prefix of

@@ -35,6 +35,10 @@ impl<'a> NodeReorgObserver<'a> {
                 gateway.reconsider_disconnected(AdmissionOrigin::Reorg, candidates.into_entries());
         }
     }
+
+    fn discard_reconsideration(&mut self) {
+        self.candidates = None;
+    }
 }
 
 impl ReorgObserver for NodeReorgObserver<'_> {
@@ -80,7 +84,14 @@ fn settle_node_reorg(
         return outcome;
     }
 
-    observer.finish_reconsideration();
+    if outcome
+        .as_ref()
+        .is_err_and(ReorgError::reconsideration_failed)
+    {
+        observer.discard_reconsideration();
+    } else {
+        observer.finish_reconsideration();
+    }
     if let Some(change) = mempool_change
         && change.finish().is_err()
     {

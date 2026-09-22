@@ -69,6 +69,42 @@ fn clean_shutdown_publishes_checkpoint_and_returns_success() -> anyhow::Result<(
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+// CONTRACT: docs/contracts/architecture.md#ARCH-05
+fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir()?;
+    let mut config = isolated_config(&temp.path().join("node-checkpoint-failure"));
+    config.p2p.connect = vec!["127.0.0.1:1".to_owned()];
+    let state = NodeState::open(config.clone(), None)?;
+    let (current, previous) = seed_checkpoint(&state)?;
+    drop(state);
+
+    let checkpoint_root = current
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint CURRENT has no parent"))?;
+    let original_mode = std::fs::metadata(checkpoint_root)?.permissions().mode();
+    std::fs::set_permissions(checkpoint_root, std::fs::Permissions::from_mode(0o500))?;
+
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+    shutdown_tx.send(())?;
+    let result = run(config, RuntimeInputs::default().with_shutdown(shutdown_rx));
+
+    std::fs::set_permissions(
+        checkpoint_root,
+        std::fs::Permissions::from_mode(original_mode),
+    )?;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(current)?, previous);
+    assert!(
+        bootstrap_drain_was_reached(),
+        "checkpoint errors must not bypass the bootstrap-worker join"
+    );
+    Ok(())
+}
+
 #[test]
 // CONTRACT: docs/contracts/architecture.md#ARCH-05
 fn teardown_join_failure_completes_cleanup_and_suppresses_checkpoint() -> anyhow::Result<()> {

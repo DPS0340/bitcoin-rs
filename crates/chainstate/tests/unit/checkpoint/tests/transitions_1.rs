@@ -99,3 +99,41 @@ fn no_applied_tip_skips_without_changing_current() -> Result<(), Box<dyn std::er
     assert_eq!(fs::read(current_path)?, before);
     Ok(())
 }
+
+#[test]
+fn failed_publication_preserves_current() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+    let applied_tip = tip_snapshot(&tree, applied)?;
+    let tree = RwLock::new(tree);
+    let utxo = UtxoSet::new();
+    let listener = CoinStatsListener::new(CoinStats::new());
+
+    super::super::write_checkpoint(
+        dir.path(),
+        config(),
+        &tree,
+        &utxo,
+        &listener,
+        Some(&applied_tip),
+    )?;
+    let current_path = dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE);
+    let before = fs::read(&current_path)?;
+
+    super::super::inject_next_checkpoint_failpoint(
+        super::super::CheckpointFailpoint::ManifestWrite,
+    );
+    assert!(
+        super::super::write_checkpoint(
+            dir.path(),
+            config(),
+            &tree,
+            &utxo,
+            &listener,
+            Some(&applied_tip),
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(current_path)?, before);
+    Ok(())
+}

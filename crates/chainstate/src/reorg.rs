@@ -65,8 +65,8 @@ pub fn invalidate_block<O>(
 where
     O: ReorgObserver + ?Sized,
 {
-    // Validate the block exists and is not genesis before beginning a chain
-    // change. A failed validation must not leave the generation odd.
+    // Validate the block exists and is not genesis before taking mutation
+    // authority. Read-only refusal should not acquire the transition.
     {
         let tree = handles.block_tree().read();
         let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
@@ -126,16 +126,20 @@ where
             handles.chain_tip().store(Some(tip));
             handles.reevaluate_assume_valid_with(&tree);
         }
-        if !outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
-            revisit_disconnected_blocks(
-                handles,
-                observer,
-                &disconnect_nodes,
-                progress.disconnected,
-                &mut no_staged_body,
-            );
+        if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
+            outcome
+        } else {
+            attach_reconsideration(
+                outcome,
+                revisit_disconnected_blocks(
+                    handles,
+                    observer,
+                    &disconnect_nodes,
+                    progress.disconnected,
+                    &mut no_staged_body,
+                ),
+            )
         }
-        outcome
     })();
     settle_reorg_transition(transition, outcome)
 }
@@ -311,22 +315,40 @@ pub enum ReorgError {
     /// refuses rather than serving it.
     #[error("reorg left the chainstate inconsistent: {0}")]
     Fatal(#[source] Box<DisconnectError>),
-    /// The chain walk concluded, but its stable generation could not be
-    /// published. Admission is permanently closed and shutdown is requested.
-    #[error("reorg generation could not be settled: {source}")]
+    /// Node-side settlement failed after the authoritative chain walk.
+    /// Admission is permanently closed and shutdown is requested.
+    #[error("reorg transition could not be settled: {source}")]
     TransitionSettlement {
-        /// Why the reserved even generation could not be published.
+        /// Why the node-side settlement failed.
         #[source]
         source: Box<ApplyError>,
         /// Execution failure retained when settlement followed a refusal.
+        original: Option<Box<Self>>,
+    },
+    /// Re-reading disconnected bodies for node-owned reconsideration failed
+    /// after authoritative rollback had already committed.
+    #[error("post-reorg disconnected-body reconsideration failed: {source}")]
+    Reconsideration {
+        /// Body read/decode failure from the post-reorg pass.
+        #[source]
+        source: Box<Self>,
+        /// Earlier coherent execution outcome, when reconsideration followed a
+        /// clean refusal instead of a completed switch.
         original: Option<Box<Self>>,
     },
     /// A nonfatal reorg completed, but the rolled-back state could not be
     /// checkpointed. The chain is coherent at the reached tip and the
     /// disconnect marker remains `RolledBack`; a restart will refuse the data
     /// directory until a later checkpoint publishes this state.
-    #[error("disconnect left a checkpoint debt the node could not settle: {0}")]
-    CheckpointSettlement(#[source] anyhow::Error),
+    #[error("disconnect left a checkpoint debt the node could not settle: {source}")]
+    CheckpointSettlement {
+        /// Checkpoint publication failure.
+        #[source]
+        source: anyhow::Error,
+        /// Earlier coherent reorg failure retained when debt settlement also
+        /// failed.
+        original: Option<Box<Self>>,
+    },
     /// The switch needs old-branch history that pruning has already
     /// deleted. Nothing was touched: the retention lease is refused before
     /// the first mutation, and an exact-identity result is impossible
@@ -364,8 +386,27 @@ impl ReorgError {
             | Self::Unavailable(_)
             | Self::Refused { .. }
             | Self::DisconnectBodyLost { .. }
-            | Self::CheckpointSettlement(_)
+            | Self::Reconsideration { .. }
+            | Self::CheckpointSettlement { .. }
             | Self::RetentionUnavailable { .. } => false,
+        }
+    }
+
+    /// Whether node-owned disconnected-transaction reconsideration was
+    /// incomplete and any partially collected candidates must be discarded.
+    #[must_use]
+    pub fn reconsideration_failed(&self) -> bool {
+        match self {
+            Self::Reconsideration { .. } => true,
+            Self::TransitionSettlement {
+                original: Some(original),
+                ..
+            }
+            | Self::CheckpointSettlement {
+                original: Some(original),
+                ..
+            } => original.reconsideration_failed(),
+            _ => false,
         }
     }
 }
@@ -459,15 +500,20 @@ where
             &connect,
             &mut staged_body,
         );
-        if !outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
-            revisit_disconnected_blocks(
-                handles,
-                observer,
-                &disconnect_nodes,
-                progress.disconnected,
-                &mut staged_body,
-            );
-        }
+        let outcome = if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
+            outcome
+        } else {
+            attach_reconsideration(
+                outcome,
+                revisit_disconnected_blocks(
+                    handles,
+                    observer,
+                    &disconnect_nodes,
+                    progress.disconnected,
+                    &mut staged_body,
+                ),
+            )
+        };
         settle_reorg_transition(transition, outcome)?;
         if let Some((hash, height)) = missing_connect {
             return Err(ReorgError::MissingBody { hash, height });
@@ -757,7 +803,8 @@ fn revisit_disconnected_blocks<F, O>(
     disconnect_nodes: &[(Hash256, u32)],
     disconnected_count: usize,
     staged_body: &mut F,
-) where
+) -> core::result::Result<(), ReorgError>
+where
     F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
     O: ReorgObserver + ?Sized,
 {
@@ -767,10 +814,22 @@ fn revisit_disconnected_blocks<F, O>(
         .map_or(0, |tip| tip.height);
     let time = u64::from(current_unix_seconds());
     for (hash, block_height) in disconnect_nodes[..disconnected_count].iter().rev() {
-        let Ok(body) = load_branch_body(handles, *hash, *block_height, staged_body) else {
-            continue;
-        };
+        let body = load_branch_body(handles, *hash, *block_height, staged_body)?;
         observer.reconsider_disconnected(&body.block, handles.utxo(), height, time);
+    }
+    Ok(())
+}
+
+fn attach_reconsideration(
+    outcome: core::result::Result<(), ReorgError>,
+    reconsideration: core::result::Result<(), ReorgError>,
+) -> core::result::Result<(), ReorgError> {
+    match reconsideration {
+        Ok(()) => outcome,
+        Err(source) => Err(ReorgError::Reconsideration {
+            source: Box::new(source),
+            original: outcome.err().map(Box::new),
+        }),
     }
 }
 
@@ -797,14 +856,14 @@ fn current_reorg_plan(
 ///
 /// A successful chainstate-journal rewind already disarms the marker, in which
 /// case this is a no-op. Publication runs only when `RolledBack` debt remains.
-fn settle_disconnect_debt(handles: &Chainstate) -> core::result::Result<(), ReorgError> {
+fn settle_disconnect_debt(handles: &Chainstate) -> anyhow::Result<()> {
     match handles.settle_disconnect_debt() {
         Ok(true) => {
             tracing::info!("published checkpoint after branch switch");
             Ok(())
         }
         Ok(false) => Ok(()),
-        Err(error) => Err(ReorgError::CheckpointSettlement(error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -820,10 +879,12 @@ fn settle_reorg_transition(
         return outcome;
     }
     drop(transition);
-    if let Err(settlement) = settle_disconnect_debt(handles) {
-        tracing::error!(%settlement, "reorg checkpoint debt remains unsettled");
-        outcome?;
-        return Err(settlement);
+    if let Err(source) = settle_disconnect_debt(handles) {
+        tracing::error!(%source, "reorg checkpoint debt remains unsettled");
+        return Err(ReorgError::CheckpointSettlement {
+            source,
+            original: outcome.err().map(Box::new),
+        });
     }
     outcome
 }

@@ -12,7 +12,7 @@ description = "bitcoin-rs :: authoritative chainstate"
 workspace = true
 
 [features]
-default = []
+default = ["kernel"]
 kernel = ["bitcoin-rs-consensus/kernel"]
 rocksdb = [
     "bitcoin-rs-chain/rocksdb",

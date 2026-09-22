@@ -31,9 +31,15 @@ Owners:
 
 ### `EVT-02`: Ordered commit and best-effort observer delivery
 
-- The apply path runs in this order:
-  1. Node reserves the mempool chain-change generation, then chainstate holds
-     its authoritative transition reservation.
+- Before authoritative mutation, node holds both the mempool chain-change
+  generation fence and chainstate's transition reservation. Single-block,
+  window, and mining paths take the chainstate reservation first and then
+  reserve the mempool generation; reorg coordination reserves the mempool
+  generation before entering chainstate. `begin_chain_change` releases the
+  mempool writer before returning its guard, so neither ordering nests the
+  two domain locks.
+- With both fences held, the apply path runs in this order:
+  1. Begin the authoritative chainstate mutation.
   2. Build exact forward and undo facts without mutating the public stable view.
   3. Append required body and undo frames. Sync files and required directory
      entries.

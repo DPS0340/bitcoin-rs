@@ -71,11 +71,11 @@ pub struct ChainEventPublisher {
 }
 
 impl ChainEventPublisher {
-    /// Creates a publisher anchored at `initial` for one process epoch.
-    pub fn new(epoch: u64, initial: ChainSnapshot) -> Self {
+    /// Creates a publisher that continues the supplied process-epoch snapshot.
+    pub fn new(initial: ChainSnapshot) -> Self {
         Self {
-            epoch,
-            sequence: AtomicU64::new(0),
+            epoch: initial.epoch,
+            sequence: AtomicU64::new(initial.sequence),
             snapshot: RwLock::new(initial),
         }
     }
@@ -84,15 +84,12 @@ impl ChainEventPublisher {
     /// Anchors at an empty tip; records still sequence and publish normally.
     #[must_use]
     pub fn detached(epoch: u64) -> Self {
-        Self::new(
+        Self::new(ChainSnapshot {
             epoch,
-            ChainSnapshot {
-                epoch,
-                sequence: 0,
-                tip_hash: Hash256::from_le_bytes(&[0; 32]),
-                tip_height: 0,
-            },
-        )
+            sequence: 0,
+            tip_hash: Hash256::from_le_bytes(&[0; 32]),
+            tip_height: 0,
+        })
     }
 
     /// Returns the process epoch this publisher stamps events with.
@@ -238,4 +235,24 @@ pub fn initialize_data_dir(path: &std::path::Path) -> Result<u64> {
     bitcoin_rs_storage::checkpoint::fs::ensure_current_schema(&dir)
         .with_context(|| format!("validate CURRENT_SCHEMA for datadir {}", path.display()))?;
     allocate_process_epoch(&dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resumed_snapshot_continues_sequence() {
+        let publisher = ChainEventPublisher::new(ChainSnapshot {
+            epoch: 7,
+            sequence: 41,
+            tip_hash: Hash256::from_le_bytes(&[1; 32]),
+            tip_height: 10,
+        });
+
+        let event = publisher.record(HintKind::Connected, 11, Hash256::from_le_bytes(&[2; 32]));
+        assert_eq!(event.epoch, 7);
+        assert_eq!(event.sequence, 42);
+        assert_eq!(publisher.snapshot().sequence, 42);
+    }
 }
