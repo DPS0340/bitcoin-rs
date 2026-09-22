@@ -55,6 +55,10 @@ This page assigns ownership and cites proof under the
   accepted a header tip, body and hedge selection may use its handshake
   capability while header discovery is pending; after that point, the
   accepted tip must be on the active chain at or beyond the requested height.
+  Retained-tip evidence is compacted at each credit refresh: a tip that
+  resolves on the active chain at or below the recorded maximum can never
+  raise it again, so only unresolved (fork) tips and the max-resolving tip
+  are kept.
 
 ### `P2P-04`: Connected-socket posture and vectored emission
 
@@ -156,3 +160,27 @@ cancelled readiness under contention.
 `crates/p2p/src/sync/tests/witness_staging_gate.rs` covers bad delivery,
 peer replacement, relearned capability and eventual application. Existing
 branch-plan, attribution, timeout and bounded-staging suites remain required.
+
+### `P2P-06`: Body-carried announcements reach header admission
+
+- **Owner**: `InboundSyncSinks::send_block` (`crates/p2p/src/listener.rs`)
+  forwards every inbound body's embedded header through the headers sink;
+  `BlockSync::admit_staged_headers` (`crates/p2p/src/sync/receive.rs`) retries
+  admission for staged bodies still lacking a tree node.
+- A block body can never become the apply frontier's expected block while
+  the tree does not know its hash. Every delivery path — `block` messages
+  (`inv` getdata answers or unsolicited pushes), reconstructed compact
+  blocks, and `cmpctblock` announcements — routes its embedded header into
+  the same admission drain as `headers` messages, so credit (P2P-03),
+  peer-fault disconnection, and ancestry requests apply uniformly.
+- A batch that cannot attach (`MissingParent`) or cannot be admitted
+  (`Refused`) requests the header ancestry from the delivering peer — or an
+  eligible full-witness peer when no source was recorded — rather than
+  silently dropping the announcement and leaving the live tip wedged behind
+  one missed header.
+
+Proof: `crates/p2p/src/sync/tests/head_sync.rs` covers body-carried header
+admission and apply, gap-fill requests for staged bodies ahead of their
+header chain, announcer-directed `getheaders` on unattached batches, and
+credit for already-known tips. `crates/p2p/src/listener.rs` test
+`send_block_forwards_the_blocks_header` covers the delivery-path forward.

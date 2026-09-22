@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin_rs_primitives::{Block, Hash256};
+use bitcoin_rs_primitives::{Block, Hash256, Header};
 use hashbrown::{HashMap, hash_map::Entry};
 
 use crate::SyncBudget;
@@ -206,6 +206,16 @@ impl BlockStager {
     #[must_use]
     pub fn contains(&self, hash: &Hash256) -> bool {
         self.received.contains_key(hash)
+    }
+
+    /// `(hash, embedded header)` for every staged body. The sync executor
+    /// retries header admission for bodies whose headers are still absent
+    /// from the tree: a staged body can never become expected until its
+    /// header lands.
+    pub fn staged_headers(&self) -> impl Iterator<Item = (Hash256, Header)> + '_ {
+        self.received
+            .iter()
+            .map(|(hash, entry)| (*hash, entry.block.header))
     }
 
     /// Clones one staged decoded body and its original wire bytes without

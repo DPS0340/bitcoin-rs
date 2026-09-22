@@ -1,15 +1,18 @@
 //! Bounded inbound body draining and exact staged-body admission.
 
 use super::BlockSync;
+use super::chain::HeaderAdmission;
 use super::chain::SyncChainError;
 use crate::InboundBlock;
 use crate::RejectDelivery;
 use crate::StagedBlock;
 use crate::download_window::INBOUND_BLOCK_STAGE_CHUNK;
 use bitcoin_rs_chain::BlockTree;
+use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::Header;
 use std::time::Instant;
 use std::vec::Vec;
 
@@ -37,6 +40,8 @@ impl BlockSync {
         if received == 0 && self.body_sync.lock().stager.received_len() == 0 {
             return;
         }
+
+        self.admit_staged_headers();
 
         let now = Instant::now();
         let dropped = self.body_sync.lock().stager.prune_expired(now);
@@ -119,6 +124,43 @@ impl BlockSync {
             active_tip.tip_id,
         )
         .then_some(active_tip.tip_id)
+    }
+
+    /// Retries header admission for staged bodies whose headers are still
+    /// absent from the tree.
+    ///
+    /// The listener forwards every inbound body's embedded header through
+    /// the headers drain, but a refused batch or a source-less delivery
+    /// leaves the body staged without a tree node — and
+    /// `apply_buffered_blocks` only drains hashes the tree knows, so the
+    /// body would otherwise sit until its staged timeout despite being
+    /// complete. `MissingParent` keeps the body staged and asks an eligible
+    /// peer for the missing ancestry; `TimestampTooFarAhead` retries
+    /// naturally each drain and admits once the header enters the allowed
+    /// window.
+    fn admit_staged_headers(&self) {
+        let unadmitted: Vec<Header> = {
+            let tree = self.chain.block_tree().read();
+            let body_sync = self.body_sync.lock();
+            body_sync
+                .stager
+                .staged_headers()
+                .filter(|(hash, _)| tree.lookup(*hash).is_none())
+                .map(|(_, header)| header)
+                .collect()
+        };
+        let mut missing_parent = false;
+        for header in unadmitted {
+            if matches!(
+                self.chain.admit_headers(&[header]),
+                HeaderAdmission::Rejected(ChainError::MissingParent { .. })
+            ) {
+                missing_parent = true;
+            }
+        }
+        if missing_parent {
+            self.request_headers_from_eligible();
+        }
     }
 
     #[allow(clippy::too_many_lines)]

@@ -1782,3 +1782,6 @@ mod validation_1;
 mod witness_staging_gate;
 
 mod frontier_recovery;
+
+#[cfg(test)]
+mod head_sync;

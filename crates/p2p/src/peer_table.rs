@@ -132,6 +132,20 @@ impl PeerTable {
         true
     }
 
+    /// Replaces the live connection's retained-tip evidence under the same
+    /// identity check as `note_announced_tip`. Used by the credit refresh to
+    /// drop resolved tips that can no longer raise the active-chain maximum —
+    /// see P2P-03 in `docs/contracts/p2p-wire.md`.
+    pub fn set_demonstrated_tips(&self, source: PeerSource, tips: Vec<Hash256>) {
+        let mut entries = self.entries.write();
+        if let Some(entry) = entries
+            .get_mut(&source.addr)
+            .filter(|entry| entry.lease.is_current(source))
+        {
+            entry.demonstrated_tips = tips;
+        }
+    }
+
     /// Raises the active-chain credit for `source`. See P2P-03 in
     /// `docs/contracts/p2p-wire.md`.
     pub fn note_announced_height(&self, source: PeerSource, height: i32) -> bool {
