@@ -133,6 +133,7 @@ expensive for a compile-only gate):
 
 ```sh
 cargo bench -p bitcoin-rs-consensus --no-run --no-default-features --bench merkle --profile quickstart
+cargo bench -p bitcoin-rs-mining --no-run --no-default-features --bench candidate --profile quickstart
 cargo bench -p bitcoin-rs-utxo --no-run \
   --no-default-features --features fjall --bench utxo_commit --profile quickstart
 cargo bench -p bitcoin-rs-node --no-run \
