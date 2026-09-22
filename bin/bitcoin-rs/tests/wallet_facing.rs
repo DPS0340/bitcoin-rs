@@ -9,9 +9,10 @@
 
 #![allow(missing_docs)]
 
+use std::cell::RefCell;
 use std::error::Error;
 use std::io::{BufRead as _, BufReader, Read, Write as _};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -53,6 +54,7 @@ fn external_wallet_can_scan_estimate_and_broadcast() -> TestResult {
     let client = Client {
         addr: node.addr,
         logs: Arc::clone(&node.logs),
+        conn: RefCell::new(None),
     };
     let p2wpkh = p2wpkh_script();
     let address = Address::from_script(&p2wpkh, Network::Regtest)
@@ -480,6 +482,10 @@ fn locked_string(logs: &Mutex<String>) -> String {
 struct Client {
     addr: SocketAddr,
     logs: Arc<Mutex<String>>,
+    // Keep-alive HTTP connection. The node's accept loop polls on a 100ms
+    // cadence, so a fresh socket per request costs ~100ms of accept
+    // latency; reusing one connection removes that floor.
+    conn: RefCell<Option<BufReader<TcpStream>>>,
 }
 
 struct HttpResponse {
@@ -587,6 +593,9 @@ impl Client {
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// Sends one request on the cached keep-alive connection, reconnecting
+    /// once when the socket is stale. A request that reached the server is
+    /// never resent: POST /api/tx broadcast is not idempotent.
     fn exchange(
         &self,
         method: &str,
@@ -594,9 +603,45 @@ impl Client {
         authorization: Option<&str>,
         body: &[u8],
     ) -> TestResult<HttpResponse> {
-        let mut stream = TcpStream::connect_timeout(&self.addr, REQUEST_TIMEOUT)?;
-        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+        let mut slot = self.conn.borrow_mut();
+        match self.exchange_once(&mut slot, method, path, authorization, body) {
+            Ok(response) => Ok(response),
+            Err((first, retryable)) => {
+                if !retryable {
+                    return Err(first);
+                }
+                *slot = None;
+                self.exchange_once(&mut slot, method, path, authorization, body)
+                    .map_err(|(error, _)| error)
+            }
+        }
+    }
+
+    /// One request/response round trip. The error flag marks failures the
+    /// retry wrapper may resend: the socket never delivered the request
+    /// (connect refused, broken write, peer closed before any reply byte).
+    fn exchange_once(
+        &self,
+        slot: &mut Option<BufReader<TcpStream>>,
+        method: &str,
+        path: &str,
+        authorization: Option<&str>,
+        body: &[u8],
+    ) -> Result<HttpResponse, (Box<dyn Error>, bool)> {
+        if slot.is_none() {
+            let stream = TcpStream::connect_timeout(&self.addr, REQUEST_TIMEOUT)
+                .map_err(|error| (error.into(), true))?;
+            stream
+                .set_read_timeout(Some(REQUEST_TIMEOUT))
+                .map_err(|error| (error.into(), true))?;
+            stream
+                .set_write_timeout(Some(REQUEST_TIMEOUT))
+                .map_err(|error| (error.into(), true))?;
+            *slot = Some(BufReader::new(stream));
+        }
+        let reader = slot
+            .as_mut()
+            .ok_or_else(|| ("missing http connection".into(), true))?;
         let auth_line = authorization
             .map(|token| format!("Authorization: Basic {token}\r\n"))
             .unwrap_or_default();
@@ -605,16 +650,31 @@ impl Client {
         } else {
             "text/plain"
         };
+        let mut wire = Vec::new();
         write!(
-            stream,
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth_line}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            wire,
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth_line}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
             self.addr,
             body.len()
-        )?;
-        stream.write_all(body)?;
-        stream.flush()?;
-        let _ignored = stream.shutdown(Shutdown::Write);
-        read_http_response(stream)
+        )
+        .map_err(|error| (error.into(), false))?;
+        wire.extend_from_slice(body);
+        reader
+            .get_mut()
+            .write_all(&wire)
+            .map_err(|error| (error.into(), true))?;
+        reader
+            .get_mut()
+            .flush()
+            .map_err(|error| (error.into(), true))?;
+        let mut status_line = String::new();
+        let count = reader
+            .read_line(&mut status_line)
+            .map_err(|error| (error.into(), false))?;
+        if count == 0 {
+            return Err(("connection closed before response".into(), true));
+        }
+        read_http_response(reader, &status_line).map_err(|error| (error, false))
     }
 }
 
@@ -942,10 +1002,10 @@ fn encode_base64(input: &[u8]) -> String {
     out
 }
 
-fn read_http_response(stream: TcpStream) -> TestResult<HttpResponse> {
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
+fn read_http_response(
+    reader: &mut BufReader<TcpStream>,
+    status_line: &str,
+) -> TestResult<HttpResponse> {
     let status = status_line
         .split_whitespace()
         .nth(1)
