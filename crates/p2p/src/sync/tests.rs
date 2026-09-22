@@ -788,7 +788,10 @@ fn deferred_gap_recovery_fires_when_request_slot_clears() -> Result<(), Box<dyn 
     install_budget(&sync, super::default_sync_budget());
     let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-    let rx_a = connect_peer(&peers, eligible_peer(addr_a, 0));
+    // A synthetic (non-serving) peer cannot be picked by the
+    // idle-frontier probe, so any `getheaders` reaching it is the
+    // deferred recovery send itself — not an indistinguishable probe.
+    let rx_a = connect_peer(&peers, synthetic_peer(addr_a, 0));
     let _rx_b = connect_peer(&peers, eligible_peer(addr_b, 0));
     let source_a = current_source(&peers, addr_a);
     let source_b = current_source(&peers, addr_b);
@@ -802,7 +805,7 @@ fn deferred_gap_recovery_fires_when_request_slot_clears() -> Result<(), Box<dyn 
     // The gap body's recovery cannot send while the slot is occupied.
     let serialized = bytes::Bytes::from(consensus_bytes(&block2));
     inbound_blocks_tx.send(crate::InboundBlock {
-        block: block2.clone(),
+        block: block2,
         serialized,
         source: Some(source_a),
     })?;

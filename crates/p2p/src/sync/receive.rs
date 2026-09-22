@@ -472,10 +472,13 @@ impl BlockSync {
         if let Some((source, prev_hash)) = gap_source
             && !self.try_gap_recovery(source, prev_hash)
         {
-            // The tracked request slot was occupied; the gap must not
-            // silently lose its retry — a later admission pass or an
-            // accepted headers batch fires it once the slot clears.
-            *self.deferred_gap_recovery.lock() = Some((source, prev_hash));
+            // Keep the earliest outstanding gap: its staged body expires
+            // soonest, so a same-tick sibling gap queues behind it rather
+            // than displacing it and silently losing its retry.
+            let mut deferred = self.deferred_gap_recovery.lock();
+            if deferred.is_none() {
+                *deferred = Some((source, prev_hash));
+            }
         }
         // Bodies staged before their headers landed (an earlier chunk's
         // refused or re-delivered admission) would otherwise keep the
