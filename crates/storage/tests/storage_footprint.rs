@@ -2,7 +2,10 @@
 
 #![cfg(unix)]
 
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(target_os = "macos"))]
+use std::fs::OpenOptions;
+#[cfg(not(target_os = "macos"))]
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::symlink;
 
@@ -65,6 +68,10 @@ fn logical_store_owners_cover_every_column_family() {
     );
 }
 
+// APFS has no hole punching for plain writes: a seek-gap allocates the
+// whole range, so the sparse-file premise only holds on filesystems that
+// actually create holes (Linux tmpfs/ext4, BSDs).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn physical_ledger_uses_allocated_blocks_not_apparent_length() {
     let dir = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
@@ -254,18 +261,13 @@ fn logical_flat_files_count_complete_frames_only() {
 }
 
 fn mkfifo(dir: &std::path::Path, name: &str) {
-    let dirfd = rustix::fs::open(
-        dir,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .unwrap_or_else(|error| panic!("open: {error}"));
-    rustix::fs::mkfifoat(
-        &dirfd,
-        name,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-    )
-    .unwrap_or_else(|error| panic!("mkfifoat: {error}"));
+    // `mknodat`/`mkfifoat` have no libc implementation on macOS, so the
+    // portable unix path is the POSIX `mkfifo` utility.
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join(name))
+        .status()
+        .unwrap_or_else(|error| panic!("mkfifo: {error}"));
+    assert!(status.success(), "mkfifo failed: {status}");
 }
 
 #[test]

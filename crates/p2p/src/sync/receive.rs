@@ -246,12 +246,31 @@ impl BlockSync {
                 (hash, source_peer, staged)
             })
             .collect();
+
+        // Resolve heights the window cannot see: an untracked delivery (inv
+        // announcement, cold-front hedge) enters `received` at height 0, and
+        // `mark_received_from` reports `needs_height_lookup` for exactly those
+        // entries so this pass can pin the tree height. A hash not yet in the
+        // tree stays 0 until the prune path's own re-evaluation.
+        let staged_blocks: Vec<_> = {
+            let tree = self.chain.block_tree().read();
+            staged_blocks
+                .into_iter()
+                .map(|(hash, source_peer, staged)| {
+                    let known_height = tree
+                        .lookup(hash)
+                        .and_then(|node_id| tree.node(node_id).ok())
+                        .map(|node| node.height);
+                    (hash, source_peer, staged, known_height)
+                })
+                .collect()
+        };
         let mut retry_count = 0_u64;
         let staged_count = staged_blocks.len() + reject_deliveries.len();
         {
             let mut body_sync = self.body_sync.lock();
             let window = &mut body_sync.window;
-            for (hash, source_peer, staged) in staged_blocks {
+            for (hash, source_peer, staged, known_height) in staged_blocks {
                 match staged {
                     StagedBlock::AlreadyStaged => {
                         metrics::counter!("node.sync.duplicate_deliveries").increment(1);
@@ -260,7 +279,11 @@ impl BlockSync {
                         }
                     }
                     StagedBlock::Memory { bytes, dropped } => {
-                        window.mark_received_from(hash, bytes, source_peer, now);
+                        let needs_height_lookup =
+                            window.mark_received_from(hash, bytes, source_peer, now);
+                        if needs_height_lookup && let Some(height) = known_height {
+                            window.update_received_height(&hash, height);
+                        }
                         for dropped in dropped {
                             window.drop_received_for_retry(&dropped.hash);
                             retry_count = retry_count.saturating_add(1);

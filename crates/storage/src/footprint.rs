@@ -331,7 +331,19 @@ pub fn opened_fd_path(fd: BorrowedFd<'_>) -> std::path::PathBuf {
     {
         std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // `/dev/fd/N` dup-opens the descriptor itself but cannot be
+        // descended into — `F_GETPATH` returns the real path, the same
+        // resolved path `/proc/self/fd/N` yields on Linux.
+        rfs::getpath(fd).map_or_else(
+            |_| std::path::PathBuf::from(format!("/dev/fd/{}", fd.as_raw_fd())),
+            |path| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path.as_bytes())),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     {
         std::path::PathBuf::from(format!("/dev/fd/{}", fd.as_raw_fd()))
     }
@@ -418,8 +430,8 @@ struct InodeSnapshot {
 impl InodeSnapshot {
     fn from_stat(stat: &Stat) -> Self {
         Self {
-            dev: stat.st_dev,
-            ino: stat.st_ino,
+            dev: u64_from_stat(stat.st_dev),
+            ino: u64_from_stat(stat.st_ino),
             nlink: u64_from_stat(stat.st_nlink),
             blocks: u64_from_stat(stat.st_blocks),
             size: u64_from_stat(stat.st_size),
