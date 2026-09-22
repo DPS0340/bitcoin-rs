@@ -92,7 +92,7 @@ nonzero-status propagation; they are not stable public status-code assignments.
   license, per-target mapping, and refresh rule.
 - `scripts/tests/test_import_qa_assets_provenance.py`: `QAC-03` acquisition,
   minimization, cleanup, mode, and failure-atomic provenance publication.
-- `bin/bitcoin-rs/tests/overhaul_reference_set.rs` (planned): G0 pin; rejects
+- `bin/bitcoin-rs/tests/overhaul_reference_set.rs`: G0 pin; rejects
   a QA corpus with a missing or mismatched upstream commit.
 - `crates/consensus/tests/overhaul_consensus_matrix.rs` (planned): G5 arm;
   counts and classifies invalid corpora with fixed skip reasons.

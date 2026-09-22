@@ -120,7 +120,7 @@ rejection). Daemon `run()` exposes teardown failures as `anyhow` errors.
 - `crates/node/tests/embed.rs::dropped_node_releases_services_and_datadir_for_reopen`
   and `startup_failure_after_state_open_rolls_back_releases_state` exercise
   abandoned-run cleanup and startup rollback.
-- `crates/node/src/lifecycle/tests.rs` contains checkpoint failure,
+- `crates/node/tests/unit/lifecycle/tests.rs` contains checkpoint failure,
   worker join failure, daemon/embedded identity, repeated teardown, rollback,
   queued-wake, and owned-startup-result regressions.
 - `crates/node/src/embed.rs::tests::broadcast_publishes_one_ordered_a_event_through_the_shared_gateway`

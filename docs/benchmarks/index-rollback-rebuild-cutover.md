@@ -16,7 +16,7 @@ Reorg handling finds the common ancestor by hash. Within the cutover depth it re
 |---|---|---|---|
 | `t_fw` and `t_rb` per-block medians per capability on target schema, fjall | `crates/index/src/runtime.rs` | bounded fjall fixture with per-commit coherent fence recapture, at least three runs | `planned_not_executed` |
 | Derived cutover and spread | same | medians of medians, spread recorded | `planned_not_executed` |
-| Routing regression: depth at or below cutover rewinds, above rebuilds; `cutover = 0` rebuilds everything; `u32::MAX` rewinds at any depth | `crates/node/tests/overhaul_index_owner.rs` and retained recovery tests | small fork fixtures | `planned_not_executed` |
+| Routing regression: depth at or below cutover rewinds, above rebuilds; `cutover = 0` rebuilds everything; `u32::MAX` rewinds at any depth | `crates/index/src/runtime/recovery_tests.rs` and retained recovery tests | small fork fixtures | `planned_not_executed` |
 
 The behavioral requirement is unchanged: the #208 incident shape (834k-block stale branch) routes to rebuild while organic reorgs of roughly 100 blocks or fewer rewind. Any value in `[1_000, 100_000]` satisfies it; the measured ratio picks the value.
 

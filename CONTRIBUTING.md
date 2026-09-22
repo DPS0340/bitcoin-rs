@@ -213,19 +213,6 @@ scripts/check-feature-matrix.sh        # every row (needs cmake/libboost for ker
 scripts/check-feature-matrix.sh pure   # fjall/redb/zmq only
 ```
 
-### Bitcoin Core differential
-
-Live observable-behavior check against a pinned Core 31.1 `bitcoind`
-(`docs/contracts/core-differential.md`):
-
-```sh
-scripts/run-p2p-core-interop.sh \
-  --bitcoind-command "$(scripts/install-bitcoind.sh)" \
-  --bitcoin-rs-command target/quickstart/bitcoin-rs
-```
-
-## Architecture and crate hierarchy
-
 ## Architecture and contribution scope
 
 Read [AGENTS.md](AGENTS.md), the relevant issue or PR, and the owning
