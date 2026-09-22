@@ -1608,30 +1608,14 @@ mod tests {
         );
     }
 
-    /// Pins the cost this change exists to remove.
-    ///
     /// One `BlockRecord` is held per applied block for the life of the process
-    /// and nothing removes one, so the record's own footprint *is* the cost.
-    ///
-    /// The field was 104 bytes inline plus a 160-byte heap `String` of hex —
-    /// 264 bytes and an allocation per block. Storing the raw header inline took
-    /// that to 168 with no allocation. Not storing it at all takes it to **64**:
-    /// a further **24 bytes per block**, about **23.1 MiB** at a mainnet-sized
-    /// chain, on top of the 73.5 MiB the boxed header saved.
-    ///
-    /// The boxing is what buys those 80 bytes and is easy to undo by accident.
-    /// An `Option<[u8; 80]>` costs its full width in every record even when it
-    /// is `None`, so emptying the log's records would have saved nothing at all.
-    /// This test is here so that reverting the box fails loudly.
+    /// and nothing removes one. The record's own footprint is gated at compile
+    /// time beside the type (`crates/index/src/block_log.rs`); this checks the
+    /// other half of the same contract — no constructor may stuff a header in.
     #[test]
-    fn a_record_costs_64_bytes_and_carries_no_header() {
+    fn constructed_records_carry_no_header() {
         let block = Network::Regtest.genesis_block();
 
-        assert_eq!(
-            core::mem::size_of::<BlockRecord>(),
-            64,
-            "BlockRecord footprint changed; re-measure the per-block saving"
-        );
         for record in [
             BlockRecord::from_block(0, &block),
             BlockRecord::synthetic(0, BlockHash::default()),

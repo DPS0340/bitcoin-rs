@@ -179,6 +179,13 @@ pub struct UtxoRecord {
     buf: ThinRecordBuf,
 }
 
+/// The whole point of the compact owner: a record never costs more than one
+/// pointer. This fails at compile time rather than in a runtime test.
+const _: () = assert!(
+    core::mem::size_of::<UtxoRecord>() == core::mem::size_of::<usize>(),
+    "UtxoRecord must stay one pointer wide"
+);
+
 /// Fixed 8-byte prefix stored at the front of every [`ThinRecordBuf`]
 /// allocation: the immutable capacity and the current live length, both counted
 /// in payload bytes. `#[repr(C)]` fixes the field order and size so the exact
@@ -1448,18 +1455,6 @@ mod tests {
         assert_eq!(output.script_pubkey, script.as_slice());
         assert_eq!(record.output_count(), 1);
         Ok(())
-    }
-
-    #[test]
-    fn compact_owner_is_one_pointer() {
-        assert_eq!(
-            core::mem::size_of::<UtxoRecord>(),
-            core::mem::size_of::<usize>()
-        );
-        assert_eq!(
-            core::mem::size_of::<UtxoRecord>(),
-            core::mem::size_of::<core::ptr::NonNull<u8>>()
-        );
     }
 
     #[test]
