@@ -128,13 +128,14 @@ that height. No Cmodern cell may close on a guessed or recalled UTXO total.
   (`python3 tools/campaign-corpus/test_corpus.py`) pins both identities, the
   eleven specials, C150 census zeros, Cmodern all-positive specials, Core
   framing, manifest digest binding, and `assume_valid_height = 0`.
-- `bin/bitcoin-rs/tests/overhaul_reference_set.rs` (planned): G0 pin; rejects
-  a corpus with a mismatched stop hash or missing chain-state oracle.
+- `bin/bitcoin-rs/tests/overhaul_reference_set.rs`: G0 pin; rejects
+  label-only, malformed, and well-formed-but-unbound identities, checks
+  kernel package custody, and pins `corpus_custody()` honesty.
 - `crates/consensus/tests/overhaul_consensus_matrix.rs` (planned): G5 replay
   arm; covers every active and inactive consensus boundary with invalid
   corpora counted and classified.
-- `crates/consensus/tests/overhaul_parse_parity.rs` (planned): G3 parse parity
-  over the product corpora, including txids, wtxids, weight, positions, and
+- `crates/consensus/tests/overhaul_parse_parity.rs`: G3 parse parity
+  over the golden fixtures, including txids, wtxids, weight, positions, and
   Merkle mutation flags.
 - Export: `python3 tools/campaign-corpus/corpus.py export --rest-url HOST:PORT --corpus-id C150|Cmodern --archive blocks.dat --manifest manifest.json`
 - Convert: `python3 tools/campaign-corpus/corpus.py convert --length-prefixed FILE --corpus-id C150 --archive blocks.dat --manifest manifest.json`

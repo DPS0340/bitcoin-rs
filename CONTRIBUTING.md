@@ -25,6 +25,7 @@ From the repository root, install and select stable:
 rustup toolchain install stable --component rustfmt --component clippy
 rustup override set stable
 cargo install --locked cargo-deny
+cargo install --locked cargo-nextest --version 0.9.143  # optional: speeds the test lanes up; ci-pr.sh falls back to cargo test
 ```
 
 [`rust-toolchain.toml`](rust-toolchain.toml), CI, pre-commit hooks, and the
@@ -212,19 +213,6 @@ The supported combinations are the rows in
 scripts/check-feature-matrix.sh        # every row (needs cmake/libboost for kernel)
 scripts/check-feature-matrix.sh pure   # fjall/redb/zmq only
 ```
-
-### Bitcoin Core differential
-
-Live observable-behavior check against a pinned Core 31.1 `bitcoind`
-(`docs/contracts/core-differential.md`):
-
-```sh
-scripts/run-p2p-core-interop.sh \
-  --bitcoind-command "$(scripts/install-bitcoind.sh)" \
-  --bitcoin-rs-command target/quickstart/bitcoin-rs
-```
-
-## Architecture and crate hierarchy
 
 ## Architecture and contribution scope
 

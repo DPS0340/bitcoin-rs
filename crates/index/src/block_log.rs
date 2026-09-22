@@ -51,6 +51,27 @@ pub struct BlockRecord {
     pub time: u32,
 }
 
+/// Compile-time gate for the per-block record cost documented on
+/// [`BlockRecord::header`]: the field was 104 bytes inline plus a 160-byte
+/// heap `String` of hex — 264 bytes and an allocation per block. Storing the
+/// raw header inline took that to 168 with no allocation. Not storing it at
+/// all takes it to **64**: a further **24 bytes per block**, about
+/// **22 MiB** at a mainnet-sized chain, on top of the 73.5 MiB the boxed
+/// header saved. The boxing is what buys those 80 bytes and is easy to undo
+/// by accident, so reverting it fails here at compile time rather than in a
+/// runtime test. The 64-byte figure is the 64-bit layout; `usize` fields make
+/// narrower targets smaller still, so the figure is an upper bound, not a
+/// floor.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    core::mem::size_of::<BlockRecord>() == 64,
+    "BlockRecord footprint changed; re-measure the per-block saving"
+);
+const _: () = assert!(
+    core::mem::size_of::<BlockRecord>() <= 64,
+    "BlockRecord grew past the 64-byte bound; re-measure the per-block saving"
+);
+
 /// The node's block-record log, with the two whole-log sums kept as it changes.
 ///
 /// The log holds one record per applied block and grows for the life of the

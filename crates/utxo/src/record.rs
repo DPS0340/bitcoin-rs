@@ -179,6 +179,13 @@ pub struct UtxoRecord {
     buf: ThinRecordBuf,
 }
 
+/// The whole point of the compact owner: a record never costs more than one
+/// pointer. This fails at compile time rather than in a runtime test.
+const _: () = assert!(
+    core::mem::size_of::<UtxoRecord>() == core::mem::size_of::<usize>(),
+    "UtxoRecord must stay one pointer wide"
+);
+
 /// Fixed 8-byte prefix stored at the front of every [`ThinRecordBuf`]
 /// allocation: the immutable capacity and the current live length, both counted
 /// in payload bytes. `#[repr(C)]` fixes the field order and size so the exact
@@ -1451,18 +1458,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_owner_is_one_pointer() {
-        assert_eq!(
-            core::mem::size_of::<UtxoRecord>(),
-            core::mem::size_of::<usize>()
-        );
-        assert_eq!(
-            core::mem::size_of::<UtxoRecord>(),
-            core::mem::size_of::<core::ptr::NonNull<u8>>()
-        );
-    }
-
-    #[test]
     fn codec_keeps_canonical_metadata_and_zero_copy_script() -> Result<(), UtxoError> {
         let record = UtxoRecord::from_owned_outputs(
             Hash256::default(),
@@ -1757,6 +1752,452 @@ mod tests {
         let mut writer = RecordWriter::new(&mut buf);
         writer.push(&[1, 2])?;
         assert!(matches!(writer.push(&[3]), Err(UtxoError::CorruptRecord)));
+        Ok(())
+    }
+
+    // --- violation tests: inputs ---
+
+    /// A zero or over-wide nibble in the widths byte names a directory that
+    /// cannot be fixed-width-addressed; the decoder must refuse it rather
+    /// than index into it.
+    #[test]
+    fn widths_byte_outside_the_valid_range_is_rejected() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(Hash256::default(), &[output(0, &[0x51], 1)])?;
+        let encoded = record.buf.as_bytes();
+        for widths in [0x00_u8, 0x05, 0x50, 0xff] {
+            let mut mutant = encoded.to_vec();
+            *mutant
+                .get_mut(WIDTHS_OFFSET)
+                .ok_or(UtxoError::CorruptRecord)? = widths;
+            assert!(
+                matches!(
+                    UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&mutant)?),
+                    Err(UtxoError::CorruptRecord)
+                ),
+                "widths byte {widths:#04x} was accepted"
+            );
+        }
+        Ok(())
+    }
+
+    /// `inline_len` prefixes the inline partition; it can never exceed the
+    /// partition capacity or the output count it describes.
+    #[test]
+    fn inline_len_past_capacity_or_count_is_rejected() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(Hash256::default(), &[output(0, &[0x51], 1)])?;
+        let encoded = record.buf.as_bytes();
+        for (inline_len, label) in [
+            (2_u8, "inline_len above output_count"),
+            (9, "inline_len above INLINE_CAPACITY"),
+        ] {
+            let mut mutant = encoded.to_vec();
+            *mutant
+                .get_mut(INLINE_LEN_OFFSET)
+                .ok_or(UtxoError::CorruptRecord)? = inline_len;
+            assert!(
+                matches!(
+                    UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&mutant)?),
+                    Err(UtxoError::CorruptRecord)
+                ),
+                "{label} was accepted"
+            );
+        }
+        Ok(())
+    }
+
+    /// A length-directory entry may claim a payload that overruns the buffer;
+    /// the decoder must refuse instead of walking past the end.
+    #[test]
+    fn an_interior_payload_length_lie_is_rejected() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[output(0, &[0x51], 1), output(1, &[0x52, 0xac], 2)],
+        )?;
+        let layout = record.layout()?;
+        let mut mutant = record.buf.as_bytes().to_vec();
+        *mutant
+            .get_mut(layout.len_dir)
+            .ok_or(UtxoError::CorruptRecord)? = 0xf0;
+        assert!(matches!(
+            UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&mutant)?),
+            Err(UtxoError::CorruptRecord)
+        ));
+        Ok(())
+    }
+
+    /// Oversized capacities must fail inside `layout_and_cap` — before any
+    /// allocator call, or the test would be asking for petabytes.
+    #[test]
+    fn capacity_past_u32_or_the_isize_bound_is_rejected_before_allocating() {
+        let over_u32_max = usize::try_from(u32::MAX)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        for cap in [over_u32_max, usize::MAX] {
+            assert!(
+                matches!(
+                    ThinRecordBuf::with_capacity(cap),
+                    Err(UtxoError::RecordTooLarge { .. })
+                ),
+                "capacity {cap} was accepted"
+            );
+        }
+        let empty = ThinRecordBuf::with_capacity(0)
+            .unwrap_or_else(|error| panic!("a zero-capacity buffer is legal: {error:?}"));
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.capacity(), 0);
+    }
+
+    /// A record with no outputs is a real encoding (a fully-spent
+    /// transaction); every accessor on it must stay empty-shaped.
+    #[test]
+    fn an_outputless_record_decodes_and_reports_empty() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(Hash256::default(), &[])?;
+        assert!(record.is_empty());
+        assert_eq!(record.output_count(), 0);
+        assert_eq!(record.max_vout(), None);
+        assert!(record.find_output(0).is_none());
+        assert_eq!(record.outputs().len(), 0);
+        let decoded = UtxoRecord::from_encoded(ThinRecordBuf::from_slice(record.buf.as_bytes())?)?;
+        assert_eq!(decoded, record);
+        // Removing nothing from nothing is an exact cover of an empty set.
+        assert!(matches!(
+            record.remove_replacement(&[])?,
+            RemovedRecord::Emptied
+        ));
+        assert_eq!(record.full_removals_by_vout(&[]), Some(Vec::new()));
+        Ok(())
+    }
+
+    /// The exact-cover test is a length guard plus a per-vout lookup, so an
+    /// empty request on a live record is *unchanged*, not emptied.
+    #[test]
+    fn removing_nothing_from_a_live_record_is_unchanged_not_emptied() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[output(0, &[0x51], 1), output(1, &[0x52], 2)],
+        )?;
+        assert!(matches!(
+            record.remove_replacement(&[])?,
+            RemovedRecord::Unchanged
+        ));
+        assert!(matches!(
+            record.remove_replacement(&[9])?,
+            RemovedRecord::Unchanged
+        ));
+        Ok(())
+    }
+
+    // --- violation tests: ordering ---
+
+    /// `full_removals_by_vout` answers in request order, not record order —
+    /// listener consumers replay the request's ordering.
+    #[test]
+    fn full_removal_materializes_outputs_in_request_order() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[
+                output(0, &[0x10], 10),
+                output(1, &[0x11], 11),
+                output(2, &[0x12], 12),
+            ],
+        )?;
+        let removed = record
+            .full_removals_by_vout(&[2, 0, 1])
+            .ok_or(UtxoError::CorruptRecord)?;
+        assert_eq!(
+            removed.iter().map(|out| out.vout).collect::<Vec<_>>(),
+            vec![2, 0, 1]
+        );
+        assert_eq!(removed[0].value, 12);
+        assert_eq!(removed[1].value, 10);
+        assert_eq!(removed[2].value, 11);
+        Ok(())
+    }
+
+    /// A duplicated vout in a removal request is not an exact cover: the
+    /// second occurrence must find nothing, not remove the same slot twice.
+    #[test]
+    fn a_duplicate_vout_in_a_removal_request_degrades_to_partial() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[
+                output(0, &[0x51], 1),
+                output(1, &[0x52], 2),
+                output(2, &[0x53], 3),
+            ],
+        )?;
+        match record.remove_replacement(&[0, 0, 1])? {
+            RemovedRecord::Replaced(replacement) => {
+                assert_eq!(replacement.output_count(), 1);
+                assert!(replacement.find_output(2).is_some());
+            }
+            _ => panic!("a duplicate request must not empty the record"),
+        }
+        let (replacement, removed) = record.stage_remove_run(&[0, 0])?;
+        assert_eq!(
+            removed
+                .iter()
+                .map(|out| out.as_ref().map(|out| out.vout))
+                .collect::<Vec<_>>(),
+            vec![Some(0), None],
+            "the duplicate request keeps its request-order slot as None"
+        );
+        assert!(replacement.is_some());
+        Ok(())
+    }
+
+    /// Exact-cover materialization and removal differ on purpose: absent vouts
+    /// are no-ops for the record but must never materialize phantom removals.
+    #[test]
+    fn full_removal_requires_an_exact_cover_of_live_vouts() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[
+                output(0, &[0x51], 1),
+                output(1, &[0x52], 2),
+                output(2, &[0x53], 3),
+            ],
+        )?;
+        for vouts in [&[0_u32, 1, 9][..], &[0, 1, 2, 9][..], &[0, 1][..]] {
+            assert_eq!(
+                record.full_removals_by_vout(vouts),
+                None,
+                "non-exact cover {vouts:?} must not materialize removals"
+            );
+        }
+        assert!(matches!(
+            record.remove_replacement(&[0, 1, 9])?,
+            RemovedRecord::Replaced(_)
+        ));
+        // An absent vout alongside every live one is still a full spend: the
+        // absent request is a no-op and the record empties.
+        assert!(matches!(
+            record.remove_replacement(&[0, 1, 2, 9])?,
+            RemovedRecord::Emptied
+        ));
+        Ok(())
+    }
+
+    /// The unique-add fast path is chosen against the pre-removal maximum;
+    /// removing the max and then adding below it must take the rebuild path,
+    /// not an append that would silently misorder the record.
+    #[test]
+    fn edit_scores_uniqueness_against_the_pre_removal_max() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[output(0, &[0x50], 5), output(5, &[0x55], 55)],
+        )?;
+        let additions = [OutputParts::new(3, 33, &[0x33], false, 1)];
+        match record.edit_replacement(&[5], &additions)? {
+            RemovedRecord::Replaced(replacement) => {
+                assert_eq!(
+                    replacement
+                        .outputs()
+                        .map(|out| out.vout)
+                        .collect::<Vec<_>>(),
+                    vec![0, 3]
+                );
+                assert_eq!(replacement.find_output(3).map(|out| out.value), Some(33));
+            }
+            _ => panic!("a partial edit must produce a replacement"),
+        }
+        Ok(())
+    }
+
+    /// A remove-then-add where every live vout is removed rebuilds from the
+    /// additions alone; no survivor may leak through.
+    #[test]
+    fn edit_past_full_removal_rebuilds_from_additions_only() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[output(0, &[0x50], 5), output(1, &[0x51], 6)],
+        )?;
+        let additions = [OutputParts::new(4, 44, &[0x44], true, 9)];
+        match record.edit_replacement(&[0, 1], &additions)? {
+            RemovedRecord::Replaced(replacement) => {
+                assert_eq!(replacement.output_count(), 1);
+                let four = replacement.find_output(4).ok_or(UtxoError::CorruptRecord)?;
+                assert_eq!(four.value, 44);
+                assert!(four.coinbase);
+                assert!(replacement.find_output(0).is_none());
+                assert!(replacement.find_output(1).is_none());
+            }
+            _ => panic!("a full-removal edit with additions must be Replaced"),
+        }
+        Ok(())
+    }
+
+    /// Removing and re-adding the same vout in one edit run is not a no-op:
+    /// the surviving output carries the *new* payload.
+    #[test]
+    fn edit_readds_a_removed_vout_with_the_new_payload() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[output(0, &[0x50], 5), output(1, &[0x51], 6)],
+        )?;
+        let additions = [OutputParts::new(1, 66, &[0x66, 0xac], false, 2)];
+        match record.edit_replacement(&[1], &additions)? {
+            RemovedRecord::Replaced(replacement) => {
+                let one = replacement.find_output(1).ok_or(UtxoError::CorruptRecord)?;
+                assert_eq!(one.value, 66);
+                assert_eq!(one.script_pubkey, &[0x66, 0xac]);
+            }
+            _ => panic!("a remove-then-add edit must produce a replacement"),
+        }
+        Ok(())
+    }
+
+    /// `edit_replacement` with an empty remove list must agree byte-for-byte
+    /// with a plain add — the fused path cannot drift from the staged one.
+    #[test]
+    fn edit_with_no_removals_is_byte_equal_to_a_plain_add() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[output(0, &[0x50], 5), output(1, &[0x51], 6)],
+        )?;
+        let additions = [OutputParts::new(7, 77, &[0x77], false, 3)];
+        let edited = match record.edit_replacement(&[], &additions)? {
+            RemovedRecord::Replaced(record) => record,
+            _ => panic!("an add-only edit must produce a replacement"),
+        };
+        assert_eq!(edited, record.add_replacement(&additions, false)?);
+        Ok(())
+    }
+
+    /// Removing an inline output leaves `inline_len` below both the count and
+    /// the partition capacity, where appends would have to rewrite the
+    /// partition; the run must fall back to a rebuild and stay correct.
+    #[test]
+    fn add_with_an_unsaturated_inline_partition_falls_back_to_rebuild() -> Result<(), UtxoError> {
+        let nine: Vec<OwnedUtxoOut> = (0..9)
+            .map(|vout| output(vout, &[0x51], u64::from(vout)))
+            .collect();
+        let record = UtxoRecord::from_owned_outputs(Hash256::default(), &nine)?;
+        let shrunk = match record.remove_replacement(&[0])? {
+            RemovedRecord::Replaced(record) => record,
+            _ => panic!("a partial removal must produce a replacement"),
+        };
+        assert_eq!(shrunk.output_count(), 8);
+        assert_eq!(shrunk.header().inline_len, 7);
+        let grown = shrunk.add_replacement(&[OutputParts::new(9, 99, &[0x59], false, 2)], true)?;
+        assert_eq!(grown.output_count(), 9);
+        for vout in 1..=9 {
+            assert!(grown.find_output(vout).is_some(), "vout {vout} was lost");
+        }
+        assert!(grown.find_output(0).is_none());
+        Ok(())
+    }
+
+    /// The fast-path guard itself: equal or decreasing vouts fail, strictly
+    /// increasing runs after any seed pass.
+    #[test]
+    fn the_unique_add_guard_rejects_equal_and_decreasing_vouts() {
+        let part = |vout: u32| OutputParts::new(vout, 1, &[0x51], false, 1);
+        assert!(additions_are_strictly_increasing(None, &[part(0)]));
+        assert!(additions_are_strictly_increasing(
+            Some(0),
+            &[part(1), part(2)]
+        ));
+        assert!(additions_are_strictly_increasing(Some(9), &[]));
+        assert!(!additions_are_strictly_increasing(Some(2), &[part(2)]));
+        assert!(!additions_are_strictly_increasing(
+            None,
+            &[part(3), part(3)]
+        ));
+        assert!(!additions_are_strictly_increasing(
+            None,
+            &[part(3), part(1)]
+        ));
+    }
+
+    // --- violation tests: state ---
+
+    /// The `Send`/`Sync` impls on the raw-pointer buffer claim a `UtxoRecord`
+    /// behaves like `Box<[u8]>`: the sole owner may cross a thread boundary.
+    #[test]
+    fn a_record_moved_across_threads_stays_decodable() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[output(0, &[0x51], 1), output(3, &[0x53], 3)],
+        )?;
+        let txid = record.txid();
+        let record = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert_eq!(record.output_count(), 2);
+                    assert!(record.find_output(3).is_some());
+                    record
+                })
+                .join()
+                .unwrap_or_else(|_| panic!("record moved across threads must not panic"))
+        });
+        assert_eq!(record.txid(), txid);
+        Ok(())
+    }
+
+    /// The staged path materializes `None` holes for absent vouts in request
+    /// order and returns `Some(empty)` — not `None` — when the run spends the
+    /// whole record, which is the delete signal the shard layer reads.
+    #[test]
+    fn staged_removal_marks_absent_vouts_and_signals_delete_as_empty() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[output(0, &[0x50], 5), output(1, &[0x51], 6)],
+        )?;
+        let (replacement, removed) = record.stage_remove_run(&[0, 9])?;
+        assert_eq!(
+            removed
+                .iter()
+                .map(|out| out.as_ref().map(|out| out.vout))
+                .collect::<Vec<_>>(),
+            vec![Some(0), None]
+        );
+        let replacement = replacement.ok_or(UtxoError::CorruptRecord)?;
+        assert_eq!(replacement.output_count(), 1);
+        assert!(replacement.find_output(1).is_some());
+
+        let (replacement, removed) = record.stage_remove_run(&[9, 8])?;
+        assert!(replacement.is_none());
+        assert!(removed.iter().all(Option::is_none));
+
+        let (replacement, removed) = record.stage_remove_run(&[0, 1])?;
+        let emptied = replacement.ok_or(UtxoError::CorruptRecord)?;
+        assert!(emptied.is_empty());
+        assert!(removed.iter().all(Option::is_some));
+        Ok(())
+    }
+
+    /// The inline/overflow partition boundary at `INLINE_CAPACITY` = 8:
+    /// counts N-1, N, N+1 must each encode, decode, iterate exactly `count`
+    /// entries, and find the first/last/absent boundary vouts.
+    #[test]
+    fn records_at_the_inline_partition_boundary_iterate_exactly() -> Result<(), UtxoError> {
+        for count in [7_u32, 8, 9] {
+            let outputs: Vec<OwnedUtxoOut> = (0..count)
+                .map(|vout| {
+                    output(
+                        vout,
+                        &[0x51, u8::try_from(vout).unwrap_or(0)],
+                        u64::from(vout) * 10,
+                    )
+                })
+                .collect();
+            let record = UtxoRecord::from_owned_outputs(Hash256::default(), &outputs)?;
+            assert_eq!(record.output_count(), usize::try_from(count).unwrap_or(0));
+            let mut iter = record.outputs();
+            assert_eq!(iter.len(), usize::try_from(count).unwrap_or(0));
+            let decoded: Vec<u32> = iter.by_ref().map(|out| out.vout).collect();
+            assert_eq!(decoded, (0..count).collect::<Vec<u32>>());
+            assert_eq!(iter.len(), 0);
+            assert!(iter.next().is_none());
+            for vout in [0, count - 1, count] {
+                assert_eq!(
+                    record.find_output(vout).is_some(),
+                    vout < count,
+                    "boundary vout {vout} on a {count}-output record"
+                );
+            }
+        }
         Ok(())
     }
 }

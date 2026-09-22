@@ -153,13 +153,13 @@ Known deltas from Core 31.1:
   `announced_transactions_request_witness_without_changing_hashes` covers
   ordinary inventory requests with and without the inventory filter.
   Node's `tx_ingress_e2e` suite requires witness requests from its
-  `NODE_WITNESS` dialers before delivering transactions. `src/inv.rs` tests
+  `NODE_WITNESS` dialers before delivering transactions. `crates/p2p/src/inv.rs` tests
   `missing_parents_use_txids_and_deduplicate_repeated_inputs`,
   `missing_parents_request_witness_by_service_not_announcement_preference`,
   `stale_missing_parent_source_cannot_send_to_or_cancel_replacement`,
   `cancelled_missing_parent_source_does_not_enqueue_a_request`, and
   `missing_parent_request_keeps_outbound_saturation_policy` cover txid parent
-  requests and live-connection identity. `src/tx_relay.rs` tests
+  requests and live-connection identity. `crates/p2p/src/tx_relay.rs` tests
   `peer_relay_reaches_replacement_and_cancels_only_saturated_peer` and
   `disconnected_relay_worker_does_not_count_queue_saturation` cover relay
   delivery and saturation ownership.

@@ -9,9 +9,10 @@
 
 #![allow(missing_docs)]
 
+use std::cell::RefCell;
 use std::error::Error;
 use std::io::{BufRead as _, BufReader, Read, Write as _};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -53,6 +54,7 @@ fn external_wallet_can_scan_estimate_and_broadcast() -> TestResult {
     let client = Client {
         addr: node.addr,
         logs: Arc::clone(&node.logs),
+        conn: RefCell::new(None),
     };
     let p2wpkh = p2wpkh_script();
     let address = Address::from_script(&p2wpkh, Network::Regtest)
@@ -480,6 +482,10 @@ fn locked_string(logs: &Mutex<String>) -> String {
 struct Client {
     addr: SocketAddr,
     logs: Arc<Mutex<String>>,
+    // Keep-alive HTTP connection. The node's accept loop polls on a 100ms
+    // cadence, so a fresh socket per request costs ~100ms of accept
+    // latency; reusing one connection removes that floor.
+    conn: RefCell<Option<BufReader<TcpStream>>>,
 }
 
 struct HttpResponse {
@@ -563,8 +569,19 @@ impl Client {
         response.json()
     }
 
+    /// Esplora surfaces 503 while the transaction index crosses a snapshot
+    /// boundary mid-query ("changed during query; retry"), which the daemon
+    /// answers asynchronously after each mined block: poll again inside the
+    /// same index deadline the scriptindex wait already allows.
     fn esplora_get(&self, path: &str) -> TestResult<HttpResponse> {
-        self.exchange("GET", path, None, b"")
+        let deadline = Instant::now() + INDEX_TIMEOUT;
+        loop {
+            let response = self.exchange("GET", path, None, b"")?;
+            if response.status != 503 || Instant::now() >= deadline {
+                return Ok(response);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn esplora_post(&self, path: &str, body: &[u8]) -> TestResult<HttpResponse> {
@@ -587,6 +604,9 @@ impl Client {
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// Sends one request on the cached keep-alive connection, reconnecting
+    /// once when the socket is stale. A request that reached the server is
+    /// never resent: POST /api/tx broadcast is not idempotent.
     fn exchange(
         &self,
         method: &str,
@@ -594,9 +614,59 @@ impl Client {
         authorization: Option<&str>,
         body: &[u8],
     ) -> TestResult<HttpResponse> {
-        let mut stream = TcpStream::connect_timeout(&self.addr, REQUEST_TIMEOUT)?;
-        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+        let mut slot = self.conn.borrow_mut();
+        match self.exchange_once(&mut slot, method, path, authorization, body) {
+            Ok(response) => Ok(response),
+            Err((first, retryable)) => {
+                // A hard failure may leave an in-flight request or a
+                // desynced response on the socket: drop it so a later call
+                // cannot be pipelined or answered with the wrong response.
+                *slot = None;
+                if !retryable {
+                    return Err(first);
+                }
+                self.exchange_once(&mut slot, method, path, authorization, body)
+                    .map_err(|(error, _)| error)
+            }
+        }
+    }
+
+    /// One request/response round trip. The error flag marks failures the
+    /// retry wrapper may resend: the socket never delivered the request to
+    /// dispatch (connect refused, broken write, idle close, or a close
+    /// before any response byte — `serve_connection` always writes a response
+    /// before it closes, so zero response bytes prove non-dispatch).
+    fn exchange_once(
+        &self,
+        slot: &mut Option<BufReader<TcpStream>>,
+        method: &str,
+        path: &str,
+        authorization: Option<&str>,
+        body: &[u8],
+    ) -> Result<HttpResponse, (Box<dyn Error>, bool)> {
+        let fresh = if slot.is_none() {
+            let stream = TcpStream::connect_timeout(&self.addr, REQUEST_TIMEOUT)
+                .map_err(|error| (error.into(), true))?;
+            stream
+                .set_read_timeout(Some(REQUEST_TIMEOUT))
+                .map_err(|error| (error.into(), true))?;
+            stream
+                .set_write_timeout(Some(REQUEST_TIMEOUT))
+                .map_err(|error| (error.into(), true))?;
+            *slot = Some(BufReader::new(stream));
+            true
+        } else {
+            false
+        };
+        let reader = slot
+            .as_mut()
+            .ok_or_else(|| ("missing http connection".into(), true))?;
+        // Probe a reused socket for a peer close before any request bytes
+        // leave the client; an idle close caught here is provably safe to
+        // reconnect, unlike EOF discovered after a write.
+        if !fresh && conn_stale(reader.get_ref()) {
+            return Err(("peer closed the kept-alive connection".into(), true));
+        }
         let auth_line = authorization
             .map(|token| format!("Authorization: Basic {token}\r\n"))
             .unwrap_or_default();
@@ -605,17 +675,78 @@ impl Client {
         } else {
             "text/plain"
         };
+        let mut wire = Vec::new();
         write!(
-            stream,
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth_line}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            wire,
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth_line}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
             self.addr,
             body.len()
-        )?;
-        stream.write_all(body)?;
-        stream.flush()?;
-        let _ignored = stream.shutdown(Shutdown::Write);
-        read_http_response(stream)
+        )
+        .map_err(|error| (error.into(), false))?;
+        wire.extend_from_slice(body);
+        // A failed write() transferred zero bytes, so resending is safe.
+        // Any partial send is not: the peer may hold a request prefix.
+        let sent = reader
+            .get_mut()
+            .write(&wire)
+            .map_err(|error| (error.into(), true))?;
+        if sent == 0 {
+            return Err(("socket closed before any bytes sent".into(), true));
+        }
+        reader
+            .get_mut()
+            .write_all(&wire[sent..])
+            .and_then(|()| reader.get_mut().flush())
+            .map_err(|error| (error.into(), false))?;
+        let mut status_line = String::new();
+        let count = match reader.read_line(&mut status_line) {
+            Ok(count) => count,
+            Err(error) => {
+                let closed = is_conn_closed(&error);
+                return Err((error.into(), closed));
+            }
+        };
+        if count == 0 {
+            // serve_connection writes a response before every close it
+            // initiates, so zero response bytes prove this request never
+            // reached dispatch: re-sending once is safe (a dead daemon
+            // fails the reconnect instead).
+            return Err(("connection closed before response".into(), true));
+        }
+        read_http_response(reader, &status_line).map_err(|error| (error, false))
     }
+}
+
+/// Reports whether a kept-alive socket was already closed (or desynced) on
+/// the peer side. A non-blocking peek sees the close before any request
+/// bytes are sent, which makes reconnecting unambiguously safe — unlike an
+/// EOF discovered after a write, which cannot rule out a processed request.
+fn conn_stale(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let stale = !matches!(
+        stream.peek(&mut [0_u8; 1]),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    );
+    if stream.set_nonblocking(false).is_err() {
+        return true;
+    }
+    stale
+}
+
+/// Socket-close errors proving the peer tore the connection down.
+/// WouldBlock/TimedOut are absent: an alive-but-slow peer means the request
+/// may still be in flight server-side, so those stay non-retryable.
+fn is_conn_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 fn p2wpkh_script() -> ScriptBuf {
@@ -942,10 +1073,10 @@ fn encode_base64(input: &[u8]) -> String {
     out
 }
 
-fn read_http_response(stream: TcpStream) -> TestResult<HttpResponse> {
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
+fn read_http_response(
+    reader: &mut BufReader<TcpStream>,
+    status_line: &str,
+) -> TestResult<HttpResponse> {
     let status = status_line
         .split_whitespace()
         .nth(1)
