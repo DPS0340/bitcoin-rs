@@ -1007,7 +1007,7 @@ fn stage_body(sync: &BlockSync, block: &Block) {
     sync.body_sync
         .lock()
         .stager
-        .insert(hash, None, block.clone(), serialized, Instant::now());
+        .insert(hash, None, block.clone(), serialized, None, Instant::now());
 }
 
 fn cache_snapshot(sync: &BlockSync) -> Option<super::ExpectedApplyCache> {

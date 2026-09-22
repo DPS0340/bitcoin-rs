@@ -202,10 +202,16 @@ impl InboundSyncSinks {
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
-    fn send_headers(&self, source: crate::PeerSource, headers: Vec<bitcoin_rs_primitives::Header>) {
+    fn send_headers(
+        &self,
+        source: crate::PeerSource,
+        headers: Vec<bitcoin_rs_primitives::Header>,
+        wire_response: bool,
+    ) {
         if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
             headers,
             source: Some(source),
+            wire_response,
         }) {
             tracing::warn!(peer_addr = %source.addr, %error, "p2p inbound headers channel disconnected");
         } else {
@@ -225,8 +231,10 @@ impl InboundSyncSinks {
         // admission. Without a tree node the body can never become the
         // apply frontier's expected block, and no announced-tip credit
         // reaches the delivering peer. The headers drain runs before the
-        // blocks drain each tick, so the body lands already expected.
-        self.send_headers(source, vec![block.header]);
+        // blocks drain each tick, so the body lands already expected. The
+        // forward is not a `headers` response: it must not consume an
+        // outstanding `getheaders` request's pending state.
+        self.send_headers(source, vec![block.header], false);
         let mut inbound = crate::InboundBlock {
             block,
             serialized,
@@ -1107,7 +1115,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 )?;
                 match message {
                     crate::Message::Headers(headers) => {
-                        inbound_sync_sinks.send_headers(lease.source(peer_addr), headers);
+                        inbound_sync_sinks.send_headers(lease.source(peer_addr), headers, true);
                     }
                     crate::Message::Block(block) => {
                         inbound_sync_sinks.send_block(lease.source(peer_addr), block, raw);
@@ -1187,7 +1195,7 @@ fn process_compact_wire_message(
         && !matches!(outcome, crate::compact_blocks::Outcome::Complete(_))
         && let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
     {
-        inbound_sync_sinks.send_headers(lease.source(peer_addr), vec![header]);
+        inbound_sync_sinks.send_headers(lease.source(peer_addr), vec![header], false);
     }
     handle_compact_outcome(outcome, lease, peer_addr, inbound_sync_sinks);
 }
@@ -1800,7 +1808,7 @@ mod writer_shutdown_tests {
         let serialized = bytes::Bytes::from(block_bytes);
         let source = lease.source(addr);
 
-        sinks.send_headers(source, Vec::new());
+        sinks.send_headers(source, Vec::new(), true);
         sinks.send_block(source, block, serialized.clone());
 
         assert_eq!(headers_rx.try_recv()?.source, Some(source));
@@ -1833,6 +1841,10 @@ mod writer_shutdown_tests {
         let forwarded = headers_rx.try_recv()?;
         assert_eq!(forwarded.source, Some(source));
         assert_eq!(forwarded.headers, vec![header]);
+        assert!(
+            !forwarded.wire_response,
+            "a body-carried header is not a getheaders response"
+        );
         Ok(())
     }
 

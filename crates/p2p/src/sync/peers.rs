@@ -60,6 +60,27 @@ pub(super) fn outranks(current: SyncPeer, candidate: SyncPeer) -> bool {
     candidate.best_known_height > current.best_known_height
 }
 
+/// Height of the deepest active-chain node that is an ancestor of `hash` —
+/// `hash`'s own height when it is on the active chain, `None` only when
+/// `hash` is unknown to the tree. A demonstrated tip implies capability for
+/// every ancestor it shares with the active chain: a fork tip whose branch
+/// later wins already proved the peer can serve the shared prefix, and one
+/// whose branch lost still proved the same.
+pub(super) fn shared_active_height(
+    tree: &BlockTree,
+    active_tip: NodeId,
+    hash: Hash256,
+) -> Option<u32> {
+    let mut node_id = tree.lookup(hash)?;
+    loop {
+        let node = tree.node(node_id).ok()?;
+        if tree.node_at_height_from(active_tip, node.height) == Some(node_id) {
+            return Some(node.height);
+        }
+        node_id = node.parent?;
+    }
+}
+
 pub(super) fn active_demonstrated_height(
     tree: &BlockTree,
     active_tip: NodeId,
@@ -67,7 +88,7 @@ pub(super) fn active_demonstrated_height(
 ) -> Option<u32> {
     demonstrated_tips
         .iter()
-        .filter_map(|hash| tree.active_height_of(active_tip, *hash))
+        .filter_map(|hash| shared_active_height(tree, active_tip, *hash))
         .max()
 }
 
@@ -79,7 +100,8 @@ pub(super) fn body_capability_height(
 ) -> Option<u32> {
     // A session has no branch evidence until its first accepted header batch;
     // keep the handshake capability during that discovery window. Once it has
-    // evidence, only a tip on the current active chain is usable for bodies.
+    // evidence, a demonstrated tip attests the deepest ancestor it shares
+    // with the active chain — a fork tip still proves the shared prefix.
     if demonstrated_tips.is_empty() {
         return u32::try_from(peer.best_known_height).ok();
     }

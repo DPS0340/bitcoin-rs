@@ -97,6 +97,10 @@ pub struct BlockSync {
     /// the P2P crate.
     body_sync: Mutex<BodySyncState>,
     pending_getheaders: Arc<Mutex<Option<PendingHeaderRequest>>>,
+    /// Last time a `Refused` admission replayed a `getheaders` re-request;
+    /// paces retries to the request timeout so a paused admission cannot
+    /// re-issue the same locator at round-trip pace.
+    refused_rerequest_at: Mutex<Option<Instant>>,
     expected_apply_cache: Arc<Mutex<Option<ExpectedApplyCache>>>,
     known_sessions: Mutex<HashMap<SocketAddr, crate::ConnectionId>>,
     /// Latched by the first [`WindowCommitDisposition::Fatal`] settlement.
@@ -177,6 +181,7 @@ impl BlockSync {
                 stager: BlockStager::new(default_sync_budget()),
             }),
             pending_getheaders: Arc::new(Mutex::new(None)),
+            refused_rerequest_at: Mutex::new(None),
             expected_apply_cache: Arc::new(Mutex::new(None)),
             known_sessions: Mutex::new(HashMap::new()),
             apply_halted: std::sync::atomic::AtomicBool::new(false),

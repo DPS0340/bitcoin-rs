@@ -47,18 +47,23 @@ This page assigns ownership and cites proof under the
 - Credit is initialized from the handshake `start_height`, raised
   monotonically (never lowered), raisable only by the delivering connection
   (a same-address replacement never inherits its predecessor's credit), and
-  raised only for accepted headers whose retained tip is on the currently
-  selected best chain (the best chain is re-selected during acceptance, so a
-  winning fork announcement earns credit in the same tick). When a later
-  announcement makes a previously losing retained tip active, its delivering
-  connection is re-evaluated before request selection. Until a session has
-  accepted a header tip, body and hedge selection may use its handshake
-  capability while header discovery is pending; after that point, the
-  accepted tip must be on the active chain at or beyond the requested height.
-  Retained-tip evidence is compacted at each credit refresh: a tip that
-  resolves on the active chain at or below the recorded maximum can never
-  raise it again, so only unresolved (fork) tips and the max-resolving tip
-  are kept.
+  raised only for accepted headers whose retained tip shares ancestry with
+  the currently selected best chain (the best chain is re-selected during
+  acceptance, so a winning fork announcement earns credit in the same tick).
+  A retained tip attests the deepest active-chain node that is its ancestor
+  — `shared_active_height`: an on-active tip attests its own height, while a
+  losing fork tip still attests the shared prefix it proved the peer holds.
+  When a later announcement makes a previously losing retained tip active,
+  its delivering connection is re-evaluated before request selection. Until
+  a session has accepted a header tip, body and hedge selection may use its
+  handshake capability while header discovery is pending; after that point,
+  the requested height must not exceed the deepest shared ancestor across
+  its retained tips. Retained-tip evidence is compacted at each credit
+  refresh: a tip that resolves on the active chain at or below the recorded
+  maximum can never raise it again, so only unresolved (fork) tips and the
+  max-resolving tip are kept. Unresolved tips are deduplicated to the
+  maximal tip per branch and capped (`MAX_UNRESOLVED_DEMONSTRATED_TIPS`),
+  so a peer cannot grow the record by announcing distinct side chains.
 
 ### `P2P-04`: Connected-socket posture and vectored emission
 
@@ -177,10 +182,24 @@ branch-plan, attribution, timeout and bounded-staging suites remain required.
   (`Refused`) requests the header ancestry from the delivering peer — or an
   eligible full-witness peer when no source was recorded — rather than
   silently dropping the announcement and leaving the live tip wedged behind
-  one missed header.
+  one missed header. `Refused` re-requests are paced to the request timeout
+  (`refused_rerequest_at`): a paused admission would otherwise replay the
+  same locator at round-trip pace.
+- The forwarded header is marked as such (`InboundHeaders::wire_response =
+  false`): it is not a `getheaders` response, so it must not consume the
+  outstanding request's pending slot — otherwise every delivered body would
+  reset request pacing and emit duplicate `getheaders`.
+- The staged retry carries the delivering connection
+  (`ReceivedBlock::source`): a retry that admits credits that peer exactly
+  as the headers drain would (`note_announced_tip`), and a peer-fault
+  rejection discards the body, releases its download-window record outright
+  (`discard_received`, never re-queued), disconnects the source, and marks
+  it unresponsive — the same outcome a rejected `headers` batch produces.
 
 Proof: `crates/p2p/src/sync/tests/head_sync.rs` covers body-carried header
 admission and apply, gap-fill requests for staged bodies ahead of their
-header chain, announcer-directed `getheaders` on unattached batches, and
-credit for already-known tips. `crates/p2p/src/listener.rs` test
+header chain, announcer-directed `getheaders` on unattached batches,
+non-response forwards preserving pending-request state, staged-retry
+credit, shared-ancestor capability, bounded fork evidence, and credit for
+already-known tips. `crates/p2p/src/listener.rs` test
 `send_block_forwards_the_blocks_header` covers the delivery-path forward.

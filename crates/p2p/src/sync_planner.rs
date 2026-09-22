@@ -10,6 +10,7 @@ use bitcoin_rs_primitives::{Block, Hash256};
 
 use crate::SyncBudget;
 use crate::block_stager::{BlockStager, DrainedBlock, DroppedBlock, StagedBlock};
+use crate::PeerSource;
 use crate::download_window::DownloadWindow;
 
 /// Network effect the executor must perform. The planner never mutates
@@ -114,10 +115,11 @@ impl SyncPlanner {
         next_expected_hash: Option<Hash256>,
         block: Block,
         serialized: bytes::Bytes,
+        source: Option<PeerSource>,
         now: Instant,
     ) -> StagedBlock {
         self.stager
-            .insert(hash, next_expected_hash, block, serialized, now)
+            .insert(hash, next_expected_hash, block, serialized, source, now)
     }
 
     /// Drops expired staged bodies.

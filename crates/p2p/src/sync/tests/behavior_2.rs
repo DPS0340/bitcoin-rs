@@ -159,7 +159,7 @@ fn drain_inbound_blocks_prunes_stale_received_blocks_without_new_arrivals()
         .body_sync
         .lock()
         .stager
-        .insert(hash, None, block, serialized, received_at);
+        .insert(hash, None, block, serialized, None, received_at);
     let StagedBlock::Memory { bytes, .. } = staged else {
         return Err(std::io::Error::other("test block should stage in memory").into());
     };

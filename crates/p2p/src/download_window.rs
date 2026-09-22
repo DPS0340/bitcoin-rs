@@ -2225,6 +2225,17 @@ impl DownloadWindow {
         entries
     }
 
+    /// Discards a received-or-pending record outright — no re-queue. Used
+    /// when the stager drops a body whose header admission permanently
+    /// failed (peer-fault rejection, or [`DrainedBlock`] for a replaced
+    /// entry): the window must not keep a delivery that can never apply.
+    /// Re-requested bodies return to `pending` via `drop_for_retry`
+    /// instead.
+    pub fn discard_received(&mut self, hash: &Hash256) {
+        self.remove_received(hash);
+        self.remove_pending(hash);
+    }
+
     fn remove_received(&mut self, hash: &Hash256) -> Option<ReceivedBlock> {
         let received = self.received.remove(hash)?;
         self.received_bytes = self.received_bytes.saturating_sub(received.bytes);

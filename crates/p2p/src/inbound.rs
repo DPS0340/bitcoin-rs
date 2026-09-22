@@ -20,6 +20,11 @@ pub struct InboundHeaders {
     pub headers: Vec<Header>,
     /// Delivering connection, or `None` for local injection.
     pub source: Option<crate::PeerSource>,
+    /// `true` only for a wire `headers` message; headers forwarded out of a
+    /// delivered block body (`false`) reach the same admission path but are
+    /// not a response to an outstanding `getheaders` and must not consume
+    /// its pending-request state.
+    pub wire_response: bool,
 }
 
 /// A transaction received from a peer, ready for mempool admission.

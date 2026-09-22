@@ -140,41 +140,82 @@ impl BlockSync {
     /// naturally each drain and admits once the header enters the allowed
     /// window; a permanently inadmissible header (a peer-fault rejection)
     /// means the body can never apply, so it is discarded instead of paying
-    /// the same admission retry every drain.
+    /// the same admission retry every drain — and its delivering peer
+    /// carries the fault, exactly as a rejected `headers` batch would.
     fn admit_staged_headers(&self) {
-        let unadmitted: Vec<(Hash256, Header)> = {
+        let unadmitted: Vec<(Hash256, Header, Option<crate::PeerSource>)> = {
             let tree = self.chain.block_tree().read();
             let body_sync = self.body_sync.lock();
             body_sync
                 .stager
                 .staged_headers()
-                .filter(|(hash, _)| tree.lookup(*hash).is_none())
+                .filter(|(hash, _, _)| tree.lookup(*hash).is_none())
                 .collect()
         };
         let mut missing_parent = false;
-        let mut invalid: Vec<Hash256> = Vec::new();
-        for (hash, header) in unadmitted {
+        let mut credit_refresh_needed = false;
+        let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
+        for (hash, header, source) in unadmitted {
             match self.chain.admit_headers(&[header]) {
+                HeaderAdmission::Accepted {
+                    announced_tip: Some(tip_hash),
+                    active_height,
+                    ..
+                } => {
+                    // A staged retry that now admits is the same
+                    // announcement the headers drain credits — the
+                    // delivering connection demonstrated the tip even if
+                    // its forwarded batch raced or was refused.
+                    if let Some(source) =
+                        source.filter(|source| self.peer_table.is_current(*source))
+                    {
+                        self.peer_table
+                            .note_announced_tip(source, tip_hash, active_height);
+                        credit_refresh_needed = true;
+                    }
+                }
                 HeaderAdmission::Rejected(
                     ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. },
                 ) => {
                     missing_parent = true;
                 }
                 HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
-                    invalid.push(hash);
+                    invalid.push((hash, source));
                 }
                 _ => {}
             }
         }
         if !invalid.is_empty() {
+            // The body's header can never admit: drop the staged entry AND
+            // the window's delivery record outright — re-queuing would just
+            // re-download a body that cannot apply. Then blame the
+            // delivering peer: a body whose embedded header fails consensus
+            // is the peer's fault, same as a rejected `headers` batch.
+            // PeerTable operations precede the body_sync lock to preserve
+            // the PeerTable → window ordering used elsewhere.
+            let blamed: Vec<std::net::SocketAddr> = invalid
+                .iter()
+                .filter_map(|(_, source)| *source)
+                .filter(|source| self.peer_table.disconnect_source(*source))
+                .map(|source| source.addr)
+                .collect();
             let mut body_sync = self.body_sync.lock();
-            for hash in &invalid {
+            for (hash, _) in &invalid {
                 body_sync.stager.discard(hash);
+                body_sync.window.discard_received(hash);
+            }
+            for peer_addr in &blamed {
+                body_sync
+                    .window
+                    .mark_peer_unresponsive(*peer_addr, Instant::now());
             }
             tracing::debug!(
                 discarded = invalid.len(),
                 "block sync: discarded bodies with inadmissible headers"
             );
+        }
+        if credit_refresh_needed {
+            self.refresh_active_peer_credit();
         }
         if missing_parent {
             self.request_headers_from_eligible();
@@ -288,6 +329,7 @@ impl BlockSync {
                     next_expected_hash,
                     inbound.block,
                     inbound.serialized,
+                    source,
                     now,
                 );
                 staged_blocks.push((hash, source, staged));
