@@ -833,9 +833,7 @@ mod tests {
             &first,
             info_with_counters(addr(1), 1, counters_first.clone()),
         );
-        assert!(
-            counted(&counters_first).write_all(&[0_u8; 10]).is_ok()
-        );
+        assert!(counted(&counters_first).write_all(&[0_u8; 10]).is_ok());
         assert_eq!(table.traffic_totals(), (0, 10));
 
         let second = lease();
