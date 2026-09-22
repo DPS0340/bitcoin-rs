@@ -269,18 +269,29 @@ impl PeerTable {
         for addr in &targets {
             if let Some(removed) = entries.remove(addr) {
                 removed.lease.cancel();
-                Self::retain_traffic(&mut entries, &removed);
+                Self::retire(&mut entries, &removed);
             }
         }
+        Self::settle_retired(&mut entries);
         targets
     }
 
     /// Retains a dropped connection's counter set so `traffic_totals` keeps
     /// counting it after the entry is gone; unpublished connections carry no
-    /// counters to retain. Also folds in counts of retired connections whose
-    /// teardown provably finished — the table holding the last `Arc` means no
-    /// writer remains, so their count is final and the list stays bounded.
-    fn retain_traffic(entries: &mut TableView, removed: &Entry) {
+    /// counters to retain. Shared (`Arc`), so bytes a dying connection records
+    /// after its entry left still land in `traffic_totals` whenever they
+    /// settle.
+    fn retire(entries: &mut TableView, removed: &Entry) {
+        if let Some(info) = removed.info.as_ref() {
+            entries.retired.push(Arc::clone(&info.counters));
+        }
+    }
+
+    /// Folds in the final counts of retired connections whose teardown provably
+    /// finished — the table holding the last `Arc` means no writer remains, so
+    /// their count is final and the list stays bounded. Runs once per removal
+    /// batch so batched disconnects stay O(N + |retired|).
+    fn settle_retired(entries: &mut TableView) {
         let TableView {
             retired,
             settled_recv,
@@ -296,9 +307,14 @@ impl PeerTable {
                 true
             }
         });
-        if let Some(info) = removed.info.as_ref() {
-            retired.push(Arc::clone(&info.counters));
-        }
+    }
+
+    /// Per-removal retention for single-entry removals: retain the dropped
+    /// connection's counter set, then settle retired connections whose
+    /// teardown finished.
+    fn retain_traffic(entries: &mut TableView, removed: &Entry) {
+        Self::retire(entries, removed);
+        Self::settle_retired(entries);
     }
 
     /// Traffic the node can account for — `(received, sent)` bytes: the live

@@ -11,7 +11,7 @@ Owners:
 
 | Layer | Crates | Responsibility |
 | --- | --- | --- |
-| 4: Compose | `node`, `bitcoin-rs` | Runtime assembly and lifecycle |
+| 4: Compose | `node`, `bitcoin-rs`, `e2e` | Runtime assembly and lifecycle |
 | 3: Surface | `rpc` | External protocol boundaries |
 | 2: Services | `chain`, `chainstate`, `utxo`, `p2p`, `mempool`, `index`, `mining` | Domain state and services |
 | 1: Storage | `storage` | Storage contracts and engine drivers |
