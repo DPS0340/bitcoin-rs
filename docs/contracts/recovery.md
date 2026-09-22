@@ -310,14 +310,12 @@ state is harmless and keeps the node operating until replay closes the gap.
   commit path with the head suppressed (`PublishMode::Replay`), publishing
   only the state the head already certifies — and fails startup closed on a
   gap that is not an ancestor prefix of stored bodies (`RCV-02`, `RCV-04`).
-- `crates/node/tests/unit/state/tests/recovery.rs` (#655):
-  - `boot_replays_the_committed_gap_without_recommitting_the_head`,
-    `boot_replays_from_every_committed_ancestor`: restart on the gap left by
-    a lost publication lands exactly on the stored head with its
-    `commit_id` untouched, at every committed ancestor, and a second
-    restart replays nothing;
-  - `boot_refuses_a_gap_whose_body_is_gone`: a gap whose durable facts are
-    gone fails startup closed instead of publishing a fabricated history.
+- `crates/chainstate/tests/unit/durable_replay_tests.rs`:
+  - `committed_gap_replays_to_head_without_recommitting_it` proves replay
+    lands exactly on the stored head and consumes its existing `commit_id`
+    instead of issuing a second durable receipt;
+  - `committed_gap_with_missing_body_fails_closed` proves a stored head whose
+    named body is gone is rejected without advancing the restored applied tip.
 - `crates/chainstate/src/connect.rs` and
   `crates/chainstate/src/disconnect.rs`: run the `RCV-02` tail —
   sync, one atomic batch, derived journal emission, then publication — and

@@ -31,6 +31,7 @@ use bitcoin_rs_storage::StorageError;
 /// set of a full node. 4 would underutilize sequential storage read locality;
 /// 16 would double the ceiling for no throughput gain in a serial walk.
 pub(crate) const DISCONNECT_STREAM_WINDOW: usize = 8;
+const CONNECT_STREAM_WINDOW: usize = DISCONNECT_STREAM_WINDOW;
 
 /// Node-owned work that follows committed reorg steps.
 ///
@@ -57,27 +58,36 @@ pub trait ReorgObserver {
 
 /// Invalidates `hash` and its descendants, then moves applied chainstate to the
 /// best remaining valid tip.
-pub fn invalidate_block<O>(
+pub fn invalidate_block<O, S>(
     handles: &Chainstate,
     observer: &mut O,
     hash: Hash256,
+    mut settle: S,
 ) -> core::result::Result<(), ReorgError>
 where
     O: ReorgObserver + ?Sized,
+    S: FnMut(&mut O, core::result::Result<(), ReorgError>) -> core::result::Result<(), ReorgError>,
 {
     // Validate the block exists and is not genesis before taking mutation
     // authority. Read-only refusal should not acquire the transition.
-    {
+    let validation = (|| {
         let tree = handles.block_tree().read();
         let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
         if tree.node(root).map_err(ReorgError::Plan)?.height == 0 {
             return Err(ReorgError::CannotInvalidateGenesis);
         }
+        Ok(())
+    })();
+    if let Err(error) = validation {
+        return settle(observer, Err(error));
     }
 
-    let transition = handles
-        .begin_transition()
-        .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
+    let transition = match handles.begin_transition() {
+        Ok(transition) => transition,
+        Err(source) => {
+            return settle(observer, Err(ReorgError::Unavailable(Box::new(source))));
+        }
+    };
     // Keep read-only planning refusals in the same settlement path as the
     // execution outcome; an early `?` must not strand a coherent generation.
     let outcome = (|| {
@@ -93,15 +103,15 @@ where
         };
         let plan = current_reorg_plan(handles, target)?;
         let mut no_staged_body = |_| None;
-        let (disconnect_nodes, connect, _retention) = match plan.as_ref() {
+        let (disconnect_nodes, connect_nodes, _retention) = match plan.as_ref() {
             Some(plan) => {
                 let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
+                let connect_nodes = branch_nodes(handles, &plan.connect)?;
                 // The lease must exist before the bodies are first read, so
                 // a concurrent prune can never delete what the walk is
                 // about to re-read.
-                let retention = retention_lease_for(handles, &disconnect_nodes)?;
-                let connect = load_branch_bodies(handles, &plan.connect, &mut no_staged_body)?;
-                (disconnect_nodes, connect, Some(retention))
+                let retention = retention_lease_for(handles, &disconnect_nodes, &connect_nodes)?;
+                (disconnect_nodes, connect_nodes, Some(retention))
             }
             None => (Vec::new(), Vec::new(), None),
         };
@@ -113,7 +123,8 @@ where
             &transition,
             observer,
             &disconnect_nodes,
-            &connect,
+            &connect_nodes,
+            &[],
             &mut no_staged_body,
         );
         if progress.disconnected == disconnect_nodes.len()
@@ -141,7 +152,7 @@ where
             )
         }
     })();
-    settle_reorg_transition(transition, outcome)
+    settle_reorg_transition(transition, observer, outcome, &mut settle)
 }
 
 /// Why a branch switch stopped, and what the chain looks like now.
@@ -344,7 +355,7 @@ pub enum ReorgError {
     CheckpointSettlement {
         /// Checkpoint publication failure.
         #[source]
-        source: anyhow::Error,
+        source: crate::CheckpointError,
         /// Earlier coherent reorg failure retained when debt settlement also
         /// failed.
         original: Option<Box<Self>>,
@@ -421,8 +432,14 @@ impl ReorgError {
 fn retention_lease_for(
     handles: &Chainstate,
     disconnect_nodes: &[(Hash256, u32)],
+    connect_nodes: &[(Hash256, u32)],
 ) -> core::result::Result<Option<bitcoin_rs_storage::RetentionLease>, ReorgError> {
-    let Some(&(_, floor)) = disconnect_nodes.iter().min_by_key(|&(_, height)| height) else {
+    let Some(floor) = disconnect_nodes
+        .iter()
+        .chain(connect_nodes)
+        .map(|(_, height)| *height)
+        .min()
+    else {
         return Ok(None);
     };
     handles
@@ -444,48 +461,79 @@ fn retention_lease_for(
 /// Every outcome other than reaching `target` is a [`ReorgError`] variant
 /// naming how far the chain moved, because "it failed" does not tell a caller
 /// whether the node is fine, degraded, or unusable.
-pub fn switch_to_branch<F, O>(
+pub fn switch_to_branch<F, O, S>(
     handles: &Chainstate,
     target: NodeId,
     mut staged_body: F,
     observer: &mut O,
+    mut settle: S,
 ) -> core::result::Result<(), ReorgError>
 where
     F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
     O: ReorgObserver + ?Sized,
+    S: FnMut(&mut O, core::result::Result<(), ReorgError>) -> core::result::Result<(), ReorgError>,
 {
     loop {
-        let Some(plan) = current_reorg_plan(handles, target)? else {
-            return Ok(());
+        let plan = match current_reorg_plan(handles, target) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return settle(observer, Ok(())),
+            Err(error) => return settle(observer, Err(error)),
         };
 
-        // A staged prefix can be committed without waiting for the entire
-        // winning branch to fit in the bounded stager.
-        let (connect, missing_connect) =
-            load_available_branch_prefix(handles, &plan.connect, &mut staged_body)?;
+        let prepared = (|| {
+            let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
+            let connect_nodes = branch_nodes(handles, &plan.connect)?;
+            // Pin both branches before the first body read. A concurrent prune
+            // must not invalidate optimistic preloading or the later streaming
+            // pass.
+            let retention = retention_lease_for(handles, &disconnect_nodes, &connect_nodes)?;
+            // Only the first connect window is retained across transition
+            // acquisition. The remainder is streamed in bounded windows while
+            // the authoritative transition is held.
+            let (connect, missing_connect) =
+                load_available_branch_prefix(handles, &connect_nodes, &mut staged_body)?;
+            if !disconnect_nodes.is_empty() {
+                preflight_disconnect_bodies(handles, &disconnect_nodes, &mut staged_body)?;
+            }
+            Ok::<_, ReorgError>((
+                disconnect_nodes,
+                connect_nodes,
+                connect,
+                missing_connect,
+                retention,
+            ))
+        })();
+        let (disconnect_nodes, connect_nodes, connect, missing_connect, _retention) = match prepared
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return settle(observer, Err(error)),
+        };
         if connect.is_empty()
             && let Some((hash, height)) = missing_connect
         {
-            return Err(ReorgError::MissingBody { hash, height });
+            return settle(observer, Err(ReorgError::MissingBody { hash, height }));
         }
-        let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
-        // Pin the old-branch bodies against pruning for this iteration. The
-        // guard outlives every exit path of the loop body — completed,
-        // refused, failed, and replanned attempts each hand the retention
-        // authority back exactly once — and it exists before the bodies are
-        // first read, so a concurrent prune can never delete what the walk
-        // is about to re-read.
-        let _retention = retention_lease_for(handles, &disconnect_nodes)?;
-        preflight_disconnect_bodies(handles, &disconnect_nodes, &mut staged_body)?;
 
         let lock = handles
             .lock_transition()
-            .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
+            .map_err(|source| ReorgError::Unavailable(Box::new(source)));
+        let lock = match lock {
+            Ok(lock) => lock,
+            Err(error) => return settle(observer, Err(error)),
+        };
 
         // Preloading is optimistic. Only an identical plan recomputed while the
         // transition lock is held may mutate chainstate.
-        let Some(authoritative) = current_reorg_plan(handles, target)? else {
-            return Ok(());
+        let authoritative = match current_reorg_plan(handles, target) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                let transition = lock.into_transition();
+                return settle_reorg_transition(transition, observer, Ok(()), &mut settle);
+            }
+            Err(error) => {
+                let transition = lock.into_transition();
+                return settle_reorg_transition(transition, observer, Err(error), &mut settle);
+            }
         };
         if plan != authoritative {
             drop(lock);
@@ -493,16 +541,26 @@ where
         }
 
         let transition = lock.into_transition();
+        let connect_limit = if missing_connect.is_some() {
+            connect.len()
+        } else {
+            connect_nodes.len()
+        };
         let (progress, outcome) = execute_streamed_plan(
             &transition,
             observer,
             &disconnect_nodes,
+            &connect_nodes[..connect_limit],
             &connect,
             &mut staged_body,
         );
         let outcome = if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
             outcome
         } else {
+            let outcome = match (outcome, missing_connect) {
+                (Ok(()), Some((hash, height))) => Err(ReorgError::MissingBody { hash, height }),
+                (outcome, _) => outcome,
+            };
             attach_reconsideration(
                 outcome,
                 revisit_disconnected_blocks(
@@ -514,11 +572,7 @@ where
                 ),
             )
         };
-        settle_reorg_transition(transition, outcome)?;
-        if let Some((hash, height)) = missing_connect {
-            return Err(ReorgError::MissingBody { hash, height });
-        }
-        return Ok(());
+        return settle_reorg_transition(transition, observer, outcome, &mut settle);
     }
 }
 
@@ -543,33 +597,18 @@ struct LoadedBranchBody {
 
 type LoadedBranchPrefix = (Vec<LoadedBranchBody>, Option<(Hash256, u32)>);
 
-/// Loads every block named by a branch, in the order given.
-fn load_branch_bodies<F>(
-    handles: &Chainstate,
-    ids: &[NodeId],
-    staged_body: &mut F,
-) -> core::result::Result<Vec<LoadedBranchBody>, ReorgError>
-where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
-{
-    branch_nodes(handles, ids)?
-        .into_iter()
-        .map(|(hash, height)| load_branch_body(handles, hash, height, staged_body))
-        .collect()
-}
-
-/// Loads the contiguous available prefix and names the first missing body.
+/// Loads at most one contiguous connect window and names the first missing body.
 fn load_available_branch_prefix<F>(
     handles: &Chainstate,
-    ids: &[NodeId],
+    nodes: &[(Hash256, u32)],
     staged_body: &mut F,
 ) -> core::result::Result<LoadedBranchPrefix, ReorgError>
 where
     F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
 {
-    let nodes = branch_nodes(handles, ids)?;
-    let mut loaded = Vec::with_capacity(nodes.len());
-    for (hash, height) in nodes {
+    let window = &nodes[..nodes.len().min(CONNECT_STREAM_WINDOW)];
+    let mut loaded = Vec::with_capacity(window.len());
+    for &(hash, height) in window {
         match load_branch_body(handles, hash, height, staged_body) {
             Ok(body) => loaded.push(body),
             Err(ReorgError::MissingBody { .. }) => {
@@ -606,6 +645,26 @@ where
     if let Some((block, serialized)) = staged_body(hash) {
         return validate_branch_body(hash, height, block, serialized);
     }
+    if let Some(store) = handles.block_body_store()
+        && let Some(body) =
+            store
+                .load_block_body(height, hash)
+                .map_err(|source| ReorgError::BodyStore {
+                    hash,
+                    height,
+                    source,
+                })?
+    {
+        return decode_branch_body(hash, height, bytes::Bytes::from(body));
+    }
+    Err(ReorgError::MissingBody { hash, height })
+}
+
+fn load_persisted_branch_body(
+    handles: &Chainstate,
+    hash: Hash256,
+    height: u32,
+) -> core::result::Result<LoadedBranchBody, ReorgError> {
     if let Some(store) = handles.block_body_store()
         && let Some(body) =
             store
@@ -698,7 +757,8 @@ fn execute_streamed_plan<F, O>(
     transition: &ChainTransition<'_>,
     observer: &mut O,
     disconnect_nodes: &[(Hash256, u32)],
-    connect: &[LoadedBranchBody],
+    connect_nodes: &[(Hash256, u32)],
+    connect_prefix: &[LoadedBranchBody],
     staged_body: &mut F,
 ) -> (LoadedPlanProgress, core::result::Result<(), ReorgError>)
 where
@@ -758,8 +818,9 @@ where
         }
     }
 
-    // Connect: from the loaded prefix (bounded by staging).
-    for body in connect {
+    // Connect the optimistic first window, then stream the remainder in
+    // bounded windows. No path retains a whole branch of block bodies.
+    for body in connect_prefix {
         match transition.connect_serialized(&body.block, body.serialized.clone()) {
             Ok(outcome) => {
                 observer.connected(&body.block, &outcome);
@@ -787,6 +848,46 @@ where
                         invalidated,
                     }),
                 );
+            }
+        }
+    }
+    for window in connect_nodes[connect_prefix.len()..].chunks(CONNECT_STREAM_WINDOW) {
+        let mut bodies = Vec::with_capacity(window.len());
+        for (hash, height) in window {
+            match load_persisted_branch_body(handles, *hash, *height) {
+                Ok(body) => bodies.push(body),
+                Err(source) => return (progress, Err(source)),
+            }
+        }
+        for body in &bodies {
+            match transition.connect_serialized(&body.block, body.serialized.clone()) {
+                Ok(outcome) => {
+                    observer.connected(&body.block, &outcome);
+                    progress.connected += 1;
+                }
+                Err(source) => {
+                    let disposition = crate::classify_apply_error(&source);
+                    let invalidated = if disposition == crate::WindowApplyDisposition::Permanent {
+                        let mut tree = handles.block_tree().write();
+                        tree.lookup(body.hash)
+                            .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    return (
+                        progress,
+                        Err(ReorgError::ConnectFailed {
+                            disconnected: progress.disconnected,
+                            connected: progress.connected,
+                            hash: body.hash,
+                            stopped_at: body.height.saturating_sub(1),
+                            source: Box::new(source),
+                            disposition,
+                            invalidated,
+                        }),
+                    );
+                }
             }
         }
     }
@@ -851,40 +952,27 @@ fn current_reorg_plan(
         .map_err(ReorgError::Plan)
 }
 
-/// Settles a rolled-back disconnect marker once the reorg owner has released
-/// its chain-transition proof.
-///
-/// A successful chainstate-journal rewind already disarms the marker, in which
-/// case this is a no-op. Publication runs only when `RolledBack` debt remains.
-fn settle_disconnect_debt(handles: &Chainstate) -> anyhow::Result<()> {
-    match handles.settle_disconnect_debt() {
-        Ok(true) => {
-            tracing::info!("published checkpoint after branch switch");
-            Ok(())
-        }
-        Ok(false) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// Completes a coherent reorg attempt before publishing disconnect debt.
-fn settle_reorg_transition(
+/// Lets the node settle its follower fence while the authoritative transition
+/// is still held, then releases the transition. Expensive checkpoint debt is
+/// intentionally not published here; the node owns that after its mempool
+/// generation is stable.
+fn settle_reorg_transition<O, S>(
     transition: ChainTransition<'_>,
+    observer: &mut O,
     outcome: core::result::Result<(), ReorgError>,
-) -> core::result::Result<(), ReorgError> {
+    settle: &mut S,
+) -> core::result::Result<(), ReorgError>
+where
+    O: ReorgObserver + ?Sized,
+    S: FnMut(&mut O, core::result::Result<(), ReorgError>) -> core::result::Result<(), ReorgError>,
+{
     let handles = transition.chainstate();
+    let outcome = settle(observer, outcome);
     if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
         handles.fail_closed_for_recovery();
         drop(transition);
         return outcome;
     }
     drop(transition);
-    if let Err(source) = settle_disconnect_debt(handles) {
-        tracing::error!(%source, "reorg checkpoint debt remains unsettled");
-        return Err(ReorgError::CheckpointSettlement {
-            source,
-            original: outcome.err().map(Box::new),
-        });
-    }
     outcome
 }

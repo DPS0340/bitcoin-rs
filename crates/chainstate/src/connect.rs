@@ -73,6 +73,11 @@ pub(super) fn apply_block_inner(
         provenance,
         PublishMode::Now,
     );
+    if result.as_ref().is_err_and(|error| {
+        crate::classify_apply_error(error) == crate::WindowApplyDisposition::Fatal
+    }) {
+        handles.fail_closed_for_recovery();
+    }
     drop(transition);
     result
 }

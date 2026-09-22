@@ -127,6 +127,8 @@ fn bind_rpc(
 std::thread_local! {
     static BOOTSTRAP_DRAIN_REACHED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static BEFORE_CLEAN_CHECKPOINT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -141,6 +143,25 @@ const fn mark_bootstrap_drain_reached() {}
 fn bootstrap_drain_was_reached() -> bool {
     BOOTSTRAP_DRAIN_REACHED.with(std::cell::Cell::take)
 }
+
+#[cfg(test)]
+fn inject_before_clean_checkpoint(hook: impl FnOnce() + 'static) {
+    BEFORE_CLEAN_CHECKPOINT.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_before_clean_checkpoint_hook() {
+    BEFORE_CLEAN_CHECKPOINT.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+const fn run_before_clean_checkpoint_hook() {}
 
 /// How the one ordered teardown was reached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,6 +379,7 @@ fn publish_clean_checkpoint_if_eligible(
     first_error: &mut Option<anyhow::Error>,
 ) {
     if let (Some(state), TeardownMode::CleanShutdown, None) = (state, mode, first_error.as_ref()) {
+        run_before_clean_checkpoint_hook();
         match state.write_clean_checkpoint() {
             Ok(None) => {
                 tracing::info!("no applied tip; clean checkpoint publication skipped");

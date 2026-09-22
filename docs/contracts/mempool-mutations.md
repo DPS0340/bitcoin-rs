@@ -233,9 +233,9 @@ state (`crates/mempool/src/orphan.rs`).
   `reconsider_disconnected_admits_in_order_once_per_candidate`,
   `reconsider_disconnected_withholds_descendants_of_a_refused_parent`.
 - `crates/node/tests/unit/sync/tests/transitions_3.rs` and
-  `transitions_7.rs`: operational, permanent, and mutated-body reorg
-  outcomes preserve the committed-prefix and invalidation semantics while the
-  node owns mempool/follower coordination.
+  `transitions_7.rs`: permanent and mutated-body reorg outcomes preserve the
+  committed-prefix and invalidation semantics while the node owns
+  mempool/follower coordination.
 - `crates/chainstate/src/reorg.rs` owns body preflight, bounded mid-rollback
   body reads, exact disconnect/connect, and typed coherent-vs-recovery
   outcomes. Node's reorg observer owns mempool reconsideration and generation

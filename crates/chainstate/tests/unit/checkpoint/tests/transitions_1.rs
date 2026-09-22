@@ -123,16 +123,23 @@ fn failed_publication_preserves_current() -> Result<(), Box<dyn std::error::Erro
     super::super::inject_next_checkpoint_failpoint(
         super::super::CheckpointFailpoint::ManifestWrite,
     );
+    let error = super::super::write_checkpoint(
+        dir.path(),
+        config(),
+        &tree,
+        &utxo,
+        &listener,
+        Some(&applied_tip),
+    )
+    .expect_err("manifest write failpoint must abort publication");
     assert!(
-        super::super::write_checkpoint(
-            dir.path(),
-            config(),
-            &tree,
-            &utxo,
-            &listener,
-            Some(&applied_tip),
-        )
-        .is_err()
+        matches!(
+            error,
+            super::super::CheckpointError::Store(
+                bitcoin_rs_storage::checkpoint::CheckpointError::Io(ref io)
+            ) if io.raw_os_error() == Some(28)
+        ),
+        "ManifestWrite must surface the injected ENOSPC boundary"
     );
     assert_eq!(fs::read(current_path)?, before);
     Ok(())

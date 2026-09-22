@@ -204,9 +204,15 @@ impl ChainFollowers {
         self.mempool
             .as_ref()
             .map(|gateway| {
-                gateway
-                    .begin_chain_change()
-                    .map_err(|_| bitcoin_rs_chainstate::ApplyError::Shutdown)
+                gateway.begin_chain_change().map_err(|error| match error {
+                    bitcoin_rs_mempool::ChainChangeError::AlreadyActive
+                    | bitcoin_rs_mempool::ChainChangeError::GenerationMoved => {
+                        bitcoin_rs_chainstate::ApplyError::ConcurrentChainChange
+                    }
+                    bitcoin_rs_mempool::ChainChangeError::Overflow => {
+                        bitcoin_rs_chainstate::ApplyError::ChainChangeGenerationOverflow
+                    }
+                })
             })
             .transpose()
     }
@@ -666,5 +672,26 @@ mod tests {
     fn disconnect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry()
     -> anyhow::Result<()> {
         assert_admission_followers_after_chain_change(false)
+    }
+
+    #[test]
+    fn active_chain_change_is_retryable_not_shutdown() -> anyhow::Result<()> {
+        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))));
+        let followers = ChainFollowers::new(
+            ChainEffects::noop(),
+            Arc::new(crate::mining::MiningGenerationSignal::new()),
+            Some(Arc::clone(&gateway)),
+        );
+        let active = gateway.begin_chain_change()?;
+
+        assert!(matches!(
+            followers.begin_mempool_change(),
+            Err(bitcoin_rs_chainstate::ApplyError::ConcurrentChainChange)
+        ));
+        active.finish()?;
+        assert!(followers.begin_mempool_change()?.is_some());
+        Ok(())
     }
 }

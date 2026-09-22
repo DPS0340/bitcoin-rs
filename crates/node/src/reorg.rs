@@ -73,14 +73,12 @@ impl ReorgObserver for NodeReorgObserver<'_> {
 }
 
 fn settle_node_reorg(
-    handles: &Chainstate,
     observer: &mut NodeReorgObserver<'_>,
-    mempool_change: Option<bitcoin_rs_mempool::ChainChangeGuard>,
+    mempool_change: &mut Option<bitcoin_rs_mempool::ChainChangeGuard>,
     outcome: core::result::Result<(), ReorgError>,
 ) -> core::result::Result<(), ReorgError> {
     if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
-        handles.fail_closed_for_recovery();
-        drop(mempool_change);
+        drop(mempool_change.take());
         return outcome;
     }
 
@@ -92,10 +90,9 @@ fn settle_node_reorg(
     } else {
         observer.finish_reconsideration();
     }
-    if let Some(change) = mempool_change
+    if let Some(change) = mempool_change.take()
         && change.finish().is_err()
     {
-        handles.fail_closed_for_recovery();
         return Err(ReorgError::TransitionSettlement {
             source: Box::new(ApplyError::Shutdown),
             original: outcome.err().map(Box::new),
@@ -104,19 +101,47 @@ fn settle_node_reorg(
     outcome
 }
 
+fn settle_checkpoint_debt(
+    handles: &Chainstate,
+    outcome: core::result::Result<(), ReorgError>,
+) -> core::result::Result<(), ReorgError> {
+    if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
+        return outcome;
+    }
+    match handles.settle_disconnect_debt() {
+        Ok(true) => {
+            tracing::info!("published checkpoint after branch switch");
+            outcome
+        }
+        Ok(false) => outcome,
+        Err(source) => {
+            tracing::error!(%source, "reorg checkpoint debt remains unsettled");
+            Err(ReorgError::CheckpointSettlement {
+                source,
+                original: outcome.err().map(Box::new),
+            })
+        }
+    }
+}
+
 /// Invalidates one block through chainstate while node-owned followers remain fenced.
 pub fn invalidate_block(
     handles: &Chainstate,
     followers: &ChainFollowers,
     hash: Hash256,
 ) -> core::result::Result<(), ReorgError> {
-    let mempool_change = followers
+    let mut mempool_change = followers
         .begin_mempool_change()
         .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
     let mut connected_body = |_| {};
     let mut observer = NodeReorgObserver::new(followers, &mut connected_body);
-    let outcome = bitcoin_rs_chainstate::reorg::invalidate_block(handles, &mut observer, hash);
-    settle_node_reorg(handles, &mut observer, mempool_change, outcome)
+    let outcome = bitcoin_rs_chainstate::reorg::invalidate_block(
+        handles,
+        &mut observer,
+        hash,
+        |observer, outcome| settle_node_reorg(observer, &mut mempool_change, outcome),
+    );
+    settle_checkpoint_debt(handles, outcome)
 }
 
 /// Switches the applied branch through chainstate while node-owned followers remain fenced.
@@ -131,7 +156,7 @@ where
     F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
     G: FnMut(Hash256),
 {
-    let mempool_change = followers
+    let mut mempool_change = followers
         .begin_mempool_change()
         .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
     let mut observer = NodeReorgObserver::new(followers, &mut connected_body);
@@ -140,6 +165,7 @@ where
         target,
         &mut staged_body,
         &mut observer,
+        |observer, outcome| settle_node_reorg(observer, &mut mempool_change, outcome),
     );
-    settle_node_reorg(handles, &mut observer, mempool_change, outcome)
+    settle_checkpoint_debt(handles, outcome)
 }

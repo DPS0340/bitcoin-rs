@@ -116,8 +116,9 @@ pub(crate) enum CheckpointWrite {
     Published { generation: u64 },
 }
 
+#[allow(missing_docs)]
 #[derive(Debug, Error)]
-pub(crate) enum CheckpointError {
+pub enum CheckpointError {
     #[error("header checkpoint failed: {0}")]
     Header(#[from] headers::HeaderCheckpointError),
     #[error("checkpoint chain state failed: {0}")]

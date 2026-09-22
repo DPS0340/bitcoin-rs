@@ -319,3 +319,7 @@ fn replay_committed_gap(
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/durable_replay_tests.rs"]
+mod tests;

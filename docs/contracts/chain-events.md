@@ -50,16 +50,22 @@ Owners:
      remove confirmed transactions, keep valid children of confirmed parents,
      remove mined conflicts and descendants, update graph and fee-delta state,
      and update the fee estimator.
-  7. Node publishes the stable coherent mempool generation only after mempool alignment.
-  8. Dispatch notifications and relay in the declared observable order
-     outside all domain locks.
+  7. Dispatch the node-owned post-commit effects in commit order while the
+     chain transition still prevents a later block from overtaking them. Reorg
+     also finishes disconnected-transaction reconsideration before settling the
+     mempool generation.
+  8. Node publishes the stable coherent mempool generation only after mempool
+     alignment and reconsideration.
+  9. Release the chainstate transition. Any disconnect checkpoint debt is
+     published only after both the mempool generation and chain transition are
+     stable, so checkpoint I/O does not extend the mutation fence.
 - A failure before stable publication leaves the fence closed until explicit
   recovery. A guard destructor must never quietly reopen the fence after an
   error.
-- Observer delivery is bounded. The publish queue has a capacity and exposes
-  dropped or gap counters. A slow or blocked observer parks its own drain
-  thread; it never holds the mempool writer, the chain transition reservation,
-  or a storage lock.
+- Observer delivery is bounded. The commit path may enqueue an observer record
+  while the transition is held to preserve ordering, but a slow consumer drains
+  on its own thread. It never holds the mempool writer, chain transition
+  reservation, or a storage lock while doing slow downstream work.
 - Canonical estimator accounting is part of the mempool lifecycle in step 6.
   It is not an observer and is never dropped.
 

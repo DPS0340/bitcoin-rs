@@ -69,12 +69,9 @@ fn clean_shutdown_publishes_checkpoint_and_returns_success() -> anyhow::Result<(
     Ok(())
 }
 
-#[cfg(unix)]
 #[test]
 // CONTRACT: docs/contracts/architecture.md#ARCH-05
 fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let temp = tempfile::tempdir()?;
     let mut config = isolated_config(&temp.path().join("node-checkpoint-failure"));
     config.p2p.connect = vec!["127.0.0.1:1".to_owned()];
@@ -84,24 +81,45 @@ fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow:
 
     let checkpoint_root = current
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("checkpoint CURRENT has no parent"))?;
-    let original_mode = std::fs::metadata(checkpoint_root)?.permissions().mode();
-    std::fs::set_permissions(checkpoint_root, std::fs::Permissions::from_mode(0o500))?;
+        .ok_or_else(|| anyhow::anyhow!("checkpoint CURRENT has no parent"))?
+        .to_path_buf();
+    let displaced = checkpoint_root.with_extension("checkpoint-failure-backup");
+    struct RestoreCheckpointRoot {
+        root: PathBuf,
+        displaced: PathBuf,
+    }
+    impl Drop for RestoreCheckpointRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.root);
+            let _ = std::fs::rename(&self.displaced, &self.root);
+        }
+    }
+    let restore = RestoreCheckpointRoot {
+        root: checkpoint_root.clone(),
+        displaced: displaced.clone(),
+    };
+    inject_before_clean_checkpoint({
+        let checkpoint_root = checkpoint_root.clone();
+        let displaced = displaced.clone();
+        move || {
+            std::fs::rename(&checkpoint_root, &displaced)
+                .unwrap_or_else(|error| panic!("move checkpoint root aside: {error}"));
+            std::fs::write(&checkpoint_root, b"not a directory")
+                .unwrap_or_else(|error| panic!("replace checkpoint root with file: {error}"));
+        }
+    });
 
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
     shutdown_tx.send(())?;
     let result = run(config, RuntimeInputs::default().with_shutdown(shutdown_rx));
 
-    std::fs::set_permissions(
-        checkpoint_root,
-        std::fs::Permissions::from_mode(original_mode),
-    )?;
     assert!(result.is_err());
-    assert_eq!(std::fs::read(current)?, previous);
+    assert_eq!(std::fs::read(displaced.join("CURRENT"))?, previous);
     assert!(
         bootstrap_drain_was_reached(),
         "checkpoint errors must not bypass the bootstrap-worker join"
     );
+    drop(restore);
     Ok(())
 }
 

@@ -280,7 +280,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "metrics",
  "parking_lot",
- "proptest",
  "quanta",
  "rayon",
  "rustix",

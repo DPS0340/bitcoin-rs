@@ -334,7 +334,7 @@ impl NodeState {
     }
 
     pub(crate) fn write_clean_checkpoint(&self) -> anyhow::Result<Option<u64>> {
-        self.chainstate.publish_checkpoint()
+        Ok(self.chainstate.publish_checkpoint()?)
     }
 
     /// Starts chainstate journal and retention maintenance.

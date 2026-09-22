@@ -65,6 +65,8 @@ pub use prepare::bytes_are_block;
 pub use window::classify_apply_error;
 
 mod checkpoint;
+pub use checkpoint::CheckpointError;
+pub use checkpoint::headers::HeaderCheckpointError;
 /// Typed chainstate mutation failures.
 pub mod error;
 pub mod events;
@@ -1005,11 +1007,9 @@ impl Chainstate {
     /// Returns `Ok(true)` when a checkpoint was written, `Ok(false)` when
     /// there was no debt or no publisher. A publication failure leaves the
     /// `RolledBack` marker in place.
-    pub fn settle_disconnect_debt(&self) -> anyhow::Result<bool> {
+    pub fn settle_disconnect_debt(&self) -> core::result::Result<bool, CheckpointError> {
         match &self.checkpoint_publisher {
-            Some(publisher) => publisher
-                .settle_disconnect_debt()
-                .map_err(anyhow::Error::new),
+            Some(publisher) => publisher.settle_disconnect_debt(),
             None => Ok(false),
         }
     }
@@ -1050,11 +1050,11 @@ impl Chainstate {
     }
 
     /// Publishes one full maintenance checkpoint.
-    pub fn publish_checkpoint(&self) -> anyhow::Result<Option<u64>> {
+    pub fn publish_checkpoint(&self) -> core::result::Result<Option<u64>, CheckpointError> {
         let Some(publisher) = &self.checkpoint_publisher else {
             return Ok(None);
         };
-        match publisher.publish().map_err(anyhow::Error::new)? {
+        match publisher.publish()? {
             crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => Ok(None),
             crate::checkpoint::CheckpointWrite::Published { generation } => Ok(Some(generation)),
         }
@@ -1111,6 +1111,12 @@ impl Chainstate {
             .begin_transition()
             .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
         let result = transition.disconnect(block);
+        if matches!(
+            result,
+            Err(crate::DisconnectError::Fatal { .. } | crate::DisconnectError::MarkerStuck { .. })
+        ) {
+            self.fail_closed_for_recovery();
+        }
         drop(transition);
         result
     }
@@ -1666,3 +1672,7 @@ mod admission_tests;
 #[cfg(test)]
 #[path = "../tests/unit/apply/chain_tx_count_tests.rs"]
 mod chain_tx_count_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/apply/persistence_tests.rs"]
+mod persistence_tests;

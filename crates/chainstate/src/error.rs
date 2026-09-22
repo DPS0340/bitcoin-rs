@@ -6,6 +6,16 @@ pub enum ApplyError {
     /// Clean shutdown has closed block-apply admission.
     #[error("block apply rejected because clean shutdown has begun")]
     Shutdown,
+    /// Another node-owned chain-change reservation is already active.
+    ///
+    /// No chainstate mutation was attempted. Callers may retry after the
+    /// in-flight transition settles.
+    #[error("another chain change is already active")]
+    ConcurrentChainChange,
+    /// The node-owned cross-domain generation counter cannot reserve another
+    /// transition. Restart is required before another coordinated mutation.
+    #[error("chain-change generation exhausted")]
+    ChainChangeGenerationOverflow,
     /// The block's previous header hash does not match the current tip's hash.
     #[error("prev hash mismatch: tip {tip}, block prev {prev}")]
     PrevHashMismatch {

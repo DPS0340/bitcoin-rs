@@ -518,6 +518,9 @@ fn map_apply_error(error: ApplyError) -> Result<BlockValidationResult, MiningCon
         ApplyError::Shutdown | ApplyError::JournalBackpressure(_) => {
             Ok(BlockValidationResult::Inconclusive)
         }
+        ApplyError::ConcurrentChainChange | ApplyError::ChainChangeGenerationOverflow => Err(
+            MiningControlError::Unavailable(CompactString::from(error.to_string())),
+        ),
         other => bip22_reject_reason(&other).map(BlockValidationResult::Rejected),
     }
 }
@@ -568,7 +571,10 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
             | ChainError::TimestampTooEarly { .. }
             | ChainError::TimestampTooFarAhead { .. }),
         ) => bitcoin_rs_mining::chain_reject_reason(chain),
-        ApplyError::Shutdown | ApplyError::JournalBackpressure(_) => {
+        ApplyError::Shutdown
+        | ApplyError::JournalBackpressure(_)
+        | ApplyError::ConcurrentChainChange
+        | ApplyError::ChainChangeGenerationOverflow => {
             return Err(MiningControlError::Unavailable(CompactString::from(
                 error.to_string(),
             )));

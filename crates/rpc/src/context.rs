@@ -726,6 +726,10 @@ impl Context {
         read()
     }
 
+    fn applied_progress_snapshot(&self) -> (Option<Arc<TipSnapshot>>, Option<u64>) {
+        self.with_stable_chainstate(|| (self.applied_tip.load_full(), self.chain_tx_count()))
+    }
+
     /// Attaches the live ZMQ publisher used by `getzmqnotifications`.
     #[must_use]
     pub fn with_zmq_publisher(mut self, publisher: Arc<dyn crate::zmq::ZmqPublisher>) -> Self {
@@ -764,7 +768,7 @@ impl Context {
     /// RPC JSON. Chainwork is the applied tip's when one exists.
     #[must_use]
     pub fn sync_progress(&self) -> SyncProgress {
-        let applied_tip = self.applied_tip.load_full();
+        let (applied_tip, chain_tx_count) = self.applied_progress_snapshot();
         let applied = applied_tip.as_ref().map_or(0, |tip| tip.height);
         let headers = self.height();
         let (difficulty, time, median_time) =
@@ -782,7 +786,7 @@ impl Context {
         // Core's estimate when the verified-transaction count is known, the
         // height ratio when it is not; `None` is a pre-tracking datadir and
         // means unknown, never zero.
-        let verification_progress = self.chain_tx_count().map_or_else(
+        let verification_progress = chain_tx_count.map_or_else(
             || {
                 if headers > 0 {
                     (f64::from(applied) / f64::from(headers)).min(1.0)
@@ -1466,6 +1470,58 @@ mod tests {
             Arc::ptr_eq(&ctx.added_nodes, &added_nodes),
             "added_nodes must be shared with caller"
         );
+    }
+
+    #[test]
+    fn progress_snapshot_waits_for_a_complete_chain_transition() -> anyhow::Result<()> {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let chain_tx_count = Arc::new(AtomicU64::new(1));
+        let barrier = Arc::new(Mutex::new(()));
+        let ctx = Arc::new(
+            Context::new()
+                .with_chain_tx_count(Arc::clone(&chain_tx_count))
+                .with_chain_transition(Arc::clone(&barrier)),
+        );
+        let genesis = Network::Regtest.genesis_block();
+        let tip = {
+            let mut tree = ctx.block_tree.write();
+            let tip_id = tree.insert_node(
+                None,
+                genesis.header,
+                bitcoin_rs_chain::node::NodeStatus::Active,
+            )?;
+            let node = tree.node(tip_id)?;
+            TipSnapshot {
+                tip_id,
+                height: node.height,
+                chainwork: node.chainwork,
+                hash: node.hash,
+            }
+        };
+
+        let transition = barrier.lock();
+        ctx.applied_tip.store(Some(Arc::new(tip.clone())));
+        let worker = Arc::clone(&ctx);
+        let (tx, rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _ = tx.send(worker.applied_progress_snapshot());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "RPC progress must not observe a half-published transition"
+        );
+        chain_tx_count.store(42, Ordering::Release);
+        drop(transition);
+
+        let (published_tip, published_count) = rx.recv_timeout(Duration::from_secs(1))?;
+        join.join()
+            .map_err(|_| anyhow::anyhow!("snapshot worker panicked"))?;
+        assert_eq!(published_tip.as_deref(), Some(&tip));
+        assert_eq!(published_count, Some(42));
+        Ok(())
     }
 
     #[test]
