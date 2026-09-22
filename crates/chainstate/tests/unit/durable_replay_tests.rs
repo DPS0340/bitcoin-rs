@@ -176,3 +176,26 @@ fn committed_gap_with_missing_body_fails_closed() -> Result<(), Box<dyn std::err
     assert_eq!(handles.durable_head.load()?, Some(head));
     Ok(())
 }
+
+#[test]
+fn durable_head_without_restored_chainstate_fails_startup() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut handles, child) = restored_chainstate()?;
+    handles.applied_tip.store(None);
+    handles.chain_tx_count.store(0, Ordering::Release);
+    let head = install_head(&mut handles, &child, Arc::new(MemoryBodies::default()))?;
+
+    let Err(error) = super::reconcile_at_boot(&handles) else {
+        panic!("cold chainstate must not start beneath an existing durable head");
+    };
+    assert!(matches!(
+        error,
+        ApplyError::DurableHeadWithoutRestoredState {
+            head: error_head,
+            head_height: 1,
+        } if error_head == head.tip
+    ));
+    assert!(handles.applied_tip.load_full().is_none());
+    assert_eq!(handles.durable_head.load()?, Some(head));
+    Ok(())
+}

@@ -382,7 +382,8 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
         ApplyError::UtxoCommit(_)
         | ApplyError::DurableHeadCommit(_)
         | ApplyError::DurableHeadLineage { .. }
-        | ApplyError::DurableHeadGapUnrecoverable { .. } => Fatal,
+        | ApplyError::DurableHeadGapUnrecoverable { .. }
+        | ApplyError::DurableHeadWithoutRestoredState { .. } => Fatal,
         ApplyError::ProofOfWork { .. }
         | ApplyError::TargetAboveLimit
         | ApplyError::NbitsNonRetargetMismatch { .. } => Permanent,

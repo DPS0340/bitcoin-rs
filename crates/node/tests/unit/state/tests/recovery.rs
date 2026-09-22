@@ -350,6 +350,45 @@ fn applied_regtest_chain(
     Ok((dir, state, config))
 }
 
+#[test]
+fn missing_checkpoint_with_post_genesis_durable_head_refuses_startup() -> anyhow::Result<()> {
+    let (_dir, state, config) = applied_regtest_chain(2, 1)?;
+    drop(state);
+    std::fs::remove_dir_all(config.data_dir.join("chainstate-checkpoints"))?;
+
+    let opened = NodeState::open(config, None);
+    let error = opened
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("cold recovery under a durable head must fail"))?;
+    assert!(
+        format!("{error:#}").contains("exists but no chainstate was restored"),
+        "startup must fail at durable-head reconciliation: {error:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn full_revalidation_with_post_genesis_durable_head_refuses_startup() -> anyhow::Result<()> {
+    let (_dir, state, config) = applied_regtest_chain(2, 1)?;
+    drop(state);
+    let journal_dir = config.data_dir.join(CHAINSTATE_JOURNAL_DIR);
+    std::fs::create_dir_all(&journal_dir)?;
+    std::fs::write(
+        journal_dir.join(bitcoin_rs_storage::chainstate_journal::FULL_REVALIDATION_MARKER),
+        b"force full validation\n",
+    )?;
+
+    let opened = NodeState::open(config, None);
+    let error = opened
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("forced cold recovery under a durable head must fail"))?;
+    assert!(
+        format!("{error:#}").contains("exists but no chainstate was restored"),
+        "startup must fail at durable-head reconciliation: {error:#}"
+    );
+    Ok(())
+}
+
 // -----------------------------------------------------------------------
 // #655: prune-then-reorg and bounded deep-reorg scenarios.
 // -----------------------------------------------------------------------

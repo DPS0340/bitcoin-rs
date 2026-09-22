@@ -597,6 +597,7 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
         | ApplyError::DurableHeadCommit(_)
         | ApplyError::DurableHeadLineage { .. }
         | ApplyError::DurableHeadGapUnrecoverable { .. }
+        | ApplyError::DurableHeadWithoutRestoredState { .. }
         | ApplyError::CoinStatsRewind(_) => {
             return Err(MiningControlError::Failed(CompactString::from(
                 error.to_string(),

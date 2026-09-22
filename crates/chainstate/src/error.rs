@@ -168,6 +168,18 @@ pub enum ApplyError {
         /// Why the gap is not a replayable publication lag.
         reason: &'static str,
     },
+    /// A durable head exists but startup restored no authoritative chainstate.
+    ///
+    /// Continuing would let ordinary sync re-apply genesis against a later
+    /// durable lineage and fail only after startup. Recovery must first restore
+    /// compatible chainstate or perform an explicit rebuild of durable authority.
+    #[error("durable head {head} at height {head_height} exists but no chainstate was restored")]
+    DurableHeadWithoutRestoredState {
+        /// Tip certified by the durable head.
+        head: bitcoin_rs_primitives::Hash256,
+        /// Height certified by the durable head.
+        head_height: u32,
+    },
     /// Rewinding the block-level coinstats failed.
     ///
     /// The per-coin fields ride the UTXO change listener and are already

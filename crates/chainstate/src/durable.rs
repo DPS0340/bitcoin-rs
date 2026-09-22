@@ -186,7 +186,9 @@ const REPLAY_GAP_BLOCK_LIMIT: usize = super::window::DURABLE_HEAD_GROUP_BLOCKS;
 /// the stored tip, re-applies them through the ordinary commit path with the
 /// head suppressed, and publishes — so ordinary operation never starts on a
 /// state the head does not certify. A gap that is not an ancestor prefix of
-/// stored bodies fails closed: no partial success publishes.
+/// stored bodies fails closed: no partial success publishes. A durable head
+/// with no restored chainstate also fails startup immediately; silently
+/// keeping it for a later genesis reapply would guarantee a lineage failure.
 pub fn reconcile_at_boot(handles: &Chainstate) -> Result<(), ApplyError> {
     let stored = handles
         .durable_head
@@ -196,12 +198,10 @@ pub fn reconcile_at_boot(handles: &Chainstate) -> Result<(), ApplyError> {
         return Ok(());
     };
     let Some(tip) = handles.applied_tip.load_full() else {
-        tracing::warn!(
-            head_height = head.height,
-            head_tip = %head.tip.to_string_be(),
-            "durable head exists but no chainstate was restored"
-        );
-        return Ok(());
+        return Err(ApplyError::DurableHeadWithoutRestoredState {
+            head: head.tip,
+            head_height: head.height,
+        });
     };
     if tip.hash == head.tip {
         return Ok(());

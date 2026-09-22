@@ -3,10 +3,11 @@
 How the node recovers an authoritative chainstate after a crash, a lost
 write, a reorganization, or an incompatible datadir. The chainstate is
 the single durable authority. `crates/chainstate` owns the ordered commit
-protocol over the storage durable head. That head certifies ordering and high-water bounds, not coin contents:
-without a restored checkpoint the node starts with an empty chainstate
-(`reconcile_at_boot` warns and continues). Every other persisted component
-is derived and reconciles to it.
+protocol over the storage durable head. That head certifies ordering and
+high-water bounds, not coin contents. If startup restores no chainstate while
+a durable head still exists, `reconcile_at_boot` fails closed instead of
+starting an empty chainstate that cannot extend the stored lineage. Every
+other persisted component is derived and reconciles to it.
 
 Owners:
 - Authoritative durable root and ordered commit protocol:
