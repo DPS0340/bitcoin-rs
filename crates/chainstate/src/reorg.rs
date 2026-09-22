@@ -128,12 +128,7 @@ where
         if progress.disconnected == prepared.disconnect_nodes.len()
             && !outcome.as_ref().is_err_and(ReorgError::requires_recovery)
         {
-            let mut tree = handles.block_tree().write();
-            let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
-            invalidated = tree.invalidate_subtree(root).map_err(ReorgError::Plan)?;
-            let tip = tree.tip().ok_or(ReorgError::NoValidTip)?;
-            handles.chain_tip().store(Some(tip));
-            handles.reevaluate_assume_valid_with(&tree);
+            invalidated = invalidate_and_republish(handles, hash)?;
         }
         if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
             outcome
@@ -156,6 +151,25 @@ where
     })();
     settle_reorg_transition(transition, observer, outcome, &mut settle)
         .map(|()| invalidated.into_boxed_slice())
+}
+
+/// Marks `hash`'s subtree invalid under the tree write lock and republishes
+/// the best remaining tip, keeping `chain_tip` and the assume-valid gate in
+/// sync with the tree. Lookup miss, tree inconsistency, and the absence of a
+/// valid tip surface as `UnknownBlock`/`Plan`/`NoValidTip` rather than an
+/// empty result so callers cannot mistake a failed invalidation for an
+/// empty subtree.
+fn invalidate_and_republish(
+    handles: &Chainstate,
+    hash: Hash256,
+) -> core::result::Result<Vec<Hash256>, ReorgError> {
+    let mut tree = handles.block_tree().write();
+    let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
+    let invalidated = tree.invalidate_subtree(root).map_err(ReorgError::Plan)?;
+    let tip = tree.tip().ok_or(ReorgError::NoValidTip)?;
+    handles.chain_tip().store(Some(tip));
+    handles.reevaluate_assume_valid_with(&tree);
+    Ok(invalidated)
 }
 
 /// Why a branch switch stopped, and what the chain looks like now.
@@ -941,18 +955,11 @@ where
         }
         Err(source) => {
             let disposition = crate::classify_apply_error(&source);
+            // A permanently-invalid block must be marked invalid or surfaced:
+            // an empty `invalidated` on a failed invalidation would let the
+            // next switch retry the same block.
             let invalidated = if disposition == crate::WindowApplyDisposition::Permanent {
-                let handles = transition.chainstate();
-                let mut tree = handles.block_tree().write();
-                let invalidated = tree
-                    .lookup(body.hash)
-                    .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
-                    .unwrap_or_default();
-                if let Some(tip) = tree.tip() {
-                    handles.chain_tip().store(Some(tip));
-                }
-                handles.reevaluate_assume_valid_with(&tree);
-                invalidated
+                invalidate_and_republish(transition.chainstate(), body.hash)?
             } else {
                 Vec::new()
             };
