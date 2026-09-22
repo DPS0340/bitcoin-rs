@@ -103,6 +103,11 @@ impl BlockSync {
     }
 
     pub(super) fn reconcile_peer_sessions(&self) {
+        // Backstop: a session whose connection already cancelled its lease
+        // leaves the table within one tick, whatever path cancelled it, so
+        // zombie entries are never candidates for fetch work.
+        self.peer_table
+            .disconnect_matching(|_, lease| lease.is_cancelled());
         let live = self.peer_table.live_connections();
         let mut body_sync = self.body_sync.lock();
         let window = &mut body_sync.window;

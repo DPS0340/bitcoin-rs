@@ -223,11 +223,8 @@ fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick()
 
     sync.tick();
     assert!(
-        peers
-            .sessions()
-            .iter()
-            .any(|session| session.addr == low && session.lease.is_cancelled()),
-        "the failed probe source remains table-resident while its lease tears down"
+        !peers.sessions().iter().any(|session| session.addr == low),
+        "the failed probe source must be evicted instead of lingering table-resident",
     );
 
     // The failed probe must hand off to request_headers_from_best_peer in the
@@ -299,6 +296,98 @@ fn failed_probe_send_excludes_dead_highest_peer_from_header_fallback()
         "the lower live peer must own the fallback request"
     );
     assert!(live_rx.try_recv().is_err());
+    Ok(())
+}
+
+#[test]
+fn dead_probe_peer_is_evicted_and_not_repicked_on_the_next_tick()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sync, peers, _, _, expected) = sync_with_header_chain(1)?;
+    install_budget(
+        &sync,
+        super::super::SyncBudget {
+            max_pending_bytes: 0,
+            max_received_bytes: 0,
+            ..super::super::default_sync_budget()
+        },
+    );
+    let dead = test_addr(9766, 0)?;
+    let live = test_addr(9766, 1)?;
+    // Lowest address wins the probe's min_by_key(addr) rotation, but its
+    // channel is dead: dropping the receiver disconnects the crossbeam
+    // sender, so the lease's try_send fails and the lease cancels itself.
+    let dead_rx = connect_peer(&peers, eligible_peer(dead, 5));
+    drop(dead_rx);
+    let live_rx = connect_peer(&peers, eligible_peer(live, 3));
+
+    // Tick 1: the dead peer's probe send fails and the same-tick fallback
+    // hands the request to the live peer.
+    sync.tick();
+    let request = next_getheaders(&live_rx)?;
+    assert_eq!(
+        request
+            .locator_hashes
+            .first()
+            .map(|hash| *hash.as_byte_array()),
+        Some(*expected[0].as_bytes()),
+        "the fallback request must start at the header tip"
+    );
+
+    // Expire the live peer's pending request so the next tick must choose a
+    // probe target again.
+    sync.pending_getheaders
+        .lock()
+        .as_mut()
+        .ok_or("fallback lost its deadline")?
+        .requested_at -= super::super::HEADER_REQUEST_TIMEOUT;
+
+    // Tick 2: the dead session must be gone (evicted on the failed send,
+    // swept by the reconciler as backstop) instead of being re-picked once
+    // per tick forever.
+    sync.tick();
+    assert!(
+        !peers.sessions().iter().any(|session| session.addr == dead),
+        "the dead peer session must not survive into the next tick",
+    );
+    assert_ne!(
+        sync.pending_getheaders
+            .lock()
+            .as_ref()
+            .map(|request| request.peer_addr),
+        Some(dead),
+        "the pending request must not be keyed to the dead addr",
+    );
+    let request = next_getheaders(&live_rx)?;
+    // The follow-up request is the idle frontier probe, anchored on the
+    // active chain at the applied height (genesis here) — not the fallback's
+    // chain-tip locator.
+    assert_eq!(
+        request
+            .locator_hashes
+            .first()
+            .map(|hash| *hash.as_byte_array()),
+        Some(*Network::Regtest.genesis_block().block_hash().as_bytes()),
+        "the live peer must own the follow-up header request",
+    );
+    assert!(live_rx.try_recv().is_err());
+    Ok(())
+}
+
+#[test]
+fn reconciler_sweeps_cancelled_lease_sessions_within_one_tick()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sync, peers, _, _, _) = sync_with_header_chain(1)?;
+    let addr = test_addr(9767, 0)?;
+    // A lease cancelled by any path (here: direct teardown request) while its
+    // session stays table-resident must leave the table within one tick.
+    let _rx = connect_peer(&peers, eligible_peer(addr, 5));
+    peers.lease(addr).ok_or("peer missing from table")?.cancel();
+    assert!(peers.sessions().iter().any(|session| session.addr == addr));
+    sync.tick();
+    assert!(
+        !peers.sessions().iter().any(|session| session.addr == addr),
+        "the reconciler must sweep cancelled-lease sessions",
+    );
     Ok(())
 }
 
