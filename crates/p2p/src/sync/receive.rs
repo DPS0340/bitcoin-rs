@@ -142,6 +142,11 @@ impl BlockSync {
         // copy silently expires with the announced tip never learned.
         self.admit_delivered_block_headers(blocks);
 
+        // Admission may have advanced the header tip past the frontier
+        // captured in `fill_inbound_block_chunk`; the stager protects the
+        // apply-frontier body from budget eviction only under the fresh one.
+        let next_expected_hash = self.next_expected_block_hash().or(next_expected_hash);
+
         // A cold-start hedge can arrive after its original copy was applied.
         // Drop only blocks proven to lie on the applied ancestry; a known
         // side-chain block at the same or lower height must remain eligible.
@@ -391,6 +396,7 @@ impl BlockSync {
     /// Runs outside `body_sync`: `admit_headers` takes the chain transition
     /// lock and the tree write, both of which rank above the window lock.
     fn admit_delivered_block_headers(&self, blocks: &[InboundBlock]) {
+        self.drain_deferred_gap_recovery();
         let mut heights = HashMap::with_capacity(blocks.len());
         let mut groups: HashMap<Option<PeerSource>, HashMap<Hash256, Header>> = HashMap::new();
         let mut deliverers: HashMap<Hash256, Vec<PeerSource>> = HashMap::new();
@@ -463,31 +469,13 @@ impl BlockSync {
                 break;
             }
         }
-        if let Some((source, prev_hash)) = gap_source {
-            // A sibling group or a later round may have admitted the
-            // missing ancestor since the gap was recorded; a healed gap
-            // makes the request void. Sending to a deliverer this pass
-            // already disconnected for a peer fault is equally void, and
-            // the single tracked slot must never displace an unrelated
-            // in-flight request — that response could not clear the
-            // tracker and later ticks would issue competing sends.
-            let healed = self.chain.block_tree().read().lookup(prev_hash).is_some();
-            // Snapshot the slot, then drop the guard before touching the
-            // table: peer-table reads under the pending lock invert the
-            // table→pending order `with_current` callers rely on.
-            let pending_request = *self.pending_getheaders.lock();
-            let live_pending = pending_request.is_some_and(|request| {
-                Instant::now().duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT
-                    && self.peer_table.ready_source(request.peer_addr).is_some()
-            });
-            if !healed && !live_pending && self.peer_table.is_current(source) {
-                let our_height = self
-                    .chain
-                    .chain_tip()
-                    .load_full()
-                    .map_or(0, |tip| tip.height);
-                self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
-            }
+        if let Some((source, prev_hash)) = gap_source
+            && !self.try_gap_recovery(source, prev_hash)
+        {
+            // The tracked request slot was occupied; the gap must not
+            // silently lose its retry — a later admission pass or an
+            // accepted headers batch fires it once the slot clears.
+            *self.deferred_gap_recovery.lock() = Some((source, prev_hash));
         }
         // Bodies staged before their headers landed (an earlier chunk's
         // refused or re-delivered admission) would otherwise keep the
@@ -500,6 +488,58 @@ impl BlockSync {
                 .reconcile_received_heights(&tree);
         }
         self.refresh_active_peer_credit();
+    }
+
+    /// Sends the pass's single recovery `getheaders` for a missing-parent
+    /// gap. Returns `true` when no retry is owed — the request went out,
+    /// a sibling admission healed the gap, or the deliverer left — and
+    /// `false` only when an unrelated in-flight request suppressed the
+    /// send, in which case the caller defers it to `deferred_gap_recovery`.
+    fn try_gap_recovery(&self, source: PeerSource, prev_hash: Hash256) -> bool {
+        // A sibling group or a later round may have admitted the missing
+        // ancestor since the gap was recorded; a healed gap makes the
+        // request void. Sending to a deliverer already disconnected for a
+        // peer fault is equally void.
+        if self.chain.block_tree().read().lookup(prev_hash).is_some()
+            || !self.peer_table.is_current(source)
+        {
+            return true;
+        }
+        // The single tracked slot must never displace an unrelated
+        // in-flight request — that response could not clear the tracker
+        // and later ticks would issue competing sends. Snapshot the slot,
+        // then drop the guard before touching the table: peer-table reads
+        // under the pending lock invert the table→pending order
+        // `with_current` callers rely on.
+        let pending_request = *self.pending_getheaders.lock();
+        let live_pending = pending_request.is_some_and(|request| {
+            Instant::now().duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT
+                && self.peer_table.ready_source(request.peer_addr).is_some()
+        });
+        if live_pending {
+            return false;
+        }
+        let our_height = self
+            .chain
+            .chain_tip()
+            .load_full()
+            .map_or(0, |tip| tip.height);
+        self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
+        true
+    }
+
+    /// Fires a recovery deferred behind an occupied request slot once a
+    /// pass finds it free; clears the slot when the gap healed, the
+    /// deliverer left, or the send went out. Called wherever header
+    /// progress can free the slot — the body-admission pass and accepted
+    /// `headers` batches.
+    pub(super) fn drain_deferred_gap_recovery(&self) {
+        let Some((source, prev_hash)) = *self.deferred_gap_recovery.lock() else {
+            return;
+        };
+        if self.try_gap_recovery(source, prev_hash) {
+            *self.deferred_gap_recovery.lock() = None;
+        }
     }
 
     /// Reacts to one deliverer's component admission with the same

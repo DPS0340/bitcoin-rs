@@ -110,6 +110,9 @@ impl BlockSync {
                 }
             }
         }
+        // Any consumed response — accepted or rejected — frees the tracked
+        // request slot; a gap recovery deferred behind it retries here.
+        self.drain_deferred_gap_recovery();
         if total_headers > 0 {
             tracing::debug!(total_headers, "block sync: drained inbound headers");
         }

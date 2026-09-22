@@ -97,6 +97,11 @@ pub struct BlockSync {
     /// the P2P crate.
     body_sync: Mutex<BodySyncState>,
     pending_getheaders: Arc<Mutex<Option<PendingHeaderRequest>>>,
+    /// A missing-parent recovery suppressed because the tracked header
+    /// request was occupied: exactly one gap waits for the slot, retried
+    /// whenever a later pass finds it free, healed by an intervening
+    /// headers batch, or dropped when its deliverer leaves.
+    deferred_gap_recovery: Mutex<Option<(PeerSource, Hash256)>>,
     expected_apply_cache: Arc<Mutex<Option<ExpectedApplyCache>>>,
     known_sessions: Mutex<HashMap<SocketAddr, crate::ConnectionId>>,
     /// Latched by the first [`WindowCommitDisposition::Fatal`] settlement.
@@ -177,6 +182,7 @@ impl BlockSync {
                 stager: BlockStager::new(default_sync_budget()),
             }),
             pending_getheaders: Arc::new(Mutex::new(None)),
+            deferred_gap_recovery: Mutex::new(None),
             expected_apply_cache: Arc::new(Mutex::new(None)),
             known_sessions: Mutex::new(HashMap::new()),
             apply_halted: std::sync::atomic::AtomicBool::new(false),

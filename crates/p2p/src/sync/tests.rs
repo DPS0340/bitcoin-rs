@@ -762,6 +762,69 @@ fn missing_parent_block_delivery_recovers_with_getheaders() -> Result<(), Box<dy
     Ok(())
 }
 
+/// A missing-parent recovery suppressed by an unrelated in-flight
+/// `getheaders` keeps its retry obligation in `deferred_gap_recovery` and
+/// fires when a response frees the tracked slot — the staged body must
+/// never have to wait for staging expiry to re-ask.
+#[test]
+fn deferred_gap_recovery_fires_when_request_slot_clears() -> Result<(), Box<dyn std::error::Error>>
+{
+    let genesis = Network::Regtest.genesis_block();
+    let block1 = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
+    let block2 = mined_block_with_prev_hash(block1.block_hash(), 2, vec![coinbase_transaction(2)]);
+    // An unrelated side-chain header: admittable, but it does not supply
+    // the missing parent, so the deferred send is not healed away.
+    let side = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(99)]);
+    let mut tree = BlockTree::new();
+    tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx,
+    } = SyncHarness::new(tree);
+    install_budget(&sync, super::default_sync_budget());
+    let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
+    let rx_a = connect_peer(&peers, eligible_peer(addr_a, 0));
+    let _rx_b = connect_peer(&peers, eligible_peer(addr_b, 0));
+    let source_a = current_source(&peers, addr_a);
+    let source_b = current_source(&peers, addr_b);
+
+    sync.tick();
+    assert_applied_genesis(&applied_tip, &block_tree)?;
+
+    // Occupy the single tracked request slot with an unrelated request.
+    assert!(sync.send_getheaders(source_b, 0, i32::MAX, sync.build_locator()));
+
+    // The gap body's recovery cannot send while the slot is occupied.
+    let serialized = bytes::Bytes::from(consensus_bytes(&block2));
+    inbound_blocks_tx.send(crate::InboundBlock {
+        block: block2.clone(),
+        serialized,
+        source: Some(source_a),
+    })?;
+    sync.tick();
+    assert!(
+        rx_a.try_recv().is_err(),
+        "recovery must defer, not displace the live request"
+    );
+
+    // A response that consumes the slot but does not heal the gap frees
+    // the deferred send.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![side.header],
+        source: Some(source_b),
+    })?;
+    sync.tick();
+    let Message::GetHeaders(_) = rx_a.try_recv()? else {
+        return Err(std::io::Error::other("expected deferred recovery getheaders").into());
+    };
+    Ok(())
+}
+
 /// Cross-tick regression for the bounded prefix-race-before-fanout
 /// handoff: a probe created below the threshold must defer fanout when the
 /// eligible count reaches the threshold on a following tick while the
