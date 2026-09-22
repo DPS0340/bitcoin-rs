@@ -569,8 +569,19 @@ impl Client {
         response.json()
     }
 
+    /// Esplora surfaces 503 while the transaction index crosses a snapshot
+    /// boundary mid-query ("changed during query; retry"), which the daemon
+    /// answers asynchronously after each mined block: poll again inside the
+    /// same index deadline the scriptindex wait already allows.
     fn esplora_get(&self, path: &str) -> TestResult<HttpResponse> {
-        self.exchange("GET", path, None, b"")
+        let deadline = Instant::now() + INDEX_TIMEOUT;
+        loop {
+            let response = self.exchange("GET", path, None, b"")?;
+            if response.status != 503 || Instant::now() >= deadline {
+                return Ok(response);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn esplora_post(&self, path: &str, body: &[u8]) -> TestResult<HttpResponse> {
