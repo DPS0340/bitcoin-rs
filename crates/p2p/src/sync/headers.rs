@@ -39,6 +39,10 @@ impl BlockSync {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;
         let mut credit_refresh_needed = false;
+        // Set when any batch reached `admit_headers`: a rejection can still
+        // commit a valid prefix, so staged-body sentinels reconcile on the
+        // attempt, not only on a clean accept.
+        let mut admission_attempted = false;
         while let Ok(InboundHeaders {
             headers,
             source,
@@ -72,6 +76,7 @@ impl BlockSync {
             // Header admission moves the header tip, which the apply path
             // reads under the transition; the implementation holds that lock
             // inside `admit_headers` until commit.
+            admission_attempted = true;
             match self.chain.admit_headers(&headers) {
                 HeaderAdmission::Accepted {
                     accepted,
@@ -83,7 +88,6 @@ impl BlockSync {
                             .note_announced_tip(source, tip_hash, active_height);
                     }
                     credit_refresh_needed = true;
-                    self.reconcile_staged_received_heights();
                     tracing::debug!(
                         accepted,
                         received = batch_len,
@@ -159,6 +163,9 @@ impl BlockSync {
         // The drain may have attached the ancestry a deferred owned fetch
         // was waiting on — resolve it against the tree now.
         self.resolve_owned_body_fetches();
+        if admission_attempted {
+            self.reconcile_staged_received_heights();
+        }
         if total_headers > 0 {
             tracing::debug!(total_headers, "block sync: drained inbound headers");
         }

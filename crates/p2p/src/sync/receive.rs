@@ -166,9 +166,12 @@ impl BlockSync {
                 .filter(|(hash, _, _)| tree.lookup(*hash).is_none())
                 .collect()
         };
+        // Every staged header reaches `admit_headers`, and a rejection can
+        // still commit a valid prefix — staged-body sentinels reconcile on
+        // the attempt, not only on a clean accept.
+        let admission_attempted = !unadmitted.is_empty();
         let mut missing_parent = false;
         let mut credit_refresh_needed = false;
-        let mut admitted_any = false;
         let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
         for (hash, header, source) in unadmitted {
             match self.chain.admit_headers(&[header]) {
@@ -177,7 +180,6 @@ impl BlockSync {
                     active_height,
                     ..
                 } => {
-                    admitted_any = true;
                     // A staged retry that now admits is the same
                     // announcement the headers drain credits — the
                     // delivering connection demonstrated the tip even if
@@ -243,7 +245,7 @@ impl BlockSync {
         if credit_refresh_needed {
             self.refresh_active_peer_credit();
         }
-        if admitted_any {
+        if admission_attempted {
             // A body staged before its header landed kept the 0-height
             // sentinel; now that the tree resolves the hash, pin the real
             // height rather than waiting for a `headers` batch to repair it.
