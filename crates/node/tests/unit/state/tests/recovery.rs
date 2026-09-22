@@ -408,25 +408,38 @@ fn applied_regtest_chain(
 }
 
 #[test]
-fn missing_checkpoint_with_post_genesis_durable_head_refuses_startup() -> anyhow::Result<()> {
+fn missing_checkpoint_replays_durable_head_chain_at_startup() -> anyhow::Result<()> {
     let (_dir, state, config) = applied_regtest_chain(2, 1)?;
+    let remembered_tip = state
+        .chainstate()
+        .applied_tip_handle()
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("applied tip missing"))?;
     drop(state);
     std::fs::remove_dir_all(config.data_dir.join("chainstate-checkpoints"))?;
 
-    let opened = NodeState::open(config, None);
-    let error = opened
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("cold recovery under a durable head must fail"))?;
-    assert!(
-        format!("{error:#}").contains("exists but no chainstate was restored"),
-        "startup must fail at durable-head reconciliation: {error:#}"
+    let reopened = NodeState::open(config, None)?;
+    let tip = reopened
+        .chainstate()
+        .applied_tip_handle()
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("replay did not publish an applied tip"))?;
+    assert_eq!(
+        (tip.hash, tip.height),
+        (remembered_tip.hash, remembered_tip.height),
+        "a missing checkpoint must replay the durable head chain from genesis"
     );
     Ok(())
 }
 
 #[test]
-fn full_revalidation_with_post_genesis_durable_head_refuses_startup() -> anyhow::Result<()> {
+fn full_revalidation_marker_resumes_on_durable_head() -> anyhow::Result<()> {
     let (_dir, state, config) = applied_regtest_chain(2, 1)?;
+    let remembered_tip = state
+        .chainstate()
+        .applied_tip_handle()
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("applied tip missing"))?;
     drop(state);
     let journal_dir = config.data_dir.join(CHAINSTATE_JOURNAL_DIR);
     std::fs::create_dir_all(&journal_dir)?;
@@ -435,13 +448,16 @@ fn full_revalidation_with_post_genesis_durable_head_refuses_startup() -> anyhow:
         b"force full validation\n",
     )?;
 
-    let opened = NodeState::open(config, None);
-    let error = opened
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("forced cold recovery under a durable head must fail"))?;
-    assert!(
-        format!("{error:#}").contains("exists but no chainstate was restored"),
-        "startup must fail at durable-head reconciliation: {error:#}"
+    let reopened = NodeState::open(config, None)?;
+    let tip = reopened
+        .chainstate()
+        .applied_tip_handle()
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("replay did not publish an applied tip"))?;
+    assert_eq!(
+        (tip.hash, tip.height),
+        (remembered_tip.hash, remembered_tip.height),
+        "forced full revalidation must rebuild on the durable head chain"
     );
     Ok(())
 }

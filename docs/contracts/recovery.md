@@ -5,8 +5,10 @@ write, a reorganization, or an incompatible datadir. The chainstate is
 the single durable authority. `crates/chainstate` owns the ordered commit
 protocol over the storage durable head. That head certifies ordering and
 high-water bounds, not coin contents. If startup restores no chainstate while
-a durable head still exists, `reconcile_at_boot` fails closed instead of
-starting an empty chainstate that cannot extend the stored lineage. Every
+a durable head still exists, `reconcile_at_boot` replays the head chain
+from genesis out of the durable bodies it certifies — coins are durable
+only through the checkpoint export, so the head is the only surviving
+authority — and a missing or mismatched body fails closed. Every
 other persisted component is derived and reconciles to it.
 
 Owners:
@@ -307,19 +309,24 @@ state is harmless and keeps the node operating until replay closes the gap.
   advance for connect, group, and disconnect commits, the lineage fence, and
   the boot reconciliation of the stored head. `reconcile_at_boot` replays a
   committed-but-unpublished gap from the durable bodies the stored head
-  chain names — bounded by one commit group, applied through the ordinary
-  commit path with the head suppressed (`PublishMode::Replay`), publishing
-  only the state the head already certifies — and fails startup closed on a
-  gap that is not an ancestor prefix of stored bodies (`RCV-02`, `RCV-04`).
+  chain names — bounded by one commit group above a restored tip, applied
+  through the ordinary commit path with the head suppressed
+  (`PublishMode::Replay`), publishing only the state the head already
+  certifies — replays the whole head chain from genesis when no chainstate
+  was restored, and fails startup closed on a gap that is not an ancestor
+  prefix of stored bodies (`RCV-02`, `RCV-04`).
 - `crates/chainstate/tests/unit/durable_replay_tests.rs`:
   - `committed_gap_replays_to_head_without_recommitting_it` proves replay
     lands exactly on the stored head and consumes its existing `commit_id`
     instead of issuing a second durable receipt;
   - `committed_gap_with_missing_body_fails_closed` proves a stored head whose
-    named body is gone is rejected without advancing the restored applied tip.
-  - `durable_head_without_restored_chainstate_fails_startup` proves a stored
-    head with no restored chainstate fails startup closed
-    (`DurableHeadWithoutRestoredState`);
+    named body is gone is rejected without advancing the restored applied tip;
+  - `cold_chainstate_replays_head_chain_from_genesis` proves a durable head
+    with no restored chainstate replays its certified bodies from genesis
+    and consumes the existing `commit_id`;
+  - `cold_chainstate_with_missing_genesis_body_fails_closed` proves a cold
+    chainstate whose head chain names a missing body still fails closed
+    with no applied tip published;
   - `committed_gap_replay_failure_fails_closed` proves an apply failure inside
     the replay transition closes admission and leaves `begin_transition`
     refusing with `ApplyError::Shutdown`.

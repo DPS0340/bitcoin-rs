@@ -167,7 +167,7 @@ fn disconnect_below_checkpoint_base_forces_full_validation() -> Result<()> {
     let genesis = Network::Regtest.genesis_block();
     let block1 = mined_regtest_child_at(genesis.block_hash(), 1)?;
     let initial = NodeState::open(config.clone(), None)?;
-    initial.apply_block(&genesis)?;
+    let genesis_tip = initial.apply_block(&genesis)?;
     initial.apply_block(&block1)?;
     initial.publish_checkpoint()?;
     drop(initial);
@@ -177,26 +177,29 @@ fn disconnect_below_checkpoint_base_forces_full_validation() -> Result<()> {
     drop(state);
 
     let resumed = NodeState::open(config.clone(), None)?;
-    assert!(
-        resumed
-            .chainstate()
-            .applied_tip_handle()
-            .load_full()
-            .is_none(),
-        "a checkpoint above the fork must not be trusted"
+    let resumed_tip = resumed
+        .chainstate()
+        .applied_tip_handle()
+        .load_full()
+        .ok_or_else(|| std::io::Error::other("durable head replay did not publish a tip"))?;
+    assert_eq!(
+        resumed_tip.as_ref(),
+        &genesis_tip,
+        "a checkpoint above the fork must not be trusted; the node resumes on the durable head"
     );
     drop(resumed);
 
     let resumed_again = NodeState::open(config.clone(), None)?;
-    assert!(
-        resumed_again
-            .chainstate()
-            .applied_tip_handle()
-            .load_full()
-            .is_none(),
+    let resumed_again_tip = resumed_again
+        .chainstate()
+        .applied_tip_handle()
+        .load_full()
+        .ok_or_else(|| std::io::Error::other("durable head replay did not publish a tip"))?;
+    assert_eq!(
+        resumed_again_tip.as_ref(),
+        &genesis_tip,
         "full validation must remain sticky until a replacement checkpoint"
     );
-    resumed_again.apply_block(&genesis)?;
     let replacement_tip = resumed_again.apply_block(&block1)?;
     resumed_again.publish_checkpoint()?;
     drop(resumed_again);

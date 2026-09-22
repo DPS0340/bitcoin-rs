@@ -158,8 +158,8 @@ fn committed_gap_with_missing_body_fails_closed() -> Result<(), Box<dyn std::err
     };
     assert_eq!(head_tip, head.tip);
     assert_eq!(head_height, 1);
-    assert_eq!(restored_tip, Network::Regtest.genesis_block_hash());
-    assert_eq!(restored_height, 0);
+    assert_eq!(restored_tip, Some(Network::Regtest.genesis_block_hash()));
+    assert_eq!(restored_height, Some(0));
     assert_eq!(reason, "a committed gap body is missing from storage");
     assert_eq!(
         handles
@@ -173,22 +173,65 @@ fn committed_gap_with_missing_body_fails_closed() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn durable_head_without_restored_chainstate_fails_startup() -> Result<(), Box<dyn std::error::Error>>
+fn cold_chainstate_replays_head_chain_from_genesis() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, child) = restored_chainstate()?;
+    handles.applied_tip.store(None);
+    handles.chain_tx_count.store(0, Ordering::Release);
+    let genesis = Network::Regtest.genesis_block();
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.persist_block_body(
+        0,
+        Hash256::from(genesis.block_hash()),
+        &consensus_bytes(&genesis),
+    )?;
+    bodies.persist_block_body(
+        1,
+        Hash256::from(child.block_hash()),
+        &consensus_bytes(&child),
+    )?;
+    let head = install_head(&mut handles, &child, bodies)?;
+
+    super::reconcile_at_boot(&handles)?;
+
+    let landed = handles
+        .applied_tip
+        .load_full()
+        .ok_or("cold replay did not publish an applied tip")?;
+    assert_eq!((landed.height, landed.hash), (1, head.tip));
+    assert_eq!(handles.chain_tx_count.load(Ordering::Acquire), 2);
+    assert_eq!(
+        handles.durable_head.load()?,
+        Some(head),
+        "replay must consume the durable receipt rather than creating a new one"
+    );
+    Ok(())
+}
+
+#[test]
+fn cold_chainstate_with_missing_genesis_body_fails_closed() -> Result<(), Box<dyn std::error::Error>>
 {
     let (mut handles, child) = restored_chainstate()?;
     handles.applied_tip.store(None);
     handles.chain_tx_count.store(0, Ordering::Release);
-    let head = install_head(&mut handles, &child, Arc::new(MemoryBodies::default()))?;
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.persist_block_body(
+        1,
+        Hash256::from(child.block_hash()),
+        &consensus_bytes(&child),
+    )?;
+    let head = install_head(&mut handles, &child, bodies)?;
 
     let Err(error) = super::reconcile_at_boot(&handles) else {
-        panic!("cold chainstate must not start beneath an existing durable head");
+        panic!("a missing committed body must fail even on a cold chainstate");
     };
     assert!(matches!(
         error,
-        ApplyError::DurableHeadWithoutRestoredState {
-            head: error_head,
-            head_height: 1,
-        } if error_head == head.tip
+        ApplyError::DurableHeadGapUnrecoverable {
+            restored_tip: None,
+            restored_height: None,
+            reason: "a committed gap body is missing from storage",
+            ..
+        }
     ));
     assert!(handles.applied_tip.load_full().is_none());
     assert_eq!(handles.durable_head.load()?, Some(head));
@@ -239,7 +282,7 @@ fn durable_head_at_or_below_restored_tip_is_not_a_replay_gap()
         undo_extent: None,
     };
 
-    let Err(error) = super::replay_committed_gap(&handles, head, &restored) else {
+    let Err(error) = super::replay_committed_gap(&handles, head, Some(&restored)) else {
         panic!("head at restored height is not a publication gap");
     };
     assert!(matches!(
@@ -269,7 +312,7 @@ fn durable_gap_wider_than_one_group_fails_closed() -> Result<(), Box<dyn std::er
         undo_extent: None,
     };
 
-    let Err(error) = super::replay_committed_gap(&handles, head, &restored) else {
+    let Err(error) = super::replay_committed_gap(&handles, head, Some(&restored)) else {
         panic!("gap beyond the commit-group bound must fail");
     };
     assert!(matches!(
@@ -302,7 +345,7 @@ fn committed_gap_body_must_hash_to_the_head_identity() -> Result<(), Box<dyn std
         undo_extent: None,
     };
 
-    let Err(error) = super::replay_committed_gap(&handles, head, &restored) else {
+    let Err(error) = super::replay_committed_gap(&handles, head, Some(&restored)) else {
         panic!("body/hash mismatch must fail");
     };
     assert!(matches!(
@@ -337,7 +380,7 @@ fn committed_gap_must_descend_from_restored_tip() -> Result<(), Box<dyn std::err
         undo_extent: None,
     };
 
-    let Err(error) = super::replay_committed_gap(&handles, head, &wrong_restored) else {
+    let Err(error) = super::replay_committed_gap(&handles, head, Some(&wrong_restored)) else {
         panic!("head chain rooted elsewhere must fail");
     };
     assert!(matches!(
@@ -376,7 +419,7 @@ fn committed_gap_replay_failure_fails_closed() -> Result<(), Box<dyn std::error:
     };
     install_arbitrary_head(&mut handles, head, bodies)?;
 
-    let Err(error) = super::replay_committed_gap(&handles, head, &restored) else {
+    let Err(error) = super::replay_committed_gap(&handles, head, Some(&restored)) else {
         panic!("a gap body that fails apply must fail the replay");
     };
     assert!(

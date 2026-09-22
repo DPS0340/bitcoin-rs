@@ -115,51 +115,17 @@ where
         };
         let plan = current_reorg_plan(handles, target)?;
         let mut no_staged_body = |_| None;
-        let (disconnect_nodes, connect_nodes, connect, missing_connect, _retention) = match plan
-            .as_ref()
-        {
-            Some(plan) => {
-                let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
-                let connect_nodes = branch_nodes(handles, &plan.connect)?;
-                // The lease must exist before the bodies are first read, so
-                // a concurrent prune can never delete what the walk is
-                // about to re-read.
-                let retention = retention_lease_for(handles, &disconnect_nodes, &connect_nodes)?;
-                let (connect, missing_connect) =
-                    load_available_branch_prefix(handles, &connect_nodes, &mut no_staged_body)?;
-                (
-                    disconnect_nodes,
-                    connect_nodes,
-                    connect,
-                    missing_connect,
-                    Some(retention),
-                )
-            }
-            None => (Vec::new(), Vec::new(), Vec::new(), None, None),
-        };
-        if connect.is_empty()
-            && let Some((hash, height)) = missing_connect
-        {
-            return Err(ReorgError::MissingBody { hash, height });
-        }
-        if !disconnect_nodes.is_empty() {
-            preflight_disconnect_bodies(handles, &disconnect_nodes, &mut no_staged_body)?;
-        }
-
-        let connect_limit = if missing_connect.is_some() {
-            connect.len()
-        } else {
-            connect_nodes.len()
-        };
+        let prepared = prepare_branches(handles, plan.as_ref(), &mut no_staged_body)?;
+        let _retention = &prepared.retention;
         let (progress, outcome) = execute_streamed_plan(
             &transition,
             observer,
-            &disconnect_nodes,
-            &connect_nodes[..connect_limit],
-            &connect,
+            &prepared.disconnect_nodes,
+            &prepared.connect_nodes[..prepared.connect_limit()],
+            &prepared.connect,
             &mut no_staged_body,
         );
-        if progress.disconnected == disconnect_nodes.len()
+        if progress.disconnected == prepared.disconnect_nodes.len()
             && !outcome.as_ref().is_err_and(ReorgError::requires_recovery)
         {
             let mut tree = handles.block_tree().write();
@@ -172,7 +138,7 @@ where
         if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
             outcome
         } else {
-            let outcome = match (outcome, missing_connect) {
+            let outcome = match (outcome, prepared.missing_connect) {
                 (Ok(()), Some((hash, height))) => Err(ReorgError::MissingBody { hash, height }),
                 (outcome, _) => outcome,
             };
@@ -181,7 +147,7 @@ where
                 revisit_disconnected_blocks(
                     handles,
                     observer,
-                    &disconnect_nodes,
+                    &prepared.disconnect_nodes,
                     progress.disconnected,
                     &mut no_staged_body,
                 ),
@@ -510,6 +476,81 @@ fn retention_lease_for(
         .map_err(|source| ReorgError::RetentionUnavailable { floor, source })
 }
 
+/// The branch-side facts one reorg attempt needs before it may mutate.
+///
+/// `disconnect_nodes` and `connect_nodes` are the plan's hashes and heights;
+/// `connect` is the first contiguous window of available connect bodies;
+/// `missing_connect` names the first absent connect body after that prefix;
+/// `retention` pins both branches' bodies against pruning until the attempt
+/// settles.
+struct PreparedBranches {
+    disconnect_nodes: Vec<(Hash256, u32)>,
+    connect_nodes: Vec<(Hash256, u32)>,
+    connect: Vec<LoadedBranchBody>,
+    missing_connect: Option<(Hash256, u32)>,
+    retention: Option<bitcoin_rs_storage::RetentionLease>,
+}
+
+impl PreparedBranches {
+    /// How much of the connect branch the execution pass may attempt.
+    fn connect_limit(&self) -> usize {
+        if self.missing_connect.is_some() {
+            self.connect.len()
+        } else {
+            self.connect_nodes.len()
+        }
+    }
+}
+
+/// Loads both branch sides of `plan` for one reorg attempt.
+///
+/// A `None` plan yields empty branches. The retention lease is taken before
+/// the first body read, so a concurrent prune can never delete what the walk
+/// is about to re-read. A first-block connect gap fails before the
+/// disconnect-side preflight runs.
+fn prepare_branches<F>(
+    handles: &Chainstate,
+    plan: Option<&ReorgPlan>,
+    staged_body: &mut F,
+) -> core::result::Result<PreparedBranches, ReorgError>
+where
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+{
+    let Some(plan) = plan else {
+        return Ok(PreparedBranches {
+            disconnect_nodes: Vec::new(),
+            connect_nodes: Vec::new(),
+            connect: Vec::new(),
+            missing_connect: None,
+            retention: None,
+        });
+    };
+    let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
+    let connect_nodes = branch_nodes(handles, &plan.connect)?;
+    // The lease must exist before the bodies are first read, so a concurrent
+    // prune can never delete what the walk is about to re-read. Only the
+    // first connect window is retained; the remainder streams in bounded
+    // windows while the authoritative transition is held.
+    let retention = retention_lease_for(handles, &disconnect_nodes, &connect_nodes)?;
+    let (connect, missing_connect) =
+        load_available_branch_prefix(handles, &connect_nodes, staged_body)?;
+    if connect.is_empty()
+        && let Some((hash, height)) = missing_connect
+    {
+        return Err(ReorgError::MissingBody { hash, height });
+    }
+    if !disconnect_nodes.is_empty() {
+        preflight_disconnect_bodies(handles, &disconnect_nodes, staged_body)?;
+    }
+    Ok(PreparedBranches {
+        disconnect_nodes,
+        connect_nodes,
+        connect,
+        missing_connect,
+        retention,
+    })
+}
+
 /// Switches the applied chain to `target`.
 ///
 /// Disconnects back to the common ancestor, then applies the target branch
@@ -546,46 +587,13 @@ where
             }
         };
 
-        let prepared = (|| {
-            let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
-            let connect_nodes = branch_nodes(handles, &plan.connect)?;
-            // Pin both branches before the first body read. A concurrent prune
-            // must not invalidate optimistic preloading or the later streaming
-            // pass.
-            let retention = retention_lease_for(handles, &disconnect_nodes, &connect_nodes)?;
-            // Only the first connect window is retained across transition
-            // acquisition. The remainder is streamed in bounded windows while
-            // the authoritative transition is held.
-            let (connect, missing_connect) =
-                load_available_branch_prefix(handles, &connect_nodes, &mut staged_body)?;
-            if !disconnect_nodes.is_empty() {
-                preflight_disconnect_bodies(handles, &disconnect_nodes, &mut staged_body)?;
-            }
-            Ok::<_, ReorgError>((
-                disconnect_nodes,
-                connect_nodes,
-                connect,
-                missing_connect,
-                retention,
-            ))
-        })();
-        let (disconnect_nodes, connect_nodes, connect, missing_connect, _retention) = match prepared
-        {
+        let prepared = match prepare_branches(handles, Some(&plan), &mut staged_body) {
             Ok(prepared) => prepared,
             Err(error) => {
                 return settle_reorg_without_transition(handles, observer, Err(error), &mut settle);
             }
         };
-        if connect.is_empty()
-            && let Some((hash, height)) = missing_connect
-        {
-            return settle_reorg_without_transition(
-                handles,
-                observer,
-                Err(ReorgError::MissingBody { hash, height }),
-                &mut settle,
-            );
-        }
+        let _retention = &prepared.retention;
 
         let lock = handles
             .lock_transition()
@@ -616,23 +624,18 @@ where
         }
 
         let transition = lock.into_transition();
-        let connect_limit = if missing_connect.is_some() {
-            connect.len()
-        } else {
-            connect_nodes.len()
-        };
         let (progress, outcome) = execute_streamed_plan(
             &transition,
             observer,
-            &disconnect_nodes,
-            &connect_nodes[..connect_limit],
-            &connect,
+            &prepared.disconnect_nodes,
+            &prepared.connect_nodes[..prepared.connect_limit()],
+            &prepared.connect,
             &mut staged_body,
         );
         let outcome = if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
             outcome
         } else {
-            let outcome = match (outcome, missing_connect) {
+            let outcome = match (outcome, prepared.missing_connect) {
                 (Ok(()), Some((hash, height))) => Err(ReorgError::MissingBody { hash, height }),
                 (outcome, _) => outcome,
             };
@@ -641,7 +644,7 @@ where
                 revisit_disconnected_blocks(
                     handles,
                     observer,
-                    &disconnect_nodes,
+                    &prepared.disconnect_nodes,
                     progress.disconnected,
                     &mut staged_body,
                 ),
