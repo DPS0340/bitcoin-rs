@@ -245,27 +245,32 @@ fn live_pending_header_request_awaits_its_connection() {
 }
 
 #[test]
-fn probe_rotates_past_the_expired_pending_owner() {
+fn probe_rotates_past_the_dead_pending_owner() {
     // The pending request's connection is gone (usable_peers no longer
-    // contains it), so the probe rotates to the next address past it.
-    let expired_owner = PeerSource::for_test(addr_of(9005));
+    // contains it), so it is not live and the probe rotates to the next
+    // address past its owner.
+    let dead_owner = PeerSource::for_test(addr_of(9005));
     let mut frontier = frontier(
         chain_frontier(5, false),
         Some(BodyState::Unowned),
         vec![usable(9001, 100, None), usable(9007, 100, None)],
     );
     frontier.header_request = Some(super::super::PendingHeaderRequest {
-        source: expired_owner,
+        source: dead_owner,
         locator_tip_hash: hash(0x01),
         target_height: 6,
-        requested_at: Instant::now()
-            .checked_sub(super::super::HEADER_REQUEST_TIMEOUT)
-            .unwrap_or_else(Instant::now),
+        requested_at: Instant::now(),
     });
+    frontier.header_request_live = super::super::frontier::header_request_live(
+        frontier.header_request,
+        &frontier.usable_peers,
+        Instant::now(),
+    );
+    assert!(!frontier.header_request_live);
     match frontier.plan().header_action {
         HeaderAction::Probe(source) => {
             assert_eq!(source.addr, addr_of(9007));
-            assert_ne!(source, expired_owner);
+            assert_ne!(source, dead_owner);
         }
         action => panic!("expected Probe, got {action:?}"),
     }

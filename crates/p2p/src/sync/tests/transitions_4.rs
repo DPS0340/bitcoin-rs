@@ -49,7 +49,7 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders()
 
     assert!(
         sync.scheduler.lock().header_request.is_none(),
-        "an attributed invalid-header fault must release the pending getheaders gate"
+        "an attributed invalid-header fault must release the pending header request"
     );
     assert!(
         !peers.is_connected(invalid_peer),

@@ -146,7 +146,15 @@ impl BlockSync {
     /// Convictions are identity-exact: `disconnect_source` removes only the
     /// connection that owns the stalled work, so a same-address replacement
     /// survives and never inherits the blame.
+    ///
+    /// While the apply path has latched a fatal settlement no recovery fires:
+    /// deliveries cannot apply, so non-delivery is not a peer fault, and a
+    /// staged body stays queued for the re-created apply path rather than
+    /// being evicted past the suppression bound.
     pub(super) fn reconcile_window_recovery(&self, chain: &ChainFrontier, now: Instant) {
+        if chain.apply_halted {
+            return;
+        }
         let frontier_hash = chain.next_required.map(|body| body.hash);
         // The stall family keys on the same `next_required` body the
         // scheduler requests; at the tip the front sits one past the applied
