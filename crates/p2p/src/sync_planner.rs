@@ -8,19 +8,20 @@ use std::time::Instant;
 
 use bitcoin_rs_primitives::{Block, Hash256};
 
-use crate::PeerSource;
 use crate::SyncBudget;
 use crate::block_stager::{BlockStager, DrainedBlock, DroppedBlock, StagedBlock};
+use crate::connection::{ConnectionId, PeerSource};
 use crate::download_window::DownloadWindow;
 
 /// Network effect the executor must perform. The planner never mutates
 /// sockets, leases, or chainstate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncAction {
-    /// Disconnect `addr` after window conviction.
+    /// Disconnect the exact convicted connection after window conviction.
     Disconnect {
-        /// Convicted peer.
-        addr: SocketAddr,
+        /// Convicted connection: the owner stamped on the stalled work, not
+        /// whatever connection currently claims its address.
+        owner: PeerSource,
         /// Why the planner selected this peer.
         reason: SyncDisconnectReason,
     },
@@ -42,7 +43,7 @@ pub enum SyncDisconnectReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColdFrontHedge {
     /// Current window-front owner.
-    pub owner: SocketAddr,
+    pub owner: PeerSource,
     /// Hash the owner still owes.
     pub front_hash: Hash256,
 }
@@ -97,9 +98,9 @@ impl SyncPlanner {
         self.window.forget_peer(addr);
     }
 
-    /// Drops window assignments whose peers are no longer live.
-    pub fn release_disconnected_peers(&mut self, is_live_peer: impl Fn(&SocketAddr) -> bool) {
-        self.window.release_disconnected_peers(is_live_peer);
+    /// Drops window assignments whose connections are no longer live.
+    pub fn release_disconnected_peers(&mut self, live: &[(SocketAddr, ConnectionId)]) {
+        self.window.release_disconnected_peers(live);
     }
 
     /// Whether the next expected apply hash is already staged.
@@ -163,10 +164,10 @@ impl SyncPlanner {
         let mut cold_front_hedge = None;
         if let Some(height) = next_apply_height {
             cold_front_hedge = self.window.observe_cold_front(height, apply_side_busy, now);
-            if let Some(addr) = self.window.observe_stall(height, apply_side_busy, now) {
+            if let Some(owner) = self.window.observe_stall(height, apply_side_busy, now) {
                 return (
                     Some(SyncAction::Disconnect {
-                        addr,
+                        owner,
                         reason: SyncDisconnectReason::WindowStaller {
                             next_apply_height: height,
                         },
@@ -175,10 +176,10 @@ impl SyncPlanner {
                 );
             }
         }
-        if let Some(addr) = self.window.observe_pending_timeout(apply_side_busy, now) {
+        if let Some(owner) = self.window.observe_pending_timeout(apply_side_busy, now) {
             return (
                 Some(SyncAction::Disconnect {
-                    addr,
+                    owner,
                     reason: SyncDisconnectReason::PendingTimeout,
                 }),
                 None,

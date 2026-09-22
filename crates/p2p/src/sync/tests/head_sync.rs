@@ -262,12 +262,12 @@ fn staged_body_with_permanently_inadmissible_header_is_discarded()
     sync.tick();
 
     assert_eq!(
-        sync.body_sync.lock().stager.received_len(),
+        sync.scheduler.lock().stager.received_len(),
         0,
         "the inadmissible body must be discarded, not retried"
     );
     assert_eq!(
-        sync.body_sync.lock().window.received_len(),
+        sync.scheduler.lock().window.received_len(),
         0,
         "the discarded body's window record must not linger and re-queue"
     );
@@ -295,8 +295,8 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
     let peer = test_addr(9705, 0)?;
     let _rx = connect_peer(&peers, eligible_peer(peer, 0));
     let source = current_source(&peers, peer);
-    *sync.pending_getheaders.lock() = Some(super::super::PendingHeaderRequest {
-        peer_addr: peer,
+    sync.scheduler.lock().header_request = Some(super::super::PendingHeaderRequest {
+        source,
         locator_tip_hash: Hash256::default(),
         target_height: 1,
         requested_at: Instant::now(),
@@ -311,7 +311,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
     })?;
     sync.drain_inbound_headers();
     assert!(
-        sync.pending_getheaders.lock().is_some(),
+        sync.scheduler.lock().header_request.is_some(),
         "a body-carried header must not consume the pending request"
     );
 
@@ -323,7 +323,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
     })?;
     sync.drain_inbound_headers();
     assert!(
-        sync.pending_getheaders.lock().is_none(),
+        sync.scheduler.lock().header_request.is_none(),
         "a wire `headers` response consumes the pending request"
     );
     Ok(())
@@ -582,8 +582,60 @@ fn compact_owned_body_fetch_marks_the_tip_pending() -> Result<(), Box<dyn std::e
     sync.drain_inbound_headers();
 
     assert!(
-        sync.body_sync.lock().window.contains_pending(&tip_hash),
+        sync.scheduler.lock().window.contains_pending(&tip_hash),
         "a compact-owned tip body must be recorded pending, not re-requested"
+    );
+    Ok(())
+}
+
+#[test]
+fn owned_fetch_mark_survives_until_its_tip_header_attaches()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A compact-owned tip announced ahead of its ancestry cannot be marked
+    // at delivery: the tree has no height for it yet. Dropping the mark
+    // would let normal scheduling issue a second fetch while the compact
+    // `getblocktxn` is still in flight, so the scheduler retains it and
+    // resolves it once the missing parent chain admits.
+    let mut tree = BlockTree::new();
+    let genesis = genesis_header();
+    tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+    let peer = test_addr(9707, 0)?;
+    let _rx = connect_peer(&peers, eligible_peer(peer, 0));
+    let mid = test_header(genesis.compute_hash(), 1);
+    let tip = test_header(mid.compute_hash(), 2);
+    let tip_hash = Hash256::from(tip.compute_hash());
+
+    // The tip arrives ahead of `mid`: admission reports MissingParent and
+    // the owned-fetch mark is retained rather than dropped.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![tip],
+        source: Some(current_source(&peers, peer)),
+        wire_response: false,
+        body_fetch_owned: true,
+    })?;
+    sync.drain_inbound_headers();
+    assert!(
+        !sync.scheduler.lock().window.contains_pending(&tip_hash),
+        "an unattached tip cannot be window-pending yet"
+    );
+
+    // The ancestry batch admits; the retained mark resolves to a pending.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![mid, tip],
+        source: Some(current_source(&peers, peer)),
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.drain_inbound_headers();
+    assert!(
+        sync.scheduler.lock().window.contains_pending(&tip_hash),
+        "the retained owned fetch must mark once its tip attaches"
     );
     Ok(())
 }

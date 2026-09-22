@@ -30,17 +30,18 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders()
         "the first getheaders must target the invalid peer"
     );
     assert!(
-        sync.pending_getheaders
+        sync.scheduler
             .lock()
-            .is_some_and(|request| request.peer_addr == invalid_peer),
+            .header_request
+            .is_some_and(|request| request.source.addr == invalid_peer),
         "a pending getheaders must name the invalid peer before its batch arrives"
     );
 
     // Deliver the attributed invalid batch while the gate is still armed
     // against the invalid peer. No other selectable peer remains, so this
     // tick cannot re-arm the gate against a different address — and the
-    // batch is marked a non-response so `consume_pending_getheaders` cannot
-    // clear it either: the only way `pending_getheaders` ends up clear is
+    // batch is marked a non-response so the wire-response consume cannot
+    // clear it either: the only way the header request ends up clear is
     // the peer-fault cleanup.
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
@@ -52,8 +53,8 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders()
     sync.tick();
 
     assert!(
-        sync.pending_getheaders.lock().is_none(),
-        "an attributed invalid-header fault must release the pending getheaders gate"
+        sync.scheduler.lock().header_request.is_none(),
+        "an attributed invalid-header fault must release the pending header request"
     );
     assert!(
         !peers.is_connected(invalid_peer),
@@ -133,7 +134,7 @@ fn disconnected_outbound_channel_does_not_mark_blocks_pending()
     sync.tick();
 
     assert_applied_genesis(&applied_tip, &block_tree)?;
-    assert_eq!(sync.body_sync.lock().window.pending_len(), 0);
+    assert_eq!(sync.scheduler.lock().window.pending_len(), 0);
     Ok(())
 }
 
@@ -180,7 +181,7 @@ fn tick_fanout_distributes_window_front_first_across_eligible_peers()
         assert!(rx.try_recv().is_err(), "no peer may exceed the fan-out cap");
     }
     assert_eq!(
-        sync.body_sync.lock().window.pending_len(),
+        sync.scheduler.lock().window.pending_len(),
         super::super::PENDING_BUDGET,
         "fan-out must fill the deep window"
     );
@@ -196,7 +197,7 @@ fn wedged_window_expires_stalled_front_and_rerequests_through_count_clamp()
     // Tick 2: wedge — staged + pending at the count budget, scan limit
     // zero, the stalled front still pending.
     sync.tick();
-    assert_eq!(sync.body_sync.lock().window.pending_len(), 2);
+    assert_eq!(sync.scheduler.lock().window.pending_len(), 2);
 
     // Past the pending timeout the wedge must process its own deadlines:
     // the expired front credits the scan-limit count headroom, the
@@ -222,13 +223,13 @@ fn wedged_window_expires_stalled_front_and_rerequests_through_count_clamp()
         "the stalled front stripe must be re-requested from a healthy peer"
     );
     assert_eq!(
-        sync.body_sync.lock().stager.received_len(),
+        sync.scheduler.lock().stager.received_len(),
         14,
         "staged progress must survive the wedge"
     );
     {
-        let body_sync = sync.body_sync.lock();
-        let window = &body_sync.window;
+        let scheduler = sync.scheduler.lock();
+        let window = &scheduler.window;
         assert_eq!(window.pending_len(), 2);
         for front in &expected[..2] {
             assert!(window.contains_pending(&Hash256::from_le_bytes(front.as_bytes())));
@@ -266,11 +267,11 @@ fn common_prefix_winner_takes_over_deep_window() -> Result<(), Box<dyn std::erro
     sync.tick();
 
     assert_eq!(
-        sync.body_sync.lock().window.preferred_peer(),
+        sync.scheduler.lock().window.preferred_peer(),
         Some(alternate)
     );
     assert!(
-        sync.body_sync
+        sync.scheduler
             .lock()
             .window
             .peer_in_staller_cooldown(owner, Instant::now())
@@ -283,13 +284,13 @@ fn common_prefix_winner_takes_over_deep_window() -> Result<(), Box<dyn std::erro
             .collect::<Vec<_>>()
     );
     assert!(peers.is_connected(owner));
-    sync.body_sync
+    sync.scheduler
         .lock()
         .window
         .mark_peer_unresponsive(alternate, Instant::now());
     sync.tick();
     assert_eq!(
-        sync.body_sync.lock().window.preferred_peer(),
+        sync.scheduler.lock().window.preferred_peer(),
         Some(alternate),
         "a temporary soft block skips the winner without erasing its election"
     );
@@ -305,7 +306,7 @@ fn stall_eviction_does_not_disconnect_replacement_connection()
     };
     let (sync, peers, _expected, _rxs, _blocks_tx) = staged_count_wedge(budget)?;
     let staller = test_addr(9320, 0)?;
-    sync.body_sync
+    sync.scheduler
         .lock()
         .window
         .seed_front_cadence_for_test(50, Instant::now());
@@ -320,20 +321,21 @@ fn stall_eviction_does_not_disconnect_replacement_connection()
         .height
         .checked_add(1)
         .ok_or_else(|| std::io::Error::other("applied height overflow"))?;
+    let selected = sync.scheduler.lock().window.observe_stall(
+        next_apply_height,
+        false,
+        Instant::now() + Duration::from_millis(150),
+    );
     let (replacement_tx, _replacement_rx) = unbounded::<Message>();
     let replacement = PeerLease::new(replacement_tx);
-    let evicted = sync.select_and_evict_window_peer(|window| {
-        let selected = window.observe_stall(
-            next_apply_height,
-            false,
-            Instant::now() + Duration::from_millis(150),
-        );
-        peers.register(staller, replacement.clone());
-        peers.publish_info(staller, &replacement, eligible_peer(staller, 200));
-        selected
-    });
+    peers.register(staller, replacement.clone());
+    peers.publish_info(staller, &replacement, eligible_peer(staller, 200));
+    // The convicted owner is the predecessor's source: the replacement at
+    // the same address must not be blamed for it.
+    let evicted = selected.is_some_and(|owner| sync.peer_table.disconnect_source(owner));
 
-    assert_eq!(evicted, None);
+    assert!(selected.is_some());
+    assert!(!evicted);
     assert!(peers.is_connected(staller));
     assert!(!replacement.is_cancelled());
     Ok(())
@@ -378,7 +380,7 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout()
     // is seeded directly instead of via two real front deliveries (the
     // real sampling path is pinned by the window tests). 50ms keeps the
     // decay floor at the injected 100ms initial threshold.
-    sync.body_sync
+    sync.scheduler
         .lock()
         .window
         .seed_front_cadence_for_test(50, Instant::now());
@@ -397,8 +399,8 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout()
     blocks_tx.send(crate::InboundBlock::from_decoded(blocks[1].clone()))?;
     sync.tick();
     {
-        let body_sync = sync.body_sync.lock();
-        let window = &body_sync.window;
+        let scheduler = sync.scheduler.lock();
+        let window = &scheduler.window;
         assert!(!window.has_request_capacity());
         assert_eq!(window.stalling_peer().map(|(addr, _)| addr), Some(staller));
     }
@@ -412,7 +414,7 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout()
     sync.tick();
     assert!(!peers.is_connected(staller));
     assert_eq!(
-        sync.body_sync.lock().stager.received_len(),
+        sync.scheduler.lock().stager.received_len(),
         1,
         "recovery must not discard staged progress (prune-free)"
     );

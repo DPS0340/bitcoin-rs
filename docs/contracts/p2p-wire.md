@@ -198,24 +198,33 @@ branch-plan, attribution, timeout and bounded-staging suites remain required.
 - A `cmpctblock` outcome that fetches the body itself (`RequestMissing`'s
   `getblocktxn`, `Fallback`'s `getdata`) is marked
   (`InboundHeaders::body_fetch_owned`): once the tip admits, the window
-  records the hash pending under the delivering peer
+  records the hash pending under the delivering connection
   (`DownloadWindow::mark_owned_fetch`) so normal scheduling does not issue
-  a duplicate `getdata`. Delivery resolves it like any window request;
-  expiry or disconnect hands it back to scheduling, so a silently dropped
-  compact fetch re-requests instead of wedging the tip.
+  a duplicate `getdata`. The mark honours the same gates a real request
+  faces — window request capacity, the owner's per-peer inflight share,
+  and the request frontier (a below-frontier mark could never be scheduled
+  and its expiry would drag `next_request_height` back into a re-request
+  sweep of applied heights). A tip that has not attached yet is retained
+  in the bounded `SchedulerState::owned_body_fetches` set and resolved
+  once ancestry admits it; marks whose source went stale are dropped, and
+  delivery resolves the mark like any window request while expiry or
+  disconnect hands it back to scheduling — a silently dropped compact
+  fetch re-requests instead of wedging the tip.
 - Every peer-removal path releases a `getheaders` gate the peer owned —
   wire-response consumption, send failure, session reconciliation, and
   peer-fault disconnects in both the headers drain and the staged-header
-  retry (`clear_pending_getheaders_for`) — so a same-address reconnect
-  cannot inherit a dead request deadline.
+  retry (`clear_header_request_for`, identity-exact) — so a same-address
+  reconnect cannot inherit a dead request deadline.
 
 Proof: `crates/p2p/src/sync/tests/head_sync.rs` covers body-carried header
 admission and apply, gap-fill requests for staged bodies ahead of their
 header chain, announcer-directed `getheaders` on unattached batches,
 non-response forwards preserving pending-request state, staged-retry
 credit, shared-ancestor capability, bounded fork evidence, credit for
-already-known tips, and the compact-owned pending mark. Fault-path gate
-cleanup is covered in
-`crates/p2p/src/sync/tests/transitions_4.rs`. `crates/p2p/src/listener.rs`
-test `send_block_forwards_the_blocks_header` covers the delivery-path
-forward.
+already-known tips, the compact-owned pending mark, and the retained
+mark resolving once its tip header attaches. Capacity and frontier gates
+on the owned-fetch mark are covered in
+`crates/p2p/src/download_window.rs` tests; fault-path gate cleanup is
+covered in `crates/p2p/src/sync/tests/transitions_4.rs`.
+`crates/p2p/src/listener.rs` test `send_block_forwards_the_blocks_header`
+covers the delivery-path forward.
