@@ -29,7 +29,6 @@ use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::connect::SpentOutputLookup;
 use bitcoin_rs_utxo::is_coinbase_tx;
 use connect::apply_block_admitted;
-use connect::apply_block_inner;
 use connect::apply_block_with_serialized_admitted;
 use connect::apply_committed_block_admitted;
 use disconnect::disconnect_block_admitted;
@@ -589,19 +588,32 @@ pub struct ChainTransition<'a> {
 }
 
 impl<'a> ChainTransition<'a> {
+    fn settle_apply<T>(
+        &self,
+        result: core::result::Result<T, ApplyError>,
+    ) -> core::result::Result<T, ApplyError> {
+        if result
+            .as_ref()
+            .is_err_and(|error| classify_apply_error(error) == WindowApplyDisposition::Fatal)
+        {
+            self.chainstate.fail_closed_for_recovery();
+        }
+        result
+    }
+
     /// Connects `block` as the next applied tip.
     ///
     /// Consensus refusal happens before the first write. See the type-level
     /// persistence notes for the commit point and retry rules.
     pub fn connect(&self, block: &Block) -> core::result::Result<ConnectOutcome, ApplyError> {
-        apply_committed_block_admitted(
+        self.settle_apply(apply_committed_block_admitted(
             self.chainstate,
             block,
             None,
             None,
             BlockProvenance::Network,
             PublishMode::Now,
-        )
+        ))
     }
 
     /// Connects `block` reusing preserved wire-format bytes.
@@ -612,7 +624,11 @@ impl<'a> ChainTransition<'a> {
         block: &Block,
         serialized: bytes::Bytes,
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        apply_block_with_serialized_admitted(self.chainstate, block, serialized)
+        self.settle_apply(apply_block_with_serialized_admitted(
+            self.chainstate,
+            block,
+            serialized,
+        ))
     }
 
     /// Re-applies a body this node already validated and persisted before a crash.
@@ -624,14 +640,14 @@ impl<'a> ChainTransition<'a> {
         block: &Block,
         serialized: bytes::Bytes,
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        apply_committed_block_admitted(
+        self.settle_apply(apply_committed_block_admitted(
             self.chainstate,
             block,
             Some(serialized),
             None,
             BlockProvenance::LocalReplay,
             PublishMode::Now,
-        )
+        ))
     }
 
     /// Disconnects `block`, which must be the current applied tip.
@@ -642,7 +658,14 @@ impl<'a> ChainTransition<'a> {
         &self,
         block: &Block,
     ) -> core::result::Result<DisconnectOutcome, crate::DisconnectError> {
-        disconnect_block_admitted(self.chainstate, block)
+        let result = disconnect_block_admitted(self.chainstate, block);
+        if matches!(
+            result,
+            Err(crate::DisconnectError::Fatal { .. } | crate::DisconnectError::MarkerStuck { .. })
+        ) {
+            self.chainstate.fail_closed_for_recovery();
+        }
+        result
     }
 
     /// Applies consecutive blocks under this one transition.
@@ -656,7 +679,15 @@ impl<'a> ChainTransition<'a> {
         blocks: &[&Block],
         serialized: &[bytes::Bytes],
     ) -> core::result::Result<Vec<ConnectOutcome>, WindowApplyError> {
-        apply_window_admitted(self.chainstate, blocks, serialized)
+        let mut result = apply_window_admitted(self.chainstate, blocks, serialized);
+        if let Err(error) = &mut result
+            && (error.disposition == WindowApplyDisposition::Fatal
+                || classify_apply_error(&error.source) == WindowApplyDisposition::Fatal)
+        {
+            error.disposition = WindowApplyDisposition::Fatal;
+            self.chainstate.fail_closed_for_recovery();
+        }
+        result
     }
 
     /// Returns the chainstate service owning this transition.
@@ -717,6 +748,7 @@ impl Chainstate {
     /// maintenance pause.
     #[must_use]
     pub fn close(&self) -> AdmissionGuard<'_> {
+        self.shutdown.store(true, Ordering::Release);
         AdmissionGuard {
             _guard: self.admission.close(),
         }
@@ -1069,7 +1101,10 @@ impl Chainstate {
     /// the chain transition is still held (`ARCH-07`). Node-owned followers
     /// consume the returned outcome outside this crate.
     pub fn apply_block(&self, block: &Block) -> core::result::Result<ConnectOutcome, ApplyError> {
-        apply_block_inner(self, block, None, BlockProvenance::Network)
+        let transition = self.begin_transition()?;
+        let result = transition.connect(block);
+        drop(transition);
+        result
     }
 
     /// Admits a transition, connects `block` from preserved bytes, then releases
@@ -1081,7 +1116,10 @@ impl Chainstate {
         block: &Block,
         serialized: bytes::Bytes,
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        apply_block_inner(self, block, Some(serialized), BlockProvenance::Network)
+        let transition = self.begin_transition()?;
+        let result = transition.connect_serialized(block, serialized);
+        drop(transition);
+        result
     }
 
     /// Admits a transition, replays a locally persisted body, then releases the
@@ -1093,7 +1131,10 @@ impl Chainstate {
         block: &Block,
         serialized: bytes::Bytes,
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        apply_block_inner(self, block, Some(serialized), BlockProvenance::LocalReplay)
+        let transition = self.begin_transition()?;
+        let result = transition.replay_local(block, serialized);
+        drop(transition);
+        result
     }
 
     /// Admits a transition, disconnects `block`, then releases the transition
@@ -1111,12 +1152,6 @@ impl Chainstate {
             .begin_transition()
             .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
         let result = transition.disconnect(block);
-        if matches!(
-            result,
-            Err(crate::DisconnectError::Fatal { .. } | crate::DisconnectError::MarkerStuck { .. })
-        ) {
-            self.fail_closed_for_recovery();
-        }
         drop(transition);
         result
     }
@@ -1156,13 +1191,7 @@ impl Chainstate {
                 drop(transition);
                 Ok(committed)
             }
-            Err(mut error) => {
-                if error.disposition == WindowApplyDisposition::Fatal
-                    || classify_apply_error(&error.source) == WindowApplyDisposition::Fatal
-                {
-                    error.disposition = WindowApplyDisposition::Fatal;
-                    self.fail_closed_for_recovery();
-                }
+            Err(error) => {
                 drop(transition);
                 Err(error)
             }

@@ -58,7 +58,6 @@ pub(crate) fn settle_window_failure(
             == bitcoin_rs_chainstate::WindowApplyDisposition::Fatal
     {
         error.disposition = bitcoin_rs_chainstate::WindowApplyDisposition::Fatal;
-        handles.fail_closed_for_recovery();
     } else if let Err(finish_source) =
         crate::chain_effects::ChainFollowers::finish_transition(handles, transition, mempool_change)
     {
@@ -303,10 +302,6 @@ impl SyncChain for NodeSyncChain {
             }
             // A disconnect failure left chainstate torn and requires shutdown.
             Err(error @ crate::reorg::ReorgError::Fatal(_)) => {
-                // The disconnect died partway; chainstate is torn. Close
-                // admission and request shutdown here, where the typed cause
-                // still exists.
-                self.handles.fail_closed_for_recovery();
                 Err(BranchSwitchError::Fatal(Box::new(error)))
             }
             // The transition generation could not be settled after reorg work.

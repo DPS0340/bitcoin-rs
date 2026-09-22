@@ -227,7 +227,6 @@ impl MiningCoordinator {
                 if bitcoin_rs_chainstate::classify_apply_error(&error)
                     == bitcoin_rs_chainstate::WindowApplyDisposition::Fatal
                 {
-                    self.chainstate.fail_closed_for_recovery();
                 } else if let Err(finish_error) =
                     crate::chain_effects::ChainFollowers::finish_transition(
                         &self.chainstate,

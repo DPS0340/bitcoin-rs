@@ -79,13 +79,18 @@ where
         Ok(())
     })();
     if let Err(error) = validation {
-        return settle(observer, Err(error));
+        return settle_reorg_without_transition(handles, observer, Err(error), &mut settle);
     }
 
     let transition = match handles.begin_transition() {
         Ok(transition) => transition,
         Err(source) => {
-            return settle(observer, Err(ReorgError::Unavailable(Box::new(source))));
+            return settle_reorg_without_transition(
+                handles,
+                observer,
+                Err(ReorgError::Unavailable(Box::new(source))),
+                &mut settle,
+            );
         }
     };
     // Keep read-only planning refusals in the same settlement path as the
@@ -103,7 +108,9 @@ where
         };
         let plan = current_reorg_plan(handles, target)?;
         let mut no_staged_body = |_| None;
-        let (disconnect_nodes, connect_nodes, _retention) = match plan.as_ref() {
+        let (disconnect_nodes, connect_nodes, connect, missing_connect, _retention) = match plan
+            .as_ref()
+        {
             Some(plan) => {
                 let disconnect_nodes = branch_nodes(handles, &plan.disconnect)?;
                 let connect_nodes = branch_nodes(handles, &plan.connect)?;
@@ -111,20 +118,38 @@ where
                 // a concurrent prune can never delete what the walk is
                 // about to re-read.
                 let retention = retention_lease_for(handles, &disconnect_nodes, &connect_nodes)?;
-                (disconnect_nodes, connect_nodes, Some(retention))
+                let (connect, missing_connect) =
+                    load_available_branch_prefix(handles, &connect_nodes, &mut no_staged_body)?;
+                (
+                    disconnect_nodes,
+                    connect_nodes,
+                    connect,
+                    missing_connect,
+                    Some(retention),
+                )
             }
-            None => (Vec::new(), Vec::new(), None),
+            None => (Vec::new(), Vec::new(), Vec::new(), None, None),
         };
+        if connect.is_empty()
+            && let Some((hash, height)) = missing_connect
+        {
+            return Err(ReorgError::MissingBody { hash, height });
+        }
         if !disconnect_nodes.is_empty() {
             preflight_disconnect_bodies(handles, &disconnect_nodes, &mut no_staged_body)?;
         }
 
+        let connect_limit = if missing_connect.is_some() {
+            connect.len()
+        } else {
+            connect_nodes.len()
+        };
         let (progress, outcome) = execute_streamed_plan(
             &transition,
             observer,
             &disconnect_nodes,
-            &connect_nodes,
-            &[],
+            &connect_nodes[..connect_limit],
+            &connect,
             &mut no_staged_body,
         );
         if progress.disconnected == disconnect_nodes.len()
@@ -140,6 +165,10 @@ where
         if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
             outcome
         } else {
+            let outcome = match (outcome, missing_connect) {
+                (Ok(()), Some((hash, height))) => Err(ReorgError::MissingBody { hash, height }),
+                (outcome, _) => outcome,
+            };
             attach_reconsideration(
                 outcome,
                 revisit_disconnected_blocks(
@@ -476,8 +505,12 @@ where
     loop {
         let plan = match current_reorg_plan(handles, target) {
             Ok(Some(plan)) => plan,
-            Ok(None) => return settle(observer, Ok(())),
-            Err(error) => return settle(observer, Err(error)),
+            Ok(None) => {
+                return settle_reorg_without_transition(handles, observer, Ok(()), &mut settle);
+            }
+            Err(error) => {
+                return settle_reorg_without_transition(handles, observer, Err(error), &mut settle);
+            }
         };
 
         let prepared = (|| {
@@ -506,12 +539,19 @@ where
         let (disconnect_nodes, connect_nodes, connect, missing_connect, _retention) = match prepared
         {
             Ok(prepared) => prepared,
-            Err(error) => return settle(observer, Err(error)),
+            Err(error) => {
+                return settle_reorg_without_transition(handles, observer, Err(error), &mut settle);
+            }
         };
         if connect.is_empty()
             && let Some((hash, height)) = missing_connect
         {
-            return settle(observer, Err(ReorgError::MissingBody { hash, height }));
+            return settle_reorg_without_transition(
+                handles,
+                observer,
+                Err(ReorgError::MissingBody { hash, height }),
+                &mut settle,
+            );
         }
 
         let lock = handles
@@ -519,7 +559,9 @@ where
             .map_err(|source| ReorgError::Unavailable(Box::new(source)));
         let lock = match lock {
             Ok(lock) => lock,
-            Err(error) => return settle(observer, Err(error)),
+            Err(error) => {
+                return settle_reorg_without_transition(handles, observer, Err(error), &mut settle);
+            }
         };
 
         // Preloading is optimistic. Only an identical plan recomputed while the
@@ -801,7 +843,6 @@ where
                 Err(
                     error @ (DisconnectError::Fatal { .. } | DisconnectError::MarkerStuck { .. }),
                 ) => {
-                    handles.fail_closed_for_recovery();
                     return (progress, Err(ReorgError::Fatal(Box::new(error))));
                 }
                 Err(error) => {
@@ -973,4 +1014,81 @@ where
     }
     drop(transition);
     outcome
+}
+
+fn settle_reorg_without_transition<O, S>(
+    handles: &Chainstate,
+    observer: &mut O,
+    outcome: core::result::Result<(), ReorgError>,
+    settle: &mut S,
+) -> core::result::Result<(), ReorgError>
+where
+    O: ReorgObserver + ?Sized,
+    S: FnMut(&mut O, core::result::Result<(), ReorgError>) -> core::result::Result<(), ReorgError>,
+{
+    let outcome = settle(observer, outcome);
+    if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
+        handles.fail_closed_for_recovery();
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::ArcSwapOption;
+    use bitcoin_rs_chain::BlockTree;
+    use bitcoin_rs_primitives::Network;
+    use bitcoin_rs_utxo::UtxoSet;
+    use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    struct NoopObserver;
+
+    impl ReorgObserver for NoopObserver {
+        fn disconnected(&mut self, _: &DisconnectOutcome) {}
+
+        fn connected(&mut self, _: &Block, _: &ConnectOutcome) {}
+
+        fn reconsider_disconnected(&mut self, _: &Block, _: &UtxoSet, _: u32, _: u64) {}
+    }
+
+    fn chainstate() -> Chainstate {
+        Chainstate::new(
+            Network::Regtest,
+            Arc::new(ArcSwapOption::empty()),
+            Arc::new(ArcSwapOption::empty()),
+            Arc::new(RwLock::new(BlockTree::new())),
+            Arc::new(UtxoSet::new()),
+            Arc::new(CoinStatsListener::new(CoinStats::default())),
+            Arc::new(crate::events::ChainEventPublisher::detached(0)),
+        )
+    }
+
+    #[test]
+    fn fatal_pretransition_settlement_closes_admission() {
+        let handles = chainstate();
+        let shutdown = handles.shutdown_handle();
+        let mut observer = NoopObserver;
+        let mut settle = |_: &mut NoopObserver, _: core::result::Result<(), ReorgError>| {
+            Err(ReorgError::TransitionSettlement {
+                source: Box::new(ApplyError::Shutdown),
+                original: None,
+            })
+        };
+
+        let result = settle_reorg_without_transition(&handles, &mut observer, Ok(()), &mut settle);
+
+        assert!(matches!(
+            result,
+            Err(ReorgError::TransitionSettlement { .. })
+        ));
+        assert!(shutdown.load(Ordering::Acquire));
+        assert!(matches!(
+            handles.begin_transition(),
+            Err(ApplyError::Shutdown)
+        ));
+    }
 }

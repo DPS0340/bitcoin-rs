@@ -58,30 +58,6 @@ pub(super) fn apply_block_with_serialized_admitted(
     )
 }
 
-pub(super) fn apply_block_inner(
-    handles: &Chainstate,
-    block: &Block,
-    provided_serialized: Option<bytes::Bytes>,
-    provenance: BlockProvenance,
-) -> core::result::Result<ConnectOutcome, ApplyError> {
-    let transition = handles.begin_transition()?;
-    let result = apply_committed_block_admitted(
-        handles,
-        block,
-        provided_serialized,
-        None,
-        provenance,
-        PublishMode::Now,
-    );
-    if result.as_ref().is_err_and(|error| {
-        crate::classify_apply_error(error) == crate::WindowApplyDisposition::Fatal
-    }) {
-        handles.fail_closed_for_recovery();
-    }
-    drop(transition);
-    result
-}
-
 /// Commit path. Callers reach this only through an admitted chain transition.
 pub(super) fn apply_committed_block_admitted<'b>(
     handles: &Chainstate,
@@ -109,11 +85,11 @@ pub(super) fn apply_committed_block_admitted<'b>(
 ///
 /// See `ARCH-07` in `docs/contracts/architecture.md`.
 ///
-/// Split from [`apply_block_inner`] so a window can take both locks once across
-/// its preparation and all of its ordered commits. Re-entering per block would
-/// be two read guards on the same lock, which deadlocks against a shutdown
-/// waiting on the write side, and would leave gaps in which another applier
-/// could move the chain out from under prepared state.
+/// Kept separate from transition acquisition so a window can take both locks
+/// once across its preparation and all of its ordered commits. Re-entering per
+/// block would be two read guards on the same lock, which deadlocks against a
+/// shutdown waiting on the write side, and would leave gaps in which another
+/// applier could move the chain out from under prepared state.
 #[allow(clippy::too_many_lines)]
 pub(super) fn apply_block_admitted<'b>(
     handles: &Chainstate,

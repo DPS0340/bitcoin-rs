@@ -8,7 +8,10 @@ use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
     Sequence, Tx, TxIn, TxOut, Txid, Witness,
 };
-use bitcoin_rs_storage::{DisconnectMarker, InMemoryUndoStore, StorageError, UndoStore};
+use bitcoin_rs_storage::{
+    CommitRecords, DisconnectMarker, DurableHead, DurableHeadStore, InMemoryDurableHeadStore,
+    InMemoryUndoStore, StorageError, UndoStore,
+};
 use bitcoin_rs_utxo::connect::build_block_changes;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
@@ -78,7 +81,9 @@ fn seed_genesis(handles: &Chainstate) -> Result<TipSnapshot, ApplyError> {
 }
 
 fn coinbase(height: u32) -> Tx {
-    let encoded_height = u8::try_from(height).unwrap_or(u8::MAX);
+    let Ok(encoded_height) = u8::try_from(height) else {
+        panic!("test coinbase height must fit in one byte");
+    };
     Tx {
         version: 2,
         inputs: vec![TxIn {
@@ -206,5 +211,51 @@ fn bip30_overwrite_undo_restores_original_coin() -> Result<(), Box<dyn std::erro
     assert_eq!(restored.txout, older);
     assert_eq!(restored.height, 91_722);
     assert!(restored.coinbase);
+    Ok(())
+}
+
+#[test]
+fn close_requests_shutdown() {
+    let handles = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    let shutdown = handles.shutdown_handle();
+    assert!(!shutdown.load(Ordering::Acquire));
+
+    let _closed = handles.close();
+
+    assert!(shutdown.load(Ordering::Acquire));
+}
+
+#[test]
+fn direct_transition_fatal_error_closes_admission() -> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block();
+    let mut handles = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    seed_genesis(&handles)?;
+    let child = mined_child(genesis.block_hash(), 1)?;
+    let incompatible = DurableHead {
+        commit_id: 1,
+        height: 0,
+        tip: Hash256::from_le_bytes(&[0x66; 32]),
+        chain_tx_count: 1,
+        body_extent: None,
+        undo_extent: None,
+    };
+    let durable = Arc::new(InMemoryDurableHeadStore::new());
+    durable.commit(None, &incompatible, &CommitRecords::default())?;
+    handles.durable_head = durable;
+    let shutdown = handles.shutdown_handle();
+
+    let transition = handles.begin_transition()?;
+    let outcome = transition.connect(&child);
+
+    assert!(matches!(
+        outcome,
+        Err(ApplyError::DurableHeadLineage { .. })
+    ));
+    assert!(shutdown.load(Ordering::Acquire));
+    drop(transition);
+    assert!(matches!(
+        handles.begin_transition(),
+        Err(ApplyError::Shutdown)
+    ));
     Ok(())
 }

@@ -336,7 +336,6 @@ impl ChainFollowers {
                 if bitcoin_rs_chainstate::classify_apply_error(&error)
                     == bitcoin_rs_chainstate::WindowApplyDisposition::Fatal
                 {
-                    handles.fail_closed_for_recovery();
                     drop(mempool_change);
                     drop(transition);
                     return Err(error);
@@ -405,7 +404,6 @@ impl ChainFollowers {
                 Err(error)
             }
             Err(error) => {
-                handles.fail_closed_for_recovery();
                 drop(mempool_change);
                 drop(transition);
                 Err(error)

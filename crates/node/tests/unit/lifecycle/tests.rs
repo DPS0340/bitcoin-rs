@@ -100,9 +100,12 @@ fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow:
         root: checkpoint_root.clone(),
         displaced: displaced.clone(),
     };
+    let injected = Arc::new(AtomicBool::new(false));
     inject_before_clean_checkpoint({
         let displaced = displaced.clone();
+        let injected = Arc::clone(&injected);
         move || {
+            injected.store(true, Ordering::Release);
             std::fs::rename(&checkpoint_root, &displaced)
                 .unwrap_or_else(|error| panic!("move checkpoint root aside: {error}"));
             std::fs::write(&checkpoint_root, b"not a directory")
@@ -115,6 +118,10 @@ fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow:
     let result = run(config, RuntimeInputs::default().with_shutdown(shutdown_rx));
 
     assert!(result.is_err());
+    assert!(
+        injected.load(Ordering::Acquire),
+        "clean-checkpoint failure hook was not reached; run failed earlier: {result:?}"
+    );
     assert_eq!(std::fs::read(displaced.join("CURRENT"))?, previous);
     assert!(
         bootstrap_drain_was_reached(),

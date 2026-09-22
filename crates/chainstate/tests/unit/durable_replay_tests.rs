@@ -118,11 +118,20 @@ fn install_head(
         body_extent: None,
         undo_extent: None,
     };
+    install_arbitrary_head(handles, head, bodies)?;
+    Ok(head)
+}
+
+fn install_arbitrary_head(
+    handles: &mut Chainstate,
+    head: DurableHead,
+    bodies: Arc<MemoryBodies>,
+) -> Result<(), StorageError> {
     let durable = Arc::new(InMemoryDurableHeadStore::new());
     durable.commit(None, &head, &CommitRecords::default())?;
     handles.durable_head = durable;
     handles.block_body_store = Some(bodies);
-    Ok(head)
+    Ok(())
 }
 
 #[test]
@@ -197,5 +206,160 @@ fn durable_head_without_restored_chainstate_fails_startup() -> Result<(), Box<dy
     ));
     assert!(handles.applied_tip.load_full().is_none());
     assert_eq!(handles.durable_head.load()?, Some(head));
+    Ok(())
+}
+
+#[test]
+fn matching_durable_head_requires_no_replay() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, _) = restored_chainstate()?;
+    let restored = handles
+        .applied_tip
+        .load_full()
+        .ok_or("restored tip missing")?;
+    let head = DurableHead {
+        commit_id: 3,
+        height: restored.height,
+        tip: restored.hash,
+        chain_tx_count: 1,
+        body_extent: None,
+        undo_extent: None,
+    };
+    install_arbitrary_head(&mut handles, head, Arc::new(MemoryBodies::default()))?;
+
+    super::reconcile_at_boot(&handles)?;
+
+    assert_eq!(handles.durable_head.load()?, Some(head));
+    assert_eq!(
+        handles.applied_tip.load_full().map(|tip| tip.hash),
+        Some(restored.hash)
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_head_at_or_below_restored_tip_is_not_a_replay_gap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (handles, child) = restored_chainstate()?;
+    let restored = handles
+        .applied_tip
+        .load_full()
+        .ok_or("restored tip missing")?;
+    let head = DurableHead {
+        commit_id: 4,
+        height: restored.height,
+        tip: Hash256::from(child.block_hash()),
+        chain_tx_count: 2,
+        body_extent: None,
+        undo_extent: None,
+    };
+
+    let Err(error) = super::replay_committed_gap(&handles, head, &restored) else {
+        panic!("head at restored height is not a publication gap");
+    };
+    assert!(matches!(
+        error,
+        ApplyError::DurableHeadGapUnrecoverable {
+            reason: "the restored tip is not below the stored head; the state is not a publication lag",
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn durable_gap_wider_than_one_group_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    let (handles, child) = restored_chainstate()?;
+    let restored = handles
+        .applied_tip
+        .load_full()
+        .ok_or("restored tip missing")?;
+    let head_height = u32::try_from(super::REPLAY_GAP_BLOCK_LIMIT)?.saturating_add(1);
+    let head = DurableHead {
+        commit_id: 5,
+        height: head_height,
+        tip: Hash256::from(child.block_hash()),
+        chain_tx_count: 2,
+        body_extent: None,
+        undo_extent: None,
+    };
+
+    let Err(error) = super::replay_committed_gap(&handles, head, &restored) else {
+        panic!("gap beyond the commit-group bound must fail");
+    };
+    assert!(matches!(
+        error,
+        ApplyError::DurableHeadGapUnrecoverable {
+            reason: "the gap is wider than one commit group",
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn committed_gap_body_must_hash_to_the_head_identity() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, child) = restored_chainstate()?;
+    let restored = handles
+        .applied_tip
+        .load_full()
+        .ok_or("restored tip missing")?;
+    let claimed = Hash256::from_le_bytes(&[0x55; 32]);
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.persist_block_body(1, claimed, &consensus_bytes(&child))?;
+    handles.block_body_store = Some(bodies);
+    let head = DurableHead {
+        commit_id: 6,
+        height: 1,
+        tip: claimed,
+        chain_tx_count: 2,
+        body_extent: None,
+        undo_extent: None,
+    };
+
+    let Err(error) = super::replay_committed_gap(&handles, head, &restored) else {
+        panic!("body/hash mismatch must fail");
+    };
+    assert!(matches!(
+        error,
+        ApplyError::DurableHeadGapUnrecoverable {
+            reason: "a stored body does not hash to its committed hash",
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn committed_gap_must_descend_from_restored_tip() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, child) = restored_chainstate()?;
+    let restored = handles
+        .applied_tip
+        .load_full()
+        .ok_or("restored tip missing")?;
+    let mut wrong_restored = (*restored).clone();
+    wrong_restored.hash = Hash256::from_le_bytes(&[0x44; 32]);
+    let child_hash = Hash256::from(child.block_hash());
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.persist_block_body(1, child_hash, &consensus_bytes(&child))?;
+    handles.block_body_store = Some(bodies);
+    let head = DurableHead {
+        commit_id: 7,
+        height: 1,
+        tip: child_hash,
+        chain_tx_count: 2,
+        body_extent: None,
+        undo_extent: None,
+    };
+
+    let Err(error) = super::replay_committed_gap(&handles, head, &wrong_restored) else {
+        panic!("head chain rooted elsewhere must fail");
+    };
+    assert!(matches!(
+        error,
+        ApplyError::DurableHeadGapUnrecoverable {
+            reason: "the head chain does not descend from the restored tip",
+            ..
+        }
+    ));
     Ok(())
 }

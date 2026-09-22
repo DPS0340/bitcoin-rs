@@ -58,6 +58,63 @@ fn invalidate_block_settles_disconnect_debt() -> anyhow::Result<()> {
 }
 
 #[test]
+fn invalidate_preflights_first_replacement_body_before_disconnect() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+    config.data_dir = dir.path().join("node-invalidate-preflight");
+    config.p2p.listen.clear();
+    let state = NodeState::open(config, None)?;
+    let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+    state.apply_block(&genesis)?;
+    let block_one = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 1, 1)?;
+    state.apply_block(&block_one)?;
+    let block_two = mined_regtest_child_at(block_one.block_hash(), genesis.header.time + 2, 2)?;
+    state.apply_block(&block_two)?;
+    let before = state
+        .chainstate()
+        .applied_tip()
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("active tip missing"))?;
+
+    let replacement = mined_regtest_child_at(genesis.block_hash(), genesis.header.time + 20, 1)?;
+    let genesis_id = state
+        .chainstate()
+        .block_tree()
+        .read()
+        .lookup(Hash256::from(genesis.block_hash()))
+        .ok_or_else(|| anyhow::anyhow!("missing genesis node"))?;
+    state.chainstate().block_tree().write().insert_node(
+        Some(genesis_id),
+        replacement.header,
+        bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+    )?;
+
+    let result = crate::reorg::invalidate_block(
+        &state.chainstate(),
+        &state.chain_followers(),
+        Hash256::from(block_one.block_hash()),
+    );
+
+    assert!(matches!(
+        result,
+        Err(crate::reorg::ReorgError::MissingBody {
+            hash,
+            height: 1,
+        }) if hash == Hash256::from(replacement.block_hash())
+    ));
+    assert_eq!(
+        state
+            .chainstate()
+            .applied_tip()
+            .load_full()
+            .map(|tip| tip.hash),
+        Some(before.hash),
+        "missing first replacement body must be discovered before disconnect"
+    );
+    Ok(())
+}
+
+#[test]
 fn switch_to_branch_settles_disconnect_debt() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let data_dir = dir.path().join("node");

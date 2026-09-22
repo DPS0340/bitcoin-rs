@@ -27,7 +27,7 @@ after promotion.
 | Core vector parity | Zero mismatches on runnable rows; pinned skip counts and skip reasons per corpus | `cargo test --locked -p bitcoin-rs-script --test core_vectors` | `planned_not_executed` |
 | Contextual and script matrix (T15) | Every §5.1 family, active and inactive boundaries, mandatory versus policy flags; zero unexplained mismatches; every exclusion counted and classified | `cargo test --locked -p bitcoin-rs-consensus --test overhaul_consensus_matrix -- --nocapture` | `planned_not_executed` |
 | Strict-Rust crypto lane (T16) | Valid and invalid ECDSA, Schnorr and tweak vectors; integer and point boundary cases; independent oracle agreement; audited dependency closure | `cargo test --locked -p bitcoin-rs-script --test overhaul_native_crypto -- --nocapture` | `planned_not_executed` |
-| Signed-spend apply (T16, T17) | Native median beats the pinned kernel median by the acceptance rule below, measured on the final strict artifact | Run the `crates/node/benches/sync_pipeline.rs` `signed_spend` arm under separate native (`fjall`) and oracle (`fjall,kernel`) target directories; command shape is pinned in `data/overhaul-signed-spend-20260904.md` | `planned_not_executed` |
+| Signed-spend apply (T16, T17) | Native median beats the pinned kernel median by the acceptance rule below, measured on the final strict artifact | Native: `CARGO_TARGET_DIR=target/signed-spend-native cargo bench --locked -p bitcoin-rs-node --bench sync_pipeline --no-default-features --features fjall -- signed_spend --sample-size 30 --warm-up-time 1 --measurement-time 8`<br>Kernel: `CARGO_TARGET_DIR=target/signed-spend-kernel cargo bench --locked -p bitcoin-rs-node --bench sync_pipeline --no-default-features --features fjall,kernel -- signed_spend --sample-size 30 --warm-up-time 1 --measurement-time 8` | `planned_not_executed` |
 | Full mainnet replay | Genesis to the pinned stop identity with sampled and exact coin comparison against Core `v31.1` | offline comparator, see [`offline-full-validation.md`](offline-full-validation.md) | `planned_not_executed` |
 | Invalid and contextual corpora | Rejection parity on invalid local corpora; a passing valid chain alone does not prove rejection | T15 matrix | `planned_not_executed` |
 | Kernel-free closure | `cargo tree --locked -p bitcoin-rs --no-default-features --features fjall -e features` shows no `bitcoinkernel` on any transitive path; native and oracle lanes built under separate `CARGO_TARGET_DIR` | `cargo tree --locked -p bitcoin-rs --no-default-features --features fjall -e features` plus `scripts/ci-pr.sh` native profiles | `planned_not_executed` |
@@ -85,8 +85,7 @@ requires every gate in the issue, not a subset.
 
 ### Decision
 
-Keep `kernel` as the `bitcoin-rs-consensus`, `bitcoin-rs-chainstate`, and
-`bitcoin-rs-node` default,
+Keep `kernel` as the `bitcoin-rs-consensus` and `bitcoin-rs-node` default,
 and in the Compose image. Leave `bin/bitcoin-rs` kernel-free. The native
 interpreter is a complete consensus script engine; it is not yet the
 measured winner. Recorded verdict: `KeepKernel`.
@@ -118,13 +117,13 @@ not flip the default.
 | Surface | Script engine |
 |---|---|
 | `bin/bitcoin-rs` default features (`fjall,redb,zmq`) | Native interpreter |
-| `bitcoin-rs-consensus` / `bitcoin-rs-chainstate` / `bitcoin-rs-node` crate defaults | `kernel` (`libbitcoinkernel`) |
+| `bitcoin-rs-consensus` / `bitcoin-rs-node` crate defaults | `kernel` (`libbitcoinkernel`) |
 | Compose image (`Dockerfile --features fjall,kernel`) | `kernel` |
 
 Until the gates pass, the library crates and the image keep `kernel`. The
 binary already builds native so a default `cargo build -p bitcoin-rs` needs
 no C++ toolchain. Promoting native is one coordinated change: drop
-`kernel` from all three validation-library defaults in the same commit.
+`kernel` from the two library defaults in the same commit.
 
 ### Measured observations
 
