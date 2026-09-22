@@ -243,13 +243,14 @@ transition. `chain` still plans the branch. Node-level reorg still sequences
 disconnect then connect. UTXO, storage, and index still own their operations.
 
 ### Chain-change proof
-The type-level binding of a `TransitionLock` to the `ChainChangeGuard` that
+The type-level binding of a `TransitionLock` to the `TransitionGuard` that
 reserved the active odd generation (`crates/chainstate/src/lib.rs`). The
-caller-facing mutation capability is `ChainTransition`, which holds that
-proof. Apply-path helpers accept `&TransitionLock`, not independent lock
-and guard arguments, so a call without an active odd generation cannot
-compile. The proof owns the guard, so the reserved generation is fixed for
-the whole transition rather than read from a snapshot that may have moved.
+caller-facing mutation capability is `ChainTransition`, which promotion of
+the lock produces. Apply-path helpers accept `&ChainTransition`, not
+independent lock and guard arguments, so a call without an active odd
+generation cannot compile. The proof owns the guard, so the reserved
+generation is fixed for the whole transition rather than read from a
+snapshot that may have moved.
 
 ### Count-and-byte bound
 A window sized by whichever of a count cap and a byte cap binds first, because item size varies by orders of magnitude across the chain. The script window (`window_len`, `crates/node/src/sync.rs`) and the download window's pending and staging budgets (`SyncBudget` in `crates/p2p/src/download_window.rs`) both use it. In the script window one block larger than the whole byte cap still goes through alone rather than stalling the chain.

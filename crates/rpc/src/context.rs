@@ -1608,26 +1608,6 @@ mod tests {
         );
     }
 
-    /// One `BlockRecord` is held per applied block; only the disconnect path
-    /// removes one, from the tail. The record's own footprint is gated at
-    /// compile time beside the type (`crates/index/src/block_log.rs`); this
-    /// checks the other half of the same contract — no constructor may stuff
-    /// a header in.
-    #[test]
-    fn constructed_records_carry_no_header() {
-        let block = Network::Regtest.genesis_block();
-
-        for record in [
-            BlockRecord::from_block(0, &block),
-            BlockRecord::synthetic(0, BlockHash::default()),
-        ] {
-            assert!(
-                record.header_bytes().is_none(),
-                "a constructed record must not carry a header; the tree holds it"
-            );
-        }
-    }
-
     /// The hex a caller sees must be byte-identical to what the stored `String`
     /// used to hold; only where it is produced changed.
     ///

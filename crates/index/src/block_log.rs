@@ -60,11 +60,16 @@ pub struct BlockRecord {
 /// header saved. The boxing is what buys those 80 bytes and is easy to undo
 /// by accident, so reverting it fails here at compile time rather than in a
 /// runtime test. The 64-byte figure is the 64-bit layout; `usize` fields make
-/// narrower targets smaller still, which can only improve the saving.
+/// narrower targets smaller still, so the figure is an upper bound, not a
+/// floor.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     core::mem::size_of::<BlockRecord>() == 64,
     "BlockRecord footprint changed; re-measure the per-block saving"
+);
+const _: () = assert!(
+    core::mem::size_of::<BlockRecord>() <= 64,
+    "BlockRecord grew past the 64-byte bound; re-measure the per-block saving"
 );
 
 /// The node's block-record log, with the two whole-log sums kept as it changes.

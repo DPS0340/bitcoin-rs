@@ -21,7 +21,7 @@ Reorg handling finds the common ancestor by hash. Within the cutover depth it re
 The behavioral requirement is unchanged: the #208 incident shape (834k-block stale branch) routes to rebuild while organic reorgs of roughly 100 blocks or fewer rewind. Any value in `[1_000, 100_000]` satisfies it; the measured ratio picks the value.
 
 ```bash
-cargo test --locked -p bitcoin-rs-index --lib runtime::recovery_tests -- --nocapture
+cargo test --locked -p bitcoin-rs-index --no-default-features --features fjall --lib runtime::recovery_tests -- --nocapture
 ```
 
 ## Required identities per sample

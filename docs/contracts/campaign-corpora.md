@@ -129,7 +129,8 @@ that height. No Cmodern cell may close on a guessed or recalled UTXO total.
   eleven specials, C150 census zeros, Cmodern all-positive specials, Core
   framing, manifest digest binding, and `assume_valid_height = 0`.
 - `bin/bitcoin-rs/tests/overhaul_reference_set.rs`: G0 pin; rejects
-  a corpus with a mismatched stop hash or missing chain-state oracle.
+  label-only, malformed, and well-formed-but-unbound identities, checks
+  kernel package custody, and pins `corpus_custody()` honesty.
 - `crates/consensus/tests/overhaul_consensus_matrix.rs` (planned): G5 replay
   arm; covers every active and inactive consensus boundary with invalid
   corpora counted and classified.
