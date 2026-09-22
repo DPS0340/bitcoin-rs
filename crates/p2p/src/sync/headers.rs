@@ -269,7 +269,22 @@ impl BlockSync {
             locator_hashes,
             bitcoin::BlockHash::all_zeros(),
         ));
-        if self.peer_table.send(source, msg).is_err() {
+        // `send_then` holds the connection's identity through the enqueue
+        // and the pending stamp under one table authority, so a replacement
+        // slipping in between cannot leave a request registered to a dead
+        // connection.
+        if self
+            .peer_table
+            .send_then(source, msg, || {
+                self.scheduler.lock().header_request = Some(PendingHeaderRequest {
+                    source,
+                    locator_tip_hash,
+                    target_height,
+                    requested_at: now,
+                });
+            })
+            .is_err()
+        {
             tracing::warn!(
                 peer_addr = %source.addr,
                 "block sync: outbound channel disconnected"
@@ -291,12 +306,6 @@ impl BlockSync {
             }
             return GetheadersOutcome::Failed;
         }
-        self.scheduler.lock().header_request = Some(PendingHeaderRequest {
-            source,
-            locator_tip_hash,
-            target_height,
-            requested_at: now,
-        });
         tracing::debug!(
             peer_addr = %source.addr,
             our_height,

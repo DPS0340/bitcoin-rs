@@ -440,6 +440,29 @@ impl PeerTable {
         entry.lease.send(message).map_err(|error| error.0)
     }
 
+    /// Like [`Self::send`], then runs `published` while the connection's
+    /// identity is still held: a same-address replacement cannot register
+    /// between the enqueue and the caller stamping request ownership under
+    /// that identity.
+    #[allow(clippy::result_large_err)]
+    pub fn send_then(
+        &self,
+        source: PeerSource,
+        message: crate::Message,
+        published: impl FnOnce(),
+    ) -> Result<(), crate::Message> {
+        let entries = self.entries.read();
+        let Some(entry) = entries
+            .get(&source.addr)
+            .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
+        else {
+            return Err(message);
+        };
+        entry.lease.send(message).map_err(|error| error.0)?;
+        published();
+        Ok(())
+    }
+
     /// Snapshots handshake-complete peers together with the connection that
     /// published them.
     #[must_use]

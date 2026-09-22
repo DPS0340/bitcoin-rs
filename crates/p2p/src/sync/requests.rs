@@ -170,21 +170,27 @@ impl BlockSync {
         let count = inventory.len();
         let msg = Message::GetData(inventory);
 
-        // `send` holds the connection's identity through the enqueue; the
-        // pending is then stamped with that same identity, so a replacement
+        // `send_then` holds the connection's identity through the enqueue
+        // and the pending stamp under one table authority, so a replacement
         // can never be blamed for — or credited with — this request.
-        if self.peer_table.send(source, msg).is_err() {
+        let mut has_request_capacity = false;
+        if self
+            .peer_table
+            .send_then(source, msg, || {
+                has_request_capacity = self
+                    .scheduler
+                    .lock()
+                    .window
+                    .mark_requested(&request, source, now);
+            })
+            .is_err()
+        {
             tracing::warn!(
                 peer_addr = %source.addr,
                 "block sync: outbound channel disconnected (getdata)"
             );
             return GetdataRequestOutcome::default();
         }
-        let has_request_capacity = self
-            .scheduler
-            .lock()
-            .window
-            .mark_requested(&request, source, now);
 
         if is_contiguous {
             *self.expected_apply_cache.lock() = Some(ExpectedApplyCache {
