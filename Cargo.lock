@@ -518,6 +518,7 @@ dependencies = [
  "cap-std",
  "fjall",
  "hashbrown 0.17.1",
+ "libc",
  "metrics",
  "parking_lot",
  "proptest",
