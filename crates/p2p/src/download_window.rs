@@ -1960,8 +1960,11 @@ impl DownloadWindow {
     }
 
     /// Records that block `hash` was received from `source_peer`, moving it
-    /// from pending to received (staged). Returns `true` if the window still
-    /// has request capacity.
+    /// from pending to received (staged). Returns `true` when the hash held
+    /// no pending request — the only place a height is inherited from — so
+    /// the caller must resolve the entry's height and pass it to
+    /// `update_received_height`; blocks whose headers the tree does not
+    /// know stay at 0 until then.
     pub fn mark_received_from(
         &mut self,
         hash: Hash256,

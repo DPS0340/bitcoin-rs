@@ -1,15 +1,22 @@
 //! Bounded inbound body draining and exact staged-body admission.
 
 use super::BlockSync;
+use super::chain::HeaderAdmission;
 use super::chain::SyncChainError;
+use super::peers::is_peer_fault;
 use crate::InboundBlock;
+use crate::PeerSource;
 use crate::RejectDelivery;
 use crate::StagedBlock;
 use crate::download_window::INBOUND_BLOCK_STAGE_CHUNK;
 use bitcoin_rs_chain::BlockTree;
+use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::Header;
+use hashbrown::HashMap;
+use hashbrown::HashSet;
 use std::time::Instant;
 use std::vec::Vec;
 
@@ -127,6 +134,13 @@ impl BlockSync {
         blocks: &mut Vec<InboundBlock>,
         next_expected_hash: Option<Hash256>,
     ) -> usize {
+        // A live-head `inv` or compact announcement fetches the body
+        // directly — no `headers` batch travels — so a body whose hash the
+        // tree does not know carries the only copy of its header. Admitting
+        // it here lets the block schedule and apply; skipped, the staged
+        // copy silently expires with the announced tip never learned.
+        let known_heights = self.admit_delivered_block_headers(blocks);
+
         // A cold-start hedge can arrive after its original copy was applied.
         // Drop only blocks proven to lie on the applied ancestry; a known
         // side-chain block at the same or lower height must remain eligible.
@@ -260,7 +274,15 @@ impl BlockSync {
                         }
                     }
                     StagedBlock::Memory { bytes, dropped } => {
-                        window.mark_received_from(hash, bytes, source_peer, now);
+                        // A delivery that owned no pending request inherits
+                        // no height; resolve it now or the received entry
+                        // keeps the 0 sentinel (successor visibility and
+                        // retry rewinds both read it).
+                        if window.mark_received_from(hash, bytes, source_peer, now)
+                            && let Some(&height) = known_heights.get(&hash)
+                        {
+                            window.update_received_height(&hash, height);
+                        }
                         for dropped in dropped {
                             window.drop_received_for_retry(&dropped.hash);
                             retry_count = retry_count.saturating_add(1);
@@ -306,4 +328,168 @@ impl BlockSync {
         }
         staged_count
     }
+
+    /// Admits headers carried by delivered bodies whose hashes are not yet
+    /// in the tree, and returns the tree height of every in-tree chunk hash
+    /// (for the window's received-height resolution above).
+    ///
+    /// Live-head announcements can reach the body stage without a `headers`
+    /// batch: an `inv` block item or a compact-block fallback fetches the
+    /// body directly, so the delivered block carries the only copy of its
+    /// header. Admission reuses the `headers`-batch seam. A missing
+    /// ancestor is not a peer fault — the delivering peer necessarily
+    /// holds the chain it announced — so the gap heals with a `getheaders`
+    /// back to it; validation faults blame the deliverer exactly as a
+    /// rejected `headers` batch does.
+    ///
+    /// Runs outside `body_sync`: `admit_headers` takes the chain transition
+    /// lock and the tree write, both of which rank above the window lock.
+    fn admit_delivered_block_headers(&self, blocks: &[InboundBlock]) -> HashMap<Hash256, u32> {
+        let mut heights = HashMap::with_capacity(blocks.len());
+        let mut unknown: HashMap<Hash256, Header> = HashMap::new();
+        let mut sources: HashMap<Hash256, PeerSource> = HashMap::new();
+        {
+            let tree = self.chain.block_tree().read();
+            for inbound in blocks {
+                let hash = Hash256::from(inbound.block.block_hash());
+                match tree
+                    .lookup(hash)
+                    .and_then(|node_id| tree.node(node_id).ok())
+                {
+                    Some(node) => {
+                        heights.insert(hash, node.height);
+                    }
+                    None => {
+                        if let hashbrown::hash_map::Entry::Vacant(entry) = unknown.entry(hash) {
+                            entry.insert(inbound.block.header);
+                            if let Some(source) = inbound.source {
+                                sources.insert(hash, source);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if unknown.is_empty() {
+            return heights;
+        }
+        let admission = self
+            .chain
+            .admit_headers(&order_headers_for_admission(&unknown));
+        let mut admitted_heights = Vec::new();
+        {
+            // Re-resolve under one read: every hash the tree now knows was
+            // admitted, so delivering it demonstrates possession of the
+            // block — the same demonstrated-tip credit a `headers`
+            // announcement earns.
+            let tree = self.chain.block_tree().read();
+            for hash in unknown.keys() {
+                let Some(node) = tree.lookup(*hash).and_then(|id| tree.node(id).ok()) else {
+                    continue;
+                };
+                heights.insert(*hash, node.height);
+                admitted_heights.push((*hash, node.height));
+                if let Some(source) = sources.get(hash) {
+                    self.peer_table.note_announced_tip(*source, *hash, None);
+                }
+            }
+        }
+        // Bodies staged by an earlier chunk (a refused or re-delivered
+        // admission) keep the 0-height sentinel forever without this.
+        if !admitted_heights.is_empty() {
+            let window = &mut self.body_sync.lock().window;
+            for (hash, height) in admitted_heights {
+                window.update_received_height(&hash, height);
+            }
+        }
+        self.refresh_active_peer_credit();
+        self.handle_carried_header_admission(admission, &unknown, &heights, &sources);
+        heights
+    }
+
+    /// Reacts to the delivered-header admission outcome with the same
+    /// semantics a `headers` batch gets: validation faults blame every
+    /// deliverer whose carried header never landed; a missing ancestor
+    /// heals with a `getheaders` back to the deliverer, which provably
+    /// holds the chain it announced (`i32::MAX`: unbounded).
+    fn handle_carried_header_admission(
+        &self,
+        admission: HeaderAdmission,
+        unknown: &HashMap<Hash256, Header>,
+        heights: &HashMap<Hash256, u32>,
+        sources: &HashMap<Hash256, PeerSource>,
+    ) {
+        match admission {
+            HeaderAdmission::Accepted { .. } => {}
+            HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
+                for hash in unknown.keys().filter(|hash| !heights.contains_key(*hash)) {
+                    let Some(source) = sources.get(hash) else {
+                        continue;
+                    };
+                    if self.peer_table.disconnect_source(*source) {
+                        self.body_sync
+                            .lock()
+                            .window
+                            .mark_peer_unresponsive(source.addr, Instant::now());
+                        tracing::warn!(
+                            peer_addr = %source.addr,
+                            %hash,
+                            %error,
+                            "block sync: delivered block carried an invalid header; disconnecting",
+                        );
+                    }
+                }
+            }
+            HeaderAdmission::Rejected(ChainError::MissingParent { .. }) => {
+                let target = unknown
+                    .keys()
+                    .filter(|hash| !heights.contains_key(*hash))
+                    .find_map(|hash| sources.get(hash).copied());
+                if let Some(source) = target {
+                    let our_height = self
+                        .chain
+                        .chain_tip()
+                        .load_full()
+                        .map_or(0, |tip| tip.height);
+                    self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
+                }
+            }
+            HeaderAdmission::Rejected(error) => {
+                tracing::warn!(
+                    %error,
+                    "block sync: rejected headers carried by delivered blocks",
+                );
+            }
+            HeaderAdmission::Refused(error) => {
+                tracing::debug!(
+                    %error,
+                    "block sync: delivered-header admission refused; dropping batch",
+                );
+            }
+        }
+    }
+}
+
+/// Orders `unknown` headers parent-before-child within the batch so a
+/// delivered chain admits in one `admit_headers` call: each emitted prefix
+/// walks back to its deepest batch ancestor. Headers whose parent sits
+/// outside both the batch and the tree trail in map order — they fail
+/// `MissingParent` individually without blocking a sibling that attaches.
+fn order_headers_for_admission(unknown: &HashMap<Hash256, Header>) -> Vec<Header> {
+    let mut ordered = Vec::with_capacity(unknown.len());
+    let mut emitted = HashSet::with_capacity(unknown.len());
+    for hash in unknown.keys() {
+        let mut chain = Vec::new();
+        let mut cursor = *hash;
+        while !emitted.contains(&cursor) {
+            let Some(header) = unknown.get(&cursor) else {
+                break;
+            };
+            chain.push(cursor);
+            emitted.insert(cursor);
+            cursor = Hash256::from(header.prev_blockhash);
+        }
+        ordered.extend(chain.into_iter().rev().map(|hash| unknown[&hash]));
+    }
+    ordered
 }
