@@ -40,9 +40,10 @@ impl BlockSync {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;
         let mut credit_refresh_needed = false;
-        // Set on any batch reaching `admit_headers`: a rejection can still
-        // commit a valid prefix, so sentinels reconcile on the attempt.
-        let mut admission_attempted = false;
+        // Set on any batch whose content reached the tree this drain — an
+        // admission attempt (a rejection can still commit a valid prefix)
+        // or a fully-known batch — so staged-body sentinels reconcile here.
+        let mut reconcile_needed = false;
         while let Ok(InboundHeaders {
             headers,
             source,
@@ -62,6 +63,7 @@ impl BlockSync {
             // batches would otherwise pay a lock acquisition per body for
             // what is almost always a lookup hit.
             if let Some((tip_hash, active_height)) = self.known_batch_outcome(&headers) {
+                reconcile_needed = true;
                 if let Some(source) = source {
                     self.peer_table
                         .note_announced_tip(source, tip_hash, active_height);
@@ -76,7 +78,7 @@ impl BlockSync {
             // Header admission moves the header tip, which the apply path
             // reads under the transition; the implementation holds that lock
             // inside `admit_headers` until commit.
-            admission_attempted = true;
+            reconcile_needed = true;
             match self.chain.admit_headers(&headers) {
                 HeaderAdmission::Accepted {
                     accepted,
@@ -163,7 +165,7 @@ impl BlockSync {
         // The drain may have attached the ancestry a deferred owned fetch
         // was waiting on — resolve it against the tree now.
         self.resolve_owned_body_fetches();
-        if admission_attempted {
+        if reconcile_needed {
             self.reconcile_staged_received_heights();
         }
         if total_headers > 0 {

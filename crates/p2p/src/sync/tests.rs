@@ -756,6 +756,14 @@ fn missing_parent_block_delivery_recovers_with_getheaders() -> Result<(), Box<dy
         witness_block_inventory(next_getdata(&rx)?)?,
         std::vec![block1.block_hash()]
     );
+    assert_eq!(
+        sync.scheduler
+            .lock()
+            .window
+            .received_height(&Hash256::from(block2.block_hash())),
+        Some(2),
+        "header admission must reconcile the staged child's height"
+    );
 
     // Delivering the parent applies both: the staged child body commits
     // right behind it (the second tick drains past the requested-prefix
