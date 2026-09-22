@@ -226,6 +226,12 @@ impl BlockSync {
         let (Some(source), Some(header)) = (source, header) else {
             return;
         };
+        // A stale source names a dead connection: its compact fetch died
+        // with it, and marking the body pending under that address would
+        // suppress scheduling from the live replacement until expiry.
+        if !self.peer_table.is_current(source) {
+            return;
+        }
         let hash = Hash256::from(header.compute_hash());
         let height = {
             let tree = self.chain.block_tree().read();

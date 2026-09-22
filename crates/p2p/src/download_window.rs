@@ -2259,7 +2259,13 @@ impl DownloadWindow {
             entries: vec![PeerRequestEntry { hash, height }],
             next_request_height: 0,
         };
+        // `mark_requested` re-enables `prefix_probe_attempted_owner` when
+        // pending was empty — that re-arm is for a real post-drain request.
+        // An externally owned fetch is not one: keep the marker so a
+        // proven-stall owner stays ineligible for the next prefix probe.
+        let attempted_owner = self.prefix_probe_attempted_owner;
         self.mark_requested(&request, now);
+        self.prefix_probe_attempted_owner = attempted_owner;
     }
 
     fn remove_received(&mut self, hash: &Hash256) -> Option<ReceivedBlock> {
