@@ -55,8 +55,12 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
     `g17_dependency_direction` gate checks this boundary explicitly.
   - **Layer 3 (Surface)**: `bitcoin-rs-rpc`. External wire protocols and RPC
     handlers, including the Bitcoin Core-compatible ZMQ protocol and transport.
-  - **Layer 4 (Compose)**: `bitcoin-rs-node`, `bitcoin-rs`. Daemon assembly,
-    subsystem lifecycle coordination, and CLI binary entry points.
+  - **Layer 4 (Compose)**: `bitcoin-rs-node`, `bitcoin-rs`, `bitcoin-rs-e2e`.
+    Daemon assembly, subsystem lifecycle coordination, and CLI binary entry
+    points. `bitcoin-rs-e2e` is the process-level test harness that drives
+    the composed daemon and the pinned reference node over their public
+    surfaces only; it declares no internal dependencies and no workspace
+    crate may depend on it.
 - **Explicit non-goal**: Layer numbers do not justify speculative new crates or
   thin wrapper layers. A boundary exists only when it isolates external
   dependencies, enforces safety/consensus boundaries, or separates independent

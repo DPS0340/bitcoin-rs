@@ -10,7 +10,8 @@
 //! - `scripts/install-bitcoind.sh` for the P2P/reorg scenarios that need Core
 //!
 //! Evidence from every run (launch argv, captured stdout/stderr, the RPC
-//! transcript) lands in `target/e2e/run-*` for CI artifact collection.
+//! transcript) lands in `target/process-harness/e2e/run-*`, under the
+//! artifact root CI uploads.
 
 pub mod error;
 pub mod helpers;

@@ -113,8 +113,9 @@ pub fn coinbase_at(node: &mut ProcessNode, height: u64) -> Result<Transaction> {
     deserialize_hex(hex).map_err(|e| Error::Assertion(format!("coinbase decode: {e}")))
 }
 
-/// Read the funding output (outpoint + full txout) of a coinbase paying
-/// `funding_address`: outpoint `(txid, 0)` and its `TxOut`.
+/// Read output 0 of a coinbase as the funding outpoint — `(txid, 0)` plus
+/// its `TxOut`. The output script is not inspected: callers must ensure the
+/// coinbase pays the script they intend to spend.
 pub fn funding_output(coinbase: &Transaction) -> Result<(OutPoint, TxOut)> {
     let output = coinbase
         .output
