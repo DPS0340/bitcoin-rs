@@ -7,10 +7,11 @@ use super::LOCATOR_MAX_ENTRIES;
 use super::PROTOCOL_VERSION;
 use super::PendingHeaderRequest;
 use super::chain::HeaderAdmission;
+use super::chain::SyncChainError;
 use super::frontier::SyncFrontier;
-use super::peers::active_demonstrated_height;
 use super::peers::is_peer_fault;
 use super::peers::outranks;
+use super::peers::shared_active_height;
 use super::peers::sync_peer_candidate;
 use crate::InboundHeaders;
 use crate::Message;
@@ -18,32 +19,54 @@ use crate::PeerSource;
 use crate::download_window::SyncPeer;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+use bitcoin_rs_chain::{ChainError, NodeId};
 use bitcoin_rs_primitives::Hash256;
 use std::time::Instant;
 use std::vec::Vec;
+
+/// Cap on retained off-chain tips per session: honest peers announce one
+/// chain, so more than this many distinct side branches is a misbehavior
+/// signal rather than evidence worth keeping.
+const MAX_UNRESOLVED_DEMONSTRATED_TIPS: usize = 8;
+
+/// Cap on deferred owned-fetch marks waiting on unattached tip headers:
+/// bounded so a peer cannot grow the scheduler by announcing tips that
+/// never admit. The oldest mark is evicted first.
+const MAX_DEFERRED_OWNED_FETCHES: usize = 16;
 
 impl BlockSync {
     pub(super) fn drain_inbound_headers(&self) {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;
-        while let Ok(InboundHeaders { headers, source }) = receiver.try_recv() {
+        let mut credit_refresh_needed = false;
+        while let Ok(InboundHeaders {
+            headers,
+            source,
+            wire_response,
+            body_fetch_owned,
+        }) = receiver.try_recv()
+        {
             let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
 
-            // A nonempty response consumes the request even when rejected.
-            // An empty response supplies no new capability: retain its
-            // deadline so idle discovery is paced and rotates to another peer.
-            // The consumption is identity-exact: only the connection the
-            // request was sent to can answer it, so a same-address
-            // replacement's batch never frees the predecessor's deadline.
-            if let Some(source) = source.filter(|_| !headers.is_empty()) {
-                let mut scheduler = self.scheduler.lock();
-                if scheduler
-                    .header_request
-                    .is_some_and(|request| request.source == source)
-                {
-                    scheduler.header_request = None;
+            self.consume_header_request(source, wire_response, headers.is_empty());
+
+            // Already-known batches skip the transition lock. The listener
+            // forwards every inbound body's embedded header here so
+            // unannounced tips (`inv`-served, compact-reconstructed, or
+            // pushed blocks) reach admission — during bulk delivery those
+            // batches would otherwise pay a lock acquisition per body for
+            // what is almost always a lookup hit.
+            if let Some((tip_hash, active_height)) = self.known_batch_outcome(&headers) {
+                if let Some(source) = source {
+                    self.peer_table
+                        .note_announced_tip(source, tip_hash, active_height);
+                    credit_refresh_needed = true;
                 }
+                if body_fetch_owned {
+                    self.note_owned_body_fetch(source, headers.last());
+                }
+                continue;
             }
 
             // Header admission moves the header tip, which the apply path
@@ -59,7 +82,7 @@ impl BlockSync {
                         self.peer_table
                             .note_announced_tip(source, tip_hash, active_height);
                     }
-                    self.refresh_active_peer_credit();
+                    credit_refresh_needed = true;
                     tracing::debug!(
                         accepted,
                         received = batch_len,
@@ -70,6 +93,10 @@ impl BlockSync {
                     let mut blamed_peer = None;
                     if let Some(source) = source {
                         if self.peer_table.disconnect_source(source) {
+                            // Every removal path releases a `getheaders`
+                            // gate the peer owned, or a same-address
+                            // reconnect inherits a dead deadline.
+                            self.clear_header_request_for(source);
                             self.scheduler
                                 .lock()
                                 .window
@@ -93,6 +120,20 @@ impl BlockSync {
                     }
                 }
                 HeaderAdmission::Rejected(error) => {
+                    // A batch that cannot attach (`MissingParent`,
+                    // `NoCommonAncestor`) proves the announcer knows a chain
+                    // beyond our tip: ask it for the missing ancestry so a
+                    // later batch lands instead of wedging the live tip
+                    // behind one missed header. Other non-fault rejections
+                    // (`TimestampTooFarAhead`, `DuplicateHeader`) get no
+                    // re-request — the announcer would only replay the same
+                    // batch into the same rejection, which paces no one.
+                    if matches!(
+                        error,
+                        ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. }
+                    ) {
+                        self.request_headers_from(source);
+                    }
                     tracing::warn!(
                         received = batch_len,
                         %error,
@@ -100,18 +141,252 @@ impl BlockSync {
                     );
                 }
                 HeaderAdmission::Refused(error) => {
-                    tracing::debug!(%error, "block sync: header admission refused; dropping batch");
+                    // Admission is paused (checkpoint publish or shutdown).
+                    // The source still has the headers; a paced re-request
+                    // relearns the tip once admission reopens rather than
+                    // silently losing the announcement.
+                    self.request_ancestry_after_refusal(source, &error);
                 }
             }
+            if body_fetch_owned {
+                self.note_owned_body_fetch(source, headers.last());
+            }
         }
+        if credit_refresh_needed {
+            self.refresh_active_peer_credit();
+        }
+        // The drain may have attached the ancestry a deferred owned fetch
+        // was waiting on — resolve it against the tree now.
+        self.resolve_owned_body_fetches();
         if total_headers > 0 {
             tracing::debug!(total_headers, "block sync: drained inbound headers");
         }
     }
 
+    /// Re-requests header ancestry from `source` after a `Refused`
+    /// admission, paced to the request timeout: while admission stays
+    /// closed each response clears its pending slot and re-refuses, so an
+    /// unpaced retry would replay the same batch at round-trip pace.
+    fn request_ancestry_after_refusal(&self, source: Option<PeerSource>, error: &SyncChainError) {
+        let now = Instant::now();
+        let mut last = self.refused_rerequest_at.lock();
+        if last.is_none_or(|last| now.duration_since(last) >= HEADER_REQUEST_TIMEOUT) {
+            *last = Some(now);
+            drop(last);
+            self.request_headers_from(source);
+            tracing::debug!(
+                %error,
+                "block sync: header admission refused; requesting ancestry",
+            );
+        } else {
+            tracing::debug!(
+                %error,
+                "block sync: header admission refused; ancestry request already recent",
+            );
+        }
+    }
+
+    /// Consumes the pending `getheaders` when a nonempty wire `headers`
+    /// response arrives on the exact connection that owns it. An empty
+    /// response supplies no new capability: retain its deadline so idle
+    /// discovery is paced and rotates to another peer. The consumption is
+    /// identity-exact: only the connection the request was sent to can
+    /// answer it, so a same-address replacement's batch never frees the
+    /// predecessor's deadline. Headers forwarded out of a delivered body
+    /// (`wire_response = false`) are not a response: letting them clear the
+    /// pending slot would let every delivered block reset request pacing
+    /// and emit duplicate `getheaders`.
+    fn consume_header_request(
+        &self,
+        source: Option<PeerSource>,
+        wire_response: bool,
+        batch_empty: bool,
+    ) {
+        if let Some(source) = source.filter(|_| wire_response && !batch_empty) {
+            self.clear_header_request_for(source);
+        }
+    }
+
+    /// Releases a `getheaders` gate owned by `source`. Every disconnect
+    /// path — send failure, window or staged-header blame — clears the
+    /// owner so a same-address reconnect cannot inherit a stale deadline.
+    /// The match is identity-exact (P2P-02): a same-address replacement
+    /// never frees its predecessor's pending request.
+    pub(super) fn clear_header_request_for(&self, source: PeerSource) {
+        let mut scheduler = self.scheduler.lock();
+        if scheduler
+            .header_request
+            .is_some_and(|request| request.source == source)
+        {
+            scheduler.header_request = None;
+        }
+    }
+
+    /// Records a body fetch the window does not own — the compact outcome
+    /// that forwarded this header already issued a `getblocktxn` or a
+    /// fallback `getdata` for the tip body — as pending under `source`, so
+    /// `next_peer_request` does not schedule a duplicate getdata for the
+    /// freshly admitted tip. A tip that has not attached yet is retained in
+    /// `SchedulerState::owned_body_fetches` and resolved once ancestry
+    /// admits it; without retention a gap batch would let the window
+    /// schedule a second fetch in parallel with the pending compact one.
+    fn note_owned_body_fetch(
+        &self,
+        source: Option<PeerSource>,
+        header: Option<&bitcoin_rs_primitives::Header>,
+    ) {
+        let (Some(source), Some(header)) = (source, header) else {
+            return;
+        };
+        // A stale source names a dead connection: its compact fetch died
+        // with it, and marking the body pending under that address would
+        // suppress scheduling from the live replacement until expiry.
+        if !self.peer_table.is_current(source) {
+            return;
+        }
+        let hash = Hash256::from(header.compute_hash());
+        let height = {
+            let tree = self.chain.block_tree().read();
+            tree.lookup(hash)
+                .and_then(|id| tree.node(id).ok().map(|node| node.height))
+        };
+        let mut scheduler = self.scheduler.lock();
+        let Some(height) = height else {
+            if !scheduler
+                .owned_body_fetches
+                .iter()
+                .any(|(_, known)| *known == hash)
+            {
+                if scheduler.owned_body_fetches.len() >= MAX_DEFERRED_OWNED_FETCHES {
+                    scheduler.owned_body_fetches.remove(0);
+                }
+                scheduler.owned_body_fetches.push((source, hash));
+            }
+            return;
+        };
+        scheduler
+            .window
+            .mark_owned_fetch(source, hash, height, Instant::now());
+    }
+
+    /// Resolves deferred owned-fetch marks now that this drain may have
+    /// admitted the ancestry their tips were waiting on. Marks whose source
+    /// went stale are dropped: the dead connection's fetch died with it and
+    /// normal scheduling asks a live peer instead.
+    pub(super) fn resolve_owned_body_fetches(&self) {
+        let deferred = {
+            let mut scheduler = self.scheduler.lock();
+            if scheduler.owned_body_fetches.is_empty() {
+                return;
+            }
+            std::mem::take(&mut scheduler.owned_body_fetches)
+        };
+        let mut unresolved = Vec::with_capacity(deferred.len());
+        let mut resolved = Vec::with_capacity(deferred.len());
+        {
+            let tree = self.chain.block_tree().read();
+            for (source, hash) in deferred {
+                let height = tree
+                    .lookup(hash)
+                    .and_then(|id| tree.node(id).ok().map(|node| node.height));
+                match height {
+                    Some(height) => resolved.push((source, hash, height)),
+                    None if self.peer_table.is_current(source) => {
+                        unresolved.push((source, hash));
+                    }
+                    None => {}
+                }
+            }
+        }
+        let mut scheduler = self.scheduler.lock();
+        let now = Instant::now();
+        for (source, hash, height) in resolved {
+            scheduler.window.mark_owned_fetch(source, hash, height, now);
+        }
+        scheduler.owned_body_fetches.extend(unresolved);
+    }
+
+    /// `(announced_tip, active_height)` when every header in `headers` is
+    /// already in the tree — the same credit outcome `admit_headers` would
+    /// produce, without taking the transition lock for a lookup hit.
+    fn known_batch_outcome(
+        &self,
+        headers: &[bitcoin_rs_primitives::Header],
+    ) -> Option<(Hash256, Option<i32>)> {
+        let tree = self.chain.block_tree().read();
+        let last_hash = Hash256::from(headers.last()?.compute_hash());
+        headers
+            .iter()
+            .all(|header| tree.lookup(Hash256::from(header.compute_hash())).is_some())
+            .then(|| {
+                (
+                    last_hash,
+                    tree.tip()
+                        .and_then(|tip| shared_active_height(&tree, tip.tip_id, last_hash))
+                        .and_then(|height| i32::try_from(height).ok()),
+                )
+            })
+    }
+
+    /// Asks `source` for the header ancestry past our tip. The delivering
+    /// peer demonstrably knows a chain beyond ours whenever its batch cannot
+    /// attach (`MissingParent`) or cannot be admitted (`Refused`): the
+    /// response makes the next batch attachable instead of leaving the live
+    /// tip wedged on one missed header.
+    fn request_headers_from(&self, source: Option<PeerSource>) {
+        let Some(source) = source else {
+            return;
+        };
+        let header_height = self
+            .chain
+            .chain_tip()
+            .load_full()
+            .map_or(0, |tip| tip.height);
+        let target_height = self
+            .peer_table
+            .sessions()
+            .iter()
+            .find(|session| session.addr == source.addr)
+            .and_then(|session| session.info.as_ref())
+            .map_or(i32::MAX, |info| info.best_known_height);
+        self.send_getheaders(source, header_height, target_height, self.build_locator());
+    }
+
+    /// Asks any live full-witness peer for the header ancestry past our tip.
+    /// Used when a staged body's parent header is unknown and no delivering
+    /// source was recorded; every fully serving peer can fill the gap.
+    pub(super) fn request_headers_from_eligible(&self) {
+        let required = bitcoin::p2p::ServiceFlags::NETWORK.to_u64()
+            | bitcoin::p2p::ServiceFlags::WITNESS.to_u64();
+        let source = self
+            .peer_table
+            .sessions()
+            .into_iter()
+            .filter(|session| {
+                !session.lease.is_cancelled()
+                    && session
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| info.services & required == required)
+            })
+            .min_by_key(|session| session.addr)
+            .map(|session| session.lease.source(session.addr));
+        self.request_headers_from(source);
+    }
+
     pub(super) fn refresh_active_peer_credit(&self) {
-        let sessions = self.peer_table.usable_peers();
-        let updates: Vec<(PeerSource, i32)> = {
+        let sessions = self.peer_table.sessions();
+        // Partition each session's retained tips into unresolved (fork
+        // evidence that must be kept until the branch wins or dies) and
+        // resolved. Only the max-resolving tip carries the active-chain
+        // evidence — resolved tips below it are dead weight the scalar
+        // watermark already covers. Forwarded body headers (P2P-06) push a
+        // tip per delivered body, so without pruning this record would grow
+        // with every download. Unresolved tips are deduplicated per branch
+        // and capped — shared-ancestor resolution (P2P-03) still lets each
+        // kept fork tip attest the deepest prefix it shares with the active
+        // chain.
+        let updates: Vec<(PeerSource, Option<i32>, Vec<Hash256>)> = {
             let tree = self.chain.block_tree().read();
             let Some(active_tip) = tree.tip() else {
                 return;
@@ -119,20 +394,64 @@ impl BlockSync {
             sessions
                 .into_iter()
                 .filter_map(|session| {
-                    let info = session.info?;
-                    let height = active_demonstrated_height(
-                        &tree,
-                        active_tip.tip_id,
-                        &session.demonstrated_tips,
-                    )?;
-                    let height = i32::try_from(height).ok()?;
-                    (height > info.best_known_height)
-                        .then_some((session.lease.source(session.addr), height))
+                    let mut argmax: Option<(u32, Hash256)> = None;
+                    let mut unresolved: Vec<(NodeId, u32, Hash256)> = Vec::new();
+                    for hash in &session.demonstrated_tips {
+                        let Some(node_id) = tree.lookup(*hash) else {
+                            continue;
+                        };
+                        let Ok(node) = tree.node(node_id) else {
+                            continue;
+                        };
+                        if tree.node_at_height_from(active_tip.tip_id, node.height) == Some(node_id)
+                        {
+                            if argmax.is_none_or(|(max, _)| node.height > max) {
+                                argmax = Some((node.height, *hash));
+                            }
+                        } else {
+                            unresolved.push((node_id, node.height, *hash));
+                        }
+                    }
+                    // Keep the maximal unresolved tip per branch, deepest
+                    // first — a kept descendant's evidence subsumes its
+                    // ancestors, so redundant entries are skipped.
+                    unresolved.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+                    let mut branch_kept: Vec<NodeId> = Vec::new();
+                    let mut keep = Vec::with_capacity(unresolved.len() + 1);
+                    let mut best_shared = argmax.map_or(0, |(height, _)| height);
+                    for (node_id, height, hash) in unresolved {
+                        if keep.len() >= MAX_UNRESOLVED_DEMONSTRATED_TIPS {
+                            break;
+                        }
+                        if branch_kept.iter().any(|&kept_id| {
+                            tree.node_at_height_from(kept_id, height) == Some(node_id)
+                        }) {
+                            continue;
+                        }
+                        branch_kept.push(node_id);
+                        best_shared = best_shared
+                            .max(shared_active_height(&tree, active_tip.tip_id, hash).unwrap_or(0));
+                        keep.push(hash);
+                    }
+                    if let Some((_, hash)) = argmax {
+                        keep.push(hash);
+                    }
+                    let needs_prune = keep.len() < session.demonstrated_tips.len();
+                    let credit = i32::try_from(best_shared).ok().filter(|height| {
+                        session
+                            .info
+                            .is_some_and(|info| *height > info.best_known_height)
+                    });
+                    (needs_prune || credit.is_some())
+                        .then(|| (session.lease.source(session.addr), credit, keep))
                 })
                 .collect()
         };
-        for (source, height) in updates {
-            self.peer_table.note_announced_height(source, height);
+        for (source, credit, keep) in updates {
+            self.peer_table.set_demonstrated_tips(source, keep);
+            if let Some(height) = credit {
+                self.peer_table.note_announced_height(source, height);
+            }
         }
     }
 
@@ -296,13 +615,7 @@ impl BlockSync {
             // to this connection dropped so a fast reconnect does not inherit
             // a stale deadline gate.
             if self.peer_table.disconnect_source(source) {
-                let mut scheduler = self.scheduler.lock();
-                if scheduler
-                    .header_request
-                    .is_some_and(|request| request.source == source)
-                {
-                    scheduler.header_request = None;
-                }
+                self.clear_header_request_for(source);
             }
             return GetheadersOutcome::Failed;
         }

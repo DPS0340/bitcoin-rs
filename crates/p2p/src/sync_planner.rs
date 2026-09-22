@@ -116,10 +116,11 @@ impl SyncPlanner {
         next_expected_hash: Option<Hash256>,
         block: Block,
         serialized: bytes::Bytes,
+        source: Option<PeerSource>,
         now: Instant,
     ) -> StagedBlock {
         self.stager
-            .insert(hash, next_expected_hash, block, serialized, now)
+            .insert(hash, next_expected_hash, block, serialized, source, now)
     }
 
     /// Drops expired staged bodies.

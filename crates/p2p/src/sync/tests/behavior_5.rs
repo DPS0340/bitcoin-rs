@@ -258,6 +258,9 @@ fn far_future_matching_peer_retries_without_peer_blame() -> Result<(), Box<dyn s
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![far_future_header(genesis.compute_hash(), 1)?],
         source: Some(current_source(&peers, peer_addr)),
+
+        wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.tick();
 

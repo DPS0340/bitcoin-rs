@@ -1,16 +1,20 @@
 //! Bounded inbound body draining and exact staged-body admission.
 
 use super::BlockSync;
+use super::chain::HeaderAdmission;
 use super::chain::SyncChainError;
+use super::peers::is_peer_fault;
 use crate::InboundBlock;
 use crate::RejectDelivery;
 use crate::StagedBlock;
 use crate::connection::PeerSource;
 use crate::download_window::INBOUND_BLOCK_STAGE_CHUNK;
 use bitcoin_rs_chain::BlockTree;
+use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::Header;
 use smallvec::SmallVec;
 use std::time::Instant;
 use std::vec::Vec;
@@ -51,6 +55,8 @@ impl BlockSync {
         if received == 0 && self.scheduler.lock().stager.received_len() == 0 {
             return;
         }
+
+        self.admit_staged_headers();
 
         let now = Instant::now();
         let dropped = self.scheduler.lock().stager.prune_expired(now);
@@ -133,6 +139,114 @@ impl BlockSync {
             active_tip.tip_id,
         )
         .then_some(active_tip.tip_id)
+    }
+
+    /// Retries header admission for staged bodies whose headers are still
+    /// absent from the tree.
+    ///
+    /// The listener forwards every inbound body's embedded header through
+    /// the headers drain, but a refused batch or a source-less delivery
+    /// leaves the body staged without a tree node — and
+    /// `apply_buffered_blocks` only drains hashes the tree knows, so the
+    /// body would otherwise sit until its staged timeout despite being
+    /// complete. `MissingParent` keeps the body staged and asks an eligible
+    /// peer for the missing ancestry; `TimestampTooFarAhead` retries
+    /// naturally each drain and admits once the header enters the allowed
+    /// window; a permanently inadmissible header (a peer-fault rejection)
+    /// means the body can never apply, so it is discarded instead of paying
+    /// the same admission retry every drain — and its delivering peer
+    /// carries the fault, exactly as a rejected `headers` batch would.
+    fn admit_staged_headers(&self) {
+        let unadmitted: Vec<(Hash256, Header, Option<crate::PeerSource>)> = {
+            let tree = self.chain.block_tree().read();
+            let scheduler = self.scheduler.lock();
+            scheduler
+                .stager
+                .staged_headers()
+                .filter(|(hash, _, _)| tree.lookup(*hash).is_none())
+                .collect()
+        };
+        let mut missing_parent = false;
+        let mut credit_refresh_needed = false;
+        let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
+        for (hash, header, source) in unadmitted {
+            match self.chain.admit_headers(&[header]) {
+                HeaderAdmission::Accepted {
+                    announced_tip: Some(tip_hash),
+                    active_height,
+                    ..
+                } => {
+                    // A staged retry that now admits is the same
+                    // announcement the headers drain credits — the
+                    // delivering connection demonstrated the tip even if
+                    // its forwarded batch raced or was refused.
+                    if let Some(source) =
+                        source.filter(|source| self.peer_table.is_current(*source))
+                    {
+                        self.peer_table
+                            .note_announced_tip(source, tip_hash, active_height);
+                        credit_refresh_needed = true;
+                    }
+                }
+                HeaderAdmission::Rejected(
+                    ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. },
+                ) => {
+                    missing_parent = true;
+                }
+                HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
+                    invalid.push((hash, source));
+                }
+                _ => {}
+            }
+        }
+        if !invalid.is_empty() {
+            // The body's header can never admit: drop the staged entry AND
+            // the window's delivery record outright — re-queuing would just
+            // re-download a body that cannot apply. Then blame the
+            // delivering peer: a body whose embedded header fails consensus
+            // is the peer's fault, same as a rejected `headers` batch.
+            // PeerTable operations precede the scheduler lock to preserve
+            // the PeerTable → scheduler ordering used elsewhere.
+            let blamed: Vec<std::net::SocketAddr> = invalid
+                .iter()
+                .filter_map(|(_, source)| *source)
+                .filter(|source| {
+                    if self.peer_table.disconnect_source(*source) {
+                        // Every removal path releases a `getheaders` gate
+                        // the peer owned, or a same-address reconnect
+                        // inherits a dead deadline.
+                        self.clear_header_request_for(*source);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .map(|source| source.addr)
+                .collect();
+            let mut scheduler = self.scheduler.lock();
+            for (hash, _) in &invalid {
+                scheduler.stager.discard(hash);
+                scheduler.window.discard_received(hash);
+            }
+            for peer_addr in &blamed {
+                scheduler
+                    .window
+                    .mark_peer_unresponsive(*peer_addr, Instant::now());
+            }
+            tracing::debug!(
+                discarded = invalid.len(),
+                "block sync: discarded bodies with inadmissible headers"
+            );
+        }
+        if credit_refresh_needed {
+            self.refresh_active_peer_credit();
+        }
+        // A staged retry that just admitted may have attached the ancestry
+        // a deferred owned fetch was waiting on — resolve it now.
+        self.resolve_owned_body_fetches();
+        if missing_parent {
+            self.request_headers_from_eligible();
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -242,6 +356,7 @@ impl BlockSync {
                     next_expected_hash,
                     inbound.block,
                     inbound.serialized,
+                    source,
                     now,
                 );
                 staged_blocks.push((hash, source, staged));

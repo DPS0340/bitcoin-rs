@@ -1009,10 +1009,14 @@ fn apply_cache_fixture(
 fn stage_body(sync: &BlockSync, block: &Block) {
     let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
     let serialized = bytes::Bytes::from(consensus_bytes(block));
-    sync.scheduler
-        .lock()
-        .stager
-        .insert(hash, None, block.clone(), serialized, Instant::now());
+    sync.scheduler.lock().stager.insert(
+        hash,
+        None,
+        block.clone(),
+        serialized,
+        None,
+        Instant::now(),
+    );
 }
 
 fn cache_snapshot(sync: &BlockSync) -> Option<super::ExpectedApplyCache> {
@@ -1795,3 +1799,4 @@ mod frontier_recovery;
 
 #[cfg(test)]
 mod frontier_model;
+mod head_sync;

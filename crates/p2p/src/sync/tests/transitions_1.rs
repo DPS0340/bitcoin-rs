@@ -105,6 +105,9 @@ fn tick_fetches_new_tip_headers_from_at_tip_peers() -> Result<(), Box<dyn std::e
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![announced_header],
         source: Some(current_source(&peers, addr)),
+
+        wire_response: true,
+        body_fetch_owned: false,
     })?;
 
     sync.tick();
@@ -183,6 +186,9 @@ fn tick_fetches_reorg_fork_announced_by_at_tip_peer() -> Result<(), Box<dyn std:
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![winning1, winning2, winning3],
         source: Some(current_source(&peers, addr)),
+
+        wire_response: true,
+        body_fetch_owned: false,
     })?;
 
     sync.tick();
@@ -262,6 +268,9 @@ fn losing_fork_credit_survives_winner_disconnect() -> Result<(), Box<dyn std::er
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![fork1, fork2],
         source: Some(current_source(&peers, peer_a)),
+
+        wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
     assert_eq!(
@@ -278,6 +287,9 @@ fn losing_fork_credit_survives_winner_disconnect() -> Result<(), Box<dyn std::er
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![fork3],
         source: Some(current_source(&peers, peer_b)),
+
+        wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
     assert_eq!(

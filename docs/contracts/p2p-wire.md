@@ -47,14 +47,23 @@ This page assigns ownership and cites proof under the
 - Credit is initialized from the handshake `start_height`, raised
   monotonically (never lowered), raisable only by the delivering connection
   (a same-address replacement never inherits its predecessor's credit), and
-  raised only for accepted headers whose retained tip is on the currently
-  selected best chain (the best chain is re-selected during acceptance, so a
-  winning fork announcement earns credit in the same tick). When a later
-  announcement makes a previously losing retained tip active, its delivering
-  connection is re-evaluated before request selection. Until a session has
-  accepted a header tip, body and hedge selection may use its handshake
-  capability while header discovery is pending; after that point, the
-  accepted tip must be on the active chain at or beyond the requested height.
+  raised only for accepted headers whose retained tip shares ancestry with
+  the currently selected best chain (the best chain is re-selected during
+  acceptance, so a winning fork announcement earns credit in the same tick).
+  A retained tip attests the deepest active-chain node that is its ancestor
+  — `shared_active_height`: an on-active tip attests its own height, while a
+  losing fork tip still attests the shared prefix it proved the peer holds.
+  When a later announcement makes a previously losing retained tip active,
+  its delivering connection is re-evaluated before request selection. Until
+  a session has accepted a header tip, body and hedge selection may use its
+  handshake capability while header discovery is pending; after that point,
+  the requested height must not exceed the deepest shared ancestor across
+  its retained tips. Retained-tip evidence is compacted at each credit
+  refresh: a tip that resolves on the active chain at or below the recorded
+  maximum can never raise it again, so only unresolved (fork) tips and the
+  max-resolving tip are kept. Unresolved tips are deduplicated to the
+  maximal tip per branch and capped (`MAX_UNRESOLVED_DEMONSTRATED_TIPS`),
+  so a peer cannot grow the record by announcing distinct side chains.
 
 ### `P2P-04`: Connected-socket posture and vectored emission
 
@@ -156,3 +165,66 @@ cancelled readiness under contention.
 `crates/p2p/src/sync/tests/witness_staging_gate.rs` covers bad delivery,
 peer replacement, relearned capability and eventual application. Existing
 branch-plan, attribution, timeout and bounded-staging suites remain required.
+
+### `P2P-06`: Body-carried announcements reach header admission
+
+- **Owner**: `InboundSyncSinks::send_block` (`crates/p2p/src/listener.rs`)
+  forwards every inbound body's embedded header through the headers sink;
+  `BlockSync::admit_staged_headers` (`crates/p2p/src/sync/receive.rs`) retries
+  admission for staged bodies still lacking a tree node.
+- A block body can never become the apply frontier's expected block while
+  the tree does not know its hash. Every delivery path — `block` messages
+  (`inv` getdata answers or unsolicited pushes), reconstructed compact
+  blocks, and `cmpctblock` announcements — routes its embedded header into
+  the same admission drain as `headers` messages, so credit (P2P-03),
+  peer-fault disconnection, and ancestry requests apply uniformly.
+- A batch that cannot attach (`MissingParent`) or cannot be admitted
+  (`Refused`) requests the header ancestry from the delivering peer — or an
+  eligible full-witness peer when no source was recorded — rather than
+  silently dropping the announcement and leaving the live tip wedged behind
+  one missed header. `Refused` re-requests are paced to the request timeout
+  (`refused_rerequest_at`): a paused admission would otherwise replay the
+  same locator at round-trip pace.
+- The forwarded header is marked as such (`InboundHeaders::wire_response =
+  false`): it is not a `getheaders` response, so it must not consume the
+  outstanding request's pending slot — otherwise every delivered body would
+  reset request pacing and emit duplicate `getheaders`.
+- The staged retry carries the delivering connection
+  (`ReceivedBlock::source`): a retry that admits credits that peer exactly
+  as the headers drain would (`note_announced_tip`), and a peer-fault
+  rejection discards the body, releases its download-window record outright
+  (`discard_received`, never re-queued), disconnects the source, and marks
+  it unresponsive — the same outcome a rejected `headers` batch produces.
+- A `cmpctblock` outcome that fetches the body itself (`RequestMissing`'s
+  `getblocktxn`, `Fallback`'s `getdata`) is marked
+  (`InboundHeaders::body_fetch_owned`): once the tip admits, the window
+  records the hash pending under the delivering connection
+  (`DownloadWindow::mark_owned_fetch`) so normal scheduling does not issue
+  a duplicate `getdata`. The mark honours the same gates a real request
+  faces — window request capacity, the owner's per-peer inflight share,
+  and the request frontier (a below-frontier mark could never be scheduled
+  and its expiry would drag `next_request_height` back into a re-request
+  sweep of applied heights). A tip that has not attached yet is retained
+  in the bounded `SchedulerState::owned_body_fetches` set and resolved
+  once ancestry admits it; marks whose source went stale are dropped, and
+  delivery resolves the mark like any window request while expiry or
+  disconnect hands it back to scheduling — a silently dropped compact
+  fetch re-requests instead of wedging the tip.
+- Every peer-removal path releases a `getheaders` gate the peer owned —
+  wire-response consumption, send failure, session reconciliation, and
+  peer-fault disconnects in both the headers drain and the staged-header
+  retry (`clear_header_request_for`, identity-exact) — so a same-address
+  reconnect cannot inherit a dead request deadline.
+
+Proof: `crates/p2p/src/sync/tests/head_sync.rs` covers body-carried header
+admission and apply, gap-fill requests for staged bodies ahead of their
+header chain, announcer-directed `getheaders` on unattached batches,
+non-response forwards preserving pending-request state, staged-retry
+credit, shared-ancestor capability, bounded fork evidence, credit for
+already-known tips, the compact-owned pending mark, and the retained
+mark resolving once its tip header attaches. Capacity and frontier gates
+on the owned-fetch mark are covered in
+`crates/p2p/src/download_window.rs` tests; fault-path gate cleanup is
+covered in `crates/p2p/src/sync/tests/transitions_4.rs`.
+`crates/p2p/src/listener.rs` test `send_block_forwards_the_blocks_header`
+covers the delivery-path forward.

@@ -2291,6 +2291,66 @@ impl DownloadWindow {
         entries
     }
 
+    /// Discards a received-or-pending record outright — no re-queue. Used
+    /// when the stager drops a body whose header admission permanently
+    /// failed (peer-fault rejection, or [`DrainedBlock`] for a replaced
+    /// entry): the window must not keep a delivery that can never apply.
+    /// Re-requested bodies return to `pending` via `drop_for_retry`
+    /// instead.
+    pub fn discard_received(&mut self, hash: &Hash256) {
+        self.remove_received(hash);
+        self.remove_pending(hash);
+    }
+
+    /// Records a body fetch the window does not own — a compact
+    /// `getblocktxn` or fallback `getdata` already issued on `owner` —
+    /// as pending so `next_peer_request` does not schedule a duplicate
+    /// request for a freshly admitted tip. Delivery resolves it like any
+    /// window request; expiry or peer disconnect hands it back to normal
+    /// scheduling, so a silently dropped compact fetch still re-requests.
+    /// The window owns no frontier for the entry: `next_request_height`
+    /// must not advance past heights it never scanned.
+    ///
+    /// The mark still consumes window budgets, so the same gates a real
+    /// request would face apply: no mark when the window has no request
+    /// capacity (its `pending` would overflow), when `owner` already holds
+    /// its per-peer inflight share, or when `height` sits below the
+    /// request frontier — a below-frontier entry could never be scheduled
+    /// anyway, and its expiry would drag `next_request_height` back down
+    /// into a re-request sweep of heights already applied.
+    pub fn mark_owned_fetch(
+        &mut self,
+        owner: PeerSource,
+        hash: Hash256,
+        height: u32,
+        now: Instant,
+    ) {
+        if self.pending.contains_key(&hash) || self.received.contains_key(&hash) {
+            return;
+        }
+        if height < self.next_request_height
+            || !self.has_request_capacity()
+            || self
+                .peer_inflight
+                .get(&owner.addr)
+                .is_some_and(|inflight| inflight.blocks >= self.effective_peer_inflight())
+        {
+            return;
+        }
+        let request = PeerRequest {
+            peer_addr: owner.addr,
+            entries: vec![PeerRequestEntry { hash, height }],
+            next_request_height: 0,
+        };
+        // `mark_requested` re-enables `prefix_probe_attempted_owner` when
+        // pending was empty — that re-arm is for a real post-drain request.
+        // An externally owned fetch is not one: keep the marker so a
+        // proven-stall owner stays ineligible for the next prefix probe.
+        let attempted_owner = self.prefix_probe_attempted_owner;
+        self.mark_requested(&request, owner, now);
+        self.prefix_probe_attempted_owner = attempted_owner;
+    }
+
     fn remove_received(&mut self, hash: &Hash256) -> Option<ReceivedBlock> {
         let received = self.received.remove(hash)?;
         self.received_bytes = self.received_bytes.saturating_sub(received.bytes);
@@ -5051,5 +5111,71 @@ mod tests {
 
     fn hash(byte: u8) -> Hash256 {
         Hash256::from_le_bytes(&[byte; 32])
+    }
+
+    #[test]
+    fn owned_fetch_preserves_prefix_probe_attempted_owner() {
+        let mut window = DownloadWindow::new(test_budget());
+        let now = Instant::now();
+        let stall_owner = super::PeerSource::for_test(staller_addr());
+        let compact_peer = super::PeerSource::for_test(healthy_addr());
+        window.prefix_probe_attempted_owner = Some(stall_owner);
+
+        // An externally owned fetch on an empty window is not a post-drain
+        // request: the marker must survive so the proven-stall owner stays
+        // ineligible for the next prefix probe.
+        window.mark_owned_fetch(compact_peer, hash(0xf1), 7, now);
+        assert_eq!(window.prefix_probe_attempted_owner, Some(stall_owner));
+        assert!(window.contains_pending(&hash(0xf1)));
+
+        // A real post-drain request still re-arms probe eligibility.
+        window.remove_pending(&hash(0xf1));
+        let request = super::non_empty_request(
+            compact_peer.addr,
+            vec![super::PeerRequestEntry {
+                hash: hash(0xf2),
+                height: 8,
+            }],
+            9,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        window.mark_requested(&request, compact_peer, now);
+        assert!(window.prefix_probe_attempted_owner.is_none());
+    }
+
+    #[test]
+    fn owned_fetch_respects_window_capacity_and_frontier() {
+        let mut window = DownloadWindow::new(SyncBudget {
+            max_pending_blocks: 1,
+            ..test_budget()
+        });
+        let now = Instant::now();
+        let owner = super::PeerSource::for_test(healthy_addr());
+
+        // The first mark lands; the second exceeds the pending budget a
+        // real request would face, so it is not recorded — the compact
+        // fetch still resolves delivery by hash either way.
+        window.mark_owned_fetch(owner, hash(0xa1), 9, now);
+        assert!(window.contains_pending(&hash(0xa1)));
+        window.mark_owned_fetch(owner, hash(0xa2), 10, now);
+        assert!(!window.contains_pending(&hash(0xa2)));
+
+        // Below the request frontier a mark could never be scheduled
+        // anyway — and its expiry would drag `next_request_height` back
+        // down into a re-request sweep of heights already applied.
+        let mut window = DownloadWindow::new(test_budget());
+        let request = super::non_empty_request(
+            owner.addr,
+            vec![super::PeerRequestEntry {
+                hash: hash(0xb0),
+                height: 10,
+            }],
+            11,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        window.mark_requested(&request, owner, now);
+        window.mark_owned_fetch(owner, hash(0xb1), 3, now);
+        assert!(!window.contains_pending(&hash(0xb1)));
+        assert_eq!(window.next_request_height, 11);
     }
 }
