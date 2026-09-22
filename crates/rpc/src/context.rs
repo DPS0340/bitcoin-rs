@@ -1608,10 +1608,11 @@ mod tests {
         );
     }
 
-    /// One `BlockRecord` is held per applied block for the life of the process
-    /// and nothing removes one. The record's own footprint is gated at compile
-    /// time beside the type (`crates/index/src/block_log.rs`); this checks the
-    /// other half of the same contract — no constructor may stuff a header in.
+    /// One `BlockRecord` is held per applied block; only the disconnect path
+    /// removes one, from the tail. The record's own footprint is gated at
+    /// compile time beside the type (`crates/index/src/block_log.rs`); this
+    /// checks the other half of the same contract — no constructor may stuff
+    /// a header in.
     #[test]
     fn constructed_records_carry_no_header() {
         let block = Network::Regtest.genesis_block();

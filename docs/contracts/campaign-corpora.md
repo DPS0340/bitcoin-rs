@@ -134,7 +134,7 @@ that height. No Cmodern cell may close on a guessed or recalled UTXO total.
   arm; covers every active and inactive consensus boundary with invalid
   corpora counted and classified.
 - `crates/consensus/tests/overhaul_parse_parity.rs`: G3 parse parity
-  over the product corpora, including txids, wtxids, weight, positions, and
+  over the golden fixtures, including txids, wtxids, weight, positions, and
   Merkle mutation flags.
 - Export: `python3 tools/campaign-corpus/corpus.py export --rest-url HOST:PORT --corpus-id C150|Cmodern --archive blocks.dat --manifest manifest.json`
 - Convert: `python3 tools/campaign-corpus/corpus.py convert --length-prefixed FILE --corpus-id C150 --archive blocks.dat --manifest manifest.json`

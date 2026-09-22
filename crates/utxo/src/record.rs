@@ -1829,7 +1829,9 @@ mod tests {
     /// allocator call, or the test would be asking for petabytes.
     #[test]
     fn capacity_past_u32_or_the_isize_bound_is_rejected_before_allocating() {
-        let over_u32_max = usize::try_from(u32::MAX).unwrap_or(usize::MAX) + 1;
+        let over_u32_max = usize::try_from(u32::MAX)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
         for cap in [over_u32_max, usize::MAX] {
             assert!(
                 matches!(

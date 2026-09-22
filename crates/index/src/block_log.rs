@@ -56,7 +56,7 @@ pub struct BlockRecord {
 /// heap `String` of hex — 264 bytes and an allocation per block. Storing the
 /// raw header inline took that to 168 with no allocation. Not storing it at
 /// all takes it to **64**: a further **24 bytes per block**, about
-/// **23.1 MiB** at a mainnet-sized chain, on top of the 73.5 MiB the boxed
+/// **22 MiB** at a mainnet-sized chain, on top of the 73.5 MiB the boxed
 /// header saved. The boxing is what buys those 80 bytes and is easy to undo
 /// by accident, so reverting it fails here at compile time rather than in a
 /// runtime test. The 64-byte figure is the 64-bit layout; `usize` fields make

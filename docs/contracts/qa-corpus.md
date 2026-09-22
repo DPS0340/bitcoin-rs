@@ -93,7 +93,9 @@ nonzero-status propagation; they are not stable public status-code assignments.
 - `scripts/tests/test_import_qa_assets_provenance.py`: `QAC-03` acquisition,
   minimization, cleanup, mode, and failure-atomic provenance publication.
 - `bin/bitcoin-rs/tests/overhaul_reference_set.rs`: G0 pin; rejects
-  a QA corpus with a missing or mismatched upstream commit.
+  a corpus absent from the manifest and reports an unpinned manifest digest
+  as custody-blocked (the upstream qa-assets commit is pinned by
+  `fuzz/CORPUS_PROVENANCE.md`).
 - `crates/consensus/tests/overhaul_consensus_matrix.rs` (planned): G5 arm;
   counts and classifies invalid corpora with fixed skip reasons.
 - `crates/primitives/tests/differential.rs`: `QAC-05` gate; enforces the
