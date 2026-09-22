@@ -125,18 +125,15 @@ fn fork_getdata_starts_at_common_ancestor_child() -> Result<(), Box<dyn std::err
     let peer = SocketAddr::from(([127, 0, 0, 1], 18_460));
     let (tx, rx) = unbounded::<Message>();
     peers.register(peer, PeerLease::new(tx));
-    let chain_tip = sync
-        .chain
-        .chain_tip()
-        .load_full()
-        .ok_or_else(|| std::io::Error::other("missing winning chain tip"))?;
-    let applied_tip = applied_tip
-        .load_full()
-        .ok_or_else(|| std::io::Error::other("missing losing applied tip"))?;
 
     assert!(
-        sync.send_getdata_for_pending_blocks(peer, false, 100, &chain_tip, &applied_tip)
-            .sent
+        sync.send_getdata_for_pending_blocks(
+            current_source(&sync.peer_table, peer),
+            false,
+            100,
+            &test_frontier(&sync)
+        )
+        .sent
     );
     assert_eq!(
         witness_block_inventory(next_getdata(&rx)?)?,
