@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -14,6 +13,7 @@ use bitcoin_rs_storage::{
 };
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
+use hashbrown::HashMap;
 use parking_lot::RwLock;
 
 use crate::{ApplyError, Chainstate};
@@ -159,7 +159,9 @@ fn committed_gap_with_missing_body_fails_closed() -> Result<(), Box<dyn std::err
     let (mut handles, child) = restored_chainstate()?;
     let head = install_head(&mut handles, &child, Arc::new(MemoryBodies::default()))?;
 
-    let error = super::reconcile_at_boot(&handles).expect_err("missing committed body must fail");
+    let Err(error) = super::reconcile_at_boot(&handles) else {
+        panic!("missing committed body must fail");
+    };
     assert!(matches!(
         error,
         ApplyError::DurableHeadGapUnrecoverable { .. }

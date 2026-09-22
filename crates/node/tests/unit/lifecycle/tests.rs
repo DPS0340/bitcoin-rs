@@ -30,6 +30,18 @@ fn seed_checkpoint(state: &NodeState) -> anyhow::Result<(PathBuf, Vec<u8>)> {
     Ok((current, previous))
 }
 
+struct RestoreCheckpointRoot {
+    root: PathBuf,
+    displaced: PathBuf,
+}
+
+impl Drop for RestoreCheckpointRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.root);
+        let _ = std::fs::rename(&self.displaced, &self.root);
+    }
+}
+
 #[test]
 // CONTRACT: docs/contracts/architecture.md#ARCH-05
 fn disabled_zmq_still_seals_the_observer_slot() {
@@ -84,22 +96,11 @@ fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("checkpoint CURRENT has no parent"))?
         .to_path_buf();
     let displaced = checkpoint_root.with_extension("checkpoint-failure-backup");
-    struct RestoreCheckpointRoot {
-        root: PathBuf,
-        displaced: PathBuf,
-    }
-    impl Drop for RestoreCheckpointRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.root);
-            let _ = std::fs::rename(&self.displaced, &self.root);
-        }
-    }
     let restore = RestoreCheckpointRoot {
         root: checkpoint_root.clone(),
         displaced: displaced.clone(),
     };
     inject_before_clean_checkpoint({
-        let checkpoint_root = checkpoint_root.clone();
         let displaced = displaced.clone();
         move || {
             std::fs::rename(&checkpoint_root, &displaced)

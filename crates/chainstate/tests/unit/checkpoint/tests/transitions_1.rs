@@ -123,15 +123,17 @@ fn failed_publication_preserves_current() -> Result<(), Box<dyn std::error::Erro
     super::super::inject_next_checkpoint_failpoint(
         super::super::CheckpointFailpoint::ManifestWrite,
     );
-    let error = super::super::write_checkpoint(
+    let result = super::super::write_checkpoint(
         dir.path(),
         config(),
         &tree,
         &utxo,
         &listener,
         Some(&applied_tip),
-    )
-    .expect_err("manifest write failpoint must abort publication");
+    );
+    let Err(error) = result else {
+        panic!("manifest write failpoint must abort publication");
+    };
     assert!(
         matches!(
             error,

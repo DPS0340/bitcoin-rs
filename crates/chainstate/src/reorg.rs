@@ -818,80 +818,78 @@ where
         }
     }
 
-    // Connect the optimistic first window, then stream the remainder in
-    // bounded windows. No path retains a whole branch of block bodies.
+    let outcome = execute_connect_stream(
+        transition,
+        observer,
+        connect_nodes,
+        connect_prefix,
+        &mut progress,
+    );
+    (progress, outcome)
+}
+
+fn execute_connect_stream<O>(
+    transition: &ChainTransition<'_>,
+    observer: &mut O,
+    connect_nodes: &[(Hash256, u32)],
+    connect_prefix: &[LoadedBranchBody],
+    progress: &mut LoadedPlanProgress,
+) -> core::result::Result<(), ReorgError>
+where
+    O: ReorgObserver + ?Sized,
+{
+    let handles = transition.chainstate();
     for body in connect_prefix {
-        match transition.connect_serialized(&body.block, body.serialized.clone()) {
-            Ok(outcome) => {
-                observer.connected(&body.block, &outcome);
-                progress.connected += 1;
-            }
-            Err(source) => {
-                let disposition = crate::classify_apply_error(&source);
-                let invalidated = if disposition == crate::WindowApplyDisposition::Permanent {
-                    let mut tree = handles.block_tree().write();
-                    tree.lookup(body.hash)
-                        .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                return (
-                    progress,
-                    Err(ReorgError::ConnectFailed {
-                        disconnected: progress.disconnected,
-                        connected: progress.connected,
-                        hash: body.hash,
-                        stopped_at: body.height.saturating_sub(1),
-                        source: Box::new(source),
-                        disposition,
-                        invalidated,
-                    }),
-                );
-            }
-        }
+        connect_loaded_body(transition, observer, progress, body)?;
     }
     for window in connect_nodes[connect_prefix.len()..].chunks(CONNECT_STREAM_WINDOW) {
         let mut bodies = Vec::with_capacity(window.len());
         for (hash, height) in window {
-            match load_persisted_branch_body(handles, *hash, *height) {
-                Ok(body) => bodies.push(body),
-                Err(source) => return (progress, Err(source)),
-            }
+            bodies.push(load_persisted_branch_body(handles, *hash, *height)?);
         }
         for body in &bodies {
-            match transition.connect_serialized(&body.block, body.serialized.clone()) {
-                Ok(outcome) => {
-                    observer.connected(&body.block, &outcome);
-                    progress.connected += 1;
-                }
-                Err(source) => {
-                    let disposition = crate::classify_apply_error(&source);
-                    let invalidated = if disposition == crate::WindowApplyDisposition::Permanent {
-                        let mut tree = handles.block_tree().write();
-                        tree.lookup(body.hash)
-                            .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    return (
-                        progress,
-                        Err(ReorgError::ConnectFailed {
-                            disconnected: progress.disconnected,
-                            connected: progress.connected,
-                            hash: body.hash,
-                            stopped_at: body.height.saturating_sub(1),
-                            source: Box::new(source),
-                            disposition,
-                            invalidated,
-                        }),
-                    );
-                }
-            }
+            connect_loaded_body(transition, observer, progress, body)?;
         }
     }
-    (progress, Ok(()))
+    Ok(())
+}
+
+fn connect_loaded_body<O>(
+    transition: &ChainTransition<'_>,
+    observer: &mut O,
+    progress: &mut LoadedPlanProgress,
+    body: &LoadedBranchBody,
+) -> core::result::Result<(), ReorgError>
+where
+    O: ReorgObserver + ?Sized,
+{
+    match transition.connect_serialized(&body.block, body.serialized.clone()) {
+        Ok(outcome) => {
+            observer.connected(&body.block, &outcome);
+            progress.connected += 1;
+            Ok(())
+        }
+        Err(source) => {
+            let disposition = crate::classify_apply_error(&source);
+            let invalidated = if disposition == crate::WindowApplyDisposition::Permanent {
+                let mut tree = transition.chainstate().block_tree().write();
+                tree.lookup(body.hash)
+                    .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            Err(ReorgError::ConnectFailed {
+                disconnected: progress.disconnected,
+                connected: progress.connected,
+                hash: body.hash,
+                stopped_at: body.height.saturating_sub(1),
+                source: Box::new(source),
+                disposition,
+                invalidated,
+            })
+        }
+    }
 }
 
 /// Re-reads disconnected bodies oldest-first for node-owned post-reorg work.
