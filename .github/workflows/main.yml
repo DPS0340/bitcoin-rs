@@ -191,16 +191,15 @@ jobs:
   # The imported qa-assets corpora (fuzz/corpus/, provenance in
   # fuzz/CORPUS_PROVENANCE.md) only pay off if they are exercised: build every
   # target and give each 10k executions against its corpus.
+  # cargo-fuzz composes its own RUSTFLAGS (env RUSTFLAGS is appended, but a
+  # sanitizer+linker combination is untested) -- this lane keeps the default
+  # linker instead of mold.
   fuzz-smoke:
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - name: mold linker
-        run: command -v mold >/dev/null || { sudo apt-get update && sudo apt-get install -y mold; }
       - uses: taiki-e/install-action@82fc405565b9cf90abfe700ba43b4751ce2fe422 # cargo-fuzz
         with:
           tool: cargo-fuzz

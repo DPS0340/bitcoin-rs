@@ -60,8 +60,6 @@ jobs:
     needs: fuzz-matrix
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    env:
-      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     strategy:
       fail-fast: false
       matrix:
@@ -83,8 +81,6 @@ jobs:
         with:
           workspaces: fuzz -> target
           shared-key: daily-fuzz-${{ matrix.target }}
-      - name: mold linker
-        run: command -v mold >/dev/null || { sudo apt-get update && sudo apt-get install -y mold; }
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # cargo-fuzz
         with:
           tool: cargo-fuzz@0.13.2
