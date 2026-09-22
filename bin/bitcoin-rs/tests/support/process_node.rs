@@ -553,16 +553,20 @@ impl ProcessNode {
                     .map_err(|_| ConnFail::Stale)?;
             self.rpc_conn = Some(BufReader::new(stream));
         }
-        let conn = match self.rpc_conn.as_mut() {
-            Some(conn) => conn,
-            None => return Err(ConnFail::Stale),
-        };
+        let conn = self.rpc_conn.as_mut().ok_or(ConnFail::Stale)?;
         conn.get_ref()
             .set_write_timeout(Some(remaining()?))
             .map_err(|_| ConnFail::Stale)?;
+        // A failed write() transferred zero bytes, so resending is safe.
+        // Any partial send is not: the peer may hold a request prefix.
+        let sent = conn.get_mut().write(wire).map_err(|_| ConnFail::Stale)?;
+        if sent == 0 {
+            return Err(ConnFail::Stale);
+        }
         conn.get_mut()
-            .write_all(wire)
-            .map_err(|_| ConnFail::Stale)?;
+            .write_all(&wire[sent..])
+            .map_err(HarnessError::Io)
+            .map_err(ConnFail::Error)?;
         let mut head = Vec::new();
         loop {
             let mut line = Vec::new();

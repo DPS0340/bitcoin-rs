@@ -659,14 +659,20 @@ impl Client {
         )
         .map_err(|error| (error.into(), false))?;
         wire.extend_from_slice(body);
+        // A failed write() transferred zero bytes, so resending is safe.
+        // Any partial send is not: the peer may hold a request prefix.
+        let sent = reader
+            .get_mut()
+            .write(&wire)
+            .map_err(|error| (error.into(), true))?;
+        if sent == 0 {
+            return Err(("socket closed before any bytes sent".into(), true));
+        }
         reader
             .get_mut()
-            .write_all(&wire)
-            .map_err(|error| (error.into(), true))?;
-        reader
-            .get_mut()
-            .flush()
-            .map_err(|error| (error.into(), true))?;
+            .write_all(&wire[sent..])
+            .and_then(|()| reader.get_mut().flush())
+            .map_err(|error| (error.into(), false))?;
         let mut status_line = String::new();
         let count = reader
             .read_line(&mut status_line)

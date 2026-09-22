@@ -59,7 +59,9 @@ pub struct BlockRecord {
 /// **23.1 MiB** at a mainnet-sized chain, on top of the 73.5 MiB the boxed
 /// header saved. The boxing is what buys those 80 bytes and is easy to undo
 /// by accident, so reverting it fails here at compile time rather than in a
-/// runtime test.
+/// runtime test. The 64-byte figure is the 64-bit layout; `usize` fields make
+/// narrower targets smaller still, which can only improve the saving.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     core::mem::size_of::<BlockRecord>() == 64,
     "BlockRecord footprint changed; re-measure the per-block saving"
