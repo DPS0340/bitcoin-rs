@@ -10,17 +10,16 @@ This version adds the scheduling requirements in `IDX-08`; changes to those
 requirements must update this clause and its executable proof together.
 
 Owners:
-- `DerivedIndexRuntime` in `crates/index/src/runtime/runtime.rs` and worker state in
-  `crates/index/src/runtime.rs`;
+- `DerivedIndexRuntime` and worker state in `crates/index/src/runtime.rs`;
   reconciliation, cursor commits, bounded preparation, and rollback in its
   `reconciliation.rs`, `cursor.rs`, `catch_up.rs`, and `rollback.rs` modules.
 - `DerivedIndexQueryEngine` in `crates/index/src/runtime/query.rs` owns the shared
-  snapshot gate and public query entrypoints. Its `query/transactions.rs`,
-  `query/scripts.rs`, `query/block_source.rs`, and `query/budget.rs` modules own
-  exact transaction resolution, script traversal, block identity, and aggregate
-  work accounting respectively.
-- Worker supervision and backend opening in `txindex/lifecycle.rs` and
-  `txindex/startup.rs`; startup owns generation-checked publication.
+  snapshot gate and public query entrypoints. Its `query/transactions.rs` and
+  `query/scripts.rs` modules own exact transaction resolution and script
+  traversal; `query.rs` itself owns block identity (`IndexBlockSource`) and
+  aggregate work accounting (`QueryBudget`).
+- Worker supervision and backend opening in `runtime/lifecycle.rs` and
+  `runtime/startup.rs`; startup owns generation-checked publication.
 - `IndexWriter`, `IndexReader`, `IndexCapabilities`, `IndexCapability`, `IndexWatermarks`, `IndexWatermark` in `crates/index/src/index.rs` and `crates/index/src/types.rs`
 - Capability status: worker-owned `DerivedIndexLifecycle` in
   `crates/index/src/runtime.rs` mapped by `DerivedIndexCapability` onto the
@@ -235,14 +234,14 @@ remove another script's output.
   - `missing_disconnected_body_routes_rewind_to_rebuild`
   - `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
   - `live_only_index_ahead_is_reported_and_reseeded`
-- `crates/index/src/runtime/lifecycle_tests.rs` and
+- `crates/index/src/runtime/startup.rs` and
   `crates/index/src/runtime/integration_tests.rs`: lifecycle
   publication, open failure/timeout, and shutdown abandonment.
 - `crates/index/src/runtime/query_tests.rs`: query gating, snapshot
   consistency, revision ABA detection, and
   `failed_worker_makes_queries_unavailable` /
   `stopped_worker_makes_queries_unavailable` worker-liveness refusal.
-- `crates/index/src/runtime/block_source_tests.rs`: confirmed-body
+- `crates/index/src/index/tests.rs`: confirmed-body
   serving by height/hash (`IDX-03`, `RCV-01`).
 - `crates/chainstate/src/reorg.rs` and the `RCV-08` recovery evidence prove
   bounded disconnect streaming under a retention lease; the departed branch
@@ -253,7 +252,7 @@ remove another script's output.
 
 ### Query-budget regression evidence
 
-`crates/index/src/runtime/query/budget/tests.rs` exercises the shared
+`crates/index/src/runtime/query.rs` tests exercise the shared
 historical/live byte budget, independent row/scan/body-read admission limits,
 rejection of truncated scans, and non-consuming rejection of over-budget work
 (`IDX-03`, `CL-14`). No query limit or persisted representation changes.
@@ -267,7 +266,6 @@ the worker's claim. Cancellation before helper creation may release normally.
 These paths do not cancel the underlying storage-engine call.
 
 Evidence for `IDX-07` abandonment and `IDX-08` shutdown:
-`crates/index/src/runtime/startup/open_wait/tests.rs` covers bounded
-cancellation, deadline precedence, disconnection, and backend error propagation;
-`crates/index/src/runtime/startup/tests.rs` covers namespace poisoning and
-clean release. The query-budget limits and on-disk formats are unchanged.
+`crates/index/src/runtime/startup.rs` tests cover bounded
+cancellation, deadline precedence, disconnection, backend error propagation,
+namespace poisoning, and clean release. The query-budget limits and on-disk formats are unchanged.

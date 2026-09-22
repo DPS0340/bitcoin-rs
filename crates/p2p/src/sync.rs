@@ -107,6 +107,10 @@ pub struct BlockSync {
     /// session-reconciliation state. Consensus and chain I/O stay outside
     /// this lock; each component's policy remains in the P2P crate.
     scheduler: Mutex<SchedulerState>,
+    /// Last time a `Refused` admission replayed a `getheaders` re-request;
+    /// paces retries to the request timeout so a paused admission cannot
+    /// re-issue the same locator at round-trip pace.
+    refused_rerequest_at: Mutex<Option<Instant>>,
     expected_apply_cache: Arc<Mutex<Option<ExpectedApplyCache>>>,
     /// Latched by the first [`WindowCommitDisposition::Fatal`] settlement.
     /// While set, [`apply_buffered_blocks`] stages inbound blocks but starts
@@ -127,11 +131,11 @@ struct SchedulerState {
     /// a known address means the predecessor's scheduler state must be
     /// dropped before the new connection can inherit it.
     known_sessions: HashMap<SocketAddr, crate::ConnectionId>,
-    /// A missing-parent recovery suppressed because the tracked header
-    /// request was occupied: exactly one gap waits for the slot, retried
-    /// whenever a later pass finds it free, healed by an intervening
-    /// headers batch, or dropped when its deliverer leaves.
-    deferred_gap_recovery: Option<(PeerSource, Hash256)>,
+    /// Deferred body-fetch ownership: a compact `getblocktxn` or fallback
+    /// `getdata` was issued for a tip hash whose header has not attached yet.
+    /// Marks resolve against the tree each drain once ancestry admits the
+    /// tip (P2P-06); bounded so announcements cannot grow it.
+    owned_body_fetches: Vec<(PeerSource, Hash256)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -205,8 +209,9 @@ impl BlockSync {
                 stager: BlockStager::new(default_sync_budget()),
                 header_request: None,
                 known_sessions: HashMap::new(),
-                deferred_gap_recovery: None,
+                owned_body_fetches: Vec::new(),
             }),
+            refused_rerequest_at: Mutex::new(None),
             expected_apply_cache: Arc::new(Mutex::new(None)),
             apply_halted: std::sync::atomic::AtomicBool::new(false),
         }
@@ -221,7 +226,7 @@ impl BlockSync {
             stager: BlockStager::new(budget),
             header_request: None,
             known_sessions: HashMap::new(),
-            deferred_gap_recovery: None,
+            owned_body_fetches: Vec::new(),
         };
     }
 

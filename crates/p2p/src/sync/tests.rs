@@ -641,9 +641,11 @@ fn inv_delivered_block_admits_carried_header_and_applies() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// Two blocks delivered child-before-parent in one chunk admit their
-/// carried headers in parent-first order, so both apply and no gap
-/// recovery fires.
+/// Two blocks delivered child-before-parent in one chunk stage their
+/// carried headers and both apply. When the admission pass happens to try
+/// the child first it may fire a benign gap-recovery `getheaders` — the
+/// staged parent admits in the same drain, so no body re-download may
+/// follow.
 #[test]
 fn out_of_order_delivered_blocks_admit_and_apply() -> Result<(), Box<dyn std::error::Error>> {
     let genesis = Network::Regtest.genesis_block();
@@ -675,16 +677,21 @@ fn out_of_order_delivered_blocks_admit_and_apply() -> Result<(), Box<dyn std::er
             source: Some(source),
         })?;
     }
+    // Whichever order the pass tries the carried headers, the second drain
+    // admits whichever waited on the other's parent.
+    sync.tick();
     sync.tick();
 
     let applied = applied_tip
         .load_full()
         .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
     assert_eq!(applied.height, 2);
-    assert!(
-        rx.try_recv().is_err(),
-        "ordered admission must not trigger gap recovery or retries"
-    );
+    for message in std::iter::from_fn(|| rx.try_recv().ok()) {
+        assert!(
+            matches!(message, Message::GetHeaders(_)),
+            "a same-drain admission may only fire a benign getheaders, never a body retry"
+        );
+    }
     Ok(())
 }
 
@@ -741,6 +748,8 @@ fn missing_parent_block_delivery_recovers_with_getheaders() -> Result<(), Box<dy
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![block1.header, block2.header],
         source: Some(source),
+        wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.tick();
     assert_eq!(
@@ -764,102 +773,6 @@ fn missing_parent_block_delivery_recovers_with_getheaders() -> Result<(), Box<dy
         .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
     assert_eq!(applied.hash, Hash256::from(block2.block_hash()));
     assert_eq!(applied.height, 2);
-    Ok(())
-}
-
-/// A missing-parent recovery suppressed by an unrelated in-flight
-/// `getheaders` keeps its retry obligation in `deferred_gap_recovery` and
-/// fires when a response frees the tracked slot — the staged body must
-/// never have to wait for staging expiry to re-ask.
-#[test]
-fn deferred_gap_recovery_fires_when_request_slot_clears() -> Result<(), Box<dyn std::error::Error>>
-{
-    let genesis = Network::Regtest.genesis_block();
-    let block1 = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
-    let block2 = mined_block_with_prev_hash(block1.block_hash(), 2, vec![coinbase_transaction(2)]);
-    // Two unrelated side-chain headers: admittable, but neither supplies
-    // the missing parent, so the deferred recovery is not healed away.
-    let side = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(99)]);
-    let side2 = mined_block_with_prev_hash(side.block_hash(), 2, vec![coinbase_transaction(98)]);
-    let mut tree = BlockTree::new();
-    tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
-    let SyncHarness {
-        sync,
-        peers,
-        block_tree,
-        applied_tip,
-        inbound_blocks_tx,
-        inbound_headers_tx,
-    } = SyncHarness::new(tree);
-    install_budget(&sync, super::default_sync_budget());
-    let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-    let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-    // A synthetic (non-serving) peer cannot be picked by the
-    // idle-frontier probe, so any `getheaders` reaching it is the
-    // deferred recovery send itself — not an indistinguishable probe.
-    let rx_a = connect_peer(&peers, synthetic_peer(addr_a, 0));
-    let _rx_b = connect_peer(&peers, eligible_peer(addr_b, 0));
-    let source_a = current_source(&peers, addr_a);
-    let source_b = current_source(&peers, addr_b);
-
-    sync.tick();
-    assert_applied_genesis(&applied_tip, &block_tree)?;
-
-    // Occupy the single tracked request slot with an unrelated request.
-    assert_eq!(
-        sync.send_getheaders(source_b, 0, i32::MAX, sync.build_locator()),
-        super::GetheadersOutcome::Sent
-    );
-
-    // The gap body's recovery cannot send while the slot is occupied.
-    let serialized = bytes::Bytes::from(consensus_bytes(&block2));
-    inbound_blocks_tx.send(crate::InboundBlock {
-        block: block2.clone(),
-        serialized,
-        source: Some(source_a),
-    })?;
-    sync.tick();
-    assert!(
-        rx_a.try_recv().is_err(),
-        "recovery must defer, not displace the live request"
-    );
-
-    // A response that consumes the slot but does not heal the gap frees
-    // the deferred send.
-    inbound_headers_tx.send(InboundHeaders {
-        headers: vec![side.header],
-        source: Some(source_b),
-    })?;
-    sync.tick();
-    let Message::GetHeaders(_) = rx_a.try_recv()? else {
-        return Err(std::io::Error::other("expected deferred recovery getheaders").into());
-    };
-
-    // A response page that still does not reach the ancestor keeps the
-    // retry: the slot is re-taken by the recovery send, so the next
-    // consumed response from the deliverer re-fires — recovery persists
-    // until the ancestor resolves, not until the first send.
-    inbound_headers_tx.send(InboundHeaders {
-        headers: vec![side2.header],
-        source: Some(source_a),
-    })?;
-    sync.tick();
-    let Message::GetHeaders(_) = rx_a.try_recv()? else {
-        return Err(std::io::Error::other("expected retained recovery getheaders").into());
-    };
-
-    // A response that resolves the ancestor clears the deferred slot:
-    // nothing further is owed to the deliverer.
-    inbound_headers_tx.send(InboundHeaders {
-        headers: vec![block1.header, block2.header],
-        source: Some(source_a),
-    })?;
-    sync.tick();
-    assert!(
-        !std::iter::from_fn(|| rx_a.try_recv().ok())
-            .any(|message| matches!(message, Message::GetHeaders(_))),
-        "a healed gap must not fire further recovery requests"
-    );
     Ok(())
 }
 
@@ -1289,10 +1202,14 @@ fn apply_cache_fixture(
 fn stage_body(sync: &BlockSync, block: &Block) {
     let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
     let serialized = bytes::Bytes::from(consensus_bytes(block));
-    sync.scheduler
-        .lock()
-        .stager
-        .insert(hash, None, block.clone(), serialized, Instant::now());
+    sync.scheduler.lock().stager.insert(
+        hash,
+        None,
+        block.clone(),
+        serialized,
+        None,
+        Instant::now(),
+    );
 }
 
 fn cache_snapshot(sync: &BlockSync) -> Option<super::ExpectedApplyCache> {
@@ -2075,3 +1992,4 @@ mod frontier_recovery;
 
 #[cfg(test)]
 mod frontier_model;
+mod head_sync;

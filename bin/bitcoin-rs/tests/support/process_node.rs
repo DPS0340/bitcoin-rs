@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{Read, Write as _};
+use std::io::{BufRead, BufReader, Read, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -140,6 +140,14 @@ impl From<serde_json::Error> for HarnessError {
     }
 }
 
+/// Transport outcome for the cached RPC socket. `Stale` means the request
+/// provably never reached the server, so one resend on a fresh socket is
+/// safe; anything else is surfaced as the original harness error.
+enum ConnFail {
+    Stale,
+    Error(HarnessError),
+}
+
 pub(crate) struct ProcessNode {
     child: Child,
     datadir: Option<TempDir>,
@@ -152,6 +160,10 @@ pub(crate) struct ProcessNode {
     journal_bytes: u64,
     started: Instant,
     output: Vec<JoinHandle<Result<(), HarnessError>>>,
+    // Keep-alive RPC connection. The node's accept loop polls on a 100ms
+    // cadence, so a fresh socket per call costs ~100ms of accept latency;
+    // reusing one connection removes that floor from every RPC.
+    rpc_conn: Option<BufReader<TcpStream>>,
 }
 
 pub(crate) fn workspace() -> PathBuf {
@@ -193,11 +205,30 @@ fn executable(binary: NodeBinary) -> Result<PathBuf, HarnessError> {
     }
 }
 
+/// Launches retried after a child died only on the reserve-release port
+/// race: the loopback port bound for selection can be grabbed by a parallel
+/// runner in the release-to-bind window, which fd-less spawning cannot
+/// close. The retry is bound to that failure signature only.
+const PORT_BIND_ATTEMPTS: u8 = 3;
+
 // Keep both ports during setup. The child binds them after release.
 fn loopback_addresses() -> Result<(TcpListener, TcpListener), HarnessError> {
     let rpc = TcpListener::bind("127.0.0.1:0")?;
     let p2p = TcpListener::bind("127.0.0.1:0")?;
     Ok((rpc, p2p))
+}
+
+/// Whether a dead child's stderr reports losing the port-bind race (either
+/// daemon's phrasing), and nothing else — any other startup failure returns
+/// its `ChildExit` untouched.
+fn exited_on_busy_port(evidence: &std::path::Path) -> bool {
+    let Ok(stderr) = fs::read_to_string(evidence.join("stderr.log")) else {
+        return false;
+    };
+    stderr.contains("Address already in use")
+        || stderr.contains("os error 98")
+        || stderr.contains("Unable to bind")
+        || stderr.contains("Failed to bind")
 }
 
 pub(crate) fn remaining_time(
@@ -300,11 +331,34 @@ impl ProcessNode {
     /// Restart scenarios move the `TempDir` out of a stopped process with
     /// [`Self::take_datadir`] and hand it here, so custody of the directory
     /// never leaves the harness and cleanup stays bound to the last owner.
+    /// A launch whose child died only on the reserve-release port race is
+    /// retried with fresh ports; anything else fails immediately.
     pub(crate) fn start_with_datadir(
         binary: NodeBinary,
         extra_args: &[&str],
         timeout: Duration,
         datadir: TempDir,
+    ) -> Result<Self, HarnessError> {
+        let mut attempt = 0_u8;
+        loop {
+            attempt += 1;
+            match Self::launch_once(binary, extra_args, timeout, &datadir) {
+                Ok(mut node) => {
+                    node.datadir = Some(datadir);
+                    return Ok(node);
+                }
+                Err(HarnessError::ChildExit { ref evidence, .. })
+                    if attempt < PORT_BIND_ATTEMPTS && exited_on_busy_port(evidence) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn launch_once(
+        binary: NodeBinary,
+        extra_args: &[&str],
+        timeout: Duration,
+        datadir: &TempDir,
     ) -> Result<Self, HarnessError> {
         let evidence_root = workspace().join("target/process-harness");
         fs::create_dir_all(&evidence_root)?;
@@ -359,7 +413,7 @@ impl ProcessNode {
         // Establish drop custody before taking the pipes or starting readers.
         let mut node = Self {
             child,
-            datadir: Some(datadir),
+            datadir: None,
             addr,
             binary,
             p2p_addr,
@@ -369,6 +423,7 @@ impl ProcessNode {
             journal_bytes: 0,
             started: Instant::now(),
             output: Vec::new(),
+            rpc_conn: None,
         };
         let stdout_pipe = node.child.stdout.take().expect("piped child stdout");
         let stderr_pipe = node.child.stderr.take().expect("piped child stderr");
@@ -423,7 +478,7 @@ impl ProcessNode {
     }
 
     pub(crate) fn http_get_json(&mut self, path: &str) -> Result<Value, HarnessError> {
-        let response = exchange_http(self.addr, None, path, Instant::now() + REQUEST_TIMEOUT);
+        let response = self.persistent_exchange(None, path, Instant::now() + REQUEST_TIMEOUT);
         self.record_response(&json!({"http_method": "GET", "path": path}), &response)?;
         response
     }
@@ -441,7 +496,7 @@ impl ProcessNode {
     ) -> Result<Value, HarnessError> {
         let request =
             json!({"jsonrpc": "1.0", "id": "process-harness", "method": method, "params": params});
-        let response = exchange(self.addr, &request, deadline);
+        let response = self.persistent_exchange(Some(&request), "/", deadline);
         self.record_response(&request, &response)?;
         let reply = response?;
         if let Some(error) = reply.get("error").filter(|error| !error.is_null()) {
@@ -494,6 +549,176 @@ impl ProcessNode {
         self.journal.flush()?;
         self.journal_bytes = next_size;
         Ok(())
+    }
+
+    /// Sends one request on the cached keep-alive connection, reconnecting
+    /// once when the socket is stale (idle close) or the exchange never
+    /// reached dispatch. A request that reached the server is never resent:
+    /// admission calls are not idempotent from the caller's view.
+    fn persistent_exchange(
+        &mut self,
+        request: Option<&Value>,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<Value, HarnessError> {
+        let wire = rpc_wire(self.addr, request, path)?;
+        match self.try_persistent(&wire, request.is_none(), deadline) {
+            Ok(reply) => Ok(reply),
+            Err(ConnFail::Stale) => {
+                self.rpc_conn = None;
+                self.try_persistent(&wire, request.is_none(), deadline)
+                    .map_err(|fail| match fail {
+                        ConnFail::Stale => HarnessError::Protocol("RPC socket failed twice".into()),
+                        ConnFail::Error(error) => error,
+                    })
+            }
+            Err(ConnFail::Error(error)) => {
+                // A hard failure may leave an in-flight request on the
+                // socket: drop it so a later call cannot be pipelined or
+                // answered with the wrong response.
+                self.rpc_conn = None;
+                Err(error)
+            }
+        }
+    }
+
+    /// Ensures `rpc_conn` holds a socket the peer has not already closed:
+    /// connects when absent, probes a reused socket for an idle close before
+    /// any request bytes leave the client (`Stale` ⇒ safe to reconnect).
+    fn live_conn(&mut self, deadline: Instant) -> Result<(), ConnFail> {
+        let fresh = if self.rpc_conn.is_none() {
+            let stream = TcpStream::connect_timeout(
+                &self.addr,
+                remaining_time(deadline, Instant::now(), "RPC deadline reached")
+                    .map_err(ConnFail::Error)?
+                    .min(Duration::from_secs(1)),
+            )
+            .map_err(|_| ConnFail::Stale)?;
+            self.rpc_conn = Some(BufReader::new(stream));
+            true
+        } else {
+            false
+        };
+        if !fresh && conn_stale(self.rpc_conn.as_ref().ok_or(ConnFail::Stale)?.get_ref()) {
+            return Err(ConnFail::Stale);
+        }
+        Ok(())
+    }
+
+    /// One request/response round trip on `rpc_conn`. `Stale` marks a
+    /// socket that closed or broke before the request could have been
+    /// dispatched (idle close, dead peer), so re-sending once is safe.
+    fn try_persistent(
+        &mut self,
+        wire: &[u8],
+        require_success: bool,
+        deadline: Instant,
+    ) -> Result<Value, ConnFail> {
+        let remaining = || {
+            remaining_time(deadline, Instant::now(), "RPC deadline reached")
+                .map_err(ConnFail::Error)
+        };
+        self.live_conn(deadline)?;
+        let conn = self.rpc_conn.as_mut().ok_or(ConnFail::Stale)?;
+        conn.get_ref()
+            .set_write_timeout(Some(remaining()?))
+            .map_err(|_| ConnFail::Stale)?;
+        // A failed write() transferred zero bytes, so resending is safe.
+        // Any partial send is not: the peer may hold a request prefix.
+        let sent = conn.get_mut().write(wire).map_err(|_| ConnFail::Stale)?;
+        if sent == 0 {
+            return Err(ConnFail::Stale);
+        }
+        conn.get_mut()
+            .write_all(&wire[sent..])
+            .map_err(HarnessError::Io)
+            .map_err(ConnFail::Error)?;
+        let mut head = Vec::new();
+        loop {
+            let mut line = Vec::new();
+            conn.get_ref()
+                .set_read_timeout(Some(remaining()?))
+                .map_err(HarnessError::Io)
+                .map_err(ConnFail::Error)?;
+            let count = conn.read_until(b'\n', &mut line).map_err(|error| {
+                if head.is_empty() && is_conn_closed(&error) {
+                    ConnFail::Stale
+                } else {
+                    ConnFail::Error(HarnessError::Io(error))
+                }
+            })?;
+            if count == 0 {
+                // serve_connection writes a response before every close it
+                // initiates, so zero response bytes prove this request never
+                // reached dispatch: re-sending once is safe (a dead daemon
+                // fails the reconnect instead). Mid-headers EOF is
+                // ambiguous and is never retried.
+                return Err(if head.is_empty() {
+                    ConnFail::Stale
+                } else {
+                    ConnFail::Error(HarnessError::Protocol(
+                        "connection closed mid-headers".into(),
+                    ))
+                });
+            }
+            head.extend_from_slice(&line);
+            if head.len() > MAX_RESPONSE {
+                return Err(ConnFail::Error(HarnessError::Protocol(
+                    "RPC response bound exceeded".into(),
+                )));
+            }
+            if line == b"\r\n" {
+                break;
+            }
+        }
+        let headers = std::str::from_utf8(&head).map_err(|error| {
+            ConnFail::Error(HarnessError::Protocol(format!(
+                "invalid HTTP headers: {error}"
+            )))
+        })?;
+        let mut content_length = None;
+        let mut peer_close = false;
+        for line in headers.split("\r\n").skip(1) {
+            if line.is_empty() {
+                continue;
+            }
+            let (name, value) = line.split_once(':').ok_or_else(|| {
+                ConnFail::Error(HarnessError::Protocol("invalid HTTP header".into()))
+            })?;
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(value.trim().parse::<usize>().map_err(|_| {
+                    ConnFail::Error(HarnessError::Protocol("invalid HTTP content length".into()))
+                })?);
+            }
+            if name.eq_ignore_ascii_case("connection") && value.trim().eq_ignore_ascii_case("close")
+            {
+                peer_close = true;
+            }
+        }
+        let content_length = content_length.ok_or_else(|| {
+            ConnFail::Error(HarnessError::Protocol("missing HTTP content length".into()))
+        })?;
+        if content_length > MAX_RESPONSE {
+            return Err(ConnFail::Error(HarnessError::Protocol(
+                "RPC response bound exceeded".into(),
+            )));
+        }
+        let mut bytes = head;
+        let start = bytes.len();
+        bytes.resize(start + content_length, 0);
+        conn.get_ref()
+            .set_read_timeout(Some(remaining()?))
+            .map_err(HarnessError::Io)
+            .map_err(ConnFail::Error)?;
+        conn.read_exact(&mut bytes[start..])
+            .map_err(HarnessError::Io)
+            .map_err(ConnFail::Error)?;
+        if peer_close {
+            self.rpc_conn = None;
+        }
+        let reply = parse_http_reply(&bytes, require_success).map_err(ConnFail::Error)?;
+        remaining()?;
+        Ok(reply)
     }
 
     fn finish_output(&mut self) -> Result<(), HarnessError> {
@@ -618,8 +843,18 @@ pub(crate) fn compare_rpc(
     method: &str,
     params: &Value,
 ) -> Result<Value, HarnessError> {
-    let reference = core.rpc(method, params)?;
-    let candidate = node.rpc(method, params)?;
+    // The reference and candidate calls are independent; running them
+    // concurrently halves the serial request latency of every paired check.
+    let (reference, candidate) = std::thread::scope(|scope| {
+        let reference = scope.spawn(|| core.rpc(method, params));
+        let candidate = scope.spawn(|| node.rpc(method, params));
+        (
+            reference.join().expect("reference request panicked"),
+            candidate.join().expect("candidate request panicked"),
+        )
+    });
+    let reference = reference?;
+    let candidate = candidate?;
     compare_reply(method, &reference, &candidate)?;
     Ok(reference)
 }
@@ -630,6 +865,73 @@ pub(crate) fn exchange(
     deadline: Instant,
 ) -> Result<Value, HarnessError> {
     exchange_http(addr, Some(request), "/", deadline)
+}
+
+/// Reports whether a kept-alive socket was already closed (or desynced) on
+/// the peer side. A non-blocking peek sees the close before any request
+/// bytes are sent, which makes reconnecting unambiguously safe.
+fn conn_stale(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let stale = !matches!(
+        stream.peek(&mut [0_u8; 1]),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    );
+    if stream.set_nonblocking(false).is_err() {
+        return true;
+    }
+    stale
+}
+
+/// Socket-close errors proving the peer tore the connection down.
+/// WouldBlock/TimedOut are absent: an alive-but-slow peer means the request
+/// may still be in flight server-side, so those stay non-retryable.
+fn is_conn_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+/// Builds one HTTP/1.1 request body wire block. `keep-alive` asks the
+/// peer to hold the socket so the process-harness can reuse it across
+/// calls instead of paying a fresh accept-poll per request.
+fn rpc_wire(
+    addr: SocketAddr,
+    request: Option<&Value>,
+    path: &str,
+) -> Result<Vec<u8>, HarnessError> {
+    let mut wire = Vec::new();
+    let body = request
+        .map(serde_json::to_vec)
+        .transpose()?
+        .unwrap_or_default();
+    // Fixed test-only credentials avoid another authentication implementation.
+    if request.is_some() {
+        write!(
+            wire,
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Basic cGFyaXR5OnBhcml0eQ==\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        )?;
+    } else {
+        if !path.starts_with("/api/") || path.bytes().any(|byte| byte <= b' ' || byte == 127) {
+            return Err(HarnessError::Protocol("invalid explorer HTTP path".into()));
+        }
+        write!(
+            wire,
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: keep-alive\r\n\r\n"
+        )?;
+    }
+    wire.extend_from_slice(&body);
+    if wire.len() > MAX_REQUEST {
+        return Err(HarnessError::Protocol("HTTP request byte limit".into()));
+    }
+    Ok(wire)
 }
 
 fn exchange_http(

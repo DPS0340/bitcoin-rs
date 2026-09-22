@@ -22,41 +22,61 @@ impl Pair {
     fn new() -> Self {
         // These are the repository's selected values, explicitly supplied to
         // Core. They are not claims about Core 31.1's changed fee defaults.
-        let mut core = ProcessNode::start_with_options(
-            NodeBinary::ReferenceCore,
-            &[
-                "-acceptnonstdtxn=0",
-                "-minrelaytxfee=0.00001000",
-                "-incrementalrelayfee=0.00001000",
-                "-dustrelayfee=0.00003000",
-                "-datacarriersize=83",
-            ],
-            START_TIMEOUT,
-        )
-        .expect("standard Core policy profile");
-        let mut node = ProcessNode::start(NodeBinary::BitcoinRs).expect("candidate process");
-        for process in [&mut core, &mut node] {
-            let policy = process
-                .rpc("getmempoolinfo", &json!([]))
-                .expect("selected settings");
-            assert_eq!(policy["minrelaytxfee"], json!(0.00001));
-            assert_eq!(policy["incrementalrelayfee"], json!(0.00001));
-            assert_eq!(policy["limitclustercount"], json!(64));
-            assert_eq!(policy["limitclustersize"], json!(101_000));
-            assert_eq!(policy["maxdatacarriersize"], json!(83));
-            assert_eq!(policy["fullrbf"], json!(true));
-        }
+        // The two process launches are independent; start them concurrently.
+        let (core, node) = std::thread::scope(|scope| {
+            let core = scope.spawn(|| {
+                ProcessNode::start_with_options(
+                    NodeBinary::ReferenceCore,
+                    &[
+                        "-acceptnonstdtxn=0",
+                        "-minrelaytxfee=0.00001000",
+                        "-incrementalrelayfee=0.00001000",
+                        "-dustrelayfee=0.00003000",
+                        "-datacarriersize=83",
+                    ],
+                    START_TIMEOUT,
+                )
+            });
+            let node = scope.spawn(|| ProcessNode::start(NodeBinary::BitcoinRs));
+            (
+                core.join().expect("reference launch panicked"),
+                node.join().expect("candidate launch panicked"),
+            )
+        });
+        let mut core = core.expect("standard Core policy profile");
+        let mut node = node.expect("candidate process");
+        std::thread::scope(|scope| {
+            for process in [&mut core, &mut node] {
+                scope.spawn(move || {
+                    let policy = process
+                        .rpc("getmempoolinfo", &json!([]))
+                        .expect("selected settings");
+                    assert_eq!(policy["minrelaytxfee"], json!(0.00001));
+                    assert_eq!(policy["incrementalrelayfee"], json!(0.00001));
+                    assert_eq!(policy["limitclustercount"], json!(64));
+                    assert_eq!(policy["limitclustersize"], json!(101_000));
+                    assert_eq!(policy["maxdatacarriersize"], json!(83));
+                    assert_eq!(policy["fullrbf"], json!(true));
+                });
+            }
+        });
         let funds = mine_common_chain(&mut core, &mut node, 101).expect("identical chain");
         let funding = funds.confirmed_output(0).expect("confirmed funding");
         let split = transaction(&[funding], 140, 20_000, 2);
-        for process in [&mut core, &mut node] {
-            assert_eq!(
-                process
-                    .rpc("sendrawtransaction", &json!([serialize_hex(&split)]))
-                    .expect("funding split"),
-                json!(split.compute_txid().to_string())
-            );
-        }
+        let split_raw = &serialize_hex(&split);
+        let split_txid = &split.compute_txid().to_string();
+        std::thread::scope(|scope| {
+            for process in [&mut core, &mut node] {
+                scope.spawn(move || {
+                    assert_eq!(
+                        process
+                            .rpc("sendrawtransaction", &json!([split_raw]))
+                            .expect("funding split"),
+                        json!(split_txid)
+                    );
+                });
+            }
+        });
         mine_common_chain(&mut core, &mut node, 1).expect("confirm shared split");
         let coins = (0..split.output.len())
             .map(|index| output(&split, index))
@@ -67,7 +87,9 @@ impl Pair {
     fn check(&mut self, tx: &Transaction, rejection: Option<&str>) {
         let raw = serialize_hex(tx);
         let txid = tx.compute_txid().to_string();
-        for process in [&mut self.core, &mut self.node] {
+        // The per-process observation sequences are independent; run the
+        // reference and candidate checks concurrently.
+        let check_one = |process: &mut ProcessNode| {
             let before = process
                 .rpc("getrawmempool", &json!([false, true]))
                 .expect("before state");
@@ -109,15 +131,23 @@ impl Pair {
                     json!(txid)
                 );
             }
-        }
-        let core = self
-            .core
-            .rpc("getrawmempool", &json!([]))
-            .expect("reference members");
-        let node = self
-            .node
-            .rpc("getrawmempool", &json!([]))
-            .expect("candidate members");
+        };
+        std::thread::scope(|scope| {
+            let reference = scope.spawn(|| check_one(&mut self.core));
+            let candidate = scope.spawn(|| check_one(&mut self.node));
+            reference.join().expect("reference check panicked");
+            candidate.join().expect("candidate check panicked");
+        });
+        let (core, node) = std::thread::scope(|scope| {
+            let core = scope.spawn(|| self.core.rpc("getrawmempool", &json!([])));
+            let node = scope.spawn(|| self.node.rpc("getrawmempool", &json!([])));
+            (
+                core.join().expect("reference member request panicked"),
+                node.join().expect("candidate member request panicked"),
+            )
+        });
+        let core = core.expect("reference members");
+        let node = node.expect("candidate members");
         let sorted = |value: Value| {
             let mut rows: Vec<_> = value
                 .as_array()
@@ -133,24 +163,30 @@ impl Pair {
 
     fn preview(&mut self, txs: &[Transaction]) -> (Value, Value) {
         let raw: Vec<_> = txs.iter().map(serialize_hex).collect();
-        let mut replies = Vec::new();
-        for process in [&mut self.core, &mut self.node] {
+        // The per-process preview observation is independent on each node.
+        let preview_one = |process: &mut ProcessNode| {
             let before = process
                 .rpc("getrawmempool", &json!([false, true]))
                 .expect("before package");
-            replies.push(
-                process
-                    .rpc("testmempoolaccept", &json!([raw]))
-                    .expect("package preview"),
-            );
+            let reply = process
+                .rpc("testmempoolaccept", &json!([raw]))
+                .expect("package preview");
             assert_eq!(
                 process
                     .rpc("getrawmempool", &json!([false, true]))
                     .expect("after package"),
                 before
             );
-        }
-        (replies.remove(0), replies.remove(0))
+            reply
+        };
+        std::thread::scope(|scope| {
+            let reference = scope.spawn(|| preview_one(&mut self.core));
+            let candidate = scope.spawn(|| preview_one(&mut self.node));
+            (
+                reference.join().expect("reference preview panicked"),
+                candidate.join().expect("candidate preview panicked"),
+            )
+        })
     }
 }
 

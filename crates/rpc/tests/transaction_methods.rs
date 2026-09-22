@@ -139,7 +139,8 @@ fn sendrawtransaction_rejects_missing_inputs() {
     let err = handler
         .dispatch("sendrawtransaction", &json!([raw.as_str()]))
         .expect_err("missing-inputs tx should be rejected");
-    assert_eq!(err.code(), RpcError::CORE_VERIFY_REJECTED);
+    // Core answers -25 (RPC_VERIFY_ERROR) for missing-or-spent inputs.
+    assert_eq!(err.code(), -25);
 }
 
 /// POL-01 (`docs/policies/mempool-policy.md`, Duplicate submission):

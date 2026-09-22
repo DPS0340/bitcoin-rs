@@ -50,35 +50,55 @@ fn start(binary: NodeBinary) -> ProcessNode {
 /// REF-07/P2P-01: compatibility must reach the binary's public P2P listener.
 #[test]
 fn normal_startup_exposes_an_isolated_loopback_p2p_listener() {
-    for binary in [NodeBinary::BitcoinRs, NodeBinary::ReferenceCore] {
-        let node = start(binary);
-        let pid = node.pid();
-        assert!(node.p2p_addr.ip().is_loopback());
-        let peer = support::process_peer::connect_loopback(
-            node.p2p_addr,
-            Instant::now() + Duration::from_secs(1),
-        )
-        .expect("normal startup must expose its configured P2P listener");
-        drop(peer);
-        node.stop().expect("stop after public P2P connection");
-        assert_reaped(pid);
-    }
+    // Each binary's startup, listener probe, and shutdown are independent.
+    std::thread::scope(|scope| {
+        for binary in [NodeBinary::BitcoinRs, NodeBinary::ReferenceCore] {
+            scope.spawn(move || {
+                let node = start(binary);
+                let pid = node.pid();
+                assert!(node.p2p_addr.ip().is_loopback());
+                let peer = support::process_peer::connect_loopback(
+                    node.p2p_addr,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .expect("normal startup must expose its configured P2P listener");
+                drop(peer);
+                node.stop().expect("stop after public P2P connection");
+                assert_reaped(pid);
+            });
+        }
+    });
 }
 
 /// POL-05/REF-07: signaling never decides replacement eligibility. Both
 /// nodes still reject an underpaying replacement without changing the pool.
 #[test]
+fn replacement_signaling_matches_pinned_core() {
+    // The signaled and unsignaled scenarios are independent node pairs.
+    std::thread::scope(|scope| {
+        for signals in [false, true] {
+            scope.spawn(move || replacement_signaling_case(signals));
+        }
+    });
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "keep the ordered replacement and rejection observations together"
 )]
-fn replacement_signaling_matches_pinned_core() {
+fn replacement_signaling_case(signals: bool) {
     use bitcoin::Sequence;
     use bitcoin::consensus::encode::serialize_hex;
 
-    for signals in [false, true] {
-        let mut core = start(NodeBinary::ReferenceCore);
-        let mut node = start(NodeBinary::BitcoinRs);
+    {
+        let (mut core, mut node) = std::thread::scope(|scope| {
+            let core = scope.spawn(|| start(NodeBinary::ReferenceCore));
+            let node = scope.spawn(|| start(NodeBinary::BitcoinRs));
+            (
+                core.join().expect("reference launch panicked"),
+                node.join().expect("candidate launch panicked"),
+            )
+        });
         let funds = mine_common_chain(&mut core, &mut node, COMMON_BLOCKS).expect("common chain");
         let sequence = if signals {
             Sequence::ENABLE_RBF_NO_LOCKTIME
@@ -99,14 +119,19 @@ fn replacement_signaling_matches_pinned_core() {
 
         // The replacement is independently valid before there is a conflict.
         // A script or funding failure must not masquerade as an RBF difference.
-        for process in [&mut core, &mut node] {
-            for raw in [&replacement_raw, &underpaying_raw] {
-                let preview = process
-                    .rpc("testmempoolaccept", &json!([[raw]]))
-                    .expect("unconflicted replacement preview");
-                assert_eq!(preview[0]["allowed"], json!(true), "{preview}");
+        let raws = [&replacement_raw, &underpaying_raw];
+        std::thread::scope(|scope| {
+            for process in [&mut core, &mut node] {
+                scope.spawn(move || {
+                    for raw in raws {
+                        let preview = process
+                            .rpc("testmempoolaccept", &json!([[raw]]))
+                            .expect("unconflicted replacement preview");
+                        assert_eq!(preview[0]["allowed"], json!(true), "{preview}");
+                    }
+                });
             }
-        }
+        });
         assert_eq!(
             compare_rpc(&mut core, &mut node, "getrawmempool", &json!([]))
                 .expect("unconflicted previews leave the pools empty"),
@@ -124,10 +149,8 @@ fn replacement_signaling_matches_pinned_core() {
         );
 
         // Independent public response expectations for the pinned fee-policy case.
-        for (process, rejection) in [
-            (&mut core, "insufficient fee"),
-            (&mut node, "insufficient fee"),
-        ] {
+        // The per-process observation sequences are independent.
+        let rejection_case = |process: &mut ProcessNode, rejection: &str| {
             let before = process
                 .rpc("getrawmempool", &json!([false, true]))
                 .expect("membership and sequence before preview");
@@ -183,7 +206,15 @@ fn replacement_signaling_matches_pinned_core() {
                 .rpc("getmempoolinfo", &json!([]))
                 .expect("enforced policy");
             assert_eq!(policy["fullrbf"], json!(true));
-        }
+        };
+        std::thread::scope(|scope| {
+            for (process, rejection) in [
+                (&mut core, "insufficient fee"),
+                (&mut node, "insufficient fee"),
+            ] {
+                scope.spawn(move || rejection_case(process, rejection));
+            }
+        });
         let (core_pid, node_pid) = (core.pid(), node.pid());
         core.stop().expect("stop reference");
         node.stop().expect("stop candidate");
@@ -198,8 +229,14 @@ fn replacement_signaling_matches_pinned_core() {
     reason = "keep the ordered public-process scenario and its observations together"
 )]
 fn signed_transaction_reaches_both_mempools_confirmation_and_public_queries() {
-    let mut core = start(NodeBinary::ReferenceCore);
-    let mut node = start(NodeBinary::BitcoinRs);
+    let (mut core, mut node) = std::thread::scope(|scope| {
+        let core = scope.spawn(|| start(NodeBinary::ReferenceCore));
+        let node = scope.spawn(|| start(NodeBinary::BitcoinRs));
+        (
+            core.join().expect("reference launch panicked"),
+            node.join().expect("candidate launch panicked"),
+        )
+    });
     let (core_pid, node_pid) = (core.pid(), node.pid());
     // Only Core exposes a mock clock today; the gap stays visible here.
     assert!(matches!(core.clock, ClockControl::Mock(_)));
@@ -236,36 +273,43 @@ fn signed_transaction_reaches_both_mempools_confirmation_and_public_queries() {
         .expect("signature scalar") ^= 1;
     input.script_sig = bitcoin::ScriptBuf::from_bytes(script);
     let invalid_raw = bitcoin::consensus::encode::serialize_hex(&invalid);
-    let mut valid_previews = Vec::new();
-    let mut invalid_previews = Vec::new();
-    let mut rejection_codes = Vec::new();
-    for process in [&mut core, &mut node] {
+    // The per-process preview and rejection observations are independent.
+    let signature_case = |process: &mut ProcessNode| {
         let valid = process
             .rpc("testmempoolaccept", &json!([[raw]]))
             .expect("valid signed preview reaches the public admission owner");
-        valid_previews.push(
-            valid
-                .pointer("/0/allowed")
-                .expect("valid preview allowed field")
-                .clone(),
-        );
+        let valid_allowed = valid
+            .pointer("/0/allowed")
+            .expect("valid preview allowed field")
+            .clone();
         let invalid = process
             .rpc("testmempoolaccept", &json!([[invalid_raw]]))
             .expect("invalid signature is a semantic preview reply");
-        invalid_previews.push(
-            invalid
-                .pointer("/0/allowed")
-                .expect("invalid preview allowed field")
-                .clone(),
-        );
+        let invalid_allowed = invalid
+            .pointer("/0/allowed")
+            .expect("invalid preview allowed field")
+            .clone();
         let rejection = process
             .rpc("sendrawtransaction", &json!([invalid_raw]))
             .expect_err("invalid signature cannot be admitted");
         let HarnessError::Rpc { code, .. } = rejection else {
             panic!("transport or setup failure is not an admission rejection: {rejection}");
         };
-        rejection_codes.push(json!(code));
-    }
+        (valid_allowed, invalid_allowed, json!(code))
+    };
+    let (valid_previews, invalid_previews, rejection_codes) = std::thread::scope(|scope| {
+        let reference = scope.spawn(|| signature_case(&mut core));
+        let candidate = scope.spawn(|| signature_case(&mut node));
+        let (reference, candidate) = (
+            reference.join().expect("reference signature case panicked"),
+            candidate.join().expect("candidate signature case panicked"),
+        );
+        (
+            vec![reference.0, candidate.0],
+            vec![reference.1, candidate.1],
+            vec![reference.2, candidate.2],
+        )
+    });
     for allowed in &valid_previews {
         compare_reply("valid signature preview allowed", &json!(true), allowed)
             .expect("valid signature preview");

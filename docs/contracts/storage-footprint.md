@@ -119,7 +119,7 @@ Owners:
   default-lane physical budget evidence. Pass requires default unpruned fjall,
   pinned mainnet stop, conservative high-water from an isolated filesystem or
   quota, and separate logical owner and physical namespace ledgers.
-- `crates/storage/tests/overhaul_atomic_durability.rs` (planned): atomic batch
+- `crates/storage/tests/overhaul_atomic_durability.rs`: atomic batch
   durability and compaction behavior, including engine WAL and temporary file
   accounting.
 - `crates/node/tests/overhaul_streaming_reorg.rs` (planned): reorg memory and

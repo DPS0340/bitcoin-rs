@@ -206,7 +206,7 @@ A stage that is parallel in shape but serial in effect because each dispatch is 
 Whether a fan-out pays is decided by per-item work against dispatch cost, not by how parallelizable the loop looks: ~100 µs script checks want more parallelism (`MIN_PARALLEL_SCRIPT_CHECKS` = 32, `crates/consensus/src/verify_tx.rs`), ~500 ns UTXO lookups want none, ~2.6 µs Merkle nodes gain from SIMD batching rather than task fan-out. Thresholds have an interior optimum in both directions. Gate on **elapsed**, never on the stage being targeted.
 
 ### Global rayon pool cap
-The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_global_thread_pool` (`crates/node/src/run.rs`). It serves the apply-path parse and non-script checks, UTXO commit, coinstats, and index preparation fan-outs, while `SCRIPT_VERIFY_POOL` separately holds up to 32 threads; uncapped, its workers oversubscribe a many-core host and spin. The cap measured better on both wall and CPU for a loopback sync to height 150,000 and cost a full-verification replay nothing (rationale and table at the constant's doc comment).
+The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_global_thread_pool` (`crates/node/src/lifecycle.rs`). It serves the apply-path parse and non-script checks, UTXO commit, coinstats, and index preparation fan-outs, while `SCRIPT_VERIFY_POOL` separately holds up to 32 threads; uncapped, its workers oversubscribe a many-core host and spin. The cap measured better on both wall and CPU for a loopback sync to height 150,000 and cost a full-verification replay nothing (rationale and table at the constant's doc comment).
 
 ### Chain generation
 The even/odd atomic counter on `MempoolGateway` that fences admission
@@ -243,16 +243,17 @@ transition. `chain` still plans the branch. Node-level reorg still sequences
 disconnect then connect. UTXO, storage, and index still own their operations.
 
 ### Chain-change proof
-The type-level binding of a `TransitionLock` to the `ChainChangeGuard` that
-reserved the active odd generation (`crates/node/src/apply.rs`). The
-caller-facing mutation capability is `ChainTransition`, which holds that
-proof. Apply-path helpers accept `&ChainChangeProof`, not independent lock
-and guard arguments, so a call without an active odd generation cannot
-compile. The proof owns the guard, so the reserved generation is fixed for
-the whole transition rather than read from a snapshot that may have moved.
+The type-level binding of a `TransitionLock` to the `TransitionGuard` that
+reserved the active odd generation (`crates/chainstate/src/lib.rs`). The
+caller-facing mutation capability is `ChainTransition`, which promotion of
+the lock produces. Apply-path helpers accept `&ChainTransition`, not
+independent lock and guard arguments, so a call without an active odd
+generation cannot compile. The proof owns the guard, so the reserved
+generation is fixed for the whole transition rather than read from a
+snapshot that may have moved.
 
 ### Count-and-byte bound
-A window sized by whichever of a count cap and a byte cap binds first, because item size varies by orders of magnitude across the chain. The script window (`window_len`, `crates/node/src/apply.rs`) and the download window's pending and staging budgets (`SyncBudget` in `crates/p2p/src/download_window.rs`) both use it. In the script window one block larger than the whole byte cap still goes through alone rather than stalling the chain.
+A window sized by whichever of a count cap and a byte cap binds first, because item size varies by orders of magnitude across the chain. The script window (`window_len`, `crates/node/src/sync.rs`) and the download window's pending and staging budgets (`SyncBudget` in `crates/p2p/src/download_window.rs`) both use it. In the script window one block larger than the whole byte cap still goes through alone rather than stalling the chain.
 
 ## Chain state and reorg
 
@@ -274,7 +275,7 @@ State that connection writes and disconnection must account for. `coin_stats` ne
 ## Derived indexes
 
 ### TxIndex capability watermarks
-Versioned durable `(height, block hash)` cursors identifying the exact active-chain prefix each independently ready row family represents. `TxLookup` owns `TxConfirmed` (`--txindex`); `ScriptHistory` owns `Funding` and `Spending` (`--scriptindex=full`, which also builds internal `TxLookup` rows for Esplora without changing Core txindex advertisement); `ScriptLive` owns compact live-output locators (`--scriptindex=utxo` or `full`) and is rebuilt from the authoritative UTXO set rather than block history. `BlockHeaders` is shared rollback-integrity metadata whose row order and count must never be read as the active chain. Equal cursors advance in one body scan and one atomic batch; a lagging cursor moves independently. Height alone cannot prove identity across a reorg. On startup the node keeps the current format, upgrades format 3 in place by resetting `ScriptHistory` only, and fully resets any other version or an unversioned cursorless table for rebuild (`IndexWriter::open` in `crates/index/src/index.rs`, `open_writer` in `crates/node/src/txindex_worker.rs`); a crash-resumable reset marker makes restart finish deletion before the writer is exposed.
+Versioned durable `(height, block hash)` cursors identifying the exact active-chain prefix each independently ready row family represents. `TxLookup` owns `TxConfirmed` (`--txindex`); `ScriptHistory` owns `Funding` and `Spending` (`--scriptindex=full`, which also builds internal `TxLookup` rows for Esplora without changing Core txindex advertisement); `ScriptLive` owns compact live-output locators (`--scriptindex=utxo` or `full`) and is rebuilt from the authoritative UTXO set rather than block history. `BlockHeaders` is shared rollback-integrity metadata whose row order and count must never be read as the active chain. Equal cursors advance in one body scan and one atomic batch; a lagging cursor moves independently. Height alone cannot prove identity across a reorg. On startup the node keeps the current format, upgrades format 3 in place by resetting `ScriptHistory` only, and fully resets any other version or an unversioned cursorless table for rebuild (`IndexWriter::open` in `crates/index/src/index.rs`, `open_writer` in `crates/index/src/recovery.rs`); a crash-resumable reset marker makes restart finish deletion before the writer is exposed.
 
 ### Coalesced TxIndex wake
 The nonblocking hint published after a committed `applied_tip.store`: an atomic revision incremented with `Release` plus `try_send` on a capacity-one channel. Tokens may coalesce or drop; the worker checks the authoritative revision before sleeping and also wakes on a bounded timeout.

@@ -311,10 +311,14 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
     {
         let block = Network::Regtest.genesis_block();
         let serialized = bytes::Bytes::from(consensus_bytes(&block));
-        sync.scheduler
-            .lock()
-            .stager
-            .insert(successor, None, block, serialized, Instant::now());
+        sync.scheduler.lock().stager.insert(
+            successor,
+            None,
+            block,
+            serialized,
+            None,
+            Instant::now(),
+        );
     }
     sync.scheduler
         .lock()
@@ -327,10 +331,14 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
     {
         let block = Network::Regtest.genesis_block();
         let serialized = bytes::Bytes::from(consensus_bytes(&block));
-        sync.scheduler
-            .lock()
-            .stager
-            .insert(frontier, None, block, serialized, Instant::now());
+        sync.scheduler.lock().stager.insert(
+            frontier,
+            None,
+            block,
+            serialized,
+            None,
+            Instant::now(),
+        );
     }
 
     let far_future = Instant::now() + Duration::from_mins(1);
@@ -423,7 +431,7 @@ fn staged_frontier_stuck_past_bound_escalates_without_blame()
         sync.scheduler
             .lock()
             .stager
-            .insert(hash, None, block, serialized, Instant::now());
+            .insert(hash, None, block, serialized, None, Instant::now());
     }
     let staged_at = Instant::now();
     sync.scheduler.lock().window.mark_received_from(

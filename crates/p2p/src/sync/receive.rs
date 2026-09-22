@@ -1,7 +1,6 @@
 //! Bounded inbound body draining and exact staged-body admission.
 
 use super::BlockSync;
-use super::HEADER_REQUEST_TIMEOUT;
 use super::chain::HeaderAdmission;
 use super::chain::SyncChainError;
 use super::peers::is_peer_fault;
@@ -16,8 +15,6 @@ use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
-use hashbrown::HashMap;
-use hashbrown::HashSet;
 use smallvec::SmallVec;
 use std::time::Instant;
 use std::vec::Vec;
@@ -58,6 +55,8 @@ impl BlockSync {
         if received == 0 && self.scheduler.lock().stager.received_len() == 0 {
             return;
         }
+
+        self.admit_staged_headers();
 
         let now = Instant::now();
         let dropped = self.scheduler.lock().stager.prune_expired(now);
@@ -142,24 +141,128 @@ impl BlockSync {
         .then_some(active_tip.tip_id)
     }
 
+    /// Retries header admission for staged bodies whose headers are still
+    /// absent from the tree.
+    ///
+    /// The listener forwards every inbound body's embedded header through
+    /// the headers drain, but a refused batch or a source-less delivery
+    /// leaves the body staged without a tree node — and
+    /// `apply_buffered_blocks` only drains hashes the tree knows, so the
+    /// body would otherwise sit until its staged timeout despite being
+    /// complete. `MissingParent` keeps the body staged and asks an eligible
+    /// peer for the missing ancestry; `TimestampTooFarAhead` retries
+    /// naturally each drain and admits once the header enters the allowed
+    /// window; a permanently inadmissible header (a peer-fault rejection)
+    /// means the body can never apply, so it is discarded instead of paying
+    /// the same admission retry every drain — and its delivering peer
+    /// carries the fault, exactly as a rejected `headers` batch would.
+    fn admit_staged_headers(&self) {
+        let unadmitted: Vec<(Hash256, Header, Option<crate::PeerSource>)> = {
+            let tree = self.chain.block_tree().read();
+            let scheduler = self.scheduler.lock();
+            scheduler
+                .stager
+                .staged_headers()
+                .filter(|(hash, _, _)| tree.lookup(*hash).is_none())
+                .collect()
+        };
+        let mut missing_parent = false;
+        let mut credit_refresh_needed = false;
+        let mut admitted_any = false;
+        let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
+        for (hash, header, source) in unadmitted {
+            match self.chain.admit_headers(&[header]) {
+                HeaderAdmission::Accepted {
+                    announced_tip: Some(tip_hash),
+                    active_height,
+                    ..
+                } => {
+                    admitted_any = true;
+                    // A staged retry that now admits is the same
+                    // announcement the headers drain credits — the
+                    // delivering connection demonstrated the tip even if
+                    // its forwarded batch raced or was refused.
+                    if let Some(source) =
+                        source.filter(|source| self.peer_table.is_current(*source))
+                    {
+                        self.peer_table
+                            .note_announced_tip(source, tip_hash, active_height);
+                        credit_refresh_needed = true;
+                    }
+                }
+                HeaderAdmission::Rejected(
+                    ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. },
+                ) => {
+                    missing_parent = true;
+                }
+                HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
+                    invalid.push((hash, source));
+                }
+                _ => {}
+            }
+        }
+        if !invalid.is_empty() {
+            // The body's header can never admit: drop the staged entry AND
+            // the window's delivery record outright — re-queuing would just
+            // re-download a body that cannot apply. Then blame the
+            // delivering peer: a body whose embedded header fails consensus
+            // is the peer's fault, same as a rejected `headers` batch.
+            // PeerTable operations precede the scheduler lock to preserve
+            // the PeerTable → scheduler ordering used elsewhere.
+            let blamed: Vec<std::net::SocketAddr> = invalid
+                .iter()
+                .filter_map(|(_, source)| *source)
+                .filter(|source| {
+                    if self.peer_table.disconnect_source(*source) {
+                        // Every removal path releases a `getheaders` gate
+                        // the peer owned, or a same-address reconnect
+                        // inherits a dead deadline.
+                        self.clear_header_request_for(*source);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .map(|source| source.addr)
+                .collect();
+            let mut scheduler = self.scheduler.lock();
+            for (hash, _) in &invalid {
+                scheduler.stager.discard(hash);
+                scheduler.window.discard_received(hash);
+            }
+            for peer_addr in &blamed {
+                scheduler
+                    .window
+                    .mark_peer_unresponsive(*peer_addr, Instant::now());
+            }
+            tracing::debug!(
+                discarded = invalid.len(),
+                "block sync: discarded bodies with inadmissible headers"
+            );
+        }
+        if credit_refresh_needed {
+            self.refresh_active_peer_credit();
+        }
+        if admitted_any {
+            // A body staged before its header landed kept the 0-height
+            // sentinel; now that the tree resolves the hash, pin the real
+            // height rather than waiting for a `headers` batch to repair it.
+            self.reconcile_staged_received_heights();
+        }
+        // A staged retry that just admitted may have attached the ancestry
+        // a deferred owned fetch was waiting on — resolve it now.
+        self.resolve_owned_body_fetches();
+        if missing_parent {
+            self.request_headers_from_eligible();
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn buffer_received_block_chunk(
         &self,
         blocks: &mut Vec<InboundBlock>,
         next_expected_hash: Option<Hash256>,
     ) -> usize {
-        // A live-head `inv` or compact announcement fetches the body
-        // directly — no `headers` batch travels — so a body whose hash the
-        // tree does not know carries the only copy of its header. Admitting
-        // it here lets the block schedule and apply; skipped, the staged
-        // copy silently expires with the announced tip never learned.
-        self.admit_delivered_block_headers(blocks);
-
-        // Admission may have advanced the header tip past the frontier
-        // captured in `fill_inbound_block_chunk`; the stager protects the
-        // apply-frontier body from budget eviction only under the fresh one.
-        let next_expected_hash = self.next_expected_block_hash().or(next_expected_hash);
-
         // A cold-start hedge can arrive after its original copy was applied.
         // Drop only blocks proven to lie on the applied ancestry; a known
         // side-chain block at the same or lower height must remain eligible.
@@ -261,6 +364,7 @@ impl BlockSync {
                     next_expected_hash,
                     inbound.block,
                     inbound.serialized,
+                    source,
                     now,
                 );
                 staged_blocks.push((hash, source, staged));
@@ -416,249 +520,4 @@ impl BlockSync {
         }
         staged_count
     }
-
-    /// Admits headers carried by delivered bodies whose hashes are not yet
-    /// in the tree, so the staging pass below resolves their heights from
-    /// the tree like any other known hash.
-    ///
-    /// Live-head announcements can reach the body stage without a `headers`
-    /// batch: an `inv` block item or a compact-block fallback fetches the
-    /// body directly, so the delivered block carries the only copy of its
-    /// header. Admission reuses the `headers`-batch seam, but one chunk can
-    /// mix deliverers, so unknown headers are grouped by source and admitted
-    /// to a fixed point: a validation fault then blames only its deliverer,
-    /// and a group whose parents arrive through a sibling's admission
-    /// attaches on a later round. Within a group, `header_components`
-    /// admits each connected chain separately — `admit_headers` stops at
-    /// its first failure, so a gap component ordered early would otherwise
-    /// strand attachable components behind it. A missing ancestor is not a
-    /// peer fault — the delivering peer necessarily holds the chain it
-    /// announced — so one gap per pass is parked in `deferred_gap_recovery`
-    /// and healed with `getheaders` requests back to its deliverer: sibling
-    /// gaps on the same chain heal from those replies, and divergent gaps
-    /// stay bounded by staged expiry rather than racing the single tracked
-    /// header request. The deferred slot owns the retry until the missing
-    /// ancestor resolves — a `headers` page may not reach it in one round —
-    /// and never displaces an unrelated live request: a send waits for the
-    /// tracked slot to free, and a healed gap or departed deliverer clears
-    /// it without sending.
-    ///
-    /// Runs outside `scheduler`: `admit_headers` takes the chain transition
-    /// lock and the tree write, both of which rank above the window lock.
-    fn admit_delivered_block_headers(&self, blocks: &[InboundBlock]) {
-        self.drain_deferred_gap_recovery();
-        let mut heights = HashMap::with_capacity(blocks.len());
-        let mut groups: HashMap<Option<PeerSource>, HashMap<Hash256, Header>> = HashMap::new();
-        let mut deliverers: HashMap<Hash256, Vec<PeerSource>> = HashMap::new();
-        {
-            let tree = self.chain.block_tree().read();
-            for inbound in blocks {
-                let hash = Hash256::from(inbound.block.block_hash());
-                if let Some(node) = tree
-                    .lookup(hash)
-                    .and_then(|node_id| tree.node(node_id).ok())
-                {
-                    heights.insert(hash, node.height);
-                } else {
-                    groups
-                        .entry(inbound.source)
-                        .or_default()
-                        .entry(hash)
-                        .or_insert(inbound.block.header);
-                    if let Some(source) = inbound.source {
-                        let delivered = deliverers.entry(hash).or_default();
-                        if !delivered.contains(&source) {
-                            delivered.push(source);
-                        }
-                    }
-                }
-            }
-        }
-        if groups.is_empty() {
-            return;
-        }
-        let mut gap_source: Option<(PeerSource, Hash256)> = None;
-        loop {
-            let mut progressed = false;
-            for (&source, group) in &mut groups {
-                group.retain(|hash, _| !heights.contains_key(hash));
-                if group.is_empty() {
-                    continue;
-                }
-                let admissions: Vec<HeaderAdmission> = header_components(group)
-                    .into_iter()
-                    .map(|component| self.chain.admit_headers(&component))
-                    .collect();
-                {
-                    // Re-resolve under one read: every hash the tree now knows
-                    // was admitted, so delivering it demonstrates possession
-                    // of the block — and EVERY deliverer of that hash earns
-                    // the same demonstrated-tip credit a `headers`
-                    // announcement earns, not just the first-iterating one.
-                    let tree = self.chain.block_tree().read();
-                    for hash in group.keys() {
-                        let Some(node) = tree.lookup(*hash).and_then(|id| tree.node(id).ok())
-                        else {
-                            continue;
-                        };
-                        if heights.insert(*hash, node.height).is_none() {
-                            progressed = true;
-                            if let Some(sources) = deliverers.get(hash) {
-                                for &deliverer in sources {
-                                    self.peer_table.note_announced_tip(deliverer, *hash, None);
-                                }
-                            }
-                        }
-                    }
-                }
-                for admission in admissions {
-                    self.handle_carried_header_admission(admission, source, &mut gap_source);
-                }
-            }
-            if !progressed {
-                break;
-            }
-        }
-        if let Some((source, prev_hash)) = gap_source {
-            // Keep the earliest outstanding gap: its staged body expires
-            // soonest, so a same-tick sibling gap queues behind it rather
-            // than displacing it and silently losing its retry.
-            let mut scheduler = self.scheduler.lock();
-            if scheduler.deferred_gap_recovery.is_none() {
-                scheduler.deferred_gap_recovery = Some((source, prev_hash));
-            }
-        }
-        self.drain_deferred_gap_recovery();
-        // Bodies staged before their headers landed (an earlier chunk's
-        // refused or re-delivered admission) would otherwise keep the
-        // 0-height sentinel forever.
-        {
-            let tree = self.chain.block_tree().read();
-            self.scheduler
-                .lock()
-                .window
-                .reconcile_received_heights(&tree);
-        }
-        self.refresh_active_peer_credit();
-    }
-
-    /// Retries a deferred missing-parent recovery: heals the slot when
-    /// the missing ancestor landed or the deliverer left, waits while an
-    /// unrelated request occupies the tracked slot, and sends one
-    /// `getheaders` to the deliverer when it is free. The gap STAYS
-    /// deferred after a send — a `headers` response is capped at
-    /// `MAX_HEADERS_MESSAGE_COUNT`, so one page may not reach the
-    /// ancestor; each consumed response re-evaluates and re-sends until
-    /// the tree resolves it. Called wherever header progress can free or
-    /// heal the slot — the body-admission pass and `headers` batches.
-    pub(super) fn drain_deferred_gap_recovery(&self) {
-        let Some((source, prev_hash)) = self.scheduler.lock().deferred_gap_recovery else {
-            return;
-        };
-        // A sibling admission may have supplied the ancestor since the
-        // gap was recorded; a healed gap makes the request void. Sending
-        // to a deliverer already disconnected for a peer fault is equally
-        // void.
-        if self.chain.block_tree().read().lookup(prev_hash).is_some()
-            || !self.peer_table.is_current(source)
-        {
-            self.scheduler.lock().deferred_gap_recovery = None;
-            return;
-        }
-        // The single tracked slot must never displace an unrelated
-        // in-flight request — that response could not clear the tracker
-        // and later ticks would issue competing sends. Snapshot the slot,
-        // then drop the guard before touching the table: peer-table reads
-        // under the scheduler lock invert the table→scheduler order
-        // `with_current` callers rely on.
-        let pending_request = self.scheduler.lock().header_request;
-        let live_pending = pending_request.is_some_and(|request| {
-            Instant::now().duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT
-                && self.peer_table.is_current(request.source)
-        });
-        if live_pending {
-            return;
-        }
-        let our_height = self
-            .chain
-            .chain_tip()
-            .load_full()
-            .map_or(0, |tip| tip.height);
-        self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
-    }
-
-    /// Reacts to one deliverer's component admission with the same
-    /// semantics a `headers` batch gets: a validation fault disconnects
-    /// that deliverer; a missing ancestor records the deliverer and the
-    /// missing hash for the pass's single recovery `getheaders`
-    /// (`i32::MAX`: unbounded).
-    fn handle_carried_header_admission(
-        &self,
-        admission: HeaderAdmission,
-        source: Option<PeerSource>,
-        gap_source: &mut Option<(PeerSource, Hash256)>,
-    ) {
-        match admission {
-            HeaderAdmission::Accepted { .. } => {}
-            HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
-                if let Some(source) = source
-                    && self.peer_table.disconnect_source(source)
-                {
-                    self.scheduler
-                        .lock()
-                        .window
-                        .mark_peer_unresponsive(source.addr, Instant::now());
-                    tracing::warn!(
-                        peer_addr = %source.addr,
-                        %error,
-                        "block sync: delivered block carried an invalid header; disconnecting",
-                    );
-                }
-            }
-            HeaderAdmission::Rejected(ChainError::MissingParent { prev_hash }) => {
-                if let Some(source) = source {
-                    gap_source.get_or_insert((source, prev_hash));
-                }
-            }
-            HeaderAdmission::Rejected(error) => {
-                tracing::warn!(
-                    %error,
-                    "block sync: rejected headers carried by delivered blocks",
-                );
-            }
-            HeaderAdmission::Refused(error) => {
-                tracing::debug!(
-                    %error,
-                    "block sync: delivered-header admission refused; dropping batch",
-                );
-            }
-        }
-    }
-}
-
-/// Splits `headers` into connected components, each ordered
-/// parent-before-child so a delivered chain admits in one `admit_headers`
-/// call per component: each emitted prefix walks back to its deepest batch
-/// ancestor. Components are independent — a gap component's `MissingParent`
-/// cannot strand the attachable components ordered behind it.
-fn header_components(headers: &HashMap<Hash256, Header>) -> Vec<Vec<Header>> {
-    let mut components = Vec::new();
-    let mut emitted = HashSet::with_capacity(headers.len());
-    for hash in headers.keys() {
-        let mut chain = Vec::new();
-        let mut cursor = *hash;
-        while !emitted.contains(&cursor) {
-            let Some(header) = headers.get(&cursor) else {
-                break;
-            };
-            chain.push(cursor);
-            emitted.insert(cursor);
-            cursor = Hash256::from(header.prev_blockhash);
-        }
-        if chain.is_empty() {
-            continue;
-        }
-        components.push(chain.into_iter().rev().map(|hash| headers[&hash]).collect());
-    }
-    components
 }

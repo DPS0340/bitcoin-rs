@@ -22,7 +22,7 @@ This document owns the on-disk format of the generic index in the target node (T
 | `index.format.bytes_per_row` per family | logical bytes per row and physical fjall bytes per row on a real pinned corpus | `planned_not_executed` |
 | `index.format.amplification` | physical over logical per family, default fjall, after compaction | `planned_not_executed` |
 | `index.backfill.throughput` | blocks/s and bytes/s per aligned capability set under `PreparedBatchLimits` | `planned_not_executed` |
-| Byte-order and encoding contract | ordering-preserving keys proven by `le_order.rs`-class tests on persisted bytes | `planned_not_executed` |
+| Byte-order and encoding contract | ordering-preserving keys proven by `be_order.rs`-class tests on persisted bytes | `planned_not_executed` |
 
 Rows plus watermarks commit atomically per bounded batch after verifying parent, target identity and runtime revision; stale prepared work is discarded. Full history backfill requires retained bodies or an explicit archive or reindex input.
 
@@ -149,7 +149,7 @@ contract. A finding is **informational** if it confirms an existing decision.
 **No multi-GB corpus build was started.** The audit uses only:
 
 1. **In-repo fixtures** — the `MemoryStore` backend (`crates/index/tests/common/mod.rs`)
-   and the test blocks constructed in `crates/index/tests/le_order.rs`.
+   and the test blocks constructed in `crates/index/tests/be_order.rs`.
 2. **Cited fjall figures** — from the existing
   `docs/benchmarks/storage-footprint.md` 200k-row synthetic corpus, not
   re-run.

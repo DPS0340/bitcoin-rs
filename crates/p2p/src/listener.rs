@@ -202,10 +202,18 @@ impl InboundSyncSinks {
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
-    fn send_headers(&self, source: crate::PeerSource, headers: Vec<bitcoin_rs_primitives::Header>) {
+    fn send_headers(
+        &self,
+        source: crate::PeerSource,
+        headers: Vec<bitcoin_rs_primitives::Header>,
+        wire_response: bool,
+        body_fetch_owned: bool,
+    ) {
         if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
             headers,
             source: Some(source),
+            wire_response,
+            body_fetch_owned,
         }) {
             tracing::warn!(peer_addr = %source.addr, %error, "p2p inbound headers channel disconnected");
         } else {
@@ -219,6 +227,16 @@ impl InboundSyncSinks {
         block: bitcoin_rs_primitives::Block,
         serialized: bytes::Bytes,
     ) {
+        // Every body carries its own header; route it through the headers
+        // sink too so tips learned only by body delivery (`inv` getdata,
+        // compact reconstruction, or an unsolicited push) reach header
+        // admission. Without a tree node the body can never become the
+        // apply frontier's expected block, and no announced-tip credit
+        // reaches the delivering peer. The headers drain runs before the
+        // blocks drain each tick, so the body lands already expected. The
+        // forward is not a `headers` response: it must not consume an
+        // outstanding `getheaders` request's pending state.
+        self.send_headers(source, vec![block.header], false, false);
         let mut inbound = crate::InboundBlock {
             block,
             serialized,
@@ -1099,7 +1117,12 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 )?;
                 match message {
                     crate::Message::Headers(headers) => {
-                        inbound_sync_sinks.send_headers(lease.source(peer_addr), headers);
+                        inbound_sync_sinks.send_headers(
+                            lease.source(peer_addr),
+                            headers,
+                            true,
+                            false,
+                        );
                     }
                     crate::Message::Block(block) => {
                         inbound_sync_sinks.send_block(lease.source(peer_addr), block, raw);
@@ -1123,19 +1146,14 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                         }
                     }
                     crate::Message::CmpctBlock(_) | crate::Message::BlockTxn(_) => {
-                        let identity_version = peer
-                            .compact_blocks
-                            .local_version
-                            .unwrap_or(crate::compact_blocks::COMPACT_BLOCK_VERSION);
-                        process_compact_message(
-                            &mut compact_reconstruction,
+                        process_compact_wire_message(
                             &message,
-                            identity_version,
+                            &mut compact_reconstruction,
+                            peer.compact_blocks.local_version,
                             compact_hints,
                             lease,
                             peer_addr,
                             inbound_sync_sinks,
-                            Instant::now(),
                         );
                     }
                     _ => {}
@@ -1152,6 +1170,55 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Handles one `cmpctblock`/`blocktxn` wire message for a connection. A
+/// compact announcement is itself a tip announcement: its embedded header
+/// is offered to admission even when reconstruction pends or falls back,
+/// so the announced tip reaches the tree and the ordinary window
+/// machinery can fetch the body.
+fn process_compact_wire_message(
+    message: &crate::Message,
+    compact_reconstruction: &mut crate::compact_blocks::Reconstruction,
+    local_compact_version: Option<u64>,
+    compact_hints: Option<&dyn crate::compact_blocks::CompactBlockHints>,
+    lease: &crate::PeerLease,
+    peer_addr: SocketAddr,
+    inbound_sync_sinks: &InboundSyncSinks,
+) {
+    let identity_version =
+        local_compact_version.unwrap_or(crate::compact_blocks::COMPACT_BLOCK_VERSION);
+    let outcome = process_compact_message(
+        compact_reconstruction,
+        message,
+        identity_version,
+        compact_hints,
+        Instant::now(),
+    );
+    // A compact announcement is itself a tip announcement: when the outcome
+    // emits no body (`Complete` already forwards its header via `send_block`),
+    // this forward is the only path the embedded header takes to admission.
+    if let crate::Message::CmpctBlock(cmpct) = message
+        && !matches!(outcome, crate::compact_blocks::Outcome::Complete(_))
+        && let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
+    {
+        // When the outcome itself fetches the body (`RequestMissing` issues
+        // a `getblocktxn`, `Fallback` a full-block `getdata`), the window
+        // must record that in-flight fetch instead of scheduling a
+        // duplicate request for the freshly admitted tip.
+        let body_fetch_owned = matches!(
+            outcome,
+            crate::compact_blocks::Outcome::RequestMissing(_)
+                | crate::compact_blocks::Outcome::Fallback(_)
+        );
+        inbound_sync_sinks.send_headers(
+            lease.source(peer_addr),
+            vec![header],
+            false,
+            body_fetch_owned,
+        );
+    }
+    handle_compact_outcome(outcome, lease, peer_addr, inbound_sync_sinks);
 }
 
 /// Applies one BIP152 receive-side outcome: a finished block enters the
@@ -1194,18 +1261,15 @@ fn handle_compact_outcome(
 }
 
 /// Feeds one receive-side BIP152 message into the loop's reconstruction
-/// state and applies the outcome.
+/// state and returns the outcome.
 fn process_compact_message(
     reconstruction: &mut crate::compact_blocks::Reconstruction,
     message: &crate::Message,
     identity_version: u64,
     compact_hints: Option<&dyn crate::compact_blocks::CompactBlockHints>,
-    lease: &crate::PeerLease,
-    peer_addr: SocketAddr,
-    inbound_sync_sinks: &InboundSyncSinks,
     now: std::time::Instant,
-) {
-    let outcome = match message {
+) -> crate::compact_blocks::Outcome {
+    match message {
         crate::Message::CmpctBlock(cmpct) => match compact_hints {
             Some(hints) => reconstruction.receive_cmpctblock(cmpct, identity_version, hints, now),
             None => crate::compact_blocks::Outcome::Fallback(
@@ -1213,9 +1277,8 @@ fn process_compact_message(
             ),
         },
         crate::Message::BlockTxn(txns) => reconstruction.receive_blocktxn(txns, now),
-        _ => return,
-    };
-    handle_compact_outcome(outcome, lease, peer_addr, inbound_sync_sinks);
+        _ => crate::compact_blocks::Outcome::Idle,
+    }
 }
 
 /// Spawns a per-connection writer thread that drains queued outbound messages
@@ -1766,13 +1829,43 @@ mod writer_shutdown_tests {
         let serialized = bytes::Bytes::from(block_bytes);
         let source = lease.source(addr);
 
-        sinks.send_headers(source, Vec::new());
+        sinks.send_headers(source, Vec::new(), true, false);
         sinks.send_block(source, block, serialized.clone());
 
         assert_eq!(headers_rx.try_recv()?.source, Some(source));
         let received = blocks_rx.try_recv()?;
         assert_eq!(received.source, Some(source));
         assert_eq!(received.serialized, serialized);
+        Ok(())
+    }
+
+    #[test]
+    fn send_block_forwards_the_blocks_header() -> Result<(), Box<dyn std::error::Error>> {
+        // Every inbound body carries its own header; `send_block` must also
+        // emit it through the headers sink so body-only announcements
+        // (`inv` getdata, compact reconstruction, pushes) reach admission.
+        let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+        let sinks = InboundSyncSinks::new(headers_tx, blocks_tx, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_449));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block_bytes = bitcoin::consensus::encode::serialize(&genesis);
+        let block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
+            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
+        let header = block.header;
+        let source = lease.source(addr);
+
+        sinks.send_block(source, block, bytes::Bytes::from(block_bytes));
+
+        let forwarded = headers_rx.try_recv()?;
+        assert_eq!(forwarded.source, Some(source));
+        assert_eq!(forwarded.headers, vec![header]);
+        assert!(
+            !forwarded.wire_response,
+            "a body-carried header is not a getheaders response"
+        );
         Ok(())
     }
 

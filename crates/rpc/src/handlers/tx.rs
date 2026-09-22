@@ -479,7 +479,10 @@ use crate::context::DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB;
 pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let raw = required_str(params, 0, "raw transaction is required")?;
     let max_feerate = optional_max_feerate(params, 1)?;
-    let tx = decode_tx(raw)?;
+    let tx = decode_tx(
+        raw,
+        "TX decode failed. Make sure the tx has at least one input.".to_owned(),
+    )?;
     let txid = tx.txid();
 
     match admit_transaction(ctx, &tx, max_feerate) {
@@ -526,7 +529,10 @@ pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Va
         let Some(raw) = raw.as_str() else {
             return Err(RpcError::InvalidType("raw transaction must be a string"));
         };
-        txs.push(decode_tx(raw)?);
+        txs.push(decode_tx(
+            raw,
+            format!("TX decode failed: {raw} Make sure the tx has at least one input."),
+        )?);
     }
 
     let facts = ctx
@@ -576,7 +582,7 @@ pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Va
 
 pub(crate) fn decoderawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let raw = required_str(params, 0, "raw transaction is required")?;
-    let tx = decode_tx(raw)?;
+    let tx = decode_tx(raw, "TX decode failed".to_owned())?;
     typed_to_sonic(&v31::DecodeRawTransaction(convert::raw_transaction(
         &tx,
         ctx.chain_network,
@@ -689,9 +695,11 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
     ))))
 }
 
-fn decode_tx(raw: &str) -> Result<Tx, RpcError> {
-    let bytes = hex_decode(raw)?;
-    native_deserialize(&bytes).map_err(|_| RpcError::InvalidParams("transaction decode failed"))
+/// Deserialize a raw transaction hex string, reporting failures as Core's
+/// `RPC_DESERIALIZATION_ERROR` (-22) with the method-specific message.
+fn decode_tx(raw: &str, message: String) -> Result<Tx, RpcError> {
+    let bytes = hex_decode(raw).map_err(|_| RpcError::Deserialization(message.clone()))?;
+    native_deserialize(&bytes).map_err(|_| RpcError::Deserialization(message))
 }
 
 fn unix_time_secs() -> u64 {
@@ -781,6 +789,11 @@ fn parse_btc_amount(value: &Value) -> Result<u64, RpcError> {
 fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
     match reason {
         AcceptanceRejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
+        // Core reports spent/unknown inputs as RPC_VERIFY_ERROR (-25), not
+        // the policy-rejection -26 used for rule violations.
+        AcceptanceRejectReason::MissingInputs => {
+            RpcError::TxVerifyError("bad-txns-inputs-missingorspent".to_owned())
+        }
         other => RpcError::TxRejected(reject_reason_to_frozen_string(other)),
     }
 }
@@ -2316,7 +2329,8 @@ mod acceptance_tests {
         assert_eq!(ctx.mempool.read().len(), 0, "nothing admitted: {error:?}");
     }
 
-    /// A rejection must say why, under Core's `RPC_VERIFY_REJECTED` code.
+    /// Missing inputs are Core's `RPC_VERIFY_ERROR` (-25), not the policy
+    /// rejection code reserved for rule violations.
     #[test]
     fn sendrawtransaction_rejects_a_transaction_whose_inputs_do_not_exist() {
         let ctx = Arc::new(Context::new());
@@ -2328,10 +2342,10 @@ mod acceptance_tests {
             panic!("a transaction with no resolvable inputs must not be accepted");
         };
         assert!(
-            matches!(error, RpcError::TxRejected(_)),
-            "expected a rejection, got {error:?}"
+            matches!(error, RpcError::TxVerifyError(_)),
+            "expected a verify error, got {error:?}"
         );
-        assert_eq!(error.code(), RpcError::CORE_VERIFY_REJECTED);
+        assert_eq!(error.code(), RpcError::CORE_VERIFY_ERROR);
         assert!(ctx.mempool.read().is_empty());
     }
 

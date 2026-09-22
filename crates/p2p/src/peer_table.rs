@@ -9,12 +9,14 @@
 //! replacement, and cancellation rules have exactly one implementation.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bitcoin_rs_primitives::Hash256;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 
 use crate::connection::{ConnectionId, PeerLease, PeerSource};
+use crate::counters::PeerCounters;
 use crate::peer_info::PeerInfo;
 
 /// One live connection joined with its handshake metadata.
@@ -37,10 +39,42 @@ struct Entry {
     demonstrated_tips: Vec<Hash256>,
 }
 
+/// The table's live entries plus the traffic accounting it retains of
+/// dropped ones. Keeping both under the same lock makes removal linearizable
+/// for `traffic_totals` readers: a connection's counter set is counted
+/// exactly once, either in `map` or in `retired`/`settled_*`.
+#[derive(Debug, Default)]
+struct TableView {
+    map: HashMap<SocketAddr, Entry>,
+    /// Counter sets of dropped connections whose teardown may still be in
+    /// flight. Shared (`Arc`), so bytes a dying connection records after its
+    /// entry left land in `traffic_totals` whenever they settle — a
+    /// removal-time snapshot of the count would lose them. Each entry folds
+    /// into `settled_*` once the table holds the last `Arc`.
+    retired: Vec<Arc<PeerCounters>>,
+    /// Final byte counts of fully torn-down retired connections.
+    settled_recv: u64,
+    settled_sent: u64,
+}
+
+impl std::ops::Deref for TableView {
+    type Target = HashMap<SocketAddr, Entry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for TableView {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
 /// Authoritative table of live peer connections keyed by remote address.
 #[derive(Debug, Default)]
 pub struct PeerTable {
-    entries: RwLock<HashMap<SocketAddr, Entry>>,
+    entries: RwLock<TableView>,
 }
 
 impl PeerTable {
@@ -69,6 +103,7 @@ impl PeerTable {
                 );
                 if let Some(prior) = prior {
                     prior.lease.cancel();
+                    Self::retain_traffic(&mut entries, &prior);
                 }
                 true
             }
@@ -130,6 +165,20 @@ impl PeerTable {
             return true;
         }
         true
+    }
+
+    /// Replaces the live connection's retained-tip evidence under the same
+    /// identity check as `note_announced_tip`. Used by the credit refresh to
+    /// drop resolved tips that can no longer raise the active-chain maximum —
+    /// see P2P-03 in `docs/contracts/p2p-wire.md`.
+    pub fn set_demonstrated_tips(&self, source: PeerSource, tips: Vec<Hash256>) {
+        let mut entries = self.entries.write();
+        if let Some(entry) = entries
+            .get_mut(&source.addr)
+            .filter(|entry| entry.lease.is_current(source))
+        {
+            entry.demonstrated_tips = tips;
+        }
     }
 
     /// Raises the active-chain credit for `source`. See P2P-03 in
@@ -214,6 +263,7 @@ impl PeerTable {
         }
         if let Some(removed) = entries.remove(&addr) {
             removed.lease.cancel();
+            Self::retain_traffic(&mut entries, &removed);
         }
         true
     }
@@ -233,9 +283,72 @@ impl PeerTable {
         for addr in &targets {
             if let Some(removed) = entries.remove(addr) {
                 removed.lease.cancel();
+                Self::retire(&mut entries, &removed);
             }
         }
+        Self::settle_retired(&mut entries);
         targets
+    }
+
+    /// Retains a dropped connection's counter set so `traffic_totals` keeps
+    /// counting it after the entry is gone; unpublished connections carry no
+    /// counters to retain. Shared (`Arc`), so bytes a dying connection records
+    /// after its entry left still land in `traffic_totals` whenever they
+    /// settle.
+    fn retire(entries: &mut TableView, removed: &Entry) {
+        if let Some(info) = removed.info.as_ref() {
+            entries.retired.push(Arc::clone(&info.counters));
+        }
+    }
+
+    /// Folds in the final counts of retired connections whose teardown provably
+    /// finished — the table holding the last `Arc` means no writer remains, so
+    /// their count is final and the list stays bounded. Runs once per removal
+    /// batch so batched disconnects stay O(N + |retired|).
+    fn settle_retired(entries: &mut TableView) {
+        let TableView {
+            retired,
+            settled_recv,
+            settled_sent,
+            ..
+        } = entries;
+        retired.retain(|counters| {
+            if Arc::strong_count(counters) == 1 {
+                *settled_recv = settled_recv.saturating_add(counters.bytes_recv());
+                *settled_sent = settled_sent.saturating_add(counters.bytes_sent());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Per-removal retention for single-entry removals: retain the dropped
+    /// connection's counter set, then settle retired connections whose
+    /// teardown finished.
+    fn retain_traffic(entries: &mut TableView, removed: &Entry) {
+        Self::retire(entries, removed);
+        Self::settle_retired(entries);
+    }
+
+    /// Traffic the node can account for — `(received, sent)` bytes: the live
+    /// connections' counters plus the retired counters of every connection
+    /// the table has dropped, so the total never decreases across disconnects.
+    pub fn traffic_totals(&self) -> (u64, u64) {
+        let entries = self.entries.read();
+        entries
+            .values()
+            .filter_map(|entry| entry.info.as_ref().map(|info| &info.counters))
+            .chain(entries.retired.iter())
+            .fold(
+                (entries.settled_recv, entries.settled_sent),
+                |(recv, sent), counters| {
+                    (
+                        recv.saturating_add(counters.bytes_recv()),
+                        sent.saturating_add(counters.bytes_sent()),
+                    )
+                },
+            )
     }
 
     /// Requests teardown of every live connection without removing its entry.
@@ -494,6 +607,18 @@ mod tests {
     }
 
     fn info(addr: SocketAddr, start_height: i32) -> PeerInfo {
+        info_with_counters(
+            addr,
+            start_height,
+            std::sync::Arc::new(crate::counters::PeerCounters::default()),
+        )
+    }
+
+    fn info_with_counters(
+        addr: SocketAddr,
+        start_height: i32,
+        counters: std::sync::Arc<crate::counters::PeerCounters>,
+    ) -> PeerInfo {
         PeerInfo {
             addr,
             version: 70016,
@@ -507,7 +632,7 @@ mod tests {
             inbound: false,
             addr_bind: addr,
             time_offset: 0,
-            counters: std::sync::Arc::new(crate::counters::PeerCounters::default()),
+            counters,
         }
     }
 
@@ -769,5 +894,78 @@ mod tests {
         assert!(!table.compact_relay_of(addr(2)));
         table.register(addr(3), lease());
         assert!(!table.compact_relay_of(addr(3)));
+    }
+
+    // `getnettotals` contract: totals persist across every removal path and
+    // keep counting bytes a dying connection records after its entry left.
+    #[test]
+    fn traffic_totals_stay_monotonic_across_removals() {
+        use std::io::{Cursor, Write as _};
+
+        fn counted(
+            counters: &Arc<crate::counters::PeerCounters>,
+        ) -> crate::counters::CountingStream<Cursor<Vec<u8>>> {
+            crate::counters::CountingStream::new(Cursor::new(Vec::new()), Arc::clone(counters))
+        }
+
+        let table = PeerTable::new();
+        assert_eq!(table.traffic_totals(), (0, 0));
+
+        // Same-address replacement retires the predecessor's counters.
+        let first = lease();
+        let counters_first = Arc::new(crate::counters::PeerCounters::default());
+        table.register(addr(1), first.clone());
+        table.publish_info(
+            addr(1),
+            &first,
+            info_with_counters(addr(1), 1, counters_first.clone()),
+        );
+        assert!(counted(&counters_first).write_all(&[0_u8; 10]).is_ok());
+        assert_eq!(table.traffic_totals(), (0, 10));
+
+        let second = lease();
+        assert!(table.register(addr(1), second.clone()));
+        assert_eq!(table.traffic_totals(), (0, 10));
+
+        // disconnect() retires counters; bytes the dying connection records
+        // after its entry left still land in the totals.
+        let counters_second = Arc::new(crate::counters::PeerCounters::default());
+        table.publish_info(
+            addr(1),
+            &second,
+            info_with_counters(addr(1), 2, counters_second.clone()),
+        );
+        let mut stream_second = counted(&counters_second);
+        assert!(stream_second.write_all(&[0_u8; 20]).is_ok());
+        assert_eq!(table.traffic_totals(), (0, 30));
+        assert!(table.disconnect(addr(1)));
+        assert!(stream_second.write_all(&[0_u8; 5]).is_ok());
+        assert_eq!(table.traffic_totals(), (0, 35));
+
+        // disconnect_matching retires counters too.
+        let third = lease();
+        let counters_third = Arc::new(crate::counters::PeerCounters::default());
+        table.register(addr(2), third.clone());
+        table.publish_info(
+            addr(2),
+            &third,
+            info_with_counters(addr(2), 3, counters_third.clone()),
+        );
+        assert!(counted(&counters_third).write_all(&[0_u8; 7]).is_ok());
+        let removed = table.disconnect_matching(|addr, _| addr.port() == 2);
+        assert_eq!(removed, vec![addr(2)]);
+        assert_eq!(table.traffic_totals(), (0, 42));
+
+        // Fully torn-down counters fold into settled totals, bounding the
+        // retired list, and nothing already counted is lost.
+        drop(stream_second);
+        drop(counters_first);
+        drop(counters_second);
+        drop(counters_third);
+        let fourth = lease();
+        table.register(addr(3), fourth);
+        assert!(table.disconnect(addr(3)));
+        assert!(table.entries.read().retired.is_empty());
+        assert_eq!(table.traffic_totals(), (0, 42));
     }
 }

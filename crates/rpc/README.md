@@ -46,7 +46,7 @@ no backend cargo feature (`g17_dependency_direction` proves both from
 ### 4. Non-blocking event notifications
 - **ZMQ Framing**: ZeroMQ notifications (`ZmqPublisher` in `crates/rpc/src/zmq.rs`) emit 3-part multipart frames `[topic, body, 4-byte LE sequence]`.
 - **Non-Blocking Delivery**: Socket writes must use non-blocking sends (`zmq::DONTWAIT`). Notification buffer saturation must drop messages at the high-water mark rather than stalling block validation or consensus execution.
-- **Reorg Sequencing & Notification Order**: Chain-transition rollback and admission orchestration in `crates/node/src/apply.rs` guarantees block disconnect events (`D`, published during rollback) are emitted before block connect events (`C`, published in `apply_block_admitted`).
+- **Reorg Sequencing & Notification Order**: Chain-transition rollback and admission orchestration in `crates/node/src/chain_effects.rs` guarantees block disconnect events (`D`, published during rollback) are emitted before block connect events (`C`, published by `after_connect`).
 
 ### 5. Architectural guardrails
 - **No Generic Middleware**: Do not introduce heavy async web framework stacks (Axum, Actix, Tower) into `RpcServer`.
