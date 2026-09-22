@@ -4857,4 +4857,34 @@ mod tests {
     fn hash(byte: u8) -> Hash256 {
         Hash256::from_le_bytes(&[byte; 32])
     }
+
+    #[test]
+    fn owned_fetch_preserves_prefix_probe_attempted_owner() {
+        let mut window = DownloadWindow::new(test_budget());
+        let now = Instant::now();
+        let stall_owner = staller_addr();
+        let compact_peer = healthy_addr();
+        window.prefix_probe_attempted_owner = Some(stall_owner);
+
+        // An externally owned fetch on an empty window is not a post-drain
+        // request: the marker must survive so the proven-stall owner stays
+        // ineligible for the next prefix probe.
+        window.mark_owned_fetch(compact_peer, hash(0xf1), 7, now);
+        assert_eq!(window.prefix_probe_attempted_owner, Some(stall_owner));
+        assert!(window.contains_pending(&hash(0xf1)));
+
+        // A real post-drain request still re-arms probe eligibility.
+        window.remove_pending(&hash(0xf1));
+        let request = super::non_empty_request(
+            compact_peer,
+            vec![super::PeerRequestEntry {
+                hash: hash(0xf2),
+                height: 8,
+            }],
+            9,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        window.mark_requested(&request, now);
+        assert!(window.prefix_probe_attempted_owner.is_none());
+    }
 }
