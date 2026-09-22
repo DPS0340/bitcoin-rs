@@ -62,14 +62,14 @@ fn peer_info_and_connection_count() -> Result<()> {
             "peer lacks int {field}: {peer}"
         );
     }
-    let _ = core;
-    node.stop()
+    node.stop()?;
+    core.stop()
 }
 
 /// `getnetworkinfo`/`getnettotals` describe the connected transport.
 #[test]
 fn network_info_and_totals() -> Result<()> {
-    let (_core, mut node) = spawn_synced_pair(3)?;
+    let (core, mut node) = spawn_synced_pair(3)?;
 
     let info = node.rpc("getnetworkinfo", &json!([]))?;
     assert!(info.u64_field("connections")? >= 1, "connections: {info}");
@@ -85,7 +85,8 @@ fn network_info_and_totals() -> Result<()> {
     let totals = node.rpc("getnettotals", &json!([]))?;
     assert!(totals.u64_field("totalbytesrecv")? > 0);
     assert!(totals.u64_field("totalbytessent")? > 0);
-    node.stop()
+    node.stop()?;
+    core.stop()
 }
 
 /// `ping` answers immediately (documented deviation from Core's
@@ -129,7 +130,8 @@ fn addnode_disconnect_flow() -> Result<()> {
             .as_u64()
             .map(|c| c >= 1))
     })?;
-    node.stop()
+    node.stop()?;
+    core.stop()
 }
 
 /// `setban`/`listbanned`/`clearbanned` maintain the ban list.
@@ -185,7 +187,8 @@ fn setnetworkactive_toggles_peers() -> Result<()> {
             .as_u64()
             .map(|c| c >= 1))
     })?;
-    node.stop()
+    node.stop()?;
+    core.stop()
 }
 
 /// `getnodeaddresses` reports the empty address manager on a fresh node.
@@ -210,5 +213,6 @@ fn node_follows_extended_core_chain() -> Result<()> {
         node.rpc("getbestblockhash", &json!([]))?,
         core.rpc("getbestblockhash", &json!([]))?
     );
-    node.stop()
+    node.stop()?;
+    core.stop()
 }

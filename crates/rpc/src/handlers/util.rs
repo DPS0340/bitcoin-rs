@@ -1,8 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::str::FromStr as _;
-use std::sync::OnceLock;
-use std::time::Instant;
 
 use miniscript::DefiniteDescriptorKey;
 use miniscript::Descriptor as MiniscriptDescriptor;
@@ -20,10 +18,6 @@ use crate::error::RpcError;
 use crate::handlers::{
     ensure_at_most_params, params_array, required_i64, required_str, required_u64,
 };
-
-/// The instant the RPC server bound its listener; falls back to the first
-/// `uptime` call for contexts that never bind a server (unit tests).
-pub(crate) static SERVER_START: OnceLock<Instant> = OnceLock::new();
 
 /// Core `MAX_CONFIRM_TARGET` in `policy/fees.h`.
 const ESTIMATE_SMART_FEE_MAX_TARGET_I64: i64 = 1008;
@@ -46,17 +40,13 @@ fn btc_amount_json(satoshis: u64) -> Value {
     }
 }
 
-pub(crate) fn uptime(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+/// `uptime` measures from the instant this context's RPC listener bound
+/// (recorded by `RpcServer::bind`), or from its first call for contexts
+/// that never bind a server.
+pub(crate) fn uptime(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
-    let start = SERVER_START.get_or_init(Instant::now);
-    let secs = start.elapsed().as_secs();
+    let secs = ctx.server_start().elapsed().as_secs();
     Ok(json!(secs))
-}
-
-/// Anchors [`uptime`] at the instant the RPC listener binds, so the handler
-/// reports server uptime rather than time since its own first call.
-pub(crate) fn mark_server_start() {
-    let _ = SERVER_START.set(Instant::now());
 }
 
 pub(crate) fn getrpcinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {

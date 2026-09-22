@@ -51,7 +51,7 @@ impl RpcServer {
         rest_enabled: bool,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(address)?;
-        crate::handlers::util::mark_server_start();
+        handler.context().mark_server_bound();
         Ok(Self {
             listener,
             auth,

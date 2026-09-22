@@ -5,8 +5,7 @@
 #![allow(clippy::expect_used)]
 
 use bitcoin_rs_e2e::helpers::{
-    COINBASE_MATURITY, coinbase_at, funding_output, genesis_block, mine_bare_blocks, spend_anyone,
-    submit_genesis, tx_hex,
+    genesis_block, mature_funding, mine_bare_blocks, spend_anyone, submit_genesis, tx_hex,
 };
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode, Result, SpawnOptions};
 use serde_json::json;
@@ -25,7 +24,11 @@ fn rpc_requires_auth() -> Result<()> {
     assert_eq!(unauth.status, 401, "missing auth must be 401");
 
     let body = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getblockcount\",\"params\":[]}";
-    // Wrong password is also a 401 — the harness only stores the good pair.
+    // A wrong password is likewise a 401; the server must not hand a
+    // 403/500 or accept it.
+    let bad = node.http_auth("POST", "/", body, Some(("parity", "wrong")))?;
+    assert_eq!(bad.status, 401, "wrong password must be 401");
+
     let resp = node.http("POST", "/", body, true)?;
     assert_eq!(resp.status, 200);
     let parsed = resp.json()?;
@@ -171,10 +174,7 @@ fn esplora_public_surface() -> Result<()> {
 #[test]
 fn esplora_post_tx_broadcasts() -> Result<()> {
     let mut node = ProcessNode::spawn(Kind::BitcoinRs)?;
-    submit_genesis(&mut node)?;
-    let _ = mine_bare_blocks(&mut node, COINBASE_MATURITY + 1)?;
-    let coinbase = coinbase_at(&mut node, 1)?;
-    let (outpoint, prevout) = funding_output(&mut node, &coinbase)?;
+    let (outpoint, prevout) = mature_funding(&mut node)?;
 
     let spend = spend_anyone(outpoint, &prevout, 1_000);
     let txid = spend.compute_txid().to_string();
@@ -207,10 +207,7 @@ fn esplora_tx_projection_with_txindex() -> Result<()> {
             ..SpawnOptions::default()
         },
     )?;
-    submit_genesis(&mut node)?;
-    let _ = mine_bare_blocks(&mut node, COINBASE_MATURITY + 1)?;
-    let coinbase = coinbase_at(&mut node, 1)?;
-    let (outpoint, prevout) = funding_output(&mut node, &coinbase)?;
+    let (outpoint, prevout) = mature_funding(&mut node)?;
 
     let spend = spend_anyone(outpoint, &prevout, 1_000);
     let txid = spend.compute_txid().to_string();

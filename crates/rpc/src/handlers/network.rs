@@ -470,22 +470,10 @@ pub(crate) fn getconnectioncount(ctx: &Arc<Context>, params: &Value) -> Result<V
 
 pub(crate) fn getnettotals(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    // The per-connection `PeerCounters` atomics are the only measured traffic
-    // counters the node keeps; `NetworkState` exists as the aggregate slot but
-    // nothing populates it. Summing the live peer table reports traffic the
-    // node can actually account for. Core's totals instead persist across
-    // disconnections, so the two diverge after churn: a departed peer's bytes
-    // disappear from this sum but stay in Core's lifetime total.
-    let (total_bytes_received, total_bytes_sent) =
-        ctx.peer_table
-            .infos()
-            .iter()
-            .fold((0_u64, 0_u64), |(recv, sent), peer| {
-                (
-                    recv.saturating_add(peer.counters.bytes_recv()),
-                    sent.saturating_add(peer.counters.bytes_sent()),
-                )
-            });
+    // `PeerTable` is the single owner of traffic accounting: it measures each
+    // live connection and folds in the counters of every connection it drops,
+    // so the totals — like Core's — never decrease across disconnects.
+    let (total_bytes_received, total_bytes_sent) = ctx.peer_table.traffic_totals();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));

@@ -9,6 +9,7 @@
 //! replacement, and cancellation rules have exactly one implementation.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin_rs_primitives::Hash256;
 use hashbrown::HashMap;
@@ -41,6 +42,11 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct PeerTable {
     entries: RwLock<HashMap<SocketAddr, Entry>>,
+    /// Byte counters folded in from every connection the table drops, so
+    /// `traffic_totals` stays monotonic across disconnects and replacements —
+    /// Core's getnettotals totals persist past a peer's lifetime too.
+    retired_recv: AtomicU64,
+    retired_sent: AtomicU64,
 }
 
 impl PeerTable {
@@ -69,6 +75,7 @@ impl PeerTable {
                 );
                 if let Some(prior) = prior {
                     prior.lease.cancel();
+                    self.retain_traffic(&prior);
                 }
                 true
             }
@@ -214,6 +221,7 @@ impl PeerTable {
         }
         if let Some(removed) = entries.remove(&addr) {
             removed.lease.cancel();
+            self.retain_traffic(&removed);
         }
         true
     }
@@ -233,9 +241,40 @@ impl PeerTable {
         for addr in &targets {
             if let Some(removed) = entries.remove(addr) {
                 removed.lease.cancel();
+                self.retain_traffic(&removed);
             }
         }
         targets
+    }
+
+    /// Folds a dropped connection's measured byte counters into the retired
+    /// totals; unpublished connections carry no counters to retain.
+    fn retain_traffic(&self, entry: &Entry) {
+        if let Some(info) = entry.info.as_ref() {
+            self.retired_recv
+                .fetch_add(info.counters.bytes_recv(), Ordering::Relaxed);
+            self.retired_sent
+                .fetch_add(info.counters.bytes_sent(), Ordering::Relaxed);
+        }
+    }
+
+    /// Traffic the node can account for — `(received, sent)` bytes: the live
+    /// connections' counters plus the retained counters of every connection
+    /// the table has dropped, so the total never decreases across disconnects.
+    pub fn traffic_totals(&self) -> (u64, u64) {
+        let (live_recv, live_sent) =
+            self.infos()
+                .iter()
+                .fold((0_u64, 0_u64), |(recv, sent), peer| {
+                    (
+                        recv.saturating_add(peer.counters.bytes_recv()),
+                        sent.saturating_add(peer.counters.bytes_sent()),
+                    )
+                });
+        (
+            live_recv.saturating_add(self.retired_recv.load(Ordering::Relaxed)),
+            live_sent.saturating_add(self.retired_sent.load(Ordering::Relaxed)),
+        )
     }
 
     /// Requests teardown of every live connection without removing its entry.

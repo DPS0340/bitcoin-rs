@@ -70,9 +70,18 @@ pub fn submit_genesis(node: &mut ProcessNode) -> Result<()> {
 /// Mine `count` blocks paying an `OP_TRUE` coinbase so outputs are spendable
 /// without signatures.
 pub fn mine_bare_blocks(node: &mut ProcessNode, count: u32) -> Result<Vec<String>> {
+    mine_blocks_to(node, count, "raw(51)")
+}
+
+/// Mine `count` blocks paying `descriptor`.
+///
+/// A distinct coinbase script produces a distinct block hash at each
+/// height, which lets reorg tests prove a regenerated branch diverged
+/// rather than reproduce the old one.
+pub fn mine_blocks_to(node: &mut ProcessNode, count: u32, descriptor: &str) -> Result<Vec<String>> {
     let mut hashes = Vec::new();
     for _ in 0..count {
-        let result = node.rpc("generateblock", &json!(["raw(51)", []]))?;
+        let result = node.rpc("generateblock", &json!([descriptor, []]))?;
         let hash = result
             .get("hash")
             .and_then(Value::as_str)
@@ -104,15 +113,24 @@ pub fn coinbase_at(node: &mut ProcessNode, height: u64) -> Result<Transaction> {
     deserialize_hex(hex).map_err(|e| Error::Assertion(format!("coinbase decode: {e}")))
 }
 
-/// Read the funding output (outpoint + full txout) created by `generator`.
-pub fn funding_output(node: &mut ProcessNode, coinbase: &Transaction) -> Result<(OutPoint, TxOut)> {
+/// Read the funding output (outpoint + full txout) of a coinbase paying
+/// `funding_address`: outpoint `(txid, 0)` and its `TxOut`.
+pub fn funding_output(coinbase: &Transaction) -> Result<(OutPoint, TxOut)> {
     let output = coinbase
         .output
         .first()
         .ok_or_else(|| Error::Assertion("coinbase has no outputs".into()))?
         .clone();
-    let _ = node;
     Ok((OutPoint::new(coinbase.compute_txid(), 0), output))
+}
+
+/// Mine `COINBASE_MATURITY + 1` blocks on a fresh genesis chain so the
+/// first coinbase is spendable, then return its funding outpoint.
+pub fn mature_funding(node: &mut ProcessNode) -> Result<(OutPoint, TxOut)> {
+    submit_genesis(node)?;
+    let _ = mine_bare_blocks(node, COINBASE_MATURITY + 1)?;
+    let coinbase = coinbase_at(node, 1)?;
+    funding_output(&coinbase)
 }
 
 /// An `OP_TRUE` script — spendable by anyone with an empty scriptSig.

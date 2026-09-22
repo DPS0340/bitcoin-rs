@@ -91,8 +91,6 @@ pub trait ValueExt {
     fn str_field(&self, key: &str) -> Result<&str>;
     /// Required unsigned integer field.
     fn u64_field(&self, key: &str) -> Result<u64>;
-    /// Required array field.
-    fn array_field(&self, key: &str) -> Result<&Vec<serde_json::Value>>;
 }
 
 impl ValueExt for serde_json::Value {
@@ -111,11 +109,5 @@ impl ValueExt for serde_json::Value {
         self.field(key)?.as_u64().ok_or_else(|| {
             Error::Assertion(format!("field {key} is not an unsigned integer in {self}"))
         })
-    }
-
-    fn array_field(&self, key: &str) -> Result<&Vec<serde_json::Value>> {
-        self.field(key)?
-            .as_array()
-            .ok_or_else(|| Error::Assertion(format!("field {key} is not an array in {self}")))
     }
 }

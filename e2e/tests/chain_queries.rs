@@ -34,10 +34,13 @@ fn height_and_hash_queries() -> Result<()> {
         "height 0 is genesis"
     );
 
-    let beyond = node.rpc_raw(&json!({
-        "jsonrpc": "2.0", "id": 1, "method": "getblockhash", "params": [99]
-    }))?;
-    assert_eq!(beyond["error"]["code"], json!(-5));
+    // Core answers out-of-range heights with -8 RPC_INVALID_PARAMETER.
+    for height in [99_i64, -1] {
+        let beyond = node.rpc_raw(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "getblockhash", "params": [height]
+        }))?;
+        assert_eq!(beyond["error"]["code"], json!(-8), "height {height}");
+    }
     node.stop()
 }
 
@@ -160,7 +163,7 @@ fn txout_lookup_and_proof() -> Result<()> {
     submit_genesis(&mut node)?;
     let _ = mine_bare_blocks(&mut node, 2)?;
     let coinbase = coinbase_at(&mut node, 1)?;
-    let (outpoint, _prevout) = funding_output(&mut node, &coinbase)?;
+    let (outpoint, _prevout) = funding_output(&coinbase)?;
     let block_hash = node
         .rpc("getblockhash", &json!([1]))?
         .as_str()
@@ -277,7 +280,7 @@ fn immature_coinbase_spend_rejected() -> Result<()> {
     submit_genesis(&mut node)?;
     let _ = mine_bare_blocks(&mut node, 3)?;
     let coinbase = coinbase_at(&mut node, 1)?;
-    let (outpoint, prevout) = funding_output(&mut node, &coinbase)?;
+    let (outpoint, prevout) = funding_output(&coinbase)?;
     let spend = bitcoin_rs_e2e::helpers::spend_anyone(outpoint, &prevout, 1_000);
     let hex = bitcoin_rs_e2e::helpers::tx_hex(&spend);
 

@@ -8,21 +8,11 @@ use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::hashes::Hash as _;
 use bitcoin::transaction::OutPoint;
 use bitcoin_rs_e2e::helpers::{
-    COINBASE_MATURITY, coinbase_at, funding_address, funding_output, mempool_txids,
-    mine_bare_blocks, op_true_script, raw_spend_to, signed_spend, spend_anyone, submit_genesis,
-    tx_hex,
+    COINBASE_MATURITY, coinbase_at, funding_address, funding_output, mature_funding, mempool_txids,
+    op_true_script, raw_spend_to, signed_spend, spend_anyone, submit_genesis, tx_hex,
 };
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode, Result, ValueExt};
 use serde_json::{Value, json};
-
-/// Mine `COINBASE_MATURITY + 1` blocks so the first coinbase is spendable,
-/// then return the spendable funding outpoint.
-fn mature_funding(node: &mut ProcessNode) -> Result<(OutPoint, bitcoin::TxOut)> {
-    submit_genesis(node)?;
-    let _ = mine_bare_blocks(node, COINBASE_MATURITY + 1)?;
-    let coinbase = coinbase_at(node, 1)?;
-    funding_output(node, &coinbase)
-}
 
 /// A broadcast enters the mempool with a complete entry view.
 #[test]
@@ -116,12 +106,12 @@ fn mempool_accept_preview() -> Result<()> {
     assert_eq!(rows[0]["allowed"], json!(false));
     assert_eq!(rows[0]["reject-reason"], json!("missing-inputs"));
 
-    // Malformed hex is a request error, not a reject row.
+    // Malformed hex is a request-level deserialization error, not a reject row.
     let reply = node.rpc_raw(&json!({
         "jsonrpc": "2.0", "id": 1, "method": "testmempoolaccept",
         "params": [["deadbeef"]]
     }))?;
-    assert_eq!(reply["error"]["code"], json!(-32602));
+    assert_eq!(reply["error"]["code"], json!(-22));
     node.stop()
 }
 
@@ -247,7 +237,7 @@ fn create_and_decode_raw_transaction() -> Result<()> {
     let bad = node.rpc_raw(&json!({
         "jsonrpc": "2.0", "id": 1, "method": "decoderawtransaction", "params": ["00ff"]
     }))?;
-    assert_eq!(bad["error"]["code"], json!(-32602));
+    assert_eq!(bad["error"]["code"], json!(-22));
     let _ = prevout;
     node.stop()
 }
@@ -266,7 +256,7 @@ fn signed_p2pkh_spend_accepted() -> Result<()> {
 
     // Find the funding UTXO paid to our address at height 1.
     let coinbase = coinbase_at(&mut node, 1)?;
-    let (outpoint, prevout) = funding_output(&mut node, &coinbase)?;
+    let (outpoint, prevout) = funding_output(&coinbase)?;
     assert_eq!(
         prevout.script_pubkey,
         funding_address()?.script_pubkey(),
@@ -371,7 +361,8 @@ fn generateblock_confirms_mempool_tx() -> Result<()> {
     node.stop()
 }
 
-/// Bad-hex and missing-input broadcast failures carry distinct codes.
+/// Undecodable and missing-input broadcasts carry Core's distinct
+/// verification codes: -22 decode failure and -25 missing inputs.
 #[test]
 fn broadcast_failure_codes() -> Result<()> {
     let mut node = ProcessNode::spawn(Kind::BitcoinRs)?;
@@ -380,7 +371,7 @@ fn broadcast_failure_codes() -> Result<()> {
     let bad_hex = node.rpc_raw(&json!({
         "jsonrpc": "2.0", "id": 1, "method": "sendrawtransaction", "params": ["deadbeef"]
     }))?;
-    assert_eq!(bad_hex["error"]["code"], json!(-32602));
+    assert_eq!(bad_hex["error"]["code"], json!(-22));
 
     let phantom = bitcoin::TxOut {
         value: bitcoin::Amount::from_sat(1_000),
@@ -395,6 +386,6 @@ fn broadcast_failure_codes() -> Result<()> {
         "jsonrpc": "2.0", "id": 2, "method": "sendrawtransaction",
         "params": [tx_hex(&missing)]
     }))?;
-    assert_eq!(reply["error"]["code"], json!(-26));
+    assert_eq!(reply["error"]["code"], json!(-25));
     node.stop()
 }

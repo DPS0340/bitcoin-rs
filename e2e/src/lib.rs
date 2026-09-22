@@ -17,4 +17,4 @@ pub mod helpers;
 pub mod node;
 
 pub use error::{Error, Result, ValueExt};
-pub use node::{HttpResponse, Kind, ProcessNode, SpawnOptions};
+pub use node::{HttpResponse, Kind, ProcessNode, SpawnOptions, mock_time};

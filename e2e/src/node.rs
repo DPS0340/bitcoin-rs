@@ -1,12 +1,14 @@
 //! Process custody for `bitcoin-rs` and pinned Bitcoin Core nodes.
 
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Read, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::hashes::{Hash as _, sha256};
 use serde_json::{Value, json};
@@ -27,8 +29,19 @@ const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
 /// Fixed test credentials; both node kinds share them.
 const AUTH_USER: &str = "parity";
 const AUTH_PASSWORD: &str = "parity";
-/// Mock clock pinned on the Core side so generated blocks are always valid.
-const MOCK_TIME: u64 = 1_780_000_000;
+
+/// Mock clock for Core regtest nodes.
+///
+/// Runs ~24h behind the host clock so generated blocks are valid under
+/// the node's unmocked wall time; a pinned epoch would future-date
+/// blocks on any host clocked earlier than it.
+pub fn mock_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1_700_000_000, |d| d.as_secs().saturating_sub(86_400))
+}
+/// Spawn retries for when a reserved port is stolen before the child binds.
+const MAX_SPAWN_ATTEMPTS: u32 = 3;
 
 /// Which binary a [`ProcessNode`] wraps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +64,10 @@ pub struct SpawnOptions<'a> {
     pub toml_override: Option<&'a str>,
     /// Readiness deadline; defaults to [`START_TIMEOUT`].
     pub timeout: Option<Duration>,
+    /// Replacement `--rpc-bind` address (bitcoin-rs only); overrides the
+    /// reserved loopback port so bind-failure scenarios exercise a real
+    /// `bind()` error rather than a duplicate CLI flag.
+    pub rpc_bind: Option<SocketAddr>,
 }
 
 /// A decoded HTTP response from the node's RPC/REST/Esplora listener.
@@ -110,22 +127,50 @@ pub fn workspace() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-/// Resolve the `bitcoin-rs` binary: `BITCOIN_RS_NODE` env, then the
-/// workspace `target/debug` and `target/release` profiles.
+/// Resolve the `bitcoin-rs` binary under test.
+///
+/// `BITCOIN_RS_NODE` wins when set. Otherwise the candidates are the `debug`
+/// and `release` profiles under `CARGO_TARGET_DIR` (falling back to the
+/// workspace `target/` when it is unset or relative to elsewhere), and the
+/// *newest* existing artifact is chosen — a fixed debug-first order would
+/// silently test a stale daemon while a freshly built one sits next to it.
+/// The suite has no Cargo dependency edge to the binary package, so callers
+/// must build it themselves (`cargo build --bin bitcoin-rs`).
 pub fn bitcoin_rs_binary() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("BITCOIN_RS_NODE") {
         return Ok(PathBuf::from(path));
     }
-    for profile in ["debug", "release"] {
-        let path = workspace().join(format!("target/{profile}/bitcoin-rs"));
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    Err(Error::Assertion(
-        "bitcoin-rs binary not found; run `cargo build --bin bitcoin-rs` first".into(),
-    ))
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map_or_else(
+            || workspace().join("target"),
+            |dir| {
+                if dir.is_absolute() {
+                    dir
+                } else {
+                    workspace().join(dir)
+                }
+            },
+        );
+    let newest = ["debug", "release"]
+        .iter()
+        .map(|profile| target_dir.join(profile).join("bitcoin-rs"))
+        .filter(|path| path.is_file())
+        .max_by_key(|path| {
+            path.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+    newest.ok_or_else(|| {
+        Error::Assertion(
+            "bitcoin-rs binary not found; run `cargo build --bin bitcoin-rs` first".into(),
+        )
+    })
 }
+
+/// The pinned bitcoind is hashed once per process; later Core spawns
+/// reuse the verified path instead of re-reading hundreds of megabytes.
+static VERIFIED_CORE: OnceLock<PathBuf> = OnceLock::new();
 
 fn core_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("BITCOIN_RS_REFERENCE_BITCOIND") {
@@ -143,6 +188,9 @@ fn core_binary() -> PathBuf {
 /// Verify the resolved bitcoind matches the pinned digest in
 /// `docs/api/core-compat.toml`. Returns the binary path on success.
 pub fn verified_core_binary() -> Result<PathBuf> {
+    if let Some(path) = VERIFIED_CORE.get() {
+        return Ok(path.clone());
+    }
     let path = core_binary();
     let compat = fs::read_to_string(workspace().join("docs/api/core-compat.toml"))
         .map_err(|e| Error::Assertion(format!("cannot read core-compat.toml: {e}")))?;
@@ -170,6 +218,7 @@ pub fn verified_core_binary() -> Result<PathBuf> {
             "bitcoind sha256 mismatch: expected {expected}, got {actual}"
         )));
     }
+    let _ = VERIFIED_CORE.set(path.clone());
     Ok(path)
 }
 
@@ -214,7 +263,7 @@ fn launch_command(
                 .arg(format!("-datadir={}", datadir.display()))
                 .arg(format!("-bind={p2p_addr}"))
                 .arg(format!("-rpcport={}", rpc_addr.port()))
-                .arg(format!("-mocktime={MOCK_TIME}"));
+                .arg(format!("-mocktime={}", mock_time()));
         }
         Kind::BitcoinRs => {
             let config_path = datadir.join("node.toml");
@@ -266,18 +315,45 @@ impl ProcessNode {
     }
 
     /// Spawn over an existing datadir (restart scenarios).
+    ///
+    /// A reserved port can still be stolen between `loopback_addresses`
+    /// dropping its listeners and the child binding, so an immediate child
+    /// exit is retried with fresh ports a bounded number of times.
     pub fn spawn_in_datadir(
         kind: Kind,
         options: &SpawnOptions<'_>,
         datadir: TempDir,
     ) -> Result<Self> {
-        let evidence_root = workspace().join("target/e2e");
+        let mut last_error = None;
+        for attempt in 0..MAX_SPAWN_ATTEMPTS {
+            match Self::spawn_in_datadir_once(kind, options, &datadir) {
+                Ok(mut node) => {
+                    node.datadir = Some(datadir);
+                    return Ok(node);
+                }
+                Err(error @ Error::ChildExit { .. }) if attempt + 1 < MAX_SPAWN_ATTEMPTS => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| Error::Assertion("spawn attempts exhausted".into())))
+    }
+
+    /// One spawn attempt over `datadir`.
+    fn spawn_in_datadir_once(
+        kind: Kind,
+        options: &SpawnOptions<'_>,
+        datadir: &TempDir,
+    ) -> Result<Self> {
+        let evidence_root = workspace().join("target/process-harness/e2e");
         fs::create_dir_all(&evidence_root)?;
         let evidence = tempfile::Builder::new()
             .prefix("run-")
             .tempdir_in(evidence_root)?
             .keep();
         let (rpc_addr, p2p_addr, rpc_listener, p2p_listener) = loopback_addresses()?;
+        let rpc_addr = options.rpc_bind.unwrap_or(rpc_addr);
         let journal = File::create(evidence.join("transcript.jsonl"))?;
         let mut command = launch_command(kind, datadir.path(), rpc_addr, p2p_addr, options)?;
         command.args(options.extra_args);
@@ -297,7 +373,7 @@ impl ProcessNode {
         let mut node = Self {
             kind,
             child,
-            datadir: Some(datadir),
+            datadir: None,
             rpc_addr,
             p2p_addr,
             evidence,
@@ -395,8 +471,7 @@ impl ProcessNode {
         body: &[u8],
         auth: bool,
     ) -> Result<HttpResponse> {
-        http_exchange(
-            self.rpc_addr,
+        self.http_auth(
             method,
             path,
             body,
@@ -405,8 +480,39 @@ impl ProcessNode {
             } else {
                 None
             },
-            REQUEST_TIMEOUT,
         )
+    }
+
+    /// HTTP request with explicit Basic-auth credentials (or none),
+    /// journaled like [`ProcessNode::http`]. Lets negative-auth tests send
+    /// credentials other than the harness pair.
+    pub fn http_auth(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        auth: Option<(&str, &str)>,
+    ) -> Result<HttpResponse> {
+        self.record(&json!({
+            "http_request": {
+                "method": method,
+                "path": path,
+                "body_bytes": body.len(),
+                "auth_user": auth.map(|(user, _)| user),
+            }
+        }))?;
+        let response = http_exchange(self.rpc_addr, method, path, body, auth, REQUEST_TIMEOUT)?;
+        self.record(&json!({
+            "http_response": {
+                "status": response.status,
+                "body_bytes": response.body.len(),
+                "body_head": String::from_utf8_lossy(
+                    &response.body[..response.body.len().min(512)]
+                )
+                .into_owned(),
+            }
+        }))?;
+        Ok(response)
     }
 
     /// GET helper for REST/Esplora surfaces.
@@ -529,28 +635,30 @@ impl Drop for ProcessNode {
     }
 }
 
+/// Retains the newest `MAX_OUTPUT` bytes of a child's stream — the tail is
+/// where a late crash or error loop actually shows up; the head is least
+/// diagnostic. The tail is materialized to `file` at EOF.
 fn capture_output(mut reader: impl Read + Send + 'static, file: PathBuf) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let Ok(mut file) = File::create(&file) else {
             return;
         };
-        let mut retained = 0_u64;
+        let mut tail: VecDeque<u8> = VecDeque::new();
+        let limit = usize::try_from(MAX_OUTPUT).unwrap_or(usize::MAX);
         let mut buffer = [0_u8; 8192];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
-                    let keep = usize::try_from(
-                        u64::try_from(count)
-                            .unwrap_or(0)
-                            .min(MAX_OUTPUT.saturating_sub(retained)),
-                    )
-                    .unwrap_or(0);
-                    let _ = file.write_all(buffer.get(..keep).unwrap_or(&[]));
-                    retained = retained.saturating_add(u64::try_from(keep).unwrap_or(0));
+                    tail.extend(buffer[..count].iter().copied());
+                    let excess = tail.len().saturating_sub(limit);
+                    if excess > 0 {
+                        tail.drain(..excess);
+                    }
                 }
             }
         }
+        let _ = file.write_all(tail.make_contiguous());
         let _ = file.flush();
     })
 }

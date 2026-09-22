@@ -207,7 +207,7 @@ fn generateblock_with_listed_tx_verifies() -> Result<()> {
     submit_genesis(&mut node)?;
     let _ = mine_bare_blocks(&mut node, COINBASE_MATURITY + 1)?;
     let coinbase = coinbase_at(&mut node, 1)?;
-    let (outpoint, prevout) = funding_output(&mut node, &coinbase)?;
+    let (outpoint, prevout) = funding_output(&coinbase)?;
 
     let spend = spend_anyone(outpoint, &prevout, 1_000);
     let txid = spend.compute_txid().to_string();

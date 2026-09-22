@@ -20,7 +20,9 @@ use crate::compat::convert::{
 };
 use crate::context::{ChainControlError, Context, TxQueryError};
 use crate::error::RpcError;
-use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
+use crate::handlers::{
+    ensure_no_params, optional_bool, params_array, required_i64, required_str, required_u64,
+};
 use bitcoin_rs_index::block_log::{BlockRecord, cumulative_tx_count_through};
 
 pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -506,13 +508,13 @@ pub(crate) fn getblockcount(ctx: &Arc<Context>, params: &Value) -> Result<Value,
 }
 
 pub(crate) fn getblockhash(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
-    let height = required_u64(params, 0, "height is required")?;
-    let height =
-        u32::try_from(height).map_err(|_| RpcError::InvalidParams("height exceeds u32"))?;
+    let height = required_i64(params, 0, "height is required")?;
+    let height = u32::try_from(height)
+        .map_err(|_| RpcError::InvalidParameter("Block height out of range".to_owned()))?;
     ctx.block_hash_at_height(height)
         .map(|hash| typed_to_sonic(&v31::GetBlockHash(hash.to_string_be())))
         .transpose()?
-        .ok_or(RpcError::NotFound("block height not found"))
+        .ok_or_else(|| RpcError::InvalidParameter("Block height out of range".to_owned()))
 }
 
 pub(crate) fn getbestblockhash(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {

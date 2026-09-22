@@ -108,7 +108,7 @@ fn malformed_config_fails_startup() -> Result<()> {
         },
     );
     match outcome {
-        Err(Error::ChildExit { .. } | Error::Timeout { .. }) => Ok(()),
+        Err(Error::ChildExit { .. }) => Ok(()),
         Err(other) => Err(Error::Assertion(format!(
             "unexpected failure mode: {other}"
         ))),
@@ -130,10 +130,7 @@ fn invalid_cli_flag_rejected() {
         },
     );
     assert!(
-        matches!(
-            outcome,
-            Err(Error::ChildExit { .. } | Error::Timeout { .. })
-        ),
+        matches!(outcome, Err(Error::ChildExit { .. })),
         "invalid --network must not start a node: {outcome:?}"
     );
 }
@@ -168,27 +165,25 @@ fn measure_storage_exits_with_report() -> Result<()> {
     Ok(())
 }
 
-/// The node's RPC surface rejects a second `--rpc-bind` squatter.
+/// The node's RPC listener cannot bind a port that is already held:
+/// `bind()` fails and the process exits instead of hanging or serving.
 #[test]
 fn rpc_bind_conflict_fails_startup() -> Result<()> {
-    // Occupy a port ourselves, then ask the node to bind it.
+    // Occupy a port ourselves, then point the node's sole `--rpc-bind` at
+    // it. The squatter stays held until spawn reports the child's exit.
     let squatter = std::net::TcpListener::bind("127.0.0.1:0")?;
     let held = squatter.local_addr()?;
-    let addr = held.to_string();
     let outcome = ProcessNode::spawn_with(
         Kind::BitcoinRs,
         &SpawnOptions {
-            extra_args: &["--rpc-bind", addr.as_str()],
+            rpc_bind: Some(held),
             timeout: Some(Duration::from_secs(30)),
             ..SpawnOptions::default()
         },
     );
     drop(squatter);
     assert!(
-        matches!(
-            outcome,
-            Err(Error::ChildExit { .. } | Error::Timeout { .. })
-        ),
+        matches!(outcome, Err(Error::ChildExit { .. })),
         "rpc bind conflict must fail startup: {outcome:?}"
     );
     Ok(())

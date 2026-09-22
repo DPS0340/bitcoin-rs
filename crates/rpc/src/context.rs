@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::compat::convert::hex_encode;
 
@@ -463,6 +464,11 @@ pub struct Context {
     pub banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     /// Persisted `addnode add` entries.
     pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
+    /// Instant this context's RPC listener bound, set by `RpcServer::bind`
+    /// and read by `uptime`. Kept per context rather than process-global so
+    /// two servers in one process report their own epochs; `None` (never
+    /// bound, e.g. unit tests) makes `uptime` measure from its first call.
+    server_bound_at: Mutex<Option<Instant>>,
     /// Live ZMQ publisher, also the source of active notifier metadata.
     pub zmq_publisher: Arc<dyn crate::zmq::ZmqPublisher>,
     /// Configured node debug-log path for `getrpcinfo`.
@@ -539,6 +545,7 @@ impl Context {
             p2p_outbound_sender: None,
             banned: Arc::new(RwLock::new(Vec::new())),
             added_nodes: Arc::new(RwLock::new(Vec::new())),
+            server_bound_at: Mutex::new(None),
             zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
@@ -591,6 +598,7 @@ impl Context {
             p2p_outbound_sender: None,
             banned: Arc::new(RwLock::new(Vec::new())),
             added_nodes: Arc::new(RwLock::new(Vec::new())),
+            server_bound_at: Mutex::new(None),
             zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
@@ -658,11 +666,24 @@ impl Context {
             prune_service: None,
             chain_control: None,
             mining_control,
+            server_bound_at: Mutex::new(None),
             zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
             rollback_warnings: None,
         }
+    }
+
+    /// Marks the instant this context's RPC listener bound. A rebind
+    /// overwrites the epoch so `uptime` measures the live server.
+    pub(crate) fn mark_server_bound(&self) {
+        *self.server_bound_at.lock() = Some(Instant::now());
+    }
+
+    /// Uptime epoch for `uptime`: the recorded bind instant, or — for a
+    /// context that never binds a server — the first call's instant.
+    pub(crate) fn server_start(&self) -> Instant {
+        *self.server_bound_at.lock().get_or_insert_with(Instant::now)
     }
 
     /// Attaches the internal transaction lookup required for Esplora output

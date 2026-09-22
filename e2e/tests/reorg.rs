@@ -6,8 +6,10 @@
 
 use std::time::Duration;
 
-use bitcoin_rs_e2e::helpers::{mine_bare_blocks, spawn_synced_pair, submit_genesis};
-use bitcoin_rs_e2e::{Error, Kind, ProcessNode, Result, SpawnOptions, ValueExt};
+use bitcoin_rs_e2e::helpers::{
+    mine_bare_blocks, mine_blocks_to, spawn_synced_pair, submit_genesis,
+};
+use bitcoin_rs_e2e::{Error, Kind, ProcessNode, Result, SpawnOptions, ValueExt, mock_time};
 use serde_json::{Value, json};
 
 /// `invalidateblock` rewinds the applied tip and records the dead branch
@@ -42,9 +44,11 @@ fn invalidateblock_rewinds_tip() -> Result<()> {
         "dead branch status: {dead}"
     );
 
-    // Mining continues from the rewound tip with a different branch.
-    let fork = mine_bare_blocks(&mut node, 4)?;
-    assert_ne!(fork[0], hashes[3]);
+    // Mining continues from the rewound tip with a different branch: a
+    // distinct coinbase script makes the regenerated height-3 hash provably
+    // differ from the invalidated one.
+    let fork = mine_blocks_to(&mut node, 4, "raw(52)")?;
+    assert_ne!(fork[0], hashes[2]);
     assert_eq!(node.rpc("getblockcount", &json!([]))?, json!(6));
     node.stop()
 }
@@ -65,7 +69,7 @@ fn core_reorg_repoints_node_tip() -> Result<()> {
     // Core runs at frozen `-mocktime`; regenerated blocks would hash
     // identically to the invalidated ones. Advancing its clock makes the
     // new branch actually diverge.
-    core.rpc("setmocktime", &json!([1_780_001_000]))?;
+    core.rpc("setmocktime", &json!([mock_time() + 3_600]))?;
 
     // Core builds a competing branch of 8 more blocks (tip at height 10).
     core.rpc(
@@ -85,7 +89,8 @@ fn core_reorg_repoints_node_tip() -> Result<()> {
         core.rpc("getblockhash", &json!([6]))?,
         "re-orged height must serve the new branch"
     );
-    node.stop()
+    node.stop()?;
+    core.stop()
 }
 
 /// A node restarted mid-chain keeps its tip and catches up with the
@@ -113,5 +118,6 @@ fn restart_mid_chain_resumes_sync() -> Result<()> {
         node.rpc("getbestblockhash", &json!([]))?,
         core.rpc("getbestblockhash", &json!([]))?
     );
-    node.stop()
+    node.stop()?;
+    core.stop()
 }
