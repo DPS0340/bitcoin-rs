@@ -14,7 +14,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -58,6 +58,13 @@ struct LivePeer {
     headers_reply: Vec<BlockHeader>,
     /// Every decoded getdata frame in arrival order.
     getdata_seen: Vec<GetdataSeen>,
+    /// Block hashes whose body has been served at least once.
+    served: HashSet<bitcoin::BlockHash>,
+    /// Hashes named by a getdata arriving after their body was served — the
+    /// re-request signature of a broken staged-entry sentinel or a retry
+    /// rewind. A duplicate getdata emitted before delivery is tolerated
+    /// (a preexisting burst quirk, not this path's invariant).
+    post_serve_requests: Vec<bitcoin::BlockHash>,
     /// `at_ms` of every getheaders frame, in arrival order.
     getheaders_at: Vec<u64>,
     /// Bodies served stripped because the node asked `MSG_BLOCK`.
@@ -92,6 +99,8 @@ impl LivePeer {
             blocks: BTreeMap::new(),
             headers_reply: Vec::new(),
             getdata_seen: Vec::new(),
+            served: HashSet::new(),
+            post_serve_requests: Vec::new(),
             getheaders_at: Vec::new(),
             stripped_served: 0,
             dropped: false,
@@ -209,6 +218,7 @@ impl LivePeer {
         let Some(block) = self.blocks.get(&hash) else {
             return Ok(());
         };
+        self.served.insert(hash);
         let body = if stripped {
             self.stripped_served += 1;
             strip_witnesses(block)
@@ -239,6 +249,16 @@ impl LivePeer {
                     };
                     self.log("getdata", &format!("{:?}", seen.items));
                     self.getdata_seen.push(seen);
+                    for item in &items {
+                        if let Inventory::WitnessBlock(hash)
+                        | Inventory::CompactBlock(hash)
+                        | Inventory::Block(hash) = item
+                        {
+                            if self.served.contains(hash) {
+                                self.post_serve_requests.push(*hash);
+                            }
+                        }
+                    }
                     let items = items.clone();
                     serve(self, &items);
                 }
@@ -659,8 +679,9 @@ fn carried_header_live_head_applies_and_continues() -> Result<(), HarnessError> 
         eprintln!("[E2E] h{} applied via carried header ({hash})", height + 1);
     }
 
-    // Every block requested at most once — no re-request churn; and never a
-    // plain MSG_BLOCK request (witness-stripped bodies would fail binding).
+    // Every block requested at least once; none re-requested after its
+    // body was delivered (the rewind signature); and never a plain
+    // MSG_BLOCK request (witness-stripped bodies would fail binding).
     for block in &chain {
         let hash = block.block_hash();
         assert_eq!(
@@ -669,11 +690,15 @@ fn carried_header_live_head_applies_and_continues() -> Result<(), HarnessError> 
             "plain MSG_BLOCK getdata seen for {hash}"
         );
         assert!(
-            peer.requests_for(&hash) <= 1,
-            "block {hash} requested {} times (churn/rewind?)",
-            peer.requests_for(&hash)
+            peer.requests_for(&hash) >= 1,
+            "block {hash} never requested"
         );
     }
+    assert!(
+        peer.post_serve_requests.is_empty(),
+        "blocks re-requested after delivery (churn/rewind?): {:?}",
+        peer.post_serve_requests
+    );
     assert_eq!(
         peer.stripped_served, 0,
         "node requested MSG_BLOCK and got a stripped body"
