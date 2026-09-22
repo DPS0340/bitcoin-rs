@@ -433,13 +433,15 @@ impl BlockSync {
     /// its first failure, so a gap component ordered early would otherwise
     /// strand attachable components behind it. A missing ancestor is not a
     /// peer fault — the delivering peer necessarily holds the chain it
-    /// announced — so one gap per pass heals with a `getheaders` back to
-    /// the first gapped deliverer: sibling gaps on the same chain heal from
-    /// that reply, and divergent gaps stay bounded by staged expiry rather
-    /// than racing the single tracked header request. The send is skipped
-    /// when the loop itself healed the gap, when the deliverer left, or
-    /// when a header request is already in flight — the slot tracks one
-    /// send, so recovery never displaces an unrelated live request.
+    /// announced — so one gap per pass is parked in `deferred_gap_recovery`
+    /// and healed with `getheaders` requests back to its deliverer: sibling
+    /// gaps on the same chain heal from those replies, and divergent gaps
+    /// stay bounded by staged expiry rather than racing the single tracked
+    /// header request. The deferred slot owns the retry until the missing
+    /// ancestor resolves — a `headers` page may not reach it in one round —
+    /// and never displaces an unrelated live request: a send waits for the
+    /// tracked slot to free, and a healed gap or departed deliverer clears
+    /// it without sending.
     ///
     /// Runs outside `scheduler`: `admit_headers` takes the chain transition
     /// lock and the tree write, both of which rank above the window lock.
@@ -517,9 +519,7 @@ impl BlockSync {
                 break;
             }
         }
-        if let Some((source, prev_hash)) = gap_source
-            && !self.try_gap_recovery(source, prev_hash)
-        {
+        if let Some((source, prev_hash)) = gap_source {
             // Keep the earliest outstanding gap: its staged body expires
             // soonest, so a same-tick sibling gap queues behind it rather
             // than displacing it and silently losing its retry.
@@ -528,6 +528,7 @@ impl BlockSync {
                 scheduler.deferred_gap_recovery = Some((source, prev_hash));
             }
         }
+        self.drain_deferred_gap_recovery();
         // Bodies staged before their headers landed (an earlier chunk's
         // refused or re-delivered admission) would otherwise keep the
         // 0-height sentinel forever.
@@ -541,20 +542,28 @@ impl BlockSync {
         self.refresh_active_peer_credit();
     }
 
-    /// Sends the pass's single recovery `getheaders` for a missing-parent
-    /// gap. Returns `true` when no retry is owed — the request went out,
-    /// a sibling admission healed the gap, or the deliverer left — and
-    /// `false` only when an unrelated in-flight request suppressed the
-    /// send, in which case the caller defers it to `deferred_gap_recovery`.
-    fn try_gap_recovery(&self, source: PeerSource, prev_hash: Hash256) -> bool {
-        // A sibling group or a later round may have admitted the missing
-        // ancestor since the gap was recorded; a healed gap makes the
-        // request void. Sending to a deliverer already disconnected for a
-        // peer fault is equally void.
+    /// Retries a deferred missing-parent recovery: heals the slot when
+    /// the missing ancestor landed or the deliverer left, waits while an
+    /// unrelated request occupies the tracked slot, and sends one
+    /// `getheaders` to the deliverer when it is free. The gap STAYS
+    /// deferred after a send — a `headers` response is capped at
+    /// `MAX_HEADERS_MESSAGE_COUNT`, so one page may not reach the
+    /// ancestor; each consumed response re-evaluates and re-sends until
+    /// the tree resolves it. Called wherever header progress can free or
+    /// heal the slot — the body-admission pass and `headers` batches.
+    pub(super) fn drain_deferred_gap_recovery(&self) {
+        let Some((source, prev_hash)) = self.scheduler.lock().deferred_gap_recovery else {
+            return;
+        };
+        // A sibling admission may have supplied the ancestor since the
+        // gap was recorded; a healed gap makes the request void. Sending
+        // to a deliverer already disconnected for a peer fault is equally
+        // void.
         if self.chain.block_tree().read().lookup(prev_hash).is_some()
             || !self.peer_table.is_current(source)
         {
-            return true;
+            self.scheduler.lock().deferred_gap_recovery = None;
+            return;
         }
         // The single tracked slot must never displace an unrelated
         // in-flight request — that response could not clear the tracker
@@ -568,7 +577,7 @@ impl BlockSync {
                 && self.peer_table.is_current(request.source)
         });
         if live_pending {
-            return false;
+            return;
         }
         let our_height = self
             .chain
@@ -576,21 +585,6 @@ impl BlockSync {
             .load_full()
             .map_or(0, |tip| tip.height);
         self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
-        true
-    }
-
-    /// Fires a recovery deferred behind an occupied request slot once a
-    /// pass finds it free; clears the slot when the gap healed, the
-    /// deliverer left, or the send went out. Called wherever header
-    /// progress can free the slot — the body-admission pass and accepted
-    /// `headers` batches.
-    pub(super) fn drain_deferred_gap_recovery(&self) {
-        let Some((source, prev_hash)) = self.scheduler.lock().deferred_gap_recovery else {
-            return;
-        };
-        if self.try_gap_recovery(source, prev_hash) {
-            self.scheduler.lock().deferred_gap_recovery = None;
-        }
     }
 
     /// Reacts to one deliverer's component admission with the same

@@ -777,9 +777,10 @@ fn deferred_gap_recovery_fires_when_request_slot_clears() -> Result<(), Box<dyn 
     let genesis = Network::Regtest.genesis_block();
     let block1 = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
     let block2 = mined_block_with_prev_hash(block1.block_hash(), 2, vec![coinbase_transaction(2)]);
-    // An unrelated side-chain header: admittable, but it does not supply
-    // the missing parent, so the deferred send is not healed away.
+    // Two unrelated side-chain headers: admittable, but neither supplies
+    // the missing parent, so the deferred recovery is not healed away.
     let side = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(99)]);
+    let side2 = mined_block_with_prev_hash(side.block_hash(), 2, vec![coinbase_transaction(98)]);
     let mut tree = BlockTree::new();
     tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
     let SyncHarness {
@@ -813,7 +814,7 @@ fn deferred_gap_recovery_fires_when_request_slot_clears() -> Result<(), Box<dyn 
     // The gap body's recovery cannot send while the slot is occupied.
     let serialized = bytes::Bytes::from(consensus_bytes(&block2));
     inbound_blocks_tx.send(crate::InboundBlock {
-        block: block2,
+        block: block2.clone(),
         serialized,
         source: Some(source_a),
     })?;
@@ -833,6 +834,32 @@ fn deferred_gap_recovery_fires_when_request_slot_clears() -> Result<(), Box<dyn 
     let Message::GetHeaders(_) = rx_a.try_recv()? else {
         return Err(std::io::Error::other("expected deferred recovery getheaders").into());
     };
+
+    // A response page that still does not reach the ancestor keeps the
+    // retry: the slot is re-taken by the recovery send, so the next
+    // consumed response from the deliverer re-fires — recovery persists
+    // until the ancestor resolves, not until the first send.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![side2.header],
+        source: Some(source_a),
+    })?;
+    sync.tick();
+    let Message::GetHeaders(_) = rx_a.try_recv()? else {
+        return Err(std::io::Error::other("expected retained recovery getheaders").into());
+    };
+
+    // A response that resolves the ancestor clears the deferred slot:
+    // nothing further is owed to the deliverer.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![block1.header, block2.header],
+        source: Some(source_a),
+    })?;
+    sync.tick();
+    assert!(
+        !std::iter::from_fn(|| rx_a.try_recv().ok())
+            .any(|message| matches!(message, Message::GetHeaders(_))),
+        "a healed gap must not fire further recovery requests"
+    );
     Ok(())
 }
 
