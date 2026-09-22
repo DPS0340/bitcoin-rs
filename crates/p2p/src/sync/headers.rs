@@ -35,13 +35,13 @@ const MAX_UNRESOLVED_DEMONSTRATED_TIPS: usize = 8;
 const MAX_DEFERRED_OWNED_FETCHES: usize = 16;
 
 impl BlockSync {
+    #[allow(clippy::too_many_lines)]
     pub(super) fn drain_inbound_headers(&self) {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;
         let mut credit_refresh_needed = false;
-        // Set when any batch reached `admit_headers`: a rejection can still
-        // commit a valid prefix, so staged-body sentinels reconcile on the
-        // attempt, not only on a clean accept.
+        // Set on any batch reaching `admit_headers`: a rejection can still
+        // commit a valid prefix, so sentinels reconcile on the attempt.
         let mut admission_attempted = false;
         while let Ok(InboundHeaders {
             headers,
