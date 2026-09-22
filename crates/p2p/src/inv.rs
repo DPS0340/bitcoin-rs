@@ -61,10 +61,11 @@ pub fn request_missing_parents(
 /// getdata requests use this flag; announcements retain their own types.
 ///
 /// Both transaction and block vectors upgrade to their witness variants:
-/// `MSG_WITNESS_BLOCK` is the only block fetch that returns witness data —
-/// a plain `MSG_BLOCK` request is served stripped, and a segwit body served
-/// stripped fails connect (BIP141 requires the witness for spends whose
-/// program demands it), which classifies the header subtree Permanent.
+/// `MSG_WITNESS_BLOCK` is the only block fetch that returns witness data.
+/// A plain `MSG_BLOCK` request is served witness-stripped, and a stripped
+/// segwit body fails the body/header binding check — its witness
+/// commitment no longer matches — surfacing as a consensus connect
+/// failure, which marks the header subtree Permanent rather than retryable.
 pub(crate) fn request_witness(items: &mut [Inventory], witness: bool) {
     if !witness {
         return;

@@ -198,9 +198,9 @@ fn pending_reorg_frontier_is_first_connect_node() -> Result<(), Box<dyn std::err
 }
 
 // A winning-branch body staged above the fork must wait for the branch
-// switch instead of churning through the extension commit: its parent is
-// the common ancestor, not the applied tip, so the commit could never
-// consume it and would restore-drop and re-request it every tick.
+// switch instead of churning through the extension commit: its parent lies
+// on the winning branch — never on the applied tip — so the commit could
+// never consume it and would restore-drop and re-request it every tick.
 #[test]
 fn apply_buffered_blocks_waits_for_pending_reorg() -> Result<(), Box<dyn std::error::Error>> {
     let (harness, applied, winning) = pending_reorg_fixture()?;

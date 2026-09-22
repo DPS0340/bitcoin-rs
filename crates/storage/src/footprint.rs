@@ -349,6 +349,28 @@ pub fn opened_fd_path(fd: BorrowedFd<'_>) -> std::path::PathBuf {
     }
 }
 
+/// Whether `path` currently resolves to the same inode `fd` holds.
+///
+/// Backends that can only open a pathname lose descriptor anchoring on
+/// platforms without `/proc/self/fd` descent (macOS's `/dev/fd` opens the
+/// descriptor itself but cannot be descended into): a rename-and-replace of
+/// the data directory mid-scan would leave the physical ledger anchored to
+/// the held inode while the logical scan reads its successor. Callers must
+/// check this identity while they still hold `fd` and fail the scan on
+/// mismatch rather than emit incoherent evidence. Fails closed — open and
+/// stat errors propagate.
+pub fn opened_path_matches_fd(fd: BorrowedFd<'_>, path: &Path) -> io::Result<bool> {
+    let held = rfs::fstat(fd)?;
+    let resolved = rfs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let resolved = rfs::fstat(&resolved)?;
+    Ok(u64_from_stat(held.st_dev) == u64_from_stat(resolved.st_dev)
+        && u64_from_stat(held.st_ino) == u64_from_stat(resolved.st_ino))
+}
+
 /// Whether `dir` contains any entry other than `.` and `..`.
 pub fn dir_has_entries(dir: BorrowedFd<'_>) -> Result<bool, FootprintError> {
     let mut entries = rfs::Dir::read_from(dir)?;

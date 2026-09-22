@@ -250,18 +250,30 @@ impl BlockSync {
         // Resolve heights the window cannot see: an untracked delivery (inv
         // announcement, cold-front hedge) enters `received` at height 0, and
         // `mark_received_from` reports `needs_height_lookup` for exactly those
-        // entries so this pass can pin the tree height. A hash not yet in the
-        // tree stays 0 until the prune path's own re-evaluation.
+        // entries so this pass can pin the tree height. The same lookup covers
+        // staged bodies this insert count-evicts: a body that arrived before
+        // its header stayed at height 0, and `drop_received_for_retry` must
+        // place the retry at the tree height, not rewind the request cursor.
+        // A hash not yet in the tree stays 0 until the prune path's own
+        // re-evaluation.
         let staged_blocks: Vec<_> = {
             let tree = self.chain.block_tree().read();
             staged_blocks
                 .into_iter()
                 .map(|(hash, source_peer, staged)| {
-                    let known_height = tree
-                        .lookup(hash)
-                        .and_then(|node_id| tree.node(node_id).ok())
-                        .map(|node| node.height);
-                    (hash, source_peer, staged, known_height)
+                    let resolve = |hash: Hash256| {
+                        tree.lookup(hash)
+                            .and_then(|node_id| tree.node(node_id).ok())
+                            .map(|node| node.height)
+                    };
+                    let known_height = resolve(hash);
+                    let dropped_heights = match &staged {
+                        StagedBlock::Memory { dropped, .. } => {
+                            dropped.iter().map(|entry| resolve(entry.hash)).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    (hash, source_peer, staged, known_height, dropped_heights)
                 })
                 .collect()
         };
@@ -270,7 +282,7 @@ impl BlockSync {
         {
             let mut body_sync = self.body_sync.lock();
             let window = &mut body_sync.window;
-            for (hash, source_peer, staged, known_height) in staged_blocks {
+            for (hash, source_peer, staged, known_height, dropped_heights) in staged_blocks {
                 match staged {
                     StagedBlock::AlreadyStaged => {
                         metrics::counter!("node.sync.duplicate_deliveries").increment(1);
@@ -284,8 +296,11 @@ impl BlockSync {
                         if needs_height_lookup && let Some(height) = known_height {
                             window.update_received_height(&hash, height);
                         }
-                        for dropped in dropped {
-                            window.drop_received_for_retry(&dropped.hash);
+                        for (entry, height) in dropped.into_iter().zip(dropped_heights) {
+                            if let Some(height) = height {
+                                window.update_received_height(&entry.hash, height);
+                            }
+                            window.drop_received_for_retry(&entry.hash);
                             retry_count = retry_count.saturating_add(1);
                         }
                     }

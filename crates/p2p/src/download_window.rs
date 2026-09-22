@@ -1456,7 +1456,8 @@ impl DownloadWindow {
     /// Returns the recorded height of a received block: the tree height for
     /// tracked deliveries, `0` when the tree could not resolve an untracked
     /// one. Test-only accessor.
-    pub fn received_height(&self, hash: &Hash256) -> Option<u32> {
+    #[cfg(test)]
+    pub(crate) fn received_height(&self, hash: &Hash256) -> Option<u32> {
         self.received.get(hash).map(|received| received.height)
     }
 

@@ -261,13 +261,14 @@ fn logical_flat_files_count_complete_frames_only() {
 }
 
 fn mkfifo(dir: &std::path::Path, name: &str) {
-    // `mknodat`/`mkfifoat` have no libc implementation on macOS, so the
-    // portable unix path is the POSIX `mkfifo` utility.
-    let status = std::process::Command::new("mkfifo")
-        .arg(dir.join(name))
-        .status()
-        .unwrap_or_else(|error| panic!("mkfifo: {error}"));
-    assert!(status.success(), "mkfifo failed: {status}");
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(dir.join(name).as_os_str().as_bytes())
+        .unwrap_or_else(|error| panic!("fifo path: {error}"));
+    // SAFETY: `path` is a valid NUL-terminated byte string that outlives
+    // the call; `mkfifo` only reads it.
+    let status = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(status, 0, "mkfifo: {}", std::io::Error::last_os_error());
 }
 
 #[test]
