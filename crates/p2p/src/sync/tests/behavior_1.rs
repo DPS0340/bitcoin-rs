@@ -204,8 +204,9 @@ fn inbound_headers_response_releases_getheaders_gate() -> Result<(), Box<dyn std
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![header],
         source: Some(current_source(&peers, addr)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     sync.tick();
     let second = rx.try_recv()?;
     if !matches!(second, Message::GetHeaders(_)) {
@@ -257,8 +258,9 @@ fn rejected_matching_peer_headers_release_gate_and_retry_immediately()
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![orphan],
         source: Some(current_source(&peers, addr)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     sync.tick();
     assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
     assert!(rx.try_recv().is_err());
@@ -285,8 +287,9 @@ fn orphan_headers_keep_source_peer_connected() -> Result<(), Box<dyn std::error:
             1,
         )],
         source: Some(current_source(&peers, peer_addr)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
 
     sync.tick();
 

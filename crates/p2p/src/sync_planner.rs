@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use bitcoin_rs_primitives::{Block, Hash256};
 
+use crate::PeerSource;
 use crate::SyncBudget;
 use crate::block_stager::{BlockStager, DrainedBlock, DroppedBlock, StagedBlock};
-use crate::PeerSource;
 use crate::download_window::DownloadWindow;
 
 /// Network effect the executor must perform. The planner never mutates

@@ -43,8 +43,9 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders()
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
         source: Some(current_source(&peers, invalid_peer)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     sync.tick();
 
     assert!(
@@ -98,8 +99,9 @@ fn unattributed_invalid_headers_do_not_disconnect_any_peer()
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
         source: None,
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
 
     sync.tick();
 

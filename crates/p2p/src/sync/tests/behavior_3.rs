@@ -311,10 +311,14 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
     {
         let block = Network::Regtest.genesis_block();
         let serialized = bytes::Bytes::from(consensus_bytes(&block));
-        sync.body_sync
-            .lock()
-            .stager
-            .insert(successor, None, block, serialized, None, Instant::now());
+        sync.body_sync.lock().stager.insert(
+            successor,
+            None,
+            block,
+            serialized,
+            None,
+            Instant::now(),
+        );
     }
     sync.body_sync
         .lock()
@@ -327,10 +331,14 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
     {
         let block = Network::Regtest.genesis_block();
         let serialized = bytes::Bytes::from(consensus_bytes(&block));
-        sync.body_sync
-            .lock()
-            .stager
-            .insert(frontier, None, block, serialized, None, Instant::now());
+        sync.body_sync.lock().stager.insert(
+            frontier,
+            None,
+            block,
+            serialized,
+            None,
+            Instant::now(),
+        );
     }
 
     let applied = sync

@@ -148,11 +148,7 @@ impl BlockSync {
     /// admission, paced to the request timeout: while admission stays
     /// closed each response clears its pending slot and re-refuses, so an
     /// unpaced retry would replay the same batch at round-trip pace.
-    fn request_ancestry_after_refusal(
-        &self,
-        source: Option<PeerSource>,
-        error: &SyncChainError,
-    ) {
+    fn request_ancestry_after_refusal(&self, source: Option<PeerSource>, error: &SyncChainError) {
         let now = Instant::now();
         let mut last = self.refused_rerequest_at.lock();
         if last.is_none_or(|last| now.duration_since(last) >= HEADER_REQUEST_TIMEOUT) {
@@ -294,8 +290,7 @@ impl BlockSync {
                         let Ok(node) = tree.node(node_id) else {
                             continue;
                         };
-                        if tree.node_at_height_from(active_tip.tip_id, node.height)
-                            == Some(node_id)
+                        if tree.node_at_height_from(active_tip.tip_id, node.height) == Some(node_id)
                         {
                             if argmax.is_none_or(|(max, _)| node.height > max) {
                                 argmax = Some((node.height, *hash));
@@ -321,10 +316,8 @@ impl BlockSync {
                             continue;
                         }
                         branch_kept.push(node_id);
-                        best_shared = best_shared.max(
-                            shared_active_height(&tree, active_tip.tip_id, hash)
-                                .unwrap_or(0),
-                        );
+                        best_shared = best_shared
+                            .max(shared_active_height(&tree, active_tip.tip_id, hash).unwrap_or(0));
                         keep.push(hash);
                     }
                     if let Some((_, hash)) = argmax {

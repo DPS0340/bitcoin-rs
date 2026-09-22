@@ -306,8 +306,9 @@ fn idle_frontier_relearns_stale_peer_credit_after_rejected_body()
     headers_tx.send(InboundHeaders {
         headers: vec![correct.header],
         source: Some(current_source(&sync.peer_table, good)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     sync.tick();
     assert_eq!(
         witness_block_inventory(next_getdata(&good_rx)?)?,

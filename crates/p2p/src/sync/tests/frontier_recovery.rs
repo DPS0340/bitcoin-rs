@@ -82,8 +82,9 @@ fn empty_header_probe_is_paced_then_rotates_to_another_peer()
     headers.send(InboundHeaders {
         headers: vec![],
         source: Some(current_source(&peers, first)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     sync.tick();
     assert!(first_rx.try_recv().is_err());
     assert!(second_rx.try_recv().is_err());

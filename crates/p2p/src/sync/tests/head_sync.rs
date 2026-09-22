@@ -98,8 +98,9 @@ fn body_arriving_ahead_of_its_header_chain_requests_the_gap()
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![block2.header, block3.header],
         source: Some(current_source(&peers, peer)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block2))?;
     sync.tick();
     assert_eq!(
@@ -133,8 +134,9 @@ fn headers_batch_missing_parent_requests_ancestry() -> Result<(), Box<dyn std::e
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![orphan_tip],
         source: Some(current_source(&peers, peer)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
 
     sync.drain_inbound_headers();
 
@@ -164,8 +166,9 @@ fn known_header_batch_still_credits_the_announcer() -> Result<(), Box<dyn std::e
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![tip1],
         source: Some(current_source(&peers, peer)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     sync.drain_inbound_headers();
 
     assert_eq!(
@@ -209,8 +212,9 @@ fn headers_batch_too_far_ahead_does_not_replay_a_request() -> Result<(), Box<dyn
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![future_tip],
         source: Some(current_source(&peers, peer)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     sync.drain_inbound_headers();
 
     assert!(
@@ -320,8 +324,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
 }
 
 #[test]
-fn staged_retry_acceptance_credits_the_delivering_peer()
--> Result<(), Box<dyn std::error::Error>> {
+fn staged_retry_acceptance_credits_the_delivering_peer() -> Result<(), Box<dyn std::error::Error>> {
     // A body that arrives without a prior `headers` announcement admits
     // its embedded header through the staged retry. The delivering peer
     // still demonstrated that tip: the credit the headers drain would have
@@ -406,8 +409,8 @@ fn fork_tip_attests_its_shared_active_ancestor() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn retained_unresolved_tips_are_deduplicated_and_capped()
--> Result<(), Box<dyn std::error::Error>> {
+fn retained_unresolved_tips_are_deduplicated_and_capped() -> Result<(), Box<dyn std::error::Error>>
+{
     // Unbounded fork evidence is a memory problem: a peer could announce
     // an arbitrary number of distinct side chains and grow the retained
     // tip vector without bound. The credit refresh keeps the maximal tip
@@ -513,13 +516,15 @@ fn delivered_tip_evidence_is_compacted_to_the_max_resolving_tip()
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![tip1],
         source: Some(current_source(&peers, peer)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![tip2],
         source: Some(current_source(&peers, peer)),
-    
-            wire_response: true,})?;
+
+        wire_response: true,
+    })?;
     sync.drain_inbound_headers();
 
     assert_eq!(

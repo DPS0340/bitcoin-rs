@@ -493,7 +493,8 @@ mod tests {
             hash,
             None,
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             Instant::now(),
         );
 
@@ -575,7 +576,8 @@ mod tests {
             old,
             None,
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             old_received_at,
         );
         stager.insert(fresh, None, block, serialized, None, fresh_received_at);
@@ -611,7 +613,14 @@ mod tests {
         let hash = Hash256::from_le_bytes(&[0x43; 32]);
 
         stager.insert(hash, None, block.clone(), serialized.clone(), None, now);
-        stager.insert(hash, None, block, serialized, None, now + Duration::from_secs(5));
+        stager.insert(
+            hash,
+            None,
+            block,
+            serialized,
+            None,
+            now + Duration::from_secs(5),
+        );
 
         assert_eq!(stager.received_len(), 1);
         assert_eq!(stager.received_bytes(), block_bytes);
@@ -637,26 +646,36 @@ mod tests {
         let third = Hash256::from_le_bytes(&[0x54; 32]);
         let incoming = Hash256::from_le_bytes(&[0x55; 32]);
 
-        stager.insert(protected, None, block.clone(), serialized.clone(), None, now);
+        stager.insert(
+            protected,
+            None,
+            block.clone(),
+            serialized.clone(),
+            None,
+            now,
+        );
         stager.insert(
             first,
             None,
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             now + Duration::from_secs(1),
         );
         stager.insert(
             second,
             None,
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             now + Duration::from_secs(2),
         );
         stager.insert(
             third,
             None,
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             now + Duration::from_secs(3),
         );
         stager.budget.max_received_blocks = 2;
@@ -665,7 +684,8 @@ mod tests {
             incoming,
             Some(protected),
             block,
-            serialized, None,
+            serialized,
+            None,
             now + Duration::from_secs(4),
         ) {
             super::StagedBlock::AlreadyStaged => {
@@ -734,7 +754,14 @@ mod tests {
         let fresh = Hash256::from_le_bytes(&[0x66; 32]);
 
         stager.insert(old, None, block.clone(), serialized.clone(), None, now);
-        stager.insert(fresh, None, block, serialized, None, now + Duration::from_secs(5));
+        stager.insert(
+            fresh,
+            None,
+            block,
+            serialized,
+            None,
+            now + Duration::from_secs(5),
+        );
 
         assert_eq!(
             stager.next_received_deadline,
@@ -863,14 +890,16 @@ mod tests {
             expected,
             Some(expected),
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             now,
         );
         stager.insert(
             successor,
             Some(expected),
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             now,
         );
         assert_eq!(stager.received_bytes(), budget.max_received_bytes);
@@ -883,7 +912,8 @@ mod tests {
                 incoming,
                 Some(expected),
                 block.clone(),
-                serialized.clone(), None,
+                serialized.clone(),
+                None,
                 now,
             ) {
                 super::StagedBlock::DroppedForRetry { dropped } => {
@@ -916,14 +946,16 @@ mod tests {
             successor_one,
             Some(expected),
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             now,
         );
         stager.insert(
             successor_two,
             Some(expected),
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             now,
         );
         assert_eq!(stager.received_bytes(), budget.max_received_bytes);
@@ -1002,16 +1034,22 @@ mod tests {
             fork_hash,
             Some(expected_hash),
             block.clone(),
-            serialized.clone(), None,
+            serialized.clone(),
+            None,
             now,
         ) else {
             panic!("fork block should stage");
         };
         assert!(dropped.is_empty());
 
-        let super::StagedBlock::Memory { dropped, .. } =
-            stager.insert(expected_hash, Some(expected_hash), block, serialized, None, now)
-        else {
+        let super::StagedBlock::Memory { dropped, .. } = stager.insert(
+            expected_hash,
+            Some(expected_hash),
+            block,
+            serialized,
+            None,
+            now,
+        ) else {
             panic!("expected block should stage");
         };
         assert_eq!(dropped.len(), 1);
