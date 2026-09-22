@@ -438,7 +438,11 @@ impl BlockSync {
             // in-flight request — that response could not clear the
             // tracker and later ticks would issue competing sends.
             let healed = self.chain.block_tree().read().lookup(prev_hash).is_some();
-            let live_pending = (*self.pending_getheaders.lock()).is_some_and(|request| {
+            // Snapshot the slot, then drop the guard before touching the
+            // table: peer-table reads under the pending lock invert the
+            // table→pending order `with_current` callers rely on.
+            let pending_request = *self.pending_getheaders.lock();
+            let live_pending = pending_request.is_some_and(|request| {
                 Instant::now().duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT
                     && self.peer_table.ready_source(request.peer_addr).is_some()
             });
