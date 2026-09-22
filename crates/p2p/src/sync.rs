@@ -402,10 +402,12 @@ impl BlockSync {
 
     /// Records why the frontier cannot advance this tick.
     fn note_no_progress(frontier: &SyncFrontier, reason: NoProgressReason) {
-        metrics::counter!("node.sync.no_progress_ticks", "reason" => reason.as_str()).increment(1);
         if reason == NoProgressReason::AtTip {
+            // At tip is the healthy terminal state, not a stall: counting it
+            // would make the no-progress signal grow monotonically forever.
             return;
         }
+        metrics::counter!("node.sync.no_progress_ticks", "reason" => reason.as_str()).increment(1);
         let applied_height = frontier
             .chain
             .applied_tip

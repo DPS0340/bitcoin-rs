@@ -121,12 +121,15 @@ impl BlockSync {
             .retain(|addr, _| live.iter().any(|(a, _)| a == addr));
         for addr in replaced {
             scheduler.window.forget_peer(addr);
-            if scheduler
-                .header_request
-                .is_some_and(|request| request.source.addr == addr)
-            {
-                scheduler.header_request = None;
-            }
+        }
+        // A header request survives only while its exact connection is live:
+        // a vanished or replaced owner leaves no deadline gate behind.
+        if scheduler.header_request.is_some_and(|request| {
+            !live.iter().any(|(addr, id)| {
+                *addr == request.source.addr && *id == request.source.connection_id()
+            })
+        }) {
+            scheduler.header_request = None;
         }
         scheduler.window.release_disconnected_peers(&live);
     }
@@ -148,10 +151,12 @@ impl BlockSync {
         // The stall family keys on the same `next_required` body the
         // scheduler requests; at the tip the front sits one past the applied
         // height, exactly as the pre-frontier derivation computed it.
-        let next_apply_height = chain
-            .next_required
-            .map(|body| body.height)
-            .or_else(|| chain.applied_tip.as_ref().map(|tip| tip.height + 1));
+        let next_apply_height = chain.next_required.map(|body| body.height).or_else(|| {
+            chain
+                .applied_tip
+                .as_ref()
+                .and_then(|tip| tip.height.checked_add(1))
+        });
         let (apply_side_escalation, cold_hedge, staller, timed_out) = {
             let mut scheduler = self.scheduler.lock();
             let apply_side_busy =
@@ -313,27 +318,37 @@ impl BlockSync {
         frontier: &SyncFrontier,
         now: Instant,
     ) -> SyncPeerSelection {
-        let our_height = frontier
-            .chain
-            .applied_tip
-            .as_ref()
-            .map_or(0, |tip| tip.height);
+        // Height clause of the fan-out eligibility predicate (KTD6) and
+        // the pre-existing candidate filter: the peer's demonstrated chain
+        // must cover the canonical next-required body — on a reorg whose
+        // first connect node sits below the applied tip, that is lower
+        // than the applied height, so gating on the applied height would
+        // declare the body requestable yet never pick a peer for it.
+        // Like Core's `pindexBestKnownBlock`, eligibility reads the
+        // demonstrated best-known height (handshake snapshot, raised as
+        // the peer hands us accepted headers) rather than the handshake
+        // value alone — a long-lived at-tip peer would otherwise become
+        // ineligible for every newly announced block (#617). Per-request
+        // truncation by `peer_best_height` still bounds the damage of a
+        // stale value. With nothing required the clause reduces to the
+        // applied tip's successor, as before.
+        let required_height = frontier.chain.next_required.map_or_else(
+            || {
+                frontier
+                    .chain
+                    .applied_tip
+                    .as_ref()
+                    .map_or(0, |tip| tip.height)
+                    .saturating_add(1)
+            },
+            |body| body.height,
+        );
         let mut candidates: Vec<FanoutCandidate> = Vec::new();
         for peer in &frontier.usable_peers {
-            // Height clause of the fan-out eligibility predicate (KTD6) and
-            // the pre-existing candidate filter: the peer's known chain must
-            // reach past our applied tip, i.e., cover the window front being
-            // requested. Like Core's `pindexBestKnownBlock`, eligibility reads
-            // the demonstrated best-known height (handshake snapshot, raised
-            // as the peer hands us accepted headers) rather than the
-            // handshake value alone — a long-lived at-tip peer would
-            // otherwise become ineligible for every newly announced block
-            // (#617). Per-request truncation by `peer_best_height` still
-            // bounds the damage of a stale value.
             let Some(active_height) = peer.capability() else {
                 continue;
             };
-            if active_height <= our_height {
+            if active_height < required_height {
                 continue;
             }
             candidates.push(FanoutCandidate {

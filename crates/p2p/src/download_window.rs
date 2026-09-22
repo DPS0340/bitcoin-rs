@@ -2003,34 +2003,27 @@ impl DownloadWindow {
     }
 
     /// Records that block `hash` was received from `source_peer`, moving it
-    /// from pending to received (staged). Returns `true` if the window still
-    /// has request capacity.
+    /// from pending to received (staged). Returns the removed pending's
+    /// height, `None` when the hash was not pending.
+    ///
+    /// The source-attributed credit runs through [`Self::credit_delivery_from`];
+    /// callers proving the source's connection is still current may also call
+    /// it directly after an unattributed `mark_received_from(hash, bytes, None, _)`.
     pub fn mark_received_from(
         &mut self,
         hash: Hash256,
         bytes: usize,
         source_peer: Option<PeerSource>,
         now: Instant,
-    ) -> bool {
+    ) -> Option<u32> {
         let pending = self.remove_pending(&hash);
-        // A local injection releases the request but cannot establish that the
-        // requested peer delivered anything.
-        let delivery_peer = source_peer;
-        if self.pending_timeout_observation.is_some_and(|observation| {
-            observation.hash == hash && Some(observation.owner) == delivery_peer
-        }) {
-            self.pending_timeout_observation = None;
+        let pending_height = pending.map(|pending| pending.height);
+        if let Some(source) = source_peer {
+            self.credit_delivery_from(hash, source, pending_height, now);
         }
-        self.resolve_cold_front_delivery(hash, delivery_peer, now);
-        self.record_prefix_probe_delivery(hash, delivery_peer, now);
-        let (height, needs_height_lookup) = if let Some(pending) = pending {
-            if let Some(source) = delivery_peer {
-                self.record_delivery_progress(source, hash, pending.height, now);
-            }
-            (pending.height, false)
-        } else {
-            (0, true)
-        };
+        // Heights of unsolicited deliveries stay 0 until `update_received_height`
+        // fills them in from the tree.
+        let height = pending_height.unwrap_or(0);
         let previous = self.received.insert(hash, ReceivedBlock { height, bytes });
         if let Some(previous) = previous {
             self.received_bytes = self.received_bytes.saturating_sub(previous.bytes);
@@ -2042,13 +2035,40 @@ impl DownloadWindow {
             .saturating_add(bytes)
             / 8;
         self.ewma_block_bytes = self.ewma_block_bytes.max(80);
-        needs_height_lookup
+        pending_height
     }
 
-    /// Test-only shorthand for delivery by the pending owner.
+    /// The source-attributed share of a staged delivery: pending-timeout,
+    /// cold-front, and prefix-probe resolution plus stall-episode progress,
+    /// all under the delivering connection's exact identity. `pending_height`
+    /// is the height the pending carried at removal — `None` for an
+    /// unsolicited delivery, which carries no progress credit.
+    pub fn credit_delivery_from(
+        &mut self,
+        hash: Hash256,
+        source: PeerSource,
+        pending_height: Option<u32>,
+        now: Instant,
+    ) {
+        if self
+            .pending_timeout_observation
+            .is_some_and(|observation| observation.hash == hash && observation.owner == source)
+        {
+            self.pending_timeout_observation = None;
+        }
+        self.resolve_cold_front_delivery(hash, Some(source), now);
+        self.record_prefix_probe_delivery(hash, Some(source), now);
+        if let Some(height) = pending_height {
+            self.record_delivery_progress(source, hash, height, now);
+        }
+    }
+
+    /// Test-only shorthand for delivery by the pending owner. Returns whether
+    /// the hash was not pending, i.e. its height needs a tree lookup.
     pub fn mark_received(&mut self, hash: Hash256, bytes: usize, now: Instant) -> bool {
         let source_peer = self.pending.get(&hash).map(|pending| pending.owner);
         self.mark_received_from(hash, bytes, source_peer, now)
+            .is_none()
     }
 
     /// Credits a duplicate after the first copy was already staged.
@@ -2067,9 +2087,11 @@ impl DownloadWindow {
     /// (Core's `RemoveBlockRequest`: "this peer delivered, so it's not
     /// stalling"). Called after `hash` was removed from `pending`.
     ///
-    /// Any requested block arriving from the episode peer clears the running
-    /// episode, so blame accumulates only against a peer that delivers
-    /// *nothing* while owning the front and others stream past it. In the
+    /// Any requested block arriving from the episode *connection* clears the
+    /// running episode, so blame accumulates only against a connection that
+    /// delivers *nothing* while owning the front and others stream past it.
+    /// A same-address replacement's deliveries never clear its predecessor's
+    /// clock. In the
     /// saturated fan-out steady state (the staged backlog sits at the count
     /// budget, so the staged-fraction arming term holds almost always),
     /// charging only front arrivals would serially false-blame
@@ -2095,7 +2117,7 @@ impl DownloadWindow {
     ) {
         if self
             .stall
-            .is_some_and(|episode| episode.owner.addr == source.addr || episode.front_hash == hash)
+            .is_some_and(|episode| episode.owner == source || episode.front_hash == hash)
         {
             self.stall = None;
             count_stall_episode_cleared("peer_delivery");
@@ -3781,8 +3803,11 @@ mod tests {
             Instant::now(),
             Duration::from_millis(100),
         );
-        insert_pending(&mut window, test_source(staller_addr()), hash(0x03), 3, now);
-        insert_pending(&mut window, test_source(staller_addr()), hash(0x06), 6, now);
+        // Both pendings belong to one connection: its mid-window delivery is
+        // owner progress and restarts that connection's episode clock.
+        let staller = test_source(staller_addr());
+        insert_pending(&mut window, staller, hash(0x03), 3, now);
+        insert_pending(&mut window, staller, hash(0x06), 6, now);
         for (byte, height) in [(0x04_u8, 4_u32), (0x05, 5)] {
             insert_pending(
                 &mut window,

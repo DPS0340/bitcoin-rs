@@ -295,8 +295,12 @@ proptest::proptest! {
         applied_ahead in proptest::bool::ANY,
         next_required in proptest::option::of(0_u32..16),
         apply_halted in proptest::bool::ANY,
-        body_unowned in proptest::bool::ANY,
-        peers in proptest::collection::vec(0_i32..32, 0..5usize),
+        body_case in 0_u8..3,
+        in_flight_live in proptest::bool::ANY,
+        peers in proptest::collection::vec(
+            (0_i32..32, proptest::bool::ANY),
+            0..5usize,
+        ),
         pending_live in proptest::bool::ANY,
     ) {
         let applied = snap(1, 8, 0x01);
@@ -305,24 +309,40 @@ proptest::proptest! {
         } else {
             snap(2, 12, 0x02)
         };
-        let body_state = next_required.map(|_height| {
-            if body_unowned {
-                BodyState::Unowned
-            } else {
-                BodyState::Staged
-            }
-        });
+        // `evidenced` peers carry demonstrated tips that resolve off the
+        // active chain, so `capability()` yields `None` — crossing the
+        // no-capable-peer branch, not just empty-vs-nonempty peers.
         let usable_peers = peers
             .iter()
             .enumerate()
-            .map(|(idx, height)| {
-                usable(
+            .map(|(idx, (height, evidenced))| {
+                let mut peer = usable(
                     u16::try_from(9100 + idx).unwrap_or(9100),
                     *height,
                     None,
-                )
+                );
+                if *evidenced {
+                    peer.demonstrated_tips = vec![hash(0x77)];
+                }
+                peer
             })
             .collect::<Vec<_>>();
+        // InFlight crosses both directions of the identity-exact owner
+        // check: a live owner counts as progress; an owner absent from the
+        // usable set is unowned work and must be re-requested.
+        let body_state = next_required.map(|_height| match body_case {
+            0 => BodyState::Unowned,
+            1 => BodyState::Staged,
+            _ => {
+                if in_flight_live {
+                    usable_peers.first().map_or(BodyState::Unowned, |peer| {
+                        BodyState::InFlight(peer.source)
+                    })
+                } else {
+                    BodyState::InFlight(PeerSource::for_test(addr_of(9999)))
+                }
+            }
+        });
         let owner = usable_peers.first().map(|peer| peer.source);
         let header_request = if let (true, Some(source)) = (pending_live, owner) {
             Some(super::super::PendingHeaderRequest {
@@ -357,15 +377,33 @@ proptest::proptest! {
                  {plan:?}"
             );
         }
-        if plan.no_progress == Some(NoProgressReason::NoUsablePeers) {
-            proptest::prop_assert!(frontier.usable_peers.is_empty());
-        }
-        if frontier.usable_peers.is_empty() && frontier.chain.next_required.is_some()
+        // A live in-flight owner counts as progress: no incapability
+        // verdict and recovery keeps scheduling while its work is pending.
+        if let Some(BodyState::InFlight(owner)) = frontier.body_state
             && !frontier.chain.apply_halted
+            && frontier
+                .usable_peers
+                .iter()
+                .any(|peer| peer.source == owner)
+        {
+            proptest::prop_assert!(plan.schedule_bodies, "live owner is progress: {plan:?}");
+            proptest::prop_assert_eq!(plan.no_progress, None);
+        }
+        // An owner absent from the usable set is unowned work: when no
+        // capable peer exists the plan must carry NoCapablePeer rather than
+        // silently relying on the dead connection.
+        if let Some(BodyState::InFlight(owner)) = frontier.body_state
+            && !frontier.usable_peers.is_empty()
+            && !frontier.usable_peers.iter().any(|peer| peer.source == owner)
+            && !frontier.chain.apply_halted
+            && !frontier
+                .usable_peers
+                .iter()
+                .any(|peer| peer.capability().is_some())
         {
             proptest::prop_assert_eq!(
                 plan.no_progress,
-                Some(NoProgressReason::NoUsablePeers)
+                Some(NoProgressReason::NoCapablePeer)
             );
         }
     }
