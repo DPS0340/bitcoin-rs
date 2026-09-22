@@ -209,12 +209,12 @@ fn apply_buffered_blocks_waits_for_pending_reorg() -> Result<(), Box<dyn std::er
         &mut vec![crate::InboundBlock::from_decoded(head.clone())],
         Some(head_hash),
     );
-    assert!(sync.body_sync.lock().stager.contains(&head_hash));
+    assert!(sync.scheduler.lock().stager.contains(&head_hash));
 
     let first_connect = Hash256::from(winning[0].block_hash());
     assert_eq!(sync.apply_buffered_blocks(Some(first_connect)), (0, 0));
     assert!(
-        sync.body_sync.lock().stager.contains(&head_hash),
+        sync.scheduler.lock().stager.contains(&head_hash),
         "an uncommittable winner body must stay staged for the branch switch"
     );
     assert_eq!(

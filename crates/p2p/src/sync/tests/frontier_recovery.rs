@@ -495,7 +495,7 @@ fn untracked_delivery_records_tree_height() -> Result<(), Box<dyn std::error::Er
         1
     );
     assert_eq!(
-        sync.body_sync.lock().window.received_height(&hash),
+        sync.scheduler.lock().window.received_height(&hash),
         Some(2),
         "an untracked tree-known body must carry its canonical height"
     );

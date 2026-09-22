@@ -312,7 +312,9 @@ impl BlockSync {
                         // A body that arrived before its header entered the
                         // tree has no pending height: adopt the tree-resolved
                         // height so a later retry lands at the right cursor.
-                        if pending_height.is_none() && let Some(height) = known_height {
+                        if pending_height.is_none()
+                            && let Some(height) = known_height
+                        {
                             window.update_received_height(&hash, height);
                         }
                         if let Some(source_peer) = source_peer {
