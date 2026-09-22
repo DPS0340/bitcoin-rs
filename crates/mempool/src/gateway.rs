@@ -58,6 +58,9 @@ pub enum ChainChangeError {
     /// failed because the generation moved underneath the guard.
     #[error("chain generation changed before finish")]
     GenerationMoved,
+    /// The guard was issued by a different gateway.
+    #[error("chain change guard belongs to another gateway")]
+    ForeignGuard,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,9 +111,10 @@ pub struct AdmissionRequest {
     pub origin: AdmissionOrigin,
     /// Exact chain generation the caller captured before admission.
     /// Ordinary submitters only ever hold an even value obtained from
-    /// [`MempoolGateway::stable_generation`]; the odd value is only ever
-    /// held by the active [`ChainChangeGuard`], so the commit-time check is
-    /// exactly "the request was prepared under the current generation".
+    /// [`MempoolGateway::stable_generation`]; requests prepared under a
+    /// [`ChainChangeGuard`] carry its odd value. The token alone grants no
+    /// authority — `check_admission_state` accepts it only under the
+    /// matching [`crate::admission::AdmissionFence`].
     pub expected_generation: u64,
     /// Exact mempool sequence the caller captured before admission.
     pub expected_sequence: u64,
@@ -745,7 +749,7 @@ impl MempoolGateway {
     // borrows it so the shared retry owner can recover the Arc after a mismatch.
     #[allow(clippy::needless_pass_by_value)]
     pub fn admit_transaction(&self, request: AdmissionRequest) -> Result<AdmitOutcome, AdmitError> {
-        self.admit_transaction_claimed(&request, None)
+        self.admit_transaction_claimed(&request, None, crate::admission::AdmissionFence::Stable)
     }
 
     /// A private resident-body claim joins generation/sequence validation.
@@ -757,10 +761,11 @@ impl MempoolGateway {
         &self,
         request: &AdmissionRequest,
         claim: Option<&crate::orphan::HeldOrphan>,
+        fence: crate::admission::AdmissionFence,
     ) -> Result<AdmitOutcome, AdmitError> {
         let mut prepared = {
             let pool = self.pool.read();
-            self.check_admission_state(&pool, request)?;
+            self.check_admission_state(&pool, request, fence)?;
             Self::prepare_admission(&pool, request, AdmissionMode::Single)
         };
         prepared.verify(request);
@@ -772,7 +777,7 @@ impl MempoolGateway {
         ordering_gate::park_if_armed(std::ptr::from_ref(self).expose_provenance());
 
         let mut pool = self.pool.write();
-        self.check_admission_state(&pool, request)?;
+        self.check_admission_state(&pool, request, fence)?;
         if !prepared.matches_pool(&pool) {
             return Err(AdmitError::MempoolChanged);
         }
@@ -826,16 +831,18 @@ impl MempoolGateway {
 
     /// Rejects a request whose captured generation no longer matches.
     ///
-    /// Ordinary submitters only ever hold an even value obtained from
-    /// [`Self::stable_generation`]; the odd value is only ever held by the
-    /// active [`ChainChangeGuard`], so the raw-load comparison is exactly
-    /// "the request was prepared under the current generation".
+    /// Authority to admit comes from the fence, not from a caller-supplied
+    /// integer: the stable fence admits only the even value returned by
+    /// [`Self::stable_generation`], and the chain-change fence admits only
+    /// the odd value reserved by its own [`ChainChangeGuard`]. A request
+    /// carrying the right number under the wrong fence is refused.
     pub(crate) fn check_admission_state(
         &self,
         pool: &Mempool,
         request: &AdmissionRequest,
+        fence: crate::admission::AdmissionFence,
     ) -> Result<(), AdmitError> {
-        if self.chain_generation.load(Ordering::Acquire) != request.expected_generation {
+        if fence.current(self) != Some(request.expected_generation) {
             return Err(AdmitError::GenerationChanged);
         }
         if pool.sequence_number() != request.expected_sequence {
@@ -1008,6 +1015,9 @@ impl MempoolGateway {
         change: &ChainChangeGuard,
         chain: &dyn crate::admission::AdmissionChain,
     ) -> Result<MutationResult, ChainChangeError> {
+        if !change.owns(self) {
+            return Err(ChainChangeError::ForeignGuard);
+        }
         let residents: Vec<Arc<Tx>> = {
             let pool = self.pool.read();
             pool.iter_entries()
@@ -1322,6 +1332,11 @@ impl ChainChangeGuard {
     #[must_use]
     pub fn reserved_even(&self) -> u64 {
         self.even
+    }
+
+    /// Whether this guard was issued by `gateway` itself.
+    pub(crate) fn owns(&self, gateway: &MempoolGateway) -> bool {
+        core::ptr::eq(Arc::as_ptr(&self.gateway), gateway)
     }
 
     /// Compare-exchanges the exact odd value to the reserved even value.

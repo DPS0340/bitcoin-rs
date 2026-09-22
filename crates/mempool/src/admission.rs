@@ -33,7 +33,7 @@ pub(crate) enum AdmissionFence {
 impl AdmissionFence {
     /// The generation this fence currently admits under, or `None` when
     /// the chain moved (odd fence mismatched, or stable fence saw odd).
-    fn current(self, gateway: &MempoolGateway) -> Option<u64> {
+    pub(crate) fn current(self, gateway: &MempoolGateway) -> Option<u64> {
         match self {
             Self::Stable => gateway.stable_generation(),
             Self::ChainChange(odd) => (gateway.chain_generation() == odd).then_some(odd),
@@ -367,6 +367,8 @@ impl MempoolGateway {
     /// `txs` must arrive parents before children. A refused candidate, and any
     /// later candidate spending it or spending a txid an earlier commit
     /// removed, is withheld so a refused parent never leaves a partial family.
+    /// A guard issued by a different gateway admits nothing and returns an
+    /// empty result: the odd value alone is not authority.
     pub fn reconsider_disconnected(
         &self,
         change: &crate::gateway::ChainChangeGuard,
@@ -374,6 +376,9 @@ impl MempoolGateway {
         time: u64,
         txs: impl IntoIterator<Item = Arc<Tx>>,
     ) -> Vec<MutationResult> {
+        if !change.owns(self) {
+            return Vec::new();
+        }
         let fence = AdmissionFence::ChainChange(change.odd_generation());
         let mut refused: HashSet<Txid> = HashSet::new();
         let mut committed = Vec::new();
@@ -507,7 +512,7 @@ impl MempoolGateway {
                 expected_generation: generation,
                 expected_sequence: sequence,
             };
-            match self.admit_transaction_claimed(&request, claim) {
+            match self.admit_transaction_claimed(&request, claim, fence) {
                 Ok(AdmitOutcome::Committed(result)) => return Ok(SubmitOutcome::Committed(result)),
                 Ok(AdmitOutcome::AlreadyKnown) => return Ok(SubmitOutcome::AlreadyKnown),
                 Err(AdmitError::GenerationChanged | AdmitError::MempoolChanged) => {
@@ -2481,8 +2486,10 @@ mod tests {
         assert!(gateway.read().contains_txid(&parent_txid));
     }
 
-    /// The admission gate compares raw values: an even token is refused while
-    /// the generation is odd, and the guard's exact odd value is accepted.
+    /// The admission gate compares the token through the fence: an even
+    /// token is refused while the generation is odd, an odd token under the
+    /// stable fence is refused too — the integer alone is not authority —
+    /// and the guard's chain-change fence admits only its own odd value.
     #[test]
     #[allow(clippy::expect_used)]
     fn admission_state_accepts_only_the_current_generation() {
@@ -2512,18 +2519,54 @@ mod tests {
         };
         let pool = gateway.read();
         assert_eq!(
-            gateway.check_admission_state(&pool, &request),
+            gateway.check_admission_state(&pool, &request, AdmissionFence::Stable),
             Err(AdmitError::GenerationChanged),
             "an even token cannot admit while the change fence is held"
         );
         let mut odd_request = request;
         odd_request.expected_generation = change.odd_generation();
         assert_eq!(
-            gateway.check_admission_state(&pool, &odd_request),
+            gateway.check_admission_state(&pool, &odd_request, AdmissionFence::Stable),
+            Err(AdmitError::GenerationChanged),
+            "the odd integer without the guard's fence is refused"
+        );
+        assert_eq!(
+            gateway.check_admission_state(
+                &pool,
+                &odd_request,
+                AdmissionFence::ChainChange(change.odd_generation()),
+            ),
             Ok(()),
-            "the guard's exact odd value admits under the fence"
+            "the guard's exact odd value admits under its own fence"
         );
         drop(pool);
         change.finish().expect("finish");
+    }
+
+    /// A guard issued by another gateway carries no authority here:
+    /// `remove_for_reorg` fails fast with `ForeignGuard` before any pool
+    /// read, and `reconsider_disconnected` inserts nothing.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn reorg_methods_refuse_a_guard_from_another_gateway() {
+        let gateway_a = gateway();
+        let gateway_b = gateway();
+        let (parent, _child) = parent_and_child();
+        insert_parent(&gateway_b, parent.clone(), AdmissionOrigin::Rpc);
+        let guard_b = gateway_b.begin_chain_change().expect("fence on b");
+
+        assert_eq!(
+            gateway_a.remove_for_reorg(&guard_b, &Coins(vec![])),
+            Err(crate::ChainChangeError::ForeignGuard),
+            "a foreign guard cannot sweep this gateway's pool"
+        );
+        assert!(
+            gateway_a
+                .reconsider_disconnected(&guard_b, &Coins(vec![]), 1, [Arc::new(parent)])
+                .is_empty(),
+            "a foreign guard admits nothing"
+        );
+        assert!(gateway_a.read().iter_entries().next().is_none());
+        guard_b.finish().expect("finish b");
     }
 }

@@ -206,7 +206,8 @@ impl ChainFollowers {
             .map(|gateway| {
                 gateway.begin_chain_change().map_err(|error| match error {
                     bitcoin_rs_mempool::ChainChangeError::AlreadyActive
-                    | bitcoin_rs_mempool::ChainChangeError::GenerationMoved => {
+                    | bitcoin_rs_mempool::ChainChangeError::GenerationMoved
+                    | bitcoin_rs_mempool::ChainChangeError::ForeignGuard => {
                         bitcoin_rs_chainstate::ApplyError::ConcurrentChainChange
                     }
                     bitcoin_rs_mempool::ChainChangeError::Overflow => {

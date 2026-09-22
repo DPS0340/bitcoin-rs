@@ -205,7 +205,11 @@ state (`crates/mempool/src/orphan.rs`).
   BIP68, coinbase-maturity and script checks an ingress submission gets —
   while the node holds the `ChainChangeGuard` fence. Requests prepared
   under the guard's reserved odd generation commit exactly where ordinary
-  submissions commit under the stable even value. Candidates arrive
+  submissions commit under the stable even value. The odd fence is derived
+  from the gateway's own `ChainChangeGuard`, never from a caller-supplied
+  generation token: a request carrying the active odd value under the
+  stable fence is refused, and a guard issued by a different gateway
+  admits nothing and sweeps nothing. Candidates arrive
   parents before children; a refused candidate, and any later candidate
   spending it or spending a txid an earlier commit removed, is withheld so
   a refused parent never leaves a partial family. Commits publish with
@@ -275,6 +279,7 @@ state (`crates/mempool/src/orphan.rs`).
   `reconsider_disconnected_does_not_register_with_the_estimator`,
   `remove_for_reorg_sweeps_only_unsupported_residents`,
   `remove_for_reorg_refuses_a_moved_generation`,
+  `reorg_methods_refuse_a_guard_from_another_gateway`,
   `admission_state_accepts_only_the_current_generation`.
 - `crates/rpc/src/context.rs` (`admission_chain_tests`):
   `stable_chainstate_reader_does_not_block_transaction_admission`,
