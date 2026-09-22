@@ -59,6 +59,11 @@ cannot drift:
 ./scripts/ci-pr.sh all            # fmt + deep + deny
 ```
 
+In CI the test lanes run under cargo-nextest's pooled scheduler and link
+with mold (`.github/actions/test-deps` installs both); where nextest is not
+installed the script falls back to `cargo test --no-fail-fast`, so local
+runs and hooks need no extra tooling.
+
 Plain `cargo test --workspace` and `cargo clippy --workspace` also enable the
 library defaults and therefore build the C++ kernel. The script passes the
 kernel-free feature selection. The binary and workspace test lanes expect the

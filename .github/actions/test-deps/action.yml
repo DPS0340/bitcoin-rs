@@ -1,0 +1,16 @@
+name: Test lane speed prerequisites
+description: >-
+  cargo-nextest (pooled test scheduling) and the mold linker for the compile-and-test
+  lanes. Kernel/rocksdb C++ prerequisites stay in .github/actions/native-deps.
+runs:
+  using: composite
+  steps:
+    # ubuntu-latest already ships mold; install it only when absent so a
+    # runner image change cannot silently drop the linker the lanes' RUSTFLAGS
+    # select.
+    - name: mold linker
+      shell: bash
+      run: command -v mold >/dev/null || { sudo apt-get update && sudo apt-get install -y mold; }
+    - uses: taiki-e/install-action@82fc405565b9cf90abfe700ba43b4751ce2fe422 # cargo-nextest
+      with:
+        tool: cargo-nextest@0.9.143
