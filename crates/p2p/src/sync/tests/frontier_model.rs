@@ -411,6 +411,22 @@ proptest::proptest! {
                 Some(NoProgressReason::NoCapablePeer)
             );
         }
+        // NoUsablePeers is reserved for an actually-empty usable set: the
+        // verdict must never fire while peers exist, and every empty-peer
+        // frontier with a required body must carry it (rather than a
+        // misattributed capability verdict).
+        if plan.no_progress == Some(NoProgressReason::NoUsablePeers) {
+            proptest::prop_assert!(frontier.usable_peers.is_empty());
+        }
+        if frontier.usable_peers.is_empty()
+            && frontier.chain.next_required.is_some()
+            && !frontier.chain.apply_halted
+        {
+            proptest::prop_assert_eq!(
+                plan.no_progress,
+                Some(NoProgressReason::NoUsablePeers)
+            );
+        }
     }
 }
 
