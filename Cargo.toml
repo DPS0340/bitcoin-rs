@@ -95,7 +95,7 @@ corepc-types = { version = "0.15.0", default-features = false, features = [
 
 # bitcoin_slices: zero-alloc block visitor. Default features list is empty;
 # enable bitcoin + sha2 explicitly.
-bitcoin_slices = { version = ">=0.11, <0.12", default-features = false, features = [
+bitcoin_slices = { version = ">=0.12, <0.13", default-features = false, features = [
     "bitcoin", "sha2",
 ] }
 
