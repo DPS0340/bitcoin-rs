@@ -196,7 +196,17 @@ impl BlockSync {
             let blamed: Vec<std::net::SocketAddr> = invalid
                 .iter()
                 .filter_map(|(_, source)| *source)
-                .filter(|source| self.peer_table.disconnect_source(*source))
+                .filter(|source| {
+                    if self.peer_table.disconnect_source(*source) {
+                        // Every removal path releases a `getheaders` gate
+                        // the peer owned, or a same-address reconnect
+                        // inherits a dead deadline.
+                        self.clear_pending_getheaders_for(source.addr);
+                        true
+                    } else {
+                        false
+                    }
+                })
                 .map(|source| source.addr)
                 .collect();
             let mut body_sync = self.body_sync.lock();

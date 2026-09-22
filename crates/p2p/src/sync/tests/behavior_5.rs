@@ -260,6 +260,7 @@ fn far_future_matching_peer_retries_without_peer_blame() -> Result<(), Box<dyn s
         source: Some(current_source(&peers, peer_addr)),
 
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.tick();
 

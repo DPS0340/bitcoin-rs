@@ -207,11 +207,13 @@ impl InboundSyncSinks {
         source: crate::PeerSource,
         headers: Vec<bitcoin_rs_primitives::Header>,
         wire_response: bool,
+        body_fetch_owned: bool,
     ) {
         if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
             headers,
             source: Some(source),
             wire_response,
+            body_fetch_owned,
         }) {
             tracing::warn!(peer_addr = %source.addr, %error, "p2p inbound headers channel disconnected");
         } else {
@@ -234,7 +236,7 @@ impl InboundSyncSinks {
         // blocks drain each tick, so the body lands already expected. The
         // forward is not a `headers` response: it must not consume an
         // outstanding `getheaders` request's pending state.
-        self.send_headers(source, vec![block.header], false);
+        self.send_headers(source, vec![block.header], false, false);
         let mut inbound = crate::InboundBlock {
             block,
             serialized,
@@ -1115,7 +1117,12 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 )?;
                 match message {
                     crate::Message::Headers(headers) => {
-                        inbound_sync_sinks.send_headers(lease.source(peer_addr), headers, true);
+                        inbound_sync_sinks.send_headers(
+                            lease.source(peer_addr),
+                            headers,
+                            true,
+                            false,
+                        );
                     }
                     crate::Message::Block(block) => {
                         inbound_sync_sinks.send_block(lease.source(peer_addr), block, raw);
@@ -1195,7 +1202,21 @@ fn process_compact_wire_message(
         && !matches!(outcome, crate::compact_blocks::Outcome::Complete(_))
         && let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
     {
-        inbound_sync_sinks.send_headers(lease.source(peer_addr), vec![header], false);
+        // When the outcome itself fetches the body (`RequestMissing` issues
+        // a `getblocktxn`, `Fallback` a full-block `getdata`), the window
+        // must record that in-flight fetch instead of scheduling a
+        // duplicate request for the freshly admitted tip.
+        let body_fetch_owned = matches!(
+            outcome,
+            crate::compact_blocks::Outcome::RequestMissing(_)
+                | crate::compact_blocks::Outcome::Fallback(_)
+        );
+        inbound_sync_sinks.send_headers(
+            lease.source(peer_addr),
+            vec![header],
+            false,
+            body_fetch_owned,
+        );
     }
     handle_compact_outcome(outcome, lease, peer_addr, inbound_sync_sinks);
 }
@@ -1808,7 +1829,7 @@ mod writer_shutdown_tests {
         let serialized = bytes::Bytes::from(block_bytes);
         let source = lease.source(addr);
 
-        sinks.send_headers(source, Vec::new(), true);
+        sinks.send_headers(source, Vec::new(), true, false);
         sinks.send_block(source, block, serialized.clone());
 
         assert_eq!(headers_rx.try_recv()?.source, Some(source));

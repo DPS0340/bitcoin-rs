@@ -51,6 +51,7 @@ fn tick_buffers_out_of_order_blocks_until_parent_arrives() -> Result<(), Box<dyn
         headers: vec![genesis.header, block_one.header, block_two.header],
         source: None,
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
         block_two.clone(),
@@ -106,6 +107,7 @@ fn tick_applies_non_coinbase_spend_and_updates_utxo_and_coinstats()
         headers: fixture.blocks.iter().map(|block| block.header).collect(),
         source: None,
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     for block in fixture.blocks.iter().skip(1) {
         inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))?;

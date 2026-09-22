@@ -38,6 +38,7 @@ impl BlockSync {
             headers,
             source,
             wire_response,
+            body_fetch_owned,
         }) = receiver.try_recv()
         {
             let batch_len = headers.len();
@@ -56,6 +57,9 @@ impl BlockSync {
                     self.peer_table
                         .note_announced_tip(source, tip_hash, active_height);
                     credit_refresh_needed = true;
+                }
+                if body_fetch_owned {
+                    self.note_owned_body_fetch(source, headers.last());
                 }
                 continue;
             }
@@ -84,6 +88,10 @@ impl BlockSync {
                     let mut blamed_peer = None;
                     if let Some(source) = source {
                         if self.peer_table.disconnect_source(source) {
+                            // Every removal path releases a `getheaders`
+                            // gate the peer owned, or a same-address
+                            // reconnect inherits a dead deadline.
+                            self.clear_pending_getheaders_for(source.addr);
                             self.body_sync
                                 .lock()
                                 .window
@@ -134,6 +142,9 @@ impl BlockSync {
                     // silently losing the announcement.
                     self.request_ancestry_after_refusal(source, &error);
                 }
+            }
+            if body_fetch_owned {
+                self.note_owned_body_fetch(source, headers.last());
             }
         }
         if credit_refresh_needed {
@@ -186,11 +197,48 @@ impl BlockSync {
         if let Some(source) = source
             && self.peer_table.is_current(source)
         {
-            let mut pending = self.pending_getheaders.lock();
-            if pending.is_some_and(|request| request.peer_addr == source.addr) {
-                *pending = None;
-            }
+            self.clear_pending_getheaders_for(source.addr);
         }
+    }
+
+    /// Releases a `getheaders` gate owned by `peer_addr`. Every disconnect
+    /// path — wire-response consumption, send failure, window or staged-
+    /// header blame — clears the owner so a same-address reconnect cannot
+    /// inherit a stale deadline.
+    pub(super) fn clear_pending_getheaders_for(&self, peer_addr: SocketAddr) {
+        let mut pending = self.pending_getheaders.lock();
+        if pending.is_some_and(|request| request.peer_addr == peer_addr) {
+            *pending = None;
+        }
+    }
+
+    /// Records a body fetch the window does not own — the compact outcome
+    /// that forwarded this header already issued a `getblocktxn` or a
+    /// fallback `getdata` for the tip body — as pending under `source`, so
+    /// `next_peer_request` does not schedule a duplicate getdata for the
+    /// freshly admitted tip. A tip that never admits has no tree height and
+    /// nothing the window could schedule anyway.
+    fn note_owned_body_fetch(
+        &self,
+        source: Option<PeerSource>,
+        header: Option<&bitcoin_rs_primitives::Header>,
+    ) {
+        let (Some(source), Some(header)) = (source, header) else {
+            return;
+        };
+        let hash = Hash256::from(header.compute_hash());
+        let height = {
+            let tree = self.chain.block_tree().read();
+            tree.lookup(hash)
+                .and_then(|id| tree.node(id).ok().map(|node| node.height))
+        };
+        let Some(height) = height else {
+            return;
+        };
+        self.body_sync
+            .lock()
+            .window
+            .mark_owned_fetch(source.addr, hash, height, Instant::now());
     }
 
     /// `(announced_tip, active_height)` when every header in `headers` is
@@ -549,10 +597,7 @@ impl BlockSync {
             // to this address dropped so a fast reconnect does not inherit a
             // stale deadline gate.
             if self.peer_table.disconnect_source(source) {
-                let mut pending = self.pending_getheaders.lock();
-                if pending.is_some_and(|request| request.peer_addr == source.addr) {
-                    *pending = None;
-                }
+                self.clear_pending_getheaders_for(source.addr);
             }
             return false;
         }

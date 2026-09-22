@@ -2236,6 +2236,32 @@ impl DownloadWindow {
         self.remove_pending(hash);
     }
 
+    /// Records a body fetch the window does not own — a compact
+    /// `getblocktxn` or fallback `getdata` already issued on `peer_addr` —
+    /// as pending so `next_peer_request` does not schedule a duplicate
+    /// request for a freshly admitted tip. Delivery resolves it like any
+    /// window request; expiry or peer disconnect hands it back to normal
+    /// scheduling, so a silently dropped compact fetch still re-requests.
+    /// The window owns no frontier for the entry: `next_request_height`
+    /// must not advance past heights it never scanned.
+    pub fn mark_owned_fetch(
+        &mut self,
+        peer_addr: SocketAddr,
+        hash: Hash256,
+        height: u32,
+        now: Instant,
+    ) {
+        if self.pending.contains_key(&hash) || self.received.contains_key(&hash) {
+            return;
+        }
+        let request = PeerRequest {
+            peer_addr,
+            entries: vec![PeerRequestEntry { hash, height }],
+            next_request_height: 0,
+        };
+        self.mark_requested(&request, now);
+    }
+
     fn remove_received(&mut self, hash: &Hash256) -> Option<ReceivedBlock> {
         let received = self.received.remove(hash)?;
         self.received_bytes = self.received_bytes.saturating_sub(received.bytes);

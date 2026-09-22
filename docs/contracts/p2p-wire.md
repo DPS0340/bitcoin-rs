@@ -195,11 +195,27 @@ branch-plan, attribution, timeout and bounded-staging suites remain required.
   rejection discards the body, releases its download-window record outright
   (`discard_received`, never re-queued), disconnects the source, and marks
   it unresponsive — the same outcome a rejected `headers` batch produces.
+- A `cmpctblock` outcome that fetches the body itself (`RequestMissing`'s
+  `getblocktxn`, `Fallback`'s `getdata`) is marked
+  (`InboundHeaders::body_fetch_owned`): once the tip admits, the window
+  records the hash pending under the delivering peer
+  (`DownloadWindow::mark_owned_fetch`) so normal scheduling does not issue
+  a duplicate `getdata`. Delivery resolves it like any window request;
+  expiry or disconnect hands it back to scheduling, so a silently dropped
+  compact fetch re-requests instead of wedging the tip.
+- Every peer-removal path releases a `getheaders` gate the peer owned —
+  wire-response consumption, send failure, session reconciliation, and
+  peer-fault disconnects in both the headers drain and the staged-header
+  retry (`clear_pending_getheaders_for`) — so a same-address reconnect
+  cannot inherit a dead request deadline.
 
 Proof: `crates/p2p/src/sync/tests/head_sync.rs` covers body-carried header
 admission and apply, gap-fill requests for staged bodies ahead of their
 header chain, announcer-directed `getheaders` on unattached batches,
 non-response forwards preserving pending-request state, staged-retry
-credit, shared-ancestor capability, bounded fork evidence, and credit for
-already-known tips. `crates/p2p/src/listener.rs` test
-`send_block_forwards_the_blocks_header` covers the delivery-path forward.
+credit, shared-ancestor capability, bounded fork evidence, credit for
+already-known tips, and the compact-owned pending mark. Fault-path gate
+cleanup is covered in
+`crates/p2p/src/sync/tests/transitions_4.rs`. `crates/p2p/src/listener.rs`
+test `send_block_forwards_the_blocks_header` covers the delivery-path
+forward.

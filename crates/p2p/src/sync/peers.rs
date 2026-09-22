@@ -117,10 +117,7 @@ impl BlockSync {
         // an existing table reader waits for this window.
         self.peer_table.with_current(source, || {
             self.body_sync.lock().window.forget_peer(source.addr);
-            let mut pending = self.pending_getheaders.lock();
-            if pending.is_some_and(|request| request.peer_addr == source.addr) {
-                *pending = None;
-            }
+            self.clear_pending_getheaders_for(source.addr);
         });
     }
 
@@ -137,10 +134,7 @@ impl BlockSync {
         for (addr, id) in &live {
             if known.insert(*addr, *id).is_some_and(|prev| prev != *id) {
                 window.forget_peer(*addr);
-                let mut pending = self.pending_getheaders.lock();
-                if pending.is_some_and(|request| request.peer_addr == *addr) {
-                    *pending = None;
-                }
+                self.clear_pending_getheaders_for(*addr);
             }
         }
         known.retain(|addr, _| live.iter().any(|(a, _)| a == addr));
@@ -431,10 +425,7 @@ impl BlockSync {
         {
             return None;
         }
-        let mut pending = self.pending_getheaders.lock();
-        if pending.is_some_and(|request| request.peer_addr == peer_addr) {
-            *pending = None;
-        }
+        self.clear_pending_getheaders_for(peer_addr);
         Some(peer_addr)
     }
 }

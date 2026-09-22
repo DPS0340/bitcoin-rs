@@ -38,13 +38,16 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders()
 
     // Deliver the attributed invalid batch while the gate is still armed
     // against the invalid peer. No other selectable peer remains, so this
-    // tick cannot re-arm the gate against a different address: the only way
-    // `pending_getheaders` ends up clear is the peer-fault cleanup.
+    // tick cannot re-arm the gate against a different address — and the
+    // batch is marked a non-response so `consume_pending_getheaders` cannot
+    // clear it either: the only way `pending_getheaders` ends up clear is
+    // the peer-fault cleanup.
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
         source: Some(current_source(&peers, invalid_peer)),
 
-        wire_response: true,
+        wire_response: false,
+        body_fetch_owned: false,
     })?;
     sync.tick();
 
@@ -101,6 +104,7 @@ fn unattributed_invalid_headers_do_not_disconnect_any_peer()
         source: None,
 
         wire_response: true,
+        body_fetch_owned: false,
     })?;
 
     sync.tick();

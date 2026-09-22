@@ -100,6 +100,7 @@ fn body_arriving_ahead_of_its_header_chain_requests_the_gap()
         source: Some(current_source(&peers, peer)),
 
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block2))?;
     sync.tick();
@@ -136,6 +137,7 @@ fn headers_batch_missing_parent_requests_ancestry() -> Result<(), Box<dyn std::e
         source: Some(current_source(&peers, peer)),
 
         wire_response: true,
+        body_fetch_owned: false,
     })?;
 
     sync.drain_inbound_headers();
@@ -168,6 +170,7 @@ fn known_header_batch_still_credits_the_announcer() -> Result<(), Box<dyn std::e
         source: Some(current_source(&peers, peer)),
 
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
 
@@ -214,6 +217,7 @@ fn headers_batch_too_far_ahead_does_not_replay_a_request() -> Result<(), Box<dyn
         source: Some(current_source(&peers, peer)),
 
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
 
@@ -303,6 +307,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
         headers: vec![body_tip],
         source: Some(source),
         wire_response: false,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
     assert!(
@@ -314,6 +319,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
         headers: vec![body_tip],
         source: Some(source),
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
     assert!(
@@ -392,6 +398,7 @@ fn fork_tip_attests_its_shared_active_ancestor() -> Result<(), Box<dyn std::erro
         headers: vec![fork1, fork2],
         source: Some(current_source(&peers, peer)),
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
 
@@ -436,11 +443,13 @@ fn retained_unresolved_tips_are_deduplicated_and_capped() -> Result<(), Box<dyn 
         headers: vec![fork_base],
         source: Some(source),
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![fork_tip],
         source: Some(source),
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
     assert_eq!(
@@ -466,6 +475,7 @@ fn retained_unresolved_tips_are_deduplicated_and_capped() -> Result<(), Box<dyn 
             headers: vec![tip],
             source: Some(source),
             wire_response: true,
+            body_fetch_owned: false,
         })?;
     }
     sync.drain_inbound_headers();
@@ -518,12 +528,14 @@ fn delivered_tip_evidence_is_compacted_to_the_max_resolving_tip()
         source: Some(current_source(&peers, peer)),
 
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![tip2],
         source: Some(current_source(&peers, peer)),
 
         wire_response: true,
+        body_fetch_owned: false,
     })?;
     sync.drain_inbound_headers();
 
@@ -536,6 +548,42 @@ fn delivered_tip_evidence_is_compacted_to_the_max_resolving_tip()
             .demonstrated_tips,
         vec![Hash256::from(tip2.compute_hash())],
         "retained evidence compacts to the max-resolving tip"
+    );
+    Ok(())
+}
+
+#[test]
+fn compact_owned_body_fetch_marks_the_tip_pending() -> Result<(), Box<dyn std::error::Error>> {
+    // A `cmpctblock` whose reconstruction pends has its body fetch in
+    // flight off-window (`getblocktxn`, or the fallback `getdata`). The
+    // forwarded header still admits, and the window records the tip hash
+    // pending under the announcing peer so normal scheduling does not
+    // issue a duplicate `getdata` for it.
+    let mut tree = BlockTree::new();
+    let genesis = genesis_header();
+    tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+    let peer = test_addr(9706, 0)?;
+    let _rx = connect_peer(&peers, eligible_peer(peer, 0));
+    let tip = test_header(genesis.compute_hash(), 1);
+    let tip_hash = Hash256::from(tip.compute_hash());
+
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![tip],
+        source: Some(current_source(&peers, peer)),
+        wire_response: false,
+        body_fetch_owned: true,
+    })?;
+    sync.drain_inbound_headers();
+
+    assert!(
+        sync.body_sync.lock().window.contains_pending(&tip_hash),
+        "a compact-owned tip body must be recorded pending, not re-requested"
     );
     Ok(())
 }
