@@ -517,9 +517,14 @@ fn map_apply_error(error: ApplyError) -> Result<BlockValidationResult, MiningCon
         ApplyError::Shutdown | ApplyError::JournalBackpressure(_) => {
             Ok(BlockValidationResult::Inconclusive)
         }
-        ApplyError::ConcurrentChainChange | ApplyError::ChainChangeGenerationOverflow => Err(
-            MiningControlError::Unavailable(CompactString::from(error.to_string())),
-        ),
+        ApplyError::ConcurrentChainChange => Err(MiningControlError::Unavailable(
+            CompactString::from(error.to_string()),
+        )),
+        // The generation counter cannot recover in-process; only a restart
+        // reserves another coordinated mutation.
+        ApplyError::ChainChangeGenerationOverflow => Err(MiningControlError::Failed(
+            CompactString::from(error.to_string()),
+        )),
         other => bip22_reject_reason(&other).map(BlockValidationResult::Rejected),
     }
 }
@@ -572,13 +577,13 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
         ) => bitcoin_rs_mining::chain_reject_reason(chain),
         ApplyError::Shutdown
         | ApplyError::JournalBackpressure(_)
-        | ApplyError::ConcurrentChainChange
-        | ApplyError::ChainChangeGenerationOverflow => {
+        | ApplyError::ConcurrentChainChange => {
             return Err(MiningControlError::Unavailable(CompactString::from(
                 error.to_string(),
             )));
         }
         ApplyError::HeightOverflow(_)
+        | ApplyError::ChainChangeGenerationOverflow
         | ApplyError::Chain(
             ChainError::NodeIdOverflow { .. }
             | ChainError::UnknownNode { .. }
@@ -595,6 +600,7 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
         | ApplyError::DisconnectBodyMismatch { .. }
         | ApplyError::DurableHeadCommit(_)
         | ApplyError::DurableHeadLineage { .. }
+        | ApplyError::DisconnectOffDurableHead { .. }
         | ApplyError::DurableHeadGapUnrecoverable { .. }
         | ApplyError::DurableHeadWithoutRestoredState { .. }
         | ApplyError::CoinStatsRewind(_) => {

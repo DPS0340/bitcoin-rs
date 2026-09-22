@@ -189,10 +189,11 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   mutation, recovery, branch switching, checkpoint publication, and retention.
   `NodeState`, `BlockSync`, mining, and RPC chain-control hold or clone that
   service; they do not assemble a transition from independent locks.
-- `Chainstate::begin_transition` is the only public constructor of a
-  `ChainTransition`. Reorg planning that must abort without mutating takes
-  `lock_transition` first and promotes it with `begin_transition_locked` only
-  after the authoritative plan matches the preloaded plan.
+- `Chainstate::begin_transition` and `TransitionLock::into_transition` are the
+  only constructors of a `ChainTransition`. Reorg planning that must abort
+  without mutating takes `lock_transition` first and promotes the lock with
+  `into_transition` only after the authoritative plan matches the preloaded
+  plan.
 - Snapshot reads (`Chainstate::snapshot`) copy the independently published
   header tip and a coherent applied-tip / chain-tx-count pair. They do not
   take the transition lock and cannot mutate chainstate. `ChainEventPublisher`

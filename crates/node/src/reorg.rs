@@ -125,11 +125,14 @@ fn settle_checkpoint_debt(
 }
 
 /// Invalidates one block through chainstate while node-owned followers remain fenced.
+///
+/// On success returns the hashes chainstate marked `Invalid`; the caller purges
+/// staged and download state after the transition has settled.
 pub fn invalidate_block(
     handles: &Chainstate,
     followers: &ChainFollowers,
     hash: Hash256,
-) -> core::result::Result<(), ReorgError> {
+) -> core::result::Result<Box<[Hash256]>, ReorgError> {
     let mut mempool_change = followers
         .begin_mempool_change()
         .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
@@ -141,7 +144,8 @@ pub fn invalidate_block(
         hash,
         |observer, outcome| settle_node_reorg(observer, &mut mempool_change, outcome),
     );
-    settle_checkpoint_debt(handles, outcome)
+    let invalidated = outcome.as_ref().ok().cloned().unwrap_or_default();
+    settle_checkpoint_debt(handles, outcome.map(|_| ())).map(|()| invalidated)
 }
 
 /// Switches the applied branch through chainstate while node-owned followers remain fenced.

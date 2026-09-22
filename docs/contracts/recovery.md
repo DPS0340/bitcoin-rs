@@ -317,6 +317,12 @@ state is harmless and keeps the node operating until replay closes the gap.
     instead of issuing a second durable receipt;
   - `committed_gap_with_missing_body_fails_closed` proves a stored head whose
     named body is gone is rejected without advancing the restored applied tip.
+  - `durable_head_without_restored_chainstate_fails_startup` proves a stored
+    head with no restored chainstate fails startup closed
+    (`DurableHeadWithoutRestoredState`);
+  - `committed_gap_replay_failure_fails_closed` proves an apply failure inside
+    the replay transition closes admission and leaves `begin_transition`
+    refusing with `ApplyError::Shutdown`.
 - `crates/chainstate/src/connect.rs` and
   `crates/chainstate/src/disconnect.rs`: run the `RCV-02` tail —
   sync, one atomic batch, derived journal emission, then publication — and
@@ -337,6 +343,13 @@ state is harmless and keeps the node operating until replay closes the gap.
 - `crates/node/tests/crash_recovery.rs` (existing): the `RCV-04` crash
   points — SIGKILL restart across journal, reorg, and publication scenarios,
   partial-write handling, and upgrade-matrix fallback.
+- `crates/node/tests/unit/state/tests/recovery.rs`:
+  `torn_disconnect_refusal_names_authoritative_stores_to_remove` proves an
+  armed disconnect marker refuses startup while naming the `chainstate`,
+  `chainstate-checkpoints`, and `txindex` paths the operator must remove;
+  `restart_without_periodic_publication_restores_tip_and_commit_id` proves
+  the durable head replays past the last checkpoint with `commit_id`
+  preserved across restarts (`RCV-10`).
 - `crates/chainstate/src/reorg.rs` and `crates/chainstate/src/disconnect.rs`
   cover `RCV-05` and bounded disconnect/reorg memory; `RCV-08`'s bounded
   stream windows and retention leases are exercised by the node sync/recovery
@@ -345,7 +358,11 @@ state is harmless and keeps the node operating until replay closes the gap.
   `crates/chainstate/tests/unit/checkpoint/tests/` covers consensus-valid active-chain
   replay, applied-ancestry selection, competing-fork rejection, and
   immutable-generation resume, including
-  `failed_publication_preserves_current`; `crates/node/tests/unit/lifecycle/tests.rs`
+  `failed_publication_preserves_current`;
+  `crates/chainstate/tests/unit/checkpoint_debt_tests.rs`
+  `checkpoint_refuses_inflight_disconnect_and_preserves_state` proves an
+  `InFlight` marker refuses publication with marker, `CURRENT`, and
+  generations untouched; `crates/node/tests/unit/lifecycle/tests.rs`
   `shutdown_checkpoint_io_failure_is_returned_and_preserves_current` proves
   clean-shutdown publication errors propagate through `run` without skipping
   worker teardown; `crates/storage/src/checkpoint/tests.rs`

@@ -13,35 +13,10 @@ use bitcoin_rs_storage::{
 };
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use hashbrown::HashMap;
 use parking_lot::RwLock;
 
+use crate::test_fixtures::MemoryBodies;
 use crate::{ApplyError, Chainstate};
-
-#[derive(Default)]
-struct MemoryBodies {
-    bodies: RwLock<HashMap<(u32, Hash256), Vec<u8>>>,
-}
-
-impl BlockBodyStore for MemoryBodies {
-    fn persist_block_body(
-        &self,
-        height: u32,
-        hash: Hash256,
-        body: &[u8],
-    ) -> Result<(), StorageError> {
-        self.bodies.write().insert((height, hash), body.to_vec());
-        Ok(())
-    }
-
-    fn load_block_body(&self, height: u32, hash: Hash256) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(self.bodies.read().get(&(height, hash)).cloned())
-    }
-
-    fn sync(&self) -> Result<(), StorageError> {
-        Ok(())
-    }
-}
 
 fn restored_chainstate() -> Result<(Chainstate, Block), Box<dyn std::error::Error>> {
     let network = Network::Regtest;
@@ -171,10 +146,21 @@ fn committed_gap_with_missing_body_fails_closed() -> Result<(), Box<dyn std::err
     let Err(error) = super::reconcile_at_boot(&handles) else {
         panic!("missing committed body must fail");
     };
-    assert!(matches!(
-        error,
-        ApplyError::DurableHeadGapUnrecoverable { .. }
-    ));
+    let ApplyError::DurableHeadGapUnrecoverable {
+        head_tip,
+        head_height,
+        restored_tip,
+        restored_height,
+        reason,
+    } = error
+    else {
+        panic!("expected DurableHeadGapUnrecoverable, got {error:?}");
+    };
+    assert_eq!(head_tip, head.tip);
+    assert_eq!(head_height, 1);
+    assert_eq!(restored_tip, Network::Regtest.genesis_block_hash());
+    assert_eq!(restored_height, 0);
+    assert_eq!(reason, "a committed gap body is missing from storage");
     assert_eq!(
         handles
             .applied_tip
@@ -361,5 +347,45 @@ fn committed_gap_must_descend_from_restored_tip() -> Result<(), Box<dyn std::err
             ..
         }
     ));
+    Ok(())
+}
+
+/// A replay failure inside the transition must close admission: the node
+/// cannot serve a chain the durable head does not yet certify.
+#[test]
+fn committed_gap_replay_failure_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, mut child) = restored_chainstate()?;
+    let restored = handles
+        .applied_tip
+        .load_full()
+        .ok_or("restored tip missing")?;
+    // The body hashes to its own header and descends from the restored tip,
+    // but its merkle root does not commit to its transactions, so the apply
+    // inside the replay transition refuses.
+    child.header.merkle_root = Hash256::from_le_bytes(&[0x77; 32]);
+    let child_hash = Hash256::from(child.block_hash());
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.persist_block_body(1, child_hash, &consensus_bytes(&child))?;
+    let head = DurableHead {
+        commit_id: 9,
+        height: 1,
+        tip: child_hash,
+        chain_tx_count: 2,
+        body_extent: None,
+        undo_extent: None,
+    };
+    install_arbitrary_head(&mut handles, head, bodies)?;
+
+    let Err(error) = super::replay_committed_gap(&handles, head, &restored) else {
+        panic!("a gap body that fails apply must fail the replay");
+    };
+    assert!(
+        handles.shutdown_handle().load(Ordering::Acquire),
+        "a failed replay must fail closed, got: {error}"
+    );
+    assert!(
+        matches!(handles.begin_transition(), Err(ApplyError::Shutdown)),
+        "admission must stay closed after a failed replay"
+    );
     Ok(())
 }

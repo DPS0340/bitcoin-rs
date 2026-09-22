@@ -36,6 +36,7 @@ const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 struct RpcChainControl {
     handles: Arc<bitcoin_rs_chainstate::Chainstate>,
     followers: crate::chain_effects::ChainFollowers,
+    sync: Arc<crate::BlockSync>,
 }
 
 impl ChainControl for RpcChainControl {
@@ -43,13 +44,16 @@ impl ChainControl for RpcChainControl {
         &self,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> core::result::Result<(), ChainControlError> {
-        crate::reorg::invalidate_block(&self.handles, &self.followers, hash).map_err(|error| {
-            match error {
+        let invalidated = crate::reorg::invalidate_block(&self.handles, &self.followers, hash)
+            .map_err(|error| match error {
                 crate::reorg::ReorgError::UnknownBlock(_) => ChainControlError::UnknownBlock,
                 crate::reorg::ReorgError::CannotInvalidateGenesis => ChainControlError::Genesis,
                 other => ChainControlError::Failed(other.to_string()),
-            }
-        })
+            })?;
+        // The transition is already released; the invalid descendants must
+        // not keep occupying bounded download staging.
+        self.sync.purge_invalidated(&invalidated);
+        Ok(())
     }
 }
 
@@ -104,6 +108,7 @@ fn bind_rpc(
         .with_chain_control(Arc::new(RpcChainControl {
             handles: chainstate,
             followers: state.chain_followers(),
+            sync: state.sync(),
         }))
         .with_zmq_publisher(state.zmq_publisher())
         .with_debug_log_path(state.data_dir().join("debug.log"))

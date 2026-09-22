@@ -142,6 +142,15 @@ pub enum ApplyError {
         /// Parent the connecting block names.
         prev: bitcoin_rs_primitives::Hash256,
     },
+    /// The durable head does not certify the block being disconnected, so
+    /// the disconnect cannot advance the head from a known commit point.
+    #[error("disconnect of {hash} refused: durable head {head:?} does not certify it")]
+    DisconnectOffDurableHead {
+        /// Block the caller asked to disconnect.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Tip the stored head certifies, when one exists.
+        head: Option<bitcoin_rs_primitives::Hash256>,
+    },
     /// The committed-but-unpublished gap cannot be replayed from durable
     /// facts, so startup must fail closed.
     ///

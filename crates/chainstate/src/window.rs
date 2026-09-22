@@ -365,7 +365,9 @@ pub(super) fn invalidate_failed_subtree(
 ///
 /// Fatal failures mean mutation or durable-head state may already have changed
 /// without a reliable commit receipt. They require restart-time recovery;
-/// callers must not retry them in-process.
+/// callers must not retry them in-process. The node-owned `ChainChangeGuard`
+/// must be dropped, not finished, so the mempool generation stays odd until
+/// recovery.
 ///
 /// Kernel-backed script verification failures are classified Operational
 /// because `bitcoinkernel` can reject a valid block depending on process

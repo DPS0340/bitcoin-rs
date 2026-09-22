@@ -587,9 +587,10 @@ fn deep_reorg_streams_bounded_prefixes_to_the_exact_reference() -> anyhow::Resul
 
     let handles = state.chainstate();
     // The rolling stager tracks fork progress through the connected-body
-    // callback: each switch may connect at most STAGED_PREFIX new blocks,
-    // and already-applied fork blocks stay servable for the disconnect
-    // walk, exactly like an external bounded stager holding staged forks.
+    // callback, exactly like an external bounded stager holding staged
+    // forks: at most STAGED_PREFIX unapplied blocks are servable at once,
+    // and each committed connect frees room for the next suffix window
+    // inside the same switch.
     let served_through = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(20));
     let mut switches = 0_u32;
     loop {
@@ -623,10 +624,6 @@ fn deep_reorg_streams_bounded_prefixes_to_the_exact_reference() -> anyhow::Resul
             Err(error) => return Err(error.into()),
         }
     }
-    assert!(
-        switches > 1,
-        "a 300-block reorg through a 16-body stager must take multiple bounded switches"
-    );
 
     let landed = handles
         .applied_tip()
@@ -650,5 +647,97 @@ fn deep_reorg_streams_bounded_prefixes_to_the_exact_reference() -> anyhow::Resul
             .load(Ordering::Acquire)
     );
     assert_eq!(handles.retention_handle().active_leases(), 0);
+    Ok(())
+}
+
+/// An armed disconnect marker refuses startup, and the refusal must name
+/// every authoritative store the operator has to remove.
+#[test]
+fn torn_disconnect_refusal_names_authoritative_stores_to_remove() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("node");
+    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+    config.data_dir = data_dir.clone();
+    config.p2p.listen.clear();
+    let state = NodeState::open(config.clone(), None)?;
+    state.storage.undo_store().arm_disconnect(
+        10,
+        bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xcd; 32]),
+    )?;
+    drop(state);
+
+    let error = match NodeState::open(config, None) {
+        Ok(_) => anyhow::bail!("node reopened with an armed disconnect marker"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    for store in ["chainstate", "chainstate-checkpoints", "txindex"] {
+        let path = data_dir.join(store);
+        assert!(
+            message.contains(&path.display().to_string()),
+            "startup refusal omitted {}: {message}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// A checkpoint at height N with the journal and durable head advanced
+/// past it restores the exact pre-restart tip and `commit_id` on restart
+/// (`RCV-10`): the durable root is the recovery authority and the last
+/// checkpoint is only the replay base, so progress made since it stays
+/// recoverable with no periodic publisher running.
+#[test]
+fn restart_without_periodic_publication_restores_tip_and_commit_id() -> anyhow::Result<()> {
+    // The checkpoint lands at height 1; blocks 2-4 exist only in the
+    // journal suffix and the durable head chain.
+    let (_dir, state, config) = applied_regtest_chain(4, 1)?;
+    let head = state
+        .storage
+        .durable_head()
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("applied chain must have a durable head"))?;
+    let pre_tip = state
+        .chainstate()
+        .applied_tip()
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("applied tip missing before restart"))?;
+    assert_eq!(pre_tip.height, 4);
+    drop(state);
+
+    // `NodeState::open` spawns no workers: this restart runs with periodic
+    // full-checkpoint publication disabled, recovery riding the stored
+    // checkpoint, the journal suffix, and the durable head.
+    let reopened = NodeState::open(config.clone(), None)?;
+    let landed = reopened
+        .chainstate()
+        .applied_tip()
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("restart must publish a tip"))?;
+    assert_eq!(landed.as_ref(), pre_tip.as_ref());
+    assert_eq!(landed.height, head.height);
+    let restored = reopened
+        .storage
+        .durable_head()
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("head must survive the restart"))?;
+    assert_eq!(restored.tip, head.tip);
+    assert_eq!(restored.commit_id, head.commit_id);
+    assert!(matches!(
+        reopened.resume_source(),
+        ResumeSource::Journal | ResumeSource::Checkpoint
+    ));
+
+    // The replay caught the journal up: a second restart, still with no
+    // periodic publisher, lands on the same head untouched.
+    drop(reopened);
+    let second = NodeState::open(config, None)?;
+    let landed = second
+        .chainstate()
+        .applied_tip()
+        .load_full()
+        .ok_or_else(|| anyhow::anyhow!("second restart must publish a tip"))?;
+    assert_eq!(landed.hash, head.tip);
+    assert_eq!(landed.height, head.height);
     Ok(())
 }

@@ -39,6 +39,20 @@ pub(super) fn plan_disconnect(
         });
     }
 
+    // The head must already certify this block: a disconnect advances the
+    // durable head from a known commit point, and any other tip is lineage
+    // divergence that refusing preserves untouched.
+    let head = handles
+        .durable_head
+        .load()
+        .map_err(ApplyError::DurableHeadCommit)?;
+    if head.as_ref().map(|head| head.tip) != Some(block_hash) {
+        return Err(ApplyError::DisconnectOffDurableHead {
+            hash: block_hash,
+            head: head.map(|head| head.tip),
+        });
+    }
+
     // An altered body under a matching header would undo transactions the
     // block never contained; txid-level merkle check also catches a duplicated
     // final transaction that `check_merkle_root` alone misses.

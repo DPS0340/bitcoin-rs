@@ -259,3 +259,45 @@ fn direct_transition_fatal_error_closes_admission() -> Result<(), Box<dyn std::e
     ));
     Ok(())
 }
+
+/// A disconnect off anything but the stored durable head refuses before the
+/// first mutation: no rollback, no marker, admission still open.
+#[test]
+fn disconnect_off_durable_head_refuses_without_mutation() -> Result<(), Box<dyn std::error::Error>>
+{
+    let genesis = Network::Regtest.genesis_block();
+    let utxo = Arc::new(UtxoSet::new());
+    let mut handles = handles(Network::Regtest, Arc::clone(&utxo));
+    handles.apply_block(&genesis)?;
+    let first = mined_child(genesis.block_hash(), 1)?;
+    handles.apply_block(&first)?;
+    let first_outpoint = OutPoint::new(first.txs[0].txid(), 0);
+    assert!(utxo.get(&first_outpoint).is_some());
+
+    // The stored head no longer certifies the applied tip.
+    handles.durable_head = Arc::new(InMemoryDurableHeadStore::new());
+
+    let outcome = handles.begin_transition()?.disconnect(&first);
+    let Err(crate::DisconnectError::Refused(error)) = outcome else {
+        panic!("an uncertified disconnect must be refused, got {outcome:?}");
+    };
+    assert!(matches!(
+        *error,
+        ApplyError::DisconnectOffDurableHead { head: None, .. }
+    ));
+    assert_eq!(
+        handles.applied_tip.load_full().map(|tip| tip.hash),
+        Some(Hash256::from(first.block_hash())),
+        "a refused disconnect must not move the applied tip"
+    );
+    assert!(
+        utxo.get(&first_outpoint).is_some(),
+        "a refused disconnect must not roll back the UTXO set"
+    );
+    assert_eq!(handles.undo_store.load_disconnect_marker()?, None);
+    assert!(
+        handles.begin_transition().is_ok(),
+        "a refusal must leave admission open"
+    );
+    Ok(())
+}

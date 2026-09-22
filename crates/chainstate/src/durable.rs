@@ -281,31 +281,41 @@ fn replay_committed_gap(
     // are unchanged — so a failed replay stays exactly the gap it started
     // as, and the next restart retries it from the same durable state.
     let transition = handles.begin_transition()?;
-    let mut commit_id = 0_u64;
     // A length always fits u64; the metrics counter counts in u64.
     let replayed_blocks = u64::try_from(chain.len()).unwrap_or(u64::MAX);
-    for (height, hash, block, bytes) in chain {
-        let outcome = super::connect::apply_committed_block_admitted(
-            handles,
-            &block,
-            Some(bytes::Bytes::from(bytes)),
-            None,
-            BlockProvenance::LocalReplay,
-            PublishMode::Replay {
-                commit_id: head.commit_id,
-            },
-        )?;
-        commit_id = outcome.commit_id;
-        tracing::debug!(height, hash = %hash.to_string_be(), "replayed committed gap block");
-    }
-    let published = handles.applied_tip.load_full();
-    let landed = published.as_ref().is_some_and(|tip| {
-        (tip.hash, tip.height, commit_id) == (head.tip, head.height, head.commit_id)
-    });
-    if !landed {
-        drop(transition);
-        return Err(unrecoverable("replay finished short of the stored head"));
-    }
+    let replayed = (|| {
+        let mut commit_id = 0_u64;
+        for (height, hash, block, bytes) in chain {
+            let outcome = super::connect::apply_committed_block_admitted(
+                handles,
+                &block,
+                Some(bytes::Bytes::from(bytes)),
+                None,
+                BlockProvenance::LocalReplay,
+                PublishMode::Replay {
+                    commit_id: head.commit_id,
+                },
+            )?;
+            commit_id = outcome.commit_id;
+            tracing::debug!(height, hash = %hash.to_string_be(), "replayed committed gap block");
+        }
+        let published = handles.applied_tip.load_full();
+        let landed = published.as_ref().is_some_and(|tip| {
+            (tip.hash, tip.height, commit_id) == (head.tip, head.height, head.commit_id)
+        });
+        if !landed {
+            return Err(unrecoverable("replay finished short of the stored head"));
+        }
+        Ok(commit_id)
+    })();
+    let commit_id = match replayed {
+        Ok(commit_id) => commit_id,
+        Err(error) => {
+            handles.fail_closed_for_recovery();
+            drop(transition);
+            return Err(error);
+        }
+    };
     drop(transition);
     metrics::counter!("node.durable_head.recovery_gaps_replayed").increment(replayed_blocks);
     metrics::counter!("node.durable_head.recovery_gaps").increment(1);

@@ -1695,6 +1695,10 @@ impl UtxoView for BlockLocalUtxoView<'_> {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/test_fixtures.rs"]
+mod test_fixtures;
+
+#[cfg(test)]
 #[path = "../tests/unit/apply/admission_tests.rs"]
 mod admission_tests;
 
@@ -1705,3 +1709,7 @@ mod chain_tx_count_tests;
 #[cfg(test)]
 #[path = "../tests/unit/apply/persistence_tests.rs"]
 mod persistence_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/checkpoint_debt_tests.rs"]
+mod checkpoint_debt_tests;

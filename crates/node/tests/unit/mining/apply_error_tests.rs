@@ -109,3 +109,25 @@ fn apply_errors_delegate_consensus_and_chain_reasons() {
         "high-hash"
     );
 }
+
+#[test]
+fn generation_overflow_is_terminal_unavailability_is_transient() {
+    assert!(
+        matches!(
+            map_apply_error(ApplyError::ChainChangeGenerationOverflow),
+            Err(MiningControlError::Failed(_))
+        ),
+        "a generation overflow requires restart, not a retry hint"
+    );
+    assert!(matches!(
+        test_block_validity_error(&ApplyError::ChainChangeGenerationOverflow),
+        MiningControlError::Failed(_)
+    ));
+    assert!(
+        matches!(
+            map_apply_error(ApplyError::ConcurrentChainChange),
+            Err(MiningControlError::Unavailable(_))
+        ),
+        "an in-flight chain change is a transient refusal"
+    );
+}

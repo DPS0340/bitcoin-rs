@@ -58,12 +58,16 @@ pub trait ReorgObserver {
 
 /// Invalidates `hash` and its descendants, then moves applied chainstate to the
 /// best remaining valid tip.
+///
+/// On success returns every hash `invalidate_subtree` marked `Invalid`, so the
+/// caller can purge staged and download state after the transition settles.
+#[allow(clippy::too_many_lines)]
 pub fn invalidate_block<O, S>(
     handles: &Chainstate,
     observer: &mut O,
     hash: Hash256,
     mut settle: S,
-) -> core::result::Result<(), ReorgError>
+) -> core::result::Result<Box<[Hash256]>, ReorgError>
 where
     O: ReorgObserver + ?Sized,
     S: FnMut(&mut O, core::result::Result<(), ReorgError>) -> core::result::Result<(), ReorgError>,
@@ -79,7 +83,8 @@ where
         Ok(())
     })();
     if let Err(error) = validation {
-        return settle_reorg_without_transition(handles, observer, Err(error), &mut settle);
+        return settle_reorg_without_transition(handles, observer, Err(error), &mut settle)
+            .map(|()| Box::default());
     }
 
     let transition = match handles.begin_transition() {
@@ -90,9 +95,11 @@ where
                 observer,
                 Err(ReorgError::Unavailable(Box::new(source))),
                 &mut settle,
-            );
+            )
+            .map(|()| Box::default());
         }
     };
+    let mut invalidated = Vec::new();
     // Keep read-only planning refusals in the same settlement path as the
     // execution outcome; an early `?` must not strand a coherent generation.
     let outcome = (|| {
@@ -157,7 +164,7 @@ where
         {
             let mut tree = handles.block_tree().write();
             let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
-            tree.invalidate_subtree(root).map_err(ReorgError::Plan)?;
+            invalidated = tree.invalidate_subtree(root).map_err(ReorgError::Plan)?;
             let tip = tree.tip().ok_or(ReorgError::NoValidTip)?;
             handles.chain_tip().store(Some(tip));
             handles.reevaluate_assume_valid_with(&tree);
@@ -182,6 +189,7 @@ where
         }
     })();
     settle_reorg_transition(transition, observer, outcome, &mut settle)
+        .map(|()| invalidated.into_boxed_slice())
 }
 
 /// Why a branch switch stopped, and what the chain looks like now.
@@ -199,6 +207,12 @@ pub enum ReorgError {
     /// Invalidation unexpectedly left no valid chain tip.
     #[error("invalidation left no valid chain tip")]
     NoValidTip,
+    /// No applied tip exists yet.
+    ///
+    /// The chain cannot be switched before genesis is applied. Nothing was
+    /// touched.
+    #[error("no applied tip; the chain cannot be switched before genesis is applied")]
+    NoAppliedTip,
     /// Planning failed: the two tips share no ancestor, or a node is unknown.
     ///
     /// Nothing was touched.
@@ -302,6 +316,22 @@ pub enum ReorgError {
     DisconnectBodyLost {
         /// Fully disconnected blocks before the loss, in plan order.
         disconnected: usize,
+        /// Height the applied tip reached before stopping.
+        stopped_at: u32,
+        /// Why the body could not be loaded.
+        #[source]
+        source: Box<Self>,
+    },
+    /// A target-branch body became unreadable after the switch started.
+    /// Everything counted committed fully; the chain is coherent at `stopped_at`.
+    #[error(
+        "reorg stopped at height {stopped_at} after {disconnected} disconnects and {connected} connects: body lost mid-switch: {source}"
+    )]
+    ConnectBodyLost {
+        /// Fully disconnected blocks before the loss, in plan order.
+        disconnected: usize,
+        /// Fully connected new-branch blocks before the loss, in plan order.
+        connected: usize,
         /// Height the applied tip reached before stopping.
         stopped_at: u32,
         /// Why the body could not be loaded.
@@ -426,6 +456,8 @@ impl ReorgError {
             | Self::Unavailable(_)
             | Self::Refused { .. }
             | Self::DisconnectBodyLost { .. }
+            | Self::ConnectBodyLost { .. }
+            | Self::NoAppliedTip
             | Self::Reconsideration { .. }
             | Self::CheckpointSettlement { .. }
             | Self::RetentionUnavailable { .. } => false,
@@ -490,6 +522,7 @@ fn retention_lease_for(
 /// Every outcome other than reaching `target` is a [`ReorgError`] variant
 /// naming how far the chain moved, because "it failed" does not tell a caller
 /// whether the node is fine, degraded, or unusable.
+#[allow(clippy::too_many_lines)]
 pub fn switch_to_branch<F, O, S>(
     handles: &Chainstate,
     target: NodeId,
@@ -702,26 +735,6 @@ where
     Err(ReorgError::MissingBody { hash, height })
 }
 
-fn load_persisted_branch_body(
-    handles: &Chainstate,
-    hash: Hash256,
-    height: u32,
-) -> core::result::Result<LoadedBranchBody, ReorgError> {
-    if let Some(store) = handles.block_body_store()
-        && let Some(body) =
-            store
-                .load_block_body(height, hash)
-                .map_err(|source| ReorgError::BodyStore {
-                    hash,
-                    height,
-                    source,
-                })?
-    {
-        return decode_branch_body(hash, height, bytes::Bytes::from(body));
-    }
-    Err(ReorgError::MissingBody { hash, height })
-}
-
 fn decode_branch_body(
     hash: Hash256,
     height: u32,
@@ -864,19 +877,22 @@ where
         observer,
         connect_nodes,
         connect_prefix,
+        staged_body,
         &mut progress,
     );
     (progress, outcome)
 }
 
-fn execute_connect_stream<O>(
+fn execute_connect_stream<F, O>(
     transition: &ChainTransition<'_>,
     observer: &mut O,
     connect_nodes: &[(Hash256, u32)],
     connect_prefix: &[LoadedBranchBody],
+    staged_body: &mut F,
     progress: &mut LoadedPlanProgress,
 ) -> core::result::Result<(), ReorgError>
 where
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
     O: ReorgObserver + ?Sized,
 {
     let handles = transition.chainstate();
@@ -886,7 +902,17 @@ where
     for window in connect_nodes[connect_prefix.len()..].chunks(CONNECT_STREAM_WINDOW) {
         let mut bodies = Vec::with_capacity(window.len());
         for (hash, height) in window {
-            bodies.push(load_persisted_branch_body(handles, *hash, *height)?);
+            match load_branch_body(handles, *hash, *height, staged_body) {
+                Ok(body) => bodies.push(body),
+                Err(source) => {
+                    return Err(ReorgError::ConnectBodyLost {
+                        disconnected: progress.disconnected,
+                        connected: progress.connected,
+                        stopped_at: applied_tip_height(handles),
+                        source: Box::new(source),
+                    });
+                }
+            }
         }
         for body in &bodies {
             connect_loaded_body(transition, observer, progress, body)?;
@@ -979,7 +1005,7 @@ fn current_reorg_plan(
 ) -> core::result::Result<Option<ReorgPlan>, ReorgError> {
     let tree = handles.block_tree().read();
     let Some(current) = handles.applied_tip().load_full() else {
-        return Ok(None);
+        return Err(ReorgError::NoAppliedTip);
     };
     let Some(current_id) = tree.lookup(current.hash) else {
         return Err(ReorgError::Plan(
