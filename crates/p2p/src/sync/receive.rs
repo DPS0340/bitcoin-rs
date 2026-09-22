@@ -338,36 +338,44 @@ impl BlockSync {
     /// body directly, so the delivered block carries the only copy of its
     /// header. Admission reuses the `headers`-batch seam, but one chunk can
     /// mix deliverers, so unknown headers are grouped by source and admitted
-    /// to a fixed point: a validation fault then blames only its deliverer
-    /// (a single batched admission stops at the first bad header and would
-    /// strand the honest groups ordered behind it), and a group whose
-    /// parents arrive through a sibling's admission attaches on a later
-    /// round. A missing ancestor is not a peer fault — the delivering peer
-    /// necessarily holds the chain it announced — so the gap heals with a
-    /// `getheaders` back to it.
+    /// to a fixed point: a validation fault then blames only its deliverer,
+    /// and a group whose parents arrive through a sibling's admission
+    /// attaches on a later round. Within a group, `header_components`
+    /// admits each connected chain separately — `admit_headers` stops at
+    /// its first failure, so a gap component ordered early would otherwise
+    /// strand attachable components behind it. A missing ancestor is not a
+    /// peer fault — the delivering peer necessarily holds the chain it
+    /// announced — so one gap per pass heals with a `getheaders` back to
+    /// the first gapped deliverer: sibling gaps on the same chain heal from
+    /// that reply, and divergent gaps stay bounded by staged expiry rather
+    /// than racing the single tracked header request.
     ///
     /// Runs outside `body_sync`: `admit_headers` takes the chain transition
     /// lock and the tree write, both of which rank above the window lock.
     fn admit_delivered_block_headers(&self, blocks: &[InboundBlock]) -> HashMap<Hash256, u32> {
         let mut heights = HashMap::with_capacity(blocks.len());
         let mut groups: HashMap<Option<PeerSource>, HashMap<Hash256, Header>> = HashMap::new();
+        let mut deliverers: HashMap<Hash256, Vec<PeerSource>> = HashMap::new();
         {
             let tree = self.chain.block_tree().read();
             for inbound in blocks {
                 let hash = Hash256::from(inbound.block.block_hash());
-                match tree
+                if let Some(node) = tree
                     .lookup(hash)
                     .and_then(|node_id| tree.node(node_id).ok())
                 {
-                    Some(node) => {
-                        heights.insert(hash, node.height);
-                    }
-                    None => {
-                        groups
-                            .entry(inbound.source)
-                            .or_default()
-                            .entry(hash)
-                            .or_insert(inbound.block.header);
+                    heights.insert(hash, node.height);
+                } else {
+                    groups
+                        .entry(inbound.source)
+                        .or_default()
+                        .entry(hash)
+                        .or_insert(inbound.block.header);
+                    if let Some(source) = inbound.source {
+                        let delivered = deliverers.entry(hash).or_default();
+                        if !delivered.contains(&source) {
+                            delivered.push(source);
+                        }
                     }
                 }
             }
@@ -375,7 +383,7 @@ impl BlockSync {
         if groups.is_empty() {
             return heights;
         }
-        let mut admitted_heights = Vec::new();
+        let mut gap_source: Option<PeerSource> = None;
         loop {
             let mut progressed = false;
             for (&source, group) in &mut groups {
@@ -383,14 +391,16 @@ impl BlockSync {
                 if group.is_empty() {
                     continue;
                 }
-                let admission = self
-                    .chain
-                    .admit_headers(&order_headers_for_admission(group));
+                let admissions: Vec<HeaderAdmission> = header_components(group)
+                    .into_iter()
+                    .map(|component| self.chain.admit_headers(&component))
+                    .collect();
                 {
                     // Re-resolve under one read: every hash the tree now knows
                     // was admitted, so delivering it demonstrates possession
-                    // of the block — the same demonstrated-tip credit a
-                    // `headers` announcement earns.
+                    // of the block — and EVERY deliverer of that hash earns
+                    // the same demonstrated-tip credit a `headers`
+                    // announcement earns, not just the first-iterating one.
                     let tree = self.chain.block_tree().read();
                     for hash in group.keys() {
                         let Some(node) = tree.lookup(*hash).and_then(|id| tree.node(id).ok())
@@ -399,39 +409,53 @@ impl BlockSync {
                         };
                         if heights.insert(*hash, node.height).is_none() {
                             progressed = true;
-                            admitted_heights.push((*hash, node.height));
-                            if let Some(source) = source {
-                                self.peer_table.note_announced_tip(source, *hash, None);
+                            if let Some(sources) = deliverers.get(hash) {
+                                for &deliverer in sources {
+                                    self.peer_table.note_announced_tip(deliverer, *hash, None);
+                                }
                             }
                         }
                     }
                 }
-                self.handle_carried_header_admission(admission, source);
+                for admission in admissions {
+                    self.handle_carried_header_admission(admission, source, &mut gap_source);
+                }
             }
             if !progressed {
                 break;
             }
         }
-        // Bodies staged by an earlier chunk (a refused or re-delivered
-        // admission) keep the 0-height sentinel forever without this.
-        if !admitted_heights.is_empty() {
-            let window = &mut self.body_sync.lock().window;
-            for (hash, height) in admitted_heights {
-                window.update_received_height(&hash, height);
-            }
+        if let Some(source) = gap_source {
+            let our_height = self
+                .chain
+                .chain_tip()
+                .load_full()
+                .map_or(0, |tip| tip.height);
+            self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
+        }
+        // Bodies staged before their headers landed (an earlier chunk's
+        // refused or re-delivered admission) would otherwise keep the
+        // 0-height sentinel forever.
+        {
+            let tree = self.chain.block_tree().read();
+            self.body_sync
+                .lock()
+                .window
+                .reconcile_received_heights(&tree);
         }
         self.refresh_active_peer_credit();
         heights
     }
 
-    /// Reacts to one deliverer's admission outcome with the same semantics
-    /// a `headers` batch gets: a validation fault disconnects that
-    /// deliverer; a missing ancestor heals with a `getheaders` back to it,
-    /// which provably holds the chain it announced (`i32::MAX`: unbounded).
+    /// Reacts to one deliverer's component admission with the same
+    /// semantics a `headers` batch gets: a validation fault disconnects
+    /// that deliverer; a missing ancestor records the deliverer for the
+    /// pass's single recovery `getheaders` (`i32::MAX`: unbounded).
     fn handle_carried_header_admission(
         &self,
         admission: HeaderAdmission,
         source: Option<PeerSource>,
+        gap_source: &mut Option<PeerSource>,
     ) {
         match admission {
             HeaderAdmission::Accepted { .. } => {}
@@ -452,12 +476,7 @@ impl BlockSync {
             }
             HeaderAdmission::Rejected(ChainError::MissingParent { .. }) => {
                 if let Some(source) = source {
-                    let our_height = self
-                        .chain
-                        .chain_tip()
-                        .load_full()
-                        .map_or(0, |tip| tip.height);
-                    self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
+                    gap_source.get_or_insert(source);
                 }
             }
             HeaderAdmission::Rejected(error) => {
@@ -476,26 +495,29 @@ impl BlockSync {
     }
 }
 
-/// Orders `unknown` headers parent-before-child within the batch so a
-/// delivered chain admits in one `admit_headers` call: each emitted prefix
-/// walks back to its deepest batch ancestor. Headers whose parent sits
-/// outside both the batch and the tree trail in map order — they fail
-/// `MissingParent` individually without blocking a sibling that attaches.
-fn order_headers_for_admission(unknown: &HashMap<Hash256, Header>) -> Vec<Header> {
-    let mut ordered = Vec::with_capacity(unknown.len());
-    let mut emitted = HashSet::with_capacity(unknown.len());
-    for hash in unknown.keys() {
+/// Splits `headers` into connected components, each ordered
+/// parent-before-child so a delivered chain admits in one `admit_headers`
+/// call per component: each emitted prefix walks back to its deepest batch
+/// ancestor. Components are independent — a gap component's `MissingParent`
+/// cannot strand the attachable components ordered behind it.
+fn header_components(headers: &HashMap<Hash256, Header>) -> Vec<Vec<Header>> {
+    let mut components = Vec::new();
+    let mut emitted = HashSet::with_capacity(headers.len());
+    for hash in headers.keys() {
         let mut chain = Vec::new();
         let mut cursor = *hash;
         while !emitted.contains(&cursor) {
-            let Some(header) = unknown.get(&cursor) else {
+            let Some(header) = headers.get(&cursor) else {
                 break;
             };
             chain.push(cursor);
             emitted.insert(cursor);
             cursor = Hash256::from(header.prev_blockhash);
         }
-        ordered.extend(chain.into_iter().rev().map(|hash| unknown[&hash]));
+        if chain.is_empty() {
+            continue;
+        }
+        components.push(chain.into_iter().rev().map(|hash| headers[&hash]).collect());
     }
-    ordered
+    components
 }

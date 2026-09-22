@@ -56,6 +56,16 @@ impl BlockSync {
                             .note_announced_tip(source, tip_hash, active_height);
                     }
                     self.refresh_active_peer_credit();
+                    // Bodies staged while their carried headers were missing
+                    // keep the 0-height sentinel; an accepted batch that
+                    // supplies those headers repairs them here.
+                    {
+                        let tree = self.chain.block_tree().read();
+                        self.body_sync
+                            .lock()
+                            .window
+                            .reconcile_received_heights(&tree);
+                    }
                     tracing::debug!(
                         accepted,
                         received = batch_len,
