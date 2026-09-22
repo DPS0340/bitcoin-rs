@@ -84,7 +84,7 @@ jobs:
       - name: Full-node binary tests
         if: ${{ !cancelled() && steps.native_deps.outcome == 'success' && steps.toolchain.outcome == 'success' && steps.fixtures.outcome == 'success' && steps.test_deps.outcome == 'success' }}
         run: |
-          cargo nextest run --locked -p bitcoin-rs \
+          cargo nextest run --locked --no-fail-fast -p bitcoin-rs \
             --no-default-features --features "${FULL_NODE_FEATURES}"
       - name: Preserve public process compatibility evidence
         if: ${{ always() }}

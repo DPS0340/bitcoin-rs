@@ -127,16 +127,18 @@ them rather than run the oracle checks.
 
 ### Benchmark compilation check
 
-The main workflow compiles the retained crate-level benchmarks without kernel:
+The main workflow compiles the retained crate-level benchmarks without kernel,
+under the `quickstart` profile (the `bench` profile's fat-LTO build is too
+expensive for a compile-only gate):
 
 ```sh
-cargo bench -p bitcoin-rs-consensus --no-run --no-default-features --bench merkle
+cargo bench -p bitcoin-rs-consensus --no-run --no-default-features --bench merkle --profile quickstart
 cargo bench -p bitcoin-rs-utxo --no-run \
-  --no-default-features --features fjall --bench utxo_commit
+  --no-default-features --features fjall --bench utxo_commit --profile quickstart
 cargo bench -p bitcoin-rs-node --no-run \
-  --no-default-features --features fjall --bench sync_pipeline
+  --no-default-features --features fjall --bench sync_pipeline --profile quickstart
 cargo bench -p bitcoin-rs-node --no-run \
-  --no-default-features --features fjall --bench chainstate_journal
+  --no-default-features --features fjall --bench chainstate_journal --profile quickstart
 ```
 
 `--no-run` checks compilation; it produces no performance measurement.
