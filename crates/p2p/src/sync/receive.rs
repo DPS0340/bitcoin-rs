@@ -1,6 +1,7 @@
 //! Bounded inbound body draining and exact staged-body admission.
 
 use super::BlockSync;
+use super::HEADER_REQUEST_TIMEOUT;
 use super::chain::HeaderAdmission;
 use super::chain::SyncChainError;
 use super::peers::is_peer_fault;
@@ -348,7 +349,10 @@ impl BlockSync {
     /// announced — so one gap per pass heals with a `getheaders` back to
     /// the first gapped deliverer: sibling gaps on the same chain heal from
     /// that reply, and divergent gaps stay bounded by staged expiry rather
-    /// than racing the single tracked header request.
+    /// than racing the single tracked header request. The send is skipped
+    /// when the loop itself healed the gap, when the deliverer left, or
+    /// when a header request is already in flight — the slot tracks one
+    /// send, so recovery never displaces an unrelated live request.
     ///
     /// Runs outside `body_sync`: `admit_headers` takes the chain transition
     /// lock and the tree write, both of which rank above the window lock.
@@ -383,7 +387,7 @@ impl BlockSync {
         if groups.is_empty() {
             return heights;
         }
-        let mut gap_source: Option<PeerSource> = None;
+        let mut gap_source: Option<(PeerSource, Hash256)> = None;
         loop {
             let mut progressed = false;
             for (&source, group) in &mut groups {
@@ -425,13 +429,27 @@ impl BlockSync {
                 break;
             }
         }
-        if let Some(source) = gap_source {
-            let our_height = self
-                .chain
-                .chain_tip()
-                .load_full()
-                .map_or(0, |tip| tip.height);
-            self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
+        if let Some((source, prev_hash)) = gap_source {
+            // A sibling group or a later round may have admitted the
+            // missing ancestor since the gap was recorded; a healed gap
+            // makes the request void. Sending to a deliverer this pass
+            // already disconnected for a peer fault is equally void, and
+            // the single tracked slot must never displace an unrelated
+            // in-flight request — that response could not clear the
+            // tracker and later ticks would issue competing sends.
+            let healed = self.chain.block_tree().read().lookup(prev_hash).is_some();
+            let live_pending = (*self.pending_getheaders.lock()).is_some_and(|request| {
+                Instant::now().duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT
+                    && self.peer_table.ready_source(request.peer_addr).is_some()
+            });
+            if !healed && !live_pending && self.peer_table.is_current(source) {
+                let our_height = self
+                    .chain
+                    .chain_tip()
+                    .load_full()
+                    .map_or(0, |tip| tip.height);
+                self.send_getheaders(source, our_height, i32::MAX, self.build_locator());
+            }
         }
         // Bodies staged before their headers landed (an earlier chunk's
         // refused or re-delivered admission) would otherwise keep the
@@ -449,13 +467,14 @@ impl BlockSync {
 
     /// Reacts to one deliverer's component admission with the same
     /// semantics a `headers` batch gets: a validation fault disconnects
-    /// that deliverer; a missing ancestor records the deliverer for the
-    /// pass's single recovery `getheaders` (`i32::MAX`: unbounded).
+    /// that deliverer; a missing ancestor records the deliverer and the
+    /// missing hash for the pass's single recovery `getheaders`
+    /// (`i32::MAX`: unbounded).
     fn handle_carried_header_admission(
         &self,
         admission: HeaderAdmission,
         source: Option<PeerSource>,
-        gap_source: &mut Option<PeerSource>,
+        gap_source: &mut Option<(PeerSource, Hash256)>,
     ) {
         match admission {
             HeaderAdmission::Accepted { .. } => {}
@@ -474,9 +493,9 @@ impl BlockSync {
                     );
                 }
             }
-            HeaderAdmission::Rejected(ChainError::MissingParent { .. }) => {
+            HeaderAdmission::Rejected(ChainError::MissingParent { prev_hash }) => {
                 if let Some(source) = source {
-                    gap_source.get_or_insert(source);
+                    gap_source.get_or_insert((source, prev_hash));
                 }
             }
             HeaderAdmission::Rejected(error) => {
