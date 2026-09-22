@@ -3,6 +3,7 @@
 use super::BlockSync;
 use super::chain::HeaderAdmission;
 use super::chain::SyncChainError;
+use super::peers::is_peer_fault;
 use crate::InboundBlock;
 use crate::RejectDelivery;
 use crate::StagedBlock;
@@ -137,26 +138,43 @@ impl BlockSync {
     /// complete. `MissingParent` keeps the body staged and asks an eligible
     /// peer for the missing ancestry; `TimestampTooFarAhead` retries
     /// naturally each drain and admits once the header enters the allowed
-    /// window.
+    /// window; a permanently inadmissible header (a peer-fault rejection)
+    /// means the body can never apply, so it is discarded instead of paying
+    /// the same admission retry every drain.
     fn admit_staged_headers(&self) {
-        let unadmitted: Vec<Header> = {
+        let unadmitted: Vec<(Hash256, Header)> = {
             let tree = self.chain.block_tree().read();
             let body_sync = self.body_sync.lock();
             body_sync
                 .stager
                 .staged_headers()
                 .filter(|(hash, _)| tree.lookup(*hash).is_none())
-                .map(|(_, header)| header)
                 .collect()
         };
         let mut missing_parent = false;
-        for header in unadmitted {
-            if matches!(
-                self.chain.admit_headers(&[header]),
-                HeaderAdmission::Rejected(ChainError::MissingParent { .. })
-            ) {
-                missing_parent = true;
+        let mut invalid: Vec<Hash256> = Vec::new();
+        for (hash, header) in unadmitted {
+            match self.chain.admit_headers(&[header]) {
+                HeaderAdmission::Rejected(
+                    ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. },
+                ) => {
+                    missing_parent = true;
+                }
+                HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
+                    invalid.push(hash);
+                }
+                _ => {}
             }
+        }
+        if !invalid.is_empty() {
+            let mut body_sync = self.body_sync.lock();
+            for hash in &invalid {
+                body_sync.stager.discard(hash);
+            }
+            tracing::debug!(
+                discarded = invalid.len(),
+                "block sync: discarded bodies with inadmissible headers"
+            );
         }
         if missing_parent {
             self.request_headers_from_eligible();

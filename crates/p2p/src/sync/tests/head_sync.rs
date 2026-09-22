@@ -174,6 +174,80 @@ fn known_header_batch_still_credits_the_announcer() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn headers_batch_too_far_ahead_does_not_replay_a_request() -> Result<(), Box<dyn std::error::Error>>
+{
+    // A valid-PoW header beyond our two-hour clock window is a non-fault
+    // rejection: the announcer can only replay the same batch into the same
+    // rejection, so the drain must not re-request — the tip is relearned
+    // once the local clock catches up or the next announcement arrives.
+    let mut tree = BlockTree::new();
+    let genesis = genesis_header();
+    tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+
+    let peer = test_addr(9704, 0)?;
+    let rx = connect_peer(&peers, eligible_peer(peer, 0));
+
+    let mut future_tip = test_header(genesis.compute_hash(), 1);
+    future_tip.time = u32::MAX;
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![future_tip],
+        source: Some(current_source(&peers, peer)),
+    })?;
+    sync.drain_inbound_headers();
+
+    assert!(
+        next_getheaders(&rx).is_err(),
+        "a future-dated rejection must not re-request the same batch"
+    );
+    Ok(())
+}
+
+#[test]
+fn staged_body_with_permanently_inadmissible_header_is_discarded()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bitcoin_rs_primitives::CompactTarget;
+    // A staged body whose embedded header fails a permanent check (wrong
+    // bits) can never become expected. The staged-header retry must drop it
+    // instead of paying the transition lock for the same rejection every
+    // drain until the staged timeout.
+    let (tree, blocks) = mined_chain(1, 0)?;
+    let SyncHarness {
+        sync,
+        applied_tip,
+        inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(blocks[0].clone()))?;
+    sync.tick();
+    assert_eq!(
+        applied_tip.load_full().ok_or("missing applied tip")?.hash,
+        Hash256::from(blocks[0].block_hash()),
+    );
+
+    let mut bad =
+        mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(2)]);
+    bad.header.bits = CompactTarget::from_consensus(0x1e0f_ff00);
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(bad))?;
+    // The body stages in the first drain; the staged-header retry runs
+    // before staging on the next and discards it.
+    sync.tick();
+    sync.tick();
+
+    assert_eq!(
+        sync.body_sync.lock().stager.received_len(),
+        0,
+        "the inadmissible body must be discarded, not retried"
+    );
+    Ok(())
+}
+
+#[test]
 fn delivered_tip_evidence_is_compacted_to_the_max_resolving_tip()
 -> Result<(), Box<dyn std::error::Error>> {
     // Every delivered body's embedded header forwards through the headers

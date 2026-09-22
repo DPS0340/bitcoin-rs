@@ -16,6 +16,7 @@ use crate::PeerSource;
 use crate::download_window::SyncPeer;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_primitives::Hash256;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -104,14 +105,20 @@ impl BlockSync {
                     }
                 }
                 HeaderAdmission::Rejected(error) => {
-                    // The batch could not attach (`MissingParent`) or failed
-                    // a check that is not the peer's fault
-                    // (`TimestampTooFarAhead`, `DuplicateHeader`). The
-                    // announcer demonstrably knows a chain beyond our tip:
-                    // ask it for the missing ancestry so a later batch lands
-                    // instead of wedging the live tip behind one missed
-                    // header.
-                    self.request_headers_from(source);
+                    // A batch that cannot attach (`MissingParent`,
+                    // `NoCommonAncestor`) proves the announcer knows a chain
+                    // beyond our tip: ask it for the missing ancestry so a
+                    // later batch lands instead of wedging the live tip
+                    // behind one missed header. Other non-fault rejections
+                    // (`TimestampTooFarAhead`, `DuplicateHeader`) get no
+                    // re-request — the announcer would only replay the same
+                    // batch into the same rejection, which paces no one.
+                    if matches!(
+                        error,
+                        ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. }
+                    ) {
+                        self.request_headers_from(source);
+                    }
                     tracing::warn!(
                         received = batch_len,
                         %error,

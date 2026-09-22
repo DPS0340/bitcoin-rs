@@ -372,6 +372,13 @@ impl BlockStager {
         Some(DroppedBlock { hash: *hash })
     }
 
+    /// Drops the staged body for `hash`, releasing its staging-budget bytes.
+    /// Used for bodies whose embedded header is permanently inadmissible —
+    /// they can never become expected, so they are dead inventory.
+    pub fn discard(&mut self, hash: &Hash256) -> bool {
+        self.remove(hash).is_some()
+    }
+
     fn track_received_deadline(&mut self, received_at: Instant) {
         let deadline = received_deadline(received_at, self.budget.received_timeout);
         self.next_received_deadline = Some(
