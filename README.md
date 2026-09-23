@@ -38,7 +38,7 @@ faster iteration. Bitcoin is unusually well suited to this model because
 implementations can be checked against Bitcoin Core, `libbitcoinkernel`,
 historical chain data, consensus test vectors, fuzzing, and differential tests.
 
-**Bitcoin is well suited to AI-native development; Bitcoin Core's development
+**Bitcoin is well suited to AI-native, human supervised development; Bitcoin Core's development
 culture is not.** Its review process prioritizes minimizing change risk,
 rewarding incrementalism, entrenching existing boundaries, and making radical
 architectural experimentation prohibitively expensive.
