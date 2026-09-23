@@ -104,8 +104,8 @@ fn settle_node_reorg(
         ) {
             let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
                 handles.utxo(),
-                handles.applied_tip(),
-                handles.block_tree(),
+                handles.applied_tip_reader(),
+                handles.block_tree_reader(),
                 handles.network(),
             );
             if !outcome

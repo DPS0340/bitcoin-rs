@@ -24,11 +24,9 @@ use crate::PreparedBatchLimits;
 use crate::writer::TxIndexWriter;
 use arc_swap::ArcSwap;
 use bitcoin_rs_chain::BlockBodySource;
-use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_chain::{BlockTreeReader, TipReader};
 use bitcoin_rs_storage::block_body::BlockBodyStore;
 use crossbeam_channel::Receiver;
-use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread;
@@ -48,8 +46,8 @@ impl DerivedIndexWorker {
     pub fn spawn(
         runtime: Arc<DerivedIndexRuntime>,
         writer: Arc<dyn TxIndexWriter>,
-        applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
-        block_tree: Arc<RwLock<BlockTree>>,
+        applied_tip: TipReader,
+        block_tree: BlockTreeReader,
         body_store: Option<Arc<dyn BlockBodyStore>>,
         batch_limits: PreparedBatchLimits,
         enabled: IndexCapabilities,
@@ -122,8 +120,8 @@ impl DerivedIndexWorker {
         spec: DerivedIndexOpenSpec,
         lifecycle: Arc<ArcSwap<DerivedIndexLifecycle>>,
         generation: Generation,
-        applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
-        block_tree: Arc<RwLock<BlockTree>>,
+        applied_tip: TipReader,
+        block_tree: BlockTreeReader,
         body_store: Option<Arc<dyn BlockBodyStore>>,
         block_source: IndexBlockSource,
         body_source: Option<Arc<dyn BlockBodySource>>,

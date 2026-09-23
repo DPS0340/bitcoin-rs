@@ -279,7 +279,7 @@ impl NodeState {
         ) = match derived_index_open_spec {
             Some(mut spec) => {
                 spec.utxo = Some(Arc::clone(&utxo));
-                spec.chain_transition = Some(chainstate.transition_barrier());
+                spec.chain_transition = Some(chainstate.read_fence());
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
                 let runtime =
                     Arc::new(bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx));
@@ -288,7 +288,7 @@ impl NodeState {
                 let block_source =
                     bitcoin_rs_index::runtime::IndexBlockSource::new(Arc::clone(&blocks))
                         .with_block_body_source(Arc::clone(&body_source))
-                        .with_block_tree(Arc::clone(&block_tree));
+                        .with_block_tree(chainstate.block_tree_reader());
                 let lifecycle: Arc<
                     arc_swap::ArcSwap<bitcoin_rs_index::runtime::DerivedIndexLifecycle>,
                 > = Arc::new(arc_swap::ArcSwap::from_pointee(

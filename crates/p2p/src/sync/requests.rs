@@ -149,7 +149,7 @@ impl BlockSync {
             return GetdataRequestOutcome::default();
         };
 
-        let tree = self.chain.block_tree().read();
+        let tree = self.chain.block_tree();
         let request = self.scheduler.lock().window.next_peer_request(
             source.addr,
             allow_expired_retry_from_peer,
@@ -236,8 +236,8 @@ impl BlockSync {
         now: Instant,
     ) -> Option<PeerSource> {
         let sessions = self.peer_table.usable_peers();
-        let tree = self.chain.block_tree().read();
-        let active_tip = self.chain.chain_tip().load_full()?.tip_id;
+        let tree = self.chain.block_tree();
+        let active_tip = self.chain.chain_tip()?.tip_id;
         let active_front_height = tree.active_height_of(active_tip, front_hash)?;
         let mut eligible = SmallVec::<[PeerSource; 8]>::new();
         for session in sessions {

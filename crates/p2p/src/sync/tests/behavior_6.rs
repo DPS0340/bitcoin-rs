@@ -114,7 +114,7 @@ fn mutated_forward_body_preserves_descendant_for_retry() -> Result<(), Box<dyn s
     bad_body.txs[0].outputs[0].value = Amount::from_sat(2);
     let descendant = mined_block_with_prev_hash(bad.block_hash(), 3, vec![coinbase_transaction(3)]);
     {
-        let mut tree = sync.chain.block_tree().write();
+        let mut tree = sync.chain.block_tree_mut();
         let main_id = tree
             .lookup(Hash256::from_le_bytes(main_hash.as_bytes()))
             .ok_or_else(|| std::io::Error::other("missing applied main block"))?;

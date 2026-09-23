@@ -80,8 +80,8 @@ impl TxIngressConsumer {
     fn chain_view(&self) -> ChainAdmissionView<'_> {
         ChainAdmissionView::new(
             self.chainstate.utxo(),
-            self.chainstate.applied_tip(),
-            self.chainstate.block_tree(),
+            self.chainstate.applied_tip_reader(),
+            self.chainstate.block_tree_reader(),
             self.chainstate.network(),
         )
     }

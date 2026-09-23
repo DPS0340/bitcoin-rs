@@ -10,7 +10,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_p2p::sync::chain::{
     BranchSwitchError, HeaderAdmission, SyncChain, SyncChainError, WindowCommitDisposition,
     WindowCommitError,
@@ -132,29 +131,28 @@ impl SyncChain for NodeSyncChain {
         self.handles.network()
     }
 
-    fn block_tree(&self) -> &parking_lot::RwLock<bitcoin_rs_chain::BlockTree> {
-        self.handles.block_tree()
+    fn block_tree(&self) -> parking_lot::RwLockReadGuard<'_, bitcoin_rs_chain::BlockTree> {
+        self.handles.read_block_tree()
     }
 
-    fn chain_tip(&self) -> &arc_swap::ArcSwapOption<TipSnapshot> {
-        self.handles.chain_tip()
+    fn chain_tip(&self) -> Option<Arc<bitcoin_rs_chain::TipSnapshot>> {
+        self.handles.header_tip()
     }
 
-    fn applied_tip(&self) -> &arc_swap::ArcSwapOption<TipSnapshot> {
-        self.handles.applied_tip()
+    fn applied_tip(&self) -> Option<Arc<bitcoin_rs_chain::TipSnapshot>> {
+        self.handles.applied_tip_snapshot()
     }
 
     fn bootstrap_genesis(&self) {
-        if self.handles.applied_tip().load_full().is_some() {
+        if self.handles.applied_tip_snapshot().is_some() {
             return;
         }
 
-        let had_chain_tip = self.handles.chain_tip().load_full().is_some();
         let genesis = self.handles.network().genesis_block();
         match self.followers.apply_connect(&self.handles, &genesis) {
             Ok(outcome) => {
-                if !had_chain_tip {
-                    self.handles.chain_tip().store(Some(Arc::new(outcome.tip)));
+                if let Err(error) = self.handles.finish_genesis_bootstrap(&outcome.tip) {
+                    tracing::warn!(%error, "block sync: failed to publish genesis header tip");
                 }
             }
             // Genesis apply failed before an applied tip could be published.
@@ -165,47 +163,17 @@ impl SyncChain for NodeSyncChain {
     }
 
     fn admit_headers(&self, headers: &[Header]) -> HeaderAdmission {
-        // Header admission moves the header tip, which the apply path
-        // reads under the transition; the lock keeps it fixed until commit.
-        let transition = match self.handles.lock_transition() {
-            Ok(transition) => transition,
-            // The transition lock is unavailable, so admission is refused.
-            Err(error) => return HeaderAdmission::Refused(Box::new(error)),
-        };
-        let mut tree = self.handles.block_tree().write();
-        let acceptance = bitcoin_rs_chain::accept_headers(
-            &mut tree,
-            headers,
-            self.handles.network(),
-            bitcoin_rs_chain::current_unix_seconds(),
-        );
-        match acceptance {
-            Ok(node_ids) => {
-                let announced_tip = node_ids
-                    .last()
-                    .and_then(|id| tree.node(*id).ok())
-                    .map(|node| node.hash);
-                let active_height = tree
-                    .tip()
-                    .zip(announced_tip)
-                    .and_then(|(active_tip, hash)| {
-                        tree.active_height_of(active_tip.tip_id, hash)
-                            .and_then(|height| i32::try_from(height).ok())
-                    });
-                self.handles.reevaluate_assume_valid_with(&tree);
-                drop(tree);
-                drop(transition);
-                HeaderAdmission::Accepted {
-                    accepted: node_ids.len(),
-                    announced_tip,
-                    active_height,
-                }
-            }
-            // Header validation rejected the batch after admission began.
-            Err(error) => {
-                drop(tree);
-                drop(transition);
+        match self.handles.admit_headers(headers) {
+            Ok(outcome) => HeaderAdmission::Accepted {
+                accepted: outcome.accepted,
+                announced_tip: outcome.announced_tip,
+                active_height: outcome.active_height,
+            },
+            Err(bitcoin_rs_chainstate::HeaderAdmissionError::Rejected(error)) => {
                 HeaderAdmission::Rejected(error)
+            }
+            Err(bitcoin_rs_chainstate::HeaderAdmissionError::Refused(error)) => {
+                HeaderAdmission::Refused(Box::new(error))
             }
         }
     }
@@ -213,7 +181,7 @@ impl SyncChain for NodeSyncChain {
     fn check_body_binding(&self, block: &Block) -> Result<(), SyncChainError> {
         let hash = Hash256::from(block.block_hash());
         let segwit_active = {
-            let tree = self.handles.block_tree().read();
+            let tree = self.handles.read_block_tree();
             tree.lookup(hash)
                 .and_then(|node_id| tree.node(node_id).ok())
                 .is_none_or(|node| {

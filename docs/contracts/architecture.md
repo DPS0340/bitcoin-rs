@@ -153,8 +153,8 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
 - `bitcoin-rs-node` owns runtime startup/shutdown sequencing, configuration
   resolution and validation (`UserConfig` layers → `NodeConfig`), the mining
   control facade (`MiningCoordinator`: it composes the mining lifecycle
-  service with the chainstate/follower handles, publishes applied tips,
-  submits solved blocks, and admits headers),
+  service with Chainstate's read and transition capabilities, submits solved
+  blocks, and requests header admission from Chainstate),
   watch-only coinbase payout configuration (`MiningConfig::payout_script`), and
   process-level cache budgeting (`dbcache` distribution across chainstate and
   txindex namespaces). The `bitcoin-rs` binary owns argv, environment, and
@@ -203,6 +203,12 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   take the transition lock and cannot mutate chainstate. `ChainEventPublisher`
   cells remain a separate coherent snapshot of the applied tip for index
   consumers (`EVT-01`).
+- Long-lived RPC, P2P, index, and mining consumers receive `TipReader`,
+  `BlockTreeReader`, and `ChainReadFence` capabilities. These types expose
+  snapshot load, tree read guards, and stable-view fencing respectively; none
+  exposes the underlying publication cell, a block-tree write guard, or the
+  raw transition mutex. Header admission and genesis tip publication are
+  intent-level `Chainstate` operations.
 - `Chainstate::validate_block` dry-runs the apply path's pre-write consensus
   gates under `lock_transition`. It does not take mempool generation and does
   not persist. BIP22 proposal omits proof-of-work; every other pre-write gate
@@ -214,8 +220,10 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   `rawtx` and canonical block bytes without holding the consumers.
 - Node owns cross-domain sequencing around a chain transition: it reserves the
   mempool generation, dispatches `ChainFollowers`, then publishes the stable
-  mempool generation before the chain transition is dropped. Convenience
-  chainstate methods do not dispatch followers.
+  mempool generation before the chain transition is dropped. Follower-free
+  convenience methods are compiled only for the `test-seam` capability and
+  are absent from production builds; production composition uses explicit
+  transitions plus follower settlement.
   RPC `BlockLog`, hash/raw ZMQ, TxIndex wake, sequence `C`/`D`, mining
   generation, admission, block-confirmation eviction, and reorg
   reconsideration run from node-owned dispatch. Consumer failure cannot

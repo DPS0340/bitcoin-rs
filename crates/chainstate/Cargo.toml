@@ -13,6 +13,9 @@ workspace = true
 
 [features]
 default = ["kernel"]
+# Cross-crate tests and benchmarks that deliberately exercise low-level
+# follower-free mutation. Production builds do not expose these helpers.
+test-seam = []
 kernel = ["bitcoin-rs-consensus/kernel"]
 rocksdb = [
     "bitcoin-rs-chain/rocksdb",

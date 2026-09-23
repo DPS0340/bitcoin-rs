@@ -100,16 +100,25 @@ impl SyncChain for TestChain {
         self.network
     }
 
-    fn block_tree(&self) -> &RwLock<BlockTree> {
-        &self.block_tree
+    fn block_tree(&self) -> parking_lot::RwLockReadGuard<'_, BlockTree> {
+        self.block_tree.read()
     }
 
-    fn chain_tip(&self) -> &ArcSwapOption<TipSnapshot> {
-        &self.chain_tip
+    fn chain_tip(&self) -> Option<Arc<TipSnapshot>> {
+        self.chain_tip.load_full()
     }
 
-    fn applied_tip(&self) -> &ArcSwapOption<TipSnapshot> {
-        &self.applied_tip
+    fn applied_tip(&self) -> Option<Arc<TipSnapshot>> {
+        self.applied_tip.load_full()
+    }
+
+    fn block_tree_mut(&self) -> parking_lot::RwLockWriteGuard<'_, BlockTree> {
+        self.block_tree.write()
+    }
+
+    fn set_tips(&self, applied: TipSnapshot, header: TipSnapshot) {
+        self.applied_tip.store(Some(Arc::new(applied)));
+        self.chain_tip.store(Some(Arc::new(header)));
     }
 
     fn bootstrap_genesis(&self) {
@@ -363,16 +372,9 @@ fn check_sync_frontier_pair(
     applied: &TipSnapshot,
     target: &TipSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expected = bitcoin_rs_chain::plan_reorg(
-        &sync.chain.block_tree().read(),
-        applied.tip_id,
-        target.tip_id,
-    )
-    .ok();
-    sync.chain
-        .applied_tip()
-        .store(Some(Arc::new(applied.clone())));
-    sync.chain.chain_tip().store(Some(Arc::new(target.clone())));
+    let expected =
+        bitcoin_rs_chain::plan_reorg(&sync.chain.block_tree(), applied.tip_id, target.tip_id).ok();
+    sync.chain.set_tips(applied.clone(), target.clone());
     assert_eq!(
         sync.outweighed_branch_target(),
         expected
@@ -402,7 +404,7 @@ fn check_sync_frontier_pair(
         return Err("expected witness getdata".into());
     };
     let requested = witness_block_inventory(inventory)?;
-    let tree = sync.chain.block_tree().read();
+    let tree = sync.chain.block_tree();
     let expected_hashes = expected_ids
         .iter()
         .take(requested.len())
@@ -1234,11 +1236,7 @@ fn apply_fixture_block(sync: &BlockSync, block: Block) -> Result<(), Box<dyn std
     );
     assert_eq!(sync.apply_buffered_blocks(Some(hash)), (1, 0));
     assert_eq!(
-        sync.chain
-            .applied_tip()
-            .load_full()
-            .ok_or("missing applied tip")?
-            .hash,
+        sync.chain.applied_tip().ok_or("missing applied tip")?.hash,
         hash
     );
     Ok(())

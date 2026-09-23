@@ -218,11 +218,7 @@ fn apply_buffered_blocks_waits_for_pending_reorg() -> Result<(), Box<dyn std::er
         "an uncommittable winner body must stay staged for the branch switch"
     );
     assert_eq!(
-        sync.chain
-            .applied_tip()
-            .load_full()
-            .ok_or("missing applied tip")?
-            .hash,
+        sync.chain.applied_tip().ok_or("missing applied tip")?.hash,
         applied.hash,
         "the losing applied tip must not be displaced by the extension path"
     );

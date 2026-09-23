@@ -332,11 +332,11 @@ impl BlockSync {
     /// The chain-side frontier: both tips and the canonical next-required
     /// body, resolved in one consistent tree read.
     pub(super) fn observe_chain_frontier(&self) -> ChainFrontier {
-        let applied_tip = self.chain.applied_tip().load_full();
-        let chain_tip = self.chain.chain_tip().load_full();
+        let applied_tip = self.chain.applied_tip();
+        let chain_tip = self.chain.chain_tip();
         let next_required = match (&applied_tip, &chain_tip) {
             (Some(applied), Some(chain)) => {
-                let tree = self.chain.block_tree().read();
+                let tree = self.chain.block_tree();
                 Self::first_connect_height(&tree, applied.hash, chain.tip_id)
                     .and_then(|height| tree.node_at_height_from(chain.tip_id, height))
                     .and_then(|node_id| {
@@ -367,7 +367,7 @@ impl BlockSync {
         let sessions = self.peer_table.usable_peers();
         let mut usable_peers = Vec::with_capacity(sessions.len());
         {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             let active_tip = chain.chain_tip.as_ref().map(|tip| tip.tip_id);
             for session in sessions {
                 let demonstrated_tips = session.demonstrated_tips;

@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{BlockBodySource, TipSnapshot, softfork_state};
+use bitcoin_rs_chain::{
+    BlockBodySource, BlockTreeReader, ChainReadFence, TipReader, TipSnapshot, softfork_state,
+};
 use bitcoin_rs_mempool::{
     AdmissionChain, ChainAdmissionSnapshot, Mempool, MempoolGateway, MempoolLimits,
     MempoolObserver, MutationResult, PrevoutMeta,
@@ -238,9 +240,9 @@ pub struct ContextHandles {
 #[derive(Clone)]
 pub struct ChainHandles {
     /// Best header-chain tip.
-    pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    pub chain_tip: TipReader,
     /// Best fully-applied block tip.
-    pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    pub applied_tip: TipReader,
     /// Cumulative transaction count for the fully-applied chain.
     pub chain_tx_count: Arc<core::sync::atomic::AtomicU64>,
     /// Applied block metadata log.
@@ -252,7 +254,7 @@ pub struct ChainHandles {
     /// Incremental UTXO statistics.
     pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     /// Shared block tree.
-    pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
+    pub block_tree: BlockTreeReader,
     /// Consensus network.
     pub chain_network: Network,
 }
@@ -266,24 +268,24 @@ pub struct ChainHandles {
 /// facts collected across such a mutation before they can affect admission.
 pub struct ChainAdmissionView<'a> {
     utxo: &'a bitcoin_rs_utxo::UtxoSet,
-    applied_tip: &'a ArcSwapOption<TipSnapshot>,
-    block_tree: &'a RwLock<bitcoin_rs_chain::BlockTree>,
+    applied_tip: TipReader,
+    block_tree: BlockTreeReader,
     network: Network,
 }
 
 impl<'a> ChainAdmissionView<'a> {
     /// Borrows the chain owner's existing handles without retaining state.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         utxo: &'a bitcoin_rs_utxo::UtxoSet,
-        applied_tip: &'a ArcSwapOption<TipSnapshot>,
-        block_tree: &'a RwLock<bitcoin_rs_chain::BlockTree>,
+        applied_tip: impl Into<TipReader>,
+        block_tree: impl Into<BlockTreeReader>,
         network: Network,
     ) -> Self {
         Self {
             utxo,
-            applied_tip,
-            block_tree,
+            applied_tip: applied_tip.into(),
+            block_tree: block_tree.into(),
             network,
         }
     }
@@ -393,11 +395,13 @@ pub struct MiningHandles {
 /// Shared state consumed by JSON-RPC handlers.
 pub struct Context {
     /// Best-chain tip snapshot published by chain validation.
-    pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    pub chain_tip: TipReader,
     /// Best-applied-block tip snapshot published after block application.
-    pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    pub applied_tip: TipReader,
     /// Serializes whole-chainstate RPC reads with node-owned connect/disconnect transitions.
-    chain_transition: Arc<Mutex<()>>,
+    chain_transition: ChainReadFence,
+    chain_tip_writer: Option<Arc<ArcSwapOption<TipSnapshot>>>,
+    applied_tip_writer: Option<Arc<ArcSwapOption<TipSnapshot>>>,
     /// Cumulative transaction count of the applied chain, `0` when unknown.
     ///
     /// Maintained by block application and restored from the chainstate
@@ -454,7 +458,7 @@ pub struct Context {
     /// Whether outbound and inbound network activity is enabled through RPC.
     pub network_active: Arc<core::sync::atomic::AtomicBool>,
     /// Shared in-memory block tree.
-    pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
+    pub block_tree: BlockTreeReader,
     /// Optional durable block body reader for metadata-only block records.
     pub block_body_source: Option<Arc<dyn BlockBodySource>>,
     /// Optional outbound channel for `addnode` to request new P2P connections.
@@ -518,10 +522,15 @@ impl Context {
         let mempool = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
             MempoolLimits::default(),
         ))));
+        let chain_tip = Arc::new(ArcSwapOption::empty());
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let block_tree = Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new()));
         Self {
-            chain_tip: Arc::new(ArcSwapOption::empty()),
-            applied_tip: Arc::new(ArcSwapOption::empty()),
-            chain_transition: Arc::new(Mutex::new(())),
+            chain_tip: TipReader::new(Arc::clone(&chain_tip)),
+            applied_tip: TipReader::new(Arc::clone(&applied_tip)),
+            chain_transition: ChainReadFence::new(Arc::new(Mutex::new(()))),
+            chain_tip_writer: Some(chain_tip),
+            applied_tip_writer: Some(applied_tip),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool,
@@ -540,7 +549,7 @@ impl Context {
             mining_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
             chain_network: Network::Mainnet,
-            block_tree: Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
+            block_tree: BlockTreeReader::new(block_tree),
             block_body_source: None,
             p2p_outbound_sender: None,
             banned: Arc::new(RwLock::new(Vec::new())),
@@ -571,10 +580,15 @@ impl Context {
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             observer,
         );
+        let chain_tip = Arc::new(ArcSwapOption::empty());
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let block_tree = Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new()));
         Self {
-            chain_tip: Arc::new(ArcSwapOption::empty()),
-            applied_tip: Arc::new(ArcSwapOption::empty()),
-            chain_transition: Arc::new(Mutex::new(())),
+            chain_tip: TipReader::new(Arc::clone(&chain_tip)),
+            applied_tip: TipReader::new(Arc::clone(&applied_tip)),
+            chain_transition: ChainReadFence::new(Arc::new(Mutex::new(()))),
+            chain_tip_writer: Some(chain_tip),
+            applied_tip_writer: Some(applied_tip),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool,
@@ -593,7 +607,7 @@ impl Context {
             mining_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
             chain_network: Network::Mainnet,
-            block_tree: Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
+            block_tree: BlockTreeReader::new(block_tree),
             block_body_source: None,
             p2p_outbound_sender: None,
             banned: Arc::new(RwLock::new(Vec::new())),
@@ -642,7 +656,9 @@ impl Context {
         Self {
             chain_tip,
             applied_tip,
-            chain_transition: Arc::new(Mutex::new(())),
+            chain_transition: ChainReadFence::new(Arc::new(Mutex::new(()))),
+            chain_tip_writer: None,
+            applied_tip_writer: None,
             chain_tx_count,
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool,
@@ -736,14 +752,14 @@ impl Context {
 
     /// Shares the node's authoritative connect/disconnect lock with RPC readers.
     #[must_use]
-    pub fn with_chain_transition(mut self, chain_transition: Arc<Mutex<()>>) -> Self {
-        self.chain_transition = chain_transition;
+    pub fn with_chain_transition(mut self, chain_transition: impl Into<ChainReadFence>) -> Self {
+        self.chain_transition = chain_transition.into();
         self
     }
 
     /// Runs a read while authoritative UTXO and applied-tip transitions are excluded.
     pub fn with_stable_chainstate<R>(&self, read: impl FnOnce() -> R) -> R {
-        let _transition = self.chain_transition.lock();
+        let _transition = self.chain_transition.read();
         read()
     }
 
@@ -874,12 +890,18 @@ impl Context {
 
     /// Publishes a new best-chain tip.
     pub fn set_chain_tip(&self, tip: TipSnapshot) {
-        self.chain_tip.store(Some(Arc::new(tip)));
+        let Some(writer) = self.chain_tip_writer.as_ref() else {
+            panic!("tip mutation is available only on an isolated test context");
+        };
+        writer.store(Some(Arc::new(tip)));
     }
 
     /// Publishes a new best-applied-block tip.
     pub fn set_applied_tip(&self, tip: TipSnapshot) {
-        self.applied_tip.store(Some(Arc::new(tip)));
+        let Some(writer) = self.applied_tip_writer.as_ref() else {
+            panic!("tip mutation is available only on an isolated test context");
+        };
+        writer.store(Some(Arc::new(tip)));
     }
 
     /// Stores a block record for block and header RPCs.
@@ -899,8 +921,8 @@ impl Context {
     pub(crate) fn admission_chain(&self) -> ChainAdmissionView<'_> {
         ChainAdmissionView::new(
             &self.utxo,
-            &self.applied_tip,
-            &self.block_tree,
+            self.applied_tip.clone(),
+            self.block_tree.clone(),
             self.chain_network,
         )
     }
@@ -1430,14 +1452,14 @@ mod tests {
         let network_active = Arc::new(core::sync::atomic::AtomicBool::new(true));
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
-                chain_tip: Arc::clone(&chain_tip),
-                applied_tip: Arc::clone(&applied_tip),
+                chain_tip: Arc::clone(&chain_tip).into(),
+                applied_tip: Arc::clone(&applied_tip).into(),
                 chain_tx_count: Arc::clone(&chain_tx_count),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
                 transactions: Arc::new(RwLock::new(HashMap::new())),
                 utxo: Arc::clone(&utxo),
                 coin_stats: Arc::clone(&coin_stats),
-                block_tree: Arc::clone(&block_tree),
+                block_tree: Arc::clone(&block_tree).into(),
                 chain_network: Network::Mainnet,
             },
             mempool: MempoolHandles {
@@ -1463,11 +1485,11 @@ mod tests {
             derived_index_status: None,
         });
         assert!(
-            Arc::ptr_eq(&ctx.chain_tip, &chain_tip),
+            ctx.chain_tip.shares_source(&chain_tip),
             "chain_tip must be shared with caller"
         );
         assert!(
-            Arc::ptr_eq(&ctx.applied_tip, &applied_tip),
+            ctx.applied_tip.shares_source(&applied_tip),
             "applied_tip must be shared with caller"
         );
         assert_eq!(ctx.chain_tx_count(), Some(1));
@@ -1482,7 +1504,7 @@ mod tests {
             "coin_stats must be shared with caller"
         );
         assert!(
-            Arc::ptr_eq(&ctx.block_tree, &block_tree),
+            ctx.block_tree.shares_source(&block_tree),
             "block_tree must be shared with caller"
         );
         assert!(

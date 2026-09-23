@@ -315,7 +315,6 @@ fn stall_eviction_does_not_disconnect_replacement_connection()
     let applied_tip = sync
         .chain
         .applied_tip()
-        .load_full()
         .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
     let next_apply_height = applied_tip
         .height

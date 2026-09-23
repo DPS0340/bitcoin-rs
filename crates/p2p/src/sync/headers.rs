@@ -256,7 +256,7 @@ impl BlockSync {
         }
         let hash = Hash256::from(header.compute_hash());
         let height = {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             tree.lookup(hash)
                 .and_then(|id| tree.node(id).ok().map(|node| node.height))
         };
@@ -294,7 +294,7 @@ impl BlockSync {
         let mut unresolved = Vec::with_capacity(deferred.len());
         let mut resolved = Vec::with_capacity(deferred.len());
         {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             for (source, hash) in deferred {
                 let height = tree
                     .lookup(hash)
@@ -320,7 +320,7 @@ impl BlockSync {
     /// 0-height sentinel in the window; an admission that just supplied
     /// those headers repairs the sentinels against the live tree.
     pub(super) fn reconcile_staged_received_heights(&self) {
-        let tree = self.chain.block_tree().read();
+        let tree = self.chain.block_tree();
         self.scheduler
             .lock()
             .window
@@ -334,7 +334,7 @@ impl BlockSync {
         &self,
         headers: &[bitcoin_rs_primitives::Header],
     ) -> Option<(Hash256, Option<i32>)> {
-        let tree = self.chain.block_tree().read();
+        let tree = self.chain.block_tree();
         let last_hash = Hash256::from(headers.last()?.compute_hash());
         headers
             .iter()
@@ -358,11 +358,7 @@ impl BlockSync {
         let Some(source) = source else {
             return;
         };
-        let header_height = self
-            .chain
-            .chain_tip()
-            .load_full()
-            .map_or(0, |tip| tip.height);
+        let header_height = self.chain.chain_tip().map_or(0, |tip| tip.height);
         let target_height = self
             .peer_table
             .sessions()
@@ -408,7 +404,7 @@ impl BlockSync {
         // kept fork tip attest the deepest prefix it shares with the active
         // chain.
         let updates: Vec<(PeerSource, Option<i32>, Vec<Hash256>)> = {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             let Some(active_tip) = tree.tip() else {
                 return;
             };
@@ -559,7 +555,7 @@ impl BlockSync {
             return GetheadersOutcome::Suppressed;
         }
         let locator = {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             let Some(active_anchor) = tree.node_at_height_from(headers.tip_id, applied.height)
             else {
                 return GetheadersOutcome::Failed;
@@ -671,11 +667,10 @@ impl BlockSync {
     }
 
     pub(super) fn build_locator(&self) -> Vec<Hash256> {
-        if let Some(tip) = self.chain.chain_tip().load_full() {
+        if let Some(tip) = self.chain.chain_tip() {
             return self
                 .chain
                 .block_tree()
-                .read()
                 .block_locator(tip.tip_id, LOCATOR_MAX_ENTRIES);
         }
         std::vec![self.chain.network().genesis_block_hash()]

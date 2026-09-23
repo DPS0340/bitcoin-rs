@@ -1636,14 +1636,14 @@ fn invalidation_handler(state: &NodeState) -> Handler {
     Handler::new(Arc::new(
         Context::from_handles(ContextHandles {
             chain: ChainHandles {
-                chain_tip: chainstate.chain_tip_handle(),
-                applied_tip: chainstate.applied_tip_handle(),
+                chain_tip: chainstate.header_tip_reader(),
+                applied_tip: chainstate.applied_tip_reader(),
                 chain_tx_count: chainstate.chain_tx_count_handle(),
                 blocks: state.blocks(),
                 transactions: state.transactions(),
                 utxo: chainstate.utxo_handle(),
                 coin_stats: chainstate.coin_stats_handle(),
-                block_tree: chainstate.block_tree_handle(),
+                block_tree: chainstate.block_tree_reader(),
                 chain_network: Network::Regtest,
             },
             mempool: MempoolHandles {
@@ -1736,8 +1736,8 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
     let chainstate = state.chainstate();
     let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
         chainstate.utxo(),
-        chainstate.applied_tip(),
-        chainstate.block_tree(),
+        chainstate.applied_tip_reader(),
+        chainstate.block_tree_reader(),
         chainstate.network(),
     );
     let change = gateway.begin_chain_change()?;

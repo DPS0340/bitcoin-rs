@@ -1,0 +1,137 @@
+use std::sync::Arc;
+
+use arc_swap::ArcSwapOption;
+#[cfg(any(test, feature = "test-seam"))]
+use parking_lot::RwLockWriteGuard;
+use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+
+use crate::{BlockTree, TipSnapshot};
+
+/// Cloneable, read-only access to one published chain tip.
+///
+/// The publication cell stays private, so consumers can observe snapshots but
+/// cannot publish a different tip.
+#[derive(Clone)]
+pub struct TipReader {
+    inner: Arc<ArcSwapOption<TipSnapshot>>,
+}
+
+impl TipReader {
+    /// Wraps a publication cell without exposing it again.
+    #[must_use]
+    pub const fn new(inner: Arc<ArcSwapOption<TipSnapshot>>) -> Self {
+        Self { inner }
+    }
+
+    /// Loads the current tip snapshot.
+    #[must_use]
+    pub fn load(&self) -> Option<Arc<TipSnapshot>> {
+        self.inner.load_full()
+    }
+
+    /// Loads the current tip snapshot, retaining the publication allocation.
+    #[must_use]
+    pub fn load_full(&self) -> Option<Arc<TipSnapshot>> {
+        self.load()
+    }
+
+    /// Publishes a fixture tip. Not present in production builds.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn store(&self, tip: Option<Arc<TipSnapshot>>) {
+        self.inner.store(tip);
+    }
+
+    /// Reports whether this fixture capability wraps `inner`.
+    #[cfg(any(test, feature = "test-seam"))]
+    #[must_use]
+    pub fn shares_source(&self, inner: &Arc<ArcSwapOption<TipSnapshot>>) -> bool {
+        Arc::ptr_eq(&self.inner, inner)
+    }
+}
+
+impl From<Arc<ArcSwapOption<TipSnapshot>>> for TipReader {
+    fn from(inner: Arc<ArcSwapOption<TipSnapshot>>) -> Self {
+        Self::new(inner)
+    }
+}
+
+impl From<&Arc<ArcSwapOption<TipSnapshot>>> for TipReader {
+    fn from(inner: &Arc<ArcSwapOption<TipSnapshot>>) -> Self {
+        Self::new(Arc::clone(inner))
+    }
+}
+
+/// Cloneable, read-only access to the authoritative block tree.
+///
+/// Only a read guard is obtainable from this capability. Header admission and
+/// all other tree mutation stay with the chainstate owner.
+#[derive(Clone)]
+pub struct BlockTreeReader {
+    inner: Arc<RwLock<BlockTree>>,
+}
+
+impl BlockTreeReader {
+    /// Wraps a block tree without exposing its write lock.
+    #[must_use]
+    pub const fn new(inner: Arc<RwLock<BlockTree>>) -> Self {
+        Self { inner }
+    }
+
+    /// Acquires a shared tree guard.
+    pub fn read(&self) -> RwLockReadGuard<'_, BlockTree> {
+        self.inner.read()
+    }
+
+    /// Acquires a fixture-only write guard. Not present in production builds.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn write(&self) -> RwLockWriteGuard<'_, BlockTree> {
+        self.inner.write()
+    }
+
+    /// Reports whether this fixture capability wraps `inner`.
+    #[cfg(any(test, feature = "test-seam"))]
+    #[must_use]
+    pub fn shares_source(&self, inner: &Arc<RwLock<BlockTree>>) -> bool {
+        Arc::ptr_eq(&self.inner, inner)
+    }
+}
+
+impl From<Arc<RwLock<BlockTree>>> for BlockTreeReader {
+    fn from(inner: Arc<RwLock<BlockTree>>) -> Self {
+        Self::new(inner)
+    }
+}
+
+impl From<&Arc<RwLock<BlockTree>>> for BlockTreeReader {
+    fn from(inner: &Arc<RwLock<BlockTree>>) -> Self {
+        Self::new(Arc::clone(inner))
+    }
+}
+
+/// Read-side fence for a stable view across an authoritative chain transition.
+///
+/// Holding this guard delays the next transition. It grants no mutation
+/// access to tips, the block tree, or UTXO state.
+#[derive(Clone)]
+pub struct ChainReadFence {
+    inner: Arc<Mutex<()>>,
+}
+
+impl ChainReadFence {
+    /// Wraps the chain-transition mutex as a read-side capability.
+    #[must_use]
+    pub const fn new(inner: Arc<Mutex<()>>) -> Self {
+        Self { inner }
+    }
+
+    /// Holds the stable-view fence until the returned guard is dropped.
+    pub fn read(&self) -> MutexGuard<'_, ()> {
+        self.inner.lock()
+    }
+}
+
+impl From<Arc<Mutex<()>>> for ChainReadFence {
+    fn from(inner: Arc<Mutex<()>>) -> Self {
+        Self::new(inner)
+    }
+}

@@ -315,7 +315,7 @@ impl BlockSync {
             return;
         }
         let height = {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             tree.lookup(frontier_hash)
                 .and_then(|node_id| tree.node(node_id).ok())
                 .map(|node| node.height)

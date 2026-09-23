@@ -62,7 +62,7 @@ impl BlockSync {
         let dropped = self.scheduler.lock().stager.prune_expired(now);
         let pruned = !dropped.is_empty();
         if pruned {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             let height_updates: Vec<(Hash256, u32)> = dropped
                 .iter()
                 .filter_map(|dropped| {
@@ -158,7 +158,7 @@ impl BlockSync {
     /// carries the fault, exactly as a rejected `headers` batch would.
     fn admit_staged_headers(&self) {
         let unadmitted: Vec<(Hash256, Header, Option<crate::PeerSource>)> = {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             let scheduler = self.scheduler.lock();
             scheduler
                 .stager
@@ -268,8 +268,8 @@ impl BlockSync {
         // A cold-start hedge can arrive after its original copy was applied.
         // Drop only blocks proven to lie on the applied ancestry; a known
         // side-chain block at the same or lower height must remain eligible.
-        if let Some(applied_tip) = self.chain.applied_tip().load_full() {
-            let tree = self.chain.block_tree().read();
+        if let Some(applied_tip) = self.chain.applied_tip() {
+            let tree = self.chain.block_tree();
             let indexed_tip = Self::indexed_applied_ancestry_tip(&tree, &applied_tip);
             blocks.retain(|inbound| {
                 let hash = Hash256::from(inbound.block.block_hash());
@@ -397,7 +397,7 @@ impl BlockSync {
         // A hash not yet in the tree stays 0 until the prune path's own
         // re-evaluation.
         let staged_blocks: Vec<_> = {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             staged_blocks
                 .into_iter()
                 .map(|(hash, source_peer, staged)| {

@@ -2,7 +2,6 @@
 //! implementation owns applied-tip mutation (node, ARCH-07); the executor
 //! owns download scheduling, staging, and peer policy.
 
-use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
@@ -11,7 +10,10 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
 use bitcoin_rs_primitives::Network;
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::RwLockReadGuard;
+#[cfg(test)]
+use parking_lot::RwLockWriteGuard;
+use std::sync::Arc;
 
 /// Boxed source for seam failures: the executor forwards them to logs and
 /// metrics without naming the implementation's error types.
@@ -224,14 +226,22 @@ pub trait SyncChain: Send + Sync {
     /// Network the applied chain validates against.
     fn network(&self) -> Network;
 
-    /// Shared block tree (headers + applied chain topology).
-    fn block_tree(&self) -> &RwLock<BlockTree>;
+    /// Read-only block tree (headers + applied chain topology).
+    fn block_tree(&self) -> RwLockReadGuard<'_, BlockTree>;
 
-    /// Header (chain) tip cell published by header admission.
-    fn chain_tip(&self) -> &ArcSwapOption<TipSnapshot>;
+    /// Header (chain) tip published by header admission.
+    fn chain_tip(&self) -> Option<Arc<TipSnapshot>>;
 
-    /// Applied tip cell published by commits and branch switches.
-    fn applied_tip(&self) -> &ArcSwapOption<TipSnapshot>;
+    /// Applied tip published by commits and branch switches.
+    fn applied_tip(&self) -> Option<Arc<TipSnapshot>>;
+
+    /// Fixture-only mutation seam, absent from production trait objects.
+    #[cfg(test)]
+    fn block_tree_mut(&self) -> RwLockWriteGuard<'_, BlockTree>;
+
+    /// Fixture-only tip publication seam, absent from production trait objects.
+    #[cfg(test)]
+    fn set_tips(&self, applied: TipSnapshot, header: TipSnapshot);
 
     /// Applies genesis when nothing is applied yet.
     fn bootstrap_genesis(&self);

@@ -83,10 +83,9 @@ fn segwit_sync_fixture() -> Result<(BlockSync, Hash256, Block, Block), Box<dyn s
     let genesis_id = sync
         .chain
         .block_tree()
-        .read()
         .lookup(Hash256::from_le_bytes(genesis.block_hash().as_bytes()))
         .ok_or("missing genesis node")?;
-    sync.chain.block_tree().write().insert_node(
+    sync.chain.block_tree_mut().insert_node(
         Some(genesis_id),
         correct_block.header,
         NodeStatus::HeaderValid,
@@ -320,11 +319,7 @@ fn idle_frontier_relearns_stale_peer_credit_after_rejected_body()
     sync.buffer_received_block_chunk(&mut vec![delivered], Some(hash));
     sync.tick();
     assert_eq!(
-        sync.chain
-            .applied_tip()
-            .load_full()
-            .ok_or("missing applied tip")?
-            .hash,
+        sync.chain.applied_tip().ok_or("missing applied tip")?.hash,
         hash
     );
     assert_no_getdata(&good_rx)?;

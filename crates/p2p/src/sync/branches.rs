@@ -34,11 +34,7 @@ impl BlockSync {
         );
         match outcome {
             Ok(()) => {
-                let height = self
-                    .chain
-                    .applied_tip()
-                    .load_full()
-                    .map_or(0, |tip| tip.height);
+                let height = self.chain.applied_tip().map_or(0, |tip| tip.height);
                 tracing::info!(height, "block sync: switched to the heavier branch");
             }
             Err(BranchSwitchError::MissingBody { height }) => {
@@ -146,12 +142,12 @@ impl BlockSync {
     /// at the applied height is the applied block itself.
     #[doc(hidden)]
     pub fn outweighed_branch_target(&self) -> Option<NodeId> {
-        let chain_tip = self.chain.chain_tip().load_full()?;
-        let applied = self.chain.applied_tip().load_full()?;
+        let chain_tip = self.chain.chain_tip()?;
+        let applied = self.chain.applied_tip()?;
         if chain_tip.hash == applied.hash {
             return None;
         }
-        let tree = self.chain.block_tree().read();
+        let tree = self.chain.block_tree();
         let applied_id = tree.lookup(applied.hash)?;
         // Normal IBD extends the applied chain. Its trusted height index proves
         // ancestry without allocating a plan for the entire remaining chain.

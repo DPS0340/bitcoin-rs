@@ -20,11 +20,9 @@ use crate::recovery::open_writer;
 use crate::writer::TxIndexWriter;
 use arc_swap::ArcSwap;
 use bitcoin_rs_chain::BlockBodySource;
-use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_chain::{BlockTreeReader, TipReader};
 use bitcoin_rs_storage::block_body::BlockBodyStore;
 use crossbeam_channel::Receiver;
-use parking_lot::RwLock;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -52,8 +50,8 @@ pub(super) fn run_worker_with_open(
     spec: DerivedIndexOpenSpec,
     lifecycle: &Arc<ArcSwap<DerivedIndexLifecycle>>,
     generation: &Generation,
-    applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
-    block_tree: Arc<RwLock<BlockTree>>,
+    applied_tip: TipReader,
+    block_tree: BlockTreeReader,
     body_store: Option<Arc<dyn BlockBodyStore>>,
     block_source: IndexBlockSource,
     body_source: Option<Arc<dyn BlockBodySource>>,
@@ -182,8 +180,8 @@ pub(super) fn open_and_run(
     spec: &DerivedIndexOpenSpec,
     lifecycle: &Arc<ArcSwap<DerivedIndexLifecycle>>,
     generation: &Generation,
-    applied_tip: &Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
-    block_tree: &Arc<RwLock<BlockTree>>,
+    applied_tip: &TipReader,
+    block_tree: &BlockTreeReader,
     body_store: &Option<Arc<dyn BlockBodyStore>>,
     block_source: &IndexBlockSource,
     body_source: &Option<Arc<dyn BlockBodySource>>,
@@ -212,8 +210,8 @@ pub(super) fn open_and_run(
         Arc::clone(runtime),
         open.reader,
         block_source.clone(),
-        Arc::clone(block_tree),
-        Arc::clone(applied_tip),
+        block_tree.clone(),
+        applied_tip.clone(),
         body_source.clone(),
         QueryEngineLive {
             utxo: spec.utxo.clone(),
@@ -237,8 +235,8 @@ pub(super) fn open_and_run(
     let worker = Worker {
         runtime: Arc::clone(runtime),
         writer: open.writer,
-        applied_tip: Arc::clone(applied_tip),
-        block_tree: Arc::clone(block_tree),
+        applied_tip: applied_tip.clone(),
+        block_tree: block_tree.clone(),
         body_store: body_store.clone(),
         batch_limits: open.batch_limits,
         enabled: spec.enabled,

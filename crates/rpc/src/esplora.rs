@@ -437,7 +437,7 @@ mod tests {
     }
 
     struct RepublishTipScriptIndex {
-        applied_tip: Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>,
+        applied_tip: bitcoin_rs_chain::TipReader,
     }
 
     impl crate::context::ScriptIndexQuery for RepublishTipScriptIndex {
@@ -1008,7 +1008,7 @@ mod tests {
         };
         context.applied_tip.store(Some(tip));
         context.script_index = Some(Arc::new(RepublishTipScriptIndex {
-            applied_tip: Arc::clone(&context.applied_tip),
+            applied_tip: context.applied_tip.clone(),
         }));
         let handler = Handler::new(Arc::new(context));
 

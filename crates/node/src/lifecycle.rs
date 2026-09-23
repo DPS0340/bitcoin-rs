@@ -68,14 +68,14 @@ fn bind_rpc(
     let chainstate = state.chainstate();
     let mut context = Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: chainstate.chain_tip_handle(),
-            applied_tip: chainstate.applied_tip_handle(),
+            chain_tip: chainstate.header_tip_reader(),
+            applied_tip: chainstate.applied_tip_reader(),
             chain_tx_count: chainstate.chain_tx_count_handle(),
             blocks: state.blocks(),
             transactions: state.transactions(),
             utxo: chainstate.utxo_handle(),
             coin_stats: chainstate.coin_stats_handle(),
-            block_tree: chainstate.block_tree_handle(),
+            block_tree: chainstate.block_tree_reader(),
             chain_network: state.config().network,
         },
         mempool: MempoolHandles {
@@ -100,7 +100,7 @@ fn bind_rpc(
     })
     .with_esplora_derived_index(state.esplora_derived_index_query())
     .with_block_body_source(block_body_source)
-    .with_chain_transition(chainstate.transition_barrier());
+    .with_chain_transition(chainstate.read_fence());
     if let Some(prune_service) = state.prune_service() {
         context = context.with_prune_service(prune_service);
     }
@@ -517,7 +517,7 @@ pub(crate) fn start_node(
     let block_body_source = state.block_body_source()?;
     let chainstate = state.chainstate();
     let p2p_chain_query: Arc<dyn bitcoin_rs_p2p::ChainQuery> = Arc::new(
-        bitcoin_rs_p2p::ActiveChainQuery::new(chainstate.block_tree_handle())
+        bitcoin_rs_p2p::ActiveChainQuery::new(chainstate.block_tree_reader())
             .with_block_body_source(Arc::clone(&block_body_source)),
     );
     let (sync_wake_tx, sync_wake_rx) = bounded(1);

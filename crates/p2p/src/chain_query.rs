@@ -11,8 +11,9 @@ use bitcoin::blockdata::block::Block as RegistryBlock;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_compact_blocks::CmpctBlock;
-use bitcoin_rs_chain::{BlockBodySource, BlockTree};
+use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
+#[cfg(test)]
 use parking_lot::RwLock;
 
 use crate::dispatch::{ChainQuery, InventoryServing};
@@ -21,16 +22,16 @@ use crate::wire::{Message, PeerError};
 /// Read-only active-chain view for P2P `getheaders` / `getdata`.
 #[derive(Clone)]
 pub struct ActiveChainQuery {
-    block_tree: Arc<RwLock<BlockTree>>,
+    block_tree: BlockTreeReader,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
 }
 
 impl ActiveChainQuery {
     /// Builds a P2P chain query view over shared active-chain state.
     #[must_use]
-    pub const fn new(block_tree: Arc<RwLock<BlockTree>>) -> Self {
+    pub fn new(block_tree: impl Into<BlockTreeReader>) -> Self {
         Self {
-            block_tree,
+            block_tree: block_tree.into(),
             block_body_source: None,
         }
     }

@@ -206,8 +206,8 @@ impl Harness {
         let worker = Worker {
             runtime: Arc::clone(&runtime),
             writer: Arc::clone(&writer),
-            applied_tip: Arc::clone(&applied_tip),
-            block_tree: Arc::clone(&fixture.tree),
+            applied_tip: Arc::clone(&applied_tip).into(),
+            block_tree: Arc::clone(&fixture.tree).into(),
             body_store: Some(body_store),
             batch_limits: DEFAULT_BATCH_LIMITS,
             enabled,
@@ -218,7 +218,7 @@ impl Harness {
             batch_delay: Duration::ZERO,
             rollback_rebuild_cutover,
             utxo,
-            chain_transition,
+            chain_transition: chain_transition.map(Into::into),
         };
         Self {
             _index_dir: index_dir,

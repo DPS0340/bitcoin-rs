@@ -17,6 +17,8 @@ pub mod reorg;
 pub mod tip;
 /// In-memory block tree.
 pub mod tree;
+/// Read-only capabilities over chain publications and topology.
+mod view;
 
 use bitcoin_rs_primitives::Hash256;
 use thiserror::Error;
@@ -37,6 +39,7 @@ pub use node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus};
 pub use reorg::{ReorgPlan, plan_reorg};
 pub use tip::TipSnapshot;
 pub use tree::BlockTree;
+pub use view::{BlockTreeReader, ChainReadFence, TipReader};
 
 /// Errors returned by header sync, block-tree, and reorg planning operations.
 #[derive(Debug, Error, PartialEq, Eq)]
