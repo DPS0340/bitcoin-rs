@@ -2178,6 +2178,26 @@ impl DownloadWindow {
         }
     }
 
+    /// Fills the 0-height sentinel on received entries whose headers have
+    /// since landed in `tree` — e.g. admitted through a `headers` batch
+    /// rather than a body admission — so successor visibility and retry
+    /// rewinds see real heights instead of staying invisible.
+    pub fn reconcile_received_heights(&mut self, tree: &BlockTree) {
+        let unresolved: Vec<Hash256> = self
+            .received
+            .iter()
+            .filter_map(|(hash, received)| (received.height == 0).then_some(*hash))
+            .collect();
+        for hash in unresolved {
+            if let Some(node) = tree
+                .lookup(hash)
+                .and_then(|node_id| tree.node(node_id).ok())
+            {
+                self.update_received_height(&hash, node.height);
+            }
+        }
+    }
+
     /// Marks a block as applied and removes it from pending. Test-only.
     #[cfg(test)]
     fn mark_applied(&mut self, hash: &Hash256) {

@@ -583,6 +583,207 @@ fn unsolicited_stale_block_retries_from_resolved_header_height()
     Ok(())
 }
 
+/// A block delivered ahead of its header — the `inv`/compact announcement
+/// path fetches bodies directly, so no `headers` batch ever travels —
+/// carries the only copy of its header. The drain admits it through the
+/// headers seam, so the body applies, and the delivery earns the same
+/// demonstrated-tip credit a `headers` announcement would.
+#[test]
+fn inv_delivered_block_admits_carried_header_and_applies() -> Result<(), Box<dyn std::error::Error>>
+{
+    let genesis = Network::Regtest.genesis_block();
+    let block = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
+    let block_hash = block.block_hash();
+    let mut tree = BlockTree::new();
+    tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx: _inbound_headers_tx,
+    } = SyncHarness::new(tree);
+    install_budget(&sync, super::default_sync_budget());
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let rx = connect_peer(&peers, synthetic_peer(addr, 0));
+
+    sync.tick();
+    assert_applied_genesis(&applied_tip, &block_tree)?;
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing to send before any announcement"
+    );
+
+    let source = current_source(&peers, addr);
+    let serialized = bytes::Bytes::from(consensus_bytes(&block));
+    inbound_blocks_tx.send(crate::InboundBlock {
+        block,
+        serialized,
+        source: Some(source),
+    })?;
+    sync.tick();
+
+    let applied = applied_tip
+        .load_full()
+        .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+    assert_eq!(applied.hash, Hash256::from(block_hash));
+    assert_eq!(applied.height, 1);
+    let best_known = peers
+        .sessions()
+        .iter()
+        .find(|session| session.addr == addr)
+        .and_then(|session| session.info.as_ref())
+        .map(|info| info.best_known_height)
+        .ok_or_else(|| std::io::Error::other("missing peer info"))?;
+    assert_eq!(best_known, 1);
+    assert_no_getdata(&rx)?;
+    Ok(())
+}
+
+/// Two blocks delivered child-before-parent in one chunk stage their
+/// carried headers and both apply. When the admission pass happens to try
+/// the child first it may fire a benign gap-recovery `getheaders` — the
+/// staged parent admits in the same drain, so no body re-download may
+/// follow.
+#[test]
+fn out_of_order_delivered_blocks_admit_and_apply() -> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block();
+    let block1 = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
+    let block2 = mined_block_with_prev_hash(block1.block_hash(), 2, vec![coinbase_transaction(2)]);
+    let mut tree = BlockTree::new();
+    tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx: _inbound_headers_tx,
+    } = SyncHarness::new(tree);
+    install_budget(&sync, super::default_sync_budget());
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let rx = connect_peer(&peers, eligible_peer(addr, 0));
+    let source = current_source(&peers, addr);
+
+    sync.tick();
+    assert_applied_genesis(&applied_tip, &block_tree)?;
+
+    for block in [block2, block1] {
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
+        inbound_blocks_tx.send(crate::InboundBlock {
+            block,
+            serialized,
+            source: Some(source),
+        })?;
+    }
+    // Whichever order the pass tries the carried headers, the second drain
+    // admits whichever waited on the other's parent.
+    sync.tick();
+    sync.tick();
+
+    let applied = applied_tip
+        .load_full()
+        .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+    assert_eq!(applied.height, 2);
+    for message in std::iter::from_fn(|| rx.try_recv().ok()) {
+        assert!(
+            matches!(message, Message::GetHeaders(_)),
+            "a same-drain admission may only fire a benign getheaders, never a body retry"
+        );
+    }
+    Ok(())
+}
+
+/// A delivered block whose carried header refers to an unlearned parent is
+/// not a peer fault — the announced chain extends past a gap the deliverer
+/// provably covers — so the sync asks it for the headers spanning the gap.
+/// Once the ancestors land, the already-staged body applies in place.
+#[test]
+fn missing_parent_block_delivery_recovers_with_getheaders() -> Result<(), Box<dyn std::error::Error>>
+{
+    let genesis = Network::Regtest.genesis_block();
+    let block1 = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
+    let block2 = mined_block_with_prev_hash(block1.block_hash(), 2, vec![coinbase_transaction(2)]);
+    let mut tree = BlockTree::new();
+    tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        inbound_blocks_tx,
+        inbound_headers_tx,
+    } = SyncHarness::new(tree);
+    install_budget(&sync, super::default_sync_budget());
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let rx = connect_peer(&peers, eligible_peer(addr, 0));
+    let source = current_source(&peers, addr);
+
+    sync.tick();
+    assert_applied_genesis(&applied_tip, &block_tree)?;
+
+    // The height-2 body arrives first; its carried header's parent is the
+    // unlearned height-1 header — a chain gap, not a peer fault.
+    let serialized = bytes::Bytes::from(consensus_bytes(&block2));
+    inbound_blocks_tx.send(crate::InboundBlock {
+        block: block2.clone(),
+        serialized,
+        source: Some(source),
+    })?;
+    sync.tick();
+    let Message::GetHeaders(_) = rx.try_recv()? else {
+        return Err(std::io::Error::other("expected recovery getheaders").into());
+    };
+    assert!(
+        block_tree
+            .read()
+            .lookup(Hash256::from(block2.block_hash()))
+            .is_none(),
+        "unattachable header must not be admitted"
+    );
+
+    // The reply covers the gap; the still-missing parent body is fetched
+    // through the ordinary window path.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![block1.header, block2.header],
+        source: Some(source),
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.tick();
+    assert_eq!(
+        witness_block_inventory(next_getdata(&rx)?)?,
+        std::vec![block1.block_hash()]
+    );
+    assert_eq!(
+        sync.scheduler
+            .lock()
+            .window
+            .received_height(&Hash256::from(block2.block_hash())),
+        Some(2),
+        "header admission must reconcile the staged child's height"
+    );
+
+    // Delivering the parent applies both: the staged child body commits
+    // right behind it (the second tick drains past the requested-prefix
+    // apply window that capped the first).
+    let serialized = bytes::Bytes::from(consensus_bytes(&block1));
+    inbound_blocks_tx.send(crate::InboundBlock {
+        block: block1,
+        serialized,
+        source: Some(source),
+    })?;
+    sync.tick();
+    sync.tick();
+    let applied = applied_tip
+        .load_full()
+        .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+    assert_eq!(applied.hash, Hash256::from(block2.block_hash()));
+    assert_eq!(applied.height, 2);
+    Ok(())
+}
+
 /// Cross-tick regression for the bounded prefix-race-before-fanout
 /// handoff: a probe created below the threshold must defer fanout when the
 /// eligible count reaches the threshold on a following tick while the

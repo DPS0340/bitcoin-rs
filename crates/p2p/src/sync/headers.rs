@@ -35,10 +35,15 @@ const MAX_UNRESOLVED_DEMONSTRATED_TIPS: usize = 8;
 const MAX_DEFERRED_OWNED_FETCHES: usize = 16;
 
 impl BlockSync {
+    #[allow(clippy::too_many_lines)]
     pub(super) fn drain_inbound_headers(&self) {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;
         let mut credit_refresh_needed = false;
+        // Set on any batch whose content reached the tree this drain — an
+        // admission attempt (a rejection can still commit a valid prefix)
+        // or a fully-known batch — so staged-body sentinels reconcile here.
+        let mut reconcile_needed = false;
         while let Ok(InboundHeaders {
             headers,
             source,
@@ -58,6 +63,7 @@ impl BlockSync {
             // batches would otherwise pay a lock acquisition per body for
             // what is almost always a lookup hit.
             if let Some((tip_hash, active_height)) = self.known_batch_outcome(&headers) {
+                reconcile_needed = true;
                 if let Some(source) = source {
                     self.peer_table
                         .note_announced_tip(source, tip_hash, active_height);
@@ -72,6 +78,7 @@ impl BlockSync {
             // Header admission moves the header tip, which the apply path
             // reads under the transition; the implementation holds that lock
             // inside `admit_headers` until commit.
+            reconcile_needed = true;
             match self.chain.admit_headers(&headers) {
                 HeaderAdmission::Accepted {
                     accepted,
@@ -158,6 +165,9 @@ impl BlockSync {
         // The drain may have attached the ancestry a deferred owned fetch
         // was waiting on — resolve it against the tree now.
         self.resolve_owned_body_fetches();
+        if reconcile_needed {
+            self.reconcile_staged_received_heights();
+        }
         if total_headers > 0 {
             tracing::debug!(total_headers, "block sync: drained inbound headers");
         }
@@ -304,6 +314,17 @@ impl BlockSync {
             scheduler.window.mark_owned_fetch(source, hash, height, now);
         }
         scheduler.owned_body_fetches.extend(unresolved);
+    }
+
+    /// Bodies staged while their carried headers were missing keep the
+    /// 0-height sentinel in the window; an admission that just supplied
+    /// those headers repairs the sentinels against the live tree.
+    pub(super) fn reconcile_staged_received_heights(&self) {
+        let tree = self.chain.block_tree().read();
+        self.scheduler
+            .lock()
+            .window
+            .reconcile_received_heights(&tree);
     }
 
     /// `(announced_tip, active_height)` when every header in `headers` is
