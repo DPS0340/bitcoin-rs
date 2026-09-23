@@ -150,8 +150,8 @@ impl SyncChain for NodeSyncChain {
 
         let genesis = self.handles.network().genesis_block();
         match self.followers.apply_connect(&self.handles, &genesis) {
-            Ok(outcome) => {
-                if let Err(error) = self.handles.finish_genesis_bootstrap(&outcome.tip) {
+            Ok(_) => {
+                if let Err(error) = self.handles.finish_genesis_bootstrap() {
                     tracing::warn!(%error, "block sync: failed to publish genesis header tip");
                 }
             }

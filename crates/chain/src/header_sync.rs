@@ -24,6 +24,10 @@ const MAX_FUTURE_TIME_SECONDS: u32 = 7200;
 /// Genesis on a non-empty tree) without relaxing validation or error
 /// propagation for unknown headers, which continue through proof-of-work and
 /// contextual nBits validation before insertion.
+/// A header whose parent exists but is already marked invalid is rejected
+/// with [`ChainError::InvalidParent`]: descendants of an invalidated subtree
+/// must never enter the tree through this admission path.
+///
 /// `now_secs` is the reference time for the future-drift bound, supplied by
 /// the caller rather than read here.
 ///
@@ -49,6 +53,7 @@ pub fn accept_headers(
         }
         validate_pow(header, hash, network)?;
         validate_empty_tree_root(tree, header, hash, network)?;
+        validate_parent_status(tree, header)?;
         validate_candidate_nbits(tree, header, network)?;
         validate_header_timestamp(tree, header, hash, now_secs)?;
         let id = tree.insert_header_with_hash(*header, hash, NodeStatus::HeaderValid)?;
@@ -185,6 +190,22 @@ pub fn validate_header_nbits(
         .ok_or(ChainError::HeightOverflow { parent: parent_id })?;
     let expected = next_work_required(tree, parent_id, header.time, network)?;
     compare_expected_bits(header, height, expected)
+}
+
+/// Rejects a candidate whose parent exists and is already marked invalid.
+///
+/// Insertion would silently inherit `NodeStatus::Invalid` and still report
+/// the header as accepted; the admission path refuses it up front instead.
+/// Unknown parents are left to `validate_candidate_nbits` and insertion.
+fn validate_parent_status(tree: &BlockTree, header: &BlockHeader) -> Result<(), ChainError> {
+    let prev_hash = prev_hash_from_header(header);
+    let Some(parent_id) = tree.lookup(prev_hash) else {
+        return Ok(());
+    };
+    if matches!(tree.node(parent_id)?.status, NodeStatus::Invalid) {
+        return Err(ChainError::InvalidParent { prev_hash });
+    }
+    Ok(())
 }
 
 fn validate_candidate_nbits(

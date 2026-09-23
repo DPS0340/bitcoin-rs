@@ -1191,7 +1191,7 @@ fn apply_cache_fixture(
         inbound_blocks_tx: _inbound_blocks_tx,
         ..
     } = SyncHarness::new(tree);
-    let chain_tip = block_tree.read().tip_handle();
+    let chain_tip = block_tree.write().tip_handle();
     // Apply genesis so the applied tip starts at height 0; no block bodies
     // are staged yet, leaving every round below to drive cache state.
     sync.chain.bootstrap_genesis();
@@ -1253,7 +1253,7 @@ struct SyncHarness {
 }
 
 impl SyncHarness {
-    fn new(tree: BlockTree) -> Self {
+    fn new(mut tree: BlockTree) -> Self {
         let chain_tip = tree.tip_handle();
         let block_tree = Arc::new(RwLock::new(tree));
         let applied_tip = Arc::new(ArcSwapOption::empty());

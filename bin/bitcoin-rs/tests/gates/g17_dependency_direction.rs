@@ -72,9 +72,15 @@ fn chainstate_facade_exposes_no_production_raw_mutation_handles()
         );
     }
 
+    // The tree's tip publication cell may only be shared through exclusive
+    // (write-guard or owned) access — a `&self` receiver would leak the
+    // writable cell through a read capability.
+    let tree = std::fs::read_to_string(root.join("crates/chain/src/tree.rs"))?;
+    assert!(tree.contains("pub fn tip_handle(&mut self)"));
+
     let node_sync = std::fs::read_to_string(root.join("crates/node/src/sync.rs"))?;
     assert!(node_sync.contains("self.handles.admit_headers(headers)"));
-    assert!(node_sync.contains("self.handles.finish_genesis_bootstrap(&outcome.tip)"));
+    assert!(node_sync.contains("self.handles.finish_genesis_bootstrap()"));
     assert!(!node_sync.contains("block_tree().write()"));
     assert!(!node_sync.contains("chain_tip().store("));
 

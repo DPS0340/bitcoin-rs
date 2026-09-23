@@ -25,7 +25,7 @@ fn tick_buffers_out_of_order_blocks_until_parent_arrives() -> Result<(), Box<dyn
     let block_two = child_coinbase_block(&block_one, 2)?;
 
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let chain_tip = block_tree.read().tip_handle();
+    let chain_tip = block_tree.write().tip_handle();
     let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
     let peer_table = Arc::new(bitcoin_rs_p2p::PeerTable::new());
     let (inbound_headers_tx, inbound_headers_rx_raw) =
@@ -81,7 +81,7 @@ fn tick_applies_non_coinbase_spend_and_updates_utxo_and_coinstats()
     let fixture = non_coinbase_spend_chain()?;
 
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let chain_tip = block_tree.read().tip_handle();
+    let chain_tip = block_tree.write().tip_handle();
     let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
     let peer_table = Arc::new(bitcoin_rs_p2p::PeerTable::new());
     let (inbound_headers_tx, inbound_headers_rx_raw) =

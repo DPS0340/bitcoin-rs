@@ -325,7 +325,7 @@ impl QueryFixture {
             body_source,
             QueryEngineLive {
                 utxo: None::<Arc<UtxoSet>>,
-                chain_transition: Some(chain_transition.into()),
+                chain_transition: Some(chain_transition),
                 enabled: IndexCapabilities::ALL,
             },
         );

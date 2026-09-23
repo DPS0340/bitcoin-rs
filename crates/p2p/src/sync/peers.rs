@@ -30,7 +30,10 @@ pub(super) fn is_peer_fault(error: &ChainError) -> bool {
         | ChainError::HeightOverflow { .. }
         // A median-time-past violation is decided entirely by the chain the peer
         // itself sent, so it is unambiguously the peer's fault.
-        | ChainError::TimestampTooEarly { .. } => true,
+        | ChainError::TimestampTooEarly { .. }
+        // Extending a header we already marked invalid is rejected like Core's
+        // bad-prevblk: the peer is feeding a known-dead subtree.
+        | ChainError::InvalidParent { .. } => true,
         // Future drift is judged against OUR clock, so a wrong local clock
         // would otherwise let us ban every honest peer and partition
         // ourselves. The header is rejected without blaming the sender.

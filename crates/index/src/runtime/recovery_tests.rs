@@ -218,7 +218,7 @@ impl Harness {
             batch_delay: Duration::ZERO,
             rollback_rebuild_cutover,
             utxo,
-            chain_transition: chain_transition.map(Into::into),
+            chain_transition,
         };
         Self {
             _index_dir: index_dir,

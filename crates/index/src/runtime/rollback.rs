@@ -42,7 +42,7 @@ impl Worker {
         // rows stream in bounded batches. Lock order matches apply:
         // chain_transition, then stable-view read.
         let (target, view) = {
-            let _transition = chain_transition.read();
+            let _transition = chain_transition.lock();
             let current = self.applied_tip.load_full();
             let Some(current) = current.as_deref() else {
                 return Ok(());

@@ -203,12 +203,13 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   take the transition lock and cannot mutate chainstate. `ChainEventPublisher`
   cells remain a separate coherent snapshot of the applied tip for index
   consumers (`EVT-01`).
-- Long-lived RPC, P2P, index, and mining consumers receive `TipReader`,
-  `BlockTreeReader`, and `ChainReadFence` capabilities. These types expose
-  snapshot load, tree read guards, and stable-view fencing respectively; none
-  exposes the underlying publication cell, a block-tree write guard, or the
-  raw transition mutex. Header admission and genesis tip publication are
-  intent-level `Chainstate` operations.
+- Long-lived RPC, P2P, index, and mining consumers receive `TipReader` and
+  `BlockTreeReader` capabilities plus the stable-view fence (`Arc<Mutex<()>>`).
+  The readers expose snapshot load and tree read guards respectively; every
+  `&self` tree accessor is a pure read, and the tip publication cell is only
+  shareable through `&mut BlockTree`. The fence's only verb is `lock()`, which
+  can delay a transition but grants no mutation path. Header admission and
+  genesis tip publication are intent-level `Chainstate` operations.
 - `Chainstate::validate_block` dry-runs the apply path's pre-write consensus
   gates under `lock_transition`. It does not take mempool generation and does
   not persist. BIP22 proposal omits proof-of-work; every other pre-write gate

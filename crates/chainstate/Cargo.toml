@@ -14,7 +14,9 @@ workspace = true
 [features]
 default = ["kernel"]
 # Cross-crate tests and benchmarks that deliberately exercise low-level
-# follower-free mutation. Production builds do not expose these helpers.
+# follower-free mutation. Any downstream can enable this feature; the
+# production-build guarantee is in-workspace, where only dev-dependencies
+# select it and the g17 gate fails if it leaks into a shipped target.
 test-seam = []
 kernel = ["bitcoin-rs-consensus/kernel"]
 rocksdb = [

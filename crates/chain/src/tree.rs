@@ -275,9 +275,12 @@ impl BlockTree {
     ///
     /// Sharing this handle lets lock-free readers observe tip advances
     /// without acquiring the `BlockTree`'s outer `RwLock`. Writes happen
-    /// through `publish_tip_if_best` (called by `insert_header`).
+    /// through `publish_tip_if_best` (called by `insert_header`). Sharing is
+    /// therefore part of the tree's mutation authority: callers that only
+    /// hold a read guard can observe the tip through [`Self::tip`] but must
+    /// not be able to extract this writable cell.
     #[must_use]
-    pub fn tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
+    pub fn tip_handle(&mut self) -> Arc<ArcSwapOption<TipSnapshot>> {
         Arc::clone(&self.tip)
     }
 

@@ -187,7 +187,7 @@ pub struct QueryEngineLive {
     /// Authoritative UTXO set for the compact live view.
     pub utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
     /// Serializes live-view work against a chain transition.
-    pub chain_transition: Option<bitcoin_rs_chain::ChainReadFence>,
+    pub chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
     /// Capability set this engine serves.
     pub enabled: IndexCapabilities,
 }
@@ -208,7 +208,7 @@ pub struct DerivedIndexQueryEngine {
     applied_tip: bitcoin_rs_chain::TipReader,
     body_source: Option<Arc<dyn BlockBodySource>>,
     utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
-    chain_transition: Option<bitcoin_rs_chain::ChainReadFence>,
+    chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
     enabled: IndexCapabilities,
 }
 
@@ -298,13 +298,13 @@ impl DerivedIndexQueryEngine {
                             "chain transition authority missing for ScriptLive".into(),
                         )
                     })?
-                    .read(),
+                    .lock(),
             )
         } else {
             None
         };
 
-        let tip_before = self.applied_tip.load().ok_or(TxQueryError::Retry)?;
+        let tip_before = self.applied_tip.load_full().ok_or(TxQueryError::Retry)?;
         let revision_before = self.runtime.revision();
 
         let reader: &dyn IndexReader = self.reader.as_ref();
@@ -337,7 +337,7 @@ impl DerivedIndexQueryEngine {
         let result = f(snapshot.as_ref(), &tip_before, &mut budget);
 
         self.query_health()?;
-        let tip_after = self.applied_tip.load();
+        let tip_after = self.applied_tip.load_full();
         let revision_after = self.runtime.revision();
         if revision_before != revision_after
             || tip_after
@@ -360,7 +360,7 @@ impl DerivedIndexQueryEngine {
     ) -> Result<IndexProgress, TxQueryError> {
         self.query_health()?;
 
-        let tip_before = self.applied_tip.load().ok_or(TxQueryError::Retry)?;
+        let tip_before = self.applied_tip.load_full().ok_or(TxQueryError::Retry)?;
         let revision_before = self.runtime.revision();
 
         let reader: &dyn IndexReader = self.reader.as_ref();
@@ -409,7 +409,7 @@ impl DerivedIndexQueryEngine {
         .unwrap_or(0);
 
         self.query_health()?;
-        let tip_after = self.applied_tip.load();
+        let tip_after = self.applied_tip.load_full();
         let revision_after = self.runtime.revision();
 
         if revision_before != revision_after

@@ -262,7 +262,7 @@ fn inbound_headers_response_releases_getheaders_gate() -> Result<(), Box<dyn std
         inbound_blocks_tx: _inbound_blocks_tx,
         ..
     } = SyncHarness::new(tree);
-    let chain_tip = block_tree.read().tip_handle();
+    let chain_tip = block_tree.write().tip_handle();
     install_budget(
         &sync,
         super::super::SyncBudget {
@@ -314,7 +314,7 @@ fn rejected_matching_peer_headers_release_gate_and_retry_immediately()
         inbound_blocks_tx: _inbound_blocks_tx,
         ..
     } = SyncHarness::new(tree);
-    let chain_tip = block_tree.read().tip_handle();
+    let chain_tip = block_tree.write().tip_handle();
     install_budget(
         &sync,
         super::super::SyncBudget {

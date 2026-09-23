@@ -1,8 +1,6 @@
 use alloc::sync::Arc;
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{
-    BlockBodySource, BlockTreeReader, ChainReadFence, TipReader, TipSnapshot, softfork_state,
-};
+use bitcoin_rs_chain::{BlockBodySource, BlockTreeReader, TipReader, TipSnapshot, softfork_state};
 use bitcoin_rs_mempool::{
     AdmissionChain, ChainAdmissionSnapshot, Mempool, MempoolGateway, MempoolLimits,
     MempoolObserver, MutationResult, PrevoutMeta,
@@ -399,7 +397,7 @@ pub struct Context {
     /// Best-applied-block tip snapshot published after block application.
     pub applied_tip: TipReader,
     /// Serializes whole-chainstate RPC reads with node-owned connect/disconnect transitions.
-    chain_transition: ChainReadFence,
+    chain_transition: Arc<Mutex<()>>,
     chain_tip_writer: Option<Arc<ArcSwapOption<TipSnapshot>>>,
     applied_tip_writer: Option<Arc<ArcSwapOption<TipSnapshot>>>,
     /// Cumulative transaction count of the applied chain, `0` when unknown.
@@ -528,7 +526,7 @@ impl Context {
         Self {
             chain_tip: TipReader::new(Arc::clone(&chain_tip)),
             applied_tip: TipReader::new(Arc::clone(&applied_tip)),
-            chain_transition: ChainReadFence::new(Arc::new(Mutex::new(()))),
+            chain_transition: Arc::new(Mutex::new(())),
             chain_tip_writer: Some(chain_tip),
             applied_tip_writer: Some(applied_tip),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
@@ -586,7 +584,7 @@ impl Context {
         Self {
             chain_tip: TipReader::new(Arc::clone(&chain_tip)),
             applied_tip: TipReader::new(Arc::clone(&applied_tip)),
-            chain_transition: ChainReadFence::new(Arc::new(Mutex::new(()))),
+            chain_transition: Arc::new(Mutex::new(())),
             chain_tip_writer: Some(chain_tip),
             applied_tip_writer: Some(applied_tip),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
@@ -656,7 +654,7 @@ impl Context {
         Self {
             chain_tip,
             applied_tip,
-            chain_transition: ChainReadFence::new(Arc::new(Mutex::new(()))),
+            chain_transition: Arc::new(Mutex::new(())),
             chain_tip_writer: None,
             applied_tip_writer: None,
             chain_tx_count,
@@ -752,14 +750,14 @@ impl Context {
 
     /// Shares the node's authoritative connect/disconnect lock with RPC readers.
     #[must_use]
-    pub fn with_chain_transition(mut self, chain_transition: impl Into<ChainReadFence>) -> Self {
-        self.chain_transition = chain_transition.into();
+    pub fn with_chain_transition(mut self, chain_transition: Arc<Mutex<()>>) -> Self {
+        self.chain_transition = chain_transition;
         self
     }
 
     /// Runs a read while authoritative UTXO and applied-tip transitions are excluded.
     pub fn with_stable_chainstate<R>(&self, read: impl FnOnce() -> R) -> R {
-        let _transition = self.chain_transition.read();
+        let _transition = self.chain_transition.lock();
         read()
     }
 

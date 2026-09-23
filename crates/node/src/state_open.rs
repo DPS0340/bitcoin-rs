@@ -129,7 +129,7 @@ impl NodeState {
         let InitialChainstate {
             utxo: mut utxo_set,
             coin_stats: initial_coin_stats,
-            tree: block_tree_value,
+            tree: mut block_tree_value,
             applied_tip: restored_applied_tip,
             chain_tx_count: restored_chain_tx_count,
             resume_source,
@@ -236,8 +236,10 @@ impl NodeState {
         // confirmation history before any admission can run. A corrupt or
         // unknown-version file degrades to insufficient data (docs/policies/db-migration.md).
         bitcoin_rs_mempool::fee_history::load(&config.data_dir, &mempool);
+        // Extract the tip publication cell while the tree is still owned
+        // here; sharing it is part of the tree's mutation authority.
+        let chain_tip = block_tree_value.tip_handle();
         let block_tree = Arc::new(RwLock::new(block_tree_value));
-        let chain_tip = block_tree.read().tip_handle();
         let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
         if let Some(restored_applied_tip) = restored_applied_tip {
             applied_tip.store(Some(Arc::new(restored_applied_tip)));

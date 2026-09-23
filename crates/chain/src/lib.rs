@@ -39,7 +39,7 @@ pub use node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus};
 pub use reorg::{ReorgPlan, plan_reorg};
 pub use tip::TipSnapshot;
 pub use tree::BlockTree;
-pub use view::{BlockTreeReader, ChainReadFence, TipReader};
+pub use view::{BlockTreeReader, TipReader};
 
 /// Errors returned by header sync, block-tree, and reorg planning operations.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -65,6 +65,13 @@ pub enum ChainError {
     /// A non-root header refers to a parent hash not present in the tree.
     #[error("missing parent header {prev_hash}")]
     MissingParent {
+        /// Previous-block hash referenced by the child header.
+        prev_hash: Hash256,
+    },
+    /// The parent header is present but was previously marked invalid, so no
+    /// descendant may extend it.
+    #[error("parent header {prev_hash} is invalid")]
+    InvalidParent {
         /// Previous-block hash referenced by the child header.
         prev_hash: Hash256,
     },

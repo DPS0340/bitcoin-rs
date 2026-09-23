@@ -400,11 +400,6 @@ impl MiningControl for MiningCoordinator {
 
     /// Admits `header` through the same Chainstate boundary inbound P2P uses.
     fn submit_header(&self, header: Header) -> Result<(), MiningControlError> {
-        if self.chainstate.header_has_invalid_parent(&header) {
-            return Err(MiningControlError::Rejected(CompactString::from(
-                "bad-prevblk",
-            )));
-        }
         match self.chainstate.admit_headers(std::slice::from_ref(&header)) {
             Ok(_) => Ok(()),
             Err(bitcoin_rs_chainstate::HeaderAdmissionError::Rejected(error)) => {
@@ -547,6 +542,7 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
         ApplyError::Consensus(consensus) => bitcoin_rs_mining::consensus_reject_reason(consensus),
         ApplyError::Chain(
             chain @ (ChainError::MissingParent { .. }
+            | ChainError::InvalidParent { .. }
             | ChainError::NonContinuousHeader { .. }
             | ChainError::ZeroTarget { .. }
             | ChainError::TargetExceedsLimit { .. }

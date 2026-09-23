@@ -7,9 +7,7 @@
 
 pub use crate::error::{ApplyError, DisconnectError};
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{
-    BlockTree, BlockTreeReader, ChainError, ChainReadFence, TipReader, TipSnapshot,
-};
+use bitcoin_rs_chain::{BlockTree, BlockTreeReader, ChainError, TipReader, TipSnapshot};
 use bitcoin_rs_consensus::rust_path::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Network;
@@ -654,25 +652,6 @@ impl<'a> ChainTransition<'a> {
         ))
     }
 
-    /// Re-applies a body this node already validated and persisted before a crash.
-    ///
-    /// Scripts do not run again (`BlockProvenance::LocalReplay`). Persistence
-    /// otherwise matches [`Self::connect`].
-    pub fn replay_local(
-        &self,
-        block: &Block,
-        serialized: bytes::Bytes,
-    ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        self.settle_apply(apply_committed_block_admitted(
-            self.chainstate,
-            block,
-            Some(serialized),
-            None,
-            BlockProvenance::LocalReplay,
-            PublishMode::Now,
-        ))
-    }
-
     /// Disconnects `block`, which must be the current applied tip.
     ///
     /// See the type-level persistence notes for marker arming, the commit
@@ -923,10 +902,11 @@ impl Chainstate {
     /// Returns the stable-view fence used by lower-layer live-view consumers.
     ///
     /// Locking this mutex prevents an authoritative transition from starting;
-    /// it does not grant mutation capability.
+    /// it grants no mutation capability: all it can do is delay the next
+    /// transition until the guard is dropped.
     #[must_use]
-    pub fn read_fence(&self) -> ChainReadFence {
-        ChainReadFence::new(Arc::clone(&self.chain_transition))
+    pub fn read_fence(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.chain_transition)
     }
 
     /// Fixture-only raw transition barrier. Not present in production builds.
@@ -946,13 +926,16 @@ impl Chainstate {
             .lock_transition()
             .map_err(HeaderAdmissionError::Refused)?;
         let mut tree = self.block_tree.write();
-        let node_ids = bitcoin_rs_chain::accept_headers(
+        let acceptance = bitcoin_rs_chain::accept_headers(
             &mut tree,
             headers,
             self.network,
             bitcoin_rs_chain::current_unix_seconds(),
-        )
-        .map_err(HeaderAdmissionError::Rejected)?;
+        );
+        // A rejected batch can still have inserted a valid prefix and moved
+        // the tip; the gate follows whatever active chain exists now.
+        self.assume_valid_gate.evaluate(&tree);
+        let node_ids = acceptance.map_err(HeaderAdmissionError::Rejected)?;
         let announced_tip = node_ids
             .last()
             .and_then(|id| tree.node(*id).ok())
@@ -964,7 +947,6 @@ impl Chainstate {
                 tree.active_height_of(active_tip.tip_id, hash)
                     .and_then(|height| i32::try_from(height).ok())
             });
-        self.assume_valid_gate.evaluate(&tree);
         Ok(HeaderAdmissionOutcome {
             accepted: node_ids.len(),
             announced_tip,
@@ -972,41 +954,19 @@ impl Chainstate {
         })
     }
 
-    /// Publishes the genesis header tip when a bootstrap connect used a tree
-    /// whose tip cell was initially empty.
+    /// Publishes the applied tip as the header tip when a bootstrap connect
+    /// left the header-tip cell empty.
     ///
-    /// This operation cannot publish an arbitrary tip: the supplied snapshot
-    /// must be the applied genesis block for this network.
-    pub fn finish_genesis_bootstrap(
-        &self,
-        tip: &TipSnapshot,
-    ) -> core::result::Result<(), ApplyError> {
+    /// This operation cannot publish an arbitrary tip: the only tip it will
+    /// ever set is the authoritative applied tip.
+    pub fn finish_genesis_bootstrap(&self) -> core::result::Result<(), ApplyError> {
         let _transition = self.lock_transition()?;
-        let genesis_hash = self.network.genesis_block_hash();
-        let applied_matches = self
-            .applied_tip
-            .load_full()
-            .is_some_and(|applied| applied.as_ref() == tip);
-        if tip.height != 0 || tip.hash != genesis_hash || !applied_matches {
-            return Err(ApplyError::ConcurrentChainChange);
-        }
-        if self.chain_tip.load_full().is_none() {
-            self.chain_tip.store(Some(Arc::new(tip.clone())));
+        if self.chain_tip.load().is_none()
+            && let Some(applied) = self.applied_tip.load_full()
+        {
+            self.chain_tip.store(Some(applied));
         }
         Ok(())
-    }
-
-    /// Reports whether an unseen header builds on an invalid tree node.
-    #[must_use]
-    pub fn header_has_invalid_parent(&self, header: &Header) -> bool {
-        let hash: Hash256 = header.compute_hash().into();
-        let tree = self.block_tree.read();
-        if tree.lookup(hash).is_some() {
-            return false;
-        }
-        tree.lookup(header.prev_blockhash.into())
-            .and_then(|parent| tree.node(parent).ok())
-            .is_some_and(|node| node.status == bitcoin_rs_chain::NodeStatus::Invalid)
     }
 
     /// Sets which committed wire payloads must be retained for node-owned followers.
@@ -1264,21 +1224,6 @@ impl Chainstate {
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
         let transition = self.begin_transition()?;
         let result = transition.connect_serialized(block, serialized);
-        drop(transition);
-        result
-    }
-
-    /// Admits a transition, replays a locally persisted body, then releases the
-    /// transition lock.
-    ///
-    /// Persistence matches [`ChainTransition::replay_local`].
-    pub fn replay_local_block(
-        &self,
-        block: &Block,
-        serialized: bytes::Bytes,
-    ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        let transition = self.begin_transition()?;
-        let result = transition.replay_local(block, serialized);
         drop(transition);
         result
     }
