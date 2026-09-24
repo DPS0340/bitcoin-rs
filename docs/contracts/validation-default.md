@@ -68,8 +68,11 @@ Owners:
   binary and the Compose image (`Dockerfile` builds `fjall,kernel`); it does
   not select the engine. Selection is `validation.engine = "kernel"`
   (`--validation-engine kernel`, `BITCOIN_RS_VALIDATION_ENGINE=kernel`, or
-  TOML `validation_engine = "kernel"`), and the shipped image CMD passes it
-  explicitly so image behavior is unchanged for operators.
+  TOML `validation_engine = "kernel"`). The shipped image selects it at the
+  **config-file** layer (`/etc/bitcoin-rs/default.toml`, handed to the node
+  with `--config`) so bare `docker run` keeps the historical kernel behavior
+  while environment, CLI, or a mounted config file still override it under
+  the documented precedence (defaults -> file -> environment -> CLI).
 - The kernel-free default is the C++-free quickstart. Changing the production
   default engine under `VAL-01` does not add `kernel` to any manifest default.
 
