@@ -699,11 +699,15 @@ fn run_fixed_peer_bootstrap(
     }
 }
 
+/// Live outbound sessions exclude cancelled leases: disabling and
+/// re-enabling the network cancels leases without removing their entries,
+/// so an unfiltered count would hide the refill deficit from DNS
+/// maintenance.
 fn live_outbound_count(peer_table: &crate::PeerTable) -> usize {
     peer_table
         .sessions()
         .iter()
-        .filter(|session| !session.lease.is_inbound())
+        .filter(|session| !session.lease.is_inbound() && !session.lease.is_cancelled())
         .count()
 }
 
@@ -915,5 +919,57 @@ mod tests {
         apply_network_active(&flag, &table, false);
         assert!(!flag.load(Ordering::Acquire));
         assert!(lease.is_cancelled());
+    }
+
+    #[test]
+    fn live_outbound_count_skips_cancelled_lease_so_dns_deficit_refills() {
+        // Replacement address differs from the registered one below so the
+        // drain cannot skip it as already connected.
+        const REPLACEMENT_PORT: u16 = 9;
+
+        struct OneAddrResolver;
+
+        impl crate::DnsResolver for OneAddrResolver {
+            fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
+                Ok(vec![SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    REPLACEMENT_PORT,
+                ))])
+            }
+        }
+
+        let table = crate::PeerTable::new();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8333));
+        table.register(addr, lease.clone());
+        assert_eq!(live_outbound_count(&table), 1);
+
+        // A disable cancels the lease and keeps its table entry; the
+        // cancelled connection must stop counting as live.
+        lease.cancel();
+        assert_eq!(table.sessions().len(), 1, "cancel keeps the entry");
+        assert_eq!(live_outbound_count(&table), 0);
+
+        // With no live outbound peer the DNS drain queues a replacement, so
+        // maintenance sees the full deficit instead of a satisfied target.
+        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+        let active = AtomicBool::new(true);
+        let mut recently_queued = HashMap::new();
+        let queued = drain_dns_peer_deficit(
+            &OneAddrResolver,
+            &["seed.example"],
+            &active,
+            &table,
+            &outbound_tx,
+            &mut recently_queued,
+            0,
+            DEFAULT_OUTBOUND_TARGET,
+        );
+        assert_eq!(queued, 1);
+        assert_eq!(
+            outbound_rx.try_recv().ok(),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, REPLACEMENT_PORT))),
+        );
     }
 }
