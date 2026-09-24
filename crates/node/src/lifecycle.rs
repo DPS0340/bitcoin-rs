@@ -473,6 +473,11 @@ pub(crate) fn start_node(
     // equally discoverable. A no-op without the `usdt` feature.
     bitcoin_rs_trace::register_probes();
     cap_global_thread_pool();
+    // The engine/build compatibility check is owned by configuration
+    // validation (`validation.engine`); repeat it on the direct embedding path
+    // so a caller that skips `resolve` cannot open chainstate or start workers
+    // on an engine this build cannot execute.
+    config.validate()?;
     let injected_shutdown = runtime.shutdown;
     let state = NodeState::open(config, runtime.mempool_observer.as_ref())?;
     let mut guard = StartupGuard {

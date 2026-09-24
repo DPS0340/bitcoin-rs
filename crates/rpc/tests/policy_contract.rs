@@ -11,6 +11,7 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use bitcoin_rs_consensus::ValidationEngine;
 
 use bitcoin_rs_mempool::{
     Mempool, MempoolEntry, MempoolGateway, MempoolLimits, MempoolObserver, MutationEnvelope,
@@ -1651,7 +1652,7 @@ fn invalidation_handler(state: &NodeState) -> Handler {
                 chain_network: Network::Regtest,
             },
             mempool: MempoolHandles {
-                mempool: MempoolGateway::shared(state.mempool()),
+                mempool: MempoolGateway::shared(state.mempool(), ValidationEngine::Native),
             },
             indexes: IndexHandles {
                 derived_index: None,
@@ -1734,9 +1735,12 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
 
     // Pool-path agreement: the same structural filter over a bare gateway
     // admits the spend once and keeps the coinbase out.
-    let gateway = MempoolGateway::shared(Arc::new(parking_lot::RwLock::new(Mempool::new(
-        MempoolLimits::default(),
-    ))));
+    let gateway = MempoolGateway::shared(
+        Arc::new(parking_lot::RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))),
+        ValidationEngine::Native,
+    );
     let chainstate = state.chainstate();
     let applied_tip = chainstate.applied_tip_reader();
     let block_tree = chainstate.block_tree_reader();

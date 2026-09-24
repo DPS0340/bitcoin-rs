@@ -28,6 +28,8 @@ pub mod bip68;
 pub mod bip9;
 /// Parse-once block state shared by the native apply path.
 pub mod block_view;
+/// The one runtime validation-engine selector.
+pub mod engine;
 /// Feature-gated bitcoinkernel wrapper.
 pub mod kernel;
 /// Portable Rust validator.
@@ -47,6 +49,7 @@ pub use bip9::{
 };
 pub use bip113::{MEDIAN_TIME_PAST_WINDOW, locktime_cutoff};
 pub use block_view::BlockView;
+pub use engine::ValidationEngine;
 pub use rust_path::UtxoView;
 pub use sigops::transaction_sigop_cost;
 pub use sigops::transaction_sigop_cost as total_sigop_cost;

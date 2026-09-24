@@ -80,7 +80,10 @@ impl Verdict {
 /// production `verify_transaction` dispatches to under `feature = "kernel"`.
 fn kernel_verdict(tx: &Tx, prevouts: &[(OutPoint, TxOut)], flags: VerifyFlags) -> Verdict {
     Verdict::of(&bitcoin_rs_consensus::kernel::verify_tx_scripts(
-        tx, prevouts, flags,
+        tx,
+        prevouts,
+        flags,
+        bitcoin_rs_consensus::ValidationEngine::Kernel,
     ))
 }
 
