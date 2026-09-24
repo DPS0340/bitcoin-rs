@@ -10,6 +10,7 @@ use bitcoin_rs_primitives::{
     BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
 };
 
+use bitcoin_rs_consensus::ValidationEngine;
 #[cfg(test)]
 use bitcoin_rs_primitives::{Amount, Script};
 use core::fmt;
@@ -492,9 +493,10 @@ impl Default for MempoolHandles {
     #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self {
-            gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                MempoolLimits::default(),
-            )))),
+            gateway: MempoolGateway::shared(
+                Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                ValidationEngine::Native,
+            ),
         }
     }
 }
@@ -558,6 +560,7 @@ impl Context {
                 gateway: MempoolGateway::shared_with(
                     Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                     observer,
+                    ValidationEngine::Native,
                 ),
             },
             ..ContextHandles::default()

@@ -129,7 +129,12 @@ fn kernel_result(tx: &Tx, prevouts: &[TxOut], flags: VerifyFlags) -> Result<(), 
         .zip(prevouts)
         .map(|(input, prevout)| (input.previous_output, prevout.clone()))
         .collect();
-    bitcoin_rs_consensus::kernel::verify_tx_scripts(tx, &spent, flags)
+    bitcoin_rs_consensus::kernel::verify_tx_scripts(
+        tx,
+        &spent,
+        flags,
+        bitcoin_rs_consensus::ValidationEngine::Kernel,
+    )
 }
 
 /// Rust-interpreter verdict for every input of `tx`, calling

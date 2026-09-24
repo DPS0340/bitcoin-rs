@@ -18,7 +18,9 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use bitcoin_rs_consensus::{ConsensusError, UtxoView, total_sigop_cost, verify_transaction};
+use bitcoin_rs_consensus::{
+    ConsensusError, UtxoView, ValidationEngine, total_sigop_cost, verify_transaction,
+};
 use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid};
 use bitcoin_rs_script::VerifyFlags;
 use bitcoin_rs_script::script::{is_p2sh, is_witness_program};
@@ -161,6 +163,9 @@ pub(crate) struct PreparedAdmission {
     rejection: Option<(AdmitError, RejectScope)>,
     stamp: crate::pool::fee_policy::PolicyStamp,
     replacement: ReplacementStage,
+    /// Engine for this attempt's script checks; set by the gateway that
+    /// prepared it, so the deferred `verify` phase cannot run under another.
+    engine: ValidationEngine,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -277,6 +282,7 @@ impl PreparedAdmission {
             height,
             request.locktime_cutoff,
             VerifyFlags::STANDARD,
+            self.engine,
         ) {
             // Core's rejection cache must allow a different witness body for
             // witness-sensitive or possibly witness-stripped script failures.
@@ -509,6 +515,10 @@ pub struct MempoolGateway {
     /// in [`Self::shared`]. Compare only for exact equality — never order or
     /// subtract wrapping counters.
     chain_generation: AtomicU64,
+    /// The one script-verification engine this gateway's admission path runs,
+    /// resolved once from node configuration (`validation.engine`). The
+    /// admission pipeline is shared; only the script backend dispatches on it.
+    engine: ValidationEngine,
 }
 
 impl core::fmt::Debug for MempoolGateway {
@@ -526,7 +536,11 @@ impl MempoolGateway {
     /// Pass `None` — or use the node's no-op publisher behind its observer —
     /// when no `--zmq-pub-sequence` endpoint is configured.
     #[must_use]
-    pub fn new(pool: Arc<RwLock<Mempool>>, observer: Option<Arc<dyn MempoolObserver>>) -> Self {
+    pub fn new(
+        pool: Arc<RwLock<Mempool>>,
+        observer: Option<Arc<dyn MempoolObserver>>,
+        engine: ValidationEngine,
+    ) -> Self {
         let composite = observer.map(|observer| {
             let composite = CompositeObserver::new();
             composite.add_leg("primary", observer);
@@ -541,7 +555,14 @@ impl MempoolGateway {
                 draining: false,
             }),
             chain_generation: AtomicU64::new(0),
+            engine,
         }
+    }
+
+    /// The resolved script-verification engine this gateway verifies with.
+    #[must_use]
+    pub const fn engine(&self) -> ValidationEngine {
+        self.engine
     }
 
     /// Attaches another named leg to this gateway's observer slot.
@@ -570,7 +591,7 @@ impl MempoolGateway {
     /// pointers: a live gateway pins its pool alive, so two live `Arc`s
     /// comparing pointer-equal are the same allocation, which makes ABA
     /// (a freed pool's address reused by a new allocation) impossible.
-    pub fn shared(pool: Arc<RwLock<Mempool>>) -> Arc<Self> {
+    pub fn shared(pool: Arc<RwLock<Mempool>>, engine: ValidationEngine) -> Arc<Self> {
         let mut gateways = REGISTRY.lock();
         gateways.retain(|weak| weak.upgrade().is_some());
         for weak in &*gateways {
@@ -580,7 +601,7 @@ impl MempoolGateway {
                 }
             }
         }
-        let gateway = Arc::new(Self::new(pool, None));
+        let gateway = Arc::new(Self::new(pool, None, engine));
         gateways.push(Arc::downgrade(&gateway));
         gateway
     }
@@ -597,6 +618,7 @@ impl MempoolGateway {
     pub fn shared_with(
         pool: Arc<RwLock<Mempool>>,
         observer: Arc<dyn MempoolObserver>,
+        engine: ValidationEngine,
     ) -> Arc<Self> {
         let mut gateways = REGISTRY.lock();
         gateways.retain(|weak| weak.upgrade().is_some());
@@ -607,7 +629,7 @@ impl MempoolGateway {
                 }
             }
         }
-        let gateway = Arc::new(Self::new(pool, Some(observer)));
+        let gateway = Arc::new(Self::new(pool, Some(observer), engine));
         gateways.push(Arc::downgrade(&gateway));
         gateway
     }
@@ -766,7 +788,7 @@ impl MempoolGateway {
         let mut prepared = {
             let pool = self.pool.read();
             self.check_admission_state(&pool, request, fence)?;
-            Self::prepare_admission(&pool, request, AdmissionMode::Single)
+            Self::prepare_admission(&pool, request, AdmissionMode::Single, self.engine())
         };
         prepared.verify(request);
 
@@ -861,6 +883,7 @@ impl MempoolGateway {
         pool: &Mempool,
         request: &AdmissionRequest,
         mode: AdmissionMode,
+        engine: ValidationEngine,
     ) -> PreparedAdmission {
         let policy = pool.policy_snapshot();
         let chain = PrevoutMap(&request.prevouts);
@@ -929,6 +952,7 @@ impl MempoolGateway {
             rejection,
             stamp: pool.policy_stamp(),
             replacement: ReplacementStage::Rejected,
+            engine,
         };
         // Preserve structural-check precedence and transaction-scoped rejects
         // before missing-input policy can retain a peer orphan.
@@ -1431,7 +1455,7 @@ pub fn reset_admission_park() {
 mod tests {
     use super::{
         AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeError, CompositeObserver,
-        MempoolGateway, MempoolObserver,
+        MempoolGateway, MempoolObserver, ValidationEngine,
     };
     use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationOutcome, RemovalReason};
     use crate::standardness::PackageTxContext;
@@ -1499,6 +1523,7 @@ mod tests {
         Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             observer,
+            ValidationEngine::Native,
         ))
     }
 
@@ -1827,6 +1852,7 @@ mod tests {
                 ..MempoolLimits::default()
             }))),
             Some(dyn_observer(&observer)),
+            ValidationEngine::Native,
         );
 
         let low = MempoolEntry::new(Arc::new(tx(13)), 100, 100, 1, 7);
@@ -1954,6 +1980,7 @@ mod tests {
         let gateway = Arc::new(MempoolGateway::new(
             Arc::clone(&pool),
             Some(dyn_observer(&observer)),
+            ValidationEngine::Native,
         ));
 
         let first_txid = tx(20).txid();
@@ -2052,6 +2079,7 @@ mod tests {
         let gateway = Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Some(dyn_observer(&observer)),
+            ValidationEngine::Native,
         ));
         *observer.gateway.lock() = Some(Arc::clone(&gateway));
 
@@ -2153,6 +2181,7 @@ mod tests {
         let gateway = Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Some(dyn_observer(&observer)),
+            ValidationEngine::Native,
         ));
         *observer.gateway.lock() = Some(Arc::clone(&gateway));
 
@@ -2283,6 +2312,7 @@ mod tests {
                 ..MempoolLimits::default()
             }))),
             Some(dyn_observer(&observer)),
+            ValidationEngine::Native,
         );
 
         let filler = tx(70);
@@ -2327,6 +2357,7 @@ mod tests {
                 ..MempoolLimits::default()
             }))),
             Some(dyn_observer(&observer)),
+            ValidationEngine::Native,
         );
 
         // Shared prevout: original and replacement conflict.
@@ -2789,16 +2820,17 @@ mod tests {
     #[test]
     fn shared_interns_one_gateway_per_pool() {
         let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-        let first = MempoolGateway::shared(Arc::clone(&pool));
-        let second = MempoolGateway::shared(Arc::clone(&pool));
+        let first = MempoolGateway::shared(Arc::clone(&pool), ValidationEngine::Native);
+        let second = MempoolGateway::shared(Arc::clone(&pool), ValidationEngine::Native);
         assert!(
             Arc::ptr_eq(&first, &second),
             "one pool must intern exactly one gateway"
         );
 
-        let other = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-            MempoolLimits::default(),
-        ))));
+        let other = MempoolGateway::shared(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            ValidationEngine::Native,
+        );
         assert!(
             !Arc::ptr_eq(&first, &other),
             "distinct pools must get distinct gateways"
@@ -3041,6 +3073,7 @@ mod tests {
                 ..MempoolLimits::default()
             }))),
             None,
+            ValidationEngine::Native,
         );
         // A standard transaction with one input, but the caller passes empty
         // prevouts — simulating a caller that did not resolve inputs. Policy
@@ -3089,6 +3122,7 @@ mod tests {
                 ..MempoolLimits::default()
             }))),
             None,
+            ValidationEngine::Native,
         );
         let mut tx = standard_tx(0x45);
         tx.inputs.push(tx.inputs[0].clone());

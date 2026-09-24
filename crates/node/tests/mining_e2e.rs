@@ -5,6 +5,7 @@
 //! rendered template JSON fields only, then enters ordinary validation.
 
 use anyhow::{Result, bail};
+use bitcoin_rs_consensus::ValidationEngine;
 
 use bitcoin_rs_mempool::{
     AdmissionOrigin, MempoolGateway, MempoolObserver, MutationEnvelope, MutationOutcome,
@@ -685,7 +686,7 @@ fn mining_handler(state: &NodeState) -> Handler {
             ..ChainHandles::default()
         },
         mempool: MempoolHandles {
-            gateway: MempoolGateway::shared(state.mempool()),
+            gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native),
         },
         indexes: IndexHandles::default(),
         network: NetworkHandles {
@@ -986,7 +987,10 @@ fn invalidateblock_readmission_publishes_a_events_through_shared_gateway() -> Re
     let observer = Arc::new(RecordingMempoolObserver::default());
     let gateway = state.mempool_gateway();
     assert!(
-        Arc::ptr_eq(&gateway, &MempoolGateway::shared(state.mempool())),
+        Arc::ptr_eq(
+            &gateway,
+            &MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
+        ),
         "the node's gateway must be the one interned for its pool"
     );
     gateway
