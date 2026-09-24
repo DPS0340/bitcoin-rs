@@ -809,8 +809,9 @@ mod tests {
     };
     #[cfg(not(feature = "kernel"))]
     use bitcoin_rs_primitives::{Sighash, SighashCache};
+    use bitcoin_rs_script::opcode::OP_EQUAL;
     #[cfg(feature = "kernel")]
-    use bitcoin_rs_script::opcode::{OP_EQUAL, OP_HASH160};
+    use bitcoin_rs_script::opcode::OP_HASH160;
     #[cfg(feature = "kernel")]
     use bitcoin_rs_script::push_data;
     use bitcoin_rs_script::{VerifyFlags, push_int};
@@ -1691,7 +1692,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "kernel")]
     fn op1_txout(value: u64) -> TxOut {
         TxOut {
             value: Amount::from_sat(value),
@@ -1699,7 +1699,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "kernel")]
     fn op_equal_txout(value: u64) -> TxOut {
         TxOut {
             value: Amount::from_sat(value),
@@ -1709,7 +1708,6 @@ mod tests {
 
     /// Input spending an `OP_EQUAL` prevout with a mismatched `7 8` scriptSig:
     /// rejected by the kernel.
-    #[cfg(feature = "kernel")]
     fn mismatch_input(outpoint: OutPoint) -> TxIn {
         TxIn {
             previous_output: outpoint,
@@ -1719,7 +1717,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "kernel")]
     fn spend_tx(inputs: Vec<TxIn>, output_value: u64) -> Tx {
         Tx {
             version: 1,
@@ -1732,7 +1729,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "kernel")]
     fn outpoint(seed: u8) -> OutPoint {
         OutPoint {
             txid: Txid(Hash256::from_le_bytes(&[seed; 32])),
@@ -1878,8 +1874,11 @@ mod tests {
     /// A same-block spend (tx2 consuming tx1's output) verifies when the node
     /// resolves it into `resolved`; a bad script in the producing tx surfaces that
     /// earlier transaction's Script error.
+    ///
+    /// The `bad` case must parse `bad_txs` itself: the kernel backend takes its
+    /// transactions from the parse at `tx_index`, so pairing the `bad` view with
+    /// the good `txs` parse would verify the wrong block and pass by accident.
     #[test]
-    #[cfg(feature = "kernel")]
     fn same_block_spend_resolves_and_verifies() {
         let tx1 = spend_tx(vec![true_spending_input(outpoint(1))], 100);
         let tx1_out = OutPoint {
@@ -1929,7 +1928,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
-            &test_block_parse(&txs),
+            &test_block_parse(&bad_txs),
         );
         assert!(
             matches!(bad, Err(ConsensusError::Script { input_index: 0, .. })),
