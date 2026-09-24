@@ -1223,6 +1223,7 @@ fn tick_fanout_deferred_for_fresh_probe_engages_at_deadline()
 /// takes the deep batch.
 fn assert_fallback_with_ineligible_candidate(
     ineligible: PeerInfo,
+    serves_fallback: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (sync, peers, block_tree, applied_tip, expected) =
         sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
@@ -1239,8 +1240,14 @@ fn assert_fallback_with_ineligible_candidate(
     sync.tick();
 
     assert_applied_genesis(&applied_tip, &block_tree)?;
-    assert_no_getdata(&ineligible_rx)?;
-    let inventory = next_getdata(&rxs[0])?;
+    let deep_rx = if serves_fallback {
+        &ineligible_rx
+    } else {
+        &rxs[0]
+    };
+    let Message::GetData(inventory) = deep_rx.try_recv()? else {
+        return Err(std::io::Error::other("expected one deep fallback getdata").into());
+    };
     assert_eq!(witness_block_inventory(inventory)?, expected);
     if !serves_fallback {
         // Header sync is not block download: the refused peer may still be
