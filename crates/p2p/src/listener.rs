@@ -8,6 +8,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin_rs_primitives::Network;
+use bitcoin::p2p::ServiceFlags;
 use crossbeam_channel::{SendTimeoutError, Sender};
 use parking_lot::RwLock;
 use thiserror::Error;
