@@ -502,7 +502,7 @@ pub(super) fn apply_block_admitted<'b>(
         block_bytes,
         raw_txs,
     };
-    let (commit_id, chain_tx_count) = match publication {
+    let commit_id = match publication {
         PublishMode::Now => {
             // RCV-02 steps 3–4: certify, then commit. `sync` makes the
             // appended body bytes, the blocks directory, and every deferred
