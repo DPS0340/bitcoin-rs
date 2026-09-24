@@ -8,7 +8,7 @@
 use bitcoin_rs_chain::{
     BlockTree, ChainError, candidate_version, header_sync, node::NodeId, softfork_state,
 };
-use bitcoin_rs_consensus::{MEDIAN_TIME_PAST_WINDOW, locktime_cutoff};
+use bitcoin_rs_consensus::{MAX_TIMEWARP, MEDIAN_TIME_PAST_WINDOW, locktime_cutoff};
 use bitcoin_rs_primitives::{CompactTarget, Hash256, Network};
 
 /// Contextual facts for the block that would extend `previous_tip_id`.
