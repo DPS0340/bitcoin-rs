@@ -173,7 +173,8 @@ cargo build --release -p bitcoin-rs --features kernel
 
 ## Operator migration: validation engine
 
-- No change if you never set an engine: the effective engine is `native` by default in every build, including `crates/consensus`, `crates/chainstate`, and `crates/node` library builds that used to compile and implicitly use kernel support.
+- No change for `bin/bitcoin-rs` users who never set an engine: the binary's default was already kernel-free and remains `native`. Direct library users take the next bullet instead.
+- `crates/consensus`, `crates/chainstate`, and `crates/node` library builds changed behavior: their defaults used to compile **and implicitly select** `kernel`, and now compile nothing kernel-related and default to `native`. A library user who relied on the old kernel default must both enable the `kernel` feature and select `validation_engine = "kernel"` (or the env/CLI equivalent) to keep the old engine.
 - To use bitcoinkernel, do both: build with `--features kernel` and set `validation_engine = "kernel"` (TOML), `BITCOIN_RS_VALIDATION_ENGINE=kernel` (env), or `--validation-engine kernel` (CLI).
 - Setting `kernel` without the feature fails at startup with the unsupported-build error above.
 - Bare `bitcoin-rs` runs native. The shipped Docker image compiles kernel support (`--features fjall,kernel`) and its CMD passes `--validation-engine kernel`, so image behavior is unchanged. Anyone overriding the image CMD who wants kernel must pass the flag (or the env/TOML equivalent).
