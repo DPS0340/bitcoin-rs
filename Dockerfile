@@ -17,7 +17,9 @@ WORKDIR /workspace
 COPY . .
 
 # Build the production verifier with the default fjall storage backend, while
-# leaving the other storage engines out of the runtime image.
+# leaving the other storage engines out of the runtime image. `kernel` is a
+# capability ("bitcoinkernel support is compiled in"); the shipped image then
+# selects it explicitly with `--validation-engine kernel` below.
 RUN cargo build --locked --release -p bitcoin-rs \
     --no-default-features --features fjall,kernel
 
@@ -42,4 +44,4 @@ VOLUME ["/data"]
 EXPOSE 8332 8333
 
 ENTRYPOINT ["bitcoin-rs"]
-CMD ["--data-dir", "/data", "--rpc-bind", "0.0.0.0:8332", "--p2p-listen", "0.0.0.0:8333"]
+CMD ["--data-dir", "/data", "--rpc-bind", "0.0.0.0:8332", "--p2p-listen", "0.0.0.0:8333", "--validation-engine", "kernel"]

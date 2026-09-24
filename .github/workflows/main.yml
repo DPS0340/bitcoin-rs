@@ -107,9 +107,10 @@ jobs:
           toolchain: "1.95.0"
           components: clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      # The default feature set includes the C++ kernel engine, so every
-      # production lane installs the native prerequisites up front (mold is
-      # included for the linker).
+      # The full-node feature set compiles the C++ kernel engine as a
+      # capability (selection is `validation.engine` at runtime), so this lane
+      # installs the native prerequisites up front (mold is included for the
+      # linker).
       - name: Kernel prerequisites
         id: kernel_deps
         uses: ./.github/actions/native-deps
