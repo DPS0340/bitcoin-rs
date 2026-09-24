@@ -20,7 +20,6 @@ use super::prepare::plan_block_transactions;
 use super::prepare::resolve_block_prevouts;
 use super::publication::publish_applied;
 use crate::error::ApplyError;
-use bitcoin_rs_chain::ChainTxCount;
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
