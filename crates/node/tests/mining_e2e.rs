@@ -675,19 +675,16 @@ fn mining_handler(state: &NodeState) -> Handler {
             chain_tip: tips.chain_tip,
             applied_tip: tips.applied_tip,
             ibd,
-            blocks: state.blocks(),
-            transactions: state.transactions(),
-            utxo: Arc::new(UtxoSet::new()),
-            coin_stats: state.chainstate().coin_stats_handle(),
-            block_tree: state.chainstate().block_tree_handle(),
-            chain_network: state.config().network,
-            chain_transition: state.chainstate().read_fence(),
-            ..ChainHandles::default()
-        },
+        ),
         mempool: MempoolHandles {
-            gateway: MempoolGateway::shared(state.mempool()),
+            mempool: MempoolGateway::shared(state.mempool()),
         },
-        indexes: IndexHandles::default(),
+        indexes: IndexHandles {
+            derived_index: None,
+            esplora_tx_index: None,
+            script_index: None,
+            derived_index_status: None,
+        },
         network: NetworkHandles {
             network: state.network(),
             network_active: state.network_active(),

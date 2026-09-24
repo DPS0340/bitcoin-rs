@@ -90,12 +90,12 @@ fn bind_rpc(
             rollback_warnings: Some(state.recovery_reporter()),
         },
         mempool: MempoolHandles {
-            gateway: state.mempool_gateway(),
+            mempool: state.mempool_gateway(),
         },
         indexes: IndexHandles {
             derived_index: state.derived_index_query(),
+            esplora_tx_index: None,
             script_index: state.script_index_query(),
-            esplora_tx_index: state.esplora_derived_index_query(),
             derived_index_status: Some(state.derived_index_status()),
         },
         network: NetworkHandles {
@@ -109,9 +109,22 @@ fn bind_rpc(
         mining: MiningHandles {
             mining_control: Some(Arc::clone(mining_control)),
         },
-        zmq_publisher: state.zmq_publisher(),
-        debug_log_path: Some(state.data_dir().join("debug.log")),
-    });
+    })
+    .with_esplora_derived_index(state.esplora_derived_index_query())
+    .with_block_body_source(block_body_source)
+    .with_chain_transition(chainstate.read_fence());
+    if let Some(prune_service) = state.prune_service() {
+        context = context.with_prune_service(prune_service);
+    }
+    context = context
+        .with_chain_control(Arc::new(RpcChainControl {
+            handles: chainstate,
+            followers: state.chain_followers(),
+            sync: state.sync(),
+        }))
+        .with_zmq_publisher(state.zmq_publisher())
+        .with_debug_log_path(state.data_dir().join("debug.log"))
+        .with_rollback_warnings(state.recovery_reporter());
     let context = Arc::new(context);
     let handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::clone(&context)));
     let server = RpcServer::bind(
