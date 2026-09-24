@@ -43,8 +43,8 @@ fn tipped_context() -> Arc<Context> {
         hash: Hash256::from_le_bytes(&[42_u8; 32]),
         chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
     };
-    ctx.chain_tip.store(Some(Arc::new(tip.clone())));
-    ctx.applied_tip.store(Some(Arc::new(tip)));
+    ctx.chain.chain_tip.store(Some(Arc::new(tip.clone())));
+    ctx.chain.applied_tip.store(Some(Arc::new(tip)));
     ctx
 }
 
@@ -370,7 +370,7 @@ fn mining_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::e
     // API-12 mainnet gates (peers + IBD) live in the handler unit tests.
     // This rendering proof runs off-mainnet so it reaches the template.
     let mut ctx = Context::new();
-    ctx.chain_network = Network::Regtest;
+    ctx.chain.chain_network = Network::Regtest;
     let handler = Handler::new(Arc::new(
         ctx.with_mining_control(Arc::new(CompatMiningControl)),
     ));

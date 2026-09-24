@@ -670,23 +670,25 @@ fn mining_handler(state: &NodeState) -> Handler {
     let mining_control: Arc<dyn MiningControl> = Arc::new(coordinator);
     let ibd = state.chainstate().ibd_latch();
     let ctx = Context::from_handles(ContextHandles {
-        chain: ChainHandles {
-            chain_tip: state.chainstate().header_tip_reader(),
-            applied_tip: state.chainstate().applied_tip_reader(),
+        chain: ChainHandles::new(
+            state.chainstate().header_tip_reader(),
+            state.chainstate().applied_tip_reader(),
+            state.blocks(),
+            state.transactions(),
+            Arc::new(UtxoSet::new()),
+            state.chainstate().coin_stats_handle(),
+            state.chainstate().block_tree_reader(),
+            state.config().network,
             ibd,
-            blocks: state.blocks(),
-            transactions: state.transactions(),
-            utxo: Arc::new(UtxoSet::new()),
-            coin_stats: state.chainstate().coin_stats_handle(),
-            block_tree: state.chainstate().block_tree_reader(),
-            chain_network: state.config().network,
-        },
+        ),
         mempool: MempoolHandles {
             mempool: MempoolGateway::shared(state.mempool()),
         },
         indexes: IndexHandles {
             derived_index: None,
+            esplora_tx_index: None,
             script_index: None,
+            derived_index_status: None,
         },
         network: NetworkHandles {
             network: state.network(),
@@ -699,7 +701,6 @@ fn mining_handler(state: &NodeState) -> Handler {
         mining: MiningHandles {
             mining_control: Some(mining_control),
         },
-        derived_index_status: None,
     });
     Handler::new(Arc::new(ctx))
 }

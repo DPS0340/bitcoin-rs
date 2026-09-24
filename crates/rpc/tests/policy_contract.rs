@@ -106,7 +106,7 @@ fn fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
         1,
     ));
     bitcoin_rs_utxo::contract::commit_block_changes(
-        &ctx.utxo,
+        &ctx.chain.utxo,
         &changes,
         &Hash256::from_le_bytes(&[0xaa; 32]),
     )
@@ -1638,23 +1638,25 @@ fn invalidation_handler(state: &NodeState) -> Handler {
     let ibd = chainstate.ibd_latch();
     Handler::new(Arc::new(
         Context::from_handles(ContextHandles {
-            chain: ChainHandles {
-                chain_tip: chainstate.header_tip_reader(),
-                applied_tip: chainstate.applied_tip_reader(),
+            chain: ChainHandles::new(
+                chainstate.header_tip_reader(),
+                chainstate.applied_tip_reader(),
+                state.blocks(),
+                state.transactions(),
+                chainstate.utxo_handle(),
+                chainstate.coin_stats_handle(),
+                chainstate.block_tree_reader(),
+                Network::Regtest,
                 ibd,
-                blocks: state.blocks(),
-                transactions: state.transactions(),
-                utxo: chainstate.utxo_handle(),
-                coin_stats: chainstate.coin_stats_handle(),
-                block_tree: chainstate.block_tree_reader(),
-                chain_network: Network::Regtest,
-            },
+            ),
             mempool: MempoolHandles {
                 mempool: MempoolGateway::shared(state.mempool()),
             },
             indexes: IndexHandles {
                 derived_index: None,
+                esplora_tx_index: None,
                 script_index: None,
+                derived_index_status: None,
             },
             network: NetworkHandles {
                 network: state.network(),
@@ -1667,7 +1669,6 @@ fn invalidation_handler(state: &NodeState) -> Handler {
             mining: MiningHandles {
                 mining_control: None,
             },
-            derived_index_status: None,
         })
         .with_chain_control(Arc::new(NodeInvalidator {
             handles: chainstate,
@@ -1780,7 +1781,7 @@ fn fund_coinbase_utxo(ctx: &Context, label: u8, value: u64, height: u32) -> OutP
         height,
     ));
     bitcoin_rs_utxo::contract::commit_block_changes(
-        &ctx.utxo,
+        &ctx.chain.utxo,
         &changes,
         &Hash256::from_le_bytes(&[0xaa; 32]),
     )
@@ -1835,7 +1836,7 @@ fn immature_coinbase_spends_reject_on_both_rpcs_and_admit_at_maturity() -> Resul
     );
 
     // At depth 100 the same spend admits through the same outlet.
-    ctx.applied_tip.store(Some(Arc::new(TipSnapshot {
+    ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
         tip_id: NodeId::new(0),
         height: 119,
         chainwork: ChainWork::ZERO,
