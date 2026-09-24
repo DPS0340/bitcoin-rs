@@ -1,7 +1,7 @@
 //! Applied-tip publication: the tip, its certified count, and the chain event.
 
 use super::Chainstate;
-use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_chain::{ChainTxCount, TipSnapshot};
 use bitcoin_rs_primitives::Block;
 use std::sync::Arc;
 

@@ -497,7 +497,7 @@ pub(super) fn apply_block_admitted<'b>(
         block_bytes,
         raw_txs,
     };
-    let commit_id = match publication {
+    let (commit_id, chain_tx_count) = match publication {
         PublishMode::Now => {
             // RCV-02 steps 3–4: certify, then commit. `sync` makes the
             // appended body bytes, the blocks directory, and every deferred
@@ -548,6 +548,14 @@ pub(super) fn apply_block_admitted<'b>(
             outcome.tip = receipt.certify(outcome.tip);
             commit_id
         }
+        // The gap block's durable batch committed before the crash: the
+        // stored head receipt covers its body, undo, and locator rows.
+        // Replay redoes only what publication owed — the journal tail
+        // and the coherent tip — and carries the receipt's commit id.
+        PublishMode::Replay { commit_id } => (
+            commit_id,
+            certified_advance(handles.applied_chain_tx_count(), height, tx_count_delta),
+        ),
         PublishMode::Grouped(group) => {
             // The window buffers the durable work: facts ride in the group
             // until its boundary, where one sync and one head batch commit
