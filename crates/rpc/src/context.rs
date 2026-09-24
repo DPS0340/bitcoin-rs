@@ -1045,6 +1045,24 @@ impl ChainHandles {
         self.applied_tip.store(Some(Arc::new(tip)));
     }
 
+    /// Publishes a new best-chain tip.
+    ///
+    /// Fixture-only like the [`TipReader`] publication it writes: production
+    /// tips arrive through chain validation, never through RPC.
+    #[cfg(test)]
+    pub fn set_chain_tip(&self, tip: TipSnapshot) {
+        self.chain_tip.store(Some(Arc::new(tip)));
+    }
+
+    /// Publishes a new best-applied-block tip.
+    ///
+    /// Fixture-only like the [`TipReader`] publication it writes: production
+    /// tips arrive through block application, never through RPC.
+    #[cfg(test)]
+    pub fn set_applied_tip(&self, tip: TipSnapshot) {
+        self.applied_tip.store(Some(Arc::new(tip)));
+    }
+
     fn header_record(&self, hash: Hash256) -> Option<BlockRecord> {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
