@@ -10,7 +10,8 @@ fn tick_sends_getdata_for_headers_above_applied_tip() -> Result<(), Box<dyn std:
 
     for height in 1_u32..=3 {
         let parent_hash = BlockHash::from(tree.node(tip_id)?.hash);
-        let header = test_header(parent_hash, height);
+        let header = regtest_fixture::mined_regtest_header(parent_hash, height)
+            .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
         tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
         expected.push(BlockHash::from(tree.node(tip_id)?.hash));
     }
@@ -70,7 +71,8 @@ fn tick_fetches_new_tip_headers_from_at_tip_peers() -> Result<(), Box<dyn std::e
     let mut tip_id = genesis_id;
     for height in 1_u32..=2 {
         let parent_hash = BlockHash::from(tree.node(tip_id)?.hash);
-        let header = test_header(parent_hash, height);
+        let header = regtest_fixture::mined_regtest_header(parent_hash, height)
+            .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
         tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
     }
     // Applied frontier at height 2; header 3 arrives later, below.
@@ -83,7 +85,9 @@ fn tick_fetches_new_tip_headers_from_at_tip_peers() -> Result<(), Box<dyn std::e
             hash: node.hash,
         }
     };
-    let announced_header = test_header(BlockHash::from(tree.node(tip_id)?.hash), 3);
+    let announced_header =
+        regtest_fixture::mined_regtest_header(BlockHash::from(tree.node(tip_id)?.hash), 3)
+            .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let expected = announced_header.compute_hash();
 
     let SyncHarness {
@@ -146,9 +150,11 @@ fn tick_fetches_reorg_fork_announced_by_at_tip_peer() -> Result<(), Box<dyn std:
     let mut tree = BlockTree::new();
     let genesis = genesis_header();
     let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-    let losing1 = test_header(genesis.compute_hash(), 1);
+    let losing1 = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let losing1_id = tree.insert_node(Some(genesis_id), losing1, NodeStatus::HeaderValid)?;
-    let losing2 = test_header(losing1.compute_hash(), 2);
+    let losing2 = regtest_fixture::mined_regtest_header(losing1.compute_hash(), 2)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let losing2_id = tree.insert_node(Some(losing1_id), losing2, NodeStatus::HeaderValid)?;
     let applied = {
         let node = tree.node(losing2_id)?;
@@ -160,9 +166,12 @@ fn tick_fetches_reorg_fork_announced_by_at_tip_peer() -> Result<(), Box<dyn std:
         }
     };
 
-    let winning1 = test_header(genesis.compute_hash(), 101);
-    let winning2 = test_header(winning1.compute_hash(), 102);
-    let winning3 = test_header(winning2.compute_hash(), 103);
+    let winning1 = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 101)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
+    let winning2 = regtest_fixture::mined_regtest_header(winning1.compute_hash(), 102)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
+    let winning3 = regtest_fixture::mined_regtest_header(winning2.compute_hash(), 103)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let expected: Vec<Hash256> = [&winning1, &winning2, &winning3]
         .iter()
         .map(|header| header.compute_hash().into())
@@ -229,9 +238,11 @@ fn losing_fork_credit_survives_winner_disconnect() -> Result<(), Box<dyn std::er
     let mut tree = BlockTree::new();
     let genesis = genesis_header();
     let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-    let losing1 = test_header(genesis.compute_hash(), 1);
+    let losing1 = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let losing1_id = tree.insert_node(Some(genesis_id), losing1, NodeStatus::HeaderValid)?;
-    let losing2 = test_header(losing1.compute_hash(), 2);
+    let losing2 = regtest_fixture::mined_regtest_header(losing1.compute_hash(), 2)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     tree.insert_node(Some(losing1_id), losing2, NodeStatus::HeaderValid)?;
     let genesis_node = tree.node(genesis_id)?;
     let applied = TipSnapshot {
@@ -241,9 +252,12 @@ fn losing_fork_credit_survives_winner_disconnect() -> Result<(), Box<dyn std::er
         hash: genesis_node.hash,
     };
 
-    let fork1 = test_header(genesis.compute_hash(), 101);
-    let fork2 = test_header(fork1.compute_hash(), 102);
-    let fork3 = test_header(fork2.compute_hash(), 103);
+    let fork1 = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 101)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
+    let fork2 = regtest_fixture::mined_regtest_header(fork1.compute_hash(), 102)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
+    let fork3 = regtest_fixture::mined_regtest_header(fork2.compute_hash(), 103)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let expected = [fork1, fork2, fork3];
     let expected_hashes: Vec<Hash256> = expected
         .iter()
