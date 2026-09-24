@@ -496,7 +496,8 @@ impl Default for MempoolHandles {
             gateway: MempoolGateway::shared(
                 Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                 ValidationEngine::Native,
-            ),
+            )
+            .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
         }
     }
 }
@@ -561,7 +562,8 @@ impl Context {
                     Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                     observer,
                     ValidationEngine::Native,
-                ),
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             ..ContextHandles::default()
         })
@@ -1258,9 +1260,11 @@ mod tests {
                 ..ChainHandles::default()
             },
             mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                    MempoolLimits::default(),
-                )))),
+                gateway: MempoolGateway::shared(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             network: NetworkHandles {
                 network_active: Arc::clone(&network_active),

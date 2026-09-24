@@ -123,7 +123,8 @@ impl ServerHarness {
                 ..ChainHandles::default()
             },
             mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native),
+                gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
+                    .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             indexes: IndexHandles {
                 derived_index: state.derived_index_query(),

@@ -686,7 +686,8 @@ fn mining_handler(state: &NodeState) -> Handler {
             ..ChainHandles::default()
         },
         mempool: MempoolHandles {
-            gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native),
+            gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
         },
         indexes: IndexHandles::default(),
         network: NetworkHandles {
@@ -990,6 +991,7 @@ fn invalidateblock_readmission_publishes_a_events_through_shared_gateway() -> Re
         Arc::ptr_eq(
             &gateway,
             &MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"))
         ),
         "the node's gateway must be the one interned for its pool"
     );

@@ -1715,7 +1715,8 @@ fn invalidation_handler(state: &NodeState) -> Handler {
             ..ChainHandles::default()
         },
         mempool: MempoolHandles {
-            gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native),
+            gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
         },
         indexes: IndexHandles {
             derived_index: None,
@@ -1800,7 +1801,8 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
             MempoolLimits::default(),
         ))),
         ValidationEngine::Native,
-    );
+    )
+    .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
     let chainstate = state.chainstate();
     let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
         chainstate.utxo_handle(),

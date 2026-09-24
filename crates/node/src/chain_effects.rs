@@ -577,7 +577,8 @@ mod tests {
         let gateway = MempoolGateway::shared(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             ValidationEngine::Native,
-        );
+        )
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let followers = ChainFollowers::new(
             ChainEffects::noop(),
             Arc::new(crate::mining::MiningGenerationSignal::new()),
@@ -698,7 +699,8 @@ mod tests {
         let gateway = MempoolGateway::shared(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             ValidationEngine::Native,
-        );
+        )
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let followers = ChainFollowers::new(
             ChainEffects::noop(),
             Arc::new(crate::mining::MiningGenerationSignal::new()),
