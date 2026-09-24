@@ -552,7 +552,7 @@ pub(super) fn apply_block_admitted<'b>(
         // stored head receipt covers its body, undo, and locator rows.
         // Replay redoes only what publication owed — the journal tail
         // and the coherent tip — and carries the receipt's commit id.
-        PublishMode::Replay { commit_id } => commit_id,
+        PublishMode::Replay { receipt } => receipt.commit_id,
         PublishMode::Grouped(group) => {
             // The window buffers the durable work: facts ride in the group
             // until its boundary, where one sync and one head batch commit
