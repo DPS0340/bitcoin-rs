@@ -65,8 +65,8 @@ The decoder types exactly the commands in `crates/p2p/src/compat.rs::COMMANDS` (
 | `wtxidrelay` | negotiated | BIP339. Sent in handshake; inbound marks the peer wtxid-relay capable. |
 | `sendaddrv2` | negotiated | BIP155. Sent in handshake; inbound tracked. |
 | `sendheaders` | negotiated | BIP130. Sent in handshake; inbound tracked. |
-| `ping` | Answered with `pong` echoing the nonce, ready peers only; pongs feed peer RTT stats. |
-| `pong` | ignored | Completes outstanding ping RTT accounting. |
+| `ping` | Answered with `pong` echoing the nonce, ready peers only. No latency telemetry is kept. |
+| `pong` | ignored | No ping RTT accounting exists; the pong body is unused. |
 | `inv` | Answered with `getdata` for announced vectors the node does not already hold. P2P's `TxInventory` implementation queries the shared mempool gateway (accepted transactions, orphans, recent rejects); `MSG_TX` announcements are requested as `MSG_WITNESS_TX` from `NODE_WITNESS` peers and as `MSG_TX` otherwise; `MSG_WTX` requests retain their wtxid and type. While the node is in initial block download, transaction-typed vectors are never requested — block-typed vectors are unaffected (Core 31.1 `net_processing.cpp:4401-4404`). Bound: 50 000 vectors (`MAX_INV_PER_MSG`, Core `MAX_INV_SZ`). |
 | `getdata` | Blocks stream from the active chain; transaction inventory is served from the mempool / orphan map. `MSG_TX` receives stripped serialization; `MSG_WITNESS_TX` and `MSG_WTX` receive witness serialization (BIP144/BIP339), without changing the retained body. Misses resolve to one trailing `notfound`. Bound: 50 000 vectors. |
 | `notfound` | ignored | Decoded with the same inventory bound. |

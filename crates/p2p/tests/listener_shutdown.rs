@@ -1,7 +1,7 @@
 //! P2P listener shutdown integration coverage.
 use bitcoin::p2p::Magic;
 use bitcoin_rs_p2p::listener::{ConnectionShared, bind_listener, serve};
-use bitcoin_rs_p2p::{NetworkActivity, PeerTable};
+use bitcoin_rs_p2p::{ListenerExtras, NetworkActivity, PeerTable};
 use std::error::Error;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -10,6 +10,42 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Stops the serve thread on every exit path: Drop stores the shutdown
+/// flag and joins the thread, so an early return never leaks an accepting
+/// listener thread.
+struct ServeGuard {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ServeGuard {
+    fn new(shutdown: &Arc<AtomicBool>, handle: thread::JoinHandle<()>) -> Self {
+        Self {
+            shutdown: Arc::clone(shutdown),
+            handle: Some(handle),
+        }
+    }
+
+    fn join(mut self) -> Result<(), Box<dyn Error>> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        match self.handle.take() {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| io::Error::other("listener thread panicked").into()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 #[test]
 fn serve_exits_when_flag_set() -> Result<(), Box<dyn Error>> {
@@ -26,6 +62,7 @@ fn serve_exits_when_flag_set() -> Result<(), Box<dyn Error>> {
         let result = serve(listener, listener_shutdown, shared);
         let _ = tx.send(result);
     });
+    let guard = ServeGuard::new(&shutdown, handle);
 
     // The listener is already bound, so the connect completes at once. The
     // accept loop proves it is running when it registers the connection;
@@ -49,17 +86,12 @@ fn serve_exits_when_flag_set() -> Result<(), Box<dyn Error>> {
         thread::sleep(Duration::from_millis(5));
     }
 
-    shutdown.store(true, Ordering::Relaxed);
     // Drop the accepted stream so the orphan handshake thread exits on a
     // read error instead of holding the connection open.
     drop(client);
+    guard.join()?;
 
     let result = rx.recv_timeout(Duration::from_secs(5))?;
-
-    match handle.join() {
-        Ok(()) => {}
-        Err(_) => return Err(io::Error::other("listener thread panicked").into()),
-    }
 
     result?;
     // Connection threads outlive the listener. The orphan handshake thread
@@ -88,12 +120,10 @@ fn serve_returns_without_accepting_when_flag_preset() -> Result<(), Box<dyn Erro
         let result = serve(listener, listener_shutdown, shared);
         let _ = tx.send(result);
     });
+    let guard = ServeGuard::new(&shutdown, handle);
 
     let result = rx.recv_timeout(Duration::from_secs(5))?;
-    match handle.join() {
-        Ok(()) => {}
-        Err(_) => return Err(io::Error::other("listener thread panicked").into()),
-    }
+    guard.join()?;
 
     result?;
     assert!(peer_table.is_empty());
@@ -116,5 +146,8 @@ fn wiring(peer_table: Arc<PeerTable>) -> ConnectionShared {
         Magic::BITCOIN,
         headers_tx,
         blocks_tx,
+        None,
+        None,
+        ListenerExtras::default(),
     )
 }

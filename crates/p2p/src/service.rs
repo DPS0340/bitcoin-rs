@@ -216,7 +216,7 @@ impl P2pService {
             bound_listeners.push((*addr, listener));
         }
 
-        let mut shared = crate::listener::ConnectionShared::new(
+        let shared = crate::listener::ConnectionShared::new(
             Arc::clone(&self.peer_table),
             Arc::clone(&self.banned),
             Arc::new(crate::NetworkActivity::from_shared(Arc::clone(
@@ -227,13 +227,10 @@ impl P2pService {
             self.config.magic,
             self.inbound_headers_tx.clone(),
             self.inbound_blocks_tx.clone(),
+            chain_query.cloned(),
+            sync_wake_tx.cloned(),
+            extras,
         );
-        shared.chain_query = chain_query.cloned();
-        shared.wake_tx = sync_wake_tx.cloned();
-        shared.tx_inventory = extras.tx_inventory;
-        shared.compact_hints = extras.compact_hints;
-        shared.inbound_tx = extras.inbound_tx;
-        shared.ibd = extras.ibd;
 
         let mut listeners = Vec::with_capacity(bound_listeners.len());
         for (listener_addr, listener) in bound_listeners {

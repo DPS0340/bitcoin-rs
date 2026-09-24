@@ -35,8 +35,8 @@ use bitcoin_rs_p2p::wire::{
     write_message,
 };
 use bitcoin_rs_p2p::{
-    BannedSubnet, COMMANDS, CORE_UNTYPED_COMMANDS, InboundBlock, InboundHeaders, Message,
-    NetworkActivity, PINNED_CORE_VERSION, Peer, PeerState, PeerTable,
+    BannedSubnet, COMMANDS, CORE_UNTYPED_COMMANDS, InboundBlock, InboundHeaders, ListenerExtras,
+    Message, NetworkActivity, PINNED_CORE_VERSION, Peer, PeerState, PeerTable,
 };
 use bitcoin_rs_primitives::{
     Block, BlockHash as NativeBlockHash, CompactTarget, Hash256, Header, consensus_bytes,
@@ -1208,6 +1208,9 @@ fn serve_and_handshake_over_tcp(network: Network, magic: Magic) -> Result<(), Bo
         magic,
         headers_tx,
         blocks_tx,
+        None,
+        None,
+        ListenerExtras::default(),
     );
 
     let handle = thread::spawn(move || serve(listener, listener_shutdown, shared));

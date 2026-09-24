@@ -103,11 +103,15 @@ pub struct ConnectionShared {
 }
 
 impl ConnectionShared {
-    /// Construct the required wiring.
+    /// Construct the complete wiring for one start epoch.
     ///
-    /// PRE: The stores belong to the same P2P start epoch.
-    /// POST: Store the arguments. Set all other optional fields to None.
+    /// PRE: The stores belong to the same P2P start epoch. `extras` carries
+    /// the node-owned transaction handles; pass [`ListenerExtras::default`]
+    /// when they are absent.
+    /// POST: Every field is set from the arguments; a caller cannot obtain
+    /// a half-wired value.
     /// INVARIANT: `None` for `ibd` means transaction relay is open.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         peer_table: Arc<crate::PeerTable>,
@@ -118,6 +122,9 @@ impl ConnectionShared {
         magic: Magic,
         headers_tx: Sender<crate::InboundHeaders>,
         blocks_tx: Sender<crate::InboundBlock>,
+        chain_query: ChainQueryHandle,
+        wake_tx: SyncWakeHandle,
+        extras: ListenerExtras,
     ) -> Self {
         Self {
             peer_table,
@@ -128,12 +135,12 @@ impl ConnectionShared {
             magic,
             headers_tx,
             blocks_tx,
-            chain_query: None,
-            wake_tx: None,
-            tx_inventory: None,
-            compact_hints: None,
-            inbound_tx: None,
-            ibd: None,
+            chain_query,
+            wake_tx,
+            tx_inventory: extras.tx_inventory,
+            compact_hints: extras.compact_hints,
+            inbound_tx: extras.inbound_tx,
+            ibd: extras.ibd,
         }
     }
 
@@ -1173,7 +1180,7 @@ fn generate_nonce(peer_addr: SocketAddr) -> u64 {
 }
 
 /// Wiring for unit tests: an active network, a start token that stays
-/// `false`, no bans, no ready callback, and mainnet magic.
+/// `false`, no bans, no ready callback, no node handles, and mainnet magic.
 #[cfg(test)]
 fn test_shared(
     peer_table: Arc<crate::PeerTable>,
@@ -1191,6 +1198,9 @@ fn test_shared(
         Magic::BITCOIN,
         headers_tx,
         blocks_tx,
+        None,
+        None,
+        ListenerExtras::default(),
     )
 }
 
