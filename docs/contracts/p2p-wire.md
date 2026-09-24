@@ -34,11 +34,13 @@ This page assigns ownership and cites proof under the
 - Parent requests validate the delivering connection and enqueue under the
   same peer-table authority that serializes replacement. Requests from an
   already cancelled lease enqueue nothing.
-- Scheduler ownership is keyed on connection identity. Each tick and each
-  ready event runs one sweep over the peer table's live session set that
-  releases every window assignment, election, probe racer, header request
-  and deferred body fetch owned by a connection outside that set, so a
-  same-address replacement never inherits or loses its predecessor's work.
+- Scheduler ownership is keyed on connection identity. Every tick runs two
+  sweep passes over the peer table's live session set, and a ready event
+  from a live connection runs one; a stale ready event runs none. Each
+  sweep releases every window assignment, election, probe racer, header
+  request and deferred body fetch owned by a connection outside that set,
+  so a same-address replacement never inherits or loses its predecessor's
+  work.
 
 ### `P2P-03`: Demonstrated best-known-height credit and request eligibility
 
