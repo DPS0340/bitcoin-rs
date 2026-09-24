@@ -186,3 +186,74 @@ fn native_engine_is_supported_and_default_in_every_build() {
         "native engine must reach the interpreter in this build"
     );
 }
+
+/// A prevout set that does not cover exactly the transaction's inputs is
+/// rejected before any backend runs, under every compiled engine. A short
+/// slice would otherwise leave trailing inputs silently unverified
+/// (fail-open); a long one would index past `tx.inputs` in the native
+/// interpreter. The check is shared, so no engine can disagree about it.
+#[test]
+fn prevout_count_mismatch_is_rejected_under_every_engine() {
+    let (tx, coins) = mismatched_equal_spend();
+    let one_prevout = coins.0.into_iter().collect::<Vec<_>>();
+
+    #[cfg(feature = "kernel")]
+    let engines = vec![ValidationEngine::Native, ValidationEngine::Kernel];
+    #[cfg(not(feature = "kernel"))]
+    let engines = vec![ValidationEngine::Native];
+
+    for engine in engines {
+        // Short: one prevout for one input is exact; two inputs are needed for
+        // a short slice to be a real fail-open case, so use a two-input tx.
+        let two_input = Tx {
+            version: 1,
+            lock_time: LockTime::ZERO,
+            inputs: vec![
+                tx.inputs[0].clone(),
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid(Hash256::from_le_bytes(&[9; 32])),
+                        vout: 0,
+                    },
+                    script_sig: Script::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+            ],
+            outputs: tx.outputs.clone(),
+        };
+
+        let short = bitcoin_rs_consensus::kernel::verify_tx_scripts(
+            &two_input,
+            &one_prevout,
+            VerifyFlags::MANDATORY,
+            engine,
+        );
+        assert!(
+            matches!(short, Err(ConsensusError::Kernel(_))),
+            "{engine:?} must reject a short prevout slice, got {short:?}"
+        );
+
+        let mut long = one_prevout.clone();
+        long.push((
+            OutPoint {
+                txid: Txid(Hash256::from_le_bytes(&[10; 32])),
+                vout: 0,
+            },
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: Script::new(),
+            },
+        ));
+        let long = bitcoin_rs_consensus::kernel::verify_tx_scripts(
+            &tx,
+            &long,
+            VerifyFlags::MANDATORY,
+            engine,
+        );
+        assert!(
+            matches!(long, Err(ConsensusError::Kernel(_))),
+            "{engine:?} must reject a long prevout slice, got {long:?}"
+        );
+    }
+}

@@ -31,6 +31,29 @@ pub(crate) fn kernel_not_compiled() -> ConsensusError {
     )
 }
 
+/// Rejects a prevout set that does not cover exactly `input_count` inputs.
+///
+/// Shared by every seam that hands resolved prevouts to a script backend, so
+/// no engine can disagree about it. The dispatch loops are driven by the
+/// prevout slice: a short slice would leave trailing inputs silently
+/// unverified (fail-open) and a long one would index past the transaction's
+/// inputs in the native interpreter.
+///
+/// # Errors
+/// Returns [`ConsensusError::Kernel`] when the counts disagree.
+pub(crate) fn ensure_prevout_count(
+    spent_outputs: &[(OutPoint, TxOut)],
+    input_count: usize,
+) -> Result<(), ConsensusError> {
+    if spent_outputs.len() != input_count {
+        return Err(ConsensusError::Kernel(format!(
+            "prevout count {} does not match input count {input_count}",
+            spent_outputs.len(),
+        )));
+    }
+    Ok(())
+}
+
 /// The native one-shot block parse, compiled in every build.
 ///
 /// The native path parses the serialized block once through the checked
@@ -282,12 +305,7 @@ mod kernel_backend {
         input_count: usize,
         spent_outputs: &[(OutPoint, TxOut)],
     ) -> Result<PreparedKernelTx<T>, ConsensusError> {
-        if spent_outputs.len() != input_count {
-            return Err(ConsensusError::Kernel(format!(
-                "prevout count {} does not match input count {input_count}",
-                spent_outputs.len(),
-            )));
-        }
+        super::ensure_prevout_count(spent_outputs, input_count)?;
         let kernel_prevouts = spent_outputs
             .iter()
             .map(|(_, prevout)| kernel_txout(prevout))
@@ -460,13 +478,14 @@ impl BlockParse {
     /// # Errors
     /// Returns [`ConsensusError::Kernel`] when the backend cannot prepare the
     /// transaction (a `spent_outputs` length that disagrees with the input
-    /// count is rejected outright).
+    /// count is rejected outright, before any backend runs).
     pub(crate) fn prepare_tx<'b>(
         &'b self,
         index: usize,
         input_count: usize,
         spent_outputs: &[(OutPoint, TxOut)],
     ) -> Result<PreparedTx<'b>, ConsensusError> {
+        ensure_prevout_count(spent_outputs, input_count)?;
         match self {
             Self::Native(block) => block.prepare_tx(index, input_count, spent_outputs),
             #[cfg(feature = "kernel")]
@@ -547,13 +566,20 @@ pub(crate) fn verify_prepared_input(
 ///
 /// # Errors
 /// Per-input verdict failures map to [`ConsensusError::Script`]; backend parse
-/// and precompute failures map to [`ConsensusError::Kernel`].
+/// and precompute failures map to [`ConsensusError::Kernel`]. A
+/// `spent_outputs` length that disagrees with the input count is rejected
+/// before any backend runs: the dispatch below is driven by `spent_outputs`,
+/// so a short slice would otherwise leave trailing inputs silently unverified
+/// (fail-open) and a long one would index past `tx.inputs` in the native
+/// interpreter. The check is shared, not per-branch, so no engine can
+/// disagree about it.
 pub fn verify_tx_scripts(
     tx: &Tx,
     spent_outputs: &[(OutPoint, TxOut)],
     flags: VerifyFlags,
     engine: ValidationEngine,
 ) -> Result<(), ConsensusError> {
+    ensure_prevout_count(spent_outputs, tx.inputs.len())?;
     match engine {
         ValidationEngine::Native => {
             // One clone of the spent outputs per transaction, shared by every
