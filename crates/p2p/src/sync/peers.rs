@@ -37,12 +37,16 @@ pub(super) fn is_peer_fault(error: &ChainError) -> bool {
         | ChainError::ChainworkOverflow { .. }
         | ChainError::HeightOverflow { .. }
         // A median-time-past violation is decided entirely by the chain the peer
-        // itself sent, so it is unambiguously the peer's fault.
+        // itself sent, so it is unambiguously the peer's fault. The same holds
+        // for the version floors and the BIP94 timewarp bound: both compare the
+        // candidate header against its own announced ancestors.
         | ChainError::TimestampTooEarly { .. }
         // Re-announcing a header we already know is invalid or extending a
         // known-invalid parent is unambiguously peer-invalid data.
         | ChainError::KnownInvalidHeader { .. }
-        | ChainError::InvalidParent { .. } => true,
+        | ChainError::InvalidParent { .. }
+        | ChainError::BadVersion { .. }
+        | ChainError::TimewarpAttack { .. } => true,
         // Future drift is judged against OUR clock, so a wrong local clock
         // would otherwise let us ban every honest peer and partition
         // ourselves. The header is rejected without blaming the sender.
