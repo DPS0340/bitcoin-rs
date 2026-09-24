@@ -1480,6 +1480,7 @@ mod tests {
                 height: node.height,
                 chainwork: node.chainwork,
                 hash: node.hash,
+                chain_tx_count: node.chain_tx_count,
             }
         };
 
@@ -1920,6 +1921,7 @@ mod admission_chain_tests {
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
         })));
         Ok(())
     }

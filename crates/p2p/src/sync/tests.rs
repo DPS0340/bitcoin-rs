@@ -153,6 +153,7 @@ impl SyncChain for TestChain {
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
         });
         self.applied_tip.store(Some(Arc::clone(&snapshot)));
         if self.chain_tip.load_full().is_none() {
@@ -301,6 +302,7 @@ impl SyncChain for TestChain {
                 height: node.height,
                 chainwork: node.chainwork,
                 hash: node.hash,
+                chain_tx_count: node.chain_tx_count,
             })));
             applied = applied.saturating_add(1);
         }
@@ -328,6 +330,7 @@ impl SyncChain for TestChain {
                                 height: node.height,
                                 chainwork: node.chainwork,
                                 hash: node.hash,
+                                chain_tx_count: node.chain_tx_count,
                             })
                         })
                     })
@@ -1682,6 +1685,7 @@ fn unrequested_body_admission_matches_core_acceptance() -> Result<(), Box<dyn st
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
         }
     };
     let SyncHarness {
@@ -1803,7 +1807,7 @@ struct SyncHarness {
 }
 
 impl SyncHarness {
-    fn new(mut tree: BlockTree) -> Self {
+    fn new(tree: BlockTree) -> Self {
         Self::with_ibd(tree, crate::sync::syncing_ibd_latch())
     }
 
