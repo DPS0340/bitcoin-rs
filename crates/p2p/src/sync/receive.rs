@@ -98,7 +98,7 @@ impl BlockSync {
             };
             let mut scheduler = self.scheduler.lock();
             for (hash, height) in requeues {
-                scheduler.window.requeue_for_retry(&hash, height);
+                scheduler.window.requeue_for_retry(&hash, height, now);
             }
         }
 
@@ -630,7 +630,7 @@ impl BlockSync {
                             ));
                         }
                         for (entry, height) in dropped.into_iter().zip(dropped_heights) {
-                            window.requeue_for_retry(&entry.hash, height);
+                            window.requeue_for_retry(&entry.hash, height, now);
                             retry_count = retry_count.saturating_add(1);
                         }
                     }
@@ -643,7 +643,7 @@ impl BlockSync {
                         // staged, so a live pending still carries its
                         // request height and an unrequested body must not
                         // move the cursor at all.
-                        window.requeue_for_retry(&dropped.hash, None);
+                        window.requeue_for_retry(&dropped.hash, None, now);
                         retry_count = retry_count.saturating_add(1);
                         tracing::warn!(%hash, "block sync: received block buffer full; dropping block for retry");
                     }
@@ -679,15 +679,18 @@ impl BlockSync {
             let mut rejected = RejectDelivery::DiscardedUnsolicited;
             let current = source.is_some_and(|source| {
                 self.peer_table.with_current(source, || {
-                    rejected = self
-                        .scheduler
-                        .lock()
-                        .window
-                        .reject_delivery(hash, Some(source));
+                    rejected =
+                        self.scheduler
+                            .lock()
+                            .window
+                            .reject_delivery(hash, Some(source), now);
                 })
             });
             if !current {
-                self.scheduler.lock().window.reject_delivery(hash, None);
+                self.scheduler
+                    .lock()
+                    .window
+                    .reject_delivery(hash, None, now);
             }
             if rejected == RejectDelivery::ReleasedPending {
                 retry_count = retry_count.saturating_add(1);

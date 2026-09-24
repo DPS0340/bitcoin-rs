@@ -183,6 +183,7 @@ impl BlockSync {
                 next_apply_height,
                 frontier_hash,
                 apply_side_busy: frontier_hash.is_some_and(|hash| stager.contains(&hash)),
+                active_downloading_peers: window.active_downloading_peers(),
             };
             let decision = window.observe_blocked(ctx, stager, &tree, now);
             let stall_seconds = window
@@ -205,7 +206,7 @@ impl BlockSync {
             // evict the stuck staged body for refetch. No peer is convicted
             // here; while the body is absent the unsuppressed stall path
             // applies as usual.
-            self.escalate_stuck_staged_body(height, Some(hash), suppressed_for);
+            self.escalate_stuck_staged_body(height, Some(hash), suppressed_for, now);
             return;
         }
         // The hedge only fires with a frontier height present, so
@@ -281,6 +282,7 @@ impl BlockSync {
         next_apply_height: u32,
         frontier_hash: Option<Hash256>,
         suppressed_for: Duration,
+        now: Instant,
     ) {
         let Some(frontier_hash) = frontier_hash else {
             return;
@@ -311,7 +313,9 @@ impl BlockSync {
             let mut scheduler = self.scheduler.lock();
             // The tree owns the height: requeue drops the cursor to the
             // body's tree height, or leaves it alone when unresolvable.
-            scheduler.window.requeue_for_retry(&frontier_hash, height);
+            scheduler
+                .window
+                .requeue_for_retry(&frontier_hash, height, now);
         }
         metrics::counter!("node.sync.apply_side_stall_escalations").increment(1);
         tracing::warn!(
