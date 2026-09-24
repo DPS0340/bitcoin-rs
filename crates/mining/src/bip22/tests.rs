@@ -104,6 +104,7 @@ fn header_failures_use_core_bip22_reasons() {
         ),
         (ChainError::InvalidParent { prev_hash: hash }, "bad-prevblk"),
         (ChainError::KnownInvalidHeader { hash }, "duplicate-invalid"),
+        (ChainError::InvalidParent { prev_hash: hash }, "bad-prevblk"),
         (
             ChainError::BadVersion {
                 version: 1,
