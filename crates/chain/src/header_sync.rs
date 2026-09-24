@@ -185,6 +185,93 @@ pub fn validate_contextual_header(
     Ok(())
 }
 
+/// Validates the contextual rules for a header extending `parent_id`.
+///
+/// PRE: `parent_id` identifies the header named by `header.prev_blockhash`;
+/// `now_secs` is UNIX time supplied by the caller.
+///
+/// POST: returns `Ok(())` only when Core's contextual nBits,
+/// median-time-past, BIP94 timewarp, future-time, and version-floor rules
+/// pass, checked in Core's order (`src/validation.cpp:4092-4126`).
+///
+/// INVARIANT: header admission and direct block connection use this
+/// operation; no caller implements a second version, timewarp, or nBits
+/// predicate.
+pub fn validate_contextual_header(
+    tree: &BlockTree,
+    parent_id: NodeId,
+    header: &BlockHeader,
+    network: Network,
+    now_secs: u32,
+) -> Result<(), ChainError> {
+    let parent = tree.node(parent_id)?;
+    let height = parent
+        .height
+        .checked_add(1)
+        .ok_or(ChainError::HeightOverflow { parent: parent_id })?;
+
+    // Contextual difficulty: the compact target the parent requires.
+    validate_header_nbits(tree, parent_id, header, network)?;
+
+    // Median-time-past floor: the candidate must beat the median of its
+    // eleven most recent ancestors.
+    let median = tree
+        .median_time_past_at(parent_id, MEDIAN_TIME_PAST_WINDOW)
+        .ok_or(ChainError::UnknownNode { id: parent_id })?;
+    if header.time <= median {
+        return Err(ChainError::TimestampTooEarly {
+            hash: hash_from_header(header),
+            timestamp: header.time,
+            median,
+        });
+    }
+
+    // BIP94 timewarp floor at a difficulty-adjustment boundary: the
+    // candidate may not fall more than `MAX_TIMEWARP` below its parent
+    // (`src/validation.cpp:4100-4110`).
+    let retarget_interval = network.retarget_interval();
+    if network.enforce_bip94()
+        && retarget_interval != 0
+        && height.is_multiple_of(retarget_interval)
+    {
+        let minimum = parent.header.time.saturating_sub(MAX_TIMEWARP);
+        if header.time < minimum {
+            return Err(ChainError::TimewarpAttack {
+                height,
+                timestamp: header.time,
+                minimum,
+            });
+        }
+    }
+
+    // Future-drift ceiling.
+    let max_allowed = now_secs.saturating_add(MAX_FUTURE_TIME_SECONDS);
+    if header.time > max_allowed {
+        return Err(ChainError::TimestampTooFarAhead {
+            hash: hash_from_header(header),
+            timestamp: header.time,
+            max_allowed,
+        });
+    }
+
+    // Version floors for the buried deployments, in Core's order
+    // (`src/validation.cpp:4112-4126`).
+    for (required, active) in [
+        (2, network.is_bip34_active(height)),
+        (3, network.is_bip66_active(height)),
+        (4, network.is_bip65_active(height)),
+    ] {
+        if active && header.version < required {
+            return Err(ChainError::BadVersion {
+                version: header.version,
+                required,
+                height,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_empty_tree_root(
     tree: &BlockTree,
     header: &BlockHeader,
