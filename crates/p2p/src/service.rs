@@ -389,8 +389,7 @@ impl P2pService {
         self.session_cancel.lock().store(true, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
         self.worker_shutdown.store(true, Ordering::Release);
-        self.network_active.store(false, Ordering::Release);
-        self.peer_table.cancel_all();
+        apply_network_active(&self.network_active, &self.peer_table, false);
     }
 
     /// Joins listener and outbound workers. Bootstrap is joined separately so
