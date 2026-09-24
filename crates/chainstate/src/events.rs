@@ -180,9 +180,21 @@ pub fn allocate_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
         .create(true)
         .follow(FollowSymlinks::No)
         .nonblock(true);
-    let lock = dir
-        .open_with(PROCESS_EPOCH_LOCK_FILE, &lock_options)
-        .with_context(|| format!("open process epoch lock {PROCESS_EPOCH_LOCK_FILE}"))?;
+    // Create-on-first-use races: when several processes open the absent lock
+    // at once, one creator's entry can disappear behind another's rename on
+    // this platform (reproduced with cap-std 4.0.3) and the loser's create
+    // reports NotFound. The file exists by then, so one plain retry settles it
+    // without weakening the `follow`/`nonblock` posture.
+    let lock = match dir.open_with(PROCESS_EPOCH_LOCK_FILE, &lock_options) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => dir
+            .open_with(PROCESS_EPOCH_LOCK_FILE, &lock_options)
+            .with_context(|| format!("open process epoch lock {PROCESS_EPOCH_LOCK_FILE}"))?,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("open process epoch lock {PROCESS_EPOCH_LOCK_FILE}"));
+        }
+    };
     let lock_metadata = lock
         .metadata()
         .with_context(|| format!("inspect process epoch lock {PROCESS_EPOCH_LOCK_FILE}"))?;

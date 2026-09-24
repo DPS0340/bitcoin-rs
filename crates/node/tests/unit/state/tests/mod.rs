@@ -60,6 +60,18 @@ fn publish_applied_tip_height(state: &NodeState, height: u32) {
         })));
 }
 
+/// Joins the data directory's entry names for one-line failure context.
+fn dir_listing(data_dir: &std::path::Path) -> String {
+    match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(","),
+        Err(error) => format!("(listing failed: {error})"),
+    }
+}
+
 #[test]
 fn process_epoch_allocation_is_unique_across_processes() -> anyhow::Result<()> {
     const CHILD_DIR_ENV: &str = "BITCOIN_RS_TEST_EPOCH_CHILD_DIR";
@@ -131,11 +143,12 @@ fn process_epoch_allocation_is_unique_across_processes() -> anyhow::Result<()> {
     std::fs::write(data_dir.join("go"), b"")?;
 
     let mut epochs = Vec::new();
-    for child in children {
+    for (index, child) in children.into_iter().enumerate() {
         let output = child.wait_with_output()?;
         anyhow::ensure!(
             output.status.success(),
-            "epoch child failed: {}",
+            "epoch child {index} failed: data_dir={data_dir:?} listing={} stderr={}",
+            dir_listing(&data_dir),
             String::from_utf8_lossy(&output.stderr)
         );
     }
