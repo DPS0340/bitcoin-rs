@@ -1534,8 +1534,9 @@ impl DownloadWindow {
     ///   kept in step; `cold_front` survives only while its waiting owner or
     ///   both racing participants do; `preferred_peer` and
     ///   `prefix_probe_attempted_owner` clear when their owner fails `owns`;
-    ///   probe racers failing `owns` leave the race, and a race left with
-    ///   fewer than two racers is cancelled.
+    ///   probe racers failing `owns` leave the race, a probe whose owner
+    ///   fails `owns` is cancelled regardless of its racers, and a race left
+    ///   with fewer than two racers is cancelled.
     /// INVARIANT: no fact here is compared by address alone.
     ///   `recent_stallers` is the one address-keyed fact and stays exempt;
     ///   `stall` is untouched because the conviction paths own its release.
@@ -1560,8 +1561,9 @@ impl DownloadWindow {
             self.prefix_probe_attempted_owner = None;
         }
         let cancel_probe = self.prefix_probe.as_mut().is_some_and(|probe| {
+            let owner_alive = owns(&probe.owner);
             probe.racers.retain(|peer, _| owns(peer));
-            probe.racers.len() < 2
+            !owner_alive || probe.racers.len() < 2
         });
         if cancel_probe {
             self.prefix_probe = None;
@@ -5006,6 +5008,42 @@ mod tests {
 
         assert_eq!(window.preferred_peer(), None);
         assert!(window.prefix_probe.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dead_owner_prefix_probe_is_released_even_with_live_alternates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = test_source(staller_addr());
+        let alternate_a = test_source(healthy_addr());
+        let alternate_b = test_source(peer_addr(2));
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[alternate_a, alternate_b], now);
+
+        // The owner's connection dies while both alternates stay live: the
+        // probe must be released with the rest of the dead owner's work,
+        // not orphaned on its racer count.
+        window.retain_owned_by(|p| p.addr != owner.addr);
+        assert!(window.prefix_probe.is_none());
+
+        // The released race can never complete: a live racer's probe
+        // deliveries install no confirmation, elect no winner, and never
+        // enter the dead owner's address in the staller cooldown that a
+        // live same-address replacement would inherit.
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(alternate_a), now);
+        }
+
+        assert!(window.prefix_probe.is_none());
+        assert_eq!(window.preferred_peer(), None);
+        assert!(!window.peer_in_staller_cooldown(owner.addr, now));
         Ok(())
     }
 
