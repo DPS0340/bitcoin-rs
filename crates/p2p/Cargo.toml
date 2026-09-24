@@ -52,3 +52,7 @@ bitcoin-rs-consensus.workspace = true
 [[bench]]
 name = "write_message"
 harness = false
+
+[[bench]]
+name = "headers_presync"
+harness = false
