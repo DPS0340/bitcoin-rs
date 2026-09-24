@@ -58,7 +58,7 @@ use bitcoin::{
     Txid as OracleTxid, Witness as OracleWitness, absolute, opcodes,
     script::Builder as OracleBuilder, transaction,
 };
-use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
+use bitcoin_rs_chain::{BlockTree, BlockTreeReader, NodeStatus, TipReader, TipSnapshot};
 use bitcoin_rs_index::BlockSource;
 pub mod evidence;
 
@@ -643,12 +643,17 @@ impl SyncFixture {
             Arc::clone(&block_tree),
         )
         .capturing(capture_rawtx, capture_block_bytes);
+        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
+            TipReader::new(Arc::clone(&applied_tip)),
+            BlockTreeReader::new(Arc::clone(&block_tree)),
+        ));
         let sync = bitcoin_rs_node::sync::block_sync(
             Arc::new(handles),
             followers,
             Arc::clone(&peer_table),
             inbound_headers_rx,
             inbound_blocks_rx,
+            Arc::clone(&ibd),
         );
 
         let outbound_rxs = install_synthetic_peers(&peer_table, peer_count);
