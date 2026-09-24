@@ -157,6 +157,28 @@ Only a measured physical high-water can prove the storage budget; a point-in-tim
 ./target/release/bitcoin-rs --data-dir .bitcoin-rs --validation-mode full
 ```
 
+## Validation engine
+
+`--validation-engine` (also `BITCOIN_RS_VALIDATION_ENGINE` or `validation_engine` in TOML) selects which script-verification engine validation runs on. The setting is resolved once at startup and passed to every script-verification seam; `--validation-mode` above is a separate policy and is unchanged.
+
+- `native` (default): the native Rust interpreter. It is compiled in every build.
+- `kernel`: Bitcoin Core's C++ engine (`libbitcoinkernel`). Requires a build with `--features kernel` (plus `cmake` and `libboost-dev`). The feature compiles kernel support in; the setting selects it.
+
+Setting `kernel` on a build without the `kernel` feature fails at startup with an unsupported-build error — ``validation engine `kernel` is not supported by this build: bitcoinkernel support is not compiled in (enable the `kernel` feature)`` — before chain state opens or workers start. There is no silent engine substitution.
+
+```sh
+cargo build --release -p bitcoin-rs --features kernel
+./target/release/bitcoin-rs --data-dir .bitcoin-rs --validation-engine kernel
+```
+
+## Operator migration: validation engine
+
+- No change if you never set an engine: the effective engine is `native` by default in every build, including `crates/consensus`, `crates/chainstate`, and `crates/node` library builds that used to compile and implicitly use kernel support.
+- To use bitcoinkernel, do both: build with `--features kernel` and set `validation_engine = "kernel"` (TOML), `BITCOIN_RS_VALIDATION_ENGINE=kernel` (env), or `--validation-engine kernel` (CLI).
+- Setting `kernel` without the feature fails at startup with the unsupported-build error above.
+- Bare `bitcoin-rs` runs native. The shipped Docker image compiles kernel support (`--features fjall,kernel`) and its CMD passes `--validation-engine kernel`, so image behavior is unchanged. Anyone overriding the image CMD who wants kernel must pass the flag (or the env/TOML equivalent).
+- `--validation-mode` / `validation_mode` (Full/AssumeValid/Fast) is the separate script-skip policy and is unchanged.
+
 ## More
 
 - [README.md](README.md): documentation index and release gates
