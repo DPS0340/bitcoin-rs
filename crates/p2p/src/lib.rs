@@ -33,7 +33,6 @@ pub mod inv;
 pub mod listener;
 
 /// Bitcoin Core `net:*` tracepoint payload mapping.
-pub(crate) mod net_trace;
 /// Peer state and peer manager types.
 pub mod peer;
 /// Peer metadata published after a successful handshake.
@@ -58,15 +57,15 @@ pub mod wtxid;
 pub use chain_query::ActiveChainQuery;
 pub use compact_blocks::{CompactBlockHints, Reconstruction};
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, Command, CommandStatus, PINNED_CORE_VERSION};
-pub use connection::{ConnectionId, PeerLease, PeerLifecycle, PeerSource, PeerStats, ReadyPeer};
+pub use connection::{ConnectionId, PeerLease, PeerLifecycle, PeerSource, ReadyPeer};
 pub use counters::{CountingStream, PeerCounters};
 pub use dispatch::{ChainQuery, InventoryServing, TxInventory};
 pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use inv::request_missing_parents;
 pub use listener::{ListenerExtras, spawn_outbound_connection};
 pub use peer::{
-    DnsResolver, MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE_USIZE, NetworkActivity, Peer,
-    PeerManager, PeerState, SystemDnsResolver, TrafficTotals, UPLOAD_TIMEFRAME_SECS, UploadTarget,
+    DnsResolver, MAX_BLOCK_SERIALIZED_SIZE_USIZE, NetworkActivity, Peer, PeerManager, PeerState,
+    SystemDnsResolver,
 };
 pub use peer_info::PeerInfo;
 pub use peer_table::{PeerSession, PeerTable};

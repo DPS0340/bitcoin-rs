@@ -313,21 +313,13 @@ fn write_all_vectored<W: Write + ?Sized>(
 }
 
 /// One encoded wire frame: the 24-byte header plus the payload `Bytes` the
-/// vectored write emits. A message encodes into a frame once so the write
-/// path and the outbound USDT probe share the same payload bytes — the
-/// analogue of Core's `CSerializedNetMsg`, whose header and payload both the
-/// send path and the `net:outbound_message` probe consume.
+/// vectored write emits — the analogue of Core's `CSerializedNetMsg`.
 pub(crate) struct FramedMessage {
     header: [u8; HEADER_LEN],
     payload: bytes::Bytes,
 }
 
 impl FramedMessage {
-    /// The encoded payload bytes this frame emits.
-    pub(crate) fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
     /// Total wire size: header plus payload.
     fn wire_len(&self) -> usize {
         HEADER_LEN + self.payload.len()
