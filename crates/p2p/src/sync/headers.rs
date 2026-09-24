@@ -181,6 +181,10 @@ impl BlockSync {
                     // (`TimestampTooFarAhead`, `DuplicateHeader`) get no
                     // re-request — the announcer would only replay the same
                     // batch into the same rejection, which paces no one.
+                    // The connection answered, so its deadline moves to this
+                    // answer: the gate stays and paces the retry, and expiry
+                    // cannot later blame a peer that did respond.
+                    self.rearm_header_request(source, now);
                     if matches!(
                         error,
                         ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. }
