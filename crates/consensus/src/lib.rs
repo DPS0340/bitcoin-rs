@@ -2,13 +2,14 @@
 //!
 //! Script verification has two backends. The native Rust interpreter in
 //! `bitcoin-rs-script` executes every consensus spend class: legacy, P2SH,
-//! `SegWit` v0, and Taproot key-path and script-path. The `kernel` feature
-//! routes the same checks through bitcoinkernel (Bitcoin Core's C++ engine)
-//! and is the production default in this crate and in `bitcoin-rs-node`.
-//! The `bin/bitcoin-rs` binary defaults to `["fjall", "redb", "zmq"]` (no
-//! `kernel`), so `cargo build -p bitcoin-rs` uses the native interpreter.
-//! Issue #213 keeps `kernel` as the library default until native wins the
-//! signed-spend and full-replay gates; see
+//! `SegWit` v0, and Taproot key-path and script-path. The `kernel` feature is
+//! a capability ("bitcoinkernel support is compiled in"), not a selection:
+//! which backend runs is the runtime `validation.engine` setting
+//! (`bitcoin_rs_consensus::ValidationEngine`, default `Native`). Enabling
+//! `kernel` compiles the bitcoinkernel backend (Bitcoin Core's C++ engine)
+//! in alongside the native one; selecting `Kernel` without the feature fails
+//! closed with the unsupported-build error. Every crate is kernel-free by
+//! default, so a plain `cargo build` links no C++ engine; see
 //! `docs/contracts/validation-default.md`.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
