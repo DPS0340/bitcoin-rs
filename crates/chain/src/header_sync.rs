@@ -188,11 +188,17 @@ pub fn validate_contextual_header(
 /// Validates the contextual rules for a header extending `parent_id`.
 ///
 /// PRE: `parent_id` identifies the header named by `header.prev_blockhash`;
-/// `now_secs` is UNIX time supplied by the caller.
+/// `now_secs` is UNIX time supplied by the caller, which keeps the
+/// future-drift bound a pure function of the inputs and testable at its
+/// boundaries.
 ///
 /// POST: returns `Ok(())` only when Core's contextual nBits,
 /// median-time-past, BIP94 timewarp, future-time, and version-floor rules
-/// pass, checked in Core's order (`src/validation.cpp:4092-4126`).
+/// pass, checked in Core's order (`src/validation.cpp:4092-4126`). The median
+/// is taken over the candidate's parent and up to ten of its ancestors; batch
+/// parents are already in the tree because `accept_headers` inserts each
+/// header before moving to the next, so a header whose parent arrived in the
+/// same batch is validated against it.
 ///
 /// INVARIANT: header admission and direct block connection use this
 /// operation; no caller implements a second version, timewarp, or nBits
@@ -230,9 +236,7 @@ pub fn validate_contextual_header(
     // candidate may not fall more than `MAX_TIMEWARP` below its parent
     // (`src/validation.cpp:4100-4110`).
     let retarget_interval = network.retarget_interval();
-    if network.enforce_bip94()
-        && retarget_interval != 0
-        && height.is_multiple_of(retarget_interval)
+    if network.enforce_bip94() && retarget_interval != 0 && height.is_multiple_of(retarget_interval)
     {
         let minimum = parent.header.time.saturating_sub(MAX_TIMEWARP);
         if header.time < minimum {
@@ -992,18 +996,16 @@ mod contextual_header_tests {
     }
 
     #[test]
-    fn child_of_invalid_parent_is_rejected() {
+    fn child_of_invalid_parent_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let network = Network::Regtest;
         let genesis = network.genesis_block();
         let base_time = genesis.header.time;
         let mut prev = genesis.block_hash();
         let mut tree = BlockTree::new();
-        accept_headers(&mut tree, &[genesis.header], network, base_time)
-            .expect("the regtest genesis admits");
+        accept_headers(&mut tree, &[genesis.header], network, base_time)?;
         extend_regtest(&mut tree, &mut prev, 1, 4, base_time);
-        let block_one = tree.lookup(prev.0).expect("block one is in the tree");
-        tree.invalidate_subtree(block_one)
-            .expect("invalidate block one");
+        let block_one = tree.lookup(prev.0).ok_or("block one is in the tree")?;
+        tree.invalidate_subtree(block_one)?;
 
         let now = base_time + 2 * 600;
         let child = mine_regtest(prev, 2, now, 4);
@@ -1017,5 +1019,6 @@ mod contextual_header_tests {
             None,
             "the refused child must not extend the invalid subtree"
         );
+        Ok(())
     }
 }
