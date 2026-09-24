@@ -509,7 +509,8 @@ impl Context {
         let mempool = MempoolGateway::shared(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             ValidationEngine::Native,
-        );
+        )
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let chain_tip = Arc::new(ArcSwapOption::empty());
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let block_tree = Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new()));
@@ -570,7 +571,8 @@ impl Context {
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             observer,
             ValidationEngine::Native,
-        );
+        )
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let chain_tip = Arc::new(ArcSwapOption::empty());
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let block_tree = Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new()));
@@ -1421,9 +1423,11 @@ mod tests {
                 chain_network: Network::Mainnet,
             },
             mempool: MempoolHandles {
-                mempool: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                    MempoolLimits::default(),
-                )))),
+                mempool: MempoolGateway::shared(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             indexes: IndexHandles {
                 derived_index: None,

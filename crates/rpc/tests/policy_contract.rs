@@ -1652,7 +1652,8 @@ fn invalidation_handler(state: &NodeState) -> Handler {
                 chain_network: Network::Regtest,
             },
             mempool: MempoolHandles {
-                mempool: MempoolGateway::shared(state.mempool(), ValidationEngine::Native),
+                mempool: MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
+                    .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             indexes: IndexHandles {
                 derived_index: None,
@@ -1740,7 +1741,8 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
             MempoolLimits::default(),
         ))),
         ValidationEngine::Native,
-    );
+    )
+    .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
     let chainstate = state.chainstate();
     let applied_tip = chainstate.applied_tip_reader();
     let block_tree = chainstate.block_tree_reader();

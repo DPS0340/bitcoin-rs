@@ -121,7 +121,8 @@ impl ServerHarness {
                 chain_network: state.config().network,
             },
             mempool: MempoolHandles {
-                mempool: MempoolGateway::shared(state.mempool(), ValidationEngine::Native),
+                mempool: MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
+                    .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             indexes: IndexHandles {
                 derived_index: state.derived_index_query(),

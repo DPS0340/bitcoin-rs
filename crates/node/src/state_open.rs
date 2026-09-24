@@ -376,7 +376,7 @@ impl NodeState {
                 Arc::clone(&mempool),
                 mining_leg,
                 config.validation.engine,
-            );
+            )?;
             if publisher.wants_notifications() {
                 gateway
                     .attach_observer_leg(

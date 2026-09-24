@@ -756,7 +756,8 @@ mod tests {
             pool,
             Arc::new(CompositeObserver::new()),
             ValidationEngine::Native,
-        );
+        )
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let (queue, rx) = TxRelayQueue::new(8);
         let observer = Arc::new(LocalTxRelayObserver::new(queue, Arc::downgrade(&gateway)));
         gateway
