@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bitcoin::p2p::Magic;
 use bitcoin_rs_p2p::listener::{ConnectionShared, bind_listener, serve, spawn_outbound_connection};
-use bitcoin_rs_p2p::{BannedSubnet, IpSubnet, NetworkActivity, PeerError, PeerTable};
+use bitcoin_rs_p2p::{
+    BannedSubnet, IpSubnet, ListenerExtras, NetworkActivity, PeerError, PeerTable,
+};
 use parking_lot::RwLock;
 
 #[test]
@@ -201,6 +203,60 @@ fn cancelled_start_refuses_outbound_before_connect() -> Result<(), Box<dyn Error
     Ok(())
 }
 
+#[test]
+fn live_handshake_traffic_reaches_the_aggregate_ledger() -> Result<(), Box<dyn Error>> {
+    let listener = bind_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let addr = listener.local_addr()?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let session_cancel = Arc::new(AtomicBool::new(false));
+    let peer_table = Arc::new(PeerTable::new());
+    let shared = wiring(
+        Arc::clone(&peer_table),
+        Arc::new(RwLock::new(Vec::new())),
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&session_cancel),
+    );
+
+    // One wiring value cloned to every worker, as the service start does.
+    let listener_shutdown = Arc::clone(&shutdown);
+    let serve_shared = shared.clone();
+    let serve_handle = thread::spawn(move || serve(listener, listener_shutdown, serve_shared));
+    let outbound_handle = spawn_outbound_connection(addr, shared);
+
+    // Metadata publication attaches the connection counters, so nonzero
+    // totals prove both handshakes completed over the loopback wire.
+    // Deadline-bounded wait; no fixed sleep.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (received, sent) = peer_table.traffic_totals();
+        if received > 0 && sent > 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "handshake traffic never reached the aggregate ledger \
+                 (received={received}, sent={sent})"
+            ))
+            .into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let (received, sent) = peer_table.traffic_totals();
+    assert!(received > 0, "aggregate recv must count handshake bytes");
+    assert!(sent > 0, "aggregate sent must count handshake bytes");
+    assert!(!peer_table.is_empty());
+
+    // Teardown: revoke the epoch's leases so both connection loops exit,
+    // then stop the accept loop and join the workers.
+    session_cancel.store(true, Ordering::Relaxed);
+    peer_table.cancel_all();
+    shutdown.store(true, Ordering::Relaxed);
+    join_listener(serve_handle)?;
+    let _ = outbound_handle.join();
+    Ok(())
+}
+
 /// Wiring for one test start epoch with no ready callback.
 fn wiring(
     peer_table: Arc<PeerTable>,
@@ -219,6 +275,9 @@ fn wiring(
         Magic::BITCOIN,
         headers_tx,
         blocks_tx,
+        None,
+        None,
+        ListenerExtras::default(),
     )
 }
 
