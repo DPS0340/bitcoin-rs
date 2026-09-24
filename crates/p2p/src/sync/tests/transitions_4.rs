@@ -393,13 +393,22 @@ fn stall_eviction_does_not_disconnect_replacement_connection()
         let tree = sync.chain.block_tree();
         let mut scheduler = sync.scheduler.lock();
         let state = &mut *scheduler;
-        state.window.observe_stall(
-            next_apply_height,
-            false,
+        match state.window.observe_blocked(
+            crate::download_window::BlockedContext {
+                next_apply_height: Some(next_apply_height),
+                frontier_hash: None,
+                apply_side_busy: false,
+            },
             &state.stager,
             &tree,
             Instant::now() + Duration::from_millis(150),
-        )
+        ) {
+            crate::download_window::BlockedDecision::Blame {
+                owner,
+                reason: crate::download_window::BlameReason::Staller,
+            } => Some(owner),
+            _ => None,
+        }
     };
     let (replacement_tx, _replacement_rx) = unbounded::<Message>();
     let replacement = PeerLease::new(replacement_tx);
