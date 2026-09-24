@@ -51,8 +51,10 @@ cargo_test() {
 }
 
 clippy_profiles() {
-  # Four kernel-free all-target profiles; consensus, chainstate, and node have
-  # kernel-enabled defaults, so they are checked separately without it.
+  # Four kernel-free all-target profiles. The kernel capability is opt-in and
+  # never implied by a default, so these lanes exercise the plain builds; the
+  # explicit `--no-default-features` spellings keep every row's feature set
+  # pinned even if a default changes again.
   profile "clippy: workspace (kernel-free)" \
     cargo clippy --locked --workspace --all-targets \
       --exclude bitcoin-rs-consensus --exclude bitcoin-rs-chainstate \
