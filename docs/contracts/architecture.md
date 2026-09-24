@@ -241,6 +241,36 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   generation fence around the operation. Reorg body memory is bounded by the
   chainstate streaming window; no whole departed branch is retained.
 
+### `ARCH-07a`: Chainstate mutates `utxo` through one narrow contract
+
+`bitcoin-rs-utxo` is not a second mutation authority: it holds the live coin
+set and the persistence formats, and chainstate drives it through one
+coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
+
+- **Apply**: `build_block_changes` turns one validated block into its
+  `BlockChanges`, its `UndoBatch`, and the `BlockValueTotals` the coinbase
+  check needs. Resolved prevouts enter through `SpentOutputLookup`; the live
+  set at BIP30 exception heights enters as the optional overwritten lookup.
+- **Commit**: `UtxoSet::commit_block` applies one block's `BlockChanges` and
+  emits commit events to the single attached `CoinStatsListener`.
+- **Disconnect**: `persist_block_undo` / `load_block_undo` round-trip one
+  block's `UndoBatch` as the `UndoRecord` bytes the durable head receipt
+  names, and `rollback_block` applies that batch under the durable
+  disconnect marker plus the coinstats rewind. `UtxoSet::undo_block` is the
+  raw inverse for tests and recovery tools; chainstate always disconnects
+  through `rollback_block`.
+- **Read**: `UtxoSet` lookups return the one `UtxoCoin` shape; whole-set
+  reads run under `with_stable_view` (`UtxoSetView`), which also serves the
+  `hash_serialized_3` commitment, script scans, and memory accounting.
+  Windowed apply reads through `WindowOverlay` over the same `OutputSource`.
+- Shard, record, commit-event, and undo-codec machinery is crate-private.
+  Chainstate is the only owner of mutation ordering and durability policy;
+  none of it lives in `utxo` (`ARCH-07`).
+- RPC and index are read consumers of the same contract types
+  (`UtxoCoin`, `UtxoScan`, `UndoBatch`); they do not assemble mutations
+  outside tests, which build fixture sets through `BlockChanges` +
+  `commit_block`.
+
 ### `ARCH-08`: Durable pruning and reorg retention
 
 - Transaction-cache pruning must not remove transactions from a block above

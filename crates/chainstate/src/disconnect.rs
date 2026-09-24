@@ -15,7 +15,7 @@ use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::Txid;
-use bitcoin_rs_utxo::{BlockRollback, RollbackError, load_block_undo, rollback_block};
+use bitcoin_rs_utxo::{RollbackError, load_block_undo, rollback_block};
 use std::sync::Arc;
 
 pub(super) fn plan_disconnect(
@@ -84,7 +84,7 @@ pub(super) fn plan_disconnect(
         )
     };
 
-    let undo = load_block_undo(handles.undo_store.as_ref(), height, block_hash)?;
+    let undo = load_block_undo(handles.undo_store.as_ref(), height, block_hash)?.batch;
 
     // Coinstats rewinds inside the marker fence; refuse its bad inputs here
     // while refusal is still free.
@@ -134,16 +134,14 @@ pub(super) fn disconnect_block_admitted(
     // Fenced per disconnect, not per reorg: an interrupted switch leaves a
     // consistent lower tip. `Refused` touched nothing; the rest may have torn
     // state and poison admission for recovery.
-    rollback_block(
+    let receipt = rollback_block(
         handles.undo_store.as_ref(),
         handles.utxo.as_ref(),
         handles.coin_stats.as_ref(),
-        &BlockRollback {
-            hash: block_hash,
-            height,
-            parent_height: parent_tip.height,
-            tx_count_delta,
-        },
+        block_hash,
+        height,
+        parent_tip.height,
+        tx_count_delta,
         &undo,
     )
     .map_err(|error| match error {
@@ -211,10 +209,6 @@ pub(super) fn disconnect_block_admitted(
     Ok(DisconnectOutcome {
         parent_tip,
         hash: block_hash,
-        restored_parents: undo
-            .restores()
-            .iter()
-            .map(|restored| restored.outpoint.txid)
-            .collect(),
+        restored_parents: receipt.restored_parents,
     })
 }

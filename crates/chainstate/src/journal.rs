@@ -170,7 +170,7 @@ impl ReplayAccumulator {
             ));
         }
         let coin_stats = bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
-        utxo.set_listener(Box::new(coin_stats.clone()));
+        utxo.track_coin_stats(coin_stats.clone());
         Ok(Self {
             tree,
             utxo,

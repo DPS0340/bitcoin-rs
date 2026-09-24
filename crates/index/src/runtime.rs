@@ -463,8 +463,8 @@ impl UndoScripts {
     pub(crate) fn from_undo_bytes(
         bytes: &[u8],
         hash: Hash256,
-    ) -> Result<Self, bitcoin_rs_utxo::undo_codec::UndoCodecError> {
-        let batch = bitcoin_rs_utxo::undo_codec::decode(bytes, hash)?;
+    ) -> Result<Self, bitcoin_rs_utxo::UndoCodecError> {
+        let batch = bitcoin_rs_utxo::decode_undo_record(bytes, hash)?;
         let mut scripts = hashbrown::HashMap::with_capacity(batch.restores().len());
         for add in batch.restores() {
             scripts.insert(

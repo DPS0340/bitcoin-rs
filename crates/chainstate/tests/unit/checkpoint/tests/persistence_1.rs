@@ -77,7 +77,7 @@ fn scanned_trailer_restores_independently_scanned_stats() -> Result<(), Box<dyn 
     assert_eq!(restored.coin_stats, expected);
 
     let listener = CoinStatsListener::new(restored.coin_stats.clone());
-    restored.utxo.set_listener(Box::new(listener.clone()));
+    restored.utxo.track_coin_stats(listener.clone());
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(
         OutPoint::new(Txid(Hash256::from_le_bytes(&[0x5a; 32])), 42),

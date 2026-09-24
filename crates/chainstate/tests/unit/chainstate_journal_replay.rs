@@ -60,7 +60,7 @@ fn base_state() -> TestResult<BaseState> {
     let base_coin = coin(1, 0, 50);
     let listener = CoinStatsListener::new(CoinStats::default());
     let mut utxo = UtxoSet::new();
-    utxo.set_listener(Box::new(listener.clone()));
+    utxo.track_coin_stats(listener.clone());
     let mut changes = BlockChanges::with_capacity(1, 0);
     changes.add(UtxoAdd::new(
         base_coin.outpoint,

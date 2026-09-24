@@ -220,7 +220,7 @@ impl NodeState {
         };
         let coin_stats_listener =
             bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
-        utxo_set.set_listener(Box::new(coin_stats_listener.clone()));
+        utxo_set.track_coin_stats(coin_stats_listener.clone());
         let journal = match journal_bootstrap {
             Some(bootstrap) => Some(
                 storage

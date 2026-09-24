@@ -27,7 +27,7 @@ use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::OutPoint;
 use bitcoin_rs_storage::{CommitRecords, DurableHead};
-use bitcoin_rs_utxo::{LiveOutput, OutputSource, UndoLoadError, load_block_undo};
+use bitcoin_rs_utxo::{OutputSource, UndoLoadError, UtxoCoin, load_block_undo};
 /// Facts of one connected block that its durable head commit names.
 pub(super) struct ConnectCommitFacts {
     /// Parent the durable head must currently name — for a group, the
@@ -186,12 +186,13 @@ const REPLAY_GAP_BLOCK_LIMIT: usize = super::window::DURABLE_HEAD_GROUP_BLOCKS;
 struct UndoRowSpends<'a>(&'a bitcoin_rs_utxo::UndoBatch);
 
 impl OutputSource for UndoRowSpends<'_> {
-    fn get_entry(&self, outpoint: &OutPoint) -> Option<LiveOutput> {
+    fn get_entry(&self, outpoint: &OutPoint) -> Option<UtxoCoin> {
         self.0
             .restores()
             .iter()
             .find(|add| &add.outpoint == outpoint)
-            .map(|add| LiveOutput {
+            .map(|add| UtxoCoin {
+                outpoint: add.outpoint,
                 txout: add.txout.clone(),
                 coinbase: add.coinbase,
                 height: add.height,
@@ -349,11 +350,11 @@ fn replay_gap_chain(
             // set has not been rebuilt. A missing row falls back to the live
             // set a restored tip still carries; an unreadable one fails closed.
             let proven = match load_block_undo(handles.undo_store.as_ref(), height, hash) {
-                Ok(undo) => Some(ProvenApply::AssumeValidSkipped(
+                Ok(loaded) => Some(ProvenApply::AssumeValidSkipped(
                     super::prepare::prepare_apply(
                         &block,
                         Some(bytes.clone()),
-                        &UndoRowSpends(&undo),
+                        &UndoRowSpends(&loaded.batch),
                     )?,
                 )),
                 Err(UndoLoadError::Missing { .. }) => None,

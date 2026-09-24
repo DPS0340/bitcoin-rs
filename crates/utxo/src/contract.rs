@@ -1,0 +1,788 @@
+//! The chainstate-facing apply/commit/disconnect contract.
+//!
+//! Chainstate hands this crate one connected block at a time and gets back the
+//! mutation payload, its undo record, and the value totals consensus checks
+//! need; a disconnect loads the same block's undo record and rolls it back.
+//! Everything the contract reads — resolved prevouts, the live set at BIP30
+//! exception heights — enters through the two read traits here, so record,
+//! shard, event, and codec machinery never leaves the crate.
+
+use std::borrow::Borrow;
+
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, TxOut, Txid};
+use bitcoin_rs_storage::{StorageError, UndoStore};
+use hashbrown::HashSet;
+
+use crate::set::{UtxoCoin, UtxoError, UtxoSet};
+use crate::stats::{CoinStatsListener, CoinStatsRewindError};
+use crate::undo_codec::{self, UndoCodecError};
+
+/// One UTXO output to add, owning a `TxOut` or borrowing it from a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UtxoAdd<T = TxOut> {
+    /// Outpoint being created.
+    pub outpoint: OutPoint,
+    /// Output payload.
+    pub txout: T,
+    /// Whether the creating transaction is coinbase.
+    pub coinbase: bool,
+    /// Creating block height.
+    pub height: u32,
+}
+
+impl<T> UtxoAdd<T> {
+    /// Constructs an add operation.
+    #[must_use]
+    pub const fn new(outpoint: OutPoint, txout: T, coinbase: bool, height: u32) -> Self {
+        Self {
+            outpoint,
+            txout,
+            coinbase,
+            height,
+        }
+    }
+}
+
+impl<T: Borrow<TxOut>> UtxoAdd<T> {
+    pub(crate) fn payload(&self) -> crate::set::BuildPayload<'_> {
+        crate::set::BuildPayload {
+            outpoint: &self.outpoint,
+            vout: self.outpoint.vout,
+            txout: self.txout.borrow(),
+            coinbase: self.coinbase,
+            height: self.height,
+        }
+    }
+}
+
+/// UTXO mutations with owned or borrowed output payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockChanges<T = TxOut> {
+    adds: Vec<UtxoAdd<T>>,
+    removes: Vec<OutPoint>,
+}
+
+impl<T> Default for BlockChanges<T> {
+    fn default() -> Self {
+        Self::with_capacity(0, 0)
+    }
+}
+
+impl<T> BlockChanges<T> {
+    /// Creates an empty change set with storage reserved for known operation counts.
+    #[must_use]
+    pub fn with_capacity(adds: usize, removes: usize) -> Self {
+        Self {
+            adds: Vec::with_capacity(adds),
+            removes: Vec::with_capacity(removes),
+        }
+    }
+
+    /// Appends an output creation.
+    pub fn add(&mut self, add: UtxoAdd<T>) {
+        self.adds.push(add);
+    }
+
+    /// Appends an output spend.
+    pub fn remove(&mut self, outpoint: OutPoint) {
+        self.removes.push(outpoint);
+    }
+
+    /// Returns the number of add operations.
+    #[must_use]
+    pub const fn add_count(&self) -> usize {
+        self.adds.len()
+    }
+
+    /// Returns the number of remove operations.
+    #[must_use]
+    pub const fn remove_count(&self) -> usize {
+        self.removes.len()
+    }
+
+    /// Returns output creations in commit order.
+    #[must_use]
+    pub fn adds(&self) -> &[UtxoAdd<T>] {
+        &self.adds
+    }
+
+    /// Iterates the spent outpoints in commit order (one per non-netted spend).
+    #[must_use]
+    pub fn spent_outpoints(&self) -> &[OutPoint] {
+        &self.removes
+    }
+
+    pub(crate) fn adds_slice(&self) -> &[UtxoAdd<T>] {
+        &self.adds
+    }
+
+    pub(crate) fn removes_slice(&self) -> &[OutPoint] {
+        &self.removes
+    }
+}
+
+/// Inverse mutations needed to disconnect one block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UndoBatch {
+    pub(crate) restores: Vec<UtxoAdd>,
+    pub(crate) removes: Vec<OutPoint>,
+}
+
+impl UndoBatch {
+    /// Outputs this batch restores, i.e. those the disconnected block spent.
+    #[must_use]
+    pub fn restores(&self) -> &[UtxoAdd] {
+        &self.restores
+    }
+
+    /// Outputs this batch removes, i.e. those the disconnected block created.
+    #[must_use]
+    pub fn removes(&self) -> &[OutPoint] {
+        &self.removes
+    }
+
+    /// Restores an output spent by the disconnected block.
+    pub fn restore(&mut self, add: UtxoAdd) {
+        self.restores.push(add);
+    }
+
+    /// Removes an output created by the disconnected block.
+    pub fn remove(&mut self, outpoint: OutPoint) {
+        self.removes.push(outpoint);
+    }
+
+    /// Returns true when the undo batch is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.restores.is_empty() && self.removes.is_empty()
+    }
+
+    /// Rebuilds a batch from its decoded parts.
+    ///
+    /// Crate-visible on purpose: the decoder rejects a record where one
+    /// outpoint appears in both halves, and this constructor performs no check
+    /// at all, so a public one is a way to build exactly the batch the codec
+    /// refuses. The decoder is the only caller and it has already done the work.
+    #[must_use]
+    pub(crate) const fn from_parts(restores: Vec<UtxoAdd>, removes: Vec<OutPoint>) -> Self {
+        Self { restores, removes }
+    }
+}
+
+/// The raw encoded undo record one block left behind.
+///
+/// Produced alongside its [`UndoBatch`] by [`persist_block_undo`] and
+/// [`load_block_undo`]. It survives block-level persistence so the same bytes
+/// can be stored in a durable head batch instead of re-encoding them.
+pub struct UndoRecord(Vec<u8>);
+
+impl std::fmt::Debug for UndoRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("UndoRecord").field(&self.0.len()).finish()
+    }
+}
+
+impl UndoRecord {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the encoded record bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// The loaded undo record for one block: its inverse mutations plus the raw
+/// bytes its persistence receipt names.
+#[derive(Debug)]
+pub struct BlockUndo {
+    /// Inverse mutations this block's disconnect applies.
+    pub batch: UndoBatch,
+    /// Raw record bytes the apply path stored for this block.
+    pub record: UndoRecord,
+}
+
+/// The outcome of rolling one block back out of the UTXO set.
+#[derive(Clone, Debug, Default)]
+pub struct DisconnectReceipt {
+    /// Parent transactions of the outputs restored into the live set.
+    pub restored_parents: Vec<Txid>,
+}
+
+/// Returns true when `tx` is a coinbase: one input with the null outpoint.
+#[must_use]
+pub fn is_coinbase_tx(tx: &Tx) -> bool {
+    tx.inputs.len() == 1
+        && tx.inputs[0].previous_output.txid == Txid::default()
+        && tx.inputs[0].previous_output.vout == u32::MAX
+}
+
+/// Lookup for the full resolved coin of a spent output, including creation
+/// metadata.
+///
+/// Implemented by chainstate's resolved-prevout view, which resolves a
+/// block's external prevouts from the committed set (or a window overlay).
+pub trait SpentOutputLookup {
+    /// Full resolved coin for a spent outpoint, or `None` if it is not live.
+    fn entry(&self, outpoint: &OutPoint) -> Option<&UtxoCoin>;
+}
+
+/// Where a block's prevouts are read from: the committed set, or a window
+/// overlay over blocks prepared but not yet committed.
+pub trait OutputSource {
+    /// The live coin an outpoint refers to, or `None` if unspendable here.
+    fn get_entry(&self, outpoint: &OutPoint) -> Option<UtxoCoin>;
+}
+
+impl OutputSource for UtxoSet {
+    fn get_entry(&self, outpoint: &OutPoint) -> Option<UtxoCoin> {
+        Self::get_entry(self, outpoint)
+    }
+}
+
+/// What a block pays its coinbase and what it earned in fees.
+///
+/// Gathered by [`build_block_changes`] because that walk already visits exactly
+/// the right two sets. Outputs created and spent inside the same block are
+/// skipped there, and they cancel in the fee sum — a same-block output is one
+/// transaction's output and another's input — so leaving both out is exact,
+/// not an approximation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockValueTotals {
+    /// Total value the coinbase outputs claim.
+    pub coinbase_out: u64,
+    /// Input value of the block's non-coinbase transactions, same-block
+    /// spends excluded.
+    pub spent_in: u64,
+    /// Output value of the block's non-coinbase transactions, outputs spent
+    /// in the same block excluded.
+    pub created_out: u64,
+}
+
+impl BlockValueTotals {
+    /// Fees the block earned, or `None` if the totals are inconsistent.
+    ///
+    /// Returns `None` rather than saturating: outputs exceeding inputs is a
+    /// consensus failure that per-transaction verification should already have
+    /// rejected, and silently reporting zero fees would let it through here.
+    #[must_use]
+    pub const fn fees(self) -> Option<u64> {
+        self.spent_in.checked_sub(self.created_out)
+    }
+}
+
+/// Errors produced while building UTXO connect changes for one block.
+#[derive(Debug, thiserror::Error)]
+pub enum BlockChangeError {
+    /// Summing a block's input or output values left the satoshi range.
+    #[error("block value total overflows the satoshi range")]
+    BlockValueOverflow,
+    /// Height or vout arithmetic overflowed `u32::MAX`.
+    #[error("height overflow at tip {0}")]
+    HeightOverflow(u32),
+    /// A spent output had no resolved prevout, so the undo record would be
+    /// unable to restore it.
+    #[error("undo record cannot restore spent output {txid}:{vout}")]
+    UndoPrevoutMissing {
+        /// Transaction id of the unresolvable spend.
+        txid: Txid,
+        /// Output index of the unresolvable spend.
+        vout: u32,
+    },
+}
+
+/// Why a stored undo record could not be turned back into an [`UndoBatch`].
+#[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
+pub enum UndoLoadError {
+    #[error("undo record read: {0}")]
+    Read(#[source] StorageError),
+    #[error("no undo record for block {hash} at height {height}")]
+    Missing { hash: Hash256, height: u32 },
+    #[error("undo record for block {hash} is unreadable: {source}")]
+    Unreadable {
+        hash: Hash256,
+        #[source]
+        source: UndoCodecError,
+    },
+}
+
+/// Only `Refused` leaves state untouched; the rest fire after the marker is
+/// armed and may leave state torn for recovery to reconcile.
+#[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
+pub enum RollbackError {
+    #[error("rollback refused: {0}")]
+    Refused(#[source] StorageError),
+    #[error("utxo undo: {0}")]
+    Utxo(#[source] UtxoError),
+    #[error("coinstats rewind: {0}")]
+    CoinStats(#[source] CoinStatsRewindError),
+    #[error("disconnect marker: {0}")]
+    Marker(#[source] StorageError),
+}
+
+/// Builds the UTXO mutation, undo batch, and value totals for one connected
+/// block.
+///
+/// # Parameters
+///
+/// - `block`: the block being connected.
+/// - `height`: the height at which it connects.
+/// - `txids`: precomputed txids for the block's transactions, in order.
+/// - `same_block_spent`: outpoints spent within the same block (netted out),
+///   or `None` when no same-block detection ran.
+/// - `add_capacity` / `remove_capacity`: pre-reserved capacities for the
+///   change sets.
+/// - `resolved`: lookup for the full coins of outputs the block spends.
+/// - `overwritten`: the committed set, passed only at BIP30 exception heights
+///   where a coinbase reuses a still-live txid.
+/// - `max_script_size`: consensus limit; outputs whose script exceeds this are
+///   not added to the UTXO set.
+///
+/// # Errors
+///
+/// [`BlockChangeError`] when value totals overflow or a spend has no resolved
+/// prevout. Genesis returns empty mutations.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub fn build_block_changes<'a>(
+    block: &'a Block,
+    height: u32,
+    txids: &[Txid],
+    same_block_spent: Option<&HashSet<OutPoint>>,
+    add_capacity: usize,
+    remove_capacity: usize,
+    resolved: &impl SpentOutputLookup,
+    overwritten: Option<&UtxoSet>,
+    max_script_size: usize,
+) -> Result<(BlockChanges<&'a TxOut>, UndoBatch, BlockValueTotals), BlockChangeError> {
+    // Bitcoin Core indexes genesis but does not connect its transactions into
+    // CoinsView; its coinbase is unspendable and absent from UTXO/MuHash state.
+    if height == 0 {
+        return Ok((
+            BlockChanges::default(),
+            UndoBatch::default(),
+            BlockValueTotals::default(),
+        ));
+    }
+
+    let net_same_block_spends = same_block_spent.is_some_and(|s| !s.is_empty());
+    let mut changes = BlockChanges::with_capacity(add_capacity, remove_capacity);
+    let mut undo = UndoBatch::default();
+    let mut totals = BlockValueTotals::default();
+    for (tx, txid) in block.txs.iter().zip(txids) {
+        let txid = *txid;
+        let coinbase = is_coinbase_tx(tx);
+        for (vout_idx, txout) in tx.outputs.iter().enumerate() {
+            // Before the unspendable-output skip below: an OP_RETURN output
+            // never enters the UTXO set, but the transaction that created it
+            // still paid for it, so it counts against the fee.
+            let value = txout.value.to_sat();
+            let vout =
+                u32::try_from(vout_idx).map_err(|_| BlockChangeError::HeightOverflow(height))?;
+            let outpoint = OutPoint::new(txid, vout);
+            let same_block =
+                net_same_block_spends && same_block_spent.is_some_and(|s| s.contains(&outpoint));
+            if coinbase {
+                totals.coinbase_out = totals
+                    .coinbase_out
+                    .checked_add(value)
+                    .ok_or(BlockChangeError::BlockValueOverflow)?;
+            } else if !same_block {
+                totals.created_out = totals
+                    .created_out
+                    .checked_add(value)
+                    .ok_or(BlockChangeError::BlockValueOverflow)?;
+            }
+            if same_block
+                || txout.script_pubkey.first() == Some(&0x6a)
+                || txout.script_pubkey.len() > max_script_size
+            {
+                continue;
+            }
+            // At a BIP30 exception height the coinbase reuses an earlier txid
+            // whose outputs are still live, so this add OVERWRITES a coin
+            // rather than creating one. `overwritten` is `Some` only at those
+            // two mainnet heights, so every other block pays no lookup.
+            let replaced = overwritten.and_then(|set| set.get_entry(&outpoint));
+            changes.add(UtxoAdd::new(outpoint, txout, coinbase, height));
+            match replaced {
+                // The inverse of overwriting is writing the old coin back, not
+                // deleting the outpoint. Emitting a remove as well would depend
+                // on the undo applying restores after removes, and it does the
+                // opposite, so the older coin would be lost and the rewound
+                // UTXO set, MuHash, and coinstats would not match the parent.
+                Some(previous) => undo.restore(UtxoAdd::new(
+                    outpoint,
+                    previous.txout,
+                    previous.coinbase,
+                    previous.height,
+                )),
+                // Disconnecting the block deletes what it created.
+                None => undo.remove(outpoint),
+            }
+        }
+
+        if !coinbase {
+            for tx_input in &tx.inputs {
+                let previous_output = tx_input.previous_output;
+                if net_same_block_spends
+                    && same_block_spent.is_some_and(|s| s.contains(&previous_output))
+                {
+                    continue;
+                }
+                changes.remove(previous_output);
+                // ...and restores what it spent. A spend with no resolved
+                // prevout would make the record unable to restore that output,
+                // so refuse rather than persist an undo that silently loses it.
+                let spent = resolved.entry(&tx_input.previous_output).ok_or(
+                    BlockChangeError::UndoPrevoutMissing {
+                        txid: previous_output.txid,
+                        vout: previous_output.vout,
+                    },
+                )?;
+                totals.spent_in = totals
+                    .spent_in
+                    .checked_add(spent.txout.value.to_sat())
+                    .ok_or(BlockChangeError::BlockValueOverflow)?;
+                undo.restore(UtxoAdd::new(
+                    previous_output,
+                    spent.txout.clone(),
+                    spent.coinbase,
+                    spent.height,
+                ));
+            }
+        }
+    }
+    Ok((changes, undo, totals))
+}
+
+/// Encodes and persists a block's undo record, returning the raw record so the
+/// caller can put the same row into its durable head batch.
+///
+/// # Errors
+///
+/// The store's write failure.
+pub fn persist_block_undo(
+    store: &dyn UndoStore,
+    height: u32,
+    hash: Hash256,
+    undo: &UndoBatch,
+) -> Result<UndoRecord, StorageError> {
+    let record = undo_codec::encode(undo, hash);
+    store.persist_undo(height, hash, &record)?;
+    Ok(UndoRecord::new(record))
+}
+
+/// Loads and decodes the record [`persist_block_undo`] wrote for a block.
+///
+/// # Errors
+///
+/// Read failure, absent record, or a record that does not decode as this
+/// block's.
+pub fn load_block_undo(
+    store: &dyn UndoStore,
+    height: u32,
+    hash: Hash256,
+) -> Result<BlockUndo, UndoLoadError> {
+    let record = store
+        .load_undo(height, hash)
+        .map_err(UndoLoadError::Read)?
+        .ok_or(UndoLoadError::Missing { hash, height })?;
+    let batch = undo_codec::decode(&record, hash)
+        .map_err(|source| UndoLoadError::Unreadable { hash, source })?;
+    Ok(BlockUndo {
+        batch,
+        record: UndoRecord::new(record),
+    })
+}
+
+/// Decodes one raw undo record that the caller already holds.
+///
+/// The stored head certifies an undo record in the same batch as its block
+/// body, so a replay that reads the body from its own store can decode the
+/// same row without going through [`load_block_undo`]'s `UndoStore`.
+///
+/// # Errors
+///
+/// A malformed record, or one bound to a different block.
+pub fn decode_undo_record(bytes: &[u8], block_hash: Hash256) -> Result<UndoBatch, UndoCodecError> {
+    undo_codec::decode(bytes, block_hash)
+}
+
+/// Rolls one block out of the UTXO set under a durable disconnect marker.
+///
+/// The marker is read before arming because arming overwrites an earlier
+/// disconnect's `RolledBack` debt, which a refusal would otherwise clear. On
+/// success it stays `RolledBack` until the caller durably publishes the
+/// rolled-back state. Per-coin coinstats follow the set's undo through the
+/// listener; only height and transaction count are rewound here.
+///
+/// # Errors
+///
+/// [`RollbackError::Refused`] before the marker is armed; every other variant
+/// after.
+#[allow(clippy::too_many_arguments)]
+pub fn rollback_block(
+    store: &dyn UndoStore,
+    utxo: &UtxoSet,
+    coin_stats: &CoinStatsListener,
+    hash: Hash256,
+    height: u32,
+    parent_height: u32,
+    tx_count_delta: u64,
+    undo: &UndoBatch,
+) -> Result<DisconnectReceipt, RollbackError> {
+    store
+        .load_disconnect_marker()
+        .map_err(RollbackError::Refused)?;
+    store
+        .arm_disconnect(height, hash)
+        .map_err(RollbackError::Refused)?;
+    utxo.undo_block(undo).map_err(RollbackError::Utxo)?;
+    coin_stats
+        .rewind_block(height, parent_height, tx_count_delta)
+        .map_err(RollbackError::CoinStats)?;
+    store
+        .complete_disconnect(height, hash)
+        .map_err(RollbackError::Marker)?;
+    Ok(DisconnectReceipt {
+        restored_parents: undo
+            .restores()
+            .iter()
+            .map(|restored| restored.outpoint.txid)
+            .collect(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, Script, TxOut, Txid};
+    use bitcoin_rs_storage::{
+        DisconnectMarker, DisconnectPhase, InMemoryUndoStore, StorageError, UndoStore,
+    };
+
+    use super::*;
+    use crate::snapshot::aggregate_hash;
+    use crate::stats::CoinStats;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const HEIGHT: u32 = 91;
+    const HASH: Hash256 = Hash256::from_le_bytes(&[0x5a; 32]);
+    const FUNDED: OutPoint = OutPoint {
+        txid: Txid(Hash256::from_le_bytes(&[0x31; 32])),
+        vout: 0,
+    };
+    const CREATED: OutPoint = OutPoint {
+        txid: Txid(Hash256::from_le_bytes(&[0x42; 32])),
+        vout: 0,
+    };
+
+    fn coin(value: u64) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: Script::from_bytes(vec![0x51]),
+        }
+    }
+
+    /// `FUNDED` at height 1, then the block at `HEIGHT` spending it and
+    /// creating `CREATED`; returns the set, its listener, the observable state
+    /// before that block, and the block's undo.
+    fn connected() -> Result<(UtxoSet, CoinStatsListener, State, UndoBatch), UtxoError> {
+        let mut utxo = UtxoSet::new();
+        let coin_stats = CoinStatsListener::new(CoinStats::new());
+        utxo.track_coin_stats(coin_stats.clone());
+        let mut seed = BlockChanges::default();
+        seed.add(UtxoAdd::new(FUNDED, coin(900), false, 1));
+        utxo.commit_block(&seed, &Hash256::from_le_bytes(&[0x01; 32]))?;
+        coin_stats.finish_block(1, 1);
+        let before = observe(&utxo, &coin_stats)?;
+
+        let mut changes = BlockChanges::default();
+        changes.remove(FUNDED);
+        changes.add(UtxoAdd::new(CREATED, coin(850), false, HEIGHT));
+        utxo.commit_block(&changes, &HASH)?;
+        coin_stats.finish_block(HEIGHT, 2);
+        let mut undo = UndoBatch::default();
+        undo.restore(UtxoAdd::new(FUNDED, coin(900), false, 1));
+        undo.remove(CREATED);
+        Ok((utxo, coin_stats, before, undo))
+    }
+
+    /// UTXO digest, coinstats digest (`MuHash` limbs are representation, not
+    /// state) and the coinstats scalars.
+    type State = (Hash256, Hash256, [u64; 5]);
+
+    fn observe(utxo: &UtxoSet, coin_stats: &CoinStatsListener) -> Result<State, UtxoError> {
+        let s = coin_stats.snapshot();
+        Ok((
+            aggregate_hash(utxo)?,
+            s.muhash.finalize_hash(),
+            [
+                s.height.into(),
+                s.total_amount,
+                s.bogo_size,
+                s.tx_count,
+                s.utxo_count,
+            ],
+        ))
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn persisted_record_survives_reopening_the_store() -> TestResult {
+        use std::sync::Arc;
+
+        use bitcoin_rs_storage::{FjallStore, KvUndoStore};
+
+        let dir = tempfile::tempdir()?;
+        let (.., undo) = connected()?;
+        persist_block_undo(
+            &KvUndoStore::new(Arc::new(FjallStore::open(dir.path())?)),
+            HEIGHT,
+            HASH,
+            &undo,
+        )?;
+        let reopened = KvUndoStore::new(Arc::new(FjallStore::open(dir.path())?));
+        assert_eq!(load_block_undo(&reopened, HEIGHT, HASH)?.batch, undo);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_and_foreign_records_are_refused() -> TestResult {
+        let store = InMemoryUndoStore::default();
+        let outcome = load_block_undo(&store, HEIGHT, HASH);
+        assert!(
+            matches!(outcome, Err(UndoLoadError::Missing { hash, height }) if hash == HASH && height == HEIGHT),
+            "{outcome:?}"
+        );
+
+        let other = Hash256::from_le_bytes(&[0xab; 32]);
+        let record = persist_block_undo(&store, HEIGHT, other, &UndoBatch::default())?;
+        store.persist_undo(HEIGHT, HASH, record.as_bytes())?;
+        let outcome = load_block_undo(&store, HEIGHT, HASH);
+        assert!(
+            matches!(outcome, Err(UndoLoadError::Unreadable { hash, .. }) if hash == HASH),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn loaded_record_bytes_are_the_persisted_record() -> TestResult {
+        let (.., undo) = connected()?;
+        let store = InMemoryUndoStore::default();
+        let record = persist_block_undo(&store, HEIGHT, HASH, &undo)?;
+        let loaded = load_block_undo(&store, HEIGHT, HASH)?;
+        assert_eq!(loaded.record.as_bytes(), record.as_bytes());
+        assert_eq!(loaded.batch, undo);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_restores_the_exact_prior_state() -> TestResult {
+        let (utxo, coin_stats, before, undo) = connected()?;
+        let store = InMemoryUndoStore::default();
+
+        let receipt = rollback_block(&store, &utxo, &coin_stats, HASH, HEIGHT, 1, 2, &undo)?;
+
+        assert!(utxo.get_entry(&CREATED).is_none());
+        assert_eq!(
+            utxo.get_entry(&FUNDED).map(|e| (e.txout, e.height)),
+            Some((coin(900), 1))
+        );
+        assert_eq!(observe(&utxo, &coin_stats)?, before);
+        assert_eq!(receipt.restored_parents, vec![FUNDED.txid]);
+        let marker = store.load_disconnect_marker()?.ok_or("marker missing")?;
+        assert_eq!(
+            (marker.phase, marker.height, marker.hash),
+            (DisconnectPhase::RolledBack, HEIGHT, HASH)
+        );
+        Ok(())
+    }
+
+    /// Marker writes fail in the chosen phase.
+    #[derive(Default)]
+    struct MarkerFails {
+        inner: InMemoryUndoStore,
+        at: Option<DisconnectPhase>,
+    }
+
+    impl UndoStore for MarkerFails {
+        fn persist_undo(&self, h: u32, hash: Hash256, r: &[u8]) -> Result<(), StorageError> {
+            self.inner.persist_undo(h, hash, r)
+        }
+        fn load_undo(&self, h: u32, hash: Hash256) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.load_undo(h, hash)
+        }
+        fn arm_disconnect(&self, h: u32, hash: Hash256) -> Result<(), StorageError> {
+            if self.at == Some(DisconnectPhase::InFlight) {
+                return Err(StorageError::Backend("injected".into()));
+            }
+            self.inner.arm_disconnect(h, hash)
+        }
+        fn complete_disconnect(&self, h: u32, hash: Hash256) -> Result<(), StorageError> {
+            if self.at == Some(DisconnectPhase::RolledBack) {
+                return Err(StorageError::Backend("injected".into()));
+            }
+            self.inner.complete_disconnect(h, hash)
+        }
+        fn disarm_disconnect(&self) -> Result<(), StorageError> {
+            self.inner.disarm_disconnect()
+        }
+        fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError> {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    #[test]
+    fn arm_failure_refuses_before_any_mutation() -> TestResult {
+        let (utxo, coin_stats, _, undo) = connected()?;
+        let connected_state = observe(&utxo, &coin_stats)?;
+        let store = MarkerFails {
+            at: Some(DisconnectPhase::InFlight),
+            ..MarkerFails::default()
+        };
+        let outcome = rollback_block(&store, &utxo, &coin_stats, HASH, HEIGHT, 1, 2, &undo);
+        assert!(
+            matches!(outcome, Err(RollbackError::Refused(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(observe(&utxo, &coin_stats)?, connected_state);
+        assert_eq!(store.load_disconnect_marker()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn completion_failure_is_fatal_and_leaves_the_marker_in_flight() -> TestResult {
+        let (utxo, coin_stats, _, undo) = connected()?;
+        let store = MarkerFails {
+            at: Some(DisconnectPhase::RolledBack),
+            ..MarkerFails::default()
+        };
+        let outcome = rollback_block(&store, &utxo, &coin_stats, HASH, HEIGHT, 1, 2, &undo);
+        assert!(
+            matches!(outcome, Err(RollbackError::Marker(_))),
+            "{outcome:?}"
+        );
+        let marker = store.load_disconnect_marker()?.ok_or("marker missing")?;
+        assert_eq!(marker.phase, DisconnectPhase::InFlight);
+        Ok(())
+    }
+
+    #[test]
+    fn coinstats_refusal_after_the_undo_is_fatal() -> TestResult {
+        let (utxo, coin_stats, _, undo) = connected()?;
+        let store = InMemoryUndoStore::default();
+        let outcome = rollback_block(&store, &utxo, &coin_stats, HASH, HEIGHT + 1, 1, 2, &undo);
+        assert!(
+            matches!(outcome, Err(RollbackError::CoinStats(_))),
+            "{outcome:?}"
+        );
+        assert!(utxo.get_entry(&FUNDED).is_some(), "undo had already run");
+        Ok(())
+    }
+}

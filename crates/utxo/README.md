@@ -2,7 +2,18 @@
 
 The in-memory UTXO set: 256 first-byte shards, each a `hashbrown::HashTable` of compact transaction-level records behind a `parking_lot::RwLock`, together with the native snapshot format and the versioned undo codec that make checkpoint load and block disconnect possible.
 
-`UtxoSet` owns the state. `UtxoSet::commit_block` applies a `BlockChanges` for a connected block (built with `BlockChanges::add`/`remove`), `UtxoSet::undo_block` reverses one block from its `UndoBatch` of restores and removes, and lookups go through `get`, `get_entry`, and `get_meta`, with `has_live_outputs_for_txid` supplying the transaction-level BIP30 duplicate-spend predicate. `UtxoSet::with_stable_view` blocks commits while a `UtxoSetView` reads the whole set, computes the Core `hash_serialized_3` commitment, and scans for exact scriptPubKey matches; `set_listener` installs a batch-only `UtxoChangeListener`. Single-shard commits deliver transaction runs directly; multi-shard commits deliver collected, order-independent event batches after shard mutation. Persistence is the native snapshot codec (`write_snapshot`, `read_snapshot_strict_v4`, the observed variants, and `aggregate_hash`), while disconnect undo records round-trip through `encode_undo`/`decode_undo` under a single `UNDO_FORMAT_VERSION`.
+`UtxoSet` owns the state, and chainstate drives it through one narrow
+contract (`contract`): `build_block_changes` turns a validated block into its
+`BlockChanges` plus the `UndoBatch` and `BlockValueTotals` consensus checks
+need, `commit_block` applies that `BlockChanges`, and `persist_block_undo` /
+`load_block_undo` / `rollback_block` carry a block's undo through
+persistence and disconnect under the durable marker. Lookups return the one
+`UtxoCoin` shape (`get`, `get_entry`) and `has_live_outputs_for_txid`
+supplies the transaction-level BIP30 duplicate-spend predicate.
+`with_stable_view` blocks commits while a `UtxoSetView` reads the whole set,
+computes the Core `hash_serialized_3` commitment, and scans for exact
+scriptPubKey matches; `track_coin_stats` attaches the single
+`CoinStatsListener` whose MuHash and accounting follow every commit.
 
 `UtxoAdd<T>` and `BlockChanges<T>` use `TxOut` by default and `&TxOut` for
 zero-copy block application. Both use `commit_block`; there is no separate
@@ -15,7 +26,7 @@ Snapshot loading is a clean-cutover contract: `read_snapshot_strict_v4` accepts 
 
 `stats` holds running UTXO-set statistics: derived computation over the set above, merged in from the former `bitcoin-rs-coinstats` crate (issue #164) because it reads authoritative UTXO state rather than owning any of its own.
 
-`MuHash3072` is Bitcoin Core's 3072-bit `MuHash` as a running numerator/denominator (`insert`, `remove`, `combine`, `finalize_hash` yielding the Core-compatible `uint256`). `CoinStats` folds the live set through `insert_utxo`/`remove_utxo` and serializes to a stable byte layout. `CoinStatsListener` keeps stats behind a lock, applies the block-level delta in `finish_block`, and exposes `rewind_block` as the explicit inverse for disconnects. `CoinStatsAccumulator` serves checkpoint traversals -- `with_parallel_muhash` buffers exact coin preimages and combines ordered insert-only partial `MuHash` values, `without_muhash` skips hashing entirely. `scan_coin_stats` recomputes on demand from a `UtxoSetView` (Core's on-demand model, no rolling listener required), and `store_coin_stats`/`load_coin_stats` persist rows keyed by little-endian height.
+`MuHash3072` is Bitcoin Core's 3072-bit `MuHash` as a running numerator/denominator (`insert`, `remove`, `combine`, `finalize_hash` yielding the Core-compatible `uint256`). `CoinStats` folds the live set through `insert_utxo`/`remove_utxo` and serializes to a stable byte layout. `CoinStatsListener` keeps stats behind a lock, applies the block-level delta in `finish_block`, and exposes `rewind_block` as the explicit inverse for disconnects. It is the one listener the set holds: shard-level commit events stay inside the crate. `CoinStatsAccumulator` serves checkpoint traversals -- `with_parallel_muhash` buffers exact coin preimages and combines ordered insert-only partial `MuHash` values, `without_muhash` skips hashing entirely. `scan_coin_stats` recomputes on demand from a `UtxoSetView` (Core's on-demand model, no rolling listener required), and `store_coin_stats`/`load_coin_stats` persist rows keyed by little-endian height.
 
 The checkpoint manifest records this component under the current codec identifier `"bitcoin-rs-coinstats-v1"`. That is an on-disk value; changes to it require a datadir schema epoch bump and explicit resync.
 

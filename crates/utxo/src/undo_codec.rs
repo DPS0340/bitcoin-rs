@@ -20,10 +20,10 @@ use std::collections::HashSet;
 use bitcoin_rs_primitives::{ConsensusDecode, ConsensusEncode, Hash256, OutPoint, TxOut};
 use thiserror::Error;
 
-use crate::set::{UndoBatch, UtxoAdd};
+use crate::contract::{UndoBatch, UtxoAdd};
 
 /// Current undo-record format version.
-pub const UNDO_FORMAT_VERSION: u8 = 1;
+pub(crate) const UNDO_FORMAT_VERSION: u8 = 1;
 
 #[cfg(test)]
 const VERSION_BYTES: usize = 1;
@@ -98,7 +98,7 @@ pub enum UndoCodecError {
 
 /// Encodes `batch` as a record bound to `block_hash`.
 #[must_use]
-pub fn encode(batch: &UndoBatch, block_hash: Hash256) -> Vec<u8> {
+pub(crate) fn encode(batch: &UndoBatch, block_hash: Hash256) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(UNDO_FORMAT_VERSION);
     out.extend_from_slice(&block_hash.to_le_bytes());
@@ -121,7 +121,7 @@ pub fn encode(batch: &UndoBatch, block_hash: Hash256) -> Vec<u8> {
 }
 
 /// Decodes a record, rejecting any that is not for `expected_hash`.
-pub fn decode(bytes: &[u8], expected_hash: Hash256) -> Result<UndoBatch, UndoCodecError> {
+pub(crate) fn decode(bytes: &[u8], expected_hash: Hash256) -> Result<UndoBatch, UndoCodecError> {
     // A restore is at least an outpoint, a minimal TxOut, a flag, and a height.
     const MIN_RESTORE_BYTES: usize = 36 + 9 + 1 + 4;
     const MIN_REMOVE_BYTES: usize = 36;
@@ -297,7 +297,7 @@ mod tests {
         COUNT_BYTES, RESTORE_COUNT_OFFSET, RESTORE_TRAILER_BYTES, UNDO_FORMAT_VERSION,
         UndoCodecError, UtxoAdd, decode, encode,
     };
-    use crate::set::UndoBatch;
+    use crate::contract::UndoBatch;
     use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 
     pub(super) fn hash(byte: u8) -> Hash256 {
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn an_empty_batch_round_trips() -> Result<(), UndoCodecError> {
         let decoded = decode(&encode(&UndoBatch::default(), hash(4)), hash(4))?;
-        assert!(decoded.is_empty());
+        assert!(decoded.restores().is_empty() && decoded.removes().is_empty());
         Ok(())
     }
 
@@ -445,7 +445,7 @@ mod tests {
 mod cross_half_tests {
     use super::tests::{hash, txout};
     use super::{UndoCodecError, UtxoAdd, decode, encode};
-    use crate::set::UndoBatch;
+    use crate::contract::UndoBatch;
     use bitcoin_rs_primitives::OutPoint;
 
     /// A block cannot both spend and create the same outpoint: the apply path

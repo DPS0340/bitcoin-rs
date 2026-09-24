@@ -1,10 +1,10 @@
 use alloc::sync::Arc;
 use core::convert::Infallible;
 
-use crate::{
-    SnapshotCoin, SnapshotCoinObserver, UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent,
-    UtxoInserted, UtxoRemoved,
+use crate::listener::{
+    UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent, UtxoInserted, UtxoRemoved,
 };
+use crate::snapshot::{SnapshotCoin, SnapshotCoinObserver};
 use bitcoin_rs_primitives::{OutPoint, TxOut};
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -1021,7 +1021,7 @@ mod tests {
 
         let mut utxo = UtxoSet::new();
         let listener = super::CoinStatsListener::new(super::CoinStats::new());
-        utxo.set_listener(Box::new(listener.clone()));
+        utxo.track_coin_stats(listener.clone());
         let mut changes = BlockChanges::default();
         for (i, script_len) in [0_usize, 1, 252, 253, 65_535].into_iter().enumerate() {
             let mut txid_bytes = [0_u8; 32];

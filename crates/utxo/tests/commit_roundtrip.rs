@@ -102,8 +102,8 @@ fn owned_and_borrowed_commits_match_independent_state_hashes()
             let mut owned = UtxoSet::new();
             let mut borrowed = UtxoSet::new();
             if with_listener {
-                owned.set_listener(Box::new(CoinStatsListener::new(CoinStats::new())));
-                borrowed.set_listener(Box::new(CoinStatsListener::new(CoinStats::new())));
+                owned.track_coin_stats(CoinStatsListener::new(CoinStats::new()));
+                borrowed.track_coin_stats(CoinStatsListener::new(CoinStats::new()));
             }
             let mut entries: Vec<_> = (0_u8..64)
                 .map(|index| {

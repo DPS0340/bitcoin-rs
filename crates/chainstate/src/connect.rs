@@ -33,8 +33,8 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Txid;
 use bitcoin_rs_primitives::consensus_bytes;
 use bitcoin_rs_storage::CommitRecords;
-use bitcoin_rs_utxo::connect::BlockChangeError;
-use bitcoin_rs_utxo::connect::build_block_changes;
+use bitcoin_rs_utxo::BlockChangeError;
+use bitcoin_rs_utxo::build_block_changes;
 use bitcoin_rs_utxo::is_coinbase_tx;
 use hashbrown::HashMap;
 use std::sync::Arc;
@@ -540,7 +540,7 @@ pub(super) fn apply_block_admitted<'b>(
             sync_appended_blocks(handles)?;
             metrics::histogram!("node.apply_block.durable_sync_seconds")
                 .record(durable_sync_started.elapsed().as_secs_f64());
-            let undo_rows = vec![(height, block_hash, undo_record.as_slice())];
+            let undo_rows = vec![(height, block_hash, undo_record.as_bytes())];
             let body_rows = stored_body_row(handles, height, block_hash)?
                 .into_iter()
                 .collect();

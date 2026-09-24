@@ -1209,7 +1209,7 @@ fn apply_handles(
 ) -> Chainstate {
     let coin_stats = Arc::new(CoinStatsListener::new(CoinStats::default()));
     let mut utxo = UtxoSet::new();
-    utxo.set_listener(Box::new((*coin_stats).clone()));
+    utxo.track_coin_stats((*coin_stats).clone());
     let utxo = Arc::new(utxo);
     Chainstate::new(
         Network::Regtest,

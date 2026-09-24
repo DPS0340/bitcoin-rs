@@ -153,7 +153,7 @@ fn pack_height(height: u32, coinbase: bool) -> u64 {
 
 /// One checked, zero-copy live output view inside a transaction-level record.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct OneUtxoOut<'a> {
+pub(crate) struct OneUtxoOut<'a> {
     /// Originating transaction output index.
     pub vout: u32,
     /// Output value in satoshis.
@@ -175,7 +175,7 @@ pub struct OneUtxoOut<'a> {
 /// from its payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct UtxoRecord {
+pub(crate) struct UtxoRecord {
     buf: ThinRecordBuf,
 }
 

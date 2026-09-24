@@ -513,7 +513,7 @@ impl Context {
             bitcoin_rs_utxo::stats::CoinStats::default(),
         );
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
-        utxo.set_listener(Box::new(coin_stats_listener.clone()));
+        utxo.track_coin_stats(coin_stats_listener.clone());
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
             MempoolLimits::default(),
@@ -568,7 +568,7 @@ impl Context {
             bitcoin_rs_utxo::stats::CoinStats::default(),
         );
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
-        utxo.set_listener(Box::new(coin_stats_listener.clone()));
+        utxo.track_coin_stats(coin_stats_listener.clone());
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = MempoolGateway::shared_with(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),

@@ -1,16 +1,13 @@
 //! Snapshot trailer integration tests for coinstats.
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use bitcoin_rs_utxo::{
-    BlockChanges, UndoBatch, UtxoAdd, UtxoChangeListener, UtxoInserted, UtxoKey, UtxoRemoved,
-    UtxoSet, aggregate_hash, write_snapshot,
-};
+use bitcoin_rs_utxo::{BlockChanges, UndoBatch, UtxoAdd, UtxoSet, aggregate_hash, write_snapshot};
 
 #[test]
 fn snapshot_trailer_uses_listener_muhash() -> Result<(), Box<dyn std::error::Error>> {
     let listener = CoinStatsListener::new(CoinStats::new());
     let mut set = UtxoSet::new();
-    set.set_listener(Box::new(listener.clone()));
+    set.track_coin_stats(listener.clone());
 
     let mut changes = BlockChanges::default();
     for index in 0_u32..3 {
@@ -34,7 +31,7 @@ fn snapshot_trailer_uses_listener_muhash() -> Result<(), Box<dyn std::error::Err
 fn snapshot_trailer_tracks_listener_after_removal() -> Result<(), Box<dyn std::error::Error>> {
     let listener = CoinStatsListener::new(CoinStats::new());
     let mut set = UtxoSet::new();
-    set.set_listener(Box::new(listener.clone()));
+    set.track_coin_stats(listener.clone());
 
     let removed_outpoint = OutPoint::new(txid(1).into(), 0);
     let kept_outpoint = OutPoint::new(txid(2).into(), 1);
@@ -83,7 +80,7 @@ fn snapshot_trailer_tracks_listener_after_removal() -> Result<(), Box<dyn std::e
 fn listener_tracks_duplicate_txid_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     let listener = CoinStatsListener::new(CoinStats::new());
     let mut set = UtxoSet::new();
-    set.set_listener(Box::new(listener.clone()));
+    set.track_coin_stats(listener.clone());
 
     let outpoint = OutPoint::new(txid(30).into(), 0);
     let original = txout(30);
@@ -115,7 +112,7 @@ fn listener_coalesced_parallel_path_preserves_overwrite_boundary()
 -> Result<(), Box<dyn std::error::Error>> {
     let listener = CoinStatsListener::new(CoinStats::new());
     let mut set = UtxoSet::new();
-    set.set_listener(Box::new(listener.clone()));
+    set.track_coin_stats(listener.clone());
     let mut expected = CoinStats::new();
     let mut initial = BlockChanges::default();
     let mut seeded = Vec::new();
@@ -124,7 +121,7 @@ fn listener_coalesced_parallel_path_preserves_overwrite_boundary()
         let index = u32::from(shard);
         let outpoint = OutPoint::new(txid_in_shard(shard, 1_100 + u64::from(shard)).into(), index);
         let original = txout(1_100 + index);
-        assert_eq!(UtxoKey::from_txid(&outpoint.txid).shard(), shard);
+        assert_eq!(shard_of(&outpoint), shard);
         expected.insert_utxo(&outpoint, &original, 110, shard % 2 == 0);
         initial.add(UtxoAdd::new(
             outpoint,
@@ -159,7 +156,7 @@ fn listener_coalesced_parallel_path_preserves_overwrite_boundary()
 fn listener_parallel_shard_delta_matches_serial_stats() -> Result<(), Box<dyn std::error::Error>> {
     let listener = CoinStatsListener::new(CoinStats::new());
     let mut set = UtxoSet::new();
-    set.set_listener(Box::new(listener.clone()));
+    set.track_coin_stats(listener.clone());
     let mut expected = CoinStats::new();
     let mut initial = BlockChanges::default();
     let mut removals = Vec::new();
@@ -169,7 +166,7 @@ fn listener_parallel_shard_delta_matches_serial_stats() -> Result<(), Box<dyn st
         let index = u32::from(shard);
         let outpoint = OutPoint::new(txid_in_shard(shard, 700 + u64::from(shard)).into(), index);
         let txout = txout(700 + index);
-        assert_eq!(UtxoKey::from_txid(&outpoint.txid).shard(), shard);
+        assert_eq!(shard_of(&outpoint), shard);
         expected.insert_utxo(&outpoint, &txout, 70, shard % 2 == 0);
         initial.add(UtxoAdd::new(outpoint, txout, shard % 2 == 0, 70));
         removals.push(outpoint);
@@ -224,7 +221,7 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
 
     let listener = CoinStatsListener::new(CoinStats::new());
     let mut set = UtxoSet::new();
-    set.set_listener(Box::new(listener.clone()));
+    set.track_coin_stats(listener.clone());
     let mut expected = CoinStats::new();
     let mut initial = BlockChanges::with_capacity(usize::try_from(ENTRIES)?, 0);
     let mut seeded = Vec::with_capacity(usize::try_from(ENTRIES)?);
@@ -234,7 +231,7 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
         let outpoint = OutPoint::new(txid_in_shard(shard, 3_000 + u64::from(index)).into(), 0);
         let txout = txout(3_000 + index);
         let coinbase = index % 2 == 0;
-        assert_eq!(UtxoKey::from_txid(&outpoint.txid).shard(), shard);
+        assert_eq!(shard_of(&outpoint), shard);
         expected.insert_utxo(&outpoint, &txout, 200, coinbase);
         initial.add(UtxoAdd::new(outpoint, txout.clone(), coinbase, 200));
         seeded.push((outpoint, txout, coinbase));
@@ -252,7 +249,7 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
         let shard = u8::try_from(index % 2)?;
         let replacement = OutPoint::new(txid_in_shard(shard, 6_000 + u64::from(index)).into(), 0);
         let replacement_txout = txout(6_000 + index);
-        assert_eq!(UtxoKey::from_txid(&replacement.txid).shard(), shard);
+        assert_eq!(shard_of(&replacement), shard);
         expected.insert_utxo(&replacement, &replacement_txout, 201, false);
         mixed.add(UtxoAdd::new(
             replacement,
@@ -275,45 +272,40 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
 }
 
 #[test]
-fn listener_parallel_direct_coin_batches_match_serial_stats()
--> Result<(), Box<dyn std::error::Error>> {
+fn listener_single_shard_runs_match_serial_stats() -> Result<(), Box<dyn std::error::Error>> {
     const ENTRIES: u32 = 2_048;
 
     let listener = CoinStatsListener::new(CoinStats::new());
+    let mut set = UtxoSet::new();
+    set.track_coin_stats(listener.clone());
     let mut expected = CoinStats::new();
-    let mut outpoints = Vec::with_capacity(usize::try_from(ENTRIES)?);
-    let mut txouts = Vec::with_capacity(usize::try_from(ENTRIES)?);
-    let mut removals = Vec::with_capacity(usize::try_from(ENTRIES)?);
+    let mut initial = BlockChanges::with_capacity(usize::try_from(ENTRIES)?, 0);
+    let mut seeded: Vec<(OutPoint, TxOut, bool)> = Vec::with_capacity(usize::try_from(ENTRIES)?);
 
+    // One shard, so the commit delivers same-transaction runs through the
+    // single-shard listener path at the run-grouping threshold.
     for index in 0_u32..ENTRIES {
-        let outpoint = OutPoint::new(txid(index).into(), index);
-        let txout = txout(index);
+        let outpoint = OutPoint::new(txid_in_shard(3, 5_000 + u64::from(index)).into(), 0);
+        let txout = txout(5_000 + index);
         let coinbase = index % 2 == 0;
+        assert_eq!(shard_of(&outpoint), 3);
         expected.insert_utxo(&outpoint, &txout, 300, coinbase);
-        removals.push(UtxoRemoved::new(outpoint, txout.clone(), 300, coinbase));
-        outpoints.push(outpoint);
-        txouts.push(txout);
+        initial.add(UtxoAdd::new(outpoint, txout.clone(), coinbase, 300));
+        seeded.push((outpoint, txout, coinbase));
     }
-
-    let insertions = outpoints
-        .iter()
-        .zip(&txouts)
-        .enumerate()
-        .map(|(index, (outpoint, txout))| UtxoInserted::new(outpoint, txout, 300, index % 2 == 0))
-        .collect::<Vec<_>>();
-    listener.on_insert_coins(&insertions);
+    set.commit_block(&initial, &txid(8_000))?;
     assert_observable_stats_eq(&listener.snapshot(), &expected);
 
-    for removal in &removals {
-        expected.remove_utxo(
-            &removal.op,
-            &removal.txout,
-            removal.height,
-            removal.coinbase,
-        );
+    let mut removals: BlockChanges = BlockChanges::with_capacity(0, usize::try_from(ENTRIES)?);
+    for (outpoint, txout, coinbase) in &seeded {
+        expected.remove_utxo(outpoint, txout, 300, *coinbase);
+        removals.remove(*outpoint);
     }
-    listener.on_remove_coins(&removals);
+    set.commit_block(&removals, &txid(8_001))?;
     assert_observable_stats_eq(&listener.snapshot(), &expected);
+    for (outpoint, ..) in &seeded {
+        assert_eq!(set.get(outpoint), None);
+    }
     Ok(())
 }
 
@@ -380,7 +372,7 @@ fn assert_observable_stats_eq(left: &CoinStats, right: &CoinStats) {
 fn listener_set() -> (UtxoSet, CoinStatsListener) {
     let listener = CoinStatsListener::new(CoinStats::new());
     let mut set = UtxoSet::new();
-    set.set_listener(Box::new(listener.clone()));
+    set.track_coin_stats(listener.clone());
     (set, listener)
 }
 
@@ -401,6 +393,11 @@ fn txout(index: u32) -> TxOut {
         value: Amount::from_sat(50_000 + u64::from(index)),
         script_pubkey: vec![0x51, index.to_le_bytes()[0]].into(),
     }
+}
+
+/// The shard a UTXO key selects: the first little-endian txid byte.
+fn shard_of(outpoint: &OutPoint) -> u8 {
+    outpoint.txid.0.to_le_bytes()[0]
 }
 
 fn txid(index: u32) -> Hash256 {
