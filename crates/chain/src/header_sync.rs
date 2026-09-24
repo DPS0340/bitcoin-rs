@@ -949,18 +949,16 @@ mod contextual_header_tests {
     }
 
     #[test]
-    fn child_of_invalid_parent_is_rejected() {
+    fn child_of_invalid_parent_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let network = Network::Regtest;
         let genesis = network.genesis_block();
         let base_time = genesis.header.time;
         let mut prev = genesis.block_hash();
         let mut tree = BlockTree::new();
-        accept_headers(&mut tree, &[genesis.header], network, base_time)
-            .expect("the regtest genesis admits");
+        accept_headers(&mut tree, &[genesis.header], network, base_time)?;
         extend_regtest(&mut tree, &mut prev, 1, 4, base_time);
-        let block_one = tree.lookup(prev.0).expect("block one is in the tree");
-        tree.invalidate_subtree(block_one)
-            .expect("invalidate block one");
+        let block_one = tree.lookup(prev.0).ok_or("block one is in the tree")?;
+        tree.invalidate_subtree(block_one)?;
 
         let now = base_time + 2 * 600;
         let child = mine_regtest(prev, 2, now, 4);
@@ -974,5 +972,6 @@ mod contextual_header_tests {
             None,
             "the refused child must not extend the invalid subtree"
         );
+        Ok(())
     }
 }
