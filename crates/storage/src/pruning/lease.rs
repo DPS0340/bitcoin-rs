@@ -236,6 +236,16 @@ pub enum HistoryUnavailable {
     Shutdown,
 }
 
+impl RegistryInner {
+    /// The lowest line a lease floor must reach: everything below the
+    /// executed prune line or below any outstanding prune reservation is
+    /// gone or already claimed for deletion.
+    fn refusal_line(&self) -> u32 {
+        self.pruned_below
+            .max(self.reservations.iter().copied().max().unwrap_or(0))
+    }
+}
+
 /// Why a retention lease could not be granted.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Error)]
 pub enum RetentionError {
@@ -532,6 +542,62 @@ impl PruneReservation {
     /// record with its deletions — the closed failure mode.
     pub fn fail_closed(self) {
         core::mem::forget(self);
+    }
+}
+
+impl Drop for PruneReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.registry.abort_reservation(self.line);
+        }
+    }
+}
+
+/// One prune pass's claim on the rows it is about to delete.
+///
+/// A pass reserves its folded deletion line before it stages rows, holds
+/// the claim across the commit, and then promotes the line it actually
+/// deleted through. While the claim is outstanding, a lease request below
+/// it is refused, so no reader can pin rows the pass has already staged.
+///
+/// PRE: built only by [`RetentionRegistry::reserve`].
+///
+/// POST: exactly one of [`Self::commit`] (the pass deleted through its
+/// line) or `Drop` (the pass failed and grants flow again) settles the
+/// claim.
+///
+/// INVARIANT: the executed prune line never moves backwards, and it never
+/// advances for a deletion that did not commit.
+#[derive(Debug)]
+pub struct PruneReservation {
+    registry: Arc<RetentionRegistry>,
+    line: u32,
+    committed: bool,
+}
+
+impl PruneReservation {
+    /// The deletion line this reservation holds: the policy line folded
+    /// with every live lease floor at reserve time.
+    ///
+    /// A pass stages through this line and must not re-derive it, or a
+    /// lease registered after the reservation would be crossed.
+    #[must_use]
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+
+    /// Records that the pass deleted through `executed` (one past the
+    /// highest row it actually staged), promotes that line into the
+    /// registry's executed prune line, and releases the claim.
+    ///
+    /// `executed` never exceeds the reserved line: the pass staged through
+    /// the reserved line, so nothing above it can have been deleted.
+    /// Returns the reserved line.
+    pub fn commit(mut self, executed: u32) -> u32 {
+        self.committed = true;
+        let line = self.line;
+        self.registry.commit_reservation(line, executed);
+        line
     }
 }
 
