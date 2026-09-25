@@ -403,6 +403,17 @@ pub fn build_block_changes<'a>(
     overwritten: Option<&UtxoSet>,
     max_script_size: usize,
 ) -> Result<(BlockChanges<&'a TxOut>, UndoBatch, BlockValueTotals), BlockChangeError> {
+    // Zipping would silently drop whichever sequence is longer, leaving
+    // trailing transactions out of the changes, undo, and value totals while
+    // reporting success - the window overlay refuses the same mismatch. This
+    // runs before the genesis early return so a mismatched slice is refused at
+    // every height, matching the documented contract.
+    if block.txs.len() != txids.len() {
+        return Err(BlockChangeError::TxidCountMismatch {
+            transactions: block.txs.len(),
+            txids: txids.len(),
+        });
+    }
     // Bitcoin Core indexes genesis but does not connect its transactions into
     // CoinsView; its coinbase is unspendable and absent from UTXO/MuHash state.
     if height == 0 {
@@ -411,15 +422,6 @@ pub fn build_block_changes<'a>(
             UndoBatch::empty(),
             BlockValueTotals::default(),
         ));
-    }
-    // Zipping would silently drop whichever sequence is longer, leaving
-    // trailing transactions out of the changes, undo, and value totals while
-    // reporting success - the window overlay refuses the same mismatch.
-    if block.txs.len() != txids.len() {
-        return Err(BlockChangeError::TxidCountMismatch {
-            transactions: block.txs.len(),
-            txids: txids.len(),
-        });
     }
 
     let net_same_block_spends = same_block_spent.is_some_and(|s| !s.is_empty());
@@ -608,7 +610,10 @@ pub fn rollback_block(
 
 #[cfg(test)]
 mod tests {
-    use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, Script, TxOut, Txid};
+    use bitcoin_rs_primitives::{
+        Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script,
+        Sequence, Tx, TxIn, TxOut, Txid, Witness,
+    };
     use bitcoin_rs_storage::{
         DisconnectMarker, DisconnectPhase, InMemoryUndoStore, StorageError, UndoStore,
     };
@@ -992,22 +997,9 @@ mod tests {
         Ok(())
     }
 
-    /// A `txids` slice shorter than the block would let `zip` silently drop
-    /// trailing transactions from the changes, undo, and value totals while
-    /// reporting success. The build refuses the mismatch before iterating.
-    #[test]
-    fn short_txid_list_is_refused_before_iterating() {
-        use bitcoin_rs_primitives::{
-            Block, CompactTarget, Header, LockTime, Sequence, Tx, TxIn, Witness,
-        };
-
-        struct NoSpend;
-        impl SpentOutputLookup for NoSpend {
-            fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
-                None
-            }
-        }
-
+    /// A block of two transactions paired with a one-element `txids` slice:
+    /// the fixture for every mismatch-refusal test below.
+    fn block_with_short_txids() -> (Block, Vec<Txid>) {
         let make_tx = |seed: u8| Tx {
             version: 1,
             lock_time: LockTime::ZERO,
@@ -1022,7 +1014,7 @@ mod tests {
         let block = Block {
             header: Header {
                 version: 1,
-                prev_blockhash: bitcoin_rs_primitives::BlockHash(Hash256::default()),
+                prev_blockhash: BlockHash(Hash256::default()),
                 merkle_root: Hash256::default(),
                 time: 0,
                 bits: CompactTarget::from_consensus(0x2100_ffff),
@@ -1031,6 +1023,22 @@ mod tests {
             txs: vec![make_tx(1), make_tx(2)],
         };
         let txids = vec![Txid(Hash256::from_le_bytes(&[0x77; 32]))];
+        (block, txids)
+    }
+
+    /// A `txids` slice shorter than the block would let `zip` silently drop
+    /// trailing transactions from the changes, undo, and value totals while
+    /// reporting success. The build refuses the mismatch before iterating.
+    #[test]
+    fn short_txid_list_is_refused_before_iterating() {
+        struct NoSpend;
+        impl SpentOutputLookup for NoSpend {
+            fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
+                None
+            }
+        }
+
+        let (block, txids) = block_with_short_txids();
         let outcome = build_block_changes(&block, HEIGHT, &txids, None, 4, 4, &NoSpend, None, 64);
         assert!(
             matches!(
@@ -1041,6 +1049,31 @@ mod tests {
                 })
             ),
             "a short txid list must be refused before iterating"
+        );
+    }
+
+    /// The genesis early return must not skip validation: a mismatched
+    /// `txids` slice is refused at height 0 too, as the contract documents.
+    #[test]
+    fn short_txid_list_is_refused_at_genesis_height() {
+        struct NoSpend;
+        impl SpentOutputLookup for NoSpend {
+            fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
+                None
+            }
+        }
+
+        let (block, txids) = block_with_short_txids();
+        let outcome = build_block_changes(&block, 0, &txids, None, 4, 4, &NoSpend, None, 64);
+        assert!(
+            matches!(
+                outcome,
+                Err(BlockChangeError::TxidCountMismatch {
+                    transactions: 2,
+                    txids: 1
+                })
+            ),
+            "a short txid list must be refused at genesis height too"
         );
     }
 }
