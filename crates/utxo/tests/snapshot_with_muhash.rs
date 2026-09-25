@@ -229,7 +229,12 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
 
     for index in 0_u32..ENTRIES {
         let shard = u8::try_from(index % 2)?;
-        let outpoint = OutPoint::new(txid_in_shard(shard, 3_000 + u64::from(index)).into(), 0);
+        // Four outputs per (txid, shard) pair so each shard's runs group
+        // several same-transaction entries, as the batching path expects.
+        let outpoint = OutPoint::new(
+            txid_in_shard(shard, 3_000 + u64::from(index / 8)).into(),
+            (index % 8) / 2,
+        );
         let txout = txout(3_000 + index);
         let coinbase = index % 2 == 0;
         assert_eq!(shard_of(&outpoint), shard);
@@ -248,7 +253,10 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
     let mut replacements = Vec::with_capacity(usize::try_from(ENTRIES)?);
     for index in 0_u32..ENTRIES {
         let shard = u8::try_from(index % 2)?;
-        let replacement = OutPoint::new(txid_in_shard(shard, 6_000 + u64::from(index)).into(), 0);
+        let replacement = OutPoint::new(
+            txid_in_shard(shard, 6_000 + u64::from(index / 8)).into(),
+            (index % 8) / 2,
+        );
         let replacement_txout = txout(6_000 + index);
         assert_eq!(shard_of(&replacement), shard);
         expected.insert_utxo(&replacement, &replacement_txout, 201, false);
@@ -284,9 +292,14 @@ fn listener_single_shard_runs_match_serial_stats() -> Result<(), Box<dyn std::er
     let mut seeded: Vec<(OutPoint, TxOut, bool)> = Vec::with_capacity(usize::try_from(ENTRIES)?);
 
     // One shard, so the commit delivers same-transaction runs through the
-    // single-shard listener path at the run-grouping threshold.
+    // single-shard listener path at the run-grouping threshold. Eight outputs
+    // per txid, so those runs have length 8 instead of 1 and the grouping
+    // path is actually exercised.
     for index in 0_u32..ENTRIES {
-        let outpoint = OutPoint::new(txid_in_shard(3, 5_000 + u64::from(index)).into(), 0);
+        let outpoint = OutPoint::new(
+            txid_in_shard(3, 5_000 + u64::from(index / 8)).into(),
+            index % 8,
+        );
         let txout = txout(5_000 + index);
         let coinbase = index % 2 == 0;
         assert_eq!(shard_of(&outpoint), 3);
