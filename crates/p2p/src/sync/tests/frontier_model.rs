@@ -16,6 +16,11 @@ use bitcoin_rs_chain::{ChainWork, NodeId};
 
 /// Advances the unified blockage observation one tick and returns the
 /// stall blame's owner, if this tick convicted one.
+///
+/// A conviction for any other reason never coalesces into `None`: the
+/// helper panics naming the whole decision, so a failing assertion tells
+/// no-conviction apart from conviction-for-another-reason. Decisions that
+/// carry no conviction at all return `None`.
 fn stall_blame(
     window: &mut DownloadWindow,
     stager: &BlockStager,
@@ -37,6 +42,9 @@ fn stall_blame(
             owner,
             reason: BlameReason::Staller,
         } => Some(owner),
+        other @ BlockedDecision::Blame { .. } => {
+            panic!("stall_blame convicted for another reason: {other:?}")
+        }
         _ => None,
     }
 }
