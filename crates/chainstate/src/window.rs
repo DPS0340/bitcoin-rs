@@ -377,6 +377,15 @@ pub(super) fn invalidate_failed_subtree(
 /// interpreter path does not produce this spurious failure, so its
 /// `ConsensusError::Script` remains Permanent.
 ///
+/// Backend-neutral shape and selection failures — `PrevoutMatrixSize`,
+/// `PrevoutCount`, `UnsupportedEngine` — are caller wiring errors, not
+/// verdicts about the block or its header. They never prove the header
+/// invalid, so they stay Operational like every other wiring failure.
+/// `UnsupportedEngine` is unreachable through the node (configuration
+/// validation rejects the selection before any block applies); the arm
+/// exists so direct consensus callers cannot turn it into a header
+/// invalidation.
+///
 pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
     use WindowApplyDisposition::{BodyMutated, Fatal, Operational, Permanent};
     use bitcoin_rs_consensus::ConsensusError;
@@ -395,6 +404,8 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
             | ConsensusError::WitnessCommitment
             | ConsensusError::UnexpectedWitness => BodyMutated,
             ConsensusError::PrevoutMatrixSize { .. }
+            | ConsensusError::PrevoutCount { .. }
+            | ConsensusError::UnsupportedEngine { .. }
             | ConsensusError::Kernel(_)
             | ConsensusError::Encoding(_) => Operational,
             ConsensusError::Script { reason, .. }

@@ -145,22 +145,16 @@ fn kernel_engine_fails_closed_without_the_kernel_feature() {
         ValidationEngine::Kernel,
     );
     match tx_verdict {
-        Err(ConsensusError::Kernel(reason)) => {
-            assert!(
-                reason.contains("not compiled"),
-                "unsupported-build error must say so, got {reason}"
-            );
+        Err(ConsensusError::UnsupportedEngine { engine }) => {
+            assert_eq!(engine, ValidationEngine::Kernel);
         }
         other => panic!("kernel engine must fail closed without the feature, got {other:?}"),
     }
 
     let block = single_tx_block(&tx);
     match BlockParse::parse(&consensus_bytes(&block), ValidationEngine::Kernel) {
-        Err(ConsensusError::Kernel(reason)) => {
-            assert!(
-                reason.contains("not compiled"),
-                "unsupported-build error must say so, got {reason}"
-            );
+        Err(ConsensusError::UnsupportedEngine { engine }) => {
+            assert_eq!(engine, ValidationEngine::Kernel);
         }
         other => panic!("kernel parse must fail closed without the feature, got {other:?}"),
     }
@@ -197,10 +191,13 @@ fn prevout_count_mismatch_is_rejected_under_every_engine() {
     let (tx, coins) = mismatched_equal_spend();
     let one_prevout = coins.0.into_iter().collect::<Vec<_>>();
 
-    #[cfg(feature = "kernel")]
-    let engines = vec![ValidationEngine::Native, ValidationEngine::Kernel];
-    #[cfg(not(feature = "kernel"))]
-    let engines = vec![ValidationEngine::Native];
+    // Every engine this build can execute, derived from the single engine
+    // list so this and other engine-parameterized tests cannot drift apart.
+    let engines = ValidationEngine::ALL
+        .iter()
+        .copied()
+        .filter(|engine| engine.is_supported())
+        .collect::<Vec<_>>();
 
     for engine in engines {
         // Short: one prevout for one input is exact; two inputs are needed for
@@ -230,7 +227,13 @@ fn prevout_count_mismatch_is_rejected_under_every_engine() {
             engine,
         );
         assert!(
-            matches!(short, Err(ConsensusError::Kernel(_))),
+            matches!(
+                short,
+                Err(ConsensusError::PrevoutCount {
+                    input_count: 2,
+                    prevout_count: 1
+                })
+            ),
             "{engine:?} must reject a short prevout slice, got {short:?}"
         );
 
@@ -252,7 +255,13 @@ fn prevout_count_mismatch_is_rejected_under_every_engine() {
             engine,
         );
         assert!(
-            matches!(long, Err(ConsensusError::Kernel(_))),
+            matches!(
+                long,
+                Err(ConsensusError::PrevoutCount {
+                    input_count: 1,
+                    prevout_count: 2
+                })
+            ),
             "{engine:?} must reject a long prevout slice, got {long:?}"
         );
     }

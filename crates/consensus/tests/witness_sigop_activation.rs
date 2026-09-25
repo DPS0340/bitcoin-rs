@@ -118,13 +118,15 @@ impl UtxoView for WitnessFixture {
 
 /// Every validation engine this build can execute. Activation semantics are a
 /// consensus rule, not an engine property, so each contract runs under every
-/// compiled engine: `native` in every build, `kernel` where compiled.
+/// compiled engine: `native` in every build, `kernel` where compiled. Derived
+/// from `ValidationEngine::ALL` so this and other engine-parameterized tests
+/// cannot drift apart.
 fn engines() -> Vec<ValidationEngine> {
-    #[cfg(feature = "kernel")]
-    let engines = vec![ValidationEngine::Native, ValidationEngine::Kernel];
-    #[cfg(not(feature = "kernel"))]
-    let engines = vec![ValidationEngine::Native];
-    engines
+    ValidationEngine::ALL
+        .iter()
+        .copied()
+        .filter(|engine| engine.is_supported())
+        .collect()
 }
 
 #[test]

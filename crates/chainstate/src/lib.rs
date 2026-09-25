@@ -1806,5 +1806,9 @@ mod chain_tx_count_tests;
 mod persistence_tests;
 
 #[cfg(test)]
+#[path = "../tests/unit/apply/window_disposition_tests.rs"]
+mod window_disposition_tests;
+
+#[cfg(test)]
 #[path = "../tests/unit/checkpoint_debt_tests.rs"]
 mod checkpoint_debt_tests;

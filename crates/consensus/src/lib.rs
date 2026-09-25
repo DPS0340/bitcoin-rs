@@ -198,6 +198,31 @@ pub enum ConsensusError {
         /// Number of supplied prevout rows.
         actual: usize,
     },
+    /// A transaction's script checks received the wrong number of prevout rows.
+    ///
+    /// A caller wiring bug, not a verdict about the transaction: a short row
+    /// set would leave trailing inputs silently unverified and a long one
+    /// would index past the input set. Backend-neutral — no script backend
+    /// ran — so consumers classify it on its own, never as a script failure.
+    #[error("transaction has {input_count} inputs but {prevout_count} prevouts")]
+    PrevoutCount {
+        /// Number of transaction inputs.
+        input_count: usize,
+        /// Number of supplied prevout rows.
+        prevout_count: usize,
+    },
+    /// The requested [`ValidationEngine`] is not compiled into this build.
+    ///
+    /// A build/wiring error, not a verdict about the transaction: this build
+    /// lacks the capability (`kernel` feature) the selection requires. The
+    /// node refuses such a selection at configuration validation before any
+    /// state or worker exists; seams reachable without that gate fail closed
+    /// with this error instead of substituting another backend.
+    #[error("unsupported validation engine: {engine}")]
+    UnsupportedEngine {
+        /// The refused engine.
+        engine: ValidationEngine,
+    },
     /// Kernel path failed or is not configured for the requested operation.
     #[error("kernel validation failed: {0}")]
     Kernel(String),
