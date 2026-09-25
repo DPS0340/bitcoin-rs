@@ -195,10 +195,52 @@ fn probe_table_matches_core_argument_layout() {
     }
 }
 
+/// Forces monomorphisation of every probe wrapper so the test binary links
+/// each probe's `.note.stapsdt` note.
+///
+/// The wrappers are generic over their `prepare` closures and the generated
+/// note assembly is emitted per monomorphization: an artifact that never
+/// instantiates a wrapper carries no note for it, and the assertion below
+/// would fail with `missing SDT note`. The guard is opaque to the optimizer
+/// and always false, so the calls are compiled in (notes linked) but never
+/// run — no probe fires while the harness parses the binary.
+#[cfg(feature = "usdt")]
+#[inline(never)]
+fn instantiate_probes() {
+    if std::hint::black_box(false) {
+        let hash = [0u8; 32];
+        bitcoin_rs_trace::block_connected(|| (hash.as_ptr(), 0, 0, 0, 0, 0));
+        bitcoin_rs_trace::added(|| (hash.as_ptr(), 0, 0));
+        bitcoin_rs_trace::removed(|| (hash.as_ptr(), "block", 0, 0, 0));
+        bitcoin_rs_trace::inbound_message(|| {
+            (
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                bitcoin_rs_trace::PayloadSlot::new(Vec::new()),
+            )
+        });
+        bitcoin_rs_trace::outbound_message(|| {
+            (
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                bitcoin_rs_trace::PayloadSlot::new(Vec::new()),
+            )
+        });
+    }
+}
+
 /// Asserts the artifact's embedded SDT notes carry Core's provider, probe
 /// names, and argument layout prefixes.
 #[test]
 fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Error>> {
+    // Instantiate every probe before the test binary is read back: the notes
+    // are link-time artifacts of these monomorphizations.
+    #[cfg(feature = "usdt")]
+    instantiate_probes();
     let path = match std::env::var_os("SDT_ELF") {
         Some(path) => PathBuf::from(path),
         None => std::env::current_exe()?,
