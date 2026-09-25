@@ -23,17 +23,36 @@ struct SdtNote {
     semaphore: u64,
 }
 
+/// Outcome of [`parse_sdt_notes`].
+enum SdtParse {
+    /// Parsed notes and the ELF machine id for operand selection.
+    Notes(u16, Vec<SdtNote>),
+    /// Not a little-endian ELF64 binary (e.g. Mach-O on macOS carries DOF
+    /// instead of SDT notes): there is legitimately nothing to parse.
+    NotElf,
+    /// The artifact claims ELF64 but its note sections are unparsable: a
+    /// damaged artifact or a parser regression that must fail the test
+    /// rather than skip the assertions.
+    Malformed(&'static str),
+}
+
 /// Parses little-endian ELF64 `NT_STAPSDT` notes out of `bytes`.
+fn parse_sdt_notes(bytes: &[u8]) -> SdtParse {
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 || bytes[5] != 1 {
+        return SdtParse::NotElf;
+    }
+    match parse_elf64_sdt_notes(bytes) {
+        Some((machine, notes)) => SdtParse::Notes(machine, notes),
+        None => SdtParse::Malformed("ELF64 binary with unparsable note sections"),
+    }
+}
+
+/// ELF64 section walk behind [`parse_sdt_notes`]; `None` means a malformed
+/// binary, never a non-ELF one (the caller has already checked the magic).
 ///
 /// Returns the ELF machine id alongside the notes so the caller can select
 /// the architecture's register-operand spelling.
-fn parse_sdt_notes(bytes: &[u8]) -> Option<(u16, Vec<SdtNote>)> {
-    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" {
-        return None;
-    }
-    if bytes[4] != 2 || bytes[5] != 1 {
-        return None;
-    }
+fn parse_elf64_sdt_notes(bytes: &[u8]) -> Option<(u16, Vec<SdtNote>)> {
     let read_u16 = |offset: usize| -> Option<u16> {
         Some(u16::from_le_bytes(
             bytes.get(offset..offset + 2)?.try_into().ok()?,
@@ -135,27 +154,32 @@ fn width_index(d_type: &str) -> usize {
     }
 }
 
-/// Returns the expected full `SystemTap` layout string for `spec` on `machine`.
+/// Returns the expected full `SystemTap` layout string for `spec` on
+/// x86-64, `None` on other architectures.
 ///
 /// The operand half is architecture- and register-allocation specific: this
-/// crate's generator always passes arguments in the platform ABI registers,
-/// so the spelling is deterministic per architecture. A consumer binds to
-/// both halves, so the assertion must cover both — Core's own binaries use a
-/// different register assignment only because the compiler allocated
-/// different registers at its probe sites.
+/// crate's generator passes arguments in the platform ABI registers, so the
+/// spelling is deterministic per architecture — but only x86-64's spellings
+/// are verified (the width-dependent `%edi`/`%rdi` table below). `AArch64`'s
+/// generator may spell narrower arguments as `w`-registers, which upstream
+/// marks untested, so other architectures compare `size@` prefixes only.
+/// A consumer binds to both halves, so the verified architecture asserts
+/// both — Core's own binaries use a different register assignment only
+/// because the compiler allocated different registers at its probe sites.
 fn expected_layout(spec: &probe_abi::ProbeSpec, machine: u16) -> Option<String> {
+    // EM_X86_64: register name depends on the argument's width.
+    if machine != 0x3E {
+        return None;
+    }
     let mut operands = Vec::new();
     for (index, arg) in spec.args.iter().enumerate() {
-        let operand = match machine {
-            // EM_X86_64: register name depends on the argument's width.
-            0x3E => X86_REGISTERS[width_index(arg.d_type)][index],
-            // EM_AARCH64: the register name never varies by width.
-            0xB7 => ["x0", "x1", "x2", "x3", "x4", "x5"][index],
-            _ => return None,
-        };
         // `layout_prefix` already ends in ARG_SEPARATOR (`size@`), matching
         // the SystemTap grammar's `Nf@OP`; only the operand is appended.
-        operands.push(format!("{}{}", arg.layout_prefix, operand));
+        operands.push(format!(
+            "{}{}",
+            arg.layout_prefix,
+            X86_REGISTERS[width_index(arg.d_type)][index]
+        ));
     }
     Some(operands.join(" "))
 }
@@ -257,7 +281,13 @@ fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Erro
         // Feature-off artifact: the whole point of the default build is that
         // no probe notes leak into it, so assert exactly that instead of
         // skipping silently.
-        let notes = parse_sdt_notes(&bytes).map_or_else(Vec::new, |(_, notes)| notes);
+        let notes = match parse_sdt_notes(&bytes) {
+            SdtParse::NotElf => Vec::new(),
+            SdtParse::Malformed(reason) => {
+                return Err(format!("{}: {reason}", path.display()).into());
+            }
+            SdtParse::Notes(_, notes) => notes,
+        };
         assert!(
             notes.iter().all(|note| probe_abi::PROBES
                 .iter()
@@ -266,14 +296,20 @@ fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Erro
         );
         return Ok(());
     }
-    let Some((machine, notes)) = parse_sdt_notes(&bytes) else {
+    let (machine, notes) = match parse_sdt_notes(&bytes) {
         // Non-ELF artifact (Mach-O on macOS carries DOF instead of SDT
         // notes). The portable table test above still guards the ABI.
-        eprintln!(
-            "skipping SDT note assertion: {} is not a little-endian ELF64 binary",
-            path.display()
-        );
-        return Ok(());
+        SdtParse::NotElf => {
+            eprintln!(
+                "skipping SDT note assertion: {} is not a little-endian ELF64 binary",
+                path.display()
+            );
+            return Ok(());
+        }
+        SdtParse::Malformed(reason) => {
+            return Err(format!("{}: {reason}", path.display()).into());
+        }
+        SdtParse::Notes(machine, notes) => (machine, notes),
     };
     for spec in probe_abi::PROBES {
         let note = notes
