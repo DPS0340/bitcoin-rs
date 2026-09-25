@@ -5,6 +5,17 @@ mod dependency_graph;
 
 use dependency_graph::WorkspaceGraph;
 
+fn has_attribute_gate(source: &str, position: usize, gate: &str) -> bool {
+    source[..position].lines().rev().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("///") || line.starts_with("#[") {
+            line == gate
+        } else {
+            false
+        }
+    })
+}
+
 #[test]
 fn workspace_dependency_direction_is_one_way() {
     let graph = WorkspaceGraph::from_cargo_metadata();
@@ -58,18 +69,18 @@ fn chainstate_facade_exposes_no_production_raw_mutation_handles()
         "apply_window",
     ] {
         let signature = format!("pub fn {method}(");
-        let position = chainstate
-            .find(&signature)
-            .unwrap_or_else(|| panic!("expected fixture method `{signature}`"));
-        let prefix = &chainstate[..position];
-        let gate = prefix
-            .rfind(test_gate)
-            .unwrap_or_else(|| panic!("`{signature}` is not test-gated"));
-        let previous_public_method = prefix.rfind("pub fn ").unwrap_or(0);
-        assert!(
-            gate > previous_public_method,
-            "`{signature}` escaped its test-only capability gate"
-        );
+        let mut found = false;
+        let mut offset = 0;
+        while let Some(relative) = chainstate[offset..].find(&signature) {
+            found = true;
+            let position = offset + relative;
+            assert!(
+                has_attribute_gate(&chainstate, position, test_gate),
+                "`{signature}` escaped its test-only capability gate"
+            );
+            offset = position + signature.len();
+        }
+        assert!(found, "expected fixture method `{signature}`");
     }
 
     // The tree's tip publication cell may only be shared through exclusive
@@ -88,8 +99,20 @@ fn chainstate_facade_exposes_no_production_raw_mutation_handles()
     let trait_body = p2p_chain
         .split_once("pub trait SyncChain")
         .ok_or_else(|| std::io::Error::other("SyncChain trait"))?
-        .1;
+        .1
+        .split_once("\n}\n")
+        .ok_or_else(|| std::io::Error::other("SyncChain trait end"))?
+        .0;
     assert!(!trait_body.contains("ArcSwapOption"));
     assert!(!trait_body.contains("&RwLock<BlockTree>"));
+    for signature in ["fn block_tree_mut(", "fn set_tips("] {
+        let position = trait_body
+            .find(signature)
+            .unwrap_or_else(|| panic!("expected fixture method `{signature}`"));
+        assert!(
+            has_attribute_gate(trait_body, position, "#[cfg(test)]"),
+            "`{signature}` escaped its test-only trait gate"
+        );
+    }
     Ok(())
 }
