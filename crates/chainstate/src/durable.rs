@@ -686,6 +686,170 @@ fn rewound_parent(
     Ok(parent_tip)
 }
 
+/// The fail-closed refusal one rewind step reports.
+fn rewind_refused(handles: &Chainstate, head: &DurableHead, reason: &'static str) -> ApplyError {
+    let restored = handles.applied_tip.load_full();
+    ApplyError::DurableHeadGapUnrecoverable {
+        head_tip: head.tip,
+        head_height: head.height,
+        restored_tip: restored.as_ref().map(|tip| tip.hash),
+        restored_height: restored.as_ref().map(|tip| tip.height),
+        reason,
+    }
+}
+
+/// Rolls a restored state that leads the durable head back to that head.
+///
+/// The blocks above the head are the ones a completed disconnect rewound
+/// past: the head batch certified each one's body and undo row in the same
+/// receipt, so every step resolves against durable evidence rather than a
+/// guess. Each step is the rollback half of a disconnect without the head
+/// commit — the stored head already names the tip the walk lands on.
+///
+/// PRE: the applied tip leads `head`, or meets its height with another hash,
+/// and no other applier can observe the chainstate.
+///
+/// POST: the applied tip names `head.tip`, or descends from it below
+/// `head.height` with the UTXO set and coin statistics rewound by exactly
+/// the blocks the walk removed; reconciliation owns the forward step.
+///
+/// INVARIANT: a missing body or undo row, a body that does not hash to the
+/// applied tip, a parent that does not match the block's own previous hash,
+/// or a rewind the set refuses fails closed and retains the marker. A
+/// partial rewind never publishes.
+fn rewind_restored_to_head(handles: &Chainstate, head: &DurableHead) -> Result<(), ApplyError> {
+    let transition = handles.begin_transition()?;
+    rewind_walk(handles, head)?;
+    drop(transition);
+    Ok(())
+}
+
+/// Steps the applied tip down one block at a time until it reaches the
+/// durable head or finds the fork point below it.
+fn rewind_walk(handles: &Chainstate, head: &DurableHead) -> Result<(), ApplyError> {
+    loop {
+        let applied = handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| rewind_refused(handles, head, "the applied tip vanished mid-rewind"))?;
+        // Landed on the head, or stepped below it onto the fork the head
+        // chain descends from: reconciliation replays the rest forward.
+        let landed_on_head = applied.hash == head.tip;
+        let onto_fork = applied.height < head.height;
+        if landed_on_head || onto_fork {
+            return Ok(());
+        }
+        rewind_one_step(handles, head, &applied)?;
+    }
+}
+
+/// Rolls one applied block back against the undo row its head commit
+/// certified, then publishes the parent tip the stored head names.
+fn rewind_one_step(
+    handles: &Chainstate,
+    head: &DurableHead,
+    applied: &TipSnapshot,
+) -> Result<(), ApplyError> {
+    let height = applied.height;
+    let hash = applied.hash;
+    let Some(store) = handles.block_body_store.as_ref() else {
+        return Err(rewind_refused(
+            handles,
+            head,
+            "no block body store is attached",
+        ));
+    };
+    let bytes = store
+        .load_block_body(height, hash)
+        .map_err(ApplyError::BlockBodyPersistence)?
+        .ok_or_else(|| rewind_refused(handles, head, "a rewound block body is missing"))?;
+    let block: Block = bitcoin_rs_primitives::deserialize(&bytes)
+        .map_err(|_| rewind_refused(handles, head, "a rewound block body does not decode"))?;
+    if block.block_hash().0 != hash {
+        return Err(rewind_refused(
+            handles,
+            head,
+            "a rewound block body does not hash to the applied tip",
+        ));
+    }
+    let undo = load_block_undo(handles.undo_store.as_ref(), height, hash).map_err(|_| {
+        rewind_refused(handles, head, "a rewound block's undo record does not load")
+    })?;
+    let tx_count_delta = tx_count_delta_for(&block);
+    let parent_tip = rewound_parent(handles, head, applied, &block, tx_count_delta)?;
+    rollback_block(
+        handles.undo_store.as_ref(),
+        handles.utxo.as_ref(),
+        handles.coin_stats.as_ref(),
+        hash,
+        height,
+        parent_tip.height,
+        tx_count_delta,
+        &undo,
+    )
+    .map_err(|error| match error {
+        RollbackError::Refused(_) => {
+            rewind_refused(handles, head, "the disconnect marker refused the rewind")
+        }
+        RollbackError::Utxo(_) => rewind_refused(
+            handles,
+            head,
+            "the UTXO set refused the rewind to the durable head",
+        ),
+        RollbackError::CoinStats(_) => rewind_refused(
+            handles,
+            head,
+            "the coin statistics refused the rewind to the durable head",
+        ),
+        RollbackError::Marker(_) => rewind_refused(
+            handles,
+            head,
+            "the disconnect marker did not record the rewind",
+        ),
+    })?;
+    publish_applied(handles, &parent_tip, crate::events::HintKind::Disconnected);
+    Ok(())
+}
+
+/// The parent tip one rewind step lands on, resolved against the block tree
+/// and the block's own previous hash.
+fn rewound_parent(
+    handles: &Chainstate,
+    head: &DurableHead,
+    applied: &TipSnapshot,
+    block: &Block,
+    tx_count_delta: u64,
+) -> Result<TipSnapshot, ApplyError> {
+    let tree = handles.block_tree.read();
+    let node = tree.node(applied.tip_id)?;
+    let parent_id = node
+        .parent
+        .ok_or_else(|| rewind_refused(handles, head, "the applied tip has no parent node"))?;
+    let parent = tree.node(parent_id)?;
+    if parent.height + 1 != node.height {
+        return Err(rewind_refused(
+            handles,
+            head,
+            "the parent node's height does not step down from the applied tip",
+        ));
+    }
+    let parent_tip = TipSnapshot {
+        tip_id: parent_id,
+        height: parent.height,
+        chainwork: parent.chainwork,
+        hash: parent.hash,
+        chain_tx_count: applied.chain_tx_count.rewind(tx_count_delta),
+    };
+    if parent_tip.hash != block.header.prev_blockhash.0 {
+        return Err(rewind_refused(
+            handles,
+            head,
+            "the rewound parent does not match the block's own previous hash",
+        ));
+    }
+    Ok(parent_tip)
+}
+
 /// Replays the committed-but-unpublished gap onto the restored chainstate.
 ///
 /// Replays every authenticated durable-head body above `restored`, or the
