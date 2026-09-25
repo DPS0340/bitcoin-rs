@@ -27,6 +27,20 @@ pub enum ApplyError {
     /// Height arithmetic overflowed `u32::MAX`.
     #[error("height overflow at tip {0}")]
     HeightOverflow(u32),
+    /// A transaction carries more outputs than a `u32` vout can index.
+    #[error("output count of transaction {txid} exceeds the vout index range")]
+    VoutOverflow {
+        /// Transaction id whose output count overflowed.
+        txid: bitcoin_rs_primitives::Txid,
+    },
+    /// The prepared block's txid slice does not cover every transaction.
+    #[error("block has {transactions} transactions but {txids} txids were supplied")]
+    TxidCountMismatch {
+        /// Transactions in the block.
+        transactions: usize,
+        /// Txids supplied for them.
+        txids: usize,
+    },
     /// Summing a block's input or output values left the satoshi range.
     #[error("block value total overflows the satoshi range")]
     BlockValueOverflow,

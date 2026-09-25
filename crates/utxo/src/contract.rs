@@ -124,13 +124,26 @@ impl<T> BlockChanges<T> {
 }
 
 /// Inverse mutations needed to disconnect one block.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// No public constructor: batches come from [`build_block_changes`] or the
+/// undo decoder ([`load_block_undo`]), so a rollback can never be asked to
+/// replay a batch the contract did not produce.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndoBatch {
     pub(crate) restores: Vec<UtxoAdd>,
     pub(crate) removes: Vec<OutPoint>,
 }
 
 impl UndoBatch {
+    /// A batch with no inverse mutations, for the genesis skip and codec tests.
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            restores: Vec::new(),
+            removes: Vec::new(),
+        }
+    }
+
     /// Outputs this batch restores, i.e. those the disconnected block spent.
     #[must_use]
     pub fn restores(&self) -> &[UtxoAdd] {
@@ -280,6 +293,20 @@ pub enum BlockChangeError {
     /// Height or vout arithmetic overflowed `u32::MAX`.
     #[error("height overflow at tip {0}")]
     HeightOverflow(u32),
+    /// A transaction carries more outputs than a `u32` vout can index.
+    #[error("output count of transaction {txid} exceeds the vout index range")]
+    VoutOverflow {
+        /// Transaction id whose output count overflowed.
+        txid: Txid,
+    },
+    /// The supplied txid slice does not cover every transaction in the block.
+    #[error("block has {transactions} transactions but {txids} txids were supplied")]
+    TxidCountMismatch {
+        /// Transactions in the block.
+        transactions: usize,
+        /// Txids supplied for them.
+        txids: usize,
+    },
     /// A spent output had no resolved prevout, so the undo record would be
     /// unable to restore it.
     #[error("undo record cannot restore spent output {txid}:{vout}")]
@@ -361,14 +388,23 @@ pub fn build_block_changes<'a>(
     if height == 0 {
         return Ok((
             BlockChanges::default(),
-            UndoBatch::default(),
+            UndoBatch::empty(),
             BlockValueTotals::default(),
         ));
+    }
+    // Zipping would silently drop whichever sequence is longer, leaving
+    // trailing transactions out of the changes, undo, and value totals while
+    // reporting success - the window overlay refuses the same mismatch.
+    if block.txs.len() != txids.len() {
+        return Err(BlockChangeError::TxidCountMismatch {
+            transactions: block.txs.len(),
+            txids: txids.len(),
+        });
     }
 
     let net_same_block_spends = same_block_spent.is_some_and(|s| !s.is_empty());
     let mut changes = BlockChanges::with_capacity(add_capacity, remove_capacity);
-    let mut undo = UndoBatch::default();
+    let mut undo = UndoBatch::empty();
     let mut totals = BlockValueTotals::default();
     for (tx, txid) in block.txs.iter().zip(txids) {
         let txid = *txid;
@@ -379,7 +415,7 @@ pub fn build_block_changes<'a>(
             // still paid for it, so it counts against the fee.
             let value = txout.value.to_sat();
             let vout =
-                u32::try_from(vout_idx).map_err(|_| BlockChangeError::HeightOverflow(height))?;
+                u32::try_from(vout_idx).map_err(|_| BlockChangeError::VoutOverflow { txid })?;
             let outpoint = OutPoint::new(txid, vout);
             let same_block =
                 net_same_block_spends && same_block_spent.is_some_and(|s| s.contains(&outpoint));
@@ -599,7 +635,7 @@ mod tests {
         changes.add(UtxoAdd::new(CREATED, coin(850), false, HEIGHT));
         utxo.commit_block(&changes, &HASH)?;
         coin_stats.finish_block(HEIGHT, 2);
-        let mut undo = UndoBatch::default();
+        let mut undo = UndoBatch::empty();
         undo.restore(UtxoAdd::new(FUNDED, coin(900), false, 1));
         undo.remove(CREATED);
         Ok((utxo, coin_stats, before, undo))
@@ -654,7 +690,7 @@ mod tests {
         );
 
         let other = Hash256::from_le_bytes(&[0xab; 32]);
-        let record = persist_block_undo(&store, HEIGHT, other, &UndoBatch::default())?;
+        let record = persist_block_undo(&store, HEIGHT, other, &UndoBatch::empty())?;
         store.persist_undo(HEIGHT, HASH, record.as_bytes())?;
         let outcome = load_block_undo(&store, HEIGHT, HASH);
         assert!(
@@ -809,7 +845,7 @@ mod tests {
 
         for height in 1_u32..=10 {
             let mut changes = BlockChanges::default();
-            let mut undo = UndoBatch::default();
+            let mut undo = UndoBatch::empty();
 
             let remove_count = live.len().min(50);
             for _ in 0..remove_count {
@@ -906,7 +942,7 @@ mod tests {
             false,
             2,
         ));
-        let mut undo = UndoBatch::default();
+        let mut undo = UndoBatch::empty();
         undo.restore(UtxoAdd::new(
             coinbase_outpoint,
             coinbase_txout.clone(),
@@ -934,5 +970,57 @@ mod tests {
             first_only_listener.snapshot().muhash.finalize()
         );
         Ok(())
+    }
+
+    /// A `txids` slice shorter than the block would let `zip` silently drop
+    /// trailing transactions from the changes, undo, and value totals while
+    /// reporting success. The build refuses the mismatch before iterating.
+    #[test]
+    fn short_txid_list_is_refused_before_iterating() {
+        use bitcoin_rs_primitives::{
+            Block, CompactTarget, Header, LockTime, Sequence, Tx, TxIn, Witness,
+        };
+
+        struct NoSpend;
+        impl SpentOutputLookup for NoSpend {
+            fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
+                None
+            }
+        }
+
+        let make_tx = |seed: u8| Tx {
+            version: 1,
+            lock_time: LockTime::ZERO,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[seed; 32])), u32::MAX),
+                script_sig: vec![0x00].into(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            outputs: vec![coin(500)],
+        };
+        let block = Block {
+            header: Header {
+                version: 1,
+                prev_blockhash: bitcoin_rs_primitives::BlockHash(Hash256::default()),
+                merkle_root: Hash256::default(),
+                time: 0,
+                bits: CompactTarget::from_consensus(0x2100_ffff),
+                nonce: 0,
+            },
+            txs: vec![make_tx(1), make_tx(2)],
+        };
+        let txids = vec![Txid(Hash256::from_le_bytes(&[0x77; 32]))];
+        let outcome = build_block_changes(&block, HEIGHT, &txids, None, 4, 4, &NoSpend, None, 64);
+        assert!(
+            matches!(
+                outcome,
+                Err(BlockChangeError::TxidCountMismatch {
+                    transactions: 2,
+                    txids: 1
+                })
+            ),
+            "a short txid list must be refused before iterating"
+        );
     }
 }

@@ -1736,7 +1736,7 @@ impl<'b> BlockLocalUtxoView<'b> {
         output_count: usize,
     ) -> core::result::Result<(), ApplyError> {
         for vout in 0..output_count {
-            let vout = u32::try_from(vout).map_err(|_| ApplyError::HeightOverflow(self.height))?;
+            let vout = u32::try_from(vout).map_err(|_| ApplyError::VoutOverflow { txid })?;
             self.overlay
                 .insert(OutPoint::new(txid, vout), Some(derived_index));
         }

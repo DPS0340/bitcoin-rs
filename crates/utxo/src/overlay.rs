@@ -178,7 +178,7 @@ mod tests {
     fn create_spend_and_recreate_shadow_the_committed_set() -> TestResult {
         let utxo = UtxoSet::new();
         let funded = OutPoint::new(Txid(Hash256::from_le_bytes(&[0x31; 32])), 0);
-        let mut seed = UndoBatch::default();
+        let mut seed = UndoBatch::empty();
         seed.restore(UtxoAdd::new(
             funded,
             paying(vec![0x51], 900).outputs.remove(0),

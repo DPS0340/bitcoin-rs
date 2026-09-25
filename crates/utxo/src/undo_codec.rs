@@ -316,7 +316,7 @@ mod tests {
     }
 
     fn sample() -> UndoBatch {
-        let mut batch = UndoBatch::default();
+        let mut batch = UndoBatch::empty();
         batch.restore(UtxoAdd::new(
             OutPoint::new(hash(1).into(), 0),
             txout(50_000),
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn an_empty_batch_round_trips() -> Result<(), UndoCodecError> {
-        let decoded = decode(&encode(&UndoBatch::default(), hash(4)), hash(4))?;
+        let decoded = decode(&encode(&UndoBatch::empty(), hash(4)), hash(4))?;
         assert!(decoded.restores().is_empty() && decoded.removes().is_empty());
         Ok(())
     }
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn an_impossible_entry_count_is_refused_without_looping() {
-        let mut bytes = encode(&UndoBatch::default(), hash(1));
+        let mut bytes = encode(&UndoBatch::empty(), hash(1));
         // Overwrite the restore count with a value no record could hold.
         let count = RESTORE_COUNT_OFFSET..RESTORE_COUNT_OFFSET + COUNT_BYTES;
         bytes[count].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn a_non_canonical_coinbase_flag_is_refused() {
-        let mut batch = UndoBatch::default();
+        let mut batch = UndoBatch::empty();
         batch.restore(UtxoAdd::new(
             OutPoint::new(hash(1).into(), 0),
             txout(10),
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn a_repeated_outpoint_is_refused() {
-        let mut batch = UndoBatch::default();
+        let mut batch = UndoBatch::empty();
         batch.remove(OutPoint::new(hash(5).into(), 0));
         batch.remove(OutPoint::new(hash(5).into(), 0));
         assert!(matches!(
@@ -454,7 +454,7 @@ mod cross_half_tests {
     #[test]
     fn an_outpoint_in_both_halves_is_refused() {
         let shared = OutPoint::new(hash(6).into(), 3);
-        let mut batch = UndoBatch::default();
+        let mut batch = UndoBatch::empty();
         batch.restore(UtxoAdd::new(shared, txout(10), false, 4));
         batch.remove(shared);
         assert!(matches!(

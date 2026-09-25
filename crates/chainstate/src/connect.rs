@@ -863,6 +863,14 @@ pub(super) fn map_block_change_error(error: &BlockChangeError) -> ApplyError {
     match error {
         BlockChangeError::BlockValueOverflow => ApplyError::BlockValueOverflow,
         BlockChangeError::HeightOverflow(height) => ApplyError::HeightOverflow(*height),
+        BlockChangeError::VoutOverflow { txid } => ApplyError::VoutOverflow { txid: *txid },
+        BlockChangeError::TxidCountMismatch {
+            transactions,
+            txids,
+        } => ApplyError::TxidCountMismatch {
+            transactions: *transactions,
+            txids: *txids,
+        },
         BlockChangeError::UndoPrevoutMissing { txid, vout } => ApplyError::UndoPrevoutMissing {
             txid: *txid,
             vout: *vout,
