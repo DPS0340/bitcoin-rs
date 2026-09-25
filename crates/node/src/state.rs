@@ -44,6 +44,8 @@ use storage::StoredBlockBodySource;
 mod index;
 #[path = "state_open.rs"]
 mod open;
+#[path = "state_index.rs"]
+mod index;
 #[path = "state_prune.rs"]
 mod prune;
 #[path = "state_storage.rs"]
