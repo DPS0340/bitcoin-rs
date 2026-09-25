@@ -62,6 +62,12 @@ pub enum ChainError {
         /// Duplicate header hash.
         hash: Hash256,
     },
+    /// A previously admitted header is known to be invalid.
+    #[error("header {hash} is known invalid")]
+    KnownInvalidHeader {
+        /// Hash of the invalid header.
+        hash: Hash256,
+    },
     /// A non-root header refers to a parent hash not present in the tree.
     #[error("missing parent header {prev_hash}")]
     MissingParent {
