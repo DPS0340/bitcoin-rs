@@ -126,8 +126,6 @@ enum UtxoChangeEvent<'a> {
 pub(crate) struct UtxoChangeEvents<'a> {
     events: Vec<UtxoChangeEvent<'a>>,
     operation_count: usize,
-    insert_capacity: usize,
-    remove_capacity: usize,
 }
 
 /// Read-only view over one committed UTXO event.
@@ -148,8 +146,6 @@ impl<'a> UtxoChangeEvents<'a> {
         Self {
             events: Vec::with_capacity(usize::from(insertions > 0) + usize::from(removals > 0)),
             operation_count: 0,
-            insert_capacity: insertions,
-            remove_capacity: removals,
         }
     }
 
@@ -163,8 +159,6 @@ impl<'a> UtxoChangeEvents<'a> {
         if let Some(UtxoChangeEvent::InsertBatch(existing)) = self.events.last_mut() {
             existing.extend(insertions);
         } else {
-            let mut insertions = insertions;
-            reserve_smallvec(&mut insertions, self.insert_capacity);
             self.events.push(UtxoChangeEvent::InsertBatch(insertions));
         }
     }
@@ -176,7 +170,6 @@ impl<'a> UtxoChangeEvents<'a> {
             existing.push(insertion);
         } else {
             let mut insertions = SmallVec::<[UtxoInserted<'a>; 8]>::new();
-            reserve_smallvec(&mut insertions, self.insert_capacity);
             insertions.push(insertion);
             self.events.push(UtxoChangeEvent::InsertBatch(insertions));
         }
@@ -192,8 +185,6 @@ impl<'a> UtxoChangeEvents<'a> {
         if let Some(UtxoChangeEvent::RemoveBatch(existing)) = self.events.last_mut() {
             existing.extend(removals);
         } else {
-            let mut removals = removals;
-            reserve_smallvec(&mut removals, self.remove_capacity);
             self.events.push(UtxoChangeEvent::RemoveBatch(removals));
         }
     }
@@ -252,14 +243,5 @@ impl<'a> UtxoChangeEvents<'a> {
                 }
             }
         }
-    }
-}
-
-fn reserve_smallvec<A>(items: &mut SmallVec<A>, capacity: usize)
-where
-    A: smallvec::Array,
-{
-    if capacity > items.capacity() {
-        items.reserve_exact(capacity - items.len());
     }
 }

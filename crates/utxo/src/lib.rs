@@ -48,4 +48,3 @@ pub use snapshot::{
     read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot,
     write_snapshot_observed,
 };
-pub use stats::CoinStatsListener;
