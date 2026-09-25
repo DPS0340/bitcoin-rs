@@ -509,9 +509,6 @@ pub struct BlockedContext {
     pub frontier_hash: Option<Hash256>,
     /// Whether the stager holds the next-expected body (apply lag).
     pub apply_side_busy: bool,
-    /// Distinct exact connections owning validated in-flight blocks this
-    /// tick, from [`DownloadWindow::active_downloading_peers`].
-    pub active_downloading_peers: usize,
 }
 
 /// Why the unified blockage observation convicted an owner.
@@ -1075,7 +1072,7 @@ impl DownloadWindow {
                 };
             }
         }
-        if let Some(owner) = self.advance_pending_timeout(now, ctx.active_downloading_peers) {
+        if let Some(owner) = self.advance_pending_timeout(now, self.active_downloading_peers()) {
             return BlockedDecision::Blame {
                 owner,
                 reason: BlameReason::PendingTimeout,
@@ -2305,6 +2302,13 @@ impl DownloadWindow {
     #[cfg(test)]
     pub(crate) fn request_cursor(&self) -> u32 {
         self.next_request_height
+    }
+
+    /// The owner's live queue start, for in-crate tests that pin queue-age
+    /// bookkeeping across sync seams.
+    #[cfg(test)]
+    pub(crate) fn owner_queue_start_for_test(&self, owner: PeerSource) -> Option<Instant> {
+        self.owner_downloading_since.get(&owner).copied()
     }
 
     /// The source-attributed share of a staged delivery: pending-timeout,
@@ -4495,7 +4499,6 @@ mod tests {
             next_apply_height: Some(1),
             frontier_hash: None,
             apply_side_busy: false,
-            active_downloading_peers: window.active_downloading_peers(),
         };
         // First tick: the episode and the cold-front timer both start.
         assert_eq!(
