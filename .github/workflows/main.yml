@@ -261,6 +261,12 @@ jobs:
       - uses: ./.github/actions/native-deps
         if: matrix.lane == 'native'
       - run: scripts/check-feature-matrix.sh ${{ matrix.lane }}
+      # The matrix rows only compile; the trace lane's acceptance gate is that
+      # a `usdt` build with `default-features = false` still embeds
+      # `.note.stapsdt` notes, which only this test asserts (it parses the
+      # built artifact's notes against `probe_abi::PROBES`).
+      - run: cargo test --locked -p bitcoin-rs-trace --features usdt --test sdt_notes
+        if: matrix.lane == 'pure'
 
   # Compile-only MSRV gate: the policy promise is that workspace crates build
   # on the declared MSRV. A second compile graph, so it runs on `main` only;
