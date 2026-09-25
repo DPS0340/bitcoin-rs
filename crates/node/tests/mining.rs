@@ -883,11 +883,18 @@ fn submit_header_admits_a_mined_child_and_is_idempotent() -> anyhow::Result<()> 
 }
 
 #[test]
-fn submit_header_accepts_duplicate_genesis_without_a_parent() -> anyhow::Result<()> {
+fn submit_header_accepts_genesis_before_and_after_bootstrap() -> anyhow::Result<()> {
     let state = open_regtest()?;
-    apply_genesis(&state)?;
     let mining = coordinator(&state);
     let genesis = Network::Regtest.genesis_block();
+    mining.submit_header(genesis.header)?;
+    assert_eq!(
+        state.chainstate().header_tip().map(|tip| tip.hash),
+        Some(genesis.block_hash().into())
+    );
+    assert!(state.chainstate().applied_tip_snapshot().is_none());
+
+    apply_genesis(&state)?;
     let before = state.chainstate().snapshot();
 
     mining.submit_header(genesis.header)?;

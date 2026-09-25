@@ -265,7 +265,8 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 - Decode failures (invalid hex, fewer than 80 bytes) are Core `-22`
   (`Block header decode failed`). Extra bytes after an 80-byte header are
   ignored, matching Core `DecodeHexBlockHeader`.
-- For an unknown header, the previous header must already be in the block tree.
+- For an unknown header, the previous header must already be in the block tree,
+  except that an empty tree admits the network's genesis header as its root.
   Otherwise the RPC returns `-25` (`Must submit previous header (HASH) first`)
   before proof-of-work validation, including when the target is invalid.
 - Admission uses `accept_headers`, the same consensus gate as inbound P2P
@@ -594,6 +595,7 @@ owned by [wallet-facing.md](wallet-facing.md).
     `submitheader_returns_null_and_forwards_decoded_header`,
     `submitheader_maps_rejected_to_verify_error`
   - `crates/node/tests/mining.rs` tests `submit_header_admits_a_mined_child_and_is_idempotent`,
+    `submit_header_accepts_genesis_before_and_after_bootstrap`,
     `submit_header_requires_the_previous_header`,
     `submit_header_rejects_bad_diffbits`,
     `submit_header_rejects_time_too_new`

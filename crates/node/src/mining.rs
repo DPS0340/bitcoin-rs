@@ -401,10 +401,14 @@ impl MiningControl for MiningCoordinator {
     /// Admits `header` through the same Chainstate boundary inbound P2P uses.
     fn submit_header(&self, header: Header) -> Result<(), MiningControlError> {
         // API-13 reports a missing parent before proof-of-work failures.
-        // Known headers (including genesis) still reach idempotent admission.
+        // Known headers stay idempotent; an empty tree also admits network genesis.
         {
             let tree = self.chainstate.read_block_tree();
-            if tree.lookup(header.compute_hash().into()).is_none()
+            let hash = header.compute_hash().into();
+            let is_genesis_root =
+                tree.is_empty() && hash == self.chainstate.network().genesis_block_hash();
+            if !is_genesis_root
+                && tree.lookup(hash).is_none()
                 && tree.lookup(header.prev_blockhash.into()).is_none()
             {
                 return Err(header_reject_reason(ChainError::MissingParent {
