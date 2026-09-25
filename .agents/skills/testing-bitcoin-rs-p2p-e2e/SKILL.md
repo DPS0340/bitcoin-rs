@@ -1,6 +1,6 @@
 ---
 name: testing-bitcoin-rs-p2p-e2e
-description: How to run real end-to-end P2P sync tests for bitcoin-rs on macOS without the pinned x86_64 bitcoind — spawn the daemon via the bin/bitcoin-rs test harness and drive it with a loopback wire-protocol fake peer.
+description: How to run real end-to-end P2P sync tests for bitcoin-rs without the pinned x86_64 bitcoind (macOS or Linux) — spawn the daemon via the bin/bitcoin-rs test harness and drive it with a loopback wire-protocol fake peer, in either connection direction.
 ---
 
 # Testing bitcoin-rs P2P sync end-to-end
