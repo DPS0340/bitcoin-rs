@@ -8,7 +8,7 @@
 //!
 //! Hot-path semantics mirror Bitcoin Core's `src/util/trace.h`: each emission
 //! site passes a `prepare` closure that *materialises* the probe arguments,
-//! and the closure is only invoked when a consumer (bpftrace, BCC, DTrace,
+//! and the closure is only invoked when a consumer (bpftrace, BCC, `DTrace`,
 //! …) has raised the probe's semaphore. With the feature on and nothing
 //! attached the cost is one volatile semaphore load per probe site; with the
 //! feature off every call is an empty function body and the closure literal

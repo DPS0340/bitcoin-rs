@@ -609,22 +609,22 @@ impl Mempool {
         self.limits.min_relay_fee_sat_per_kvb
     }
 
-/// Bitcoin Core `RemovalReasonToString` mapping for `mempool:removed`.
-///
-/// Core publishes exactly `expiry`, `sizelimit`, `reorg`, `block`,
-/// `conflict`, `replaced`; this pool adds a descendant-of-replacement class
-/// (emitted as `replaced`) and an explicit pool clear (`unknown`).
-const fn core_removal_reason(reason: RemovalReason) -> &'static str {
-    match reason {
-        RemovalReason::BlockInclusion => "block",
-        RemovalReason::Conflict => "conflict",
-        RemovalReason::Replaced | RemovalReason::Descendant => "replaced",
-        RemovalReason::PolicyEviction => "sizelimit",
-        RemovalReason::Expiry => "expiry",
-        RemovalReason::Reorg => "reorg",
-        RemovalReason::Clear => "unknown",
+    /// Bitcoin Core `RemovalReasonToString` mapping for `mempool:removed`.
+    ///
+    /// Core publishes exactly `expiry`, `sizelimit`, `reorg`, `block`,
+    /// `conflict`, `replaced`; this pool adds a descendant-of-replacement class
+    /// (emitted as `replaced`) and an explicit pool clear (`unknown`).
+    const fn core_removal_reason(reason: RemovalReason) -> &'static str {
+        match reason {
+            RemovalReason::BlockInclusion => "block",
+            RemovalReason::Conflict => "conflict",
+            RemovalReason::Replaced | RemovalReason::Descendant => "replaced",
+            RemovalReason::PolicyEviction => "sizelimit",
+            RemovalReason::Expiry => "expiry",
+            RemovalReason::Reorg => "reorg",
+            RemovalReason::Clear => "unknown",
+        }
     }
-}
 
     /// Records one committed change and assigns it the next mempool sequence
     /// value. Callers hold the write lock for the whole mutation, so

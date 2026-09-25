@@ -1053,6 +1053,7 @@ fn run_connected_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn run_message_loop<S: std::io::Read + std::io::Write>(
     peer: &mut Peer<S>,
     peer_addr: SocketAddr,
@@ -1096,7 +1097,11 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             Ok((message, raw)) => {
                 last_inbound = Instant::now();
                 crate::net_trace::inbound_message(
-                    crate::net_trace::TracePeer::new(lease.node_id(), peer_addr, lease.is_inbound()),
+                    crate::net_trace::TracePeer::new(
+                        lease.node_id(),
+                        peer_addr,
+                        lease.is_inbound(),
+                    ),
                     &message,
                     &raw,
                 );

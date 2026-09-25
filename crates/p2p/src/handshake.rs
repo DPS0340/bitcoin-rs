@@ -206,7 +206,11 @@ pub(crate) fn read_handshake_message<S: Read>(
                 let wire_len =
                     u64::try_from(raw.len() + crate::wire::HEADER_LEN).unwrap_or(u64::MAX);
                 crate::net_trace::inbound_message(
-                    crate::net_trace::TracePeer::new(lease.node_id(), peer_addr, lease.is_inbound()),
+                    crate::net_trace::TracePeer::new(
+                        lease.node_id(),
+                        peer_addr,
+                        lease.is_inbound(),
+                    ),
                     &message,
                     &raw,
                 );

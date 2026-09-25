@@ -42,7 +42,7 @@ pub struct ArgSpec {
     pub prepare_type: &'static str,
     /// Type published in Bitcoin Core `doc/tracing.md`.
     pub core_doc: &'static str,
-    /// Expected `size@` prefix of the SystemTap argument layout string.
+    /// Expected `size@` prefix of the `SystemTap` argument layout string.
     ///
     /// The leading `-` marks a signed argument. Pointers and strings are
     /// pointer-sized unsigned (`8@` on a 64-bit target).

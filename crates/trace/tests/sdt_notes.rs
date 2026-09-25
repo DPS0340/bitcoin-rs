@@ -1,4 +1,4 @@
-//! Asserts the built artifact's SystemTap SDT notes match the documented
+//! Asserts the built artifact's `SystemTap` SDT notes match the documented
 //! Bitcoin Core probe ABI.
 //!
 //! This is the host-portable half of the acceptance evidence: it parses the
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use bitcoin_rs_trace::probe_abi;
 
-/// One parsed SystemTap SDT note.
+/// One parsed `SystemTap` SDT note.
 struct SdtNote {
     provider: String,
     name: String,
@@ -35,19 +35,25 @@ fn parse_sdt_notes(bytes: &[u8]) -> Option<(u16, Vec<SdtNote>)> {
         return None;
     }
     let read_u16 = |offset: usize| -> Option<u16> {
-        Some(u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?))
+        Some(u16::from_le_bytes(
+            bytes.get(offset..offset + 2)?.try_into().ok()?,
+        ))
     };
     let read_u32 = |offset: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset + 4)?.try_into().ok()?,
+        ))
     };
     let read_u64 = |offset: usize| -> Option<u64> {
-        Some(u64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?))
+        Some(u64::from_le_bytes(
+            bytes.get(offset..offset + 8)?.try_into().ok()?,
+        ))
     };
 
     let machine = read_u16(18)?;
-    let section_header_offset = read_u64(40)? as usize;
-    let section_header_size = read_u16(58)? as usize;
-    let section_count = read_u16(60)? as usize;
+    let section_header_offset = usize::try_from(read_u64(40)?).ok()?;
+    let section_header_size = usize::from(read_u16(58)?);
+    let section_count = usize::from(read_u16(60)?);
     let mut notes = Vec::new();
     for index in 0..section_count {
         let header = section_header_offset + index * section_header_size;
@@ -55,13 +61,13 @@ fn parse_sdt_notes(bytes: &[u8]) -> Option<(u16, Vec<SdtNote>)> {
         if section_type != 7 {
             continue;
         }
-        let section_offset = read_u64(header + 24)? as usize;
-        let section_size = read_u64(header + 32)? as usize;
+        let section_offset = usize::try_from(read_u64(header + 24)?).ok()?;
+        let section_size = usize::try_from(read_u64(header + 32)?).ok()?;
         let section = bytes.get(section_offset..section_offset.checked_add(section_size)?)?;
         let mut cursor = 0usize;
         while cursor + 12 <= section.len() {
-            let name_size = read_le_u32(section, cursor)? as usize;
-            let desc_size = read_le_u32(section, cursor + 4)? as usize;
+            let name_size = usize::try_from(read_le_u32(section, cursor)?).ok()?;
+            let desc_size = usize::try_from(read_le_u32(section, cursor + 4)?).ok()?;
             let note_type = read_le_u32(section, cursor + 8)?;
             cursor += 12;
             let name_end = cursor.checked_add(name_size)?;
@@ -92,11 +98,15 @@ fn parse_sdt_notes(bytes: &[u8]) -> Option<(u16, Vec<SdtNote>)> {
 }
 
 fn read_le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
 }
 
 fn read_le_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset + 8)?.try_into().ok()?,
+    ))
 }
 
 const fn align4(offset: usize) -> usize {
@@ -122,7 +132,7 @@ fn width_index(d_type: &str) -> usize {
     }
 }
 
-/// Returns the expected full SystemTap layout string for `spec` on `machine`.
+/// Returns the expected full `SystemTap` layout string for `spec` on `machine`.
 ///
 /// The operand half is architecture- and register-allocation specific: this
 /// crate's generator always passes arguments in the platform ABI registers,
@@ -155,17 +165,14 @@ fn layout_prefixes_of(layout: &str) -> Vec<&str> {
 /// Portable ABI-table assertions: the spec table itself must match Core's
 /// published argument layout for every probe this slice implements.
 #[test]
-fn probe_table_matches_core_argument_layout() -> Result<(), Box<dyn std::error::Error>> {
+fn probe_table_matches_core_argument_layout() {
     let expected: &[(&str, &[&str])] = &[
         (
             "validation:block_connected",
             &["8@", "-4@", "8@", "-4@", "-8@", "-8@"],
         ),
         ("mempool:added", &["8@", "-4@", "-8@"]),
-        (
-            "mempool:removed",
-            &["8@", "8@", "-4@", "-8@", "8@"],
-        ),
+        ("mempool:removed", &["8@", "8@", "-4@", "-8@", "8@"]),
         (
             "net:inbound_message",
             &["-8@", "8@", "8@", "8@", "8@", "8@"],
@@ -181,7 +188,6 @@ fn probe_table_matches_core_argument_layout() -> Result<(), Box<dyn std::error::
         assert_eq!(&full_name, name);
         assert_eq!(&probe_abi::layout_prefixes(spec), prefixes);
     }
-    Ok(())
 }
 
 /// Asserts the artifact's embedded SDT notes carry Core's provider, probe
@@ -206,9 +212,7 @@ fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Erro
         let note = notes
             .iter()
             .find(|note| note.provider == spec.provider && note.name == spec.name)
-            .ok_or_else(|| {
-                format!("missing SDT note {}:{}", spec.provider, spec.name)
-            })?;
+            .ok_or_else(|| format!("missing SDT note {}:{}", spec.provider, spec.name))?;
         if let Some(expected) = expected_layout(spec, machine) {
             // Full-string check: both the size/sign prefix and the operand
             // form (register-direct like Core's `8@%reg`, never the

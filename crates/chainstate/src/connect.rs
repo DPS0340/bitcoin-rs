@@ -28,6 +28,7 @@ use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::node::NodeId;
 use bitcoin_rs_consensus::MAX_SCRIPT_SIZE;
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
+use bitcoin_rs_consensus::rust_path::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Txid;
@@ -35,7 +36,6 @@ use bitcoin_rs_primitives::consensus_bytes;
 use bitcoin_rs_storage::CommitRecords;
 use bitcoin_rs_utxo::connect::BlockChangeError;
 use bitcoin_rs_utxo::connect::build_block_changes;
-use bitcoin_rs_consensus::rust_path::UtxoView;
 use bitcoin_rs_utxo::is_coinbase_tx;
 use hashbrown::HashMap;
 use std::sync::Arc;
@@ -661,12 +661,9 @@ fn emit_block_connected(
                     prevouts.push((input.previous_output, output));
                 }
             }
-            sigops = sigops
-                .saturating_add(u64::from(bitcoin_rs_consensus::transaction_sigop_cost(
-                    tx,
-                    &prevouts,
-                    flags,
-                )));
+            sigops = sigops.saturating_add(u64::from(
+                bitcoin_rs_consensus::transaction_sigop_cost(tx, &prevouts, flags),
+            ));
             if let Some(txid) = txids.get(index) {
                 let _ = view.add_outputs(
                     u32::try_from(index).unwrap_or(u32::MAX),
