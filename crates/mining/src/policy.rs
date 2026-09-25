@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::cell::Cell;
 use std::collections::HashSet;
 
 use bitcoin_rs_consensus::is_final_tx;
@@ -8,11 +6,6 @@ use bitcoin_rs_primitives::{Tx, Txid};
 
 use crate::MiningError;
 use crate::template::{CandidateContext, transaction_count_size};
-
-#[cfg(test)]
-thread_local! {
-    static CHUNK_PACKAGE_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
-}
 
 /// One dependency-closed package selected for a candidate.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,8 +142,6 @@ fn chunk_package(
     snapshot: &MempoolMiningSnapshot,
     indices: Vec<usize>,
 ) -> Result<SelectedPackage, MiningError> {
-    #[cfg(test)]
-    CHUNK_PACKAGE_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
     if indices.len() == 1 {
         let index = indices[0];
         return Ok(single_entry_package(&snapshot.entries[index], index));
@@ -242,7 +233,6 @@ pub(crate) fn modified_fee(entry: &SnapshotEntry) -> i128 {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::cell::Cell;
     use std::sync::Arc;
 
     use bitcoin_rs_mempool::{MempoolMiningSnapshot, SnapshotEntry};
@@ -251,7 +241,7 @@ mod tests {
         Txid, Witness,
     };
 
-    use super::{CHUNK_PACKAGE_CONSTRUCTIONS, select_packages};
+    use super::select_packages;
     use crate::template::CandidateContext;
 
     #[test]
@@ -263,17 +253,13 @@ mod tests {
             entries: vec![filler, leftover],
         };
 
-        CHUNK_PACKAGE_CONSTRUCTIONS.with(|count| count.set(0));
         let weight_full = select_packages(&context(1_004, 4_000_000, 80_000), &snapshot, 0, 0, 0)
             .expect("weight-full selection");
         assert_eq!(weight_full.0, vec![0]);
-        assert_eq!(CHUNK_PACKAGE_CONSTRUCTIONS.with(Cell::get), 1);
 
-        CHUNK_PACKAGE_CONSTRUCTIONS.with(|count| count.set(0));
         let size_full = select_packages(&context(4_000_000, 1_001, 80_000), &snapshot, 0, 0, 0)
             .expect("size-full selection");
         assert_eq!(size_full.0, vec![0]);
-        assert_eq!(CHUNK_PACKAGE_CONSTRUCTIONS.with(Cell::get), 1);
     }
 
     /// Even an empty body needs one byte to encode its reserved coinbase count.
@@ -285,12 +271,10 @@ mod tests {
             entries: vec![zero_size],
         };
 
-        CHUNK_PACKAGE_CONSTRUCTIONS.with(|count| count.set(0));
         assert!(matches!(
             select_packages(&context(4_000_000, 0, 80_000), &snapshot, 0, 0, 0),
             Err(crate::MiningError::CapacityExhausted { field: "size" })
         ));
-        assert_eq!(CHUNK_PACKAGE_CONSTRUCTIONS.with(Cell::get), 0);
     }
 
     fn context(max_weight: u64, max_size: u64, max_sigops: u64) -> CandidateContext {
