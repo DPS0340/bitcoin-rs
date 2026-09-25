@@ -259,7 +259,8 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
   disconnect marker plus the coinstats rewind. The raw inverse
   (`UtxoSet::undo_block`) is crate-private: every external disconnect goes
   through `rollback_block`.
-- **Read**: `UtxoSet` lookups return the one `UtxoCoin` shape; whole-set
+- **Read**: `UtxoSet::get` returns the `TxOut` payload while `get_entry`
+  returns the one `UtxoCoin` shape; whole-set
   reads run under `with_stable_view` (`UtxoSetView`), which also serves the
   `hash_serialized_3` commitment, script scans, and memory accounting.
   Windowed apply reads through `WindowOverlay` over the same `OutputSource`.
@@ -273,7 +274,8 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
   only owner of mutation ordering and durability policy (`ARCH-07`).
 - The contract surface is `bitcoin_rs_utxo::contract`; the crate root keeps
   only read, snapshot, and statistics names. RPC and index are read consumers
-  of the same contract types (`UtxoCoin`, `UtxoScan`, `UndoBatch`); they do
+  of the root read types (`UtxoCoin`, `UtxoScan`) and of the contract's
+  decoded `UndoBatch`; they do
   not assemble mutations outside tests, which build fixture sets through
   `BlockChanges` + `commit_block`.
 

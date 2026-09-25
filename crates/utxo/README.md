@@ -9,9 +9,10 @@ need, `commit_block` applies that `BlockChanges`, and `persist_block_undo` /
 `load_block_undo` / `rollback_block` carry a block's undo through
 persistence and disconnect under the durable marker. Everything contract-
 owned is named from `bitcoin_rs_utxo::contract`; the crate root keeps only
-the read, snapshot, and statistics names. Lookups return the one
-`UtxoCoin` shape (`get`, `get_entry`) and `has_live_outputs_for_txid`
-supplies the transaction-level BIP30 duplicate-spend predicate.
+the read, snapshot, and statistics names. `get` returns the `TxOut` payload
+while `get_entry` returns the one `UtxoCoin` shape, and
+`has_live_outputs_for_txid` supplies the transaction-level BIP30
+duplicate-spend predicate.
 `with_stable_view` blocks commits while a `UtxoSetView` reads the whole set,
 computes the Core `hash_serialized_3` commitment, and scans for exact
 scriptPubKey matches; `track_coin_stats` attaches the single
