@@ -1047,7 +1047,7 @@ mod tests {
                 },
             ));
         }
-        utxo.commit_block(&changes, &Hash256::default())
+        crate::contract::commit_block_changes(&utxo, &changes, &Hash256::default())
             .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
 
         let rolling = listener.snapshot();

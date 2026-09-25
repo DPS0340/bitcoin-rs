@@ -114,11 +114,12 @@ fn fund_utxo_script(
         false,
         100,
     ));
-    state
-        .chainstate()
-        .utxo_handle()
-        .commit_block(&changes, &Hash256::from_le_bytes(&[0xBB; 32]))
-        .map_err(|error| anyhow!("utxo commit failed: {error}"))
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &state.chainstate().utxo_handle(),
+        &changes,
+        &Hash256::from_le_bytes(&[0xBB; 32]),
+    )
+    .map_err(|error| anyhow!("utxo commit failed: {error}"))
 }
 
 /// One-input spend of the funded output; `output_value` sets the fee

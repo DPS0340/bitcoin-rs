@@ -69,7 +69,7 @@ fn base_state() -> TestResult<BaseState> {
         base_coin.coinbase,
         base_coin.height,
     ));
-    utxo.commit_block(&changes, &base_tip.hash)?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&utxo, &changes, &base_tip.hash)?;
     listener.finish_block(0, 1);
     Ok((tree, utxo, listener.snapshot(), base_tip, base_coin))
 }

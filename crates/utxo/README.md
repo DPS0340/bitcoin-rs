@@ -5,7 +5,7 @@ The in-memory UTXO set: 256 first-byte shards, each a `hashbrown::HashTable` of 
 `UtxoSet` owns the state, and chainstate drives it through one narrow
 contract (`contract`): `build_block_changes` turns a validated block into its
 `BlockChanges` plus the `UndoBatch` and `BlockValueTotals` consensus checks
-need, `commit_block` applies that `BlockChanges`, and `persist_block_undo` /
+need, `commit_block_changes` applies that `BlockChanges`, and `persist_block_undo` /
 `load_block_undo` / `rollback_block` carry a block's undo through
 persistence and disconnect under the durable marker. Everything contract-
 owned is named from `bitcoin_rs_utxo::contract`; the crate root keeps only
@@ -19,7 +19,7 @@ scriptPubKey matches; `track_coin_stats` attaches the single
 `CoinStatsListener` whose MuHash and accounting follow every commit.
 
 `UtxoAdd<T>` and `BlockChanges<T>` use `TxOut` by default and `&TxOut` for
-zero-copy block application. Both use `commit_block`; there is no separate
+zero-copy block application. Both commit through `commit_block_changes`; there is no separate
 borrowed mutation API. Removal-only batches specify `BlockChanges` explicitly
 because they carry no output from which to infer `T`.
 

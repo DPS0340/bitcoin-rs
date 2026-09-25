@@ -16,7 +16,7 @@ fn snapshot_trailer_uses_listener_muhash() -> Result<(), Box<dyn std::error::Err
         changes.add(UtxoAdd::new(outpoint, txout(index), index == 0, 7));
     }
 
-    set.commit_block(&changes, &txid(999))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &changes, &txid(999))?;
 
     let mut snapshot = Vec::new();
     let trailer = write_snapshot(&set, &txid(999), 7, &mut snapshot)?;
@@ -47,12 +47,12 @@ fn snapshot_trailer_tracks_listener_after_removal() -> Result<(), Box<dyn std::e
         7,
     ));
     adds.add(UtxoAdd::new(kept_outpoint, kept_txout.clone(), true, 7));
-    set.commit_block(&adds, &txid(100))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &adds, &txid(100))?;
     let before_removal = listener.snapshot();
 
     let mut removes: BlockChanges = BlockChanges::default();
     removes.remove(removed_outpoint);
-    set.commit_block(&removes, &txid(101))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &removes, &txid(101))?;
 
     let mut expected = CoinStats::new();
     expected.insert_utxo(&removed_outpoint, &removed_txout, 7, false);
@@ -89,11 +89,11 @@ fn listener_tracks_duplicate_txid_overwrite() -> Result<(), Box<dyn std::error::
 
     let mut first = BlockChanges::default();
     first.add(UtxoAdd::new(outpoint, original.clone(), true, 91_722));
-    set.commit_block(&first, &txid(100))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &first, &txid(100))?;
 
     let mut overwrite = BlockChanges::default();
     overwrite.add(UtxoAdd::new(outpoint, replacement.clone(), true, 91_842));
-    set.commit_block(&overwrite, &txid(101))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &overwrite, &txid(101))?;
 
     let mut expected = CoinStats::new();
     expected.insert_utxo(&outpoint, &original, 91_722, true);
@@ -132,7 +132,7 @@ fn listener_coalesced_parallel_path_preserves_overwrite_boundary()
         ));
         seeded.push((outpoint, original, shard % 2 == 0));
     }
-    set.commit_block(&initial, &txid(2_100))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &initial, &txid(2_100))?;
 
     let mut overwrite = BlockChanges::default();
     let mut replacements = Vec::new();
@@ -144,7 +144,7 @@ fn listener_coalesced_parallel_path_preserves_overwrite_boundary()
         overwrite.add(UtxoAdd::new(*outpoint, replacement.clone(), false, 111));
         replacements.push((*outpoint, replacement));
     }
-    set.commit_block(&overwrite, &txid(2_101))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &overwrite, &txid(2_101))?;
 
     assert_observable_stats_eq(&listener.snapshot(), &expected);
     for (outpoint, replacement) in replacements {
@@ -172,7 +172,7 @@ fn listener_parallel_shard_delta_matches_serial_stats() -> Result<(), Box<dyn st
         initial.add(UtxoAdd::new(outpoint, txout, shard % 2 == 0, 70));
         removals.push(outpoint);
     }
-    set.commit_block(&initial, &txid(1_700))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &initial, &txid(1_700))?;
 
     let mut mixed = BlockChanges::default();
     for shard in (0_u8..20).rev() {
@@ -194,7 +194,7 @@ fn listener_parallel_shard_delta_matches_serial_stats() -> Result<(), Box<dyn st
         mixed.add(UtxoAdd::new(replacement, replacement_txout, false, 71));
         replacements.push((replacement, txout(900 + index)));
     }
-    set.commit_block(&mixed, &txid(1_701))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &mixed, &txid(1_701))?;
 
     let actual = listener.snapshot();
     assert_observable_stats_eq(&actual, &expected);
@@ -242,7 +242,7 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
         initial.add(UtxoAdd::new(outpoint, txout.clone(), coinbase, 200));
         seeded.push((outpoint, txout, coinbase));
     }
-    set.commit_block(&initial, &txid(3_000))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &initial, &txid(3_000))?;
 
     let mut mixed =
         BlockChanges::with_capacity(usize::try_from(ENTRIES)?, usize::try_from(ENTRIES)?);
@@ -268,7 +268,7 @@ fn listener_chunked_two_shard_delta_matches_serial_stats() -> Result<(), Box<dyn
         ));
         replacements.push((replacement, replacement_txout));
     }
-    set.commit_block(&mixed, &txid(3_001))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &mixed, &txid(3_001))?;
 
     assert_observable_stats_eq(&listener.snapshot(), &expected);
     for (outpoint, _txout, _coinbase) in seeded {
@@ -307,7 +307,7 @@ fn listener_single_shard_runs_match_serial_stats() -> Result<(), Box<dyn std::er
         initial.add(UtxoAdd::new(outpoint, txout.clone(), coinbase, 300));
         seeded.push((outpoint, txout, coinbase));
     }
-    set.commit_block(&initial, &txid(8_000))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &initial, &txid(8_000))?;
     assert_observable_stats_eq(&listener.snapshot(), &expected);
 
     let mut removals: BlockChanges = BlockChanges::with_capacity(0, usize::try_from(ENTRIES)?);
@@ -315,7 +315,7 @@ fn listener_single_shard_runs_match_serial_stats() -> Result<(), Box<dyn std::er
         expected.remove_utxo(outpoint, txout, 300, *coinbase);
         removals.remove(*outpoint);
     }
-    set.commit_block(&removals, &txid(8_001))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &removals, &txid(8_001))?;
     assert_observable_stats_eq(&listener.snapshot(), &expected);
     for (outpoint, ..) in &seeded {
         assert_eq!(set.get(outpoint), None);

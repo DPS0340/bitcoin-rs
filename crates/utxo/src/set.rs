@@ -313,7 +313,11 @@ impl UtxoSet {
     }
 
     /// Applies all UTXO changes for a connected block.
-    pub fn commit_block<T: Borrow<TxOut>>(
+    ///
+    /// Crate-visible on purpose: the public commit entry is the contract's
+    /// [`commit_block_changes`](crate::contract::commit_block_changes), so
+    /// every cross-crate mutation goes through `utxo::contract`.
+    pub(crate) fn commit_block<T: Borrow<TxOut>>(
         &self,
         changes: &BlockChanges<T>,
         block_hash: &Hash256,

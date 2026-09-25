@@ -346,6 +346,24 @@ pub enum RollbackError {
     Marker(#[source] StorageError),
 }
 
+/// Applies one connected block's [`BlockChanges`] to the set.
+///
+/// The public commit entry point: chainstate and every test seam commit
+/// through this function, so `utxo::contract` owns the full
+/// build → commit → persist/disconnect mutation surface and the set itself
+/// keeps no public mutator.
+///
+/// # Errors
+///
+/// [`UtxoError`] when a shard mutation fails.
+pub fn commit_block_changes<T: Borrow<TxOut>>(
+    set: &UtxoSet,
+    changes: &BlockChanges<T>,
+    block_hash: &Hash256,
+) -> Result<(), UtxoError> {
+    set.commit_block(changes, block_hash)
+}
+
 /// Builds the UTXO mutation, undo batch, and value totals for one connected
 /// block.
 ///
@@ -628,14 +646,14 @@ mod tests {
         utxo.track_coin_stats(coin_stats.clone());
         let mut seed = BlockChanges::default();
         seed.add(UtxoAdd::new(FUNDED, coin(900), false, 1));
-        utxo.commit_block(&seed, &Hash256::from_le_bytes(&[0x01; 32]))?;
+        commit_block_changes(&utxo, &seed, &Hash256::from_le_bytes(&[0x01; 32]))?;
         coin_stats.finish_block(1, 1);
         let before = observe(&utxo, &coin_stats)?;
 
         let mut changes = BlockChanges::default();
         changes.remove(FUNDED);
         changes.add(UtxoAdd::new(CREATED, coin(850), false, HEIGHT));
-        utxo.commit_block(&changes, &HASH)?;
+        commit_block_changes(&utxo, &changes, &HASH)?;
         coin_stats.finish_block(HEIGHT, 2);
         let mut undo = UndoBatch::empty();
         undo.restore(UtxoAdd::new(FUNDED, coin(900), false, 1));
@@ -880,7 +898,7 @@ mod tests {
         let full = UtxoSet::new();
 
         for (height, (changes, _undo)) in (1_u64..=10).zip(&blocks) {
-            full.commit_block(changes, &undo_txid(height))?;
+            commit_block_changes(&full, changes, &undo_txid(height))?;
         }
         for (_changes, undo) in blocks.iter().rev().take(5) {
             full.undo_block(undo)?;
@@ -888,7 +906,7 @@ mod tests {
 
         let first_five = UtxoSet::new();
         for (height, (changes, _undo)) in (1_u64..=5).zip(&blocks) {
-            first_five.commit_block(changes, &undo_txid(height))?;
+            commit_block_changes(&first_five, changes, &undo_txid(height))?;
         }
 
         assert_eq!(aggregate_hash(&full)?, aggregate_hash(&first_five)?);
@@ -934,7 +952,7 @@ mod tests {
             kept_outpoint,
             kept_txout.clone(),
         );
-        full.commit_block(&first, &undo_txid(140))?;
+        commit_block_changes(&full, &first, &undo_txid(140))?;
 
         let mut second = BlockChanges::default();
         second.remove(coinbase_outpoint);
@@ -953,11 +971,11 @@ mod tests {
         ));
         undo.remove(replacement_outpoint);
 
-        full.commit_block(&second, &undo_txid(141))?;
+        commit_block_changes(&full, &second, &undo_txid(141))?;
         full.undo_block(&undo)?;
 
         let (first_only, first_only_listener) = listener_set();
-        first_only.commit_block(&first, &undo_txid(140))?;
+        commit_block_changes(&first_only, &first, &undo_txid(140))?;
 
         assert_eq!(full.get(&coinbase_outpoint), Some(coinbase_txout));
         assert_eq!(full.get(&kept_outpoint), Some(kept_txout));

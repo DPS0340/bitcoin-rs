@@ -359,12 +359,13 @@ mod tests {
                 1,
             ));
         }
-        node.state
-            .chainstate()
-            .utxo_handle()
-            .commit_block(&changes, &Hash256::from_le_bytes(&[0xAB; 32]))
-            .map_err(|error| format!("fixture utxo commit failed: {error}"))
-            .expect("fixture utxo commit");
+        bitcoin_rs_utxo::contract::commit_block_changes(
+            &node.state.chainstate().utxo_handle(),
+            &changes,
+            &Hash256::from_le_bytes(&[0xAB; 32]),
+        )
+        .map_err(|error| format!("fixture utxo commit failed: {error}"))
+        .expect("fixture utxo commit");
 
         let broadcast_tx = spending_tx(broadcast_prevout);
         let broadcast_txid = broadcast_tx.txid();

@@ -101,11 +101,12 @@ fn fund_utxo(state: &NodeState, parent: Txid, value: u64) -> Result<()> {
         false,
         100,
     ));
-    state
-        .chainstate()
-        .utxo_handle()
-        .commit_block(&changes, &Hash256::from_le_bytes(&[0xBB; 32]))
-        .map_err(|error| anyhow!("utxo commit failed: {error}"))
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &state.chainstate().utxo_handle(),
+        &changes,
+        &Hash256::from_le_bytes(&[0xBB; 32]),
+    )
+    .map_err(|error| anyhow!("utxo commit failed: {error}"))
 }
 
 /// Deterministic funded parent txid for a marker byte.

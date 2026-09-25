@@ -125,7 +125,8 @@ fn synthetic_case(seed: u64, shape: ShardShape) -> (UtxoSet, BlockChanges) {
     for spend in &workload.spends {
         preload.add(utxo_add(spend));
     }
-    if let Err(error) = set.commit_block(&preload, &txid(seed)) {
+    if let Err(error) = bitcoin_rs_utxo::contract::commit_block_changes(&set, &preload, &txid(seed))
+    {
         panic!("synthetic preload failed: {error}");
     }
 
@@ -170,7 +171,9 @@ fn spend_fanout_case(seed: u64) -> (UtxoSet, BlockChanges) {
         ));
         changes.remove(outpoint);
     }
-    if let Err(error) = set.commit_block(&preload, &txid(seed.wrapping_add(1))) {
+    if let Err(error) =
+        bitcoin_rs_utxo::contract::commit_block_changes(&set, &preload, &txid(seed.wrapping_add(1)))
+    {
         panic!("spend-fanout preload failed: {error}");
     }
 
@@ -207,7 +210,11 @@ fn bench_synthetic(c: &mut Criterion, name: &str, shape: ShardShape) {
         b.iter_batched(
             || synthetic_case(0x00ab_cdef, shape),
             |(set, changes)| {
-                if let Err(error) = set.commit_block(black_box(&changes), &txid(0x0012_3456)) {
+                if let Err(error) = bitcoin_rs_utxo::contract::commit_block_changes(
+                    &set,
+                    black_box(&changes),
+                    &txid(0x0012_3456),
+                ) {
                     panic!("synthetic commit failed: {error}");
                 }
             },
@@ -221,7 +228,11 @@ fn bench_spend_fanout(c: &mut Criterion) {
         b.iter_batched(
             || spend_fanout_case(0x0405_0607),
             |(set, changes)| {
-                if let Err(error) = set.commit_block(black_box(&changes), &txid(0x0412_1314)) {
+                if let Err(error) = bitcoin_rs_utxo::contract::commit_block_changes(
+                    &set,
+                    black_box(&changes),
+                    &txid(0x0412_1314),
+                ) {
                     panic!("spend-fanout commit failed: {error}");
                 }
             },

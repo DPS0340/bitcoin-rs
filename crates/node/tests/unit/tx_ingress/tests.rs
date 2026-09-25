@@ -145,8 +145,12 @@ fn make_consumer(gateway: &Arc<MempoolGateway>, mining: Arc<RecordingMining>) ->
         false,
         100,
     ));
-    utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0xBB; 32]))
-        .expect("utxo commit must succeed");
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &utxo,
+        &changes,
+        &Hash256::from_le_bytes(&[0xBB; 32]),
+    )
+    .expect("utxo commit must succeed");
     let (relay, _relay_rx) = TxRelayQueue::new(DEFAULT_TX_RELAY_QUEUE_CAPACITY);
     TxIngressConsumer {
         utxo,

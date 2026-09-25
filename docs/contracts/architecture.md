@@ -251,8 +251,10 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
   `BlockChanges`, its `UndoBatch`, and the `BlockValueTotals` the coinbase
   check needs. Resolved prevouts enter through `SpentOutputLookup`; the live
   set at BIP30 exception heights enters as the optional overwritten lookup.
-- **Commit**: `UtxoSet::commit_block` applies one block's `BlockChanges` and
-  emits commit events to the single attached `CoinStatsListener`.
+- **Commit**: `contract::commit_block_changes` applies one block's
+  `BlockChanges` and
+  emits commit events to the single attached `CoinStatsListener`; the set's
+  raw mutator is crate-private.
 - **Disconnect**: `persist_block_undo` / `load_block_undo` round-trip one
   block's `UndoBatch` as the `UndoRecord` bytes the durable head receipt
   names, and `rollback_block` applies that batch under the durable
@@ -277,7 +279,7 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
   root read types (`UtxoCoin`, `UtxoScan`); index is the read consumer that
   decodes the contract's `UndoBatch`. Neither assembles mutations outside
   tests, which build fixture sets through
-  `BlockChanges` + `commit_block`.
+  `BlockChanges` + `commit_block_changes`.
 
 ### `ARCH-08`: Durable pruning and reorg retention
 

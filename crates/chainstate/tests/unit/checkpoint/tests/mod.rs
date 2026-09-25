@@ -189,7 +189,7 @@ fn populated_utxo() -> Result<UtxoSet, bitcoin_rs_utxo::UtxoError> {
         0,
     ));
     let utxo = UtxoSet::new();
-    utxo.commit_block(&changes, &Hash256::default())?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&utxo, &changes, &Hash256::default())?;
     Ok(utxo)
 }
 

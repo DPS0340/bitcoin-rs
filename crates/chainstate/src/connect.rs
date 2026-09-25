@@ -473,7 +473,8 @@ pub(super) fn apply_block_admitted<'b>(
         .record(block_tree_insert_dur.as_secs_f64());
 
     let utxo_commit_started = quanta::Instant::now();
-    let utxo_commit_result = handles.utxo.commit_block(&changes, &block_hash);
+    let utxo_commit_result =
+        bitcoin_rs_utxo::contract::commit_block_changes(&handles.utxo, &changes, &block_hash);
     let utxo_commit_dur = utxo_commit_started.elapsed();
     metrics::histogram!("node.apply_block.utxo_commit_seconds")
         .record(utxo_commit_dur.as_secs_f64());

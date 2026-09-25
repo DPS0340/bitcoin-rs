@@ -329,13 +329,17 @@ fn apply_record_mutations(
             }
         }
     }
-    utxo.commit_block(&changes, &Hash256::from_le_bytes(&record.block_hash))
-        .map_err(|error| {
-            JournalReplayError::CommittedRangeInvalid(format!(
-                "height {}: utxo commit failed: {error}",
-                record.height
-            ))
-        })
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        utxo,
+        &changes,
+        &Hash256::from_le_bytes(&record.block_hash),
+    )
+    .map_err(|error| {
+        JournalReplayError::CommittedRangeInvalid(format!(
+            "height {}: utxo commit failed: {error}",
+            record.height
+        ))
+    })
 }
 
 fn advance_coin_stats(

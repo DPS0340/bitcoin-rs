@@ -45,7 +45,7 @@ fn snapshot_roundtrip_preserves_vout_and_metadata_boundaries()
     changes.add(UtxoAdd::new(low, low_txout.clone(), false, 400));
     changes.add(UtxoAdd::new(high, high_txout.clone(), true, 401));
     changes.add(UtxoAdd::new(max, max_txout.clone(), false, u32::MAX));
-    set.commit_block(&changes, &txid(42_004))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &changes, &txid(42_004))?;
 
     let expected_hash = hash_serialized_3(&set)?;
     let mut file = tempfile()?;
@@ -168,7 +168,7 @@ fn observed_snapshot_traversal_matches_the_current_reader() -> Result<(), Box<dy
         false,
         2002,
     ));
-    set.commit_block(&changes, &txid(200_002))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &changes, &txid(200_002))?;
 
     let mut ordinary = Vec::new();
     let ordinary_trailer = write_snapshot(&set, &txid(200_003), 2002, &mut ordinary)?;
@@ -203,7 +203,7 @@ fn snapshot_trailer_round_trips_without_a_listener() -> Result<(), Box<dyn std::
     let op = OutPoint::new(txid(130_000).into(), 0);
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(op, txout(130_001), false, 900));
-    set.commit_block(&changes, &txid(130_099))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &changes, &txid(130_099))?;
 
     let mut file = tempfile()?;
     let returned_trailer = write_snapshot(&set, &txid(130_100), 900, &mut file)?;
