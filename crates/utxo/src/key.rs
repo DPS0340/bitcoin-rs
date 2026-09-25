@@ -62,3 +62,23 @@ impl UtxoKey {
         UtxoBuildHasher::default().hash_one(self.as_u64())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shard rule the snapshot/listener test fixtures mirror (first
+    /// little-endian txid byte) must track the real key rule: if the shard
+    /// scheme ever changes, this fails and the fixtures get updated too.
+    #[test]
+    fn shard_is_the_first_le_txid_byte() {
+        for first in [0_u8, 1, 3, 255] {
+            let mut bytes = [0_u8; 32];
+            bytes[0] = first;
+            bytes[1..9].copy_from_slice(&7_u64.to_le_bytes());
+            let key =
+                UtxoKey::from_txid(&Txid(bitcoin_rs_primitives::Hash256::from_le_bytes(&bytes)));
+            assert_eq!(key.shard(), first);
+        }
+    }
+}
