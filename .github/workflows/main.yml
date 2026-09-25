@@ -114,13 +114,14 @@ jobs:
       - name: Kernel prerequisites
         id: kernel_deps
         uses: ./.github/actions/native-deps
-      # Reuse this lane's C++ prerequisites for the focused kernel regression;
-      # the fast gate's rust job exercises the same target with the native
-      # backend.
-      - name: Witness activation kernel regression
+      # Reuse this lane's C++ prerequisites for the focused kernel
+      # regressions; the fast gate's rust job exercises the same targets with
+      # the native backend.
+      - name: Kernel-enabled consensus regressions
         run: |
           cargo test --locked -p bitcoin-rs-consensus \
-            --no-default-features --features kernel --test witness_sigop_activation
+            --no-default-features --features kernel \
+            --test witness_sigop_activation --test validation_engine
       # The `--no-run` passes below are compile-and-link gates only --
       # measured executions remain release evidence outside CI. They build
       # under the `quickstart` profile (opt-level 3, no fat LTO, 16
