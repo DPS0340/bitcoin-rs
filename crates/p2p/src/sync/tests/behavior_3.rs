@@ -572,9 +572,9 @@ fn transient_demotion_does_not_flap_fanout_mode() -> Result<(), Box<dyn std::err
             fanout_peer_inflight: 2,
             min_peers_for_fanout: 8,
             getdata_batch_limit: 16,
-            pending_timeout_override: Some(Duration::from_millis(250)),
             ..super::super::default_sync_budget(Network::Regtest)
-        },
+        }
+        .with_pending_timeout_override(Duration::from_millis(250)),
     );
     let mut rxs = Vec::new();
     for idx in 0..PEER_COUNT {

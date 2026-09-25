@@ -8,9 +8,9 @@ fn tick_retries_expired_pending_before_new_heights() -> Result<(), Box<dyn std::
         super::super::SyncBudget {
             max_pending_blocks: 2,
             getdata_batch_limit: 2,
-            pending_timeout_override: Some(Duration::ZERO),
             ..super::super::default_sync_budget(Network::Regtest)
-        },
+        }
+        .with_pending_timeout_override(Duration::ZERO),
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
@@ -43,9 +43,9 @@ fn tick_fills_mixed_retry_and_new_height_batch() -> Result<(), Box<dyn std::erro
             max_pending_bytes: 3 * 256 * 1024,
             max_peer_inflight: 3,
             getdata_batch_limit: 3,
-            pending_timeout_override: Some(Duration::ZERO),
             ..super::super::default_sync_budget(Network::Regtest)
-        },
+        }
+        .with_pending_timeout_override(Duration::ZERO),
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));

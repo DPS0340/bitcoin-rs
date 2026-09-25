@@ -273,6 +273,7 @@ pub fn default_sync_budget(network: Network) -> SyncBudget {
         min_peers_for_fanout: MIN_PEERS_FOR_FANOUT,
         getdata_batch_limit: GETDATA_BATCH_SIZE,
         block_spacing: Duration::from_secs(u64::from(network.target_spacing_seconds())),
+        #[cfg(test)]
         pending_timeout_override: None,
         received_timeout: RECEIVED_BLOCK_TIMEOUT,
         stall_timeout_initial: BLOCK_STALLING_TIMEOUT,
@@ -312,14 +313,29 @@ pub struct SyncBudget {
     /// counts the other owners with validated in-flight blocks, with the
     /// two Core constants expressed in half-spacing units.
     pub block_spacing: Duration,
-    /// Test-only deterministic escape hatch. Production sets `None`.
     /// When `Some`, every owner expires at this fixed age instead of the
-    /// spacing-derived per-owner budget.
-    pub pending_timeout_override: Option<Duration>,
+    /// spacing-derived per-owner budget. The slot is compiled only into
+    /// test builds; production budgets never carry it.
+    #[cfg(test)]
+    pub(crate) pending_timeout_override: Option<Duration>,
     pub received_timeout: Duration,
     pub stall_timeout_initial: Duration,
     pub stall_timeout_max: Duration,
     pub staller_cooldown: Duration,
+}
+
+impl SyncBudget {
+    /// Sets the fixed per-owner pending timeout. Test-only: this
+    /// constructor is compiled out of production builds.
+    ///
+    /// PRE: `timeout` is the fixed age every owner expires at.
+    /// POST: `pending_timeout_override` is `Some(timeout)`.
+    /// INVARIANT: production never populates `pending_timeout_override`.
+    #[cfg(test)]
+    pub(crate) fn with_pending_timeout_override(mut self, timeout: Duration) -> Self {
+        self.pending_timeout_override = Some(timeout);
+        self
+    }
 }
 
 /// A batch of block requests prepared for a single peer.
@@ -1694,6 +1710,7 @@ impl DownloadWindow {
     /// INVARIANT: one tick applies this one budget to every owner; the
     ///      override is a test-only escape hatch, never production.
     fn effective_owner_timeout(&self, active_downloading_peers: usize) -> Duration {
+        #[cfg(test)]
         if let Some(timeout) = self.budget.pending_timeout_override {
             return timeout;
         }
@@ -2892,14 +2909,16 @@ mod tests {
 
     #[test]
     fn request_peer_scan_limit_counts_expired_pending_capacity() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            max_pending_blocks: 2,
-            max_pending_bytes: 2 * 256 * 1024,
-            max_peer_inflight: 2,
-            getdata_batch_limit: 2,
-            pending_timeout_override: Some(Duration::ZERO),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            SyncBudget {
+                max_pending_blocks: 2,
+                max_pending_bytes: 2 * 256 * 1024,
+                max_peer_inflight: 2,
+                getdata_batch_limit: 2,
+                ..test_budget()
+            }
+            .with_pending_timeout_override(Duration::ZERO),
+        );
         let stager = test_stager(&window);
         let now = Instant::now();
         let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
@@ -2923,10 +2942,9 @@ mod tests {
 
     #[test]
     fn pending_timeout_waits_for_second_delivery_drain() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout_override: Some(Duration::from_secs(10)),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let mut stager = test_stager(&window);
         let requested_at = Instant::now();
         let observed_at = requested_at + Duration::from_secs(10);
@@ -2957,10 +2975,9 @@ mod tests {
 
     #[test]
     fn pending_timeout_apply_busy_clears_suspicion_without_blame() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout_override: Some(Duration::from_secs(10)),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let requested_at = Instant::now();
         let observed_at = requested_at + Duration::from_secs(10);
         let peer_addr = staller_addr();
@@ -3030,10 +3047,9 @@ mod tests {
 
     #[test]
     fn releasing_a_dead_owner_drops_its_queue_start() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout_override: Some(Duration::from_secs(10)),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let now = Instant::now();
         let stale_owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
         let live_owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 2], 8333)));
@@ -3076,10 +3092,9 @@ mod tests {
 
     #[test]
     fn receiving_the_oldest_pending_resets_the_owner_queue_start() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout_override: Some(Duration::from_secs(10)),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let mut stager = test_stager(&window);
         let now = Instant::now();
         let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
@@ -3210,11 +3225,13 @@ mod tests {
     /// budget, keeping deterministic tests independent of spacing math.
     #[test]
     fn pending_timeout_override_wins_over_spacing_policy() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            block_spacing: Duration::from_secs(600),
-            pending_timeout_override: Some(Duration::from_secs(5)),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            SyncBudget {
+                block_spacing: Duration::from_secs(600),
+                ..test_budget()
+            }
+            .with_pending_timeout_override(Duration::from_secs(5)),
+        );
         let requested_at = Instant::now();
         let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
         insert_pending(&mut window, owner, hash(0xd1), 1, requested_at);
@@ -3407,14 +3424,16 @@ mod tests {
         // the credit must reopen the scan limit so the request path can
         // expire and re-request the front (otherwise the wedge can only be
         // broken by pruning every staged block into re-download).
-        let mut window = DownloadWindow::new(SyncBudget {
-            max_pending_blocks: 4,
-            max_received_blocks: 4,
-            max_peer_inflight: 4,
-            getdata_batch_limit: 4,
-            pending_timeout_override: Some(Duration::from_secs(10)),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            SyncBudget {
+                max_pending_blocks: 4,
+                max_received_blocks: 4,
+                max_peer_inflight: 4,
+                getdata_batch_limit: 4,
+                ..test_budget()
+            }
+            .with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let mut stager = test_stager(&window);
         let now = Instant::now();
         let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
@@ -6090,12 +6109,13 @@ mod tests {
             fanout_peer_inflight: 128,
             min_peers_for_fanout: usize::MAX,
             getdata_batch_limit: 16,
-            pending_timeout_override: Some(Duration::from_secs(30)),
             received_timeout: Duration::from_secs(30),
             stall_timeout_initial: Duration::from_secs(2),
             stall_timeout_max: Duration::from_secs(64),
             staller_cooldown: Duration::from_secs(64),
+            pending_timeout_override: None,
         }
+        .with_pending_timeout_override(Duration::from_secs(30))
     }
 
     /// The hash of the height-`byte` header of [`TEST_CHAIN`].

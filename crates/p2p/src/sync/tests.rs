@@ -427,9 +427,9 @@ fn tick_allows_demoted_peer_when_it_is_the_only_eligible_peer()
             max_pending_blocks: 2,
             max_peer_inflight: 2,
             getdata_batch_limit: 2,
-            pending_timeout_override: Some(Duration::ZERO),
             ..super::default_sync_budget(Network::Regtest)
-        },
+        }
+        .with_pending_timeout_override(Duration::ZERO),
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
@@ -1087,10 +1087,10 @@ fn staging_exhaustion_fixture() -> Result<ExhaustionFixture, Box<dyn std::error:
         super::SyncBudget {
             max_received_bytes: consensus_bytes(&block2).len(),
             getdata_batch_limit: 2,
-            pending_timeout_override: Some(Duration::ZERO),
             received_timeout: Duration::from_millis(100),
             ..super::default_sync_budget(Network::Regtest)
-        },
+        }
+        .with_pending_timeout_override(Duration::ZERO),
     );
     let stalled_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let healthy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
@@ -1609,9 +1609,9 @@ fn wedge_budget(pending_timeout: Duration) -> super::SyncBudget {
         fanout_peer_inflight: 2,
         min_peers_for_fanout: 8,
         getdata_batch_limit: 16,
-        pending_timeout_override: Some(pending_timeout),
         ..super::default_sync_budget(Network::Regtest)
     }
+    .with_pending_timeout_override(pending_timeout)
 }
 
 fn staged_count_wedge(
