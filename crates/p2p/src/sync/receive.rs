@@ -66,18 +66,19 @@ impl BlockSync {
             // The tree owns heights: a pruned body requeues at its tree
             // height, or without a cursor move when the tree cannot resolve
             // it (the old 0-sentinel rewind to genesis is unrepresentable).
-            let requeues: Vec<(Hash256, Option<u32>)> = dropped
-                .iter()
-                .map(|dropped| {
-                    let height = {
-                        let tree = self.chain.block_tree();
-                        tree.lookup(dropped.hash)
+            let requeues: Vec<(Hash256, Option<u32>)> = {
+                let tree = self.chain.block_tree();
+                dropped
+                    .iter()
+                    .map(|dropped| {
+                        let height = tree
+                            .lookup(dropped.hash)
                             .and_then(|node_id| tree.node(node_id).ok())
-                            .map(|node| node.height)
-                    };
-                    (dropped.hash, height)
-                })
-                .collect();
+                            .map(|node| node.height);
+                        (dropped.hash, height)
+                    })
+                    .collect()
+            };
             let mut scheduler = self.scheduler.lock();
             for (hash, height) in requeues {
                 scheduler.window.requeue_for_retry(&hash, height);
@@ -142,6 +143,44 @@ impl BlockSync {
         .then_some(active_tip.tip_id)
     }
 
+    /// Discards staged bodies whose headers can never admit and blames
+    /// their delivering peers. Re-queuing would re-download a body that
+    /// cannot apply, and a body whose embedded header fails consensus is
+    /// the peer's fault, same as a rejected `headers` batch. `PeerTable`
+    /// operations precede the scheduler lock to preserve the `PeerTable` ->
+    /// scheduler ordering used elsewhere.
+    fn discard_inadmissible_header_bodies(&self, invalid: &[(Hash256, Option<crate::PeerSource>)]) {
+        let blamed: Vec<std::net::SocketAddr> = invalid
+            .iter()
+            .filter_map(|(_, source)| *source)
+            .filter(|source| {
+                if self.peer_table.disconnect_source(*source) {
+                    // Every removal path releases a `getheaders` gate
+                    // the peer owned, or a same-address reconnect
+                    // inherits a dead deadline.
+                    self.clear_header_request_for(*source);
+                    true
+                } else {
+                    false
+                }
+            })
+            .map(|source| source.addr)
+            .collect();
+        let mut scheduler = self.scheduler.lock();
+        for (hash, _) in invalid {
+            scheduler.stager.discard(hash);
+        }
+        for peer_addr in &blamed {
+            scheduler
+                .window
+                .mark_peer_unresponsive(*peer_addr, Instant::now());
+        }
+        tracing::debug!(
+            discarded = invalid.len(),
+            "block sync: discarded bodies with inadmissible headers"
+        );
+    }
+
     /// Retries header admission for staged bodies whose headers are still
     /// absent from the tree.
     ///
@@ -172,8 +211,9 @@ impl BlockSync {
         let mut missing_parent = false;
         let mut credit_refresh_needed = false;
         let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
+        let mut inadmissible: Vec<Hash256> = Vec::new();
         for (hash, header, source) in unadmitted {
-            match self.chain.admit_headers(&[header]) {
+            let admitted = match self.chain.admit_headers(&[header]) {
                 HeaderAdmission::Accepted {
                     announced_tip: Some(tip_hash),
                     active_height,
@@ -190,54 +230,60 @@ impl BlockSync {
                             .note_announced_tip(source, tip_hash, active_height);
                         credit_refresh_needed = true;
                     }
+                    true
                 }
+                HeaderAdmission::Accepted { .. } => true,
                 HeaderAdmission::Rejected(
                     ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. },
                 ) => {
                     missing_parent = true;
+                    false
                 }
                 HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
                     invalid.push((hash, source));
+                    false
                 }
-                _ => {}
+                _ => false,
+            };
+            if admitted {
+                // The body staged while its header was unknown — a body
+                // slightly ahead of its in-flight header is legitimate. Now
+                // that the tree resolves it, hold it to the same
+                // unrequested-admission clauses a resolved arrival faced.
+                let chain_tip = self.chain.chain_tip();
+                let applied_tip = self.chain.applied_tip();
+                let tree = self.chain.block_tree();
+                if !unrequested_body_admissible(
+                    &tree,
+                    hash,
+                    chain_tip.as_deref(),
+                    applied_tip.as_deref(),
+                    self.chain.network().minimum_chain_work(),
+                ) {
+                    inadmissible.push(hash);
+                }
             }
         }
         if !invalid.is_empty() {
-            // The body's header can never admit: drop the staged entry AND
-            // the window's delivery record outright — re-queuing would just
-            // re-download a body that cannot apply. Then blame the
-            // delivering peer: a body whose embedded header fails consensus
-            // is the peer's fault, same as a rejected `headers` batch.
-            // PeerTable operations precede the scheduler lock to preserve
-            // the PeerTable → scheduler ordering used elsewhere.
-            let blamed: Vec<std::net::SocketAddr> = invalid
-                .iter()
-                .filter_map(|(_, source)| *source)
-                .filter(|source| {
-                    if self.peer_table.disconnect_source(*source) {
-                        // Every removal path releases a `getheaders` gate
-                        // the peer owned, or a same-address reconnect
-                        // inherits a dead deadline.
-                        self.clear_header_request_for(*source);
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .map(|source| source.addr)
-                .collect();
+            self.discard_inadmissible_header_bodies(&invalid);
+        }
+        if !inadmissible.is_empty() {
+            // The headers resolved onto bodies Core would not process
+            // (off-branch or below the work floor). They staged while their
+            // headers were unknown; now that the tree resolves them they
+            // are dead inventory — evict immediately instead of holding
+            // bounded staging state until the staged timeout. No peer
+            // fault: Core drops an inadmissible unrequested body without
+            // punishing the peer, and a body here was never requested — a
+            // pending hash's header is already in the tree, so it never
+            // reaches the staged-header retry.
             let mut scheduler = self.scheduler.lock();
-            for (hash, _) in &invalid {
+            for hash in &inadmissible {
                 scheduler.stager.discard(hash);
             }
-            for peer_addr in &blamed {
-                scheduler
-                    .window
-                    .mark_peer_unresponsive(*peer_addr, Instant::now());
-            }
             tracing::debug!(
-                discarded = invalid.len(),
-                "block sync: discarded bodies with inadmissible headers"
+                discarded = inadmissible.len(),
+                "block sync: discarded staged bodies that resolved inadmissible"
             );
         }
         if credit_refresh_needed {
@@ -298,10 +344,10 @@ impl BlockSync {
         // Core's `AcceptBlock` would process it. A discarded body leaves no
         // staged state and queues no retry. Lock order: tree, then scheduler.
         let already_staged: Vec<bool> = {
-            let chain_tip = self.chain.chain_tip().load_full();
-            let applied_tip = self.chain.applied_tip().load_full();
+            let chain_tip = self.chain.chain_tip();
+            let applied_tip = self.chain.applied_tip();
             let minimum_chain_work = self.chain.network().minimum_chain_work();
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             let scheduler = self.scheduler.lock();
             let offered = blocks.len();
             let mut already_staged = Vec::with_capacity(offered);
@@ -476,7 +522,13 @@ impl BlockSync {
                     }
                     StagedBlock::DroppedForRetry { dropped } => {
                         // Count-evicted before staging: release what the
-                        // window holds without a cursor rewind.
+                        // window holds without a cursor rewind. Unlike the
+                        // `Memory` arm's evictions — staged victims whose
+                        // pending left at staging, so the tree height is
+                        // the only rewind evidence — this body never
+                        // staged, so a live pending still carries its
+                        // request height and an unrequested body must not
+                        // move the cursor at all.
                         window.requeue_for_retry(&dropped.hash, None);
                         retry_count = retry_count.saturating_add(1);
                         tracing::warn!(%hash, "block sync: received block buffer full; dropping block for retry");
@@ -557,16 +609,19 @@ impl BlockSync {
 /// 1. The node lies on the header tip's branch.
 /// 2. The node's chainwork is at least the applied tip's
 ///    (`fHasMoreOrSameWork`).
-/// 3. The header tip's chainwork meets the network's minimum chain work.
+/// 3. The node's chainwork meets the network's minimum chain work.
 /// 4. The node is at most `CORE_REORG_SAFETY_MARGIN` blocks above the
 ///    applied tip (`fTooFarAhead`).
 ///
-/// Core checks the minimum-work floor on the body itself. Here the header
-/// tip carries it: this window releases an expired request without
-/// disconnecting its peer, so a late delivery during initial block
-/// download must not be discarded only because its block predates the
-/// floor. Clause 1 keeps a low-work side chain out on its own.
-fn unrequested_body_admissible(
+/// Core checks the minimum-work floor on the body itself for
+/// `fRequested == false`. The requested path is the caller's: a hash with a
+/// recorded pending request never reaches this function, so a late delivery
+/// is admitted on the pending's recorded request alone. Once the window has
+/// released a request (expiry, rejection, purge), a later delivery of that
+/// hash is never-requested for this gate: the four clauses apply with the
+/// body's own chainwork, including the floor. Clause 1 keeps a low-work
+/// side chain out on its own.
+pub(super) fn unrequested_body_admissible(
     tree: &BlockTree,
     hash: Hash256,
     chain_tip: Option<&TipSnapshot>,
@@ -587,9 +642,9 @@ fn unrequested_body_admissible(
         tip.height.saturating_add(CORE_REORG_SAFETY_MARGIN)
     });
     // Big-endian, fixed width: byte order is numeric order.
-    let tip_work: [u8; 32] = chain_tip.chainwork.to_be_bytes();
+    let node_work: [u8; 32] = node.chainwork.to_be_bytes();
     tree.node_at_height_from(chain_tip.tip_id, node.height) == Some(node_id)
         && applied_tip.is_none_or(|tip| node.chainwork >= tip.chainwork)
-        && tip_work >= minimum_chain_work
+        && node_work >= minimum_chain_work
         && node.height <= max_height
 }

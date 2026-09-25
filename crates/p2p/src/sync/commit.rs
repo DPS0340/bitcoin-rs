@@ -113,6 +113,7 @@ impl BlockSync {
             });
         let mut applied_hashes = ExpectedBlockHashes::with_capacity(expected_len);
         let mut failed_hash = None;
+        let mut failed_permanent = false;
         // Applied in windows, not one at a time: the window verifies every
         // block's input scripts in a single dispatch, which is where the
         // measured apply win comes from. Blocks still commit one by one and in
@@ -148,6 +149,7 @@ impl BlockSync {
                     if let Some(blocker) = blocker {
                         failed_hash = Some(blocker.hash);
                     }
+                    failed_permanent = error.disposition == WindowCommitDisposition::Permanent;
                     if error.disposition == WindowCommitDisposition::Fatal {
                         self.note_fatal_settlement(stopped, error.source.as_ref());
                     } else if let Some(blocker) = blocker {
@@ -195,7 +197,16 @@ impl BlockSync {
             chunk_start = chunk_end;
         }
         if !applied_hashes.is_empty() || failed_hash.is_some() {
-            if let Some(hash) = failed_hash {
+            // A Permanent failure released the failed hash inside
+            // `purge_invalidated`: `invalidate_failed_subtree` marks the
+            // failed block as the root of its own invalidated subtree, so
+            // the purge always covers it (the one shape where the subtree
+            // comes back empty — a header the tree never resolved — cannot
+            // arise here, because the drain only yields hashes the tree
+            // holds). Re-queueing the hash again with its tree height would
+            // rewind the request cursor onto the invalidated block, so the
+            // tree-height requeue runs only for retryable dispositions.
+            if let Some(hash) = failed_hash.filter(|_| !failed_permanent) {
                 // The tree owns heights: the retry cursor drops to the failed
                 // body's tree height, or stays put when the tree cannot
                 // resolve it (no rewind to genesis).
