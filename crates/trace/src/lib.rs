@@ -217,7 +217,7 @@ pub fn register_probes() {
     #[cfg(feature = "usdt")]
     {
         if let Err(error) = usdt::register_probes() {
-            tracing::debug!(%error, "usdt probe registration failed");
+            tracing::warn!(%error, "usdt probe registration failed; tracepoints may not be visible");
         }
     }
 }
