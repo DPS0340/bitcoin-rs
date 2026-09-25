@@ -443,6 +443,10 @@ struct PendingBlock {
 struct PendingTimeoutObservation {
     owner: PeerSource,
     hash: Hash256,
+    /// Set when the owner's own timeout expiry released the observed
+    /// request: the blame evidence the second tick convicts on. A
+    /// delivery or a requeue releases without it and pardons.
+    expired_release: bool,
 }
 
 /// A running window-blocked stall observation: the window front (`front_hash`)
@@ -1088,13 +1092,21 @@ impl DownloadWindow {
     ///
     /// A block may arrive while synchronous apply is running and wait in the
     /// inbound channel after its request timestamp expires. The first
-    /// observation records suspicion only. Delivery from that same peer
-    /// clears it; delivery of a retry from another peer does not.
+    /// observation records suspicion only; delivery from the observed owner
+    /// clears it at once, and any path that releases the observed hash
+    /// without a delivery (the retarget and purge paths) leaves a suspicion
+    /// that no longer measures anything. The second tick therefore
+    /// re-verifies the observation against the live window before it
+    /// converts suspicion into blame.
     ///
     /// PRE: the apply side is not busy this tick.
     /// POST: `Some(owner)` exactly when the previous observation named
-    ///      `owner`; that owner's address enters the staller cooldown.
-    /// INVARIANT: the observation names the exact owning connection.
+    ///      `owner`, that owner still owns the observed hash in `pending`,
+    ///      and that owner is still expired this tick; the owner's address
+    ///      then enters the staller cooldown. Every other outcome clears
+    ///      the observation and blames nobody.
+    /// INVARIANT: the observation names the exact owning connection, and a
+    ///      conviction never outlives the queue age it measured.
     fn advance_pending_timeout(
         &mut self,
         now: Instant,
@@ -1102,8 +1114,22 @@ impl DownloadWindow {
     ) -> Option<PeerSource> {
         if let Some(observation) = self.pending_timeout_observation {
             self.pending_timeout_observation = None;
-            self.mark_peer_unresponsive(observation.owner.addr, now);
-            return Some(observation.owner);
+            let still_owned = self
+                .pending
+                .get(&observation.hash)
+                .is_some_and(|pending| pending.owner == observation.owner);
+            if observation.expired_release
+                || (still_owned
+                    && self.owner_download_expired(
+                        observation.owner,
+                        active_downloading_peers,
+                        now,
+                    ))
+            {
+                self.mark_peer_unresponsive(observation.owner.addr, now);
+                return Some(observation.owner);
+            }
+            return None;
         }
         self.pending_timeout_observation = self
             .pending
@@ -1115,6 +1141,7 @@ impl DownloadWindow {
             .map(|(hash, pending)| PendingTimeoutObservation {
                 owner: pending.owner,
                 hash: *hash,
+                expired_release: false,
             });
         None
     }
@@ -1742,12 +1769,17 @@ impl DownloadWindow {
     /// PRE: the entry is already out of `pending`; `removed_requested_at`
     ///      is its request time; `now` is the caller's injected clock.
     /// POST: the owner keeps no entry once it owns nothing; the entry moves
-    ///      to `now` exactly when the removed entry was its oldest;
-    ///      otherwise the entry is untouched.
+    ///      to `now` exactly when the removed entry was strictly older
+    ///      than every survivor (the true queue head left); when a
+    ///      survivor carries the removed entry's own stamp, the clock
+    ///      keeps that stamp; otherwise the entry is untouched.
     /// INVARIANT: the local equivalent of Core's `m_downloading_since`
     ///      start-and-oldest-removal reset (`net_processing.cpp:1323-1332,
     ///      1363-1368`); `requested_at` stays the ordering and diagnostic
-    ///      record, never the sole source of the queue age.
+    ///      record, never the sole source of the queue age. One batched
+    ///      `mark_requested` stamps every entry with one `requested_at`,
+    ///      so only that batch's front advances the clock: a peer cannot
+    ///      postpone its timeout by dripping non-front deliveries.
     fn reset_owner_queue_start(
         &mut self,
         owner: PeerSource,
@@ -1764,9 +1796,19 @@ impl DownloadWindow {
             None => {
                 self.owner_downloading_since.remove(&owner);
             }
-            Some(oldest) if removed_requested_at <= oldest => {
+            // Strictly older than every survivor: the true head left, and
+            // the clock restarts at the removal instant.
+            Some(oldest) if removed_requested_at < oldest => {
                 self.owner_downloading_since.insert(owner, now);
             }
+            // The removed entry shares the surviving head's stamp (entries
+            // of one batched request share one `requested_at`): the head
+            // keeps that stamp, so the clock stays at the batch origin
+            // until the front itself is removed.
+            Some(oldest) if removed_requested_at == oldest => {
+                self.owner_downloading_since.insert(owner, oldest);
+            }
+            // A strictly older survivor is still the head: untouched.
             Some(_) => {}
         }
     }
@@ -2507,6 +2549,7 @@ impl DownloadWindow {
         }
         let mut entries = Vec::new();
         let mut removed: Vec<(PeerSource, Instant)> = Vec::new();
+        let armed_observation = &mut self.pending_timeout_observation;
         {
             let pending_bytes = &mut self.pending_bytes;
             let next_request_height = &mut self.next_request_height;
@@ -2514,6 +2557,12 @@ impl DownloadWindow {
                 .pending
                 .extract_if(|_hash, pending| expired_owners.contains(&pending.owner))
             {
+                if let Some(observation) = armed_observation
+                    && observation.hash == hash
+                    && observation.owner == pending.owner
+                {
+                    observation.expired_release = true;
+                }
                 *pending_bytes = pending_bytes.saturating_sub(pending.estimated_bytes);
                 *next_request_height = (*next_request_height).min(pending.height);
                 entries.push(PeerRequestEntry {
@@ -3000,12 +3049,15 @@ mod tests {
         assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
     }
 
+    /// A retry delivery releases the observed hash without the owner: the
+    /// second tick must re-verify the suspicion against the live window
+    /// and blame nobody, because a conviction here would outlive the
+    /// queue age it measured.
     #[test]
-    fn retry_delivery_does_not_clear_original_peer_timeout() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout_override: Some(Duration::from_secs(10)),
-            ..test_budget()
-        });
+    fn retry_delivery_resolves_original_peer_timeout_without_blame() {
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let requested_at = Instant::now();
         let observed_at = requested_at + Duration::from_secs(10);
         let original_peer = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
@@ -3025,14 +3077,121 @@ mod tests {
             .owner_downloading_since
             .insert(original_owner, requested_at);
 
+        // First idle tick arms the suspicion on the original owner.
         assert_eq!(timeout_owner(&mut window, false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_some());
+
+        // A retry from another peer releases the observed hash; the second
+        // tick clears the suspicion without convicting anyone.
         window.mark_received_from(block_hash, 80, Some(test_source(retry_peer)), observed_at);
-        assert_eq!(
-            timeout_owner(&mut window, false, observed_at),
-            Some(original_peer)
-        );
-        assert!(window.peer_in_staller_cooldown(original_peer, observed_at));
+        assert_eq!(timeout_owner(&mut window, false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_none());
+        assert!(!window.peer_in_staller_cooldown(original_peer, observed_at));
         assert!(!window.peer_in_staller_cooldown(retry_peer, observed_at));
+    }
+
+    /// One batched `mark_requested` stamps every entry with one
+    /// `requested_at`: removing a non-front entry ties with the surviving
+    /// front's stamp, so the queue start must stay at the batch origin.
+    /// Re-stamping from the removal instant on each tie would let a peer
+    /// postpone its timeout indefinitely by dripping non-front deliveries
+    /// of one batch while the front stays outstanding.
+    #[test]
+    fn batched_non_front_deliveries_do_not_postpone_the_owner_timeout() {
+        let mut window = DownloadWindow::new(test_budget());
+        let stager = test_stager(&window);
+        let now = Instant::now();
+        let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        let front = hash(0xe5);
+        let first = super::non_empty_request(
+            owner,
+            vec![
+                super::PeerRequestEntry {
+                    hash: front,
+                    height: 1,
+                },
+                super::PeerRequestEntry {
+                    hash: hash(0xe6),
+                    height: 2,
+                },
+                super::PeerRequestEntry {
+                    hash: hash(0xe7),
+                    height: 3,
+                },
+            ],
+            4,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        assert!(window.mark_requested(&stager, &first, owner, now));
+
+        // A later batch keeps the owner active, so front removal must move
+        // the clock forward rather than drop the entry.
+        let second_at = now + Duration::from_secs(9);
+        let second = super::non_empty_request(
+            owner,
+            vec![super::PeerRequestEntry {
+                hash: hash(0xe8),
+                height: 4,
+            }],
+            5,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        assert!(window.mark_requested(&stager, &second, owner, second_at));
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&now));
+
+        // Deliver every non-front entry one at a time: each removal ties
+        // with the front's own stamp, so the clock never leaves the first
+        // batch's origin.
+        for byte in [0xe6, 0xe7] {
+            window.mark_received_from(hash(byte), SMALL_BODY, Some(owner), second_at);
+            assert_eq!(window.owner_downloading_since.get(&owner), Some(&now));
+        }
+
+        // Removing the front itself — the first batch's true oldest, with
+        // only the newer batch surviving — advances the clock to the
+        // removal instant.
+        let front_removed_at = second_at + Duration::from_millis(1);
+        window.mark_received_from(front, SMALL_BODY, Some(owner), front_removed_at);
+        assert_eq!(
+            window.owner_downloading_since.get(&owner),
+            Some(&front_removed_at)
+        );
+    }
+
+    /// The retarget path releases a pending without a delivery; a
+    /// suspicion armed on its owner must clear instead of convicting when
+    /// the second tick finds the observed hash no longer pending-owned.
+    #[test]
+    fn requeue_of_the_observed_block_clears_the_suspicion_without_blame() {
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
+        let requested_at = Instant::now();
+        let observed_at = requested_at + Duration::from_secs(10);
+        let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let block_hash = hash(0x93);
+        let owner = insert_pending(
+            &mut window,
+            test_source(peer_addr),
+            block_hash,
+            1,
+            requested_at,
+        );
+
+        // First idle tick arms the suspicion.
+        assert_eq!(timeout_owner(&mut window, false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_some());
+
+        // The retarget path releases the observed hash before the second
+        // tick, and the owner's queue age leaves with it.
+        window.requeue_for_retry(&block_hash, Some(1), observed_at);
+        assert_eq!(window.pending_owner(&block_hash), None);
+        assert_eq!(window.owner_queue_start_for_test(owner), None);
+
+        // The second tick clears the suspicion without blame.
+        assert_eq!(timeout_owner(&mut window, false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_none());
+        assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
     }
 
     #[test]
@@ -5130,6 +5289,7 @@ mod tests {
         window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
             owner,
             hash: hash(0x01),
+            expired_release: false,
         });
         window.mark_received_from(hash(0x01), 80, Some(alternate), t1);
         assert_eq!(window.preferred_peer(), Some(alternate));
@@ -5688,6 +5848,7 @@ mod tests {
         window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
             owner,
             hash: block_hash,
+            expired_release: false,
         });
 
         assert_eq!(
@@ -5759,6 +5920,7 @@ mod tests {
         window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
             owner,
             hash: block_hash,
+            expired_release: false,
         });
         window.cold_front = Some(super::ColdFrontState::Racing {
             owner,
