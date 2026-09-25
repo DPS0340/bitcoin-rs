@@ -244,6 +244,142 @@ impl RegistryInner {
         self.pruned_below
             .max(self.reservations.iter().copied().max().unwrap_or(0))
     }
+
+    /// The lowest live floor, which no pass may cross.
+    fn lowest_floor(&self) -> Option<u32> {
+        self.floors.values().map(LeaseEntry::floor).min()
+    }
+
+    /// Drops optional pins whose floor fell outside their budget.
+    ///
+    /// A mandatory pin never expires: chainstate correctness outranks
+    /// freeing space. An optional pin that lags the policy line by more than
+    /// its budget stops binding the line here, so pruning continues and the
+    /// consumer learns the capability is gone at its next request.
+    fn expire_optional_leases(&mut self, policy_line: u32) {
+        self.floors
+            .retain(|_, entry| !entry.expires_at(policy_line));
+    }
+}
+
+/// Why a reader needs the history it pins.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum LeaseKind {
+    /// Node correctness: a chain transition or boot replay re-reads these
+    /// rows. A mandatory pin never expires and always clamps the line.
+    Mandatory,
+    /// An optional consumer, such as a derived index, that may lose the
+    /// history it has not reached yet and rebuild instead of blocking
+    /// pruning.
+    Optional {
+        /// The bound the consumer was granted under.
+        budget: RetentionBudget,
+    },
+}
+
+/// One live pin: its floor and the kind that decides whether it expires.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct LeaseEntry {
+    floor: u32,
+    kind: LeaseKind,
+}
+
+impl LeaseEntry {
+    fn mandatory(floor: u32) -> Self {
+        Self {
+            floor,
+            kind: LeaseKind::Mandatory,
+        }
+    }
+
+    fn optional(floor: u32, budget: RetentionBudget) -> Self {
+        Self {
+            floor,
+            kind: LeaseKind::Optional { budget },
+        }
+    }
+
+    const fn floor(&self) -> u32 {
+        self.floor
+    }
+
+    /// True when this pin lags `policy_line` by more than its budget.
+    fn expires_at(&self, policy_line: u32) -> bool {
+        let LeaseKind::Optional { budget } = self.kind else {
+            return false;
+        };
+        match budget {
+            RetentionBudget::Unlimited => false,
+            RetentionBudget::Depth(depth) => self.floor < policy_line.saturating_sub(depth),
+        }
+    }
+}
+
+/// How much history an optional consumer may pin.
+///
+/// Depth is the budget this authority enforces, for three reasons. The
+/// prune line is already a height, so expiry is one comparison per live pin
+/// at reserve time and needs no second registry or clock. A stalled
+/// consumer then costs a bounded number of blocks, not an unbounded window
+/// a pass would have to measure while deleting. And the bound lines up with
+/// the mandatory policy it must never outrank: the reorg margin is itself a
+/// depth.
+///
+/// `Unlimited` is an operator's explicit choice to let one consumer clamp
+/// pruning forever. It is never the default, because an optional consumer
+/// that stalls must not retain history indefinitely.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RetentionBudget {
+    /// Pin at most `depth` blocks below the policy line; a lease that lags
+    /// further is expired by the next pass.
+    Depth(u32),
+    /// No bound: the lease clamps every pass until its holder releases it.
+    Unlimited,
+}
+
+impl RetentionBudget {
+    /// Maps a configured block count onto a budget. Zero means the operator
+    /// opted out of bounding this consumer.
+    #[must_use]
+    pub const fn from_blocks(blocks: u32) -> Self {
+        match blocks {
+            0 => Self::Unlimited,
+            blocks => Self::Depth(blocks),
+        }
+    }
+}
+
+/// Why the owner could not grant the history a consumer asked for.
+///
+/// A raw `Option` from a byte read is not a policy answer, because absence
+/// has several causes. This is the vocabulary the owner boundary uses:
+/// [`RetentionRegistry::history_from`] answers permanence, and while a
+/// [`HistoryLease`] is live the owner guarantees no row at or above its
+/// floor is deleted, so a read that returns nothing under that grant is
+/// `Missing` and a read that returns damaged bytes is `Corrupt`. A consumer
+/// relays these meanings; it never compares a height against a copied prune
+/// frontier to decide them.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Error)]
+pub enum HistoryUnavailable {
+    /// Heights below `below` are permanently gone. The defined recovery for
+    /// an optional consumer is a rebuild from what remains, not a retry.
+    #[error("history below height {below} is pruned")]
+    Pruned {
+        /// One past the highest row a committed pass deleted.
+        below: u32,
+    },
+    /// The row lies inside retained history but is not there yet: it may
+    /// appear through backfill or a reconnect. Retry; do not rebuild.
+    #[error("retained history is temporarily unavailable")]
+    Missing,
+    /// The row is present but damaged. Retrying cannot recover it. Owners
+    /// that verify what they serve answer this; the boundary names it so a
+    /// consumer never has to guess between damage and absence.
+    #[error("retained history is corrupt")]
+    Corrupt,
+    /// The node is shutting down, so no new history is granted.
+    #[error("history is unavailable while the node shuts down")]
+    Shutdown,
 }
 
 /// Why a retention lease could not be granted.
