@@ -378,10 +378,12 @@ impl ChainFollowers {
                 if let (Some(change), Some(gateway)) =
                     (mempool_change.as_ref(), self.mempool_gateway())
                 {
+                    let applied_tip = handles.applied_tip_reader();
+                    let block_tree = handles.block_tree_reader();
                     let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
                         handles.utxo(),
-                        handles.applied_tip(),
-                        handles.block_tree(),
+                        &applied_tip,
+                        &block_tree,
                         handles.network(),
                     );
                     if gateway.remove_for_reorg(change, &chain).is_err() {
@@ -405,10 +407,7 @@ impl ChainFollowers {
             }
             Err(error @ bitcoin_rs_chainstate::DisconnectError::Refused(_)) => {
                 let hash = Hash256::from(block.block_hash());
-                let height = handles
-                    .applied_tip()
-                    .load_full()
-                    .map_or(0, |tip| tip.height);
+                let height = handles.applied_tip_snapshot().map_or(0, |tip| tip.height);
                 if let Err(settlement) =
                     Self::finish_transition(handles, transition, mempool_change)
                 {

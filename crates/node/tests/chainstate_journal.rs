@@ -54,8 +54,7 @@ fn restart_replays_durable_journal_suffix_above_checkpoint() -> Result<()> {
     let resumed = NodeState::open(config, None)?;
     let resumed_tip = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("journal replay did not publish a tip"))?;
     assert_eq!(resumed_tip.as_ref(), &expected_tip);
     assert_eq!(
@@ -113,8 +112,7 @@ fn disconnect_rewrites_durable_head_before_restart() -> Result<()> {
     let resumed = NodeState::open(config.clone(), None)?;
     let resumed_tip = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("reorg replay did not publish a tip"))?;
     assert_eq!(resumed_tip.as_ref(), &tip1);
     assert_eq!(
@@ -149,8 +147,7 @@ fn disconnect_rewrites_durable_head_before_restart() -> Result<()> {
     let replaced = NodeState::open(config, None)?;
     let persisted_tip = replaced
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("replacement journal tip missing"))?;
     assert_eq!(persisted_tip.as_ref(), &replacement_tip);
     Ok(())
@@ -179,8 +176,7 @@ fn disconnect_below_checkpoint_base_forces_full_validation() -> Result<()> {
     let resumed = NodeState::open(config.clone(), None)?;
     let resumed_tip = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("durable head replay did not publish a tip"))?;
     assert_eq!(
         resumed_tip.as_ref(),
@@ -192,8 +188,7 @@ fn disconnect_below_checkpoint_base_forces_full_validation() -> Result<()> {
     let resumed_again = NodeState::open(config.clone(), None)?;
     let resumed_again_tip = resumed_again
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("durable head replay did not publish a tip"))?;
     assert_eq!(
         resumed_again_tip.as_ref(),
@@ -207,8 +202,7 @@ fn disconnect_below_checkpoint_base_forces_full_validation() -> Result<()> {
     let recovered = NodeState::open(config, None)?;
     let recovered_tip = recovered
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("replacement checkpoint was ignored"))?;
     assert_eq!(recovered_tip.as_ref(), &replacement_tip);
     Ok(())
@@ -241,8 +235,7 @@ fn idle_journal_batch_flushes_on_wall_clock_deadline() -> Result<()> {
     let resumed = NodeState::open(config, None)?;
     let resumed_tip = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("idle journal record was not durable"))?;
     assert_eq!(resumed_tip.as_ref(), &expected_tip);
     Ok(())
@@ -329,8 +322,7 @@ fn retention_pressure_stops_apply_before_tip_mutation() -> Result<()> {
     ));
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("genesis tip missing"))?;
     assert_eq!(tip.as_ref(), &genesis_tip);
     Ok(())

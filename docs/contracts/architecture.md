@@ -153,8 +153,8 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
 - `bitcoin-rs-node` owns runtime startup/shutdown sequencing, configuration
   resolution and validation (`UserConfig` layers → `NodeConfig`), the mining
   control facade (`MiningCoordinator`: it composes the mining lifecycle
-  service with the chainstate/follower handles, publishes applied tips,
-  submits solved blocks, and admits headers),
+  service with Chainstate's read and transition capabilities, submits solved
+  blocks, and requests header admission from Chainstate),
   watch-only coinbase payout configuration (`MiningConfig::payout_script`), and
   process-level cache budgeting (`dbcache` distribution across chainstate and
   txindex namespaces). The `bitcoin-rs` binary owns argv, environment, and
@@ -203,6 +203,16 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   take the transition lock and cannot mutate chainstate. `ChainEventPublisher`
   cells remain a separate coherent snapshot of the applied tip for index
   consumers (`EVT-01`).
+- Long-lived RPC, P2P, index, and mining consumers receive `TipReader` and
+  `BlockTreeReader` capabilities plus the stable-view fence (`Arc<Mutex<()>>`).
+  The readers expose snapshot load and tree read guards respectively; every
+  `&self` tree accessor is a pure read, and the tip publication cell is only
+  shareable through `&mut BlockTree`. The fence's only verb is `lock()`, which
+  can delay a transition but grants no mutation path. Header admission uses
+  `Chainstate::admit_headers`; normal genesis connect publishes through the
+  tree's shared tip cell without a separate publication fallback.
+  Short-lived `ChainAdmissionView` values borrow readers; the P2P transaction
+  ingress worker acquires its owned readers once at startup.
 - `Chainstate::validate_block` dry-runs the apply path's pre-write consensus
   gates under `lock_transition`. It does not take mempool generation and does
   not persist. BIP22 proposal omits proof-of-work; every other pre-write gate
@@ -214,8 +224,11 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   `rawtx` and canonical block bytes without holding the consumers.
 - Node owns cross-domain sequencing around a chain transition: it reserves the
   mempool generation, dispatches `ChainFollowers`, then publishes the stable
-  mempool generation before the chain transition is dropped. Convenience
-  chainstate methods do not dispatch followers.
+  mempool generation before the chain transition is dropped. Follower-free
+  convenience methods are compiled only for tests or the `test-seam` capability.
+  In-workspace production dependencies and feature forwarding must not enable
+  that capability; production composition uses explicit transitions plus
+  follower settlement. Downstream users can explicitly opt into `test-seam`.
   RPC `BlockLog`, hash/raw ZMQ, TxIndex wake, sequence `C`/`D`, mining
   generation, admission, block-confirmation eviction, and reorg
   reconsideration run from node-owned dispatch. Consumer failure cannot
@@ -258,7 +271,14 @@ composition seam.
     no dependency on storage and forwards no backend features, and verifies
     backend feature forwarding is confined to operator tiers and service
     adapters, and rejects empty backend markers on crates that do not own an
-    engine.
+    engine. Normal/build dependency selections and production feature paths
+    must not enable `test-seam`; dev-only selections remain available to fixtures.
+  - `chainstate_facade_exposes_no_production_raw_mutation_handles`: compiles an
+    isolated Cargo consumer without dev-feature unification. Read operations
+    must compile; raw mutation handles, reader write/publication methods,
+    mutable tip-cell access through a read guard, and `SyncChain` fixture
+    methods must fail with the intended compiler diagnostics. Removing an
+    obsolete accessor or private field remains allowed.
 - Manifest enforcement:
   - Root `Cargo.toml`: workspace member list and package versions.
   - `crates/storage/Cargo.toml`: engine dependency definitions.

@@ -42,8 +42,8 @@ fn tipped_context() -> Arc<Context> {
         chainwork: ChainWork::ZERO,
         hash: Hash256::from_le_bytes(&[42_u8; 32]),
     };
-    ctx.set_chain_tip(tip.clone());
-    ctx.set_applied_tip(tip);
+    ctx.chain_tip.store(Some(Arc::new(tip.clone())));
+    ctx.applied_tip.store(Some(Arc::new(tip)));
     ctx
 }
 

@@ -30,7 +30,11 @@ pub(super) fn is_peer_fault(error: &ChainError) -> bool {
         | ChainError::HeightOverflow { .. }
         // A median-time-past violation is decided entirely by the chain the peer
         // itself sent, so it is unambiguously the peer's fault.
-        | ChainError::TimestampTooEarly { .. } => true,
+        | ChainError::TimestampTooEarly { .. }
+        // Re-announcing a header we already know is invalid or extending a
+        // known-invalid parent is unambiguously peer-invalid data.
+        | ChainError::KnownInvalidHeader { .. }
+        | ChainError::InvalidParent { .. } => true,
         // Future drift is judged against OUR clock, so a wrong local clock
         // would otherwise let us ban every honest peer and partition
         // ourselves. The header is rejected without blaming the sender.
@@ -315,7 +319,7 @@ impl BlockSync {
             return;
         }
         let height = {
-            let tree = self.chain.block_tree().read();
+            let tree = self.chain.block_tree();
             tree.lookup(frontier_hash)
                 .and_then(|node_id| tree.node(node_id).ok())
                 .map(|node| node.height)

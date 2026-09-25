@@ -437,7 +437,7 @@ mod tests {
     }
 
     struct RepublishTipScriptIndex {
-        applied_tip: Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>,
+        applied_tip: bitcoin_rs_chain::TipReader,
     }
 
     impl crate::context::ScriptIndexQuery for RepublishTipScriptIndex {
@@ -550,7 +550,7 @@ mod tests {
                 .as_ref()
                 .clone()
         };
-        context.set_applied_tip(tip);
+        context.applied_tip.store(Some(Arc::new(tip)));
         context.esplora_tx_index = Some(Arc::new(FixtureTxIndex(vec![(transaction.clone(), 0)])));
         let funding = vec![ScriptIndexRecord {
             txid,
@@ -1008,7 +1008,7 @@ mod tests {
         };
         context.applied_tip.store(Some(tip));
         context.script_index = Some(Arc::new(RepublishTipScriptIndex {
-            applied_tip: Arc::clone(&context.applied_tip),
+            applied_tip: context.applied_tip.clone(),
         }));
         let handler = Handler::new(Arc::new(context));
 
@@ -1404,7 +1404,7 @@ mod tests {
             let tip = tree
                 .tip()
                 .ok_or_else(|| std::io::Error::other("missing active tip"))?;
-            ctx.set_applied_tip((*tip).clone());
+            ctx.applied_tip.store(Some(tip));
         }
         ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(transaction)));
 

@@ -290,10 +290,12 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
         lock_time: LockTime::from_consensus(GENESIS_TIME + 95),
     };
     let nonfinal_txid = nonfinal.txid();
+    let applied_tip = handles.applied_tip_reader();
+    let block_tree = handles.block_tree_reader();
     let view = bitcoin_rs_rpc::context::ChainAdmissionView::new(
         handles.utxo(),
-        handles.applied_tip(),
-        handles.block_tree(),
+        &applied_tip,
+        &block_tree,
         handles.network(),
     );
     let submitted = gateway.submit_transaction(

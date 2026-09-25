@@ -250,7 +250,6 @@ fn far_future_matching_peer_retries_without_peer_blame() -> Result<(), Box<dyn s
     let tip_before = sync
         .chain
         .chain_tip()
-        .load_full()
         .ok_or_else(|| std::io::Error::other("missing genesis tip"))?;
 
     sync.tick();
@@ -264,10 +263,7 @@ fn far_future_matching_peer_retries_without_peer_blame() -> Result<(), Box<dyn s
     })?;
     sync.tick();
 
-    assert_eq!(
-        sync.chain.chain_tip().load_full().as_deref(),
-        Some(tip_before.as_ref())
-    );
+    assert_eq!(sync.chain.chain_tip().as_deref(), Some(tip_before.as_ref()));
     assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
     assert!(rx.try_recv().is_err());
     assert!(

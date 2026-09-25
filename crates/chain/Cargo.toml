@@ -13,6 +13,8 @@ workspace = true
 
 [features]
 default = []
+# Mutable access on read capabilities for cross-crate fixtures only.
+test-seam = []
 rocksdb = ["bitcoin-rs-storage/rocksdb"]
 fjall = ["bitcoin-rs-storage/fjall"]
 redb = ["bitcoin-rs-storage/redb"]

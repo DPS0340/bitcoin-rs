@@ -69,7 +69,7 @@ where
     // Validate the block exists and is not genesis before taking mutation
     // authority. Read-only refusal should not acquire the transition.
     let validation = (|| {
-        let tree = handles.block_tree().read();
+        let tree = handles.block_tree.read();
         let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
         if tree.node(root).map_err(ReorgError::Plan)?.height == 0 {
             return Err(ReorgError::CannotInvalidateGenesis);
@@ -98,7 +98,7 @@ where
     // execution outcome; an early `?` must not strand a coherent generation.
     let outcome = (|| {
         let target = {
-            let tree = handles.block_tree().read();
+            let tree = handles.block_tree.read();
             let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
             if tree.node(root).map_err(ReorgError::Plan)?.height == 0 {
                 return Err(ReorgError::CannotInvalidateGenesis);
@@ -157,11 +157,11 @@ fn invalidate_and_republish(
     handles: &Chainstate,
     hash: Hash256,
 ) -> core::result::Result<Vec<Hash256>, ReorgError> {
-    let mut tree = handles.block_tree().write();
+    let mut tree = handles.block_tree.write();
     let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
     let invalidated = tree.invalidate_subtree(root).map_err(ReorgError::Plan)?;
     let tip = tree.tip().ok_or(ReorgError::NoValidTip)?;
-    handles.chain_tip().store(Some(tip));
+    handles.chain_tip.store(Some(tip));
     handles.reevaluate_assume_valid_with(&tree);
     Ok(invalidated)
 }
@@ -727,7 +727,7 @@ fn branch_nodes(
     handles: &Chainstate,
     ids: &[NodeId],
 ) -> core::result::Result<Vec<(Hash256, u32)>, ReorgError> {
-    let tree = handles.block_tree().read();
+    let tree = handles.block_tree.read();
     ids.iter()
         .map(|id| {
             let node = tree.node(*id).map_err(ReorgError::Plan)?;
@@ -830,10 +830,7 @@ where
 
 /// Returns the current applied-tip height, or 0 when no tip is set.
 fn applied_tip_height(handles: &Chainstate) -> u32 {
-    handles
-        .applied_tip()
-        .load_full()
-        .map_or(0, |tip| tip.height)
+    handles.applied_tip.load_full().map_or(0, |tip| tip.height)
 }
 
 fn execute_streamed_plan<F, O>(
@@ -978,8 +975,8 @@ where
                         // keep pointing at the invalidated branch, then
                         // surface both failures.
                         let handles = transition.chainstate();
-                        let tree = handles.block_tree().read();
-                        handles.chain_tip().store(tree.tip());
+                        let tree = handles.block_tree.read();
+                        handles.chain_tip.store(tree.tip());
                         handles.reevaluate_assume_valid_with(&tree);
                         drop(tree);
                         return Err(ReorgError::Invalidation {
@@ -1051,8 +1048,8 @@ fn current_reorg_plan(
     handles: &Chainstate,
     target: NodeId,
 ) -> core::result::Result<Option<ReorgPlan>, ReorgError> {
-    let tree = handles.block_tree().read();
-    let Some(current) = handles.applied_tip().load_full() else {
+    let tree = handles.block_tree.read();
+    let Some(current) = handles.applied_tip.load_full() else {
         return Err(ReorgError::NoAppliedTip);
     };
     let Some(current_id) = tree.lookup(current.hash) else {

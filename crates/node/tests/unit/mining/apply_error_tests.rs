@@ -108,6 +108,12 @@ fn apply_errors_delegate_consensus_and_chain_reasons() {
         })),
         "high-hash"
     );
+    assert_eq!(
+        rejected(ApplyError::Chain(ChainError::KnownInvalidHeader {
+            hash: Hash256::default(),
+        })),
+        "duplicate-invalid"
+    );
 }
 
 #[test]

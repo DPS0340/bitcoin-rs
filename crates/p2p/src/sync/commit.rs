@@ -241,8 +241,8 @@ impl BlockSync {
         if max_count == 0 {
             return None;
         }
-        let chain_tip = self.chain.chain_tip().load_full()?;
-        let applied_tip = self.chain.applied_tip().load_full()?;
+        let chain_tip = self.chain.chain_tip()?;
+        let applied_tip = self.chain.applied_tip()?;
         let start_height = applied_tip.height.checked_add(1)?;
         if start_height > chain_tip.height {
             return None;
@@ -254,7 +254,7 @@ impl BlockSync {
             .min(chain_tip.height);
         let capacity = usize::try_from(end_height.saturating_sub(start_height).saturating_add(1))
             .unwrap_or(max_count);
-        let tree = self.chain.block_tree().read();
+        let tree = self.chain.block_tree();
         let mut cursor = tree.node_at_height_from(chain_tip.tip_id, end_height)?;
         let mut hashes = ExpectedBlockHashes::with_capacity(capacity);
         let mut reached_start = false;
@@ -308,8 +308,8 @@ impl BlockSync {
         &self,
         max_count: usize,
     ) -> Option<(Vec<DrainedBlock>, usize)> {
-        let chain_tip = self.chain.chain_tip().load_full()?;
-        let applied_tip = self.chain.applied_tip().load_full()?;
+        let chain_tip = self.chain.chain_tip()?;
+        let applied_tip = self.chain.applied_tip()?;
         let cache = self.expected_apply_cache.lock();
         let cache = cache.as_ref()?;
         if cache.chain_tip_hash != chain_tip.hash
@@ -344,11 +344,11 @@ impl BlockSync {
         if cache_guard.is_none() {
             return;
         }
-        let Some(chain_tip) = self.chain.chain_tip().load_full() else {
+        let Some(chain_tip) = self.chain.chain_tip() else {
             *cache_guard = None;
             return;
         };
-        let Some(applied_tip) = self.chain.applied_tip().load_full() else {
+        let Some(applied_tip) = self.chain.applied_tip() else {
             *cache_guard = None;
             return;
         };
@@ -386,13 +386,12 @@ impl BlockSync {
     /// heavier pending branch leaves the applied tip on the losing side
     /// until the switch connects across the fork.
     fn applied_is_chain_ancestor(&self) -> bool {
-        let (Some(chain_tip), Some(applied_tip)) = (
-            self.chain.chain_tip().load_full(),
-            self.chain.applied_tip().load_full(),
-        ) else {
+        let (Some(chain_tip), Some(applied_tip)) =
+            (self.chain.chain_tip(), self.chain.applied_tip())
+        else {
             return false;
         };
-        let tree = self.chain.block_tree().read();
+        let tree = self.chain.block_tree();
         Self::is_ancestor_at_height(
             &tree,
             applied_tip.tip_id,
@@ -412,9 +411,9 @@ impl BlockSync {
     /// applied tip sits on the losing side, so `applied_tip.height + 1`
     /// names a mid-path winner node rather than the connect frontier.
     pub(super) fn next_expected_block(&self) -> Option<(u32, Hash256)> {
-        let chain_tip = self.chain.chain_tip().load_full()?;
-        let applied_tip = self.chain.applied_tip().load_full()?;
-        let tree = self.chain.block_tree().read();
+        let chain_tip = self.chain.chain_tip()?;
+        let applied_tip = self.chain.applied_tip()?;
+        let tree = self.chain.block_tree();
         let height = Self::first_connect_height(&tree, applied_tip.hash, chain_tip.tip_id)?;
         let node_id = tree.node_at_height_from(chain_tip.tip_id, height)?;
         Some((height, tree.node(node_id).ok()?.hash))

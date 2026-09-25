@@ -7,16 +7,15 @@
 
 pub use crate::error::{ApplyError, DisconnectError};
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_chain::{BlockTree, BlockTreeReader, ChainError, TipReader, TipSnapshot};
 use bitcoin_rs_consensus::rust_path::UtxoView;
 use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_primitives::OutPoint;
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::TxOut;
 use bitcoin_rs_primitives::Txid;
+use bitcoin_rs_primitives::{Hash256, Header};
 pub use bitcoin_rs_storage::DisconnectPhase;
 use bitcoin_rs_storage::DurableHeadStore;
 use bitcoin_rs_storage::InMemoryUndoStore;
@@ -439,6 +438,28 @@ pub struct ChainstateSnapshot {
     pub chain_tx_count: u64,
 }
 
+/// Facts returned after Chainstate admits one contiguous header batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderAdmissionOutcome {
+    /// Number of accepted inputs, including idempotent duplicates.
+    pub accepted: usize,
+    /// Hash of the final input header, when the batch was non-empty.
+    pub announced_tip: Option<Hash256>,
+    /// Height of `announced_tip` on the active header chain, when resolvable.
+    pub active_height: Option<i32>,
+}
+
+/// Failure to admit a batch at the authoritative header-tree boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum HeaderAdmissionError {
+    /// Mutation admission was closed before header validation began.
+    #[error("header admission refused: {0}")]
+    Refused(ApplyError),
+    /// Header validation rejected the batch.
+    #[error(transparent)]
+    Rejected(ChainError),
+}
+
 /// In-process facade for authoritative applied-chain mutation.
 ///
 /// See `ARCH-07` in `docs/contracts/architecture.md`. Construction and
@@ -631,25 +652,6 @@ impl<'a> ChainTransition<'a> {
         ))
     }
 
-    /// Re-applies a body this node already validated and persisted before a crash.
-    ///
-    /// Scripts do not run again (`BlockProvenance::LocalReplay`). Persistence
-    /// otherwise matches [`Self::connect`].
-    pub fn replay_local(
-        &self,
-        block: &Block,
-        serialized: bytes::Bytes,
-    ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        self.settle_apply(apply_committed_block_admitted(
-            self.chainstate,
-            block,
-            Some(serialized),
-            None,
-            BlockProvenance::LocalReplay,
-            PublishMode::Now,
-        ))
-    }
-
     /// Disconnects `block`, which must be the current applied tip.
     ///
     /// See the type-level persistence notes for marker arming, the commit
@@ -760,40 +762,60 @@ impl Chainstate {
         self.network
     }
 
-    /// Returns the best-work header-tip cell.
+    /// Returns a read-only best-work header-tip capability.
+    #[must_use]
+    pub fn header_tip_reader(&self) -> TipReader {
+        TipReader::new(Arc::clone(&self.chain_tip))
+    }
+
+    /// Returns a read-only authoritative applied-tip capability.
+    #[must_use]
+    pub fn applied_tip_reader(&self) -> TipReader {
+        TipReader::new(Arc::clone(&self.applied_tip))
+    }
+
+    /// Loads the current best-work header tip.
+    #[must_use]
+    pub fn header_tip(&self) -> Option<Arc<TipSnapshot>> {
+        self.chain_tip.load_full()
+    }
+
+    /// Loads the current authoritative applied tip.
+    #[must_use]
+    pub fn applied_tip_snapshot(&self) -> Option<Arc<TipSnapshot>> {
+        self.applied_tip.load_full()
+    }
+
+    /// Returns a cloneable read-only block-tree capability.
+    #[must_use]
+    pub fn block_tree_reader(&self) -> BlockTreeReader {
+        BlockTreeReader::new(Arc::clone(&self.block_tree))
+    }
+
+    /// Acquires a shared block-tree guard.
+    pub fn read_block_tree(&self) -> RwLockReadGuard<'_, BlockTree> {
+        self.block_tree.read()
+    }
+
+    /// Fixture-only writable header-tip cell. Not present in production builds.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn chain_tip(&self) -> &ArcSwapOption<TipSnapshot> {
         &self.chain_tip
     }
 
-    /// Clones the best-work header-tip handle for node-owned readers.
-    #[must_use]
-    pub fn chain_tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
-        Arc::clone(&self.chain_tip)
-    }
-
-    /// Returns the authoritative applied-tip cell.
+    /// Fixture-only writable applied-tip cell. Not present in production builds.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn applied_tip(&self) -> &ArcSwapOption<TipSnapshot> {
         &self.applied_tip
     }
 
-    /// Returns the shared applied-tip handle for node-owned readers.
-    #[must_use]
-    pub fn applied_tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
-        Arc::clone(&self.applied_tip)
-    }
-
-    /// Returns the shared block tree.
+    /// Fixture-only writable block tree. Not present in production builds.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn block_tree(&self) -> &RwLock<BlockTree> {
         &self.block_tree
-    }
-
-    /// Clones the shared block-tree handle for node-owned readers.
-    #[must_use]
-    pub fn block_tree_handle(&self) -> Arc<RwLock<BlockTree>> {
-        Arc::clone(&self.block_tree)
     }
 
     /// Returns the authoritative UTXO set.
@@ -856,13 +878,52 @@ impl Chainstate {
         Arc::clone(&self.retention)
     }
 
-    /// Returns the read barrier used by lower-layer live-view consumers.
+    /// Returns the stable-view fence used by lower-layer live-view consumers.
     ///
     /// Locking this mutex prevents an authoritative transition from starting;
-    /// it does not grant mutation capability.
+    /// it grants no mutation capability: all it can do is delay the next
+    /// transition until the guard is dropped.
     #[must_use]
-    pub fn transition_barrier(&self) -> Arc<Mutex<()>> {
+    pub fn read_fence(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.chain_transition)
+    }
+
+    /// Admits headers and publishes the best-work header tip under Chainstate's
+    /// transition authority.
+    pub fn admit_headers(
+        &self,
+        headers: &[Header],
+    ) -> core::result::Result<HeaderAdmissionOutcome, HeaderAdmissionError> {
+        let _transition = self
+            .lock_transition()
+            .map_err(HeaderAdmissionError::Refused)?;
+        let mut tree = self.block_tree.write();
+        let acceptance = bitcoin_rs_chain::accept_headers(
+            &mut tree,
+            headers,
+            self.network,
+            bitcoin_rs_chain::current_unix_seconds(),
+        );
+        // A rejected batch can still have inserted a valid prefix and moved
+        // the tip; the gate follows whatever active chain exists now.
+        self.assume_valid_gate.evaluate(&tree);
+        let node_ids = acceptance.map_err(HeaderAdmissionError::Rejected)?;
+        let announced_tip = node_ids
+            .last()
+            .and_then(|id| tree.node(*id).ok())
+            .map(|node| node.hash);
+        let active_height = tree
+            .tip()
+            .zip(announced_tip)
+            .and_then(|(active_tip, hash)| {
+                tree.active_height_of(active_tip.tip_id, hash)
+                    .and_then(|height| i32::try_from(height).ok())
+            });
+        Ok(HeaderAdmissionOutcome {
+            accepted: node_ids.len(),
+            announced_tip,
+            active_height,
+        })
     }
 
     /// Sets which committed wire payloads must be retained for node-owned followers.
@@ -877,7 +938,7 @@ impl Chainstate {
     }
 
     /// Re-evaluates the assume-valid anchor against an already locked tree.
-    pub fn reevaluate_assume_valid_with(&self, tree: &BlockTree) {
+    pub(crate) fn reevaluate_assume_valid_with(&self, tree: &BlockTree) {
         self.assume_valid_gate.evaluate(tree);
     }
 
@@ -1100,6 +1161,7 @@ impl Chainstate {
     /// not invoked. Production paths with followers must dispatch while the
     /// the chain transition is still held (`ARCH-07`). Node-owned followers
     /// consume the returned outcome outside this crate.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_block(&self, block: &Block) -> core::result::Result<ConnectOutcome, ApplyError> {
         let transition = self.begin_transition()?;
         let result = transition.connect(block);
@@ -1111,6 +1173,7 @@ impl Chainstate {
     /// the transition lock.
     ///
     /// Persistence matches [`ChainTransition::connect`].
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_block_with_serialized(
         &self,
         block: &Block,
@@ -1122,21 +1185,6 @@ impl Chainstate {
         result
     }
 
-    /// Admits a transition, replays a locally persisted body, then releases the
-    /// transition lock.
-    ///
-    /// Persistence matches [`ChainTransition::replay_local`].
-    pub fn replay_local_block(
-        &self,
-        block: &Block,
-        serialized: bytes::Bytes,
-    ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        let transition = self.begin_transition()?;
-        let result = transition.replay_local(block, serialized);
-        drop(transition);
-        result
-    }
-
     /// Admits a transition, disconnects `block`, then releases the transition
     /// lock. Refusal and fatal-recovery semantics are defined by
     /// [`ChainTransition::disconnect`].
@@ -1144,6 +1192,7 @@ impl Chainstate {
     /// Persistence matches [`ChainTransition::disconnect`]. An admission
     /// failure is `DisconnectError::Refused`. Derived consumers are not
     /// invoked; node-owned followers consume the returned outcome.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn disconnect_block(
         &self,
         block: &Block,
@@ -1159,6 +1208,7 @@ impl Chainstate {
     /// Admits a transition, applies consecutive blocks, then releases the
     /// transition lock. Persistence matches [`ChainTransition::connect_window`].
     #[allow(clippy::result_large_err)]
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_window(
         &self,
         blocks: &[&Block],

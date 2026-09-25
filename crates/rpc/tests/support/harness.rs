@@ -76,8 +76,7 @@ impl NodeHarness {
         let headers = self
             .state
             .chainstate()
-            .chain_tip_handle()
-            .load_full()
+            .header_tip()
             .map_or(applied.height, |header| header.height);
         Ok(LiveChain {
             blocks: u64::from(applied.height),
@@ -108,14 +107,14 @@ impl ServerHarness {
         let chainstate = state.chainstate();
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
-                chain_tip: chainstate.chain_tip_handle(),
-                applied_tip: chainstate.applied_tip_handle(),
+                chain_tip: chainstate.header_tip_reader(),
+                applied_tip: chainstate.applied_tip_reader(),
                 chain_tx_count: chainstate.chain_tx_count_handle(),
                 blocks: state.blocks(),
                 transactions: state.transactions(),
                 utxo: chainstate.utxo_handle(),
                 coin_stats: chainstate.coin_stats_handle(),
-                block_tree: chainstate.block_tree_handle(),
+                block_tree: chainstate.block_tree_reader(),
                 chain_network: state.config().network,
             },
             mempool: MempoolHandles {

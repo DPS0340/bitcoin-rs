@@ -2613,18 +2613,18 @@ mod acceptance_tests {
             let best_id = ids[11];
             let applied_node = tree.node(applied_id).expect("applied node exists");
             let best_node = tree.node(best_id).expect("best node exists");
-            ctx.set_applied_tip(TipSnapshot {
+            ctx.applied_tip.store(Some(Arc::new(TipSnapshot {
                 tip_id: applied_id,
                 height: applied_node.height,
                 chainwork: applied_node.chainwork,
                 hash: applied_node.hash,
-            });
-            ctx.set_chain_tip(TipSnapshot {
+            })));
+            ctx.chain_tip.store(Some(Arc::new(TipSnapshot {
                 tip_id: best_id,
                 height: best_node.height,
                 chainwork: best_node.chainwork,
                 hash: best_node.hash,
-            });
+            })));
             (applied_node.hash, best_node.hash)
         };
 

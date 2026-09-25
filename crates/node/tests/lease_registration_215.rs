@@ -19,7 +19,7 @@ use parking_lot::{Mutex, RwLock};
 
 fn make_sync(peer_table: Arc<PeerTable>) -> BlockSync {
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let chain_tip = block_tree.read().tip_handle();
+    let chain_tip = block_tree.write().tip_handle();
     let applied_tip = Arc::new(ArcSwapOption::empty());
     let (_headers_tx, headers_rx) = unbounded();
     let (_blocks_tx, blocks_rx) = unbounded();

@@ -129,7 +129,7 @@ impl NodeState {
         let InitialChainstate {
             utxo: mut utxo_set,
             coin_stats: initial_coin_stats,
-            tree: block_tree_value,
+            tree: mut block_tree_value,
             applied_tip: restored_applied_tip,
             chain_tx_count: restored_chain_tx_count,
             resume_source,
@@ -236,8 +236,10 @@ impl NodeState {
         // confirmation history before any admission can run. A corrupt or
         // unknown-version file degrades to insufficient data (docs/policies/db-migration.md).
         bitcoin_rs_mempool::fee_history::load(&config.data_dir, &mempool);
+        // Extract the tip publication cell while the tree is still owned
+        // here; sharing it is part of the tree's mutation authority.
+        let chain_tip = block_tree_value.tip_handle();
         let block_tree = Arc::new(RwLock::new(block_tree_value));
-        let chain_tip = block_tree.read().tip_handle();
         let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
         if let Some(restored_applied_tip) = restored_applied_tip {
             applied_tip.store(Some(Arc::new(restored_applied_tip)));
@@ -279,7 +281,7 @@ impl NodeState {
         ) = match derived_index_open_spec {
             Some(mut spec) => {
                 spec.utxo = Some(Arc::clone(&utxo));
-                spec.chain_transition = Some(chainstate.transition_barrier());
+                spec.chain_transition = Some(chainstate.read_fence());
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
                 let runtime =
                     Arc::new(bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx));
@@ -288,7 +290,7 @@ impl NodeState {
                 let block_source =
                     bitcoin_rs_index::runtime::IndexBlockSource::new(Arc::clone(&blocks))
                         .with_block_body_source(Arc::clone(&body_source))
-                        .with_block_tree(Arc::clone(&block_tree));
+                        .with_block_tree(chainstate.block_tree_reader());
                 let lifecycle: Arc<
                     arc_swap::ArcSwap<bitcoin_rs_index::runtime::DerivedIndexLifecycle>,
                 > = Arc::new(arc_swap::ArcSwap::from_pointee(

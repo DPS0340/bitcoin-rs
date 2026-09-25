@@ -98,8 +98,7 @@ fn replay_10k_subprocess_probe() -> Result<()> {
     let rss_after_kib = peak_rss_kib()?;
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("10k replay produced no applied tip"))?;
     let result = ProbeResult {
         records: RECORDS,

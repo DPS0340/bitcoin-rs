@@ -5,14 +5,11 @@
 
 use crate::chain_effects::ChainFollowers;
 use alloc::sync::Arc;
-use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_chain::accept_headers;
-use bitcoin_rs_chain::current_unix_seconds;
 use bitcoin_rs_chain::signalling_deployments;
+use bitcoin_rs_chain::{BlockTreeReader, TipReader};
 use bitcoin_rs_chainstate::ApplyError;
 use bitcoin_rs_chainstate::Chainstate;
 use bitcoin_rs_chainstate::bytes_are_block;
@@ -70,17 +67,15 @@ impl MiningCoordinator {
         coinbase_script: Vec<u8>,
     ) -> Self {
         let network = chainstate.network();
-        let applied_tip = chainstate.applied_tip_handle();
-        let block_tree = chainstate.block_tree_handle();
+        let applied_tip = chainstate.applied_tip_reader();
+        let block_tree = chainstate.block_tree_reader();
         let shutdown = chainstate.shutdown_handle();
         let service = MiningService::new(
             network,
-            Arc::new(AppliedTipAdapter {
-                tip: Arc::clone(&applied_tip),
-            }),
+            Arc::new(AppliedTipAdapter { tip: applied_tip }),
             Arc::new(MempoolAdapter { mempool }),
             Arc::new(ChainContextAdapter {
-                block_tree: Arc::clone(&block_tree),
+                block_tree,
                 network,
             }),
             coinbase_script,
@@ -120,7 +115,7 @@ impl MiningCoordinator {
     /// tree entry, including a header-only `Active` tip, is still
     /// inconclusive — `NodeStatus::Active` is the header chain, not scripts.
     fn known_block_result(&self, block_hash: Hash256) -> Option<BlockValidationResult> {
-        let tree = self.chainstate.block_tree().read();
+        let tree = self.chainstate.read_block_tree();
         let node_id = tree.lookup(block_hash)?;
         let node = tree.node(node_id).ok()?;
         if node.status == NodeStatus::Invalid {
@@ -128,8 +123,7 @@ impl MiningCoordinator {
         }
         let on_applied = self
             .chainstate
-            .applied_tip()
-            .load_full()
+            .applied_tip_snapshot()
             .is_some_and(|tip| tree.node_at_height_from(tip.tip_id, node.height) == Some(node_id));
         if on_applied || node.chain_tx_count != 0 {
             return Some(BlockValidationResult::Duplicate);
@@ -140,7 +134,7 @@ impl MiningCoordinator {
     /// Core `submitblock` fills the coinbase reserved nonce when the block
     /// already has a BIP141 commitment but no coinbase witness. Proposal skips this.
     fn fill_uncommitted_witness(&self, block: &mut Block) -> bool {
-        let tree = self.chainstate.block_tree().read();
+        let tree = self.chainstate.read_block_tree();
         let Some(prev_id) = tree.lookup(block.header.prev_blockhash.into()) else {
             return false;
         };
@@ -200,7 +194,7 @@ impl MiningCoordinator {
             Ok(outcome) => {
                 self.followers.committed_connect(block, &outcome);
                 let tip = outcome.tip;
-                let Some(visible) = self.chainstate.applied_tip().load_full() else {
+                let Some(visible) = self.chainstate.applied_tip_snapshot() else {
                     self.chainstate.fail_closed_for_recovery();
                     return Err(MiningControlError::Failed(CompactString::from(
                         "applied tip missing after accepted submission",
@@ -246,7 +240,7 @@ impl MiningCoordinator {
 
 /// Serves the lifecycle the applied-tip snapshot the node publishes.
 struct AppliedTipAdapter {
-    tip: Arc<ArcSwapOption<TipSnapshot>>,
+    tip: TipReader,
 }
 
 impl AppliedTipSource for AppliedTipAdapter {
@@ -292,7 +286,7 @@ impl MempoolSnapshotSource for MempoolAdapter {
 
 /// Resolves applied-tree facts for the lifecycle.
 struct ChainContextAdapter {
-    block_tree: Arc<RwLock<BlockTree>>,
+    block_tree: BlockTreeReader,
     network: Network,
 }
 
@@ -351,9 +345,9 @@ impl MiningControl for MiningCoordinator {
     }
 
     fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
-        let tip = self.chainstate.applied_tip().load_full();
+        let tip = self.chainstate.applied_tip_snapshot();
         let network_hashes_per_second = {
-            let tree = self.chainstate.block_tree().read();
+            let tree = self.chainstate.read_block_tree();
             tip.as_ref().map_or(0.0, |tip| {
                 bitcoin_rs_mining::estimate_network_hashps(
                     &tree,
@@ -369,8 +363,8 @@ impl MiningControl for MiningCoordinator {
     }
 
     fn network_hash_ps(&self, lookup: i64, height: i64) -> Result<f64, MiningControlError> {
-        let tree = self.chainstate.block_tree().read();
-        let tip = self.chainstate.applied_tip().load_full();
+        let tree = self.chainstate.read_block_tree();
+        let tip = self.chainstate.applied_tip_snapshot();
         bitcoin_rs_mining::network_hash_ps(
             &tree,
             tip.as_deref(),
@@ -404,36 +398,33 @@ impl MiningControl for MiningCoordinator {
         self.submit(&block, Some(serialized))
     }
 
-    /// Admits `header` through [`accept_headers`], the same gate inbound P2P uses.
+    /// Admits `header` through the same Chainstate boundary inbound P2P uses.
     fn submit_header(&self, header: Header) -> Result<(), MiningControlError> {
-        let _transition = self.chainstate.lock_transition().map_err(|error| {
-            MiningControlError::Unavailable(CompactString::from(error.to_string()))
-        })?;
-        let mut tree = self.chainstate.block_tree().write();
-        // Preserve accept_headers' idempotent duplicate path, including genesis.
-        if tree.lookup(header.compute_hash().into()).is_none() {
-            let parent = tree.lookup(header.prev_blockhash.into()).ok_or_else(|| {
-                header_reject_reason(ChainError::MissingParent {
-                    prev_hash: header.prev_blockhash.into(),
-                })
-            })?;
-            if tree
-                .node(parent)
-                .is_ok_and(|node| node.status == NodeStatus::Invalid)
+        // API-13 reports a missing parent before proof-of-work failures.
+        // Known headers stay idempotent; an empty tree also admits network genesis.
+        {
+            let tree = self.chainstate.read_block_tree();
+            let hash = header.compute_hash().into();
+            let is_genesis_root =
+                tree.is_empty() && hash == self.chainstate.network().genesis_block_hash();
+            if !is_genesis_root
+                && tree.lookup(hash).is_none()
+                && tree.lookup(header.prev_blockhash.into()).is_none()
             {
-                return Err(MiningControlError::Rejected(CompactString::from(
-                    "bad-prevblk",
-                )));
+                return Err(header_reject_reason(ChainError::MissingParent {
+                    prev_hash: header.prev_blockhash.into(),
+                }));
             }
         }
-        accept_headers(
-            &mut tree,
-            std::slice::from_ref(&header),
-            self.chainstate.network(),
-            current_unix_seconds(),
-        )
-        .map(|_| ())
-        .map_err(header_reject_reason)
+        match self.chainstate.admit_headers(std::slice::from_ref(&header)) {
+            Ok(_) => Ok(()),
+            Err(bitcoin_rs_chainstate::HeaderAdmissionError::Rejected(error)) => {
+                Err(header_reject_reason(error))
+            }
+            Err(bitcoin_rs_chainstate::HeaderAdmissionError::Refused(error)) => Err(
+                MiningControlError::Unavailable(CompactString::from(error.to_string())),
+            ),
+        }
     }
 
     fn publish_generation(&self) {
@@ -567,6 +558,8 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
         ApplyError::Consensus(consensus) => bitcoin_rs_mining::consensus_reject_reason(consensus),
         ApplyError::Chain(
             chain @ (ChainError::MissingParent { .. }
+            | ChainError::InvalidParent { .. }
+            | ChainError::KnownInvalidHeader { .. }
             | ChainError::NonContinuousHeader { .. }
             | ChainError::ZeroTarget { .. }
             | ChainError::TargetExceedsLimit { .. }

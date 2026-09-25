@@ -11,8 +11,9 @@ use bitcoin::blockdata::block::Block as RegistryBlock;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_compact_blocks::CmpctBlock;
-use bitcoin_rs_chain::{BlockBodySource, BlockTree};
+use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
+#[cfg(test)]
 use parking_lot::RwLock;
 
 use crate::dispatch::{ChainQuery, InventoryServing};
@@ -21,14 +22,14 @@ use crate::wire::{Message, PeerError};
 /// Read-only active-chain view for P2P `getheaders` / `getdata`.
 #[derive(Clone)]
 pub struct ActiveChainQuery {
-    block_tree: Arc<RwLock<BlockTree>>,
+    block_tree: BlockTreeReader,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
 }
 
 impl ActiveChainQuery {
     /// Builds a P2P chain query view over shared active-chain state.
     #[must_use]
-    pub const fn new(block_tree: Arc<RwLock<BlockTree>>) -> Self {
+    pub fn new(block_tree: BlockTreeReader) -> Self {
         Self {
             block_tree,
             block_body_source: None,
@@ -403,7 +404,7 @@ mod tests {
         let active1_id = tree.insert_node(Some(genesis_id), active1, NodeStatus::Active)?;
         tree.insert_node(Some(active1_id), active2, NodeStatus::Active)?;
         tree.insert_node(Some(genesis_id), fork1, NodeStatus::Stale)?;
-        let query = ActiveChainQuery::new(Arc::new(RwLock::new(tree)));
+        let query = ActiveChainQuery::new(BlockTreeReader::new(Arc::new(RwLock::new(tree))));
 
         let response = query.headers_after(&[fork1.compute_hash()], BlockHash::default(), 10);
 
@@ -731,7 +732,9 @@ mod tests {
         for header in headers {
             parent = Some(tree.insert_node(parent, header, NodeStatus::Active)?);
         }
-        Ok(ActiveChainQuery::new(Arc::new(RwLock::new(tree))))
+        Ok(ActiveChainQuery::new(BlockTreeReader::new(Arc::new(
+            RwLock::new(tree),
+        ))))
     }
 
     fn seed_headers(count: u32) -> Vec<Header> {

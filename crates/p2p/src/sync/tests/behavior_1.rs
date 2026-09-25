@@ -218,11 +218,7 @@ fn apply_buffered_blocks_waits_for_pending_reorg() -> Result<(), Box<dyn std::er
         "an uncommittable winner body must stay staged for the branch switch"
     );
     assert_eq!(
-        sync.chain
-            .applied_tip()
-            .load_full()
-            .ok_or("missing applied tip")?
-            .hash,
+        sync.chain.applied_tip().ok_or("missing applied tip")?.hash,
         applied.hash,
         "the losing applied tip must not be displaced by the extension path"
     );
@@ -266,7 +262,7 @@ fn inbound_headers_response_releases_getheaders_gate() -> Result<(), Box<dyn std
         inbound_blocks_tx: _inbound_blocks_tx,
         ..
     } = SyncHarness::new(tree);
-    let chain_tip = block_tree.read().tip_handle();
+    let chain_tip = block_tree.write().tip_handle();
     install_budget(
         &sync,
         super::super::SyncBudget {
@@ -318,7 +314,7 @@ fn rejected_matching_peer_headers_release_gate_and_retry_immediately()
         inbound_blocks_tx: _inbound_blocks_tx,
         ..
     } = SyncHarness::new(tree);
-    let chain_tip = block_tree.read().tip_handle();
+    let chain_tip = block_tree.write().tip_handle();
     install_budget(
         &sync,
         super::super::SyncBudget {

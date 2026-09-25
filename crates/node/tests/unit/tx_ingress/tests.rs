@@ -3,7 +3,6 @@
 use super::*;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_chainstate::events::ChainEventPublisher;
 use bitcoin_rs_mempool::{
     Mempool, MempoolEntry, MempoolLimits, MempoolObserver, MutationEnvelope, MutationOutcome,
 };
@@ -148,20 +147,12 @@ fn make_consumer(gateway: &Arc<MempoolGateway>, mining: Arc<RecordingMining>) ->
     ));
     utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0xBB; 32]))
         .expect("utxo commit must succeed");
-    let chainstate = Arc::new(bitcoin_rs_chainstate::Chainstate::new(
-        Network::Regtest,
-        Arc::new(ArcSwapOption::empty()),
-        Arc::new(ArcSwapOption::empty()),
-        Arc::new(RwLock::new(BlockTree::new())),
-        utxo,
-        Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
-            bitcoin_rs_utxo::stats::CoinStats::default(),
-        )),
-        Arc::new(ChainEventPublisher::detached(0)),
-    ));
     let (relay, _relay_rx) = TxRelayQueue::new(DEFAULT_TX_RELAY_QUEUE_CAPACITY);
     TxIngressConsumer {
-        chainstate,
+        utxo,
+        applied_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
+        block_tree: BlockTreeReader::new(Arc::new(RwLock::new(BlockTree::new()))),
+        network: Network::Regtest,
         peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
         mempool_gateway: Arc::clone(gateway),
         mining_control: mining,

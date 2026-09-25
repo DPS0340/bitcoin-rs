@@ -9,7 +9,6 @@ fn tick_skips_getheaders_when_header_tip_matches_peer_height()
         let chain_tip = sync
             .chain
             .chain_tip()
-            .load_full()
             .ok_or_else(|| std::io::Error::other("missing chain tip"))?;
         let node_id = tree
             .node_at_height_from(chain_tip.tip_id, 1)

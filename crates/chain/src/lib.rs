@@ -17,6 +17,8 @@ pub mod reorg;
 pub mod tip;
 /// In-memory block tree.
 pub mod tree;
+/// Read-only capabilities over chain publications and topology.
+mod view;
 
 use bitcoin_rs_primitives::Hash256;
 use thiserror::Error;
@@ -37,6 +39,7 @@ pub use node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus};
 pub use reorg::{ReorgPlan, plan_reorg};
 pub use tip::TipSnapshot;
 pub use tree::BlockTree;
+pub use view::{BlockTreeReader, TipReader};
 
 /// Errors returned by header sync, block-tree, and reorg planning operations.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -59,9 +62,22 @@ pub enum ChainError {
         /// Duplicate header hash.
         hash: Hash256,
     },
+    /// A previously admitted header is known to be invalid.
+    #[error("header {hash} is known invalid")]
+    KnownInvalidHeader {
+        /// Hash of the invalid header.
+        hash: Hash256,
+    },
     /// A non-root header refers to a parent hash not present in the tree.
     #[error("missing parent header {prev_hash}")]
     MissingParent {
+        /// Previous-block hash referenced by the child header.
+        prev_hash: Hash256,
+    },
+    /// The parent header is present but was previously marked invalid, so no
+    /// descendant may extend it.
+    #[error("parent header {prev_hash} is invalid")]
+    InvalidParent {
         /// Previous-block hash referenced by the child header.
         prev_hash: Hash256,
     },

@@ -2,7 +2,7 @@
 //!
 //! The validator enforces the five-layer one-way dependency model, the
 //! storage-engine ownership boundary, the ZMQ surface ownership boundary,
-//! and backend feature-forwarding rules described in
+//! backend feature-forwarding rules, and production test-seam isolation in
 //! `docs/contracts/architecture.md`.
 
 #![expect(
@@ -10,8 +10,12 @@
     reason = "malformed Cargo metadata is a test failure"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
+
+#[cfg(test)]
+#[path = "dependency_graph_tests.rs"]
+mod tests;
 
 /// Storage engine crates. Only `bitcoin-rs-storage` may depend on these.
 pub(crate) const ENGINE_CRATES: [&str; 3] = ["fjall", "redb", "rust-rocksdb"];
@@ -70,6 +74,15 @@ pub(crate) fn approved_layer(crate_name: &str) -> u8 {
     }
 }
 
+/// A normal or build workspace dependency, before dev-feature unification.
+#[derive(Clone, Debug)]
+struct FeatureDependency {
+    name: String,
+    alias: String,
+    features: Vec<String>,
+    uses_default_features: bool,
+}
+
 /// Parsed workspace dependency graph used by the gates.
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceGraph {
@@ -81,6 +94,8 @@ pub(crate) struct WorkspaceGraph {
     pub zmq_deps: BTreeMap<String, Vec<String>>,
     /// Cargo feature implies per crate.
     pub features: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// Feature selections on normal/build workspace edges, excluding dev fixtures.
+    production_deps: BTreeMap<String, Vec<FeatureDependency>>,
     /// Number of workspace packages seen in the metadata.
     pub classified: usize,
 }
@@ -145,6 +160,7 @@ impl WorkspaceGraph {
         let mut engine_deps = BTreeMap::new();
         let mut zmq_deps = BTreeMap::new();
         let mut features = BTreeMap::new();
+        let mut production_deps = BTreeMap::new();
         let mut classified = 0_usize;
 
         for package in metadata["packages"].as_array().expect("packages array") {
@@ -155,6 +171,7 @@ impl WorkspaceGraph {
             let mut edges = Vec::new();
             let mut engines = Vec::new();
             let mut zmq = Vec::new();
+            let mut feature_deps = Vec::new();
             for dependency in package["dependencies"].as_array().expect("deps array") {
                 let dep_name = dependency["name"].as_str().expect("dep name").to_owned();
                 if dep_name == ZMQ_CRATE {
@@ -176,12 +193,29 @@ impl WorkspaceGraph {
                     dependency["kind"].as_str().unwrap_or("normal"),
                     "normal" | "build"
                 ) {
+                    feature_deps.push(FeatureDependency {
+                        alias: dependency["rename"]
+                            .as_str()
+                            .unwrap_or(&dep_name)
+                            .to_owned(),
+                        name: dep_name.clone(),
+                        features: dependency["features"]
+                            .as_array()
+                            .expect("dependency features")
+                            .iter()
+                            .map(|feature| feature.as_str().expect("dependency feature").to_owned())
+                            .collect(),
+                        uses_default_features: dependency["uses_default_features"]
+                            .as_bool()
+                            .expect("dependency default-features flag"),
+                    });
                     edges.push(dep_name);
                 }
             }
             normal_deps.insert(name.clone(), edges);
             engine_deps.insert(name.clone(), engines);
             zmq_deps.insert(name.clone(), zmq);
+            production_deps.insert(name.clone(), feature_deps);
 
             let mut feature_map = BTreeMap::new();
             for (feature, implies) in package["features"].as_object().expect("features object") {
@@ -201,6 +235,7 @@ impl WorkspaceGraph {
             engine_deps,
             zmq_deps,
             features,
+            production_deps,
             classified,
         }
     }
@@ -295,6 +330,10 @@ impl WorkspaceGraph {
         //    Node may forward the surface feature but must not name the
         //    external dependency directly.
         checked_features += self.validate_zmq_surface(&mut violations);
+
+        // 6. Fixture capabilities must never be selected by production edges
+        //    or forwarded by production/default features.
+        checked_features += self.validate_test_seam_isolation(&mut violations);
 
         if violations.is_empty() {
             Ok(Validation {
@@ -411,6 +450,76 @@ impl WorkspaceGraph {
         }
         checked
     }
+
+    /// Rejects fixture features without conflating production and dev edges.
+    fn validate_test_seam_isolation(&self, violations: &mut Vec<String>) -> usize {
+        let mut checked = 0;
+        for (name, dependencies) in &self.production_deps {
+            for dependency in dependencies {
+                let selected = dependency
+                    .features
+                    .iter()
+                    .map(String::as_str)
+                    .chain(dependency.uses_default_features.then_some("default"));
+                for feature in selected {
+                    checked += 1;
+                    if let Some(target) = self.test_seam_target(&dependency.name, feature) {
+                        violations.push(format!(
+                            "production dependency `{name}` -> `{}` selects `{feature}`, \
+                             enabling `{target}/test-seam`",
+                            dependency.name
+                        ));
+                    }
+                }
+            }
+        }
+        for (name, features) in &self.features {
+            for feature in features.keys().filter(|feature| *feature != "test-seam") {
+                checked += 1;
+                if let Some(target) = self.test_seam_target(name, feature) {
+                    violations.push(format!(
+                        "production feature `{name}/{feature}` enables `{target}/test-seam`"
+                    ));
+                }
+            }
+        }
+        checked
+    }
+
+    /// Follows local aliases and dependency feature forwarding, including
+    /// renamed and weak optional edges. Feature cycles are visited only once.
+    fn test_seam_target<'a>(&'a self, name: &'a str, feature: &'a str) -> Option<&'a str> {
+        let mut pending = vec![(name, feature)];
+        let mut visited = BTreeSet::new();
+        while let Some((name, feature)) = pending.pop() {
+            if !visited.insert((name, feature)) {
+                continue;
+            }
+            if feature == "test-seam" {
+                return Some(name);
+            }
+            let Some(implies) = self
+                .features
+                .get(name)
+                .and_then(|features| features.get(feature))
+            else {
+                continue;
+            };
+            for entry in implies {
+                if let Some((alias, forwarded)) = entry.split_once('/') {
+                    for dependency in self.production_deps.get(name).into_iter().flatten() {
+                        if dependency.alias == alias.trim_end_matches('?') {
+                            pending.push((&dependency.name, forwarded));
+                        }
+                    }
+                } else if !entry.starts_with("dep:") {
+                    pending.push((name, entry));
+                }
+            }
+        }
+        None
+    }
+
     /// Detects cycles in the internal bitcoin-rs-* dependency graph using
     /// a depth-first coloring. Returns the number of crates visited.
     fn detect_cycles(&self, violations: &mut Vec<String>) -> usize {

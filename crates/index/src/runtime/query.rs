@@ -5,12 +5,12 @@
 use super::{
     Arc, Block, BlockBodySource, BlockHash, BlockLog, BlockSource, BlockTree, DerivedIndexInfo,
     DerivedIndexQuery, DerivedIndexRuntime, Hash256, IndexCapabilities, IndexCapability,
-    IndexReader, IndexWatermark, MAX_SERIALIZED_BLOCK_BYTES, Mutex, Ordering, OutPoint,
-    PrefixScanLimit, QUERY_BODY_READ_LIMIT, QUERY_SCAN_BYTE_LIMIT, QUERY_SCAN_COUNT_LIMIT,
-    QUERY_SCAN_ROW_LIMIT, RwLock, ScriptHash, ScriptHistoryRecord, ScriptIndexQuery,
-    ScriptIndexRecord, ScriptIndexSnapshot, ScriptLiveScan, SpendingRecord, TipSnapshot, Tx,
-    TxIndexScan, TxIndexScanRow, TxIndexSnapshot, TxPosition, TxPositionValue, TxQueryError, Txid,
-    deserialize, record_at_height,
+    IndexReader, IndexWatermark, MAX_SERIALIZED_BLOCK_BYTES, Ordering, OutPoint, PrefixScanLimit,
+    QUERY_BODY_READ_LIMIT, QUERY_SCAN_BYTE_LIMIT, QUERY_SCAN_COUNT_LIMIT, QUERY_SCAN_ROW_LIMIT,
+    RwLock, ScriptHash, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
+    ScriptIndexSnapshot, ScriptLiveScan, SpendingRecord, TipSnapshot, Tx, TxIndexScan,
+    TxIndexScanRow, TxIndexSnapshot, TxPosition, TxPositionValue, TxQueryError, Txid, deserialize,
+    record_at_height,
 };
 
 mod scripts;
@@ -22,7 +22,7 @@ mod transactions;
 pub struct IndexBlockSource {
     blocks: Arc<RwLock<BlockLog>>,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
-    block_tree: Option<Arc<RwLock<BlockTree>>>,
+    block_tree: Option<bitcoin_rs_chain::BlockTreeReader>,
 }
 
 impl IndexBlockSource {
@@ -45,7 +45,7 @@ impl IndexBlockSource {
 
     /// Adds the authoritative block tree used for active-chain identity.
     #[must_use]
-    pub fn with_block_tree(mut self, tree: Arc<RwLock<BlockTree>>) -> Self {
+    pub fn with_block_tree(mut self, tree: bitcoin_rs_chain::BlockTreeReader) -> Self {
         self.block_tree = Some(tree);
         self
     }
@@ -187,7 +187,7 @@ pub struct QueryEngineLive {
     /// Authoritative UTXO set for the compact live view.
     pub utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
     /// Serializes live-view work against a chain transition.
-    pub chain_transition: Option<Arc<Mutex<()>>>,
+    pub chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
     /// Capability set this engine serves.
     pub enabled: IndexCapabilities,
 }
@@ -204,11 +204,11 @@ pub struct DerivedIndexQueryEngine {
     runtime: Arc<DerivedIndexRuntime>,
     reader: Arc<dyn IndexReader>,
     block_source: IndexBlockSource,
-    block_tree: Arc<RwLock<BlockTree>>,
-    applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
+    block_tree: bitcoin_rs_chain::BlockTreeReader,
+    applied_tip: bitcoin_rs_chain::TipReader,
     body_source: Option<Arc<dyn BlockBodySource>>,
     utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
-    chain_transition: Option<Arc<Mutex<()>>>,
+    chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
     enabled: IndexCapabilities,
 }
 
@@ -226,8 +226,8 @@ impl DerivedIndexQueryEngine {
         runtime: Arc<DerivedIndexRuntime>,
         reader: Arc<dyn IndexReader>,
         block_source: IndexBlockSource,
-        block_tree: Arc<RwLock<BlockTree>>,
-        applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
+        block_tree: bitcoin_rs_chain::BlockTreeReader,
+        applied_tip: bitcoin_rs_chain::TipReader,
         body_source: Option<Arc<dyn BlockBodySource>>,
         live: QueryEngineLive,
     ) -> Self {
@@ -304,12 +304,7 @@ impl DerivedIndexQueryEngine {
             None
         };
 
-        let tip_before = self
-            .applied_tip
-            .load()
-            .as_ref()
-            .cloned()
-            .ok_or(TxQueryError::Retry)?;
+        let tip_before = self.applied_tip.load_full().ok_or(TxQueryError::Retry)?;
         let revision_before = self.runtime.revision();
 
         let reader: &dyn IndexReader = self.reader.as_ref();
@@ -342,7 +337,7 @@ impl DerivedIndexQueryEngine {
         let result = f(snapshot.as_ref(), &tip_before, &mut budget);
 
         self.query_health()?;
-        let tip_after = self.applied_tip.load();
+        let tip_after = self.applied_tip.load_full();
         let revision_after = self.runtime.revision();
         if revision_before != revision_after
             || tip_after
@@ -365,12 +360,7 @@ impl DerivedIndexQueryEngine {
     ) -> Result<IndexProgress, TxQueryError> {
         self.query_health()?;
 
-        let tip_before = self
-            .applied_tip
-            .load()
-            .as_ref()
-            .cloned()
-            .ok_or(TxQueryError::Retry)?;
+        let tip_before = self.applied_tip.load_full().ok_or(TxQueryError::Retry)?;
         let revision_before = self.runtime.revision();
 
         let reader: &dyn IndexReader = self.reader.as_ref();
@@ -419,7 +409,7 @@ impl DerivedIndexQueryEngine {
         .unwrap_or(0);
 
         self.query_health()?;
-        let tip_after = self.applied_tip.load();
+        let tip_after = self.applied_tip.load_full();
         let revision_after = self.runtime.revision();
 
         if revision_before != revision_after

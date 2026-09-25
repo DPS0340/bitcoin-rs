@@ -12,7 +12,7 @@ fn branch_switch_uses_staged_bodies_without_durable_store() -> Result<(), Box<dy
         "fixture must not fall back to durable body storage"
     );
     let followers = crate::chain_effects::ChainFollowers::noop();
-    let applied_tip = handles.applied_tip_handle();
+    let applied_tip = handles.applied_tip_reader();
 
     // Fork rooted one below the tip: three blocks of work outweigh the
     // main chain's one-block lead.
@@ -108,7 +108,7 @@ fn branch_switch_replans_after_a_competing_connect_before_transition()
     use bitcoin_rs_primitives::Script;
     let (handles, main, mut bodies) = matured_chain(101)?;
     let followers = crate::chain_effects::ChainFollowers::noop();
-    let applied_tip = handles.applied_tip_handle();
+    let applied_tip = handles.applied_tip_reader();
 
     let fork_root_hash = main[99].block_hash();
     let mut fork_parent = handles

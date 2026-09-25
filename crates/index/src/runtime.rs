@@ -19,7 +19,7 @@
 
 use arc_swap::ArcSwap;
 
-use bitcoin_rs_chain::{BlockBodySource, BlockTree, TipSnapshot};
+use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader, TipReader, TipSnapshot};
 
 use crate::{
     BlockSource, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
@@ -48,7 +48,9 @@ use std::sync::atomic::AtomicU64;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use parking_lot::{Mutex, RwLock};
+#[cfg(all(test, feature = "fjall"))]
+use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 #[cfg(all(test, feature = "fjall"))]
 use startup::open_derived_index_with_timeout;
@@ -406,7 +408,7 @@ pub struct DerivedIndexOpenSpec {
     /// Test-only open specs may leave this unset; live queries then fail closed.
     pub utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
     /// Serializes a live-view query or seed against a chain transition.
-    pub chain_transition: Option<Arc<Mutex<()>>>,
+    pub chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
 }
 
 /// Handle used to spawn and join the supervised reconciliation worker.
@@ -544,8 +546,8 @@ impl IndexAheadSink for RecordedIndexAhead {
 struct Worker {
     runtime: Arc<DerivedIndexRuntime>,
     writer: Arc<dyn TxIndexWriter>,
-    applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
-    block_tree: Arc<RwLock<BlockTree>>,
+    applied_tip: TipReader,
+    block_tree: BlockTreeReader,
     body_store: Option<Arc<dyn BlockBodyStore>>,
     batch_limits: PreparedBatchLimits,
     enabled: IndexCapabilities,
@@ -563,7 +565,7 @@ struct Worker {
     /// Authoritative UTXO source for live-view seeding.
     utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
     /// Chain transition authority shared with apply and RPC reads.
-    chain_transition: Option<Arc<Mutex<()>>>,
+    chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
 }
 
 /// Uncommitted contiguous rows based on one unchanged durable watermark.
