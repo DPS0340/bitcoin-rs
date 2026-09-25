@@ -609,6 +609,23 @@ impl Mempool {
         self.limits.min_relay_fee_sat_per_kvb
     }
 
+/// Bitcoin Core `RemovalReasonToString` mapping for `mempool:removed`.
+///
+/// Core publishes exactly `expiry`, `sizelimit`, `reorg`, `block`,
+/// `conflict`, `replaced`; this pool adds a descendant-of-replacement class
+/// (emitted as `replaced`) and an explicit pool clear (`unknown`).
+const fn core_removal_reason(reason: RemovalReason) -> &'static str {
+    match reason {
+        RemovalReason::BlockInclusion => "block",
+        RemovalReason::Conflict => "conflict",
+        RemovalReason::Replaced | RemovalReason::Descendant => "replaced",
+        RemovalReason::PolicyEviction => "sizelimit",
+        RemovalReason::Expiry => "expiry",
+        RemovalReason::Reorg => "reorg",
+        RemovalReason::Clear => "unknown",
+    }
+}
+
     /// Records one committed change and assigns it the next mempool sequence
     /// value. Callers hold the write lock for the whole mutation, so
     /// assignment is total, ordered, and gap-free within a batch.
@@ -777,6 +794,16 @@ impl Mempool {
         // become reachable once this entry is in the spend indexes.
         let affected = self.metadata_closure(&[id]);
         self.refresh_metadata(&affected);
+        // Core fires `mempool:added` from `CTxMemPool::addUnchecked`, the
+        // pool-internal install funnel, after the entry is linked into the
+        // pool. `prepare` runs only while a consumer is attached.
+        bitcoin_rs_trace::added(|| {
+            (
+                txid.as_bytes().as_ptr(),
+                i32::try_from(added_vsize).unwrap_or(i32::MAX),
+                i64::try_from(added_fee).unwrap_or(i64::MAX),
+            )
+        });
         self.finish_mutation(changes)
     }
 
@@ -1749,6 +1776,21 @@ impl Mempool {
                 continue;
             };
             let entry = retired.entry;
+            // Core fires `mempool:removed` from `CTxMemPool::removeUnchecked`,
+            // the pool-internal retire funnel, per entry as it leaves the
+            // pool. `prepare` runs only while a consumer is attached.
+            let probe_vsize = i32::try_from(entry.vsize).unwrap_or(i32::MAX);
+            let probe_fee = i64::try_from(entry.fee).unwrap_or(i64::MAX);
+            let probe_reason = Self::core_removal_reason(*reason);
+            bitcoin_rs_trace::removed(|| {
+                (
+                    entry.txid.as_bytes().as_ptr(),
+                    probe_reason,
+                    probe_vsize,
+                    probe_fee,
+                    entry.time,
+                )
+            });
             // The component shrinks by exactly this member; the survivors may
             // still be one component, or several, and that is settled once
             // every removal has been applied.

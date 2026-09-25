@@ -30,6 +30,10 @@ fn wait_for_shutdown(shutdown: &AtomicBool, delay: Duration) -> bool {
 /// that decision and consumes the node through its explicit shutdown path.
 pub fn run(config: NodeConfig, runtime: RuntimeInputs) -> Result<()> {
     logging::install_tracing(&config.observability.log_level);
+    // Registers the Bitcoin Core-compatible USDT probes with the platform
+    // tracer so consumers (bpftrace, BCC, DTrace) can discover them. A no-op
+    // without the `usdt` feature.
+    bitcoin_rs_trace::register_probes();
     let node = crate::lifecycle::start_node(config, runtime, true)?;
     let shutdown = node.state.shutdown();
     while !wait_for_shutdown(&shutdown, Duration::from_secs(DAEMON_SIGNAL_WAIT_SECS)) {}

@@ -58,11 +58,12 @@ pub const fn post_verack_messages() -> [Message; 1] {
 /// Sends the post-verack preference messages and records what we advertised.
 pub(crate) fn send_post_verack_messages<S: Read + Write>(
     peer: &mut Peer<S>,
+    peer_addr: SocketAddr,
     lease: &PeerLease,
     totals: Option<&Arc<crate::TrafficTotals>>,
 ) -> Result<(), PeerError> {
     for message in post_verack_messages() {
-        send_handshake_message(peer, &message, lease, totals)?;
+        send_handshake_message(peer, peer_addr, &message, lease, totals)?;
     }
     peer.compact_blocks
         .record_local_advertised(COMPACT_BLOCK_VERSION);
@@ -120,32 +121,34 @@ pub fn run_inbound_handshake<S: Read + Write>(
     peer: &mut Peer<S>,
     our_nonce: u64,
     our_start_height: i32,
+    peer_addr: SocketAddr,
     lease: &PeerLease,
     totals: Option<&Arc<crate::TrafficTotals>>,
     deadline: Instant,
 ) -> Result<(), PeerError> {
-    let (remote_version, _) = read_handshake_message(peer, lease, totals, deadline)?;
+    let (remote_version, _) = read_handshake_message(peer, peer_addr, lease, totals, deadline)?;
     let responses = dispatch_inbound(peer, &remote_version)?;
 
     peer.state = PeerState::VersionExchange;
     send_handshake_message(
         peer,
+        peer_addr,
         &Message::Version(version_message(our_nonce, our_start_height)),
         lease,
         totals,
     )?;
     for response in responses {
-        send_handshake_message(peer, &response, lease, totals)?;
+        send_handshake_message(peer, peer_addr, &response, lease, totals)?;
     }
 
     while peer.state != PeerState::Ready {
-        let (inbound, _) = read_handshake_message(peer, lease, totals, deadline)?;
+        let (inbound, _) = read_handshake_message(peer, peer_addr, lease, totals, deadline)?;
         let responses = dispatch_inbound(peer, &inbound)?;
         for response in responses {
-            send_handshake_message(peer, &response, lease, totals)?;
+            send_handshake_message(peer, peer_addr, &response, lease, totals)?;
         }
     }
-    send_post_verack_messages(peer, lease, totals)?;
+    send_post_verack_messages(peer, peer_addr, lease, totals)?;
     Ok(())
 }
 
@@ -158,11 +161,16 @@ pub fn run_inbound_handshake<S: Read + Write>(
 /// shared aggregate totals.
 pub(crate) fn send_handshake_message<S: Read + Write>(
     peer: &mut Peer<S>,
+    peer_addr: SocketAddr,
     message: &Message,
     lease: &PeerLease,
     totals: Option<&Arc<crate::TrafficTotals>>,
 ) -> Result<(), PeerError> {
     let written = peer.send(message)?;
+    crate::net_trace::outbound_message(
+        crate::net_trace::TracePeer::new(lease.node_id(), peer_addr, lease.is_inbound()),
+        message,
+    );
     let wire_len = u64::try_from(written).unwrap_or(u64::MAX);
     lease.stats().record_sent(wire_len);
     lease.stats().record_msg_sent();
@@ -179,6 +187,7 @@ pub(crate) fn send_handshake_message<S: Read + Write>(
 /// message loop's reader accounting so handshake traffic is observable.
 pub(crate) fn read_handshake_message<S: Read>(
     peer: &mut Peer<S>,
+    peer_addr: SocketAddr,
     lease: &PeerLease,
     totals: Option<&Arc<crate::TrafficTotals>>,
     deadline: Instant,
@@ -196,6 +205,11 @@ pub(crate) fn read_handshake_message<S: Read>(
             Ok((message, raw)) => {
                 let wire_len =
                     u64::try_from(raw.len() + crate::wire::HEADER_LEN).unwrap_or(u64::MAX);
+                crate::net_trace::inbound_message(
+                    crate::net_trace::TracePeer::new(lease.node_id(), peer_addr, lease.is_inbound()),
+                    &message,
+                    &raw,
+                );
                 lease.stats().record_recv(wire_len);
                 lease.stats().record_msg_recv();
                 if let Some(totals) = totals {
@@ -308,6 +322,7 @@ mod tests {
             &mut peer,
             1,
             0,
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 18_446)),
             &lease,
             None,
             std::time::Instant::now() + std::time::Duration::from_secs(5),

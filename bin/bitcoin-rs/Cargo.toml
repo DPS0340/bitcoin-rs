@@ -28,6 +28,7 @@ toml.workspace = true
 bitcoin-rs-node.workspace = true
 bitcoin-rs-chainstate.workspace = true
 bitcoin-rs-storage.workspace = true
+bitcoin-rs-trace.workspace = true
 
 [dev-dependencies]
 thiserror.workspace = true
@@ -38,6 +39,8 @@ bitcoin.workspace = true
 bitcoin-rs-rpc = { workspace = true }
 
 [features]
+usdt = ["bitcoin-rs-node/usdt"]
+
 default = ["fjall", "redb", "zmq"]
 rocksdb = ["bitcoin-rs-node/rocksdb"]
 fjall = ["bitcoin-rs-node/fjall"]
