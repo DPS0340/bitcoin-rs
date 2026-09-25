@@ -102,6 +102,14 @@ fn header_failures_use_core_bip22_reasons() {
             ChainError::MissingParent { prev_hash: hash },
             "prev-blk-not-found",
         ),
+        (
+            ChainError::InvalidParent { prev_hash: hash },
+            "bad-prevblk",
+        ),
+        (
+            ChainError::KnownInvalidHeader { hash },
+            "duplicate-invalid",
+        ),
     ] {
         assert_eq!(chain_reject_reason(&error), want, "{error:?}");
     }
