@@ -1508,7 +1508,7 @@ mod tests {
             gateway
                 .insert_entry(
                     AdmissionOrigin::Rpc,
-                    MempoolEntry::new(Arc::new(tx.clone()), 100, 10_000, 1, 0),
+                    MempoolEntry::new(Arc::new(tx.clone()), 100, 10_000, 1, 0, 0),
                 )
                 .is_ok()
         );
@@ -1610,7 +1610,7 @@ mod tests {
                     gateway
                         .insert_entry(
                             AdmissionOrigin::Rpc,
-                            MempoolEntry::new(Arc::clone(&tx), 100, 10_000, 1, 0),
+                            MempoolEntry::new(Arc::clone(&tx), 100, 10_000, 1, 0, 0),
                         )
                         .is_ok()
                 );

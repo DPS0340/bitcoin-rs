@@ -2587,7 +2587,7 @@ mod tests {
                 script_pubkey: vec![0x51].into(),
             }],
         };
-        let entry = MempoolEntry::new(Arc::new(tx), 100, 100, 1, 7);
+        let entry = MempoolEntry::new(Arc::new(tx), 100, 100, 1, 7, 0);
         let result = pool.insert_entry(entry);
 
         assert!(
@@ -2613,7 +2613,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
         };
-        let entry = MempoolEntry::new(Arc::new(tx), 123, 4_567, 0, 0);
+        let entry = MempoolEntry::new(Arc::new(tx), 123, 4_567, 0, 0, 0);
         let expected_vsize = u64::from(entry.vsize);
         let expected_fee = entry.fee;
 
@@ -2631,8 +2631,8 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         assert_eq!(pool.aggregate_fees(), 0);
 
-        let entry_a = MempoolEntry::new(Arc::new(tx(1, Vec::new())), 400, 500, 1, 7);
-        let entry_b = MempoolEntry::new(Arc::new(tx(2, Vec::new())), 900, 1_000, 2, 7);
+        let entry_a = MempoolEntry::new(Arc::new(tx(1, Vec::new())), 400, 500, 1, 7, 0);
+        let entry_b = MempoolEntry::new(Arc::new(tx(2, Vec::new())), 900, 1_000, 2, 7, 0);
         pool.insert_entry(entry_a)?;
         pool.insert_entry(entry_b)?;
 
@@ -2656,10 +2656,10 @@ mod tests {
             100,
             u64::MAX - 1,
             1,
-            7,
+            7, 0
         ))?;
-        pool.insert_entry(MempoolEntry::new(Arc::new(prioritised), 100, 100, 2, 7))?;
-        pool.insert_entry(MempoolEntry::new(Arc::new(removed.clone()), 100, 50, 3, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(prioritised), 100, 100, 2, 7, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(removed.clone()), 100, 50, 3, 7, 0))?;
 
         assert_eq!(pool.aggregate_fees(), u64::MAX);
         assert!(
@@ -2689,7 +2689,7 @@ mod tests {
             }],
         };
         let txid = tx.txid();
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7));
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0));
         assert!(pool.contains_txid(&txid));
         let other = txid_of([0xff; 32]);
         assert!(!pool.contains_txid(&other));
@@ -2708,7 +2708,7 @@ mod tests {
             outputs: vec![],
         };
         let txid = tx.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0))?;
         let Some(entry) = pool.entry_by_txid(&txid) else {
             panic!("entry_by_txid returned None for inserted tx");
         };
@@ -2737,7 +2737,7 @@ mod tests {
         };
         let txid = tx.txid();
         let tx_arc = Arc::new(tx);
-        pool.insert_entry(MempoolEntry::new(Arc::clone(&tx_arc), 500, 100, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::clone(&tx_arc), 500, 100, 1, 7, 0))?;
         let Some(retrieved) = pool.transaction_by_txid(&txid) else {
             panic!("transaction_by_txid returned None");
         };
@@ -2786,8 +2786,8 @@ mod tests {
             }],
         };
         let txid_b = tx_b.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx_a), 500, 100, 1, 7))?;
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx_b), 500, 100, 2, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx_a), 500, 100, 1, 7, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx_b), 500, 100, 2, 7, 0))?;
         let txids = pool.iter_txids();
         assert_eq!(txids.len(), 2);
         assert!(txids.contains(&txid_a));
@@ -2809,7 +2809,7 @@ mod tests {
             }],
         };
         let low_txid = low_tx.txid();
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(low_tx), 100, 1_000, 1, 7));
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(low_tx), 100, 1_000, 1, 7, 0));
         let high_tx = Tx {
             version: 2,
             lock_time: LockTime::ZERO,
@@ -2820,7 +2820,7 @@ mod tests {
             }],
         };
         let high_txid = high_tx.txid();
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(high_tx), 100, 10_000, 1, 7));
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(high_tx), 100, 10_000, 1, 7, 0));
         let ordered = pool.iter_by_fee_rate_desc();
         assert_eq!(ordered.len(), 2);
         let Some(&first_id) = ordered.first() else {
@@ -2852,8 +2852,8 @@ mod tests {
             ..MempoolLimits::default()
         });
 
-        let high = MempoolEntry::new(Arc::new(tx(1, Vec::new())), 1_000, 5_000, 1, 7);
-        let low = MempoolEntry::new(Arc::new(tx(2, Vec::new())), 1_000, 1_500, 1, 7);
+        let high = MempoolEntry::new(Arc::new(tx(1, Vec::new())), 1_000, 5_000, 1, 7, 0);
+        let low = MempoolEntry::new(Arc::new(tx(2, Vec::new())), 1_000, 1_500, 1, 7, 0);
         pool.insert_entry(high)?;
         pool.insert_entry(low)?;
 
@@ -2890,7 +2890,7 @@ mod tests {
         });
         assert_floor(&pool, None, "empty");
 
-        let high = MempoolEntry::new(Arc::new(tx(1, Vec::new())), 1_000, 5_000, 1, 7);
+        let high = MempoolEntry::new(Arc::new(tx(1, Vec::new())), 1_000, 5_000, 1, 7, 0);
         pool.insert_entry(high)?;
         assert_floor(&pool, Some(5_000), "insert high");
 
@@ -2901,13 +2901,13 @@ mod tests {
             1_000,
             1_500,
             1,
-            7,
+            7, 0
         ))?;
         assert_floor(&pool, Some(1_500), "insert lower rate");
 
         let low_b_tx = tx(3, Vec::new());
         let low_b_txid = low_b_tx.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(low_b_tx), 1_000, 1_500, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(low_b_tx), 1_000, 1_500, 1, 7, 0))?;
         assert_floor(&pool, Some(1_500), "duplicate min rate");
 
         let removed = pool.remove_for_block(&[&low_a_tx], &[low_a_txid], 8);
@@ -2925,14 +2925,14 @@ mod tests {
             1_000,
             2_000,
             1,
-            7,
+            7, 0
         ))?;
         assert_floor(&pool, Some(2_000), "insert new min before block");
         let removed = pool.remove_for_block(&[&mined], &[mined_txid], 8);
         assert_eq!(removed.len(), 1);
         assert_floor(&pool, Some(5_000), "remove_for_block of current min");
 
-        let bulky_low = MempoolEntry::new(Arc::new(tx(5, Vec::new())), 5_000, 5_000, 1, 7);
+        let bulky_low = MempoolEntry::new(Arc::new(tx(5, Vec::new())), 5_000, 5_000, 1, 7, 0);
         pool.insert_entry(bulky_low)?;
         assert_floor(&pool, Some(1_000), "insert eviction victim");
         let evicted = pool.enforce_size_limit(5_000)?;
@@ -2978,13 +2978,13 @@ mod tests {
                 script_pubkey: vec![0x51].into(),
             }],
         };
-        pool.insert_entry(MempoolEntry::new(Arc::new(original), 1_000, 2_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(original), 1_000, 2_000, 1, 7, 0))?;
         pool.insert_entry(MempoolEntry::new(
             Arc::new(tx(8, Vec::new())),
             1_000,
             1_500,
             1,
-            7,
+            7, 0
         ))?;
         assert_floor(&pool, Some(1_500), "before replacement");
 
@@ -3029,7 +3029,7 @@ mod tests {
                 script_pubkey: vec![0x51].into(),
             }],
         };
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(low_tx), 100, 1_000, 1, 7)); // fee_rate = 1000
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(low_tx), 100, 1_000, 1, 7, 0)); // fee_rate = 1000
         let high_tx = Tx {
             version: 2,
             lock_time: LockTime::ZERO,
@@ -3039,7 +3039,7 @@ mod tests {
                 script_pubkey: vec![0x52].into(),
             }],
         };
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(high_tx), 100, 10_000, 1, 7)); // fee_rate = 100_000
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(high_tx), 100, 10_000, 1, 7, 0)); // fee_rate = 100_000
         let high_only = pool.iter_above_fee_rate(50_000);
         assert_eq!(high_only.len(), 1);
         let both = pool.iter_above_fee_rate(500);
@@ -3067,7 +3067,7 @@ mod tests {
             outputs: Vec::new(),
         };
         let rbf_txid = rbf_tx.txid();
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(rbf_tx), 100, 10_000, 1, 7));
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(rbf_tx), 100, 10_000, 1, 7, 0));
         // Non-RBF tx (sequence = MAX = 0xFFFFFFFF).
         let non_rbf_tx = Tx {
             version: 2,
@@ -3084,7 +3084,7 @@ mod tests {
             outputs: Vec::new(),
         };
         let non_rbf_txid = non_rbf_tx.txid();
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(non_rbf_tx), 100, 10_000, 1, 7));
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(non_rbf_tx), 100, 10_000, 1, 7, 0));
         let replaceable = pool.iter_replaceable_txids();
         assert!(replaceable.contains(&rbf_txid));
         assert!(!replaceable.contains(&non_rbf_txid));
@@ -3101,7 +3101,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
         };
-        let entry = MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7);
+        let entry = MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7, 0);
         pool.insert_entry(entry)?;
         let after = pool.sequence_number();
         assert!(after > before, "expected sequence to bump");
@@ -3120,7 +3120,7 @@ mod tests {
                 script_pubkey: vec![0x51].into(),
             }],
         };
-        let _id = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))?;
+        let _id = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0))?;
         let seq_before_clear = pool.sequence_number();
 
         pool.clear();
@@ -3174,7 +3174,7 @@ mod tests {
             }],
         };
         let spending_txid = spending.txid();
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(spending), 100, 10_000, 1, 7));
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(spending), 100, 10_000, 1, 7, 0));
         let spender = pool
             .outpoint_spender(outpoint)
             .expect("the index and the entries agree")
@@ -3221,14 +3221,14 @@ mod tests {
         let matching_tx = funder(matching.clone(), 0xaa);
         let matching_txid = matching_tx.txid();
         let matching_wtxid = matching_tx.wtxid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(matching_tx), 100, 10_000, 1, 7))
+        pool.insert_entry(MempoolEntry::new(Arc::new(matching_tx), 100, 10_000, 1, 7, 0))
             .expect("matching insert");
         pool.insert_entry(MempoolEntry::new(
             Arc::new(funder(other, 0xbb)),
             100,
             10_000,
             1,
-            7,
+            7, 0
         ))
         .expect("other insert");
 
@@ -3291,7 +3291,7 @@ mod tests {
             }],
         };
         let entry_txid = tx.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0))
             .expect("insertion succeeds");
         let id = pool
             .entry_id_by_txid(&entry_txid)
@@ -3332,7 +3332,7 @@ mod tests {
         };
         let first = spender_tx(99_000);
         let first_txid = first.txid();
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(first), 100, 10_000, 1, 7));
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(first), 100, 10_000, 1, 7, 0));
         // A second spender of the same outpoint is a pool invariant violation
         // that insertion does not police; the query must still answer with
         // the first indexed entry, like the scan it replaces did.
@@ -3341,7 +3341,7 @@ mod tests {
             100,
             10_000,
             1,
-            7,
+            7, 0
         ));
         let spender = pool
             .outpoint_spender(outpoint)
@@ -3372,7 +3372,7 @@ mod tests {
             }],
             outputs: vec![],
         };
-        pool.insert_entry(MempoolEntry::new(Arc::new(spending), 100, 10_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(spending), 100, 10_000, 1, 7, 0))?;
         assert!(pool.is_outpoint_spent(&outpoint));
         Ok(())
     }
@@ -3399,9 +3399,9 @@ mod tests {
             100,
             1_000,
             1,
-            7,
+            7, 0
         ))?;
-        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 2, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 2, 7, 0))?;
         let child_id = pool
             .entry_id_by_txid(&child_txid)
             .expect("child id resolves");
@@ -3428,13 +3428,13 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let parent = tx(1, Vec::new());
         let parent_txid = parent.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0, 0))?;
         let parent_id = pool
             .entry_id_by_txid(&parent_txid)
             .expect("parent id resolves");
         let child = tx(2, vec![OutPoint::new(parent_txid, 0)]);
         let child_txid = child.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 0, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 0, 0, 0))?;
         let child_id = pool
             .entry_id_by_txid(&child_txid)
             .expect("child id resolves");
@@ -3450,7 +3450,7 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let lone = tx(1, Vec::new());
         let lone_txid = lone.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(lone), 500, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(lone), 500, 1_000, 1, 7, 0))?;
         let Some(id) = pool.entry_id_by_txid(&lone_txid) else {
             panic!("insert failed");
         };
@@ -3464,7 +3464,7 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let tx = tx(1, Vec::new());
         let txid = tx.txid();
-        let _id = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7))?;
+        let _id = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7, 0))?;
 
         pool.prioritise(txid, 500).expect("overlay delta applies");
 
@@ -3496,7 +3496,7 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let tx = tx(2, Vec::new());
         let txid = tx.txid();
-        let _id = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7))?;
+        let _id = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7, 0))?;
 
         pool.prioritise(txid, -2_000)
             .expect("negative overlay applies");
@@ -3522,7 +3522,7 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let entry_tx = tx(3, Vec::new());
         let txid = entry_tx.txid();
-        let _id = pool.insert_entry(MempoolEntry::new(Arc::new(entry_tx), 100, 1_000, 1, 7))?;
+        let _id = pool.insert_entry(MempoolEntry::new(Arc::new(entry_tx), 100, 1_000, 1, 7, 0))?;
 
         pool.prioritise(txid, 2_000).expect("first delta applies");
         pool.prioritise(txid, 3_000)
@@ -3537,7 +3537,7 @@ mod tests {
 
         let other = tx(4, Vec::new());
         let other_txid = other.txid();
-        let _other_id = pool.insert_entry(MempoolEntry::new(Arc::new(other), 100, 1_000, 1, 7))?;
+        let _other_id = pool.insert_entry(MempoolEntry::new(Arc::new(other), 100, 1_000, 1, 7, 0))?;
         pool.prioritise(other_txid, i64::MAX)
             .expect("the signed range edge itself is storable");
         assert_eq!(
@@ -3559,7 +3559,7 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let pooled = tx(30, Vec::new());
         let pooled_txid = pooled.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(pooled), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(pooled), 100, 1_000, 1, 7, 0))?;
         pool.prioritise(pooled_txid, 500)
             .expect("pooled overlay applies");
 
@@ -3591,7 +3591,7 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let pooled = tx(32, Vec::new());
         let pooled_txid = pooled.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(pooled), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(pooled), 100, 1_000, 1, 7, 0))?;
         pool.prioritise(pooled_txid, 500)
             .expect("pooled overlay applies");
         pool.prioritise(pooled_txid, -500)
@@ -3613,19 +3613,19 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let parent = tx(5, Vec::new());
         let parent_txid = parent.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0, 0))?;
         let parent_id = pool
             .entry_id_by_txid(&parent_txid)
             .expect("parent id resolves");
         let child = tx(6, vec![OutPoint::new(parent_txid, 0)]);
         let child_txid = child.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 2_000, 0, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 2_000, 0, 0, 0))?;
         let child_id = pool
             .entry_id_by_txid(&child_txid)
             .expect("child id resolves");
         let grandchild = tx(7, vec![OutPoint::new(child_txid, 0)]);
         let grandchild_txid = grandchild.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(grandchild), 100, 3_000, 0, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(grandchild), 100, 3_000, 0, 0, 0))?;
         let grandchild_id = pool
             .entry_id_by_txid(&grandchild_txid)
             .expect("grandchild id resolves");
@@ -3672,7 +3672,7 @@ mod tests {
         assert!(!pool.contains_txid(&txid));
         assert_eq!(pool.sequence_number(), before);
 
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7, 0))?;
 
         let Some(entry) = pool.entry_by_txid(&txid) else {
             panic!("insert failed");
@@ -3691,12 +3691,12 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let tx = tx(9, Vec::new());
         let txid = tx.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7, 0))?;
         pool.prioritise(txid, 700).expect("delta applies");
 
         assert!(!pool.evict_below_fee_rate(10_001).is_empty());
 
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7, 0))?;
         let Some(entry) = pool.entry_by_txid(&txid) else {
             panic!("readmission failed");
         };
@@ -3715,11 +3715,11 @@ mod tests {
             100,
             1_000,
             1,
-            7,
+            7, 0
         ))?;
         let child = tx(11, vec![OutPoint::new(parent_txid, 0)]);
         let child_txid = child.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 1, 7, 0))?;
         // A delta stored for a transaction that never reached the pool.
         let stranger = tx(12, Vec::new());
         let stranger_txid = stranger.txid();
@@ -3752,7 +3752,7 @@ mod tests {
         assert!(pool.contains_txid(&child_txid));
 
         // Readmission answers from the surviving state alone.
-        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 1, 7, 0))?;
         assert_eq!(
             pool.entry_by_txid(&parent_txid)
                 .map(|entry| entry.fee_delta),
@@ -3767,13 +3767,13 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let lower_fee_tx = tx(13, Vec::new());
         let lower_fee_txid = lower_fee_tx.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(lower_fee_tx), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(lower_fee_tx), 100, 1_000, 1, 7, 0))?;
         let lower_fee_id = pool
             .entry_id_by_txid(&lower_fee_txid)
             .expect("lower id resolves");
         let higher_fee_tx = tx(14, Vec::new());
         let higher_fee_txid = higher_fee_tx.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(higher_fee_tx), 100, 2_000, 2, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(higher_fee_tx), 100, 2_000, 2, 7, 0))?;
         let higher_fee_id = pool
             .entry_id_by_txid(&higher_fee_txid)
             .expect("higher id resolves");
@@ -3798,11 +3798,11 @@ mod tests {
         let parent = Arc::new(tx(15, Vec::new()));
         let parent_txid = parent.txid();
         let _parent_id =
-            pool.insert_entry(MempoolEntry::new(Arc::clone(&parent), 100, 1_000, 1, 7))?;
+            pool.insert_entry(MempoolEntry::new(Arc::clone(&parent), 100, 1_000, 1, 7, 0))?;
         let child = Arc::new(tx(16, vec![OutPoint::new(parent_txid, 0)]));
         let child_txid = child.txid();
         let _child_id =
-            pool.insert_entry(MempoolEntry::new(Arc::clone(&child), 100, 2_000, 2, 7))?;
+            pool.insert_entry(MempoolEntry::new(Arc::clone(&child), 100, 2_000, 2, 7, 0))?;
 
         let snapshot = pool.mining_snapshot();
         assert_eq!(snapshot.sequence, pool.sequence_number());
@@ -3866,7 +3866,7 @@ mod tests {
         let tx = tx(17, Vec::new());
         let txid = tx.txid();
         let shared = Arc::new(tx);
-        pool.insert_entry(MempoolEntry::new(Arc::clone(&shared), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::clone(&shared), 100, 1_000, 1, 7, 0))?;
 
         let snapshot = pool.mining_snapshot();
         pool.clear();
@@ -3901,14 +3901,14 @@ mod tests {
             100,
             10_000,
             1,
-            7,
+            7, 0
         ))?;
         pool.insert_entry(MempoolEntry::new(
             Arc::new(second.clone()),
             100,
             10_000,
             1,
-            7,
+            7, 0
         ))?;
         assert_eq!(
             pool.estimate_fee_rate(2),
@@ -3949,7 +3949,7 @@ mod tests {
             }],
         };
         let low_txid = low.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(low), 100, 100, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(low), 100, 100, 1, 7, 0))?;
 
         let high = Tx {
             version: 2,
@@ -3961,7 +3961,7 @@ mod tests {
             }],
         };
         let high_txid = high.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(high), 100, 10_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(high), 100, 10_000, 1, 7, 0))?;
 
         let evicted = pool.evict_below_fee_rate(5_000);
 
@@ -3988,7 +3988,7 @@ mod tests {
             }],
         };
         let low_txid = low.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(low), 500, 100, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(low), 500, 100, 1, 7, 0))?;
 
         let high = Tx {
             version: 2,
@@ -4000,7 +4000,7 @@ mod tests {
             }],
         };
         let high_txid = high.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(high), 500, 10_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(high), 500, 10_000, 1, 7, 0))?;
 
         let evicted = pool.enforce_size_limit(600)?;
 
@@ -4032,7 +4032,7 @@ mod tests {
             };
             let fee = 100_u64.saturating_add(u64::from(nonce).saturating_mul(50));
 
-            let _ = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 600, fee, 1, 7));
+            let _ = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 600, fee, 1, 7, 0));
         }
 
         assert!(
@@ -4066,18 +4066,18 @@ mod tests {
         let mut pool = Mempool::new(limits);
 
         // Fills the pool at a rate the arrivals below are measured against.
-        let seated = pool.insert_entry(MempoolEntry::new(tx_paying(1), 900, 90_000, 1, 7));
+        let seated = pool.insert_entry(MempoolEntry::new(tx_paying(1), 900, 90_000, 1, 7, 0));
         assert!(seated.is_ok(), "the first transaction fits: {seated:?}");
 
         let before = (pool.sequence_number(), pool.estimator_history());
-        let refused = pool.insert_entry(MempoolEntry::new(tx_paying(2), 900, 10, 2, 7));
+        let refused = pool.insert_entry(MempoolEntry::new(tx_paying(2), 900, 10, 2, 7, 0));
         assert!(matches!(refused, Err(MempoolError::Full)));
         assert_eq!(pool.len(), 1);
         assert_eq!(pool.sequence_number(), before.0);
         assert_eq!(pool.estimator_history(), before.1);
 
         // The paired accept: pays more, so the trim takes the other one.
-        let admitted = pool.insert_entry(MempoolEntry::new(tx_paying(3), 900, 900_000, 3, 7));
+        let admitted = pool.insert_entry(MempoolEntry::new(tx_paying(3), 900, 900_000, 3, 7, 0));
         let Ok(_result) = admitted else {
             panic!("a better-paying transaction must be admitted: {admitted:?}");
         };
@@ -4121,13 +4121,13 @@ mod tests {
             }],
         };
         let original_txid = original.txid();
-        let seated = pool.insert_entry(MempoolEntry::new(Arc::new(original), 100, 10_000, 1, 7));
+        let seated = pool.insert_entry(MempoolEntry::new(Arc::new(original), 100, 10_000, 1, 7, 0));
         assert!(seated.is_ok(), "original must fit: {seated:?}");
 
         // Bystander: 850 vbytes, high fee rate (10_000 sat/vbyte), fills pool.
         let bystander = tx(8, Vec::new());
         let seated_by =
-            pool.insert_entry(MempoolEntry::new(Arc::new(bystander), 850, 8_500_000, 1, 7));
+            pool.insert_entry(MempoolEntry::new(Arc::new(bystander), 850, 8_500_000, 1, 7, 0));
         assert!(seated_by.is_ok(), "bystander must fit: {seated_by:?}");
         assert_eq!(pool.len(), 2);
 
@@ -4215,7 +4215,7 @@ mod tests {
                 vsize,
                 u64::from(vsize) * 10,
                 u64::from(label),
-                1,
+                1, 0
             ))?;
             Ok(OutPoint::new(txid, 0))
         };
@@ -4319,30 +4319,30 @@ mod tests {
 
         let root = tx(31, vec![OutPoint::default()]);
         let root_out = OutPoint::new(root.txid(), 0);
-        pool.insert_entry(MempoolEntry::new(Arc::new(root), 100, 500, 0, 1))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(root), 100, 500, 0, 1, 0))?;
         let child = tx(32, vec![root_out]);
         let child_out = OutPoint::new(child.txid(), 0);
-        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 9_000, 1, 1))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 9_000, 1, 1, 0))?;
         pool.insert_entry(MempoolEntry::new(
             Arc::new(tx(33, vec![child_out])),
             100,
             100_000,
             2,
-            1,
+            1, 0
         ))?;
         pool.insert_entry(MempoolEntry::new(
             Arc::new(tx(34, vec![OutPoint::default()])),
             100,
             200,
             3,
-            1,
+            1, 0
         ))?;
         pool.insert_entry(MempoolEntry::new(
             Arc::new(tx(35, vec![OutPoint::default()])),
             100,
             300,
             4,
-            1,
+            1, 0
         ))?;
         assert!(
             pool.len() < 5,
@@ -4500,9 +4500,9 @@ mod tests {
         let child = tx(12, vec![parent_out]);
 
         // Child first: at this point it has no in-mempool ancestor.
-        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 0, 1))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 0, 1, 0))?;
         // Then the parent it spends from.
-        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 200, 4_000, 1, 1))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 200, 4_000, 1, 1, 0))?;
 
         let incremental = totals(&pool);
         pool.recompute_all_metadata();
@@ -4600,7 +4600,7 @@ mod spend_index_tests {
 
         let mut pool = Mempool::new(MempoolLimits::default());
         for tx in [root, child_a, child_b, child_c] {
-            let entry = MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7);
+            let entry = MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0);
             let Ok(_id) = pool.insert_entry(entry) else {
                 panic!("mempool insert failed while building the fixture");
             };
@@ -4670,7 +4670,7 @@ mod spend_index_tests {
                 ..MempoolLimits::default()
             };
             let mut pool = Mempool::new(limits);
-            let root_entry = MempoolEntry::new(Arc::new(root.clone()), 100, 10_000, 1, 7);
+            let root_entry = MempoolEntry::new(Arc::new(root.clone()), 100, 10_000, 1, 7, 0);
             let Ok(_id) = pool.insert_entry(root_entry) else {
                 panic!("root must be admitted");
             };
@@ -4684,7 +4684,7 @@ mod spend_index_tests {
                     1,
                     u64::from(vout).saturating_add(2),
                 );
-                let entry = MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7);
+                let entry = MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7, 0);
                 outcomes.push(pool.insert_entry(entry));
             }
             outcomes
@@ -4742,13 +4742,13 @@ mod spend_index_tests {
         };
         let mut pool = Mempool::new(limits);
         for tx in [a, b, c] {
-            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0))
             else {
                 panic!("the three-member cluster must be admitted under a limit of three");
             };
         }
 
-        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(d), 100, 10_000, 1, 7));
+        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(d), 100, 10_000, 1, 7, 0));
         assert!(
             matches!(
                 outcome,
@@ -4773,12 +4773,12 @@ mod spend_index_tests {
         };
         let mut pool = Mempool::new(limits);
 
-        let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(root), 200, 10_000, 1, 7))
+        let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(root), 200, 10_000, 1, 7, 0))
         else {
             panic!("root must be admitted");
         };
         let child = tx_with(&[OutPoint::new(root_txid, 0)], 1, 2);
-        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7));
+        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7, 0));
         assert!(
             matches!(
                 outcome,
@@ -4808,13 +4808,13 @@ mod spend_index_tests {
         let mut pool = Mempool::new(limits);
 
         // The child lands first; nothing in the pool is its parent yet.
-        let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7))
+        let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7, 0))
         else {
             panic!("the child must be admitted into an empty pool");
         };
         // Now its parent arrives. Seeding the walk from parents alone would
         // find nothing and admit it into a cluster of two.
-        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 10_000, 1, 7));
+        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 10_000, 1, 7, 0));
         assert!(
             matches!(
                 outcome,
@@ -4869,7 +4869,7 @@ mod spend_index_tests {
         };
         let mut pool = Mempool::new(limits);
         for tx in [root, a, b] {
-            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0))
             else {
                 panic!("the three-member cluster must be admitted under a limit of three");
             };
@@ -4911,7 +4911,7 @@ mod spend_index_tests {
         };
         let mut pool = Mempool::new(limits);
         for tx in [root, child_a, child_b] {
-            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0))
             else {
                 panic!("the three-member cluster must be admitted under a limit of three");
             };
@@ -4934,7 +4934,7 @@ mod spend_index_tests {
             "the preview must reject a cluster-only violation: {preview:?}"
         );
 
-        let admission = pool.insert_entry(MempoolEntry::new(Arc::new(child_c), 100, 10_000, 4, 7));
+        let admission = pool.insert_entry(MempoolEntry::new(Arc::new(child_c), 100, 10_000, 4, 7, 0));
         assert!(
             matches!(
                 admission,
@@ -4969,7 +4969,7 @@ mod spend_index_tests {
         };
         let mut pool = Mempool::new(limits);
         for tx in [root, a, b] {
-            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0))
             else {
                 panic!("the three-member cluster must be admitted under a limit of three");
             };
@@ -4990,7 +4990,7 @@ mod spend_index_tests {
         assert_eq!(preview.evicted, vec![a_id]);
         assert_eq!(pool.tx_count(), 3, "preview does not mutate");
         assert_eq!(
-            pool.insert_entry(MempoolEntry::new(Arc::new(replacement), 100, 20_000, 1, 7))
+            pool.insert_entry(MempoolEntry::new(Arc::new(replacement), 100, 20_000, 1, 7, 0))
                 .err(),
             Some(MempoolError::Policy(PolicyError::ClusterCountLimit)),
             "ordinary insertion cannot grow this full cluster"
@@ -5058,12 +5058,12 @@ mod spend_index_tests {
         let child_txid = child.txid();
         let mut pool = Mempool::new(MempoolLimits::default());
 
-        let child_entry = MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7);
+        let child_entry = MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7, 0);
         assert!(
             pool.insert_entry(child_entry).is_ok(),
             "child insertion failed"
         );
-        let parent_entry = MempoolEntry::new(Arc::new(parent), 100, 10_000, 1, 7);
+        let parent_entry = MempoolEntry::new(Arc::new(parent), 100, 10_000, 1, 7, 0);
         assert!(
             pool.insert_entry(parent_entry).is_ok(),
             "parent insertion failed"
@@ -5142,7 +5142,7 @@ mod dynamic_memory_usage_tests {
             ..MempoolLimits::default()
         });
         for tag in 0..count {
-            let entry = MempoolEntry::new(Arc::new(tx_with(script_len, tag)), 100, 10_000, 1, 7);
+            let entry = MempoolEntry::new(Arc::new(tx_with(script_len, tag)), 100, 10_000, 1, 7, 0);
             let Ok(_id) = pool.insert_entry(entry) else {
                 panic!("fixture insert failed");
             };
@@ -5323,7 +5323,7 @@ mod entry_overhead_tests {
         });
         let count = 8_u32;
         for tag in 0..count {
-            let entry = MempoolEntry::new(Arc::new(empty_tx(tag)), 100, 10_000, 1, 7);
+            let entry = MempoolEntry::new(Arc::new(empty_tx(tag)), 100, 10_000, 1, 7, 0);
             let Ok(_id) = pool.insert_entry(entry) else {
                 panic!("fixture insert failed");
             };
@@ -5420,7 +5420,7 @@ mod graph_tests {
     fn insert_ok(pool: &mut Mempool, nonce: u32, inputs: &[OutPoint], vsize: u32) -> Txid {
         let tx = graph_tx(nonce, inputs, false);
         let txid = tx.txid();
-        pool.insert_entry(MempoolEntry::new(Arc::new(tx), vsize, 1_000, TIME, HEIGHT))
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx), vsize, 1_000, TIME, HEIGHT, 0))
             .expect("fixture insert must pass validation");
         txid
     }
@@ -5680,7 +5680,7 @@ mod graph_tests {
         // b's and d's outputs are the unspent ones; spending them joins both
         // 2-member clusters plus the candidate.
         let joiner = graph_tx(5, &[OutPoint::new(b, 0), OutPoint::new(d, 0)], false);
-        let entry = MempoolEntry::new(Arc::new(joiner.clone()), 100, 1_000, TIME, HEIGHT);
+        let entry = MempoolEntry::new(Arc::new(joiner.clone()), 100, 1_000, TIME, HEIGHT, 0);
         let error = pool
             .insert_entry(entry)
             .expect_err("cluster of five is over the limit");
@@ -5923,7 +5923,7 @@ mod graph_tests {
             vsize,
             1_000,
             TIME,
-            HEIGHT,
+            HEIGHT, 0
         ));
         outcome.ok()?;
         txs.push(tx);
@@ -6019,7 +6019,7 @@ mod graph_tests {
                         let excluded: HashSet<EntryId> = evicted.iter().copied().collect();
                         let fee = 2_000 + u64::try_from(rng.below(1_000)).unwrap_or(0);
                         let entry =
-                            MempoolEntry::new(Arc::new(candidate.clone()), 100, fee, TIME, HEIGHT);
+                            MempoolEntry::new(Arc::new(candidate.clone()), 100, fee, TIME, HEIGHT, 0);
                         let Ok(prepared) = pool.validate_insert(entry, &excluded) else {
                             continue;
                         };
