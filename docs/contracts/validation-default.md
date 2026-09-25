@@ -71,8 +71,11 @@ Owners:
   TOML `validation_engine = "kernel"`). The shipped image selects it at the
   **config-file** layer (`/etc/bitcoin-rs/default.toml`, handed to the node
   with `--config`) so bare `docker run` keeps the historical kernel behavior
-  while environment, CLI, or a mounted config file still override it under
-  the documented precedence (defaults -> file -> environment -> CLI).
+  while an environment override or a mounted config file still overrides it
+  under the documented precedence (defaults -> file -> environment -> CLI).
+  A CLI override replaces `CMD` wholesale under docker semantics (running
+  `bitcoin-rs <args>` instead of the shipped argument list), so it must
+  repeat the full `--config --data-dir --rpc-bind --p2p-listen` set.
 - The kernel-free default is the C++-free quickstart. Changing the production
   default engine under `VAL-01` does not add `kernel` to any manifest default.
 

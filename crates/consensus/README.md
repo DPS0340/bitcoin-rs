@@ -20,7 +20,8 @@ layout parse under `validation.engine = "native"`, or `bitcoinkernel::Block::new
 under `validation.engine = "kernel"` on `kernel`-feature builds — yielding the
 txids and (on the kernel arm) the borrowed transaction objects that script
 preparation reuses. `kernel::verify_tx_scripts` dispatches per-input script
-checks to the selected backend over any `UtxoView` pair. BIP9 activation is
+checks to the selected backend over its resolved `(OutPoint, TxOut)`
+`spent_outputs` rows. BIP9 activation is
 `compute_state`
 over a `DeploymentContext` with `DeploymentParams`. Consensus bounds are exported as
 `MAX_SCRIPT_SIZE`, `MAX_BLOCK_SIGOPS_COST`, `MAX_BLOCK_WEIGHT`, and

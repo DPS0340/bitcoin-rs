@@ -52,9 +52,11 @@ cargo_test() {
 
 clippy_profiles() {
   # Four kernel-free all-target profiles. The kernel capability is opt-in and
-  # never implied by a default, so these lanes exercise the plain builds; the
-  # explicit `--no-default-features` spellings keep every row's feature set
-  # pinned even if a default changes again.
+  # never implied by a default, so these lanes exercise the plain builds. The
+  # explicit `--no-default-features` spellings keep the per-crate rows'
+  # feature sets pinned even if a default changes again; the workspace row
+  # builds with default features by design (it is the "plain build works"
+  # row).
   profile "clippy: workspace (kernel-free)" \
     cargo clippy --locked --workspace --all-targets \
       --exclude bitcoin-rs-consensus --exclude bitcoin-rs-chainstate \
