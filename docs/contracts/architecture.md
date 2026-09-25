@@ -272,8 +272,10 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
   set mutation (arm the marker, undo the set, rewind coinstats, complete the
   marker) and nothing beyond it. Chainstate owns everything around that
   fence — refusing a stale tip before arming, then journal rewind, durable
-  head advance, publication, and marker disarm, in that order — and is the
-  only owner of mutation ordering and durability policy (`ARCH-07`).
+  head advance, and publication. It disarms the marker only when the journal
+  rewind succeeds; otherwise a matching clean checkpoint disarms it after
+  publishing the rolled-back set. Chainstate owns this surrounding order and
+  durability policy (`ARCH-07`).
 - The contract surface is `bitcoin_rs_utxo::contract`; the crate root keeps
   only read, snapshot, and statistics names. RPC is a read consumer of the
   root read types (`UtxoCoin`, `UtxoScan`); index is the read consumer that
