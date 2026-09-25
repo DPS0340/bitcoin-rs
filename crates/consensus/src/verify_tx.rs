@@ -11,7 +11,7 @@ use bitcoin_rs_script::Interpreter;
 use bitcoin_rs_script::VerifyFlags;
 use rayon::prelude::*;
 
-use crate::rust_path::UtxoView;
+use crate::UtxoView;
 use crate::{ConsensusError, MAX_BLOCK_SIGOPS_COST};
 
 const LOCKTIME_THRESHOLD: u32 = 500_000_000;
@@ -859,7 +859,7 @@ mod tests {
         view.set_resolved(resolved);
         view
     }
-    use crate::{ConsensusError, rust_path::UtxoView};
+    use crate::{ConsensusError, UtxoView};
 
     impl UtxoView for hashbrown::HashMap<OutPoint, TxOut> {
         fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {

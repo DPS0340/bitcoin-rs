@@ -8,7 +8,7 @@
 pub use crate::error::{ApplyError, DisconnectError};
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::{BlockTree, BlockTreeReader, ChainError, TipReader, TipSnapshot};
-use bitcoin_rs_consensus::rust_path::UtxoView;
+use bitcoin_rs_consensus::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_primitives::OutPoint;
