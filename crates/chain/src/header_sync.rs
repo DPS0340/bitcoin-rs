@@ -48,6 +48,9 @@ pub fn accept_headers(
     for header in headers {
         let hash = hash_from_header(header);
         if let Some(existing_id) = tree.lookup(hash) {
+            if matches!(tree.node(existing_id)?.status, NodeStatus::Invalid) {
+                return Err(ChainError::KnownInvalidHeader { hash });
+            }
             accepted.push(existing_id);
             continue;
         }
