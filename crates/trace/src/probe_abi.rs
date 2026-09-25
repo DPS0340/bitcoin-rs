@@ -38,7 +38,9 @@ pub struct ArgSpec {
     /// Type the probe-crate prepare closure hands to the emitter.
     ///
     /// Byte buffers appear as `*const u8` and are converted to the buffer
-    /// address for the emitter; everything else matches [`ArgSpec::d_type`].
+    /// address for the emitter; integer arguments use the corresponding Rust
+    /// scalar (`i32`, `i64`, `u64`), and `char*` values use Rust string types
+    /// (`&'static str` or `String`).
     pub prepare_type: &'static str,
     /// Type published in Bitcoin Core `doc/tracing.md`.
     pub core_doc: &'static str,

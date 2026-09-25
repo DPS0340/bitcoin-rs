@@ -60,9 +60,10 @@ buffer address, reproducing Core's operand form exactly. String arguments
 (`char*`) need no workaround: the `usdt` crate's `char*` generates Core's
 by-value pointer operand. `crates/trace/tests/sdt_notes.rs` asserts the
 artifact's argument-layout strings (via `SDT_ELF=<binary>`) against this
-table: the full `size@operand` strings on x86-64 and AArch64, where the
-register spellings are deterministic, and the `size@` prefix sequence on
-other ELF architectures, so an operand-form regression fails the test.
+table: the full `size@operand` strings on x86-64, where the register
+spellings are verified, and the `size@` prefix sequence on other ELF
+architectures (AArch64's `w`-register spellings are unverified upstream),
+so an operand-form regression fails the test on the verified architecture.
 
 ## Smoke test
 
@@ -76,10 +77,10 @@ sudo bpftrace docs/tracing/smoke.bt
 ./target/release/bitcoin-rs   # in a second terminal, once bpftrace has attached
 ```
 
-Path-based `usdt:` selectors fire only for processes started *after* bpftrace
-attaches, so the node must be launched (or restarted) once the script is
-running; to attach to an already-running node pass `-p $(pgrep bitcoin-rs)`
-to bpftrace instead. Every `usdt:` selector embeds the
+When bpftrace and the kernel support uprobe refcounts, path-based `usdt:`
+probes also work on an already-running node. Without that support, start
+the node before bpftrace attaches and pass `-p $(pgrep bitcoin-rs)` to
+bpftrace to activate its semaphores. Every `usdt:` selector embeds the
 `./target/release/bitcoin-rs` path literally — bpftrace reads the SDT notes
 from that file and takes no binary argument. To run the same script against
 a running or Core `bitcoind`, replace the selector paths with that binary's
