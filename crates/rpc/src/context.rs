@@ -427,7 +427,7 @@ pub struct IndexHandles {
     /// Generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
     /// Live txindex status for the `getcapabilities` projection.
-    pub derived_index_status: Option<Arc<dyn crate::capabilities::DerivedIndexCapabilitySource>>,
+    pub derived_index_status: Option<Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource>>,
 }
 
 /// Network capability handles.
@@ -1328,11 +1328,11 @@ mod tests {
     /// capability travels to `indexes` without a live index runtime.
     struct ReadySource;
 
-    impl crate::capabilities::DerivedIndexCapabilitySource for ReadySource {
-        fn capability(&self) -> crate::capabilities::CapabilityStatus {
-            crate::capabilities::derived_index_status(
+    impl bitcoin_rs_index::DerivedIndexCapabilitySource for ReadySource {
+        fn capability(&self) -> bitcoin_rs_index::CapabilityStatus {
+            bitcoin_rs_index::derived_index_status(
                 true,
-                crate::capabilities::CapabilityState::Ready,
+                bitcoin_rs_index::CapabilityState::Ready,
             )
         }
     }
@@ -1548,7 +1548,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
 
         let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
-        let status: Arc<dyn crate::capabilities::DerivedIndexCapabilitySource> =
+        let status: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource> =
             Arc::new(ReadySource);
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
