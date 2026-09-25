@@ -862,7 +862,6 @@ pub(super) fn applied_header_tip(
 pub(super) fn map_block_change_error(error: &BlockChangeError) -> ApplyError {
     match error {
         BlockChangeError::BlockValueOverflow => ApplyError::BlockValueOverflow,
-        BlockChangeError::HeightOverflow(height) => ApplyError::HeightOverflow(*height),
         BlockChangeError::VoutOverflow { txid } => ApplyError::VoutOverflow { txid: *txid },
         BlockChangeError::TxidCountMismatch {
             transactions,

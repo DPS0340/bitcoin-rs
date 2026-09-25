@@ -290,9 +290,6 @@ pub enum BlockChangeError {
     /// Summing a block's input or output values left the satoshi range.
     #[error("block value total overflows the satoshi range")]
     BlockValueOverflow,
-    /// Height or vout arithmetic overflowed `u32::MAX`.
-    #[error("height overflow at tip {0}")]
-    HeightOverflow(u32),
     /// A transaction carries more outputs than a `u32` vout can index.
     #[error("output count of transaction {txid} exceeds the vout index range")]
     VoutOverflow {
@@ -369,7 +366,12 @@ pub enum RollbackError {
 ///
 /// # Errors
 ///
-/// [`BlockChangeError`] when value totals overflow or a spend has no resolved
+/// [`BlockChangeError::TxidCountMismatch`] when `txids` does not cover every
+/// transaction, refused before iterating so no trailing transaction can be
+/// silently dropped; [`BlockChangeError::VoutOverflow`] when a transaction
+/// carries more outputs than a `u32` vout can index;
+/// [`BlockChangeError::BlockValueOverflow`] when value totals overflow; and
+/// [`BlockChangeError::UndoPrevoutMissing`] when a spend has no resolved
 /// prevout. Genesis returns empty mutations.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn build_block_changes<'a>(

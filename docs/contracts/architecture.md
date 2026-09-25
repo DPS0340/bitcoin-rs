@@ -273,10 +273,10 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
   head advance, publication, and marker disarm, in that order — and is the
   only owner of mutation ordering and durability policy (`ARCH-07`).
 - The contract surface is `bitcoin_rs_utxo::contract`; the crate root keeps
-  only read, snapshot, and statistics names. RPC and index are read consumers
-  of the root read types (`UtxoCoin`, `UtxoScan`) and of the contract's
-  decoded `UndoBatch`; they do
-  not assemble mutations outside tests, which build fixture sets through
+  only read, snapshot, and statistics names. RPC is a read consumer of the
+  root read types (`UtxoCoin`, `UtxoScan`); index is the read consumer that
+  decodes the contract's `UndoBatch`. Neither assembles mutations outside
+  tests, which build fixture sets through
   `BlockChanges` + `commit_block`.
 
 ### `ARCH-08`: Durable pruning and reorg retention
