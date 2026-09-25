@@ -141,13 +141,19 @@ impl UndoBatch {
         &self.removes
     }
 
-    /// Restores an output spent by the disconnected block.
-    pub fn restore(&mut self, add: UtxoAdd) {
+    /// Restores an output the disconnected block spent into this `UndoBatch`.
+    ///
+    /// Crate-visible on purpose: only the apply path ([`build_block_changes`])
+    /// and the undo decoder build batches; everything outside this crate
+    /// receives them from the contract.
+    pub(crate) fn restore(&mut self, add: UtxoAdd) {
         self.restores.push(add);
     }
 
-    /// Removes an output created by the disconnected block.
-    pub fn remove(&mut self, outpoint: OutPoint) {
+    /// Removes an output the disconnected block created from this `UndoBatch`.
+    ///
+    /// Crate-visible on purpose: see [`Self::restore`].
+    pub(crate) fn remove(&mut self, outpoint: OutPoint) {
         self.removes.push(outpoint);
     }
 
