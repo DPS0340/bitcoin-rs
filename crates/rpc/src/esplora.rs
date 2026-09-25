@@ -117,7 +117,7 @@ mod tests {
         Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script,
         Sequence, Tx, TxIn, TxOut, Txid, Witness, consensus_bytes,
     };
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     use serde_json::{Value, json};
 
     use super::projection::Projection;

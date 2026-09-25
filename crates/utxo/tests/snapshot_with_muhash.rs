@@ -1,7 +1,8 @@
 //! Snapshot trailer integration tests for coinstats.
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, TxOut};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet, write_snapshot};
+use bitcoin_rs_utxo::{UtxoSet, write_snapshot};
 
 #[test]
 fn snapshot_trailer_uses_listener_muhash() -> Result<(), Box<dyn std::error::Error>> {

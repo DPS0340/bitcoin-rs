@@ -982,7 +982,7 @@ mod tests {
         Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
         encode::double_sha256,
     };
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
     use std::sync::mpsc;
     use std::thread;
@@ -2162,7 +2162,7 @@ mod acceptance_tests {
         Amount, BlockHash, CompactTarget, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn,
         TxOut, Txid, Witness, consensus_bytes,
     };
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
     use super::{getrawtransaction, sendrawtransaction, testmempoolaccept};

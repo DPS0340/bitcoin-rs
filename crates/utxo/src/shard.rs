@@ -960,7 +960,7 @@ mod tests {
             value: Amount::from_sat(7),
             script_pubkey: vec![0x51].into(),
         };
-        let add = crate::UtxoAdd::new(
+        let add = crate::contract::UtxoAdd::new(
             OutPoint::new(bitcoin_rs_primitives::Txid::from(txid), 0),
             txout,
             false,

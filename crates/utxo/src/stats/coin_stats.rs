@@ -1016,7 +1016,8 @@ mod tests {
 
     #[test]
     fn scan_coin_stats_matches_rolling_listener() {
-        use crate::{BlockChanges, SnapshotCoin, SnapshotCoinObserver, UtxoAdd, UtxoSet};
+        use crate::contract::{BlockChanges, UtxoAdd};
+        use crate::{SnapshotCoin, SnapshotCoinObserver, UtxoSet};
         use bitcoin_rs_primitives::{Hash256, OutPoint};
 
         let mut utxo = UtxoSet::new();

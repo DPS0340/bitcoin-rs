@@ -235,7 +235,7 @@ mod tests {
     use bitcoin_rs_primitives::{
         Amount, LockTime, Network, OutPoint, Script, Sequence, TxIn, TxOut, Witness,
     };
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     use parking_lot::Mutex;
 
     use bitcoin_rs_rpc::zmq::MempoolSequenceObserver;

@@ -13,7 +13,8 @@ static GLOBAL_MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::hint::black_box;
 
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, TxOut};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
+use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 const ENTRY_COUNT: u64 = 10_000;

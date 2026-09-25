@@ -49,7 +49,7 @@ use bitcoin_rs_p2p::{
 use bitcoin_rs_primitives::{
     Amount, Block, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
 };
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 

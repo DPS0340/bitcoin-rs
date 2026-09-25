@@ -33,9 +33,9 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Txid;
 use bitcoin_rs_primitives::consensus_bytes;
 use bitcoin_rs_storage::CommitRecords;
-use bitcoin_rs_utxo::BlockChangeError;
-use bitcoin_rs_utxo::build_block_changes;
-use bitcoin_rs_utxo::is_coinbase_tx;
+use bitcoin_rs_utxo::contract::BlockChangeError;
+use bitcoin_rs_utxo::contract::build_block_changes;
+use bitcoin_rs_utxo::contract::is_coinbase_tx;
 use hashbrown::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -407,9 +407,13 @@ pub(super) fn apply_block_admitted<'b>(
     // record cannot be written the block must not apply at all, and leaving
     // body bytes or index rows behind for it would be worse than not starting.
     let undo_persist_started = quanta::Instant::now();
-    let undo_persist_result =
-        bitcoin_rs_utxo::persist_block_undo(handles.undo_store.as_ref(), height, block_hash, &undo)
-            .map_err(ApplyError::UndoPersistence);
+    let undo_persist_result = bitcoin_rs_utxo::contract::persist_block_undo(
+        handles.undo_store.as_ref(),
+        height,
+        block_hash,
+        &undo,
+    )
+    .map_err(ApplyError::UndoPersistence);
     metrics::histogram!("node.apply_block.undo_persist_seconds")
         .record(undo_persist_started.elapsed().as_secs_f64());
     let undo_record = undo_persist_result?;
@@ -881,8 +885,8 @@ fn build_journal_record(
     height: u32,
     block_hash: Hash256,
     prev_hash: Hash256,
-    undo: &bitcoin_rs_utxo::UndoBatch,
-    changes: &bitcoin_rs_utxo::BlockChanges<&'_ bitcoin_rs_primitives::TxOut>,
+    undo: &bitcoin_rs_utxo::contract::UndoBatch,
+    changes: &bitcoin_rs_utxo::contract::BlockChanges<&'_ bitcoin_rs_primitives::TxOut>,
     coin_stats_height_delta: i64,
 ) -> BuiltJournalRecord {
     if height == 0 {

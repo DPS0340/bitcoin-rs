@@ -12,9 +12,10 @@ use bitcoin_rs_storage::{
     CommitRecords, DisconnectMarker, DurableHead, DurableHeadStore, InMemoryDurableHeadStore,
     InMemoryUndoStore, StorageError, UndoStore,
 };
-use bitcoin_rs_utxo::build_block_changes;
+use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::contract::build_block_changes;
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 

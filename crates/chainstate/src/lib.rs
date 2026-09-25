@@ -24,7 +24,7 @@ pub use bitcoin_rs_storage::UndoStore;
 use bitcoin_rs_storage::block_body::BlockBodyStore;
 use bitcoin_rs_utxo::UtxoCoin;
 use bitcoin_rs_utxo::UtxoSet;
-use bitcoin_rs_utxo::{SpentOutputLookup, is_coinbase_tx};
+use bitcoin_rs_utxo::contract::{SpentOutputLookup, is_coinbase_tx};
 use connect::apply_block_admitted;
 use connect::apply_block_with_serialized_admitted;
 use connect::apply_committed_block_admitted;
@@ -1277,7 +1277,7 @@ struct DisconnectPlan {
     parent_tip: TipSnapshot,
     parent_prev_hash: Hash256,
     parent_chain_tx_count: u64,
-    undo: bitcoin_rs_utxo::UndoBatch,
+    undo: bitcoin_rs_utxo::contract::UndoBatch,
     height: u32,
     tx_count_delta: u64,
 }
@@ -1636,7 +1636,7 @@ impl ResolvedUtxoView {
     /// Generic so a window can substitute an overlay carrying the outputs its
     /// earlier blocks created. Every caller outside a window passes the
     /// committed set.
-    fn resolve<S: bitcoin_rs_utxo::OutputSource + ?Sized>(
+    fn resolve<S: bitcoin_rs_utxo::contract::OutputSource + ?Sized>(
         utxo: &S,
         block: &Block,
         tx_plan: &BlockTxPlan,

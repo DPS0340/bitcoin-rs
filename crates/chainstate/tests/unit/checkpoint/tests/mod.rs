@@ -11,8 +11,9 @@ use bitcoin_rs_primitives::{
     Amount, BlockHash, CompactTarget, Hash256, Header, Network, OutPoint, Script, TxOut, Txid,
     deserialize,
 };
+use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener, scan_coin_stats};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 

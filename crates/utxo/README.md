@@ -7,7 +7,9 @@ contract (`contract`): `build_block_changes` turns a validated block into its
 `BlockChanges` plus the `UndoBatch` and `BlockValueTotals` consensus checks
 need, `commit_block` applies that `BlockChanges`, and `persist_block_undo` /
 `load_block_undo` / `rollback_block` carry a block's undo through
-persistence and disconnect under the durable marker. Lookups return the one
+persistence and disconnect under the durable marker. Everything contract-
+owned is named from `bitcoin_rs_utxo::contract`; the crate root keeps only
+the read, snapshot, and statistics names. Lookups return the one
 `UtxoCoin` shape (`get`, `get_entry`) and `has_live_outputs_for_txid`
 supplies the transaction-level BIP30 duplicate-spend predicate.
 `with_stable_view` blocks commits while a `UtxoSetView` reads the whole set,

@@ -3,9 +3,10 @@
 use std::io::{Cursor, Seek};
 
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, Script, TxOut};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::{
-    BlockChanges, SnapshotCoin, SnapshotCoinObserver, UtxoAdd, UtxoError, UtxoSet,
-    hash_serialized_3, read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot,
+    SnapshotCoin, SnapshotCoinObserver, UtxoError, UtxoSet, hash_serialized_3,
+    read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot,
     write_snapshot_observed,
 };
 use tempfile::tempfile;

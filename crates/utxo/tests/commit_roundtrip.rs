@@ -1,7 +1,8 @@
 //! Public commit/get coverage for the UTXO set.
 
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, Script, TxOut, varint};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoError, UtxoSet, hash_serialized_3};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::{UtxoError, UtxoSet, hash_serialized_3};
 use sha2::{Digest, Sha256};
 
 fn txid(seed: u64) -> Hash256 {

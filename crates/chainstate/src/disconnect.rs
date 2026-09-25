@@ -1,4 +1,4 @@
-//! Orders [`bitcoin_rs_utxo::rollback_block`] against the journal, the
+//! Orders [`bitcoin_rs_utxo::contract::rollback_block`] against the journal, the
 //! durable head, and publication.
 
 use super::Chainstate;
@@ -15,7 +15,7 @@ use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::Txid;
-use bitcoin_rs_utxo::{RollbackError, load_block_undo, rollback_block};
+use bitcoin_rs_utxo::contract::{RollbackError, load_block_undo, rollback_block};
 use std::sync::Arc;
 
 pub(super) fn plan_disconnect(

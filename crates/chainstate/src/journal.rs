@@ -15,9 +15,9 @@ use bitcoin_rs_storage::chainstate_journal::JournalReplayBase;
 use bitcoin_rs_storage::chainstate_journal::JournalReplayError;
 use bitcoin_rs_storage::chainstate_journal::Mutation;
 use bitcoin_rs_storage::chainstate_journal::replay_committed_range;
-use bitcoin_rs_utxo::BlockChanges;
-use bitcoin_rs_utxo::UtxoAdd;
 use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::contract::BlockChanges;
+use bitcoin_rs_utxo::contract::UtxoAdd;
 use hashbrown::HashMap;
 use thiserror::Error;
 

@@ -17,7 +17,7 @@ use bitcoin_rs_primitives::{
 };
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_rpc::{Handler, RpcError};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
 /// A standard P2WPKH script paid to a known key.

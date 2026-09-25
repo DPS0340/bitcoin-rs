@@ -41,12 +41,6 @@ pub mod stats;
 /// Versioned on-disk encoding for undo records.
 mod undo_codec;
 
-pub use contract::{
-    BlockChangeError, BlockChanges, BlockValueTotals, DisconnectReceipt, OutputSource,
-    RollbackError, SpentOutputLookup, UndoBatch, UndoLoadError, UndoRecord, UtxoAdd,
-    build_block_changes, decode_undo_record, is_coinbase_tx, load_block_undo, persist_block_undo,
-    rollback_block,
-};
 pub use overlay::{WindowOverlay, WindowOverlayError};
 pub use set::{UtxoCoin, UtxoError, UtxoMemoryReport, UtxoScan, UtxoSet, UtxoSetView};
 pub use snapshot::{
@@ -55,4 +49,3 @@ pub use snapshot::{
     write_snapshot_observed,
 };
 pub use stats::CoinStatsListener;
-pub use undo_codec::UndoCodecError;

@@ -15,7 +15,9 @@ use hashbrown::HashSet;
 
 use crate::set::{UtxoCoin, UtxoError, UtxoSet};
 use crate::stats::{CoinStatsListener, CoinStatsRewindError};
-use crate::undo_codec::{self, UndoCodecError};
+use crate::undo_codec;
+
+pub use crate::undo_codec::UndoCodecError;
 
 /// One UTXO output to add, owning a `TxOut` or borrowing it from a block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -775,6 +777,7 @@ mod tests {
         assert!(utxo.get_entry(&FUNDED).is_some(), "undo had already run");
         Ok(())
     }
+
     // Undo-determinism coverage, relocated from the crate's integration
     // tests once the raw inverse (`undo_block`) and the `UndoBatch` builders
     // became crate-visible only.

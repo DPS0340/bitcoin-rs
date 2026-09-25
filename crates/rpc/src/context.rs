@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     fn new_context_wires_utxo_commits_to_coin_stats() {
         use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid};
-        use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+        use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 
         let ctx = Context::new();
         let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&[1_u8; 32])), 0);
@@ -1821,7 +1821,7 @@ mod admission_chain_tests {
     use anyhow::Context as _;
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_primitives::{Header, LockTime, Sequence, TxIn, TxOut, Witness};
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     use sha2::{Digest as _, Sha256};
 
     use super::*;

@@ -23,7 +23,7 @@ use bitcoin_rs_primitives::{
 };
 use bitcoin_rs_rpc::context::{ChainControl, ChainControlError, Context};
 use bitcoin_rs_rpc::{Handler, RpcError};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
 struct SmokeMiningControl;

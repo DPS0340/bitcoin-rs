@@ -95,7 +95,7 @@ pub enum ApplyError {
     /// Fatal for the disconnect: without it the UTXO set cannot be restored,
     /// and guessing would silently corrupt the chainstate.
     #[error(transparent)]
-    UndoLoad(#[from] bitcoin_rs_utxo::UndoLoadError),
+    UndoLoad(#[from] bitcoin_rs_utxo::contract::UndoLoadError),
     /// The block asked to be disconnected is not the applied tip.
     ///
     /// Blocks must be disconnected tip-first. Taking one from the middle would

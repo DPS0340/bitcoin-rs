@@ -2,8 +2,9 @@ use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
 use bitcoin_rs_primitives::{
     Amount, BlockHash, CompactTarget, Hash256, Header, OutPoint, TxOut, Txid, consensus_bytes,
 };
+use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 
 use super::{JournalRecord, JournalReplayError, Mutation, replay_records, validate_replayed_head};
 use bitcoin_rs_storage::chainstate_journal::Coin;

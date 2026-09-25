@@ -37,7 +37,7 @@ use bitcoin_rs_primitives::{
     Txid, Witness, encode::double_sha256,
 };
 use bitcoin_rs_rpc::context::ChainAdmissionView;
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 
 /// Header timestamp base for the regtest fixture chain.
 const BASE_TIME: u32 = 1_296_688_603;
