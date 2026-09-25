@@ -9,8 +9,6 @@
 A Bitcoin full-node project for developers exploring typed Rust integration,
 node-owned indexing, and familiar Bitcoin interfaces.
 
-**Run locally. Inspect the contracts. Share one reproducible result.**
-
 [Getting started](docs/getting-started.md) ·
 [Documentation](docs/README.md) ·
 [Contributing](CONTRIBUTING.md) ·
@@ -86,38 +84,6 @@ Bitcoin Core and build a better Bitcoin implementation. That challenge
 strengthens the Bitcoin ecosystem: a separately designed codebase cross-checks
 consensus interpretation, increases implementation diversity, and reduces the
 risk of correlated implementation failures.
-
-## Features
-
-- Consensus validation: the native Rust interpreter verifies Legacy, SegWit v0,
-  and Taproot key-path and script-path spends. Core's committed `script_tests`,
-  `tx_valid`, and `tx_invalid` vectors pin zero native mismatches. Script checks
-  run in parallel across rayon workers with sighash midstate reuse per
-  transaction. `--features kernel` routes the same checks through
-  `libbitcoinkernel` (Bitcoin Core's C++ engine) as an independent oracle.
-- Kernel feature: `--features kernel` enables `libbitcoinkernel`. The
-  `crates/consensus`, `crates/chainstate`, and `crates/node` library crates
-  default to `kernel`;
-  the `bin/bitcoin-rs` binary defaults to `["fjall", "redb", "zmq"]` (no kernel)
-  and does not link `libbitcoinkernel`. Issue #213 keeps that split until
-  native wins the signed-spend and full-replay gates; see the
-  [validation-default contract](docs/contracts/validation-default.md).
-- Pure-Rust storage defaults: LSM-tree storage backed by `fjall` by default,
-  with `redb` compiled in and `rocksdb` available through an optional Cargo
-  feature.
-- Sharded UTXO cache: a 256-shard in-memory UTXO set (`hashbrown::HashTable` of
-  compact records behind `parking_lot::RwLock`) with checkpoint-based crash
-  recovery and effective `--dbcache-mb` budget allocation.
-- Asynchronous index consumer: `txindex` reconciles over a monotonic chain
-  snapshot and event hint channel without blocking block validation.
-- Integrated ScriptIndex and Esplora APIs: address and scripthash UTXO indexing
-  and confirmed transaction history served directly over HTTP.
-- Mempool mutation gateway: centralized mutation tracking publishing ordered
-  accept and remove events over ZMQ `pubsequence`.
-- Block template assembly: mining candidate generation via `getblocktemplate`.
-- Core-compatible RPC and typed embedding: synchronous HTTP JSON-RPC using Core
-  method names and wire formats (walletless, no private keys), plus a typed
-  async `Node` embedding API for in-process Rust integrations.
 
 ## Quick start
 
