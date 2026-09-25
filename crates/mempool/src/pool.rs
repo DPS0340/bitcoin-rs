@@ -565,18 +565,16 @@ impl Mempool {
     pub fn clear(&mut self) -> MutationResult {
         // Every entry leaves the pool here, so this is the same retire funnel
         // Core walks during a bulk clear: fire `mempool:removed` per entry
-        // before the arena is emptied. bitcoin-rs's explicit-clear class has
-        // no Core reason string and reports `unknown`.
+        // before the arena is emptied. The explicit-clear class reports
+        // `unknown`, Core's `MemPoolRemovalReason::UNKNOWN` string.
         let mut txids = Vec::with_capacity(self.entries.len());
         for (_id, entry) in self.entries.iter() {
-            let probe_vsize = i32::try_from(entry.vsize).unwrap_or(i32::MAX);
-            let probe_fee = i64::try_from(entry.fee).unwrap_or(i64::MAX);
             bitcoin_rs_trace::removed(|| {
                 (
                     entry.txid.as_bytes().as_ptr(),
                     "unknown",
-                    probe_vsize,
-                    probe_fee,
+                    i32::try_from(entry.vsize).unwrap_or(i32::MAX),
+                    i64::try_from(entry.fee).unwrap_or(i64::MAX),
                     entry.time,
                 )
             });
@@ -629,9 +627,10 @@ impl Mempool {
 
     /// Bitcoin Core `RemovalReasonToString` mapping for `mempool:removed`.
     ///
-    /// Core publishes exactly `expiry`, `sizelimit`, `reorg`, `block`,
-    /// `conflict`, `replaced`; this pool adds a descendant-of-replacement class
-    /// (emitted as `replaced`) and an explicit pool clear (`unknown`).
+    /// Core publishes `expiry`, `sizelimit`, `reorg`, `block`, `conflict`,
+    /// `replaced`, and `unknown`; this pool adds a descendant-of-replacement
+    /// class (emitted as `replaced`) and maps an explicit pool clear to
+    /// `unknown`.
     const fn core_removal_reason(reason: RemovalReason) -> &'static str {
         match reason {
             RemovalReason::BlockInclusion => "block",
@@ -1797,15 +1796,12 @@ impl Mempool {
             // Core fires `mempool:removed` from `CTxMemPool::removeUnchecked`,
             // the pool-internal retire funnel, per entry as it leaves the
             // pool. `prepare` runs only while a consumer is attached.
-            let probe_vsize = i32::try_from(entry.vsize).unwrap_or(i32::MAX);
-            let probe_fee = i64::try_from(entry.fee).unwrap_or(i64::MAX);
-            let probe_reason = Self::core_removal_reason(*reason);
             bitcoin_rs_trace::removed(|| {
                 (
                     entry.txid.as_bytes().as_ptr(),
-                    probe_reason,
-                    probe_vsize,
-                    probe_fee,
+                    Self::core_removal_reason(*reason),
+                    i32::try_from(entry.vsize).unwrap_or(i32::MAX),
+                    i64::try_from(entry.fee).unwrap_or(i64::MAX),
                     entry.time,
                 )
             });

@@ -3,6 +3,7 @@
 # lane=pure: no C++ / libbitcoinkernel / rocksdb
 # lane=native: needs cmake+libboost (kernel) and/or C storage engines
 bin-default	bitcoin-rs	pure	--no-default-features --features fjall,redb,zmq
+bin-usdt	bitcoin-rs	pure	--no-default-features --features fjall,usdt
 portable	bitcoin-rs	pure	--no-default-features --features fjall,zmq
 no-zmq	bitcoin-rs	pure	--no-default-features --features fjall,redb
 fjall-only	bitcoin-rs	pure	--no-default-features --features fjall
@@ -20,3 +21,4 @@ rpc-no-defaults	bitcoin-rs-rpc	pure	--no-default-features --all-targets
 node-fjall	bitcoin-rs-node	pure	--no-default-features --features fjall --all-targets
 node-fjall-zmq	bitcoin-rs-node	pure	--no-default-features --features fjall,zmq --all-targets
 node-default	bitcoin-rs-node	native	--all-targets
+trace-usdt	bitcoin-rs-trace	pure	--features usdt --all-targets

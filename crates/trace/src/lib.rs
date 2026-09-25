@@ -11,8 +11,8 @@
 //! and the closure is only invoked when a consumer (bpftrace, BCC, `DTrace`,
 //! …) has raised the probe's semaphore. With the feature on and nothing
 //! attached the cost is one volatile semaphore load per probe site; with the
-//! feature off every call is an empty function body and the closure literal
-//! is dropped without being constructed.
+//! feature off every call is an empty function body and the closure is
+//! dropped without running.
 
 /// Documented argument ABI of every probe this crate defines.
 pub mod probe_abi;
@@ -76,8 +76,15 @@ mod raw {
     #[cfg(feature = "usdt")]
     pub(super) fn inbound_message(prepare: impl FnOnce() -> super::MessageArgs) {
         net::inbound_message!(|| {
-            let (node_id, addr, conn_type, msg_type, payload) = prepare();
-            (node_id, addr, conn_type, msg_type, payload.len(), payload)
+            let (node_id, addr, conn_type, msg_type, size, payload) = prepare();
+            (
+                node_id,
+                addr,
+                conn_type,
+                msg_type,
+                size,
+                address_of(payload),
+            )
         });
     }
 
@@ -85,48 +92,16 @@ mod raw {
     #[cfg(feature = "usdt")]
     pub(super) fn outbound_message(prepare: impl FnOnce() -> super::MessageArgs) {
         net::outbound_message!(|| {
-            let (node_id, addr, conn_type, msg_type, payload) = prepare();
-            (node_id, addr, conn_type, msg_type, payload.len(), payload)
+            let (node_id, addr, conn_type, msg_type, size, payload) = prepare();
+            (
+                node_id,
+                addr,
+                conn_type,
+                msg_type,
+                size,
+                address_of(payload),
+            )
         });
-    }
-}
-
-/// Owned message payload kept alive for the duration of a probe call.
-///
-/// The emitter passes the message bytes to Core's probes as a pointer by
-/// value (see [`probe_abi`]), and the pointer must stay valid while the
-/// probe fires. The tuple the emitter materialises owns this slot, so the
-/// bytes outlive the call even though the probe macro receives only the
-/// address.
-pub struct PayloadSlot {
-    address: u64,
-    bytes: Vec<u8>,
-}
-
-impl PayloadSlot {
-    /// Wraps encoded message payload bytes.
-    #[must_use]
-    pub fn new(bytes: Vec<u8>) -> Self {
-        let address = u64::try_from(bytes.as_ptr().addr()).unwrap_or(0);
-        Self { address, bytes }
-    }
-
-    /// Payload length in bytes, Core's message-size argument.
-    #[must_use]
-    pub fn len(&self) -> u64 {
-        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
-    }
-
-    /// Returns whether the slot holds no bytes.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-}
-
-impl std::borrow::Borrow<u64> for PayloadSlot {
-    fn borrow(&self) -> &u64 {
-        &self.address
     }
 }
 
@@ -151,11 +126,10 @@ pub type RemovedArgs = (*const u8, &'static str, i32, i64, u64);
 
 /// Prepared arguments of `net:inbound_message` / `net:outbound_message`.
 ///
-/// `(node_id, addr, conn_type, msg_type, payload)`. The payload is owned by
-/// the tuple the emitter keeps alive for the probe call, so callers hand over
-/// the message bytes rather than a borrowed pointer; the emitter derives the
-/// message size from it.
-pub type MessageArgs = (i64, String, String, String, PayloadSlot);
+/// `(node_id, addr, conn_type, msg_type, payload_size, payload)`. `payload`
+/// must address `payload_size` bytes that outlive the probe call; callers
+/// pass the encoded frame's own byte slice.
+pub type MessageArgs = (i64, String, String, String, u64, *const u8);
 
 /// Fires `validation:block_connected` if probes are compiled in.
 ///

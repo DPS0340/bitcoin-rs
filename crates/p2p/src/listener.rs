@@ -1389,10 +1389,20 @@ fn write_ready_burst(
     let mut pending = Some(first);
     while let Some(head) = pending.take() {
         let (burst, leftover) = collect_write_burst(head, outbound_rx);
-        for message in &burst {
-            crate::net_trace::outbound_message(trace_peer, message);
+        // Encode once per message: the probe consumes the same frame bytes
+        // the write emits, the way Core's `CSerializedNetMsg` is shared by
+        // its send path and the `net:outbound_message` probe.
+        let frames = match crate::wire::encode_frames(magic, &burst) {
+            Ok(frames) => frames,
+            Err(error) => {
+                tracing::debug!(%error, "p2p writer thread exiting");
+                return false;
+            }
+        };
+        for (message, frame) in burst.iter().zip(frames.iter()) {
+            crate::net_trace::outbound_message(trace_peer, message, frame.payload());
         }
-        match crate::wire::write_messages(writer, magic, &burst) {
+        match crate::wire::write_frames(writer, &frames) {
             Ok(sizes) => {
                 account_written(&sizes, stats, totals, budget);
                 pending = leftover;

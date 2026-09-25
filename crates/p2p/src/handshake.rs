@@ -166,11 +166,15 @@ pub(crate) fn send_handshake_message<S: Read + Write>(
     lease: &PeerLease,
     totals: Option<&Arc<crate::TrafficTotals>>,
 ) -> Result<(), PeerError> {
-    let written = peer.send(message)?;
+    // Encode once: the probe consumes the same frame bytes the write emits,
+    // matching the writer loop and the documented per-attempt semantics.
+    let frame = crate::wire::encode_frame(peer.magic, message)?;
     crate::net_trace::outbound_message(
         crate::net_trace::TracePeer::new(lease.node_id(), peer_addr, lease.is_inbound()),
         message,
+        frame.payload(),
     );
+    let written = crate::wire::write_frame(&mut peer.stream, &frame)?;
     let wire_len = u64::try_from(written).unwrap_or(u64::MAX);
     lease.stats().record_sent(wire_len);
     lease.stats().record_msg_sent();

@@ -218,7 +218,8 @@ fn instantiate_probes() {
                 String::new(),
                 String::new(),
                 String::new(),
-                bitcoin_rs_trace::PayloadSlot::new(Vec::new()),
+                0,
+                hash.as_ptr(),
             )
         });
         bitcoin_rs_trace::outbound_message(|| {
@@ -227,7 +228,8 @@ fn instantiate_probes() {
                 String::new(),
                 String::new(),
                 String::new(),
-                bitcoin_rs_trace::PayloadSlot::new(Vec::new()),
+                0,
+                hash.as_ptr(),
             )
         });
     }

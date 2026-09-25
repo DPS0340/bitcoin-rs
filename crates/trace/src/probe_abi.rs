@@ -9,10 +9,10 @@
 //! Core's *pointer-by-value* operand form — see the note below.
 //!
 //! Widths and signs follow the SystemTap SDT notes emitted by a released
-//! Bitcoin Core binary (verified out of tree against `bitcoind`, whose notes
-//! this crate's test asserts against byte-for-byte in the prefix), not
-//! `doc/tracing.md`, wherever the two disagree. The discrepancies are
-//! recorded per argument below.
+//! Bitcoin Core binary (verified out of tree against `bitcoind`), not
+//! `doc/tracing.md`, wherever the two disagree. The in-repo test checks
+//! bitcoin-rs's built artifact against this table rather than Core's notes;
+//! the discrepancies are recorded per argument below.
 //!
 //! # Byte-pointer arguments
 //!
