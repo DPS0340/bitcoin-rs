@@ -414,6 +414,10 @@ pub(super) fn apply_block_admitted<'b>(
     metrics::histogram!("node.apply_block.undo_persist_seconds")
         .record(undo_persist_started.elapsed().as_secs_f64());
     let undo_record = undo_persist_result?;
+    // Core ends the connect-block interval at undo persistence (the last
+    // step of `ConnectBlock` before it returns), so the probe's duration
+    // argument is captured here, not after the later coin-stat work.
+    let block_connected_dur = total_started.elapsed();
 
     // Serialize the block lazily: only when a consumer actually needs the
     // full bytes. During IBD with pruning+txindex disabled this avoids a
@@ -510,7 +514,7 @@ pub(super) fn apply_block_admitted<'b>(
         scratch.txids(),
         &resolved,
         verify_flags,
-        total_dur,
+        block_connected_dur,
     );
     tracing::debug!(
         height,
