@@ -18,6 +18,15 @@
 pub mod probe_abi;
 
 mod raw {
+    // The usdt generator's probe macros cast their arguments to usize and
+    // define an inline type-check item inside their expansion; that output
+    // is not ours to reshape, so allow its lint set at this module.
+    #![allow(
+        clippy::items_after_statements,
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     // Raw generated probe macros, one generated module per provider. The
     // generator names a module after each provider, so this private module
     // keeps the generated `validation`/`mempool`/`net` modules out of the

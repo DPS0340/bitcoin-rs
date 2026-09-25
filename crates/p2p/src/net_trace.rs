@@ -65,6 +65,14 @@ impl TracePeer {
 /// what Core passes as its message-bytes argument. `prepare` runs only while
 /// a consumer is attached, so the copy into the probe slot costs nothing
 /// when nobody is watching.
+///
+/// Lifetime: the closure only *borrows* `message`/`payload` — both belong to
+/// the caller and outlive this call — and returns the strings and the
+/// [`bitcoin_rs_trace::PayloadSlot`] **by value** in the argument tuple. The
+/// generated probe macro binds that tuple in the same block as its `asm!`,
+/// so every pointer the probe passes is backed by memory that is still alive
+/// when the probe fires. Nothing addressable is created only inside the
+/// closure body.
 pub(crate) fn inbound_message(peer: TracePeer, message: &Message, payload: &[u8]) {
     bitcoin_rs_trace::inbound_message(move || {
         let (node_id, addr, conn_type) = peer.header();

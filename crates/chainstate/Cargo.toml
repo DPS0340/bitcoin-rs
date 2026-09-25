@@ -65,4 +65,3 @@ bitcoin-rs-trace.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile = ">=3.20.0, <4"
-

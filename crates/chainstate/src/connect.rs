@@ -505,6 +505,7 @@ pub(super) fn apply_block_admitted<'b>(
     // consensus state is applied to the chainstate before publication.
     emit_block_connected(
         block,
+        &block_hash,
         height,
         scratch.txids(),
         &resolved,
@@ -642,14 +643,18 @@ pub(super) fn apply_block_admitted<'b>(
 /// no consumer attached — does none of it.
 fn emit_block_connected(
     block: &Block,
+    block_hash: &Hash256,
     height: u32,
     txids: &[Txid],
     resolved: &Arc<ResolvedUtxoView>,
     flags: bitcoin_rs_script::VerifyFlags,
     elapsed: std::time::Duration,
 ) {
+    // `block_hash` borrows the caller's already-computed hash local, which
+    // outlives this call: the probe argument must not point into a value the
+    // prepare closure owns, because the generated macro fires only after the
+    // closure has returned.
     bitcoin_rs_trace::block_connected(move || {
-        let probe_hash = block.block_hash();
         let mut view = BlockLocalUtxoView::new(Arc::clone(resolved), &block.txs, height, 0);
         let mut inputs: u32 = 0;
         let mut sigops: u64 = 0;
@@ -673,7 +678,7 @@ fn emit_block_connected(
             }
         }
         (
-            probe_hash.as_bytes().as_ptr(),
+            block_hash.as_byte_array().as_ptr(),
             i32::try_from(height).unwrap_or(i32::MAX),
             u64::try_from(block.txs.len()).unwrap_or(u64::MAX),
             i32::try_from(inputs).unwrap_or(i32::MAX),

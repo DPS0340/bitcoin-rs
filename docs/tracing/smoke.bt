@@ -1,16 +1,19 @@
 #!/usr/bin/env bpftrace
-# Smoke test for bitcoin-rs USDT probes, adapted from Bitcoin Core's
-# contrib/tracing/log_p2p_traffic.bt. The probe names and argument positions
-# are Bitcoin Core's, so this script works unchanged against a Core bitcoind.
-#
-# Usage (Linux, root):
-#   sudo bpftrace docs/tracing/smoke.bt /path/to/bitcoin-rs
-# or hardcode the path in the usdt: probe spec below:
-#   usdt:/path/to/bitcoin-rs:net:inbound_message
-#
-# bpftrace resolves the probes from the binary's SDT notes; no bitcoin-rs
-# runtime or library is involved. Live run status in docs/tracing.md: NOT_RUN
-# on the development host (macOS; needs a Linux kernel and root).
+// Smoke test for bitcoin-rs USDT probes, adapted from Bitcoin Core's
+// contrib/tracing/log_p2p_traffic.bt. The probe names and argument positions
+// are Bitcoin Core's, so this script works unchanged against a Core bitcoind.
+//
+// Every probe selector below names the same binary path literally: bpftrace
+// reads the SDT notes straight from that file and takes no binary argument on
+// its command line. Run from the repository root after building to the path
+// used below (or edit the five selectors):
+//
+//   cargo build --release --features usdt -p bitcoin-rs
+//   sudo bpftrace docs/tracing/smoke.bt
+//
+// Live run status (docs/tracing.md): NOT_RUN on the development host (macOS;
+// needs a Linux kernel and root). No bitcoin-rs runtime or library is
+// involved in consuming the probes.
 
 BEGIN
 {

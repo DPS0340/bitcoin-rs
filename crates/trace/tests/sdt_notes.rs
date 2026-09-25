@@ -113,6 +113,9 @@ const fn align4(offset: usize) -> usize {
     offset.saturating_add(3) & !3
 }
 
+/// Separator between a layout entry's `size@` prefix and its operand.
+const ARG_SEPARATOR: char = '@';
+
 /// x86-64 register operand spelling per argument index and byte width.
 const X86_REGISTERS: [&[&str]; 4] = [
     &["%dil", "%sil", "%dl", "%cl", "%r8b", "%r9b"],
@@ -150,7 +153,9 @@ fn expected_layout(spec: &probe_abi::ProbeSpec, machine: u16) -> Option<String> 
             0xB7 => ["x0", "x1", "x2", "x3", "x4", "x5"][index],
             _ => return None,
         };
-        operands.push(format!("{}@{}", arg.layout_prefix, operand));
+        // `layout_prefix` already ends in ARG_SEPARATOR (`size@`), matching
+        // the SystemTap grammar's `Nf@OP`; only the operand is appended.
+        operands.push(format!("{}{}", arg.layout_prefix, operand));
     }
     Some(operands.join(" "))
 }
@@ -158,7 +163,7 @@ fn expected_layout(spec: &probe_abi::ProbeSpec, machine: u16) -> Option<String> 
 fn layout_prefixes_of(layout: &str) -> Vec<&str> {
     layout
         .split_whitespace()
-        .map(|entry| entry.split('@').next().unwrap_or_default())
+        .map(|entry| entry.split(ARG_SEPARATOR).next().unwrap_or_default())
         .collect()
 }
 
@@ -199,6 +204,19 @@ fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Erro
         None => std::env::current_exe()?,
     };
     let bytes = fs::read(&path)?;
+    if std::env::var_os("SDT_ELF").is_none() && !cfg!(feature = "usdt") {
+        // Feature-off artifact: the whole point of the default build is that
+        // no probe notes leak into it, so assert exactly that instead of
+        // skipping silently.
+        let notes = parse_sdt_notes(&bytes).map_or_else(Vec::new, |(_, notes)| notes);
+        assert!(
+            notes.iter().all(|note| probe_abi::PROBES
+                .iter()
+                .all(|spec| { note.provider != spec.provider || note.name != spec.name })),
+            "a feature-off build must embed no Core-compatible probe notes"
+        );
+        return Ok(());
+    }
     let Some((machine, notes)) = parse_sdt_notes(&bytes) else {
         // Non-ELF artifact (Mach-O on macOS carries DOF instead of SDT
         // notes). The portable table test above still guards the ABI.

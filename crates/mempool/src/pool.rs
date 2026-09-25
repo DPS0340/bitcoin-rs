@@ -563,7 +563,25 @@ impl Mempool {
     /// keeps the recorded confirmations and re-arms only the re-admitted
     /// entries — so chain recovery cannot silently discard fee history.
     pub fn clear(&mut self) -> MutationResult {
-        let txids: Vec<Txid> = self.entries.iter().map(|(_id, entry)| entry.txid).collect();
+        // Every entry leaves the pool here, so this is the same retire funnel
+        // Core walks during a bulk clear: fire `mempool:removed` per entry
+        // before the arena is emptied. bitcoin-rs's explicit-clear class has
+        // no Core reason string and reports `unknown`.
+        let mut txids = Vec::with_capacity(self.entries.len());
+        for (_id, entry) in self.entries.iter() {
+            let probe_vsize = i32::try_from(entry.vsize).unwrap_or(i32::MAX);
+            let probe_fee = i64::try_from(entry.fee).unwrap_or(i64::MAX);
+            bitcoin_rs_trace::removed(|| {
+                (
+                    entry.txid.as_bytes().as_ptr(),
+                    "unknown",
+                    probe_vsize,
+                    probe_fee,
+                    entry.time,
+                )
+            });
+            txids.push(entry.txid);
+        }
         self.entries.clear();
         self.by_txid.clear();
         self.funding.clear();
