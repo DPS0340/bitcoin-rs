@@ -1,0 +1,30 @@
+[package]
+name        = "bitcoin-rs-trace"
+version     = "0.8.0"
+edition     = "2024"
+rust-version = "1.95.0"
+license     = "Apache-2.0"
+repository  = "https://github.com/gosuda/bitcoin-rs"
+authors     = ["metaphorics"]
+description = "Optional Bitcoin Core-compatible USDT tracepoints"
+publish     = false
+
+[lib]
+name = "bitcoin_rs_trace"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+usdt = { workspace = true, optional = true }
+tracing.workspace = true
+
+[dev-dependencies]
+
+[features]
+default = []
+# Emits SystemTap/DTrace USDT probes with Bitcoin Core's provider names and
+# argument layout. Off by default: nothing is prepared or emitted unless the
+# binary is built with this feature AND a consumer raises a probe semaphore.
+usdt = ["dep:usdt"]

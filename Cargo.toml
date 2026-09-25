@@ -13,6 +13,7 @@ members = [
     "crates/mempool",
     "crates/p2p",
     "crates/mining",
+    "crates/trace",
     "crates/rpc",
     "crates/node",
     "bin/bitcoin-rs",
@@ -51,6 +52,8 @@ bitcoin-rs-p2p        = { path = "crates/p2p",        version = "0.8.0" }
 bitcoin-rs-mining     = { path = "crates/mining",     version = "0.8.0" }
 bitcoin-rs-rpc        = { path = "crates/rpc",        version = "0.8.0" }
 bitcoin-rs-node       = { path = "crates/node",       version = "0.8.0", default-features = false }
+# USDT tracepoint layer. Optional everywhere it is used; see crates/trace.
+bitcoin-rs-trace      = { path = "crates/trace",      version = "0.8.0", default-features = false }
 
 # Allocator. Defaults pull `secure` and `extended` overhead — disable for perf.
 mimalloc = { version = ">=0.1.50, <0.2", default-features = false }
@@ -182,6 +185,9 @@ clap       = { version = ">=4.6, <5",   default-features = false, features = [
 
 # --- Observability ------------------------------------------------------------
 tracing            = { version = ">=0.1.44, <0.2", default-features = false, features = ["std", "attributes"] }
+# USDT probe emission for crates/trace (optional; pulled in only by the `usdt`
+# feature). Apache-2.0, pure Rust, no C toolchain or AWS-LC/ring providers.
+usdt               = { version = "=0.6.0", default-features = false }
 tracing-subscriber = { version = ">=0.3.23, <0.4", default-features = false, features = [
     "std", "fmt", "registry", "ansi", "env-filter", "json", "smallvec",
     "tracing-log", "sharded-slab", "thread_local",
