@@ -321,8 +321,8 @@ fn stall_eviction_does_not_disconnect_replacement_connection()
         .checked_add(1)
         .ok_or_else(|| std::io::Error::other("applied height overflow"))?;
     let selected = {
-        let mut scheduler = sync.scheduler.lock();
         let tree = sync.chain.block_tree();
+        let mut scheduler = sync.scheduler.lock();
         let state = &mut *scheduler;
         state.window.observe_stall(
             next_apply_height,

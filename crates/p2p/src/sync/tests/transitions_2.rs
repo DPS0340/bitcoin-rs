@@ -171,7 +171,11 @@ fn retarget_purges_staged_off_branch_bodies() -> Result<(), Box<dyn std::error::
     );
 
     let mut late = vec![crate::InboundBlock::from_decoded(losing2)];
-    sync.buffer_received_block_chunk(&mut late, None);
+    assert_eq!(
+        sync.buffer_received_block_chunk(&mut late, None),
+        0,
+        "the late losing-branch delivery must be discarded, not staged"
+    );
     let scheduler = sync.scheduler.lock();
     assert_eq!(
         scheduler.stager.received_len(),
