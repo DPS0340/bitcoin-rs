@@ -14,8 +14,8 @@ use std::hint::black_box;
 
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::UtxoSet;
-use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use bitcoin_rs_utxo::contract::{self, BlockChanges, UtxoAdd};
+use criterion::{BatchSize, Criterion, criterion_group};
 
 const ENTRY_COUNT: u64 = 10_000;
 const SPEND_PROXY_FANOUT: usize = 64;
@@ -125,8 +125,7 @@ fn synthetic_case(seed: u64, shape: ShardShape) -> (UtxoSet, BlockChanges) {
     for spend in &workload.spends {
         preload.add(utxo_add(spend));
     }
-    if let Err(error) = bitcoin_rs_utxo::contract::commit_block_changes(&set, &preload, &txid(seed))
-    {
+    if let Err(error) = contract::commit_block_changes(&set, &preload, &txid(seed)) {
         panic!("synthetic preload failed: {error}");
     }
 
@@ -171,8 +170,7 @@ fn spend_fanout_case(seed: u64) -> (UtxoSet, BlockChanges) {
         ));
         changes.remove(outpoint);
     }
-    if let Err(error) =
-        bitcoin_rs_utxo::contract::commit_block_changes(&set, &preload, &txid(seed.wrapping_add(1)))
+    if let Err(error) = contract::commit_block_changes(&set, &preload, &txid(seed.wrapping_add(1)))
     {
         panic!("spend-fanout preload failed: {error}");
     }
@@ -210,11 +208,9 @@ fn bench_synthetic(c: &mut Criterion, name: &str, shape: ShardShape) {
         b.iter_batched(
             || synthetic_case(0x00ab_cdef, shape),
             |(set, changes)| {
-                if let Err(error) = bitcoin_rs_utxo::contract::commit_block_changes(
-                    &set,
-                    black_box(&changes),
-                    &txid(0x0012_3456),
-                ) {
+                if let Err(error) =
+                    contract::commit_block_changes(&set, black_box(&changes), &txid(0x0012_3456))
+                {
                     panic!("synthetic commit failed: {error}");
                 }
             },
@@ -228,11 +224,9 @@ fn bench_spend_fanout(c: &mut Criterion) {
         b.iter_batched(
             || spend_fanout_case(0x0405_0607),
             |(set, changes)| {
-                if let Err(error) = bitcoin_rs_utxo::contract::commit_block_changes(
-                    &set,
-                    black_box(&changes),
-                    &txid(0x0412_1314),
-                ) {
+                if let Err(error) =
+                    contract::commit_block_changes(&set, black_box(&changes), &txid(0x0412_1314))
+                {
                     panic!("spend-fanout commit failed: {error}");
                 }
             },
@@ -247,5 +241,54 @@ fn utxo_commit(c: &mut Criterion) {
     bench_spend_fanout(c);
 }
 
+/// Settles one workload's commit outside Criterion timing and prints the
+/// retained [`UtxoMemoryReport`] as one JSON line, so an external run can
+/// capture process peak RSS (for example `/usr/bin/time -v`) around it.
+fn measure_memory(arm: &str) -> Result<(), String> {
+    let ((set, changes), commit_txid) = match arm {
+        "existing" => (
+            synthetic_case(0x00ab_cdef, ShardShape::Existing),
+            txid(0x0012_3456),
+        ),
+        "concentrated" => (
+            synthetic_case(0x00ab_cdef, ShardShape::Concentrated),
+            txid(0x0012_3456),
+        ),
+        "spend_fanout_64" => (spend_fanout_case(0x0405_0607), txid(0x0412_1314)),
+        other => return Err(format!("unknown measurement arm: {other}")),
+    };
+    if let Err(error) = contract::commit_block_changes(&set, &changes, &commit_txid) {
+        return Err(format!("measurement commit failed: {error}"));
+    }
+    let report = set.memory_report();
+    println!(
+        "{{\"arm\":\"{arm}\",\"records\":{},\"outputs\":{},\"record_payload_bytes\":{},\"table_bytes\":{},\"accounted_bytes\":{}}}",
+        report.records,
+        report.outputs,
+        report.record_payload_bytes,
+        report.table_bytes,
+        report.accounted_bytes()
+    );
+    Ok(())
+}
+
 criterion_group!(benches, utxo_commit);
-criterion_main!(benches);
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--measure-memory") {
+        if let Some(arm) = args.next().as_deref() {
+            if let Err(error) = measure_memory(arm) {
+                eprintln!("measurement failed: {error}");
+                std::process::exit(2);
+            }
+        } else {
+            eprintln!(
+                "usage: utxo_commit --measure-memory <existing|concentrated|spend_fanout_64>"
+            );
+            std::process::exit(2);
+        }
+        return;
+    }
+    benches();
+}
