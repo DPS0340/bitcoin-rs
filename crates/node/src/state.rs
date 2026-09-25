@@ -14,6 +14,7 @@ use bitcoin_rs_chainstate::ApplyError;
 use bitcoin_rs_chainstate::events::ChainEventPublisher;
 #[cfg(test)]
 pub(crate) use bitcoin_rs_chainstate::recovery::ResumeSource;
+use bitcoin_rs_index::IndexCapability;
 use bitcoin_rs_index::block_log::BlockLog;
 use bitcoin_rs_index::runtime::DEFAULT_BATCH_LIMITS;
 use bitcoin_rs_index::runtime::OpenDerivedIndex;
