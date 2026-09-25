@@ -34,21 +34,18 @@ bitcoin-rs asks a simple question:
 
 ### Why now?
 
-AI is changing how software is built. Work that once required large teams and
-long development cycles can now be attempted by much smaller teams with far
-faster iteration. Bitcoin is unusually well suited to this model because
-implementations can be checked against Bitcoin Core, `libbitcoinkernel`,
-historical chain data, consensus test vectors, fuzzing, and differential tests.
+Bitcoin is unusually well suited to independent implementation because its
+behavior can be checked against Bitcoin Core, `libbitcoinkernel`, historical
+chain data, consensus test vectors, fuzzing, and differential tests.
 
-**Bitcoin is well suited to AI-native, human supervised development; Bitcoin Core's development
-culture is not.** Its review process prioritizes minimizing change risk,
-rewarding incrementalism, entrenching existing boundaries, and making radical
-architectural experimentation prohibitively expensive.
+Bitcoin Core prioritizes stability, compatibility, and minimizing change risk.
+Those properties are essential for the reference implementation, but they also
+make large architectural changes difficult to explore within the same
+codebase.
 
 **That is why we built `bitcoin-rs`: to preserve Bitcoin's consensus while
-making bold architectural experimentation practical—build alternatives,
-verify them against reproducible evidence, and keep iterating until better
-designs emerge.**
+making architectural experimentation practical—build alternatives, verify them
+against reproducible evidence, and keep iterating on the implementation.**
 
 ### What can be improved
 
@@ -62,28 +59,18 @@ designs emerge.**
   and explorer-specific views around the same chain data. `bitcoin-rs`
   simplifies that boundary: the node owns the canonical UTXO set used for
   validation and an integrated script index exposed through Esplora-compatible
-  APIs. This eliminates the need for a separate Electrum server with its own
-  duplicate chain state and ingestion pipeline.
-  Wallet-specific keys, policies, and metadata remain outside the node.
-  Consumers build on node state; they do not redefine where Bitcoin's coin
-  state lives.
+  APIs. Wallet-specific keys, policies, and metadata remain outside the node.
 - **Modularity keeps the core isolated and components composable.** Clear
   dependency and failure boundaries keep extensions from destabilizing
   validation or chainstate while allowing components to be reused independently.
-  Extensions own their state and lifecycle and may build on core capabilities,
-  but they do not become dependencies of the core.
 - **Rust-native integration is a primary path.** Applications and extensions in
   the Rust Bitcoin ecosystem can attach to the node as typed, in-process
   components instead of routing through serialized RPC or separate processes.
-  This improves runtime efficiency and simplifies integration and deployment,
-  making the full node a native, composable part of the ecosystem.
 
 Bitcoin is not defined by the continued preservation of one codebase. **The code
-can change; consensus is what must remain.** `bitcoin-rs` aims to challenge
-Bitcoin Core and build a better Bitcoin implementation. That challenge
-strengthens the Bitcoin ecosystem: a separately designed codebase cross-checks
-consensus interpretation, increases implementation diversity, and reduces the
-risk of correlated implementation failures.
+can change; consensus is what must remain.** `bitcoin-rs` aims to provide an
+independently designed implementation that can be compared against Bitcoin Core
+and other implementations through reproducible evidence.
 
 ## Quick start
 
