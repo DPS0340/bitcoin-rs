@@ -163,7 +163,12 @@ fn expected_layout(spec: &probe_abi::ProbeSpec, machine: u16) -> Option<String> 
 fn layout_prefixes_of(layout: &str) -> Vec<&str> {
     layout
         .split_whitespace()
-        .map(|entry| entry.split(ARG_SEPARATOR).next().unwrap_or_default())
+        .map(|entry| {
+            entry
+                .split_inclusive(ARG_SEPARATOR)
+                .next()
+                .unwrap_or_default()
+        })
         .collect()
 }
 

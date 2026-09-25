@@ -98,7 +98,9 @@ pub const BLOCK_CONNECTED: ProbeSpec = ProbeSpec {
             d_type: "int64_t",
             prepare_type: "i64",
             core_doc: "SigOps in the Block (excluding coinbase SigOps) as uint64 \
-                       (int64 in Core's implementation)",
+                       (int64 in Core's implementation; the exclusion is Core's \
+                       doc text — the binary counts the coinbase's legacy SigOps \
+                       like every other transaction)",
             layout_prefix: "-8@",
         },
         ArgSpec {

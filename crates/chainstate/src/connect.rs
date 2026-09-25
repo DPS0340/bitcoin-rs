@@ -414,10 +414,6 @@ pub(super) fn apply_block_admitted<'b>(
     metrics::histogram!("node.apply_block.undo_persist_seconds")
         .record(undo_persist_started.elapsed().as_secs_f64());
     let undo_record = undo_persist_result?;
-    // Core ends the connect-block interval at undo persistence (the last
-    // step of `ConnectBlock` before it returns), so the probe's duration
-    // argument is captured here, not after the later coin-stat work.
-    let block_connected_dur = total_started.elapsed();
 
     // Serialize the block lazily: only when a consumer actually needs the
     // full bytes. During IBD with pruning+txindex disabled this avoids a
@@ -479,6 +475,12 @@ pub(super) fn apply_block_admitted<'b>(
     metrics::histogram!("node.apply_block.utxo_commit_seconds")
         .record(utxo_commit_dur.as_secs_f64());
     utxo_commit_result.map_err(ApplyError::UtxoCommit)?;
+    // Core's connect-block interval ends with the block's UTXO application
+    // and bookkeeping (`UpdateCoins` per tx, undo write, `SetBestBlock`) at
+    // the end of `ConnectBlock`; the durable `view.Flush()` runs afterwards
+    // in `ConnectTip`. `commit_block` is the in-memory UTXO application, so
+    // the probe's duration argument is captured here.
+    let block_connected_dur = total_started.elapsed();
     // Capture before `finish_block` advances the listener's height: the
     // journal delta of this block is exactly (height - parent_height).
     let coin_stats_height_delta =
