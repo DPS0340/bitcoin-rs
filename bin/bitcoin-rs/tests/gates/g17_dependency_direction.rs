@@ -6,14 +6,17 @@ mod dependency_graph;
 use dependency_graph::WorkspaceGraph;
 
 fn has_attribute_gate(source: &str, position: usize, gate: &str) -> bool {
-    source[..position].lines().rev().any(|line| {
+    for line in source[..position].lines().rev() {
         let line = line.trim();
         if line.is_empty() || line.starts_with("///") || line.starts_with("#[") {
-            line == gate
-        } else {
-            false
+            if line == gate {
+                return true;
+            }
+            continue;
         }
-    })
+        break;
+    }
+    false
 }
 
 #[test]
