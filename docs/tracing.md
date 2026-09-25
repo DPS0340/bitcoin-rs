@@ -85,4 +85,6 @@ argument positions are identical.
 Linux kernel and root). The static evidence shipped with this change is the
 SDT note assertion in `crates/trace/tests/sdt_notes.rs`, which reads the built
 binary's `.note.stapsdt` section and checks provider, probe name, and the full
-`size@operand` argument layout strings against `probe_abi.rs`.
+`size@operand` argument layout strings against `probe_abi.rs` — verified
+against the `bitcoin-rs` ELF artifact on x86-64 Linux
+(`SDT_ELF=target/debug/bitcoin-rs cargo test -p bitcoin-rs-trace --features usdt`).
