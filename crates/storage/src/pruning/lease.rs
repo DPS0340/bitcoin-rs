@@ -586,13 +586,15 @@ impl PruneReservation {
         self.line
     }
 
-    /// Records that the pass deleted through `executed` (one past the
-    /// highest row it actually staged), promotes that line into the
-    /// registry's executed prune line, and releases the claim.
+    /// Records that the pass deleted through `executed`, promotes it into
+    /// the registry's executed prune line, and releases the claim.
     ///
-    /// `executed` never exceeds the reserved line: the pass staged through
-    /// the reserved line, so nothing above it can have been deleted.
-    /// Returns the reserved line.
+    /// `executed` is the frontier this pass leaves behind: one past the
+    /// highest row it deleted, clamped with the durable frontier it migrated
+    /// from. The promotion is monotonic, so a pass never lowers the line and
+    /// never claims a deletion that did not commit.
+    ///
+    /// Returns the line this reservation held.
     pub fn commit(mut self, executed: u32) -> u32 {
         self.committed = true;
         let line = self.line;
