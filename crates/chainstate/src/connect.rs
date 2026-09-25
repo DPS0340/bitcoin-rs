@@ -175,19 +175,6 @@ pub(super) fn apply_block_admitted<'b>(
         _ => {}
     }
 
-    // Contextual header rules, shared with header admission: the difficulty
-    // continuity, median-time-past, BIP94 timewarp, future-drift, and version
-    // floors all come from the one gate, so a block whose header never passed
-    // header sync cannot be connected and a direct `submitblock` cannot skip a
-    // rule by relying on header-sync history. Runs before the first mutation.
-    let contextual_header_started = quanta::Instant::now();
-    let contextual_header_result =
-        validate_contextual_block_header(handles, block, height, prior.as_deref());
-    let contextual_header_dur = contextual_header_started.elapsed();
-    metrics::histogram!("node.apply_block.contextual_header_seconds")
-        .record(contextual_header_dur.as_secs_f64());
-    contextual_header_result?;
-
     let (prev_median_time_past, softfork_state) = if let Some(tip) = prior.as_deref() {
         let tree = handles.block_tree.read();
         let mtp = tree
