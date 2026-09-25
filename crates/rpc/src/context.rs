@@ -514,7 +514,6 @@ impl Context {
         let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
             Arc::clone(&applied_tip),
             Arc::clone(&block_tree),
-            Network::Mainnet,
         ));
         Self {
             chain_tip: TipReader::new(chain_tip),
@@ -575,7 +574,6 @@ impl Context {
         let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
             Arc::clone(&applied_tip),
             Arc::clone(&block_tree),
-            Network::Mainnet,
         ));
         Self {
             chain_tip: TipReader::new(chain_tip),
@@ -845,7 +843,7 @@ impl Context {
             time,
             median_time,
             verification_progress,
-            initial_block_download: self.ibd.is_active(now),
+            initial_block_download: self.ibd.is_active(now, self.chain_network),
             chain_work: applied_tip
                 .as_deref()
                 .map_or_else(|| self.chainwork_hex(), Self::tip_chainwork_hex),
@@ -1360,6 +1358,100 @@ mod tests {
         );
         assert!(record_at_height(&records, 1).is_none());
     }
+    #[test]
+    /// The latch the context hands out must read the same tree the context
+    /// exposes: a latch built over any other `BlockTree` finds no node for
+    /// the applied tip and keeps reporting initial block download forever.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn ibd_latch_judges_the_contexts_own_tree() {
+        use alloc::sync::Arc;
+
+        fn insert_recent_tip(ctx: &Context, now: u64) -> TipSnapshot {
+            let genesis = Network::Regtest.genesis_block();
+            let mut tree = ctx.block_tree.write();
+            let genesis_id = tree
+                .insert_node(
+                    None,
+                    genesis.header,
+                    bitcoin_rs_chain::node::NodeStatus::Active,
+                )
+                .expect("genesis insert");
+            let mut child = genesis.header;
+            child.prev_blockhash = genesis.block_hash();
+            child.time = u32::try_from(now - 60).unwrap_or(u32::MAX);
+            child.nonce = 1;
+            let child_id = tree
+                .insert_node(
+                    Some(genesis_id),
+                    child,
+                    bitcoin_rs_chain::node::NodeStatus::Active,
+                )
+                .expect("child insert");
+            let node = tree.node(child_id).expect("inserted node");
+            TipSnapshot {
+                tip_id: child_id,
+                height: node.height,
+                chainwork: node.chainwork,
+                hash: node.hash,
+            }
+        }
+
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
+        let ctx = Context::from_handles(ContextHandles {
+            chain: ChainHandles {
+                chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
+                applied_tip: TipReader::new(Arc::clone(&applied_tip)),
+                chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(1)),
+                ibd: Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
+                    Arc::clone(&applied_tip),
+                    Arc::clone(&block_tree),
+                )),
+                blocks: Arc::new(RwLock::new(BlockLog::new())),
+                transactions: Arc::new(RwLock::new(HashMap::new())),
+                utxo: Arc::new(bitcoin_rs_utxo::UtxoSet::new()),
+                coin_stats: Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+                    bitcoin_rs_utxo::stats::CoinStats::default(),
+                )),
+                block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
+                chain_network: Network::Mainnet,
+            },
+            mempool: MempoolHandles {
+                mempool: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+                    MempoolLimits::default(),
+                )))),
+            },
+            indexes: IndexHandles {
+                derived_index: None,
+                script_index: None,
+            },
+            network: NetworkHandles {
+                network: Arc::new(RwLock::new(NetworkState::default())),
+                network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+                peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
+                p2p_outbound_sender: None,
+                banned: Arc::new(RwLock::new(Vec::new())),
+                added_nodes: Arc::new(RwLock::new(Vec::new())),
+            },
+            mining: MiningHandles {
+                mining_control: None,
+            },
+            derived_index_status: None,
+        });
+
+        // With the regtest work floor at zero and the tip recent, only the
+        // tree lookup can make `is_active` answer false; a latch holding any
+        // other tree finds no node and keeps reporting true.
+        let now = 1_800_000_000_u64;
+        let tip = insert_recent_tip(&ctx, now);
+        ctx.applied_tip.store(Some(Arc::new(tip)));
+        assert!(
+            !ctx.ibd.is_active(now, Network::Regtest),
+            "the latch must judge the tip it reaches through the context's tree"
+        );
+    }
+
     #[test]
     fn progress_snapshot_waits_for_a_complete_chain_transition() -> anyhow::Result<()> {
         use core::sync::atomic::{AtomicU64, Ordering};

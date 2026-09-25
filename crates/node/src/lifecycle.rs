@@ -549,7 +549,6 @@ pub(crate) fn start_node(
     let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
         chainstate.applied_tip_handle(),
         chainstate.block_tree_handle(),
-        state.config().network,
     ));
     let tx_inventory: Arc<dyn bitcoin_rs_p2p::TxInventory> = gateway.clone();
     let compact_hints: Arc<dyn bitcoin_rs_p2p::CompactBlockHints> = gateway.clone();

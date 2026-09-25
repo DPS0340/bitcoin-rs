@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::Magic;
+use bitcoin_rs_primitives::Network;
 use crossbeam_channel::{SendTimeoutError, Sender};
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -1084,6 +1085,31 @@ fn run_connected_session(
     loop_result
 }
 
+/// The consensus network a connection's wire magic belongs to.
+///
+/// PRE: `magic` is the magic the connection was admitted under; the
+/// handshake rejects every foreign magic.
+/// POST: returns the supported network whose [`Network::magic`] equals
+/// `magic`; no byte table is re-pinned here, the scan compares against the
+/// networks' own magic constants.
+/// INVARIANT: the unreachable fallback is mainnet, the highest work floor,
+/// so an impossible magic fails closed and keeps the relay gate shut.
+fn network_of_magic(magic: Magic) -> Network {
+    let bytes = magic.to_bytes();
+    for network in [
+        Network::Mainnet,
+        Network::Testnet3,
+        Network::Testnet4,
+        Network::Signet,
+        Network::Regtest,
+    ] {
+        if network.magic() == bytes {
+            return network;
+        }
+    }
+    Network::Mainnet
+}
+
 #[allow(clippy::too_many_arguments)]
 // The transaction-relay gate adds one documented parameter and one lazy
 // closure to an already-large dispatch loop.
@@ -1105,11 +1131,15 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 
     const IDLE_DISCONNECT: Duration = Duration::from_mins(1);
 
-    // PRE: the handle is the RPC-shared IBD Arc. POST: a closed gate requests
-    // no announced transaction and enqueues no tx body. INVARIANT: blocks and
-    // punishment are unchanged; read lazily per relevant message, never at
-    // connect, so opening the gate needs no reconnect.
-    let tx_relay_open = || ibd.is_none_or(|latch| !latch.is_active(unix_time_secs()));
+    // PRE: the handle is the RPC-shared IBD Arc; `network` is this
+    // connection's handshake magic resolved to its consensus network, the
+    // node's own, because the latch holds no network of its own. POST: a
+    // closed gate requests no announced transaction and enqueues no tx body.
+    // INVARIANT: blocks and punishment are unchanged; read lazily per
+    // relevant message, never at connect, so opening the gate needs no
+    // reconnect.
+    let network = network_of_magic(peer.magic);
+    let tx_relay_open = || ibd.is_none_or(|latch| !latch.is_active(unix_time_secs(), network));
 
     let mut last_inbound = Instant::now();
     let budget = lease.budget_handle();

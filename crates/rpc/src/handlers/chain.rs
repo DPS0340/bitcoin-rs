@@ -2562,6 +2562,33 @@ mod tests {
     }
 
     #[test]
+    fn getblockchaininfo_reports_initial_block_download_false_for_a_recent_regtest_tip() {
+        // A context is assembled before its network is chosen, and the chain
+        // latch must judge the live `chain_network`, not the network the
+        // context was born with. The regtest tip is recent but carries no
+        // chain work, so a latch still holding mainnet's work floor would
+        // answer true forever.
+        let now = unix_now();
+        let ctx = context_with_tip(
+            bitcoin_rs_primitives::Network::Regtest,
+            0x207f_ffff,
+            &[
+                u32::try_from(now.saturating_sub(7_200)).unwrap_or(u32::MAX),
+                u32::try_from(now.saturating_sub(3_600)).unwrap_or(u32::MAX),
+            ],
+        );
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result
+                .get("initialblockdownload")
+                .and_then(JsonValueTrait::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn getblockchaininfo_size_on_disk_zero_for_empty_blocks() {
         let ctx = Arc::new(Context::new());
         let result = getblockchaininfo(&ctx, &json!([]))

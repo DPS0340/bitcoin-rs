@@ -1638,7 +1638,6 @@ fn invalidation_handler(state: &NodeState) -> Handler {
     let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
         chainstate.applied_tip_handle(),
         chainstate.block_tree_handle(),
-        Network::Regtest,
     ));
     Handler::new(Arc::new(
         Context::from_handles(ContextHandles {

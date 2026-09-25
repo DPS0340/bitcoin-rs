@@ -108,7 +108,6 @@ impl ServerHarness {
         let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
             chainstate.applied_tip_handle(),
             chainstate.block_tree_handle(),
-            state.config().network,
         ));
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
