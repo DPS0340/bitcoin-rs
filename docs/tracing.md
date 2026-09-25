@@ -1,0 +1,80 @@
+# USDT tracepoints (Bitcoin Core-compatible)
+
+bitcoin-rs can emit User-space Statically Defined Tracing probes whose
+provider names, probe names, and argument ABI match Bitcoin Core's
+`doc/tracing.md`, so Core-oriented tooling consumes a bitcoin-rs node without
+any bitcoin-rs-specific runtime. The probes are compiled in only with the
+`usdt` cargo feature (default **off**):
+
+```bash
+cargo build --release --features usdt -p bitcoin-rs
+```
+
+With the feature on, probe payloads are prepared **only** while a consumer
+(bpftrace, BCC, DTrace) has attached to a probe: each call site passes a lazy
+`prepare` closure that the emitter runs behind the probe's `.probes` semaphore
+(the same guard Core's `src/util/trace.h` uses). Unattached, the cost is one
+volatile semaphore load per probe site; with the feature off, the call sites
+are empty functions and the closures are never constructed.
+
+The machine-readable ABI table lives in
+[`crates/trace/src/probe_abi.rs`](../crates/trace/src/probe_abi.rs) and is
+asserted against the built binary's SystemTap SDT notes by
+`crates/trace/tests/sdt_notes.rs`.
+
+## Compatibility table
+
+Argument types are given as published by Core's `doc/tracing.md`, with the
+SystemTap layout string of Core's shipped `bitcoind` binary in parentheses
+(the layout is what consumer scripts bind to).
+
+| Core probe | Core argument ABI | bitcoin-rs emission point | Payload mapping | Unsupported fields / semantic differences |
+| --- | --- | --- | --- | --- |
+| `validation:block_connected` | 1. block hash `uint8_t*` (32 bytes LE) (`8@`)<br>2. height `int32` (`-4@`)<br>3. tx count `uint64` (`8@`)<br>4. input count `int32` (`-4@`)<br>5. sigops cost `uint64` (doc) — Core's binary emits `int64` (`-8@`)<br>6. connect duration ns `uint64` (doc) — Core's binary emits `int64` (`-8@`) | `crates/chainstate/src/connect.rs` `emit_block_connected`, fired after the block's consensus state is committed in `apply_block_admitted` (the same point Core fires at the end of `ConnectBlock`) | 1. `block.block_hash().as_bytes().as_ptr()`<br>2. applied height<br>3. `block.txs.len()`<br>4. sum of `tx.inputs.len()` over all txs (coinbase included, as Core's `nInputs`)<br>5. sum of `bitcoin_rs_consensus::transaction_sigop_cost` over all txs against the connect view — the same rules as Core's `GetTransactionSigOpCost`<br>6. `total_started.elapsed()` in ns | Args 5/6 are signed 64-bit (`-8@`) in Core's shipped notes although `doc/tracing.md` says `uint64`; bitcoin-rs matches the **binary** so consumer scripts bind identically. The per-tx prevout resolution for arg 5 runs inside `prepare`, so it costs nothing when no consumer is attached. Windowed (`PublishMode::Grouped`) applies still fire at consensus-commit time, not at the later durable-publish time. |
+| `mempool:added` | 1. txid `uint8_t*` (32 bytes LE) (`8@`)<br>2. vsize `int32` (`-4@`)<br>3. fee `int64` (`-8@`) | `crates/mempool/src/pool.rs` `Mempool::commit_insert`, after the entry is linked into the pool (Core fires from `CTxMemPool::addUnchecked`, the same install funnel) | 1. `entry.txid.as_bytes().as_ptr()`<br>2. `entry.vsize` (policy vsize; Core uses its entry's `GetTxSize()` — same quantity: the virtual size counted for policy)<br>3. `entry.fee` | — |
+| `mempool:removed` | 1. txid `uint8_t*` (`8@`)<br>2. reason `char*` (max 9 chars) (`8@`)<br>3. vsize `int32` (`-4@`)<br>4. fee `int64` (`-8@`)<br>5. entry time (epoch) `uint64` (`8@`) | `crates/mempool/src/pool.rs` `Mempool::remove_entries_with_reasons`, per entry as it is retired (Core fires from `CTxMemPool::removeUnchecked`) | 1. `entry.txid.as_bytes().as_ptr()`<br>2. Core's `RemovalReasonToString` values: `block`, `replaced`, `conflict`, `expiry`, `sizelimit`, `reorg`<br>3. `entry.vsize`<br>4. `entry.fee`<br>5. `entry.time` | bitcoin-rs maps `PolicyEviction` → `sizelimit`, replacement descendants → `replaced`, and a wholesale pool clear → `unknown` (9 chars, outside Core's reason set). Arg 5 is the acceptance timestamp recorded by the node's clock — Core records the mempool entry acceptance time likewise; both are seconds-since-epoch. |
+| `net:inbound_message` | 1. peer id `int64` (`-8@`)<br>2. address:port `char*` (`8@`)<br>3. connection type `char*` (`8@`)<br>4. message type `char*` (`8@`)<br>5. message size `uint64` (`8@`)<br>6. message bytes `uint8_t*` (`8@`) | `crates/p2p/src/net_trace.rs`, fired per decoded message in the connection read loop and during the handshake | 1. `PeerLease::node_id()` (process-unique connection id, Core `nodeid`)<br>2. peer `SocketAddr` as `host:port`<br>3. `inbound` for accepted connections<br>4. wire command (e.g. `inv`, `ping`, `getdata`)<br>5. encoded payload length<br>6. the checksum-validated wire payload as read | bitcoin-rs has no block-relay-only/addr-fetch/feeler/manual connection classes yet; all inbound connections report `inbound` and all outbound report `outbound-full-relay` (Core's `ConnectionTypeAsString`). The message-bytes argument is passed **by value** as Core does: the consumer receives the buffer address and reads `size` bytes from it. |
+| `net:outbound_message` | same as `net:inbound_message` | `crates/p2p/src/net_trace.rs`, fired per message written by the connection writer (and per handshake write) | as above, with the payload encoded inside `prepare` — the write path never encodes twice for tracing | Message bytes are the encoded payload; Core passes the same payload view it sends. Size is the payload length (not the 24-byte framed length). |
+
+### Not implemented
+
+Core's `utxocache:*`, `mempool:replaced`, `mempool:rejected`,
+`net:inbound_connection`, `net:outbound_connection`,
+`net:closed_connection`, `net:evicted_inbound_connection`,
+`net:misbehaving_connection`, and `coin_selection:*` probes are out of scope
+for this slice (see the issue's non-goals). IPC compatibility is not a goal:
+the consumer surface is the SDT note only.
+
+### Byte-pointer arguments (ABI note)
+
+Core's hash/message buffer arguments bind as *pointers by value* (`8@%reg`):
+the consumer receives the buffer address. The `usdt` crate's `uint8_t*`
+declaration instead generates the dereferencing operand `8@(%reg)`, which
+would hand the consumer the buffer's first bytes. bitcoin-rs therefore
+declares those arguments `uint64_t` in `crates/trace/probes.d` and feeds the
+buffer address, reproducing Core's operand form exactly. String arguments
+(`char*`) need no workaround: the `usdt` crate's `char*` generates Core's
+by-value pointer operand. `crates/trace/tests/sdt_notes.rs` asserts the full
+argument-layout strings of the built artifact (via `SDT_ELF=<binary>`)
+against this table, so an operand-form regression fails the test.
+
+## Smoke test
+
+`docs/tracing/smoke.bt` is adapted from Core's
+`contrib/tracing/log_p2p_traffic.bt` and binds Core's argument positions
+directly. On a Linux host with `bpftrace` and root:
+
+```bash
+cargo build --release --features usdt -p bitcoin-rs
+sudo bpftrace docs/tracing/smoke.bt ./target/release/bitcoin-rs
+```
+
+(or point the `usdt:` path at a running binary; bpftrace resolves the probes
+from the file's SDT notes). The same script works unchanged against a Core
+`bitcoind` — the probe names and argument positions are identical.
+
+**Live run status: NOT_RUN** on the development host (macOS; bpftrace needs a
+Linux kernel and root). The static evidence shipped with this change is the
+SDT note assertion in `crates/trace/tests/sdt_notes.rs`, which reads the built
+binary's `.note.stapsdt` section and checks provider, probe name, and the full
+`size@operand` argument layout strings against `probe_abi.rs`.

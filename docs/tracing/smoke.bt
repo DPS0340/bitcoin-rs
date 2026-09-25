@@ -1,0 +1,68 @@
+#!/usr/bin/env bpftrace
+# Smoke test for bitcoin-rs USDT probes, adapted from Bitcoin Core's
+# contrib/tracing/log_p2p_traffic.bt. The probe names and argument positions
+# are Bitcoin Core's, so this script works unchanged against a Core bitcoind.
+#
+# Usage (Linux, root):
+#   sudo bpftrace docs/tracing/smoke.bt /path/to/bitcoin-rs
+# or hardcode the path in the usdt: probe spec below:
+#   usdt:/path/to/bitcoin-rs:net:inbound_message
+#
+# bpftrace resolves the probes from the binary's SDT notes; no bitcoin-rs
+# runtime or library is involved. Live run status in docs/tracing.md: NOT_RUN
+# on the development host (macOS; needs a Linux kernel and root).
+
+BEGIN
+{
+  printf("Logging bitcoin-rs P2P traffic, mempool changes, and block connections\n");
+}
+
+usdt:./target/release/bitcoin-rs:net:inbound_message
+{
+  $peer_id = (int64) arg0;
+  $peer_addr = str(arg1);
+  $peer_type = str(arg2);
+  $msg_type = str(arg3);
+  $msg_len = arg4;
+  printf("inbound '%s' msg from peer %d (%s, %s) with %d bytes\n", $msg_type, $peer_id, $peer_type, $peer_addr, $msg_len);
+}
+
+usdt:./target/release/bitcoin-rs:net:outbound_message
+{
+  $peer_id = (int64) arg0;
+  $peer_addr = str(arg1);
+  $peer_type = str(arg2);
+  $msg_type = str(arg3);
+  $msg_len = arg4;
+  printf("outbound '%s' msg to peer %d (%s, %s) with %d bytes\n", $msg_type, $peer_id, $peer_type, $peer_addr, $msg_len);
+}
+
+usdt:./target/release/bitcoin-rs:validation:block_connected
+{
+  // Core args: block hash (32 bytes LE at arg0), height, tx count,
+  // input count, sigops cost, connect duration (ns).
+  $height = (int32) arg1;
+  $txs = arg2;
+  $inputs = (int32) arg3;
+  $sigops = (int64) arg4;
+  $ns = (int64) arg5;
+  printf("block connected at height %d: %d txs, %d inputs, %d sigops cost in %d ns\n", $height, $txs, $inputs, $sigops, $ns);
+}
+
+usdt:./target/release/bitcoin-rs:mempool:added
+{
+  // Core args: txid (32 bytes LE at arg0), vsize, fee.
+  $vsize = (int32) arg1;
+  $fee = (int64) arg2;
+  printf("mempool added tx %s: %d vB, %d sat\n", buf(arg0, 32), $vsize, $fee);
+}
+
+usdt:./target/release/bitcoin-rs:mempool:removed
+{
+  // Core args: txid (32 bytes LE at arg0), reason, vsize, fee, entry time.
+  $reason = str(arg1);
+  $vsize = (int32) arg2;
+  $fee = (int64) arg3;
+  $time = arg4;
+  printf("mempool removed tx %s (%s): %d vB, %d sat, entered at %d\n", buf(arg0, 32), $reason, $vsize, $fee, $time);
+}
