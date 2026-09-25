@@ -19,7 +19,7 @@ use crate::PeerSource;
 use crate::download_window::SyncPeer;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
-use bitcoin_rs_chain::{ChainError, NodeId};
+use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus};
 use bitcoin_rs_primitives::Hash256;
 use std::time::Instant;
 use std::vec::Vec;
@@ -338,7 +338,11 @@ impl BlockSync {
         let last_hash = Hash256::from(headers.last()?.compute_hash());
         headers
             .iter()
-            .all(|header| tree.lookup(Hash256::from(header.compute_hash())).is_some())
+            .all(|header| {
+                tree.lookup(Hash256::from(header.compute_hash()))
+                    .and_then(|id| tree.node(id).ok())
+                    .is_some_and(|node| !matches!(node.status, NodeStatus::Invalid))
+            })
             .then(|| {
                 (
                     last_hash,
