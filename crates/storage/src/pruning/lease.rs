@@ -368,6 +368,15 @@ pub enum HistoryUnavailable {
         /// One past the highest row a committed pass deleted.
         below: u32,
     },
+    /// Heights below `below` are claimed by a prune pass that has not yet
+    /// committed or aborted. The claim is provisional — it may release the
+    /// range without deleting anything — so the defined reaction is to wait
+    /// and retry, never to rebuild.
+    #[error("history below height {below} is reserved by an in-flight prune pass")]
+    Reserved {
+        /// The deletion line the outstanding pass claimed.
+        below: u32,
+    },
     /// The row lies inside retained history but is not there yet: it may
     /// appear through backfill or a reconnect. Retry; do not rebuild.
     #[error("retained history is temporarily unavailable")]
