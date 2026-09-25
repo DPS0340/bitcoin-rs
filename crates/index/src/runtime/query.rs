@@ -45,8 +45,8 @@ impl IndexBlockSource {
 
     /// Adds the authoritative block tree used for active-chain identity.
     #[must_use]
-    pub fn with_block_tree(mut self, tree: impl Into<bitcoin_rs_chain::BlockTreeReader>) -> Self {
-        self.block_tree = Some(tree.into());
+    pub fn with_block_tree(mut self, tree: bitcoin_rs_chain::BlockTreeReader) -> Self {
+        self.block_tree = Some(tree);
         self
     }
 
@@ -226,8 +226,8 @@ impl DerivedIndexQueryEngine {
         runtime: Arc<DerivedIndexRuntime>,
         reader: Arc<dyn IndexReader>,
         block_source: IndexBlockSource,
-        block_tree: impl Into<bitcoin_rs_chain::BlockTreeReader>,
-        applied_tip: impl Into<bitcoin_rs_chain::TipReader>,
+        block_tree: bitcoin_rs_chain::BlockTreeReader,
+        applied_tip: bitcoin_rs_chain::TipReader,
         body_source: Option<Arc<dyn BlockBodySource>>,
         live: QueryEngineLive,
     ) -> Self {
@@ -235,8 +235,8 @@ impl DerivedIndexQueryEngine {
             runtime,
             reader,
             block_source,
-            block_tree: block_tree.into(),
-            applied_tip: applied_tip.into(),
+            block_tree,
+            applied_tip,
             body_source,
             utxo: live.utxo,
             chain_transition: live.chain_transition,

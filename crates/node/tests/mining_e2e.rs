@@ -225,8 +225,7 @@ fn template_mines_to_tip_and_drains_mempool() -> Result<()> {
     );
 
     // --- tip advanced, mempool drained, next template rebased ----------------
-    let applied = state.chainstate().applied_tip_handle();
-    let loaded_tip = applied.load_full();
+    let loaded_tip = state.chainstate().applied_tip_snapshot();
     let Some(tip) = loaded_tip.as_ref() else {
         bail!("applied tip must exist after an accepted submission");
     };
@@ -402,8 +401,7 @@ fn seed_chain(state: &NodeState, count: u32) -> Result<Hash256> {
 }
 
 fn current_tip(state: &NodeState) -> Result<bitcoin_rs_chain::TipSnapshot> {
-    let applied = state.chainstate().applied_tip_handle();
-    let Some(tip) = applied.load_full() else {
+    let Some(tip) = state.chainstate().applied_tip_snapshot() else {
         bail!("applied tip must exist");
     };
     Ok((*tip).clone())
@@ -593,8 +591,8 @@ fn assemble_regtest_block(prev: Hash256, height: u32, txs: Vec<Tx>) -> Result<Bl
 #[allow(clippy::unnecessary_wraps)]
 fn admit_to_mempool(state: &NodeState, tx: &Tx) -> Result<()> {
     let utxo = state.chainstate().utxo_handle();
-    let applied_tip = state.chainstate().applied_tip_handle();
-    let block_tree = state.chainstate().block_tree_handle();
+    let applied_tip = state.chainstate().applied_tip_reader();
+    let block_tree = state.chainstate().block_tree_reader();
     let view = ChainAdmissionView::new(&utxo, &applied_tip, &block_tree, Network::Regtest);
     let outcome = state.mempool_gateway().submit_transaction(
         Arc::new(tx.clone()),

@@ -137,8 +137,8 @@ fn spending_tx(parent: Txid, fee_sats: u64, sequence: u32) -> Tx {
 /// ingress.
 fn admit(state: &NodeState, tx: Tx, time: u64) -> Result<SubmitOutcome> {
     let utxo = state.chainstate().utxo_handle();
-    let applied_tip = state.chainstate().applied_tip_handle();
-    let block_tree = state.chainstate().block_tree_handle();
+    let applied_tip = state.chainstate().applied_tip_reader();
+    let block_tree = state.chainstate().block_tree_reader();
     let view = ChainAdmissionView::new(&utxo, &applied_tip, &block_tree, Network::Regtest);
     state
         .mempool_gateway()
@@ -758,8 +758,7 @@ fn txids(txs: &[Tx]) -> Vec<Txid> {
 fn applied_tip_hash(state: &NodeState) -> Result<Hash256> {
     state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .map(|tip| tip.hash)
         .ok_or_else(|| anyhow!("applied tip must exist"))
 }

@@ -400,6 +400,18 @@ impl MiningControl for MiningCoordinator {
 
     /// Admits `header` through the same Chainstate boundary inbound P2P uses.
     fn submit_header(&self, header: Header) -> Result<(), MiningControlError> {
+        // API-13 reports a missing parent before proof-of-work failures.
+        // Known headers (including genesis) still reach idempotent admission.
+        {
+            let tree = self.chainstate.read_block_tree();
+            if tree.lookup(header.compute_hash().into()).is_none()
+                && tree.lookup(header.prev_blockhash.into()).is_none()
+            {
+                return Err(header_reject_reason(ChainError::MissingParent {
+                    prev_hash: header.prev_blockhash.into(),
+                }));
+            }
+        }
         match self.chainstate.admit_headers(std::slice::from_ref(&header)) {
             Ok(_) => Ok(()),
             Err(bitcoin_rs_chainstate::HeaderAdmissionError::Rejected(error)) => {

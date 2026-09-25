@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bitcoin_rs_chainstate::Chainstate;
+use bitcoin_rs_chain::{BlockTreeReader, TipReader};
 use bitcoin_rs_mempool::{AdmissionOrigin, MempoolGateway, PeerToken, SubmitError, SubmitOutcome};
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_p2p::TxRelayQueue;
-use bitcoin_rs_primitives::{Hash256, Txid, Wtxid};
+use bitcoin_rs_primitives::{Hash256, Network, Txid, Wtxid};
 use bitcoin_rs_rpc::context::ChainAdmissionView;
+use bitcoin_rs_utxo::UtxoSet;
 use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
 
@@ -36,7 +37,10 @@ pub fn spawn_tx_ingress_consumer(
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let chainstate = state.chainstate();
     let consumer = TxIngressConsumer {
-        chainstate,
+        utxo: chainstate.utxo_handle(),
+        applied_tip: chainstate.applied_tip_reader(),
+        block_tree: chainstate.block_tree_reader(),
+        network: chainstate.network(),
         peer_table: state.peer_table(),
         mempool_gateway: gateway,
         mining_control,
@@ -69,7 +73,10 @@ pub fn spawn_tx_ingress_consumer(
 }
 
 struct TxIngressConsumer {
-    chainstate: Arc<Chainstate>,
+    utxo: Arc<UtxoSet>,
+    applied_tip: TipReader,
+    block_tree: BlockTreeReader,
+    network: Network,
     peer_table: Arc<bitcoin_rs_p2p::PeerTable>,
     mempool_gateway: Arc<MempoolGateway>,
     mining_control: Arc<dyn MiningControl>,
@@ -79,10 +86,10 @@ struct TxIngressConsumer {
 impl TxIngressConsumer {
     fn chain_view(&self) -> ChainAdmissionView<'_> {
         ChainAdmissionView::new(
-            self.chainstate.utxo(),
-            self.chainstate.applied_tip_reader(),
-            self.chainstate.block_tree_reader(),
-            self.chainstate.network(),
+            &self.utxo,
+            &self.applied_tip,
+            &self.block_tree,
+            self.network,
         )
     }
 

@@ -172,8 +172,7 @@ fn run_sigkill_scenario(scenario: &str) -> Result<()> {
     let expected_hash = block1.block_hash().0;
     let tip = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("restarted node has no applied tip"))?;
     assert_eq!(tip.height, 1, "scenario {scenario}");
     assert_eq!(tip.hash, expected_hash, "scenario {scenario}");
@@ -198,8 +197,7 @@ fn test_config(data_dir: PathBuf) -> NodeConfig {
 fn assert_tip(state: &NodeState, expected: &bitcoin_rs_chain::TipSnapshot) -> Result<()> {
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("recovered node has no applied tip"))?;
     assert_eq!(tip.as_ref(), expected);
     Ok(())

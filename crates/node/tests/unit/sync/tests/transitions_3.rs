@@ -6,7 +6,7 @@ fn branch_switch_retires_only_the_connected_prefix_after_connect_failure()
     use bitcoin_rs_primitives::{Amount, Script};
     let (handles, main, mut bodies) = matured_chain(101)?;
     let followers = crate::chain_effects::ChainFollowers::noop();
-    let applied_tip = handles.applied_tip_handle();
+    let applied_tip = handles.applied_tip_reader();
     let main_tip_hash = Hash256::from_le_bytes(main[100].block_hash().as_bytes());
 
     let fork_root_hash = main[99].block_hash();
@@ -96,7 +96,7 @@ fn branch_switch_retires_only_the_connected_prefix_after_connect_failure()
 fn permanent_reorg_failure_invalidates_descendants() -> Result<(), Box<dyn std::error::Error>> {
     let (handles, main, mut bodies) = matured_chain(101)?;
     let followers = crate::chain_effects::ChainFollowers::noop();
-    let applied_tip = handles.applied_tip_handle();
+    let applied_tip = handles.applied_tip_reader();
 
     let main_tip_hash = Hash256::from_le_bytes(main[100].block_hash().as_bytes());
     let fork_root_hash = main[99].block_hash();
@@ -171,7 +171,7 @@ fn branch_switch_rejects_a_body_for_another_header_before_mutation()
     use bitcoin_rs_primitives::Script;
     let (handles, main, mut bodies) = matured_chain(101)?;
     let followers = crate::chain_effects::ChainFollowers::noop();
-    let applied_tip = handles.applied_tip_handle();
+    let applied_tip = handles.applied_tip_reader();
     let applied_before = applied_tip
         .load_full()
         .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
@@ -233,7 +233,7 @@ fn branch_switch_rejects_mismatched_preserved_bytes_before_mutation()
     use bitcoin_rs_primitives::Script;
     let (handles, main, mut bodies) = matured_chain(101)?;
     let followers = crate::chain_effects::ChainFollowers::noop();
-    let applied_tip = handles.applied_tip_handle();
+    let applied_tip = handles.applied_tip_reader();
     let applied_before = applied_tip
         .load_full()
         .ok_or_else(|| std::io::Error::other("missing applied tip"))?;

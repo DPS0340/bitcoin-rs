@@ -260,16 +260,19 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 - **Owner**: `MiningCoordinator::submit_header` in `crates/node/src/mining.rs`.
   RPC decodes the hex and projects the result; it does not admit headers.
   The reject-reason projection is `header_reject_reason` in
-  `crates/mining/src/bip22.rs`; admission itself stays
-  `MiningCoordinator::submit_header`.
+  `crates/mining/src/bip22.rs`; authoritative admission runs through
+  `Chainstate::admit_headers`.
 - Decode failures (invalid hex, fewer than 80 bytes) are Core `-22`
   (`Block header decode failed`). Extra bytes after an 80-byte header are
   ignored, matching Core `DecodeHexBlockHeader`.
-- The previous header must already be in the block tree. Otherwise the RPC
-  returns `-25` (`Must submit previous header (HASH) first`).
+- For an unknown header, the previous header must already be in the block tree.
+  Otherwise the RPC returns `-25` (`Must submit previous header (HASH) first`)
+  before proof-of-work validation, including when the target is invalid.
 - Admission uses `accept_headers`, the same consensus gate as inbound P2P
-  headers. Duplicates succeed. Invalid headers return `-25` with Core reject
-  reasons (`high-hash`, `bad-diffbits`, `time-too-old`, `time-too-new`).
+  headers. Known-valid duplicates (including genesis) succeed. Known-invalid
+  duplicates return `-25` (`duplicate-invalid`); descendants of invalid parents
+  return `-25` (`bad-prevblk`). Other invalid headers return `-25` with Core
+  reject reasons (`high-hash`, `bad-diffbits`, `time-too-old`, `time-too-new`).
 - Success is JSON `null`. Header-only admission does not apply the block or
   publish a mining generation.
 

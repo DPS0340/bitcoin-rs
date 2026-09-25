@@ -320,8 +320,8 @@ impl QueryFixture {
             Arc::clone(&runtime),
             reader,
             block_source,
-            tree,
-            applied_tip,
+            bitcoin_rs_chain::BlockTreeReader::new(tree),
+            bitcoin_rs_chain::TipReader::new(applied_tip),
             body_source,
             QueryEngineLive {
                 utxo: None::<Arc<UtxoSet>>,

@@ -931,8 +931,8 @@ mod tests {
             hash: tip_node.hash,
         };
         drop(tree);
-        ctx.set_applied_tip(tip.clone());
-        ctx.set_chain_tip(tip);
+        ctx.applied_tip.store(Some(Arc::new(tip.clone())));
+        ctx.chain_tip.store(Some(Arc::new(tip)));
         hashes
     }
 
@@ -1180,7 +1180,7 @@ mod tests {
                 .expect("header tip");
             applied_tip
         };
-        ctx.set_applied_tip(applied_tip);
+        ctx.applied_tip.store(Some(Arc::new(applied_tip)));
         let header_tip_hash = Hash256::from(header_tip.compute_hash());
 
         let response = route(
@@ -1354,8 +1354,8 @@ mod tests {
             hash: broken_node.hash,
         };
         drop(tree);
-        ctx.set_applied_tip(tip.clone());
-        ctx.set_chain_tip(tip);
+        ctx.applied_tip.store(Some(Arc::new(tip.clone())));
+        ctx.chain_tip.store(Some(Arc::new(tip)));
 
         let path = format!("/rest/headers/{}.json", genesis.block_hash());
         let response = route(&ctx, &path, "count=2", true);

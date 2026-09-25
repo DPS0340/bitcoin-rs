@@ -76,8 +76,7 @@ impl NodeHarness {
         let headers = self
             .state
             .chainstate()
-            .chain_tip_handle()
-            .load_full()
+            .header_tip()
             .map_or(applied.height, |header| header.height);
         Ok(LiveChain {
             blocks: u64::from(applied.height),

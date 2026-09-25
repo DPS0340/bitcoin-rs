@@ -527,8 +527,7 @@ fn proposal_has_no_side_effects() -> anyhow::Result<()> {
     mining.publish_generation();
     let before = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing before proposal"));
     let before_seq = state.mempool().read().sequence_number();
     let before_blocks = state.blocks().read().len();
@@ -548,8 +547,7 @@ fn proposal_has_no_side_effects() -> anyhow::Result<()> {
 
     let after = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after proposal"));
     assert_eq!(before.hash, after.hash);
     assert_eq!(before_seq, state.mempool().read().sequence_number());
@@ -565,8 +563,7 @@ fn proposal_rejects_excess_coinbase_without_side_effects() -> anyhow::Result<()>
     mining.publish_generation();
     let before = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing before proposal"));
     let before_seq = state.mempool().read().sequence_number();
     let before_blocks = state.blocks().read().len();
@@ -588,8 +585,7 @@ fn proposal_rejects_excess_coinbase_without_side_effects() -> anyhow::Result<()>
 
     let after = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after proposal"));
     assert_eq!(before.hash, after.hash);
     assert_eq!(before_seq, state.mempool().read().sequence_number());
@@ -754,8 +750,7 @@ fn accepted_submission_is_visible_before_return() -> anyhow::Result<()> {
     assert_eq!(result, BlockValidationResult::Accepted);
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after submit"));
     assert_eq!(tip.hash, Hash256::from(child_hash));
     assert_eq!(tip.height, 1);
@@ -819,8 +814,7 @@ fn submit_block_fills_omitted_coinbase_witness() -> anyhow::Result<()> {
     assert_eq!(mining.submit_block(block)?, BlockValidationResult::Accepted);
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after submit"));
     assert_eq!(tip.hash, Hash256::from(block_hash));
     Ok(())
@@ -871,16 +865,14 @@ fn submit_header_admits_a_mined_child_and_is_idempotent() -> anyhow::Result<()> 
     assert!(
         state
             .chainstate()
-            .block_tree_handle()
-            .read()
+            .read_block_tree()
             .lookup(child_hash)
             .is_some(),
         "submitted header must be in the tree"
     );
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing"));
     assert_eq!(
         tip.hash,
@@ -918,7 +910,7 @@ fn submit_header_rejects_an_invalid_parent_without_inserting_child() -> anyhow::
     let genesis = Network::Regtest.genesis_block();
     let invalid = mined_child(genesis.block_hash())?;
     let child = mined_child(invalid.block_hash())?;
-    let tree = state.chainstate().block_tree_handle();
+    let tree = state.chainstate().block_tree_reader();
     {
         let mut tree = tree.write();
         let genesis_id = tree
@@ -945,18 +937,24 @@ fn submit_header_requires_the_previous_header() -> anyhow::Result<()> {
     apply_genesis(&state)?;
     let mining = coordinator(&state);
     let orphan = mined_child(BlockHash::from(Hash256::from_le_bytes(&[0x11; 32])))?;
-    match mining.submit_header(orphan.header) {
-        Err(MiningControlError::Rejected(reason)) => {
-            assert!(
-                reason.starts_with("Must submit previous header ("),
-                "unexpected reason: {reason}"
-            );
-            assert!(
-                reason.contains(&orphan.header.prev_blockhash.to_string()),
-                "reason must name the missing prev hash: {reason}"
-            );
+    for bits in [orphan.header.bits, CompactTarget::from_consensus(0)] {
+        let header = Header {
+            bits,
+            ..orphan.header
+        };
+        match mining.submit_header(header) {
+            Err(MiningControlError::Rejected(reason)) => {
+                assert_eq!(
+                    reason,
+                    format!(
+                        "Must submit previous header ({}) first",
+                        header.prev_blockhash
+                    ),
+                    "missing-parent rejection must precede proof-of-work validation"
+                );
+            }
+            other => panic!("expected missing-prev rejection, got {other:?}"),
         }
-        other => panic!("expected missing-prev rejection, got {other:?}"),
     }
     Ok(())
 }
@@ -1275,8 +1273,7 @@ fn duplicate_solved_submission_is_idempotent() -> anyhow::Result<()> {
     );
     let height = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .map_or(0, |tip| tip.height);
     assert_eq!(
         mining.submit_block(child)?,
@@ -1285,8 +1282,7 @@ fn duplicate_solved_submission_is_idempotent() -> anyhow::Result<()> {
     assert_eq!(
         state
             .chainstate()
-            .applied_tip_handle()
-            .load_full()
+            .applied_tip_snapshot()
             .map_or(0, |tip| tip.height),
         height,
         "duplicate solved submission must not reapply"
@@ -1400,7 +1396,7 @@ fn proposal_of_an_invalid_header_is_duplicate_invalid() -> anyhow::Result<()> {
     let genesis_hash = genesis.block_hash();
     let invalid = mined_child_labeled(genesis.block_hash(), 2)?;
     {
-        let tree = state.chainstate().block_tree_handle();
+        let tree = state.chainstate().block_tree_reader();
         let genesis_id = tree
             .read()
             .lookup(Hash256::from(genesis_hash))
@@ -1429,7 +1425,7 @@ fn proposal_of_a_header_only_block_is_duplicate_inconclusive() -> anyhow::Result
     let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_bytes());
     let side = mined_child_labeled(genesis.block_hash(), 3)?;
     {
-        let tree = state.chainstate().block_tree_handle();
+        let tree = state.chainstate().block_tree_reader();
         let genesis_id = tree
             .read()
             .lookup(genesis_hash)
@@ -1468,7 +1464,7 @@ fn proposal_of_a_disconnected_scripts_valid_block_is_duplicate() -> anyhow::Resu
     );
     disconnect_applied(&state, &child)?;
     let chain_tx_count = {
-        let tree = state.chainstate().block_tree_handle();
+        let tree = state.chainstate().block_tree_reader();
         tree.read()
             .node_by_hash(child_hash)
             .ok_or_else(|| anyhow::anyhow!("disconnected child missing from tree"))?
@@ -1480,8 +1476,7 @@ fn proposal_of_a_disconnected_scripts_valid_block_is_duplicate() -> anyhow::Resu
     );
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after disconnect"));
     assert_eq!(tip.hash, Hash256::from(genesis.block_hash()));
     assert_eq!(
@@ -1512,8 +1507,7 @@ fn submit_of_a_disconnected_scripts_valid_block_is_duplicate() -> anyhow::Result
     );
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after duplicate submit"));
     assert_eq!(tip.hash, genesis_hash);
     Ok(())
@@ -1531,7 +1525,7 @@ fn applied_ancestor_with_unset_chain_tx_count_is_duplicate() -> anyhow::Result<(
     let child = mined_child(genesis.block_hash())?;
     assert_eq!(mining.submit_block(child)?, BlockValidationResult::Accepted);
     {
-        let tree = state.chainstate().block_tree_handle();
+        let tree = state.chainstate().block_tree_reader();
         let mut tree = tree.write();
         let genesis_id = tree
             .lookup(genesis_hash)
@@ -1562,8 +1556,7 @@ fn submit_block_applies_a_header_already_in_the_tree() -> anyhow::Result<()> {
     assert_eq!(mining.submit_block(child)?, BlockValidationResult::Accepted);
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after submit"));
     assert_eq!(tip.hash, child_hash);
     Ok(())
@@ -1750,8 +1743,7 @@ fn generate_mines_coinbase_only_blocks_to_the_tip() -> anyhow::Result<()> {
     assert_eq!(hashes.len(), 2);
     let tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after generate"));
     assert_eq!(tip.height, 2);
     assert_eq!(
@@ -1857,8 +1849,7 @@ fn generate_without_submit_does_not_advance_the_tip() -> anyhow::Result<()> {
     mining.publish_generation();
     let before = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing before generate"));
     let generated = mining.generate(GenerateRequest {
         payout: vec![0x51],
@@ -1871,8 +1862,7 @@ fn generate_without_submit_does_not_advance_the_tip() -> anyhow::Result<()> {
     assert!(!generated[0].hex.is_empty());
     let after = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("applied tip missing after generate"));
     assert_eq!(after.height, before.height);
     assert_eq!(after.hash, before.hash);

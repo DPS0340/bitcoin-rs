@@ -3,21 +3,36 @@
 #[path = "../support/dependency_graph.rs"]
 mod dependency_graph;
 
+#[path = "../support/capability_compile.rs"]
+mod capability_compile;
 use dependency_graph::WorkspaceGraph;
 
-fn has_attribute_gate(source: &str, position: usize, gate: &str) -> bool {
-    for line in source[..position].lines().rev() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("///") || line.starts_with("#[") {
-            if line == gate {
-                return true;
-            }
-            continue;
-        }
-        break;
-    }
-    false
+const READ_CONTROL: &str = r"
+use std::sync::Arc;
+use bitcoin_rs_chain::{BlockTreeReader, TipReader, TipSnapshot};
+use bitcoin_rs_chainstate::{Chainstate, ChainstateSnapshot};
+use bitcoin_rs_p2p::sync::SyncChain;
+
+pub fn observe(state: &Chainstate) -> (Option<Arc<TipSnapshot>>, usize) {
+    let header: TipReader = state.header_tip_reader();
+    let applied: TipReader = state.applied_tip_reader();
+    let tree: BlockTreeReader = state.block_tree_reader();
+    let _: Option<Arc<TipSnapshot>> = header.clone().load_full();
+    let _: Option<Arc<TipSnapshot>> = state.header_tip();
+    let _: Option<Arc<TipSnapshot>> = state.applied_tip_snapshot();
+    let _: ChainstateSnapshot = state.snapshot();
+    let _ = state.chain_snapshot();
+    let _ = tree.read().tip();
+    let _ = state.read_block_tree().tip_height();
+    (applied.load_full(), tree.clone().read().len())
 }
+
+pub fn observe_sync(chain: &dyn SyncChain) -> Option<Arc<TipSnapshot>> {
+    let _ = chain.block_tree().tip();
+    let _ = chain.chain_tip();
+    chain.applied_tip()
+}
+";
 
 #[test]
 fn workspace_dependency_direction_is_one_way() {
@@ -50,14 +65,55 @@ fn workspace_dependency_direction_is_one_way() {
 }
 
 #[test]
-fn chainstate_facade_exposes_no_production_raw_mutation_handles()
--> Result<(), Box<dyn std::error::Error>> {
-    let root = dependency_graph::workspace_root_manifest()
+fn chainstate_facade_exposes_no_production_raw_mutation_handles() -> anyhow::Result<()> {
+    let manifest = dependency_graph::workspace_root_manifest();
+    let root = manifest
         .parent()
         .ok_or_else(|| std::io::Error::other("workspace root"))?
-        .to_path_buf();
-    let chainstate = std::fs::read_to_string(root.join("crates/chainstate/src/lib.rs"))?;
-    let test_gate = "#[cfg(any(test, feature = \"test-seam\"))]";
+        .canonicalize()?;
+    let consumer = capability_compile::ProductionConsumer::new(&root)?;
+    consumer.allow_reads(READ_CONTROL)?;
+
+    for (receiver, statement, member) in [
+        ("tip: &TipReader", "tip.store(None)", "store"),
+        ("tree: &BlockTreeReader", "tree.write()", "write"),
+    ] {
+        consumer.deny(
+            &format!("{READ_CONTROL}\npub fn denied({receiver}) {{ let _ = {statement}; }}"),
+            &["E0599"],
+            member,
+        )?;
+    }
+    // A private field may also be removed: both outcomes seal the capability.
+    for (receiver, member) in [
+        ("tip: &TipReader", "tip.inner"),
+        ("tree: &BlockTreeReader", "tree.inner"),
+        ("state: &Chainstate", "state.chain_tip"),
+        ("state: &Chainstate", "state.applied_tip"),
+        ("state: &Chainstate", "state.block_tree"),
+        ("state: &Chainstate", "state.chain_transition"),
+    ] {
+        let field = member.rsplit('.').next().unwrap_or(member);
+        consumer.deny(
+            &format!("{READ_CONTROL}\npub fn denied({receiver}) {{ let _ = &{member}; }}"),
+            &["E0616", "E0609"],
+            field,
+        )?;
+    }
+    consumer.deny(
+        &format!(
+            "{READ_CONTROL}\n\
+             pub fn denied(tree: &BlockTreeReader) {{\n\
+                 let mut guard = tree.read();\n\
+                 guard.tip_handle().store(None);\n\
+             }}"
+        ),
+        &["E0596"],
+        "tip_handle",
+    )?;
+
+    // Refer to associated methods without supplying arguments: this rejects
+    // availability regardless of signature, and deleted APIs remain valid.
     for method in [
         "chain_tip",
         "chain_tip_handle",
@@ -71,51 +127,18 @@ fn chainstate_facade_exposes_no_production_raw_mutation_handles()
         "disconnect_block",
         "apply_window",
     ] {
-        let signature = format!("pub fn {method}(");
-        let mut found = false;
-        let mut offset = 0;
-        while let Some(relative) = chainstate[offset..].find(&signature) {
-            found = true;
-            let position = offset + relative;
-            assert!(
-                has_attribute_gate(&chainstate, position, test_gate),
-                "`{signature}` escaped its test-only capability gate"
-            );
-            offset = position + signature.len();
-        }
-        assert!(found, "expected fixture method `{signature}`");
+        consumer.deny(
+            &format!("{READ_CONTROL}\npub fn denied() {{ let _ = Chainstate::{method}; }}"),
+            &["E0599"],
+            method,
+        )?;
     }
-
-    // The tree's tip publication cell may only be shared through exclusive
-    // (write-guard or owned) access — a `&self` receiver would leak the
-    // writable cell through a read capability.
-    let tree = std::fs::read_to_string(root.join("crates/chain/src/tree.rs"))?;
-    assert!(tree.contains("pub fn tip_handle(&mut self)"));
-
-    let node_sync = std::fs::read_to_string(root.join("crates/node/src/sync.rs"))?;
-    assert!(node_sync.contains("self.handles.admit_headers(headers)"));
-    assert!(node_sync.contains("self.handles.finish_genesis_bootstrap()"));
-    assert!(!node_sync.contains("block_tree().write()"));
-    assert!(!node_sync.contains("chain_tip().store("));
-
-    let p2p_chain = std::fs::read_to_string(root.join("crates/p2p/src/sync/chain.rs"))?;
-    let trait_body = p2p_chain
-        .split_once("pub trait SyncChain")
-        .ok_or_else(|| std::io::Error::other("SyncChain trait"))?
-        .1
-        .split_once("\n}\n")
-        .ok_or_else(|| std::io::Error::other("SyncChain trait end"))?
-        .0;
-    assert!(!trait_body.contains("ArcSwapOption"));
-    assert!(!trait_body.contains("&RwLock<BlockTree>"));
-    for signature in ["fn block_tree_mut(", "fn set_tips("] {
-        let position = trait_body
-            .find(signature)
-            .unwrap_or_else(|| panic!("expected fixture method `{signature}`"));
-        assert!(
-            has_attribute_gate(trait_body, position, "#[cfg(test)]"),
-            "`{signature}` escaped its test-only trait gate"
-        );
+    for method in ["block_tree_mut", "set_tips"] {
+        consumer.deny(
+            &format!("{READ_CONTROL}\npub fn denied() {{ let _ = <dyn SyncChain>::{method}; }}"),
+            &["E0599"],
+            method,
+        )?;
     }
     Ok(())
 }

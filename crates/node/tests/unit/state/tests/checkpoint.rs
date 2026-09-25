@@ -89,17 +89,12 @@ fn clean_checkpoint_reopens_and_applies_the_next_block() -> anyhow::Result<()> {
     assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
     let applied = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("checkpoint did not publish applied tip"))?;
     assert_eq!(applied.height, genesis_tip.height);
     assert_eq!(applied.hash, genesis_tip.hash);
     assert_eq!(
-        resumed
-            .chainstate()
-            .chain_tip_handle()
-            .load_full()
-            .as_deref(),
+        resumed.chainstate().header_tip().as_deref(),
         Some(applied.as_ref())
     );
     assert_eq!(
@@ -270,8 +265,7 @@ fn journal_replay_restores_state_above_checkpoint() -> anyhow::Result<()> {
     assert_eq!(resumed.resume_source(), ResumeSource::Journal);
     let resumed_tip = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("journal replay did not publish a tip"))?;
     assert_eq!(resumed_tip.as_ref(), &expected_tip);
     assert_eq!(
@@ -333,8 +327,7 @@ fn publish_checkpoint_returns_generation_and_reopens() -> anyhow::Result<()> {
     assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
     let applied = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| std::io::Error::other("checkpoint did not publish applied tip"))?;
     assert_eq!(applied.height, tip.height);
     assert_eq!(applied.hash, tip.hash);

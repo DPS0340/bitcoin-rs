@@ -206,8 +206,8 @@ impl Harness {
         let worker = Worker {
             runtime: Arc::clone(&runtime),
             writer: Arc::clone(&writer),
-            applied_tip: Arc::clone(&applied_tip).into(),
-            block_tree: Arc::clone(&fixture.tree).into(),
+            applied_tip: bitcoin_rs_chain::TipReader::new(Arc::clone(&applied_tip)),
+            block_tree: bitcoin_rs_chain::BlockTreeReader::new(Arc::clone(&fixture.tree)),
             body_store: Some(body_store),
             batch_limits: DEFAULT_BATCH_LIMITS,
             enabled,

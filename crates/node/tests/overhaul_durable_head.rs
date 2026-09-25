@@ -329,8 +329,7 @@ fn durable_head_precedes_publication_and_survives_restart() -> Result<()> {
     let resumed = NodeState::open(test_config(data_dir.clone()), None)?;
     let restored = resumed
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| anyhow::anyhow!("restart must restore an applied tip"))?;
     assert_eq!(restored.hash, tip.hash);
     let block4 = mined_regtest_child_at(BlockHash(restored.hash), 4)?;

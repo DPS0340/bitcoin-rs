@@ -804,13 +804,6 @@ impl Chainstate {
         &self.chain_tip
     }
 
-    /// Fixture-only writable header-tip handle. Not present in production builds.
-    #[cfg(any(test, feature = "test-seam"))]
-    #[must_use]
-    pub fn chain_tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
-        Arc::clone(&self.chain_tip)
-    }
-
     /// Fixture-only writable applied-tip cell. Not present in production builds.
     #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
@@ -818,25 +811,11 @@ impl Chainstate {
         &self.applied_tip
     }
 
-    /// Fixture-only writable applied-tip handle. Not present in production builds.
-    #[cfg(any(test, feature = "test-seam"))]
-    #[must_use]
-    pub fn applied_tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
-        Arc::clone(&self.applied_tip)
-    }
-
     /// Fixture-only writable block tree. Not present in production builds.
     #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn block_tree(&self) -> &RwLock<BlockTree> {
         &self.block_tree
-    }
-
-    /// Fixture-only writable block-tree handle. Not present in production builds.
-    #[cfg(any(test, feature = "test-seam"))]
-    #[must_use]
-    pub fn block_tree_handle(&self) -> Arc<RwLock<BlockTree>> {
-        Arc::clone(&self.block_tree)
     }
 
     /// Returns the authoritative UTXO set.
@@ -909,13 +888,6 @@ impl Chainstate {
         Arc::clone(&self.chain_transition)
     }
 
-    /// Fixture-only raw transition barrier. Not present in production builds.
-    #[cfg(any(test, feature = "test-seam"))]
-    #[must_use]
-    pub fn transition_barrier(&self) -> Arc<Mutex<()>> {
-        Arc::clone(&self.chain_transition)
-    }
-
     /// Admits headers and publishes the best-work header tip under Chainstate's
     /// transition authority.
     pub fn admit_headers(
@@ -952,21 +924,6 @@ impl Chainstate {
             announced_tip,
             active_height,
         })
-    }
-
-    /// Publishes the applied tip as the header tip when a bootstrap connect
-    /// left the header-tip cell empty.
-    ///
-    /// This operation cannot publish an arbitrary tip: the only tip it will
-    /// ever set is the authoritative applied tip.
-    pub fn finish_genesis_bootstrap(&self) -> core::result::Result<(), ApplyError> {
-        let _transition = self.lock_transition()?;
-        if self.chain_tip.load().is_none()
-            && let Some(applied) = self.applied_tip.load_full()
-        {
-            self.chain_tip.store(Some(applied));
-        }
-        Ok(())
     }
 
     /// Sets which committed wire payloads must be retained for node-owned followers.

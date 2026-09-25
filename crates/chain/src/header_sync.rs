@@ -16,10 +16,10 @@ const MAX_FUTURE_TIME_SECONDS: u32 = 7200;
 
 /// Accepts a contiguous batch of headers after proof-of-work validation.
 ///
-/// An already-present header is treated as an idempotent input: before any
-/// validation or insertion the header hash is derived and looked up in the
-/// tree, and when found the existing [`NodeId`] is appended to the returned
-/// vector and the header is skipped. This preserves a 1:1 positional
+/// An already-present header not marked invalid is an idempotent input: the
+/// header hash is derived and looked up before validation or insertion.
+/// Known-invalid entries return [`ChainError::KnownInvalidHeader`]; otherwise
+/// the existing [`NodeId`] is appended and the header is skipped, preserving a 1:1
 /// correspondence between input headers and returned ids (including duplicate
 /// Genesis on a non-empty tree) without relaxing validation or error
 /// propagation for unknown headers, which continue through proof-of-work and

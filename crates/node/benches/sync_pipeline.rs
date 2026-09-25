@@ -125,8 +125,7 @@ fn sync_pipeline_apply_proxy(c: &mut Criterion) {
                 black_box(
                     state
                         .chainstate()
-                        .applied_tip_handle()
-                        .load_full()
+                        .applied_tip_snapshot()
                         .unwrap_or_else(|| panic!("proxy apply did not publish a tip"))
                         .height,
                 );
@@ -147,8 +146,7 @@ fn sync_pipeline_apply_proxy(c: &mut Criterion) {
                 }
                 let tip = state
                     .chainstate()
-                    .applied_tip_handle()
-                    .load_full()
+                    .applied_tip_snapshot()
                     .unwrap_or_else(|| panic!("pruned proxy apply did not publish a tip"));
                 let record = state
                     .blocks()
@@ -176,8 +174,7 @@ fn sync_pipeline_apply_proxy(c: &mut Criterion) {
                 black_box(
                     state
                         .chainstate()
-                        .applied_tip_handle()
-                        .load_full()
+                        .applied_tip_snapshot()
                         .unwrap_or_else(|| panic!("spend-heavy proxy did not publish a tip"))
                         .height,
                 );
@@ -224,8 +221,7 @@ fn sync_pipeline_apply_signed_spend_proxy(c: &mut Criterion) {
                 black_box(
                     state
                         .chainstate()
-                        .applied_tip_handle()
-                        .load_full()
+                        .applied_tip_snapshot()
                         .unwrap_or_else(|| panic!("signed-spend proxy did not publish a tip"))
                         .height,
                 );
@@ -501,8 +497,7 @@ fn print_proxy_summary(blocks: &[Block]) {
     let elapsed = started.elapsed();
     let applied_height = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("proxy summary did not publish a tip"))
         .height;
     let blocks_per_second = f64::from(applied_height.saturating_add(1)) / elapsed.as_secs_f64();
@@ -529,8 +524,7 @@ fn print_spend_proxy_summary(blocks: &[Block]) {
     let elapsed = started.elapsed();
     let applied_height = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("spend-heavy proxy summary did not publish a tip"))
         .height;
     let transaction_count: usize = blocks.iter().map(|block| block.txs.len()).sum();
@@ -980,7 +974,7 @@ impl ProductionStateSyncFixture {
             .start_index_workers()
             .unwrap_or_else(|error| panic!("start index workers failed: {error}"));
         let blocks = {
-            let block_tree = state.chainstate().block_tree_handle();
+            let block_tree = state.chainstate().block_tree_reader();
             let mut tree = block_tree.write();
             populate_blocks(&mut tree)
         };
@@ -1032,8 +1026,7 @@ impl ProductionStateSyncFixture {
         sync.tick();
         self.state
             .chainstate()
-            .applied_tip_handle()
-            .load_full()
+            .applied_tip_snapshot()
             .unwrap_or_else(|| panic!("production sync proxy did not publish applied tip"))
             .height
     }
@@ -1095,8 +1088,7 @@ impl ProductionStateSyncFixture {
         self.state.sync().tick();
         self.state
             .chainstate()
-            .applied_tip_handle()
-            .load_full()
+            .applied_tip_snapshot()
             .unwrap_or_else(|| panic!("production sync proxy did not publish applied tip"))
             .height
     }
@@ -1983,8 +1975,7 @@ fn print_signed_spend_proxy_summary(blocks: &[Block]) {
     let elapsed = started.elapsed();
     let applied_height = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .unwrap_or_else(|| panic!("signed-spend summary did not publish a tip"))
         .height;
     let transaction_count: usize = blocks.iter().map(|b| b.txs.len()).sum();

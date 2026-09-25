@@ -34,25 +34,6 @@ impl TipReader {
     pub fn store(&self, tip: Option<Arc<TipSnapshot>>) {
         self.inner.store(tip);
     }
-
-    /// Reports whether this fixture capability wraps `inner`.
-    #[cfg(any(test, feature = "test-seam"))]
-    #[must_use]
-    pub fn shares_source(&self, inner: &Arc<ArcSwapOption<TipSnapshot>>) -> bool {
-        Arc::ptr_eq(&self.inner, inner)
-    }
-}
-
-impl From<Arc<ArcSwapOption<TipSnapshot>>> for TipReader {
-    fn from(inner: Arc<ArcSwapOption<TipSnapshot>>) -> Self {
-        Self::new(inner)
-    }
-}
-
-impl From<&Arc<ArcSwapOption<TipSnapshot>>> for TipReader {
-    fn from(inner: &Arc<ArcSwapOption<TipSnapshot>>) -> Self {
-        Self::new(Arc::clone(inner))
-    }
 }
 
 /// Cloneable, read-only access to the authoritative block tree.
@@ -82,24 +63,5 @@ impl BlockTreeReader {
     #[cfg(any(test, feature = "test-seam"))]
     pub fn write(&self) -> RwLockWriteGuard<'_, BlockTree> {
         self.inner.write()
-    }
-
-    /// Reports whether this fixture capability wraps `inner`.
-    #[cfg(any(test, feature = "test-seam"))]
-    #[must_use]
-    pub fn shares_source(&self, inner: &Arc<RwLock<BlockTree>>) -> bool {
-        Arc::ptr_eq(&self.inner, inner)
-    }
-}
-
-impl From<Arc<RwLock<BlockTree>>> for BlockTreeReader {
-    fn from(inner: Arc<RwLock<BlockTree>>) -> Self {
-        Self::new(inner)
-    }
-}
-
-impl From<&Arc<RwLock<BlockTree>>> for BlockTreeReader {
-    fn from(inner: &Arc<RwLock<BlockTree>>) -> Self {
-        Self::new(Arc::clone(inner))
     }
 }

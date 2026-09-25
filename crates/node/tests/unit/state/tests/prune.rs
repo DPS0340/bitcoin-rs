@@ -86,7 +86,7 @@ fn prune_waits_for_chain_transition_and_revalidates_applied_tip() -> anyhow::Res
     };
 
     let handles = state.chainstate();
-    let barrier = handles.transition_barrier();
+    let barrier = handles.read_fence();
     let transition = barrier.lock();
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);

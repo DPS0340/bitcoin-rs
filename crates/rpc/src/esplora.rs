@@ -550,7 +550,7 @@ mod tests {
                 .as_ref()
                 .clone()
         };
-        context.set_applied_tip(tip);
+        context.applied_tip.store(Some(Arc::new(tip)));
         context.esplora_tx_index = Some(Arc::new(FixtureTxIndex(vec![(transaction.clone(), 0)])));
         let funding = vec![ScriptIndexRecord {
             txid,
@@ -1404,7 +1404,7 @@ mod tests {
             let tip = tree
                 .tip()
                 .ok_or_else(|| std::io::Error::other("missing active tip"))?;
-            ctx.set_applied_tip((*tip).clone());
+            ctx.applied_tip.store(Some(tip));
         }
         ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(transaction)));
 

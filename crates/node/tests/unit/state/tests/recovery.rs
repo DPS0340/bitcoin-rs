@@ -412,8 +412,7 @@ fn missing_checkpoint_replays_durable_head_chain_at_startup() -> anyhow::Result<
     let (_dir, state, config) = applied_regtest_chain(2, 1)?;
     let remembered_tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| anyhow::anyhow!("applied tip missing"))?;
     drop(state);
     std::fs::remove_dir_all(config.data_dir.join("chainstate-checkpoints"))?;
@@ -421,8 +420,7 @@ fn missing_checkpoint_replays_durable_head_chain_at_startup() -> anyhow::Result<
     let reopened = NodeState::open(config, None)?;
     let tip = reopened
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| anyhow::anyhow!("replay did not publish an applied tip"))?;
     assert_eq!(
         (tip.hash, tip.height),
@@ -437,8 +435,7 @@ fn full_revalidation_marker_resumes_on_durable_head() -> anyhow::Result<()> {
     let (_dir, state, config) = applied_regtest_chain(2, 1)?;
     let remembered_tip = state
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| anyhow::anyhow!("applied tip missing"))?;
     drop(state);
     let journal_dir = config.data_dir.join(CHAINSTATE_JOURNAL_DIR);
@@ -451,8 +448,7 @@ fn full_revalidation_marker_resumes_on_durable_head() -> anyhow::Result<()> {
     let reopened = NodeState::open(config, None)?;
     let tip = reopened
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| anyhow::anyhow!("replay did not publish an applied tip"))?;
     assert_eq!(
         (tip.hash, tip.height),
@@ -483,7 +479,7 @@ fn plan_fork(
     time_base: u32,
 ) -> anyhow::Result<ForkPlan> {
     let ancestor = {
-        let tree = state.chainstate().block_tree_handle();
+        let tree = state.chainstate().block_tree_reader();
         let tree = tree.read();
         let tip = tree.tip().ok_or_else(|| anyhow::anyhow!("no chain tip"))?;
         tree.node_at_height_from(tip.tip_id, fork_height)
@@ -647,8 +643,7 @@ fn deep_reorg_streams_bounded_prefixes_to_the_exact_reference() -> anyhow::Resul
         .ok_or_else(|| anyhow::anyhow!("reorg must publish a tip"))?;
     let reference_tip = reference
         .chainstate()
-        .applied_tip_handle()
-        .load_full()
+        .applied_tip_snapshot()
         .ok_or_else(|| anyhow::anyhow!("reference must publish a tip"))?;
     assert_eq!(landed.hash, reference_tip.hash);
     assert_eq!(landed.height, reference_tip.height);
