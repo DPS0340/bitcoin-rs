@@ -57,7 +57,7 @@ usdt:./target/release/bitcoin-rs:mempool:added
   // Core args: txid (32 bytes LE at arg0), vsize, fee.
   $vsize = (int32) arg1;
   $fee = (int64) arg2;
-  printf("mempool added tx %s: %d vB, %d sat\n", buf(arg0, 32), $vsize, $fee);
+  printf("mempool added tx %r: %d vB, %d sat\n", buf(arg0, 32), $vsize, $fee);
 }
 
 usdt:./target/release/bitcoin-rs:mempool:removed
@@ -67,5 +67,5 @@ usdt:./target/release/bitcoin-rs:mempool:removed
   $vsize = (int32) arg2;
   $fee = (int64) arg3;
   $time = arg4;
-  printf("mempool removed tx %s (%s): %d vB, %d sat, entered at %d\n", buf(arg0, 32), $reason, $vsize, $fee, $time);
+  printf("mempool removed tx %r (%s): %d vB, %d sat, entered at %d\n", buf(arg0, 32), $reason, $vsize, $fee, $time);
 }
