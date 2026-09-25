@@ -26,7 +26,7 @@ pub enum ValidationEngine {
     Native,
     /// Bitcoin Core's C++ consensus engine (`libbitcoinkernel`). Selecting it
     /// on a build without the `kernel` feature fails closed with
-    /// [`crate::ConsensusError::Kernel`].
+    /// [`crate::ConsensusError::UnsupportedEngine`].
     Kernel,
 }
 

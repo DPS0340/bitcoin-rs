@@ -24,11 +24,9 @@ use crate::ValidationEngine;
 /// to another engine. Only builds without the capability produce it.
 #[cfg(not(feature = "kernel"))]
 pub(crate) fn kernel_not_compiled() -> ConsensusError {
-    ConsensusError::Kernel(
-        "validation engine `kernel` requested, but bitcoinkernel support is not compiled \
-         into this build (enable the `kernel` feature)"
-            .to_owned(),
-    )
+    ConsensusError::UnsupportedEngine {
+        engine: ValidationEngine::Kernel,
+    }
 }
 
 /// Rejects a prevout set that does not cover exactly `input_count` inputs.
@@ -40,16 +38,18 @@ pub(crate) fn kernel_not_compiled() -> ConsensusError {
 /// inputs in the native interpreter.
 ///
 /// # Errors
-/// Returns [`ConsensusError::Kernel`] when the counts disagree.
+/// Returns [`ConsensusError::PrevoutCount`] when the counts disagree: the
+/// mismatch is a caller wiring bug and is reported backend-neutrally, never
+/// as a script failure.
 pub(crate) fn ensure_prevout_count(
     spent_outputs: &[(OutPoint, TxOut)],
     input_count: usize,
 ) -> Result<(), ConsensusError> {
     if spent_outputs.len() != input_count {
-        return Err(ConsensusError::Kernel(format!(
-            "prevout count {} does not match input count {input_count}",
-            spent_outputs.len(),
-        )));
+        return Err(ConsensusError::PrevoutCount {
+            input_count,
+            prevout_count: spent_outputs.len(),
+        });
     }
     Ok(())
 }
