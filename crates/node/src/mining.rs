@@ -543,6 +543,7 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
         ApplyError::Chain(
             chain @ (ChainError::MissingParent { .. }
             | ChainError::InvalidParent { .. }
+            | ChainError::KnownInvalidHeader { .. }
             | ChainError::NonContinuousHeader { .. }
             | ChainError::ZeroTarget { .. }
             | ChainError::TargetExceedsLimit { .. }
