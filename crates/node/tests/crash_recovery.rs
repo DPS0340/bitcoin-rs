@@ -257,6 +257,63 @@ fn pruned_frontier_survives_sigkill_and_refuses_deleted_history() -> Result<()> 
     Ok(())
 }
 
+/// The executed prune frontier is a durable fact, not process state: after a
+/// SIGKILL the restarted node still refuses a lease over the rows the killed
+/// process deleted, and those rows stay gone (#1151).
+#[test]
+fn pruned_frontier_survives_sigkill_and_refuses_deleted_history() -> Result<()> {
+    use bitcoin_rs_storage::pruning::RetentionError;
+
+    const FRONTIER: u32 = 12;
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("prune-node");
+    let config = prune_test_config(data_dir.clone());
+
+    crash_child("prune", &data_dir, Duration::from_secs(120))?;
+
+    let resumed = NodeState::open(config, None).context("restart after SIGKILL in prune")?;
+    let retention = resumed.chainstate().retention_handle();
+    assert_eq!(
+        retention.pruned_below(),
+        FRONTIER,
+        "the restarted authority starts from the frontier the killed process committed"
+    );
+    assert!(
+        matches!(
+            retention.acquire(FRONTIER - 1),
+            Err(RetentionError::PrunedBelow {
+                requested: 11,
+                pruned_below: 12,
+            })
+        ),
+        "deleted history is refused, not granted and discovered by a failed read"
+    );
+    retention.acquire(FRONTIER)?.release();
+
+    let tree = resumed.chainstate().block_tree_handle();
+    let hash_at = |height: u32| -> Result<Hash256> {
+        let tree = tree.read();
+        let tip = tree.tip().context("restarted node has no chain tip")?;
+        let id = tree
+            .node_at_height_from(tip.tip_id, height)
+            .context("chain is shorter than the sample height")?;
+        Ok(tree.node(id)?.hash)
+    };
+    let bodies = resumed
+        .chainstate()
+        .block_body_store_handle()
+        .context("pruned node has a body store")?;
+    assert!(
+        bodies.load_block_body(5, hash_at(5)?)?.is_none(),
+        "a body the killed pass deleted stays gone"
+    );
+    assert!(
+        bodies.load_block_body(20, hash_at(20)?)?.is_some(),
+        "history the frontier retains survives the restart"
+    );
+    Ok(())
+}
+
 #[test]
 fn upgrade_matrix_falls_back_without_misclassifying_corruption() -> Result<()> {
     let temp = tempfile::tempdir()?;
