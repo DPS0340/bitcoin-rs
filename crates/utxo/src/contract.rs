@@ -785,4 +785,161 @@ mod tests {
         assert!(utxo.get_entry(&FUNDED).is_some(), "undo had already run");
         Ok(())
     }
+    // Undo-determinism coverage, relocated from the crate's integration
+    // tests once the raw inverse (`undo_block`) and the `UndoBatch` builders
+    // became crate-visible only.
+
+    fn undo_txid(seed: u64) -> Hash256 {
+        let mut bytes = [0_u8; 32];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        bytes[8..16].copy_from_slice(&seed.rotate_left(9).to_le_bytes());
+        bytes[16..24].copy_from_slice(&seed.wrapping_mul(0xd6e8_feb8_6659_fd93).to_le_bytes());
+        bytes[24..32].copy_from_slice(&seed.wrapping_add(0xfeed_face_cafe_beef).to_le_bytes());
+        Hash256::from_le_bytes(&bytes)
+    }
+
+    fn undo_txout(seed: u64) -> TxOut {
+        let mut script = Vec::with_capacity(10);
+        script.extend_from_slice(&[0x00, 0x08]);
+        script.extend_from_slice(&seed.to_le_bytes());
+        TxOut {
+            value: Amount::from_sat(50_000 + seed),
+            script_pubkey: script.into(),
+        }
+    }
+
+    /// Ten blocks of 100 creates and up to 50 spends each, with the matching
+    /// undo batches.
+    fn build_undo_blocks() -> Result<Vec<(BlockChanges, UndoBatch)>, Box<dyn std::error::Error>> {
+        let mut live: Vec<UtxoAdd> = Vec::new();
+        let mut blocks = Vec::with_capacity(10);
+
+        for height in 1_u32..=10 {
+            let mut changes = BlockChanges::default();
+            let mut undo = UndoBatch::default();
+
+            let remove_count = live.len().min(50);
+            for _ in 0..remove_count {
+                let add = live.remove(0);
+                changes.remove(add.outpoint);
+                undo.restore(add);
+            }
+
+            for n in 0_u64..100 {
+                let seed = u64::from(height) * 1_000 + n;
+                let outpoint = OutPoint::new(undo_txid(seed).into(), u32::try_from(n % 3)?);
+                let txout = undo_txout(seed);
+                let add = UtxoAdd::new(outpoint, txout, height == 1, height);
+                live.push(add.clone());
+                changes.add(add);
+                undo.remove(outpoint);
+            }
+
+            blocks.push((changes, undo));
+        }
+
+        Ok(blocks)
+    }
+
+    /// Undo coverage for deterministic block disconnects: undoing the last
+    /// five of ten blocks lands exactly on the five-block-only state.
+    #[test]
+    fn undoing_last_five_blocks_matches_first_five_only_state() -> TestResult {
+        let blocks = build_undo_blocks()?;
+        let full = UtxoSet::new();
+
+        for (height, (changes, _undo)) in (1_u64..=10).zip(&blocks) {
+            full.commit_block(changes, &undo_txid(height))?;
+        }
+        for (_changes, undo) in blocks.iter().rev().take(5) {
+            full.undo_block(undo)?;
+        }
+
+        let first_five = UtxoSet::new();
+        for (height, (changes, _undo)) in (1_u64..=5).zip(&blocks) {
+            first_five.commit_block(changes, &undo_txid(height))?;
+        }
+
+        assert_eq!(aggregate_hash(&full)?, aggregate_hash(&first_five)?);
+        assert_eq!(full.len(), first_five.len());
+
+        Ok(())
+    }
+
+    fn listener_set() -> (UtxoSet, CoinStatsListener) {
+        let listener = CoinStatsListener::new(CoinStats::new());
+        let mut set = UtxoSet::new();
+        set.track_coin_stats(listener.clone());
+        (set, listener)
+    }
+
+    fn first_undo_test_block(
+        coinbase_outpoint: OutPoint,
+        coinbase_txout: TxOut,
+        kept_outpoint: OutPoint,
+        kept_txout: TxOut,
+    ) -> BlockChanges {
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(coinbase_outpoint, coinbase_txout, true, 1));
+        changes.add(UtxoAdd::new(kept_outpoint, kept_txout, false, 1));
+        changes
+    }
+
+    /// The listener must restore the exact `MuHash` and accounting of the
+    /// history the undone blocks never touched.
+    #[test]
+    fn listener_undo_restores_muhash_and_accounting() -> TestResult {
+        let (full, full_listener) = listener_set();
+        let coinbase_outpoint = OutPoint::new(undo_txid(40).into(), 0);
+        let coinbase_txout = undo_txout(40);
+        let kept_outpoint = OutPoint::new(undo_txid(41).into(), 0);
+        let kept_txout = undo_txout(41);
+        let replacement_outpoint = OutPoint::new(undo_txid(42).into(), 0);
+        let replacement_txout = undo_txout(42);
+
+        let first = first_undo_test_block(
+            coinbase_outpoint,
+            coinbase_txout.clone(),
+            kept_outpoint,
+            kept_txout.clone(),
+        );
+        full.commit_block(&first, &undo_txid(140))?;
+
+        let mut second = BlockChanges::default();
+        second.remove(coinbase_outpoint);
+        second.add(UtxoAdd::new(
+            replacement_outpoint,
+            replacement_txout,
+            false,
+            2,
+        ));
+        let mut undo = UndoBatch::default();
+        undo.restore(UtxoAdd::new(
+            coinbase_outpoint,
+            coinbase_txout.clone(),
+            true,
+            1,
+        ));
+        undo.remove(replacement_outpoint);
+
+        full.commit_block(&second, &undo_txid(141))?;
+        full.undo_block(&undo)?;
+
+        let (first_only, first_only_listener) = listener_set();
+        first_only.commit_block(&first, &undo_txid(140))?;
+
+        assert_eq!(full.get(&coinbase_outpoint), Some(coinbase_txout));
+        assert_eq!(full.get(&kept_outpoint), Some(kept_txout));
+        assert_eq!(full.get(&replacement_outpoint), None);
+        assert_eq!(full.len(), first_only.len());
+        assert_eq!(
+            observe(&full, &full_listener)?,
+            observe(&first_only, &first_only_listener)?
+        );
+        assert_eq!(
+            full_listener.snapshot().muhash.finalize(),
+            first_only_listener.snapshot().muhash.finalize()
+        );
+        Ok(())
+    }
 }

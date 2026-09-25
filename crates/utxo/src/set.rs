@@ -360,10 +360,11 @@ impl UtxoSet {
     /// Reverses one connected block using its undo data.
     ///
     /// The raw inverse of [`Self::commit_block`], without any durability
-    /// ordering. Chainstate disconnects through
+    /// ordering. Crate-visible on purpose: everything outside this crate
+    /// disconnects through
     /// [`contract::rollback_block`](crate::contract::rollback_block), which
     /// runs this under the durable disconnect marker and the coinstats rewind.
-    pub fn undo_block(&self, undo: &UndoBatch) -> Result<(), UtxoError> {
+    pub(crate) fn undo_block(&self, undo: &UndoBatch) -> Result<(), UtxoError> {
         self.commit_adds_and_removes(&undo.restores, &undo.removes)
     }
 
