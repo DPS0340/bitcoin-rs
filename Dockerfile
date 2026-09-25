@@ -42,9 +42,12 @@ COPY --from=builder /workspace/target/release/bitcoin-rs /usr/local/bin/bitcoin-
 # The image's engine selection lives at the config-file layer, below
 # environment and CLI in the documented precedence
 # (defaults -> file -> environment -> CLI): bare `docker run` keeps the
-# historical kernel behavior, while `BITCOIN_RS_VALIDATION_ENGINE=native`,
-# `--validation-engine native`, or a config file mounted over this one
-# still override it.
+# historical kernel behavior, while `BITCOIN_RS_VALIDATION_ENGINE=native`
+# or a config file mounted over this one still override it without touching
+# CMD. A CLI override (`--validation-engine`) replaces CMD wholesale under
+# docker semantics — `docker run IMAGE args` runs `bitcoin-rs args` — so
+# going that route means repeating the whole argument list
+# (`--config --data-dir --rpc-bind --p2p-listen` included).
 RUN install -d -o bitcoin-rs -g bitcoin-rs /etc/bitcoin-rs \
     && printf 'validation_engine = "kernel"\n' > /etc/bitcoin-rs/default.toml \
     && chown bitcoin-rs:bitcoin-rs /etc/bitcoin-rs/default.toml
