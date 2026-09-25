@@ -73,7 +73,10 @@ fn network_info_and_totals() -> Result<()> {
 
     let info = node.rpc("getnetworkinfo", &json!([]))?;
     assert!(info.u64_field("connections")? >= 1, "connections: {info}");
-    assert_eq!(info.str_field("subversion")?, "/bitcoin-rs:0.7.0/");
+    assert_eq!(
+        info.str_field("subversion")?,
+        concat!("/bitcoin-rs:", env!("CARGO_PKG_VERSION"), "/")
+    );
     assert_eq!(info.u64_field("protocolversion")?, 70016);
     let services = info["localservicesnames"]
         .as_array()
