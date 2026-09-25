@@ -177,9 +177,9 @@ impl UndoBatch {
 
 /// The raw encoded undo record one block left behind.
 ///
-/// Produced alongside its [`UndoBatch`] by [`persist_block_undo`] and
-/// [`load_block_undo`]. It survives block-level persistence so the same bytes
-/// can be stored in a durable head batch instead of re-encoding them.
+/// Produced alongside its [`UndoBatch`] by [`persist_block_undo`]. It survives
+/// block-level persistence so the same bytes can be stored in a durable head
+/// batch instead of re-encoding them.
 pub struct UndoRecord(Vec<u8>);
 
 impl std::fmt::Debug for UndoRecord {
@@ -198,16 +198,6 @@ impl UndoRecord {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
-}
-
-/// The loaded undo record for one block: its inverse mutations plus the raw
-/// bytes its persistence receipt names.
-#[derive(Debug)]
-pub struct BlockUndo {
-    /// Inverse mutations this block's disconnect applies.
-    pub batch: UndoBatch,
-    /// Raw record bytes the apply path stored for this block.
-    pub record: UndoRecord,
 }
 
 /// The outcome of rolling one block back out of the UTXO set.
@@ -492,17 +482,12 @@ pub fn load_block_undo(
     store: &dyn UndoStore,
     height: u32,
     hash: Hash256,
-) -> Result<BlockUndo, UndoLoadError> {
+) -> Result<UndoBatch, UndoLoadError> {
     let record = store
         .load_undo(height, hash)
         .map_err(UndoLoadError::Read)?
         .ok_or(UndoLoadError::Missing { hash, height })?;
-    let batch = undo_codec::decode(&record, hash)
-        .map_err(|source| UndoLoadError::Unreadable { hash, source })?;
-    Ok(BlockUndo {
-        batch,
-        record: UndoRecord::new(record),
-    })
+    undo_codec::decode(&record, hash).map_err(|source| UndoLoadError::Unreadable { hash, source })
 }
 
 /// Decodes one raw undo record that the caller already holds.
@@ -653,7 +638,7 @@ mod tests {
             &undo,
         )?;
         let reopened = KvUndoStore::new(Arc::new(FjallStore::open(dir.path())?));
-        assert_eq!(load_block_undo(&reopened, HEIGHT, HASH)?.batch, undo);
+        assert_eq!(load_block_undo(&reopened, HEIGHT, HASH)?, undo);
         Ok(())
     }
 
@@ -678,13 +663,12 @@ mod tests {
     }
 
     #[test]
-    fn loaded_record_bytes_are_the_persisted_record() -> TestResult {
+    fn persisted_record_bytes_decode_back_to_the_batch() -> TestResult {
         let (.., undo) = connected()?;
         let store = InMemoryUndoStore::default();
         let record = persist_block_undo(&store, HEIGHT, HASH, &undo)?;
-        let loaded = load_block_undo(&store, HEIGHT, HASH)?;
-        assert_eq!(loaded.record.as_bytes(), record.as_bytes());
-        assert_eq!(loaded.batch, undo);
+        assert_eq!(decode_undo_record(record.as_bytes(), HASH)?, undo);
+        assert_eq!(load_block_undo(&store, HEIGHT, HASH)?, undo);
         Ok(())
     }
 

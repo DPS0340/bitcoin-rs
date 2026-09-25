@@ -42,7 +42,7 @@ pub mod stats;
 mod undo_codec;
 
 pub use contract::{
-    BlockChangeError, BlockChanges, BlockUndo, BlockValueTotals, DisconnectReceipt, OutputSource,
+    BlockChangeError, BlockChanges, BlockValueTotals, DisconnectReceipt, OutputSource,
     RollbackError, SpentOutputLookup, UndoBatch, UndoLoadError, UndoRecord, UtxoAdd,
     build_block_changes, decode_undo_record, is_coinbase_tx, load_block_undo, persist_block_undo,
     rollback_block,

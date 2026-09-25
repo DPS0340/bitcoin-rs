@@ -84,7 +84,7 @@ pub(super) fn plan_disconnect(
         )
     };
 
-    let undo = load_block_undo(handles.undo_store.as_ref(), height, block_hash)?.batch;
+    let undo = load_block_undo(handles.undo_store.as_ref(), height, block_hash)?;
 
     // Coinstats rewinds inside the marker fence; refuse its bad inputs here
     // while refusal is still free.

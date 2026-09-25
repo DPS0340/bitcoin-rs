@@ -350,11 +350,11 @@ fn replay_gap_chain(
             // set has not been rebuilt. A missing row falls back to the live
             // set a restored tip still carries; an unreadable one fails closed.
             let proven = match load_block_undo(handles.undo_store.as_ref(), height, hash) {
-                Ok(loaded) => Some(ProvenApply::AssumeValidSkipped(
+                Ok(undo) => Some(ProvenApply::AssumeValidSkipped(
                     super::prepare::prepare_apply(
                         &block,
                         Some(bytes.clone()),
-                        &UndoRowSpends(&loaded.batch),
+                        &UndoRowSpends(&undo),
                     )?,
                 )),
                 Err(UndoLoadError::Missing { .. }) => None,
