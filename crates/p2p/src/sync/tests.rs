@@ -455,6 +455,65 @@ fn tick_allows_demoted_peer_when_it_is_the_only_eligible_peer()
     Ok(())
 }
 
+/// A purge of one invalidated batch stamps the owner's remaining queue
+/// age at a single instant: entries of one batched request share one
+/// `requested_at`, so releasing them leaves the queue start at the batch
+/// origin instead of re-stamping it once per removed hash.
+#[test]
+fn purge_of_one_invalidated_batch_keeps_the_owner_queue_start_at_one_instant()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sync, peers, block_tree, applied_tip, expected) = sync_with_header_chain(8)?;
+    install_budget(
+        &sync,
+        super::SyncBudget {
+            max_pending_blocks: 4,
+            max_peer_inflight: 4,
+            getdata_batch_limit: 4,
+            ..super::default_sync_budget(Network::Regtest)
+        },
+    );
+    let addr = test_addr(9345, 0)?;
+    let rx = connect_peer(&peers, synthetic_peer(addr, 100));
+
+    // One peer takes the whole window: the striped getdata is one batched
+    // request, so all four pendings share one request stamp.
+    sync.tick();
+
+    assert_applied_genesis(&applied_tip, &block_tree)?;
+    let requested = witness_block_inventory(next_getdata(&rx)?)?;
+    assert_eq!(requested, expected[..4]);
+    let to_hash = |block: &BlockHash| Hash256::from_le_bytes(block.as_bytes());
+    let all: Vec<Hash256> = requested.iter().map(to_hash).collect();
+    let owner = current_source(&peers, addr);
+    let queue_start = |sync: &BlockSync| {
+        sync.scheduler
+            .lock()
+            .window
+            .owner_queue_start_for_test(owner)
+    };
+    let before = queue_start(&sync)
+        .unwrap_or_else(|| panic!("the batched request stamps the owner's queue start"));
+
+    // Releasing the first two invalidated hashes leaves the surviving pair
+    // owning the queue start at the batch origin.
+    sync.purge_invalidated(&all[..2]);
+    assert_eq!(
+        queue_start(&sync),
+        Some(before),
+        "one purge must not re-stamp the owner's queue age per removed hash"
+    );
+    assert_eq!(
+        sync.scheduler.lock().window.pending_owner(&all[2]),
+        Some(owner)
+    );
+
+    // Releasing the rest drops the queue start with the owner's last
+    // pending.
+    sync.purge_invalidated(&all[2..]);
+    assert_eq!(queue_start(&sync), None);
+    Ok(())
+}
+
 /// Near-tip requests to a compact-relaying peer ride the compact flavor;
 /// deep IBD requests and non-relaying peers keep the witness flavor. The
 /// download window resolves either answer by hash, unchanged.

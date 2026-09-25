@@ -126,18 +126,24 @@ impl BlockSync {
 
     /// Frees every bounded download slot held by an invalidated hash under
     /// one `scheduler` acquisition.
+    ///
+    /// PRE: `hashes` are the hashes invalidated by one settlement event.
+    /// POST: every hash's pending is released with no cursor rewind; each
+    ///      owner's queue start follows
+    ///      [`DownloadWindow::reset_owner_queue_start`].
+    /// INVARIANT: all releases share one `now`, so one purge stamps an
+    ///      owner's queue age at a single instant.
     #[doc(hidden)]
     pub fn purge_invalidated(&self, hashes: &[Hash256]) {
         if hashes.is_empty() {
             return;
         }
         let mut scheduler = self.scheduler.lock();
+        let now = Instant::now();
         for hash in hashes {
             scheduler.stager.retire_applied(hash);
             // Invalidated hashes are never re-requested: no cursor rewind.
-            scheduler
-                .window
-                .requeue_for_retry(hash, None, Instant::now());
+            scheduler.window.requeue_for_retry(hash, None, now);
         }
     }
 
