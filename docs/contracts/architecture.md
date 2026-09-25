@@ -256,20 +256,26 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
 - **Disconnect**: `persist_block_undo` / `load_block_undo` round-trip one
   block's `UndoBatch` as the `UndoRecord` bytes the durable head receipt
   names, and `rollback_block` applies that batch under the durable
-  disconnect marker plus the coinstats rewind. `UtxoSet::undo_block` is the
-  raw inverse for tests and recovery tools; chainstate always disconnects
+  disconnect marker plus the coinstats rewind. The raw inverse
+  (`UtxoSet::undo_block`) is crate-private: every external disconnect goes
   through `rollback_block`.
 - **Read**: `UtxoSet` lookups return the one `UtxoCoin` shape; whole-set
   reads run under `with_stable_view` (`UtxoSetView`), which also serves the
   `hash_serialized_3` commitment, script scans, and memory accounting.
   Windowed apply reads through `WindowOverlay` over the same `OutputSource`.
 - Shard, record, commit-event, and undo-codec machinery is crate-private.
-  Chainstate is the only owner of mutation ordering and durability policy;
-  none of it lives in `utxo` (`ARCH-07`).
-- RPC and index are read consumers of the same contract types
-  (`UtxoCoin`, `UtxoScan`, `UndoBatch`); they do not assemble mutations
-  outside tests, which build fixture sets through `BlockChanges` +
-  `commit_block`.
+  Rollback sequencing is split at the marker fence, which is exactly where
+  the crate boundary runs: `utxo::contract::rollback_block` owns the fenced
+  set mutation (arm the marker, undo the set, rewind coinstats, complete the
+  marker) and nothing beyond it. Chainstate owns everything around that
+  fence — refusing a stale tip before arming, then journal rewind, durable
+  head advance, publication, and marker disarm, in that order — and is the
+  only owner of mutation ordering and durability policy (`ARCH-07`).
+- The contract surface is `bitcoin_rs_utxo::contract`; the crate root keeps
+  only read, snapshot, and statistics names. RPC and index are read consumers
+  of the same contract types (`UtxoCoin`, `UtxoScan`, `UndoBatch`); they do
+  not assemble mutations outside tests, which build fixture sets through
+  `BlockChanges` + `commit_block`.
 
 ### `ARCH-08`: Durable pruning and reorg retention
 
