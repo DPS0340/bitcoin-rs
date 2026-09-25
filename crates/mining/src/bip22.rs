@@ -62,6 +62,7 @@ pub fn chain_reject_reason(error: &ChainError) -> CompactString {
         ChainError::TimestampTooFarAhead { .. } => "time-too-new",
         ChainError::MissingParent { .. } => "prev-blk-not-found",
         ChainError::InvalidParent { .. } => "bad-prevblk",
+        ChainError::KnownInvalidHeader { .. } => "duplicate-invalid",
         ChainError::DuplicateHeader { .. } => "duplicate",
         _ => return CompactString::from(error.to_string()),
     })
