@@ -10,7 +10,7 @@
 use std::borrow::Borrow;
 
 use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, TxOut, Txid};
-use bitcoin_rs_storage::{StorageError, UndoStore};
+use bitcoin_rs_storage::{DisconnectPhase, StorageError, UndoStore};
 use hashbrown::HashSet;
 
 use crate::set::{UtxoCoin, UtxoError, UtxoSet};
@@ -565,9 +565,11 @@ pub fn decode_undo_record(bytes: &[u8], block_hash: Hash256) -> Result<UndoBatch
 
 /// Rolls one block out of the UTXO set under a durable disconnect marker.
 ///
-/// The marker is read before arming because arming overwrites an earlier
-/// disconnect's `RolledBack` debt, which a refusal would otherwise clear. On
-/// success it stays `RolledBack` until the caller durably publishes the
+/// The marker is read before arming so a refusal cannot overwrite the
+/// previous disconnect's marker: an `InFlight` marker is a torn rollback that
+/// must not be armed over, while a `RolledBack` marker is owed checkpoint
+/// debt that sequential disconnects carry into the next arm. On success the
+/// marker stays `RolledBack` until the caller durably publishes the
 /// rolled-back state. Per-coin coinstats follow the set's undo through the
 /// listener; only height and transaction count are rewound here.
 ///
@@ -586,9 +588,15 @@ pub fn rollback_block(
     tx_count_delta: u64,
     undo: &UndoBatch,
 ) -> Result<DisconnectReceipt, RollbackError> {
-    store
+    if store
         .load_disconnect_marker()
-        .map_err(RollbackError::Refused)?;
+        .map_err(RollbackError::Refused)?
+        .is_some_and(|marker| marker.phase == DisconnectPhase::InFlight)
+    {
+        return Err(RollbackError::Refused(StorageError::InvalidOperation(
+            "a disconnect is already in flight",
+        )));
+    }
     store
         .arm_disconnect(height, hash)
         .map_err(RollbackError::Refused)?;
@@ -747,6 +755,49 @@ mod tests {
             utxo.get_entry(&FUNDED).map(|e| (e.txout, e.height)),
             Some((coin(900), 1))
         );
+        assert_eq!(observe(&utxo, &coin_stats)?, before);
+        assert_eq!(receipt.restored_parents, vec![FUNDED.txid]);
+        let marker = store.load_disconnect_marker()?.ok_or("marker missing")?;
+        assert_eq!(
+            (marker.phase, marker.height, marker.hash),
+            (DisconnectPhase::RolledBack, HEIGHT, HASH)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn in_flight_marker_refuses_before_arming() -> TestResult {
+        let (utxo, coin_stats, _, undo) = connected()?;
+        let connected_state = observe(&utxo, &coin_stats)?;
+        let store = InMemoryUndoStore::default();
+        let torn = Hash256::from_le_bytes(&[0x77; 32]);
+        store.arm_disconnect(HEIGHT - 1, torn)?;
+
+        let outcome = rollback_block(&store, &utxo, &coin_stats, HASH, HEIGHT, 1, 2, &undo);
+
+        assert!(
+            matches!(outcome, Err(RollbackError::Refused(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(observe(&utxo, &coin_stats)?, connected_state);
+        let marker = store.load_disconnect_marker()?.ok_or("marker missing")?;
+        assert_eq!(
+            (marker.phase, marker.height, marker.hash),
+            (DisconnectPhase::InFlight, HEIGHT - 1, torn)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rolled_back_marker_carries_into_the_next_disconnect() -> TestResult {
+        let (utxo, coin_stats, before, undo) = connected()?;
+        let store = InMemoryUndoStore::default();
+        let prior = Hash256::from_le_bytes(&[0x66; 32]);
+        store.arm_disconnect(HEIGHT - 1, prior)?;
+        store.complete_disconnect(HEIGHT - 1, prior)?;
+
+        let receipt = rollback_block(&store, &utxo, &coin_stats, HASH, HEIGHT, 1, 2, &undo)?;
+
         assert_eq!(observe(&utxo, &coin_stats)?, before);
         assert_eq!(receipt.restored_parents, vec![FUNDED.txid]);
         let marker = store.load_disconnect_marker()?.ok_or("marker missing")?;
