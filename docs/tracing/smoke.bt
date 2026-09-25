@@ -10,6 +10,10 @@
 //
 //   cargo build --release --features usdt -p bitcoin-rs
 //   sudo bpftrace docs/tracing/smoke.bt
+//   ./target/release/bitcoin-rs   # second terminal: path-based selectors
+//                                 # fire only for processes started after
+//                                 # attach; for an already-running node use
+//                                 # `sudo bpftrace -p $(pgrep bitcoin-rs)`
 //
 // Live run status (docs/tracing.md): NOT_RUN on the development host (macOS;
 // needs a Linux kernel and root). No bitcoin-rs runtime or library is

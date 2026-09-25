@@ -73,18 +73,24 @@ directly. On a Linux host with `bpftrace` and root:
 ```bash
 cargo build --release --features usdt -p bitcoin-rs
 sudo bpftrace docs/tracing/smoke.bt
+./target/release/bitcoin-rs   # in a second terminal, once bpftrace has attached
 ```
 
-Every `usdt:` selector embeds the `./target/release/bitcoin-rs` path
-literally — bpftrace reads the SDT notes from that file and takes no binary
-argument. To run the same script against a running or Core `bitcoind`,
-replace the selector paths with that binary's own path; the probe names and
-argument positions are identical.
+Path-based `usdt:` selectors fire only for processes started *after* bpftrace
+attaches, so the node must be launched (or restarted) once the script is
+running; to attach to an already-running node pass `-p $(pgrep bitcoin-rs)`
+to bpftrace instead. Every `usdt:` selector embeds the
+`./target/release/bitcoin-rs` path literally — bpftrace reads the SDT notes
+from that file and takes no binary argument. To run the same script against
+a running or Core `bitcoind`, replace the selector paths with that binary's
+own path; the probe names and argument positions are identical.
 
 **Live run status: NOT_RUN** on the development host (macOS; bpftrace needs a
 Linux kernel and root). The static evidence shipped with this change is the
 SDT note assertion in `crates/trace/tests/sdt_notes.rs`, which reads the built
 binary's `.note.stapsdt` section and checks provider, probe name, and the full
 `size@operand` argument layout strings against `probe_abi.rs` — verified
-against the `bitcoin-rs` ELF artifact on x86-64 Linux
-(`SDT_ELF=target/debug/bitcoin-rs cargo test -p bitcoin-rs-trace --features usdt`).
+against the `bitcoin-rs` ELF artifact on x86-64 Linux — after building the
+node itself with `--features usdt` (`cargo build --release --features usdt
+-p bitcoin-rs`), run `SDT_ELF=target/release/bitcoin-rs cargo test
+-p bitcoin-rs-trace --features usdt`.
