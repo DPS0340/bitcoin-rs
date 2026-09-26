@@ -226,7 +226,8 @@ fn live_handshake_traffic_reaches_the_aggregate_ledger() -> Result<(), Box<dyn E
 
     // Metadata publication attaches the connection counters, so nonzero
     // totals prove both handshakes completed over the loopback wire.
-    // Deadline-bounded wait; no fixed sleep.
+    // Deadline-bounded wait; no fixed sleep. Every exit path takes the same
+    // teardown, so a failed assertion cannot leak the accept loop.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let (received, sent) = peer_table.traffic_totals();
@@ -234,11 +235,18 @@ fn live_handshake_traffic_reaches_the_aggregate_ledger() -> Result<(), Box<dyn E
             break;
         }
         if Instant::now() >= deadline {
-            return Err(io::Error::other(format!(
+            let detail = format!(
                 "handshake traffic never reached the aggregate ledger \
                  (received={received}, sent={sent})"
-            ))
-            .into());
+            );
+            teardown_epoch(
+                &session_cancel,
+                &peer_table,
+                &shutdown,
+                serve_handle,
+                outbound_handle,
+            )?;
+            return Err(io::Error::other(detail).into());
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -247,14 +255,13 @@ fn live_handshake_traffic_reaches_the_aggregate_ledger() -> Result<(), Box<dyn E
     assert!(sent > 0, "aggregate sent must count handshake bytes");
     assert!(!peer_table.is_empty());
 
-    // Teardown: revoke the epoch's leases so both connection loops exit,
-    // then stop the accept loop and join the workers.
-    session_cancel.store(true, Ordering::Relaxed);
-    peer_table.cancel_all();
-    shutdown.store(true, Ordering::Relaxed);
-    join_listener(serve_handle)?;
-    let _ = outbound_handle.join();
-    Ok(())
+    teardown_epoch(
+        &session_cancel,
+        &peer_table,
+        &shutdown,
+        serve_handle,
+        outbound_handle,
+    )
 }
 
 /// Wiring for one test start epoch with no ready callback.
@@ -363,5 +370,28 @@ fn join_listener(
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(error.into()),
         Err(_) => Err(io::Error::other("listener thread panicked").into()),
+    }
+}
+
+/// Shared teardown for one test epoch: revokes every lease, stops the accept
+/// loop, and joins both workers — surfacing an outbound panic or connection
+/// error instead of discarding it.
+fn teardown_epoch(
+    session_cancel: &AtomicBool,
+    peer_table: &PeerTable,
+    shutdown: &AtomicBool,
+    serve_handle: thread::JoinHandle<Result<(), bitcoin_rs_p2p::listener::ListenerError>>,
+    outbound_handle: thread::JoinHandle<Result<(), bitcoin_rs_p2p::PeerError>>,
+) -> Result<(), Box<dyn Error>> {
+    session_cancel.store(true, Ordering::Relaxed);
+    peer_table.cancel_all();
+    shutdown.store(true, Ordering::Relaxed);
+    join_listener(serve_handle)?;
+    match outbound_handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            Err(io::Error::other(format!("outbound ended with error: {error}")).into())
+        }
+        Err(_) => Err(io::Error::other("outbound thread panicked during teardown").into()),
     }
 }

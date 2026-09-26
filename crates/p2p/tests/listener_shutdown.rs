@@ -89,9 +89,13 @@ fn serve_exits_when_flag_set() -> Result<(), Box<dyn Error>> {
     // Drop the accepted stream so the orphan handshake thread exits on a
     // read error instead of holding the connection open.
     drop(client);
-    guard.join()?;
 
+    // Raise the flag, then drain before joining: a serve loop that never
+    // observes the flag fails after 5 s instead of hanging the test on an
+    // unbounded join.
+    shutdown.store(true, Ordering::Relaxed);
     let result = rx.recv_timeout(Duration::from_secs(5))?;
+    guard.join()?;
 
     result?;
     // Connection threads outlive the listener. The orphan handshake thread
