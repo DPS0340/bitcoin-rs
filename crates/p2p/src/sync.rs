@@ -600,7 +600,10 @@ impl BlockSync {
         let block_spacing =
             Duration::from_secs(u64::from(self.chain.network().target_spacing_seconds()));
         let mut scheduler = self.scheduler.lock();
-        if self.ibd.is_active(crate::counters::now_seconds()) {
+        if self
+            .ibd
+            .is_active(crate::counters::now_seconds(), self.chain.network())
+        {
             // Core withholds the extra full-relay dial until the node has
             // left initial block download (`net_processing.cpp:1434-1448`).
             scheduler.stale_tip.extra_dial_allowed = false;

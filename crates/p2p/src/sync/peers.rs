@@ -45,7 +45,6 @@ pub(super) fn is_peer_fault(error: &ChainError) -> bool {
         // Re-announcing a header we already know is invalid or extending a
         // known-invalid parent is unambiguously peer-invalid data.
         | ChainError::KnownInvalidHeader { .. }
-        | ChainError::InvalidParent { .. }
         | ChainError::BadVersion { .. }
         | ChainError::TimewarpAttack { .. } => true,
         // Future drift is judged against OUR clock, so a wrong local clock
@@ -797,9 +796,7 @@ mod tests {
             // An invalid parent names our own operator-driven invalidation,
             // which the sender cannot see, so the child is refused without
             // blame.
-            ChainError::InvalidParent {
-                parent: NodeId::new(3),
-            },
+            ChainError::InvalidParent { prev_hash: hash },
             ChainError::UnknownNode { id: NodeId::new(1) },
         ] {
             assert!(!is_peer_fault(&error), "{error:?} must spare the peer");

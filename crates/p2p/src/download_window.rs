@@ -2894,7 +2894,10 @@ mod tests {
     use bitcoin_rs_primitives::Hash256;
     use core::net::SocketAddr;
 
-    use bitcoin_rs_chain::{BlockTree, ChainWork, InitialBlockDownload, Network, TipSnapshot};
+    use bitcoin_rs_chain::{
+        BlockTree, BlockTreeReader, ChainWork, InitialBlockDownload, Network, TipReader,
+        TipSnapshot,
+    };
     use bitcoin_rs_primitives::{
         Amount, Block, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness,
         consensus_bytes,
@@ -2954,10 +2957,10 @@ mod tests {
         };
         BlockDownloadPolicy {
             ibd: Arc::new(InitialBlockDownload::new(
-                Arc::new(ArcSwapOption::from_pointee(tip)),
-                Arc::new(parking_lot::RwLock::new(tree)),
-                network,
+                TipReader::new(Arc::new(ArcSwapOption::from_pointee(tip))),
+                BlockTreeReader::new(Arc::new(parking_lot::RwLock::new(tree))),
             )),
+            network,
             requested_height,
         }
     }
