@@ -281,6 +281,7 @@ pub(crate) fn transaction_count_size(body_count: usize) -> Result<u64, MiningErr
     Ok(u64::try_from(varint::encoded_len(count)).unwrap_or(u64::MAX))
 }
 
+/// Reserves the header and a coinbase with the final witness-commitment shape.
 fn fixed_reservation(
     context: &CandidateContext,
     payout: &[u8],
@@ -311,6 +312,8 @@ fn fixed_reservation(
     })
 }
 
+/// Includes every requested transaction or refuses the whole ordered candidate.
+/// Transaction-count bytes belong to the body; the header and coinbase are fixed.
 fn exact_order(
     context: &CandidateContext,
     snapshot: &MempoolMiningSnapshot,
@@ -370,6 +373,7 @@ fn exact_order(
     })
 }
 
+/// Builds commitments and adds the fixed reservation to the selected body totals.
 fn finish_candidate(
     context: &CandidateContext,
     snapshot: &MempoolMiningSnapshot,
