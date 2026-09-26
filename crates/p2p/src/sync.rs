@@ -456,12 +456,15 @@ impl BlockSync {
         // Convicted connections must release their work before selection so
         // the same tick can re-request it.
         self.reconcile_peer_sessions();
-        let frontier = self.observe_frontier(chain, now);
+        let frontier = self.observe_frontier(chain.clone(), now);
         // A connection that has had twenty minutes to bring a better chain and
         // two more to answer a probe is retired before this tick plans any
         // further work with it.
         self.sweep_chain_sync(&frontier, now);
         self.follow_tip_progress(&frontier, now);
+        // The sweep can disconnect a peer; re-observe so selection and body
+        // planning never address a lease the sweep just removed.
+        let frontier = self.observe_frontier(chain, now);
         let plan = frontier.plan();
 
         if !frontier.usable_peers.is_empty() {

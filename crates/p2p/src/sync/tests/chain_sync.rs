@@ -438,3 +438,58 @@ fn chain_sync_probe_locator_anchors_at_the_header_tips_parent() {
         "the locator roots at the header tip's parent so the answer carries the tip"
     );
 }
+
+/// The sweep-level guarantee for the same contract
+/// `a_probe_that_never_reached_the_wire_is_not_a_probe` checks on
+/// `probe_chain_sync`: when the sweep's probe send fails — the lease's queue
+/// is gone — the connection's record is put back exactly as the sweep found
+/// it, so the next tick retries instead of holding a response window against
+/// a request that never arrived.
+#[test]
+#[allow(clippy::expect_used)]
+fn a_failed_sweep_probe_restores_the_armed_record() {
+    let t0 = Instant::now();
+    let (tree, _blocks) = mined_chain(1, 1).expect("chain fixture builds");
+    let SyncHarness { sync, peers, .. } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+
+    let addr = test_addr(9_920, 0).expect("test address");
+    let (tx, rx) = unbounded::<Message>();
+    // Old enough that the connection is a chain-sync subject on every tick.
+    let connected_at = t0
+        .checked_sub(MINIMUM_CONNECT_TIME)
+        .expect("the test clock predates the connect age");
+    let lease = PeerLease::new_connected_at(tx, connected_at);
+    peers.register(addr, lease.clone());
+    peers.publish_info(addr, &lease, eligible_peer(addr, 0));
+    let source = current_source(&peers, addr);
+
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), t0);
+    sync.sweep_chain_sync(&frontier, t0);
+    {
+        let scheduler = sync.scheduler.lock();
+        let state = scheduler
+            .chain_sync
+            .get(&source)
+            .expect("the first sweep arms the lagging claimant");
+        assert!(
+            !state.probe_sent(),
+            "an armed window has not yet owed a probe"
+        );
+    }
+
+    // Kill the connection's outbound queue so the probe send must fail.
+    drop(rx);
+    let stale = sync.observe_frontier(sync.observe_chain_frontier(), t0);
+    sync.sweep_chain_sync(&stale, t0 + Duration::from_mins(20));
+
+    let scheduler = sync.scheduler.lock();
+    let state = scheduler
+        .chain_sync
+        .get(&source)
+        .expect("a failed probe restores the armed record rather than advancing it");
+    assert!(
+        !state.probe_sent(),
+        "the probe never reached the wire, so no response window is running"
+    );
+}

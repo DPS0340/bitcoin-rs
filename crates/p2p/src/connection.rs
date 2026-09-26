@@ -305,6 +305,18 @@ impl PeerLease {
         Self::with_direction(outbound, true, crate::peer_info::PeerRole::FullRelay, false)
     }
 
+    /// Test constructor: an outbound lease already `connected_at` old, for
+    /// exercising rules gated on connection age without sleeping.
+    #[cfg(test)]
+    pub(crate) fn new_connected_at(
+        outbound: Sender<crate::Message>,
+        connected_at: Instant,
+    ) -> Self {
+        let mut lease = Self::new(outbound);
+        lease.connected = connected_at;
+        lease
+    }
+
     fn with_direction(
         outbound: Sender<crate::Message>,
         inbound: bool,

@@ -153,6 +153,13 @@ impl ChainSyncState {
         self.protected
     }
 
+    /// Whether a probe has been marked sent in the running window.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) const fn probe_sent(&self) -> bool {
+        self.probe_sent
+    }
+
     /// Starts a fresh window against the current tip, as Core's
     /// `m_work_header = tip` arm does
     /// (`net_processing.cpp:5519-5527`).

@@ -122,7 +122,7 @@ witness variant. The cache and retry lifecycle are governed by
 | Locator > 101 hashes | disconnect (checked before any state mutation) | misbehavior 255 → ban |
 | `headers` > 2 000 entries | disconnect | misbehavior |
 | `verack` before `version`; duplicate `version`; feature message while disconnected | disconnect | misbehavior |
-| Idle connection | one `ping` per 2 min; disconnect once a direction is silent past 20 min | same (`PING_INTERVAL`, `net_processing.cpp:125`; `TIMEOUT_INTERVAL`, `net.h:59`; `InactivityCheck`, `net.cpp:2043-2090`) |
+| Idle connection | `ping` once a direction has been idle 2 min; disconnect once a direction is silent past 20 min | `ping` per 2 min regardless of traffic; disconnect when the outstanding ping goes unanswered for 20 min (`PING_INTERVAL`, `net_processing.cpp:125`; `TIMEOUT_INTERVAL`, `net.h:59`; `MaybeSendPing`, `net_processing.cpp:5698-5712`; `InactivityCheck`, `net.cpp:2043-2090`) |
 | `tx` or a transaction `inv` on a block-relay-only connection | disconnect (protocol violation) | disconnect (`RejectIncomingTxs`, `net_processing.cpp:4706-4711`; the `inv` branch at `net_processing.cpp:4385-4390`) |
 | `addr` or `addrv2` on a block-relay-only connection | ignored | ignored (address relay declined, `SetupAddressRelay`, `net_processing.cpp:5952-5970`) |
 

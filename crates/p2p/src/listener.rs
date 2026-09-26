@@ -945,8 +945,8 @@ impl Keepalive {
     /// Starts a ledger for a connection whose loop begins at `now`.
     ///
     /// PRE: `now` is the monotonic instant the session loop starts.
-    /// POST: both directions count as fresh at `now`, and the first probe is
-    ///   owed immediately.
+    /// POST: both directions count as fresh at `now`; the first probe is owed
+    ///   once a direction has been idle for one [`PING_INTERVAL`].
     fn starting(now: Instant) -> Self {
         Self {
             last_recv: now,
@@ -999,10 +999,15 @@ impl Keepalive {
         {
             return KeepaliveAction::Expired;
         }
+        // A probe exists to detect a dead connection; a connection already
+        // carrying traffic in either direction inside this interval does not
+        // need one.
+        let idle = now.saturating_duration_since(self.last_recv) >= PING_INTERVAL
+            || now.saturating_duration_since(self.last_send) >= PING_INTERVAL;
         let probe_owed = self
             .last_ping
             .is_none_or(|last| now.saturating_duration_since(last) >= PING_INTERVAL);
-        if probe_owed {
+        if probe_owed && idle {
             KeepaliveAction::Ping
         } else {
             KeepaliveAction::Idle
@@ -1015,20 +1020,31 @@ mod keepalive_tests {
     use super::{Keepalive, KeepaliveAction, PING_INTERVAL, TIMEOUT_INTERVAL};
     use std::time::{Duration, Instant};
 
-    /// A fresh connection is probed at once and then once per ping interval,
-    /// never twice inside one interval.
+    /// A fresh connection carries no probe obligation: a ping is owed only
+    /// once a direction has been idle for an interval, then at most once per
+    /// interval while it stays idle.
     #[test]
-    fn probes_owe_one_ping_per_interval() {
+    fn probes_owe_one_ping_per_idle_interval() {
         let t0 = Instant::now();
         let mut keepalive = Keepalive::starting(t0);
-        assert_eq!(keepalive.next_action(t0), KeepaliveAction::Ping);
-        keepalive.record_probe(t0);
         assert_eq!(
-            keepalive.next_action(t0 + PING_INTERVAL / 2),
+            keepalive.next_action(t0),
+            KeepaliveAction::Idle,
+            "a busy-enough connection sends no keepalive"
+        );
+        keepalive.record_send(t0);
+        assert_eq!(
+            keepalive.next_action(t0 + PING_INTERVAL),
+            KeepaliveAction::Ping,
+            "one silent direction for an interval owes a probe"
+        );
+        keepalive.record_probe(t0 + PING_INTERVAL);
+        assert_eq!(
+            keepalive.next_action(t0 + PING_INTERVAL + PING_INTERVAL / 2),
             KeepaliveAction::Idle
         );
         assert_eq!(
-            keepalive.next_action(t0 + PING_INTERVAL),
+            keepalive.next_action(t0 + PING_INTERVAL * 2),
             KeepaliveAction::Ping
         );
     }
