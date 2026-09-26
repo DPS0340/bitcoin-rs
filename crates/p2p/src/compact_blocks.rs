@@ -235,6 +235,11 @@ impl Reconstruction {
         }
         let filled = std::mem::take(&mut entry.filled);
         let Ok(block) = complete_block(entry.header, filled) else {
+            // The taken bodies are dropped, so no byte stays retained: without
+            // this reset the dead entry keeps its charge until the deadline
+            // and later compact reconstructions can be refused for bytes that
+            // no longer exist.
+            entry.retained_bytes = 0;
             entry.fallback = true;
             return Outcome::Fallback(hash);
         };
@@ -1059,6 +1064,56 @@ mod tests {
         assert!(
             matches!(outcome, Outcome::Fallback(_)),
             "a wrong-body completion must fall back, got {outcome:?}"
+        );
+
+        let late = BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: request.txs_request.block_hash,
+                transactions: vec![registry_tx(&test_tx(2))],
+            },
+        };
+        assert!(matches!(
+            reconstruction.receive_blocktxn(&late, now()),
+            Outcome::Idle
+        ));
+    }
+
+    /// A `blocktxn` that fails verification drops its bodies, so the dead
+    /// entry must release its byte charge: until the deadline the pool would
+    /// otherwise refuse later reconstructions for bytes that no longer
+    /// exist, while the entry itself stays closed for late responses.
+    #[test]
+    fn failed_verification_releases_retained_bytes() {
+        let (native, cmpct) = sample_cmpct(vec![test_tx(1), test_tx(2)], 2, 0x78);
+        let hints = SetHints {
+            txs: vec![native.txs[0].clone()],
+        };
+        let mut reconstruction = Reconstruction::new();
+
+        let outcome =
+            reconstruction.receive_cmpctblock(&cmpct, COMPACT_BLOCK_VERSION, &hints, now());
+        let Outcome::RequestMissing(request) = outcome else {
+            panic!("expected a getblocktxn request, got {outcome:?}");
+        };
+        assert!(
+            reconstruction.retained_bytes() > 0,
+            "the pending entry must charge its bodies"
+        );
+
+        let wrong_body = BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: request.txs_request.block_hash,
+                transactions: vec![registry_tx(&test_tx(9))],
+            },
+        };
+        assert!(matches!(
+            reconstruction.receive_blocktxn(&wrong_body, now()),
+            Outcome::Fallback(_)
+        ));
+        assert_eq!(
+            reconstruction.retained_bytes(),
+            0,
+            "a failed verification keeps no body behind"
         );
 
         let late = BlockTxn {
