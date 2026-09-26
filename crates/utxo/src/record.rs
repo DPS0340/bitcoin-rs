@@ -608,7 +608,7 @@ impl UtxoRecord {
         txid: Hash256,
         additions: &'p [OutputParts<'p>],
         add_unique: bool,
-        mut overwritten: Option<&mut Vec<Option<OwnedUtxoOut>>>,
+        overwritten: Option<&mut Vec<Option<OwnedUtxoOut>>>,
     ) -> Result<Self, UtxoError> {
         if add_unique {
             let appended = match existing {
@@ -1651,7 +1651,7 @@ mod tests {
         let original = record.clone();
         let too_large = OwnedUtxoOut::new(1, 2, vec![0_u8; usize::from(u16::MAX) + 1], false, 1);
         let additions = [OutputParts::from_owned(&too_large)];
-        for overwritten in [None, Some(Vec::new())] {
+        for mut overwritten in [None, Some(Vec::new())] {
             assert!(matches!(
                 UtxoRecord::add_run_replacement(
                     Some(&record),
@@ -1878,13 +1878,13 @@ mod tests {
         assert_eq!(
             removed
                 .iter()
-                .map(|out| out.unwrap().vout)
+                .map(|out| out.as_ref().unwrap().vout)
                 .collect::<Vec<_>>(),
             vec![2, 0, 1]
         );
-        assert_eq!(removed[0].unwrap().value, 12);
-        assert_eq!(removed[1].unwrap().value, 10);
-        assert_eq!(removed[2].unwrap().value, 11);
+        assert_eq!(removed[0].as_ref().unwrap().value, 12);
+        assert_eq!(removed[1].as_ref().unwrap().value, 10);
+        assert_eq!(removed[2].as_ref().unwrap().value, 11);
         Ok(())
     }
 
