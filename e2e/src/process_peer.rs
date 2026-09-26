@@ -245,25 +245,30 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     remaining_time(deadline, Instant::now(), "P2P operation deadline")
 }
 
-fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], first_byte: Duration) -> Result<()> {
+fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
     let total = bytes.len();
     while !bytes.is_empty() {
-        // Once a read is partially consumed it must run to completion at
-        // the message timeout: abandoning it would strand the stream
-        // mid-frame and desynchronize every read that follows.
-        let wait = if bytes.len() == total {
-            first_byte
-        } else {
-            TIMEOUT
-        };
+        // The deadline bounds every wait with a floor, so a peer dribbling
+        // one byte at a time cannot renew it. Before any byte lands the
+        // failure stays a retryable timeout; once the buffer is partially
+        // consumed the wire is mid-frame — resuming would read a desynced
+        // offset, so expiry surfaces as a terminal error instead.
+        let wait = remaining(deadline).unwrap_or(Duration::from_millis(1));
         stream.set_read_timeout(Some(wait))?;
-        let count = stream.read(bytes)?;
-        if count == 0 {
-            return Err(Error::Protocol("truncated P2P frame".to_owned()));
+        match stream.read(bytes) {
+            Ok(0) => return Err(Error::Protocol("truncated P2P frame".to_owned())),
+            Ok(count) => {
+                bytes = bytes
+                    .get_mut(count..)
+                    .ok_or_else(|| Error::Protocol("invalid read length".to_owned()))?;
+            }
+            Err(error) if bytes.len() != total => {
+                return Err(Error::Protocol(format!(
+                    "P2P frame abandoned mid-read: {error}"
+                )));
+            }
+            Err(error) => return Err(error.into()),
         }
-        bytes = bytes
-            .get_mut(count..)
-            .ok_or_else(|| Error::Protocol("invalid read length".to_owned()))?;
     }
     Ok(())
 }
@@ -284,18 +289,26 @@ fn payload_length(header: &[u8]) -> Result<usize> {
 /// Read one complete wire frame (header plus payload) before the deadline.
 pub fn read_frame(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>> {
     let mut header = [0; HEADER_BYTES];
-    let first_byte = remaining(deadline).unwrap_or(Duration::from_millis(1));
-    read_exact(stream, &mut header, first_byte)?;
+    read_exact(stream, &mut header, deadline)?;
     let length = payload_length(&header)?;
     let mut frame = header.to_vec();
     frame.resize(HEADER_BYTES + length, 0);
     let payload = frame
         .get_mut(HEADER_BYTES..)
         .ok_or_else(|| Error::Protocol("missing P2P payload".to_owned()))?;
-    // The header is in, so the frame is in flight: the payload runs at the
-    // message timeout rather than the frame-start deadline, which may have
-    // already elapsed and would abort the read mid-frame.
-    read_exact(stream, payload, TIMEOUT)?;
+    // The header was consumed, so a payload-phase timeout strands the
+    // stream mid-frame: it is terminal for the peer, never a soft retry.
+    read_exact(stream, payload, deadline).map_err(|error| match error {
+        Error::Io(ref io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Error::Protocol(format!("P2P payload read expired mid-frame: {error}"))
+        }
+        other => other,
+    })?;
     Ok(frame)
 }
 
