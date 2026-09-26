@@ -693,6 +693,27 @@ mod tests {
     }
 
     #[test]
+    fn multisig_shape_without_valid_keys_is_nonstandard() {
+        // OP_1 <4 bytes> OP_1 OP_CHECKMULTISIG: the template shape of bare
+        // multisig with a push that is not pubkey-sized at all.
+        let short_push = [0x51, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x51, 0xae];
+        // OP_1 <33 bytes starting 0x04> OP_1 OP_CHECKMULTISIG: pubkey-sized
+        // but a 0x04 header promises a 65-byte key, so `CPubKey::IsValid`
+        // (and `multisig_key_count`) rejects it.
+        let mut wrong_prefix = vec![0x51, 0x21, 0x04];
+        wrong_prefix.extend([0x11; 32]);
+        wrong_prefix.extend([0x51, 0xae]);
+        for script in [&short_push[..], &wrong_prefix[..]] {
+            assert_eq!(classify(script), ScriptShape::Nonstandard, "{script:?}");
+            assert_eq!(
+                core_type_name(classify(script)),
+                "nonstandard",
+                "{script:?}"
+            );
+        }
+    }
+
+    #[test]
     fn core_json_types_anchor_and_future_witness_programs() {
         let anchor = tx_render::script_pub_key_json(&fixtures::anchor(), Network::Mainnet);
         assert_eq!(

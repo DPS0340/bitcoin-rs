@@ -181,13 +181,18 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
         }
     }
 
-    let Some(live) = ctx.chain.utxo.get_entry(&outpoint) else {
+    // Core: the UTXO lookup and the chainstate tip (`coins_view->GetBestBlock`)
+    // are read under `cs_main`; capture both inside the stability barrier so a
+    // tip advance cannot interleave between the coin and its `bestblock`.
+    let Some((live, view)) = ctx.chain.with_stable_chainstate(|| {
+        ctx.chain
+            .utxo
+            .get_entry(&outpoint)
+            .map(|live| (live, ctx.chain.applied_view()))
+    }) else {
         // Spent or never existed: Core-spec returns JSON null.
         return Ok(Value::new_null());
     };
-    // Core: confirmations and `bestblock` both come from the chainstate tip
-    // (`coins_view->GetBestBlock`), so one captured view supplies both.
-    let view = ctx.chain.applied_view();
     let confirmations = view.height().saturating_sub(live.height).saturating_add(1);
     txout_typed(
         ctx,

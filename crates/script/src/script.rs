@@ -336,16 +336,23 @@ pub fn is_multisig(script: &[u8]) -> bool {
 /// is not a serialized pubkey.
 ///
 /// `is_multisig` checks the template shape only; this is the strictness Core's
-/// `Solver` applies on top, where each key push must be a compressed
-/// (33-byte) or uncompressed (65-byte) pubkey. `OP_1 <4 bytes> OP_1
-/// OP_CHECKMULTISIG` has the shape but no valid key, so it returns `None`.
+/// `Solver` applies on top, where each key push must decode as a `CPubKey`:
+/// 33 bytes starting `0x02`/`0x03` for compressed, 65 bytes starting
+/// `0x04`/`0x06`/`0x07` for uncompressed and hybrid (`CPubKey::GetLen`).
+/// `OP_1 <4 bytes> OP_1 OP_CHECKMULTISIG` has the shape but no valid key, so
+/// it returns `None`.
 #[must_use]
 pub fn multisig_key_count(script: &[u8]) -> Option<u8> {
     let mut count: u8 = 0;
     for inst in instructions(script) {
         match inst {
             Ok(Instruction::PushBytes(bytes)) => {
-                if bytes.len() != 33 && bytes.len() != 65 {
+                let is_pubkey = match bytes.len() {
+                    33 => matches!(bytes[0], 0x02 | 0x03),
+                    65 => matches!(bytes[0], 0x04 | 0x06 | 0x07),
+                    _ => false,
+                };
+                if !is_pubkey {
                     return None;
                 }
                 count = count.checked_add(1)?;
