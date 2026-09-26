@@ -313,7 +313,7 @@ impl PeerLease {
         connected_at: Instant,
     ) -> Self {
         let mut lease = Self::new(outbound);
-        lease.connected = connected_at;
+        lease.backdate_for_test(connected_at);
         lease
     }
 
@@ -429,6 +429,7 @@ impl PeerLease {
     /// Moves this lease's connection instant into the past.
     #[cfg(test)]
     pub(crate) fn backdate_for_test(&mut self, at: Instant) {
+        debug_assert!(at <= Instant::now());
         self.connected = at;
     }
 
