@@ -277,10 +277,10 @@ fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Erro
         None => std::env::current_exe()?,
     };
     let bytes = fs::read(&path)?;
-    if std::env::var_os("SDT_ELF").is_none() && !cfg!(feature = "usdt") {
+    if !cfg!(feature = "usdt") {
         // Feature-off artifact: the whole point of the default build is that
-        // no probe notes leak into it, so assert exactly that instead of
-        // skipping silently.
+        // no probe notes leak into it, so assert exactly that for whichever
+        // artifact is under test instead of skipping silently.
         let notes = match parse_sdt_notes(&bytes) {
             SdtParse::NotElf => Vec::new(),
             SdtParse::Malformed(reason) => {

@@ -52,7 +52,8 @@ bitcoin-rs-p2p        = { path = "crates/p2p",        version = "0.8.0" }
 bitcoin-rs-mining     = { path = "crates/mining",     version = "0.8.0" }
 bitcoin-rs-rpc        = { path = "crates/rpc",        version = "0.8.0" }
 bitcoin-rs-node       = { path = "crates/node",       version = "0.8.0", default-features = false }
-# USDT tracepoint layer. Optional everywhere it is used; see crates/trace.
+# USDT probe emission is optional everywhere the crate is used (feature
+# `usdt`, off by default); see crates/trace.
 bitcoin-rs-trace      = { path = "crates/trace",      version = "0.8.0", default-features = false }
 
 # Allocator. Defaults pull `secure` and `extended` overhead — disable for perf.
