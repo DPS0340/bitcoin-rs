@@ -21,7 +21,7 @@ fn checkpoint_roundtrip_preserves_record_with_440_outputs() -> Result<(), Box<dy
         ));
     }
     let utxo = UtxoSet::new();
-    utxo.commit_block(&changes, &Hash256::default())?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&utxo, &changes, &Hash256::default())?;
 
     super::super::write_checkpoint(
         dir.path(),
@@ -77,7 +77,7 @@ fn scanned_trailer_restores_independently_scanned_stats() -> Result<(), Box<dyn 
     assert_eq!(restored.coin_stats, expected);
 
     let listener = CoinStatsListener::new(restored.coin_stats.clone());
-    restored.utxo.set_listener(Box::new(listener.clone()));
+    restored.utxo.track_coin_stats(listener.clone());
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(
         OutPoint::new(Txid(Hash256::from_le_bytes(&[0x5a; 32])), 42),
@@ -88,9 +88,11 @@ fn scanned_trailer_restores_independently_scanned_stats() -> Result<(), Box<dyn 
         false,
         restored.applied_tip.height,
     ));
-    restored
-        .utxo
-        .commit_block(&changes, &Hash256::from_le_bytes(&[0xa5; 32]))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &restored.utxo,
+        &changes,
+        &Hash256::from_le_bytes(&[0xa5; 32]),
+    )?;
     let continued = restored
         .utxo
         .with_stable_view(|view| scan_coin_stats(view, restored.applied_tip.height, true))?;

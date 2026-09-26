@@ -3,21 +3,9 @@
 use bitcoin_rs_primitives::{Block, OutPoint, Txid};
 use hashbrown::{HashMap, HashSet};
 
-use crate::connect::is_coinbase_tx;
-use crate::{UtxoSet, shard::LiveOutput};
-
-/// Where a block's prevouts are read from: the committed set, or a
-/// [`WindowOverlay`] over blocks prepared but not yet committed.
-pub trait OutputSource {
-    /// The live output an outpoint refers to, or `None` if unspendable here.
-    fn get_entry(&self, outpoint: &OutPoint) -> Option<LiveOutput>;
-}
-
-impl OutputSource for UtxoSet {
-    fn get_entry(&self, outpoint: &OutPoint) -> Option<LiveOutput> {
-        Self::get_entry(self, outpoint)
-    }
-}
+use crate::UtxoSet;
+use crate::contract::{OutputSource, is_coinbase_tx};
+use crate::set::UtxoCoin;
 
 /// The committed UTXO set plus the net effect of window blocks already prepared.
 /// Spends are tombstoned rather than removed so a later window block can
@@ -26,7 +14,7 @@ pub struct WindowOverlay<'u> {
     base: &'u UtxoSet,
     max_script_size: usize,
     /// `Some` created and live, `None` spent, absent means ask `base`.
-    changed: HashMap<OutPoint, Option<LiveOutput>>,
+    changed: HashMap<OutPoint, Option<UtxoCoin>>,
 }
 
 impl<'u> WindowOverlay<'u> {
@@ -42,7 +30,7 @@ impl<'u> WindowOverlay<'u> {
 
     /// Folds one block's net effect into the view. `same_block_spent`
     /// outpoints are skipped on both sides, as in
-    /// [`build_block_changes`](crate::connect::build_block_changes). Genesis is
+    /// [`build_block_changes`](crate::contract::build_block_changes). Genesis is
     /// a no-op, as in the apply path.
     ///
     /// # Errors
@@ -79,7 +67,8 @@ impl<'u> WindowOverlay<'u> {
                 let txout = txout.clone();
                 self.changed.insert(
                     outpoint,
-                    Some(LiveOutput {
+                    Some(UtxoCoin {
+                        outpoint,
                         txout,
                         coinbase,
                         height,
@@ -108,7 +97,7 @@ pub enum WindowOverlayError {
 }
 
 impl OutputSource for WindowOverlay<'_> {
-    fn get_entry(&self, outpoint: &OutPoint) -> Option<LiveOutput> {
+    fn get_entry(&self, outpoint: &OutPoint) -> Option<UtxoCoin> {
         self.changed
             .get(outpoint)
             .map_or_else(|| self.base.get_entry(outpoint), Clone::clone)
@@ -124,7 +113,8 @@ mod tests {
     use hashbrown::HashSet;
 
     use super::{OutputSource, WindowOverlay, WindowOverlayError};
-    use crate::{UndoBatch, UtxoAdd, UtxoSet};
+    use crate::UtxoSet;
+    use crate::contract::{UndoBatch, UtxoAdd};
 
     /// Opaque test bound; the apply path supplies the consensus value.
     const MAX_SCRIPT_SIZE: usize = 64;
@@ -188,7 +178,7 @@ mod tests {
     fn create_spend_and_recreate_shadow_the_committed_set() -> TestResult {
         let utxo = UtxoSet::new();
         let funded = OutPoint::new(Txid(Hash256::from_le_bytes(&[0x31; 32])), 0);
-        let mut seed = UndoBatch::default();
+        let mut seed = UndoBatch::empty();
         seed.restore(UtxoAdd::new(
             funded,
             paying(vec![0x51], 900).outputs.remove(0),

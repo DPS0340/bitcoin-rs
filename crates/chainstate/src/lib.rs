@@ -22,11 +22,9 @@ use bitcoin_rs_storage::InMemoryUndoStore;
 pub use bitcoin_rs_storage::KvUndoStore;
 pub use bitcoin_rs_storage::UndoStore;
 use bitcoin_rs_storage::block_body::BlockBodyStore;
-use bitcoin_rs_utxo::LiveOutput;
-use bitcoin_rs_utxo::LiveOutputMeta;
+use bitcoin_rs_utxo::UtxoCoin;
 use bitcoin_rs_utxo::UtxoSet;
-use bitcoin_rs_utxo::connect::SpentOutputLookup;
-use bitcoin_rs_utxo::is_coinbase_tx;
+use bitcoin_rs_utxo::contract::{SpentOutputLookup, is_coinbase_tx};
 use connect::apply_block_admitted;
 use connect::apply_block_with_serialized_admitted;
 use connect::apply_committed_block_admitted;
@@ -1279,7 +1277,7 @@ struct DisconnectPlan {
     parent_tip: TipSnapshot,
     parent_prev_hash: Hash256,
     parent_chain_tx_count: u64,
-    undo: bitcoin_rs_utxo::UndoBatch,
+    undo: bitcoin_rs_utxo::contract::UndoBatch,
     height: u32,
     tx_count_delta: u64,
 }
@@ -1609,11 +1607,27 @@ impl WitnessPresence {
     }
 }
 
+/// Creation metadata of a spent prevout: what maturity and sequence-lock
+/// checks read, without materializing the output payload.
+struct PrevoutMeta {
+    coinbase: bool,
+    height: u32,
+}
+
+impl PrevoutMeta {
+    const fn of(coin: &UtxoCoin) -> Self {
+        Self {
+            coinbase: coin.coinbase,
+            height: coin.height,
+        }
+    }
+}
+
 /// All external (already-committed) prevouts for one block, resolved in a single
 /// parallel pass so `script_verify`, `coinbase_maturity`, and `bip68` reuse one
 /// lookup table instead of hitting the `UtxoSet` repeatedly.
 struct ResolvedUtxoView {
-    external: HashMap<OutPoint, LiveOutput>,
+    external: HashMap<OutPoint, UtxoCoin>,
 }
 
 impl ResolvedUtxoView {
@@ -1622,7 +1636,7 @@ impl ResolvedUtxoView {
     /// Generic so a window can substitute an overlay carrying the outputs its
     /// earlier blocks created. Every caller outside a window passes the
     /// committed set.
-    fn resolve<S: bitcoin_rs_utxo::OutputSource + ?Sized>(
+    fn resolve<S: bitcoin_rs_utxo::contract::OutputSource + ?Sized>(
         utxo: &S,
         block: &Block,
         tx_plan: &BlockTxPlan,
@@ -1653,15 +1667,12 @@ impl ResolvedUtxoView {
     }
 
     /// Full resolved entry for a spent outpoint, including creation metadata.
-    fn entry(&self, outpoint: &OutPoint) -> Option<&LiveOutput> {
+    fn entry(&self, outpoint: &OutPoint) -> Option<&UtxoCoin> {
         self.external.get(outpoint)
     }
 
-    fn lookup_meta(&self, outpoint: &OutPoint) -> Option<LiveOutputMeta> {
-        self.external.get(outpoint).map(|entry| LiveOutputMeta {
-            coinbase: entry.coinbase,
-            height: entry.height,
-        })
+    fn lookup_meta(&self, outpoint: &OutPoint) -> Option<PrevoutMeta> {
+        self.external.get(outpoint).map(PrevoutMeta::of)
     }
 }
 
@@ -1672,7 +1683,7 @@ impl UtxoView for ResolvedUtxoView {
 }
 
 impl SpentOutputLookup for ResolvedUtxoView {
-    fn entry(&self, outpoint: &OutPoint) -> Option<&LiveOutput> {
+    fn entry(&self, outpoint: &OutPoint) -> Option<&UtxoCoin> {
         self.entry(outpoint)
     }
 }
@@ -1699,12 +1710,12 @@ impl<'b> BlockLocalUtxoView<'b> {
         }
     }
 
-    fn lookup_meta(&self, outpoint: &OutPoint) -> Option<LiveOutputMeta> {
+    fn lookup_meta(&self, outpoint: &OutPoint) -> Option<PrevoutMeta> {
         if let Some(entry) = self.overlay.get(outpoint) {
             let derived_index = usize::try_from((*entry)?).ok()?;
             let vout = usize::try_from(outpoint.vout).ok()?;
             self.txdata.get(derived_index)?.outputs.get(vout)?;
-            return Some(LiveOutputMeta {
+            return Some(PrevoutMeta {
                 coinbase: derived_index == 0,
                 height: self.height,
             });
@@ -1725,7 +1736,7 @@ impl<'b> BlockLocalUtxoView<'b> {
         output_count: usize,
     ) -> core::result::Result<(), ApplyError> {
         for vout in 0..output_count {
-            let vout = u32::try_from(vout).map_err(|_| ApplyError::HeightOverflow(self.height))?;
+            let vout = u32::try_from(vout).map_err(|_| ApplyError::VoutOverflow { txid })?;
             self.overlay
                 .insert(OutPoint::new(txid, vout), Some(derived_index));
         }

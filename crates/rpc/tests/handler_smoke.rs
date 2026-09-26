@@ -23,7 +23,7 @@ use bitcoin_rs_primitives::{
 };
 use bitcoin_rs_rpc::context::{ChainControl, ChainControlError, Context};
 use bitcoin_rs_rpc::{Handler, RpcError};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
 struct SmokeMiningControl;
@@ -320,8 +320,11 @@ fn gettxoutsetinfo_returns_real_utxo_counts() -> Result<(), Box<dyn std::error::
         false,
         1,
     ));
-    ctx.utxo
-        .commit_block(&changes, &Hash256::from_le_bytes(&[0xaa; 32]))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &ctx.utxo,
+        &changes,
+        &Hash256::from_le_bytes(&[0xaa; 32]),
+    )?;
     let handler = Handler::new(Arc::clone(&ctx));
     let result = handler.dispatch("gettxoutsetinfo", &json!([]))?;
     assert_eq!(

@@ -67,7 +67,7 @@ pub(super) struct PendingBlockCommit {
     /// Commit id 0 until the group's batch assigns the prefix id.
     pub outcome: ConnectOutcome,
     /// The block's encoded undo record, landed in the group's receipt.
-    pub undo_record: Vec<u8>,
+    pub undo_record: bitcoin_rs_utxo::contract::UndoRecord,
     pub tx_count_delta: u64,
     pub chain_tx_count_after: u64,
     /// This block's parent; the group's first entry anchors the lineage
@@ -162,7 +162,7 @@ impl WindowGroup {
             undo_rows.push((
                 pending.outcome.height,
                 pending.outcome.hash,
-                pending.undo_record.as_slice(),
+                pending.undo_record.as_bytes(),
             ));
             if let Some(row) =
                 stored_body_row(handles, pending.outcome.height, pending.outcome.hash)?

@@ -27,7 +27,8 @@ use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::OutPoint;
 use bitcoin_rs_storage::{CommitRecords, DurableHead};
-use bitcoin_rs_utxo::{LiveOutput, OutputSource, UndoLoadError, load_block_undo};
+use bitcoin_rs_utxo::UtxoCoin;
+use bitcoin_rs_utxo::contract::{OutputSource, UndoLoadError, load_block_undo};
 /// Facts of one connected block that its durable head commit names.
 pub(super) struct ConnectCommitFacts {
     /// Parent the durable head must currently name — for a group, the
@@ -183,15 +184,16 @@ const REPLAY_GAP_BLOCK_LIMIT: usize = super::window::DURABLE_HEAD_GROUP_BLOCKS;
 ///
 /// The stored head certifies the undo record in the same batch as the body,
 /// so the coins it restores are exactly the inputs the committed block saw.
-struct UndoRowSpends<'a>(&'a bitcoin_rs_utxo::UndoBatch);
+struct UndoRowSpends<'a>(&'a bitcoin_rs_utxo::contract::UndoBatch);
 
 impl OutputSource for UndoRowSpends<'_> {
-    fn get_entry(&self, outpoint: &OutPoint) -> Option<LiveOutput> {
+    fn get_entry(&self, outpoint: &OutPoint) -> Option<UtxoCoin> {
         self.0
             .restores()
             .iter()
             .find(|add| &add.outpoint == outpoint)
-            .map(|add| LiveOutput {
+            .map(|add| UtxoCoin {
+                outpoint: add.outpoint,
                 txout: add.txout.clone(),
                 coinbase: add.coinbase,
                 height: add.height,

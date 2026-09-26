@@ -576,6 +576,8 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
             )));
         }
         ApplyError::HeightOverflow(_)
+        | ApplyError::VoutOverflow { .. }
+        | ApplyError::TxidCountMismatch { .. }
         | ApplyError::ChainChangeGenerationOverflow
         | ApplyError::Chain(
             ChainError::NodeIdOverflow { .. }

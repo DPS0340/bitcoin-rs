@@ -2,8 +2,9 @@ use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
 use bitcoin_rs_primitives::{
     Amount, BlockHash, CompactTarget, Hash256, Header, OutPoint, TxOut, Txid, consensus_bytes,
 };
+use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 
 use super::{JournalRecord, JournalReplayError, Mutation, replay_records, validate_replayed_head};
 use bitcoin_rs_storage::chainstate_journal::Coin;
@@ -60,7 +61,7 @@ fn base_state() -> TestResult<BaseState> {
     let base_coin = coin(1, 0, 50);
     let listener = CoinStatsListener::new(CoinStats::default());
     let mut utxo = UtxoSet::new();
-    utxo.set_listener(Box::new(listener.clone()));
+    utxo.track_coin_stats(listener.clone());
     let mut changes = BlockChanges::with_capacity(1, 0);
     changes.add(UtxoAdd::new(
         base_coin.outpoint,
@@ -68,7 +69,7 @@ fn base_state() -> TestResult<BaseState> {
         base_coin.coinbase,
         base_coin.height,
     ));
-    utxo.commit_block(&changes, &base_tip.hash)?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&utxo, &changes, &base_tip.hash)?;
     listener.finish_block(0, 1);
     Ok((tree, utxo, listener.snapshot(), base_tip, base_coin))
 }

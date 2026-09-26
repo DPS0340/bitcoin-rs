@@ -25,7 +25,7 @@ fn make_sync(peer_table: Arc<PeerTable>) -> BlockSync {
     let (_blocks_tx, blocks_rx) = unbounded();
     let coin_stats = Arc::new(CoinStatsListener::new(CoinStats::default()));
     let mut utxo = UtxoSet::new();
-    utxo.set_listener(Box::new((*coin_stats).clone()));
+    utxo.track_coin_stats((*coin_stats).clone());
     let handles = Chainstate::new(
         Network::Regtest,
         chain_tip,

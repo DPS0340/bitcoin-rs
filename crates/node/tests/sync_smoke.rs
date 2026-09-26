@@ -260,7 +260,7 @@ fn apply_handles_with_coin_stats_and_utxo(
 ) -> (Chainstate, Arc<CoinStatsListener>, Arc<UtxoSet>) {
     let coin_stats = Arc::new(CoinStatsListener::new(CoinStats::default()));
     let mut utxo = UtxoSet::new();
-    utxo.set_listener(Box::new((*coin_stats).clone()));
+    utxo.track_coin_stats((*coin_stats).clone());
     let utxo = Arc::new(utxo);
     let chain_events = bitcoin_rs_chainstate::events::ChainEventPublisher::detached(0);
     let handles = Chainstate::new(

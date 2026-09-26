@@ -8,11 +8,11 @@ use smallvec::SmallVec;
 
 use crate::{
     UtxoError, UtxoKey,
+    contract::UtxoAdd,
+    listener::{UtxoChangeEvents, UtxoChangeListener, UtxoInserted, UtxoRemoved},
     record::{OutputParts, OwnedUtxoOut, RemovedRecord, UtxoRecord},
-    set::{
-        BuildPayload, ScannedUtxo, SpendPayload, UtxoAdd, UtxoChangeEvents, UtxoChangeListener,
-        UtxoInserted, UtxoRemoved, UtxoScan,
-    },
+    set::{BuildPayload, SpendPayload},
+    set::{UtxoCoin, UtxoScan},
 };
 
 /// Per-shard hash table of compact, inline UTXO record owners.
@@ -67,26 +67,6 @@ impl ShardTable {
         let buckets = capacity.saturating_mul(8).div_ceil(7).next_power_of_two();
         buckets.saturating_mul(core::mem::size_of::<UtxoRecord>() + 1)
     }
-}
-
-/// One live UTXO output with the metadata consensus consumers need.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LiveOutput {
-    /// The transaction output script + value.
-    pub txout: TxOut,
-    /// Whether the originating transaction was a coinbase.
-    pub coinbase: bool,
-    /// Block height at which this output was created.
-    pub height: u32,
-}
-
-/// One live UTXO output's metadata without script or value materialization.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LiveOutputMeta {
-    /// Whether the originating transaction was a coinbase.
-    pub coinbase: bool,
-    /// Block height at which this output was created.
-    pub height: u32,
 }
 
 /// One cache-padded, lock-protected UTXO shard.
@@ -153,36 +133,18 @@ impl Shard {
         Some(txout_from_parts(output.value, output.script_pubkey))
     }
 
-    /// Returns the full live-output entry (txout + coinbase + height)
+    /// Returns the full live coin (outpoint + txout + coinbase + height)
     /// if `key:vout` is live in this shard.
     #[must_use]
-    pub(crate) fn get_entry(&self, key: UtxoKey, txid: &Hash256, vout: u32) -> Option<LiveOutput> {
+    pub(crate) fn get_entry(&self, key: UtxoKey, txid: &Hash256, vout: u32) -> Option<UtxoCoin> {
         let table = self.inner.read();
         let record = table.table.find(key.hash(), |record| {
             record.key() == key && record.txid() == *txid
         })?;
         let output = record.find_output(vout)?;
-        Some(LiveOutput {
+        Some(UtxoCoin {
+            outpoint: OutPoint::new((*txid).into(), vout),
             txout: txout_from_parts(output.value, output.script_pubkey),
-            coinbase: output.coinbase,
-            height: output.height,
-        })
-    }
-
-    /// Returns live-output metadata without materializing script bytes.
-    #[must_use]
-    pub(crate) fn get_meta(
-        &self,
-        key: UtxoKey,
-        txid: &Hash256,
-        vout: u32,
-    ) -> Option<LiveOutputMeta> {
-        let table = self.inner.read();
-        let record = table.table.find(key.hash(), |record| {
-            record.key() == key && record.txid() == *txid
-        })?;
-        let output = record.find_output(vout)?;
-        Some(LiveOutputMeta {
             coinbase: output.coinbase,
             height: output.height,
         })
@@ -211,28 +173,13 @@ impl Shard {
             for output in record.outputs() {
                 scan.txouts = scan.txouts.saturating_add(1);
                 if scripts.iter().any(|target| *target == output.script_pubkey) {
-                    scan.unspents.push(ScannedUtxo {
+                    scan.unspents.push(UtxoCoin {
                         outpoint: OutPoint::new(record.txid().into(), output.vout),
                         txout: txout_from_parts(output.value, output.script_pubkey),
                         coinbase: output.coinbase,
                         height: output.height,
                     });
                 }
-            }
-        }
-    }
-
-    pub(crate) fn scan_all(&self, scan: &mut UtxoScan) {
-        let table = self.inner.read();
-        for record in &table.table {
-            for output in record.outputs() {
-                scan.txouts = scan.txouts.saturating_add(1);
-                scan.unspents.push(ScannedUtxo {
-                    outpoint: OutPoint::new(record.txid().into(), output.vout),
-                    txout: txout_from_parts(output.value, output.script_pubkey),
-                    coinbase: output.coinbase,
-                    height: output.height,
-                });
             }
         }
     }
@@ -1013,7 +960,7 @@ mod tests {
             value: Amount::from_sat(7),
             script_pubkey: vec![0x51].into(),
         };
-        let add = crate::UtxoAdd::new(
+        let add = crate::contract::UtxoAdd::new(
             OutPoint::new(bitcoin_rs_primitives::Txid::from(txid), 0),
             txout,
             false,

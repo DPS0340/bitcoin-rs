@@ -241,6 +241,48 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   generation fence around the operation. Reorg body memory is bounded by the
   chainstate streaming window; no whole departed branch is retained.
 
+### `ARCH-07a`: Chainstate mutates `utxo` through one narrow contract
+
+`bitcoin-rs-utxo` is not a second mutation authority: it holds the live coin
+set and the persistence formats, and chainstate drives it through one
+coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
+
+- **Apply**: `build_block_changes` turns one validated block into its
+  `BlockChanges`, its `UndoBatch`, and the `BlockValueTotals` the coinbase
+  check needs. Resolved prevouts enter through `SpentOutputLookup`; the live
+  set at BIP30 exception heights enters as the optional overwritten lookup.
+- **Commit**: `contract::commit_block_changes` applies one block's
+  `BlockChanges` and
+  emits commit events to the single attached `CoinStatsListener`; the set's
+  raw mutator is crate-private.
+- **Disconnect**: `persist_block_undo` / `load_block_undo` round-trip one
+  block's `UndoBatch` as the `UndoRecord` bytes the durable head receipt
+  names, and `rollback_block` applies that batch under the durable
+  disconnect marker plus the coinstats rewind. The raw inverse
+  (`UtxoSet::undo_block`) is crate-private: every external disconnect goes
+  through `rollback_block`.
+- **Read**: `UtxoSet::get` returns the `TxOut` payload while `get_entry`
+  returns the one `UtxoCoin` shape; whole-set
+  reads run under `with_stable_view` (`UtxoSetView`), which also serves the
+  `hash_serialized_3` commitment, script scans, and memory accounting.
+  Windowed apply reads through `WindowOverlay` over the same `OutputSource`.
+- Shard, record, commit-event, and undo-codec machinery is crate-private.
+  Rollback sequencing is split at the marker fence, which is exactly where
+  the crate boundary runs: `utxo::contract::rollback_block` owns the fenced
+  set mutation (arm the marker, undo the set, rewind coinstats, complete the
+  marker) and nothing beyond it. Chainstate owns everything around that
+  fence — refusing a stale tip before arming, then journal rewind, durable
+  head advance, and publication. It disarms the marker only when the journal
+  rewind succeeds; otherwise a matching clean checkpoint disarms it after
+  publishing the rolled-back set. Chainstate owns this surrounding order and
+  durability policy (`ARCH-07`).
+- The contract surface is `bitcoin_rs_utxo::contract`; the crate root keeps
+  only read, snapshot, and statistics names. RPC is a read consumer of the
+  root read types (`UtxoCoin`, `UtxoScan`); index is the read consumer that
+  decodes the contract's `UndoBatch`. Neither assembles mutations outside
+  tests, which build fixture sets through
+  `BlockChanges` + `commit_block_changes`.
+
 ### `ARCH-08`: Durable pruning and reorg retention
 
 - Transaction-cache pruning must not remove transactions from a block above

@@ -1,10 +1,10 @@
 use alloc::sync::Arc;
 use core::convert::Infallible;
 
-use crate::{
-    SnapshotCoin, SnapshotCoinObserver, UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent,
-    UtxoInserted, UtxoRemoved,
+use crate::listener::{
+    UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent, UtxoInserted, UtxoRemoved,
 };
+use crate::snapshot::{SnapshotCoin, SnapshotCoinObserver};
 use bitcoin_rs_primitives::{OutPoint, TxOut};
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -1016,12 +1016,13 @@ mod tests {
 
     #[test]
     fn scan_coin_stats_matches_rolling_listener() {
-        use crate::{BlockChanges, SnapshotCoin, SnapshotCoinObserver, UtxoAdd, UtxoSet};
+        use crate::contract::{BlockChanges, UtxoAdd};
+        use crate::{SnapshotCoin, SnapshotCoinObserver, UtxoSet};
         use bitcoin_rs_primitives::{Hash256, OutPoint};
 
         let mut utxo = UtxoSet::new();
         let listener = super::CoinStatsListener::new(super::CoinStats::new());
-        utxo.set_listener(Box::new(listener.clone()));
+        utxo.track_coin_stats(listener.clone());
         let mut changes = BlockChanges::default();
         for (i, script_len) in [0_usize, 1, 252, 253, 65_535].into_iter().enumerate() {
             let mut txid_bytes = [0_u8; 32];
@@ -1046,7 +1047,7 @@ mod tests {
                 },
             ));
         }
-        utxo.commit_block(&changes, &Hash256::default())
+        crate::contract::commit_block_changes(&utxo, &changes, &Hash256::default())
             .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
 
         let rolling = listener.snapshot();

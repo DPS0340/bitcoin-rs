@@ -12,9 +12,10 @@ use bitcoin_rs_storage::{
     CommitRecords, DisconnectMarker, DurableHead, DurableHeadStore, InMemoryDurableHeadStore,
     InMemoryUndoStore, StorageError, UndoStore,
 };
-use bitcoin_rs_utxo::connect::build_block_changes;
+use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::contract::build_block_changes;
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 
@@ -184,7 +185,11 @@ fn bip30_overwrite_undo_restores_original_coin() -> Result<(), Box<dyn std::erro
     };
     let mut seed = BlockChanges::default();
     seed.add(UtxoAdd::new(reused, older.clone(), true, 91_722));
-    utxo.commit_block(&seed, &Hash256::from_le_bytes(&[0x30; 32]))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &utxo,
+        &seed,
+        &Hash256::from_le_bytes(&[0x30; 32]),
+    )?;
 
     let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
     let resolved = ResolvedUtxoView {

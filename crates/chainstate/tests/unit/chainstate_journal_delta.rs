@@ -1,5 +1,5 @@
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, TxOut, Txid};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 
 use super::{Coin, Mutation, mutations_for_block};
 

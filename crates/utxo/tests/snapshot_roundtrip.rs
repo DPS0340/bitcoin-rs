@@ -3,9 +3,9 @@
 use std::io::{Cursor, Seek};
 
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, Script, TxOut};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::{
-    BlockChanges, SnapshotCoin, SnapshotCoinObserver, UtxoAdd, UtxoChangeEvents,
-    UtxoChangeListener, UtxoError, UtxoInserted, UtxoKey, UtxoRemoved, UtxoSet, hash_serialized_3,
+    SnapshotCoin, SnapshotCoinObserver, UtxoError, UtxoSet, hash_serialized_3,
     read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot,
     write_snapshot_observed,
 };
@@ -45,7 +45,7 @@ fn snapshot_roundtrip_preserves_vout_and_metadata_boundaries()
     changes.add(UtxoAdd::new(low, low_txout.clone(), false, 400));
     changes.add(UtxoAdd::new(high, high_txout.clone(), true, 401));
     changes.add(UtxoAdd::new(max, max_txout.clone(), false, u32::MAX));
-    set.commit_block(&changes, &txid(42_004))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &changes, &txid(42_004))?;
 
     let expected_hash = hash_serialized_3(&set)?;
     let mut file = tempfile()?;
@@ -168,7 +168,7 @@ fn observed_snapshot_traversal_matches_the_current_reader() -> Result<(), Box<dy
         false,
         2002,
     ));
-    set.commit_block(&changes, &txid(200_002))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &changes, &txid(200_002))?;
 
     let mut ordinary = Vec::new();
     let ordinary_trailer = write_snapshot(&set, &txid(200_003), 2002, &mut ordinary)?;
@@ -194,36 +194,23 @@ fn observed_snapshot_traversal_matches_the_current_reader() -> Result<(), Box<dy
     Ok(())
 }
 
-struct StaticTrailer {
-    trailer: [u8; 384],
-}
-
-impl UtxoChangeListener for StaticTrailer {
-    fn on_insert_coins(&self, _: &[UtxoInserted<'_>]) {}
-    fn on_remove_coins(&self, _: &[UtxoRemoved]) {}
-    fn on_committed_event_batches(&self, _: &[UtxoChangeEvents<'_>]) {}
-    fn muhash3072(&self) -> Option<[u8; 384]> {
-        Some(self.trailer)
-    }
-}
-
 #[test]
-fn snapshot_trailer_round_trips_through_listener() -> Result<(), Box<dyn std::error::Error>> {
-    let trailer: [u8; 384] = core::array::from_fn(|i| u8::try_from(i % 256).unwrap_or_default());
-    let mut set = UtxoSet::new();
-    set.set_listener(Box::new(StaticTrailer { trailer }));
+fn snapshot_trailer_round_trips_without_a_listener() -> Result<(), Box<dyn std::error::Error>> {
+    // With no coinstats attached, the writer falls back to the zero trailer
+    // and the strict reader round-trips exactly those bytes.
+    let set = UtxoSet::new();
 
     let op = OutPoint::new(txid(130_000).into(), 0);
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(op, txout(130_001), false, 900));
-    set.commit_block(&changes, &txid(130_099))?;
+    bitcoin_rs_utxo::contract::commit_block_changes(&set, &changes, &txid(130_099))?;
 
     let mut file = tempfile()?;
     let returned_trailer = write_snapshot(&set, &txid(130_100), 900, &mut file)?;
-    assert_eq!(returned_trailer, trailer);
+    assert_eq!(returned_trailer, [0_u8; 384]);
     file.rewind()?;
     let loaded = read_snapshot_strict_v4(&mut file)?;
-    assert_eq!(loaded.muhash_trailer, trailer);
+    assert_eq!(loaded.muhash_trailer, [0_u8; 384]);
     Ok(())
 }
 
@@ -237,10 +224,10 @@ fn v4_header(tip_hash: Hash256, height: u32, record_count: u64) -> Vec<u8> {
     bytes
 }
 
-fn v4_record_body(key: UtxoKey, txid_bytes: &[u8; 32], output_count: u32) -> Vec<u8> {
+fn v4_record_body(txid_bytes: &[u8; 32], output_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.push(key.shard());
-    bytes.extend_from_slice(&key.to_prefix());
+    bytes.push(txid_bytes[0]);
+    bytes.extend_from_slice(&txid_bytes[..8]);
     bytes.extend_from_slice(txid_bytes);
     bytes.extend_from_slice(&output_count.to_le_bytes());
     bytes
@@ -277,9 +264,8 @@ fn snapshot_read_rejects_unsupported_version() {
 #[test]
 fn snapshot_read_rejects_duplicate_vouts_in_a_v4_record() {
     let record_txid = txid(160_010);
-    let key = UtxoKey::from_txid(&record_txid.into());
     let mut bytes = v4_header(txid(160_011), 1601, 1);
-    bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 4));
+    bytes.extend_from_slice(&v4_record_body(&record_txid.to_le_bytes(), 4));
     for vout in [9, 1, 9, 1] {
         append_snapshot_output(&mut bytes, vout, 1_000, 1601, false, &[0x51]);
     }
@@ -297,9 +283,8 @@ fn snapshot_read_rejects_duplicate_vouts_in_a_v4_record() {
 #[test]
 fn snapshot_read_rejects_a_record_count_mismatch() {
     let record_txid = txid(170_000);
-    let key = UtxoKey::from_txid(&record_txid.into());
     let mut bytes = v4_header(txid(170_001), 1700, 1);
-    bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 0));
+    bytes.extend_from_slice(&v4_record_body(&record_txid.to_le_bytes(), 0));
     bytes.extend_from_slice(&[0_u8; 384]);
 
     let Err(error) = read_snapshot_strict_v4(&mut Cursor::new(bytes)) else {
@@ -336,10 +321,9 @@ fn strict_v4_observer_is_dropped_on_error() {
     }
 
     let record_txid = txid(180_000);
-    let key = UtxoKey::from_txid(&record_txid.into());
     let mut bytes = v4_header(txid(180_001), 1800, 2);
     for vout in 0..2 {
-        bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 1));
+        bytes.extend_from_slice(&v4_record_body(&record_txid.to_le_bytes(), 1));
         append_snapshot_output(
             &mut bytes,
             vout,

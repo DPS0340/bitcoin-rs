@@ -19,7 +19,7 @@ use bitcoin_rs_primitives::OutPoint;
 use bitcoin_rs_primitives::TxOut;
 use bitcoin_rs_primitives::Txid;
 use bitcoin_rs_primitives::consensus_bytes;
-use bitcoin_rs_utxo::is_coinbase_tx;
+use bitcoin_rs_utxo::contract::is_coinbase_tx;
 use hashbrown::HashSet;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ pub(super) fn parse_block_for_apply(
 /// `source` is where prevouts come from. Every caller outside a window passes
 /// the committed UTXO set; a window passes an overlay so a block can see
 /// outputs an earlier block in the same window created.
-pub(super) fn prepare_apply<'b, S: bitcoin_rs_utxo::OutputSource + ?Sized>(
+pub(super) fn prepare_apply<'b, S: bitcoin_rs_utxo::contract::OutputSource + ?Sized>(
     block: &'b Block,
     provided_serialized: Option<bytes::Bytes>,
     source: &S,

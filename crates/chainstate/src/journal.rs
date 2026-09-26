@@ -15,9 +15,9 @@ use bitcoin_rs_storage::chainstate_journal::JournalReplayBase;
 use bitcoin_rs_storage::chainstate_journal::JournalReplayError;
 use bitcoin_rs_storage::chainstate_journal::Mutation;
 use bitcoin_rs_storage::chainstate_journal::replay_committed_range;
-use bitcoin_rs_utxo::BlockChanges;
-use bitcoin_rs_utxo::UtxoAdd;
 use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::contract::BlockChanges;
+use bitcoin_rs_utxo::contract::UtxoAdd;
 use hashbrown::HashMap;
 use thiserror::Error;
 
@@ -170,7 +170,7 @@ impl ReplayAccumulator {
             ));
         }
         let coin_stats = bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
-        utxo.set_listener(Box::new(coin_stats.clone()));
+        utxo.track_coin_stats(coin_stats.clone());
         Ok(Self {
             tree,
             utxo,
@@ -329,13 +329,17 @@ fn apply_record_mutations(
             }
         }
     }
-    utxo.commit_block(&changes, &Hash256::from_le_bytes(&record.block_hash))
-        .map_err(|error| {
-            JournalReplayError::CommittedRangeInvalid(format!(
-                "height {}: utxo commit failed: {error}",
-                record.height
-            ))
-        })
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        utxo,
+        &changes,
+        &Hash256::from_le_bytes(&record.block_hash),
+    )
+    .map_err(|error| {
+        JournalReplayError::CommittedRangeInvalid(format!(
+            "height {}: utxo commit failed: {error}",
+            record.height
+        ))
+    })
 }
 
 fn advance_coin_stats(

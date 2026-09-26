@@ -6,6 +6,8 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 use thiserror::Error;
 
+use crate::contract::{BlockChanges, UndoBatch, UtxoAdd};
+use crate::listener::{UtxoChangeEvents, UtxoChangeListener};
 use crate::{UtxoKey, record::OwnedUtxoOut, shard::Shard};
 
 /// Below this many combined add+remove operations, a multi-shard no-listener
@@ -100,299 +102,13 @@ pub enum UtxoError {
     },
 }
 
-/// Receives UTXO mutations committed to durable shard state.
+/// One live UTXO coin as contract consumers observe it.
 ///
-/// The notification interface is batch-only and order-independent. A commit
-/// that touches exactly one shard delivers its same-transaction runs directly
-/// through [`Self::on_insert_coins`] and [`Self::on_remove_coins`]; a commit
-/// that touches two or more shards collects every shard's events and delivers
-/// them once, after all shard mutations have landed, through
-/// [`Self::on_committed_event_batches`].
-///
-/// Multi-shard batch order and chunking are not semantic. Batches arrive in
-/// shard order and each groups one shard's same-transaction runs, but they may
-/// be chunked, merged, or split without changing the mutations they
-/// represent. A listener must derive the same final state from direct
-/// single-shard batches and collected multi-shard batches. The one ordering
-/// guarantee that always holds within a commit: the removal of an outpoint is
-/// delivered before the insertion that replaces it — overwrite removals
-/// arrive as one-element `RemoveBatch` events ahead of their replacement
-/// `InsertBatch`.
-pub trait UtxoChangeListener {
-    /// Called after a run of same-transaction outputs has been inserted into
-    /// its shard.
-    fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]);
-
-    /// Called after a run of same-transaction outputs has been removed from
-    /// its shard. Overwrite removals arrive as one-element batches ordered
-    /// ahead of their replacement insertions.
-    fn on_remove_coins(&self, removals: &[UtxoRemoved]);
-
-    /// Called once with every collected shard event batch for a multi-shard
-    /// commit, synchronously, after the shard mutations have landed and
-    /// before any shard error is returned.
-    ///
-    /// Every event for a mutation that landed is delivered here even when a
-    /// later shard failed: a partial commit stays fatal and never rolls back,
-    /// so the listener must observe exactly what the shards now hold.
-    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]);
-
-    /// Returns the current `MuHash3072` snapshot trailer, when this listener tracks one.
-    fn muhash3072(&self) -> Option<[u8; 384]> {
-        None
-    }
-}
-
-/// One inserted UTXO event delivered to a change listener.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UtxoInserted<'a> {
-    /// Outpoint that was inserted.
-    pub op: &'a OutPoint,
-    /// Inserted transaction output.
-    pub txout: &'a TxOut,
-    /// Height at which the inserted output was created.
-    pub height: u32,
-    /// Whether the inserted output came from a coinbase transaction.
-    pub coinbase: bool,
-}
-
-impl<'a> UtxoInserted<'a> {
-    /// Constructs one inserted UTXO event.
-    #[must_use]
-    pub const fn new(op: &'a OutPoint, txout: &'a TxOut, height: u32, coinbase: bool) -> Self {
-        Self {
-            op,
-            txout,
-            height,
-            coinbase,
-        }
-    }
-}
-
-/// One removed UTXO event delivered to a change listener.
+/// The single coin shape for lookups, window overlays, and scans: it replaces
+/// the separate live-output, metadata-only, and scanned-coin records.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UtxoRemoved {
-    /// Outpoint that was removed.
-    pub op: OutPoint,
-    /// Removed transaction output.
-    pub txout: TxOut,
-    /// Height at which the removed output was created.
-    pub height: u32,
-    /// Whether the removed output came from a coinbase transaction.
-    pub coinbase: bool,
-}
-
-impl UtxoRemoved {
-    /// Constructs one removed UTXO event.
-    #[must_use]
-    pub const fn new(op: OutPoint, txout: TxOut, height: u32, coinbase: bool) -> Self {
-        Self {
-            op,
-            txout,
-            height,
-            coinbase,
-        }
-    }
-}
-
-enum UtxoChangeEvent<'a> {
-    InsertBatch(SmallVec<[UtxoInserted<'a>; 8]>),
-    RemoveBatch(SmallVec<[UtxoRemoved; 2]>),
-}
-
-/// Events collected from the shards one multi-shard commit touched.
-///
-/// Handed to [`UtxoChangeListener::on_committed_event_batches`] after every
-/// shard mutation has landed. Batch order and chunking are not semantic:
-/// batches arrive in shard order and each groups one shard's
-/// same-transaction runs, but a listener must derive the same final state
-/// however the events are chunked or merged. Within one commit the removal
-/// of an outpoint always precedes the insertion that replaces it; overwrite
-/// removals appear as one-element `RemoveBatch` events ahead of their
-/// replacement `InsertBatch`.
-pub struct UtxoChangeEvents<'a> {
-    events: Vec<UtxoChangeEvent<'a>>,
-    operation_count: usize,
-    insert_capacity: usize,
-    remove_capacity: usize,
-}
-
-/// Read-only view over one committed UTXO event.
-///
-/// One inserted batch or one removed batch. Removed batches include the
-/// one-element batches emitted at overwrite boundaries, ordered ahead of
-/// their replacement insertions.
-#[derive(Clone, Copy)]
-pub enum UtxoCommittedEvent<'batch, 'coin> {
-    /// Batch of inserted UTXOs.
-    InsertBatch(&'batch [UtxoInserted<'coin>]),
-    /// Batch of removed UTXOs, including one-element overwrite removals.
-    RemoveBatch(&'batch [UtxoRemoved]),
-}
-
-impl<'a> UtxoChangeEvents<'a> {
-    pub(crate) fn with_capacity_hint(insertions: usize, removals: usize) -> Self {
-        Self {
-            events: Vec::with_capacity(usize::from(insertions > 0) + usize::from(removals > 0)),
-            operation_count: 0,
-            insert_capacity: insertions,
-            remove_capacity: removals,
-        }
-    }
-
-    /// Appends a run of insertions, merging into the previous insert batch
-    /// when the stream still ends on one.
-    pub(crate) fn push_insert_batch(&mut self, insertions: SmallVec<[UtxoInserted<'a>; 8]>) {
-        if insertions.is_empty() {
-            return;
-        }
-        self.operation_count = self.operation_count.saturating_add(insertions.len());
-        if let Some(UtxoChangeEvent::InsertBatch(existing)) = self.events.last_mut() {
-            existing.extend(insertions);
-        } else {
-            let mut insertions = insertions;
-            reserve_smallvec(&mut insertions, self.insert_capacity);
-            self.events.push(UtxoChangeEvent::InsertBatch(insertions));
-        }
-    }
-
-    /// Appends one insertion, merging into the previous insert batch.
-    pub(crate) fn push_insert_coin(&mut self, insertion: UtxoInserted<'a>) {
-        self.operation_count = self.operation_count.saturating_add(1);
-        if let Some(UtxoChangeEvent::InsertBatch(existing)) = self.events.last_mut() {
-            existing.push(insertion);
-        } else {
-            let mut insertions = SmallVec::<[UtxoInserted<'a>; 8]>::new();
-            reserve_smallvec(&mut insertions, self.insert_capacity);
-            insertions.push(insertion);
-            self.events.push(UtxoChangeEvent::InsertBatch(insertions));
-        }
-    }
-
-    /// Appends a run of removals, merging into the previous remove batch when
-    /// the stream still ends on one.
-    pub(crate) fn push_remove_batch(&mut self, removals: SmallVec<[UtxoRemoved; 2]>) {
-        if removals.is_empty() {
-            return;
-        }
-        self.operation_count = self.operation_count.saturating_add(removals.len());
-        if let Some(UtxoChangeEvent::RemoveBatch(existing)) = self.events.last_mut() {
-            existing.extend(removals);
-        } else {
-            let mut removals = removals;
-            reserve_smallvec(&mut removals, self.remove_capacity);
-            self.events.push(UtxoChangeEvent::RemoveBatch(removals));
-        }
-    }
-
-    /// Appends one removal as its own remove batch.
-    ///
-    /// Used for overwrite removals, which must not merge with a previous remove
-    /// batch so the replacement insert is ordered after this exact removal.
-    pub(crate) fn push_remove_coin(&mut self, removal: UtxoRemoved) {
-        self.operation_count = self.operation_count.saturating_add(1);
-        let mut removals = SmallVec::<[UtxoRemoved; 2]>::new();
-        removals.push(removal);
-        self.events.push(UtxoChangeEvent::RemoveBatch(removals));
-    }
-
-    /// Visits committed events in collection order.
-    pub fn for_each(&self, mut visit: impl FnMut(UtxoCommittedEvent<'_, 'a>)) {
-        for event in &self.events {
-            match event {
-                UtxoChangeEvent::InsertBatch(insertions) => {
-                    visit(UtxoCommittedEvent::InsertBatch(insertions));
-                }
-                UtxoChangeEvent::RemoveBatch(removals) => {
-                    visit(UtxoCommittedEvent::RemoveBatch(removals));
-                }
-            }
-        }
-    }
-
-    /// Returns the number of output-level mutations represented by these events.
-    #[must_use]
-    pub fn operation_count(&self) -> usize {
-        self.operation_count
-    }
-
-    /// Visits committed events split into bounded chunks.
-    ///
-    /// Chunking is not semantic: any chunk size yields the same mutations.
-    pub fn for_each_chunk<'batch>(
-        &'batch self,
-        chunk_size: usize,
-        mut visit: impl FnMut(UtxoCommittedEvent<'batch, 'a>),
-    ) {
-        let chunk_size = chunk_size.max(1);
-        for event in &self.events {
-            match event {
-                UtxoChangeEvent::InsertBatch(insertions) => {
-                    for chunk in insertions.chunks(chunk_size) {
-                        visit(UtxoCommittedEvent::InsertBatch(chunk));
-                    }
-                }
-                UtxoChangeEvent::RemoveBatch(removals) => {
-                    for chunk in removals.chunks(chunk_size) {
-                        visit(UtxoCommittedEvent::RemoveBatch(chunk));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn reserve_smallvec<A>(items: &mut SmallVec<A>, capacity: usize)
-where
-    A: smallvec::Array,
-{
-    if capacity > items.capacity() {
-        items.reserve_exact(capacity - items.len());
-    }
-}
-
-/// One UTXO output to add, owning a `TxOut` or borrowing it from a block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UtxoAdd<T = TxOut> {
-    /// Outpoint being created.
-    pub outpoint: OutPoint,
-    /// Output payload.
-    pub txout: T,
-    /// Whether the creating transaction is coinbase.
-    pub coinbase: bool,
-    /// Creating block height.
-    pub height: u32,
-}
-
-impl<T> UtxoAdd<T> {
-    /// Constructs an add operation.
-    #[must_use]
-    pub const fn new(outpoint: OutPoint, txout: T, coinbase: bool, height: u32) -> Self {
-        Self {
-            outpoint,
-            txout,
-            coinbase,
-            height,
-        }
-    }
-}
-
-impl<T: Borrow<TxOut>> UtxoAdd<T> {
-    pub(crate) fn payload(&self) -> BuildPayload<'_> {
-        BuildPayload {
-            outpoint: &self.outpoint,
-            vout: self.outpoint.vout,
-            txout: self.txout.borrow(),
-            coinbase: self.coinbase,
-            height: self.height,
-        }
-    }
-}
-
-/// One live output found by a UTXO script scan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScannedUtxo {
-    /// Outpoint that identifies the live output.
+pub struct UtxoCoin {
+    /// Outpoint that identifies the live coin.
     pub outpoint: OutPoint,
     /// Output payload stored in the UTXO set.
     pub txout: TxOut,
@@ -405,122 +121,10 @@ pub struct ScannedUtxo {
 /// Result of scanning a stable UTXO-set view.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UtxoScan {
-    /// Number of live outputs visited during the scan.
+    /// Number of live coins visited during the scan.
     pub txouts: usize,
-    /// Live outputs whose script matched the scan set.
-    pub unspents: Vec<ScannedUtxo>,
-}
-
-/// UTXO mutations with owned or borrowed output payloads.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockChanges<T = TxOut> {
-    adds: Vec<UtxoAdd<T>>,
-    removes: Vec<OutPoint>,
-}
-
-impl<T> Default for BlockChanges<T> {
-    fn default() -> Self {
-        Self::with_capacity(0, 0)
-    }
-}
-
-impl<T> BlockChanges<T> {
-    /// Creates an empty change set with storage reserved for known operation counts.
-    #[must_use]
-    pub fn with_capacity(adds: usize, removes: usize) -> Self {
-        Self {
-            adds: Vec::with_capacity(adds),
-            removes: Vec::with_capacity(removes),
-        }
-    }
-
-    /// Appends an output creation.
-    pub fn add(&mut self, add: UtxoAdd<T>) {
-        self.adds.push(add);
-    }
-
-    /// Appends an output spend.
-    pub fn remove(&mut self, outpoint: OutPoint) {
-        self.removes.push(outpoint);
-    }
-
-    /// Returns true when there are no additions or removals.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.adds.is_empty() && self.removes.is_empty()
-    }
-
-    /// Returns the number of add operations.
-    #[must_use]
-    pub const fn add_count(&self) -> usize {
-        self.adds.len()
-    }
-
-    /// Returns the number of remove operations.
-    #[must_use]
-    pub const fn remove_count(&self) -> usize {
-        self.removes.len()
-    }
-
-    /// Returns output creations in commit order.
-    #[must_use]
-    pub fn adds(&self) -> &[UtxoAdd<T>] {
-        &self.adds
-    }
-
-    /// Iterates the spent outpoints in commit order (one per non-netted spend).
-    #[must_use]
-    pub fn spent_outpoints(&self) -> &[OutPoint] {
-        &self.removes
-    }
-}
-
-/// Inverse mutations needed to disconnect one block.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct UndoBatch {
-    restores: Vec<UtxoAdd>,
-    removes: Vec<OutPoint>,
-}
-
-impl UndoBatch {
-    /// Restores an output spent by the disconnected block.
-    pub fn restore(&mut self, add: UtxoAdd) {
-        self.restores.push(add);
-    }
-
-    /// Removes an output created by the disconnected block.
-    pub fn remove(&mut self, outpoint: OutPoint) {
-        self.removes.push(outpoint);
-    }
-
-    /// Returns true when the undo batch is empty.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.restores.is_empty() && self.removes.is_empty()
-    }
-
-    /// Outputs this batch restores, i.e. those the disconnected block spent.
-    #[must_use]
-    pub fn restores(&self) -> &[UtxoAdd] {
-        &self.restores
-    }
-
-    /// Outputs this batch removes, i.e. those the disconnected block created.
-    #[must_use]
-    pub fn removes(&self) -> &[OutPoint] {
-        &self.removes
-    }
-
-    /// Rebuilds a batch from its decoded parts.
-    ///
-    /// Crate-visible on purpose. `undo_codec::decode` rejects a record where one
-    /// outpoint appears in both halves, and this constructor performs no check
-    /// at all, so a public one is a way to build exactly the batch the codec
-    /// refuses. The decoder is the only caller and it has already done the work.
-    #[must_use]
-    pub(crate) const fn from_parts(restores: Vec<UtxoAdd>, removes: Vec<OutPoint>) -> Self {
-        Self { restores, removes }
-    }
+    /// Live coins whose script matched the scan set.
+    pub unspents: Vec<UtxoCoin>,
 }
 
 #[derive(Copy, Clone)]
@@ -638,15 +242,6 @@ impl UtxoSetView<'_> {
         Ok(scan)
     }
 
-    /// Scans every live output in this stable view.
-    pub fn scan_all(&self) -> UtxoScan {
-        let mut scan = UtxoScan::default();
-        for shard in &self.set.shards {
-            shard.scan_all(&mut scan);
-        }
-        scan
-    }
-
     /// Visits every live output without materializing the complete set.
     pub fn for_each_all(&self, mut f: impl FnMut(&OutPoint, &[u8])) {
         for shard in &self.set.shards {
@@ -656,7 +251,7 @@ impl UtxoSetView<'_> {
 
     /// Returns the full live-output entry for `op` in this stable view.
     #[must_use]
-    pub fn get_entry(&self, op: &OutPoint) -> Option<crate::shard::LiveOutput> {
+    pub fn get_entry(&self, op: &OutPoint) -> Option<UtxoCoin> {
         let key = UtxoKey::from_txid(&op.txid);
         self.set.shards[usize::from(key.shard())].get_entry(key, &op.txid.into(), op.vout)
     }
@@ -691,9 +286,13 @@ impl UtxoSet {
         }
     }
 
-    /// Installs a listener for subsequently committed UTXO changes.
-    pub fn set_listener(&mut self, listener: Box<dyn UtxoChangeListener + Send + Sync>) {
-        self.listener = Some(listener);
+    /// Attaches the coinstats listener for subsequently committed UTXO changes.
+    ///
+    /// The set keeps one listener slot and the node keeps one listener: the
+    /// [`CoinStatsListener`](crate::stats::CoinStatsListener) whose `MuHash` and
+    /// accounting track every commit. Replay and recovery attach the same one.
+    pub fn track_coin_stats(&mut self, listener: crate::stats::CoinStatsListener) {
+        self.listener = Some(Box::new(listener));
     }
 
     /// Runs `read` while commits are blocked, yielding a stable whole-set view.
@@ -714,13 +313,22 @@ impl UtxoSet {
     }
 
     /// Applies all UTXO changes for a connected block.
-    pub fn commit_block<T: Borrow<TxOut>>(
+    ///
+    /// Crate-visible on purpose: the public commit entry is the contract's
+    /// [`commit_block_changes`](crate::contract::commit_block_changes), so
+    /// every cross-crate mutation goes through `utxo::contract`.
+    pub(crate) fn commit_block<T: Borrow<TxOut>>(
         &self,
         changes: &BlockChanges<T>,
         block_hash: &Hash256,
     ) -> Result<(), UtxoError> {
-        tracing::trace!(%block_hash, adds = changes.adds.len(), removes = changes.removes.len(), "commit utxo block");
-        self.commit_adds_and_removes(&changes.adds, &changes.removes)
+        tracing::trace!(
+            %block_hash,
+            adds = changes.add_count(),
+            removes = changes.remove_count(),
+            "commit utxo block"
+        );
+        self.commit_adds_and_removes(changes.adds_slice(), changes.removes_slice())
     }
 
     /// Returns an owned transaction output if the outpoint is live.
@@ -733,30 +341,14 @@ impl UtxoSet {
     /// Returns the full live-output entry (txout + coinbase + height)
     /// if `op` is live in the set.
     #[must_use]
-    pub fn get_entry(&self, op: &OutPoint) -> Option<crate::shard::LiveOutput> {
+    pub fn get_entry(&self, op: &OutPoint) -> Option<UtxoCoin> {
         let key = UtxoKey::from_txid(&op.txid);
         self.shards[usize::from(key.shard())].get_entry(key, &op.txid.into(), op.vout)
-    }
-
-    /// Returns live-output metadata without materializing script bytes.
-    #[must_use]
-    pub fn get_meta(&self, op: &OutPoint) -> Option<crate::shard::LiveOutputMeta> {
-        let key = UtxoKey::from_txid(&op.txid);
-        self.shards[usize::from(key.shard())].get_meta(key, &op.txid.into(), op.vout)
     }
 
     /// Scans a stable whole-set view for exact scriptPubKey matches.
     pub fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
         self.with_stable_view(|view| view.scan_script_pubkeys(scripts))
-    }
-
-    /// Scans every live output while commits are excluded.
-    #[expect(
-        clippy::redundant_closure_for_method_calls,
-        reason = "the view lifetime is tied to this set's stable guard"
-    )]
-    pub fn scan_all(&self) -> UtxoScan {
-        self.with_stable_view(|view| view.scan_all())
     }
 
     /// Returns true when any output of `txid` is live in the set.
@@ -770,7 +362,13 @@ impl UtxoSet {
     }
 
     /// Reverses one connected block using its undo data.
-    pub fn undo_block(&self, undo: &UndoBatch) -> Result<(), UtxoError> {
+    ///
+    /// The raw inverse of [`Self::commit_block`], without any durability
+    /// ordering. Crate-visible on purpose: everything outside this crate
+    /// disconnects through
+    /// [`contract::rollback_block`](crate::contract::rollback_block), which
+    /// runs this under the durable disconnect marker and the coinstats rewind.
+    pub(crate) fn undo_block(&self, undo: &UndoBatch) -> Result<(), UtxoError> {
         self.commit_adds_and_removes(&undo.restores, &undo.removes)
     }
 

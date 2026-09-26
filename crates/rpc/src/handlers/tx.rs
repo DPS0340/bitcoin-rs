@@ -982,7 +982,7 @@ mod tests {
         Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
         encode::double_sha256,
     };
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
     use std::sync::mpsc;
     use std::thread;
@@ -1979,9 +1979,12 @@ mod tests {
             false,
             1,
         ));
-        ctx.utxo
-            .commit_block(&changes, &Hash256::from_le_bytes(&[0xaa; 32]))
-            .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
+        bitcoin_rs_utxo::contract::commit_block_changes(
+            &ctx.utxo,
+            &changes,
+            &Hash256::from_le_bytes(&[0xaa; 32]),
+        )
+        .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
         OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0)
     }
 
@@ -2162,7 +2165,7 @@ mod acceptance_tests {
         Amount, BlockHash, CompactTarget, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn,
         TxOut, Txid, Witness, consensus_bytes,
     };
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
     use super::{getrawtransaction, sendrawtransaction, testmempoolaccept};
@@ -2189,8 +2192,7 @@ mod acceptance_tests {
             false,
             7,
         ));
-        ctx.utxo
-            .commit_block(&changes, &Hash256::default())
+        bitcoin_rs_utxo::contract::commit_block_changes(&ctx.utxo, &changes, &Hash256::default())
             .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
     }
 

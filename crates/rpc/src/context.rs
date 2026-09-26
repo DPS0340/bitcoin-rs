@@ -513,7 +513,7 @@ impl Context {
             bitcoin_rs_utxo::stats::CoinStats::default(),
         );
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
-        utxo.set_listener(Box::new(coin_stats_listener.clone()));
+        utxo.track_coin_stats(coin_stats_listener.clone());
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
             MempoolLimits::default(),
@@ -568,7 +568,7 @@ impl Context {
             bitcoin_rs_utxo::stats::CoinStats::default(),
         );
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
-        utxo.set_listener(Box::new(coin_stats_listener.clone()));
+        utxo.track_coin_stats(coin_stats_listener.clone());
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = MempoolGateway::shared_with(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     fn new_context_wires_utxo_commits_to_coin_stats() {
         use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid};
-        use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+        use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 
         let ctx = Context::new();
         let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&[1_u8; 32])), 0);
@@ -1485,8 +1485,7 @@ mod tests {
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(outpoint, txout, true, 7));
 
-        ctx.utxo
-            .commit_block(&changes, &Hash256::default())
+        bitcoin_rs_utxo::contract::commit_block_changes(&ctx.utxo, &changes, &Hash256::default())
             .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
 
         let snapshot = ctx.coin_stats.snapshot();
@@ -1821,7 +1820,7 @@ mod admission_chain_tests {
     use anyhow::Context as _;
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_primitives::{Header, LockTime, Sequence, TxIn, TxOut, Witness};
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     use sha2::{Digest as _, Sha256};
 
     use super::*;
@@ -1896,7 +1895,7 @@ mod admission_chain_tests {
             false,
             0,
         ));
-        ctx.utxo.commit_block(&changes, &Hash256::default())?;
+        bitcoin_rs_utxo::contract::commit_block_changes(&ctx.utxo, &changes, &Hash256::default())?;
 
         // Stable whole-chain readers hold this mutex without changing the
         // generation. Admission must succeed through its real RPC path while
@@ -1927,7 +1926,7 @@ mod admission_chain_tests {
             false,
             0,
         ));
-        ctx.utxo.commit_block(&changes, &Hash256::default())?;
+        bitcoin_rs_utxo::contract::commit_block_changes(&ctx.utxo, &changes, &Hash256::default())?;
         ctx.add_transaction(tx.clone());
         assert!(
             !ctx.admission_chain()
@@ -1960,7 +1959,7 @@ mod admission_chain_tests {
         let output = OutPoint::new(tx.txid(), 0);
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(output, tx.outputs[0].clone(), false, 0));
-        ctx.utxo.commit_block(&changes, &Hash256::default())?;
+        bitcoin_rs_utxo::contract::commit_block_changes(&ctx.utxo, &changes, &Hash256::default())?;
         assert!(ctx.transactions.read().is_empty());
         assert!(
             ctx.admission_chain()
@@ -1997,8 +1996,7 @@ mod admission_chain_tests {
             false,
             0,
         ));
-        ctx.utxo
-            .commit_block(&changes, &Hash256::default())
+        bitcoin_rs_utxo::contract::commit_block_changes(&ctx.utxo, &changes, &Hash256::default())
             .context("fund input")?;
         publish_tip(&ctx, 100)?;
         publish_tip(&ctx, 200)?;

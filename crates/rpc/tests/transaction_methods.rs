@@ -17,7 +17,7 @@ use bitcoin_rs_primitives::{
 };
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_rpc::{Handler, RpcError};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
 /// A standard P2WPKH script paid to a known key.
@@ -94,9 +94,12 @@ fn fund_utxo(ctx: &Context, txid_byte: u8, value: u64) -> OutPoint {
         false,
         1,
     ));
-    ctx.utxo
-        .commit_block(&changes, &Hash256::from_le_bytes(&[0xaa; 32]))
-        .expect("commit_block");
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &ctx.utxo,
+        &changes,
+        &Hash256::from_le_bytes(&[0xaa; 32]),
+    )
+    .expect("commit_block");
     outpoint
 }
 

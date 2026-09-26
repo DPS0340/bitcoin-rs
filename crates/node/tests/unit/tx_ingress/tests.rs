@@ -129,7 +129,7 @@ fn zero_fee_gateway() -> Arc<MempoolGateway> {
 }
 
 fn make_consumer(gateway: &Arc<MempoolGateway>, mining: Arc<RecordingMining>) -> TxIngressConsumer {
-    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
+    use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
     let utxo = Arc::new(UtxoSet::new());
     let parent_txid = Txid::from(Hash256::from_le_bytes(&[0xAA; 32]));
     let mut changes = BlockChanges::with_capacity(1, 0);
@@ -145,8 +145,12 @@ fn make_consumer(gateway: &Arc<MempoolGateway>, mining: Arc<RecordingMining>) ->
         false,
         100,
     ));
-    utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0xBB; 32]))
-        .expect("utxo commit must succeed");
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &utxo,
+        &changes,
+        &Hash256::from_le_bytes(&[0xBB; 32]),
+    )
+    .expect("utxo commit must succeed");
     let (relay, _relay_rx) = TxRelayQueue::new(DEFAULT_TX_RELAY_QUEUE_CAPACITY);
     TxIngressConsumer {
         utxo,
