@@ -211,6 +211,10 @@ fn bench_block_txn(request: &BlockTransactionsRequest, body: &[Tx]) -> BlockTxn 
 /// after the `getblocktxn` answer.
 #[expect(clippy::expect_used, reason = "timed fixture calls must fail loudly")]
 fn bench_compact_reconstruction(c: &mut Criterion) {
+    use bitcoin::bip152::BlockTransactions;
+    use bitcoin::p2p::message_compact_blocks::BlockTxn;
+    use bitcoin_rs_p2p::compact_blocks::Outcome;
+
     let mut group = c.benchmark_group("compact_reconstruction");
     for (block_txs, decoys, missing) in [(100_usize, 5_000_usize, 0_usize), (100, 5_000, 5)] {
         let body: Vec<Tx> = (1..=u32::try_from(block_txs).expect("block size fits u32"))
