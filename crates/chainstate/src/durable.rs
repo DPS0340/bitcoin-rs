@@ -709,40 +709,44 @@ fn rewind_refused(handles: &Chainstate, head: &DurableHead, reason: &'static str
 /// PRE: the applied tip leads `head`, or meets its height with another hash,
 /// and no other applier can observe the chainstate.
 ///
-/// POST: the applied tip names `head.tip`, or descends from it below
-/// `head.height` with the UTXO set and coin statistics rewound by exactly
-/// the blocks the walk removed; reconciliation owns the forward step.
+/// POST: the applied tip lies on the certified head chain — at or below
+/// `anchor`, or on the authenticated segment above it — with the UTXO set
+/// and coin statistics rewound by exactly the blocks the walk removed;
+/// reconciliation owns the forward step.
 ///
 /// INVARIANT: a missing body or undo row, a body that does not hash to the
 /// applied tip, a parent that does not match the block's own previous hash,
 /// or a rewind the set refuses fails closed and retains the marker. A
 /// partial rewind never publishes.
-fn rewind_restored_to_head(handles: &Chainstate, head: &DurableHead) -> Result<(), ApplyError> {
+fn rewind_restored_to_head(
+    handles: &Chainstate,
+    head: &DurableHead,
+    anchor: &HeadChainAnchor,
+) -> Result<(), ApplyError> {
     let transition = handles.begin_transition()?;
-    rewind_walk(handles, head)?;
+    rewind_walk(handles, head, anchor)?;
     drop(transition);
     Ok(())
 }
 
-/// Steps the applied tip down one block at a time until it reaches the
-/// durable head or finds the fork point below it.
-fn rewind_walk(handles: &Chainstate, head: &DurableHead) -> Result<(), ApplyError> {
+/// Steps the applied tip down one block at a time until it lands on the
+/// certified head chain — the anchor, one of its tree-resolved ancestors,
+/// or a descriptor the body walk recorded above it.
+fn rewind_walk(
+    handles: &Chainstate,
+    head: &DurableHead,
+    anchor: &HeadChainAnchor,
+) -> Result<(), ApplyError> {
     loop {
         let applied = handles
             .applied_tip
             .load_full()
             .ok_or_else(|| rewind_refused(handles, head, "the applied tip vanished mid-rewind"))?;
-        // Landed on the head or on an ancestor of it — the fork the head
-        // chain descends from: reconciliation replays the rest forward.
-        // Anything below the head's height on a branch the head does not
-        // descend from is not the fork and keeps rewinding.
-        let on_head_chain = {
-            let tree = handles.block_tree.read();
-            tree.lookup(head.tip).is_some_and(|head_id| {
-                tree.find_common_ancestor(head_id, applied.tip_id) == Some(applied.tip_id)
-            })
-        };
-        if on_head_chain {
+        // Landed on the head chain — the fork the head descends from or a
+        // point the authenticated body walk recorded. Anything else keeps
+        // rewinding; the applied branch always shares the tree's genesis,
+        // so the walk cannot outrun the fork.
+        if anchor.contains_tip(handles, &applied) {
             return Ok(());
         }
         rewind_one_step(handles, head, &applied)?;
