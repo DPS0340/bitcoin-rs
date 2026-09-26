@@ -6,13 +6,10 @@
 //! (`IsInitialBlockDownload`, `m_cached_is_ibd`); keeping one latch here means
 //! RPC and P2P can never answer differently.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use arc_swap::ArcSwapOption;
-use parking_lot::RwLock;
-
-use crate::{BlockTree, Network, TipSnapshot};
+use crate::Network;
+use crate::view::{BlockTreeReader, TipReader};
 
 /// How stale the applied tip may be while the node still counts as synced.
 ///
@@ -46,22 +43,20 @@ pub struct InitialBlockDownload {
     /// judged a superseded tip yields to an exit another caller latched while
     /// it ran.
     left: AtomicBool,
-    applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    block_tree: Arc<RwLock<BlockTree>>,
+    applied_tip: TipReader,
+    block_tree: BlockTreeReader,
 }
 
 impl InitialBlockDownload {
     /// Builds the latch over node-owned chain handles.
     ///
-    /// PRE: the handles belong to the node whose downloads are being judged.
+    /// PRE: the readers observe the node whose downloads are being judged.
     /// POST: the latch starts active (Core leaves `m_cached_is_ibd` unset at
     /// startup); an absent applied tip always reports active.
-    /// INVARIANT: construction copies no chain state; the handles are shared.
+    /// INVARIANT: construction copies no chain state; the readers share the
+    /// node's published cells, never private copies.
     #[must_use]
-    pub fn new(
-        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-        block_tree: Arc<RwLock<BlockTree>>,
-    ) -> Self {
+    pub fn new(applied_tip: TipReader, block_tree: BlockTreeReader) -> Self {
         Self {
             left: AtomicBool::new(false),
             applied_tip,
@@ -143,6 +138,7 @@ mod initial_block_download_tests {
 
     use super::InitialBlockDownload;
     use crate::tree::BlockTree;
+    use crate::view::{BlockTreeReader, TipReader};
     use crate::{BlockHeader, NodeStatus};
 
     const DAY: u64 = 24 * 60 * 60;
@@ -186,13 +182,19 @@ mod initial_block_download_tests {
             (*tip).clone()
         };
         applied_tip.store(Some(Arc::new(tip)));
-        InitialBlockDownload::new(applied_tip, block_tree)
+        InitialBlockDownload::new(
+            TipReader::new(applied_tip),
+            BlockTreeReader::new(block_tree),
+        )
     }
 
     #[test]
     fn a_node_that_has_applied_nothing_is_in_initial_block_download() {
         let applied_tip = Arc::new(arc_swap::ArcSwapOption::empty());
-        let latch = InitialBlockDownload::new(applied_tip, Arc::new(RwLock::new(BlockTree::new())));
+        let latch = InitialBlockDownload::new(
+            TipReader::new(applied_tip),
+            BlockTreeReader::new(Arc::new(RwLock::new(BlockTree::new()))),
+        );
         assert!(latch.is_active(1_800_000_000, Network::Mainnet));
     }
 

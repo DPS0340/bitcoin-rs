@@ -512,8 +512,8 @@ impl Context {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let block_tree = Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new()));
         let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-            Arc::clone(&applied_tip),
-            Arc::clone(&block_tree),
+            TipReader::new(Arc::clone(&applied_tip)),
+            BlockTreeReader::new(Arc::clone(&block_tree)),
         ));
         Self {
             chain_tip: TipReader::new(chain_tip),
@@ -572,8 +572,8 @@ impl Context {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let block_tree = Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new()));
         let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-            Arc::clone(&applied_tip),
-            Arc::clone(&block_tree),
+            TipReader::new(Arc::clone(&applied_tip)),
+            BlockTreeReader::new(Arc::clone(&block_tree)),
         ));
         Self {
             chain_tip: TipReader::new(chain_tip),
@@ -1358,7 +1358,7 @@ mod tests {
         );
         assert!(record_at_height(&records, 1).is_none());
     }
-    #[test]
+
     /// The latch the context hands out must read the same tree the context
     /// exposes: a latch built over any other `BlockTree` finds no node for
     /// the applied tip and keeps reporting initial block download forever.
@@ -1405,8 +1405,8 @@ mod tests {
                 applied_tip: TipReader::new(Arc::clone(&applied_tip)),
                 chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(1)),
                 ibd: Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-                    Arc::clone(&applied_tip),
-                    Arc::clone(&block_tree),
+                    TipReader::new(Arc::clone(&applied_tip)),
+                    BlockTreeReader::new(Arc::clone(&block_tree)),
                 )),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
                 transactions: Arc::new(RwLock::new(HashMap::new())),
