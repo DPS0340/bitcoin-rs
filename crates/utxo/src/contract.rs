@@ -765,6 +765,8 @@ mod tests {
         Ok(())
     }
 
+    /// A torn rollback's `InFlight` marker must not be armed over: the
+    /// refusal leaves both the set and the marker untouched.
     #[test]
     fn in_flight_marker_refuses_before_arming() -> TestResult {
         let (utxo, coin_stats, _, undo) = connected()?;
@@ -788,6 +790,8 @@ mod tests {
         Ok(())
     }
 
+    /// A `RolledBack` marker only owes a checkpoint of the rolled-back set, so
+    /// the next disconnect re-arms over it and supersedes its identity.
     #[test]
     fn rolled_back_marker_carries_into_the_next_disconnect() -> TestResult {
         let (utxo, coin_stats, before, undo) = connected()?;
