@@ -806,7 +806,6 @@ fn rewind_one_step(
         handles.undo_store.as_ref(),
         handles.utxo.as_ref(),
         handles.coin_stats.as_ref(),
-        hash,
         height,
         parent_tip.height,
         tx_count_delta,
