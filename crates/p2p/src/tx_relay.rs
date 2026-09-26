@@ -1165,6 +1165,16 @@ mod tests {
             .wtxid
     }
 
+    /// Reads the resident entry's wtxid for a fixture transaction, so a
+    /// queued request carries the same identity the gateway serves.
+    fn live_wtxid(txid: &Txid, gateway: &MempoolGateway) -> Wtxid {
+        gateway
+            .read()
+            .entry_by_txid(txid)
+            .expect("fixture entry present")
+            .wtxid
+    }
+
     fn relay_identity_peer() -> AdmissionOrigin {
         AdmissionOrigin::Peer(bitcoin_rs_mempool::PeerToken {
             addr: SocketAddr::from(([127, 0, 0, 1], 8333)),
