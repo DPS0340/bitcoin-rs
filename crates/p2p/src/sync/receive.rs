@@ -182,7 +182,8 @@ impl BlockSync {
     }
 
     /// Retries header admission for staged bodies whose headers are still
-    /// absent from the tree.
+    /// absent from the tree, and re-gates the staged bodies that staged
+    /// before their headers were tree-known.
     ///
     /// The listener forwards every inbound body's embedded header through
     /// the headers drain, but a refused batch or a source-less delivery
@@ -196,6 +197,15 @@ impl BlockSync {
     /// means the body can never apply, so it is discarded instead of paying
     /// the same admission retry every drain — and its delivering peer
     /// carries the fault, exactly as a rejected `headers` batch would.
+    ///
+    /// A body that staged while its header was unknown passed the arrival
+    /// gate's missing-header arm without facing the unrequested-admission
+    /// clauses — the stager flags it `gate_pending`. The header can resolve
+    /// anywhere: the retry loop here, or the ordinary headers drain the
+    /// listener forwards into. Either way the flagged body faces the same
+    /// clauses a resolved arrival faced, unless request evidence exists —
+    /// a live pending mark, or an owned fetch resolved by
+    /// `resolve_owned_body_fetches` (which settles the flag directly).
     fn admit_staged_headers(&self) {
         let unadmitted: Vec<(Hash256, Header, Option<crate::PeerSource>)> = {
             let tree = self.chain.block_tree();
@@ -211,9 +221,8 @@ impl BlockSync {
         let mut missing_parent = false;
         let mut credit_refresh_needed = false;
         let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
-        let mut inadmissible: Vec<Hash256> = Vec::new();
         for (hash, header, source) in unadmitted {
-            let admitted = match self.chain.admit_headers(&[header]) {
+            match self.chain.admit_headers(&[header]) {
                 HeaderAdmission::Accepted {
                     announced_tip: Some(tip_hash),
                     active_height,
@@ -230,68 +239,83 @@ impl BlockSync {
                             .note_announced_tip(source, tip_hash, active_height);
                         credit_refresh_needed = true;
                     }
-                    true
                 }
-                HeaderAdmission::Accepted { .. } => true,
                 HeaderAdmission::Rejected(
                     ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. },
                 ) => {
                     missing_parent = true;
-                    false
                 }
                 HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
                     invalid.push((hash, source));
-                    false
                 }
-                _ => false,
-            };
-            if admitted {
-                // The body staged while its header was unknown — a body
-                // slightly ahead of its in-flight header is legitimate. Now
-                // that the tree resolves it, hold it to the same
-                // unrequested-admission clauses a resolved arrival faced.
-                let chain_tip = self.chain.chain_tip();
-                let applied_tip = self.chain.applied_tip();
-                let tree = self.chain.block_tree();
-                if !unrequested_body_admissible(
-                    &tree,
-                    hash,
-                    chain_tip.as_deref(),
-                    applied_tip.as_deref(),
-                    self.chain.network().minimum_chain_work(),
-                ) {
-                    inadmissible.push(hash);
-                }
+                _ => {}
             }
         }
         if !invalid.is_empty() {
             self.discard_inadmissible_header_bodies(&invalid);
         }
-        if !inadmissible.is_empty() {
-            // The headers resolved onto bodies Core would not process
-            // (off-branch or below the work floor). They staged while their
-            // headers were unknown; now that the tree resolves them they
-            // are dead inventory — evict immediately instead of holding
-            // bounded staging state until the staged timeout. No peer
-            // fault: Core drops an inadmissible unrequested body without
-            // punishing the peer, and a body here was never requested — a
-            // pending hash's header is already in the tree, so it never
-            // reaches the staged-header retry.
+        // A staged retry that just admitted may have attached the ancestry
+        // a deferred owned fetch was waiting on — resolve it now. A mark
+        // resolving onto an already-staged body is that body's request
+        // evidence: `mark_owned_fetch` settles its owed gate directly.
+        self.resolve_owned_body_fetches();
+
+        // Recheck every staged body that still owes the admission gate now
+        // that it is tree-known — whether its header attached through the
+        // retry loop above or through the ordinary headers drain. The
+        // headers drain runs ahead of this call each tick, so a body that
+        // staged on the missing-header arm and resolved outside the retry
+        // loop is still caught before it can drain or crowd out requested
+        // work. A live pending mark is request evidence: the body counts
+        // as requested and settles its gate.
+        let resolved: Vec<Hash256> = {
+            let tree = self.chain.block_tree();
+            let scheduler = self.scheduler.lock();
+            scheduler
+                .stager
+                .gate_pending_hashes()
+                .filter(|hash| tree.lookup(*hash).is_some())
+                .collect()
+        };
+        if !resolved.is_empty() {
+            let chain_tip = self.chain.chain_tip();
+            let applied_tip = self.chain.applied_tip();
+            let minimum_chain_work = self.chain.network().minimum_chain_work();
+            let tree = self.chain.block_tree();
             let mut scheduler = self.scheduler.lock();
-            for hash in &inadmissible {
-                scheduler.stager.discard(hash);
+            let mut discarded = 0_usize;
+            for hash in resolved {
+                // The body resolved onto one Core would not process
+                // (off-branch, below the work floor, or too far ahead). It
+                // is dead inventory: evict immediately instead of holding
+                // bounded staging state until the staged timeout. No peer
+                // fault: Core drops an inadmissible unrequested body
+                // without punishing the peer.
+                if scheduler.window.contains_pending(&hash)
+                    || unrequested_body_admissible(
+                        &tree,
+                        hash,
+                        chain_tip.as_deref(),
+                        applied_tip.as_deref(),
+                        minimum_chain_work,
+                    )
+                {
+                    scheduler.stager.clear_gate_pending(&hash);
+                } else {
+                    scheduler.stager.discard(&hash);
+                    discarded = discarded.saturating_add(1);
+                }
             }
-            tracing::debug!(
-                discarded = inadmissible.len(),
-                "block sync: discarded staged bodies that resolved inadmissible"
-            );
+            if discarded > 0 {
+                tracing::debug!(
+                    discarded,
+                    "block sync: discarded staged bodies that resolved inadmissible"
+                );
+            }
         }
         if credit_refresh_needed {
             self.refresh_active_peer_credit();
         }
-        // A staged retry that just admitted may have attached the ancestry
-        // a deferred owned fetch was waiting on — resolve it now.
-        self.resolve_owned_body_fetches();
         if missing_parent {
             self.request_headers_from_eligible();
         }
@@ -341,32 +365,49 @@ impl BlockSync {
         //
         // The same pass gates unrequested bodies: a body that no connection
         // has in flight (Core's `fRequested` is false) stages only when
-        // Core's `AcceptBlock` would process it. A discarded body leaves no
-        // staged state and queues no retry. Lock order: tree, then scheduler.
-        let already_staged: Vec<bool> = {
+        // Core's `AcceptBlock` would process it, and only while a staging
+        // slot is genuinely free — an insert at the count budget would
+        // count-evict already-downloaded work, possibly requested, for a
+        // delivery nobody asked for. `free_slots` accounts for every insert
+        // this chunk will run, so the refusal tracks slot consumption in
+        // arrival order rather than only the snapshot taken here. A
+        // discarded body leaves no staged state and queues no retry.
+        // Lock order: tree, then scheduler.
+        let admission_plan: Vec<(bool, bool)> = {
             let chain_tip = self.chain.chain_tip();
             let applied_tip = self.chain.applied_tip();
             let minimum_chain_work = self.chain.network().minimum_chain_work();
             let tree = self.chain.block_tree();
             let scheduler = self.scheduler.lock();
             let offered = blocks.len();
-            let mut already_staged = Vec::with_capacity(offered);
+            let mut free_slots = scheduler.stager.count_headroom();
+            let mut admission_plan = Vec::with_capacity(offered);
             blocks.retain(|inbound| {
                 let hash = Hash256::from(inbound.block.block_hash());
-                let staged = scheduler.stager.contains(&hash);
-                let admitted = staged
-                    || scheduler.window.contains_pending(&hash)
-                    || unrequested_body_admissible(
-                        &tree,
-                        hash,
-                        chain_tip.as_deref(),
-                        applied_tip.as_deref(),
-                        minimum_chain_work,
-                    );
-                if admitted {
-                    already_staged.push(staged);
+                if scheduler.stager.contains(&hash) {
+                    admission_plan.push((true, false));
+                    return true;
                 }
-                admitted
+                let requested = scheduler.window.contains_pending(&hash);
+                let admitted = requested
+                    || (free_slots > 0
+                        && unrequested_body_admissible(
+                            &tree,
+                            hash,
+                            chain_tip.as_deref(),
+                            applied_tip.as_deref(),
+                            minimum_chain_work,
+                        ));
+                if !admitted {
+                    return false;
+                }
+                free_slots = free_slots.saturating_sub(1);
+                // A body staged while its header is unknown passed the
+                // gate's missing-header arm without facing the clauses —
+                // flag it so `admit_staged_headers` re-gates it once the
+                // tree resolves it, wherever the header lands.
+                admission_plan.push((false, !requested && tree.lookup(hash).is_none()));
+                true
             });
             let discarded = offered.saturating_sub(blocks.len());
             if discarded > 0 {
@@ -375,7 +416,7 @@ impl BlockSync {
                     "block sync: discarded unrequested bodies Core would not process"
                 );
             }
-            already_staged
+            admission_plan
         };
 
         // For non-staged blocks, the chain side derives segwit_active from
@@ -384,8 +425,8 @@ impl BlockSync {
         // consensus semantics without the executor owning the rule.
         let binding_results: Vec<Result<(), SyncChainError>> = blocks
             .iter()
-            .zip(&already_staged)
-            .map(|(inbound, already_staged)| {
+            .zip(&admission_plan)
+            .map(|(inbound, (already_staged, _))| {
                 if *already_staged {
                     Ok(())
                 } else {
@@ -402,9 +443,9 @@ impl BlockSync {
         {
             let mut scheduler = self.scheduler.lock();
             let stager = &mut scheduler.stager;
-            for (inbound, (already_staged, binding_result)) in blocks
+            for (inbound, ((already_staged, gate_pending), binding_result)) in blocks
                 .drain(..)
-                .zip(already_staged.into_iter().zip(binding_results))
+                .zip(admission_plan.into_iter().zip(binding_results))
             {
                 let hash = Hash256::from(inbound.block.block_hash());
                 let source = inbound.source;
@@ -449,6 +490,9 @@ impl BlockSync {
                     source,
                     now,
                 );
+                if gate_pending && matches!(staged, StagedBlock::Memory { .. }) {
+                    stager.set_gate_pending(&hash);
+                }
                 staged_blocks.push((hash, source, staged));
             }
         }
@@ -599,10 +643,14 @@ impl BlockSync {
 /// `AcceptBlock` acceptance for `fRequested == false`
 /// (validation.cpp:4327-4353), plus an active-branch clause.
 ///
-/// PRE: `hash` names a body that is neither staged nor pending.
+/// PRE: `hash` names a body with no live pending request — a fresh arrival
+///   that is neither staged nor pending, or a staged body still flagged
+///   `gate_pending` whose header has since resolved (the callers in
+///   `buffer_received_block_chunk` and `admit_staged_headers`).
 /// POST: `true` when the tree cannot resolve `hash` (the missing-header
-/// path: the body applies once its ancestry lands); otherwise `true` only
-/// when all four admission clauses below hold.
+///   path: the body stages flagged `gate_pending` and faces the four
+///   clauses once its header lands); otherwise `true` only when all four
+///   admission clauses below hold.
 /// INVARIANT: reads only the tree and the two tip snapshots.
 ///
 /// The admission clauses:
