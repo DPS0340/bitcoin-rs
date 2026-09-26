@@ -14,7 +14,7 @@ use bitcoin_rs_storage::pruning::{
 use bitcoin_rs_storage::{
     BlockFilePosition, ColumnFamily, FlatFileBlockStore, KvIter, KvSnapshot, KvStore, KvUndoStore,
     StorageError, UndoStore, WriteBatch, WriteCondition, block_file_max_height_key,
-    encode_block_file_max_height,
+    decode_block_file_max_height, encode_block_file_max_height,
 };
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -54,11 +54,18 @@ fn write_body_rows(
         );
         appended.push((height, hash, position));
     }
-    let max_height = appended.iter().map(|&(height, _, _)| height).max();
-    if let Some(max_height) = max_height {
+    if let Some(appended_max) = appended.iter().map(|&(height, _, _)| height).max() {
+        // The flat file may already hold taller rows from an earlier append;
+        // the file metadata keeps the maximum, mirroring store_block_body.
+        let key = block_file_max_height_key(appended[0].2.file_no);
+        let max_height = store
+            .get(BLOCK_DATA_CF, &key)?
+            .as_deref()
+            .and_then(decode_block_file_max_height)
+            .map_or(appended_max, |previous| previous.max(appended_max));
         batch.put(
             BLOCK_DATA_CF,
-            &block_file_max_height_key(appended[0].2.file_no),
+            &key,
             &encode_block_file_max_height(max_height),
         );
     }
