@@ -218,9 +218,19 @@ impl GatePeer {
                 }
                 Ok(NetworkMessage::Inv(items)) => {
                     for item in items {
-                        if let Inventory::Transaction(txid) = item {
-                            self.relayed_seen.push(txid.to_string());
-                            self.log("relayed_inv", &txid.to_string());
+                        // The peer negotiated wtxid relay, so the node may
+                        // announce either encoding; both name the same
+                        // transaction for the purposes of this gate.
+                        let announced = match item {
+                            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                                Some(txid.to_string())
+                            }
+                            Inventory::WTx(wtxid) => Some(wtxid.to_string()),
+                            _ => None,
+                        };
+                        if let Some(hash) = announced {
+                            self.relayed_seen.push(hash.clone());
+                            self.log("relayed_inv", &hash);
                         }
                     }
                 }
@@ -265,8 +275,14 @@ impl GatePeer {
             .any(|(_, hash)| hash == txid)
     }
 
-    fn relayed(&self, txid: &str) -> bool {
-        self.relayed_seen.iter().any(|announced| announced == txid)
+    /// Whether `tx` was announced under either inventory encoding: its txid
+    /// for `Transaction`/`WitnessTransaction` or its wtxid for `WTx`.
+    fn relayed(&self, tx: &Transaction) -> bool {
+        let txid = tx.compute_txid().to_string();
+        let wtxid = tx.compute_wtxid().to_string();
+        self.relayed_seen
+            .iter()
+            .any(|announced| announced == &txid || announced == &wtxid)
     }
 }
 
@@ -568,7 +584,7 @@ fn ibd_node_ignores_then_requests_relay_transactions() -> Result<(), HarnessErro
         }
         bystander.pump(Duration::from_millis(200));
         assert!(
-            !bystander.relayed(&txid.to_string()),
+            !bystander.relayed(&relayed),
             "the transaction was relayed to a bystander peer during initial block download"
         );
     }

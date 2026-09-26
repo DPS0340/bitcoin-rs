@@ -525,6 +525,12 @@ pub struct Chainstate {
     /// and required readers pin old-branch bodies here so pruning cannot
     /// delete data an active transition still re-reads (#655, `RCV-08`).
     pub(crate) retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
+    /// Process-wide initial-block-download latch owned by the chainstate.
+    ///
+    /// RPC and P2P receive this one read-only answer rather than building
+    /// their own, so `initialblockdownload` and the transaction-relay gate
+    /// can never disagree (Core `ChainstateManager::m_cached_is_ibd`).
+    ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
 }
 
 /// Construction inputs for one authoritative chainstate service.
@@ -705,6 +711,10 @@ impl Chainstate {
             parts.assume_valid_height,
         ));
         assume_valid_gate.evaluate(&parts.block_tree.read());
+        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
+            TipReader::new(Arc::clone(&parts.applied_tip)),
+            BlockTreeReader::new(Arc::clone(&parts.block_tree)),
+        ));
         Self {
             network: parts.network,
             chain_tip: parts.chain_tip,
@@ -729,6 +739,7 @@ impl Chainstate {
             capture_rawtx: parts.capture_rawtx,
             capture_block_bytes: parts.capture_block_bytes,
             retention: Arc::new(bitcoin_rs_storage::RetentionRegistry::new()),
+            ibd,
         }
     }
 
@@ -788,6 +799,15 @@ impl Chainstate {
     #[must_use]
     pub fn block_tree_reader(&self) -> BlockTreeReader {
         BlockTreeReader::new(Arc::clone(&self.block_tree))
+    }
+
+    /// Returns the chainstate-owned initial-block-download latch.
+    ///
+    /// The latch exposes only `is_active`, so consumers share the
+    /// authoritative answer without gaining a way to mutate it.
+    #[must_use]
+    pub fn ibd_latch(&self) -> Arc<bitcoin_rs_chain::InitialBlockDownload> {
+        Arc::clone(&self.ibd)
     }
 
     /// Acquires a shared block-tree guard.
@@ -1027,6 +1047,10 @@ impl Chainstate {
         coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
         chain_events: Arc<crate::events::ChainEventPublisher>,
     ) -> Self {
+        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
+            TipReader::new(Arc::clone(&applied_tip)),
+            BlockTreeReader::new(Arc::clone(&block_tree)),
+        ));
         Self {
             network,
             chain_tip,
@@ -1051,6 +1075,7 @@ impl Chainstate {
             capture_rawtx: false,
             capture_block_bytes: false,
             retention: Arc::new(bitcoin_rs_storage::RetentionRegistry::new()),
+            ibd,
         }
     }
 

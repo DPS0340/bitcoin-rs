@@ -105,10 +105,7 @@ impl ServerHarness {
     pub(crate) fn start(node: &NodeHarness) -> GateResult<Self> {
         let state = &node.state;
         let chainstate = state.chainstate();
-        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-            chainstate.applied_tip_reader(),
-            chainstate.block_tree_reader(),
-        ));
+        let ibd = chainstate.ibd_latch();
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
                 chain_tip: chainstate.header_tip_reader(),

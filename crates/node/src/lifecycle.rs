@@ -546,10 +546,7 @@ pub(crate) fn start_node(
     let gateway = state.mempool_gateway();
     // One chain-owned latch, shared by the RPC context and the P2P listener:
     // `initialblockdownload` and the transaction-relay gate can never disagree.
-    let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-        chainstate.applied_tip_reader(),
-        chainstate.block_tree_reader(),
-    ));
+    let ibd = chainstate.ibd_latch();
     let tx_inventory: Arc<dyn bitcoin_rs_p2p::TxInventory> = gateway.clone();
     let compact_hints: Arc<dyn bitcoin_rs_p2p::CompactBlockHints> = gateway.clone();
     let listener_extras = bitcoin_rs_p2p::ListenerExtras {

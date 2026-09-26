@@ -668,10 +668,7 @@ fn mining_handler(state: &NodeState) -> Handler {
         state.config().mining.payout_script.clone(),
     );
     let mining_control: Arc<dyn MiningControl> = Arc::new(coordinator);
-    let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-        state.chainstate().applied_tip_reader(),
-        state.chainstate().block_tree_reader(),
-    ));
+    let ibd = state.chainstate().ibd_latch();
     let ctx = Context::from_handles(ContextHandles {
         chain: ChainHandles {
             chain_tip: state.chainstate().header_tip_reader(),
