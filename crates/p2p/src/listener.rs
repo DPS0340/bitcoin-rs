@@ -2303,10 +2303,10 @@ mod writer_shutdown_tests {
         assert_eq!(reads.load(Ordering::Relaxed), 2);
     }
 
-    /// A quiet connection is probed with one `ping` before the peer is asked
-    /// to speak, so liveness never depends on inbound traffic.
+    /// A connection quiet for less than one `PING_INTERVAL` owes no probe:
+    /// its loop ends on the read error without emitting a `ping`.
     #[test]
-    fn message_loop_probes_a_quiet_peer() {
+    fn message_loop_does_not_probe_a_peer_inside_one_interval() {
         let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(outbound_tx);
         let reads = Arc::new(AtomicUsize::new(0));
@@ -2320,10 +2320,9 @@ mod writer_shutdown_tests {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_448));
 
         assert!(run_message_loop(&mut peer, addr, &lease, &shared, None).is_err());
-        let probe = outbound_rx.try_recv();
         assert!(
-            matches!(probe, Ok(crate::Message::Ping(_))),
-            "the loop must probe a quiet peer with one ping, got {probe:?}",
+            matches!(outbound_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)),
+            "a peer quiet for less than one interval owes no probe",
         );
     }
 
@@ -2698,6 +2697,8 @@ mod writer_shutdown_tests {
         let mut wire = Vec::new();
         crate::wire::write_message(&mut wire, Magic::BITCOIN, &crate::Message::Ping(41))
             .expect("ping encodes");
+        crate::wire::write_message(&mut wire, Magic::BITCOIN, &crate::Message::Ping(42))
+            .expect("ping encodes");
         let mut peer = Peer::new(
             ScriptedStream {
                 script: io::Cursor::new(wire),
@@ -2713,9 +2714,9 @@ mod writer_shutdown_tests {
         );
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_447));
 
-        // The loop's keepalive probe takes the one-frame budget, so the Pong
-        // response cannot be admitted and the saturation policy cancels the
-        // lease and ends the loop.
+        // The first Pong response takes the one-frame budget, so the second
+        // cannot be admitted and the saturation policy cancels the lease and
+        // ends the loop.
         let result = run_message_loop(&mut peer, addr, &lease, &shared, None);
         assert!(result.is_err(), "saturation must end the message loop");
         assert!(lease.is_cancelled());
