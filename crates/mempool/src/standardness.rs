@@ -313,23 +313,29 @@ pub(crate) fn evaluate_one(
     tx: &Tx,
     context: PackageTxContext,
     max_feerate_sat_per_kvb: Option<u64>,
-    mempool_min_fee_sat_per_kvb: u64,
+    mempool_min_fee_sat_per_kvb: Option<u64>,
     finality: &Bip68Admission<'_>,
 ) -> TxAcceptanceFact {
     let txid = tx.txid();
     let wtxid = tx.wtxid();
     let weight = tx.weight();
     let vsize = context.vsize;
-    let fee_rejection = match (
-        pool.modified_fee_for(txid, context.fee),
-        crate::rbf::required_fee(mempool_min_fee_sat_per_kvb, vsize),
-    ) {
-        (Ok(fee), Ok(required)) => {
-            (fee < required).then_some(AcceptanceRejectReason::MinRelayFeeNotMet)
-        }
-        _ => Some(AcceptanceRejectReason::Replacement(
-            RbfError::ArithmeticOverflow,
-        )),
+    // `None` omits the floor comparison entirely (Core `bypassLimits`):
+    // a zero floor still rejects a tx whose prioritisation delta drags
+    // its modified fee negative, which bypassing must not do.
+    let fee_rejection = match mempool_min_fee_sat_per_kvb {
+        None => None,
+        Some(floor) => match (
+            pool.modified_fee_for(txid, context.fee),
+            crate::rbf::required_fee(floor, vsize),
+        ) {
+            (Ok(fee), Ok(required)) => {
+                (fee < required).then_some(AcceptanceRejectReason::MinRelayFeeNotMet)
+            }
+            _ => Some(AcceptanceRejectReason::Replacement(
+                RbfError::ArithmeticOverflow,
+            )),
+        },
     };
 
     let reject = if pool.contains_txid(&txid) {

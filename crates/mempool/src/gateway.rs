@@ -937,12 +937,15 @@ impl MempoolGateway {
         };
         let deferred = enforcement == LimitEnforcement::Deferred;
         let floor = if deferred {
-            0
+            // `None`, not a zero floor: the comparison itself must not run,
+            // else a negative `prioritisetransaction` overlay could still
+            // fail a bypassed re-admission on `fee < 0`.
+            None
         } else {
-            crate::eviction::mempool_min_fee_sat_per_kvb(
+            Some(crate::eviction::mempool_min_fee_sat_per_kvb(
                 pool,
                 policy.incremental_relay_fee_sat_per_kvb,
-            )
+            ))
         };
         // BIP68 is evaluated at the next block. A resolved input that is not
         // present in the confirmed metadata is an unconfirmed (mempool/package)

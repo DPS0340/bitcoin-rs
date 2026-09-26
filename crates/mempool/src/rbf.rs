@@ -36,13 +36,15 @@ impl FeeEstimation {
 /// Policy limit enforcement strategy for admission.
 ///
 /// [`LimitEnforcement::Full`] applies every policy gate; [`LimitEnforcement::Deferred`]
-/// bypasses cluster limits and per-accept trim during individual admit attempts,
-/// deferring the total-size trim to one post-settlement pass (reorg re-admission).
+/// skips the min-fee floor and the per-acceptance size trim during individual
+/// admit attempts, deferring the total-size trim to one post-settlement pass
+/// (reorg re-admission, Core's `bypassLimits`). Topology checks — ancestor
+/// topology, TRUC, ephemeral spend — still run under `Deferred`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LimitEnforcement {
+pub(crate) enum LimitEnforcement {
     /// Apply all policy limits immediately.
     Full,
-    /// Defer cluster and trim limits to post-settlement.
+    /// Defer the fee floor and size trim to post-settlement.
     Deferred,
 }
 
