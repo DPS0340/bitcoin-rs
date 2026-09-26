@@ -143,6 +143,56 @@ fn replay_extends_checkpoint_state_and_returns_valid_tip() -> TestResult {
 }
 
 #[test]
+fn replay_preserves_an_unknown_checkpoint_count() -> TestResult {
+    let (mut tree, utxo, coin_stats, genesis_tip, _) = base_state()?;
+    // A non-genesis checkpoint that never learned its total: zero here
+    // means unknown, not empty. (A height-0 base with zero is
+    // genesis-empty and still counts its records, matching the journal
+    // writer.) The checkpoint loader accepts the unknown, so replay must
+    // carry it instead of rejecting the suffix back to checkpoint
+    // recovery; adding the suffix would fabricate a chain total, so
+    // unknown stays unknown while the tip, UTXO set, and coin stats
+    // still advance.
+    let base_header = header(BlockHash(genesis_tip.hash), 2, 2);
+    let base_hash = base_header.compute_hash().0;
+    let base_id = tree.insert_node(
+        Some(genesis_tip.tip_id),
+        base_header,
+        NodeStatus::HeaderValid,
+    )?;
+    let base_node = tree.node(base_id)?;
+    let base_tip = TipSnapshot {
+        tip_id: base_id,
+        height: base_node.height,
+        chainwork: base_node.chainwork,
+        hash: base_node.hash,
+    };
+    assert_eq!(base_tip.height, 1);
+    let next_header = header(BlockHash(base_hash), 3, 3);
+    let next_hash = next_header.compute_hash();
+    let new_coin = coin(3, 2, 25);
+    let record = JournalRecord {
+        height: 2,
+        block_hash: next_hash.0.to_le_bytes(),
+        prev_hash: base_hash.to_le_bytes(),
+        block_tx_count: 2,
+        coin_stats_height_delta: 2,
+        raw_header: raw_header(&next_header),
+        mutations: vec![Mutation::Create {
+            coin: new_coin.clone(),
+        }],
+    };
+    let replayed = replay_records(vec![record], tree, utxo, coin_stats, base_tip, 0)?;
+
+    assert_eq!(replayed.chain_tx_count, 0);
+    assert_eq!(replayed.applied_tip.height, 2);
+    assert_eq!(replayed.applied_tip.hash, next_hash.0);
+    assert!(replayed.utxo.get_entry(&new_coin.outpoint).is_some());
+    assert_eq!(replayed.coin_stats.height, 2);
+    Ok(())
+}
+
+#[test]
 fn replay_requires_each_record_to_extend_the_replayed_tip() -> TestResult {
     for stale_parent in [false, true] {
         let (tree, utxo, coin_stats, base_tip, _) = base_state()?;
