@@ -565,8 +565,7 @@ impl<'a> Projection<'a> {
             .collect::<std::collections::BTreeSet<_>>();
         for (txid, _time, transaction) in &funders {
             outputs.extend(
-                Self::outputs_paying(transaction, mempool_hash)
-                    .map(|(_, vout, _)| (*txid, vout)),
+                Self::outputs_paying(transaction, mempool_hash).map(|(_, vout, _)| (*txid, vout)),
             );
         }
         let spenders = {
