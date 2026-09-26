@@ -870,6 +870,65 @@ fn ambiguous_durability_fails_closed_when_the_outcome_is_unprovable()
     Ok(())
 }
 
+/// A retry at the same requested height can stage deletions whose batch then
+/// fails before apply: the frontier and requested height read back as the
+/// earlier pass's values, so only the per-batch receipt can refuse to
+/// mistake them for this pass's proof.
+#[test]
+fn ambiguous_durability_does_not_confuse_a_retry_with_its_earlier_pass()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(MemoryStore::default());
+    let data_dir = tempdir()?;
+    let block_files = FlatFileBlockStore::open(data_dir.path())?;
+    write_body_rows(
+        &store,
+        &block_files,
+        &[(10, b"block-body"), (11, b"block-body")],
+    )?;
+    let retention = Arc::new(RetentionRegistry::new());
+
+    // The first pass commits its line.
+    let first = prune_to_height(
+        &*store,
+        &block_files,
+        &retention,
+        11 + CORE_REORG_SAFETY_MARGIN,
+        11 + CORE_REORG_SAFETY_MARGIN,
+        11,
+        |_| Ok(()),
+    )?;
+    assert_eq!(first.pruned_below, 11);
+    assert_eq!(
+        load_executed_frontier(&*store)?,
+        Some(ExecutedFrontier::new(11)),
+    );
+
+    // A row below the frontier is reintroduced — e.g. a rewound block's
+    // body rewritten — and a retry at the same line stages it.
+    write_body_rows(&store, &block_files, &[(9, b"reintroduced")])?;
+
+    // The retry's batch never applies. Its reconciler must not accept the
+    // earlier pass's frontier and requested height as proof: the batch
+    // receipt is the only value unique to this attempt, and without it the
+    // pass would reclaim files whose index rows still exist.
+    store.arm_write_durable(WriteDurableOutcome::FailedBeforeApply);
+    let failed = prune_to_height(
+        &*store,
+        &block_files,
+        &retention,
+        11 + CORE_REORG_SAFETY_MARGIN,
+        11 + CORE_REORG_SAFETY_MARGIN,
+        11,
+        |_| Ok(()),
+    );
+    assert!(failed.is_err());
+    assert!(
+        row_stored(&store, &block_body_key(9, fake_hash(9)))?,
+        "the unapplied batch's deletions remain staged, not effective"
+    );
+    Ok(())
+}
+
 /// An optional consumer inside its budget still clamps the line; one that
 /// lags beyond it stops blocking pruning, and the owner tells it the
 /// capability is gone instead of the consumer guessing from a read that

@@ -67,6 +67,10 @@ use thiserror::Error;
 
 const PRUNEHEIGHT_METADATA_KEY: &[u8] = b"node:pruneheight";
 const PRUNE_EXECUTED_METADATA_KEY: &[u8] = b"node:prune_executed";
+/// Monotonic per-pass receipt: each prune batch stores its sequence value,
+/// so a failed `write_durable` can prove whether *this* batch applied even
+/// when a retry repeats the same frontier and requested height.
+const PRUNE_BATCH_METADATA_KEY: &[u8] = b"node:prune_batch";
 
 /// Reads one big-endian `u32` metadata row from the UTXO meta family.
 fn load_u32_metadata<S: crate::KvStore>(
@@ -86,6 +90,22 @@ fn load_u32_metadata<S: crate::KvStore>(
     let mut encoded = [0_u8; size_of::<u32>()];
     encoded.copy_from_slice(&bytes);
     Ok(Some(u32::from_be_bytes(encoded)))
+}
+
+/// Loads the persisted prune-batch receipt counter.
+fn load_prune_batch<S: crate::KvStore>(store: &S) -> Result<Option<u64>, StorageError> {
+    let Some(bytes) = store.get(crate::ColumnFamily::UtxoMeta, PRUNE_BATCH_METADATA_KEY)? else {
+        return Ok(None);
+    };
+    if bytes.len() != size_of::<u64>() {
+        return Err(StorageError::IncompatibleData(format!(
+            "invalid persisted prune batch length {}",
+            bytes.len()
+        )));
+    }
+    let mut encoded = [0_u8; size_of::<u64>()];
+    encoded.copy_from_slice(&bytes);
+    Ok(Some(u64::from_be_bytes(encoded)))
 }
 
 /// Loads the persisted manual-prune line.
@@ -295,23 +315,34 @@ pub fn prune_to_height<S: crate::KvStore>(
         PRUNE_EXECUTED_METADATA_KEY,
         &executed.get().to_be_bytes(),
     );
+    // The batch receipt is per-pass: frontier and requested height can both
+    // repeat on a retry at the same line, so only a value unique to this
+    // batch can prove *this* batch applied after a durability error.
+    let receipt = load_prune_batch(store)?.unwrap_or(0).wrapping_add(1);
+    batch.put(
+        crate::ColumnFamily::UtxoMeta,
+        PRUNE_BATCH_METADATA_KEY,
+        &receipt.to_be_bytes(),
+    );
     if let Err(error) = store.write_durable(batch) {
         // A durability error is not a rollback receipt: the batch may already
         // have been applied, so the claim cannot be released on `Err` alone.
-        // The frontier record shares the deletions' atomic boundary, so its
-        // presence proves the outcome.
-        return match (load_executed_frontier(store), load_pruneheight(store)) {
-            // The receipt persisted, so the deletions did too: the batch
-            // proved itself durable despite the reported error, so run the
-            // same in-memory follow-ups the success path would — the line
-            // promotion and the flat-file reclaim — and hand the caller the
-            // staged result. Answering `Err` here would strand claimable
+        // The receipt shares the deletions' atomic boundary, so its presence
+        // proves the outcome.
+        return match (
+            load_executed_frontier(store),
+            load_pruneheight(store),
+            load_prune_batch(store),
+        ) {
+            // The batch's own receipt persisted, so the deletions did too:
+            // run the same in-memory follow-ups the success path would — the
+            // line promotion and the flat-file reclaim — and hand the caller
+            // the staged result. Answering `Err` here would strand claimable
             // files and leave every caller-side follow-up unapplied.
-            // The frontier alone is only a lower bound (a past pass may
-            // already have reached it), so the batch-specific intent record
-            // must match this pass's requested height as well.
-            (Ok(Some(persisted)), Ok(Some(persisted_height)))
-                if persisted.get() >= executed.get() && persisted_height == pruneheight =>
+            (Ok(Some(persisted)), Ok(Some(persisted_height)), Ok(Some(persisted_receipt)))
+                if persisted.get() >= executed.get()
+                    && persisted_height == pruneheight
+                    && persisted_receipt == receipt =>
             {
                 reservation.commit(persisted.get());
                 reclaim_staged_flat_block_files(store, block_files, &staged.file_numbers)?;
@@ -319,7 +350,7 @@ pub fn prune_to_height<S: crate::KvStore>(
             }
             // No new receipt persisted, so the atomic batch applied nothing:
             // dropping the reservation safely reopens lease grants.
-            (Ok(_), Ok(_)) => Err(error.into()),
+            (Ok(_), Ok(_), Ok(_)) => Err(error.into()),
             // The outcome cannot be proven: fail closed and hold the claim
             // until restart-time recovery reconciles record and deletions.
             _ => {
