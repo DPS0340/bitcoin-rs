@@ -105,7 +105,7 @@ impl ServerHarness {
     pub(crate) fn start(node: &NodeHarness) -> GateResult<Self> {
         let state = &node.state;
         let chainstate = state.chainstate();
-        let ibd = chainstate.ibd_latch();
+        let ibd = state.ibd();
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles::new(
                 chainstate.header_tip_reader(),
