@@ -31,7 +31,7 @@ use bitcoin_rs_primitives::OutPoint;
 use bitcoin_rs_storage::{CommitRecords, DurableHead};
 use bitcoin_rs_utxo::UtxoCoin;
 use bitcoin_rs_utxo::contract::{
-    OutputSource, RollbackError, UndoLoadError, load_block_undo, rollback_block,
+    OutputSource, RollbackError, UndoLoadError, load_block_undo, rollback_block_recovery,
 };
 
 /// What one durable head commit certified.
@@ -612,11 +612,12 @@ fn rewind_one_step(
     })?;
     let tx_count_delta = tx_count_delta_for(&block);
     let parent_tip = rewound_parent(handles, head, applied, &block, tx_count_delta)?;
-    rollback_block(
-        handles.undo_store.as_ref(),
+    // Recovery owns the surviving marker — the ordinary path's arming
+    // guard would refuse every step under it, and overwriting it would
+    // erase the evidence being reconciled.
+    rollback_block_recovery(
         handles.utxo.as_ref(),
         handles.coin_stats.as_ref(),
-        hash,
         height,
         parent_tip.height,
         tx_count_delta,
