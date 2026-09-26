@@ -1635,12 +1635,14 @@ fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>>
 
 fn invalidation_handler(state: &NodeState) -> Handler {
     let chainstate = state.chainstate();
+    let ibd = chainstate.ibd_latch();
     Handler::new(Arc::new(
         Context::from_handles(ContextHandles {
             chain: ChainHandles {
                 chain_tip: chainstate.header_tip_reader(),
                 applied_tip: chainstate.applied_tip_reader(),
                 chain_tx_count: chainstate.chain_tx_count_handle(),
+                ibd,
                 blocks: state.blocks(),
                 transactions: state.transactions(),
                 utxo: chainstate.utxo_handle(),

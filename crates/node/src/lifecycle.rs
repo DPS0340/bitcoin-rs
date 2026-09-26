@@ -63,6 +63,7 @@ fn bind_rpc(
     state: &NodeState,
     mining_control: &Arc<dyn MiningControl>,
     block_body_source: Arc<dyn BlockBodySource>,
+    ibd: &Arc<bitcoin_rs_chain::InitialBlockDownload>,
 ) -> Result<(Arc<Context>, RpcServer)> {
     let rpc_auth = Arc::new(state.config().rpc.auth.to_rpc_auth()?);
     let chainstate = state.chainstate();
@@ -71,6 +72,7 @@ fn bind_rpc(
             chain_tip: chainstate.header_tip_reader(),
             applied_tip: chainstate.applied_tip_reader(),
             chain_tx_count: chainstate.chain_tx_count_handle(),
+            ibd: Arc::clone(ibd),
             blocks: state.blocks(),
             transactions: state.transactions(),
             utxo: chainstate.utxo_handle(),
@@ -542,12 +544,19 @@ pub(crate) fn start_node(
     signal.attach(&mining_control);
     signal.attach_sequence_wake(&sequence_wake);
     let gateway = state.mempool_gateway();
+    // One chain-owned latch, shared by the RPC context and the P2P listener:
+    // `initialblockdownload` and the transaction-relay gate can never disagree.
+    let ibd = chainstate.ibd_latch();
     let tx_inventory: Arc<dyn bitcoin_rs_p2p::TxInventory> = gateway.clone();
     let compact_hints: Arc<dyn bitcoin_rs_p2p::CompactBlockHints> = gateway.clone();
     let listener_extras = bitcoin_rs_p2p::ListenerExtras {
         tx_inventory: Some(tx_inventory),
         compact_hints: Some(compact_hints),
         inbound_tx: Some(state.inbound_tx_sender()),
+        // The latch answers against the configured consensus network, not a
+        // magic-derived one: a custom `--p2p-magic` can carry another
+        // network's bytes.
+        ibd: Some((Arc::clone(&ibd), state.config().network)),
     };
     let (relay_queue, relay_rx) =
         bitcoin_rs_p2p::TxRelayQueue::new(bitcoin_rs_p2p::DEFAULT_TX_RELAY_QUEUE_CAPACITY);
@@ -574,7 +583,7 @@ pub(crate) fn start_node(
         )
         .map_err(anyhow::Error::msg)?;
 
-    let (context, rpc_server) = bind_rpc(state, &mining_control, block_body_source)?;
+    let (context, rpc_server) = bind_rpc(state, &mining_control, block_body_source, &ibd)?;
     let rpc_local_addr = rpc_server.local_addr()?;
     tracing::info!(addr = %rpc_local_addr, "rpc listener bound");
     let rpc_shutdown = Arc::clone(&shutdown);

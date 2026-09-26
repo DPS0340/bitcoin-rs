@@ -668,11 +668,13 @@ fn mining_handler(state: &NodeState) -> Handler {
         state.config().mining.payout_script.clone(),
     );
     let mining_control: Arc<dyn MiningControl> = Arc::new(coordinator);
+    let ibd = state.chainstate().ibd_latch();
     let ctx = Context::from_handles(ContextHandles {
         chain: ChainHandles {
             chain_tip: state.chainstate().header_tip_reader(),
             applied_tip: state.chainstate().applied_tip_reader(),
             chain_tx_count: state.chainstate().chain_tx_count_handle(),
+            ibd,
             blocks: state.blocks(),
             transactions: state.transactions(),
             utxo: Arc::new(UtxoSet::new()),
