@@ -319,9 +319,9 @@ mod tests {
         let regtest = MiningChainContext::resolve(&tree, Network::Regtest, tip, last.time)?;
         assert_eq!(
             header_sync::minimum_candidate_time(last.time, regtest.height, Network::Regtest),
-            None
+            Some(last.time.saturating_sub(600))
         );
-        assert_eq!(regtest.min_time, regtest.prev_median_time_past + 1);
+        assert_eq!(regtest.min_time, last.time - 600);
         Ok(())
     }
 
