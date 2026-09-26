@@ -1330,10 +1330,7 @@ mod tests {
 
     impl bitcoin_rs_index::DerivedIndexCapabilitySource for ReadySource {
         fn capability(&self) -> bitcoin_rs_index::CapabilityStatus {
-            bitcoin_rs_index::derived_index_status(
-                true,
-                bitcoin_rs_index::CapabilityState::Ready,
-            )
+            bitcoin_rs_index::derived_index_status(true, bitcoin_rs_index::CapabilityState::Ready)
         }
     }
 
