@@ -30,6 +30,12 @@ pub struct PeerSession {
     pub info: Option<PeerInfo>,
     /// Header tips this connection has delivered and the node accepted.
     pub demonstrated_tips: Vec<Hash256>,
+    /// Headers tip this connection demonstrated by ending a download-twice
+    /// sync with nothing past it — the cap header selection reads. `None`
+    /// until a presync proves a ceiling; body eligibility keeps reading
+    /// [`PeerInfo::best_known_height`], the P2P-03 credit this does not
+    /// disturb.
+    pub headers_horizon: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -37,6 +43,7 @@ struct Entry {
     lease: PeerLease,
     info: Option<PeerInfo>,
     demonstrated_tips: Vec<Hash256>,
+    headers_horizon: Option<u32>,
 }
 
 /// The table's live entries plus the traffic accounting it retains of
@@ -107,6 +114,7 @@ impl PeerTable {
                         lease,
                         info: None,
                         demonstrated_tips: Vec::new(),
+                        headers_horizon: None,
                     },
                 );
                 if let Some(prior) = prior {
@@ -122,6 +130,7 @@ impl PeerTable {
                         lease,
                         info: None,
                         demonstrated_tips: Vec::new(),
+                        headers_horizon: None,
                     },
                 );
                 false
@@ -195,6 +204,7 @@ impl PeerTable {
                 lease: lease.clone(),
                 info: None,
                 demonstrated_tips: Vec::new(),
+                headers_horizon: None,
             },
         );
         if let Some(prior) = prior {
@@ -284,15 +294,19 @@ impl PeerTable {
         }
     }
 
-    /// Lowers the live connection's advertised headers horizon to `height`
-    /// after its download-twice sync ended below the work floor without
-    /// releasing headers — the peer demonstrated it has nothing past that
+    /// Records `height` as the live connection's demonstrated headers
+    /// horizon after its download-twice sync ended below the work floor
+    /// without releasing headers — the peer proved it has nothing past that
     /// cursor, and leaving a higher handshake claim in place would keep
     /// reselecting it while starving every other peer.
     ///
-    /// Unlike `note_announced_height`, which only raises the recorded
-    /// horizon, this lowers it to a demonstrated fact. Returns `false` for
-    /// a stale, unpublished, or cancelled connection.
+    /// The cap is written to its own field, not `best_known_height`: that
+    /// credit also gates block-body eligibility, and a peer with nothing
+    /// left to offer headers can still legitimately serve bodies it
+    /// advertised or demonstrated. Header-selection readers take
+    /// `min(best_known_height, headers_horizon)`; this writer only lowers
+    /// the horizon. Returns `false` for a stale, unpublished, or cancelled
+    /// connection.
     pub fn note_headers_horizon(&self, source: PeerSource, height: u32) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
@@ -301,13 +315,10 @@ impl PeerTable {
         else {
             return false;
         };
-        let Some(info) = entry.info.as_mut() else {
+        if entry.info.is_none() {
             return false;
-        };
-        let height = i32::try_from(height).unwrap_or(i32::MAX);
-        if height < info.best_known_height {
-            info.best_known_height = height;
         }
+        entry.headers_horizon = Some(entry.headers_horizon.map_or(height, |cap| cap.min(height)));
         true
     }
 
@@ -601,6 +612,7 @@ impl PeerTable {
                 lease: entry.lease.clone(),
                 info: entry.info.clone(),
                 demonstrated_tips: entry.demonstrated_tips.clone(),
+                headers_horizon: entry.headers_horizon,
             })
             .collect();
         sessions.sort_unstable_by_key(|session| session.lease.connection_id().get());
@@ -622,6 +634,7 @@ impl PeerTable {
                 lease: entry.lease.clone(),
                 info: entry.info.clone(),
                 demonstrated_tips: entry.demonstrated_tips.clone(),
+                headers_horizon: entry.headers_horizon,
             })
             .collect();
         sessions.sort_unstable_by_key(|session| session.lease.connection_id().get());

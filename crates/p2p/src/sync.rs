@@ -677,6 +677,7 @@ impl BlockSync {
                     info,
                     demonstrated_tips,
                     active_height,
+                    headers_horizon: session.headers_horizon,
                     role: session.lease.role(),
                     manual: session.lease.is_manual(),
                     connected_at: session.lease.connected_at(),

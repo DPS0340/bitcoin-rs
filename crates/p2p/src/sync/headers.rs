@@ -25,6 +25,7 @@ use crate::InboundHeaders;
 use crate::Message;
 use crate::PeerSource;
 use crate::download_window::SyncPeer;
+use crate::peer_info::PeerInfo;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
 use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus};
@@ -538,8 +539,9 @@ impl BlockSync {
             .sessions()
             .iter()
             .find(|session| session.addr == source.addr)
-            .and_then(|session| session.info.as_ref())
-            .map_or(i32::MAX, |info| info.best_known_height);
+            .map_or(i32::MAX, |session| {
+                headers_target_height(session.headers_horizon, session.info.as_ref())
+            });
         self.send_getheaders(source, header_height, target_height, self.build_locator());
     }
 
@@ -668,8 +670,12 @@ impl BlockSync {
             .map_or(applied_height, |tip| tip.height);
         let mut header_peer: Option<(PeerSource, SyncPeer)> = None;
         for peer in &frontier.usable_peers {
-            let Some(candidate) = sync_peer_candidate(peer.source, &peer.info, applied_height)
-            else {
+            let Some(candidate) = sync_peer_candidate(
+                peer.source,
+                &peer.info,
+                peer.headers_horizon,
+                applied_height,
+            ) else {
                 continue;
             };
             if exclude.is_some_and(|excluded| excluded == peer.source) {
@@ -1148,8 +1154,9 @@ impl BlockSync {
             .sessions()
             .iter()
             .find(|session| session.addr == source.addr)
-            .and_then(|session| session.info.as_ref())
-            .map_or(i32::MAX, |info| info.best_known_height);
+            .map_or(i32::MAX, |session| {
+                headers_target_height(session.headers_horizon, session.info.as_ref())
+            });
         self.send_getheaders(source, height, target_height, locator)
     }
 
@@ -1193,6 +1200,18 @@ impl BlockSync {
                 .block_locator(tip.tip_id, LOCATOR_MAX_ENTRIES);
         }
         std::vec![self.chain.network().genesis_block_hash()]
+    }
+}
+
+/// The tallest header tip worth requesting from this session: the
+/// demonstrated horizon when a spent low-work presync proved one, else the
+/// published best-known height, `i32::MAX` while the handshake is still
+/// unpublished.
+fn headers_target_height(horizon: Option<u32>, info: Option<&PeerInfo>) -> i32 {
+    let claimed = info.map_or(i32::MAX, |info| info.best_known_height);
+    match horizon {
+        Some(cap) => claimed.min(i32::try_from(cap).unwrap_or(i32::MAX)),
+        None => claimed,
     }
 }
 
