@@ -101,11 +101,13 @@ other sources receive `MSG_TX`, following
 [BIP144](https://github.com/bitcoin/bips/blob/master/bip-0144.mediawiki#relay). Relay queue
 saturation drops the newest announcement without blocking admission;
 per-peer outbound saturation cancels that connection's lease. Each queued
-announcement is checked against the shared mempool at send time: a
-transaction that left the pool before the relay worker sent it (block
-connection, replacement, eviction, or reorg) is consumed with no `inv`, so a
-peer never receives an announcement for a transaction that had already left
-the pool at send time.
+announcement is checked against the shared mempool immediately before its
+relay send, matched on the admission epoch recorded when the request was
+queued: a transaction that left the pool before the check — or was
+re-admitted under a new admission — is consumed with no `inv`. The check
+narrows the stale-announcement window; it does not close it. A removal
+landing between the check and a peer's send cannot be retracted, so a peer
+can still receive inventory for a transaction that has just left the pool.
 
 The inventory view respects the reject cache's identity scope: witness-only
 refusals suppress the exact wtxid, not legacy txid inventory or another

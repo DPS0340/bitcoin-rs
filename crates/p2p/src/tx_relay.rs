@@ -75,16 +75,22 @@ pub struct RelayRequest {
     /// The delivering peer's node id to exclude, or `None` for local
     /// injection.
     pub source: Option<u64>,
+    /// The mempool admission epoch the request was queued under, from
+    /// [`bitcoin_rs_mempool::mutation::MutationResult::sequence_of`]. Removal
+    /// and re-admission of the same body invalidates the epoch, so the
+    /// send-time check matches the exact admission that queued the request.
+    pub sequence: u64,
 }
 
 impl RelayRequest {
     /// Builds a relay request for an accepted transaction.
     #[must_use]
-    pub fn new(txid: Txid, wtxid: Wtxid, source: Option<u64>) -> Self {
+    pub fn new(txid: Txid, wtxid: Wtxid, source: Option<u64>, sequence: u64) -> Self {
         Self {
             txid,
             wtxid,
             source,
+            sequence,
         }
     }
 }
@@ -120,8 +126,8 @@ impl TxRelayQueue {
     /// Returns `true` if the request was queued, `false` if the queue was
     /// full (the request is dropped) or the worker receiver has been dropped.
     /// Admission callers ignore the return value: relay is best-effort.
-    pub fn announce(&self, txid: Txid, wtxid: Wtxid, source: Option<u64>) -> bool {
-        let request = RelayRequest::new(txid, wtxid, source);
+    pub fn announce(&self, txid: Txid, wtxid: Wtxid, source: Option<u64>, sequence: u64) -> bool {
+        let request = RelayRequest::new(txid, wtxid, source, sequence);
         match self.tx.try_send(request) {
             Ok(()) => {
                 self.enqueued.fetch_add(1, Ordering::Relaxed);
@@ -191,7 +197,7 @@ impl MempoolObserver for LocalTxRelayObserver {
                 .entry_by_txid_at_sequence(&txid, sequence)
                 .map(|entry| entry.wtxid);
             if let Some(wtxid) = wtxid {
-                self.relay.announce(txid, wtxid, None);
+                self.relay.announce(txid, wtxid, None, sequence);
             }
         }
     }
@@ -281,18 +287,21 @@ impl RelaySink for PeerRelaySink {
 /// Returns whether the queued transaction is still relayable.
 ///
 /// PRE: `gateway` is the shared gateway for the node's live mempool.
-/// POST: returns true exactly when `txid` is present in the mempool read at
-/// this call AND the resident entry still carries `wtxid` — a same-txid
-/// entry re-admitted with a mutated witness does not satisfy the queued
-/// request, whose `inv` would then name a body `getdata` cannot serve.
+/// POST: returns true exactly when the admission that queued `request` —
+/// identified by its txid at its admission epoch — is still resident in the
+/// mempool read at this call. Removal and re-admission, even of byte-identical
+/// bytes or a witness-mutated same-txid entry, does not satisfy the queued
+/// request: `entry_by_txid_at_sequence` invalidates on the sequence, so a
+/// stale request can neither announce a transaction admitted under a
+/// different epoch nor advertise it back to a different source peer.
 /// INVARIANT: the check does not mutate the mempool, relay queue, or
 /// observer state. The read guard is released before this function
 /// returns, so no caller holds it while it sends to peers.
-fn transaction_is_live(gateway: &MempoolGateway, txid: &Txid, wtxid: &Wtxid) -> bool {
+fn transaction_is_live(gateway: &MempoolGateway, request: &RelayRequest) -> bool {
     gateway
         .read()
-        .entry_by_txid(txid)
-        .is_some_and(|entry| entry.wtxid == *wtxid)
+        .entry_by_txid_at_sequence(&request.txid, request.sequence)
+        .is_some()
 }
 
 /// Synchronously drains every currently-queued relay request into `sink`,
@@ -316,7 +325,7 @@ pub fn drain_relay_queue(
 ) -> usize {
     let mut processed = 0;
     while let Ok(request) = rx.try_recv() {
-        if transaction_is_live(gateway, &request.txid, &request.wtxid) {
+        if transaction_is_live(gateway, &request) {
             sink.announce_inv(request.txid, request.wtxid, request.source);
         }
         processed += 1;
@@ -350,7 +359,7 @@ pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
             while !shutdown.load(Ordering::Relaxed) {
                 match rx.recv_timeout(RELAY_POLL) {
                     Ok(request) => {
-                        if transaction_is_live(&gateway, &request.txid, &request.wtxid) {
+                        if transaction_is_live(&gateway, &request) {
                             sink.announce_inv(request.txid, request.wtxid, request.source);
                         }
                     }
@@ -561,14 +570,17 @@ mod tests {
     fn relay_queue_saturation_drops_overflow() {
         let gateway = relay_identity_gateway();
         let (queue, rx) = TxRelayQueue::new(2);
-        let live: Vec<Txid> = (1..=3)
-            .map(|marker| admit_live_tx(marker, &gateway).txid())
+        let live: Vec<(Txid, u64)> = (1..=3)
+            .map(|marker| {
+                let (tx, sequence) = admit_live_tx(marker, &gateway);
+                (tx.txid(), sequence)
+            })
             .collect();
 
-        assert!(queue.announce(live[0], live_wtxid(&live[0], &gateway), None));
-        assert!(queue.announce(live[1], live_wtxid(&live[1], &gateway), None));
+        assert!(queue.announce(live[0].0, live_wtxid(&live[0].0, &gateway), None, live[0].1));
+        assert!(queue.announce(live[1].0, live_wtxid(&live[1].0, &gateway), None, live[1].1));
         // Queue is full: the third announcement is dropped, not blocked.
-        assert!(!queue.announce(live[2], live_wtxid(&live[2], &gateway), None));
+        assert!(!queue.announce(live[2].0, live_wtxid(&live[2].0, &gateway), None, live[2].1));
 
         assert_eq!(queue.enqueued(), 2);
         assert_eq!(queue.dropped(), 1);
@@ -587,13 +599,26 @@ mod tests {
         let (peers, ids) = fake_peers(3);
         let (queue, rx) = TxRelayQueue::new(8);
         let sink = FakeSink::new(peers);
-        let live: Vec<Txid> = (1..=3)
-            .map(|marker| admit_live_tx(marker, &gateway).txid())
+        let live: Vec<(Txid, u64)> = (1..=3)
+            .map(|marker| {
+                let (tx, sequence) = admit_live_tx(marker, &gateway);
+                (tx.txid(), sequence)
+            })
             .collect();
 
-        queue.announce(live[0], live_wtxid(&live[0], &gateway), Some(ids[0]));
-        queue.announce(live[1], live_wtxid(&live[1], &gateway), Some(ids[1]));
-        queue.announce(live[2], live_wtxid(&live[2], &gateway), None);
+        queue.announce(
+            live[0].0,
+            live_wtxid(&live[0].0, &gateway),
+            Some(ids[0]),
+            live[0].1,
+        );
+        queue.announce(
+            live[1].0,
+            live_wtxid(&live[1].0, &gateway),
+            Some(ids[1]),
+            live[1].1,
+        );
+        queue.announce(live[2].0, live_wtxid(&live[2].0, &gateway), None, live[2].1);
 
         let processed = drain_relay_queue(&rx, &sink, &gateway);
         assert_eq!(processed, 3);
@@ -608,25 +633,30 @@ mod tests {
     }
 
     #[test]
-    fn a_witness_replaced_request_is_not_announced() {
-        // The transaction leaves and returns under the same txid but a new
-        // witness before the drain. The queued request still names the old
-        // wtxid, so announcing it would advertise a body `getdata` cannot
-        // serve — the gate must drop it.
+    fn a_re_admitted_request_is_not_announced() {
+        // The transaction leaves and returns — same body, same txid —
+        // before the drain. Re-admission assigns a new admission epoch, so
+        // the queued request's epoch no longer matches and the stale
+        // request (whose `source` belongs to the earlier admission) must
+        // not announce the fresh entry.
         let (peers, _ids) = fake_peers(1);
         let sink = FakeSink::new(peers);
         let gateway = relay_identity_gateway();
         let (queue, rx) = TxRelayQueue::new(8);
 
-        let txid = admit_live_tx(20, &gateway).txid();
-        queue.announce(txid, dummy_wtxid(0x77), None);
+        let (tx, sequence) = admit_live_tx(20, &gateway);
+        queue.announce(tx.txid(), tx.wtxid(), None, sequence);
+
+        gateway.clear(AdmissionOrigin::Block);
+        let re_admitted = admit_entry(&tx, &gateway);
+        assert_ne!(re_admitted, sequence);
 
         let processed = drain_relay_queue(&rx, &sink, &gateway);
 
         assert_eq!(processed, 1);
         assert!(
             sink.log().is_empty(),
-            "a request whose queued wtxid no longer matches the resident entry must not be announced"
+            "a request whose admission epoch no longer matches must not be announced"
         );
     }
 
@@ -637,8 +667,8 @@ mod tests {
         let gateway = relay_identity_gateway();
         let (queue, rx) = TxRelayQueue::new(8);
 
-        let tx = admit_live_tx(10, &gateway);
-        queue.announce(tx.txid(), tx.wtxid(), None);
+        let (tx, sequence) = admit_live_tx(10, &gateway);
+        queue.announce(tx.txid(), tx.wtxid(), None, sequence);
 
         // The transaction leaves the shared mempool (block connect,
         // replacement, or eviction) before the drain.
@@ -663,10 +693,10 @@ mod tests {
         let gateway = relay_identity_gateway();
         let (queue, rx) = TxRelayQueue::new(8);
 
-        let live = admit_live_tx(11, &gateway);
-        let confirmed = admit_live_tx(12, &gateway);
-        queue.announce(live.txid(), live.wtxid(), None);
-        queue.announce(confirmed.txid(), confirmed.wtxid(), None);
+        let (live, live_seq) = admit_live_tx(11, &gateway);
+        let (confirmed, confirmed_seq) = admit_live_tx(12, &gateway);
+        queue.announce(live.txid(), live.wtxid(), None, live_seq);
+        queue.announce(confirmed.txid(), confirmed.wtxid(), None, confirmed_seq);
 
         // A block connection confirms the second transaction before the
         // worker reaches it, so only the first may be announced.
@@ -913,7 +943,7 @@ mod tests {
         let (queue, receiver) = TxRelayQueue::new(1);
         drop(receiver);
 
-        assert!(!queue.announce(dummy_txid(1), dummy_wtxid(1), None));
+        assert!(!queue.announce(dummy_txid(1), dummy_wtxid(1), None, 0));
         assert_eq!(queue.enqueued(), 0);
         assert_eq!(queue.dropped(), 0);
     }
@@ -1040,21 +1070,33 @@ mod tests {
 
     /// Admits a transaction with a distinct coinbase-style input to
     /// `gateway`, so a queued announcement for its txid is live at send
-    /// time, and returns the transaction.
-    fn admit_live_tx(marker: u8, gateway: &MempoolGateway) -> Arc<bitcoin_rs_primitives::Tx> {
-        use bitcoin_rs_mempool::MempoolEntry;
+    /// time, and returns the transaction with its admission epoch.
+    fn admit_live_tx(
+        marker: u8,
+        gateway: &MempoolGateway,
+    ) -> (Arc<bitcoin_rs_primitives::Tx>, u64) {
         use bitcoin_rs_primitives::OutPoint;
 
         let mut tx = (*relay_identity_tx()).clone();
         tx.inputs[0].previous_output = OutPoint::new(dummy_txid(marker), 0);
         let tx = Arc::new(tx);
+        let sequence = admit_entry(&tx, gateway);
+        (tx, sequence)
+    }
+
+    /// Inserts `tx` and returns the admission epoch its relay request must
+    /// carry for the send-time residency check to match.
+    fn admit_entry(tx: &Arc<bitcoin_rs_primitives::Tx>, gateway: &MempoolGateway) -> u64 {
+        use bitcoin_rs_mempool::MempoolEntry;
+
         gateway
             .insert_entry(
                 AdmissionOrigin::Rpc,
-                MempoolEntry::new(Arc::clone(&tx), 100, 10_000, 1, 0),
+                MempoolEntry::new(Arc::clone(tx), 100, 10_000, 1, 0),
             )
-            .expect("admit live fixture");
-        tx
+            .expect("admit live fixture")
+            .sequence_of(0)
+            .expect("a single insert carries one admission sequence")
     }
 
     /// Reads the resident entry's wtxid for a fixture transaction, so a
