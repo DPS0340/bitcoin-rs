@@ -1047,6 +1047,7 @@ fn invalidateblock_readmits_a_below_floor_family_through_the_deferred_fence() ->
     // already paid for its place when it was mined.
     let parent = seed_coinbase_spend_with_fee(1);
     let parent_txid = parent.txid();
+    let child_txid;
     let child = Tx {
         version: 2,
         inputs: vec![TxIn {
