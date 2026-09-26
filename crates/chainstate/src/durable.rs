@@ -732,11 +732,17 @@ fn rewind_walk(handles: &Chainstate, head: &DurableHead) -> Result<(), ApplyErro
             .applied_tip
             .load_full()
             .ok_or_else(|| rewind_refused(handles, head, "the applied tip vanished mid-rewind"))?;
-        // Landed on the head, or stepped below it onto the fork the head
+        // Landed on the head or on an ancestor of it — the fork the head
         // chain descends from: reconciliation replays the rest forward.
-        let landed_on_head = applied.hash == head.tip;
-        let onto_fork = applied.height < head.height;
-        if landed_on_head || onto_fork {
+        // Anything below the head's height on a branch the head does not
+        // descend from is not the fork and keeps rewinding.
+        let on_head_chain = {
+            let tree = handles.block_tree.read();
+            tree.lookup(head.tip).is_some_and(|head_id| {
+                tree.find_common_ancestor(head_id, applied.tip_id) == Some(applied.tip_id)
+            })
+        };
+        if on_head_chain {
             return Ok(());
         }
         rewind_one_step(handles, head, &applied)?;
@@ -770,6 +776,21 @@ fn rewind_one_step(
             handles,
             head,
             "a rewound block body does not hash to the applied tip",
+        ));
+    }
+    // A header-matching body can still carry altered transactions; the
+    // txid-level merkle check the ordinary disconnect path runs applies
+    // here for the same reason.
+    let txids: Vec<bitcoin_rs_primitives::Txid> = block
+        .txs
+        .iter()
+        .map(bitcoin_rs_primitives::Tx::txid)
+        .collect();
+    if bitcoin_rs_consensus::verify_merkle_root_with_txids(&block, &txids).is_err() {
+        return Err(rewind_refused(
+            handles,
+            head,
+            "a rewound block body does not match its header's merkle root",
         ));
     }
     let undo = load_block_undo(handles.undo_store.as_ref(), height, hash).map_err(|_| {
