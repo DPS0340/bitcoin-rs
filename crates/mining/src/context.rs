@@ -219,9 +219,11 @@ mod tests {
         let inner = MiningChainContext::resolve(&tree, Network::Testnet4, before_tip, last.time)?;
         assert_eq!(inner.min_time, inner.prev_median_time_past + 1);
 
-        // Regtest never enforces BIP94, so its boundary keeps the old floor.
+        // Regtest never enforces BIP94 as consensus, but 2016 is still a
+        // regtest retarget boundary and `GetMinimumTime` applies the floor
+        // on every network: the template's minimum follows it.
         let regtest = MiningChainContext::resolve(&tree, Network::Regtest, tip, last.time)?;
-        assert_eq!(regtest.min_time, regtest.prev_median_time_past + 1);
+        assert_eq!(regtest.min_time, last.time - 600);
         Ok(())
     }
 
@@ -268,9 +270,9 @@ mod tests {
         let regtest = MiningChainContext::resolve(&tree, Network::Regtest, tip, last.time)?;
         assert_eq!(
             header_sync::minimum_candidate_time(last.time, regtest.height, Network::Regtest),
-            None
+            Some(last.time.saturating_sub(600))
         );
-        assert_eq!(regtest.min_time, regtest.prev_median_time_past + 1);
+        assert_eq!(regtest.min_time, last.time - 600);
         Ok(())
     }
 

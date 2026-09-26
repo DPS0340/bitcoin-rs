@@ -59,18 +59,6 @@ pub enum ApplyError {
     /// Declared target exceeds the network's proof-of-work limit.
     #[error("declared target exceeds network max_target")]
     TargetAboveLimit,
-    /// Declared `nBits` does not match the parent block's `nBits` at a non-retarget height.
-    #[error(
-        "nBits {actual:08x} does not match parent {expected:08x} at non-retarget height {height}"
-    )]
-    NbitsNonRetargetMismatch {
-        /// This block's `nBits`.
-        actual: u32,
-        /// Parent block's `nBits`.
-        expected: u32,
-        /// Block height.
-        height: u32,
-    },
     /// Consensus validation rejected the block.
     #[error("consensus: {0}")]
     Consensus(#[from] bitcoin_rs_consensus::ConsensusError),

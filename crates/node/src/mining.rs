@@ -538,9 +538,7 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
     let reason = match error {
         ApplyError::ProofOfWork { .. } => CompactString::from("high-hash"),
         ApplyError::PrevHashMismatch { .. } => CompactString::from("inconclusive-not-best-prevblk"),
-        ApplyError::TargetAboveLimit | ApplyError::NbitsNonRetargetMismatch { .. } => {
-            CompactString::from("bad-diffbits")
-        }
+        ApplyError::TargetAboveLimit => CompactString::from("bad-diffbits"),
         ApplyError::BlockOutputsExceedInputs | ApplyError::BlockValueOverflow => {
             CompactString::from("bad-cb-amount")
         }

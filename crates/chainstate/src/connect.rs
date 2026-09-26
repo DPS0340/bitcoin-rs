@@ -883,18 +883,7 @@ fn validate_contextual_block_header(
         handles.network,
         bitcoin_rs_chain::current_unix_seconds(),
     )
-    .map_err(|error| match error {
-        bitcoin_rs_chain::ChainError::NbitsMismatch {
-            actual,
-            expected,
-            height,
-        } => ApplyError::NbitsNonRetargetMismatch {
-            actual,
-            expected,
-            height,
-        },
-        error => ApplyError::Chain(error),
-    })
+    .map_err(ApplyError::Chain)
 }
 
 pub(super) fn applied_predecessor(
