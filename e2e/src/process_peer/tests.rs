@@ -105,6 +105,36 @@ fn read_completion_fails_after_the_time_limit() {
 }
 
 #[test]
+fn bytes_past_the_deadline_do_not_renew_it() {
+    let (mut peer, mut remote, _dir) = fixture();
+    remote.write_all(&[7]).expect("one byte before the read");
+    let error = super::read_exact(&mut peer.stream, &mut [0; 2], Instant::now())
+        .expect_err("lapsed-deadline progress must be terminal");
+    assert!(
+        matches!(error, super::Error::Protocol(ref message) if message.starts_with("P2P frame abandoned mid-read")),
+        "mid-read expiry must be terminal rather than a retryable timeout: {error:?}"
+    );
+}
+
+#[test]
+fn payload_expiry_after_the_header_is_terminal() {
+    let (mut peer, mut remote, _dir) = fixture();
+    let frame = serialize(&RawNetworkMessage::new(
+        Magic::REGTEST,
+        NetworkMessage::Ping(1),
+    ));
+    remote
+        .write_all(&frame[..24])
+        .expect("a complete header only");
+    let error = super::read_frame(&mut peer.stream, Instant::now() + Duration::from_millis(50))
+        .expect_err("an absent payload must expire");
+    assert!(
+        matches!(error, super::Error::Protocol(ref message) if message.starts_with("P2P payload read expired mid-frame")),
+        "payload-phase expiry must be terminal rather than a retryable timeout: {error:?}"
+    );
+}
+
+#[test]
 fn send_deadline_keeps_the_attempt_and_error() {
     let (mut peer, _remote, dir) = fixture();
     let error = peer

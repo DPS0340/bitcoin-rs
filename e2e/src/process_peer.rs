@@ -248,11 +248,11 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
     let total = bytes.len();
     while !bytes.is_empty() {
-        // The deadline bounds every wait with a floor, so a peer dribbling
-        // one byte at a time cannot renew it. Before any byte lands the
-        // failure stays a retryable timeout; once the buffer is partially
-        // consumed the wire is mid-frame — resuming would read a desynced
-        // offset, so expiry surfaces as a terminal error instead.
+        // The deadline bounds every wait, and a byte that slips in during
+        // the floor cannot renew it: lapsed-deadline progress is terminal.
+        // Before any byte lands the failure stays a retryable timeout; once
+        // the buffer is partially consumed the wire is mid-frame — resuming
+        // would read a desynced offset, so expiry is a terminal error.
         let wait = remaining(deadline).unwrap_or(Duration::from_millis(1));
         stream.set_read_timeout(Some(wait))?;
         match stream.read(bytes) {
@@ -261,6 +261,9 @@ fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -
                 bytes = bytes
                     .get_mut(count..)
                     .ok_or_else(|| Error::Protocol("invalid read length".to_owned()))?;
+                if remaining(deadline).is_err() {
+                    return Err(Error::Protocol("P2P frame abandoned mid-read".to_owned()));
+                }
             }
             Err(error) if bytes.len() != total => {
                 return Err(Error::Protocol(format!(
