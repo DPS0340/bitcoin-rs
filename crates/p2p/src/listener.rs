@@ -921,8 +921,9 @@ enum KeepaliveAction {
 /// One connection's liveness ledger: when it last heard, last spoke, and
 /// last probed.
 ///
-/// PRE: [`Keepalive::record_recv`] runs for every message the loop reads and
-///   [`Keepalive::record_send`] for every message the loop queues.
+/// PRE: [`Keepalive::record_recv`] runs for every message the loop reads;
+///   every admitted `PeerLease::send` stamps the shared `last_send` the loop
+///   folds in via [`Keepalive::observe_send`].
 /// POST: [`Keepalive::next_action`] orders a `ping` once [`PING_INTERVAL`]
 ///   of quiet has passed since the previous probe, and an `Expired` end
 ///   once either direction has been silent past [`TIMEOUT_INTERVAL`].
@@ -962,6 +963,14 @@ impl Keepalive {
     /// Credits this node with one message queued at `now`.
     fn record_send(&mut self, now: Instant) {
         self.last_send = now;
+    }
+
+    /// Folds a send timestamp recorded outside this loop (every admitted
+    /// `PeerLease::send`) into the ledger.
+    fn observe_send(&mut self, sent: Instant) {
+        if sent > self.last_send {
+            self.last_send = sent;
+        }
     }
 
     /// Records a probe actually queued at `now`: the interval counts from
@@ -1115,6 +1124,11 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             return Ok(());
         }
 
+        // Every admitted `lease.send` — compact follow-ups, relay `inv`s,
+        // dispatch replies — stamps `lease.last_send`, not just the ping and
+        // response paths below. Fold it in so sustained outbound traffic
+        // counts as send activity.
+        keepalive.observe_send(lease.last_send());
         match keepalive.next_action(Instant::now()) {
             KeepaliveAction::Idle => {}
             KeepaliveAction::Ping => {

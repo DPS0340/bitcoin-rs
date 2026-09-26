@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::peer_info::PeerRole;
+use crate::sync::GetheadersOutcome;
 use crate::sync::frontier::UsablePeer;
 use crate::sync::peers::{ChainSyncAction, ChainSyncState, chain_sync_subject, consider_eviction};
 
@@ -379,5 +380,61 @@ fn an_unsent_chain_sync_probe_arms_no_response_window() {
             .chain_sync
             .contains_key(&subject.source),
         "no response window is armed for a probe the connection never received"
+    );
+}
+
+/// The eviction benchmark is taken from the header tip, so the probe's
+/// locator anchors at the best header's parent — an applied-tip anchor
+/// cannot return the header tip while IBD lags a page behind it, and a
+/// correct answer would credit only the applied side.
+#[test]
+#[allow(clippy::expect_used)]
+fn chain_sync_probe_locator_anchors_at_the_header_tips_parent() {
+    let t0 = Instant::now();
+    // Bodies to 1, headers to 3, genesis applied: the applied anchor sits
+    // two headers under the benchmark.
+    let (tree, _blocks) = mined_chain(1, 2).expect("fixture chain mines");
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    let chain_frontier = sync.observe_chain_frontier();
+    let frontier = sync.observe_frontier(chain_frontier, t0);
+    let tip = frontier
+        .chain
+        .chain_tip
+        .as_ref()
+        .expect("the fixture mines a header tip")
+        .clone();
+    assert_eq!(tip.height, 3, "premise: header tip is height 3");
+
+    let addr = test_addr(9_900, 0).expect("test address builds");
+    let rx = connect_peer(&peers, eligible_peer(addr, i32::MAX));
+    let outcome = sync.send_chain_sync_probe(&frontier, current_source(&peers, addr));
+    assert_eq!(outcome, GetheadersOutcome::Sent);
+
+    let Ok(Message::GetHeaders(getheaders)) = rx.try_recv() else {
+        panic!("the probe enqueues one getheaders");
+    };
+    let parent = block_tree
+        .read()
+        .node(tip.tip_id)
+        .expect("tip is in the tree")
+        .parent
+        .expect("a height-3 tip has a parent");
+    let expected = block_tree
+        .read()
+        .node(parent)
+        .expect("parent is in the tree")
+        .hash;
+    assert_eq!(
+        getheaders.locator_hashes.first(),
+        Some(&bitcoin::BlockHash::from_byte_array(
+            *expected.as_byte_array()
+        )),
+        "the locator roots at the header tip's parent so the answer carries the tip"
     );
 }

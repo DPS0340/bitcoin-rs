@@ -689,10 +689,9 @@ impl BlockSync {
         outcome
     }
 
-    /// Sends one `getheaders` for the chain-sync eviction probe: the same
-    /// applied-anchor locator the frontier probe uses, but without the
+    /// Sends one `getheaders` for the chain-sync eviction probe, without the
     /// frontier-ownership gate — a lagging peer owes an answer for its own
-    /// silence regardless of who owns the next body, and without claiming
+    /// silence regardless of who owns the next body — and without claiming
     /// the singleton `header_request` slot.
     ///
     /// PRE: `source` names a live subject connection.
@@ -704,10 +703,26 @@ impl BlockSync {
         frontier: &SyncFrontier,
         source: PeerSource,
     ) -> GetheadersOutcome {
-        let Some((our_height, target_height, locator)) = self.applied_frontier_probe(frontier)
-        else {
+        // Core anchors this probe at the best header's parent
+        // (`net_processing.cpp` ConsiderEviction) so the answer can carry
+        // the header tip the eviction benchmark is measured against. The
+        // applied anchor cannot reach it while IBD lags by more than one
+        // headers page — a correct answer there would credit only the
+        // applied side and retire a peer that answered honestly.
+        let Some(headers) = frontier.chain.chain_tip.as_ref() else {
             return GetheadersOutcome::Failed;
         };
+        let locator = {
+            let tree = self.chain.block_tree();
+            let anchor = tree
+                .node(headers.tip_id)
+                .ok()
+                .and_then(|node| node.parent)
+                .unwrap_or(headers.tip_id);
+            tree.block_locator(anchor, LOCATOR_MAX_ENTRIES)
+        };
+        let our_height = headers.height.saturating_sub(1);
+        let target_height = i32::try_from(headers.height).unwrap_or(i32::MAX);
         let outcome =
             self.send_getheaders_tracked(source, our_height, target_height, locator, false);
         if outcome == GetheadersOutcome::Sent {
