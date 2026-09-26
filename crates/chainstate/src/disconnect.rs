@@ -188,6 +188,14 @@ pub(super) fn disconnect_block_admitted(
     )
     .map_err(fatal)?;
     let parent_tip = receipt.certify(parent_tip);
+    // The certified count also belongs on the parent's tree node: a later
+    // connect of a competing child derives its count from that node, and a
+    // checkpoint restore deliberately leaves non-tip nodes unknown.
+    handles
+        .block_tree
+        .write()
+        .restore_chain_tx_count(parent_tip.tip_id, parent_tip.chain_tx_count)
+        .map_err(|error| fatal(ApplyError::from(error)))?;
     publish_applied(handles, &parent_tip, crate::events::HintKind::Disconnected);
     if journal_rewound {
         handles.undo_store.disarm_disconnect().map_err(|error| {

@@ -178,6 +178,24 @@ impl CheckpointPublisher {
                 tracing::error!(%error, "failed to resume chainstate journal after publication error");
             }
         }
+        // The disconnect marker retires only once the whole publication
+        // transaction — checkpoint, journal compaction, and resume — has
+        // committed. A failure anywhere before this point must leave the
+        // marker armed so the next startup repeats marker-aware recovery.
+        if result.is_ok() {
+            let marker_retired = match retirement {
+                DisconnectRetirement::Ordinary => self.undo_store.disarm_disconnect(),
+                DisconnectRetirement::Recovered
+                    if matches!(result, Ok(CheckpointWrite::Published { .. })) =>
+                {
+                    self.undo_store.retire_disconnect_marker()
+                }
+                DisconnectRetirement::Recovered => Ok(()),
+            };
+            if let Err(error) = marker_retired {
+                result = Err(error.into());
+            }
+        }
         result
     }
 
@@ -296,20 +314,6 @@ impl CheckpointPublisher {
                 ))
             })?;
         }
-        // Remove the disconnect marker only after this checkpoint publishes
-        // the matching UTXO set and applied tip. A recovery whose write was
-        // skipped — no applied tip to certify — keeps the marker so the
-        // next recovery attempt still has its evidence.
-        let marker_retired = match retirement {
-            DisconnectRetirement::Ordinary => self.undo_store.disarm_disconnect(),
-            DisconnectRetirement::Recovered
-                if matches!(written, CheckpointWrite::Published { .. }) =>
-            {
-                self.undo_store.retire_disconnect_marker()
-            }
-            DisconnectRetirement::Recovered => Ok(()),
-        };
-        marker_retired.map_err(CheckpointError::from)?;
         // Marker retirement is a second durability step after `CURRENT`.
         // Propagate failure so the worker retries next tick; the published
         // checkpoint stays, and the marker stays until unlink+dirsync commits.

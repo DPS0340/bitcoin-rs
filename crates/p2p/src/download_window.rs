@@ -266,12 +266,18 @@ pub struct BlockDownloadPolicy {
 ///   cannot serve the range is never asked for it.
 pub fn serves_requested_height(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> bool {
     let network = ServiceFlags::NETWORK.to_u64();
+    let limited = ServiceFlags::NETWORK_LIMITED.to_u64();
     let witness = ServiceFlags::WITNESS.to_u64();
     if peer.services & witness == 0 {
         return false;
     }
     if peer.services & network != 0 {
         return true;
+    }
+    // Without NODE_NETWORK only a NODE_NETWORK_LIMITED peer serves bodies at
+    // all, and then only its last 288 blocks.
+    if peer.services & limited == 0 {
+        return false;
     }
     if policy
         .ibd
