@@ -290,8 +290,14 @@ fn staged_body_whose_resolved_header_is_inadmissible_is_evicted()
     // Put requested bodies in flight next to the unsolicited one: the
     // getdata marks heights 1..=2 pending in the window.
     assert!(
-        sync.send_getdata_for_pending_blocks(source, false, 100, &test_frontier(&sync))
-            .sent,
+        sync.send_getdata_for_pending_blocks(
+            source,
+            false,
+            100,
+            &test_frontier(&sync),
+            Instant::now(),
+        )
+        .sent,
         "the fixture must put requested bodies in flight"
     );
     assert_eq!(sync.scheduler.lock().window.pending_len(), 2);

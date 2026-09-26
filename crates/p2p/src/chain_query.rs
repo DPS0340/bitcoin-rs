@@ -230,7 +230,7 @@ impl ChainQuery for ActiveChainQuery {
             return Ok(None);
         };
         let deep = beyond_depth(tip_height, height, MAX_BLOCKTXN_DEPTH);
-        if !headroom() {
+        if deep && !headroom() {
             return Ok(None);
         }
         let Some((payload, tip_height)) = self.load_active_block(height, hash) else {

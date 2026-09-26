@@ -252,7 +252,7 @@ impl BlockSync {
         if !direct_fetch.is_empty() {
             let chain = self.observe_chain_frontier();
             for (source, announced_tip) in direct_fetch {
-                self.direct_fetch_announced_tip(source, announced_tip, &chain);
+                self.direct_fetch_announced_tip(source, announced_tip, &chain, now);
             }
         }
         self.drain_block_announcements(now);
@@ -336,6 +336,7 @@ impl BlockSync {
         source: PeerSource,
         announced_tip: Hash256,
         chain: &ChainFrontier,
+        now: Instant,
     ) -> GetdataRequestOutcome {
         let (Some(chain_tip), Some(required)) = (chain.chain_tip.as_ref(), chain.next_required)
         else {
@@ -355,13 +356,14 @@ impl BlockSync {
         {
             return GetdataRequestOutcome::default();
         }
-        let outcome = self.send_getdata_for_pending_blocks(source, false, height, chain);
+        let outcome = self.send_getdata_for_pending_blocks(source, false, height, chain, now);
         // The request path primes the expected-apply cache with exactly this
         // batch. A direct fetch runs before this round's apply pass, where
         // more bodies may already be staged, so drop the primed cache and let
         // the apply path walk the tree and repopulate it with the full run —
-        // but only when a request actually went out; a refused outcome left
-        // the cache untouched.
+        // but only when this call actually sent, or an older pending
+        // request's apply plan would be erased with nothing replacing it.
+        // A refused outcome left the cache untouched.
         if outcome.sent {
             *self.expected_apply_cache.lock() = None;
         }

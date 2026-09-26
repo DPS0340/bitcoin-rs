@@ -83,9 +83,11 @@ impl BlockSync {
                 &mut apply_head_check,
             );
             if !blocks.is_empty() {
-                received = received.saturating_add(
-                    self.buffer_received_block_chunk(&mut blocks, next_expected_hash),
-                );
+                received = received.saturating_add(self.buffer_received_block_chunk(
+                    &mut blocks,
+                    next_expected_hash,
+                    now,
+                ));
             }
         }
         if received == 0 && self.scheduler.lock().stager.received_len() == 0 {
@@ -94,7 +96,9 @@ impl BlockSync {
 
         self.admit_staged_headers(now);
 
-        let now = Instant::now();
+        // Expired staging is pruned against the drain's own instant, not a
+        // fresh read: one tick keeps deadlines, cooldowns, and deliveries on
+        // a single clock.
         let dropped = self.scheduler.lock().stager.prune_expired(now);
         let pruned = !dropped.is_empty();
         if pruned {
@@ -267,9 +271,7 @@ impl BlockSync {
         let mut credit_refresh_needed = false;
         let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
         for (hash, header, source) in unadmitted {
-            let Some(admission) =
-                self.route_headers_batch(&[header], source, false, 1, Instant::now())
-            else {
+            let Some(admission) = self.route_headers_batch(&[header], source, false, 1, now) else {
                 continue;
             };
             match admission {
@@ -412,6 +414,7 @@ impl BlockSync {
         &self,
         blocks: &mut Vec<InboundBlock>,
         next_expected_hash: Option<Hash256>,
+        now: Instant,
     ) -> usize {
         // A cold-start hedge can arrive after its original copy was applied.
         // Drop only blocks proven to lie on the applied ancestry; a known
@@ -529,7 +532,6 @@ impl BlockSync {
         let mut staged_blocks = Vec::with_capacity(blocks.len());
         let mut reject_deliveries = Vec::new();
         let mut refused_at_budget = 0_usize;
-        let now = Instant::now();
         {
             let mut scheduler = self.scheduler.lock();
             let stager = &mut scheduler.stager;
