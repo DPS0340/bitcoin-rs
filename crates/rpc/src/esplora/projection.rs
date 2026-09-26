@@ -532,7 +532,8 @@ impl<'a> Projection<'a> {
     }
 
     /// PRE: `confirmed_unspent` contains the script index's current records.
-    /// POST: Capture relevant funders and spenders from one pool view.
+    /// POST: Capture funders under one pool view, then spenders under a
+    ///   fresh one after output matching releases the first.
     /// POST: Release the guard before hashing scripts, deduplicating and sorting.
     /// INVARIANT: Each txid appears once in descending `(time, txid)` order.
     fn mempool_activity(
@@ -541,29 +542,36 @@ impl<'a> Projection<'a> {
         confirmed_unspent: &[ScriptIndexRecord],
     ) -> Vec<Arc<Tx>> {
         let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
-        // The guard covers pool facts only: each funder, and the spender of
-        // every outpoint that could pay the queried script. Candidates are
-        // the confirmed unspent outpoints plus the script-matching outputs of
-        // every funder — probing the spend index for a funder's unrelated
-        // outputs would let a wide funding transaction amplify work under
-        // the guard. Funders are captured as `Arc` clones rather than txids
-        // alone: resolving a txid back to an entry afterwards costs a scan of
-        // the whole pool per selected transaction.
-        let (funders, outputs, spenders) = {
+        // The guard covers pool facts only. Funders are captured as `Arc`
+        // clones rather than txids alone: resolving a txid back to an entry
+        // afterwards costs a scan of the whole pool per selected
+        // transaction.
+        let funders = {
             let pool = self.ctx.mempool.gateway.read();
-            let mut funders = Vec::new();
-            let mut outputs = confirmed_unspent
-                .iter()
-                .map(|record| (record.txid, record.vout))
-                .collect::<std::collections::BTreeSet<_>>();
-            for entry in pool.entries_funding_script(mempool_hash) {
-                funders.push((entry.txid, entry.time, Arc::clone(&entry.tx)));
-                outputs.extend(
-                    Self::outputs_paying(&entry.tx, mempool_hash)
-                        .map(|(_, vout, _)| (entry.txid, vout)),
-                );
-            }
-            let spenders = outputs
+            pool.entries_funding_script(mempool_hash)
+                .map(|entry| (entry.txid, entry.time, Arc::clone(&entry.tx)))
+                .collect::<Vec<_>>()
+        };
+        // Candidates are the confirmed unspent outpoints plus the
+        // script-matching outputs of every funder — probing the spend index
+        // for a funder's unrelated outputs would let a wide funding
+        // transaction amplify work. Output matching hashes every output, so
+        // it runs after the first guard releases; the spend index is then
+        // probed under a fresh read, where `outpoint_spender` simply finds
+        // no spender for an entry that left the pool between the two reads.
+        let mut outputs = confirmed_unspent
+            .iter()
+            .map(|record| (record.txid, record.vout))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (txid, _time, transaction) in &funders {
+            outputs.extend(
+                Self::outputs_paying(transaction, mempool_hash)
+                    .map(|(_, vout, _)| (*txid, vout)),
+            );
+        }
+        let spenders = {
+            let pool = self.ctx.mempool.gateway.read();
+            outputs
                 .iter()
                 .filter_map(|(txid, vout)| {
                     let Ok(Some(spender)) = pool.outpoint_spender(OutPoint::new(*txid, *vout))
@@ -579,8 +587,7 @@ impl<'a> Projection<'a> {
                         ),
                     ))
                 })
-                .collect::<std::collections::BTreeMap<_, _>>();
-            (funders, outputs, spenders)
+                .collect::<std::collections::BTreeMap<_, _>>()
         };
         // Keyed by txid so a transaction reached through both the funding index
         // and the spend scan is selected once.
