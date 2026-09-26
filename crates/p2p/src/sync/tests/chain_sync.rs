@@ -413,7 +413,7 @@ fn chain_sync_probe_locator_anchors_at_the_header_tips_parent() {
     assert_eq!(tip.height, 3, "premise: header tip is height 3");
 
     let addr = test_addr(9_900, 0).expect("test address builds");
-    let rx = connect_peer(&peers, eligible_peer(addr, i32::MAX));
+    let rx = connect_peer(&peers, synthetic_peer(addr, i32::MAX));
     let outcome = sync.send_chain_sync_probe(&frontier, current_source(&peers, addr));
     assert_eq!(outcome, GetheadersOutcome::Sent);
 
@@ -462,7 +462,7 @@ fn a_failed_sweep_probe_restores_the_armed_record() {
         .expect("the test clock predates the connect age");
     let lease = PeerLease::new_connected_at(tx, connected_at);
     peers.register(addr, lease.clone());
-    peers.publish_info(addr, &lease, eligible_peer(addr, 0));
+    peers.publish_info(addr, &lease, synthetic_peer(addr, 0));
     let source = current_source(&peers, addr);
 
     let frontier = sync.observe_frontier(sync.observe_chain_frontier(), t0);
