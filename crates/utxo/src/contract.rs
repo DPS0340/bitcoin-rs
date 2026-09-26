@@ -570,11 +570,12 @@ pub fn decode_undo_record(bytes: &[u8], block_hash: Hash256) -> Result<UndoBatch
 /// must not be armed over, while a `RolledBack` marker is owed checkpoint
 /// debt that sequential disconnects carry into the next arm. On success the
 /// marker stays `RolledBack` until the caller durably publishes the
-/// rolled-back state. A marker that survives to the next startup no longer
-/// refuses it: startup recovers automatically from the durable certified
-/// head before anything serves (`docs/contracts/recovery.md`). Per-coin
-/// coinstats follow the set's undo through the listener; only height and
-/// transaction count are rewound here.
+/// rolled-back state. Startup no longer refuses a marker that survives
+/// to the next open: recovery replays automatically from the durable
+/// certified head before anything serves, and still fails closed when
+/// that head is absent or unreadable (`docs/contracts/recovery.md`).
+/// Per-coin coinstats follow the set's undo through the listener; only
+/// height and transaction count are rewound here.
 ///
 /// # Errors
 ///
