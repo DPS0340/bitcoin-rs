@@ -1772,7 +1772,8 @@ impl DownloadWindow {
     ///      to `now` exactly when the removed entry was strictly older
     ///      than every survivor (the true queue head left); when a
     ///      survivor carries the removed entry's own stamp, the clock
-    ///      keeps that stamp; otherwise the entry is untouched.
+    ///      adopts that stamp without ever regressing; otherwise the
+    ///      entry is untouched.
     /// INVARIANT: the local equivalent of Core's `m_downloading_since`
     ///      start-and-oldest-removal reset (`net_processing.cpp:1323-1332,
     ///      1363-1368`); `requested_at` stays the ordering and diagnostic
@@ -1804,9 +1805,16 @@ impl DownloadWindow {
             // The removed entry shares the surviving head's stamp (entries
             // of one batched request share one `requested_at`): the head
             // keeps that stamp, so the clock stays at the batch origin
-            // until the front itself is removed.
+            // until the front itself is removed. The clock may already sit
+            // ahead of the stamp — an earlier true-head removal moved it
+            // to the removal instant — and must not regress: Core's
+            // `m_downloading_since` only ever moves forward
+            // (`max(since, now)`).
             Some(oldest) if removed_requested_at == oldest => {
-                self.owner_downloading_since.insert(owner, oldest);
+                self.owner_downloading_since
+                    .entry(owner)
+                    .and_modify(|since| *since = (*since).max(oldest))
+                    .or_insert(oldest);
             }
             // A strictly older survivor is still the head: untouched.
             Some(_) => {}
@@ -3158,6 +3166,66 @@ mod tests {
         );
     }
 
+    /// A batch sibling removed after the clock already restarted must not
+    /// drag the clock back to its older batch stamp — the rewind would
+    /// postpone `owner_download_expired` for a queue the peer is actively
+    /// draining.
+    #[test]
+    fn tied_removal_never_rewinds_the_owner_queue_clock() {
+        let mut window = DownloadWindow::new(test_budget());
+        let stager = test_stager(&window);
+        let t0 = Instant::now();
+        let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        let batch_a = super::non_empty_request(
+            owner,
+            vec![
+                super::PeerRequestEntry {
+                    hash: hash(0xf1),
+                    height: 1,
+                },
+                super::PeerRequestEntry {
+                    hash: hash(0xf2),
+                    height: 2,
+                },
+            ],
+            3,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        assert!(window.mark_requested(&stager, &batch_a, owner, t0));
+
+        let t5 = t0 + Duration::from_secs(5);
+        let batch_b = super::non_empty_request(
+            owner,
+            vec![
+                super::PeerRequestEntry {
+                    hash: hash(0xf3),
+                    height: 3,
+                },
+                super::PeerRequestEntry {
+                    hash: hash(0xf4),
+                    height: 4,
+                },
+            ],
+            5,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        assert!(window.mark_requested(&stager, &batch_b, owner, t5));
+
+        // Drain batch A: its front ties with its sibling (clock stays at
+        // the batch origin), then the sibling leaves as the true head and
+        // restarts the clock at the removal instant.
+        window.mark_received_from(hash(0xf1), SMALL_BODY, Some(owner), t5);
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&t0));
+        let t9 = t5 + Duration::from_secs(4);
+        window.mark_received_from(hash(0xf2), SMALL_BODY, Some(owner), t9);
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&t9));
+
+        // The first batch-B removal ties with its sibling's t5 stamp: the
+        // clock must keep t9, not regress to t5.
+        window.mark_received_from(hash(0xf3), SMALL_BODY, Some(owner), t9);
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&t9));
+    }
+
     /// The retarget path releases a pending without a delivery; a
     /// suspicion armed on its owner must clear instead of convicting when
     /// the second tick finds the observed hash no longer pending-owned.
@@ -3390,7 +3458,7 @@ mod tests {
     fn pending_timeout_override_wins_over_spacing_policy() {
         let mut window = DownloadWindow::new(
             SyncBudget {
-                block_spacing: Duration::from_secs(600),
+                block_spacing: Duration::from_mins(10),
                 ..test_budget()
             }
             .with_pending_timeout_override(Duration::from_secs(5)),
@@ -6264,7 +6332,7 @@ mod tests {
     fn test_budget() -> SyncBudget {
         SyncBudget {
             max_pending_blocks: 128,
-            block_spacing: Duration::from_secs(600),
+            block_spacing: Duration::from_mins(10),
             max_pending_bytes: usize::MAX,
             max_received_blocks: 128,
             max_received_bytes: usize::MAX,
