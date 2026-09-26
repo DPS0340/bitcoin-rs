@@ -300,24 +300,29 @@ pub fn prune_to_height<S: crate::KvStore>(
         // have been applied, so the claim cannot be released on `Err` alone.
         // The frontier record shares the deletions' atomic boundary, so its
         // presence proves the outcome.
-        return match load_executed_frontier(store) {
+        return match (load_executed_frontier(store), load_pruneheight(store)) {
             // The receipt persisted, so the deletions did too: the batch
             // proved itself durable despite the reported error, so run the
             // same in-memory follow-ups the success path would — the line
             // promotion and the flat-file reclaim — and hand the caller the
             // staged result. Answering `Err` here would strand claimable
             // files and leave every caller-side follow-up unapplied.
-            Ok(Some(persisted)) if persisted.get() >= executed.get() => {
+            // The frontier alone is only a lower bound (a past pass may
+            // already have reached it), so the batch-specific intent record
+            // must match this pass's requested height as well.
+            (Ok(Some(persisted)), Ok(Some(persisted_height)))
+                if persisted.get() >= executed.get() && persisted_height == pruneheight =>
+            {
                 reservation.commit(persisted.get());
                 reclaim_staged_flat_block_files(store, block_files, &staged.file_numbers)?;
                 Ok(staged)
             }
             // No new receipt persisted, so the atomic batch applied nothing:
             // dropping the reservation safely reopens lease grants.
-            Ok(_) => Err(error.into()),
+            (Ok(_), Ok(_)) => Err(error.into()),
             // The outcome cannot be proven: fail closed and hold the claim
             // until restart-time recovery reconciles record and deletions.
-            Err(_) => {
+            _ => {
                 reservation.fail_closed();
                 Err(error.into())
             }
