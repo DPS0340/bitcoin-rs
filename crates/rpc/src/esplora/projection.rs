@@ -542,28 +542,28 @@ impl<'a> Projection<'a> {
     ) -> Vec<Arc<Tx>> {
         let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
         // The guard covers pool facts only: each funder, and the spender of
-        // every outpoint that could be a candidate. Candidates are the
-        // confirmed unspent outpoints plus every output of every funder — a
-        // superset chosen so the script match that narrows it again stays
-        // off-guard. Funders are captured as `Arc` clones rather than txids
+        // every outpoint that could pay the queried script. Candidates are
+        // the confirmed unspent outpoints plus the script-matching outputs of
+        // every funder — probing the spend index for a funder's unrelated
+        // outputs would let a wide funding transaction amplify work under
+        // the guard. Funders are captured as `Arc` clones rather than txids
         // alone: resolving a txid back to an entry afterwards costs a scan of
         // the whole pool per selected transaction.
-        let (funders, spenders) = {
+        let (funders, outputs, spenders) = {
             let pool = self.ctx.mempool.gateway.read();
             let mut funders = Vec::new();
-            let mut candidates = confirmed_unspent
+            let mut outputs = confirmed_unspent
                 .iter()
                 .map(|record| (record.txid, record.vout))
                 .collect::<std::collections::BTreeSet<_>>();
             for entry in pool.entries_funding_script(mempool_hash) {
                 funders.push((entry.txid, entry.time, Arc::clone(&entry.tx)));
-                candidates.extend(
-                    (0..entry.tx.outputs.len())
-                        .filter_map(|position| u32::try_from(position).ok())
-                        .map(|vout| (entry.txid, vout)),
+                outputs.extend(
+                    Self::outputs_paying(&entry.tx, mempool_hash)
+                        .map(|(_, vout, _)| (entry.txid, vout)),
                 );
             }
-            let spenders = candidates
+            let spenders = outputs
                 .iter()
                 .filter_map(|(txid, vout)| {
                     let Ok(Some(spender)) = pool.outpoint_spender(OutPoint::new(*txid, *vout))
@@ -580,20 +580,13 @@ impl<'a> Projection<'a> {
                     ))
                 })
                 .collect::<std::collections::BTreeMap<_, _>>();
-            (funders, spenders)
+            (funders, outputs, spenders)
         };
         // Keyed by txid so a transaction reached through both the funding index
         // and the spend scan is selected once.
         let mut selected = std::collections::BTreeMap::new();
-        let mut outputs = confirmed_unspent
-            .iter()
-            .map(|record| (record.txid, record.vout))
-            .collect::<std::collections::BTreeSet<_>>();
         for (txid, time, transaction) in &funders {
             selected.insert(*txid, (*time, Arc::clone(transaction)));
-            for (_, vout, _) in Self::outputs_paying(transaction, mempool_hash) {
-                outputs.insert((*txid, vout));
-            }
         }
         for (txid, vout) in &outputs {
             if let Some((time, spender_txid, transaction)) = spenders.get(&(*txid, *vout)) {

@@ -512,9 +512,10 @@ fn mempool_recent(ctx: &Context) -> Response {
     const RECENT: usize = 10;
     let latest = {
         let pool = ctx.mempool.gateway.read();
-        // Bounded top-ten selection: only a retained candidate pays for an
-        // `Arc` clone, never every scanned entry.
-        let mut latest: Vec<(u64, Txid, u64, u32, Arc<Tx>)> = Vec::with_capacity(RECENT);
+        // Bounded top-ten selection: candidates borrow the scanned entry, so
+        // only the ten survivors pay an `Arc` clone — an eviction ordering
+        // never clones a transaction it evicts (SEL-01).
+        let mut latest: Vec<(u64, Txid, u64, u32, &Arc<Tx>)> = Vec::with_capacity(RECENT);
         for entry in pool.iter_entries() {
             let rank = (entry.time, entry.txid);
             let position = match latest.iter().position(|kept| rank > (kept.0, kept.1)) {
@@ -524,17 +525,16 @@ fn mempool_recent(ctx: &Context) -> Response {
             };
             latest.insert(
                 position,
-                (
-                    entry.time,
-                    entry.txid,
-                    entry.fee,
-                    entry.vsize,
-                    Arc::clone(&entry.tx),
-                ),
+                (entry.time, entry.txid, entry.fee, entry.vsize, &entry.tx),
             );
             latest.truncate(RECENT);
         }
         latest
+            .into_iter()
+            .map(|(time, txid, fee, vsize, transaction)| {
+                (time, txid, fee, vsize, Arc::clone(transaction))
+            })
+            .collect::<Vec<_>>()
     };
     json_response(
         latest
