@@ -604,7 +604,7 @@ impl UtxoRecord {
     /// INVARIANT: an error leaves the source record, shard table, and any
     /// `overwritten` sink unchanged.
     pub(crate) fn add_run_replacement<'p>(
-        existing: Option<&UtxoRecord>,
+        existing: Option<&Self>,
         txid: Hash256,
         additions: &'p [OutputParts<'p>],
         add_unique: bool,
