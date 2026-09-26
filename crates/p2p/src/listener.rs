@@ -236,15 +236,7 @@ impl InboundSyncSinks {
         // blocks drain each tick, so the body lands already expected. The
         // forward is not a `headers` response: it must not consume an
         // outstanding `getheaders` request's pending state.
-        //
-        // The body goes on its channel before the header goes on its own on
-        // purpose: a tip learned only by body delivery arrives untracked
-        // (the `inv` getdata is never marked pending), so if the header
-        // reached the tree while the body still sat outside `received`, the
-        // same tick would schedule a duplicate fetch for it. Queueing the
-        // body first means the tick that admits the header always marks the
-        // body received first.
-        let header = block.header;
+        self.send_headers(source, vec![block.header], false, false);
         let mut inbound = crate::InboundBlock {
             block,
             serialized,
@@ -261,7 +253,7 @@ impl InboundSyncSinks {
             match self.blocks_tx.send_timeout(inbound, POLL_INTERVAL) {
                 Ok(()) => {
                     wake_sync(self.wake_tx.as_ref());
-                    break;
+                    return;
                 }
                 Err(SendTimeoutError::Timeout(returned)) => inbound = returned,
                 Err(SendTimeoutError::Disconnected(_)) => {
@@ -273,7 +265,6 @@ impl InboundSyncSinks {
                 }
             }
         }
-        self.send_headers(source, vec![header], false, false);
     }
 
     /// Forwards a decoded transaction into the node's ingress channel.
