@@ -792,9 +792,7 @@ impl Mempool {
         }
 
         let ancestors = self.ancestor_ids_for_tx(&entry.tx);
-        if enforcement == crate::rbf::LimitEnforcement::Full {
-            self.check_cluster_limits(&entry.tx, entry.policy_weight(), excluded)?;
-        }
+        self.check_cluster_limits(&entry.tx, entry.policy_weight(), excluded)?;
 
         if excluded.is_empty() && u32::try_from(self.entries.vacant_key()).is_err() {
             return Err(MempoolError::TooManyEntries);
