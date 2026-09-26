@@ -687,7 +687,7 @@ impl BlockSync {
                         // staged, so a live pending still carries its
                         // request height and an unrequested body must not
                         // move the cursor at all.
-                        window.requeue_for_retry(&dropped.hash, None, now);
+                        window.release_pending_without_rewind(&dropped.hash, now);
                         retry_count = retry_count.saturating_add(1);
                         tracing::warn!(%hash, "block sync: received block buffer full; dropping block for retry");
                     }
