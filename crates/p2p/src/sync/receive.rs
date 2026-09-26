@@ -15,6 +15,7 @@ use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
+use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
 use smallvec::SmallVec;
 use std::time::Instant;
 use std::vec::Vec;
@@ -62,24 +63,25 @@ impl BlockSync {
         let dropped = self.scheduler.lock().stager.prune_expired(now);
         let pruned = !dropped.is_empty();
         if pruned {
-            let tree = self.chain.block_tree();
-            let height_updates: Vec<(Hash256, u32)> = dropped
-                .iter()
-                .filter_map(|dropped| {
-                    let node_id = tree.lookup(dropped.hash)?;
-                    tree.node(node_id)
-                        .ok()
-                        .map(|node| (dropped.hash, node.height))
-                })
-                .collect();
-            drop(tree);
+            // The tree owns heights: a pruned body requeues at its tree
+            // height, or without a cursor move when the tree cannot resolve
+            // it (the old 0-sentinel rewind to genesis is unrepresentable).
+            let requeues: Vec<(Hash256, Option<u32>)> = {
+                let tree = self.chain.block_tree();
+                dropped
+                    .iter()
+                    .map(|dropped| {
+                        let height = tree
+                            .lookup(dropped.hash)
+                            .and_then(|node_id| tree.node(node_id).ok())
+                            .map(|node| node.height);
+                        (dropped.hash, height)
+                    })
+                    .collect()
+            };
             let mut scheduler = self.scheduler.lock();
-            let window = &mut scheduler.window;
-            for (hash, height) in height_updates {
-                window.update_received_height(&hash, height);
-            }
-            for dropped in dropped {
-                window.drop_received_for_retry(&dropped.hash);
+            for (hash, height) in requeues {
+                scheduler.window.requeue_for_retry(&hash, height);
             }
         }
 
@@ -141,6 +143,44 @@ impl BlockSync {
         .then_some(active_tip.tip_id)
     }
 
+    /// Discards staged bodies whose headers can never admit and blames
+    /// their delivering peers. Re-queuing would re-download a body that
+    /// cannot apply, and a body whose embedded header fails consensus is
+    /// the peer's fault, same as a rejected `headers` batch. `PeerTable`
+    /// operations precede the scheduler lock to preserve the `PeerTable` ->
+    /// scheduler ordering used elsewhere.
+    fn discard_inadmissible_header_bodies(&self, invalid: &[(Hash256, Option<crate::PeerSource>)]) {
+        let blamed: Vec<std::net::SocketAddr> = invalid
+            .iter()
+            .filter_map(|(_, source)| *source)
+            .filter(|source| {
+                if self.peer_table.disconnect_source(*source) {
+                    // Every removal path releases a `getheaders` gate
+                    // the peer owned, or a same-address reconnect
+                    // inherits a dead deadline.
+                    self.clear_header_request_for(*source);
+                    true
+                } else {
+                    false
+                }
+            })
+            .map(|source| source.addr)
+            .collect();
+        let mut scheduler = self.scheduler.lock();
+        for (hash, _) in invalid {
+            scheduler.stager.discard(hash);
+        }
+        for peer_addr in &blamed {
+            scheduler
+                .window
+                .mark_peer_unresponsive(*peer_addr, Instant::now());
+        }
+        tracing::debug!(
+            discarded = invalid.len(),
+            "block sync: discarded bodies with inadmissible headers"
+        );
+    }
+
     /// Retries header admission for staged bodies whose headers are still
     /// absent from the tree.
     ///
@@ -167,14 +207,13 @@ impl BlockSync {
                 .collect()
         };
         // Every staged header reaches `admit_headers`, and a rejection can
-        // still commit a valid prefix — staged-body sentinels reconcile on
-        // the attempt, not only on a clean accept.
-        let admission_attempted = !unadmitted.is_empty();
+        // still commit a valid prefix.
         let mut missing_parent = false;
         let mut credit_refresh_needed = false;
         let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
+        let mut inadmissible: Vec<Hash256> = Vec::new();
         for (hash, header, source) in unadmitted {
-            match self.chain.admit_headers(&[header]) {
+            let admitted = match self.chain.admit_headers(&[header]) {
                 HeaderAdmission::Accepted {
                     announced_tip: Some(tip_hash),
                     active_height,
@@ -191,65 +230,64 @@ impl BlockSync {
                             .note_announced_tip(source, tip_hash, active_height);
                         credit_refresh_needed = true;
                     }
+                    true
                 }
+                HeaderAdmission::Accepted { .. } => true,
                 HeaderAdmission::Rejected(
                     ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. },
                 ) => {
                     missing_parent = true;
+                    false
                 }
                 HeaderAdmission::Rejected(error) if is_peer_fault(&error) => {
                     invalid.push((hash, source));
+                    false
                 }
-                _ => {}
+                _ => false,
+            };
+            if admitted {
+                // The body staged while its header was unknown — a body
+                // slightly ahead of its in-flight header is legitimate. Now
+                // that the tree resolves it, hold it to the same
+                // unrequested-admission clauses a resolved arrival faced.
+                let chain_tip = self.chain.chain_tip();
+                let applied_tip = self.chain.applied_tip();
+                let tree = self.chain.block_tree();
+                if !unrequested_body_admissible(
+                    &tree,
+                    hash,
+                    chain_tip.as_deref(),
+                    applied_tip.as_deref(),
+                    self.chain.network().minimum_chain_work(),
+                ) {
+                    inadmissible.push(hash);
+                }
             }
         }
         if !invalid.is_empty() {
-            // The body's header can never admit: drop the staged entry AND
-            // the window's delivery record outright — re-queuing would just
-            // re-download a body that cannot apply. Then blame the
-            // delivering peer: a body whose embedded header fails consensus
-            // is the peer's fault, same as a rejected `headers` batch.
-            // PeerTable operations precede the scheduler lock to preserve
-            // the PeerTable → scheduler ordering used elsewhere.
-            let blamed: Vec<std::net::SocketAddr> = invalid
-                .iter()
-                .filter_map(|(_, source)| *source)
-                .filter(|source| {
-                    if self.peer_table.disconnect_source(*source) {
-                        // Every removal path releases a `getheaders` gate
-                        // the peer owned, or a same-address reconnect
-                        // inherits a dead deadline.
-                        self.clear_header_request_for(*source);
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .map(|source| source.addr)
-                .collect();
+            self.discard_inadmissible_header_bodies(&invalid);
+        }
+        if !inadmissible.is_empty() {
+            // The headers resolved onto bodies Core would not process
+            // (off-branch or below the work floor). They staged while their
+            // headers were unknown; now that the tree resolves them they
+            // are dead inventory — evict immediately instead of holding
+            // bounded staging state until the staged timeout. No peer
+            // fault: Core drops an inadmissible unrequested body without
+            // punishing the peer, and a body here was never requested — a
+            // pending hash's header is already in the tree, so it never
+            // reaches the staged-header retry.
             let mut scheduler = self.scheduler.lock();
-            for (hash, _) in &invalid {
+            for hash in &inadmissible {
                 scheduler.stager.discard(hash);
-                scheduler.window.discard_received(hash);
-            }
-            for peer_addr in &blamed {
-                scheduler
-                    .window
-                    .mark_peer_unresponsive(*peer_addr, Instant::now());
             }
             tracing::debug!(
-                discarded = invalid.len(),
-                "block sync: discarded bodies with inadmissible headers"
+                discarded = inadmissible.len(),
+                "block sync: discarded staged bodies that resolved inadmissible"
             );
         }
         if credit_refresh_needed {
             self.refresh_active_peer_credit();
-        }
-        if admission_attempted {
-            // A body staged before its header landed kept the 0-height
-            // sentinel; now that the tree resolves the hash, pin the real
-            // height rather than waiting for a `headers` batch to repair it.
-            self.reconcile_staged_received_heights();
         }
         // A staged retry that just admitted may have attached the ancestry
         // a deferred owned fetch was waiting on — resolve it now.
@@ -259,6 +297,17 @@ impl BlockSync {
         }
     }
 
+    /// Stages one chunk of delivered bodies.
+    ///
+    /// PRE: `blocks` is non-empty; `next_expected_hash` is the apply
+    ///   frontier's next hash when one is known.
+    /// POST: `blocks` is empty; returns how many bodies were staged, found
+    ///   already staged, or rejected for a failed body/header binding. A
+    ///   body that no connection has in flight stages only when
+    ///   `unrequested_body_admissible` holds; any other such body is
+    ///   discarded with no retry and is not counted.
+    /// INVARIANT: an unrequested body whose tree-resolved node fails an
+    ///   admission clause is never staged.
     #[allow(clippy::too_many_lines)]
     pub(super) fn buffer_received_block_chunk(
         &self,
@@ -289,13 +338,44 @@ impl BlockSync {
         // Already-staged precheck: skip the expensive body-binding hashes for
         // blocks whose hash is already in the stager. A correct body already
         // staged must not be displaced by a late malformed duplicate (P2-3).
+        //
+        // The same pass gates unrequested bodies: a body that no connection
+        // has in flight (Core's `fRequested` is false) stages only when
+        // Core's `AcceptBlock` would process it. A discarded body leaves no
+        // staged state and queues no retry. Lock order: tree, then scheduler.
         let already_staged: Vec<bool> = {
+            let chain_tip = self.chain.chain_tip();
+            let applied_tip = self.chain.applied_tip();
+            let minimum_chain_work = self.chain.network().minimum_chain_work();
+            let tree = self.chain.block_tree();
             let scheduler = self.scheduler.lock();
-            let stager = &scheduler.stager;
-            blocks
-                .iter()
-                .map(|inbound| stager.contains(&Hash256::from(inbound.block.block_hash())))
-                .collect()
+            let offered = blocks.len();
+            let mut already_staged = Vec::with_capacity(offered);
+            blocks.retain(|inbound| {
+                let hash = Hash256::from(inbound.block.block_hash());
+                let staged = scheduler.stager.contains(&hash);
+                let admitted = staged
+                    || scheduler.window.contains_pending(&hash)
+                    || unrequested_body_admissible(
+                        &tree,
+                        hash,
+                        chain_tip.as_deref(),
+                        applied_tip.as_deref(),
+                        minimum_chain_work,
+                    );
+                if admitted {
+                    already_staged.push(staged);
+                }
+                admitted
+            });
+            let discarded = offered.saturating_sub(blocks.len());
+            if discarded > 0 {
+                tracing::debug!(
+                    discarded,
+                    "block sync: discarded unrequested bodies Core would not process"
+                );
+            }
+            already_staged
         };
 
         // For non-staged blocks, the chain side derives segwit_active from
@@ -387,15 +467,10 @@ impl BlockSync {
             })
             .collect();
 
-        // Resolve heights the window cannot see: an untracked delivery (inv
-        // announcement, cold-front hedge) enters `received` at height 0, and
-        // `mark_received_from` reports `needs_height_lookup` for exactly those
-        // entries so this pass can pin the tree height. The same lookup covers
-        // staged bodies this insert count-evicts: a body that arrived before
-        // its header stayed at height 0, and `drop_received_for_retry` must
-        // place the retry at the tree height, not rewind the request cursor.
-        // A hash not yet in the tree stays 0 until the prune path's own
-        // re-evaluation.
+        // The block tree owns heights: bodies this insert count-evicts are
+        // requeued at their tree-resolved heights, never at a stored sentinel
+        // (there is no stored height). A hash the tree cannot resolve
+        // requeues with no cursor move.
         let staged_blocks: Vec<_> = {
             let tree = self.chain.block_tree();
             staged_blocks
@@ -406,14 +481,13 @@ impl BlockSync {
                             .and_then(|node_id| tree.node(node_id).ok())
                             .map(|node| node.height)
                     };
-                    let known_height = resolve(hash);
                     let dropped_heights = match &staged {
                         StagedBlock::Memory { dropped, .. } => {
                             dropped.iter().map(|entry| resolve(entry.hash)).collect()
                         }
                         _ => Vec::new(),
                     };
-                    (hash, source_peer, staged, known_height, dropped_heights)
+                    (hash, source_peer, staged, dropped_heights)
                 })
                 .collect()
         };
@@ -424,7 +498,7 @@ impl BlockSync {
         {
             let mut scheduler = self.scheduler.lock();
             let window = &mut scheduler.window;
-            for (hash, source_peer, staged, known_height, dropped_heights) in staged_blocks {
+            for (hash, source_peer, staged, dropped_heights) in staged_blocks {
                 match staged {
                     StagedBlock::AlreadyStaged => {
                         metrics::counter!("node.sync.duplicate_deliveries").increment(1);
@@ -434,14 +508,6 @@ impl BlockSync {
                     }
                     StagedBlock::Memory { bytes, dropped } => {
                         let pending_height = window.mark_received_from(hash, bytes, None, now);
-                        // A body that arrived before its header entered the
-                        // tree has no pending height: adopt the tree-resolved
-                        // height so a later retry lands at the right cursor.
-                        if pending_height.is_none()
-                            && let Some(height) = known_height
-                        {
-                            window.update_received_height(&hash, height);
-                        }
                         if let Some(source_peer) = source_peer {
                             delivery_credits.push((
                                 hash,
@@ -450,15 +516,20 @@ impl BlockSync {
                             ));
                         }
                         for (entry, height) in dropped.into_iter().zip(dropped_heights) {
-                            if let Some(height) = height {
-                                window.update_received_height(&entry.hash, height);
-                            }
-                            window.drop_received_for_retry(&entry.hash);
+                            window.requeue_for_retry(&entry.hash, height);
                             retry_count = retry_count.saturating_add(1);
                         }
                     }
                     StagedBlock::DroppedForRetry { dropped } => {
-                        window.drop_for_retry(&dropped.hash);
+                        // Count-evicted before staging: release what the
+                        // window holds without a cursor rewind. Unlike the
+                        // `Memory` arm's evictions — staged victims whose
+                        // pending left at staging, so the tree height is
+                        // the only rewind evidence — this body never
+                        // staged, so a live pending still carries its
+                        // request height and an unrequested body must not
+                        // move the cursor at all.
+                        window.requeue_for_retry(&dropped.hash, None);
                         retry_count = retry_count.saturating_add(1);
                         tracing::warn!(%hash, "block sync: received block buffer full; dropping block for retry");
                     }
@@ -522,4 +593,58 @@ impl BlockSync {
         }
         staged_count
     }
+}
+
+/// Whether a body that no connection has in flight may stage: Core's
+/// `AcceptBlock` acceptance for `fRequested == false`
+/// (validation.cpp:4327-4353), plus an active-branch clause.
+///
+/// PRE: `hash` names a body that is neither staged nor pending.
+/// POST: `true` when the tree cannot resolve `hash` (the missing-header
+/// path: the body applies once its ancestry lands); otherwise `true` only
+/// when all four admission clauses below hold.
+/// INVARIANT: reads only the tree and the two tip snapshots.
+///
+/// The admission clauses:
+/// 1. The node lies on the header tip's branch.
+/// 2. The node's chainwork is at least the applied tip's
+///    (`fHasMoreOrSameWork`).
+/// 3. The node's chainwork meets the network's minimum chain work.
+/// 4. The node is at most `CORE_REORG_SAFETY_MARGIN` blocks above the
+///    applied tip (`fTooFarAhead`).
+///
+/// Core checks the minimum-work floor on the body itself for
+/// `fRequested == false`. The requested path is the caller's: a hash with a
+/// recorded pending request never reaches this function, so a late delivery
+/// is admitted on the pending's recorded request alone. Once the window has
+/// released a request (expiry, rejection, purge), a later delivery of that
+/// hash is never-requested for this gate: the four clauses apply with the
+/// body's own chainwork, including the floor. Clause 1 keeps a low-work
+/// side chain out on its own.
+pub(super) fn unrequested_body_admissible(
+    tree: &BlockTree,
+    hash: Hash256,
+    chain_tip: Option<&TipSnapshot>,
+    applied_tip: Option<&TipSnapshot>,
+    minimum_chain_work: [u8; 32],
+) -> bool {
+    let Some(node_id) = tree.lookup(hash) else {
+        return true;
+    };
+    let Ok(node) = tree.node(node_id) else {
+        return true;
+    };
+    let Some(chain_tip) = chain_tip else {
+        return false;
+    };
+    // Core's `ActiveHeight()` is -1 on an empty chain.
+    let max_height = applied_tip.map_or(CORE_REORG_SAFETY_MARGIN - 1, |tip| {
+        tip.height.saturating_add(CORE_REORG_SAFETY_MARGIN)
+    });
+    // Big-endian, fixed width: byte order is numeric order.
+    let node_work: [u8; 32] = node.chainwork.to_be_bytes();
+    tree.node_at_height_from(chain_tip.tip_id, node.height) == Some(node_id)
+        && applied_tip.is_none_or(|tip| node.chainwork >= tip.chainwork)
+        && node_work >= minimum_chain_work
+        && node.height <= max_height
 }

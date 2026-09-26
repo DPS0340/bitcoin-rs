@@ -255,9 +255,7 @@ fn staged_body_with_permanently_inadmissible_header_is_discarded()
     bad.header.bits = CompactTarget::from_consensus(0x1e0f_ff00);
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(bad))?;
     // The body stages in the first drain; the staged-header retry runs
-    // before staging on the next and discards it — the window's delivery
-    // record must be dropped outright too: keeping it would re-queue a
-    // body whose header can never admit (C19).
+    // before staging on the next and discards it.
     sync.tick();
     sync.tick();
 
@@ -266,10 +264,58 @@ fn staged_body_with_permanently_inadmissible_header_is_discarded()
         0,
         "the inadmissible body must be discarded, not retried"
     );
+    Ok(())
+}
+
+#[test]
+fn staged_body_whose_resolved_header_is_inadmissible_is_evicted()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A body may stage while its header is still unknown — a body slightly
+    // ahead of its in-flight header is legitimate. Once the header
+    // resolves, the body must face the same unrequested-admission clauses
+    // a resolved arrival faced: an off-branch body is dead inventory and
+    // is evicted at once, without releasing a concurrently pending
+    // requested body.
+    let (tree, blocks) = mined_chain(2, 0)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    let peer = test_addr(9709, 0)?;
+    let _rx = connect_peer(&peers, eligible_peer(peer, 2));
+    let source = current_source(&peers, peer);
+    // Put requested bodies in flight next to the unsolicited one: the
+    // getdata marks heights 1..=2 pending in the window.
+    assert!(
+        sync.send_getdata_for_pending_blocks(source, false, 100, &test_frontier(&sync))
+            .sent,
+        "the fixture must put requested bodies in flight"
+    );
+    assert_eq!(sync.scheduler.lock().window.pending_len(), 2);
+
+    // An unsolicited body whose header is not in the tree: it stages at
+    // arrival (the missing-header path), and its header extends the losing
+    // height-2 branch — once the header resolves it is off the active
+    // branch and inadmissible.
+    let fork =
+        mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(60)]);
+    let fork_hash = Hash256::from(fork.block_hash());
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(fork))?;
+    sync.tick();
+    sync.tick();
+
+    let scheduler = sync.scheduler.lock();
+    assert!(
+        !scheduler.stager.contains(&fork_hash),
+        "a body that resolves inadmissible must not survive header resolution"
+    );
     assert_eq!(
-        sync.scheduler.lock().window.received_len(),
-        0,
-        "the discarded body's window record must not linger and re-queue"
+        scheduler.window.pending_len(),
+        2,
+        "evicting the inadmissible body must not touch the pending requested bodies"
     );
     Ok(())
 }

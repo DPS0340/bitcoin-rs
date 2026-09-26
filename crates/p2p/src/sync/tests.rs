@@ -34,6 +34,7 @@ use super::chain::{
     BranchSwitchError, HeaderAdmission, SyncChain, SyncChainError, WindowCommitDisposition,
     WindowCommitError,
 };
+use super::receive::unrequested_body_admissible;
 use super::{BlockSync, Inventory};
 use crate::{InboundHeaders, Message, PeerInfo, PeerLease, PeerSource, PeerTable, StagedBlock};
 
@@ -565,16 +566,24 @@ fn unsolicited_stale_block_retries_from_resolved_header_height()
     );
     let _headers = rx.try_recv()?;
     apply_fixture_block(&sync, block1)?;
-    sync.scheduler
-        .lock()
-        .window
-        .drop_for_retry(&Hash256::from(expected_hash));
+    {
+        let hash = Hash256::from(expected_hash);
+        let height = {
+            let tree = sync.chain.block_tree();
+            tree.lookup(hash)
+                .and_then(|id| tree.node(id).ok())
+                .map(|node| node.height)
+        };
+        sync.scheduler
+            .lock()
+            .window
+            .requeue_for_retry(&hash, height);
+    }
 
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block2))?;
     sync.drain_inbound_blocks();
 
     assert_eq!(sync.scheduler.lock().stager.received_len(), 0);
-    assert_eq!(sync.scheduler.lock().window.received_len(), 0);
 
     sync.tick();
 
@@ -759,10 +768,13 @@ fn missing_parent_block_delivery_recovers_with_getheaders() -> Result<(), Box<dy
         std::vec![block1.block_hash()]
     );
     assert_eq!(
-        sync.scheduler
-            .lock()
-            .window
-            .received_height(&Hash256::from(block2.block_hash())),
+        {
+            let hash = Hash256::from(block2.block_hash());
+            let tree = sync.chain.block_tree();
+            tree.lookup(hash)
+                .and_then(|id| tree.node(id).ok())
+                .map(|node| node.height)
+        },
         Some(2),
         "header admission must reconcile the staged child's height"
     );
@@ -954,11 +966,10 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
     sync.tick();
     {
         let scheduler = sync.scheduler.lock();
-        let window = &scheduler.window;
-        assert_eq!(window.received_len(), 14);
-        assert_eq!(window.pending_len(), 2);
+        assert_eq!(scheduler.stager.received_len(), 14);
+        assert_eq!(scheduler.window.pending_len(), 2);
         assert_eq!(
-            window.stalling_peer().map(|(addr, _)| addr),
+            scheduler.window.stalling_peer().map(|(addr, _)| addr),
             Some(staller),
             "the front-stripe owner must be the observed staller"
         );
@@ -1102,7 +1113,10 @@ fn staging_exhaustion_fixture() -> Result<ExhaustionFixture, Box<dyn std::error:
     // budget, closing the request gate.
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block2))?;
     sync.drain_inbound_blocks();
-    assert!(!sync.scheduler.lock().window.has_request_capacity());
+    assert!(!{
+        let scheduler = sync.scheduler.lock();
+        scheduler.window.has_request_capacity(&scheduler.stager)
+    });
 
     let healthy_rx = connect_peer(&peers, synthetic_peer(healthy_addr, 100));
 
@@ -1238,6 +1252,206 @@ fn apply_fixture_block(sync: &BlockSync, block: Block) -> Result<(), Box<dyn std
     assert_eq!(
         sync.chain.applied_tip().ok_or("missing applied tip")?.hash,
         hash
+    );
+    Ok(())
+}
+
+/// BLK-06/07 follow-up: a Permanent commit failure purges the failed
+/// subtree instead of re-queueing it. The failed block heads its own
+/// invalidated subtree, so the purge releases it; the unconditional
+/// tree-height retry requeue must not run for that disposition, or it
+/// rewinds the request cursor onto the invalidated block and the frontier
+/// cycles on a block the tree has marked Invalid.
+#[test]
+fn permanent_rejection_keeps_the_request_cursor_off_the_invalidated_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    // One valid block, then a two-coinbase body whose header the tree
+    // knows: the commit classifier treats the body as a permanent
+    // ExtraCoinbase invalidity and invalidates its subtree while the
+    // transition is held.
+    let (mut tree, mut blocks) = mined_chain(1, 0)?;
+    let tip_id = tree.tip_id().ok_or("missing mined tip")?;
+    let extra_coinbase = mined_block_with_prev_hash(
+        blocks[0].block_hash(),
+        2,
+        vec![coinbase_transaction(90), coinbase_transaction(91)],
+    );
+    let extra_id =
+        tree.insert_node(Some(tip_id), extra_coinbase.header, NodeStatus::HeaderValid)?;
+    let follower = mined_block_with_prev_hash(
+        extra_coinbase.block_hash(),
+        3,
+        vec![coinbase_transaction(92)],
+    );
+    tree.insert_node(Some(extra_id), follower.header, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_blocks_tx: _inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    let peer = test_addr(9789, 0)?;
+    let _rx = connect_peer(&peers, eligible_peer(peer, 3));
+    sync.tick();
+    let failing_hash = Hash256::from(extra_coinbase.block_hash());
+
+    // Deliver all three bodies: staging releases each one's pending, so
+    // the request cursor sits strictly above the failing height and a
+    // rewind onto it would be observable.
+    let staged = sync.buffer_received_block_chunk(
+        &mut vec![
+            crate::InboundBlock::from_decoded(blocks.remove(0)),
+            crate::InboundBlock::from_decoded(extra_coinbase),
+            crate::InboundBlock::from_decoded(follower),
+        ],
+        None,
+    );
+    assert_eq!(staged, 3, "all three delivered bodies must stage");
+    let cursor_before = sync.scheduler.lock().window.request_cursor();
+    assert!(
+        cursor_before > 2,
+        "the request frontier must sit above the failing height for the rewind to be observable"
+    );
+
+    assert_eq!(sync.apply_buffered_blocks(None), (1, 1));
+    assert_eq!(
+        sync.scheduler.lock().window.request_cursor(),
+        cursor_before,
+        "a Permanent rejection must not rewind the request cursor onto the invalidated block"
+    );
+    assert!(
+        !sync.scheduler.lock().stager.contains(&failing_hash),
+        "the invalidated block and its descendants must leave the stager"
+    );
+    Ok(())
+}
+
+/// BLK-06/07: an unrequested body stages only when Core's `AcceptBlock`
+/// would process it with `fRequested == false` (validation.cpp:4327-4353):
+/// on the active branch, with at least the applied tip's work, and at most
+/// 288 blocks above the applied tip. Requested bodies are not gated.
+#[test]
+fn unrequested_body_admission_matches_core_acceptance() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut tree, blocks) = mined_chain(300, 0)?;
+    let fork_parent = tree
+        .lookup(Hash256::from(blocks[4].block_hash()))
+        .ok_or("missing height 5")?;
+    let fork_body =
+        mined_block_with_prev_hash(blocks[4].block_hash(), 606, vec![coinbase_transaction(606)]);
+    tree.insert_node(Some(fork_parent), fork_body.header, NodeStatus::HeaderValid)?;
+    let applied = {
+        let node = tree.node(fork_parent)?;
+        TipSnapshot {
+            tip_id: fork_parent,
+            height: node.height,
+            chainwork: node.chainwork,
+            hash: node.hash,
+        }
+    };
+    let SyncHarness {
+        sync,
+        applied_tip,
+        inbound_headers_tx: _inbound_headers_tx,
+        inbound_blocks_tx: _inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
+    applied_tip.store(Some(Arc::new(applied)));
+    let mut blocks = blocks.into_iter();
+    let successor = blocks.nth(5).ok_or("missing height 6")?;
+    let far_body = blocks.nth(288).ok_or("missing height 295")?;
+    let successor_hash = Hash256::from(successor.block_hash());
+    let far_hash = Hash256::from(far_body.block_hash());
+    let fork_hash = Hash256::from(fork_body.block_hash());
+    let mut delivery = vec![
+        crate::InboundBlock::from_decoded(successor),
+        crate::InboundBlock::from_decoded(far_body),
+        crate::InboundBlock::from_decoded(fork_body),
+    ];
+    sync.buffer_received_block_chunk(&mut delivery, None);
+
+    let scheduler = sync.scheduler.lock();
+    assert!(
+        scheduler.stager.contains(&successor_hash),
+        "an active-branch successor passes every clause"
+    );
+    assert!(
+        !scheduler.stager.contains(&far_hash),
+        "a body more than 288 blocks above the applied tip is too far ahead"
+    );
+    assert!(
+        !scheduler.stager.contains(&fork_hash),
+        "a body off the active branch is discarded"
+    );
+    assert_eq!(scheduler.stager.received_len(), 1);
+    Ok(())
+}
+
+/// Clause coverage the regtest fixture cannot reach: its floor is zero and
+/// its candidates all sit above the applied tip, so clauses 2 and 3 never
+/// fire. The floor is injected through the gate's parameter — no network
+/// identity is faked — and the below-applied candidate isolates clause 2.
+#[test]
+fn unrequested_body_gate_rejects_below_floor_and_below_applied_work()
+-> Result<(), Box<dyn std::error::Error>> {
+    fn snapshot(
+        tree: &BlockTree,
+        hash: Hash256,
+    ) -> Result<TipSnapshot, Box<dyn std::error::Error>> {
+        let node_id = tree.lookup(hash).ok_or("missing fixture block")?;
+        let node = tree.node(node_id)?;
+        Ok(TipSnapshot {
+            tip_id: node_id,
+            height: node.height,
+            chainwork: node.chainwork,
+            hash: node.hash,
+        })
+    }
+    let (tree, blocks) = mined_chain(8, 0)?;
+    let chain_tip = snapshot(&tree, Hash256::from(blocks[7].block_hash()))?;
+    let applied_tip = snapshot(&tree, Hash256::from(blocks[3].block_hash()))?;
+    let floor = {
+        let node_id = tree
+            .lookup(Hash256::from(blocks[7].block_hash()))
+            .ok_or("missing tip fixture block")?;
+        tree.node(node_id)?.chainwork.to_be_bytes()
+    };
+
+    // Clause 3: on the active branch and above the applied tip, but with
+    // less work than the injected floor.
+    let above_applied = Hash256::from(blocks[5].block_hash());
+    assert!(
+        !unrequested_body_admissible(
+            &tree,
+            above_applied,
+            Some(&chain_tip),
+            Some(&applied_tip),
+            floor,
+        ),
+        "a candidate below the work floor must be rejected even on-branch above the applied tip"
+    );
+    assert!(
+        unrequested_body_admissible(
+            &tree,
+            above_applied,
+            Some(&chain_tip),
+            Some(&applied_tip),
+            [0; 32],
+        ),
+        "the same candidate passes with the regtest zero floor, isolating the floor clause"
+    );
+
+    // Clause 2: on the active branch with less work than the applied tip.
+    let below_applied = Hash256::from(blocks[1].block_hash());
+    assert!(
+        !unrequested_body_admissible(
+            &tree,
+            below_applied,
+            Some(&chain_tip),
+            Some(&applied_tip),
+            [0; 32],
+        ),
+        "a candidate with less work than the applied tip must be rejected"
     );
     Ok(())
 }
