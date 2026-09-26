@@ -15,7 +15,8 @@ use bitcoin_rs_mempool::SnapshotEntry;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::{Block, BlockHash, CompactTarget, Header, Network, Tx, Txid};
 #[cfg(any(test, feature = "test-seam"))]
-use bitcoin_rs_primitives::{Hash256, consensus_bytes};
+use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Block, BlockHash, CompactTarget, Header, Network, Tx, Txid};
 use compact_str::CompactString;
 #[cfg(any(test, feature = "test-seam"))]
 use parking_lot::Mutex;
