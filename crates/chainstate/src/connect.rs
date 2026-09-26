@@ -852,9 +852,9 @@ pub(super) fn check_bip30_and_bip34(
 ///
 /// POST: `Ok(())` only when
 /// [`bitcoin_rs_chain::validate_contextual_header`] accepts the block's
-/// header against its parent. A difficulty mismatch keeps its dedicated
-/// [`ApplyError`] variant so the sync window still classifies it as a
-/// permanent refusal.
+/// header against its parent. Every failure is wrapped as
+/// [`ApplyError::Chain`]; `classify_apply_error` marks the deterministic
+/// contextual variants (including `NbitsMismatch`) as permanent.
 ///
 /// INVARIANT: this operation adds no header rule of its own; header
 /// admission and block connection share the one contextual implementation.
