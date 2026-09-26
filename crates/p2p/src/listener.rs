@@ -221,6 +221,13 @@ impl InboundSyncSinks {
         }
     }
 
+    /// Enqueues a decoded block body into ingress, then forwards its carried
+    /// header to header admission.
+    ///
+    /// The body is queued first so the header can never reach `headers_tx`
+    /// while the body is still unsent: request scheduling runs after both
+    /// drains, so the staged-or-received body suppresses a duplicate
+    /// `getdata` for a tip learned only by delivery.
     fn send_block(
         &self,
         source: crate::PeerSource,
