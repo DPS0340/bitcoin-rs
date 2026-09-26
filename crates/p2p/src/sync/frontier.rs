@@ -78,6 +78,10 @@ pub(crate) struct UsablePeer {
     /// The peer's demonstrated height resolved on the active chain, `None`
     /// when its announced tips do not intersect it.
     pub active_height: Option<u32>,
+    /// Demonstrated headers ceiling from a spent low-work presync, `None`
+    /// until one proves a cap. Only headers selection reads it; body
+    /// eligibility keeps `info.best_known_height`.
+    pub headers_horizon: Option<u32>,
     /// What this connection relays, fixed when it was created.
     pub role: crate::peer_info::PeerRole,
     /// Whether the operator pinned this dial by name (`--connect` or

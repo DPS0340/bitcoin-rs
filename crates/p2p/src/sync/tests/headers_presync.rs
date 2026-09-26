@@ -744,10 +744,23 @@ fn a_terminal_low_work_page_demotes_the_source() -> Result<(), Box<dyn std::erro
         None,
         "the terminal page spends the sync state"
     );
+    let session = peers
+        .sessions()
+        .into_iter()
+        .find(|session| session.addr == addr)
+        .ok_or_else(|| std::io::Error::other("session vanished"))?;
     assert_eq!(
-        peers.info_of(addr).map(|info| info.best_known_height),
+        session.headers_horizon,
         Some(5),
         "the horizon must fall to the demonstrated cursor height"
+    );
+    // The demotion caps header selection only: the shared P2P-03 credit
+    // still carries the handshake claim, so the connection remains
+    // body-eligible for blocks it advertised.
+    assert_eq!(
+        session.info.map(|info| info.best_known_height),
+        Some(100_000),
+        "best_known_height must not be lowered"
     );
     assert!(
         peers.is_connected(addr),

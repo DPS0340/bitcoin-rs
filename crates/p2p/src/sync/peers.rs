@@ -75,12 +75,18 @@ pub(super) fn is_peer_fault(error: &ChainError) -> bool {
 pub(super) fn sync_peer_candidate(
     source: PeerSource,
     peer: &PeerInfo,
+    headers_horizon: Option<u32>,
     floor: u32,
 ) -> Option<SyncPeer> {
-    let height = u32::try_from(peer.best_known_height).ok()?;
+    // The eligibility read is `min(best_known_height, headers_horizon)`: a
+    // connection whose download-twice sync already proved its headers end
+    // at the horizon stays selectable for what it can serve, but no
+    // longer outranks peers with a taller proven chain.
+    let claimed = u32::try_from(peer.best_known_height).ok()?;
+    let height = headers_horizon.map_or(claimed, |cap| claimed.min(cap));
     (height > floor).then_some(SyncPeer {
         source,
-        best_known_height: peer.best_known_height,
+        best_known_height: i32::try_from(height).unwrap_or(i32::MAX),
     })
 }
 
