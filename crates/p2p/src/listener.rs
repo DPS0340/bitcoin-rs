@@ -2321,7 +2321,10 @@ mod writer_shutdown_tests {
 
         assert!(run_message_loop(&mut peer, addr, &lease, &shared, None).is_err());
         assert!(
-            matches!(outbound_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)),
+            matches!(
+                outbound_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
             "a peer quiet for less than one interval owes no probe",
         );
     }
