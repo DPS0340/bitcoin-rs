@@ -35,7 +35,7 @@ fn tick_sends_getdata_from_next_applied_height_when_gap_exceeds_batch()
         &sync,
         super::super::SyncBudget {
             getdata_batch_limit: usize::try_from(batch_size)?,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -181,7 +181,7 @@ fn tick_respects_pending_byte_budget() -> Result<(), Box<dyn std::error::Error>>
         &sync,
         super::super::SyncBudget {
             max_pending_bytes: 256 * 1024,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -205,7 +205,7 @@ fn tick_limits_inflight_per_peer() -> Result<(), Box<dyn std::error::Error>> {
         &sync,
         super::super::SyncBudget {
             max_peer_inflight: 2,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -284,10 +284,8 @@ fn demoted_peer_not_counted_toward_fanout_threshold() -> Result<(), Box<dyn std:
         sync_with_header_chain(u32::try_from(super::super::PENDING_BUDGET)?)?;
     install_budget(
         &sync,
-        super::super::SyncBudget {
-            pending_timeout: Duration::ZERO,
-            ..super::super::default_sync_budget()
-        },
+        super::super::default_sync_budget(Network::Regtest)
+            .with_pending_timeout_override(Duration::ZERO),
     );
     // Phase 1: the lone peer takes the deep window; the zero timeout
     // expires every pending immediately, soft-demoting it.
@@ -342,10 +340,8 @@ fn ineligible_peers_receive_no_block_requests_during_fanout()
     // peer within the same tick.)
     install_budget(
         &sync,
-        super::super::SyncBudget {
-            pending_timeout: Duration::from_millis(250),
-            ..super::super::default_sync_budget()
-        },
+        super::super::default_sync_budget(Network::Regtest)
+            .with_pending_timeout_override(Duration::from_millis(250)),
     );
     // Soft-demote one otherwise-eligible peer: it takes the deep window
     // and never delivers.

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bitcoin::p2p::ServiceFlags;
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, Network};
 use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
@@ -22,8 +22,14 @@ use crate::connection::PeerSource;
 // Download-policy constants
 // ---------------------------------------------------------------------------
 
-/// Time after which a pending getdata is considered stuck and re-requestable.
-pub const PENDING_TIMEOUT: Duration = Duration::from_mins(1);
+/// Core's `BLOCK_DOWNLOAD_TIMEOUT_BASE` in half-target-spacing units
+/// (`net_processing.cpp:153-168`): an owner with no other validated-block
+/// downloaders gets one full proof-of-work target spacing of queue age
+/// before its oldest request is considered stuck.
+const BLOCK_DOWNLOAD_TIMEOUT_BASE: u32 = 2;
+/// Core's `BLOCK_DOWNLOAD_TIMEOUT_PER_PEER` in half-target-spacing units:
+/// each additional active downloader adds half a spacing to the budget.
+const BLOCK_DOWNLOAD_TIMEOUT_PER_PEER: u32 = 1;
 /// Maximum number of in-flight getdata requests we'll track per `BlockSync`.
 ///
 /// 256 is the measured single-peer IBD depth: a bounded 0–150,000 daemon
@@ -250,7 +256,13 @@ pub fn configure_request_mode(
 }
 
 /// Returns the production [`SyncBudget`] used by the sync coordinator.
-pub const fn default_sync_budget() -> SyncBudget {
+///
+/// PRE: `network` is the chain the coordinator syncs.
+/// POST: the per-owner block-download budget derives from that network's
+///      proof-of-work target spacing; no timeout override is set.
+/// INVARIANT: production never populates `pending_timeout_override`.
+#[must_use]
+pub fn default_sync_budget(network: Network) -> SyncBudget {
     SyncBudget {
         max_pending_blocks: PENDING_BUDGET,
         max_pending_bytes: PENDING_BYTE_BUDGET,
@@ -260,7 +272,9 @@ pub const fn default_sync_budget() -> SyncBudget {
         fanout_peer_inflight: MAX_BLOCKS_IN_TRANSIT_PER_PEER,
         min_peers_for_fanout: MIN_PEERS_FOR_FANOUT,
         getdata_batch_limit: GETDATA_BATCH_SIZE,
-        pending_timeout: PENDING_TIMEOUT,
+        block_spacing: Duration::from_secs(u64::from(network.target_spacing_seconds())),
+        #[cfg(test)]
+        pending_timeout_override: None,
         received_timeout: RECEIVED_BLOCK_TIMEOUT,
         stall_timeout_initial: BLOCK_STALLING_TIMEOUT,
         stall_timeout_max: BLOCK_STALLING_TIMEOUT_MAX,
@@ -270,11 +284,11 @@ pub const fn default_sync_budget() -> SyncBudget {
 
 /// Returns the opt-in fast-sync [`SyncBudget`]: the default window striped
 /// shallower and earlier across up to [`FAST_OUTBOUND_PEER_TARGET`] peers.
-pub const fn fast_sync_budget() -> SyncBudget {
+pub fn fast_sync_budget(network: Network) -> SyncBudget {
     SyncBudget {
         fanout_peer_inflight: FAST_BLOCKS_IN_TRANSIT_PER_PEER,
         min_peers_for_fanout: FAST_MIN_PEERS_FOR_FANOUT,
-        ..default_sync_budget()
+        ..default_sync_budget(network)
     }
 }
 
@@ -293,11 +307,35 @@ pub struct SyncBudget {
     pub fanout_peer_inflight: usize,
     pub min_peers_for_fanout: usize,
     pub getdata_batch_limit: usize,
-    pub pending_timeout: Duration,
+    /// The network's proof-of-work target spacing (Core's nPowTargetSpacing):
+    /// the unit of the per-owner block-download budget,
+    /// `block_spacing / 2 * (BASE + PER_PEER * other)`, where `other`
+    /// counts the other owners with validated in-flight blocks, with the
+    /// two Core constants expressed in half-spacing units.
+    pub block_spacing: Duration,
+    /// When `Some`, every owner expires at this fixed age instead of the
+    /// spacing-derived per-owner budget. The slot is compiled only into
+    /// test builds; production budgets never carry it.
+    #[cfg(test)]
+    pub(crate) pending_timeout_override: Option<Duration>,
     pub received_timeout: Duration,
     pub stall_timeout_initial: Duration,
     pub stall_timeout_max: Duration,
     pub staller_cooldown: Duration,
+}
+
+impl SyncBudget {
+    /// Sets the fixed per-owner pending timeout. Test-only: this
+    /// constructor is compiled out of production builds.
+    ///
+    /// PRE: `timeout` is the fixed age every owner expires at.
+    /// POST: `pending_timeout_override` is `Some(timeout)`.
+    /// INVARIANT: production never populates `pending_timeout_override`.
+    #[cfg(test)]
+    pub(crate) fn with_pending_timeout_override(mut self, timeout: Duration) -> Self {
+        self.pending_timeout_override = Some(timeout);
+        self
+    }
 }
 
 /// A batch of block requests prepared for a single peer.
@@ -405,6 +443,10 @@ struct PendingBlock {
 struct PendingTimeoutObservation {
     owner: PeerSource,
     hash: Hash256,
+    /// Set when the owner's own timeout expiry released the observed
+    /// request: the blame evidence the second tick convicts on. A
+    /// delivery or a requeue releases without it and pardons.
+    expired_release: bool,
 }
 
 /// A running window-blocked stall observation: the window front (`front_hash`)
@@ -418,13 +460,13 @@ struct StallEpisode {
     since: Instant,
     /// Whether the one-shot episode-observability INFO line has been emitted
     /// for this episode (fires once when the episode survives
-    /// [`STALL_EPISODE_LOG_AGE`]; see [`DownloadWindow::observe_stall`]).
+    /// [`STALL_EPISODE_LOG_AGE`]; see [`DownloadWindow::advance_stall`]).
     info_logged: bool,
 }
 
 /// One continuous apply-side stuck episode: the apply frontier pinned at
 /// `(height, frontier_hash)` with a staged body held (`apply_side_busy`)
-/// across [`DownloadWindow::observe_apply_side_bound`] calls.
+/// across [`DownloadWindow::advance_apply_side_stuck`] calls.
 ///
 /// Keyed by height AND hash: the prune/refetch cycle briefly removes and
 /// re-delivers the stuck staged body (flipping `apply_side_busy` off and
@@ -453,6 +495,74 @@ enum ColdFrontState {
         alternate: PeerSource,
         hash: Hash256,
     },
+}
+
+/// The canonical frontier facts one blockage observation needs.
+///
+/// PRE: `next_apply_height` and `frontier_hash` describe the same
+///      `next_required` body the scheduler requested this tick;
+///      `apply_side_busy` is current for that body.
+/// POST: one tick advances every observation from this one snapshot.
+/// INVARIANT: a frontier without a next-expected block has `None` height
+///      and `None` hash; only the pending timeout still runs there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockedContext {
+    /// The next height apply expects, or `None` at the chain tip.
+    pub next_apply_height: Option<u32>,
+    /// The hash of that next-expected body, or `None` at the chain tip.
+    pub frontier_hash: Option<Hash256>,
+    /// Whether the stager holds the next-expected body (apply lag).
+    pub apply_side_busy: bool,
+}
+
+/// Why the unified blockage observation convicted an owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlameReason {
+    /// The window-blocked stall predicate fired on this owner.
+    Staller,
+    /// This owner's pending block passed its timeout twice.
+    PendingTimeout,
+}
+
+/// The single action the sync coordinator owes this tick.
+///
+/// PRE: apply-side state and exact pending owners are current; `now` is
+///      injected by the caller.
+/// POST: at most one action returns, in precedence
+///      `EvictStaged` > `Blame(Staller)` > `Blame(PendingTimeout)` >
+///      `HedgeColdFront` > `None`.
+/// INVARIANT: a same-address replacement never inherits blame, because
+///      every observation keys on the exact [`PeerSource`]; only the
+///      apply-side bound can produce [`BlockedDecision::EvictStaged`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockedDecision {
+    /// Disconnect `owner`: it is stalling the window or missed its
+    /// request timeout.
+    Blame {
+        /// The exact owning connection.
+        owner: PeerSource,
+        /// Which rule convicted it.
+        reason: BlameReason,
+    },
+    /// The apply-side no-blame suppression outlived its bound: evict the
+    /// staged body at `height`/`hash` for refetch. No peer is blamed.
+    EvictStaged {
+        /// The stuck apply-frontier height.
+        height: u32,
+        /// The stuck staged body's hash.
+        hash: Hash256,
+        /// How long the suppression had held when it fired.
+        suppressed_for: Duration,
+    },
+    /// Send a duplicate request for the cold front from another peer.
+    HedgeColdFront {
+        /// The current exact owner of the front block.
+        owner: PeerSource,
+        /// The front block's hash.
+        front_hash: Hash256,
+    },
+    /// Nothing to do this tick.
+    None,
 }
 #[derive(Debug)]
 struct PrefixProbe {
@@ -486,7 +596,7 @@ const PREFIX_PROBE_ESTIMATED_BYTES: usize = 2 * 1024 * 1024;
 /// Stall-episode clearing reasons, the counter taxonomy for
 /// `node.sync.stall_episodes_cleared{reason}`. Every path that zeroes the
 /// episode clock tags exactly one reason:
-/// - `apply_busy`: the no-blame guard held this tick ([`DownloadWindow::observe_stall`]).
+/// - `apply_busy`: the no-blame guard held this tick ([`DownloadWindow::advance_stall`]).
 /// - `predicate`: a [`DownloadWindow::window_blocked_on`] term went false
 ///   (front moved off the frontier, no staged successor, or capacity opened).
 /// - `front_moved`: the predicate still holds but for a different
@@ -519,20 +629,24 @@ pub struct DownloadWindow {
     ewma_block_bytes: usize,
     next_request_height: u32,
     request_tip: Option<(Hash256, u32)>,
-    next_pending_deadline: Option<Instant>,
+    /// Per-owner block-download queue start: the local equivalent of
+    /// Core's per-peer `m_downloading_since` (`net_processing.cpp:1323-1332,
+    /// 1363-1368`). Keyed by the exact `PeerSource`; an entry exists exactly
+    /// while that owner has validated in-flight blocks.
+    owner_downloading_since: HashMap<PeerSource, Instant>,
     /// Eligible outbound witness peers available for new block assignments.
     /// The count sizes each stripe; engagement keeps one-peer hysteresis so a
     /// transient demotion does not switch candidate classes mid-window.
     fanout_eligible_peers: usize,
     fanout_engaged: bool,
     /// Current window-blocked stall observation, if any (R8). Re-derived from
-    /// the predicate every [`Self::observe_stall`] call; cleared whenever any
+    /// the predicate every [`Self::advance_stall`] call; cleared whenever any
     /// predicate term stops holding, so a transient stall never accumulates
     /// blame across unrelated episodes.
     stall: Option<StallEpisode>,
     /// Current apply-side stuck observation, if any (#1091 bound). Re-keyed
     /// on the apply-front `(height, hash)` every
-    /// [`Self::observe_apply_side_bound`] call; a front advance or a
+    /// [`Self::advance_apply_side_stuck`] call; a front advance or a
     /// same-height branch replacement resets it, brief unbusy seams do not,
     /// and an idle frontier starts no clock at all.
     apply_side_stuck: Option<ApplySideStuck>,
@@ -557,12 +671,13 @@ pub struct DownloadWindow {
     /// x0.85 decay re-cross g in ~4-5 front advances and fire again — a limit
     /// cycle draining one honest peer per ~5g seconds. Keying the floor to
     /// twice the demonstrated cadence kills the cycle while a true staller
-    /// (silent while others stream) still convicts at ~2g. Two guards keep
-    /// the estimate honest: same-chunk batch arrivals (samples under
+    /// (silent while others stream) still convicts at ~2g. The estimate
+    /// stays honest because same-chunk batch arrivals (samples under
     /// [`EWMA_MIN_SAMPLE_MS`]) are skipped so an in-order burst sharing one
-    /// chunk timestamp cannot deflate the floor, and while no sample exists
-    /// at all (cold start) [`Self::observe_stall`] suppresses conviction
-    /// entirely, deferring to the 60s pending-timeout fallback.
+    /// chunk timestamp cannot deflate the floor. A window with no sample at
+    /// all (cold start) convicts at the `stall_timeout_initial` floor —
+    /// [`Self::advance_stall`] never suppresses conviction for lack of a
+    /// cadence estimate.
     front_interval_ewma_ms: Option<u64>,
     /// When the window front last advanced (a front block arrived); the
     /// anchor for the next `front_interval_ewma_ms` sample.
@@ -604,7 +719,7 @@ impl DownloadWindow {
             ewma_block_bytes: 256 * 1024,
             next_request_height: 1,
             request_tip: None,
-            next_pending_deadline: None,
+            owner_downloading_since: HashMap::with_capacity(budget.max_pending_blocks),
             fanout_eligible_peers: 0,
             fanout_engaged: false,
             stall: None,
@@ -634,7 +749,7 @@ impl DownloadWindow {
     /// resolves/cancels or the fixed `stall_timeout_initial` interval
     /// expires, existing hysteresis and immediate prefix-probe cancellation
     /// behavior resume unchanged. `now` is injected (not read here) so the
-    /// tick/selection path controls the clock; see [`Self::observe_stall`]
+    /// tick/selection path controls the clock; see [`Self::advance_stall`]
     /// for the same discipline.
     pub fn set_fanout_eligible_peers(&mut self, count: usize, now: Instant) {
         let was_engaged = self.fanout_engaged;
@@ -864,17 +979,20 @@ impl DownloadWindow {
             .saturating_add(self.owner_address_count())
     }
 
+    /// Blocks and bytes whose owner's queue has aged past its budget: the
+    /// capacity the request path credits back for re-request this tick.
+    ///
+    /// PRE: `now` is the caller's injected clock.
+    /// POST: totals over `pending` entries whose owner satisfies
+    ///      [`Self::owner_download_expired`] under this tick's owner count.
+    /// INVARIANT: the same per-owner predicate every consumer uses; no
+    ///      fixed-duration path remains.
     fn expired_pending_capacity(&self, now: Instant) -> (usize, usize) {
-        if self
-            .next_pending_deadline
-            .is_none_or(|deadline| now < deadline)
-        {
-            return (0, 0);
-        }
+        let active = self.active_downloading_peers();
         self.pending
             .values()
             .fold((0_usize, 0_usize), |(blocks, bytes), pending| {
-                if now.duration_since(pending.requested_at) < self.budget.pending_timeout {
+                if !self.owner_download_expired(pending.owner, active, now) {
                     return (blocks, bytes);
                 }
                 (
@@ -889,54 +1007,141 @@ impl DownloadWindow {
     /// requests unless it is the last-resort peer, and it does not count as
     /// fan-out-eligible (KTD6's "not currently soft-demoted" clause).
     pub fn peer_has_expired_pending(&self, source: PeerSource, now: Instant) -> bool {
-        if self
-            .next_pending_deadline
-            .is_none_or(|deadline| now < deadline)
-        {
-            return false;
+        self.owner_download_expired(source, self.active_downloading_peers(), now)
+    }
+
+    /// Advances every blockage observation once and returns at most one
+    /// action for this tick.
+    ///
+    /// The order is fixed: the measurement intervals; the apply-side bound;
+    /// the no-blame guard; the cold-front timer and the stall predicate;
+    /// staller blame; the pending timeout (also at the chain tip); pending
+    /// blame; the cold-front hedge.
+    ///
+    /// PRE: `ctx` describes the canonical frontier after this tick's apply
+    ///      drain; `stager` is the coupled staging set and `tree` resolves
+    ///      staged hashes to heights; `now` is injected by the caller.
+    /// POST: the no-blame guard is evaluated once; the return value is the
+    ///      single action the caller owes: disconnect the blamed exact
+    ///      owner, evict the stuck staged body without blame, send the
+    ///      cold-front duplicate request, or nothing.
+    /// INVARIANT: a same-address replacement never inherits blame, because
+    ///      every observation keys on the exact [`PeerSource`].
+    /// INVARIANT: while `ctx.apply_side_busy` holds, no stall, timeout, or
+    ///      hedge action returns; only the apply-side bound can return
+    ///      [`BlockedDecision::EvictStaged`].
+    pub fn observe_blocked(
+        &mut self,
+        ctx: BlockedContext,
+        stager: &BlockStager,
+        tree: &BlockTree,
+        now: Instant,
+    ) -> BlockedDecision {
+        let evicted = if let Some(next_apply_height) = ctx.next_apply_height {
+            self.observe_intervals(ctx.apply_side_busy, now);
+            self.advance_apply_side_stuck(
+                next_apply_height,
+                ctx.frontier_hash,
+                ctx.apply_side_busy,
+                now,
+            )
+        } else {
+            None
+        };
+        if ctx.apply_side_busy {
+            // The no-blame guard: our own slowness is never a peer's fault.
+            if self.stall.take().is_some() {
+                count_stall_episode_cleared("apply_busy");
+            }
+            self.pending_timeout_observation = None;
+            if !matches!(self.cold_front, Some(ColdFrontState::Racing { .. })) {
+                self.cold_front = None;
+            }
+            return match (ctx.next_apply_height, evicted) {
+                (Some(height), Some((hash, suppressed_for))) => BlockedDecision::EvictStaged {
+                    height,
+                    hash,
+                    suppressed_for,
+                },
+                _ => BlockedDecision::None,
+            };
         }
-        self.pending.values().any(|pending| {
-            pending.owner == source
-                && now.duration_since(pending.requested_at) >= self.budget.pending_timeout
+        let mut hedge = None;
+        if let Some(next_apply_height) = ctx.next_apply_height {
+            hedge = self.advance_cold_front(next_apply_height, now);
+            if let Some(owner) = self.advance_stall(next_apply_height, stager, tree, now) {
+                return BlockedDecision::Blame {
+                    owner,
+                    reason: BlameReason::Staller,
+                };
+            }
+        }
+        if let Some(owner) = self.advance_pending_timeout(now, self.active_downloading_peers()) {
+            return BlockedDecision::Blame {
+                owner,
+                reason: BlameReason::PendingTimeout,
+            };
+        }
+        hedge.map_or(BlockedDecision::None, |(owner, front_hash)| {
+            BlockedDecision::HedgeColdFront { owner, front_hash }
         })
     }
 
-    /// Observes the lowest expired request and convicts only on a second idle tick.
+    /// Observes the lowest expired request and convicts only on a second
+    /// idle tick.
     ///
     /// A block may arrive while synchronous apply is running and wait in the
     /// inbound channel after its request timestamp expires. The first
-    /// observation records suspicion only. Delivery from that same peer
-    /// clears it; delivery of a retry from another peer does not.
-    pub fn observe_pending_timeout(
+    /// observation records suspicion only; delivery from the observed owner
+    /// clears it at once, and any path that releases the observed hash
+    /// without a delivery (the retarget and purge paths) leaves a suspicion
+    /// that no longer measures anything. The second tick therefore
+    /// re-verifies the observation against the live window before it
+    /// converts suspicion into blame.
+    ///
+    /// PRE: the apply side is not busy this tick.
+    /// POST: `Some(owner)` exactly when the previous observation named
+    ///      `owner`, that owner still owns the observed hash in `pending`,
+    ///      and that owner is still expired this tick; the owner's address
+    ///      then enters the staller cooldown. Every other outcome clears
+    ///      the observation and blames nobody.
+    /// INVARIANT: the observation names the exact owning connection, and a
+    ///      conviction never outlives the queue age it measured.
+    fn advance_pending_timeout(
         &mut self,
-        apply_side_busy: bool,
         now: Instant,
+        active_downloading_peers: usize,
     ) -> Option<PeerSource> {
-        if apply_side_busy {
-            self.pending_timeout_observation = None;
-            return None;
-        }
         if let Some(observation) = self.pending_timeout_observation {
             self.pending_timeout_observation = None;
-            self.mark_peer_unresponsive(observation.owner.addr, now);
-            return Some(observation.owner);
-        }
-        if self
-            .next_pending_deadline
-            .is_none_or(|deadline| now < deadline)
-        {
+            let still_owned = self
+                .pending
+                .get(&observation.hash)
+                .is_some_and(|pending| pending.owner == observation.owner);
+            if observation.expired_release
+                || (still_owned
+                    && self.owner_download_expired(
+                        observation.owner,
+                        active_downloading_peers,
+                        now,
+                    ))
+            {
+                self.mark_peer_unresponsive(observation.owner.addr, now);
+                return Some(observation.owner);
+            }
             return None;
         }
         self.pending_timeout_observation = self
             .pending
             .iter()
             .filter(|(_, pending)| {
-                now.duration_since(pending.requested_at) >= self.budget.pending_timeout
+                self.owner_download_expired(pending.owner, active_downloading_peers, now)
             })
             .min_by_key(|(_, pending)| pending.height)
             .map(|(hash, pending)| PendingTimeoutObservation {
                 owner: pending.owner,
                 hash: *hash,
+                expired_release: false,
             });
         None
     }
@@ -969,18 +1174,18 @@ impl DownloadWindow {
     /// Firing re-arms the clock, so a persistently stuck frontier escalates
     /// at most once per bound.
     ///
-    /// `frontier_hash` is `None` when no next-expected block exists (the
-    /// applied tip sits at the chain tip): nothing can be stuck, and a
-    /// leftover episode is dropped.
-    ///
-    /// Returns `Some(suppressed_for)` exactly on fire.
-    pub fn observe_apply_side_bound(
+    /// PRE: `frontier_hash` is `None` when no next-expected block exists
+    ///      (the applied tip sits at the chain tip).
+    /// POST: `Some((frontier_hash, suppressed_for))` exactly on fire; a
+    ///      missing frontier drops any leftover episode.
+    /// INVARIANT: the clock runs only while `apply_side_busy` holds.
+    fn advance_apply_side_stuck(
         &mut self,
         next_apply_height: u32,
         frontier_hash: Option<Hash256>,
         apply_side_busy: bool,
         now: Instant,
-    ) -> Option<Duration> {
+    ) -> Option<(Hash256, Duration)> {
         let Some(frontier_hash) = frontier_hash else {
             // No expected frontier: nothing can be stuck.
             self.apply_side_stuck = None;
@@ -1017,46 +1222,21 @@ impl DownloadWindow {
         if let Some(stuck) = self.apply_side_stuck.as_mut() {
             stuck.since = now;
         }
-        Some(suppressed_for)
+        Some((frontier_hash, suppressed_for))
     }
 
-    /// Advances the window-blocked stall state machine one observation (R8).
+    /// Measurement only (issue #51): interval bookkeeping that never feeds
+    /// a blockage decision.
     ///
-    /// Inputs computed by the sync layer each tick, after the apply drain:
-    /// - `next_apply_height`: `applied_tip.height + 1`, the apply frontier.
-    /// - `apply_side_busy`: the no-blame guard — true while the stager holds
-    ///   the next expected block (apply lag / failed-apply restore). Our own
-    ///   slowness must never be blamed on a peer, so the stall clock does not
-    ///   run at all.
+    /// - download-blocked-by-apply: apply owns the frontier while requests
+    ///   are in flight — download progress gated by apply speed.
+    /// - apply-idle: requests in flight, nothing staged — apply starved by
+    ///   the network.
     ///
-    /// Deliberately *not* an input: a chain-tail arm ("nothing above the
-    /// window left to request"). At the tip, one >2s block from a caught-up
-    /// peer is the normal regime, not a stall — Core's stalling logic does
-    /// not engage there either, and the last <window blocks of IBD stay
-    /// covered by the pre-existing 60s pending-timeout machinery.
-    ///
-    /// Returns `Some(peer)` exactly when the stall threshold fires: the
-    /// caller must disconnect that peer (its pendings then re-queue through
-    /// [`Self::retain_owned_by`]). On fire the adaptive threshold doubles
-    /// (capped at `stall_timeout_max`) and the peer enters the staller
-    /// cooldown. When any predicate term stops holding — including any
-    /// delivery from the blamed peer ([`Self::record_delivery_progress`]) —
-    /// the episode is cleared, more forgiving than freezing the clock and
-    /// Core-shaped (`m_stalling_since` is likewise re-derived, never frozen).
-    pub fn observe_stall(
-        &mut self,
-        next_apply_height: u32,
-        apply_side_busy: bool,
-        stager: &BlockStager,
-        tree: &BlockTree,
-        now: Instant,
-    ) -> Option<PeerSource> {
-        // Measurement only (issue #51): interval bookkeeping ahead of the
-        // stall state machine, which these observations never feed.
-        // - download-blocked-by-apply: apply owns the frontier while requests
-        //   are in flight — download progress gated by apply speed.
-        // - apply-idle: requests in flight, nothing staged — apply starved
-        //   by the network.
+    /// PRE: called once per tick that has an apply frontier.
+    /// POST: at most one of the two intervals is open.
+    /// INVARIANT: a closed interval records its duration exactly once.
+    fn observe_intervals(&mut self, apply_side_busy: bool, now: Instant) {
         if apply_side_busy {
             if self.pending.is_empty() {
                 self.close_download_blocked_by_apply(now);
@@ -1072,12 +1252,40 @@ impl DownloadWindow {
                 self.apply_idle_since = Some(now);
             }
         }
-        if apply_side_busy {
-            if self.stall.take().is_some() {
-                count_stall_episode_cleared("apply_busy");
-            }
-            return None;
-        }
+    }
+
+    /// Advances the window-blocked stall state machine one observation (R8).
+    ///
+    /// `next_apply_height` is `applied_tip.height + 1`, the apply frontier.
+    ///
+    /// Deliberately *not* an input: a chain-tail arm ("nothing above the
+    /// window left to request"). At the tip, one >2s block from a caught-up
+    /// peer is the normal regime, not a stall — Core's stalling logic does
+    /// not engage there either, and the last <window blocks of IBD stay
+    /// covered by the pending-timeout machinery.
+    ///
+    /// An unseeded front-cadence EWMA (cold start) does not suppress
+    /// conviction: the threshold is then the stored adaptive value, whose
+    /// floor is `stall_timeout_initial` — Core's `BLOCK_STALLING_TIMEOUT_DEFAULT`.
+    ///
+    /// PRE: the apply side is not busy this tick.
+    /// POST: `Some(owner)` exactly when the stall threshold fires: the
+    ///      caller must disconnect that exact owner (its pendings then
+    ///      re-queue through [`Self::retain_owned_by`]). On fire the
+    ///      adaptive threshold doubles (capped at `stall_timeout_max`) and
+    ///      the owner's address enters the staller cooldown.
+    /// INVARIANT: when any predicate term stops holding — including any
+    ///      delivery from the blamed peer ([`Self::record_delivery_progress`])
+    ///      — the episode is cleared, more forgiving than freezing the clock
+    ///      and Core-shaped (`m_stalling_since` is likewise re-derived,
+    ///      never frozen).
+    fn advance_stall(
+        &mut self,
+        next_apply_height: u32,
+        stager: &BlockStager,
+        tree: &BlockTree,
+        now: Instant,
+    ) -> Option<PeerSource> {
         let Some((owner, front_hash)) = self.window_blocked_on(stager, tree, next_apply_height)
         else {
             if self.stall.take().is_some() {
@@ -1108,8 +1316,12 @@ impl DownloadWindow {
         // Phase 0 observability: one INFO line per episode, once it survives
         // STALL_EPISODE_LOG_AGE — visible below the WARN fire line so episode
         // dynamics (and the EWMA the threshold tracks, the design falsifier)
-        // appear in run logs. Emitted regardless of EWMA cold start: a
-        // suppressed-conviction episode is exactly what must be observable.
+        // appear in run logs.
+        //
+        // The fire threshold is the stored adaptive value, never below the
+        // ADV-DRIP-1 decay floor: on a network whose demonstrated front
+        // cadence exceeds `stall_timeout_initial`, an episode younger than
+        // twice that cadence is the uniform-slow steady state, not a stall.
         let effective_timeout = self.stall_timeout.max(self.stall_decay_floor());
         if !episode.info_logged && now.duration_since(episode.since) >= STALL_EPISODE_LOG_AGE {
             if let Some(stored) = self.stall.as_mut() {
@@ -1127,12 +1339,6 @@ impl DownloadWindow {
                 "block sync: stall episode running"
             );
         }
-        self.front_interval_ewma_ms?;
-        // The fire threshold (`effective_timeout` above) is the stored
-        // adaptive value, never below the ADV-DRIP-1 decay floor: on a
-        // network whose demonstrated front cadence exceeds
-        // `stall_timeout_initial`, an episode younger than twice that
-        // cadence is the uniform-slow steady state, not a stall.
         if now.duration_since(episode.since) < effective_timeout {
             return None;
         }
@@ -1191,13 +1397,13 @@ impl DownloadWindow {
     ///   cannot re-cross g — zero false fires — while a true staller
     ///   (silent while others stream) still convicts at ~6s, far inside the
     ///   60s pending-timeout fallback. That zero-false-fires guarantee
-    ///   holds only because of two qualifications: same-chunk batch
-    ///   arrivals are filtered out of the EWMA (sub-[`EWMA_MIN_SAMPLE_MS`]
-    ///   samples share one chunk timestamp and would otherwise deflate the
-    ///   floor back to the static 2s), and a cold-start window (no sample
-    ///   yet) does not trust the floor at all — [`Self::observe_stall`]
-    ///   suppresses conviction and defers to the 60s pending-timeout
-    ///   fallback until the cadence estimate has one real sample.
+    ///   holds only because same-chunk batch arrivals are filtered out of
+    ///   the EWMA (sub-[`EWMA_MIN_SAMPLE_MS`] samples share one chunk
+    ///   timestamp and would otherwise deflate the floor back to the static
+    ///   2s). A cold-start window (no sample yet) convicts at the
+    ///   `stall_timeout_initial` floor: an unproven cadence is never an
+    ///   exemption, matching Core's `BLOCK_STALLING_TIMEOUT_DEFAULT`
+    ///   behavior for a fresh connection.
     ///
     /// The 2x multiplier is deliberately hardcoded (no `SyncBudget` knob):
     /// it is the audit finding's refuted-equilibrium margin — the floor must
@@ -1243,7 +1449,7 @@ impl DownloadWindow {
     ///    shapes (staged + pending pinned at the count budget) satisfy this
     ///    term trivially, so wedge conviction is preserved. The chain tail
     ///    (nothing above the window left to request) is deliberately not an
-    ///    arm of this term — see [`Self::observe_stall`].
+    ///    arm of this term — see [`Self::advance_stall`].
     ///
     /// PRE: `stager` is the coupled staging set and `tree` resolves staged
     ///      hashes to heights.
@@ -1291,17 +1497,22 @@ impl DownloadWindow {
     /// Advances the cold-start front timer independently of the strong stall
     /// predicate. Returns a duplicate request only after the same apply-front
     /// hash remains pending to one owner for the initial stall timeout.
-    pub fn observe_cold_front(
+    ///
+    /// PRE: the apply side is not busy this tick (the no-blame guard in
+    ///      [`Self::observe_blocked`] owns the busy case).
+    /// POST: `Some((owner, hash))` names the exact owner of the waiting
+    ///      front; a seeded cadence EWMA or a spent hedge budget drops the
+    ///      timer.
+    /// INVARIANT: a running race is never restarted from here.
+    fn advance_cold_front(
         &mut self,
         next_apply_height: u32,
-        apply_side_busy: bool,
         now: Instant,
     ) -> Option<(PeerSource, Hash256)> {
         if matches!(self.cold_front, Some(ColdFrontState::Racing { .. })) {
             return None;
         }
-        if apply_side_busy
-            || self.front_interval_ewma_ms.is_some()
+        if self.front_interval_ewma_ms.is_some()
             || self.cold_hedged_fronts.len() >= MAX_COLD_FRONT_HEDGES
         {
             self.cold_front = None;
@@ -1501,28 +1712,113 @@ impl DownloadWindow {
         self.prefix_probe.as_ref().map(|probe| probe.started_at)
     }
 
-    fn pending_deadline(&self, requested_at: Instant) -> Instant {
-        requested_at
-            .checked_add(self.budget.pending_timeout)
-            .unwrap_or(requested_at)
+    /// Distinct exact connections owning validated in-flight blocks: the
+    /// per-owner block-download budget's peer count (Core's
+    /// `m_peers_downloading_from`, `net_processing.cpp:153-168`).
+    ///
+    /// POST: equals the population of `owner_downloading_since`.
+    /// INVARIANT: announced or merely-assigned peers never count; only
+    ///      ownership of at least one pending block does.
+    pub fn active_downloading_peers(&self) -> usize {
+        self.owner_downloading_since.len()
     }
 
-    fn record_pending_deadline(&mut self, requested_at: Instant) {
-        let deadline = self.pending_deadline(requested_at);
-        if self
-            .next_pending_deadline
-            .is_none_or(|current| deadline < current)
-        {
-            self.next_pending_deadline = Some(deadline);
+    /// The per-owner block-download budget for one tick.
+    ///
+    /// PRE: `active_downloading_peers` counts the owners with validated
+    ///      in-flight blocks.
+    /// POST: `SyncBudget::pending_timeout_override` when set; else
+    ///      `block_spacing * (BLOCK_DOWNLOAD_TIMEOUT_BASE
+    ///      + BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * other) / 2` with `other`
+    ///      the count minus one, saturating at `Duration::MAX`.
+    /// INVARIANT: one tick applies this one budget to every owner; the
+    ///      override is a test-only escape hatch, never production.
+    fn effective_owner_timeout(&self, active_downloading_peers: usize) -> Duration {
+        #[cfg(test)]
+        if let Some(timeout) = self.budget.pending_timeout_override {
+            return timeout;
         }
+        let other = u32::try_from(active_downloading_peers.saturating_sub(1)).unwrap_or(u32::MAX);
+        let raw_factor = BLOCK_DOWNLOAD_TIMEOUT_BASE
+            .saturating_add(BLOCK_DOWNLOAD_TIMEOUT_PER_PEER.saturating_mul(other));
+        self.budget.block_spacing.saturating_mul(raw_factor) / 2
     }
 
-    fn refresh_next_pending_deadline(&mut self) {
-        self.next_pending_deadline = self
+    /// Whether `owner`'s download queue has aged past its budget.
+    ///
+    /// PRE: `active_downloading_peers` is this tick's owner count.
+    /// POST: `true` exactly while the owner has a queue start at least the
+    ///      budget old; an owner with no entry never expired.
+    /// INVARIANT: every expiry, eligibility, and blame decision shares this
+    ///      one predicate.
+    fn owner_download_expired(
+        &self,
+        owner: PeerSource,
+        active_downloading_peers: usize,
+        now: Instant,
+    ) -> bool {
+        self.owner_downloading_since
+            .get(&owner)
+            .is_some_and(|since| {
+                now.duration_since(*since) >= self.effective_owner_timeout(active_downloading_peers)
+            })
+    }
+
+    /// Re-derives one owner's queue start after a removal from `pending`.
+    ///
+    /// PRE: the entry is already out of `pending`; `removed_requested_at`
+    ///      is its request time; `now` is the caller's injected clock.
+    /// POST: the owner keeps no entry once it owns nothing; the entry moves
+    ///      to `now` exactly when the removed entry was strictly older
+    ///      than every survivor (the true queue head left); when a
+    ///      survivor carries the removed entry's own stamp, the clock
+    ///      adopts that stamp without ever regressing; otherwise the
+    ///      entry is untouched.
+    /// INVARIANT: the local equivalent of Core's `m_downloading_since`
+    ///      start-and-oldest-removal reset (`net_processing.cpp:1323-1332,
+    ///      1363-1368`); `requested_at` stays the ordering and diagnostic
+    ///      record, never the sole source of the queue age. One batched
+    ///      `mark_requested` stamps every entry with one `requested_at`,
+    ///      so only that batch's front advances the clock: a peer cannot
+    ///      postpone its timeout by dripping non-front deliveries.
+    fn reset_owner_queue_start(
+        &mut self,
+        owner: PeerSource,
+        removed_requested_at: Instant,
+        now: Instant,
+    ) {
+        let oldest_remaining = self
             .pending
             .values()
-            .map(|pending| self.pending_deadline(pending.requested_at))
+            .filter(|pending| pending.owner == owner)
+            .map(|pending| pending.requested_at)
             .min();
+        match oldest_remaining {
+            None => {
+                self.owner_downloading_since.remove(&owner);
+            }
+            // Strictly older than every survivor: the true head left, and
+            // the clock restarts at the removal instant.
+            Some(oldest) if removed_requested_at < oldest => {
+                self.owner_downloading_since.insert(owner, now);
+            }
+            // The removed entry shares the surviving head's stamp (entries
+            // of one batched request share one `requested_at`): the head
+            // keeps that stamp, so the clock stays at the batch origin
+            // until the front itself is removed. The clock may already sit
+            // ahead of the stamp — an earlier true-head removal moved it
+            // to the removal instant — and must not regress: Core's
+            // `m_downloading_since` only ever moves forward
+            // (`max(since, now)`).
+            Some(oldest) if removed_requested_at == oldest => {
+                self.owner_downloading_since
+                    .entry(owner)
+                    .and_modify(|since| *since = (*since).max(oldest))
+                    .or_insert(oldest);
+            }
+            // A strictly older survivor is still the head: untouched.
+            Some(_) => {}
+        }
     }
 
     /// Retains only ownership facts whose connection `owns` still names.
@@ -1530,7 +1826,7 @@ impl DownloadWindow {
     /// PRE: `owns` is false for every connection absent from the peer
     ///   table's live set.
     /// POST: `pending` holds only entries whose owner satisfies `owns`, with
-    ///   `pending_bytes`, `next_request_height`, and `next_pending_deadline`
+    ///   `pending_bytes`, `next_request_height`, and `owner_downloading_since`
     ///   kept in step; `cold_front` survives only while its waiting owner or
     ///   both racing participants do; `preferred_peer` and
     ///   `prefix_probe_attempted_owner` clear when their owner fails `owns`;
@@ -1579,27 +1875,19 @@ impl DownloadWindow {
             self.pending_timeout_observation = None;
         }
         let mut retry_height = self.next_request_height;
-        let mut removed_earliest_deadline = false;
-        let pending_timeout = self.budget.pending_timeout;
-        let next_pending_deadline = self.next_pending_deadline;
         self.pending.retain(|_hash, pending| {
             if retain_owner(&pending.owner) {
                 return true;
             }
             retry_height = retry_height.min(pending.height);
             self.pending_bytes = self.pending_bytes.saturating_sub(pending.estimated_bytes);
-            let deadline = pending
-                .requested_at
-                .checked_add(pending_timeout)
-                .unwrap_or(pending.requested_at);
-            if Some(deadline) == next_pending_deadline {
-                removed_earliest_deadline = true;
-            }
             false
         });
-        if removed_earliest_deadline {
-            self.refresh_next_pending_deadline();
-        }
+        // A released owner loses every pending it had: its queue start
+        // goes with them, so no phantom age survives to blame a later
+        // assignment to the same connection.
+        self.owner_downloading_since
+            .retain(|owner, _| retain_owner(owner));
         self.next_request_height = retry_height;
     }
 
@@ -1623,7 +1911,7 @@ impl DownloadWindow {
         tree: &BlockTree,
         now: Instant,
     ) -> Option<PeerRequest> {
-        self.retarget_request_branch(stager, chain_tip, request_start_height, tree);
+        self.retarget_request_branch(stager, chain_tip, request_start_height, tree, now);
         if self.staged_bytes_exhausted(stager) {
             return None;
         }
@@ -1715,6 +2003,7 @@ impl DownloadWindow {
         chain_tip: &TipSnapshot,
         request_start_height: u32,
         tree: &BlockTree,
+        now: Instant,
     ) {
         let Some((previous_hash, previous_height)) =
             self.request_tip.replace((chain_tip.hash, chain_tip.height))
@@ -1740,7 +2029,7 @@ impl DownloadWindow {
             })
             .collect();
         for hash in stale_pending {
-            self.remove_pending(&hash);
+            self.remove_pending(&hash, now);
         }
         // The stager is the single staged-body store: bodies the request
         // branch left behind are released here, so freed capacity is real
@@ -1998,7 +2287,7 @@ impl DownloadWindow {
         self.pending_blocks_high_water = self.pending_blocks_high_water.max(self.pending.len());
         self.pending_bytes_high_water = self.pending_bytes_high_water.max(self.pending_bytes);
         if !request.entries.is_empty() {
-            self.record_pending_deadline(now);
+            self.owner_downloading_since.entry(owner).or_insert(now);
         }
         self.next_request_height = self.next_request_height.max(request.next_request_height);
         self.has_request_capacity(stager)
@@ -2022,7 +2311,7 @@ impl DownloadWindow {
         source_peer: Option<PeerSource>,
         now: Instant,
     ) -> Option<u32> {
-        let pending = self.remove_pending(&hash);
+        let pending = self.remove_pending(&hash, now);
         let pending_height = pending.map(|pending| pending.height);
         if let Some(source) = source_peer {
             self.credit_delivery_from(hash, source, pending_height, now);
@@ -2042,13 +2331,14 @@ impl DownloadWindow {
     /// PRE: `height`, when known, is the tree height of `hash`.
     /// POST: a pending for `hash` is released; the request cursor is lowered
     ///   to the lower of `height` and the released pending's height, when
-    ///   either is known.
+    ///   either is known; the owner's queue start follows the removal rules
+    ///   of [`Self::reset_owner_queue_start`].
     /// INVARIANT: every rewind target is a tree height (the caller's, or the
     ///   one the pending recorded at request time); a body of unknown height
     ///   with no pending never moves the cursor, so the height-0 rewind to
     ///   genesis is unrepresentable.
-    pub fn requeue_for_retry(&mut self, hash: &Hash256, height: Option<u32>) {
-        let pending_height = self.remove_pending(hash).map(|pending| pending.height);
+    pub fn requeue_for_retry(&mut self, hash: &Hash256, height: Option<u32>, now: Instant) {
+        let pending_height = self.remove_pending(hash, now).map(|pending| pending.height);
         let target = match (height, pending_height) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (known, None) | (None, known) => known,
@@ -2062,6 +2352,13 @@ impl DownloadWindow {
     #[cfg(test)]
     pub(crate) fn request_cursor(&self) -> u32 {
         self.next_request_height
+    }
+
+    /// The owner's live queue start, for in-crate tests that pin queue-age
+    /// bookkeeping across sync seams.
+    #[cfg(test)]
+    pub(crate) fn owner_queue_start_for_test(&self, owner: PeerSource) -> Option<Instant> {
+        self.owner_downloading_since.get(&owner).copied()
     }
 
     /// The source-attributed share of a staged delivery: pending-timeout,
@@ -2202,6 +2499,7 @@ impl DownloadWindow {
         &mut self,
         hash: Hash256,
         source_peer: Option<PeerSource>,
+        now: Instant,
     ) -> RejectDelivery {
         // A malformed response is still proof that this peer answered. Do not
         // let a first-tick timeout observation disconnect it on the next tick.
@@ -2237,7 +2535,7 @@ impl DownloadWindow {
             .get(&hash)
             .is_some_and(|pending| Some(pending.owner) == source_peer);
         if is_owner {
-            if let Some(pending) = self.remove_pending(&hash) {
+            if let Some(pending) = self.remove_pending(&hash, now) {
                 self.next_request_height = self.next_request_height.min(pending.height);
             }
             RejectDelivery::ReleasedPending
@@ -2247,29 +2545,44 @@ impl DownloadWindow {
     }
 
     fn expire_pending(&mut self, now: Instant) -> Vec<PeerRequestEntry> {
-        if self
-            .next_pending_deadline
-            .is_none_or(|deadline| now < deadline)
-        {
+        let timeout = self.effective_owner_timeout(self.active_downloading_peers());
+        let expired_owners: HashSet<PeerSource> = self
+            .owner_downloading_since
+            .iter()
+            .filter(|(_, since)| now.duration_since(**since) >= timeout)
+            .map(|(owner, _)| *owner)
+            .collect();
+        if expired_owners.is_empty() {
             return Vec::new();
         }
-        let pending_timeout = self.budget.pending_timeout;
         let mut entries = Vec::new();
+        let mut removed: Vec<(PeerSource, Instant)> = Vec::new();
+        let armed_observation = &mut self.pending_timeout_observation;
         {
             let pending_bytes = &mut self.pending_bytes;
             let next_request_height = &mut self.next_request_height;
-            for (hash, pending) in self.pending.extract_if(|_hash, pending| {
-                now.duration_since(pending.requested_at) >= pending_timeout
-            }) {
+            for (hash, pending) in self
+                .pending
+                .extract_if(|_hash, pending| expired_owners.contains(&pending.owner))
+            {
+                if let Some(observation) = armed_observation
+                    && observation.hash == hash
+                    && observation.owner == pending.owner
+                {
+                    observation.expired_release = true;
+                }
                 *pending_bytes = pending_bytes.saturating_sub(pending.estimated_bytes);
                 *next_request_height = (*next_request_height).min(pending.height);
                 entries.push(PeerRequestEntry {
                     hash,
                     height: pending.height,
                 });
+                removed.push((pending.owner, pending.requested_at));
             }
         }
-        self.refresh_next_pending_deadline();
+        for (owner, requested_at) in removed {
+            self.reset_owner_queue_start(owner, requested_at, now);
+        }
         entries
     }
 
@@ -2327,12 +2640,10 @@ impl DownloadWindow {
         self.prefix_probe_attempted_owner = attempted_owner;
     }
 
-    fn remove_pending(&mut self, hash: &Hash256) -> Option<PendingBlock> {
+    fn remove_pending(&mut self, hash: &Hash256, now: Instant) -> Option<PendingBlock> {
         let pending = self.pending.remove(hash)?;
         self.pending_bytes = self.pending_bytes.saturating_sub(pending.estimated_bytes);
-        if Some(self.pending_deadline(pending.requested_at)) == self.next_pending_deadline {
-            self.refresh_next_pending_deadline();
-        }
+        self.reset_owner_queue_start(pending.owner, pending.requested_at, now);
         Some(pending)
     }
 
@@ -2439,8 +2750,9 @@ mod tests {
     };
 
     use super::{
-        BlockStager, DownloadWindow, FAST_BLOCKS_IN_TRANSIT_PER_PEER, FAST_MIN_PEERS_FOR_FANOUT,
-        FAST_OUTBOUND_PEER_TARGET, PENDING_BUDGET, SyncBudget, fast_sync_budget,
+        BlameReason, BlockStager, BlockedContext, BlockedDecision, ColdFrontState, DownloadWindow,
+        FAST_BLOCKS_IN_TRANSIT_PER_PEER, FAST_MIN_PEERS_FOR_FANOUT, FAST_OUTBOUND_PEER_TARGET,
+        PENDING_BUDGET, SyncBudget, count_stall_episode_cleared, fast_sync_budget,
     };
     use crate::connection::PeerSource;
 
@@ -2567,6 +2879,10 @@ mod tests {
         PeerSource::for_test(addr)
     }
 
+    // The per-rule wrappers drive the private advances directly, including
+    // the no-blame guard's clears, so each test observes exactly one state
+    // machine. `BlockedDecision` precedence is pinned separately through
+    // the unified `observe_blocked` entry.
     fn stall_owner(
         window: &mut DownloadWindow,
         stager: &BlockStager,
@@ -2575,8 +2891,14 @@ mod tests {
         apply_side_busy: bool,
         now: Instant,
     ) -> Option<std::net::SocketAddr> {
+        if apply_side_busy {
+            if window.stall.take().is_some() {
+                count_stall_episode_cleared("apply_busy");
+            }
+            return None;
+        }
         window
-            .observe_stall(next_apply_height, apply_side_busy, stager, tree, now)
+            .advance_stall(next_apply_height, stager, tree, now)
             .map(|owner| owner.addr)
     }
 
@@ -2585,8 +2907,13 @@ mod tests {
         apply_side_busy: bool,
         now: Instant,
     ) -> Option<std::net::SocketAddr> {
+        if apply_side_busy {
+            window.pending_timeout_observation = None;
+            return None;
+        }
+        let active = window.active_downloading_peers();
         window
-            .observe_pending_timeout(apply_side_busy, now)
+            .advance_pending_timeout(now, active)
             .map(|owner| owner.addr)
     }
 
@@ -2596,9 +2923,30 @@ mod tests {
         apply_side_busy: bool,
         now: Instant,
     ) -> Option<(std::net::SocketAddr, Hash256)> {
+        if apply_side_busy {
+            if !matches!(window.cold_front, Some(ColdFrontState::Racing { .. })) {
+                window.cold_front = None;
+            }
+            return None;
+        }
         window
-            .observe_cold_front(next_apply_height, apply_side_busy, now)
+            .advance_cold_front(next_apply_height, now)
             .map(|(owner, hash)| (owner.addr, hash))
+    }
+
+    fn apply_side_bound(
+        window: &mut DownloadWindow,
+        next_apply_height: u32,
+        frontier_hash: Option<Hash256>,
+        apply_side_busy: bool,
+        now: Instant,
+    ) -> Option<Duration> {
+        window
+            .advance_apply_side_stuck(next_apply_height, frontier_hash, apply_side_busy, now)
+            .map(|(hash, suppressed_for)| {
+                debug_assert_eq!(Some(hash), frontier_hash);
+                suppressed_for
+            })
     }
 
     #[test]
@@ -2622,22 +2970,25 @@ mod tests {
 
     #[test]
     fn request_peer_scan_limit_counts_expired_pending_capacity() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            max_pending_blocks: 2,
-            max_pending_bytes: 2 * 256 * 1024,
-            max_peer_inflight: 2,
-            getdata_batch_limit: 2,
-            pending_timeout: Duration::ZERO,
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            SyncBudget {
+                max_pending_blocks: 2,
+                max_pending_bytes: 2 * 256 * 1024,
+                max_peer_inflight: 2,
+                getdata_batch_limit: 2,
+                ..test_budget()
+            }
+            .with_pending_timeout_override(Duration::ZERO),
+        );
         let stager = test_stager(&window);
         let now = Instant::now();
         let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let owner = test_source(peer_addr);
         for (byte, height) in [(1, 1_u32), (2, 2)] {
             window.pending.insert(
                 hash(byte),
                 super::PendingBlock {
-                    owner: test_source(peer_addr),
+                    owner,
                     requested_at: now,
                     height,
                     estimated_bytes: 256 * 1024,
@@ -2645,32 +2996,32 @@ mod tests {
             );
             window.pending_bytes = window.pending_bytes.saturating_add(256 * 1024);
         }
-        window.next_pending_deadline = Some(now);
+        window.owner_downloading_since.insert(owner, now);
 
         assert_eq!(window.request_peer_scan_limit(&stager, now), 2);
     }
 
     #[test]
     fn pending_timeout_waits_for_second_delivery_drain() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout: Duration::from_secs(10),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let mut stager = test_stager(&window);
         let requested_at = Instant::now();
         let observed_at = requested_at + Duration::from_secs(10);
         let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
         let block_hash = hash(0x90);
+        let owner = test_source(peer_addr);
         window.pending.insert(
             block_hash,
             super::PendingBlock {
-                owner: test_source(peer_addr),
+                owner,
                 requested_at,
                 height: 1,
                 estimated_bytes: 80,
             },
         );
-        window.next_pending_deadline = Some(observed_at);
+        window.owner_downloading_since.insert(owner, requested_at);
         assert_eq!(timeout_owner(&mut window, false, observed_at), None);
         receive_staged(
             &mut window,
@@ -2685,10 +3036,9 @@ mod tests {
 
     #[test]
     fn pending_timeout_apply_busy_clears_suspicion_without_blame() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout: Duration::from_secs(10),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let requested_at = Instant::now();
         let observed_at = requested_at + Duration::from_secs(10);
         let peer_addr = staller_addr();
@@ -2707,41 +3057,214 @@ mod tests {
         assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
     }
 
+    /// A retry delivery releases the observed hash without the owner: the
+    /// second tick must re-verify the suspicion against the live window
+    /// and blame nobody, because a conviction here would outlive the
+    /// queue age it measured.
     #[test]
-    fn retry_delivery_does_not_clear_original_peer_timeout() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout: Duration::from_secs(10),
-            ..test_budget()
-        });
+    fn retry_delivery_resolves_original_peer_timeout_without_blame() {
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let requested_at = Instant::now();
         let observed_at = requested_at + Duration::from_secs(10);
         let original_peer = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
         let retry_peer = std::net::SocketAddr::from(([127, 0, 0, 2], 8333));
         let block_hash = hash(0x91);
+        let original_owner = test_source(original_peer);
         window.pending.insert(
             block_hash,
             super::PendingBlock {
-                owner: test_source(original_peer),
+                owner: original_owner,
                 requested_at,
                 height: 1,
                 estimated_bytes: 80,
             },
         );
-        window.next_pending_deadline = Some(observed_at);
+        window
+            .owner_downloading_since
+            .insert(original_owner, requested_at);
 
+        // First idle tick arms the suspicion on the original owner.
         assert_eq!(timeout_owner(&mut window, false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_some());
+
+        // A retry from another peer releases the observed hash; the second
+        // tick clears the suspicion without convicting anyone.
         window.mark_received_from(block_hash, 80, Some(test_source(retry_peer)), observed_at);
-        assert_eq!(
-            timeout_owner(&mut window, false, observed_at),
-            Some(original_peer)
-        );
-        assert!(window.peer_in_staller_cooldown(original_peer, observed_at));
+        assert_eq!(timeout_owner(&mut window, false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_none());
+        assert!(!window.peer_in_staller_cooldown(original_peer, observed_at));
         assert!(!window.peer_in_staller_cooldown(retry_peer, observed_at));
+    }
+
+    /// One batched `mark_requested` stamps every entry with one
+    /// `requested_at`: removing a non-front entry ties with the surviving
+    /// front's stamp, so the queue start must stay at the batch origin.
+    /// Re-stamping from the removal instant on each tie would let a peer
+    /// postpone its timeout indefinitely by dripping non-front deliveries
+    /// of one batch while the front stays outstanding.
+    #[test]
+    fn batched_non_front_deliveries_do_not_postpone_the_owner_timeout() {
+        let mut window = DownloadWindow::new(test_budget());
+        let stager = test_stager(&window);
+        let now = Instant::now();
+        let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        let front = hash(0xe5);
+        let first = super::non_empty_request(
+            owner,
+            vec![
+                super::PeerRequestEntry {
+                    hash: front,
+                    height: 1,
+                },
+                super::PeerRequestEntry {
+                    hash: hash(0xe6),
+                    height: 2,
+                },
+                super::PeerRequestEntry {
+                    hash: hash(0xe7),
+                    height: 3,
+                },
+            ],
+            4,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        assert!(window.mark_requested(&stager, &first, owner, now));
+
+        // A later batch keeps the owner active, so front removal must move
+        // the clock forward rather than drop the entry.
+        let second_at = now + Duration::from_secs(9);
+        let second = super::non_empty_request(
+            owner,
+            vec![super::PeerRequestEntry {
+                hash: hash(0xe8),
+                height: 4,
+            }],
+            5,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        assert!(window.mark_requested(&stager, &second, owner, second_at));
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&now));
+
+        // Deliver every non-front entry one at a time: each removal ties
+        // with the front's own stamp, so the clock never leaves the first
+        // batch's origin.
+        for byte in [0xe6, 0xe7] {
+            window.mark_received_from(hash(byte), SMALL_BODY, Some(owner), second_at);
+            assert_eq!(window.owner_downloading_since.get(&owner), Some(&now));
+        }
+
+        // Removing the front itself — the first batch's true oldest, with
+        // only the newer batch surviving — advances the clock to the
+        // removal instant.
+        let front_removed_at = second_at + Duration::from_millis(1);
+        window.mark_received_from(front, SMALL_BODY, Some(owner), front_removed_at);
+        assert_eq!(
+            window.owner_downloading_since.get(&owner),
+            Some(&front_removed_at)
+        );
+    }
+
+    /// A batch sibling removed after the clock already restarted must not
+    /// drag the clock back to its older batch stamp — the rewind would
+    /// postpone `owner_download_expired` for a queue the peer is actively
+    /// draining.
+    #[test]
+    fn tied_removal_never_rewinds_the_owner_queue_clock() {
+        let mut window = DownloadWindow::new(test_budget());
+        let stager = test_stager(&window);
+        let t0 = Instant::now();
+        let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        let batch_a = super::non_empty_request(
+            owner,
+            vec![
+                super::PeerRequestEntry {
+                    hash: hash(0xf1),
+                    height: 1,
+                },
+                super::PeerRequestEntry {
+                    hash: hash(0xf2),
+                    height: 2,
+                },
+            ],
+            3,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        assert!(window.mark_requested(&stager, &batch_a, owner, t0));
+
+        let t5 = t0 + Duration::from_secs(5);
+        let batch_b = super::non_empty_request(
+            owner,
+            vec![
+                super::PeerRequestEntry {
+                    hash: hash(0xf3),
+                    height: 3,
+                },
+                super::PeerRequestEntry {
+                    hash: hash(0xf4),
+                    height: 4,
+                },
+            ],
+            5,
+        )
+        .unwrap_or_else(|| panic!("non-empty request"));
+        assert!(window.mark_requested(&stager, &batch_b, owner, t5));
+
+        // Drain batch A: its front ties with its sibling (clock stays at
+        // the batch origin), then the sibling leaves as the true head and
+        // restarts the clock at the removal instant.
+        window.mark_received_from(hash(0xf1), SMALL_BODY, Some(owner), t5);
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&t0));
+        let t9 = t5 + Duration::from_secs(4);
+        window.mark_received_from(hash(0xf2), SMALL_BODY, Some(owner), t9);
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&t9));
+
+        // The first batch-B removal ties with its sibling's t5 stamp: the
+        // clock must keep t9, not regress to t5.
+        window.mark_received_from(hash(0xf3), SMALL_BODY, Some(owner), t9);
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&t9));
+    }
+
+    /// The retarget path releases a pending without a delivery; a
+    /// suspicion armed on its owner must clear instead of convicting when
+    /// the second tick finds the observed hash no longer pending-owned.
+    #[test]
+    fn requeue_of_the_observed_block_clears_the_suspicion_without_blame() {
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
+        let requested_at = Instant::now();
+        let observed_at = requested_at + Duration::from_secs(10);
+        let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let block_hash = hash(0x93);
+        let owner = insert_pending(
+            &mut window,
+            test_source(peer_addr),
+            block_hash,
+            1,
+            requested_at,
+        );
+
+        // First idle tick arms the suspicion.
+        assert_eq!(timeout_owner(&mut window, false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_some());
+
+        // The retarget path releases the observed hash before the second
+        // tick, and the owner's queue age leaves with it.
+        window.requeue_for_retry(&block_hash, Some(1), observed_at);
+        assert_eq!(window.pending_owner(&block_hash), None);
+        assert_eq!(window.owner_queue_start_for_test(owner), None);
+
+        // The second tick clears the suspicion without blame.
+        assert_eq!(timeout_owner(&mut window, false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_none());
+        assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
     }
 
     #[test]
     fn default_budget_keeps_full_request_window_for_large_blocks() {
-        let mut window = DownloadWindow::new(super::default_sync_budget());
+        let mut window = DownloadWindow::new(super::default_sync_budget(Network::Regtest));
         let stager = test_stager(&window);
         window.ewma_block_bytes = 2 * 1024 * 1024;
         window.pending_bytes = window
@@ -2754,55 +3277,58 @@ mod tests {
     }
 
     #[test]
-    fn releasing_a_dead_owner_refreshes_pending_deadline() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout: Duration::from_secs(10),
-            ..test_budget()
-        });
+    fn releasing_a_dead_owner_drops_its_queue_start() {
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let now = Instant::now();
-        let stale_peer = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
-        let live_peer = std::net::SocketAddr::from(([127, 0, 0, 2], 8333));
+        let stale_owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        let live_owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 2], 8333)));
         let stale_requested_at = now
             .checked_sub(Duration::from_secs(9))
             .unwrap_or_else(|| panic!("test instant underflow"));
         let estimated_bytes = 256 * 1024;
-        for (peer_addr, requested_at, height, byte) in [
-            (stale_peer, stale_requested_at, 1_u32, 0x81),
-            (live_peer, now, 2_u32, 0x82),
+        for (owner, requested_at, height, byte) in [
+            (stale_owner, stale_requested_at, 1_u32, 0x81),
+            (live_owner, now, 2_u32, 0x82),
         ] {
             window.pending.insert(
                 hash(byte),
                 super::PendingBlock {
-                    owner: test_source(peer_addr),
+                    owner,
                     requested_at,
                     height,
                     estimated_bytes,
                 },
             );
             window.pending_bytes = window.pending_bytes.saturating_add(estimated_bytes);
-            window.record_pending_deadline(requested_at);
+            window.owner_downloading_since.insert(owner, requested_at);
         }
 
-        window.retain_owned_by(|p| p.addr == live_peer);
+        window.retain_owned_by(|p| p.addr == live_owner.addr);
 
         assert_eq!(window.pending_len(), 1);
         assert_eq!(window.pending_bytes(), estimated_bytes);
         assert_eq!(window.next_request_height, 1);
-        assert_eq!(
-            window.next_pending_deadline,
-            Some(now + Duration::from_secs(10))
-        );
+        // The dead owner's queue start is gone with its pendings; the live
+        // owner's age bookkeeping is untouched.
+        assert_eq!(window.active_downloading_peers(), 1);
+        assert_eq!(window.owner_downloading_since.get(&live_owner), Some(&now));
+        assert!(!window.owner_download_expired(
+            live_owner,
+            window.active_downloading_peers(),
+            now + Duration::from_secs(9)
+        ));
     }
 
     #[test]
-    fn mark_received_refreshes_pending_deadline_after_earliest_pending() {
-        let mut window = DownloadWindow::new(SyncBudget {
-            pending_timeout: Duration::from_secs(10),
-            ..test_budget()
-        });
+    fn receiving_the_oldest_pending_resets_the_owner_queue_start() {
+        let mut window = DownloadWindow::new(
+            test_budget().with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let mut stager = test_stager(&window);
         let now = Instant::now();
-        let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
         let earliest = hash(0x91);
         let later = hash(0x92);
         let earliest_requested_at = now
@@ -2816,25 +3342,135 @@ mod tests {
             window.pending.insert(
                 hash,
                 super::PendingBlock {
-                    owner: test_source(peer_addr),
+                    owner,
                     requested_at,
                     height,
                     estimated_bytes,
                 },
             );
             window.pending_bytes = window.pending_bytes.saturating_add(estimated_bytes);
-            window.record_pending_deadline(requested_at);
         }
+        window
+            .owner_downloading_since
+            .insert(owner, earliest_requested_at);
 
         let unsolicited = receive_staged(&mut window, &mut stager, earliest, SMALL_BODY, now);
 
         assert!(!unsolicited);
         assert_eq!(window.pending_len(), 1);
         assert!(window.contains_pending(&later));
+        // The queue head left: the surviving head's clock starts at the
+        // removal instant, not at its own request time.
+        assert_eq!(window.owner_downloading_since.get(&owner), Some(&now));
         assert_eq!(
-            window.next_pending_deadline,
-            Some(now + Duration::from_secs(10))
+            timeout_owner(&mut window, false, now + Duration::from_secs(9)),
+            None
         );
+        assert!(window.pending_timeout_observation.is_none());
+        assert_eq!(
+            timeout_owner(&mut window, false, now + Duration::from_secs(10)),
+            None
+        );
+        assert!(window.pending_timeout_observation.is_some());
+    }
+
+    /// BLK-05: the block-download budget is Core's per-owner queue-age
+    /// rule — one target spacing plus half a spacing per other active
+    /// owner (`net_processing.cpp:153-168`) — not a fixed 60 seconds.
+    /// One active owner expires at exactly one spacing; three active
+    /// owners each get two spacings.
+    #[test]
+    fn slow_peer_timeout_uses_spacing_and_other_downloaders() {
+        let spacing = Duration::from_secs(10);
+        let requested_at = Instant::now();
+
+        // One active owner: the budget is exactly one spacing.
+        let mut window = DownloadWindow::new(SyncBudget {
+            block_spacing: spacing,
+            pending_timeout_override: None,
+            ..test_budget()
+        });
+        let solo = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        insert_pending(&mut window, solo, hash(0xb1), 1, requested_at);
+        assert_eq!(
+            timeout_owner(
+                &mut window,
+                false,
+                requested_at + spacing.saturating_sub(Duration::from_millis(1)),
+            ),
+            None
+        );
+        assert!(window.pending_timeout_observation.is_none());
+        assert_eq!(
+            timeout_owner(&mut window, false, requested_at + spacing),
+            None
+        );
+        assert!(window.pending_timeout_observation.is_some());
+        assert_eq!(
+            timeout_owner(&mut window, false, requested_at + spacing),
+            Some(solo.addr)
+        );
+
+        // Three active owners: every owner's `other` count is 2, so the
+        // budget is exactly two spacings and one spacing convicts nobody.
+        let mut window = DownloadWindow::new(SyncBudget {
+            block_spacing: spacing,
+            pending_timeout_override: None,
+            ..test_budget()
+        });
+        let owners: Vec<PeerSource> = (1..=3_u8)
+            .map(|byte| {
+                let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 20 + byte], 8333)));
+                insert_pending(
+                    &mut window,
+                    owner,
+                    hash(0xc0 + byte),
+                    u32::from(byte),
+                    requested_at,
+                );
+                owner
+            })
+            .collect();
+        assert_eq!(window.active_downloading_peers(), 3);
+        assert_eq!(
+            timeout_owner(&mut window, false, requested_at + spacing),
+            None
+        );
+        assert!(
+            window.pending_timeout_observation.is_none(),
+            "one spacing must not convict while three owners share the queue"
+        );
+        assert_eq!(
+            timeout_owner(&mut window, false, requested_at + 2 * spacing),
+            None
+        );
+        assert!(window.pending_timeout_observation.is_some());
+        assert_eq!(
+            timeout_owner(&mut window, false, requested_at + 2 * spacing),
+            Some(owners[0].addr),
+            "the second observation convicts the pinned owner"
+        );
+    }
+
+    /// The override is a test-only escape hatch and wins over the derived
+    /// budget, keeping deterministic tests independent of spacing math.
+    #[test]
+    fn pending_timeout_override_wins_over_spacing_policy() {
+        let mut window = DownloadWindow::new(
+            SyncBudget {
+                block_spacing: Duration::from_mins(10),
+                ..test_budget()
+            }
+            .with_pending_timeout_override(Duration::from_secs(5)),
+        );
+        let requested_at = Instant::now();
+        let owner = test_source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        insert_pending(&mut window, owner, hash(0xd1), 1, requested_at);
+        assert_eq!(
+            timeout_owner(&mut window, false, requested_at + Duration::from_secs(5)),
+            None
+        );
+        assert!(window.pending_timeout_observation.is_some());
     }
 
     #[test]
@@ -2922,7 +3558,7 @@ mod tests {
 
     #[test]
     fn fast_sync_budget_stripes_window_across_fast_outbound_target() {
-        let mut window = DownloadWindow::new(fast_sync_budget());
+        let mut window = DownloadWindow::new(fast_sync_budget(Network::Regtest));
         let stager = test_stager(&window);
         let now = Instant::now();
 
@@ -3019,30 +3655,33 @@ mod tests {
         // the credit must reopen the scan limit so the request path can
         // expire and re-request the front (otherwise the wedge can only be
         // broken by pruning every staged block into re-download).
-        let mut window = DownloadWindow::new(SyncBudget {
-            max_pending_blocks: 4,
-            max_received_blocks: 4,
-            max_peer_inflight: 4,
-            getdata_batch_limit: 4,
-            pending_timeout: Duration::from_secs(10),
-            ..test_budget()
-        });
+        let mut window = DownloadWindow::new(
+            SyncBudget {
+                max_pending_blocks: 4,
+                max_received_blocks: 4,
+                max_peer_inflight: 4,
+                getdata_batch_limit: 4,
+                ..test_budget()
+            }
+            .with_pending_timeout_override(Duration::from_secs(10)),
+        );
         let mut stager = test_stager(&window);
         let now = Instant::now();
         let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let owner = test_source(peer_addr);
         for (byte, height) in [(0xe1, 1_u32), (0xe2, 2)] {
             window.pending.insert(
                 hash(byte),
                 super::PendingBlock {
-                    owner: test_source(peer_addr),
+                    owner,
                     requested_at: now,
                     height,
                     estimated_bytes: 256 * 1024,
                 },
             );
             window.pending_bytes = window.pending_bytes.saturating_add(256 * 1024);
-            window.record_pending_deadline(now);
         }
+        window.owner_downloading_since.insert(owner, now);
         for byte in [0xe3, 0xe4] {
             receive_staged(&mut window, &mut stager, hash(byte), SMALL_BODY, now);
         }
@@ -3117,16 +3756,16 @@ mod tests {
             },
         );
         window.pending_bytes = window.pending_bytes.saturating_add(80);
-        window.record_pending_deadline(now);
+        window.owner_downloading_since.entry(owner).or_insert(now);
         owner
     }
 
     /// Seeds the front-cadence EWMA through the real delivery path: heights
     /// 1 and 2 arrive from `peer` `gap` apart (must be >=
     /// `EWMA_MIN_SAMPLE_MS` or the second advance is skipped as a batch
-    /// artifact) and apply immediately. Disarms `observe_stall`'s cold-start
-    /// fire suppression and returns the instant of the second front advance
-    /// — the anchor for the next interval sample.
+    /// artifact) and apply immediately. Lifts `advance_stall`'s decay floor
+    /// to twice the demonstrated cadence and returns the instant of the
+    /// second front advance — the anchor for the next interval sample.
     fn seed_front_cadence(
         window: &mut DownloadWindow,
         peer: std::net::SocketAddr,
@@ -3578,9 +4217,8 @@ mod tests {
     fn successor_arrival_does_not_reset_stall_clock() {
         // Mid-window deliveries are data progress but not front progress: the
         // episode keeps running and fires on schedule. Heights 1-2 seed the
-        // cadence EWMA first (cold start would otherwise defer the fire to
-        // the pending-timeout fallback); the 100ms cadence keeps the decay
-        // floor at the static 2s.
+        // cadence EWMA; the 100ms cadence keeps the decay floor at the
+        // static 2s.
         let mut window = DownloadWindow::new(stall_budget());
         let mut stager = test_stager(&window);
         let tree = test_tree();
@@ -3832,7 +4470,7 @@ mod tests {
                 None
             );
             assert_eq!(recorder.started(), 3);
-            window.remove_pending(&hash(0x03));
+            window.remove_pending(&hash(0x03), now);
             insert_pending(&mut window, test_source(healthy_addr()), hash(0x07), 3, now);
             assert_eq!(
                 stall_owner(&mut window, &stager, &tree, 3, false, now),
@@ -3888,7 +4526,7 @@ mod tests {
     }
 
     /// The stored episode's one-shot log latch, if an episode is running.
-    /// `observe_stall` emits the INFO line in exactly the branch that flips
+    /// `advance_stall` emits the INFO line in exactly the branch that flips
     /// this `false -> true`, so the latch IS the emission contract — pinned
     /// here at the state level because asserting through the global tracing
     /// pipeline is racy under parallel tests (tracing-core caches per-callsite
@@ -4005,12 +4643,13 @@ mod tests {
         assert_eq!(info_logged(&window), Some(true));
     }
 
-    /// Cold start (front-cadence EWMA unseeded): conviction is suppressed
-    /// but the episode still forms and the observability line still fires —
-    /// a suppressed-conviction episode is exactly what must be visible in
-    /// run logs (the `front_interval_ewma_ms=None` shape).
+    /// An unseeded front-cadence EWMA (cold start) is not a conviction
+    /// exemption: the fire threshold is the stored adaptive value, whose
+    /// floor is `stall_timeout_initial` — Core's
+    /// `BLOCK_STALLING_TIMEOUT_DEFAULT`. The observability line still fires
+    /// at 1s, one full second before the first possible conviction.
     #[test]
-    fn stall_episode_logs_info_during_ewma_cold_start_without_firing() {
+    fn stall_convicts_at_initial_floor_before_ewma_is_seeded() {
         let now = Instant::now();
         let mut window = DownloadWindow::new(stall_budget());
         let mut stager = test_stager(&window);
@@ -4033,7 +4672,7 @@ mod tests {
             None
         );
         assert_eq!(info_logged(&window), Some(false));
-        // The INFO latch flips at 1s, but an unseeded window never convicts.
+        // The INFO latch flips at 1s; the initial floor has not elapsed.
         assert_eq!(
             stall_owner(
                 &mut window,
@@ -4046,6 +4685,8 @@ mod tests {
             None
         );
         assert_eq!(info_logged(&window), Some(true));
+        // Past the 2s initial floor the exact owner convicts with no EWMA
+        // sample: an unproven cadence never exempts a proven-slow front.
         assert_eq!(
             stall_owner(
                 &mut window,
@@ -4053,11 +4694,54 @@ mod tests {
                 &tree,
                 1,
                 false,
-                now + Duration::from_mins(1)
+                now + Duration::from_millis(2100)
             ),
-            None
+            Some(staller_addr())
         );
-        assert_eq!(info_logged(&window), Some(true));
+    }
+
+    /// The unified entry returns at most one action per tick and blame
+    /// outranks the hedge: a tick where the cold-front timer and the stall
+    /// predicate both mature convicts the staller and sends no duplicate
+    /// request.
+    #[test]
+    fn at_most_one_action_per_tick_blame_outranks_hedge() {
+        let now = Instant::now();
+        let mut window = DownloadWindow::new(stall_budget());
+        let mut stager = test_stager(&window);
+        let tree = test_tree();
+        let staller = test_source(staller_addr());
+        insert_pending(&mut window, staller, hash(0x01), 1, now);
+        for (byte, height) in [(0x02_u8, 2_u32), (0x03, 3), (0x04, 4)] {
+            insert_pending(
+                &mut window,
+                test_source(healthy_addr()),
+                hash(byte),
+                height,
+                now,
+            );
+            receive_staged(&mut window, &mut stager, hash(byte), SMALL_BODY, now);
+        }
+        let ctx = BlockedContext {
+            next_apply_height: Some(1),
+            frontier_hash: None,
+            apply_side_busy: false,
+        };
+        // First tick: the episode and the cold-front timer both start.
+        assert_eq!(
+            window.observe_blocked(ctx, &stager, &tree, now),
+            BlockedDecision::None
+        );
+        // Both mature past the 2s floor: the blame wins alone.
+        let decision =
+            window.observe_blocked(ctx, &stager, &tree, now + Duration::from_millis(2100));
+        assert_eq!(
+            decision,
+            BlockedDecision::Blame {
+                owner: staller,
+                reason: BlameReason::Staller,
+            }
+        );
     }
 
     fn peer_addr(idx: u8) -> std::net::SocketAddr {
@@ -4093,12 +4777,12 @@ mod tests {
         // Pre-seed: the network has already demonstrated its 3s front
         // cadence — two front advances 3s apart seed the interval EWMA at
         // 3000ms and lift the decay floor to 2x3s = 6s before the saturated
-        // rounds begin. An unseeded window cannot fire at all (cold-start
-        // conviction is suppressed and deferred to the pending-timeout
-        // fallback — `cold_start_unseeded_ewma_never_fires_and_defers_to_
-        // fallback`), and in real IBD the EWMA has tracked the cadence since
-        // the first two blocks of the session anyway, long before blocks
-        // grow past one threshold of transfer time.
+        // rounds begin. An unseeded window would fire at the static 2s
+        // floor while its honest peers need 3s per round, so the adaptive
+        // floor must be demonstrated before the saturated rounds start; in
+        // real IBD the EWMA has tracked the cadence since the first two
+        // blocks of the session anyway, long before blocks grow past one
+        // threshold of transfer time.
         insert_pending(&mut window, test_source(peer_addr(0)), hash(0x01), 1, t0);
         receive_staged(&mut window, &mut stager, hash(0x01), SMALL_BODY, t0);
         apply_staged(&mut stager, &hash(0x01));
@@ -4221,9 +4905,8 @@ mod tests {
         // per-peer delivery restarts the clock instead. When the same peer
         // then stops delivering entirely, it is a true staller and still
         // fires one full threshold after its last delivery. Heights 1-2 seed
-        // the cadence EWMA first (cold start would otherwise defer the fire
-        // to the pending-timeout fallback); the 100ms cadence keeps the
-        // decay floor at the static 2s.
+        // the cadence EWMA; the 100ms cadence keeps the decay floor at the
+        // static 2s.
         let mut window = DownloadWindow::new(stall_budget());
         let mut stager = test_stager(&window);
         let tree = test_tree();
@@ -4406,11 +5089,10 @@ mod tests {
         // no re-fire ever, while a true staller still convicts at the
         // elevated ~2g threshold.
         //
-        // The session's first two blocks seed the EWMA at the 3s cadence
-        // (cold start no longer convicts at all — the fire suppression
-        // defers an unseeded window to the pending-timeout fallback, pinned
-        // by `cold_start_unseeded_ewma_never_fires_and_defers_to_fallback`),
-        // so even the FIRST conviction is judged at the 6s adaptive floor.
+        // The session's first two blocks seed the EWMA at the 3s cadence,
+        // so even the FIRST conviction is judged at the 6s adaptive floor
+        // (an unseeded window would convict at the static 2s floor, below
+        // the honest 3s cadence).
         let (mut window, stager, front, at, _silent) = limit_cycle_window_state();
         let tree = test_tree();
         assert_eq!(window.front_interval_ewma_ms(), Some(3239));
@@ -4675,6 +5357,7 @@ mod tests {
         window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
             owner,
             hash: hash(0x01),
+            expired_release: false,
         });
         window.mark_received_from(hash(0x01), 80, Some(alternate), t1);
         assert_eq!(window.preferred_peer(), Some(alternate));
@@ -5136,7 +5819,7 @@ mod tests {
         assert_eq!(window.pending_count_for(loser), 0);
         assert!(window.pending_count_for(unrelated) > 0);
         assert_eq!(window.next_request_height, 1);
-        assert!(window.next_pending_deadline.is_some());
+        assert!(window.owner_downloading_since.contains_key(&unrelated));
         assert!(window.peer_in_staller_cooldown(owner.addr, now));
         Ok(())
     }
@@ -5212,7 +5895,7 @@ mod tests {
         assert!(window.contains_pending(&block_hash));
         assert_eq!(window.pending_len(), 1);
 
-        let outcome = window.reject_delivery(block_hash, Some(owner));
+        let outcome = window.reject_delivery(block_hash, Some(owner), now);
 
         assert_eq!(outcome, super::RejectDelivery::ReleasedPending);
         assert!(!window.contains_pending(&block_hash));
@@ -5233,10 +5916,11 @@ mod tests {
         window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
             owner,
             hash: block_hash,
+            expired_release: false,
         });
 
         assert_eq!(
-            window.reject_delivery(block_hash, Some(owner)),
+            window.reject_delivery(block_hash, Some(owner), now),
             super::RejectDelivery::ReleasedPending
         );
         assert!(window.pending_timeout_observation.is_none());
@@ -5262,7 +5946,7 @@ mod tests {
         });
 
         assert_eq!(
-            window.reject_delivery(block_hash, Some(alternate)),
+            window.reject_delivery(block_hash, Some(alternate), now),
             super::RejectDelivery::DiscardedUnsolicited
         );
         assert!(window.cold_front.is_none());
@@ -5283,7 +5967,7 @@ mod tests {
         );
 
         assert_eq!(
-            window.reject_delivery(block_hash, Some(owner)),
+            window.reject_delivery(block_hash, Some(owner), now),
             super::RejectDelivery::ReleasedPending
         );
         assert!(window.cold_front.is_none());
@@ -5304,6 +5988,7 @@ mod tests {
         window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
             owner,
             hash: block_hash,
+            expired_release: false,
         });
         window.cold_front = Some(super::ColdFrontState::Racing {
             owner,
@@ -5312,7 +5997,7 @@ mod tests {
         });
 
         assert_eq!(
-            window.reject_delivery(block_hash, Some(unrelated)),
+            window.reject_delivery(block_hash, Some(unrelated), now),
             super::RejectDelivery::DiscardedUnsolicited
         );
         assert!(window.pending_timeout_observation.is_some());
@@ -5338,7 +6023,7 @@ mod tests {
         assert!(window.contains_pending(&block_hash));
         assert_eq!(window.pending_len(), 1);
 
-        let outcome = window.reject_delivery(block_hash, Some(other));
+        let outcome = window.reject_delivery(block_hash, Some(other), now);
 
         assert_eq!(outcome, super::RejectDelivery::DiscardedUnsolicited);
         assert!(window.contains_pending(&block_hash));
@@ -5357,7 +6042,7 @@ mod tests {
         let mut window = DownloadWindow::new(test_budget());
         insert_pending(&mut window, owner, block_hash, 100, now);
 
-        let outcome = window.reject_delivery(block_hash, None);
+        let outcome = window.reject_delivery(block_hash, None, now);
 
         assert_eq!(outcome, super::RejectDelivery::DiscardedUnsolicited);
         assert!(window.contains_pending(&block_hash));
@@ -5369,7 +6054,8 @@ mod tests {
         let mut window = DownloadWindow::new(test_budget());
         let block_hash = hash(0x99);
 
-        let outcome = window.reject_delivery(block_hash, Some(test_source(peer_addr(1))));
+        let outcome =
+            window.reject_delivery(block_hash, Some(test_source(peer_addr(1))), Instant::now());
 
         assert_eq!(outcome, super::RejectDelivery::DiscardedUnsolicited);
         assert_eq!(window.pending_len(), 0);
@@ -5399,11 +6085,17 @@ mod tests {
         // Stuck at the same frontier (height, hash): observations prime and
         // advance the clock, but nothing fires below the bound.
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), true, start),
+            apply_side_bound(&mut window, 7, Some(frontier), true, start),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), true, just_below(start, bound, 1)),
+            apply_side_bound(
+                &mut window,
+                7,
+                Some(frontier),
+                true,
+                just_below(start, bound, 1)
+            ),
             None
         );
         // The no-blame suppression itself is unchanged below the bound.
@@ -5426,15 +6118,16 @@ mod tests {
         let start = Instant::now();
         let bound = test_budget().received_timeout.saturating_mul(2);
         let frontier = hash(0x07);
-        let _ = window.observe_apply_side_bound(7, Some(frontier), true, start);
+        let _ = apply_side_bound(&mut window, 7, Some(frontier), true, start);
 
-        let fired = window.observe_apply_side_bound(7, Some(frontier), true, start + bound);
+        let fired = apply_side_bound(&mut window, 7, Some(frontier), true, start + bound);
         assert_eq!(fired, Some(bound));
         // Re-armed: the next stuck observation does not immediately re-fire,
         // so a persistently stuck frontier escalates once per bound, not
         // once per tick.
         assert_eq!(
-            window.observe_apply_side_bound(
+            apply_side_bound(
+                &mut window,
                 7,
                 Some(frontier),
                 true,
@@ -5443,7 +6136,8 @@ mod tests {
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(
+            apply_side_bound(
+                &mut window,
                 7,
                 Some(frontier),
                 true,
@@ -5464,20 +6158,33 @@ mod tests {
         let start = Instant::now();
         let bound = test_budget().received_timeout.saturating_mul(2);
         let frontier = hash(0x07);
-        let _ = window.observe_apply_side_bound(7, Some(frontier), true, start);
+        let _ = apply_side_bound(&mut window, 7, Some(frontier), true, start);
 
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), true, just_below(start, bound, 10)),
+            apply_side_bound(
+                &mut window,
+                7,
+                Some(frontier),
+                true,
+                just_below(start, bound, 10)
+            ),
             None
         );
         // The prune seam: the body is briefly absent (unbusy), then the
         // refetched copy is staged again.
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), false, just_below(start, bound, 9)),
+            apply_side_bound(
+                &mut window,
+                7,
+                Some(frontier),
+                false,
+                just_below(start, bound, 9)
+            ),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(
+            apply_side_bound(
+                &mut window,
                 7,
                 Some(frontier),
                 true,
@@ -5493,9 +6200,15 @@ mod tests {
         let start = Instant::now();
         let bound = test_budget().received_timeout.saturating_mul(2);
         let frontier = hash(0x07);
-        let _ = window.observe_apply_side_bound(7, Some(frontier), true, start);
+        let _ = apply_side_bound(&mut window, 7, Some(frontier), true, start);
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), true, just_below(start, bound, 1)),
+            apply_side_bound(
+                &mut window,
+                7,
+                Some(frontier),
+                true,
+                just_below(start, bound, 1)
+            ),
             None
         );
 
@@ -5504,15 +6217,21 @@ mod tests {
         let moved = start + bound + Duration::from_secs(1);
         let advanced = hash(0x08);
         assert_eq!(
-            window.observe_apply_side_bound(8, Some(advanced), true, moved),
+            apply_side_bound(&mut window, 8, Some(advanced), true, moved),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(8, Some(advanced), true, just_below(moved, bound, 1)),
+            apply_side_bound(
+                &mut window,
+                8,
+                Some(advanced),
+                true,
+                just_below(moved, bound, 1)
+            ),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(8, Some(advanced), true, moved + bound),
+            apply_side_bound(&mut window, 8, Some(advanced), true, moved + bound),
             Some(bound)
         );
     }
@@ -5530,23 +6249,24 @@ mod tests {
 
         // Idle (nothing staged) far past the bound: no episode, no clock.
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), false, start),
+            apply_side_bound(&mut window, 7, Some(frontier), false, start),
             None
         );
         let delivered = start + bound + Duration::from_secs(10);
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), false, delivered),
+            apply_side_bound(&mut window, 7, Some(frontier), false, delivered),
             None
         );
 
         // The first normal delivery arrives: the clock starts here and must
         // hold a full bound before any escalation.
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), true, delivered),
+            apply_side_bound(&mut window, 7, Some(frontier), true, delivered),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(
+            apply_side_bound(
+                &mut window,
                 7,
                 Some(frontier),
                 true,
@@ -5555,7 +6275,7 @@ mod tests {
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(frontier), true, delivered + bound),
+            apply_side_bound(&mut window, 7, Some(frontier), true, delivered + bound),
             Some(bound)
         );
     }
@@ -5573,26 +6293,38 @@ mod tests {
 
         // Branch A nearly exhausted its bound.
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(branch_a), true, start),
+            apply_side_bound(&mut window, 7, Some(branch_a), true, start),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(branch_a), true, just_below(start, bound, 1)),
+            apply_side_bound(
+                &mut window,
+                7,
+                Some(branch_a),
+                true,
+                just_below(start, bound, 1)
+            ),
             None
         );
 
         // Same height, different frontier body: a fresh episode.
         let moved = start + bound + Duration::from_secs(1);
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(branch_b), true, moved),
+            apply_side_bound(&mut window, 7, Some(branch_b), true, moved),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(branch_b), true, just_below(moved, bound, 1)),
+            apply_side_bound(
+                &mut window,
+                7,
+                Some(branch_b),
+                true,
+                just_below(moved, bound, 1)
+            ),
             None
         );
         assert_eq!(
-            window.observe_apply_side_bound(7, Some(branch_b), true, moved + bound),
+            apply_side_bound(&mut window, 7, Some(branch_b), true, moved + bound),
             Some(bound)
         );
     }
@@ -5600,6 +6332,7 @@ mod tests {
     fn test_budget() -> SyncBudget {
         SyncBudget {
             max_pending_blocks: 128,
+            block_spacing: Duration::from_mins(10),
             max_pending_bytes: usize::MAX,
             max_received_blocks: 128,
             max_received_bytes: usize::MAX,
@@ -5609,12 +6342,13 @@ mod tests {
             fanout_peer_inflight: 128,
             min_peers_for_fanout: usize::MAX,
             getdata_batch_limit: 16,
-            pending_timeout: Duration::from_secs(30),
             received_timeout: Duration::from_secs(30),
             stall_timeout_initial: Duration::from_secs(2),
             stall_timeout_max: Duration::from_secs(64),
             staller_cooldown: Duration::from_secs(64),
+            pending_timeout_override: None,
         }
+        .with_pending_timeout_override(Duration::from_secs(30))
     }
 
     /// The hash of the height-`byte` header of [`TEST_CHAIN`].
@@ -5638,7 +6372,7 @@ mod tests {
         assert!(window.contains_pending(&hash(0xf1)));
 
         // A real post-drain request still re-arms probe eligibility.
-        window.remove_pending(&hash(0xf1));
+        window.remove_pending(&hash(0xf1), now);
         let request = super::non_empty_request(
             compact_peer,
             vec![super::PeerRequestEntry {

@@ -232,7 +232,7 @@ fn tick_does_not_resend_same_getheaders_while_pending() -> Result<(), Box<dyn st
         &sync,
         super::super::SyncBudget {
             max_pending_blocks: 0,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -267,7 +267,7 @@ fn inbound_headers_response_releases_getheaders_gate() -> Result<(), Box<dyn std
         &sync,
         super::super::SyncBudget {
             max_pending_blocks: 0,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -319,7 +319,7 @@ fn rejected_matching_peer_headers_release_gate_and_retry_immediately()
         &sync,
         super::super::SyncBudget {
             max_pending_blocks: 0,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -396,7 +396,7 @@ fn tick_bounded_request_peer_selection_skips_inflight_saturated_prefix()
             max_pending_blocks: 4,
             max_peer_inflight: 2,
             getdata_batch_limit: 2,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let first_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -447,9 +447,9 @@ fn tick_demotes_peer_after_expired_pending_and_retries_on_alternate_peer()
             max_pending_blocks: 2,
             max_peer_inflight: 2,
             getdata_batch_limit: 2,
-            pending_timeout: Duration::ZERO,
-            ..super::super::default_sync_budget()
-        },
+            ..super::super::default_sync_budget(Network::Regtest)
+        }
+        .with_pending_timeout_override(Duration::ZERO),
     );
     let stale_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let healthy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);

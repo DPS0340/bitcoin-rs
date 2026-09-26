@@ -19,7 +19,7 @@ fn slow_trickle_front_peer_observable_but_never_disconnected()
                 getdata_batch_limit: 3,
                 // Default 2s initial threshold: the 100ms trickle below
                 // stays far under it on any machine.
-                ..super::super::default_sync_budget()
+                ..super::super::default_sync_budget(Network::Regtest)
             },
         );
         let trickler = test_addr(9440, 0)?;
@@ -126,16 +126,18 @@ fn uniform_slow_saturated_fanout_disconnects_no_peer_and_completes()
                 min_peers_for_fanout: 8,
                 getdata_batch_limit: 24,
                 stall_timeout_initial: Duration::from_millis(100),
-                ..super::super::default_sync_budget()
+                ..super::super::default_sync_budget(Network::Regtest)
             },
         );
         let mut rxs = Vec::new();
+        let mut sources = Vec::new();
         for idx in 0..8_usize {
             let addr = test_addr(9470, idx)?;
             rxs.push(connect_peer(
                 &peers,
                 eligible_peer(addr, 200 - i32::try_from(idx)?),
             ));
+            sources.push(current_source(&peers, addr));
         }
 
         // Tick 1: fan-out stripes the 24-block window, 3 blocks per peer.
@@ -156,10 +158,10 @@ fn uniform_slow_saturated_fanout_disconnects_no_peer_and_completes()
         // so the interval EWMA takes its first sample at round 1 and the
         // adaptive floor (2x the ~150ms demonstrated cadence) covers the
         // mid-gap wakes from the round 1 -> 2 gap on. The round 0 -> 1
-        // gap has no sample yet, but an unseeded window cannot fire at
-        // all: cold-start conviction is suppressed and deferred to the
-        // 60s pending-timeout fallback (`observe_stall` in the window
-        // module), so even a wake landing there is safe.
+        // gap has no sample yet and no wake lands there: the predicate
+        // only arms at round 1's observe (the staged set crosses the
+        // half-window term then), so the unseeded 100ms floor never
+        // judges a front in that gap.
         for round in 0..3_usize {
             if round == 2 {
                 // The wake path observes at ~g/8 cadence, so episodes
@@ -185,11 +187,15 @@ fn uniform_slow_saturated_fanout_disconnects_no_peer_and_completes()
             } else {
                 std::thread::sleep(Duration::from_millis(150));
             }
-            for stripe in &stripes {
+            for (idx, stripe) in stripes.iter().enumerate() {
                 let block = by_hash
                     .get(&stripe[round])
                     .ok_or_else(|| std::io::Error::other("unknown getdata hash"))?;
-                blocks_tx.send(crate::InboundBlock::from_decoded(block.clone()))?;
+                let mut inbound = crate::InboundBlock::from_decoded(block.clone());
+                // Source-attributed, like the wire path: the front arrival
+                // credits the cadence EWMA and clears the owner's episode.
+                inbound.source = Some(sources[idx]);
+                blocks_tx.send(inbound)?;
             }
             sync.tick();
             assert_eq!(
@@ -275,7 +281,7 @@ fn tick_preserves_partial_window_order_across_pending_gap() -> Result<(), Box<dy
             max_pending_bytes: 4 * 256 * 1024,
             max_peer_inflight: 4,
             getdata_batch_limit: 4,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
@@ -293,7 +299,11 @@ fn tick_preserves_partial_window_order_across_pending_gap() -> Result<(), Box<dy
     {
         let mut scheduler = sync.scheduler.lock();
         let window = &mut scheduler.window;
-        window.requeue_for_retry(&Hash256::from_le_bytes(expected[1].as_bytes()), Some(2));
+        window.requeue_for_retry(
+            &Hash256::from_le_bytes(expected[1].as_bytes()),
+            Some(2),
+            Instant::now(),
+        );
     }
 
     sync.tick();

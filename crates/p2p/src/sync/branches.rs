@@ -6,6 +6,7 @@ use super::chain::WindowCommitDisposition;
 use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chain::plan_reorg;
 use bitcoin_rs_primitives::Hash256;
+use std::time::Instant;
 
 impl BlockSync {
     /// Moves the applied chain onto the header tip's branch when it has been
@@ -76,7 +77,9 @@ impl BlockSync {
                     };
                     let mut scheduler = self.scheduler.lock();
                     scheduler.stager.retire_applied(&hash);
-                    scheduler.window.requeue_for_retry(&hash, height);
+                    scheduler
+                        .window
+                        .requeue_for_retry(&hash, height, Instant::now());
                 }
                 // Invalid descendants cannot occupy bounded download state or
                 // they can prevent the newly selected valid branch from refilling.
@@ -123,16 +126,24 @@ impl BlockSync {
 
     /// Frees every bounded download slot held by an invalidated hash under
     /// one `scheduler` acquisition.
+    ///
+    /// PRE: `hashes` are the hashes invalidated by one settlement event.
+    /// POST: every hash's pending is released with no cursor rewind; each
+    ///      owner's queue start follows
+    ///      [`DownloadWindow::reset_owner_queue_start`].
+    /// INVARIANT: all releases share one `now`, so one purge stamps an
+    ///      owner's queue age at a single instant.
     #[doc(hidden)]
     pub fn purge_invalidated(&self, hashes: &[Hash256]) {
         if hashes.is_empty() {
             return;
         }
         let mut scheduler = self.scheduler.lock();
+        let now = Instant::now();
         for hash in hashes {
             scheduler.stager.retire_applied(hash);
             // Invalidated hashes are never re-requested: no cursor rewind.
-            scheduler.window.requeue_for_retry(hash, None);
+            scheduler.window.requeue_for_retry(hash, None, now);
         }
     }
 

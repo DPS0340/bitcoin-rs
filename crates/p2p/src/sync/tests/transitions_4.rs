@@ -371,7 +371,7 @@ fn stall_eviction_does_not_disconnect_replacement_connection()
 -> Result<(), Box<dyn std::error::Error>> {
     let budget = super::super::SyncBudget {
         stall_timeout_initial: Duration::from_millis(100),
-        ..wedge_budget(super::super::PENDING_TIMEOUT)
+        ..wedge_budget(Duration::from_mins(1))
     };
     let (sync, peers, _expected, _rxs, _blocks_tx) = staged_count_wedge(budget)?;
     let staller = test_addr(9320, 0)?;
@@ -393,13 +393,22 @@ fn stall_eviction_does_not_disconnect_replacement_connection()
         let tree = sync.chain.block_tree();
         let mut scheduler = sync.scheduler.lock();
         let state = &mut *scheduler;
-        state.window.observe_stall(
-            next_apply_height,
-            false,
+        match state.window.observe_blocked(
+            crate::download_window::BlockedContext {
+                next_apply_height: Some(next_apply_height),
+                frontier_hash: None,
+                apply_side_busy: false,
+            },
             &state.stager,
             &tree,
             Instant::now() + Duration::from_millis(150),
-        )
+        ) {
+            crate::download_window::BlockedDecision::Blame {
+                owner,
+                reason: crate::download_window::BlameReason::Staller,
+            } => Some(owner),
+            _ => None,
+        }
     };
     let (replacement_tx, _replacement_rx) = unbounded::<Message>();
     let replacement = PeerLease::new(replacement_tx);
@@ -442,7 +451,7 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout()
             max_received_blocks: 2,
             getdata_batch_limit: 2,
             stall_timeout_initial: Duration::from_millis(100),
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let staller = test_addr(9430, 0)?;

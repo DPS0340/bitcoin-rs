@@ -8,7 +8,7 @@ fn tick_caps_requests_at_staged_byte_headroom() -> Result<(), Box<dyn std::error
         &sync,
         super::super::SyncBudget {
             max_received_bytes: 3 * slot,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     // Two of three staging slots already occupied: the staged-byte gate is
@@ -55,7 +55,7 @@ fn stalled_front_stripe_wedges_into_request_backpressure_not_evict_churn()
     // default one-minute timeouts never fire inside the test, so the only
     // thing that can stop the second wave is the count clamp itself.
     let (sync, _peers, expected, rxs, _blocks_tx) =
-        staged_count_wedge(wedge_budget(super::super::PENDING_TIMEOUT))?;
+        staged_count_wedge(wedge_budget(Duration::from_mins(1)))?;
 
     // Tick 2: the healthy deliveries stage; staged (14) + pending (2) sit
     // exactly at the count budget (16). The byte gates are unbounded here
@@ -105,11 +105,39 @@ fn cold_start_stall_hedges_front_without_reassigning_owner()
 -> Result<(), Box<dyn std::error::Error>> {
     let budget = super::super::SyncBudget {
         stall_timeout_initial: Duration::from_millis(100),
-        ..wedge_budget(super::super::PENDING_TIMEOUT)
+        ..wedge_budget(Duration::from_mins(1))
     };
-    let (sync, peers, expected, rxs, _blocks_tx) = staged_count_wedge(budget)?;
+    // A striped window with nothing delivered: the stall predicate stays
+    // unarmed (no staged successor), so the cold-front hedge is the only
+    // actor. A shape whose predicate is armed convicts at the initial
+    // floor even with an unseeded cadence EWMA — pinned at the window
+    // level by `stall_convicts_at_initial_floor_before_ewma_is_seeded`.
+    let ((sync, peers, _block_tree, _applied_tip, expected), _blocks_tx) =
+        sync_with_header_chain_and_blocks(64)?;
+    install_budget(&sync, budget);
+    let mut rxs = Vec::new();
+    for idx in 0..budget.min_peers_for_fanout {
+        let addr = test_addr(9320, idx)?;
+        rxs.push(connect_peer(
+            &peers,
+            eligible_peer(addr, 200 - i32::try_from(idx)?),
+        ));
+    }
     let owner = test_addr(9320, 0)?;
     let alternate = test_addr(9320, 1)?;
+
+    // The first tick stripes the window and starts the cold-front timer.
+    sync.tick();
+    assert_eq!(sync.scheduler.lock().window.pending_len(), 16);
+    for (idx, rx) in rxs.iter().enumerate() {
+        let Message::GetData(inventory) = rx.try_recv()? else {
+            return Err(std::io::Error::other("expected a striped getdata per peer").into());
+        };
+        assert_eq!(
+            witness_block_inventory(inventory)?,
+            expected[idx * 2..(idx + 1) * 2]
+        );
+    }
 
     // The alternate peer connected at height zero. Its accepted header
     // announcement proves the active front, which must make it a hedge
@@ -130,10 +158,8 @@ fn cold_start_stall_hedges_front_without_reassigning_owner()
         Hash256::from_le_bytes(expected[0].as_bytes()),
         Some(1),
     ));
-
-    // The first drain builds the asymmetric wedge and starts the episode.
+    // The tick that observes the striped front arms the cold-front timer.
     sync.tick();
-    assert_eq!(sync.scheduler.lock().window.pending_len(), 2);
     std::thread::sleep(Duration::from_millis(150));
     sync.tick();
 
@@ -150,7 +176,14 @@ fn cold_start_stall_hedges_front_without_reassigning_owner()
         }
     }
     assert_eq!(hedged, expected[..1]);
-    assert_eq!(sync.scheduler.lock().window.pending_len(), 2);
+    assert_eq!(
+        sync.scheduler
+            .lock()
+            .window
+            .pending_owner(&Hash256::from_le_bytes(expected[0].as_bytes())),
+        Some(current_source(&peers, owner)),
+        "the hedge must not reassign the front's owner"
+    );
 
     // The confirmed front hash is not duplicated again on later ticks.
     std::thread::sleep(Duration::from_millis(50));
@@ -174,7 +207,7 @@ fn fanout_replaces_preferred_peer_when_eligible_pool_recovers()
             fanout_peer_inflight: 2,
             min_peers_for_fanout: super::super::MIN_PEERS_FOR_FANOUT,
             getdata_batch_limit: 16,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let owner = test_addr(9322, 0)?;
@@ -291,7 +324,7 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> Result<(), Box<dyn st
             max_received_blocks: 2,
             max_peer_inflight: 2,
             getdata_batch_limit: 2,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let staller = test_addr(9450, 0)?;
@@ -404,7 +437,7 @@ fn staged_frontier_stuck_past_bound_escalates_without_blame()
             max_received_blocks: 2,
             max_peer_inflight: 2,
             getdata_batch_limit: 2,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(Network::Regtest)
         },
     );
     let staller = test_addr(9470, 0)?;
@@ -450,7 +483,7 @@ fn staged_frontier_stuck_past_bound_escalates_without_blame()
         .window
         .mark_received_from(successor, 80, None, staged_at);
 
-    let bound = super::super::default_sync_budget()
+    let bound = super::super::default_sync_budget(Network::Regtest)
         .received_timeout
         .saturating_mul(2);
     let start = Instant::now();
@@ -539,9 +572,9 @@ fn transient_demotion_does_not_flap_fanout_mode() -> Result<(), Box<dyn std::err
             fanout_peer_inflight: 2,
             min_peers_for_fanout: 8,
             getdata_batch_limit: 16,
-            pending_timeout: Duration::from_millis(250),
-            ..super::super::default_sync_budget()
-        },
+            ..super::super::default_sync_budget(Network::Regtest)
+        }
+        .with_pending_timeout_override(Duration::from_millis(250)),
     );
     let mut rxs = Vec::new();
     for idx in 0..PEER_COUNT {

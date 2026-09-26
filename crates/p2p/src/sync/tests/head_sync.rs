@@ -444,7 +444,7 @@ fn unrequested_body_at_the_count_budget_is_refused() -> Result<(), Box<dyn std::
         &sync,
         super::super::SyncBudget {
             max_received_blocks: 2,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(bitcoin_rs_primitives::Network::Regtest)
         },
     );
     {
@@ -550,7 +550,7 @@ fn binding_failure_does_not_burn_the_last_staging_slot() -> Result<(), Box<dyn s
         &sync,
         super::super::SyncBudget {
             max_received_blocks: 1,
-            ..super::super::default_sync_budget()
+            ..super::super::default_sync_budget(bitcoin_rs_primitives::Network::Regtest)
         },
     );
 
