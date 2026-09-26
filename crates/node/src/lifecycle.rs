@@ -465,6 +465,11 @@ pub(crate) fn start_node(
     runtime: RuntimeInputs,
     install_signals: bool,
 ) -> Result<Node> {
+    // Registers the Bitcoin Core-compatible USDT probes with the platform
+    // tracer so consumers (bpftrace, BCC, DTrace) can discover them — shared
+    // startup, so daemon (`run`) and embedded (`Node::start`) nodes are
+    // equally discoverable. A no-op without the `usdt` feature.
+    bitcoin_rs_trace::register_probes();
     cap_global_thread_pool();
     let injected_shutdown = runtime.shutdown;
     let state = NodeState::open(config, runtime.mempool_observer.as_ref())?;

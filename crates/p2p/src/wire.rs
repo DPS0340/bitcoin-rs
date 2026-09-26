@@ -312,31 +312,93 @@ fn write_all_vectored<W: Write + ?Sized>(
     Ok(())
 }
 
-fn write_framed<W: Write + ?Sized>(
-    writer: &mut W,
-    magic: Magic,
-    command: &CommandString,
-    payload: &[u8],
-) -> Result<usize, PeerError> {
+/// One encoded wire frame: the 24-byte header plus the payload `Bytes` the
+/// vectored write emits. A message encodes into a frame once so the write
+/// path and the outbound USDT probe share the same payload bytes — the
+/// analogue of Core's `CSerializedNetMsg`, whose header and payload both the
+/// send path and the `net:outbound_message` probe consume.
+pub(crate) struct FramedMessage {
+    header: [u8; HEADER_LEN],
+    payload: bytes::Bytes,
+}
+
+impl FramedMessage {
+    /// The encoded payload bytes this frame emits.
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Total wire size: header plus payload.
+    fn wire_len(&self) -> usize {
+        HEADER_LEN + self.payload.len()
+    }
+}
+
+/// Encodes `message` into its wire frame.
+///
+/// `BlockPayload` shares its borrowed `Bytes` allocation instead of copying
+/// it into a fresh buffer.
+pub(crate) fn encode_frame(magic: Magic, message: &Message) -> Result<FramedMessage, PeerError> {
+    let payload = match message {
+        Message::BlockPayload(bytes) => bytes.clone(),
+        other => bytes::Bytes::from(encode_payload(other)?),
+    };
     if payload.len() > MAX_MESSAGE_PAYLOAD {
         return Err(PeerError::PayloadTooLarge(payload.len()));
     }
 
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(&magic.to_bytes());
-    header[4..16].copy_from_slice(&encode_command(command)?);
+    header[4..16].copy_from_slice(&encode_command(&message.command())?);
     header[16..20].copy_from_slice(
         &u32::try_from(payload.len())
             .map_err(|_| PeerError::PayloadTooLarge(payload.len()))?
             .to_le_bytes(),
     );
-    header[20..24].copy_from_slice(&checksum(payload));
+    header[20..24].copy_from_slice(&checksum(&payload));
+    Ok(FramedMessage { header, payload })
+}
 
-    // Assemble header and payload into one vectored write so each message is
+/// Encodes a burst of messages into wire frames, in order.
+pub(crate) fn encode_frames(
+    magic: Magic,
+    messages: &[Message],
+) -> Result<Vec<FramedMessage>, PeerError> {
+    messages
+        .iter()
+        .map(|message| encode_frame(magic, message))
+        .collect()
+}
+
+/// Writes one encoded frame with a single vectored write and returns the
+/// frame's wire length.
+pub(crate) fn write_frame<W: Write + ?Sized>(
+    writer: &mut W,
+    frame: &FramedMessage,
+) -> Result<usize, PeerError> {
+    // Header and payload ride in one vectored write so each message is
     // emitted with a single syscall instead of five (avoids header/payload
     // segment splits and per-part syscall overhead on TcpStream).
-    write_all_vectored(writer, &mut [IoSlice::new(&header), IoSlice::new(payload)])?;
-    Ok(HEADER_LEN + payload.len())
+    write_all_vectored(
+        writer,
+        &mut [IoSlice::new(&frame.header), IoSlice::new(&frame.payload)],
+    )?;
+    Ok(frame.wire_len())
+}
+
+/// Writes encoded frames in one vectored pass and returns each frame's wire
+/// length, in order, so the writer can release the budget that admitted it.
+pub(crate) fn write_frames<W: Write + ?Sized>(
+    writer: &mut W,
+    frames: &[FramedMessage],
+) -> Result<Vec<usize>, PeerError> {
+    let mut slices = Vec::with_capacity(frames.len().saturating_mul(2));
+    for frame in frames {
+        slices.push(IoSlice::new(&frame.header));
+        slices.push(IoSlice::new(&frame.payload));
+    }
+    write_all_vectored(writer, &mut slices)?;
+    Ok(frames.iter().map(FramedMessage::wire_len).collect())
 }
 
 /// Write a Bitcoin v1 network message.
@@ -348,62 +410,21 @@ pub fn write_message<W: Write + ?Sized>(
     magic: Magic,
     message: &Message,
 ) -> Result<usize, PeerError> {
-    match message {
-        Message::BlockPayload(payload) => write_framed(writer, magic, &message.command(), payload),
-        other => {
-            let command = other.command();
-            let payload = encode_payload(other)?;
-            write_framed(writer, magic, &command, &payload)
-        }
-    }
+    let frame = encode_frame(magic, message)?;
+    write_frame(writer, &frame)
 }
+
 /// Write a burst of Bitcoin v1 network messages in one vectored pass.
 ///
 /// Returns the framed wire length of each message, in order, so the writer
-/// can release the outbound budget that admitted them. A single message uses
-/// the stack-header path in [`write_message`].
+/// can release the outbound budget that admitted them.
 pub fn write_messages<W: Write + ?Sized>(
     writer: &mut W,
     magic: Magic,
     messages: &[Message],
 ) -> Result<Vec<usize>, PeerError> {
-    if messages.is_empty() {
-        return Ok(Vec::new());
-    }
-    if let [message] = messages {
-        return Ok(vec![write_message(writer, magic, message)?]);
-    }
-
-    let mut headers = Vec::with_capacity(messages.len());
-    let mut payloads = Vec::with_capacity(messages.len());
-    let mut sizes = Vec::with_capacity(messages.len());
-    for message in messages {
-        let command = message.command();
-        let payload = encode_payload(message)?;
-        if payload.len() > MAX_MESSAGE_PAYLOAD {
-            return Err(PeerError::PayloadTooLarge(payload.len()));
-        }
-        let mut header = [0u8; HEADER_LEN];
-        header[..4].copy_from_slice(&magic.to_bytes());
-        header[4..16].copy_from_slice(&encode_command(&command)?);
-        header[16..20].copy_from_slice(
-            &u32::try_from(payload.len())
-                .map_err(|_| PeerError::PayloadTooLarge(payload.len()))?
-                .to_le_bytes(),
-        );
-        header[20..24].copy_from_slice(&checksum(&payload));
-        sizes.push(HEADER_LEN + payload.len());
-        headers.push(header);
-        payloads.push(payload);
-    }
-
-    let mut slices = Vec::with_capacity(headers.len().saturating_mul(2));
-    for (header, payload) in headers.iter().zip(payloads.iter()) {
-        slices.push(IoSlice::new(header));
-        slices.push(IoSlice::new(payload));
-    }
-    write_all_vectored(writer, &mut slices)?;
-    Ok(sizes)
+    let frames = encode_frames(magic, messages)?;
+    write_frames(writer, &frames)
 }
 
 /// Read and validate a Bitcoin v1 network message.

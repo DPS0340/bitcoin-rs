@@ -563,7 +563,23 @@ impl Mempool {
     /// keeps the recorded confirmations and re-arms only the re-admitted
     /// entries — so chain recovery cannot silently discard fee history.
     pub fn clear(&mut self) -> MutationResult {
-        let txids: Vec<Txid> = self.entries.iter().map(|(_id, entry)| entry.txid).collect();
+        // Every entry leaves the pool here, so this is the same retire funnel
+        // Core walks during a bulk clear: fire `mempool:removed` per entry
+        // before the arena is emptied. The explicit-clear class reports
+        // `unknown`, Core's `MemPoolRemovalReason::UNKNOWN` string.
+        let mut txids = Vec::with_capacity(self.entries.len());
+        for (_id, entry) in self.entries.iter() {
+            bitcoin_rs_trace::removed(|| {
+                (
+                    entry.txid.as_bytes().as_ptr(),
+                    "unknown",
+                    i32::try_from(entry.vsize).unwrap_or(i32::MAX),
+                    i64::try_from(entry.fee).unwrap_or(i64::MAX),
+                    entry.time,
+                )
+            });
+            txids.push(entry.txid);
+        }
         self.entries.clear();
         self.by_txid.clear();
         self.funding.clear();
@@ -607,6 +623,24 @@ impl Mempool {
     #[must_use]
     pub const fn min_relay_fee_sat_per_kvb(&self) -> u64 {
         self.limits.min_relay_fee_sat_per_kvb
+    }
+
+    /// Bitcoin Core `RemovalReasonToString` mapping for `mempool:removed`.
+    ///
+    /// Core publishes `expiry`, `sizelimit`, `reorg`, `block`, `conflict`,
+    /// `replaced`, and `unknown`; this pool adds a descendant-of-replacement
+    /// class (emitted as `replaced`) and maps an explicit pool clear to
+    /// `unknown`.
+    const fn core_removal_reason(reason: RemovalReason) -> &'static str {
+        match reason {
+            RemovalReason::BlockInclusion => "block",
+            RemovalReason::Conflict => "conflict",
+            RemovalReason::Replaced | RemovalReason::Descendant => "replaced",
+            RemovalReason::PolicyEviction => "sizelimit",
+            RemovalReason::Expiry => "expiry",
+            RemovalReason::Reorg => "reorg",
+            RemovalReason::Clear => "unknown",
+        }
     }
 
     /// Records one committed change and assigns it the next mempool sequence
@@ -777,6 +811,16 @@ impl Mempool {
         // become reachable once this entry is in the spend indexes.
         let affected = self.metadata_closure(&[id]);
         self.refresh_metadata(&affected);
+        // Core fires `mempool:added` from `CTxMemPool::addUnchecked`, the
+        // pool-internal install funnel, after the entry is linked into the
+        // pool. `prepare` runs only while a consumer is attached.
+        bitcoin_rs_trace::added(|| {
+            (
+                txid.as_bytes().as_ptr(),
+                i32::try_from(added_vsize).unwrap_or(i32::MAX),
+                i64::try_from(added_fee).unwrap_or(i64::MAX),
+            )
+        });
         self.finish_mutation(changes)
     }
 
@@ -1749,6 +1793,18 @@ impl Mempool {
                 continue;
             };
             let entry = retired.entry;
+            // Core fires `mempool:removed` from `CTxMemPool::removeUnchecked`,
+            // the pool-internal retire funnel, per entry as it leaves the
+            // pool. `prepare` runs only while a consumer is attached.
+            bitcoin_rs_trace::removed(|| {
+                (
+                    entry.txid.as_bytes().as_ptr(),
+                    Self::core_removal_reason(*reason),
+                    i32::try_from(entry.vsize).unwrap_or(i32::MAX),
+                    i64::try_from(entry.fee).unwrap_or(i64::MAX),
+                    entry.time,
+                )
+            });
             // The component shrinks by exactly this member; the survivors may
             // still be one component, or several, and that is settled once
             // every removal has been applied.

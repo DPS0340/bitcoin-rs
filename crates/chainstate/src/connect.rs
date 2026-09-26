@@ -28,6 +28,7 @@ use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::node::NodeId;
 use bitcoin_rs_consensus::MAX_SCRIPT_SIZE;
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
+use bitcoin_rs_consensus::rust_path::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Txid;
@@ -479,6 +480,12 @@ pub(super) fn apply_block_admitted<'b>(
     metrics::histogram!("node.apply_block.utxo_commit_seconds")
         .record(utxo_commit_dur.as_secs_f64());
     utxo_commit_result.map_err(ApplyError::UtxoCommit)?;
+    // Core's connect-block interval ends with the block's UTXO application
+    // and bookkeeping (`UpdateCoins` per tx, undo write, `SetBestBlock`) at
+    // the end of `ConnectBlock`; the durable `view.Flush()` runs afterwards
+    // in `ConnectTip`. `commit_block` is the in-memory UTXO application, so
+    // the probe's duration argument is captured here.
+    let block_connected_dur = total_started.elapsed();
     // Capture before `finish_block` advances the listener's height: the
     // journal delta of this block is exactly (height - parent_height).
     let coin_stats_height_delta =
@@ -502,6 +509,20 @@ pub(super) fn apply_block_admitted<'b>(
     let total_dur = total_started.elapsed();
     metrics::histogram!("node.apply_block.total_seconds").record(total_dur.as_secs_f64());
     metrics::counter!("node.apply_block.txs_applied").increment(tx_count_delta);
+    // Core fires `validation:block_connected` at the end of `ConnectBlock`,
+    // after the block is connected. Everything below this point is
+    // publication of an already-applied block, so this is the same commit
+    // point. A grouped publish still counts as connected here: the block's
+    // consensus state is applied to the chainstate before publication.
+    emit_block_connected(
+        block,
+        &block_hash,
+        height,
+        scratch.txids(),
+        &resolved,
+        verify_flags,
+        block_connected_dur,
+    );
     tracing::debug!(
         height,
         %block_hash,
@@ -620,6 +641,62 @@ pub(super) fn apply_block_admitted<'b>(
     publish_connect(handles, &tip, tx_count_delta);
     outcome.commit_id = commit_id;
     Ok(ApplyFinish::Committed(outcome))
+}
+
+/// Accumulates Core's `validation:block_connected` payload facts and fires
+/// the probe.
+///
+/// Core counts `nInputs` over every transaction and `nSigOpsCost` with
+/// `GetTransactionSigOpCost` against the connect view (the same rules as
+/// `bitcoin_rs_consensus::transaction_sigop_cost`), then fires the probe
+/// after the block is connected. The per-transaction prevout resolution runs
+/// inside `prepare`, so a build without the `usdt` feature — or a node with
+/// no consumer attached — does none of it.
+fn emit_block_connected(
+    block: &Block,
+    block_hash: &Hash256,
+    height: u32,
+    txids: &[Txid],
+    resolved: &Arc<ResolvedUtxoView>,
+    flags: bitcoin_rs_script::VerifyFlags,
+    elapsed: std::time::Duration,
+) {
+    // `block_hash` borrows the caller's already-computed hash local, which
+    // outlives this call: the probe argument must not point into a value the
+    // prepare closure owns, because the generated macro fires only after the
+    // closure has returned.
+    bitcoin_rs_trace::block_connected(move || {
+        let mut view = BlockLocalUtxoView::new(Arc::clone(resolved), &block.txs, height, 0);
+        let mut inputs: u32 = 0;
+        let mut sigops: u64 = 0;
+        for (index, tx) in block.txs.iter().enumerate() {
+            inputs = inputs.saturating_add(u32::try_from(tx.inputs.len()).unwrap_or(u32::MAX));
+            let mut prevouts = Vec::with_capacity(tx.inputs.len());
+            for input in &tx.inputs {
+                if let Some(output) = view.lookup(&input.previous_output) {
+                    prevouts.push((input.previous_output, output));
+                }
+            }
+            sigops = sigops.saturating_add(u64::from(
+                bitcoin_rs_consensus::transaction_sigop_cost(tx, &prevouts, flags),
+            ));
+            if let Some(txid) = txids.get(index) {
+                let _ = view.add_outputs(
+                    u32::try_from(index).unwrap_or(u32::MAX),
+                    *txid,
+                    tx.outputs.len(),
+                );
+            }
+        }
+        (
+            block_hash.as_byte_array().as_ptr(),
+            i32::try_from(height).unwrap_or(i32::MAX),
+            u64::try_from(block.txs.len()).unwrap_or(u64::MAX),
+            i32::try_from(inputs).unwrap_or(i32::MAX),
+            i64::try_from(sigops).unwrap_or(i64::MAX),
+            i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX),
+        )
+    });
 }
 
 pub(super) fn check_coinbase_maturity(

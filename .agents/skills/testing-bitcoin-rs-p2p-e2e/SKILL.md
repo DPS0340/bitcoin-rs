@@ -1,16 +1,16 @@
 ---
 name: testing-bitcoin-rs-p2p-e2e
-description: How to run real end-to-end P2P sync tests for bitcoin-rs on macOS without the pinned x86_64 bitcoind — spawn the daemon via the bin/bitcoin-rs test harness and drive it with a loopback wire-protocol fake peer.
+description: How to run real end-to-end P2P sync tests for bitcoin-rs without the pinned x86_64 bitcoind (macOS or Linux) — spawn the daemon via the bin/bitcoin-rs test harness and drive it with a loopback wire-protocol fake peer, in either connection direction.
 ---
 
-# Testing bitcoin-rs P2P sync end-to-end (macOS)
+# Testing bitcoin-rs P2P sync end-to-end
 
 ## When this applies
-The `overhaul_process_*` / `overhaul_reference_set` lanes in `bin/bitcoin-rs/tests` exec a pinned **x86_64-linux** `bitcoind` at `target/reference-core-31.1/` and cannot run on macOS. You can still exercise the real daemon end-to-end (inv/headers → getdata → bodies → apply/reorg) with a fake wire-protocol peer over loopback.
+The `overhaul_process_*` / `overhaul_reference_set` lanes in `bin/bitcoin-rs/tests` exec a pinned **x86_64-linux** `bitcoind` at `target/reference-core-31.1/` and cannot run on macOS. You can still exercise the real daemon end-to-end (inv/headers → getdata → bodies → apply/reorg) with a fake wire-protocol peer over loopback — on Linux too.
 
 ## Environment
-- Rust toolchain is NOT on PATH on this box: `export PATH="/Users/devin/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"`.
-- A debug daemon binary is usually already built at `target/debug/bitcoin-rs`; rebuild portable with `cargo build --bin bitcoin-rs --no-default-features --features fjall`.
+- Linux (this box): `cargo` IS on PATH (`~/.cargo/bin`). A debug daemon binary is usually already built at `target/debug/bitcoin-rs`; rebuild portable with `cargo build --bin bitcoin-rs --no-default-features --features fjall`.
+- macOS (the original box this skill was written for): Rust toolchain is NOT on PATH: `export PATH="/Users/devin/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"`.
 
 ## Harness pattern
 Create a **temporary** integration test `bin/bitcoin-rs/tests/<name>.rs` with `mod support;` (reuses the checked-in harness crate: `support::process_node`, `support::process_peer`, `support::process_node::NodeBinary`, `HarnessError`).
@@ -26,6 +26,13 @@ Recipe proven in `crates/node/tests/sync_smoke.rs`:
 - Clone the parent block's coinbase tx, rewrite the height push in `script_sig`, recompute `merkle_root`, grind `nonce` until `bitcoin::Target::from_compact(bits).is_met_by(hash)` (bits 0x207fffff ≈ 1-in-2 per nonce). Do NOT hand-roll endian comparisons — `is_met_by` handles them.
 - For segwit blocks: coinbase `input[0].witness = Witness::from_slice(&[reserved32])`, plus an `OP_RETURN` output with script_pubkey `[0x6a,0x24,0xaa,0x21,0xa9,0xed] || sha256d(witness_root || reserved)` (see `check_block_body_binding` in crates/consensus/src/verify_block.rs). A witness-stripped body then fails binding as `WitnessNonceSize` — exactly what you want for discriminating tests.
 - Serving "faithfully": `WitnessBlock`/`CompactBlock` getdata → full body; plain `Block` getdata → strip all input witnesses (real Core behavior).
+
+## Driving the OUTBOUND direction too (both directions on one node)
+- To make the node dial a fake peer (covers `run_outbound_handshake`/`send_handshake_message` + outbound writer loop): pre-bind a `TcpListener` on `127.0.0.1:0`, convert its address to a string (`let addr = listener.local_addr()?.to_string()`), then `ProcessNode::start_with_options(NodeBinary::BitcoinRs, &["--connect", &addr], START_TIMEOUT)` — `start_with_options` takes `&[&str]`, so `&SocketAddr` does not compile. `connect` becomes `fixed_peers` → `run_fixed_peer_bootstrap` pushes it to the outbound-drain worker, which dials within ~1 s. `accept()` with a nonblocking poll loop (30 s) catches it.
+- To make the node dial YOU (inbound for the node): `connect_loopback(node.p2p_addr, deadline)` as usual.
+- `getpeerinfo` exposes `inbound: bool` — assert one `true` + one `false` to prove both directions registered.
+- Observed on a `--connect` outbound conn: the node sends `wtxidrelay`/`sendaddrv2`/`sendheaders` TWICE — once upfront in `handshake::start()` and again in `dispatch_inbound`'s reply to our `version` (dispatch.rs:182). Pre-existing message selection, not a wire-encoding issue.
+- Node serves `getdata` for applied blocks with `block` frames on BOTH directions (the `outbound production gate` in dispatch.rs is a write-budget headroom check, not a sync gate).
 
 ## Node behaviors worth knowing (observed live)
 - `SYNC_TICK` = 1s; inv-echo `getdata` is emitted synchronously on the connection (observed 0 ms after `inv`).
