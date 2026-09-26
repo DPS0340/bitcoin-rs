@@ -245,16 +245,14 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     remaining_time(deadline, Instant::now(), "P2P operation deadline")
 }
 
-fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
+fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], first_byte: Duration) -> Result<()> {
     let total = bytes.len();
     while !bytes.is_empty() {
-        // The deadline bounds the wait for the first byte, with a floor.
-        // Once a frame is partially consumed it must run to completion at
+        // Once a read is partially consumed it must run to completion at
         // the message timeout: abandoning it would strand the stream
         // mid-frame and desynchronize every read that follows.
         let wait = if bytes.len() == total {
-            remaining_time(deadline, Instant::now(), "P2P operation deadline")
-                .unwrap_or(Duration::from_millis(1))
+            first_byte
         } else {
             TIMEOUT
         };
@@ -286,14 +284,18 @@ fn payload_length(header: &[u8]) -> Result<usize> {
 /// Read one complete wire frame (header plus payload) before the deadline.
 pub fn read_frame(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>> {
     let mut header = [0; HEADER_BYTES];
-    read_exact(stream, &mut header, deadline)?;
+    let first_byte = remaining(deadline).unwrap_or(Duration::from_millis(1));
+    read_exact(stream, &mut header, first_byte)?;
     let length = payload_length(&header)?;
     let mut frame = header.to_vec();
     frame.resize(HEADER_BYTES + length, 0);
     let payload = frame
         .get_mut(HEADER_BYTES..)
         .ok_or_else(|| Error::Protocol("missing P2P payload".to_owned()))?;
-    read_exact(stream, payload, deadline)?;
+    // The header is in, so the frame is in flight: the payload runs at the
+    // message timeout rather than the frame-start deadline, which may have
+    // already elapsed and would abort the read mid-frame.
+    read_exact(stream, payload, TIMEOUT)?;
     Ok(frame)
 }
 
