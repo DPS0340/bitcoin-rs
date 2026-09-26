@@ -20,9 +20,9 @@ stay one frame. Inbound traffic reaches the host through
 budget's pre-load production headroom gate and reads the active chain through the
 `ChainQuery` trait. Served block bodies are the stored consensus bytes
 (`Message::BlockPayload`); they are not decoded and re-encoded. `inbound` hands over
-`InboundBlock` and `InboundHeaders` with their wire bytes preserved. Misbehaving peers accumulate score on the file-persisted
-`BanList`; whole subnets are excluded as a `BannedSubnet` built from an `IpSubnet`,
-and BIP155 addrv2 and BIP339 wtxid-relay state live in `addrv2` and `wtxid`.
+`InboundBlock` and `InboundHeaders` with their wire bytes preserved. Manual bans exclude
+whole subnets as a `BannedSubnet` built from an `IpSubnet`, held in memory.
+`wire` decodes BIP155 `addrv2` messages, and BIP339 wtxid-relay state lives in `wtxid`.
 
 `PeerTable` is the single authoritative owner of live peer sessions (`PeerSession`),
 connection control leases (`PeerLease`), and post-handshake metadata (`PeerInfo`).
@@ -53,11 +53,13 @@ peer-visible inventory and relay behavior are defined in
 addresses. Live session registration, replacement, metadata publication, and
 identity-checked removal go through `PeerTable`, used by the inbound TCP
 `listener` and connection-session paths. A connection is identified by a
-`ConnectionId`, cleaned up through a `PeerLease`, and opened outbound through
-`spawn_outbound_connection`, while the `listener` module accepts inbound TCP connections
-with graceful shutdown. A connection negotiates version/verack in
-`handshake`, then runs the peer finite-state machine in `fsm`; `wire` is the protocol
-codec, decoding `Message` values and reporting `PeerError`. Inbound traffic reaches
+`ConnectionId` and cleaned up through a `PeerLease`. The `listener` module has one
+entry point per role: `bind_listener` binds a local address, `serve` runs the accept
+loop on that bound listener until shutdown, and `spawn_outbound_connection` dials one
+peer. `serve` and `spawn_outbound_connection` read one cloneable `ConnectionShared`
+wiring value per start epoch, which also owns the header, block, and transaction sinks. A connection negotiates
+version/verack in `handshake`, then runs the peer finite-state machine in `fsm`;
+`wire` is the protocol codec, decoding `Message` values and reporting `PeerError`. Inbound traffic reaches
 the host through `dispatch_inbound_full`, which streams getdata responses
 block by block behind the outbound budget's pre-load production headroom gate,
 filters transaction inventory through the `TxInventory` trait, reads the
@@ -67,21 +69,9 @@ initial-block-download gate that the `listener` supplies to it through its
 vectors are never requested and `tx` bodies are dropped before ingress (Core
 31.1 `net_processing.cpp:4401-4404`, `:4713-4716`); `inbound` hands over
 `InboundBlock`,
-`InboundHeaders`, and `InboundTx` with their delivering peer stamped. Misbehaving peers
-are tracked via the file-persisted `BanList` of the `banlist` module, whole subnets are
-excluded as a `BannedSubnet` built from an `IpSubnet`, and BIP155 addrv2 and BIP339
-wtxid-relay state live in `addrv2` and `wtxid`.
-
-## Ban-list persistence contract
-
-`BanList::load` and `BanList::save` own the score-list file. Each non-empty row is
-`<ip>\t<score>\t<until-seconds>\t<reason>`; `until-seconds = 0` means no expiry,
-and non-zero values are seconds since `UNIX_EPOCH`. A missing file loads as an
-empty list. Other open or read failures are unavailable and propagate as
-`PeerError::Io`, consistent with `CONSTRAINTS.md` `CL-23` (unavailable is not
-empty). Malformed fields and expiry values that cannot be represented by
-`SystemTime` fail as `PeerError::InvalidBanEntry`. Loading does not rewrite the
-source file. This contract does not make `save` crash-atomic.
+`InboundHeaders`, and `InboundTx` with their delivering peer stamped. Manual bans
+exclude whole subnets as a `BannedSubnet` built from an `IpSubnet`, held in memory.
+`wire` decodes BIP155 `addrv2` messages, and BIP339 wtxid-relay state lives in `wtxid`.
 
 ## Features
 - `default` (enables `fjall`): build with the fjall storage backend selected.

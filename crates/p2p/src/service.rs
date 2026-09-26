@@ -18,7 +18,7 @@ use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 
-use crate::connection::{PeerLifecycle, PeerSource};
+use crate::connection::PeerSource;
 use crate::listener::ListenerError;
 
 const DEFAULT_OUTBOUND_TARGET: usize = 8;
@@ -137,7 +137,7 @@ pub struct P2pService {
     shutdown: Arc<AtomicBool>,
     worker_shutdown: Arc<AtomicBool>,
     network_active: Arc<AtomicBool>,
-    lifecycle: Arc<PeerLifecycle>,
+    peer_table: Arc<crate::PeerTable>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     added_nodes: Arc<RwLock<Vec<SocketAddr>>>,
     outbound_tx: Sender<SocketAddr>,
@@ -175,7 +175,7 @@ impl P2pService {
             shutdown,
             worker_shutdown: Arc::new(AtomicBool::new(false)),
             network_active: Arc::new(AtomicBool::new(true)),
-            lifecycle: Arc::new(PeerLifecycle::new()),
+            peer_table: Arc::new(crate::PeerTable::new()),
             session_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             banned: Arc::new(RwLock::new(Vec::new())),
             added_nodes: Arc::new(RwLock::new(Vec::new())),
@@ -200,9 +200,6 @@ impl P2pService {
         peer_ready: &Arc<dyn Fn(crate::PeerSource) + Send + Sync>,
         extras: crate::listener::ListenerExtras,
     ) -> Result<(), P2pServiceError> {
-        let chain_query = chain_query.cloned();
-        let sync_wake_tx = sync_wake_tx.cloned();
-        let peer_ready = peer_ready.clone();
         let mut slot = self.workers.lock();
         if slot.is_some() {
             return Err(P2pServiceError::AlreadyStarted);
@@ -219,40 +216,30 @@ impl P2pService {
             bound_listeners.push((*addr, listener));
         }
 
+        let shared = crate::listener::ConnectionShared::new(
+            Arc::clone(&self.peer_table),
+            Arc::clone(&self.banned),
+            Arc::new(crate::NetworkActivity::from_shared(Arc::clone(
+                &self.network_active,
+            ))),
+            session_cancel,
+            Some(Arc::clone(peer_ready)),
+            self.config.magic,
+            self.inbound_headers_tx.clone(),
+            self.inbound_blocks_tx.clone(),
+            chain_query.cloned(),
+            sync_wake_tx.cloned(),
+            extras,
+        );
+
         let mut listeners = Vec::with_capacity(bound_listeners.len());
         for (listener_addr, listener) in bound_listeners {
             let shutdown = Arc::clone(&self.worker_shutdown);
-            let network_active = Arc::clone(&self.network_active);
-            let peer_table = self.lifecycle.table();
-            let banned = Arc::clone(&self.banned);
-            let headers_tx = self.inbound_headers_tx.clone();
-            let blocks_tx = self.inbound_blocks_tx.clone();
-            let chain_query = chain_query.clone();
-            let sync_wake_tx = sync_wake_tx.clone();
-            let session_cancel = Arc::clone(&session_cancel);
-            let peer_ready = Arc::clone(&peer_ready);
-            let extras = extras.clone();
-            let magic = self.config.magic;
+            let shared = shared.clone();
             let handle = match thread::Builder::new()
                 .name(format!("bitcoin-rs-p2p-{listener_addr}"))
-                .spawn(move || {
-                    crate::listener::serve_bound_with_session_cancel(
-                        listener_addr,
-                        listener,
-                        shutdown,
-                        network_active,
-                        magic,
-                        peer_table,
-                        headers_tx,
-                        blocks_tx,
-                        banned,
-                        chain_query,
-                        sync_wake_tx,
-                        session_cancel,
-                        peer_ready,
-                        extras,
-                    )
-                }) {
+                .spawn(move || crate::listener::serve(listener, shutdown, shared))
+            {
                 Ok(handle) => handle,
                 Err(error) => {
                     self.rollback_startup(listeners, None);
@@ -262,13 +249,7 @@ impl P2pService {
             listeners.push(handle);
         }
 
-        let outbound = match self.spawn_outbound_worker(
-            chain_query,
-            sync_wake_tx,
-            Arc::clone(&session_cancel),
-            Arc::clone(&peer_ready),
-            extras,
-        ) {
+        let outbound = match self.spawn_outbound_worker(shared) {
             Ok(handle) => handle,
             Err(error) => {
                 self.rollback_startup(listeners, None);
@@ -299,7 +280,7 @@ impl P2pService {
         // new token; resetting this one would un-cancel leftover workers.
         self.session_cancel.lock().store(true, Ordering::Release);
         self.worker_shutdown.store(true, Ordering::Release);
-        self.lifecycle.cancel_all();
+        self.peer_table.cancel_all();
         for handle in listeners {
             let _ = handle.join();
         }
@@ -310,29 +291,22 @@ impl P2pService {
 
     fn spawn_outbound_worker(
         &self,
-        chain_query: Option<Arc<dyn crate::ChainQuery + 'static>>,
-        sync_wake_tx: Option<Sender<()>>,
-        session_cancel: Arc<AtomicBool>,
-        peer_ready: Arc<dyn Fn(crate::PeerSource) + Send + Sync>,
-        extras: crate::listener::ListenerExtras,
+        shared: crate::listener::ConnectionShared,
     ) -> Result<JoinHandle<()>, io::Error> {
         let outbound_rx = Arc::clone(&self.outbound_rx);
-        let lifecycle = Arc::clone(&self.lifecycle);
-        let banned = Arc::clone(&self.banned);
-        let headers_tx = self.inbound_headers_tx.clone();
-        let blocks_tx = self.inbound_blocks_tx.clone();
-        let network_active = Arc::clone(&self.network_active);
+        let peer_table = Arc::clone(&self.peer_table);
         let shutdown = Arc::clone(&self.worker_shutdown);
-        let magic = self.config.magic;
         let active_limit = self.config.outbound_active_limit;
         thread::Builder::new()
             .name("bitcoin-rs-p2p-outbound-drain".to_owned())
             .spawn(move || {
                 let mut active = HashSet::new();
                 let mut handles = Vec::new();
-                while !shutdown.load(Ordering::Acquire) && !session_cancel.load(Ordering::Acquire) {
+                while !shutdown.load(Ordering::Acquire)
+                    && !shared.session_cancel.load(Ordering::Acquire)
+                {
                     reap_finished_outbound_connections(&mut active, &mut handles);
-                    if !network_active.load(Ordering::Acquire) || active.len() >= active_limit {
+                    if !shared.activity.is_active() || active.len() >= active_limit {
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     }
@@ -346,27 +320,14 @@ impl P2pService {
                         }
                         continue;
                     };
-                    if active.contains(&addr) || lifecycle.contains(addr) {
+                    if active.contains(&addr) || peer_table.is_connected(addr) {
                         tracing::debug!(
                             addr = %addr,
                             "p2p outbound request skipped: already active"
                         );
                         continue;
                     }
-                    let handle = crate::listener::spawn_outbound_connection_with_session_cancel(
-                        addr,
-                        magic,
-                        lifecycle.table(),
-                        headers_tx.clone(),
-                        blocks_tx.clone(),
-                        Arc::clone(&banned),
-                        Arc::clone(&network_active),
-                        chain_query.clone(),
-                        sync_wake_tx.clone(),
-                        Arc::clone(&session_cancel),
-                        Arc::clone(&peer_ready),
-                        extras.clone(),
-                    );
+                    let handle = crate::listener::spawn_outbound_connection(addr, shared.clone());
                     active.insert(addr);
                     handles.push((addr, handle));
                 }
@@ -380,7 +341,7 @@ impl P2pService {
         if !self.config.fixed_peers.is_empty() {
             let shutdown = Arc::clone(&self.worker_shutdown);
             let network_active = Arc::clone(&self.network_active);
-            let lifecycle = Arc::clone(&self.lifecycle);
+            let peer_table = Arc::clone(&self.peer_table);
             let outbound_tx = self.outbound_tx.clone();
             let endpoints = self.config.fixed_peers.clone();
             return thread::Builder::new()
@@ -389,7 +350,7 @@ impl P2pService {
                     run_fixed_peer_bootstrap(
                         shutdown,
                         network_active,
-                        lifecycle,
+                        peer_table,
                         outbound_tx,
                         endpoints,
                     );
@@ -402,7 +363,7 @@ impl P2pService {
         }
         let shutdown = Arc::clone(&self.worker_shutdown);
         let network_active = Arc::clone(&self.network_active);
-        let lifecycle = Arc::clone(&self.lifecycle);
+        let peer_table = Arc::clone(&self.peer_table);
         let outbound_tx = self.outbound_tx.clone();
         let port = self.config.dns_port;
         let seeds = self.config.dns_seeds.clone();
@@ -413,7 +374,7 @@ impl P2pService {
                 run_dns_peer_maintenance(
                     shutdown,
                     network_active,
-                    lifecycle,
+                    peer_table,
                     outbound_tx,
                     port,
                     seeds,
@@ -428,8 +389,7 @@ impl P2pService {
         self.session_cancel.lock().store(true, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
         self.worker_shutdown.store(true, Ordering::Release);
-        self.network_active.store(false, Ordering::Release);
-        self.lifecycle.cancel_all();
+        apply_network_active(&self.network_active, &self.peer_table, false);
     }
 
     /// Joins listener and outbound workers. Bootstrap is joined separately so
@@ -509,16 +469,10 @@ impl P2pService {
         core.and(bootstrap)
     }
 
-    /// Returns the shared connection lifecycle view used by sync and RPC reads.
-    #[must_use]
-    pub fn lifecycle(&self) -> Arc<PeerLifecycle> {
-        Arc::clone(&self.lifecycle)
-    }
-
     /// Returns the single session table owned by this service.
     #[must_use]
     pub fn table(&self) -> Arc<crate::PeerTable> {
-        self.lifecycle.table()
+        Arc::clone(&self.peer_table)
     }
 
     /// Returns whether P2P network activity is enabled.
@@ -530,7 +484,7 @@ impl P2pService {
     /// Enables or disables network activity. Disabling cancels current peers;
     /// their owners remove the leases during teardown.
     pub fn set_network_active(&self, active: bool) {
-        apply_network_active(&self.network_active, &self.lifecycle.table(), active);
+        apply_network_active(&self.network_active, &self.peer_table, active);
     }
 
     /// Returns the shared admission switch for compatibility with node
@@ -626,12 +580,12 @@ impl P2pService {
     /// gone away, allowing callers to keep ownership of retry decisions.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, source: PeerSource, message: crate::Message) -> Result<(), crate::Message> {
-        self.lifecycle.send(source, message)
+        self.peer_table.send(source, message)
     }
 
     /// Disconnects only the connection identified by source.
     pub fn disconnect(&self, source: PeerSource) -> bool {
-        self.lifecycle.disconnect_source(source)
+        self.peer_table.disconnect_source(source)
     }
 
     /// Returns a cloned inbound headers receiver for the node sync coordinator.
@@ -708,7 +662,7 @@ fn wait_for_shutdown(shutdown: &AtomicBool, delay: Duration) -> bool {
 fn run_fixed_peer_bootstrap(
     shutdown: Arc<AtomicBool>,
     network_active: Arc<AtomicBool>,
-    lifecycle: Arc<PeerLifecycle>,
+    peer_table: Arc<crate::PeerTable>,
     outbound_tx: Sender<SocketAddr>,
     endpoints: Vec<String>,
 ) {
@@ -731,7 +685,7 @@ fn run_fixed_peer_bootstrap(
                 }
             };
             for addr in addresses {
-                if lifecycle.contains(addr) || !network_active.load(Ordering::Acquire) {
+                if peer_table.is_connected(addr) || !network_active.load(Ordering::Acquire) {
                     continue;
                 }
                 if outbound_tx.try_send(addr).is_err() {
@@ -745,11 +699,15 @@ fn run_fixed_peer_bootstrap(
     }
 }
 
-fn live_outbound_count(lifecycle: &PeerLifecycle) -> usize {
-    lifecycle
-        .live_leases()
+/// Live outbound sessions exclude cancelled leases: disabling and
+/// re-enabling the network cancels leases without removing their entries,
+/// so an unfiltered count would hide the refill deficit from DNS
+/// maintenance.
+fn live_outbound_count(peer_table: &crate::PeerTable) -> usize {
+    peer_table
+        .sessions()
         .iter()
-        .filter(|(_, lease)| !lease.is_inbound())
+        .filter(|session| !session.lease.is_inbound() && !session.lease.is_cancelled())
         .count()
 }
 
@@ -757,7 +715,7 @@ fn live_outbound_count(lifecycle: &PeerLifecycle) -> usize {
 fn run_dns_peer_maintenance(
     shutdown: Arc<AtomicBool>,
     network_active: Arc<AtomicBool>,
-    lifecycle: Arc<PeerLifecycle>,
+    peer_table: Arc<crate::PeerTable>,
     outbound_tx: Sender<SocketAddr>,
     port: u16,
     seeds: Vec<String>,
@@ -776,7 +734,7 @@ fn run_dns_peer_maintenance(
         &resolver,
         &seeds,
         &network_active,
-        &lifecycle,
+        &peer_table,
         &outbound_tx,
         &mut failed_backoff,
         cursor,
@@ -786,7 +744,7 @@ fn run_dns_peer_maintenance(
     tracing::info!(queued, "dns peer bootstrap queued initial addresses");
 
     while !shutdown.load(Ordering::Acquire) {
-        let live = live_outbound_count(&lifecycle);
+        let live = live_outbound_count(&peer_table);
         let delay = if live == 0 && queued > 0 && fast_refills < DNS_BOOTSTRAP_FAST_REFILL_LIMIT {
             fast_refills = fast_refills.saturating_add(1);
             DNS_BOOTSTRAP_REFILL_INTERVAL
@@ -805,7 +763,7 @@ fn run_dns_peer_maintenance(
         if wait_for_shutdown(&shutdown, delay) {
             break;
         }
-        let live = live_outbound_count(&lifecycle);
+        let live = live_outbound_count(&peer_table);
         if live >= target {
             continue;
         }
@@ -814,7 +772,7 @@ fn run_dns_peer_maintenance(
             &resolver,
             &seeds,
             &network_active,
-            &lifecycle,
+            &peer_table,
             &outbound_tx,
             &mut failed_backoff,
             cursor,
@@ -836,7 +794,7 @@ fn drain_dns_peer_deficit<R>(
     resolver: &R,
     seeds: &[&str],
     network_active: &AtomicBool,
-    lifecycle: &PeerLifecycle,
+    peer_table: &crate::PeerTable,
     outbound_tx: &Sender<SocketAddr>,
     recently_queued: &mut HashMap<SocketAddr, Instant>,
     cursor: usize,
@@ -866,7 +824,9 @@ where
             addresses.rotate_left(offset);
         }
         for addr in addresses {
-            if !seen.insert(addr) || lifecycle.contains(addr) || recently_queued.contains_key(&addr)
+            if !seen.insert(addr)
+                || peer_table.is_connected(addr)
+                || recently_queued.contains_key(&addr)
             {
                 continue;
             }
@@ -959,5 +919,57 @@ mod tests {
         apply_network_active(&flag, &table, false);
         assert!(!flag.load(Ordering::Acquire));
         assert!(lease.is_cancelled());
+    }
+
+    #[test]
+    fn live_outbound_count_skips_cancelled_lease_so_dns_deficit_refills() {
+        // Replacement address differs from the registered one below so the
+        // drain cannot skip it as already connected.
+        const REPLACEMENT_PORT: u16 = 9;
+
+        struct OneAddrResolver;
+
+        impl crate::DnsResolver for OneAddrResolver {
+            fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
+                Ok(vec![SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    REPLACEMENT_PORT,
+                ))])
+            }
+        }
+
+        let table = crate::PeerTable::new();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8333));
+        table.register(addr, lease.clone());
+        assert_eq!(live_outbound_count(&table), 1);
+
+        // A disable cancels the lease and keeps its table entry; the
+        // cancelled connection must stop counting as live.
+        lease.cancel();
+        assert_eq!(table.sessions().len(), 1, "cancel keeps the entry");
+        assert_eq!(live_outbound_count(&table), 0);
+
+        // With no live outbound peer the DNS drain queues a replacement, so
+        // maintenance sees the full deficit instead of a satisfied target.
+        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+        let active = AtomicBool::new(true);
+        let mut recently_queued = HashMap::new();
+        let queued = drain_dns_peer_deficit(
+            &OneAddrResolver,
+            &["seed.example"],
+            &active,
+            &table,
+            &outbound_tx,
+            &mut recently_queued,
+            0,
+            DEFAULT_OUTBOUND_TARGET,
+        );
+        assert_eq!(queued, 1);
+        assert_eq!(
+            outbound_rx.try_recv().ok(),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, REPLACEMENT_PORT))),
+        );
     }
 }

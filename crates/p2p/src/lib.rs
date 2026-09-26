@@ -1,10 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-/// BIP155 addrv2 address helpers.
-pub mod addrv2;
-/// Peer banning and persistence.
-pub mod banlist;
 /// Out-of-order inbound block staging bounded by the download window budget.
 pub mod block_stager;
 /// Active-chain `getheaders` / `getdata` serving.
@@ -29,11 +25,10 @@ pub mod handshake;
 pub mod inbound;
 /// Inventory relay helpers.
 pub mod inv;
-/// TCP listener skeleton with graceful shutdown.
+/// Inbound accept loop, outbound dial, and their shared start-epoch wiring.
 pub mod listener;
 
 /// Bitcoin Core `net:*` tracepoint payload mapping.
-pub(crate) mod net_trace;
 /// Peer state and peer manager types.
 pub mod peer;
 /// Peer metadata published after a successful handshake.
@@ -58,17 +53,15 @@ pub mod wtxid;
 pub use chain_query::ActiveChainQuery;
 pub use compact_blocks::{CompactBlockHints, Reconstruction};
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, Command, CommandStatus, PINNED_CORE_VERSION};
-pub use connection::{ConnectionId, PeerLease, PeerLifecycle, PeerSource, PeerStats, ReadyPeer};
+pub use connection::{ConnectionId, PeerLease, PeerSource, ReadyPeer};
 pub use counters::{CountingStream, PeerCounters};
 pub use dispatch::{ChainQuery, InventoryServing, TxInventory};
 pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use inv::request_missing_parents;
-pub use listener::{ListenerExtras, spawn_outbound_connection};
+pub use listener::ListenerExtras;
 pub use peer::{
-    AddNodeError, AddedNodeInfo, BanError, ConnectedPeer, ConnectionCounts, DnsResolver,
-    MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE_USIZE, NetworkActivity, NetworkControls,
-    NodeAddress, Peer, PeerManager, PeerState, SystemDnsResolver, TrafficTotals,
-    UPLOAD_TIMEFRAME_SECS, UploadTarget,
+    DnsResolver, MAX_BLOCK_SERIALIZED_SIZE_USIZE, NetworkActivity, Peer, PeerManager, PeerState,
+    SystemDnsResolver,
 };
 pub use peer_info::PeerInfo;
 pub use peer_table::{PeerSession, PeerTable};
