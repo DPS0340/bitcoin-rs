@@ -1029,6 +1029,12 @@ impl BlockSync {
             // keep winning `request_headers_from_best_peer` while it serves
             // the same terminal page, starving every other peer.
             self.peer_table.note_headers_horizon(source, outcome.height);
+        } else {
+            // A batch that advanced the verified cursor past a previous
+            // cap disproves the terminal-page observation: lift the cap so
+            // the connection can win selection again on its new evidence.
+            self.peer_table
+                .note_headers_progress(source, outcome.height);
         }
         // The batch answered the connection's outstanding request, so
         // that request retires here, before the continuation: Core
