@@ -6575,4 +6575,70 @@ mod tests {
         assert!(!window.contains_pending(&hash(0xb1)));
         assert_eq!(window.next_request_height, 11);
     }
+
+    #[test]
+    fn fanout_eligibility_requires_block_service_flags() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::{PeerCounters, PeerInfo};
+
+        fn peer(services: u64, inbound: bool) -> PeerInfo {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+            PeerInfo {
+                addr,
+                version: 70_016,
+                wtxid_relay: false,
+                compact_block_relay: false,
+                services,
+                user_agent: String::from("/test/"),
+                start_height: 0,
+                best_known_height: 0,
+                conn_time: 0,
+                inbound,
+                addr_bind: addr,
+                time_offset: 0,
+                counters: std::sync::Arc::new(PeerCounters::default()),
+            }
+        }
+
+        fn policy(requested_height: u32) -> super::BlockDownloadPolicy {
+            super::BlockDownloadPolicy {
+                ibd: crate::sync::tests::synced_ibd_latch(),
+                requested_height,
+                network: Network::Regtest,
+            }
+        }
+
+        const WITNESS: u64 = 1_u64 << 3;
+        const NETWORK: u64 = 1_u64;
+        const LIMITED: u64 = 1_u64 << 10;
+        // A witness peer without block-service flags must never receive
+        // block `getdata`: cold-front recovery would ask it for a body it
+        // cannot serve.
+        assert!(!super::statically_fanout_eligible(
+            &peer(WITNESS, false),
+            &policy(0)
+        ));
+        // Full block-service peers stay eligible.
+        assert!(super::statically_fanout_eligible(
+            &peer(WITNESS | NETWORK, false),
+            &policy(0)
+        ));
+        // Limited peers without `NETWORK` keep their recent-block eligibility;
+        // the retained-height clause inside the one service predicate keeps
+        // them recent.
+        assert!(super::statically_fanout_eligible(
+            &peer(WITNESS | LIMITED, false),
+            &policy(0)
+        ));
+        // Inbound and non-witness peers stay ineligible.
+        assert!(!super::statically_fanout_eligible(
+            &peer(WITNESS | NETWORK, true),
+            &policy(0)
+        ));
+        assert!(!super::statically_fanout_eligible(
+            &peer(NETWORK, false),
+            &policy(0)
+        ));
+    }
 }
