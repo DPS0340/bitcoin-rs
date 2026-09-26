@@ -221,22 +221,36 @@ fn low_work_headers_do_not_reach_block_tree() -> Result<(), Box<dyn std::error::
 /// the order the wire delivered.
 #[test]
 fn sufficient_work_chain_syncs_presync_then_redownload() -> Result<(), Box<dyn std::error::Error>> {
-    // One full page whose last header reaches the floor exactly: the sync
-    // commits at the page boundary and the replay is that same page.
-    let chain = chain_on(&genesis_header(), 0, PAGE);
-    let threshold = ChainWork::from(WORK_PER_HEADER * u64::try_from(PAGE).unwrap_or(u64::MAX));
-    assert_eq!(
-        chain_work(&chain),
-        threshold,
-        "the floor must sit exactly on the page's last header"
-    );
+    // A chain one page plus a tail long, with the floor on its last
+    // header: the first page's own claimed work stays below the floor, so
+    // it collects under presync; the tail page carries the cumulative work
+    // over it and the crossing commits the sync to its second pass.
+    let chain = chain_on(&genesis_header(), 0, PAGE + 500);
+    let threshold = chain_work(&chain);
     let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(threshold)?;
     let (addr, _lease, rx) = connect(&peers, 9702, 100_000);
     let source = current_source(&peers, addr);
     sync.tick();
     assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
 
-    deliver_headers(&inbound_headers_tx, chain.clone(), source)?;
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "a page whose own claimed work is below the floor collects"
+    );
+    // Presync wants the next page on the wire, continuing from the
+    // collected tip.
+    assert_eq!(
+        next_locator(&rx).map(|locator| locator.first().copied()),
+        Some(Some(
+            Hash256::from(chain[PAGE - 1].compute_hash()).to_le_bytes()
+        )),
+        "presync must request the continuation from the collected tip",
+    );
+
+    deliver_headers(&inbound_headers_tx, chain[PAGE..].to_vec(), source)?;
     sync.tick();
 
     // The crossing header committed the sync: it now asks for the whole
@@ -273,13 +287,15 @@ fn sufficient_work_chain_syncs_presync_then_redownload() -> Result<(), Box<dyn s
     // Serve the second pass as the answer to that request: its last
     // header crosses the floor inside the state, which releases the whole
     // verified chain in wire order.
-    let chain_last = chain[PAGE - 1].compute_hash();
-    deliver_headers(&inbound_headers_tx, chain, source)?;
+    let chain_last = chain[PAGE + 500 - 1].compute_hash();
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    deliver_headers(&inbound_headers_tx, chain[PAGE..].to_vec(), source)?;
     sync.tick();
     let tree = sync.chain.block_tree();
     assert_eq!(
         tree.height_of_hash(Hash256::from(chain_last)),
-        Some(u32::try_from(PAGE).unwrap_or(u32::MAX)),
+        Some(u32::try_from(PAGE + 500).unwrap_or(u32::MAX)),
         "the committed replay must admit the whole chain in wire order (len {})",
         tree.len(),
     );
@@ -625,6 +641,117 @@ fn a_refused_release_reemits_on_the_next_pop() -> Result<(), Box<dyn std::error:
     assert!(
         next.ready_headers.starts_with(&chain[..5]),
         "the requeued prefix must lead the next release"
+    );
+    Ok(())
+}
+
+/// A batch whose own claimed work crosses the floor skips the presync
+/// entirely: Core's `TryLowWorkHeadersSync` fast path counts
+/// `chain_start->nChainWork + CalculateClaimedHeadersWork`, so the headers
+/// admit directly without a download-twice pass or a re-requested page.
+#[test]
+fn a_batch_crossing_the_floor_admits_without_presync() -> Result<(), Box<dyn std::error::Error>> {
+    let chain = chain_on(&genesis_header(), 0, 10);
+    let floor = chain_work(&chain);
+    let (_genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, _rx) = connect(&peers, 9704, 100_000);
+    let source = current_source(&peers, addr);
+
+    deliver_headers(&inbound_headers_tx, chain.clone(), source)?;
+    sync.tick();
+
+    assert_eq!(
+        tree_node_count(&sync),
+        1 + chain.len(),
+        "a batch whose claimed work reaches the floor must admit directly"
+    );
+    assert_eq!(
+        sync_phase(&sync, source),
+        None,
+        "the fast path must not open a download-twice state"
+    );
+    Ok(())
+}
+
+/// A batch anchored on a node a subtree invalidation already marked
+/// `Invalid` must not open a download-twice pass: hashing and retaining
+/// commitments for headers that can never admit is wasted work. The batch
+/// routes to the admission path's `InvalidParent` refusal instead — a
+/// non-fault refusal, so the peer stays connected and no sync state is
+/// created.
+#[test]
+fn an_invalid_anchor_refuses_without_presync() -> Result<(), Box<dyn std::error::Error>> {
+    let floor = ChainWork::from(u64::MAX);
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let doomed = chain_on(&genesis, 0, 3);
+    let doomed_len;
+    {
+        let mut tree = sync.chain.block_tree_mut();
+        let mut root = None;
+        for header in &doomed {
+            let id = tree.insert_header(*header, NodeStatus::HeaderValid)?;
+            root = root.or(Some(id));
+        }
+        let root = root.ok_or_else(|| std::io::Error::other("no doomed root"))?;
+        tree.invalidate_subtree(root)?;
+        doomed_len = tree.len();
+    }
+
+    let (addr, _lease, _rx) = connect(&peers, 9705, 100_000);
+    let source = current_source(&peers, addr);
+    let continuation = chain_on(&doomed[2], 3, 5);
+    deliver_headers(&inbound_headers_tx, continuation, source)?;
+    sync.tick();
+
+    assert_eq!(
+        sync_phase(&sync, source),
+        None,
+        "an invalid anchor must not open a download-twice state"
+    );
+    assert_eq!(
+        tree_node_count(&sync),
+        doomed_len,
+        "the InvalidParent refusal must not grow the tree"
+    );
+    assert!(
+        peers.is_connected(addr),
+        "a refused anchor is not a peer fault"
+    );
+    Ok(())
+}
+
+/// A peer whose short page ends its presync below the floor has
+/// demonstrated it has nothing past that cursor: capping its advertised
+/// horizon at the reached height keeps the scheduler from reselecting the
+/// same connection forever while it serves the same terminal page.
+#[test]
+fn a_terminal_low_work_page_demotes_the_source() -> Result<(), Box<dyn std::error::Error>> {
+    let floor = ChainWork::from(u64::MAX);
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, _rx) = connect(&peers, 9706, 100_000);
+    let source = current_source(&peers, addr);
+    assert_eq!(
+        peers.info_of(addr).map(|info| info.best_known_height),
+        Some(100_000)
+    );
+
+    let chain = chain_on(&genesis, 0, 5);
+    deliver_headers(&inbound_headers_tx, chain, source)?;
+    sync.tick();
+
+    assert_eq!(
+        sync_phase(&sync, source),
+        None,
+        "the terminal page spends the sync state"
+    );
+    assert_eq!(
+        peers.info_of(addr).map(|info| info.best_known_height),
+        Some(5),
+        "the horizon must fall to the demonstrated cursor height"
+    );
+    assert!(
+        peers.is_connected(addr),
+        "a short sync below the floor is not a peer fault"
     );
     Ok(())
 }

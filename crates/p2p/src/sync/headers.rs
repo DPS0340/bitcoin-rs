@@ -1016,6 +1016,14 @@ impl BlockSync {
             self.settle_presync_fault(source, error);
             return None;
         }
+        if outcome.finished && !outcome.request_more && outcome.ready_headers.is_empty() {
+            // The sync ended below the floor without releasing headers: the
+            // peer demonstrated it has nothing past the cursor, so cap its
+            // advertised horizon there. An unchanged handshake height would
+            // keep winning `request_headers_from_best_peer` while it serves
+            // the same terminal page, starving every other peer.
+            self.peer_table.note_headers_horizon(source, outcome.height);
+        }
         // The batch answered the connection's outstanding request, so
         // that request retires here, before the continuation: Core
         // clears the request stamp on every processed headers message
@@ -1090,9 +1098,11 @@ impl BlockSync {
     ///
     /// PRE: none.
     /// POST: return the anchor for the batch's first header's parent when
-    ///   this node holds that parent and its cumulative chainwork is below
-    ///   the network minimum; return `None` when the parent is unknown (the
-    ///   admission path reports the missing ancestry) or already sufficient
+    ///   this node holds that parent, it is not already `Invalid` (the
+    ///   admission path owns that refusal), and its cumulative chainwork
+    ///   plus the batch's claimed work stays below the network minimum;
+    ///   return `None` when the parent is unknown (the admission path
+    ///   reports the missing ancestry) or the floor is already met
     ///   (Core's `TryLowWorkHeadersSync` fast path,
     ///   `net_processing.cpp:3010-3018`).
     /// INVARIANT: the tree read closes before any scheduler or transition
@@ -1104,7 +1114,23 @@ impl BlockSync {
         let tree = self.chain.block_tree();
         let fork_id = tree.lookup(Hash256::from(first.prev_blockhash))?;
         let fork = tree.node(fork_id).ok()?;
-        if fork.chainwork >= minimum_work {
+        // An anchor a subtree invalidation already marked `Invalid` can
+        // never admit: decline it so the batch routes straight through the
+        // admission path's `InvalidParent` refusal instead of opening a
+        // presync that hashes and retains commitments for a doomed pass.
+        if fork.status == NodeStatus::Invalid {
+            return None;
+        }
+        // Core's `TryLowWorkHeadersSync` fast path counts the work the batch
+        // itself claims (`chain_start->nChainWork +
+        // CalculateClaimedHeadersWork`, `net_processing.cpp:3010-3018`): a
+        // batch that crosses the floor on its own admits directly instead
+        // of opening a presync that re-requests the same page after the
+        // crossing.
+        let claimed = headers.iter().fold(fork.chainwork, |sum, header| {
+            sum.saturating_add(bitcoin_rs_chain::block_work(header))
+        });
+        if claimed >= minimum_work {
             return None;
         }
         let median_time_past = tree.median_time_past_at(fork_id, MEDIAN_TIME_PAST_WINDOW)?;
