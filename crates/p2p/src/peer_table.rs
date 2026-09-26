@@ -284,6 +284,33 @@ impl PeerTable {
         }
     }
 
+    /// Lowers the live connection's advertised headers horizon to `height`
+    /// after its download-twice sync ended below the work floor without
+    /// releasing headers — the peer demonstrated it has nothing past that
+    /// cursor, and leaving a higher handshake claim in place would keep
+    /// reselecting it while starving every other peer.
+    ///
+    /// Unlike `note_announced_height`, which only raises the recorded
+    /// horizon, this lowers it to a demonstrated fact. Returns `false` for
+    /// a stale, unpublished, or cancelled connection.
+    pub fn note_headers_horizon(&self, source: PeerSource, height: u32) -> bool {
+        let mut entries = self.entries.write();
+        let Some(entry) = entries
+            .get_mut(&source.addr)
+            .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
+        else {
+            return false;
+        };
+        let Some(info) = entry.info.as_mut() else {
+            return false;
+        };
+        let height = i32::try_from(height).unwrap_or(i32::MAX);
+        if height < info.best_known_height {
+            info.best_known_height = height;
+        }
+        true
+    }
+
     /// Raises the compact-block relay preference for `source` — its live
     /// connection accepted a post-verack `sendcmpct` with a known version.
     /// Returns `false` for a stale or unpublished connection.
