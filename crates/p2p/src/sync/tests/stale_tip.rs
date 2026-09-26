@@ -170,7 +170,13 @@ fn the_stale_tip_allowance_dials_past_the_slot_cap() {
         scheduler.stale_tip.follow(100, 0, SPACING, t0);
         scheduler
             .stale_tip
-            .follow(100, 0, SPACING, t0 + Duration::from_mins(35));
+            .follow((100, Hash256::from_le_bytes(&[100; 32])), 0, SPACING, t0);
+        scheduler.stale_tip.follow(
+            (100, Hash256::from_le_bytes(&[100; 32])),
+            0,
+            SPACING,
+            t0 + Duration::from_mins(35),
+        );
     }
     assert!(
         sync.allow_extra_full_relay_dial(),
