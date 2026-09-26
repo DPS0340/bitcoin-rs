@@ -1199,6 +1199,7 @@ impl Chainstate {
     /// followers must dispatch while the chain transition is still held
     /// (`ARCH-07`); node-owned followers consume the returned outcome outside
     /// this crate.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_block(
         &self,
         block: &Block,
