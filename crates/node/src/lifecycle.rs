@@ -553,7 +553,10 @@ pub(crate) fn start_node(
         tx_inventory: Some(tx_inventory),
         compact_hints: Some(compact_hints),
         inbound_tx: Some(state.inbound_tx_sender()),
-        ibd: Some(Arc::clone(&ibd)),
+        // The latch answers against the configured consensus network, not a
+        // magic-derived one: a custom `--p2p-magic` can carry another
+        // network's bytes.
+        ibd: Some((Arc::clone(&ibd), state.config().network)),
     };
     let (relay_queue, relay_rx) =
         bitcoin_rs_p2p::TxRelayQueue::new(bitcoin_rs_p2p::DEFAULT_TX_RELAY_QUEUE_CAPACITY);

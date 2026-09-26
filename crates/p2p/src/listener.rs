@@ -46,11 +46,14 @@ pub struct ListenerExtras {
     pub compact_hints: CompactHintsHandle,
     /// Bounded ingress for decoded `tx` bodies from Ready peers.
     pub inbound_tx: Option<Sender<crate::InboundTx>>,
-    /// Chain-owned initial-block-download latch. `None` means transaction
-    /// relay is open (callers without a chain, and tests). While `Some` and
-    /// active, tx-typed `inv` vectors are not requested and `tx` bodies are
-    /// dropped before ingress (Core 31.1 `net_processing.cpp:4401`, `:4716`).
-    pub ibd: Option<Arc<bitcoin_rs_chain::InitialBlockDownload>>,
+    /// Chain-owned initial-block-download latch paired with the node's
+    /// configured consensus network. `None` means transaction relay is open
+    /// (callers without a chain, and tests). While `Some` and active,
+    /// tx-typed `inv` vectors are not requested and `tx` bodies are dropped
+    /// before ingress (Core 31.1 `net_processing.cpp:4401`, `:4716`). The
+    /// network travels with the latch because the wire magic is not an
+    /// identity: a `--p2p-magic` override can carry another network's bytes.
+    pub ibd: Option<(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
 }
 
 /// State shared by the listener and every connection thread it spawns.
@@ -70,7 +73,7 @@ struct ConnectionShared {
     compact_hints: CompactHintsHandle,
     session_cancel: Option<Arc<AtomicBool>>,
     peer_ready: PeerReadyHandle,
-    ibd: Option<Arc<bitcoin_rs_chain::InitialBlockDownload>>,
+    ibd: Option<(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
 }
 
 impl ConnectionShared {
@@ -131,7 +134,10 @@ impl ConnectionShared {
         self
     }
 
-    fn with_ibd(mut self, ibd: Option<Arc<bitcoin_rs_chain::InitialBlockDownload>>) -> Self {
+    fn with_ibd(
+        mut self,
+        ibd: Option<(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
+    ) -> Self {
         self.ibd = ibd;
         self
     }
@@ -1087,29 +1093,6 @@ fn run_connected_session(
 
 /// The consensus network a connection's wire magic belongs to.
 ///
-/// PRE: `magic` is the magic the connection was admitted under; the
-/// handshake rejects every foreign magic.
-/// POST: returns the supported network whose [`Network::magic`] equals
-/// `magic`; no byte table is re-pinned here, the scan compares against the
-/// networks' own magic constants.
-/// INVARIANT: the unreachable fallback is mainnet, the highest work floor,
-/// so an impossible magic fails closed and keeps the relay gate shut.
-fn network_of_magic(magic: Magic) -> Network {
-    let bytes = magic.to_bytes();
-    for network in [
-        Network::Mainnet,
-        Network::Testnet3,
-        Network::Testnet4,
-        Network::Signet,
-        Network::Regtest,
-    ] {
-        if network.magic() == bytes {
-            return network;
-        }
-    }
-    Network::Mainnet
-}
-
 #[allow(clippy::too_many_arguments)]
 // The transaction-relay gate adds one documented parameter and one lazy
 // closure to an already-large dispatch loop.
@@ -1123,7 +1106,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
     chain_query: Option<&dyn crate::dispatch::ChainQuery>,
     tx_inventory: Option<&dyn crate::dispatch::TxInventory>,
     compact_hints: Option<&dyn crate::compact_blocks::CompactBlockHints>,
-    ibd: Option<&Arc<bitcoin_rs_chain::InitialBlockDownload>>,
+    ibd: Option<&(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
     totals: Option<&Arc<crate::TrafficTotals>>,
 ) -> Result<(), crate::wire::PeerError> {
     use crate::peer::PeerState;
@@ -1131,15 +1114,14 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 
     const IDLE_DISCONNECT: Duration = Duration::from_mins(1);
 
-    // PRE: the handle is the RPC-shared IBD Arc; `network` is this
-    // connection's handshake magic resolved to its consensus network, the
-    // node's own, because the latch holds no network of its own. POST: a
-    // closed gate requests no announced transaction and enqueues no tx body.
-    // INVARIANT: blocks and punishment are unchanged; read lazily per
-    // relevant message, never at connect, so opening the gate needs no
-    // reconnect.
-    let network = network_of_magic(peer.magic);
-    let tx_relay_open = || ibd.is_none_or(|latch| !latch.is_active(unix_time_secs(), network));
+    // PRE: the latch travels with the node's configured consensus network —
+    // never a magic-derived guess, since a custom P2P magic can carry another
+    // network's bytes. POST: a closed gate requests no announced transaction
+    // and enqueues no tx body. INVARIANT: blocks and punishment are
+    // unchanged; read lazily per relevant message, never at connect, so
+    // opening the gate needs no reconnect.
+    let tx_relay_open =
+        || ibd.is_none_or(|(latch, network)| !latch.is_active(unix_time_secs(), *network));
 
     let mut last_inbound = Instant::now();
     let budget = lease.budget_handle();
