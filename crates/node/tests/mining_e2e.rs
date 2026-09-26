@@ -28,8 +28,6 @@ use bitcoin_rs_rpc::{
     },
 };
 
-use bitcoin_rs_utxo::UtxoSet;
-
 use parking_lot::Mutex;
 
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
