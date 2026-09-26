@@ -246,13 +246,18 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 }
 
 fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
+    let total = bytes.len();
     while !bytes.is_empty() {
-        // The deadline bounds the wait for the next byte, with a floor:
-        // a slice that expires between two chunks of one frame must not
-        // strand the stream mid-frame, and a peer dribbling past the
-        // deadline cannot outrun the floor.
-        let wait = remaining_time(deadline, Instant::now(), "P2P operation deadline")
-            .unwrap_or(Duration::from_millis(1));
+        // The deadline bounds the wait for the first byte, with a floor.
+        // Once a frame is partially consumed it must run to completion at
+        // the message timeout: abandoning it would strand the stream
+        // mid-frame and desynchronize every read that follows.
+        let wait = if bytes.len() == total {
+            remaining_time(deadline, Instant::now(), "P2P operation deadline")
+                .unwrap_or(Duration::from_millis(1))
+        } else {
+            TIMEOUT
+        };
         stream.set_read_timeout(Some(wait))?;
         let count = stream.read(bytes)?;
         if count == 0 {
@@ -262,7 +267,6 @@ fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -
             .get_mut(count..)
             .ok_or_else(|| Error::Protocol("invalid read length".to_owned()))?;
     }
-    remaining(deadline)?;
     Ok(())
 }
 

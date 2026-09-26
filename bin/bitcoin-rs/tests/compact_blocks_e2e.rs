@@ -287,8 +287,17 @@ fn read_frame(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, Erro
         mut bytes: &mut [u8],
         deadline: Instant,
     ) -> Result<(), Error> {
+        let total = bytes.len();
         while !bytes.is_empty() {
-            stream.set_read_timeout(remaining(deadline, "read deadline reached")?)?;
+            // The deadline bounds the wait for the first byte only: a frame
+            // that is already partially consumed must run to completion or
+            // the wire stream desynchronizes for every later read.
+            let wait = if bytes.len() == total {
+                remaining(deadline, "read deadline reached")?
+            } else {
+                Some(Duration::from_secs(10))
+            };
+            stream.set_read_timeout(wait)?;
             let count = stream.read(bytes)?;
             if count == 0 {
                 return Err(Error::Protocol("truncated P2P frame".to_owned()));

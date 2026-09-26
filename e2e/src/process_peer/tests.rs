@@ -100,7 +100,7 @@ fn record_write_failure_does_not_replace_the_network_error() {
 #[test]
 fn read_completion_fails_after_the_time_limit() {
     let (mut peer, _remote, _dir) = fixture();
-    let result = super::read_exact(&mut peer.stream, &mut [], Instant::now());
+    let result = super::read_exact(&mut peer.stream, &mut [0], Instant::now());
     assert!(result.is_err(), "an expired operation must not succeed");
 }
 
