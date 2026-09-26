@@ -45,6 +45,7 @@ pub struct ProcessPeer {
     journal: File,
     journal_bytes: u64,
     started: Instant,
+    pending: FrameBuffer,
 }
 
 impl ProcessPeer {
@@ -65,6 +66,7 @@ impl ProcessPeer {
             journal,
             journal_bytes: 0,
             started: node.evidence_clock(),
+            pending: FrameBuffer::default(),
         };
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let mut version = VersionMessage::new(
@@ -157,7 +159,7 @@ impl ProcessPeer {
 
     fn receive(&mut self, deadline: Instant) -> Result<NetworkMessage> {
         let result = (|| {
-            let frame = read_frame(&mut self.stream, deadline)?;
+            let frame = read_frame(&mut self.stream, deadline, &mut self.pending)?;
             let decoded = decode_frame(&frame);
             let record = self.record("received", decoded.as_ref().ok(), &frame);
             let message = decoded?;
@@ -245,35 +247,14 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     remaining_time(deadline, Instant::now(), "P2P operation deadline")
 }
 
-fn read_exact(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
-    let total = bytes.len();
-    while !bytes.is_empty() {
-        // The deadline bounds every wait, and a byte that slips in during
-        // the floor cannot renew it: lapsed-deadline progress is terminal.
-        // Before any byte lands the failure stays a retryable timeout; once
-        // the buffer is partially consumed the wire is mid-frame — resuming
-        // would read a desynced offset, so expiry is a terminal error.
-        let wait = remaining(deadline).unwrap_or(Duration::from_millis(1));
-        stream.set_read_timeout(Some(wait))?;
-        match stream.read(bytes) {
-            Ok(0) => return Err(Error::Protocol("truncated P2P frame".to_owned())),
-            Ok(count) => {
-                bytes = bytes
-                    .get_mut(count..)
-                    .ok_or_else(|| Error::Protocol("invalid read length".to_owned()))?;
-                if remaining(deadline).is_err() {
-                    return Err(Error::Protocol("P2P frame abandoned mid-read".to_owned()));
-                }
-            }
-            Err(error) if bytes.len() != total => {
-                return Err(Error::Protocol(format!(
-                    "P2P frame abandoned mid-read: {error}"
-                )));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
+/// Partial bytes of an in-flight wire frame carried between calls. A read
+/// interrupted by its deadline resumes here instead of leaving the socket
+/// mid-frame, so pump-slice deadlines can pause a frame without desyncing
+/// the stream. Cleared when the frame completes or the socket closes.
+#[derive(Debug, Default)]
+pub struct FrameBuffer {
+    bytes: Vec<u8>,
+    want: usize,
 }
 
 fn payload_length(header: &[u8]) -> Result<usize> {
@@ -290,28 +271,51 @@ fn payload_length(header: &[u8]) -> Result<usize> {
 }
 
 /// Read one complete wire frame (header plus payload) before the deadline.
-pub fn read_frame(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>> {
-    let mut header = [0; HEADER_BYTES];
-    read_exact(stream, &mut header, deadline)?;
-    let length = payload_length(&header)?;
-    let mut frame = header.to_vec();
-    frame.resize(HEADER_BYTES + length, 0);
-    let payload = frame
-        .get_mut(HEADER_BYTES..)
-        .ok_or_else(|| Error::Protocol("missing P2P payload".to_owned()))?;
-    // The header was consumed, so a payload-phase timeout strands the
-    // stream mid-frame: it is terminal for the peer, never a soft retry.
-    read_exact(stream, payload, deadline).map_err(|error| match error {
-        Error::Io(ref io)
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            Error::Protocol(format!("P2P payload read expired mid-frame: {error}"))
+/// `pending` carries an in-flight frame between calls: an interrupt leaves
+/// the consumed bytes there and the next call resumes them, so a retry
+/// never reads a desynced offset.
+pub fn read_frame(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    pending: &mut FrameBuffer,
+) -> Result<Vec<u8>> {
+    if pending.want == 0 {
+        pending.want = HEADER_BYTES;
+    }
+    let mut scratch = [0; 64 * 1024];
+    while pending.bytes.len() < pending.want {
+        let want = (pending.want - pending.bytes.len()).min(scratch.len());
+        // The deadline bounds every wait, with a floor for an already
+        // lapsed deadline; a byte slipping in during that floor does not
+        // renew it — the lapsed deadline interrupts after the read below.
+        let wait = remaining(deadline).unwrap_or(Duration::from_millis(1));
+        stream.set_read_timeout(Some(wait))?;
+        match stream.read(&mut scratch[..want]) {
+            Ok(0) => {
+                pending.bytes.clear();
+                pending.want = 0;
+                return Err(Error::Protocol("truncated P2P frame".to_owned()));
+            }
+            Ok(count) => {
+                pending.bytes.extend_from_slice(&scratch[..count]);
+                if pending.want == HEADER_BYTES && pending.bytes.len() == HEADER_BYTES {
+                    pending.want = HEADER_BYTES
+                        + payload_length(&pending.bytes).inspect_err(|_| {
+                            pending.bytes.clear();
+                            pending.want = 0;
+                        })?;
+                }
+                if pending.bytes.len() < pending.want && remaining(deadline).is_err() {
+                    return Err(Error::Protocol(
+                        "P2P frame paused at the read deadline".to_owned(),
+                    ));
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
-        other => other,
-    })?;
+    }
+    let frame = std::mem::take(&mut pending.bytes);
+    pending.want = 0;
     Ok(frame)
 }
 

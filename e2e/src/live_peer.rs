@@ -29,7 +29,7 @@ use serde_json::json;
 
 use crate::error::{Error, Result};
 use crate::node::ProcessNode;
-use crate::process_peer::{decode_frame, read_frame};
+use crate::process_peer::{FrameBuffer, decode_frame, read_frame};
 
 /// One decoded getdata frame: every item flattened to `(inv_type, hash)`.
 #[derive(Clone, Debug)]
@@ -70,6 +70,9 @@ pub struct LivePeer {
     pub stripped_served: usize,
     /// Peer socket died (node disconnected or transport error).
     pub dropped: bool,
+    /// Bytes of an in-flight frame paused at a pump-slice deadline; the
+    /// next `recv` resumes them instead of reading a desynced offset.
+    pending: FrameBuffer,
 }
 
 impl LivePeer {
@@ -106,6 +109,7 @@ impl LivePeer {
             getheaders_at: Vec::new(),
             stripped_served: 0,
             dropped: false,
+            pending: FrameBuffer::default(),
         };
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let mut version = VersionMessage::new(
@@ -201,7 +205,7 @@ impl LivePeer {
 
     /// Read one wire frame, marking the peer dropped on hard failures.
     pub fn recv(&mut self, deadline: Instant) -> Result<NetworkMessage> {
-        match read_frame(&mut self.stream, deadline) {
+        match read_frame(&mut self.stream, deadline, &mut self.pending) {
             Ok(frame) => {
                 let message = decode_frame(&frame)?;
                 self.log("recv", message.cmd());

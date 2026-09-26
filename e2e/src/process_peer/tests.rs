@@ -34,6 +34,7 @@ fn fixture() -> (ProcessPeer, TcpStream, TempDir) {
         journal: File::create(dir.path().join("p2p.jsonl")).expect("record file"),
         journal_bytes: 0,
         started: Instant::now(),
+        pending: super::FrameBuffer::default(),
     };
     (peer, remote, dir)
 }
@@ -100,7 +101,11 @@ fn record_write_failure_does_not_replace_the_network_error() {
 #[test]
 fn read_completion_fails_after_the_time_limit() {
     let (mut peer, _remote, _dir) = fixture();
-    let result = super::read_exact(&mut peer.stream, &mut [0], Instant::now());
+    let result = super::read_frame(
+        &mut peer.stream,
+        Instant::now(),
+        &mut super::FrameBuffer::default(),
+    );
     assert!(result.is_err(), "an expired operation must not succeed");
 }
 
@@ -108,30 +113,44 @@ fn read_completion_fails_after_the_time_limit() {
 fn bytes_past_the_deadline_do_not_renew_it() {
     let (mut peer, mut remote, _dir) = fixture();
     remote.write_all(&[7]).expect("one byte before the read");
-    let error = super::read_exact(&mut peer.stream, &mut [0; 2], Instant::now())
-        .expect_err("lapsed-deadline progress must be terminal");
+    let mut pending = super::FrameBuffer::default();
+    let error = super::read_frame(&mut peer.stream, Instant::now(), &mut pending)
+        .expect_err("lapsed-deadline progress must still interrupt");
     assert!(
-        matches!(error, super::Error::Protocol(ref message) if message.starts_with("P2P frame abandoned mid-read")),
-        "mid-read expiry must be terminal rather than a retryable timeout: {error:?}"
+        matches!(error, super::Error::Protocol(ref message) if message == "P2P frame paused at the read deadline"),
+        "a byte slipping in during the floor must not renew the deadline: {error:?}"
     );
 }
 
 #[test]
-fn payload_expiry_after_the_header_is_terminal() {
+fn a_paused_frame_resumes_from_where_it_stopped() {
     let (mut peer, mut remote, _dir) = fixture();
     let frame = serialize(&RawNetworkMessage::new(
         Magic::REGTEST,
         NetworkMessage::Ping(1),
     ));
     remote
-        .write_all(&frame[..24])
-        .expect("a complete header only");
-    let error = super::read_frame(&mut peer.stream, Instant::now() + Duration::from_millis(50))
-        .expect_err("an absent payload must expire");
+        .write_all(&frame[..10])
+        .expect("partial header bytes");
+    let mut pending = super::FrameBuffer::default();
+    let error = super::read_frame(
+        &mut peer.stream,
+        Instant::now() + Duration::from_millis(50),
+        &mut pending,
+    )
+    .expect_err("a partial frame must pause at the deadline");
     assert!(
-        matches!(error, super::Error::Protocol(ref message) if message.starts_with("P2P payload read expired mid-frame")),
-        "payload-phase expiry must be terminal rather than a retryable timeout: {error:?}"
+        !matches!(error, super::Error::Protocol(ref message) if message == "P2P payload byte limit"),
+        "a paused frame must not surface as desynced: {error:?}"
     );
+    remote.write_all(&frame[10..]).expect("remaining bytes");
+    let completed = super::read_frame(
+        &mut peer.stream,
+        Instant::now() + Duration::from_secs(1),
+        &mut pending,
+    )
+    .expect("the paused frame resumes");
+    assert_eq!(completed, frame);
 }
 
 #[test]

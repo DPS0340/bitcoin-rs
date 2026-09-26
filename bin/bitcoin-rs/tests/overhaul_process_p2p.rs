@@ -8,7 +8,9 @@ use bitcoin::consensus::serialize;
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin_rs_e2e::differential::{compare_rpc, mine_common_chain};
-use bitcoin_rs_e2e::process_peer::{ProcessPeer, connect_loopback, decode_frame, read_frame};
+use bitcoin_rs_e2e::process_peer::{
+    FrameBuffer, ProcessPeer, connect_loopback, decode_frame, read_frame,
+};
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode, SpawnOptions};
 use serde_json::json;
 
@@ -122,7 +124,11 @@ fn fragmented_p2p_response_obeys_one_total_deadline() {
         }
     });
     let start = Instant::now();
-    let result = read_frame(&mut client, start + Duration::from_millis(100));
+    let result = read_frame(
+        &mut client,
+        start + Duration::from_millis(100),
+        &mut FrameBuffer::default(),
+    );
     let elapsed = start.elapsed();
     drop(client);
     writer.join().expect("fixture joins");
@@ -156,8 +162,12 @@ fn oversized_p2p_length_is_rejected_without_a_body() {
     let mut header = [0_u8; 24];
     header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
     server.write_all(&header).expect("header only");
-    let error = read_frame(&mut client, Instant::now() + Duration::from_millis(200))
-        .expect_err("oversized length must fail before reading the missing body");
+    let error = read_frame(
+        &mut client,
+        Instant::now() + Duration::from_millis(200),
+        &mut FrameBuffer::default(),
+    )
+    .expect_err("oversized length must fail before reading the missing body");
     assert!(matches!(error, Error::Protocol(ref message) if message == "P2P payload byte limit"));
 }
 
