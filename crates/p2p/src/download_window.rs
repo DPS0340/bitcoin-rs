@@ -2339,13 +2339,20 @@ impl DownloadWindow {
     /// into a re-request sweep of heights already applied.
     pub fn mark_owned_fetch(
         &mut self,
-        stager: &BlockStager,
+        stager: &mut BlockStager,
         owner: PeerSource,
         hash: Hash256,
         height: u32,
         now: Instant,
     ) {
-        if self.pending.contains_key(&hash) || stager.contains(&hash) {
+        if self.pending.contains_key(&hash) {
+            return;
+        }
+        if stager.contains(&hash) {
+            // The fetch's body is already staged: the owned fetch is its
+            // request evidence, so the body counts as requested and owes
+            // no unrequested-admission gate.
+            stager.clear_gate_pending(&hash);
             return;
         }
         if height < self.next_request_height
@@ -5655,7 +5662,7 @@ mod tests {
         // An externally owned fetch on an empty window is not a post-drain
         // request: the marker must survive so the proven-stall owner stays
         // ineligible for the next prefix probe.
-        window.mark_owned_fetch(&test_stager(&window), compact_peer, hash(0xf1), 7, now);
+        window.mark_owned_fetch(&mut test_stager(&window), compact_peer, hash(0xf1), 7, now);
         assert_eq!(window.prefix_probe_attempted_owner, Some(stall_owner));
         assert!(window.contains_pending(&hash(0xf1)));
 
@@ -5686,9 +5693,9 @@ mod tests {
         // The first mark lands; the second exceeds the pending budget a
         // real request would face, so it is not recorded — the compact
         // fetch still resolves delivery by hash either way.
-        window.mark_owned_fetch(&test_stager(&window), owner, hash(0xa1), 9, now);
+        window.mark_owned_fetch(&mut test_stager(&window), owner, hash(0xa1), 9, now);
         assert!(window.contains_pending(&hash(0xa1)));
-        window.mark_owned_fetch(&test_stager(&window), owner, hash(0xa2), 10, now);
+        window.mark_owned_fetch(&mut test_stager(&window), owner, hash(0xa2), 10, now);
         assert!(!window.contains_pending(&hash(0xa2)));
 
         // Below the request frontier a mark could never be scheduled
@@ -5705,7 +5712,7 @@ mod tests {
         )
         .unwrap_or_else(|| panic!("non-empty request"));
         window.mark_requested(&test_stager(&window), &request, owner, now);
-        window.mark_owned_fetch(&test_stager(&window), owner, hash(0xb1), 3, now);
+        window.mark_owned_fetch(&mut test_stager(&window), owner, hash(0xb1), 3, now);
         assert!(!window.contains_pending(&hash(0xb1)));
         assert_eq!(window.next_request_height, 11);
     }

@@ -321,6 +321,325 @@ fn staged_body_whose_resolved_header_is_inadmissible_is_evicted()
 }
 
 #[test]
+fn staged_body_gated_when_the_headers_drain_resolves_its_header()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A staged body gated on an unknown header must face the
+    // unrequested-admission clauses wherever the header lands — including
+    // the ordinary headers drain, which resolves most headers long before
+    // the staged-header retry reaches them. An off-branch body is dead
+    // inventory and is evicted the same drain its header attaches.
+    let (tree, _blocks) = mined_chain(2, 0)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_blocks_tx,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    let peer = test_addr(9711, 0)?;
+    let _rx = connect_peer(&peers, eligible_peer(peer, 2));
+
+    // A losing fork: a side header at height 1 and a height-2 body on it,
+    // so the body's header cannot attach until the side header admits.
+    let fork_root = test_header(genesis_header().compute_hash(), 1);
+    let orphan_body =
+        mined_block_with_prev_hash(fork_root.compute_hash(), 2, vec![coinbase_transaction(70)]);
+    let orphan_hash = Hash256::from(orphan_body.block_hash());
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(orphan_body.clone()))?;
+    sync.tick();
+    assert!(
+        sync.scheduler.lock().stager.contains(&orphan_hash),
+        "the body must stage while its header is unknown"
+    );
+
+    // The headers drain resolves the body's header directly: the fork
+    // tops out at the incumbent tip's height and loses, so the body
+    // resolves inadmissible and the same drain evicts it.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![fork_root, orphan_body.header],
+        source: None,
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.tick();
+
+    assert!(
+        !sync.scheduler.lock().stager.contains(&orphan_hash),
+        "a body whose header resolves off-branch must not survive the drain"
+    );
+    Ok(())
+}
+
+#[test]
+fn deferred_owned_body_fetch_settles_the_staged_gate() -> Result<(), Box<dyn std::error::Error>> {
+    // A compact-relayed body may stage while its header is still unknown;
+    // the peer already owns the fetch, so the mark is deferred without a
+    // tree height. When the header later admits, resolving the mark must
+    // lift the gate on the staged body — otherwise the recheck evicts a
+    // body the peer already fetches for us and the window would schedule
+    // a duplicate request.
+    let (tree, _blocks) = mined_chain(2, 0)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_blocks_tx,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    let peer = test_addr(9712, 0)?;
+    let _rx = connect_peer(&peers, eligible_peer(peer, 2));
+    let source = current_source(&peers, peer);
+
+    let fork_root = test_header(genesis_header().compute_hash(), 1);
+    let orphan_body =
+        mined_block_with_prev_hash(fork_root.compute_hash(), 2, vec![coinbase_transaction(71)]);
+    let orphan_hash = Hash256::from(orphan_body.block_hash());
+
+    // The owned-fetch announcement arrives before the batch can attach:
+    // the tip is retained as a deferred mark, and the body stages
+    // gate-pending in the same tick.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![orphan_body.header],
+        source: Some(source),
+        wire_response: true,
+        body_fetch_owned: true,
+    })?;
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(orphan_body.clone()))?;
+    sync.tick();
+
+    // The fork admits through the ordinary drain; resolving the deferred
+    // mark settles the staged body's flag, so the recheck leaves it
+    // alone even though the fork is off the active branch.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![fork_root, orphan_body.header],
+        source: None,
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.tick();
+
+    assert!(
+        sync.scheduler.lock().stager.contains(&orphan_hash),
+        "a body the peer already fetches must be exempt from the recheck"
+    );
+    Ok(())
+}
+
+#[test]
+fn unrequested_body_at_the_count_budget_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    // `max_received_blocks` is a window budget: at the cap an unrequested
+    // body is refused outright instead of evicting a staged entry to make
+    // room — the stager never holds more than the budget, and already
+    // staged bodies are never displaced.
+    let (tree, blocks) = mined_chain(3, 0)?;
+    let SyncHarness {
+        sync,
+        inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    install_budget(
+        &sync,
+        super::super::SyncBudget {
+            max_received_blocks: 2,
+            ..super::super::default_sync_budget()
+        },
+    );
+    {
+        let mut scheduler = sync.scheduler.lock();
+        let now = Instant::now();
+        for (idx, block) in blocks[..2].iter().enumerate() {
+            let mut key = [0_u8; 32];
+            key[0] = 0x71_u8.saturating_add(idx.try_into()?);
+            scheduler.stager.insert(
+                Hash256::from_le_bytes(&key),
+                None,
+                block.clone(),
+                bytes::Bytes::from(consensus_bytes(block)),
+                None,
+                now,
+            );
+        }
+    }
+
+    // An unrequested height-3 body arrives at the full budget: admissible
+    // on every clause except the free slot it does not have.
+    let refused_hash = Hash256::from(blocks[2].block_hash());
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(blocks[2].clone()))?;
+    sync.drain_inbound_blocks();
+
+    let scheduler = sync.scheduler.lock();
+    assert_eq!(
+        scheduler.stager.received_len(),
+        2,
+        "a refused body must not evict staged entries to make room"
+    );
+    assert!(
+        !scheduler.stager.contains(&refused_hash),
+        "the unrequested body is refused, not staged"
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_owned_fetch_source_does_not_settle_the_gate() -> Result<(), Box<dyn std::error::Error>> {
+    // A deferred owned-fetch mark belongs to a connection. If that
+    // connection dies before the header resolves, the dead fetch is no
+    // request evidence: resolving the mark must not settle the staged
+    // body's gate, and the ordinary recheck evicts the inadmissible body.
+    let (tree, _blocks) = mined_chain(2, 0)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_blocks_tx,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    let peer = test_addr(9713, 0)?;
+    let _rx = connect_peer(&peers, eligible_peer(peer, 2));
+    let source = current_source(&peers, peer);
+
+    let fork_root = test_header(genesis_header().compute_hash(), 1);
+    let orphan_body =
+        mined_block_with_prev_hash(fork_root.compute_hash(), 2, vec![coinbase_transaction(72)]);
+    let orphan_hash = Hash256::from(orphan_body.block_hash());
+
+    // Defer the mark, stage the body, then drop the owning connection.
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![orphan_body.header],
+        source: Some(source),
+        wire_response: true,
+        body_fetch_owned: true,
+    })?;
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(orphan_body.clone()))?;
+    sync.tick();
+    peers.disconnect_source(source);
+
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![fork_root, orphan_body.header],
+        source: None,
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.tick();
+
+    assert!(
+        !sync.scheduler.lock().stager.contains(&orphan_hash),
+        "a stale owner's mark must not exempt the staged body from the gate"
+    );
+    Ok(())
+}
+
+#[test]
+fn binding_failure_does_not_burn_the_last_staging_slot() -> Result<(), Box<dyn std::error::Error>> {
+    // The staging-slot charge lands at insert time, not at the admission
+    // precheck: a body that fails body/header binding never occupies the
+    // slot it tentatively counted, so a later admissible unrequested body
+    // in the same chunk still stages.
+    let (tree, blocks) = mined_chain(3, 0)?;
+    let SyncHarness {
+        sync,
+        inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    install_budget(
+        &sync,
+        super::super::SyncBudget {
+            max_received_blocks: 1,
+            ..super::super::default_sync_budget()
+        },
+    );
+
+    // A body whose header is tree-known and admissible, but whose mutated
+    // transactions fail the body/header binding: it may never stage.
+    let mut bad = blocks[2].clone();
+    bad.txs.push(coinbase_transaction(90));
+    let bad_hash = Hash256::from(bad.block_hash());
+    let good_hash = Hash256::from(blocks[1].block_hash());
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(bad))?;
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(blocks[1].clone()))?;
+    sync.drain_inbound_blocks();
+
+    let scheduler = sync.scheduler.lock();
+    assert_eq!(
+        scheduler.stager.received_len(),
+        1,
+        "the binding-failed body must not consume the single staging slot"
+    );
+    assert!(!scheduler.stager.contains(&bad_hash));
+    assert!(
+        scheduler.stager.contains(&good_hash),
+        "the admissible unrequested body stages into the freed slot"
+    );
+    Ok(())
+}
+
+#[test]
+fn gate_pending_body_survives_a_pending_branch_switch() -> Result<(), Box<dyn std::error::Error>> {
+    // During a header-first reorg the applied tip still sits on the losing
+    // branch until the switch completes — and the switch cannot complete
+    // while branch bodies are still missing. A gated body on the winning
+    // branch must keep its flag through that window: evicting it would
+    // force a re-download of ancestry the pending apply needs.
+    let (tree, blocks) = mined_chain(3, 0)?;
+    let SyncHarness {
+        sync,
+        inbound_blocks_tx,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    for block in &blocks {
+        inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block.clone()))?;
+    }
+    sync.tick();
+    assert_eq!(
+        sync.chain.applied_tip().ok_or("missing applied tip")?.hash,
+        Hash256::from(blocks[2].block_hash()),
+        "the losing branch must be applied to height 3"
+    );
+
+    // A heavier fork: one real body at height 2 plus header-only links, so
+    // the switch stalls on missing bodies exactly when the body resolves.
+    let fork_root = test_header(genesis_header().compute_hash(), 1);
+    let winner_body =
+        mined_block_with_prev_hash(fork_root.compute_hash(), 2, vec![coinbase_transaction(73)]);
+    let winner_hash = Hash256::from(winner_body.block_hash());
+    let fork_h3 = test_header(winner_body.header.compute_hash(), 3);
+    let fork_h4 = test_header(fork_h3.compute_hash(), 4);
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(winner_body.clone()))?;
+    sync.tick();
+    assert!(
+        sync.scheduler.lock().stager.contains(&winner_hash),
+        "the body must stage while its header is unknown"
+    );
+
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![fork_root, winner_body.header, fork_h3, fork_h4],
+        source: None,
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.tick();
+
+    let applied = sync.chain.applied_tip().ok_or("missing applied tip")?;
+    assert_eq!(
+        applied.hash,
+        Hash256::from(blocks[2].block_hash()),
+        "the switch must still be pending on the missing fork bodies"
+    );
+    assert!(
+        sync.scheduler.lock().stager.contains(&winner_hash),
+        "a winning-branch body must survive a pending branch switch"
+    );
+    Ok(())
+}
+
+#[test]
 fn body_carried_header_does_not_consume_a_pending_getheaders()
 -> Result<(), Box<dyn std::error::Error>> {
     // The listener forwards each delivered body's embedded header through

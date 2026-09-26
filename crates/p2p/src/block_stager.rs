@@ -46,6 +46,11 @@ struct ReceivedBlock {
     /// Delivering connection, retained so a header-admission fault on the
     /// staged body can blame the right peer.
     source: Option<PeerSource>,
+    /// The body staged while the tree could not resolve its hash, so the
+    /// arrival gate's missing-header arm passed it without evaluating the
+    /// unrequested-admission clauses. Cleared once the clauses run against
+    /// the resolved node, or by request evidence (a resolved owned fetch).
+    gate_pending: bool,
 }
 
 /// A contiguous apply-prefix body drained from staging.
@@ -60,6 +65,9 @@ pub struct DrainedBlock {
     received_at: Instant,
     bytes: usize,
     source: Option<PeerSource>,
+    /// Carried through a partial-apply restore so an ungated body still owes
+    /// the admission clauses afterward.
+    gate_pending: bool,
 }
 
 /// A staged body dropped for retry or eviction.
@@ -195,6 +203,7 @@ impl BlockStager {
             received_at: now,
             bytes,
             source,
+            gate_pending: false,
         });
         self.received_order.push_back(hash);
         self.received_bytes = self.received_bytes.saturating_add(bytes);
@@ -282,6 +291,7 @@ impl BlockStager {
                     received_at: drained.received_at,
                     bytes: drained.bytes,
                     source: drained.source,
+                    gate_pending: drained.gate_pending,
                 },
             );
             if let Some(previous) = previous {
@@ -305,6 +315,7 @@ impl BlockStager {
             received_at: entry.received_at,
             bytes: entry.bytes,
             source: entry.source,
+            gate_pending: entry.gate_pending,
         })
     }
 
@@ -396,6 +407,43 @@ impl BlockStager {
     /// they can never become expected, so they are dead inventory.
     pub fn discard(&mut self, hash: &Hash256) -> bool {
         self.remove(hash).is_some()
+    }
+
+    /// Flags a freshly staged body as still owing the unrequested-admission
+    /// clauses: it staged while the tree could not resolve its hash, so the
+    /// arrival gate's missing-header arm passed it without evaluating them.
+    pub fn set_gate_pending(&mut self, hash: &Hash256) {
+        if let Some(entry) = self.received.get_mut(hash) {
+            entry.gate_pending = true;
+        }
+    }
+
+    /// Staged bodies that arrived before their headers were tree-known and
+    /// have neither faced the admission clauses nor earned request evidence
+    /// since.
+    pub fn gate_pending_hashes(&self) -> impl Iterator<Item = Hash256> + '_ {
+        self.received
+            .iter()
+            .filter(|(_, entry)| entry.gate_pending)
+            .map(|(hash, _)| *hash)
+    }
+
+    /// Settles the owed gate: the clauses held against the resolved node, or
+    /// request evidence (a resolved owned fetch) exempted the body.
+    pub fn clear_gate_pending(&mut self, hash: &Hash256) {
+        if let Some(entry) = self.received.get_mut(hash) {
+            entry.gate_pending = false;
+        }
+    }
+
+    /// Free slots before the count budget forces an eviction; an insert that
+    /// finds none must not displace already-staged work for a delivery
+    /// nobody asked for.
+    #[must_use]
+    pub fn count_headroom(&self) -> usize {
+        self.budget
+            .max_received_blocks
+            .saturating_sub(self.received.len())
     }
 
     fn track_received_deadline(&mut self, received_at: Instant) {
