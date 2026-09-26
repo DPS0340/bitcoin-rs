@@ -633,6 +633,12 @@ fn rewind_applied_coins(
     tx_count_delta: u64,
     undo: &UndoBatch,
 ) -> Result<(), RollbackError> {
+    // Refuse mismatched stats before the UTXO mutation: a recovery that
+    // fails closed after undoing the block would retry against a partially
+    // rewound set.
+    coin_stats
+        .check_rewind(height, tx_count_delta)
+        .map_err(RollbackError::CoinStats)?;
     utxo.undo_block(undo).map_err(RollbackError::Utxo)?;
     coin_stats
         .rewind_block(height, parent_height, tx_count_delta)
@@ -958,16 +964,19 @@ mod tests {
         Ok(())
     }
 
+    /// Mismatched coinstats refuse the rollback before the undo runs: no
+    /// part of the connected set moves for a recovery that cannot commit.
     #[test]
-    fn coinstats_refusal_after_the_undo_is_fatal() -> TestResult {
+    fn coinstats_refusal_precedes_the_undo() -> TestResult {
         let (utxo, coin_stats, _, undo) = connected()?;
+        let connected_state = observe(&utxo, &coin_stats)?;
         let store = InMemoryUndoStore::default();
         let outcome = rollback_block(&store, &utxo, &coin_stats, HASH, HEIGHT + 1, 1, 2, &undo);
         assert!(
             matches!(outcome, Err(RollbackError::CoinStats(_))),
             "{outcome:?}"
         );
-        assert!(utxo.get_entry(&FUNDED).is_some(), "undo had already run");
+        assert_eq!(observe(&utxo, &coin_stats)?, connected_state);
         Ok(())
     }
 
