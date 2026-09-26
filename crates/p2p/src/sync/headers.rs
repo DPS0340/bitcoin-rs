@@ -286,15 +286,18 @@ impl BlockSync {
         {
             let tree = self.chain.block_tree();
             for (source, hash) in deferred {
+                // A stale source names a dead connection: its fetch died
+                // with it, so the mark must neither settle a staged body's
+                // gate nor mark it pending under the dead owner.
+                if !self.peer_table.is_current(source) {
+                    continue;
+                }
                 let height = tree
                     .lookup(hash)
                     .and_then(|id| tree.node(id).ok().map(|node| node.height));
                 match height {
                     Some(height) => resolved.push((source, hash, height)),
-                    None if self.peer_table.is_current(source) => {
-                        unresolved.push((source, hash));
-                    }
-                    None => {}
+                    None => unresolved.push((source, hash)),
                 }
             }
         }
