@@ -177,7 +177,7 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
             && let Ok(vout) = usize::try_from(vout_u32)
             && let Some(output) = entry.tx.outputs.get(vout)
         {
-            return txout_typed(ctx, output, 0, false);
+            return txout_typed(ctx, output, 0, false, ctx.chain.applied_hash());
         }
     }
 
@@ -185,15 +185,17 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
         // Spent or never existed: Core-spec returns JSON null.
         return Ok(Value::new_null());
     };
-    // Confirmations count back from the applied tip. The envelope's `bestblock`
-    // is the header tip, a distinct source Core reports deliberately.
-    let confirmations = ctx
-        .chain
-        .applied_view()
-        .height()
-        .saturating_sub(live.height)
-        .saturating_add(1);
-    txout_typed(ctx, &live.txout, confirmations, live.coinbase)
+    // Core: confirmations and `bestblock` both come from the chainstate tip
+    // (`coins_view->GetBestBlock`), so one captured view supplies both.
+    let view = ctx.chain.applied_view();
+    let confirmations = view.height().saturating_sub(live.height).saturating_add(1);
+    txout_typed(
+        ctx,
+        &live.txout,
+        confirmations,
+        live.coinbase,
+        view.hash(ctx.chain.chain_network),
+    )
 }
 
 fn txout_typed(
@@ -201,9 +203,10 @@ fn txout_typed(
     output: &TxOut,
     confirmations: u32,
     coinbase: bool,
+    best_block: Hash256,
 ) -> Result<Value, RpcError> {
     typed_to_sonic(&v31::GetTxOut {
-        best_block: ctx.chain.best_hash().to_string(),
+        best_block: best_block.to_string(),
         confirmations,
         value: sat_to_btc(output.value.to_sat()),
         script_pubkey: convert::script_pub_key_typed(

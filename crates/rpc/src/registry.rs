@@ -89,7 +89,7 @@ declare_rows! {
     "getblockcount", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getblockcount);
     "getblockhash", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getblockhash);
     "getbestblockhash", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getbestblockhash);
-    "getblock", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "Response is the pinned corepc v31 verbose contract; verbosity 3 serves the verbosity-2 shape (no prevout source).", "0.4.0", Some(chain::getblock);
+    "getblock", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Response is the pinned corepc v31 verbose contract; verbosity 3 serves the verbosity-2 shape because no prevout source exists — Core returns prevouts at verbosity 3 (crates/rpc/src/handlers/chain.rs).", "0.4.0", Some(chain::getblock);
     "getblockheader", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getblockheader);
     "getblockstats", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getblockstats);
     "verifychain", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::verifychain);
@@ -123,7 +123,7 @@ declare_rows! {
     "getdescriptorinfo", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(util::getdescriptorinfo);
     "deriveaddresses", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(util::deriveaddresses);
     "getnetworkinfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Core declares warnings as a string; this node emits an array. Tracked in #160.", "0.4.0", Some(network::getnetworkinfo);
-    "getpeerinfo", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "Pinned v31 shape; telemetry this node does not measure (byte counters, pingwait, addr relay stats) reports Core's zero-value defaults.", "0.4.0", Some(network::getpeerinfo);
+    "getpeerinfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Pinned v31 shape; telemetry this node does not measure (byte counters, pingwait, addr relay stats) reports Core's zero-value defaults rather than measured values (crates/rpc/src/handlers/network.rs).", "0.4.0", Some(network::getpeerinfo);
     "ping", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Answers immediately; Core schedules a P2P ping and reports the seen pong (crates/rpc/src/handlers/network.rs).", "0.4.0", Some(network::ping);
     "addnode", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(network::addnode);
     "disconnectnode", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(network::disconnectnode);

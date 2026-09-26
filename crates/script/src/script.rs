@@ -332,6 +332,31 @@ pub fn is_multisig(script: &[u8]) -> bool {
     iter.next().is_none()
 }
 
+/// Counts the pubkeys in a bare multisig script, or `None` if any push in it
+/// is not a serialized pubkey.
+///
+/// `is_multisig` checks the template shape only; this is the strictness Core's
+/// `Solver` applies on top, where each key push must be a compressed
+/// (33-byte) or uncompressed (65-byte) pubkey. `OP_1 <4 bytes> OP_1
+/// OP_CHECKMULTISIG` has the shape but no valid key, so it returns `None`.
+#[must_use]
+pub fn multisig_key_count(script: &[u8]) -> Option<u8> {
+    let mut count: u8 = 0;
+    for inst in instructions(script) {
+        match inst {
+            Ok(Instruction::PushBytes(bytes)) => {
+                if bytes.len() != 33 && bytes.len() != 65 {
+                    return None;
+                }
+                count = count.checked_add(1)?;
+            }
+            Ok(Instruction::Op(_)) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(count)
+}
+
 /// Returns the smallest non-dust value in satoshis for an output paying
 /// `script` under `dust_relay_fee_sat_per_kvb`.
 ///

@@ -16,7 +16,8 @@ use alloc::vec::Vec;
 use bitcoin::Address;
 use bitcoin_rs_primitives::{CompactTarget, Network, Tx, TxIn, TxOut, consensus_bytes};
 use bitcoin_rs_script::{
-    is_multisig, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, witness_program,
+    is_multisig, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, multisig_key_count,
+    witness_program,
 };
 use sonic_rs::{JsonValueMutTrait as _, JsonValueTrait as _, Value};
 
@@ -194,7 +195,9 @@ pub(crate) fn classify(script: &[u8]) -> ScriptShape {
     if is_p2pkh(script) {
         return ScriptShape::PubkeyHash;
     }
-    if is_multisig(script) {
+    // Core's Solver classifies multisig only when every key push is a
+    // serialized pubkey (33 or 65 bytes); `is_multisig` is the shape alone.
+    if is_multisig(script) && multisig_key_count(script).is_some() {
         return ScriptShape::Multisig;
     }
     ScriptShape::Nonstandard

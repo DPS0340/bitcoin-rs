@@ -445,8 +445,8 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     // The end check compares for exact equality only; a generation that
     // moved while the reads ran discards the assembled results and asks the
     // client to retry.
-    if entry_generation.is_some_and(|entry| ctx.mempool.stable_generation() != Some(entry)) {
-        return service_unavailable("chain generation is odd; retry");
+    if let Some(response) = end_generation_refusal(ctx, entry_generation) {
+        return response;
     }
     // Bitmap packs the least-significant hit bit first per byte, matching Core.
     for (index, hit) in hits.iter().enumerate() {
@@ -500,6 +500,18 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
             &serialize_getutxos_bin(active_height, active_hash, &bitmap, &outs),
         ),
         _ => format_not_found(available_formats()),
+    }
+}
+
+/// Second generation check after the fenced reads: a moved generation
+/// discards the assembled body and a missing one refuses too, but the two
+/// events carry distinct retry messages.
+fn end_generation_refusal(ctx: &Arc<Context>, entry_generation: Option<u64>) -> Option<Response> {
+    let entry = entry_generation?;
+    match ctx.mempool.stable_generation() {
+        None => Some(service_unavailable("chain generation is odd; retry")),
+        Some(now) if now != entry => Some(service_unavailable("chain generation moved; retry")),
+        Some(_) => None,
     }
 }
 
@@ -1974,7 +1986,8 @@ mod tests {
     }
 
     /// A generation that moves between the entry check and the end check
-    /// discards the assembled body and returns the same retry response.
+    /// discards the assembled body and returns the retry response naming the
+    /// move rather than a missing generation.
     #[test]
     fn getutxos_checkmempool_rejects_moved_generation() {
         let ctx = Arc::new(Context::new());
@@ -1983,7 +1996,7 @@ mod tests {
         arm_capture_hook(move || mover.mempool.force_chain_generation(6));
         let response = route(&ctx, CHECKMEMPOOL_JSON, "", true);
         assert_eq!(response.status, 503);
-        assert_eq!(response.body, b"chain generation is odd; retry".to_vec());
+        assert_eq!(response.body, b"chain generation moved; retry".to_vec());
     }
 
     /// The plain branch reads no mempool fact and deploymentinfo never reads
