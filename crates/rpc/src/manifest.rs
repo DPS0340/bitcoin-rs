@@ -13,7 +13,7 @@
 //! Row semantics:
 //! - `status`: [`Status::Supported`] is differentially verified against the
 //!   pinned reference and requires `reference.differential_harness` in
-//!   `docs/api/core-compat.toml`; [`Status::Deviation`] ships with a
+//!   `crates/rpc/core-compat.toml`; [`Status::Deviation`] ships with a
 //!   recorded difference (the `notes` field cites the source file carrying
 //!   it); [`Status::ImplementedUnverified`] ships without a comparison
 //!   against the pinned reference; [`Status::Extension`] has no Core
@@ -121,7 +121,7 @@ impl Status {
     pub const fn legend(self) -> &'static str {
         match self {
             Self::Supported => {
-                "differentially verified against the pinned Bitcoin Core reference; requires `reference.differential_harness` in `docs/api/core-compat.toml`."
+                "differentially verified against the pinned Bitcoin Core reference; requires `reference.differential_harness` in `crates/rpc/core-compat.toml`."
             }
             Self::Deviation => {
                 "shipped with a recorded difference from Core; notes cite the source file."
