@@ -947,17 +947,19 @@ impl BlockSync {
     ///   state, not the tree, owns the connection's chain — and a wire
     ///   batch on a below-floor fork opens one. A body-carried batch
     ///   (`wire_response = false`) never opens or feeds the state: below
-    ///   the work floor it returns `None`, retiring to retry once the
-    ///   wire sync commits it; at or above the floor it takes direct
-    ///   admission. Otherwise return `Some` with the admission outcome
-    ///   when the batch may be admitted directly — an empty batch, a
-    ///   source-less delivery, an unknown fork, or a fork already at the
-    ///   network minimum — or when the committed phase released headers;
-    ///   and `None` when the sync state retained the batch, in which case
-    ///   this call already retired the answered request, sent the
-    ///   state-cursor continuation, or ran the fault path.
-    /// INVARIANT: a batch below the work threshold reaches
-    ///   [`SyncChain::admit_headers`] only as
+    ///   the work floor, a valid one-header batch returns `None` and retries
+    ///   after the wire sync commits it; invalid body-carried headers and
+    ///   batches at or above the floor take direct admission. Otherwise
+    ///   return `Some` with the admission outcome when the batch may be
+    ///   admitted directly — an empty batch, source-less delivery, unknown
+    ///   fork, or fork already at the network minimum — or when the
+    ///   committed phase released headers; and `None` when the sync state
+    ///   retained the batch, in which case this call already retired the
+    ///   answered request, sent the state-cursor continuation, or ran the
+    ///   fault path.
+    /// INVARIANT: a body-carried header is deferred below the work floor
+    ///   only after standalone `PoW` and contextual validation pass; wire
+    ///   batches reach admission below the floor only as
     ///   [`super::headers_presync::HeaderSyncResult::ready_headers`], and
     ///   only a wire `headers` message mutates `headers_sync`.
     pub(super) fn route_headers_batch(
@@ -992,10 +994,12 @@ impl BlockSync {
         // commits it; at or above the floor, direct admission applies as
         // to any batch.
         if !wire_response {
-            if self.presync_anchor(headers).is_some() {
-                return None;
+            if self.presync_anchor(headers).is_none()
+                || self.body_carried_header_needs_admission(headers)
+            {
+                return Some(self.chain.admit_headers(headers));
             }
-            return Some(self.chain.admit_headers(headers));
+            return None;
         }
         let outcome = {
             // Page validation runs without the scheduler lock: hashing a
@@ -1082,6 +1086,37 @@ impl BlockSync {
             return Some(admission);
         }
         None
+    }
+    /// Checks a body-carried header before deferring it below the work floor.
+    ///
+    /// PRE: `headers` is a body-carried batch whose parent was anchored by
+    ///   [`Self::presync_anchor`].
+    /// POST: return `true` when the batch is not one header, its parent is
+    ///   no longer known, or its header fails proof-of-work or contextual
+    ///   checks against that parent.
+    /// INVARIANT: the block-tree read guard is released before the caller
+    ///   enters ordinary admission.
+    fn body_carried_header_needs_admission(&self, headers: &[Header]) -> bool {
+        let [header] = headers else {
+            return true;
+        };
+        let tree = self.chain.block_tree();
+        let Some(parent_id) = tree.lookup(Hash256::from(header.prev_blockhash)) else {
+            return true;
+        };
+        let network = self.chain.network();
+        let hash = Hash256::from(header.compute_hash());
+        validate_pow(header, hash, network)
+            .and_then(|()| {
+                bitcoin_rs_chain::validate_contextual_header(
+                    &tree,
+                    parent_id,
+                    header,
+                    network,
+                    bitcoin_rs_chain::current_unix_seconds(),
+                )
+            })
+            .is_err()
     }
 
     /// Feeds one batch to one connection's sync state.

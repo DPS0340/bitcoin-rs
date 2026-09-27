@@ -858,3 +858,102 @@ fn unsolicited_presync_continuation_keeps_another_peers_pending_request()
     );
     Ok(())
 }
+
+fn assert_invalid_body_header_is_discarded(
+    block: Block,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let floor = ChainWork::from(u64::MAX);
+    let (_genesis, sync, _inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, _rx) = connect(&peers, port, 100_000);
+    let source = current_source(&peers, addr);
+    let hash = Hash256::from(block.block_hash());
+    let mut batch = vec![crate::InboundBlock::from_decoded(block)];
+    batch[0].source = Some(source);
+    assert_eq!(sync.buffer_received_block_chunk(&mut batch, None), 1);
+    assert!(
+        sync.scheduler.lock().stager.contains(&hash),
+        "the unresolved body must stage before its carried header is retried"
+    );
+
+    sync.drain_inbound_blocks();
+
+    assert!(
+        !sync.scheduler.lock().stager.contains(&hash),
+        "an inadmissible carried header must release its staged body"
+    );
+    assert!(
+        !peers.is_connected(addr),
+        "a permanent header fault must disconnect the delivering peer"
+    );
+    assert_eq!(
+        tree_node_count(&sync),
+        1,
+        "the invalid header must not be admitted"
+    );
+    Ok(())
+}
+
+#[test]
+fn body_carried_low_work_bad_pow_is_discarded_and_faults_peer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block().header;
+    let mut block =
+        mined_block_with_prev_hash(genesis.compute_hash(), 1, vec![coinbase_transaction(1)]);
+    while pow_met(
+        block.header.bits.to_consensus(),
+        Hash256::from(block.block_hash()),
+    ) {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+
+    assert_invalid_body_header_is_discarded(block, 9711)
+}
+
+#[test]
+fn body_carried_low_work_bad_nbits_is_discarded_and_faults_peer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block().header;
+    let mut block =
+        mined_block_with_prev_hash(genesis.compute_hash(), 1, vec![coinbase_transaction(2)]);
+    block.header.bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x207f_fffe);
+    while !pow_met(
+        block.header.bits.to_consensus(),
+        Hash256::from(block.block_hash()),
+    ) {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+
+    assert_invalid_body_header_is_discarded(block, 9712)
+}
+
+#[test]
+fn body_carried_low_work_valid_header_stays_deferred() -> Result<(), Box<dyn std::error::Error>> {
+    let floor = ChainWork::from(u64::MAX);
+    let (_genesis, sync, _inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, _rx) = connect(&peers, 9713, 100_000);
+    let source = current_source(&peers, addr);
+    let genesis = Network::Regtest.genesis_block();
+    let block = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(3)]);
+    let hash = Hash256::from(block.block_hash());
+    let mut batch = vec![crate::InboundBlock::from_decoded(block)];
+    batch[0].source = Some(source);
+    assert_eq!(sync.buffer_received_block_chunk(&mut batch, None), 1);
+
+    sync.drain_inbound_blocks();
+
+    assert!(
+        sync.scheduler.lock().stager.contains(&hash),
+        "a valid below-floor body must wait for the wire presync admission"
+    );
+    assert!(
+        peers.is_connected(addr),
+        "valid carried headers do not fault the peer"
+    );
+    assert_eq!(
+        tree_node_count(&sync),
+        1,
+        "the low-work header remains unadmitted"
+    );
+    Ok(())
+}
