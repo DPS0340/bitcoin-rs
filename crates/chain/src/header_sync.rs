@@ -496,8 +496,9 @@ pub fn permitted_difficulty_transition(
 ///
 /// `decode_compact` mirrors Bitcoin Core's `arith_uint256::SetCompact`: the
 /// sign bit is masked out of the mantissa, the magnitude is decoded, and
-/// the sign is reported separately (`negative`, like Core's `pfNegative`,
-/// with `pfOverflow` for size overflow). `compact_to_target` then diverges
+/// the sign is reported separately (`negative`, like Core's `pfNegative`);
+/// a shift past 256 bits folds the decoded magnitude into `ChainWork::ZERO`
+/// rather than surfacing Core's `pfOverflow`. `compact_to_target` then diverges
 /// deliberately: Core's consensus check rejects the flagged encoding,
 /// while this crate maps a signed encoding to `ChainWork::ZERO` — both
 /// reject the header in practice. `target_to_compact` covers `GetCompact`

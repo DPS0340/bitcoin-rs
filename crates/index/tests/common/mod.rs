@@ -185,6 +185,13 @@ pub(crate) fn put_funding_row_positions(
     height: u32,
     positions: &[TxPosition],
 ) -> Result<(), StorageError> {
+    // An empty slice encodes an empty value — indistinguishable from
+    // `put_funding_row`'s scan-path marker, so the positioned read would
+    // silently not be exercised.
+    assert!(
+        !positions.is_empty(),
+        "a funding row exists only because at least one transaction produced it"
+    );
     store.put(
         ColumnFamily::Funding,
         &ScriptHashRow::row(scripthash, height).to_db_row(),

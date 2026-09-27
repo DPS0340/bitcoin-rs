@@ -20,7 +20,6 @@ use bitcoin_rs_primitives::{
 pub(crate) const SEED_BASE_TIME: u32 = 1_296_688_603;
 /// Seconds between seed blocks; Core's regtest spacing.
 pub(crate) const SEED_BLOCK_INTERVAL: u32 = 600;
-/// The never-retargeting regtest minimum target.
 /// Immature coinbase subsidy on regtest.
 pub(crate) const REGTEST_SUBSIDY_SATS: u64 = 50 * 100_000_000;
 

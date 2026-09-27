@@ -11,7 +11,7 @@
 //! INVARIANT: a returned block is accepted by `validate_pow` and its header
 //! merkle root equals `merkle_root(&block.txs)`.
 
-use bitcoin_rs_consensus::compute_merkle_root;
+use bitcoin_rs_consensus::{block_subsidy, compute_merkle_root};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
     Sequence, Tx, TxIn, TxOut, Txid, Witness,
@@ -87,7 +87,9 @@ pub fn script_num_push(value: i64) -> Vec<u8> {
 /// POST: the coinbase spends the null outpoint, carries `script_num_push(height)`
 /// followed by an `OP_0` extranonce byte in its scriptSig (consensus requires
 /// 2..=100 scriptSig bytes, and the height push alone is one byte for heights
-/// 1..=16), and pays 1 sat to an empty script.
+/// 1..=16), and pays the regtest block subsidy at `height` to an empty
+/// script — the subsidy, not a fixed amount, so fixtures stay valid once a
+/// halving (every 150 blocks) pulls it under one satoshi.
 #[must_use]
 pub fn coinbase(height: u32) -> Tx {
     let mut script_sig = script_num_push(i64::from(height));
@@ -102,7 +104,10 @@ pub fn coinbase(height: u32) -> Tx {
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
-            value: Amount::from_sat(1),
+            value: Amount::from_sat(block_subsidy(
+                height,
+                Network::Regtest.subsidy_halving_interval(),
+            )),
             script_pubkey: Script::new(),
         }],
     }

@@ -387,6 +387,10 @@ fn candidate_solves_an_unsolved_regtest_header() -> Result<(), Box<dyn Error>> {
     solve_block(&mut solved, 1_000_000)?;
     assert_eq!(solved.txs.len(), 1);
     assert_eq!(solved.header.prev_blockhash.0, context.previous_block_hash);
+    assert!(
+        bitcoin_rs_chain::compact_is_met_by(solved.header.bits, Hash256::from(solved.block_hash())),
+        "solve_block must return a header whose hash meets its compact target"
+    );
     Ok(())
 }
 

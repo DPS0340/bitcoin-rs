@@ -12,7 +12,7 @@ the coinbase (subsidy plus actual fees) and, when `SegWit` is active, attaches t
 witness commitment through consensus `compute_merkle_root` (the same AVX2/spine
 fold block rules use).
 [`into_unsolved_block`](crate::Candidate::into_unsolved_block) turns that candidate
-into a header with a zero nonce, and [`solve_block`](crate::solve_block) searches
+into a block whose header has a zero nonce, and [`solve_block`](crate::solve_block) searches
 nonces until the header meets its compact target. Failures surface as
 [`MiningError`](crate::MiningError).
 

@@ -397,7 +397,3 @@ fn corrupt_head_rows_fail_startup_fail_closed() -> Result<()> {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Regtest miner, mirroring the crash-recovery fixtures.
-// ---------------------------------------------------------------------------

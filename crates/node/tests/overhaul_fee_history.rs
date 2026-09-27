@@ -45,7 +45,6 @@ use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 const BASE_TIME: u32 = 1_296_688_603;
 /// Seconds between fixture blocks; also spaces admission timestamps.
 const BLOCK_INTERVAL: u32 = 600;
-/// Regtest difficulty: one hash attempt meets it.
 /// Regtest block subsidy paid to every fixture coinbase.
 const REGTEST_SUBSIDY_SATS: u64 = 50 * 100_000_000;
 /// Input value of every funded fixture parent.

@@ -65,6 +65,36 @@ fn mined_child_merkle_root_binds() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn mined_block_merkle_root_binds_over_an_odd_tx_count() -> Result<(), Box<dyn std::error::Error>> {
+    // Three transactions exercise the odd-leaf duplication both merkle folds
+    // implement — the case where implementations diverge.
+    let coinbase = regtest_fixture::coinbase(3);
+    let mut tx2 = coinbase.clone();
+    tx2.lock_time = bitcoin_rs_primitives::LockTime::from_consensus(1);
+    let mut tx3 = coinbase.clone();
+    tx3.lock_time = bitcoin_rs_primitives::LockTime::from_consensus(2);
+    let block =
+        regtest_fixture::mined_block_with_prev_hash(genesis_parent(), 3, vec![coinbase, tx2, tx3])?;
+    assert_eq!(
+        Some(block.header.merkle_root),
+        regtest_fixture::merkle_root(&block.txs),
+        "the header merkle root must equal the fixture fold over the block's transactions"
+    );
+    let txids = block
+        .txs
+        .iter()
+        .map(|tx| bitcoin::Txid::from_byte_array(*tx.txid().as_bytes()));
+    let root =
+        bitcoin::merkle_tree::calculate_root(txids).ok_or("fixture block has transactions")?;
+    assert_eq!(
+        block.header.merkle_root,
+        Hash256::from_le_bytes(root.as_byte_array()),
+        "the fixture fold must agree with the bitcoin crate's merkle computation on an odd leaf count"
+    );
+    Ok(())
+}
+
+#[test]
 fn grind_is_deterministic() -> Result<(), Box<dyn std::error::Error>> {
     let first = regtest_fixture::mined_regtest_child_at(genesis_parent(), 3)?;
     let second = regtest_fixture::mined_regtest_child_at(genesis_parent(), 3)?;

@@ -263,7 +263,7 @@ The format-5 height suffix is big-endian, so store iteration order already
 is numeric height order within one 8-byte prefix. The high-level resolvers
 (`resolve_script_history`, `resolve_unspent_outputs_with_height`) return
 entries sorted by numeric height. The raw `iter_funding_rows`,
-`iter_spending_rows`, and `iter_txid_rows` functions return rows in store
+`iter_spending_rows`, and `iter_txid_rows_with_values` functions return rows in store
 order, so callers get chronological order without sorting.
 
 #### Q4: Per-CF cost table (fixture-scale)

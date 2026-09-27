@@ -31,4 +31,14 @@ fn oracle_accepts_genesis_and_rejects_a_far_hash() {
         !pow_is_met(genesis.header.bits, &far_hash),
         "an all-ones hash must exceed the regtest target"
     );
+    // Byte order is the oracle's load-bearing detail: a hash encoding 2^255
+    // in little-endian bytes exceeds the regtest target, while the same
+    // bytes read big-endian are 128 — far below it.
+    let mut le_bytes = [0_u8; 32];
+    le_bytes[31] = 0x80;
+    let le_2_pow_255 = BlockHash(bitcoin_rs_primitives::Hash256::from_le_bytes(&le_bytes));
+    assert!(
+        !pow_is_met(genesis.header.bits, &le_2_pow_255),
+        "a hash encoding 2^255 little-endian must exceed the regtest target"
+    );
 }

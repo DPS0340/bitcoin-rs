@@ -353,12 +353,6 @@ fn a_substituted_redownload_header_disconnects_the_connection()
         chain[commitment_index - 2].compute_hash(),
         commitment_height,
     );
-    // The fixture header mines `version: 4` at the declared regtest target;
-    // the substitution loop below regrinds only the nonce, so the rogue
-    // header keeps a version and target the admission rules accept.
-    let mut merkle = [0_u8; 32];
-    merkle[..4].copy_from_slice(&commitment_height.to_le_bytes());
-    rogue.merkle_root = Hash256::from_le_bytes(&merkle);
     let original_bit = with_sync_state(&sync, source, |state| {
         state.commitment_bit(Hash256::from(original_hash))
     })

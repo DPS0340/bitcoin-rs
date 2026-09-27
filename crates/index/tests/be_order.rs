@@ -23,6 +23,11 @@ use common::{MemoryStore, put_funding_row, put_funding_row_positions, put_spendi
 /// A block source backed by a simple map, serving multiple heights.
 struct MultiHeightSource {
     blocks: hashbrown::HashMap<u32, Block>,
+    /// Optional override for the sliced-read channel. When a height has an
+    /// entry, `block_bytes_at_height` serves these bytes instead of the
+    /// `blocks` encoding — a test can then distinguish the positioned path
+    /// (sliced reads) from the scan fallback (whole blocks).
+    byte_blocks: hashbrown::HashMap<u32, Vec<u8>>,
 }
 
 impl BlockSource for MultiHeightSource {
@@ -31,10 +36,13 @@ impl BlockSource for MultiHeightSource {
     }
 
     fn block_bytes_at_height(&self, height: u32, offset: u32, len: u32) -> Option<Vec<u8>> {
-        let block = self.block_at_height(height)?;
-        let bytes = consensus_bytes(&block);
         let start = usize::try_from(offset).ok()?;
         let end = start.checked_add(usize::try_from(len).ok()?)?;
+        if let Some(bytes) = self.byte_blocks.get(&height) {
+            return bytes.get(start..end).map(<[u8]>::to_vec);
+        }
+        let block = self.block_at_height(height)?;
+        let bytes = consensus_bytes(&block);
         bytes.get(start..end).map(<[u8]>::to_vec)
     }
 }
@@ -153,6 +161,7 @@ fn be_key_order_matches_numeric_and_history_sorts_by_height()
     let txid_at_256 = block_at_256.txs[0].txid();
     let source = MultiHeightSource {
         blocks: [(1, block_at_1), (256, block_at_256)].into_iter().collect(),
+        byte_blocks: hashbrown::HashMap::new(),
     };
     let entries = indexer.resolve_script_history(scripthash, &source)?;
 
@@ -192,6 +201,7 @@ fn unspent_outputs_with_height_sorts_by_numeric_height() -> Result<(), Box<dyn s
 
     let source = MultiHeightSource {
         blocks: [(1, block_at_1), (256, block_at_256)].into_iter().collect(),
+        byte_blocks: hashbrown::HashMap::new(),
     };
 
     let outputs = indexer.resolve_unspent_outputs_with_height(scripthash, &source)?;
@@ -206,27 +216,40 @@ fn unspent_outputs_with_height_sorts_by_numeric_height() -> Result<(), Box<dyn s
 }
 
 /// Spending rows share the same BE height order as funding rows.
-/// The scan oracle and the fast positioned resolver agree on entries and
-/// order.
+/// The positioned resolver reads through `block_bytes_at_height`, which here
+/// serves a different transaction per height than the whole-block channel
+/// feeding the oracle and the scan fallback — so the positioned path is
+/// load-bearing: a silent fallback surfaces the oracle's txids and fails.
 #[test]
 fn history_scan_oracle_agrees_with_positioned_resolver() -> Result<(), Box<dyn std::error::Error>> {
     let script = vec![0x51, 0x02];
     let scripthash = ScriptHash::from_script_bytes(&script);
     let store = Arc::new(MemoryStore::default());
 
-    let block_at_1 = Block {
+    // Whole-block channel: scanned by the oracle and by the fallback.
+    let scan_block_at_1 = Block {
         header: header(),
         txs: vec![tx_with_script(spent_outpoint(3, 0), script.clone())],
     };
-    let block_at_256 = Block {
+    let scan_block_at_256 = Block {
         header: header(),
-        txs: vec![tx_with_script(spent_outpoint(4, 0), script)],
+        txs: vec![tx_with_script(spent_outpoint(4, 0), script.clone())],
+    };
+    // Sliced-read channel: different transactions funding the same script.
+    let byte_block_at_1 = Block {
+        header: header(),
+        txs: vec![tx_with_script(spent_outpoint(8, 0), script.clone())],
+    };
+    let byte_block_at_256 = Block {
+        header: header(),
+        txs: vec![tx_with_script(spent_outpoint(9, 0), script)],
     };
 
-    // Rows carry each block's single transaction position — offset past the
-    // 80-byte header and the compact-size count — so `resolve_script_history`
-    // takes its sliced-read path rather than the scan fallback.
-    for (height, block) in [(1_u32, &block_at_1), (256, &block_at_256)] {
+    // Rows carry each byte block's single transaction position — offset
+    // past the 80-byte header and the compact-size count — so
+    // `resolve_script_history` takes its sliced-read path rather than the
+    // scan fallback.
+    for (height, block) in [(1_u32, &byte_block_at_1), (256, &byte_block_at_256)] {
         let offset = 80_usize + varint::encode(u64::try_from(block.txs.len())?).len();
         let position = TxPosition::new(
             u32::try_from(offset)?,
@@ -236,18 +259,45 @@ fn history_scan_oracle_agrees_with_positioned_resolver() -> Result<(), Box<dyn s
     }
     let indexer = Indexer::new(store);
 
+    let positioned_txid_at_1 = byte_block_at_1.txs[0].txid();
+    let positioned_txid_at_256 = byte_block_at_256.txs[0].txid();
     let source = MultiHeightSource {
-        blocks: [(1, block_at_1), (256, block_at_256)].into_iter().collect(),
+        blocks: [(1, scan_block_at_1), (256, scan_block_at_256)]
+            .into_iter()
+            .collect(),
+        byte_blocks: [
+            (1, consensus_bytes(&byte_block_at_1)),
+            (256, consensus_bytes(&byte_block_at_256)),
+        ]
+        .into_iter()
+        .collect(),
     };
 
     let fast = indexer.resolve_script_history(scripthash, &source)?;
     let scan = scan_script_history(&indexer, scripthash, &source)?;
 
-    assert_eq!(fast, scan, "fast and scan resolvers must agree on order");
     assert_eq!(
         fast.iter().map(|e| e.height).collect::<Vec<_>>(),
         vec![1, 256],
-        "both resolvers sort by numeric height"
+        "the positioned resolver sorts by numeric height"
+    );
+    assert_eq!(
+        scan.iter().map(|e| e.height).collect::<Vec<_>>(),
+        vec![1, 256],
+        "the scan oracle sorts by numeric height"
+    );
+    // The sliced read must surface the byte-served transactions; equal
+    // txids between `fast` and `scan` mean the resolver silently fell back
+    // to the whole-block channel.
+    assert_eq!(
+        fast.iter().map(|e| e.txid).collect::<Vec<_>>(),
+        vec![positioned_txid_at_1, positioned_txid_at_256],
+        "the positioned resolver must return the byte-served txids"
+    );
+    assert_ne!(
+        fast, scan,
+        "channels serve different transactions, so fast == scan would mean \
+         the positioned path silently fell back to a scan"
     );
     Ok(())
 }
