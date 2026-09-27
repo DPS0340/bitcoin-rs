@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{BlockBodySource, BlockTreeReader, TipReader, TipSnapshot, softfork_state};
+use bitcoin_rs_chain::{
+    BlockBodySource, BlockTreeReader, LatchReader, TipReader, TipSnapshot, softfork_state,
+};
 use bitcoin_rs_mempool::{
     AdmissionChain, ChainAdmissionSnapshot, Mempool, MempoolGateway, MempoolLimits,
     MempoolObserver, MutationResult, PrevoutMeta,
@@ -245,6 +247,10 @@ pub struct ChainHandles {
     /// Process-wide initial-block-download latch over the applied chain,
     /// shared with P2P so both surfaces answer identically.
     pub ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
+    /// Chain-mutation admission latch: the same fact
+    /// `Chainstate::is_closed_for_recovery` publishes, exposed read-only and
+    /// kept separate from [`Self::ibd`] by that fact's invariant.
+    pub closed_for_recovery: LatchReader,
     /// Applied block metadata log.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Transactions retained for direct RPC lookup.
@@ -470,6 +476,9 @@ impl Default for ChainHandles {
             chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
             applied_tip: TipReader::new(applied_tip),
             ibd,
+            closed_for_recovery: LatchReader::new(Arc::new(core::sync::atomic::AtomicBool::new(
+                false,
+            ))),
             blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::new(utxo),

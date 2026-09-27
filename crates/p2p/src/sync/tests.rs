@@ -535,6 +535,35 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate()
             "a body-forwarded batch is not an answer: the gate stays with `a`",
         );
 
+        // Strictly short of the deadline the request keeps the gate: expiry
+        // is a boundary, not a window. The margin is a millisecond because
+        // the tick reads the wall clock — a nanosecond would be swallowed
+        // by scheduling latency.
+        let almost = Instant::now()
+            .checked_sub(super::HEADER_REQUEST_TIMEOUT.saturating_sub(Duration::from_millis(1)))
+            .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
+        sync.scheduler
+            .lock()
+            .header_request
+            .as_mut()
+            .ok_or("the request must still be registered")?
+            .requested_at = almost;
+        sync.tick();
+        assert!(
+            sync.scheduler
+                .lock()
+                .header_request
+                .is_some_and(|request| request.source == a_source && request.requested_at == almost),
+            "a request short of its deadline keeps its owner and stamp",
+        );
+        assert!(
+            !a_rx
+                .try_iter()
+                .chain(b_rx.try_iter())
+                .any(|message| matches!(message, Message::GetHeaders(_))),
+            "no header request re-issues before the deadline",
+        );
+
         let backdated = Instant::now()
             .checked_sub(super::HEADER_REQUEST_TIMEOUT)
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
@@ -2493,9 +2522,9 @@ fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error:
     no_service_info.services = WITNESS;
     let no_service_rx = connect_peer(&peers, no_service_info.clone());
     let no_service = current_source(&peers, no_service_addr);
-    let no_service_usable = UsablePeer {
-        source: no_service,
-        info: no_service_info,
+    let usable_of = |source, info| UsablePeer {
+        source,
+        info,
         demonstrated_tips: Vec::new(),
         active_height: None,
         headers_horizon: None,
@@ -2503,17 +2532,9 @@ fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error:
         manual: false,
         connected_at: Instant::now(),
     };
+    let no_service_usable = usable_of(no_service, no_service_info);
     let limited = current_source(&peers, limited_addr);
-    let usable = UsablePeer {
-        source: limited,
-        info: limited_info,
-        demonstrated_tips: Vec::new(),
-        active_height: None,
-        headers_horizon: None,
-        role: crate::peer_info::PeerRole::FullRelay,
-        manual: false,
-        connected_at: Instant::now(),
-    };
+    let usable = usable_of(limited, limited_info);
     let frontier = |height, hash, usable_peer| SyncFrontier {
         chain: ChainFrontier {
             applied_tip: None,

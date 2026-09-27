@@ -644,10 +644,7 @@ impl SyncFixture {
             Arc::clone(&block_tree),
         )
         .capturing(capture_rawtx, capture_block_bytes);
-        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-            bitcoin_rs_chain::TipReader::new(Arc::clone(&applied_tip)),
-            bitcoin_rs_chain::BlockTreeReader::new(Arc::clone(&block_tree)),
-        ));
+        let ibd = handles.ibd_latch();
         let sync = bitcoin_rs_node::sync::block_sync(
             Arc::new(handles),
             followers,

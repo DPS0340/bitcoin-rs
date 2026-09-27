@@ -11,7 +11,7 @@ use bitcoin::blockdata::block::Block as RegistryBlock;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock};
-use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader, ChainWork};
+use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader, ChainWork, TipReader};
 use bitcoin_rs_primitives::layout::{ParsedBlock, ParsedTransaction};
 use bitcoin_rs_primitives::{BlockHash, Hash256, Header, Network};
 #[cfg(test)]
@@ -35,6 +35,7 @@ const MAX_BLOCKTXN_DEPTH: u32 = 10;
 #[derive(Clone)]
 pub struct ActiveChainQuery {
     block_tree: BlockTreeReader,
+    applied_tip: TipReader,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
     network: Network,
 }
@@ -43,14 +44,17 @@ impl ActiveChainQuery {
     /// Builds a P2P chain query view over shared active-chain state of one
     /// network.
     ///
-    /// PRE: `block_tree` holds only headers of `network`.
+    /// PRE: `block_tree` holds only headers of `network`, and `applied_tip`
+    ///   publishes the chain owner's fully-applied tip.
     /// POST: returns the view; serving queries refuse below the network's
-    ///   minimum chain work.
+    ///   minimum chain work, and tip-age reads (`best_block_time`) report
+    ///   the applied tip, never a fresher-but-unapplied header.
     /// INVARIANT: the view's network never changes after construction.
     #[must_use]
-    pub fn new(block_tree: BlockTreeReader, network: Network) -> Self {
+    pub fn new(block_tree: BlockTreeReader, applied_tip: TipReader, network: Network) -> Self {
         Self {
             block_tree,
+            applied_tip,
             block_body_source: None,
             network,
         }
@@ -203,11 +207,14 @@ impl ChainQuery for ActiveChainQuery {
         headers
     }
 
-    /// The active tip's header time, read from the same tree the serving
-    /// paths use.
+    /// The applied tip's header time. Limited-peer admission derives the
+    /// local depth from it, so it must read the fully-applied tip the
+    /// download policy serves, not the header tip: fresh-but-unapplied
+    /// headers would make a lagging node look current and admit
+    /// `NODE_NETWORK_LIMITED` peers it cannot download bodies from.
     fn best_block_time(&self) -> Option<u32> {
+        let tip = self.applied_tip.load_full()?;
         let tree = self.block_tree.read();
-        let tip = tree.tip()?;
         tree.node(tip.tip_id).ok().map(|node| node.header.time)
     }
 
@@ -554,10 +561,7 @@ mod tests {
         let active1_id = tree.insert_node(Some(genesis_id), active1, NodeStatus::Active)?;
         tree.insert_node(Some(active1_id), active2, NodeStatus::Active)?;
         tree.insert_node(Some(genesis_id), fork1, NodeStatus::Stale)?;
-        let query = ActiveChainQuery::new(
-            BlockTreeReader::new(Arc::new(RwLock::new(tree))),
-            Network::Regtest,
-        );
+        let query = query_over(tree, Network::Regtest);
 
         let response = query.headers_after(&[fork1.compute_hash()], BlockHash::default(), 10);
 
@@ -591,10 +595,7 @@ mod tests {
         };
         // Mainnet's floor is far above three regtest-easy headers: the
         // serving path must go quiet below it.
-        let mainnet = ActiveChainQuery::new(
-            BlockTreeReader::new(Arc::new(RwLock::new(low_work_tree()?))),
-            Network::Mainnet,
-        );
+        let mainnet = query_over(low_work_tree()?, Network::Mainnet);
         assert!(
             mainnet
                 .headers_after(&[genesis.compute_hash()], BlockHash::default(), 10)
@@ -608,10 +609,7 @@ mod tests {
             "the empty-locator stop-hash path must refuse too"
         );
 
-        let regtest = ActiveChainQuery::new(
-            BlockTreeReader::new(Arc::new(RwLock::new(low_work_tree()?))),
-            Network::Regtest,
-        );
+        let regtest = query_over(low_work_tree()?, Network::Regtest);
         assert_eq!(
             header_hashes(&regtest.headers_after(
                 &[genesis.compute_hash()],
@@ -839,11 +837,17 @@ mod tests {
             let mut tree = BlockTree::new();
             tree.insert_node(None, header, NodeStatus::Active)?;
             let tree = Arc::new(RwLock::new(tree));
-            let query = ActiveChainQuery::new(BlockTreeReader::new(tree.clone()), Network::Regtest)
-                .with_block_body_source(Arc::new(SwitchingSource {
-                    tree,
-                    body: consensus_bytes(&block),
-                }));
+            let applied_tip = TipReader::new(Arc::new(arc_swap::ArcSwapOption::empty()));
+            applied_tip.store(tree.read().tip());
+            let query = ActiveChainQuery::new(
+                BlockTreeReader::new(tree.clone()),
+                applied_tip,
+                Network::Regtest,
+            )
+            .with_block_body_source(Arc::new(SwitchingSource {
+                tree,
+                body: consensus_bytes(&block),
+            }));
             let outcome = query.serve_inventory_blocks(&[item], None, &|| true, &mut |_| {
                 panic!("stale body cannot serve")
             })?;
@@ -1531,16 +1535,22 @@ mod tests {
         }
     }
 
+    /// A query over `tree` whose applied tip publishes the tree tip:
+    /// fixture trees mark every node `Active`, so the two tips coincide.
+    fn query_over(tree: BlockTree, network: Network) -> ActiveChainQuery {
+        let block_tree = BlockTreeReader::new(Arc::new(RwLock::new(tree)));
+        let applied_tip = TipReader::new(Arc::new(arc_swap::ArcSwapOption::empty()));
+        applied_tip.store(block_tree.read().tip());
+        ActiveChainQuery::new(block_tree, applied_tip, network)
+    }
+
     fn query_with(headers: Vec<Header>) -> Result<ActiveChainQuery, bitcoin_rs_chain::ChainError> {
         let mut tree = BlockTree::new();
         let mut parent = None;
         for header in headers {
             parent = Some(tree.insert_node(parent, header, NodeStatus::Active)?);
         }
-        Ok(ActiveChainQuery::new(
-            BlockTreeReader::new(Arc::new(RwLock::new(tree))),
-            Network::Regtest,
-        ))
+        Ok(query_over(tree, Network::Regtest))
     }
 
     fn seed_headers(count: u32) -> Vec<Header> {

@@ -647,6 +647,7 @@ fn mining_handler(state: &NodeState) -> Handler {
             block_tree: state.chainstate().block_tree_handle(),
             chain_network: state.config().network,
             chain_transition: state.chainstate().read_fence(),
+            closed_for_recovery: state.chainstate().closed_for_recovery_reader(),
             ..ChainHandles::default()
         },
         mempool: MempoolHandles {

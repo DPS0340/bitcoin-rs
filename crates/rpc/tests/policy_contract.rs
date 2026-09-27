@@ -1636,6 +1636,7 @@ fn invalidation_handler(state: &NodeState) -> Handler {
             coin_stats: chainstate.coin_stats_handle(),
             block_tree: chainstate.block_tree_handle(),
             chain_network: Network::Regtest,
+            closed_for_recovery: chainstate.closed_for_recovery_reader(),
             chain_transition: chainstate.read_fence(),
             chain_control: Some(Arc::new(NodeInvalidator {
                 handles: chainstate,

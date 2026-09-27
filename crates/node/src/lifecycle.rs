@@ -81,6 +81,7 @@ fn bind_rpc(
             chain_transition: chainstate.read_fence(),
             block_body_source: Some(block_body_source),
             prune_service: state.prune_service(),
+            closed_for_recovery: chainstate.closed_for_recovery_reader(),
             chain_control: Some(Arc::new(RpcChainControl {
                 handles: chainstate,
                 followers: state.chain_followers(),
@@ -487,6 +488,7 @@ pub(crate) fn start_node(
     let p2p_chain_query: Arc<dyn bitcoin_rs_p2p::ChainQuery> = Arc::new(
         bitcoin_rs_p2p::ActiveChainQuery::new(
             chainstate.block_tree_reader(),
+            chainstate.applied_tip_reader(),
             state.config().network,
         )
         .with_block_body_source(Arc::clone(&block_body_source)),

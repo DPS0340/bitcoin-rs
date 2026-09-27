@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwapOption;
 #[cfg(any(test, feature = "test-seam"))]
@@ -33,6 +34,35 @@ impl TipReader {
     #[cfg(any(test, feature = "test-seam"))]
     pub fn store(&self, tip: Option<Arc<TipSnapshot>>) {
         self.inner.store(tip);
+    }
+}
+
+/// Cloneable, read-only access to one chain-owned latch.
+///
+/// The flag cell stays private, so consumers can observe the latch but
+/// cannot set it; only the owner writes.
+#[derive(Clone)]
+pub struct LatchReader {
+    inner: Arc<AtomicBool>,
+}
+
+impl LatchReader {
+    /// Wraps a latch cell without exposing it again.
+    #[must_use]
+    pub const fn new(inner: Arc<AtomicBool>) -> Self {
+        Self { inner }
+    }
+
+    /// Loads the latch's current state.
+    #[must_use]
+    pub fn load(&self) -> bool {
+        self.inner.load(Ordering::Acquire)
+    }
+
+    /// Sets a fixture latch. Not present in production builds.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn store(&self, value: bool) {
+        self.inner.store(value, Ordering::Release);
     }
 }
 

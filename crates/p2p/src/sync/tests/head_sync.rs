@@ -1202,8 +1202,13 @@ fn announced_near_tip_is_direct_fetched_before_tick() -> Result<(), Box<dyn std:
     })?;
     sync.drain_inbound_headers();
     assert!(
-        matches!(next_getdata(&rx)?.first(), Some(Inventory::CompactBlock(_))),
-        "a compact-relay peer's single near-tip fetch rides the compact flavor"
+        matches!(
+            next_getdata(&rx)?.first(),
+            Some(Inventory::CompactBlock(hash))
+                if Hash256::from_le_bytes(hash.as_byte_array())
+                    == Hash256::from(block3.block_hash())
+        ),
+        "a compact-relay peer's single near-tip fetch rides the compact flavor for the announced block"
     );
     Ok(())
 }

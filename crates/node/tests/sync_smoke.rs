@@ -38,10 +38,7 @@ fn tick_buffers_out_of_order_blocks_until_parent_arrives() -> Result<(), Box<dyn
         Arc::clone(&applied_tip),
         Arc::clone(&block_tree),
     );
-    let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-        bitcoin_rs_chain::TipReader::new(Arc::clone(&applied_tip)),
-        bitcoin_rs_chain::BlockTreeReader::new(Arc::clone(&block_tree)),
-    ));
+    let ibd = handles.ibd_latch();
     let sync = bitcoin_rs_node::sync::block_sync(
         Arc::new(handles),
         bitcoin_rs_node::ChainFollowers::noop(),
@@ -99,10 +96,7 @@ fn tick_applies_non_coinbase_spend_and_updates_utxo_and_coinstats()
         Arc::clone(&applied_tip),
         Arc::clone(&block_tree),
     );
-    let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-        bitcoin_rs_chain::TipReader::new(Arc::clone(&applied_tip)),
-        bitcoin_rs_chain::BlockTreeReader::new(Arc::clone(&block_tree)),
-    ));
+    let ibd = handles.ibd_latch();
     let sync = bitcoin_rs_node::sync::block_sync(
         Arc::new(handles),
         bitcoin_rs_node::ChainFollowers::noop(),
