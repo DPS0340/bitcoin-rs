@@ -1584,6 +1584,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn release_after_park_rearms_dns_backoff() {
+        struct OneAddrResolver(SocketAddr);
+
+        impl crate::DnsResolver for OneAddrResolver {
+            fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
+                Ok(vec![self.0])
+            }
+        }
+
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 66));
+        let expired_at = Instant::now()
+            .checked_sub(FAILED_ADDR_BACKOFF + Duration::from_secs(1))
+            .expect("test clock is past the DNS backoff");
+        let dns_queue = Mutex::new(DnsQueueState::default());
+        {
+            let mut queue = dns_queue.lock();
+            queue.recently_queued.insert(address, expired_at);
+            queue.pending.insert(address);
+        }
+        clear_pending_auto_dial(&dns_queue, OutboundDial::auto(address));
+
+        let table = crate::PeerTable::new();
+        let active = AtomicBool::new(true);
+        let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(1);
+        assert_eq!(
+            drain_dns_peer_deficit(
+                &OneAddrResolver(address),
+                &["seed.example"],
+                &active,
+                &table,
+                &outbound_tx,
+                &dns_queue,
+                0,
+                1,
+            ),
+            0,
+            "release re-arms suppression for the new connection attempt"
+        );
+        assert!(
+            matches!(
+                outbound_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "a still-suppressed address must not be enqueued again"
+        );
+        let rearmed_at = dns_queue
+            .lock()
+            .recently_queued
+            .get(&address)
+            .copied()
+            .expect("release records the new suppression time");
+        assert!(
+            Instant::now().duration_since(rearmed_at) < FAILED_ADDR_BACKOFF,
+            "the connection attempt receives a fresh one-minute suppression"
+        );
+    }
+
     /// The dialer fills full-relay slots before block-relay slots, and serves
     /// an explicit request as full relay once both classes are full.
     #[test]
