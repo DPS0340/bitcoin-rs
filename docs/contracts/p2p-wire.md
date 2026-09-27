@@ -22,9 +22,14 @@ This page assigns ownership and cites proof under the
 - Message framing, envelope decoder, service flags, and network magic follow
   the inventory and the policy document. v1 frames for handshake and inventory
   commands are byte-identical to rust-bitcoin's `RawNetworkMessage`.
-  `getdata` block serving writes stored consensus payload bytes
-  (`Message::BlockPayload`) without a decode/re-encode round trip. The
-  decoder still types inbound `block` as `Message::Block`.
+  `getdata` block serving validates the stored body and answers
+  `MSG_WITNESS_BLOCK` with its exact stored consensus payload bytes
+  (`Message::BlockPayload`). `MSG_BLOCK` copies the checked header, transaction
+  count, and stripped transaction spans into its payload, following BIP144.
+  Both forms validate the complete borrowed layout without materializing
+  scripts or witnesses; malformed bodies are never forwarded. Both forms
+  recheck active-chain identity after preparing the payload. The decoder
+  still types inbound `block` as `Message::Block`.
 
 ### `P2P-02`: Connection lifecycle and peer lease ownership
 
@@ -100,6 +105,13 @@ This page assigns ownership and cites proof under the
 
 ## Proven by
 
+- `crates/p2p/src/chain_query.rs` tests
+  `getdata_block_encoding_matches_requested_inventory_on_wire`,
+  `getdata_block_encodings_keep_headroom_and_body_failure_rules`, and
+  `getdata_block_encodings_recheck_active_chain_after_body_load` cover BIP144
+  block encodings against the independent rust-bitcoin envelope, request
+  order, retained body immutability, headroom, corruption, and stale reads
+  (P2P-01).
 - `crates/p2p/src/inv.rs` test
   `cancelled_missing_parent_source_does_not_enqueue_a_request` and
   `crates/p2p/src/peer_table.rs` test
@@ -266,8 +278,8 @@ covers the delivery-path forward.
 ### `P2P-07`: Block announcements lead with headers; ingress is bounded twice
 
 - **Owner**: the block branch of `dispatch_inbound_full`
-  (`crates/p2p/src/dispatch.rs`), `BlockSync::announce_block` and
-  `BlockSync::drain_block_announcements`
+  (`crates/p2p/src/dispatch.rs`), `BlockSync::announce_block`
+  (`crates/p2p/src/sync.rs`) and `BlockSync::drain_block_announcements`
   (`crates/p2p/src/sync/headers.rs`).
 - `MSG_BLOCK` and `MSG_WITNESS_BLOCK` inventory vectors are availability
   information, never a body request: each one is queued against the
@@ -315,7 +327,9 @@ covers the delivery-path forward.
   branch switch (`BranchSwitchError::ConnectFailed`, attributed through the
   staged entry's recorded source) —
   `BlockSync::punish_permanent_delivery_source` disconnects the delivering
-  connection after the invalidated hashes are purged, and releases its
+  connection — in the apply pass, after the invalidated hashes are purged;
+  in a branch switch, before the purge drops the staged entry that carries
+  the source — and releases its
   `getheaders` gate and marks it unresponsive only when that exact
   connection was current and removed (Core `net_processing.cpp:2031-2068`).
   Each punishment increments `node.sync.invalid_block_disconnects`. A
@@ -421,3 +435,11 @@ tests `permanent_consensus_body_disconnects_delivering_source` and
   node answers `getheaders` with the empty response
   (`ActiveChainQuery::headers_after`, `net_processing.cpp:3010-3018`), so a
   syncing node does not spread its low-work branch.
+
+Proof: `crates/p2p/src/sync/tests/headers_presync.rs` pins the presync
+lifecycle end to end — first-pass commitment collection, the work-floor
+crossing that restarts the sync at the fork point, commitment divergence
+on a substituted redownload header, salted-commitment spends, the benign
+lost-continuity break, and the disconnects every other failure costs the
+connection. `crates/p2p/benches/headers_presync.rs` measures the hashing
+bound the first pass pays per page.

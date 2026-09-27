@@ -35,8 +35,18 @@ const BLOCK_DOWNLOAD_TIMEOUT_PER_PEER: u32 = 1;
 /// blocks: Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`
 /// (`net_processing.cpp:159`), the 288 blocks a `NODE_NETWORK_LIMITED` peer
 /// keeps past its pruning horizon. Core holds a two-block race buffer at
-/// `:1637`; this node keeps the plain 288.
+/// `:1637`; the handshake clause keeps the plain 288, and the
+/// demonstrated-height clause ([`peer_can_serve_height`]) applies the
+/// buffer.
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
+/// Core's limited-service race buffer (`net_processing.cpp:1637`): a peer
+/// that keeps only the retained window may have pruned two of its newest
+/// blocks by the time the request lands.
+const NODE_NETWORK_LIMITED_RACE_BUFFER: u32 = 2;
+/// `NODE_NETWORK_LIMITED` (bit 10) has no `ServiceFlags` variant in this
+/// `rust-bitcoin` version; the bit follows the protocol assignment also
+/// decoded in `PeerInfo::services_names`.
+const NETWORK_LIMITED: u64 = 1_u64 << 10;
 /// Maximum number of in-flight getdata requests we'll track per `BlockSync`.
 ///
 /// 256 is the measured single-peer IBD depth: a bounded 0–150,000 daemon
@@ -62,7 +72,7 @@ pub const PENDING_BYTE_BUDGET: usize = PENDING_BUDGET * PENDING_BLOCK_BYTE_ESTIM
 pub const RECEIVED_BLOCK_BYTE_BUDGET: usize = PENDING_BYTE_BUDGET;
 /// Consensus-maximum serialized block size in bytes: a witness-serialized
 /// block cannot exceed its 4,000,000 weight, so no valid block is larger.
-pub const MAX_SERIALIZED_BLOCK_SIZE: usize = 4_000_000;
+pub const MAX_SERIALIZED_BLOCK_SIZE: usize = crate::MAX_BLOCK_SERIALIZED_SIZE_USIZE;
 // Staller-arming reachability invariant (Phase 1 of the staller arming
 // redesign): the stall episode arms on a staged-count fraction
 // (`received >= max_received_blocks / 2`, `window_blocked_on` term 3), so the
@@ -331,6 +341,30 @@ pub fn servable_floor(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> u32 {
 /// INVARIANT: this is the only fan-out service clause.
 pub fn statically_fanout_eligible(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> bool {
     !peer.inbound && serves_requested_height(peer, policy)
+}
+
+fn peer_advertises_block_service(peer: &PeerInfo) -> bool {
+    let network = ServiceFlags::NETWORK.to_u64();
+    peer.services & (network | NETWORK_LIMITED) != 0
+}
+
+/// Whether a peer advertising block service can serve one required body height.
+///
+/// Core leaves two blocks of race buffer inside the 288-block limited-service
+/// window (`net_processing.cpp:1636-1638`).
+pub(crate) fn peer_can_serve_height(
+    peer: &PeerInfo,
+    peer_height: u32,
+    required_height: u32,
+) -> bool {
+    if !peer_advertises_block_service(peer) || required_height > peer_height {
+        return false;
+    }
+    let limited_only =
+        peer.services & NETWORK_LIMITED != 0 && peer.services & ServiceFlags::NETWORK.to_u64() == 0;
+    !limited_only
+        || peer_height - required_height
+            < NODE_NETWORK_LIMITED_MIN_BLOCKS - NODE_NETWORK_LIMITED_RACE_BUFFER
 }
 
 /// Set the fan-out/request mode on the window from the current candidate set.
@@ -628,9 +662,6 @@ pub struct BlockedContext {
     pub frontier_hash: Option<Hash256>,
     /// Whether the stager holds the next-expected body (apply lag).
     pub apply_side_busy: bool,
-    /// Distinct exact connections owning validated in-flight blocks this
-    /// tick, from [`DownloadWindow::active_downloading_peers`].
-    pub active_downloading_peers: usize,
 }
 
 /// Why the unified blockage observation convicted an owner.
@@ -2138,7 +2169,7 @@ impl DownloadWindow {
         non_empty_request(source, entries, next_request_height)
     }
 
-    fn retarget_request_branch(
+    pub(crate) fn retarget_request_branch(
         &mut self,
         stager: &mut BlockStager,
         chain_tip: &TipSnapshot,
@@ -2171,23 +2202,6 @@ impl DownloadWindow {
             .collect();
         for hash in stale_pending {
             self.remove_pending(&hash, now);
-        }
-        // The stager is the single staged-body store: bodies the request
-        // branch left behind are released here, so freed capacity is real
-        // and a late old-branch delivery cannot re-acquire purged state.
-        // A hash the tree cannot resolve is off-branch by definition.
-        let stale_staged: Vec<Hash256> = stager
-            .staged_hashes()
-            .filter(|hash| {
-                let on_branch = tree
-                    .lookup(*hash)
-                    .and_then(|node_id| tree.node(node_id).ok())
-                    .map(|node| is_on_request_branch(node.hash, node.height));
-                on_branch != Some(true)
-            })
-            .collect();
-        for hash in stale_staged {
-            stager.discard(&hash);
         }
         // The stager is the single staged-body store: bodies the request
         // branch left behind are released here, so freed capacity is real
@@ -4900,7 +4914,6 @@ mod tests {
             next_apply_height: Some(1),
             frontier_hash: None,
             apply_side_busy: false,
-            active_downloading_peers: window.active_downloading_peers(),
         };
         // First tick: the episode and the cold-front timer both start.
         assert_eq!(
@@ -6595,5 +6608,71 @@ mod tests {
         window.mark_owned_fetch(&mut test_stager(&window), owner, hash(0xb1), 3, now);
         assert!(!window.contains_pending(&hash(0xb1)));
         assert_eq!(window.next_request_height, 11);
+    }
+
+    #[test]
+    fn fanout_eligibility_requires_block_service_flags() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::{PeerCounters, PeerInfo};
+
+        fn peer(services: u64, inbound: bool) -> PeerInfo {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+            PeerInfo {
+                addr,
+                version: 70_016,
+                wtxid_relay: false,
+                compact_block_relay: false,
+                services,
+                user_agent: String::from("/test/"),
+                start_height: 0,
+                best_known_height: 0,
+                conn_time: 0,
+                inbound,
+                addr_bind: addr,
+                time_offset: 0,
+                counters: std::sync::Arc::new(PeerCounters::default()),
+            }
+        }
+
+        fn policy(requested_height: u32) -> super::BlockDownloadPolicy {
+            super::BlockDownloadPolicy {
+                ibd: crate::sync::tests::synced_ibd_latch(),
+                requested_height,
+                network: Network::Regtest,
+            }
+        }
+
+        const WITNESS: u64 = 1_u64 << 3;
+        const NETWORK: u64 = 1_u64;
+        const LIMITED: u64 = 1_u64 << 10;
+        // A witness peer without block-service flags must never receive
+        // block `getdata`: cold-front recovery would ask it for a body it
+        // cannot serve.
+        assert!(!super::statically_fanout_eligible(
+            &peer(WITNESS, false),
+            &policy(0)
+        ));
+        // Full block-service peers stay eligible.
+        assert!(super::statically_fanout_eligible(
+            &peer(WITNESS | NETWORK, false),
+            &policy(0)
+        ));
+        // Limited peers without `NETWORK` keep their recent-block eligibility;
+        // the retained-height clause inside the one service predicate keeps
+        // them recent.
+        assert!(super::statically_fanout_eligible(
+            &peer(WITNESS | LIMITED, false),
+            &policy(0)
+        ));
+        // Inbound and non-witness peers stay ineligible.
+        assert!(!super::statically_fanout_eligible(
+            &peer(WITNESS | NETWORK, true),
+            &policy(0)
+        ));
+        assert!(!super::statically_fanout_eligible(
+            &peer(NETWORK, false),
+            &policy(0)
+        ));
     }
 }

@@ -211,6 +211,17 @@ impl Worker {
         if self.runtime.should_stop() {
             return Ok(ChunkAction::Stalled);
         }
+        // A held optional pin can still expire under a concurrent prune pass
+        // (`floor()` answers `None` once revoked). Reading past it mislabels
+        // deleted rows as transient absence and stalls this pass anyway, so
+        // stop now and let the next `request_history` route the `Pruned`
+        // refusal into the rebuild.
+        if history.floor().is_none() {
+            if !state.batch.is_empty() {
+                *pending = Some(state.take(self.batch_limits));
+            }
+            return Ok(ChunkAction::Stalled);
+        }
 
         let Some(bodies) = load_body_prefix(body_reader.as_mut(), identities, &|| {
             self.runtime.should_stop()

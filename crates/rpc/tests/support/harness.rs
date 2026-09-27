@@ -106,11 +106,10 @@ impl ServerHarness {
         let state = &node.state;
         let chainstate = state.chainstate();
         let ibd = chainstate.ibd_latch();
-        let tips = chainstate.rpc_tip_bundle();
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
-                chain_tip: tips.chain_tip,
-                applied_tip: tips.applied_tip,
+                chain_tip: chainstate.header_tip_reader(),
+                applied_tip: chainstate.applied_tip_reader(),
                 ibd,
                 blocks: state.blocks(),
                 transactions: state.transactions(),
