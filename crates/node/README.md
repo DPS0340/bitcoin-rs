@@ -43,7 +43,7 @@ Data-directory storage evidence is an explicit command, not a node service:
 in [storage-footprint.md](../../docs/contracts/storage-footprint.md).
 
 The node crate registers three benchmark targets: `benches/sync_pipeline.rs`,
-a harness-less deterministic initial-sync proxy benchmark (its own `main`);
+a Criterion benchmark for the deterministic initial-sync proxy;
 `benches/chainstate_journal.rs`, a harness-less journal replay performance
 and memory gate (its own `main`); and `benches/evidence.rs`, the recorded
 sync-pipeline evidence unit tests behind the built-in harness.
