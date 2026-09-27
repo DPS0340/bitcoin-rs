@@ -392,13 +392,13 @@ fn invalidate_permanent_failure(
 /// must be dropped, not finished, so the mempool generation stays odd until
 /// recovery.
 ///
-/// Kernel-backed script verification failures are classified Operational
-/// because `bitcoinkernel` can reject a valid block depending on process
-/// state (issue #618): the same block applies successfully after restart.
-/// Treating these as Permanent would freeze the node at the tip and
-/// invalidate a valid header subtree with no retry path. The native
-/// interpreter path does not produce this spurious failure, so its
-/// `ConsensusError::Script` remains Permanent.
+/// A kernel-backed script failure is Operational because `bitcoinkernel` can
+/// reject a valid block depending on process state (issue #618): the same
+/// block applies successfully after restart. Treating it as Permanent would
+/// freeze the node at the tip and invalidate a valid header subtree with no
+/// retry path. The native interpreter does not produce that spurious failure,
+/// so its `ConsensusError::Script` stays Permanent. The engine field decides
+/// this; the reason text is never inspected.
 ///
 /// Backend-neutral shape and selection failures — `PrevoutMatrixSize`,
 /// `PrevoutCount`, `UnsupportedEngine` — are caller wiring errors, not
@@ -408,8 +408,6 @@ fn invalidate_permanent_failure(
 /// validation rejects the selection before any block applies); the arm
 /// exists so direct consensus callers cannot turn it into a header
 /// invalidation.
-///
-/// so its `ConsensusError::Script` stays Permanent. The engine field decides
 pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
     use WindowApplyDisposition::{BodyMutated, Fatal, Operational, Permanent};
     use bitcoin_rs_consensus::{ConsensusError, ScriptEngine};

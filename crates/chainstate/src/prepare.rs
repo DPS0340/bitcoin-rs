@@ -70,13 +70,10 @@ pub(super) fn parse_block_for_apply(
     let parsed = bitcoin_rs_consensus::kernel::BlockParse::parse(&raw_block, engine)
         .map_err(ApplyError::Consensus)?;
     if parsed.transaction_count() != block.txs.len() {
-        return Err(ApplyError::Consensus(
-            bitcoin_rs_consensus::ConsensusError::Encoding(format!(
-                "block parse produced {} transactions, decoder produced {}",
-                parsed.transaction_count(),
-                block.txs.len()
-            )),
-        ));
+        return Err(ApplyError::TxidCountMismatch {
+            transactions: block.txs.len(),
+            txids: parsed.transaction_count(),
+        });
     }
     let txids = parsed.txids().map_err(ApplyError::Consensus)?;
     Ok((parsed, txids))

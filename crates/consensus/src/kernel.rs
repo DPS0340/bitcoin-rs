@@ -173,6 +173,14 @@ mod native {
     }
 }
 
+/// The prefix every `bitcoinkernel` script rejection carries.
+///
+/// It reaches clients inside the BIP22 reject reason, so the bytes are a
+/// boundary contract. Classification never reads it: a kernel rejection is
+/// identified by [`crate::ScriptEngine::Kernel`].
+#[cfg(feature = "kernel")]
+pub(crate) const KERNEL_SCRIPT_REJECT_PREFIX: &str = "kernel script verification failed: ";
+
 /// The `libbitcoinkernel` block parse and script backend.
 #[cfg(feature = "kernel")]
 mod kernel_backend {
