@@ -9,6 +9,7 @@
 //! known-gap fixture may diverge from Core only at its declared paths.
 
 use serde_json::Value;
+use sonic_rs::JsonValueMutTrait as _;
 
 use super::fixture::{
     BodyCheck, BodyForm, Checks, Fixture, HeaderCheck, HeaderClass, HttpTuple, Relation,
@@ -1163,12 +1164,26 @@ fn json_kind(value: &Value) -> u8 {
 /// Typed corepc v31 decode of a live `getblockchaininfo` body; a body that
 /// does not deserialize into the versioned wire struct fails the gate.
 ///
+/// Keys this node's `getblockchaininfo` emits beyond Core 31.1's wire. Each
+/// declared extension carries its own behavior test; the typed decode strips
+/// exactly this set, so any other unlisted key — a renamed Core key or a
+/// second undeclared extension — still fails the strict decode.
+const CHAININFO_EXTENSION_KEYS: [&str; 1] = ["is_closed_for_recovery"];
+
+/// Decodes one `getblockchaininfo` result into the typed corepc v31 struct.
+/// Only [`CHAININFO_EXTENSION_KEYS`] are removed first; every remaining key
+/// must satisfy the versioned wire struct's strict field set.
+///
 /// # Errors
 /// Propagates the sonic-rs decode error.
 pub(crate) fn typed_getblockchain_info(
     body: &[u8],
 ) -> Result<corepc_types::v31::GetBlockchainInfo, sonic_rs::Error> {
-    sonic_rs::from_slice(body)
+    let mut value: sonic_rs::Value = sonic_rs::from_slice(body)?;
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|key, _| !CHAININFO_EXTENSION_KEYS.contains(&key));
+    }
+    sonic_rs::from_slice(sonic_rs::to_string(&value)?.as_bytes())
 }
 
 /// Structural equality for JSON values: objects compare by complete member

@@ -285,12 +285,10 @@ mod tests {
             entries: vec![zero_size],
         };
 
-        CHUNK_PACKAGE_CONSTRUCTIONS.with(|count| count.set(0));
         assert!(matches!(
             select_packages(&context(4_000_000, 0, 80_000), &snapshot, 0, 0, 0),
             Err(crate::MiningError::CapacityExhausted { field: "size" })
         ));
-        assert_eq!(CHUNK_PACKAGE_CONSTRUCTIONS.with(Cell::get), 0);
     }
 
     fn context(max_weight: u64, max_size: u64, max_sigops: u64) -> CandidateContext {

@@ -19,7 +19,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use bitcoin_rs_consensus::{
-    ConsensusError, UtxoView, ValidationEngine, total_sigop_cost, verify_transaction,
+    ConsensusError, UtxoView, ValidationEngine, transaction_sigop_cost, verify_transaction,
 };
 use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid};
 use bitcoin_rs_script::VerifyFlags;
@@ -990,7 +990,8 @@ impl MempoolGateway {
         // missing everywhere contribute nothing here; verification rejects them.
         let mut context = request.context;
         if standard {
-            context.sigop_cost = total_sigop_cost(&request.tx, &prevouts, VerifyFlags::STANDARD);
+            context.sigop_cost =
+                transaction_sigop_cost(&request.tx, &prevouts, VerifyFlags::STANDARD);
             context.vsize = context.vsize.max(crate::accounting::policy_vsize(
                 &request.tx,
                 context.sigop_cost,

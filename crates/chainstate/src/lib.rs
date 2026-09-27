@@ -10,7 +10,7 @@ use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::{
     BlockTree, BlockTreeReader, ChainError, ChainTxCount, TipReader, TipSnapshot,
 };
-use bitcoin_rs_consensus::rust_path::UtxoView;
+use bitcoin_rs_consensus::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_primitives::OutPoint;
@@ -151,14 +151,14 @@ const LOCAL_OVERLAY_TXID_SET_THRESHOLD: usize = 8;
 
 /// Admission barrier shared by every cloned apply handle.
 pub(crate) struct ApplyAdmission {
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     barrier: RwLock<()>,
 }
 
 impl ApplyAdmission {
     pub(crate) fn new() -> Self {
         Self {
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             barrier: RwLock::new(()),
         }
     }
@@ -789,6 +789,17 @@ impl Chainstate {
     #[must_use]
     pub fn is_closed_for_recovery(&self) -> bool {
         self.admission.closed.load(Ordering::Acquire)
+    }
+
+    /// Shares the admission-closed latch with the read-only surfaces (RPC
+    /// and P2P), so every surface answers from one owner.
+    ///
+    /// PRE: none.
+    /// POST: the returned reader reports the same fact
+    ///   [`Self::is_closed_for_recovery`] reads and offers no writer.
+    #[must_use]
+    pub fn closed_for_recovery_reader(&self) -> bitcoin_rs_chain::LatchReader {
+        bitcoin_rs_chain::LatchReader::new(Arc::clone(&self.admission.closed))
     }
 
     /// Permanently closes mutation admission and waits for in-flight mutations.

@@ -15,6 +15,10 @@ pub mod header_sync;
 pub mod ibd;
 /// Block-tree node types.
 pub mod node;
+/// Regtest block and proof-of-work builders shared by cross-crate test
+/// harnesses. Compiled only under the `test-seam` feature.
+#[cfg(feature = "test-seam")]
+pub mod regtest_fixture;
 /// Reorganization planning.
 pub mod reorg;
 /// Best-tip snapshot type.
@@ -45,7 +49,7 @@ pub use node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus};
 pub use reorg::{ReorgPlan, plan_reorg};
 pub use tip::TipSnapshot;
 pub use tree::BlockTree;
-pub use view::{BlockTreeReader, TipReader};
+pub use view::{BlockTreeReader, LatchReader, TipReader};
 
 /// Errors returned by header sync, block-tree, and reorg planning operations.
 #[derive(Debug, Error, PartialEq, Eq)]
