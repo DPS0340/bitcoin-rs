@@ -126,12 +126,14 @@ fn verify_witness(
     witness: &[Vec<u8>],
     flags: VerifyFlags,
 ) -> Result<bool, ScriptError> {
-    Interpreter.execute(
+    // BIP143 uses INPUT's spent amount; repeat it to fill the full prevout set.
+    let prevouts = vec![prevout.clone(); tx.inputs.len()];
+    Interpreter.execute_with_prevouts(
         &prevout.script_pubkey,
         &[],
         witness,
         flags,
-        prevout,
+        &prevouts,
         tx,
         INPUT,
     )

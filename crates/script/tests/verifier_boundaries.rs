@@ -122,6 +122,19 @@ fn bip341_binds_all_prevouts_and_the_transaction() {
             )
             .is_err()
     );
+    // Exercise legacy evaluation so Taproot's own guard cannot mask the fallback.
+    assert_eq!(
+        Interpreter.execute_with_prevouts(
+            &[0x51],
+            &[],
+            &[],
+            VerifyFlags::NONE,
+            &prevouts[..1],
+            &tx,
+            0,
+        ),
+        Err(ScriptError::TaprootPrevoutsUnavailable),
+    );
 
     let mut altered_tx = tx;
     altered_tx.outputs[0].value =
