@@ -4,19 +4,20 @@
 //! and witness activation. rust-bitcoin independently checks active costs;
 //! these fixtures exercise accounting, not script validity or admission.
 
+mod common;
+
 use std::error::Error;
 use std::sync::Arc;
 
 use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits};
 use bitcoin_rs_mining::{
-    CandidateContext, GenerateSelection, GenerateTx, MiningError, assemble_ordered_candidate,
-    snapshot_for_selection,
+    GenerateSelection, GenerateTx, MiningError, assemble_ordered_candidate, snapshot_for_selection,
 };
 use bitcoin_rs_primitives::{
-    Amount, CompactTarget, Hash256, LockTime, Network, OutPoint, Sequence, Tx, TxIn, TxOut, Txid,
-    consensus_bytes,
+    Amount, Hash256, LockTime, OutPoint, Sequence, Tx, TxIn, TxOut, Txid, consensus_bytes,
 };
 use bitcoin_rs_script::script::push_data;
+use common::{context, oracle_transaction, p2pkh};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -153,7 +154,7 @@ fn cases() -> Vec<RawCase> {
 
 /// Uses the independent rust-bitcoin consensus cost implementation with the same prevout.
 fn oracle_cost(tx: &Tx, prevout: &TxOut) -> Result<u32, Box<dyn Error>> {
-    let oracle: bitcoin::Transaction = bitcoin::consensus::deserialize(&consensus_bytes(tx))?;
+    let oracle = oracle_transaction(tx)?;
     let prevout: bitcoin::TxOut = bitcoin::consensus::deserialize(&consensus_bytes(prevout))?;
     Ok(u32::try_from(
         oracle.total_sigop_cost(|_| Some(prevout.clone())),
@@ -181,27 +182,5 @@ fn raw_tx(case: &RawCase) -> Tx {
             script_pubkey: p2pkh().into(),
         }],
         lock_time: LockTime::ZERO,
-    }
-}
-
-fn p2pkh() -> Vec<u8> {
-    [vec![0x76, 0xa9, 0x14], vec![0x11; 20], vec![0x88, 0xac]].concat()
-}
-
-fn context(segwit_active: bool, max_sigops: u64) -> CandidateContext {
-    CandidateContext {
-        previous_block_hash: Hash256::from_le_bytes(&[0x11; 32]),
-        height: 100,
-        version: 0x2000_0000,
-        bits: CompactTarget::from_consensus(0x207f_ffff),
-        min_time: 1,
-        current_time: 2,
-        locktime_cutoff: 1,
-        network: Network::Regtest,
-        csv_active: true,
-        segwit_active,
-        max_weight: 4_000_000,
-        max_size: 4_000_000,
-        max_sigops,
     }
 }

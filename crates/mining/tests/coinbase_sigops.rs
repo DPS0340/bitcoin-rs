@@ -4,6 +4,8 @@
 //! then returns immediately for coinbase. rust-bitcoin supplies an independent
 //! transaction-cost oracle; admitted snapshot costs are already scaled.
 
+mod common;
+
 use std::error::Error;
 use std::sync::Arc;
 
@@ -13,10 +15,10 @@ use bitcoin_rs_mining::{
     Candidate, CandidateContext, MiningError, assemble_candidate, assemble_ordered_candidate,
 };
 use bitcoin_rs_primitives::{
-    Amount, CompactTarget, Hash256, LockTime, Network, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
-    Txid, Witness, encode::consensus_bytes,
+    Amount, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
 };
 use bitcoin_rs_script::VerifyFlags;
+use common::{context, oracle_transaction, p2pkh};
 
 type TestResult = Result<(), Box<dyn Error>>;
 type Assemble =
@@ -122,12 +124,8 @@ fn coinbase_and_admitted_package_costs_share_one_inclusive_limit() -> TestResult
 }
 
 fn oracle_sigop_cost(tx: &Tx) -> Result<u64, Box<dyn Error>> {
-    let oracle: bitcoin::Transaction = bitcoin::consensus::deserialize(&consensus_bytes(tx))?;
+    let oracle = oracle_transaction(tx)?;
     Ok(u64::try_from(oracle.total_sigop_cost(|_| None))?)
-}
-
-fn p2pkh() -> Vec<u8> {
-    [vec![0x76, 0xa9, 0x14], vec![0x11; 20], vec![0x88, 0xac]].concat()
 }
 
 fn transaction(parent: Option<Txid>, value: u64) -> Tx {
@@ -147,23 +145,5 @@ fn transaction(parent: Option<Txid>, value: u64) -> Tx {
             script_pubkey: p2pkh().into(),
         }],
         lock_time: LockTime::ZERO,
-    }
-}
-
-fn context(segwit_active: bool, max_sigops: u64) -> CandidateContext {
-    CandidateContext {
-        previous_block_hash: Hash256::from_le_bytes(&[0x11; 32]),
-        height: 100,
-        version: 0x2000_0000,
-        bits: CompactTarget::from_consensus(0x207f_ffff),
-        min_time: 1,
-        current_time: 2,
-        locktime_cutoff: 1,
-        network: Network::Regtest,
-        csv_active: true,
-        segwit_active,
-        max_weight: 4_000_000,
-        max_size: 4_000_000,
-        max_sigops,
     }
 }
