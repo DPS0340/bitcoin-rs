@@ -439,7 +439,7 @@ impl<'a> Projection<'a> {
         confirmed.dedup_by_key(|activity| activity.record.txid);
 
         let confirmed_unspent = index.unspent_outputs(script_hash).map_err(query_error)?;
-        let mempool = self.mempool_activity(script_hash, &confirmed_unspent);
+        let mempool = self.mempool_activity(script_hash, &confirmed_unspent)?;
         Ok(ScriptActivity {
             confirmed,
             confirmed_funding: snapshot.funding,
@@ -532,33 +532,33 @@ impl<'a> Projection<'a> {
     }
 
     /// PRE: `confirmed_unspent` contains the script index's current records.
-    /// POST: Capture funders under one pool view, then spenders under a
-    ///   fresh one after output matching releases the first.
-    /// POST: Release the guard before hashing scripts, deduplicating and sorting.
-    /// INVARIANT: Each txid appears once in descending `(time, txid)` order.
+    /// POST: Capture funders, then spenders after output matching releases the first guard.
+    /// POST: Release both guards before hashing scripts, deduplicating and sorting.
+    /// INVARIANT: Both sets use one pool sequence; each txid appears once in descending `(time, txid)` order.
     fn mempool_activity(
         &self,
         script_hash: ScriptHash,
         confirmed_unspent: &[ScriptIndexRecord],
-    ) -> Vec<Arc<Tx>> {
+    ) -> Result<Vec<Arc<Tx>>, Response> {
         let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
         // The guard covers pool facts only. Funders are captured as `Arc`
         // clones rather than txids alone: resolving a txid back to an entry
         // afterwards costs a scan of the whole pool per selected
         // transaction.
-        let funders = {
+        let (sequence, funders) = {
             let pool = self.ctx.mempool.gateway.read();
-            pool.entries_funding_script(mempool_hash)
+            let sequence = pool.sequence_number();
+            let funders = pool
+                .entries_funding_script(mempool_hash)
                 .map(|entry| (entry.txid, entry.time, Arc::clone(&entry.tx)))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (sequence, funders)
         };
-        // Candidates are the confirmed unspent outpoints plus the
-        // script-matching outputs of every funder — probing the spend index
-        // for a funder's unrelated outputs would let a wide funding
-        // transaction amplify work. Output matching hashes every output, so
-        // it runs after the first guard releases; the spend index is then
-        // probed under a fresh read, where `outpoint_spender` simply finds
-        // no spender for an entry that left the pool between the two reads.
+        #[cfg(test)]
+        crate::esplora::tests::gate_mempool_activity_for_tests();
+        // Match outputs after releasing the first guard. The second guard
+        // checks the captured sequence before reading spenders, so a concurrent
+        // membership change returns Retry instead of mixing pool views.
         let mut outputs = confirmed_unspent
             .iter()
             .map(|record| (record.txid, record.vout))
@@ -570,6 +570,9 @@ impl<'a> Projection<'a> {
         }
         let spenders = {
             let pool = self.ctx.mempool.gateway.read();
+            if pool.sequence_number() != sequence {
+                return Err(query_error(TxQueryError::Retry));
+            }
             outputs
                 .iter()
                 .filter_map(|(txid, vout)| {
@@ -606,10 +609,10 @@ impl<'a> Projection<'a> {
         entries.sort_unstable_by(|left, right| {
             right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
         });
-        entries
+        Ok(entries
             .into_iter()
             .map(|(_, _, transaction)| transaction)
-            .collect()
+            .collect())
     }
 
     /// The outputs of `transaction` that pay `script`, as their position in the
