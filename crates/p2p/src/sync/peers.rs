@@ -530,40 +530,6 @@ impl BlockSync {
     /// frontier's usable-peer snapshot. The selection no longer re-walks the
     /// session table or the block tree: `observe_frontier` already resolved
     /// each peer's demonstrated capability once this tick.
-
-    /// The height- and service-eligible body candidates for one selection pass.
-    ///
-    /// PRE: `required_height` is the canonical next-required body height and
-    ///   `policy` carries the same height with the node's sync phase.
-    /// POST: every returned candidate's demonstrated chain covers
-    ///   `required_height` inside the peer's retained window, and each carries
-    ///   the two sealed service clauses separately.
-    fn body_candidates(
-        frontier: &SyncFrontier,
-        required_height: u32,
-        policy: &BlockDownloadPolicy,
-    ) -> Vec<FanoutCandidate> {
-        let mut candidates: Vec<FanoutCandidate> = Vec::new();
-        for peer in &frontier.usable_peers {
-            let Some(active_height) = peer.capability() else {
-                continue;
-            };
-            if !peer_can_serve_height(&peer.info, active_height, required_height) {
-                continue;
-            }
-            candidates.push(FanoutCandidate {
-                peer: SyncPeer {
-                    source: peer.source,
-                    best_known_height: i32::try_from(active_height).unwrap_or(i32::MAX),
-                },
-                serves_bodies: serves_requested_height(&peer.info, policy),
-                fanout_eligible: statically_fanout_eligible(&peer.info, policy),
-                soft_blocked: false,
-            });
-        }
-        candidates
-    }
-
     pub(super) fn sync_peer_selection(
         &self,
         frontier: &SyncFrontier,

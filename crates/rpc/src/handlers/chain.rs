@@ -2004,7 +2004,13 @@ mod tests {
         use std::time::Duration;
 
         let barrier = Arc::new(parking_lot::Mutex::new(()));
-        let ctx = Arc::new(Context::new().with_chain_transition(Arc::clone(&barrier)));
+        let ctx = Arc::new(Context::from_handles(crate::context::ContextHandles {
+            chain: crate::context::ChainHandles {
+                chain_transition: Arc::clone(&barrier),
+                ..crate::context::ChainHandles::default()
+            },
+            ..crate::context::ContextHandles::default()
+        }));
         let transition = barrier.lock();
         let worker = Arc::clone(&ctx);
         let (tx, rx) = std::sync::mpsc::channel();
