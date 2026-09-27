@@ -286,14 +286,16 @@ pub fn read_frame(
         pending.want = HEADER_BYTES;
     }
     while pending.bytes.len() < pending.want {
+        // The deadline bounds every wait, with a floor for an already
+        // lapsed deadline. The timeout is set before the buffer grows so a
+        // setup failure cannot leave placeholder bytes behind; a frame that
+        // completes inside the floor still returns, while a lapsed deadline
+        // pauses a partially-read frame after the read below.
+        let wait = remaining(deadline).unwrap_or(Duration::from_millis(1));
+        stream.set_read_timeout(Some(wait))?;
         let want = (pending.want - pending.bytes.len()).min(64 * 1024);
         let base = pending.bytes.len();
         pending.bytes.resize(base + want, 0);
-        // The deadline bounds every wait, with a floor for an already
-        // lapsed deadline; a byte slipping in during that floor does not
-        // renew it — the lapsed deadline interrupts after the read below.
-        let wait = remaining(deadline).unwrap_or(Duration::from_millis(1));
-        stream.set_read_timeout(Some(wait))?;
         match stream.read(&mut pending.bytes[base..]) {
             Ok(0) => {
                 pending.bytes.clear();

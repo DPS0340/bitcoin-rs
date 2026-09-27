@@ -113,6 +113,13 @@ fn read_completion_fails_after_the_time_limit() {
 fn bytes_past_the_deadline_do_not_renew_it() {
     let (mut peer, mut remote, _dir) = fixture();
     remote.write_all(&[7]).expect("one byte before the read");
+    // Wait for the byte to reach the socket so the lapsed deadline pauses on
+    // real progress instead of timing out on an empty queue.
+    peer.stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("peek timeout");
+    let mut one = [0u8; 1];
+    peer.stream.peek(&mut one).expect("the byte arrives");
     let mut pending = super::FrameBuffer::default();
     let error = super::read_frame(&mut peer.stream, Instant::now(), &mut pending)
         .expect_err("lapsed-deadline progress must still interrupt");
@@ -132,16 +139,28 @@ fn a_paused_frame_resumes_from_where_it_stopped() {
     remote
         .write_all(&frame[..10])
         .expect("partial header bytes");
+    // Wait for the partial header to be queued so the first call consumes
+    // it before its deadline interrupts.
+    peer.stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("peek timeout");
+    let mut ten = [0u8; 10];
+    peer.stream.peek(&mut ten).expect("the header bytes arrive");
     let mut pending = super::FrameBuffer::default();
     let error = super::read_frame(
         &mut peer.stream,
-        Instant::now() + Duration::from_millis(50),
+        Instant::now() + Duration::from_millis(250),
         &mut pending,
     )
     .expect_err("a partial frame must pause at the deadline");
     assert!(
         !matches!(error, super::Error::Protocol(ref message) if message == "P2P payload byte limit"),
         "a paused frame must not surface as desynced: {error:?}"
+    );
+    assert_eq!(
+        pending.bytes.len(),
+        10,
+        "the paused call keeps its consumed header bytes"
     );
     remote.write_all(&frame[10..]).expect("remaining bytes");
     let completed = super::read_frame(
