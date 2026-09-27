@@ -152,6 +152,7 @@ impl SyncChain for TestChain {
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
         });
         self.applied_tip.store(Some(Arc::clone(&snapshot)));
         if self.chain_tip.load_full().is_none() {
@@ -300,6 +301,7 @@ impl SyncChain for TestChain {
                 height: node.height,
                 chainwork: node.chainwork,
                 hash: node.hash,
+                chain_tx_count: node.chain_tx_count,
             })));
             applied = applied.saturating_add(1);
         }
@@ -327,6 +329,7 @@ impl SyncChain for TestChain {
                                 height: node.height,
                                 chainwork: node.chainwork,
                                 hash: node.hash,
+                                chain_tx_count: node.chain_tx_count,
                             })
                         })
                     })
@@ -1602,6 +1605,7 @@ fn unrequested_body_admission_matches_core_acceptance() -> Result<(), Box<dyn st
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
         }
     };
     let SyncHarness {
@@ -1659,6 +1663,7 @@ fn unrequested_body_gate_rejects_below_floor_and_below_applied_work()
             tip_id: node_id,
             height: node.height,
             chainwork: node.chainwork,
+            chain_tx_count: node.chain_tx_count,
             hash: node.hash,
         })
     }
@@ -2545,6 +2550,7 @@ pub(crate) fn connect_peer(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error::Error>> {
     use super::frontier::{BodyState, ChainFrontier, RequiredBody, SyncFrontier, UsablePeer};
 
@@ -2590,6 +2596,7 @@ fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error:
         info: no_service_info,
         demonstrated_tips: Vec::new(),
         active_height: None,
+        headers_horizon: None,
         role: crate::peer_info::PeerRole::FullRelay,
         manual: false,
         connected_at: Instant::now(),
@@ -2600,6 +2607,7 @@ fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error:
         info: limited_info,
         demonstrated_tips: Vec::new(),
         active_height: None,
+        headers_horizon: None,
         role: crate::peer_info::PeerRole::FullRelay,
         manual: false,
         connected_at: Instant::now(),

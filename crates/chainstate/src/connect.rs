@@ -17,9 +17,7 @@ use super::durable::{
 };
 use super::prepare::prepare_apply;
 use super::prepare::verify_block_transactions;
-use super::publication::advanced_chain_tx_count;
-use super::publication::advanced_chain_tx_count_from;
-use super::publication::publish_connect;
+use super::publication::publish_applied;
 use super::publication::tx_count_delta_for;
 use super::scratch::ApplyScratch;
 use super::window::{PendingBlockCommit, PublishMode};
@@ -39,25 +37,6 @@ use bitcoin_rs_utxo::contract::build_block_changes;
 use bitcoin_rs_utxo::contract::is_coinbase_tx;
 use hashbrown::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-
-/// Applies one serialized block while the caller holds admission and `chain_transition`.
-///
-/// The caller MUST hold both guards in admission-then-transition order.
-pub(super) fn apply_block_with_serialized_admitted(
-    handles: &Chainstate,
-    block: &Block,
-    serialized: bytes::Bytes,
-) -> core::result::Result<ConnectOutcome, ApplyError> {
-    apply_committed_block_admitted(
-        handles,
-        block,
-        Some(serialized),
-        None,
-        BlockProvenance::Network,
-        PublishMode::Now,
-    )
-}
 
 /// Commit path. Callers reach this only through an admitted chain transition.
 pub(super) fn apply_committed_block_admitted<'b>(
@@ -515,7 +494,7 @@ pub(super) fn apply_block_admitted<'b>(
     );
     let (txids, raw_txs) = scratch.into_payloads();
     let mut outcome = ConnectOutcome {
-        tip: tip.clone(),
+        tip,
         commit_id: 0,
         height,
         hash: block_hash,
@@ -543,13 +522,15 @@ pub(super) fn apply_block_admitted<'b>(
                 .into_iter()
                 .collect();
             let durable_commit_started = quanta::Instant::now();
-            let commit_id = commit_connect_head(
+            let receipt = commit_connect_head(
                 handles,
                 &ConnectCommitFacts {
                     prev_hash,
                     tip: block_hash,
                     height,
-                    chain_tx_count_after: advanced_chain_tx_count(handles, height, tx_count_delta),
+                    // The node's own cumulative total is what the batch
+                    // names, and publication may carry nothing else.
+                    chain_tx_count_after: outcome.tip.chain_tx_count.to_wire(),
                     undo_extent: Some((height, block_hash)),
                 },
                 &CommitRecords {
@@ -559,22 +540,18 @@ pub(super) fn apply_block_admitted<'b>(
             )?;
             metrics::histogram!("node.apply_block.durable_commit_seconds")
                 .record(durable_commit_started.elapsed().as_secs_f64());
-            commit_id
+            outcome.tip = receipt.certify(outcome.tip);
+            receipt.commit_id
         }
-        PublishMode::Replay { commit_id } => {
-            // The gap block's durable batch committed before the crash: the
-            // stored head receipt covers its body, undo, and locator rows.
-            // Replay redoes only what publication owed — the journal tail
-            // and the coherent tip — and carries the receipt's commit id.
-            commit_id
-        }
+        // The gap block's durable batch committed before the crash: the
+        // stored head receipt covers its body, undo, and locator rows.
+        // Replay redoes only what publication owed — the journal tail
+        // and the coherent tip — and carries the receipt's commit id.
+        PublishMode::Replay { receipt } => receipt.commit_id,
         PublishMode::Grouped(group) => {
             // The window buffers the durable work: facts ride in the group
             // until its boundary, where one sync and one head batch commit
             // the whole verified prefix and the prefix publishes in order.
-            let known = group
-                .chain_tx_count_base()
-                .unwrap_or_else(|| handles.chain_tx_count.load(Ordering::Relaxed));
             let journal_record = build_journal_record(
                 block,
                 height,
@@ -587,8 +564,6 @@ pub(super) fn apply_block_admitted<'b>(
             group.stage(PendingBlockCommit {
                 outcome: outcome.clone(),
                 undo_record,
-                tx_count_delta,
-                chain_tx_count_after: advanced_chain_tx_count_from(known, height, tx_count_delta),
                 prev_hash,
                 journal_record,
             });
@@ -610,7 +585,7 @@ pub(super) fn apply_block_admitted<'b>(
         ),
         height,
     );
-    publish_connect(handles, &tip, tx_count_delta);
+    publish_applied(handles, &outcome.tip, crate::events::HintKind::Connected);
     outcome.commit_id = commit_id;
     Ok(ApplyFinish::Committed(outcome))
 }
@@ -941,13 +916,25 @@ pub(super) fn applied_header_tip(
             },
         ));
     }
+    let parent_known = node
+        .parent
+        .and_then(|parent| tree.node(parent).ok())
+        .is_some_and(|parent| parent.chain_tx_count.get().is_some());
     tree.record_applied_tx_count(node_id, tx_count_delta_for(block))?;
     let node = tree.node(node_id)?;
+    if parent_known && node.chain_tx_count.get().is_none() {
+        tracing::warn!(
+            height,
+            hash = %block_hash,
+            "cumulative chain transaction count overflowed; marking it unknown"
+        );
+    }
     Ok(TipSnapshot {
         tip_id: node_id,
         height: node.height,
         chainwork: node.chainwork,
         hash: node.hash,
+        chain_tx_count: node.chain_tx_count,
     })
 }
 
