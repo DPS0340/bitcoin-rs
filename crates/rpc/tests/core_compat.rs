@@ -32,7 +32,7 @@ use bitcoin_rs_primitives::{
 };
 use bitcoin_rs_rpc::Handler;
 use bitcoin_rs_rpc::context::Context;
-use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
+use sonic_rs::{JsonContainerTrait as _, JsonValueMutTrait as _, JsonValueTrait as _, json};
 
 /// Re-parses one dispatched response against the pinned upstream wire type.
 fn typed<T: serde::de::DeserializeOwned>(
@@ -106,6 +106,26 @@ fn chain_state_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn s
     // Pruning needs block-log rows this fixture does not provide.
     assert!(handler.dispatch("pruneblockchain", &json!([1])).is_err());
 
+    Ok(())
+}
+
+#[test]
+fn chaininfo_projection_rejects_unknown_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let handler = Handler::new(tipped_context());
+    let mut response = handler.dispatch("getblockchaininfo", &json!([]))?;
+    response
+        .as_object_mut()
+        .ok_or("getblockchaininfo must return an object")?
+        .insert("unexpected", json!(true));
+    let body = sonic_rs::to_string(&response)?;
+    let error = match support::compare::typed_getblockchain_info(body.as_bytes()) {
+        Err(error) => error,
+        Ok(_) => return Err("the unknown chaininfo field was accepted".into()),
+    };
+    assert!(
+        error.to_string().contains("unexpected"),
+        "strict decode error did not name the unknown field: {error}"
+    );
     Ok(())
 }
 
