@@ -343,7 +343,12 @@ pub fn statically_fanout_eligible(peer: &PeerInfo, policy: &BlockDownloadPolicy)
     !peer.inbound && serves_requested_height(peer, policy)
 }
 
-/// Whether a peer can serve one required body height.
+fn peer_advertises_block_service(peer: &PeerInfo) -> bool {
+    let network = ServiceFlags::NETWORK.to_u64();
+    peer.services & (network | NETWORK_LIMITED) != 0
+}
+
+/// Whether a peer advertising block service can serve one required body height.
 ///
 /// Core leaves two blocks of race buffer inside the 288-block limited-service
 /// window (`net_processing.cpp:1636-1638`).
@@ -352,7 +357,7 @@ pub(crate) fn peer_can_serve_height(
     peer_height: u32,
     required_height: u32,
 ) -> bool {
-    if required_height > peer_height {
+    if !peer_advertises_block_service(peer) || required_height > peer_height {
         return false;
     }
     let limited_only =

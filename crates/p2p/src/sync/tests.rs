@@ -2511,7 +2511,7 @@ pub(crate) fn connect_peer(
 }
 
 #[test]
-fn limited_peer_range_gates_both_request_paths() -> Result<(), Box<dyn std::error::Error>> {
+fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error::Error>> {
     use super::frontier::{BodyState, ChainFrontier, RequiredBody, SyncFrontier, UsablePeer};
 
     const WITNESS: u64 = 1 << 3;
@@ -2545,6 +2545,21 @@ fn limited_peer_range_gates_both_request_paths() -> Result<(), Box<dyn std::erro
     let mut limited_info = synthetic_peer(limited_addr, 300);
     limited_info.services = WITNESS | NETWORK_LIMITED;
     let limited_rx = connect_peer(&peers, limited_info.clone());
+    let no_service_addr = test_addr(18_900, 2)?;
+    let mut no_service_info = synthetic_peer(no_service_addr, 300);
+    // WITNESS alone advertises neither NODE_NETWORK nor NODE_NETWORK_LIMITED.
+    no_service_info.services = WITNESS;
+    let no_service_rx = connect_peer(&peers, no_service_info.clone());
+    let no_service = current_source(&peers, no_service_addr);
+    let no_service_usable = UsablePeer {
+        source: no_service,
+        info: no_service_info,
+        demonstrated_tips: Vec::new(),
+        active_height: None,
+        role: crate::peer_info::PeerRole::FullRelay,
+        manual: false,
+        connected_at: Instant::now(),
+    };
     let limited = current_source(&peers, limited_addr);
     let usable = UsablePeer {
         source: limited,
@@ -2555,7 +2570,7 @@ fn limited_peer_range_gates_both_request_paths() -> Result<(), Box<dyn std::erro
         manual: false,
         connected_at: Instant::now(),
     };
-    let frontier = |height, hash| SyncFrontier {
+    let frontier = |height, hash, usable_peer| SyncFrontier {
         chain: ChainFrontier {
             applied_tip: None,
             chain_tip: None,
@@ -2565,12 +2580,20 @@ fn limited_peer_range_gates_both_request_paths() -> Result<(), Box<dyn std::erro
         body_state: Some(BodyState::Unowned),
         header_request: None,
         header_request_live: false,
-        usable_peers: vec![usable.clone()],
+        usable_peers: vec![usable_peer],
     };
 
-    let historical = sync.sync_peer_selection(&frontier(14, historical_hash), Instant::now());
+    let historical = sync.sync_peer_selection(
+        &frontier(14, historical_hash, usable.clone()),
+        Instant::now(),
+    );
     assert!(historical.request_peers.is_empty());
-    let recent = sync.sync_peer_selection(&frontier(15, recent_hash), Instant::now());
+    let no_service_selection = sync.sync_peer_selection(
+        &frontier(15, recent_hash, no_service_usable),
+        Instant::now(),
+    );
+    assert!(no_service_selection.request_peers.is_empty());
+    let recent = sync.sync_peer_selection(&frontier(15, recent_hash, usable), Instant::now());
     assert_eq!(recent.request_peers.len(), 1);
     assert_eq!(recent.request_peers[0].source, limited);
 
@@ -2592,6 +2615,7 @@ fn limited_peer_range_gates_both_request_paths() -> Result<(), Box<dyn std::erro
             bitcoin::BlockHash::from_byte_array(*recent_hash.as_byte_array())
         )]
     );
+    assert!(no_service_rx.try_recv().is_err());
     Ok(())
 }
 
