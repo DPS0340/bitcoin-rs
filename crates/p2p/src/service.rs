@@ -407,7 +407,7 @@ impl P2pService {
         thread::Builder::new()
             .name("bitcoin-rs-p2p-outbound-drain".to_owned())
             .spawn(move || {
-                let mut active: HashMap<SocketAddr, (crate::peer_info::PeerRole, bool)> =
+                let mut active: HashMap<SocketAddr, crate::peer_info::PeerRole> =
                     HashMap::new();
                 // Automatic dials that arrived while the automatic cap was
                 // full, retried in order once a slot opens.
@@ -794,7 +794,7 @@ pub fn apply_network_active(flag: &AtomicBool, table: &crate::PeerTable, active:
 }
 
 fn reap_finished_outbound_connections(
-    active: &mut HashMap<SocketAddr, (crate::peer_info::PeerRole, bool)>,
+    active: &mut HashMap<SocketAddr, crate::peer_info::PeerRole>,
     handles: &mut Vec<(SocketAddr, JoinHandle<Result<(), crate::PeerError>>)>,
 ) {
     let mut index = 0;
@@ -895,7 +895,7 @@ fn live_outbound_count(peer_table: &crate::PeerTable) -> usize {
 fn dial_outbound_role(
     dial: &OutboundDial,
     peer_table: &crate::PeerTable,
-    pending: &HashMap<SocketAddr, (crate::peer_info::PeerRole, bool)>,
+    pending: &HashMap<SocketAddr, crate::peer_info::PeerRole>,
     full_relay_slots: usize,
     block_relay_slots: usize,
     extra_full_relay: bool,
@@ -918,7 +918,7 @@ fn spawn_outbound_dial(
     dial: &OutboundDial,
     shared: &crate::listener::ConnectionShared,
     peer_table: &crate::PeerTable,
-    active: &mut HashMap<SocketAddr, (crate::peer_info::PeerRole, bool)>,
+    active: &mut HashMap<SocketAddr, crate::peer_info::PeerRole>,
     handles: &mut Vec<(SocketAddr, JoinHandle<Result<(), crate::PeerError>>)>,
     full_relay_slots: usize,
     block_relay_slots: usize,
@@ -944,7 +944,7 @@ fn spawn_outbound_dial(
     } else {
         crate::listener::spawn_outbound_connection(dial.addr, shared.clone(), role)
     };
-    active.insert(dial.addr, (role, dial.manual));
+    active.insert(dial.addr, role);
     handles.push((dial.addr, handle));
 }
 
@@ -969,7 +969,7 @@ fn spawn_outbound_dial(
 ///   assigned full relay by the caller and never reaches this chooser.
 fn next_outbound_role(
     peer_table: &crate::PeerTable,
-    pending: &HashMap<SocketAddr, (crate::peer_info::PeerRole, bool)>,
+    pending: &HashMap<SocketAddr, crate::peer_info::PeerRole>,
     full_relay_slots: usize,
     block_relay_slots: usize,
     extra_full_relay: bool,
@@ -998,8 +998,8 @@ fn next_outbound_role(
     let in_flight = |want: PeerRole| {
         pending
             .iter()
-            .filter(|(addr, (role, _manual))| {
-                *role == want && !census.iter().any(|session| session.addr == **addr)
+            .filter(|(addr, role)| {
+                **role == want && !census.iter().any(|session| session.addr == **addr)
             })
             .count()
     };
@@ -1317,6 +1317,15 @@ mod tests {
         Arc::new(|_source: PeerSource| {})
     }
 
+    /// Every DNS lookup answers with this single address.
+    struct OneAddrResolver(SocketAddr);
+
+    impl crate::DnsResolver for OneAddrResolver {
+        fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
+            Ok(vec![self.0])
+        }
+    }
+
     #[test]
     fn start_fails_when_listener_cannot_bind() {
         let occupied =
@@ -1475,17 +1484,6 @@ mod tests {
         // drain cannot skip it as already connected.
         const REPLACEMENT_PORT: u16 = 9;
 
-        struct OneAddrResolver;
-
-        impl crate::DnsResolver for OneAddrResolver {
-            fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
-                Ok(vec![SocketAddr::from((
-                    Ipv4Addr::LOCALHOST,
-                    REPLACEMENT_PORT,
-                ))])
-            }
-        }
-
         let table = crate::PeerTable::new();
         let (tx, _rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(tx);
@@ -1505,7 +1503,7 @@ mod tests {
         let active = AtomicBool::new(true);
         let dns_queue = Mutex::new(DnsQueueState::default());
         let queued = drain_dns_peer_deficit(
-            &OneAddrResolver,
+            &OneAddrResolver(SocketAddr::from((Ipv4Addr::LOCALHOST, REPLACEMENT_PORT))),
             &["seed.example"],
             &active,
             &table,
@@ -1526,14 +1524,6 @@ mod tests {
 
     #[test]
     fn parked_dial_overflow_releases_dns_backoff_for_retry() {
-        struct OneAddrResolver(SocketAddr);
-
-        impl crate::DnsResolver for OneAddrResolver {
-            fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
-                Ok(vec![self.0])
-            }
-        }
-
         let table = crate::PeerTable::new();
         let active = AtomicBool::new(true);
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 65));
@@ -1586,14 +1576,6 @@ mod tests {
 
     #[test]
     fn release_after_park_rearms_dns_backoff() {
-        struct OneAddrResolver(SocketAddr);
-
-        impl crate::DnsResolver for OneAddrResolver {
-            fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
-                Ok(vec![self.0])
-            }
-        }
-
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 66));
         let expired_at = Instant::now()
             .checked_sub(FAILED_ADDR_BACKOFF + Duration::from_secs(1))
@@ -1697,11 +1679,11 @@ mod tests {
     fn in_flight_dials_hold_their_class() {
         use crate::peer_info::PeerRole;
         let table = crate::PeerTable::new();
-        let mut pending: HashMap<SocketAddr, (PeerRole, bool)> = HashMap::new();
+        let mut pending: HashMap<SocketAddr, PeerRole> = HashMap::new();
         for port in 1..=8_u16 {
             pending.insert(
                 SocketAddr::from(([127, 0, 0, 1], port)),
-                (PeerRole::FullRelay, false),
+                PeerRole::FullRelay,
             );
         }
         assert!(
@@ -1714,7 +1696,7 @@ mod tests {
         for port in 9..=10_u16 {
             pending.insert(
                 SocketAddr::from(([127, 0, 0, 1], port)),
-                (PeerRole::BlockRelayOnly, false),
+                PeerRole::BlockRelayOnly,
             );
         }
         assert!(
@@ -1734,12 +1716,12 @@ mod tests {
         use crate::connection::PeerLease;
         use crate::peer_info::PeerRole;
         let table = crate::PeerTable::new();
-        let mut pending: HashMap<SocketAddr, (PeerRole, bool)> = HashMap::new();
+        let mut pending: HashMap<SocketAddr, PeerRole> = HashMap::new();
         for port in 1..=5_u16 {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
             let (tx, _rx) = crossbeam_channel::unbounded();
             table.register(addr, PeerLease::new(tx));
-            pending.insert(addr, (PeerRole::FullRelay, false));
+            pending.insert(addr, PeerRole::FullRelay);
         }
         assert!(
             matches!(
