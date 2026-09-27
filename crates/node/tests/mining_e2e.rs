@@ -672,8 +672,8 @@ fn mining_handler(state: &NodeState) -> Handler {
     let tips = state.chainstate().rpc_tip_bundle();
     let ctx = Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: tips.chain_tip,
-            applied_tip: tips.applied_tip,
+            chain_tip: bitcoin_rs_chain::TipReader::new(tips.chain_tip),
+            applied_tip: bitcoin_rs_chain::TipReader::new(tips.applied_tip),
             chain_tx_count: state.chainstate().chain_tx_count_handle(),
             ibd,
             blocks: state.blocks(),

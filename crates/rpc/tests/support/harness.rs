@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
+use bitcoin_rs_chain::TipReader;
 use bitcoin_rs_mempool::MempoolGateway;
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_rpc::context::{
@@ -109,8 +110,8 @@ impl ServerHarness {
         let tips = chainstate.rpc_tip_bundle();
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
-                chain_tip: tips.chain_tip,
-                applied_tip: tips.applied_tip,
+                chain_tip: TipReader::new(tips.chain_tip),
+                applied_tip: TipReader::new(tips.applied_tip),
                 chain_tx_count: chainstate.chain_tx_count_handle(),
                 ibd,
                 blocks: state.blocks(),

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use bitcoin_rs_chain::BlockBodySource;
+use bitcoin_rs_chain::{BlockBodySource, TipReader};
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_rpc::{
     RpcServer,
@@ -70,8 +70,8 @@ fn bind_rpc(
     let tips = chainstate.rpc_tip_bundle();
     let context = Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: tips.chain_tip,
-            applied_tip: tips.applied_tip,
+            chain_tip: TipReader::new(tips.chain_tip),
+            applied_tip: TipReader::new(tips.applied_tip),
             chain_tx_count: chainstate.chain_tx_count_handle(),
             ibd: Arc::clone(ibd),
             blocks: state.blocks(),

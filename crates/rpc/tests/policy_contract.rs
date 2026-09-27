@@ -1697,8 +1697,8 @@ fn invalidation_handler(state: &NodeState) -> Handler {
     ));
     Handler::new(Arc::new(Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: tips.chain_tip,
-            applied_tip: tips.applied_tip,
+            chain_tip: bitcoin_rs_chain::TipReader::new(tips.chain_tip),
+            applied_tip: bitcoin_rs_chain::TipReader::new(tips.applied_tip),
             chain_tx_count: chainstate.chain_tx_count_handle(),
             ibd,
             blocks: state.blocks(),
@@ -1895,12 +1895,12 @@ fn immature_coinbase_spends_reject_on_both_rpcs_and_admit_at_maturity() -> Resul
     );
 
     // At depth 100 the same spend admits through the same outlet.
-    ctx.set_applied_tip(TipSnapshot {
+    ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
         tip_id: NodeId::new(0),
         height: 119,
         chainwork: ChainWork::ZERO,
         hash: Hash256::from_le_bytes(&[0x71; 32]),
-    });
+    })));
     handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&spend)]))?;
     assert!(
         ctx.mempool.gateway.read().contains_txid(&rpc_txid(&spend)),
