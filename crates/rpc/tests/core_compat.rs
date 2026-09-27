@@ -43,8 +43,8 @@ fn tipped_context() -> Arc<Context> {
         hash: Hash256::from_le_bytes(&[42_u8; 32]),
         chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
     };
-    ctx.chain.set_chain_tip(tip.clone());
-    ctx.chain.set_applied_tip(tip);
+    ctx.chain.chain_tip.store(Some(Arc::new(tip.clone())));
+    ctx.chain.applied_tip.store(Some(Arc::new(tip)));
     ctx
 }
 

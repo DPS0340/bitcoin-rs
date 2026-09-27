@@ -108,20 +108,21 @@ impl ServerHarness {
         let state = &node.state;
         let chainstate = state.chainstate();
         let ibd = chainstate.ibd_latch();
-        let tips = chainstate.rpc_tip_bundle();
         let transition = chainstate.read_fence();
         let ctx = Context::from_handles(ContextHandles {
-            chain: ChainHandles::new(
-                tips.chain_tip,
-                tips.applied_tip,
-                state.blocks(),
-                state.transactions(),
-                chainstate.utxo_handle(),
-                chainstate.coin_stats_handle(),
-                chainstate.block_tree_handle(),
-                state.config().network,
+            chain: ChainHandles {
+                chain_tip: chainstate.header_tip_reader(),
+                applied_tip: chainstate.applied_tip_reader(),
                 ibd,
-            ),
+                blocks: state.blocks(),
+                transactions: state.transactions(),
+                utxo: chainstate.utxo_handle(),
+                coin_stats: chainstate.coin_stats_handle(),
+                block_tree: chainstate.block_tree_handle(),
+                chain_network: state.config().network,
+                chain_transition: Arc::clone(&transition),
+                ..ChainHandles::default()
+            },
             mempool: MempoolHandles {
                 gateway: MempoolGateway::shared(state.mempool()),
             },
@@ -143,8 +144,7 @@ impl ServerHarness {
                 mining_control: None,
             },
             ..ContextHandles::default()
-        })
-        .with_chain_transition(Arc::clone(&transition));
+        });
         let handler = Arc::new(Handler::new(Arc::new(ctx)));
         let auth = Arc::new(Auth::basic(REPLAY_USER, REPLAY_PASSWORD));
         let server = RpcServer::bind(

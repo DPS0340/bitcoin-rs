@@ -239,15 +239,10 @@ pub struct ContextHandles {
 /// Chain capability handles.
 #[derive(Clone)]
 pub struct ChainHandles {
-    /// Best header-chain tip.
-    pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    /// Best fully-applied block tip.
-    pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    /// Excludes RPC reads that need a stable mutable chainstate — a live UTXO
-    /// scan or mempool admission — from node-owned connect/disconnect
-    /// transitions. Published status reads answer from an [`AppliedView`]
-    /// instead and never take it.
-    chain_transition: Arc<Mutex<()>>,
+    /// Best header-chain tip. Read-only: only Chainstate publishes.
+    pub chain_tip: TipReader,
+    /// Best fully-applied block tip. Read-only: only Chainstate publishes.
+    pub applied_tip: TipReader,
     /// Process-wide initial-block-download latch over the applied chain,
     /// shared with P2P so both surfaces answer identically.
     pub ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
@@ -263,6 +258,10 @@ pub struct ChainHandles {
     pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
     /// Consensus network.
     pub chain_network: Network,
+    /// Authoritative chain connect/disconnect transition barrier. Production
+    /// supplies the chain owner's barrier; the synthetic `Default` builds a
+    /// private one for tests.
+    pub chain_transition: Arc<Mutex<()>>,
     /// Durable block-body reader for metadata-only block records.
     pub block_body_source: Option<Arc<dyn BlockBodySource>>,
     /// Optional storage pruning mutator.
@@ -469,8 +468,8 @@ impl Default for ChainHandles {
             BlockTreeReader::new(Arc::clone(&block_tree)),
         ));
         Self {
-            chain_tip: Arc::new(ArcSwapOption::empty()),
-            applied_tip,
+            chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
+            applied_tip: TipReader::new(applied_tip),
             ibd,
             blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
@@ -807,47 +806,6 @@ fn unix_time_secs() -> u64 {
 }
 
 impl ChainHandles {
-    /// Builds a chain group from its live handles with the transition barrier
-    /// unattached; the owner attaches its own through
-    /// [`Context::with_chain_transition`].
-    ///
-    /// PRE: every handle points at the caller's real chainstate — no synthetic
-    ///   copies. POST: the group owns these exact handles, the optional
-    ///   adapters are `None`, and the unattached transition barrier is the
-    ///   empty-context default.
-    /// INVARIANT: construction copies no subsystem state and creates no second
-    ///   initial-block-download latch or transaction-count authority.
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
-        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-        blocks: Arc<RwLock<BlockLog>>,
-        transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
-        utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
-        coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
-        block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
-        chain_network: Network,
-        ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
-    ) -> Self {
-        Self {
-            chain_tip,
-            applied_tip,
-            chain_transition: Arc::new(Mutex::new(())),
-            ibd,
-            blocks,
-            transactions,
-            utxo,
-            coin_stats,
-            prune_service: None,
-            chain_control: None,
-            chain_network,
-            block_tree,
-            block_body_source: None,
-            rollback_warnings: None,
-        }
-    }
-
     /// Runs a read with authoritative UTXO and applied-tip transitions excluded.
     ///
     /// PRE: `read` does not reacquire the transition mutex.
@@ -972,16 +930,6 @@ impl ChainHandles {
         bitcoin_rs_mining::difficulty_for_bits(bits)
     }
 
-    /// Publishes a new best-chain tip.
-    pub fn set_chain_tip(&self, tip: TipSnapshot) {
-        self.chain_tip.store(Some(Arc::new(tip)));
-    }
-
-    /// Publishes a new best-applied-block tip.
-    pub fn set_applied_tip(&self, tip: TipSnapshot) {
-        self.applied_tip.store(Some(Arc::new(tip)));
-    }
-
     /// Stores a block record for block and header RPCs.
     pub fn add_block(&self, record: BlockRecord) {
         self.blocks.write().push(record);
@@ -999,7 +947,7 @@ impl ChainHandles {
     pub(crate) fn admission_chain(&self) -> ChainAdmissionView {
         ChainAdmissionView::new(
             Arc::clone(&self.utxo),
-            TipReader::new(Arc::clone(&self.applied_tip)),
+            self.applied_tip.clone(),
             BlockTreeReader::new(Arc::clone(&self.block_tree)),
             self.chain_network,
         )
@@ -1491,13 +1439,13 @@ mod tests {
 
         let barrier = Arc::new(Mutex::new(()));
         let ctx = Arc::new(Context::new().with_chain_transition(Arc::clone(&barrier)));
-        ctx.chain.set_applied_tip(TipSnapshot {
+        ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
             tip_id: bitcoin_rs_chain::NodeId::new(0),
             height: 5,
             chainwork: bitcoin_rs_chain::ChainWork::ZERO,
             hash: bitcoin_rs_primitives::Hash256::default(),
             chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(1),
-        });
+        })));
 
         let transition = barrier.lock();
         let worker = Arc::clone(&ctx);
@@ -1685,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::arc_with_non_send_sync, clippy::too_many_lines)]
     fn from_handles_shares_chain_handles_with_caller() {
         use alloc::sync::Arc;
 
@@ -1706,8 +1654,8 @@ mod tests {
         let chain_transition = Arc::new(Mutex::new(()));
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
-                chain_tip: Arc::clone(&chain_tip),
-                applied_tip: Arc::clone(&applied_tip),
+                chain_tip: TipReader::new(Arc::clone(&chain_tip)),
+                applied_tip: TipReader::new(Arc::clone(&applied_tip)),
                 ibd: Arc::clone(&ibd),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
                 transactions: Arc::new(RwLock::new(HashMap::new())),
@@ -1735,12 +1683,23 @@ mod tests {
             Arc::ptr_eq(&ctx.chain.chain_transition, &chain_transition),
             "the caller's transition barrier must be the one the context locks"
         );
-        assert!(
-            Arc::ptr_eq(&ctx.chain.chain_tip, &chain_tip),
+        let marker = || TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(0),
+            height: 7,
+            chainwork: bitcoin_rs_chain::ChainWork::ZERO,
+            hash: Hash256::from_le_bytes(&[7; 32]),
+            chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
+        };
+        chain_tip.store(Some(Arc::new(marker())));
+        assert_eq!(
+            ctx.chain.chain_tip.load_full().map(|tip| tip.height),
+            Some(7),
             "chain_tip must be shared with caller"
         );
-        assert!(
-            Arc::ptr_eq(&ctx.chain.applied_tip, &applied_tip),
+        applied_tip.store(Some(Arc::new(marker())));
+        assert_eq!(
+            ctx.chain.applied_tip.load_full().map(|tip| tip.height),
+            Some(7),
             "applied_tip must be shared with caller"
         );
         // The count travels inside the applied tip: one publication replaces
@@ -2100,7 +2059,9 @@ mod tests {
             let applied_tip = tree
                 .tip()
                 .ok_or_else(|| std::io::Error::other("missing child tip"))?;
-            ctx.chain.set_applied_tip((*applied_tip).clone());
+            ctx.chain
+                .applied_tip
+                .store(Some(Arc::new((*applied_tip).clone())));
             // Stale cache entry at the SAME height as the tree child but with a
             // different hash. The active-tree identity must win over this cache.
             let stale_hash = Hash256::from_le_bytes(&[0xa5_u8; 32]);
@@ -2181,8 +2142,12 @@ mod tests {
             (applied_tip, header_tip)
         };
 
-        ctx.chain.set_applied_tip((*applied_tip).clone());
-        ctx.chain.set_chain_tip((*header_tip).clone());
+        ctx.chain
+            .applied_tip
+            .store(Some(Arc::new((*applied_tip).clone())));
+        ctx.chain
+            .chain_tip
+            .store(Some(Arc::new((*header_tip).clone())));
         ctx.chain
             .add_block(BlockRecord::synthetic(2, BlockHash::from(header_tip.hash)));
 

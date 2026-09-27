@@ -14,8 +14,8 @@ use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid, Wtxid};
 #[cfg(test)]
 use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
 use bitcoin_rs_script::{
-    Instruction, is_multisig, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh,
-    is_p2wsh, is_push_only, minimal_non_dust, multisig_key_count, opcode, script::instructions,
+    Instruction, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
+    is_push_only, minimal_non_dust, multisig_key_count, opcode, script::instructions,
 };
 use thiserror::Error;
 
@@ -478,7 +478,7 @@ fn is_standard_output_script(script: &[u8]) -> bool {
 ///
 /// Bitcoin Core's `IsStandard` allows bare multisig with up to 3 keys.
 fn is_standard_multisig(script: &[u8]) -> bool {
-    is_multisig(script) && multisig_key_count(script).is_some_and(|n| n <= 3)
+    multisig_key_count(script).is_some_and(|n| n <= 3)
 }
 
 /// Returns `true` if a non-`OP_RETURN` output is dust.

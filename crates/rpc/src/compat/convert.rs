@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use bitcoin::Address;
 use bitcoin_rs_primitives::{CompactTarget, Network, Tx, TxIn, TxOut, consensus_bytes};
 use bitcoin_rs_script::{
-    is_multisig, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, multisig_key_count,
+    is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_push_only, multisig_key_count,
     witness_program,
 };
 use sonic_rs::{JsonValueMutTrait as _, JsonValueTrait as _, Value};
@@ -186,7 +186,10 @@ pub(crate) fn classify(script: &[u8]) -> ScriptShape {
             _ => ScriptShape::Nonstandard,
         };
     }
-    if is_op_return(script) {
+    // Core's Solver classifies an `OP_RETURN` output `nulldata` only when the
+    // bytes after the opcode are all pushes; an interleaved opcode is
+    // `nonstandard`.
+    if is_op_return(script) && is_push_only(&script[1..]) {
         return ScriptShape::NullData;
     }
     if is_p2pk(script) {
@@ -195,9 +198,10 @@ pub(crate) fn classify(script: &[u8]) -> ScriptShape {
     if is_p2pkh(script) {
         return ScriptShape::PubkeyHash;
     }
-    // Core's Solver classifies multisig only when every key push is a
-    // serialized pubkey (33 or 65 bytes); `is_multisig` is the shape alone.
-    if is_multisig(script) && multisig_key_count(script).is_some() {
+    // `multisig_key_count` is Core's `MatchMultisig`: it already requires
+    // valid count operands and serialized pubkeys, so the shape check alone
+    // adds nothing here.
+    if multisig_key_count(script).is_some() {
         return ScriptShape::Multisig;
     }
     ScriptShape::Nonstandard
@@ -337,7 +341,7 @@ pub(crate) struct VerboseTxChain {
     pub block_hash: String,
     /// Confirmations on the applied chain.
     pub confirmations: u64,
-    /// Confirming block time (reported as both `time` and `blocktime`).
+    /// Confirming block time (reported only with positive confirmations).
     pub time: u64,
     /// Whether the confirming block is on the applied chain.
     pub in_active_chain: Option<bool>,
@@ -365,11 +369,12 @@ pub(crate) fn raw_transaction_verbose(
         .collect::<Result<Vec<_>, _>>()?;
     let (block_hash, confirmations, transaction_time, block_time, in_active_chain) =
         chain.map_or((None, None, None, None, None), |chain| {
+            let time = (chain.confirmations > 0).then_some(chain.time);
             (
                 Some(chain.block_hash),
                 Some(chain.confirmations),
-                Some(chain.time),
-                Some(chain.time),
+                time,
+                time,
                 chain.in_active_chain,
             )
         });

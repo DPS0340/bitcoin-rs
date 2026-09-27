@@ -669,19 +669,20 @@ fn mining_handler(state: &NodeState) -> Handler {
     );
     let mining_control: Arc<dyn MiningControl> = Arc::new(coordinator);
     let ibd = state.chainstate().ibd_latch();
-    let tips = state.chainstate().rpc_tip_bundle();
     let ctx = Context::from_handles(ContextHandles {
-        chain: ChainHandles::new(
-            tips.chain_tip,
-            tips.applied_tip,
-            state.blocks(),
-            state.transactions(),
-            Arc::new(UtxoSet::new()),
-            state.chainstate().coin_stats_handle(),
-            state.chainstate().block_tree_handle(),
-            state.config().network,
+        chain: ChainHandles {
+            chain_tip: state.chainstate().header_tip_reader(),
+            applied_tip: state.chainstate().applied_tip_reader(),
             ibd,
-        ),
+            blocks: state.blocks(),
+            transactions: state.transactions(),
+            utxo: Arc::new(UtxoSet::new()),
+            coin_stats: state.chainstate().coin_stats_handle(),
+            block_tree: state.chainstate().block_tree_handle(),
+            chain_network: state.config().network,
+            chain_transition: state.chainstate().read_fence(),
+            ..ChainHandles::default()
+        },
         mempool: MempoolHandles {
             gateway: MempoolGateway::shared(state.mempool()),
         },
@@ -698,8 +699,7 @@ fn mining_handler(state: &NodeState) -> Handler {
             mining_control: Some(mining_control),
         },
         ..ContextHandles::default()
-    })
-    .with_chain_transition(state.chainstate().read_fence());
+    });
     Handler::new(Arc::new(ctx))
 }
 

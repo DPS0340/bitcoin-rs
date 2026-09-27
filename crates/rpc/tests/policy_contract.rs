@@ -1681,7 +1681,7 @@ fn reorg_mine_and_apply(
 }
 
 fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>> {
-    let applied = state.chainstate().rpc_tip_bundle().applied_tip;
+    let applied = state.chainstate().applied_tip_reader();
     let Some(tip) = applied.load_full() else {
         return Err("applied tip must exist".into());
     };
@@ -1690,52 +1690,50 @@ fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>>
 
 fn invalidation_handler(state: &NodeState) -> Handler {
     let chainstate = state.chainstate();
-    let tips = chainstate.rpc_tip_bundle();
     let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-        bitcoin_rs_chain::TipReader::new(Arc::clone(&tips.applied_tip)),
+        chainstate.applied_tip_reader(),
         bitcoin_rs_chain::BlockTreeReader::new(chainstate.block_tree_handle()),
     ));
-    Handler::new(Arc::new(
-        Context::from_handles(ContextHandles {
-            chain: ChainHandles::new(
-                tips.chain_tip,
-                tips.applied_tip,
-                state.blocks(),
-                state.transactions(),
-                chainstate.utxo_handle(),
-                chainstate.coin_stats_handle(),
-                chainstate.block_tree_handle(),
-                Network::Regtest,
-                ibd,
-            ),
-            mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(state.mempool()),
-            },
-            indexes: IndexHandles {
-                derived_index: None,
-                script_index: None,
-                esplora_tx_index: None,
-                derived_index_status: None,
-            },
-            network: NetworkHandles {
-                network: state.network(),
-                network_active: state.network_active(),
-                peer_table: state.peer_table(),
-                p2p_outbound_sender: Some(state.p2p_outbound_sender()),
-                banned: state.banned_subnets(),
-                added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            },
-            mining: MiningHandles {
-                mining_control: None,
-            },
-            ..ContextHandles::default()
-        })
-        .with_chain_transition(chainstate.read_fence())
-        .with_chain_control(Arc::new(NodeInvalidator {
-            handles: chainstate,
-            followers: state.chain_followers(),
-        })),
-    ))
+    Handler::new(Arc::new(Context::from_handles(ContextHandles {
+        chain: ChainHandles {
+            chain_tip: chainstate.header_tip_reader(),
+            applied_tip: chainstate.applied_tip_reader(),
+            ibd,
+            blocks: state.blocks(),
+            transactions: state.transactions(),
+            utxo: chainstate.utxo_handle(),
+            coin_stats: chainstate.coin_stats_handle(),
+            block_tree: chainstate.block_tree_handle(),
+            chain_network: Network::Regtest,
+            chain_transition: chainstate.read_fence(),
+            chain_control: Some(Arc::new(NodeInvalidator {
+                handles: chainstate,
+                followers: state.chain_followers(),
+            })),
+            ..ChainHandles::default()
+        },
+        mempool: MempoolHandles {
+            gateway: MempoolGateway::shared(state.mempool()),
+        },
+        indexes: IndexHandles {
+            derived_index: None,
+            script_index: None,
+            esplora_tx_index: None,
+            derived_index_status: None,
+        },
+        network: NetworkHandles {
+            network: state.network(),
+            network_active: state.network_active(),
+            peer_table: state.peer_table(),
+            p2p_outbound_sender: Some(state.p2p_outbound_sender()),
+            banned: state.banned_subnets(),
+            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        },
+        mining: MiningHandles {
+            mining_control: None,
+        },
+        ..ContextHandles::default()
+    })))
 }
 
 #[test]
@@ -1895,13 +1893,13 @@ fn immature_coinbase_spends_reject_on_both_rpcs_and_admit_at_maturity() -> Resul
     );
 
     // At depth 100 the same spend admits through the same outlet.
-    ctx.chain.set_applied_tip(TipSnapshot {
+    ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
         tip_id: NodeId::new(0),
         height: 119,
         chainwork: ChainWork::ZERO,
         hash: Hash256::from_le_bytes(&[0x71; 32]),
         chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
-    });
+    })));
     handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&spend)]))?;
     assert!(
         ctx.mempool.gateway.read().contains_txid(&rpc_txid(&spend)),
