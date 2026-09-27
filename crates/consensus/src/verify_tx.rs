@@ -222,6 +222,12 @@ fn verify_transaction_with_locktime_cutoff(
     engine: ValidationEngine,
     skip_scripts: bool,
 ) -> Result<(), ConsensusError> {
+    // Fail closed on an unsupported selection before the shared pre-phase:
+    // a coinbase returns `Ok(None)` there and would otherwise skip the
+    // engine dispatch in `verify_tx_scripts` entirely.
+    if !engine.is_supported() {
+        return Err(ConsensusError::UnsupportedEngine { engine });
+    }
     let Some(prep) = prepare_tx_checks(tx, height, locktime_cutoff, |_, outpoint| {
         prevouts.lookup(outpoint)
     })?

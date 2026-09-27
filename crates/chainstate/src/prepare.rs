@@ -71,7 +71,7 @@ pub(super) fn parse_block_for_apply(
         .map_err(ApplyError::Consensus)?;
     if parsed.transaction_count() != block.txs.len() {
         return Err(ApplyError::Consensus(
-            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
+            bitcoin_rs_consensus::ConsensusError::Encoding(format!(
                 "block parse produced {} transactions, decoder produced {}",
                 parsed.transaction_count(),
                 block.txs.len()

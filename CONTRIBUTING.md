@@ -14,7 +14,8 @@ workflow, coding standards, and verification commands used across the project.
   `rocksdb` backend (notably the dependency-range minimal lane, which
   checks `--all-features`) additionally require libclang (`libclang-dev`
   on Debian/Ubuntu). No manifest enables `kernel` by default: the feature is
-  an opt-in capability on the consensus, node, and binary crates, and engine
+  an opt-in capability on the consensus, script, chainstate, node, and binary
+  crates, and engine
   selection is the runtime `validation.engine` setting. The exact defaults are
   owned by the
   [validation-default contract](docs/contracts/validation-default.md).

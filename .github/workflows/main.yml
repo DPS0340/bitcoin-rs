@@ -62,7 +62,7 @@ jobs:
       # Consensus fixture corpus includes the large deterministic vectors.
       - name: Kernel consensus tests including ignored vectors
         if: ${{ !cancelled() && steps.native_deps.outcome == 'success' && steps.toolchain.outcome == 'success' }}
-        run: cargo test --locked -p bitcoin-rs-consensus --no-fail-fast -- --include-ignored
+        run: cargo test --locked -p bitcoin-rs-consensus --features kernel --no-fail-fast -- --include-ignored
       # -p bitcoin-rs propagates all backends and kernel through the binary's
       # feature table; virtual-workspace --features would not do so.
       - name: Full-node binary Clippy
@@ -74,11 +74,11 @@ jobs:
       # The binary's all-target pass does not lint dependency test targets.
       - name: Kernel node Clippy
         if: ${{ !cancelled() && steps.native_deps.outcome == 'success' && steps.toolchain.outcome == 'success' }}
-        run: cargo clippy --locked -p bitcoin-rs-node --all-targets -- -D warnings
+        run: cargo clippy --locked -p bitcoin-rs-node --all-targets --features kernel -- -D warnings
       # Include consensus's kernel-gated tests and kernel_verify_spike example.
       - name: Kernel consensus Clippy
         if: ${{ !cancelled() && steps.native_deps.outcome == 'success' && steps.toolchain.outcome == 'success' }}
-        run: cargo clippy --locked -p bitcoin-rs-consensus --all-targets -- -D warnings
+        run: cargo clippy --locked -p bitcoin-rs-consensus --all-targets --features kernel -- -D warnings
       # Formal checks run independently in model-check-manual. Runs under
       # cargo-nextest's pooled scheduler like the PR test lanes.
       - name: Full-node binary tests
@@ -228,9 +228,9 @@ jobs:
         range: [minimal, maximum]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # consensus and node have `kernel` in their per-crate defaults, so
-      # `cargo check --workspace --all-targets` compiles the C++ kernel
-      # engine; install the native prerequisites.
+      # The minimal lane checks --all-features and the maximum lane runs an
+      # explicit kernel check, so both compile the C++ kernel engine; install
+      # the native prerequisites.
       - uses: ./.github/actions/native-deps
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly

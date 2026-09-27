@@ -151,6 +151,38 @@ fn kernel_engine_fails_closed_without_the_kernel_feature() {
         other => panic!("kernel engine must fail closed without the feature, got {other:?}"),
     }
 
+    // A coinbase returns from the pre-phase before any engine dispatch; the
+    // selection check must still fire.
+    let coinbase = Tx {
+        version: 1,
+        lock_time: LockTime::ZERO,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            script_sig: vec![1, 1].into(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        outputs: vec![TxOut {
+            value: Amount::from_sat(50),
+            script_pubkey: Script::new(),
+        }],
+    };
+    match verify_transaction(
+        &coinbase,
+        &coins,
+        0,
+        0,
+        VerifyFlags::MANDATORY,
+        ValidationEngine::Kernel,
+    ) {
+        Err(ConsensusError::UnsupportedEngine { engine }) => {
+            assert_eq!(engine, ValidationEngine::Kernel);
+        }
+        other => {
+            panic!("coinbase under kernel must fail closed without the feature, got {other:?}")
+        }
+    }
+
     let block = single_tx_block(&tx);
     match BlockParse::parse(&consensus_bytes(&block), ValidationEngine::Kernel) {
         Err(ConsensusError::UnsupportedEngine { engine }) => {

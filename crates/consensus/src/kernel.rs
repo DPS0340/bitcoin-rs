@@ -434,8 +434,10 @@ impl BlockParse {
     /// Parses `raw_block` once under `engine`.
     ///
     /// # Errors
-    /// Returns [`ConsensusError::Kernel`] when the bytes are not a valid block,
-    /// and the unsupported-build error when `engine` is
+    /// The error variant follows the selected backend: [`ConsensusError::Encoding`]
+    /// when the native layout parse rejects the bytes, [`ConsensusError::Kernel`]
+    /// when the kernel backend cannot parse them, and
+    /// [`ConsensusError::UnsupportedEngine`] when `engine` is
     /// [`ValidationEngine::Kernel`] on a build without kernel support.
     pub fn parse(raw_block: &[u8], engine: ValidationEngine) -> Result<Self, ConsensusError> {
         match engine {

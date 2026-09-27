@@ -54,13 +54,30 @@ fn native_script_verdicts_remain_permanent() {
 }
 
 /// Kernel-backend failures stay Operational (issue #618: `bitcoinkernel`
-/// can reject a valid block depending on process state).
+/// can reject a valid block depending on process state). `Kernel` carries
+/// backend parse/precompute failures; a per-input verdict arrives as
+/// `Script` instead.
 #[test]
 fn kernel_backend_failures_remain_operational() {
     assert_eq!(
         classify_apply_error(&ApplyError::Consensus(ConsensusError::Kernel(
-            "kernel script verification failed: test".to_owned()
+            "kernel transaction parse failed".to_owned()
         ))),
+        WindowApplyDisposition::Operational
+    );
+}
+
+/// A kernel per-input verdict surfaces as `Script` with the
+/// `kernel script verification failed:` prefix; classification still treats
+/// it as the retryable #618 backend outcome rather than a proof the header
+/// is invalid.
+#[test]
+fn kernel_script_verdicts_stay_operational() {
+    assert_eq!(
+        classify_apply_error(&ApplyError::Consensus(ConsensusError::Script {
+            input_index: 0,
+            reason: "kernel script verification failed: test".to_owned(),
+        })),
         WindowApplyDisposition::Operational
     );
 }

@@ -11,7 +11,6 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use bitcoin_rs_consensus::ValidationEngine;
 
 use bitcoin_rs_mempool::{
     Mempool, MempoolEntry, MempoolGateway, MempoolLimits, MempoolObserver, MutationEnvelope,
@@ -1796,12 +1795,14 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
     );
 
     // Pool-path agreement: the same structural filter over a bare gateway
-    // admits the spend once and keeps the coinbase out.
+    // admits the spend once and keeps the coinbase out. The bare gateway
+    // takes the resolved config engine so it mirrors the RPC path under any
+    // selection, not only the regtest default.
     let gateway = MempoolGateway::shared(
         Arc::new(parking_lot::RwLock::new(Mempool::new(
             MempoolLimits::default(),
         ))),
-        ValidationEngine::Native,
+        state.config().validation.engine,
     )
     .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
     let chainstate = state.chainstate();

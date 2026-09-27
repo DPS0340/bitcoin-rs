@@ -464,17 +464,18 @@ pub(crate) fn start_node(
     runtime: RuntimeInputs,
     install_signals: bool,
 ) -> Result<Node> {
+    // The engine/build compatibility check is owned by configuration
+    // validation (`validation.engine`); repeat it on the direct embedding path
+    // so a caller that skips `resolve` cannot open chainstate or start workers
+    // on an engine this build cannot execute. It runs before anything else:
+    // not even the tracer or the rayon pool may be primed for a run that
+    // cannot start.
+    config.validate()?;
     // Registers the Bitcoin Core-compatible USDT probes with the platform
     // tracer so consumers (bpftrace, BCC, DTrace) can discover them — shared
     // startup, so daemon (`run`) and embedded (`Node::start`) nodes are
     // equally discoverable. A no-op without the `usdt` feature.
     bitcoin_rs_trace::register_probes();
-    // The engine/build compatibility check is owned by configuration
-    // validation (`validation.engine`); repeat it on the direct embedding path
-    // so a caller that skips `resolve` cannot open chainstate or start workers
-    // on an engine this build cannot execute. It runs before anything else:
-    // not even the rayon pool may be primed for a run that cannot start.
-    config.validate()?;
     cap_global_thread_pool();
     let injected_shutdown = runtime.shutdown;
     let state = NodeState::open(config, runtime.mempool_observer.as_ref())?;

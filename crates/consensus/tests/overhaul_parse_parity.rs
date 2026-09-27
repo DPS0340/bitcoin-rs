@@ -260,19 +260,27 @@ fn assert_parse_matches_oracle(parsed: &BlockParse, oracle: &bitcoin::Block, mat
     );
 }
 
+/// One fixture, two reference passes: the independent oracle decode and the
+/// checked layout parse whose materialization re-encodes to the fixture
+/// bytes. Both engine tests share this setup so their inputs cannot drift.
+fn fixture_parts(height: u32) -> (Vec<u8>, bitcoin::Block, Block) {
+    let bytes = fixture_bytes(height);
+    let oracle: bitcoin::Block = bitcoin::consensus::deserialize(&bytes).expect("oracle decode");
+    let mut reader = bytes.as_slice();
+    let layout = ParsedBlock::parse(&mut reader).expect("layout parse");
+    let materialized: Block = layout.materialize();
+    (bytes, oracle, materialized)
+}
+
 /// `engine = native`'s parse is the single layout pass: it carries positions
 /// and pre-populated witness IDs, and rejects trailing bytes like the decoder
 /// it replaced. The native engine is compiled in every build, so this parse
 /// stays available in kernel builds too.
 #[test]
 fn native_block_parse_matches_oracle_identities() {
-    let bytes = fixture_bytes(SEGWIT_HEIGHT);
-    let oracle: bitcoin::Block = bitcoin::consensus::deserialize(&bytes).expect("oracle decode");
+    let (bytes, oracle, materialized) = fixture_parts(SEGWIT_HEIGHT);
     let parsed =
         BlockParse::parse(&bytes, ValidationEngine::Native).expect("one-pass native block parse");
-    let mut reader = bytes.as_slice();
-    let layout = ParsedBlock::parse(&mut reader).expect("layout parse");
-    let materialized: Block = layout.materialize();
     assert_parse_matches_oracle(&parsed, &oracle, &materialized);
 
     let facts = parsed.derive_facts(&materialized.txs, &parsed.txids().expect("native txids"));
@@ -285,7 +293,7 @@ fn native_block_parse_matches_oracle_identities() {
         native_facts.transaction_spans().len(),
         parsed.transaction_count()
     );
-    let mut padded = bytes.clone();
+    let mut padded = bytes;
     padded.push(0x00);
     assert!(
         BlockParse::parse(&padded, ValidationEngine::Native).is_err(),
@@ -298,13 +306,9 @@ fn native_block_parse_matches_oracle_identities() {
 #[test]
 #[cfg(feature = "kernel")]
 fn kernel_block_parse_matches_oracle_identities() {
-    let bytes = fixture_bytes(SEGWIT_HEIGHT);
-    let oracle: bitcoin::Block = bitcoin::consensus::deserialize(&bytes).expect("oracle decode");
+    let (bytes, oracle, materialized) = fixture_parts(SEGWIT_HEIGHT);
     let parsed =
         BlockParse::parse(&bytes, ValidationEngine::Kernel).expect("one-pass kernel block parse");
-    let mut reader = bytes.as_slice();
-    let layout = ParsedBlock::parse(&mut reader).expect("layout parse");
-    let materialized: Block = layout.materialize();
     assert_parse_matches_oracle(&parsed, &oracle, &materialized);
 }
 

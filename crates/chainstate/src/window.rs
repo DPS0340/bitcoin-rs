@@ -593,8 +593,9 @@ pub(super) fn prove_window<'a>(
     // One slot per input block, so a skipped unit leaves a hole rather than
     // shifting every later block onto the wrong prepared state.
     let mut skipped = vec![false; prepared.len()];
-    // One dispatch for the whole window. The check units borrow their kernel
-    // blocks, so they live and die inside this scope, before anything commits.
+    // One dispatch for the whole window. The check units borrow the selected
+    // engine's parsed blocks, so they live and die inside this scope, before
+    // anything commits.
     {
         // Each block's checks are built from its own prepared state, so the
         // window builds them all at once. The overlay walk above already fixed

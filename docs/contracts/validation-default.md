@@ -28,7 +28,11 @@ Owners:
 - `validation.engine` selects the engine at runtime, default `native`. The
   `kernel` selection requires a `--features kernel` build; on any other build
   it is rejected during configuration validation with an unsupported-build
-  error, never by silent engine substitution.
+  error, never by silent engine substitution. The `native` default is the
+  resolved code default — what an unset config runs on a bare build — not
+  the production default: the shipped image still selects `kernel` at the
+  config-file layer (`VAL-03`), so the promotion evidence below keeps gating
+  that switch.
 - Switching the production default engine is a measured decision under the
   promotion evidence below, not a manifest edit: the evidence gates keep or
   move that default (Core-vector parity, signed-spend **apply-path** native
