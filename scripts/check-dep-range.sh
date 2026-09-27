@@ -17,8 +17,9 @@
 #
 # The minimal endpoint uses --all-features so the resolved oldest versions
 # are also checked with every optional feature enabled. The maximum endpoint
-# uses the default feature set; the named feature matrix is owned by
-# FEAT-01 / scripts/check-feature-matrix.sh.
+# checks the default feature set plus one explicit kernel-enabled check so
+# the optional C++ engine still sees its newest allowed versions; the named
+# feature matrix is owned by FEAT-01 / scripts/check-feature-matrix.sh.
 # The minimal endpoint uses --all-features, so the rocksdb backend builds
 # bindgen; bindgen's clang-sys dependency needs a visible libclang at build
 # time. See CONTRIBUTING.md, Prerequisites.
@@ -72,9 +73,9 @@ else
   CARGO=(cargo)
 fi
 
-# Library defaults include kernel, so --workspace --all-targets builds
-# libbitcoinkernel. Callers that need that path must install cmake and
-# libboost-dev first; this script does not.
+# The minimal lane's --all-features and the maximum lane's explicit kernel
+# check build libbitcoinkernel. Callers that need those paths must install
+# cmake and libboost-dev first; this script does not.
 case "${RANGE}" in
   minimal)
     log "resolving direct dependencies at their oldest allowed versions"
@@ -87,6 +88,11 @@ case "${RANGE}" in
     "${CARGO[@]}" update
     log "checking the resolved maximum graph"
     "${CARGO[@]}" check --workspace --all-targets
+    # The default feature set no longer compiles the kernel engine, so check
+    # it explicitly against the resolved maximum graph; -p propagates the
+    # feature through node's forwarding chain to consensus.
+    log "checking the kernel engine against the resolved maximum graph"
+    "${CARGO[@]}" check -p bitcoin-rs-node --all-targets --features kernel
     ;;
 esac
 

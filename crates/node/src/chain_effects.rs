@@ -395,6 +395,7 @@ impl ChainFollowers {
 mod tests {
     use super::*;
     use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
+    use bitcoin_rs_consensus::ValidationEngine;
     use bitcoin_rs_mempool::{
         AdmissionChain, AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolLimits,
         MutationOutcome, PeerToken, SubmitError, SubmitOutcome,
@@ -588,9 +589,11 @@ mod tests {
     /// apply.rs; this checks the follower's lifecycle notification boundary.
     #[allow(clippy::too_many_lines)]
     fn assert_admission_followers_after_chain_change(connect: bool) -> anyhow::Result<()> {
-        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-            MempoolLimits::default(),
-        ))));
+        let gateway = MempoolGateway::shared(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            ValidationEngine::Native,
+        )
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let followers = followers_with_gateway(&gateway);
         let block = Network::Regtest.genesis_block();
         let parent = block.txs[0].txid();
@@ -693,9 +696,11 @@ mod tests {
 
     #[test]
     fn active_chain_change_is_retryable_not_shutdown() -> anyhow::Result<()> {
-        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-            MempoolLimits::default(),
-        ))));
+        let gateway = MempoolGateway::shared(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            ValidationEngine::Native,
+        )
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let followers = followers_with_gateway(&gateway);
         let active = gateway.begin_chain_change()?;
 

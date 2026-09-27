@@ -40,6 +40,13 @@ const WORK_PER_HEADER: u64 = 2;
 /// minimum block version at heights 500, 1251, and 1351, and these fixture
 /// chains are longer than all of them.
 fn mine_header(prev_blockhash: BlockHash, height: u32) -> Header {
+    regtest_fixture::mined_regtest_header(prev_blockhash, height)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"))
+}
+
+/// One regtest-easy header with the height salted into its merkle root, the
+/// shape the presync commitment tests vary; grinds at the declared target.
+fn test_header(prev_blockhash: BlockHash, height: u32) -> Header {
     use bitcoin_rs_primitives::CompactTarget;
     let mut merkle = [0_u8; 32];
     merkle[..4].copy_from_slice(&height.to_le_bytes());
@@ -47,16 +54,12 @@ fn mine_header(prev_blockhash: BlockHash, height: u32) -> Header {
         version: 4,
         prev_blockhash,
         merkle_root: Hash256::from_le_bytes(&merkle),
-        time: GENESIS_TIME.saturating_add(height),
-        bits: CompactTarget::from_consensus(0x207f_ffff),
-        nonce: height,
+        time: regtest_fixture::genesis_time().saturating_add(height),
+        bits: CompactTarget::from_consensus(regtest_fixture::REGTEST_BITS),
+        nonce: 0,
     };
-    while !pow_met(
-        header.bits.to_consensus(),
-        Hash256::from(header.compute_hash()),
-    ) {
-        header.nonce = header.nonce.wrapping_add(1);
-    }
+    regtest_fixture::mine_header_to_declared_target(&mut header)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     header
 }
 
@@ -360,7 +363,7 @@ fn a_substituted_redownload_header_disconnects_the_connection()
             .unwrap_or_else(|| unreachable!("the sync state is live"));
         if hash != Hash256::from(original_hash)
             && bit != original_bit
-            && pow_met(rogue.bits.to_consensus(), hash)
+            && bitcoin_rs_chain::compact_is_met_by(rogue.bits, hash)
         {
             break;
         }
@@ -375,8 +378,8 @@ fn a_substituted_redownload_header_disconnects_the_connection()
     for index in commitment_index..chain_len {
         let mut header = substituted[index];
         header.prev_blockhash = substituted[index - 1].compute_hash();
-        while !pow_met(
-            header.bits.to_consensus(),
+        while !bitcoin_rs_chain::compact_is_met_by(
+            header.bits,
             Hash256::from(header.compute_hash()),
         ) {
             header.nonce = header.nonce.wrapping_add(1);
@@ -898,12 +901,13 @@ fn assert_invalid_body_header_is_discarded(
 fn body_carried_low_work_bad_pow_is_discarded_and_faults_peer()
 -> Result<(), Box<dyn std::error::Error>> {
     let genesis = Network::Regtest.genesis_block().header;
-    let mut block =
-        mined_block_with_prev_hash(genesis.compute_hash(), 1, vec![coinbase_transaction(1)]);
-    while pow_met(
-        block.header.bits.to_consensus(),
-        Hash256::from(block.block_hash()),
-    ) {
+    let mut block = regtest_fixture::mined_block_with_prev_hash(
+        genesis.compute_hash(),
+        1,
+        vec![regtest_fixture::coinbase(1)],
+    )?;
+    while bitcoin_rs_chain::compact_is_met_by(block.header.bits, Hash256::from(block.block_hash()))
+    {
         block.header.nonce = block.header.nonce.wrapping_add(1);
     }
 
@@ -914,13 +918,14 @@ fn body_carried_low_work_bad_pow_is_discarded_and_faults_peer()
 fn body_carried_low_work_bad_nbits_is_discarded_and_faults_peer()
 -> Result<(), Box<dyn std::error::Error>> {
     let genesis = Network::Regtest.genesis_block().header;
-    let mut block =
-        mined_block_with_prev_hash(genesis.compute_hash(), 1, vec![coinbase_transaction(2)]);
+    let mut block = regtest_fixture::mined_block_with_prev_hash(
+        genesis.compute_hash(),
+        1,
+        vec![regtest_fixture::coinbase(2)],
+    )?;
     block.header.bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x207f_fffe);
-    while !pow_met(
-        block.header.bits.to_consensus(),
-        Hash256::from(block.block_hash()),
-    ) {
+    while !bitcoin_rs_chain::compact_is_met_by(block.header.bits, Hash256::from(block.block_hash()))
+    {
         block.header.nonce = block.header.nonce.wrapping_add(1);
     }
 
@@ -934,7 +939,11 @@ fn body_carried_low_work_valid_header_stays_deferred() -> Result<(), Box<dyn std
     let (addr, _lease, _rx) = connect(&peers, 9713, 100_000);
     let source = current_source(&peers, addr);
     let genesis = Network::Regtest.genesis_block();
-    let block = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(3)]);
+    let block = regtest_fixture::mined_block_with_prev_hash(
+        genesis.block_hash(),
+        1,
+        vec![regtest_fixture::coinbase(3)],
+    )?;
     let hash = Hash256::from(block.block_hash());
     let mut batch = vec![crate::InboundBlock::from_decoded(block)];
     batch[0].source = Some(source);

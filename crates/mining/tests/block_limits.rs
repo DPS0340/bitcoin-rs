@@ -136,7 +136,7 @@ fn lower_limit(context: &mut CandidateContext, field: &str) {
 
 /// Compares reported totals with rust-bitcoin wire parsing and enforces configured limits.
 fn assert_serialized_limits(candidate: &Candidate) -> TestResult {
-    let block = candidate.into_unsolved_block();
+    let block = candidate.into_unsolved_block()?;
     let bytes = consensus_bytes(&block);
     let oracle: bitcoin::Block = bitcoin::consensus::deserialize(&bytes)?;
     assert_eq!(bitcoin::consensus::serialize(&oracle), bytes);

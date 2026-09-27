@@ -67,6 +67,19 @@ fn consensus_failures_use_core_bip22_reasons() {
             script("EVAL_FALSE"),
             "block-script-verify-flag-failed (EVAL_FALSE)",
         ),
+        (
+            ConsensusError::PrevoutCount {
+                input_count: 2,
+                prevout_count: 1,
+            },
+            "transaction has 2 inputs but 1 prevouts",
+        ),
+        (
+            ConsensusError::UnsupportedEngine {
+                engine: bitcoin_rs_consensus::ValidationEngine::Kernel,
+            },
+            "unsupported validation engine: kernel",
+        ),
     ] {
         assert_eq!(consensus_reject_reason(&error), want, "{error:?}");
     }
