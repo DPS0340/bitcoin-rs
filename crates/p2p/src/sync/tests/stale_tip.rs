@@ -9,7 +9,7 @@ use std::thread;
 use super::super::{StaleTipState, tip_may_be_stale};
 use super::*;
 use crate::listener::ListenerExtras;
-use crate::service::{P2pService, P2pServiceConfig};
+use crate::service::{OutboundDial, P2pService, P2pServiceConfig};
 use bitcoin_rs_primitives::Hash256;
 
 /// The network's target spacing: ten minutes, as every production chain
@@ -88,8 +88,8 @@ fn the_stale_tip_allowance_dials_past_the_slot_cap() {
         )
         .expect("the service starts");
 
-    // Three pinned addresses: two fill the slots, the third may only dial
-    // because the stale tip raises the cap by one.
+    // Three automatic addresses: two fill the slots, and the third may only
+    // dial because the stale tip raises the cap by one.
     let listeners: Vec<TcpListener> = (0..3)
         .map(|_| {
             let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -100,9 +100,12 @@ fn the_stale_tip_allowance_dials_past_the_slot_cap() {
             listener
         })
         .collect();
+    let outbound = service.outbound_sender();
     for listener in &listeners {
         let addr = listener.local_addr().expect("fake peer address");
-        service.add_node(addr, false).expect("queue the dial");
+        outbound
+            .send(OutboundDial::auto(addr))
+            .expect("queue the automatic dial");
     }
 
     let mut held = Vec::new();
