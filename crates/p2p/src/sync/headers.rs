@@ -28,7 +28,7 @@ use crate::download_window::SyncPeer;
 use crate::peer_info::PeerInfo;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
-use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus};
+use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus, validate_pow};
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
@@ -1056,16 +1056,19 @@ impl BlockSync {
         }
         if !outcome.ready_headers.is_empty() {
             let admission = self.chain.admit_headers(&outcome.ready_headers);
-            if matches!(admission, HeaderAdmission::Refused(_)) {
-                // Admission is paused: return the released prefix to the
-                // live state so the next page's release re-emits it once
-                // admission reopens. The sync's own continuation is already
-                // in flight, so no tree-anchored re-request runs here — one
-                // would restart the whole sync.
-                if let Some(state) = self.scheduler.lock().headers_sync.get_mut(&source) {
-                    state.requeue_released(&outcome.ready_headers);
-                    return None;
+            if let HeaderAdmission::Refused(error) = admission {
+                // Admission is paused (checkpoint publish or shutdown):
+                // retaining the released prefix in the live state grows
+                // without bound — every refused page requeues the whole
+                // excess and the next page adds another page's worth. Drop
+                // the sync instead; the paced ancestry re-request restarts
+                // it once admission reopens, the same retry the direct path
+                // gets.
+                if let Some(mut state) = self.scheduler.lock().headers_sync.remove(&source) {
+                    state.finalize();
                 }
+                self.request_ancestry_after_refusal(Some(source), &error);
+                return None;
             }
             return Some(admission);
         }
@@ -1139,11 +1142,26 @@ impl BlockSync {
         // batch that crosses the floor on its own admits directly instead
         // of opening a presync that re-requests the same page after the
         // crossing.
-        let claimed = headers.iter().fold(fork.chainwork, |sum, header| {
-            sum.saturating_add(bitcoin_rs_chain::block_work(header))
+        //
+        // The claim counts declared `bits`, so it is honest only when every
+        // header actually meets its target: a page ending in an unmet
+        // tiny-target header inflates `claimed` and takes the direct path,
+        // where admission inserts each valid prefix as it goes and never
+        // rolls back on the failure — letting a reconnecting peer fill the
+        // tree below the floor. Pre-validate the whole page's proof of work
+        // before trusting the sum; a page with an unmet target falls through
+        // to the presync, which faults the peer on it instead.
+        let page_pow_valid = headers.iter().all(|header| {
+            let hash = Hash256::from(header.compute_hash());
+            validate_pow(header, hash, network).is_ok()
         });
-        if claimed >= minimum_work {
-            return None;
+        if page_pow_valid {
+            let claimed = headers.iter().fold(fork.chainwork, |sum, header| {
+                sum.saturating_add(bitcoin_rs_chain::block_work(header))
+            });
+            if claimed >= minimum_work {
+                return None;
+            }
         }
         let median_time_past = tree.median_time_past_at(fork_id, MEDIAN_TIME_PAST_WINDOW)?;
         Some(HeaderAnchor {
