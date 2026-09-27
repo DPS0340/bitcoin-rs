@@ -38,7 +38,6 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 - Each `Entry` row carries `name`, `kind` (`Rpc`, `Rest`, `Zmq`),
   `status`, `feature`, `core_version`, `notes`, and `since`, extended
   with required capabilities, error behavior, consistency class, resource
-<<<<<<< HEAD
   budget, and evidence scenario. The `Status` vocabulary is `Supported`,
   `Deviation`, `Implemented (unverified)`, `Extension`, `Disabled`,
   `Unimplemented`. `[reference].differential_harness` in
@@ -262,7 +261,6 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 
 - **Owner**: `ensure_template_ready` in `crates/rpc/src/handlers/mining.rs`.
 - Template mode on mainnet requires at least one live peer (`PeerTable`) and
-<<<<<<< HEAD
   that the node has left IBD
   (`!ctx.chain.ibd.is_active(now, ctx.chain.chain_network)`, the chain-crate
   latch in `crates/chain/src/ibd.rs` negated by the gate).
