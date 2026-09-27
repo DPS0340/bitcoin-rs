@@ -628,6 +628,7 @@ impl Harness {
         harness.relay = Some(spawn_tx_relay_worker(
             PeerRelaySink::new(harness.state.peer_table()),
             relay_rx,
+            Arc::downgrade(&harness.gateway),
             Arc::clone(&harness.shutdown),
         )?);
         harness.ingress = Some(spawn_tx_ingress_consumer(
@@ -692,7 +693,8 @@ fn full_relay_queue_does_not_block_peer_admission_or_mining_wake() -> anyhow::Re
     let gateway = state.mempool_gateway();
     let (relay, _relay_rx) = TxRelayQueue::new(1);
     let pending = spending_tx(parent_txid(0xEE), 40_000);
-    assert!(relay.announce(pending.txid(), pending.wtxid(), None));
+    // The filler request is never admitted, so it carries no real epoch.
+    assert!(relay.announce(pending.txid(), pending.wtxid(), None, u64::MAX));
     let mining = Arc::new(RecordingMining::default());
     let mining_control: Arc<dyn MiningControl> = Arc::<RecordingMining>::clone(&mining);
     let shutdown = Arc::new(AtomicBool::new(false));

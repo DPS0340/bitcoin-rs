@@ -134,14 +134,20 @@ impl TxIngressConsumer {
     ) {
         match outcome {
             Ok(SubmitOutcome::Committed(result)) => {
-                if result.changes.iter().any(|change| {
-                    change.txid == Hash256::from(txid)
-                        && matches!(
-                            change.outcome,
-                            bitcoin_rs_mempool::MutationOutcome::Accepted
-                        )
-                }) {
-                    self.relay.announce(txid, wtxid, Some(source.connection_id));
+                if let Some(sequence) = result
+                    .changes
+                    .iter()
+                    .position(|change| {
+                        change.txid == Hash256::from(txid)
+                            && matches!(
+                                change.outcome,
+                                bitcoin_rs_mempool::MutationOutcome::Accepted
+                            )
+                    })
+                    .and_then(|index| result.sequence_of(index))
+                {
+                    self.relay
+                        .announce(txid, wtxid, Some(source.connection_id), sequence);
                     self.mining_control.publish_generation();
                 }
             }

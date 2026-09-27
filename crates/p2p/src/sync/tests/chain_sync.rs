@@ -21,6 +21,7 @@ fn outbound(port: u16, height: u32, role: PeerRole, at: Instant) -> UsablePeer {
         info: synthetic_peer(addr, i32::try_from(height).unwrap_or(i32::MAX)),
         demonstrated_tips: vec![Hash256::from_le_bytes(&[0x7c; 32])],
         active_height: Some(height),
+        headers_horizon: None,
         role,
         manual: false,
         connected_at: at,

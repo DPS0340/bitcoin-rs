@@ -24,8 +24,8 @@ fjall = ["bitcoin-rs-chain/fjall"]
 redb = ["bitcoin-rs-chain/redb"]
 
 [dependencies]
-bitcoin-rs-chain.workspace = true
 bitcoin-rs-consensus.workspace = true
+bitcoin-rs-chain.workspace = true
 bitcoin-rs-mempool.workspace = true
 bitcoin-rs-primitives.workspace = true
 bitcoin.workspace = true
@@ -50,4 +50,8 @@ bitcoin-rs-consensus.workspace = true
 
 [[bench]]
 name = "write_message"
+harness = false
+
+[[bench]]
+name = "headers_presync"
 harness = false

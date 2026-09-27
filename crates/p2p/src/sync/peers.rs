@@ -15,7 +15,7 @@ use crate::download_window::SyncPeer;
 use crate::download_window::SyncPeerSelection;
 use crate::download_window::configure_request_mode;
 use crate::download_window::{
-    BlockDownloadPolicy, serves_requested_height, statically_fanout_eligible,
+    BlockDownloadPolicy, peer_can_serve_height, serves_requested_height, statically_fanout_eligible,
 };
 use crate::peer_info::PeerRole;
 use bitcoin_rs_chain::BlockTree;
@@ -75,12 +75,18 @@ pub(super) fn is_peer_fault(error: &ChainError) -> bool {
 pub(super) fn sync_peer_candidate(
     source: PeerSource,
     peer: &PeerInfo,
+    headers_horizon: Option<u32>,
     floor: u32,
 ) -> Option<SyncPeer> {
-    let height = u32::try_from(peer.best_known_height).ok()?;
+    // The eligibility read is `min(best_known_height, headers_horizon)`: a
+    // connection whose download-twice sync already proved its headers end
+    // at the horizon stays selectable for what it can serve, but no
+    // longer outranks peers with a taller proven chain.
+    let claimed = u32::try_from(peer.best_known_height).ok()?;
+    let height = headers_horizon.map_or(claimed, |cap| claimed.min(cap));
     (height > floor).then_some(SyncPeer {
         source,
-        best_known_height: peer.best_known_height,
+        best_known_height: i32::try_from(height).unwrap_or(i32::MAX),
     })
 }
 
@@ -589,8 +595,9 @@ impl BlockSync {
         // value alone — a long-lived at-tip peer would otherwise become
         // ineligible for every newly announced block (#617). Per-request
         // truncation by `peer_best_height` still bounds the damage of a
-        // stale value. With nothing required the clause reduces to the
-        // applied tip's successor, as before.
+        // stale value. `peer_can_serve_height` also keeps a limited-service
+        // peer inside its retained range. With nothing required the clause
+        // reduces to the applied tip's successor, as before.
         let required_height = frontier.chain.next_required.map_or_else(
             || {
                 frontier
@@ -612,7 +619,7 @@ impl BlockSync {
             let Some(active_height) = peer.capability() else {
                 continue;
             };
-            if active_height < required_height {
+            if !peer_can_serve_height(&peer.info, active_height, required_height) {
                 continue;
             }
             candidates.push(FanoutCandidate {
