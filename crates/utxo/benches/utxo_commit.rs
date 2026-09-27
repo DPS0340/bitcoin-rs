@@ -203,14 +203,27 @@ fn spend_fanout_case(seed: u64) -> (UtxoSet, BlockChanges) {
     (set, changes)
 }
 
+/// One deterministic workload seed shared by the timed arms and the
+/// measurement mode, so both paths measure identical inputs.
+const SYNTHETIC_SEED: u64 = 0x00ab_cdef;
+/// Deterministic workload seed for the spend-fanout arm, shared by both
+/// paths.
+const FANOUT_SEED: u64 = 0x0405_0607;
+/// Commit txid for the synthetic arms, shared by both paths.
+const SYNTHETIC_COMMIT_TXID: u64 = 0x0012_3456;
+/// Commit txid for the spend-fanout arm, shared by both paths.
+const FANOUT_COMMIT_TXID: u64 = 0x0412_1314;
+
 fn bench_synthetic(c: &mut Criterion, name: &str, shape: ShardShape) {
     c.bench_function(name, |b| {
         b.iter_batched(
-            || synthetic_case(0x00ab_cdef, shape),
+            || synthetic_case(SYNTHETIC_SEED, shape),
             |(set, changes)| {
-                if let Err(error) =
-                    contract::commit_block_changes(&set, black_box(&changes), &txid(0x0012_3456))
-                {
+                if let Err(error) = contract::commit_block_changes(
+                    &set,
+                    black_box(&changes),
+                    &txid(SYNTHETIC_COMMIT_TXID),
+                ) {
                     panic!("synthetic commit failed: {error}");
                 }
             },
@@ -222,11 +235,13 @@ fn bench_synthetic(c: &mut Criterion, name: &str, shape: ShardShape) {
 fn bench_spend_fanout(c: &mut Criterion) {
     c.bench_function("utxo_commit/spend_fanout_64", |b| {
         b.iter_batched(
-            || spend_fanout_case(0x0405_0607),
+            || spend_fanout_case(FANOUT_SEED),
             |(set, changes)| {
-                if let Err(error) =
-                    contract::commit_block_changes(&set, black_box(&changes), &txid(0x0412_1314))
-                {
+                if let Err(error) = contract::commit_block_changes(
+                    &set,
+                    black_box(&changes),
+                    &txid(FANOUT_COMMIT_TXID),
+                ) {
                     panic!("spend-fanout commit failed: {error}");
                 }
             },
@@ -247,14 +262,14 @@ fn utxo_commit(c: &mut Criterion) {
 fn measure_memory(arm: &str) -> Result<(), String> {
     let ((set, changes), commit_txid) = match arm {
         "existing" => (
-            synthetic_case(0x00ab_cdef, ShardShape::Existing),
-            txid(0x0012_3456),
+            synthetic_case(SYNTHETIC_SEED, ShardShape::Existing),
+            txid(SYNTHETIC_COMMIT_TXID),
         ),
         "concentrated" => (
-            synthetic_case(0x00ab_cdef, ShardShape::Concentrated),
-            txid(0x0012_3456),
+            synthetic_case(SYNTHETIC_SEED, ShardShape::Concentrated),
+            txid(SYNTHETIC_COMMIT_TXID),
         ),
-        "spend_fanout_64" => (spend_fanout_case(0x0405_0607), txid(0x0412_1314)),
+        "spend_fanout_64" => (spend_fanout_case(FANOUT_SEED), txid(FANOUT_COMMIT_TXID)),
         other => return Err(format!("unknown measurement arm: {other}")),
     };
     if let Err(error) = contract::commit_block_changes(&set, &changes, &commit_txid) {

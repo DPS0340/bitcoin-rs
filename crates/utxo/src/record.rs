@@ -755,7 +755,7 @@ fn apply_additions<'a>(
     inline_len: &mut usize,
     additions: &[OutputParts<'a>],
     add_unique: bool,
-    mut overwritten: Option<&mut Vec<Option<OwnedUtxoOut>>>,
+    overwritten: Option<&mut Vec<Option<OwnedUtxoOut>>>,
 ) {
     let mut displaced = Vec::with_capacity(additions.len());
     for &addition in additions {
@@ -771,7 +771,7 @@ fn apply_additions<'a>(
         push_part(parts, inline_len, addition);
         displaced.push(old.map(OutputParts::into_owned));
     }
-    if let Some(sink) = overwritten.as_deref_mut() {
+    if let Some(sink) = overwritten {
         sink.extend(displaced);
     }
 }
