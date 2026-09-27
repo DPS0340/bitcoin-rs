@@ -1064,7 +1064,8 @@ impl BlockSync {
                 // the sync instead; the paced ancestry re-request restarts
                 // it once admission reopens, the same retry the direct path
                 // gets.
-                if let Some(mut state) = self.scheduler.lock().headers_sync.remove(&source) {
+                let dropped = self.scheduler.lock().headers_sync.remove(&source);
+                if let Some(mut state) = dropped {
                     state.finalize();
                 }
                 self.request_ancestry_after_refusal(Some(source), &error);

@@ -399,6 +399,10 @@ impl SyncChain for RefusingChain {
         )))
     }
 
+    fn minimum_chain_work(&self) -> ChainWork {
+        self.0.minimum_chain_work()
+    }
+
     fn check_body_binding(&self, block: &Block) -> Result<(), SyncChainError> {
         self.0.check_body_binding(block)
     }
