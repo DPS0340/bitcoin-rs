@@ -277,13 +277,13 @@ fn retarget_runs_before_the_peer_budget_truncates() -> Result<(), Box<dyn std::e
     let mut losing_tip_id = genesis_id;
     let mut prev_hash = genesis.compute_hash();
     for index in 0..LOSING_LEN {
-        let header = test_header(prev_hash, u32::try_from(index + 1)?);
+        let header = regtest_fixture::mined_regtest_header(prev_hash, u32::try_from(index + 1)?)?;
         losing_tip_id = tree.insert_node(Some(losing_tip_id), header, NodeStatus::HeaderValid)?;
         prev_hash = header.compute_hash();
     }
     let losing_tip = snapshot(&tree, losing_tip_id)?;
 
-    let winning_header = test_header(genesis.compute_hash(), 101);
+    let winning_header = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 101)?;
     let winning_id = tree.insert_node(Some(genesis_id), winning_header, NodeStatus::HeaderValid)?;
     let winning_tip = snapshot(&tree, winning_id)?;
 

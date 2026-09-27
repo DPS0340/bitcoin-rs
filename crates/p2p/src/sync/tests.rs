@@ -2447,6 +2447,7 @@ pub(crate) fn connect_peer(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error::Error>> {
     use super::frontier::{BodyState, ChainFrontier, RequiredBody, SyncFrontier, UsablePeer};
 
@@ -2459,7 +2460,7 @@ fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error:
     let mut recent_hash = None;
     // At tip 300, height 14 is at Core's 286-block cutoff; height 15 is recent enough.
     for height in 0..=300 {
-        let header = test_header(previous, height);
+        let header = regtest_fixture::mined_regtest_header(previous, height)?;
         previous = header.compute_hash();
         let height_hash = Hash256::from_le_bytes(previous.as_bytes());
         parent = Some(tree.insert_node(parent, header, NodeStatus::HeaderValid)?);
@@ -2492,6 +2493,7 @@ fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error:
         info: no_service_info,
         demonstrated_tips: Vec::new(),
         active_height: None,
+        headers_horizon: None,
         role: crate::peer_info::PeerRole::FullRelay,
         manual: false,
         connected_at: Instant::now(),
@@ -2502,6 +2504,7 @@ fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error:
         info: limited_info,
         demonstrated_tips: Vec::new(),
         active_height: None,
+        headers_horizon: None,
         role: crate::peer_info::PeerRole::FullRelay,
         manual: false,
         connected_at: Instant::now(),

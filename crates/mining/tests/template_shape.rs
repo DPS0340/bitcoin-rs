@@ -115,7 +115,7 @@ fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box
         }
     }
     assert_eq!(candidate.fees, fees);
-    let block = candidate.into_unsolved_block();
+    let block = candidate.into_unsolved_block()?;
     let oracle: bitcoin::Block =
         bitcoin::consensus::deserialize(&bitcoin_rs_primitives::encode::consensus_bytes(&block))?;
     assert_eq!(candidate.weight, oracle.weight().to_wu());

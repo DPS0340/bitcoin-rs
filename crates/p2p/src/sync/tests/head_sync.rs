@@ -183,8 +183,8 @@ fn body_carried_rejection_keeps_the_live_pending_gate() -> Result<(), Box<dyn st
     let peer = test_addr(9768, 0)?;
     let rx = connect_peer(&peers, synthetic_peer(peer, 10));
 
-    let gap_parent = test_header(genesis.compute_hash(), 1);
-    let orphan_tip = test_header(gap_parent.compute_hash(), 2);
+    let gap_parent = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)?;
+    let orphan_tip = regtest_fixture::mined_regtest_header(gap_parent.compute_hash(), 2)?;
     let batch = || InboundHeaders {
         headers: vec![orphan_tip],
         source: Some(current_source(&peers, peer)),
