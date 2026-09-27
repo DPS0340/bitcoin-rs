@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use bitcoin_rs_consensus::block_subsidy;
 use bitcoin_rs_node::{Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::{
@@ -48,7 +48,10 @@ fn replay_10k_records_with_bounded_time_and_memory() -> Result<()> {
     let genesis = Network::Regtest.genesis_block();
     let state = NodeState::open(config, None)?;
     state.apply_block(&genesis)?;
-    let _ = state.publish_checkpoint()?;
+    ensure!(
+        state.publish_checkpoint()?.is_some(),
+        "checkpoint must publish at genesis before the 10k replay"
+    );
 
     let mut previous = genesis.block_hash();
     for height in 1..=RECORDS {
