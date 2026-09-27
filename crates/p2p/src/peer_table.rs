@@ -30,6 +30,12 @@ pub struct PeerSession {
     pub info: Option<PeerInfo>,
     /// Header tips this connection has delivered and the node accepted.
     pub demonstrated_tips: Vec<Hash256>,
+    /// Headers tip this connection demonstrated by ending a download-twice
+    /// sync with nothing past it — the cap header selection reads. `None`
+    /// until a presync proves a ceiling; body eligibility keeps reading
+    /// [`PeerInfo::best_known_height`], the P2P-03 credit this does not
+    /// disturb.
+    pub headers_horizon: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -37,6 +43,7 @@ struct Entry {
     lease: PeerLease,
     info: Option<PeerInfo>,
     demonstrated_tips: Vec<Hash256>,
+    headers_horizon: Option<u32>,
 }
 
 /// The table's live entries plus the traffic accounting it retains of
@@ -107,6 +114,7 @@ impl PeerTable {
                         lease,
                         info: None,
                         demonstrated_tips: Vec::new(),
+                        headers_horizon: None,
                     },
                 );
                 if let Some(prior) = prior {
@@ -122,6 +130,7 @@ impl PeerTable {
                         lease,
                         info: None,
                         demonstrated_tips: Vec::new(),
+                        headers_horizon: None,
                     },
                 );
                 false
@@ -195,6 +204,7 @@ impl PeerTable {
                 lease: lease.clone(),
                 info: None,
                 demonstrated_tips: Vec::new(),
+                headers_horizon: None,
             },
         );
         if let Some(prior) = prior {
@@ -282,6 +292,57 @@ impl PeerTable {
             }
             _ => false,
         }
+    }
+
+    /// Records `height` as the live connection's demonstrated headers
+    /// horizon after its download-twice sync ended below the work floor
+    /// without releasing headers — the peer proved it has nothing past that
+    /// cursor, and leaving a higher handshake claim in place would keep
+    /// reselecting it while starving every other peer.
+    ///
+    /// The cap is written to its own field, not `best_known_height`: that
+    /// credit also gates block-body eligibility, and a peer with nothing
+    /// left to offer headers can still legitimately serve bodies it
+    /// advertised or demonstrated. Header-selection readers take
+    /// `min(best_known_height, headers_horizon)`; this writer only lowers
+    /// the horizon. Returns `false` for a stale, unpublished, or cancelled
+    /// connection.
+    pub fn note_headers_horizon(&self, source: PeerSource, height: u32) -> bool {
+        let mut entries = self.entries.write();
+        let Some(entry) = entries
+            .get_mut(&source.addr)
+            .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
+        else {
+            return false;
+        };
+        if entry.info.is_none() {
+            return false;
+        }
+        entry.headers_horizon = Some(entry.headers_horizon.map_or(height, |cap| cap.min(height)));
+        true
+    }
+
+    /// Lifts a terminal-page cap when the connection's download-twice sync
+    /// verified headers past it: `height` is the cursor an accepted batch
+    /// reached, so the earlier terminal page was not the connection's tip.
+    /// Announcement credits (`note_announced_*`) never reach here — a claim
+    /// alone does not undo the safeguard; only verified batches do. Returns
+    /// `false` for a stale, unpublished, or cancelled connection.
+    pub fn note_headers_progress(&self, source: PeerSource, height: u32) -> bool {
+        let mut entries = self.entries.write();
+        let Some(entry) = entries
+            .get_mut(&source.addr)
+            .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
+        else {
+            return false;
+        };
+        if entry.info.is_none() {
+            return false;
+        }
+        if entry.headers_horizon.is_some_and(|cap| height > cap) {
+            entry.headers_horizon = None;
+        }
+        true
     }
 
     /// Raises the compact-block relay preference for `source` — its live
@@ -574,6 +635,7 @@ impl PeerTable {
                 lease: entry.lease.clone(),
                 info: entry.info.clone(),
                 demonstrated_tips: entry.demonstrated_tips.clone(),
+                headers_horizon: entry.headers_horizon,
             })
             .collect();
         sessions.sort_unstable_by_key(|session| session.lease.connection_id().get());
@@ -595,6 +657,7 @@ impl PeerTable {
                 lease: entry.lease.clone(),
                 info: entry.info.clone(),
                 demonstrated_tips: entry.demonstrated_tips.clone(),
+                headers_horizon: entry.headers_horizon,
             })
             .collect();
         sessions.sort_unstable_by_key(|session| session.lease.connection_id().get());
@@ -1064,6 +1127,33 @@ mod tests {
         // The live connection raises the entry it owns.
         assert!(table.note_announced_height(current_source, 42));
         assert_eq!(table.infos()[0].best_known_height, 42);
+    }
+
+    #[test]
+    fn note_headers_progress_lifts_the_cap_only_on_verified_advance() {
+        let table = PeerTable::new();
+        let current = lease();
+        table.register(addr(1), current.clone());
+        let source = current.source(addr(1));
+        assert!(table.publish_info(addr(1), &current, info(addr(1), 100)));
+
+        // A terminal page caps the horizon at the demonstrated cursor.
+        assert!(table.note_headers_horizon(source, 5));
+
+        // Verified progress at or below the cap changes nothing.
+        assert!(table.note_headers_progress(source, 5));
+        let sessions = table.sessions();
+        assert_eq!(sessions[0].headers_horizon, Some(5));
+
+        // Verified progress past the cap lifts it entirely: the peer
+        // proved the earlier terminal page was not its tip.
+        assert!(table.note_headers_progress(source, 12));
+        let sessions = table.sessions();
+        assert_eq!(sessions[0].headers_horizon, None);
+        assert_eq!(
+            sessions[0].info.as_ref().map(|info| info.best_known_height),
+            Some(100)
+        );
     }
 
     // Contract proof: P2P-03 (docs/contracts/p2p-wire.md).

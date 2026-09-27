@@ -399,3 +399,38 @@ fn tick_bounded_request_peer_selection_preserves_equal_height_order()
     );
     Ok(())
 }
+
+/// Delivers `headers` to `sync` as a wire answer from `source`.
+pub(crate) fn deliver_headers(
+    tx: &crossbeam_channel::Sender<InboundHeaders>,
+    headers: Vec<Header>,
+    source: PeerSource,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tx.send(InboundHeaders {
+        headers,
+        source: Some(source),
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    Ok(())
+}
+
+/// The `getheaders` locators a message carries, as raw consensus bytes, or
+/// `None` for another message.
+pub(crate) fn locator_of(message: &Message) -> Option<Vec<[u8; 32]>> {
+    match message {
+        Message::GetHeaders(request) => Some(
+            request
+                .locator_hashes
+                .iter()
+                .map(|hash| *hash.as_byte_array())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The first `getheaders` locator on `rx`, or `None` if none is queued.
+pub(crate) fn next_locator(rx: &crossbeam_channel::Receiver<Message>) -> Option<Vec<[u8; 32]>> {
+    rx.try_iter().find_map(|message| locator_of(&message))
+}
