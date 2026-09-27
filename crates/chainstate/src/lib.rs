@@ -653,20 +653,64 @@ impl<'a> ChainTransition<'a> {
 
     /// Re-applies a body this node already validated and persisted before a crash.
     ///
-    /// Scripts do not run again (`BlockProvenance::LocalReplay`). Persistence
-    /// otherwise matches [`Self::connect`].
+    /// Scripts do not run again (`BlockProvenance::LocalReplay`). When the
+    /// stored durable head already names this block — it was committed but
+    /// never published — replay republishes under the head's receipt instead
+    /// of re-committing a head that would refuse the lineage. A block the
+    /// head does not certify still commits under `PublishMode::Now`.
     pub fn replay_local(
         &self,
         block: &Block,
         serialized: bytes::Bytes,
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
+        let head = self
+            .chainstate
+            .durable_head
+            .load()
+            .map_err(ApplyError::DurableHeadCommit)?;
+        let hash = block.block_hash().into();
+        let (mode, proven) = match head.as_ref() {
+            Some(head) if head.tip == hash => {
+                // The block's durable batch already committed: its spends are
+                // the inputs the undo row restores, not whatever a cold live
+                // set happens to carry.
+                let proven = match bitcoin_rs_utxo::contract::load_block_undo(
+                    self.chainstate.undo_store.as_ref(),
+                    head.height,
+                    hash,
+                ) {
+                    Ok(undo) => Some(ProvenApply::AssumeValidSkipped(prepare::prepare_apply(
+                        block,
+                        Some(serialized.clone()),
+                        &durable::UndoRowSpends(&undo),
+                    )?)),
+                    Err(bitcoin_rs_utxo::contract::UndoLoadError::Missing { .. }) => None,
+                    Err(_) => {
+                        return Err(ApplyError::DurableHeadGapUnrecoverable {
+                            head_tip: head.tip,
+                            head_height: head.height,
+                            restored_tip: None,
+                            restored_height: None,
+                            reason: "a committed block's undo record does not load",
+                        });
+                    }
+                };
+                (
+                    PublishMode::Replay {
+                        receipt: durable::DurableReceipt::from_head(head),
+                    },
+                    proven,
+                )
+            }
+            _ => (PublishMode::Now, None),
+        };
         self.settle_apply(apply_committed_block_admitted(
             self.chainstate,
             block,
             Some(serialized),
-            None,
+            proven,
             BlockProvenance::LocalReplay,
-            PublishMode::Now,
+            mode,
         ))
     }
 
