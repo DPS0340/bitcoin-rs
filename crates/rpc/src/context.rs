@@ -807,6 +807,47 @@ fn unix_time_secs() -> u64 {
 }
 
 impl ChainHandles {
+    /// Builds a chain group from its live handles with the transition barrier
+    /// unattached; the owner attaches its own through
+    /// [`Context::with_chain_transition`].
+    ///
+    /// PRE: every handle points at the caller's real chainstate — no synthetic
+    ///   copies. POST: the group owns these exact handles, the optional
+    ///   adapters are `None`, and the unattached transition barrier is the
+    ///   empty-context default.
+    /// INVARIANT: construction copies no subsystem state and creates no second
+    ///   initial-block-download latch or transaction-count authority.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
+        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+        blocks: Arc<RwLock<BlockLog>>,
+        transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
+        utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
+        coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
+        block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
+        chain_network: Network,
+        ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
+    ) -> Self {
+        Self {
+            chain_tip,
+            applied_tip,
+            chain_transition: Arc::new(Mutex::new(())),
+            ibd,
+            blocks,
+            transactions,
+            utxo,
+            coin_stats,
+            prune_service: None,
+            chain_control: None,
+            chain_network,
+            block_tree,
+            block_body_source: None,
+            rollback_warnings: None,
+        }
+    }
+
     /// Runs a read with authoritative UTXO and applied-tip transitions excluded.
     ///
     /// PRE: `read` does not reacquire the transition mutex.

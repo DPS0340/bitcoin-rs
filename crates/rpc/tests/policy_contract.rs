@@ -1695,46 +1695,47 @@ fn invalidation_handler(state: &NodeState) -> Handler {
         bitcoin_rs_chain::TipReader::new(Arc::clone(&tips.applied_tip)),
         bitcoin_rs_chain::BlockTreeReader::new(chainstate.block_tree_handle()),
     ));
-    Handler::new(Arc::new(Context::from_handles(ContextHandles {
-        chain: ChainHandles {
-            chain_tip: tips.chain_tip,
-            applied_tip: tips.applied_tip,
-            ibd,
-            blocks: state.blocks(),
-            transactions: state.transactions(),
-            utxo: chainstate.utxo_handle(),
-            coin_stats: chainstate.coin_stats_handle(),
-            block_tree: chainstate.block_tree_handle(),
-            chain_network: Network::Regtest,
-            chain_transition: chainstate.read_fence(),
-            chain_control: Some(Arc::new(NodeInvalidator {
-                handles: chainstate,
-                followers: state.chain_followers(),
-            })),
-            ..ChainHandles::default()
-        },
-        mempool: MempoolHandles {
-            gateway: MempoolGateway::shared(state.mempool()),
-        },
-        indexes: IndexHandles {
-            derived_index: None,
-            script_index: None,
-            esplora_tx_index: None,
-            derived_index_status: None,
-        },
-        network: NetworkHandles {
-            network: state.network(),
-            network_active: state.network_active(),
-            peer_table: state.peer_table(),
-            p2p_outbound_sender: Some(state.p2p_outbound_sender()),
-            banned: state.banned_subnets(),
-            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
-        },
-        mining: MiningHandles {
-            mining_control: None,
-        },
-        ..ContextHandles::default()
-    })))
+    Handler::new(Arc::new(
+        Context::from_handles(ContextHandles {
+            chain: ChainHandles::new(
+                tips.chain_tip,
+                tips.applied_tip,
+                state.blocks(),
+                state.transactions(),
+                chainstate.utxo_handle(),
+                chainstate.coin_stats_handle(),
+                chainstate.block_tree_handle(),
+                Network::Regtest,
+                ibd,
+            ),
+            mempool: MempoolHandles {
+                gateway: MempoolGateway::shared(state.mempool()),
+            },
+            indexes: IndexHandles {
+                derived_index: None,
+                script_index: None,
+                esplora_tx_index: None,
+                derived_index_status: None,
+            },
+            network: NetworkHandles {
+                network: state.network(),
+                network_active: state.network_active(),
+                peer_table: state.peer_table(),
+                p2p_outbound_sender: Some(state.p2p_outbound_sender()),
+                banned: state.banned_subnets(),
+                added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            },
+            mining: MiningHandles {
+                mining_control: None,
+            },
+            ..ContextHandles::default()
+        })
+        .with_chain_transition(chainstate.read_fence())
+        .with_chain_control(Arc::new(NodeInvalidator {
+            handles: chainstate,
+            followers: state.chain_followers(),
+        })),
+    ))
 }
 
 #[test]

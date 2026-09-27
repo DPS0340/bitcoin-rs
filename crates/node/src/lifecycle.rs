@@ -71,27 +71,18 @@ fn bind_rpc(
     let rpc_auth = Arc::new(state.config().rpc.auth.to_rpc_auth()?);
     let chainstate = state.chainstate();
     let tips = chainstate.rpc_tip_bundle();
-    let context = Context::from_handles(ContextHandles {
-        chain: ChainHandles {
-            chain_tip: tips.chain_tip,
-            applied_tip: tips.applied_tip,
-            ibd: Arc::clone(ibd),
-            blocks: state.blocks(),
-            transactions: state.transactions(),
-            utxo: chainstate.utxo_handle(),
-            coin_stats: chainstate.coin_stats_handle(),
-            block_tree: chainstate.block_tree_handle(),
-            chain_network: state.config().network,
-            chain_transition: chainstate.read_fence(),
-            block_body_source: Some(block_body_source),
-            prune_service: state.prune_service(),
-            chain_control: Some(Arc::new(RpcChainControl {
-                handles: chainstate,
-                followers: state.chain_followers(),
-                sync: state.sync(),
-            })),
-            rollback_warnings: Some(state.recovery_reporter()),
-        },
+    let mut context = Context::from_handles(ContextHandles {
+        chain: ChainHandles::new(
+            tips.chain_tip,
+            tips.applied_tip,
+            state.blocks(),
+            state.transactions(),
+            chainstate.utxo_handle(),
+            chainstate.coin_stats_handle(),
+            chainstate.block_tree_handle(),
+            state.config().network,
+            Arc::clone(ibd),
+        ),
         mempool: MempoolHandles {
             gateway: state.mempool_gateway(),
         },
@@ -114,7 +105,19 @@ fn bind_rpc(
         },
         zmq_publisher: state.zmq_publisher(),
         debug_log_path: Some(state.data_dir().join("debug.log")),
-    });
+    })
+    .with_block_body_source(block_body_source)
+    .with_chain_transition(chainstate.read_fence());
+    if let Some(prune_service) = state.prune_service() {
+        context = context.with_prune_service(prune_service);
+    }
+    let context = context
+        .with_chain_control(Arc::new(RpcChainControl {
+            handles: chainstate,
+            followers: state.chain_followers(),
+            sync: state.sync(),
+        }))
+        .with_rollback_warnings(state.recovery_reporter());
     let context = Arc::new(context);
     let handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::clone(&context)));
     let server = RpcServer::bind(

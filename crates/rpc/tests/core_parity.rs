@@ -310,7 +310,7 @@ fn seeded_chain_tx_count(node: &NodeHarness) -> Result<u64, Box<dyn std::error::
     let applied = node
         .state
         .chainstate()
-        .applied_tip_handle()
+        .applied_tip()
         .load_full()
         .ok_or_else(|| support::fail("the seeded node has no applied tip"))?;
     Ok(applied
