@@ -494,8 +494,15 @@ pub fn permitted_difficulty_transition(
 
 /// Compact proof-of-work target decode/encode and block-work helpers.
 ///
-/// These mirror Bitcoin Core's `arith_uint256::SetCompact`/`GetCompact`
-/// exactly, including sign-bit normalization and overflow classification.
+/// `decode_compact` mirrors Bitcoin Core's `arith_uint256::SetCompact`: the
+/// sign bit is masked out of the mantissa, the magnitude is decoded, and
+/// the sign is reported separately (`negative`, like Core's `pfNegative`);
+/// a shift past 256 bits folds the decoded magnitude into `ChainWork::ZERO`
+/// rather than surfacing Core's `pfOverflow`. `compact_to_target` then diverges
+/// deliberately: Core's consensus check rejects the flagged encoding,
+/// while this crate maps a signed encoding to `ChainWork::ZERO` — both
+/// reject the header in practice. `target_to_compact` covers `GetCompact`
+/// for non-negative targets.
 pub(crate) mod pow {
     use bitcoin_rs_primitives::{CompactTarget, Hash256};
 
@@ -557,10 +564,13 @@ pub(crate) mod pow {
     /// Encodes a non-negative 256-bit target into compact consensus form.
     #[must_use]
     pub(crate) fn target_to_compact(target: ChainWork) -> CompactTarget {
-        CompactTarget::from_consensus(get_compact(target, false))
+        CompactTarget::from_consensus(get_compact(target))
     }
 
-    fn get_compact(target: ChainWork, negative: bool) -> u32 {
+    /// PRE: `target` is a non-negative 256-bit chain target.
+    /// POST: Return its compact consensus encoding.
+    /// INVARIANT: No signed-target bit is added.
+    fn get_compact(target: ChainWork) -> u32 {
         if target == ChainWork::ZERO {
             return 0;
         }
@@ -579,13 +589,7 @@ pub(crate) mod pow {
         debug_assert_eq!(compact & !0x007f_ffff, 0);
         debug_assert!(size < 256);
 
-        compact
-            | (u32::try_from(size).unwrap_or(0) << 24)
-            | if negative && compact & 0x007f_ffff != 0 {
-                0x0080_0000
-            } else {
-                0
-            }
+        compact | (u32::try_from(size).unwrap_or(0) << 24)
     }
 }
 

@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{BlockBodySource, BlockTreeReader, TipReader, TipSnapshot, softfork_state};
+use bitcoin_rs_chain::{
+    BlockBodySource, BlockTreeReader, LatchReader, TipReader, TipSnapshot, softfork_state,
+};
 use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
 use bitcoin_rs_mempool::{
     AdmissionChain, AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolGateway,
@@ -11,6 +13,7 @@ use bitcoin_rs_primitives::{
     BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
 };
 
+use bitcoin_rs_consensus::ValidationEngine;
 #[cfg(test)]
 use bitcoin_rs_primitives::{Amount, Script};
 use core::fmt;
@@ -246,6 +249,10 @@ pub struct ChainHandles {
     /// Process-wide initial-block-download latch over the applied chain,
     /// shared with P2P so both surfaces answer identically.
     pub ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
+    /// Chain-mutation admission latch: the same fact
+    /// `Chainstate::is_closed_for_recovery` publishes, exposed read-only and
+    /// kept separate from [`Self::ibd`] by that fact's invariant.
+    pub closed_for_recovery: LatchReader,
     /// Applied block metadata log.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Transactions retained for direct RPC lookup.
@@ -471,6 +478,9 @@ impl Default for ChainHandles {
             chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
             applied_tip: TipReader::new(applied_tip),
             ibd,
+            closed_for_recovery: LatchReader::new(Arc::new(core::sync::atomic::AtomicBool::new(
+                false,
+            ))),
             blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::new(utxo),
@@ -490,9 +500,11 @@ impl Default for MempoolHandles {
     #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self {
-            gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                MempoolLimits::default(),
-            )))),
+            gateway: MempoolGateway::shared(
+                Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                ValidationEngine::Native,
+            )
+            .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
         }
     }
 }
@@ -556,7 +568,9 @@ impl Context {
                 gateway: MempoolGateway::shared_with(
                     Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                     observer,
-                ),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             ..ContextHandles::default()
         })
@@ -1603,6 +1617,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::too_many_lines)]
     fn from_handles_shares_chain_handles_with_caller() {
         use alloc::sync::Arc;
 
@@ -1636,9 +1651,11 @@ mod tests {
                 ..ChainHandles::default()
             },
             mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                    MempoolLimits::default(),
-                )))),
+                gateway: MempoolGateway::shared(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             network: NetworkHandles {
                 network_active: Arc::clone(&network_active),

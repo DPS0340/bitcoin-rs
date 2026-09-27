@@ -11,7 +11,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use bitcoin_rs_chain::{
-    BlockTree, BlockTreeReader, ChainWork, NodeStatus, block_work, compact_is_met_by,
+    BlockTree, BlockTreeReader, ChainWork, NodeStatus, TipReader, block_work, compact_is_met_by,
 };
 use bitcoin_rs_p2p::sync::{HeaderAnchor, HeadersSyncPhase, HeadersSyncState};
 use bitcoin_rs_p2p::{ActiveChainQuery, ChainQuery};
@@ -212,10 +212,10 @@ fn serve_headers_page(c: &mut Criterion) {
             .insert_node(Some(parent), header, NodeStatus::Active)
             .expect("fixture header");
     }
-    let query = ActiveChainQuery::new(
-        BlockTreeReader::new(Arc::new(RwLock::new(tree))),
-        Network::Regtest,
-    );
+    let block_tree = BlockTreeReader::new(Arc::new(RwLock::new(tree)));
+    let applied_tip = TipReader::new(Arc::new(arc_swap::ArcSwapOption::empty()));
+    applied_tip.store(block_tree.read().tip());
+    let query = ActiveChainQuery::new(block_tree, applied_tip, Network::Regtest);
     let locator = [genesis_hash];
 
     c.bench_function("serve_headers_page", |b| {

@@ -17,6 +17,9 @@ workspace = true
 [features]
 # USDT tracepoints (Bitcoin Core-compatible probe ABI); empty unless enabled.
 usdt = ["bitcoin-rs-trace/usdt"]
+# Worker injection for cross-crate teardown tests; never enabled in release
+# builds.
+test-seam = []
 
 default = ["fjall"]
 rocksdb = ["bitcoin-rs-chain/rocksdb"]
@@ -42,6 +45,7 @@ sha2.workspace = true
 bitcoin-rs-trace.workspace = true
 
 [dev-dependencies]
+bitcoin-rs-chain = { workspace = true, features = ["test-seam"] }
 bitcoin-rs-mempool = { workspace = true, features = ["test-seam"] }
 criterion.workspace = true
 proptest.workspace = true

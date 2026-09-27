@@ -5,13 +5,11 @@
 use std::time::Duration;
 
 use super::*;
+use crate::download_window::MINIMUM_CONNECT_TIME;
 use crate::peer_info::PeerRole;
 use crate::sync::GetheadersOutcome;
 use crate::sync::frontier::UsablePeer;
 use crate::sync::peers::{ChainSyncAction, ChainSyncState, chain_sync_subject, consider_eviction};
-
-/// The minimum age at which a connection's silence may be held against it.
-const MINIMUM_CONNECT_TIME: Duration = Duration::from_secs(30);
 
 /// An outbound connection that demonstrated `height`.
 fn outbound(port: u16, height: u32, role: PeerRole, at: Instant) -> UsablePeer {

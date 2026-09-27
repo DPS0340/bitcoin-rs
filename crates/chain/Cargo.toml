@@ -33,3 +33,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 bitcoin.workspace = true
+# Own integration tests are a separate crate: the lib compiles there without
+# `cfg(test)`, so the regtest fixture seam must arrive through the
+# `test-seam` feature, the same way `bitcoin-rs-mempool` opts its tests in.
+bitcoin-rs-chain = { workspace = true, features = ["test-seam"] }

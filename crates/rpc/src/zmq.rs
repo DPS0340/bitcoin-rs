@@ -1051,6 +1051,7 @@ mod manifest_tests {
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Some(observer),
+            bitcoin_rs_consensus::ValidationEngine::Native,
         );
         (gateway, publisher)
     }
@@ -1133,6 +1134,7 @@ mod manifest_tests {
                 ..MempoolLimits::default()
             }))),
             Some(observer),
+            bitcoin_rs_consensus::ValidationEngine::Native,
         );
         let low = MempoolEntry::new(std::sync::Arc::new(sequence_tx(5)), 100, 100, 1, 7);
         let high = MempoolEntry::new(std::sync::Arc::new(sequence_tx(6)), 100, 900, 1, 7);
@@ -1254,6 +1256,7 @@ mod manifest_tests {
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Some(std::sync::Arc::new(composite) as std::sync::Arc<dyn MempoolObserver>),
+            bitcoin_rs_consensus::ValidationEngine::Native,
         );
         gateway
             .insert_entry(AdmissionOrigin::Rpc, sequence_entry(&sequence_tx(7)))

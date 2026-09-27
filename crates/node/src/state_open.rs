@@ -221,6 +221,7 @@ impl NodeState {
             shutdown: Arc::clone(&shutdown),
             assume_valid_height: config.validation.assume_valid_height,
             validation_mode: config.validation.mode,
+            validation_engine: config.validation.engine,
             journal,
             capture_rawtx: false,
             capture_block_bytes: false,
@@ -338,8 +339,11 @@ impl NodeState {
             let publisher = Arc::clone(&zmq_publisher);
             let cloned_mining = Arc::clone(&mining_generation);
             let mining_leg: Arc<dyn bitcoin_rs_mempool::MempoolObserver> = cloned_mining;
-            let gateway =
-                bitcoin_rs_mempool::MempoolGateway::shared_with(Arc::clone(&mempool), mining_leg);
+            let gateway = bitcoin_rs_mempool::MempoolGateway::shared_with(
+                Arc::clone(&mempool),
+                mining_leg,
+                config.validation.engine,
+            )?;
             if publisher.wants_notifications() {
                 gateway
                     .attach_observer_leg(
@@ -394,14 +398,12 @@ impl NodeState {
             Err(error) => return Err(anyhow::Error::new(error)),
         }
         let chainstate = Arc::new(chainstate);
-        // One chain-owned latch for the whole process: the block-download
-        // executor, the RPC context, and the P2P listener all hold this same
-        // `Arc`, so `initialblockdownload`, the transaction-relay gate, and
-        // block-peer eligibility can never disagree.
-        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-            chainstate.applied_tip_reader(),
-            chainstate.block_tree_reader(),
-        ));
+        // One chain-owned latch for the whole process: the chainstate builds
+        // it once, and the block-download executor, the RPC context, and the
+        // P2P listener all hold this same `Arc`, so `initialblockdownload`,
+        // the transaction-relay gate, and block-peer eligibility can never
+        // disagree.
+        let ibd = chainstate.ibd_latch();
         let sync = Arc::new(crate::sync::block_sync(
             Arc::clone(&chainstate),
             followers.clone(),
