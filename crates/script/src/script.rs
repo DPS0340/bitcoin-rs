@@ -224,8 +224,9 @@ pub fn is_p2sh(script: &[u8]) -> bool {
 }
 
 /// Returns the public-key bytes of a bare P2PK script
-/// (`<33 or 65 bytes> OP_CHECKSIG`), or `None` for any other shape or for a
-/// push that does not decode as a `CPubKey` (`ValidSize`: 33-byte keys start
+/// (`<33 or 65 bytes> OP_CHECKSIG`), or `None` for any other shape.
+///
+/// The push must decode as a `CPubKey` (`ValidSize`: 33-byte keys start
 /// `0x02`/`0x03`, 65-byte keys `0x04`/`0x06`/`0x07`), the strictness Core's
 /// `Solver` applies before classifying `pubkey`.
 #[must_use]
@@ -341,116 +342,125 @@ pub fn is_multisig(script: &[u8]) -> bool {
 }
 
 /// Counts the pubkeys in a bare multisig script, or `None` unless it matches
-/// Core's `MatchMultisig` exactly: `m` and `n` are small integers in
-/// `1..=MAX_PUBKEYS_PER_MULTISIG` encoded as `OP_1..=OP_16` or minimally
-/// encoded script-number pushes, every key push decodes as a `CPubKey`
-/// (33 bytes starting `0x02`/`0x03`, 65 bytes starting `0x04`/`0x06`/`0x07`),
-/// `m <= n` equals the number of key pushes, and `OP_CHECKMULTISIG` ends the
-/// script.
+/// Core's `MatchMultisig` exactly.
+///
+/// `m` and `n` are small integers in `1..=MAX_PUBKEYS_PER_MULTISIG` encoded as
+/// `OP_1..=OP_16` or minimally encoded script-number pushes, every key push
+/// decodes as a `CPubKey` (33 bytes starting `0x02`/`0x03`, 65 bytes starting
+/// `0x04`/`0x06`/`0x07`), `m <= n` equals the number of key pushes, and
+/// `OP_CHECKMULTISIG` ends the script.
+/// Core `MAX_PUBKEYS_PER_MULTISIG`.
+const MAX_BARE_MULTISIG_PUBKEYS: i64 = 20;
+
+/// Yields the next element as Core's `CScript::GetOp` does: the opcode
+/// byte and its pushed data (empty for non-push opcodes).
+fn next_op<'a>(script: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
+    let &opcode = script.get(*pos)?;
+    *pos += 1;
+    let len = match opcode {
+        0x01..=0x4b => usize::from(opcode),
+        opcode::OP_PUSHDATA1 | opcode::OP_PUSHDATA2 | opcode::OP_PUSHDATA4 => {
+            let width = usize::from(opcode - opcode::OP_PUSHDATA1 + 1);
+            let bytes = script.get(*pos..pos.checked_add(width)?)?;
+            *pos += width;
+            let mut len = 0usize;
+            for (shift, byte) in bytes.iter().enumerate() {
+                len |= usize::from(*byte) << (8 * shift);
+            }
+            len
+        }
+        _ => 0,
+    };
+    let data = script.get(*pos..pos.checked_add(len)?)?;
+    *pos += len;
+    Some((opcode, data))
+}
+
+/// Core `CheckMinimalPush`: the opcode must be the smallest push form
+/// that can carry `data.len()` bytes.
+fn minimal_push_opcode(opcode: u8, data_len: usize) -> bool {
+    match data_len {
+        0 => {
+            opcode == opcode::OP_0
+                || opcode == opcode::OP_1NEGATE
+                || opcode::decode_pushnum(opcode).is_some()
+        }
+        1..=75 => usize::from(opcode) == data_len,
+        76..=255 => opcode == opcode::OP_PUSHDATA1,
+        256..=65_535 => opcode == opcode::OP_PUSHDATA2,
+        _ => opcode == opcode::OP_PUSHDATA4,
+    }
+}
+
+/// Core `CScriptNum` with `fRequireMinimal`: the sign-magnitude value of
+/// a little-endian byte string of at most 4 bytes.
+fn minimal_script_num(data: &[u8]) -> Option<i64> {
+    if data.is_empty() {
+        return Some(0);
+    }
+    if data.len() > 4 {
+        return None;
+    }
+    let last = *data.last()?;
+    if last.trailing_zeros() >= 7 && (data.len() == 1 || data[data.len() - 2] & 0x80 == 0) {
+        return None;
+    }
+    let mut value = 0i64;
+    for (shift, byte) in data.iter().enumerate() {
+        let bits = if shift == data.len() - 1 {
+            i64::from(*byte & 0x7f)
+        } else {
+            i64::from(*byte)
+        };
+        value |= bits << (8 * shift);
+    }
+    Some(if last & 0x80 != 0 { -value } else { value })
+}
+
+/// Core `GetScriptNumber`: a minimally encoded count in `min..=max`,
+/// whether carried by an `OP_n` opcode or a data push.
+fn script_count(opcode: u8, data: &[u8], min: i64, max: i64) -> Option<u8> {
+    let count = if let Some(pushnum) = opcode::decode_pushnum(opcode) {
+        i64::from(pushnum)
+    } else if opcode <= opcode::OP_PUSHDATA4 {
+        if !minimal_push_opcode(opcode, data.len()) {
+            return None;
+        }
+        minimal_script_num(data)?
+    } else {
+        return None;
+    };
+    if count < min || count > max {
+        return None;
+    }
+    u8::try_from(count).ok()
+}
+
+/// Core `CPubKey::ValidSize`.
+fn pubkey_valid_size(data: &[u8]) -> bool {
+    match data.len() {
+        33 => matches!(data[0], 0x02 | 0x03),
+        65 => matches!(data[0], 0x04 | 0x06 | 0x07),
+        _ => false,
+    }
+}
+
+/// Counts the pubkeys in a bare multisig script, or `None` unless it matches
+/// Core's `MatchMultisig` exactly.
+///
+/// `m` and `n` are small integers in `1..=MAX_PUBKEYS_PER_MULTISIG` encoded as
+/// `OP_1..=OP_16` or minimally encoded script-number pushes, every key push
+/// decodes as a `CPubKey` (33 bytes starting `0x02`/`0x03`, 65 bytes starting
+/// `0x04`/`0x06`/`0x07`), `m <= n` equals the number of key pushes, and
+/// `OP_CHECKMULTISIG` ends the script.
 #[must_use]
 pub fn multisig_key_count(script: &[u8]) -> Option<u8> {
-    /// Core `MAX_PUBKEYS_PER_MULTISIG`.
-    const MAX_PUBKEYS: i64 = 20;
-
-    /// Yields the next element as Core's `CScript::GetOp` does: the opcode
-    /// byte and its pushed data (empty for non-push opcodes).
-    fn next_op<'a>(script: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
-        let &opcode = script.get(*pos)?;
-        *pos += 1;
-        let len = match opcode {
-            0x01..=0x4b => usize::from(opcode),
-            opcode::OP_PUSHDATA1 | opcode::OP_PUSHDATA2 | opcode::OP_PUSHDATA4 => {
-                let width = usize::from(opcode - opcode::OP_PUSHDATA1 + 1);
-                let bytes = script.get(*pos..pos.checked_add(width)?)?;
-                *pos += width;
-                let mut len = 0usize;
-                for (shift, byte) in bytes.iter().enumerate() {
-                    len |= usize::from(*byte) << (8 * shift);
-                }
-                len
-            }
-            _ => 0,
-        };
-        let data = script.get(*pos..pos.checked_add(len)?)?;
-        *pos += len;
-        Some((opcode, data))
-    }
-
-    /// Core `CheckMinimalPush`: the opcode must be the smallest push form
-    /// that can carry `data.len()` bytes.
-    fn minimal_push_opcode(opcode: u8, data_len: usize) -> bool {
-        match data_len {
-            0 => {
-                opcode == opcode::OP_0
-                    || opcode == opcode::OP_1NEGATE
-                    || opcode::decode_pushnum(opcode).is_some()
-            }
-            1..=75 => usize::from(opcode) == data_len,
-            76..=255 => opcode == opcode::OP_PUSHDATA1,
-            256..=65_535 => opcode == opcode::OP_PUSHDATA2,
-            _ => opcode == opcode::OP_PUSHDATA4,
-        }
-    }
-
-    /// Core `CScriptNum` with `fRequireMinimal`: the sign-magnitude value of
-    /// a little-endian byte string of at most 4 bytes.
-    fn minimal_script_num(data: &[u8]) -> Option<i64> {
-        if data.is_empty() {
-            return Some(0);
-        }
-        if data.len() > 4 {
-            return None;
-        }
-        let last = *data.last()?;
-        if last & 0x7f == 0 && (data.len() == 1 || data[data.len() - 2] & 0x80 == 0) {
-            return None;
-        }
-        let mut value = 0i64;
-        for (shift, byte) in data.iter().enumerate() {
-            let bits = if shift == data.len() - 1 {
-                i64::from(*byte & 0x7f)
-            } else {
-                i64::from(*byte)
-            };
-            value |= bits << (8 * shift);
-        }
-        Some(if last & 0x80 != 0 { -value } else { value })
-    }
-
-    /// Core `GetScriptNumber`: a minimally encoded count in `min..=max`,
-    /// whether carried by an `OP_n` opcode or a data push.
-    fn script_count(opcode: u8, data: &[u8], min: i64, max: i64) -> Option<u8> {
-        let count = if let Some(pushnum) = opcode::decode_pushnum(opcode) {
-            i64::from(pushnum)
-        } else if opcode <= opcode::OP_PUSHDATA4 {
-            if !minimal_push_opcode(opcode, data.len()) {
-                return None;
-            }
-            minimal_script_num(data)?
-        } else {
-            return None;
-        };
-        if count < min || count > max {
-            return None;
-        }
-        u8::try_from(count).ok()
-    }
-
-    /// Core `CPubKey::ValidSize`.
-    fn pubkey_valid_size(data: &[u8]) -> bool {
-        match data.len() {
-            33 => matches!(data[0], 0x02 | 0x03),
-            65 => matches!(data[0], 0x04 | 0x06 | 0x07),
-            _ => false,
-        }
-    }
-
     if *script.last()? != opcode::OP_CHECKMULTISIG {
         return None;
     }
     let mut pos = 0usize;
     let (op, data) = next_op(script, &mut pos)?;
-    let required = i64::from(script_count(op, data, 1, MAX_PUBKEYS)?);
+    let required = i64::from(script_count(op, data, 1, MAX_BARE_MULTISIG_PUBKEYS)?);
     let mut keys = 0usize;
     let (op, data) = loop {
         let (op, data) = next_op(script, &mut pos)?;
@@ -459,7 +469,7 @@ pub fn multisig_key_count(script: &[u8]) -> Option<u8> {
         }
         keys = keys.checked_add(1)?;
     };
-    let declared = script_count(op, data, required, MAX_PUBKEYS)?;
+    let declared = script_count(op, data, required, MAX_BARE_MULTISIG_PUBKEYS)?;
     if usize::from(declared) != keys {
         return None;
     }
