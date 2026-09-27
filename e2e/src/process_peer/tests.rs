@@ -119,7 +119,11 @@ fn bytes_past_the_deadline_do_not_renew_it() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("peek timeout");
     let mut one = [0u8; 1];
-    peer.stream.peek(&mut one).expect("the byte arrives");
+    let wait_until = Instant::now() + Duration::from_secs(5);
+    while peer.stream.peek(&mut one).expect("peek") == 0 {
+        assert!(Instant::now() < wait_until, "the byte never arrived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let mut pending = super::FrameBuffer::default();
     let error = super::read_frame(&mut peer.stream, Instant::now(), &mut pending)
         .expect_err("lapsed-deadline progress must still interrupt");
@@ -145,7 +149,14 @@ fn a_paused_frame_resumes_from_where_it_stopped() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("peek timeout");
     let mut ten = [0u8; 10];
-    peer.stream.peek(&mut ten).expect("the header bytes arrive");
+    let wait_until = Instant::now() + Duration::from_secs(5);
+    while peer.stream.peek(&mut ten).expect("peek") < ten.len() {
+        assert!(
+            Instant::now() < wait_until,
+            "the header bytes never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let mut pending = super::FrameBuffer::default();
     let error = super::read_frame(
         &mut peer.stream,
