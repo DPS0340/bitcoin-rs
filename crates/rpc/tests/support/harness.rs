@@ -7,13 +7,11 @@
 //! shutdown flag are joined and released by `Drop`, and the temporary data
 //! directory is deleted after the node state closes.
 
-use bitcoin_rs_consensus::ValidationEngine;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-use bitcoin_rs_mempool::MempoolGateway;
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_rpc::context::{
     ChainHandles, Context, ContextHandles, IndexHandles, MempoolHandles, NetworkHandles,
@@ -123,8 +121,10 @@ impl ServerHarness {
                 ..ChainHandles::default()
             },
             mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
-                    .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
+                // The daemon wires this handle as `state.mempool_gateway()`
+                // (lifecycle.rs): the gateway interned under the resolved
+                // `config.validation.engine`, not a re-interned Native one.
+                gateway: state.mempool_gateway(),
             },
             indexes: IndexHandles {
                 derived_index: state.derived_index_query(),

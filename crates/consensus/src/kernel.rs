@@ -82,13 +82,15 @@ mod native {
         /// share.
         ///
         /// # Errors
-        /// Returns [`ConsensusError::Kernel`] if `raw_block` is not a valid block.
+        /// Returns [`ConsensusError::Encoding`] if `raw_block` is not a valid
+        /// block — a backend-neutral parse failure, so kernel-less builds do
+        /// not report it as a kernel error.
         pub fn parse(raw_block: &[u8]) -> Result<Self, ConsensusError> {
             // `parse_exact` keeps the old owned decoder's contract: trailing
             // bytes are a typed error, and the whole pass validates shape
             // without materializing a transaction tree.
             let parsed = bitcoin_rs_primitives::layout::ParsedBlock::parse_exact(raw_block)
-                .map_err(|error| ConsensusError::Kernel(error.to_string()))?;
+                .map_err(|error| ConsensusError::Encoding(error.to_string()))?;
             Ok(Self {
                 facts: crate::block_view::BlockFacts::from_parsed(&parsed),
             })

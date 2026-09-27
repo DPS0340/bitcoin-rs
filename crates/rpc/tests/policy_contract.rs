@@ -1715,8 +1715,9 @@ fn invalidation_handler(state: &NodeState) -> Handler {
             ..ChainHandles::default()
         },
         mempool: MempoolHandles {
-            gateway: MempoolGateway::shared(state.mempool(), ValidationEngine::Native)
-                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
+            // The daemon wires this handle as `state.mempool_gateway()`:
+            // the gateway interned under `config.validation.engine`.
+            gateway: state.mempool_gateway(),
         },
         indexes: IndexHandles {
             derived_index: None,

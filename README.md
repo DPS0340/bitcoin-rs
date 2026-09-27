@@ -154,7 +154,7 @@ Core & domain: crates/consensus, crates/script, crates/utxo, crates/chain, crate
 | Setting | Default |
 |---|---|
 | Storage backend | `fjall` |
-| Validation engine | Native Rust interpreter (`validation.engine = "native"`, the default in every build); `libbitcoinkernel` only when selected at runtime with `validation.engine = "kernel"` on a `--features kernel` build |
+| Validation engine | Native Rust interpreter (`validation.engine = "native"`, the code default in every build); `libbitcoinkernel` when selected at runtime with `validation.engine = "kernel"` on a `--features kernel` build. The released Docker image presets `validation_engine = "kernel"` via its shipped `/etc/bitcoin-rs/default.toml`, overridable by env, config file, or CLI |
 | Kernel feature | Off by default in every crate; `--features kernel` compiles in `libbitcoinkernel` support without selecting it |
 | Database cache | 450 MiB (`--dbcache-mb`, split 80/20 when txindex is enabled) |
 | Multi-peer download | On (10 outbound peers: 8 full-relay, 2 block-relay-only; 256-block window) |
