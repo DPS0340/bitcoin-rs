@@ -858,11 +858,13 @@ fn replay_gap_chain(
         // A head stored before counts were tracked records the unknown
         // marker (wire 0): replay may reconstruct a real count, so the count
         // is part of the landing check only when the head actually knows it.
+        let (head_tip, head_height, head_count, head_commit) =
+            (head.tip, head.height, head.chain_tx_count, head.commit_id);
         let landed = published.as_ref().is_some_and(|tip| {
-            tip.hash == head.tip
-                && tip.height == head.height
-                && commit_id == head.commit_id
-                && (head.chain_tx_count == 0 || tip.chain_tx_count.to_wire() == head.chain_tx_count)
+            tip.hash == head_tip
+                && tip.height == head_height
+                && commit_id == head_commit
+                && (head_count == 0 || tip.chain_tx_count.to_wire() == head_count)
         });
         if !landed {
             return Err(unrecoverable("replay finished short of the stored head"));
