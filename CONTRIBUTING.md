@@ -113,8 +113,8 @@ cargo test -p bitcoin-rs --no-fail-fast \
 cargo clippy -p bitcoin-rs --all-targets \
   --no-default-features --features "rocksdb,fjall,redb,kernel" -- -D warnings
 
-cargo clippy -p bitcoin-rs-node --all-targets -- -D warnings
-cargo clippy -p bitcoin-rs-consensus --all-targets -- -D warnings
+cargo clippy -p bitcoin-rs-node --all-targets --features kernel -- -D warnings
+cargo clippy -p bitcoin-rs-consensus --all-targets --features kernel -- -D warnings
 ```
 
 ### Consensus test vectors and parity gate

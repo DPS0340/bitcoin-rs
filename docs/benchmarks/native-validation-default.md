@@ -126,13 +126,15 @@ not flip the default.
 | Surface | Script engine |
 |---|---|
 | `bin/bitcoin-rs` default features (`fjall,redb,zmq`) | Native interpreter |
-| `bitcoin-rs-consensus` / `bitcoin-rs-node` crate defaults | `kernel` (`libbitcoinkernel`) |
-| Compose image (`Dockerfile --features fjall,kernel`) | `kernel` |
+| `bitcoin-rs-consensus` / `bitcoin-rs-node` crate defaults | Native (kernel-free; `validation.engine` defaults to `native`) |
+| Compose image (`Dockerfile --features fjall,kernel`) | `kernel`, selected through `/etc/bitcoin-rs/default.toml` |
 
-Until the gates pass, the library crates and the image keep `kernel`. The
-binary already builds native so a default `cargo build -p bitcoin-rs` needs
-no C++ toolchain. Promoting native is one coordinated change: drop
-`kernel` from the two library defaults in the same commit.
+The library crates are kernel-free by default. The image compiles `kernel`
+support and selects it through `/etc/bitcoin-rs/default.toml`, so the
+documented production engine stays `kernel` until promotion. The binary
+already builds native so a default `cargo build -p bitcoin-rs` needs no C++
+toolchain. Promoting native is one coordinated change under `VAL-01`: change
+the documented production engine selection, not the manifest defaults.
 
 ### Measured observations
 
