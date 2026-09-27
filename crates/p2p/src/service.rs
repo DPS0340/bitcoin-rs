@@ -536,21 +536,20 @@ impl P2pService {
         let port = self.config.dns_port;
         let seeds = self.config.dns_seeds.clone();
         let target = self.config.total_outbound_active_limit();
+        let maintenance = DnsPeerMaintenance {
+            shutdown,
+            network_active,
+            peer_table,
+            outbound_tx,
+            port,
+            seeds,
+            target,
+            block_sync,
+            dns_queue,
+        };
         thread::Builder::new()
             .name("bitcoin-rs-dns-maintenance".to_owned())
-            .spawn(move || {
-                run_dns_peer_maintenance(
-                    shutdown,
-                    network_active,
-                    peer_table,
-                    outbound_tx,
-                    port,
-                    seeds,
-                    target,
-                    block_sync,
-                    dns_queue,
-                );
-            })
+            .spawn(move || run_dns_peer_maintenance(maintenance))
             .map(Some)
     }
 
@@ -1115,6 +1114,18 @@ struct DnsQueueState {
     pending: HashSet<SocketAddr>,
 }
 
+struct DnsPeerMaintenance {
+    shutdown: Arc<AtomicBool>,
+    network_active: Arc<AtomicBool>,
+    peer_table: Arc<crate::PeerTable>,
+    outbound_tx: Sender<OutboundDial>,
+    port: u16,
+    seeds: Vec<String>,
+    target: usize,
+    block_sync: Option<Arc<crate::sync::BlockSync>>,
+    dns_queue: Arc<Mutex<DnsQueueState>>,
+}
+
 /// Parks one automatic dial, or sheds it when the bounded retry queue is full.
 fn park_automatic_dial(
     parked: &mut VecDeque<OutboundDial>,
@@ -1141,15 +1152,17 @@ fn clear_pending_auto_dial(dns_queue: &Mutex<DnsQueueState>, dial: OutboundDial)
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_dns_peer_maintenance(
-    shutdown: Arc<AtomicBool>,
-    network_active: Arc<AtomicBool>,
-    peer_table: Arc<crate::PeerTable>,
-    outbound_tx: Sender<OutboundDial>,
-    port: u16,
-    seeds: Vec<String>,
-    target: usize,
-    block_sync: Option<Arc<crate::sync::BlockSync>>,
-    dns_queue: Arc<Mutex<DnsQueueState>>,
+    DnsPeerMaintenance {
+        shutdown,
+        network_active,
+        peer_table,
+        outbound_tx,
+        port,
+        seeds,
+        target,
+        block_sync,
+        dns_queue,
+    }: DnsPeerMaintenance,
 ) {
     let resolver = crate::SystemDnsResolver::new(port);
     let seeds: Vec<&str> = seeds.iter().map(String::as_str).collect();
@@ -1558,7 +1571,10 @@ mod tests {
             1,
             "the address can be queued again immediately instead of waiting 60 seconds"
         );
-        assert_eq!(outbound_rx.try_recv().ok(), Some(OutboundDial::auto(address)));
+        assert_eq!(
+            outbound_rx.try_recv().ok(),
+            Some(OutboundDial::auto(address))
+        );
     }
 
     /// The dialer fills full-relay slots before block-relay slots, and serves
