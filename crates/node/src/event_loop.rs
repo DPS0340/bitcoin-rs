@@ -28,8 +28,8 @@ impl EventLoop {
     ///
     /// PRE: the shutdown receiver is bridged and the sync orchestrator is
     /// constructed.
-    /// POST: the loop runs `spin` ticks for mempool, metrics, and sync work
-    /// until the shutdown signal arrives.
+    /// POST: `spin` runs sync ticks and telemetry while shutdown remains
+    /// unset.
     /// INVARIANT: every caller supplies a wake receiver, and sync work
     /// progresses on both the wake and the one-second sync tick.
     #[must_use]
