@@ -434,28 +434,20 @@ impl P2pService {
                         .block_sync
                         .as_ref()
                         .is_some_and(|sync| sync.allow_extra_full_relay_dial());
-                    // Only automatic dials count against the automatic
-                    // outbound cap: a manual `--connect`/`addnode` dial
-                    // proceeds whatever the slot counts are
-                    // (Core's `ConnectionType::MANUAL` is exempt from
-                    // `nMaxOutbound`), and a manual dial already in flight
-                    // cannot hold back the next automatic one. An automatic
-                    // dial that arrives at capacity is parked and retried
-                    // once a slot opens — the way Core's
-                    // `ThreadOpenConnections` simply does not dial on a full
-                    // set (`net.cpp:1787-1806`, `net.cpp:2786-2806`) — rather
-                    // than dropped, which would leave its address in the
-                    // resolver's `recently_queued` backoff with no dial
-                    // attempted. A stale tip raises the cap by one so the
-                    // extra full-relay peer can form beside a full slot
-                    // set.
-                    let automatic_in_flight =
-                        |active: &HashMap<SocketAddr, (crate::peer_info::PeerRole, bool)>| {
-                            active.values().filter(|(_, manual)| !*manual).count()
-                        };
+                    // Manual dials bypass the cap when admitted, but every
+                    // active outbound connection occupies a slot for later
+                    // automatic dials, matching Core's `nMaxOutbound` census.
+                    // Automatic dials at capacity are parked and retried once
+                    // a slot opens — Core's `ThreadOpenConnections` simply
+                    // does not dial on a full set (`net.cpp:1787-1806`,
+                    // `net.cpp:2786-2806`) — rather than dropped, which would
+                    // leave the address in the resolver's `recently_queued`
+                    // backoff with no dial attempted. A stale tip raises the
+                    // cap by one so an extra full-relay peer can form beside
+                    // a full slot set.
                     let cap = active_limit + usize::from(extra_dial);
                     while let Some(&dial) = parked.front() {
-                        if automatic_in_flight(&active) >= cap {
+                        if active.len() >= cap {
                             break;
                         }
                         parked.pop_front();
@@ -480,7 +472,7 @@ impl P2pService {
                         }
                         continue;
                     };
-                    if !dial.manual && automatic_in_flight(&active) >= cap {
+                    if !dial.manual && active.len() >= cap {
                         if parked.len() < MAX_PARKED_DIALS {
                             parked.push_back(dial);
                         }
@@ -1309,6 +1301,100 @@ mod tests {
             .expect("empty listen set starts");
         service.shutdown();
         service.join().expect("clean join");
+    }
+
+
+    #[test]
+    fn active_manual_dial_occupies_an_automatic_slot() {
+        fn accept_for(
+            listener: &TcpListener,
+            timeout: Duration,
+        ) -> Option<std::net::TcpStream> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return Some(stream),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+        }
+
+        let manual_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("manual listener");
+        manual_listener
+            .set_nonblocking(true)
+            .expect("nonblocking manual listener");
+        let automatic_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("auto listener");
+        automatic_listener
+            .set_nonblocking(true)
+            .expect("nonblocking auto listener");
+
+        let service = P2pService::new(
+            P2pServiceConfig {
+                listen_addrs: Vec::new(),
+                dns_seeds: Vec::new(),
+                outbound_full_relay_slots: 1,
+                outbound_block_relay_slots: 0,
+                ..P2pServiceConfig::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        service
+            .start(
+                None,
+                None,
+                &idle_ready(),
+                crate::listener::ListenerExtras::default(),
+            )
+            .expect("service starts");
+        service
+            .add_node(
+                manual_listener.local_addr().expect("manual address"),
+                false,
+            )
+            .expect("manual dial queued");
+
+        let manual_connection = accept_for(&manual_listener, Duration::from_secs(5))
+            .expect("manual dial starts");
+        service
+            .outbound_sender()
+            .send(OutboundDial::auto(
+                automatic_listener.local_addr().expect("automatic address"),
+            ))
+            .expect("automatic dial queued");
+
+        let automatic_before_release =
+            accept_for(&automatic_listener, Duration::from_secs(1));
+        drop(manual_connection);
+        let automatic_after_release = if automatic_before_release.is_none() {
+            accept_for(&automatic_listener, Duration::from_secs(5))
+        } else {
+            None
+        };
+        let connected_too_early = automatic_before_release.is_some();
+        let automatic_resumed = automatic_after_release.is_some();
+
+        drop(automatic_before_release);
+        drop(automatic_after_release);
+        service.shutdown();
+        service.join().expect("service joins");
+
+        assert!(
+            !connected_too_early,
+            "an active manual connection must occupy the configured outbound slot"
+        );
+        assert!(
+            automatic_resumed,
+            "the queued automatic dial starts after the manual connection leaves"
+        );
     }
 
     #[test]
