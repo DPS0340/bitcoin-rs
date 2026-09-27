@@ -117,6 +117,8 @@ fn chainstate_facade_exposes_no_production_raw_mutation_handles() -> anyhow::Res
     for method in [
         "chain_tip",
         "applied_tip",
+        "chain_tip_handle",
+        "applied_tip_handle",
         "block_tree",
         "transition_barrier",
         "apply_block",

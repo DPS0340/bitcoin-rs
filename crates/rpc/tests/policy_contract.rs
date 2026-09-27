@@ -1681,7 +1681,7 @@ fn reorg_mine_and_apply(
 }
 
 fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>> {
-    let applied = state.chainstate().applied_tip_handle();
+    let applied = state.chainstate().rpc_tip_bundle().applied_tip;
     let Some(tip) = applied.load_full() else {
         return Err("applied tip must exist".into());
     };
@@ -1690,14 +1690,15 @@ fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>>
 
 fn invalidation_handler(state: &NodeState) -> Handler {
     let chainstate = state.chainstate();
+    let tips = chainstate.rpc_tip_bundle();
     let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-        bitcoin_rs_chain::TipReader::new(chainstate.applied_tip_handle()),
+        bitcoin_rs_chain::TipReader::new(Arc::clone(&tips.applied_tip)),
         bitcoin_rs_chain::BlockTreeReader::new(chainstate.block_tree_handle()),
     ));
     Handler::new(Arc::new(Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: chainstate.chain_tip_handle(),
-            applied_tip: chainstate.applied_tip_handle(),
+            chain_tip: tips.chain_tip,
+            applied_tip: tips.applied_tip,
             chain_tx_count: chainstate.chain_tx_count_handle(),
             ibd,
             blocks: state.blocks(),

@@ -715,6 +715,19 @@ impl<'a> ChainTransition<'a> {
     }
 }
 
+/// The two tip publication cells that the RPC capability bundle receives.
+///
+/// The RPC context is a sibling capability boundary: it holds each cell, so
+/// handlers publish and observe the tips that the chain owner already moved.
+/// Handlers do not route each read through a reader.
+#[must_use]
+pub struct TipBundle {
+    /// Best-work header-tip publication cell.
+    pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Authoritative applied-tip publication cell.
+    pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+}
+
 impl Chainstate {
     /// Creates the production service from lower-layer capabilities.
     #[must_use]
@@ -816,21 +829,18 @@ impl Chainstate {
         TipReader::new(Arc::clone(&self.applied_tip))
     }
 
-    /// Clones the best-work header-tip cell for the RPC capability bundle.
+    /// Clones both tip publication cells as one bundle for RPC.
     ///
-    /// The RPC context is a sibling capability boundary (ARCH-10): it holds
-    /// the cell itself so handlers can publish and observe the tip the chain
-    /// owner already moved, without routing every read through a reader.
-    #[must_use]
-    pub fn chain_tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
-        Arc::clone(&self.chain_tip)
-    }
-
-    /// Clones the authoritative applied-tip cell for the RPC capability
-    /// bundle.
-    #[must_use]
-    pub fn applied_tip_handle(&self) -> Arc<ArcSwapOption<TipSnapshot>> {
-        Arc::clone(&self.applied_tip)
+    /// PRE: this service owns its two live tip cells.
+    /// POST: the bundle shares the live cells; the method makes no new cell
+    ///   and moves no tip.
+    /// INVARIANT: this is the only production `Chainstate` method that
+    ///   returns both cells together.
+    pub fn rpc_tip_bundle(&self) -> TipBundle {
+        TipBundle {
+            chain_tip: Arc::clone(&self.chain_tip),
+            applied_tip: Arc::clone(&self.applied_tip),
+        }
     }
 
     /// Publishes the genesis connect outcome as the best-work header tip.
