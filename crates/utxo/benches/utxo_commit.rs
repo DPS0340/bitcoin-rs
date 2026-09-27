@@ -291,4 +291,5 @@ fn main() {
         return;
     }
     benches();
+    Criterion::default().final_summary();
 }
