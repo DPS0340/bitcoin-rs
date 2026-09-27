@@ -126,12 +126,14 @@ fn verify_witness(
     witness: &[Vec<u8>],
     flags: VerifyFlags,
 ) -> Result<bool, ScriptError> {
+    // BIP143 uses INPUT's spent amount; repeat it to fill the full prevout set.
+    let prevouts = vec![prevout.clone(); tx.inputs.len()];
     Interpreter.execute_with_prevouts(
         &prevout.script_pubkey,
         &[],
         witness,
         flags,
-        std::slice::from_ref(prevout),
+        &prevouts,
         tx,
         INPUT,
     )

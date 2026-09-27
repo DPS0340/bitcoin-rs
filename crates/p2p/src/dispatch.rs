@@ -11,8 +11,10 @@ use crate::inv::{
     inventory_block_hash, inventory_tx_hash, is_within_inventory_bound, request_witness,
 };
 use crate::peer::{Peer, PeerState};
-use crate::wire::{MAX_HEADERS_MESSAGE_COUNT, Message, PeerError};
+use crate::wire::{Message, PeerError};
 
+/// Maximum headers returned by one `headers` response.
+pub const MAX_HEADERS_RESPONSE: usize = 2_000;
 /// Maximum block locator hashes accepted in one locator-based request.
 pub use crate::wire::MAX_LOCATOR_HASHES;
 
@@ -46,9 +48,9 @@ pub trait ChainQuery: Send + Sync {
     /// [`Message::BlockPayload`]; `MSG_CMPCT_BLOCK` items as
     /// [`Message::CmpctBlock`] built at the given BIP152 version — `None`
     /// (peer never negotiated) leaves compact items in `not_found`. Each
-    /// loaded body is the stored consensus payload, delivered through
-    /// `serve` without a full-block decode/re-encode round trip. A `serve`
-    /// error aborts production and propagates. Non-block / unservable items
+    /// `MSG_WITNESS_BLOCK` body preserves the stored consensus payload;
+    /// `MSG_BLOCK` strips witness data from the validated body (BIP144).
+    /// A `serve` error aborts production and propagates. Non-block / unservable items
     /// are collected into `not_found` and never loaded.
     fn serve_inventory_blocks(
         &self,
@@ -59,19 +61,22 @@ pub trait ChainQuery: Send + Sync {
     ) -> Result<InventoryServing, PeerError>;
 
     /// PRE: `request` carries decoded absolute transaction indexes for one
-    /// block.
+    /// block. `compact_version` is the peer's servable BIP152 profile.
     /// POST: return the reply to send — a `blocktxn` for a block shallow
-    /// enough to reconstruct, or the whole witness-bearing `block` for one
-    /// too deep for a useful hint set (Core 31.1 answers both instead of
-    /// leaving a peer to time out); `Ok(None)` leaves the request unanswered
-    /// (unknown, stale, pruned, or headless block, or a saturated
-    /// `headroom` gate). `Err` reports an out-of-range transaction index —
-    /// a protocol disconnect per BIP152 (Core scores misbehavior).
+    /// enough to reconstruct, encoded for `compact_version` (v1 strips
+    /// witnesses, any other profile keeps them), or the whole
+    /// witness-bearing `block` for one too deep for a useful hint set
+    /// (Core 31.1 answers both instead of leaving a peer to time out);
+    /// `Ok(None)` leaves the request unanswered (unknown, stale, pruned,
+    /// or headless block, or a saturated `headroom` gate). `Err` reports
+    /// an out-of-range transaction index — a protocol disconnect per
+    /// BIP152 (Core scores misbehavior).
     /// INVARIANT: `headroom` is evaluated before any block body is loaded,
     /// so a saturated outbound gate materializes no body for this request.
     fn block_transactions(
         &self,
         request: &BlockTransactionsRequest,
+        compact_version: Option<u64>,
         headroom: &dyn Fn() -> bool,
     ) -> Result<Option<Message>, PeerError>;
 
@@ -101,10 +106,7 @@ pub trait TxInventory: Send + Sync {
     /// Returns `true` when the node already holds the transaction identified
     /// by `hash` — in the mempool, the orphan map, or the recent-rejects
     /// cache. `hash_is_wtxid` follows the inventory item's type: `WTx`
-    /// carries a wtxid, while `Transaction`/`WitnessTransaction` carry a
-    /// txid. Orphan residency is keyed by wtxid alone: a resident orphan
-    /// suppresses only an exact wtxid match and never claims its txid,
-    /// because another witness variant of the same txid can still be valid.
+    /// carries a wtxid, while `Transaction`/`WitnessTransaction` carry a txid.
     fn have_tx(&self, hash: Hash256, hash_is_wtxid: bool) -> bool;
 
     /// Returns the witness transaction body for `txid`, or `None` when the
@@ -146,28 +148,46 @@ impl crate::compact_blocks::CompactBlockHints for bitcoin_rs_mempool::MempoolGat
 /// Chainless dispatch: collects the protocol responses and returns them.
 ///
 /// With `chain: None` responses can never contain a block body, so the batch
-/// is protocol-bounded (at most [`crate::wire::MAX_HEADERS_MESSAGE_COUNT`]
-/// headers, or one inventory-bound notfound/getdata echo) and safe to
-/// materialize whole. Block announcements go to a no-op sink.
+/// is protocol-bounded (at most [`MAX_HEADERS_RESPONSE`] headers, or one
+/// inventory-bound notfound/getdata echo) and safe to materialize whole.
+/// Block announcements go to a no-op sink.
 pub fn dispatch_inbound<S>(
     peer: &mut Peer<S>,
     message: &Message,
 ) -> Result<Vec<Message>, PeerError> {
     let responses = RefCell::new(Vec::new());
+    dispatch_inbound_with_chain(peer, message, None, &|| true, &mut |response| {
+        responses.borrow_mut().push(response);
+        Ok(())
+    })?;
+    Ok(responses.into_inner())
+}
+
+/// Dispatch with an active-chain view but no transaction-inventory filter.
+///
+/// Equivalent to [`dispatch_inbound_full`] with `tx_inventory: None` and a
+/// no-op block-announcement sink: every announced tx is requested, and
+/// tx-typed `getdata` items are reported missing. Production listeners pass
+/// a [`TxInventory`] and an announcement sink through
+/// [`dispatch_inbound_full`]; this wrapper remains for call sites that only
+/// have a chain view.
+pub fn dispatch_inbound_with_chain<S>(
+    peer: &mut Peer<S>,
+    message: &Message,
+    chain: Option<&dyn ChainQuery>,
+    headroom: &dyn Fn() -> bool,
+    send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+) -> Result<(), PeerError> {
     dispatch_inbound_full(
         peer,
         message,
-        None,
+        chain,
         None,
         &|| true,
-        &|| true,
-        &mut |response| {
-            responses.borrow_mut().push(response);
-            Ok(())
-        },
+        headroom,
+        send,
         &mut |_| {},
-    )?;
-    Ok(responses.into_inner())
+    )
 }
 
 /// Dispatch with an active-chain view and a transaction-inventory filter.
@@ -273,8 +293,10 @@ pub fn dispatch_inbound_full<S>(
             serve_getdata(chain, tx_inventory, compact_version, items, headroom, send)?;
         }
         Message::GetBlockTxn(request) => {
+            ensure_block_txn_indexes_valid(&request.txs_request)?;
             step(peer, message)?;
-            serve_block_txn(chain, &request.txs_request, headroom, send)?;
+            let compact_version = peer.compact_blocks.servable_version();
+            serve_block_txn(chain, &request.txs_request, compact_version, headroom, send)?;
         }
         _ => step(peer, message)?,
     }
@@ -294,9 +316,9 @@ fn headers_response(chain: Option<&dyn ChainQuery>, request: &GetHeadersMessage)
         .collect();
     let stop_hash = BlockHash(Hash256::from_le_bytes(request.stop_hash.as_byte_array()));
     let mut headers = chain.map_or_else(Vec::new, |chain| {
-        chain.headers_after(&locator_hashes, stop_hash, MAX_HEADERS_MESSAGE_COUNT)
+        chain.headers_after(&locator_hashes, stop_hash, MAX_HEADERS_RESPONSE)
     });
-    headers.truncate(MAX_HEADERS_MESSAGE_COUNT);
+    headers.truncate(MAX_HEADERS_RESPONSE);
     Message::Headers(headers)
 }
 
@@ -419,26 +441,47 @@ fn serve_getdata_blocks(
 }
 
 /// Answers one `getblocktxn` through the chain view and sends whatever reply
-/// it produces. PRE: none — the chain validates shallow requests itself.
-/// POST: a servable shallow block gets its `blocktxn`, a block too deep for
-/// a compact answer gets the whole `block` whatever its index list looks
-/// like, and an unknown, stale, headless, or production-gated block — or a
-/// node with no chain view — leaves the request unanswered. INVARIANT: the
-/// dispatch boundary never learns which reply shape the chain chose, so a
-/// deep request with a malformed index list still receives the block (Core
-/// 31.1 `net_processing.cpp:4590-4624`), and a saturated `headroom` gate
-/// loads no block body here.
+/// it produces. PRE: the request's indexes are structurally valid.
+/// `compact_version` is the peer's servable BIP152 profile (`None` leaves
+/// witness encoding untouched). POST: a servable block gets its `blocktxn`
+/// in the peer's profile encoding, a block too deep for a compact answer
+/// gets the whole `block`, and an unknown, stale, headless, or
+/// production-gated block — or a node with no chain view — leaves the
+/// request unanswered. INVARIANT: the dispatch boundary never learns which
+/// reply shape the chain chose, and a saturated `headroom` gate loads no
+/// block body here.
 fn serve_block_txn(
     chain: Option<&dyn ChainQuery>,
     request: &BlockTransactionsRequest,
+    compact_version: Option<u64>,
     headroom: &dyn Fn() -> bool,
     send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
 ) -> Result<(), PeerError> {
     let Some(chain) = chain else {
         return Ok(());
     };
-    if let Some(response) = chain.block_transactions(request, headroom)? {
+    if let Some(response) = chain.block_transactions(request, compact_version, headroom)? {
         send(response)?;
+    }
+    Ok(())
+}
+
+/// Rejects a `getblocktxn` whose index list cannot name transactions: empty,
+/// or not strictly increasing.
+///
+/// PRE: the request carries decoded absolute indexes. POST: a malformed list
+/// returns `PeerError::Protocol` and the connection drops through the
+/// listener's error path. INVARIANT: a malformed list never reaches a chain
+/// query, including on a node with no chain at all — one decision at the
+/// inbound boundary (Core 31.1 `net_processing.cpp:4560-4574`).
+fn ensure_block_txn_indexes_valid(request: &BlockTransactionsRequest) -> Result<(), PeerError> {
+    if request.indexes.is_empty() {
+        return Err(PeerError::Protocol("getblocktxn with empty index list"));
+    }
+    if request.indexes.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(PeerError::Protocol(
+            "getblocktxn indexes not strictly increasing",
+        ));
     }
     Ok(())
 }
@@ -477,13 +520,13 @@ mod tests {
     };
 
     use super::{
-        ChainQuery, InventoryServing, MAX_LOCATOR_HASHES, TxInventory, dispatch_inbound,
-        dispatch_inbound_full,
+        ChainQuery, InventoryServing, MAX_HEADERS_RESPONSE, MAX_LOCATOR_HASHES, TxInventory,
+        dispatch_inbound, dispatch_inbound_full, dispatch_inbound_with_chain,
     };
     use crate::connection::{OutboundBudget, PeerLease};
     use crate::inv::MAX_INV_PER_MSG;
     use crate::peer::{Peer, PeerState};
-    use crate::wire::{MAX_HEADERS_MESSAGE_COUNT, Message, PeerError};
+    use crate::wire::{Message, PeerError};
 
     fn block_payload_bytes(block: &Block) -> bytes::Bytes {
         bytes::Bytes::from(bitcoin_rs_primitives::consensus_bytes(block))
@@ -559,6 +602,7 @@ mod tests {
         fn block_transactions(
             &self,
             _request: &BlockTransactionsRequest,
+            _compact_version: Option<u64>,
             _headroom: &dyn Fn() -> bool,
         ) -> Result<Option<Message>, PeerError> {
             Ok(None)
@@ -606,6 +650,7 @@ mod tests {
         fn block_transactions(
             &self,
             _request: &BlockTransactionsRequest,
+            _compact_version: Option<u64>,
             _headroom: &dyn Fn() -> bool,
         ) -> Result<Option<Message>, PeerError> {
             Ok(None)
@@ -619,19 +664,10 @@ mod tests {
         chain: Option<&dyn ChainQuery>,
     ) -> Result<Vec<Message>, PeerError> {
         let collected = RefCell::new(Vec::new());
-        dispatch_inbound_full(
-            peer,
-            message,
-            chain,
-            None,
-            &|| true,
-            &|| true,
-            &mut |response| {
-                collected.borrow_mut().push(response);
-                Ok(())
-            },
-            &mut |_| {},
-        )?;
+        dispatch_inbound_with_chain(peer, message, chain, &|| true, &mut |response| {
+            collected.borrow_mut().push(response);
+            Ok(())
+        })?;
         Ok(collected.into_inner())
     }
 
@@ -655,7 +691,7 @@ mod tests {
 
     #[test]
     fn getheaders_truncates_chain_response_above_protocol_cap() -> Result<(), PeerError> {
-        let count = u32::try_from(MAX_HEADERS_MESSAGE_COUNT + 1)
+        let count = u32::try_from(MAX_HEADERS_RESPONSE + 1)
             .map_err(|_| PeerError::Protocol("test header count overflow"))?;
         let chain = GreedyHeaders {
             headers: FakeChain::with_headers(count).headers,
@@ -671,7 +707,7 @@ mod tests {
         let [Message::Headers(headers)] = responses.as_slice() else {
             panic!("expected one headers response, got {responses:?}");
         };
-        assert_eq!(headers.len(), MAX_HEADERS_MESSAGE_COUNT);
+        assert_eq!(headers.len(), MAX_HEADERS_RESPONSE);
         Ok(())
     }
 
@@ -800,6 +836,7 @@ mod tests {
             fn block_transactions(
                 &self,
                 request: &BlockTransactionsRequest,
+                _compact_version: Option<u64>,
                 _headroom: &dyn Fn() -> bool,
             ) -> Result<Option<Message>, PeerError> {
                 Ok(Some(Message::BlockTxn(BlockTxn {
@@ -827,64 +864,36 @@ mod tests {
         Ok(())
     }
 
-    /// A malformed `getblocktxn` index list is refused only where the chain
-    /// decides the request is shallow: the dispatch boundary no longer
-    /// inspects it, so the serving chain below receives the request either
-    /// way.
-    #[test]
-    fn malformed_getblocktxn_reaches_the_chain_decision() -> Result<(), PeerError> {
-        struct ServingChain;
-        impl ChainQuery for ServingChain {
-            fn headers_after(
-                &self,
-                _locator_hashes: &[BlockHash],
-                _stop_hash: BlockHash,
-                _limit: usize,
-            ) -> Vec<Header> {
-                Vec::new()
-            }
-
-            fn serve_inventory_blocks(
-                &self,
-                _items: &[Inventory],
-                _compact_version: Option<u64>,
-                _headroom: &dyn Fn() -> bool,
-                _serve: &mut dyn FnMut(Message) -> Result<(), PeerError>,
-            ) -> Result<InventoryServing, PeerError> {
-                Ok(InventoryServing::default())
-            }
-
-            fn block_transactions(
-                &self,
-                _request: &BlockTransactionsRequest,
-                _headroom: &dyn Fn() -> bool,
-            ) -> Result<Option<Message>, PeerError> {
-                // A deep block would be answered with the whole payload; a
-                // shallow malformed list would be refused inside the real
-                // query. The boundary itself sends neither disconnect nor
-                // reply of its own.
-                Ok(None)
-            }
-        }
-
-        for indexes in [Vec::new(), vec![1, 1], vec![3, 2]] {
+    /// Refuses one `getblocktxn` index list both with a chain attached and
+    /// with none, so the boundary decision cannot depend on chain state.
+    fn assert_getblocktxn_refused(indexes: Vec<u64>) {
+        let chain = FakeChain::with_headers(2);
+        let message = Message::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
+            txs_request: BlockTransactionsRequest {
+                block_hash: bitcoin::BlockHash::from_byte_array([7; 32]),
+                indexes,
+            },
+        });
+        let view: &dyn ChainQuery = &chain;
+        for case in [Some(view), None] {
             let mut peer = ready_peer();
-            let responses = dispatch_collect(
-                &mut peer,
-                &Message::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
-                    txs_request: BlockTransactionsRequest {
-                        block_hash: bitcoin::BlockHash::from_byte_array([7; 32]),
-                        indexes,
-                    },
-                }),
-                Some(&ServingChain),
-            )?;
+            let outcome = dispatch_collect(&mut peer, &message, case);
             assert!(
-                responses.is_empty(),
-                "the boundary must leave the reply to the chain, got {responses:?}"
+                matches!(outcome, Err(PeerError::Protocol(_))),
+                "a malformed getblocktxn must disconnect, got {outcome:?}",
             );
         }
-        Ok(())
+    }
+
+    /// An empty or non-increasing `getblocktxn` index list is refused at the
+    /// inbound boundary, so a malformed request never reaches a chain query
+    /// and the peer is dropped through the listener's error path (Core 31.1
+    /// `net_processing.cpp:4560-4574`).
+    #[test]
+    fn invalid_getblocktxn_indexes_disconnect() {
+        assert_getblocktxn_refused(Vec::new());
+        assert_getblocktxn_refused(vec![1, 1]);
+        assert_getblocktxn_refused(vec![3, 2]);
     }
 
     /// A saturated headroom gate leaves a `getblocktxn` unanswered through
@@ -921,6 +930,7 @@ mod tests {
             fn block_transactions(
                 &self,
                 request: &BlockTransactionsRequest,
+                _compact_version: Option<u64>,
                 headroom: &dyn Fn() -> bool,
             ) -> Result<Option<Message>, PeerError> {
                 self.observed.fetch_add(1, Ordering::Relaxed);
@@ -1034,6 +1044,7 @@ mod tests {
         fn block_transactions(
             &self,
             _request: &BlockTransactionsRequest,
+            _compact_version: Option<u64>,
             _headroom: &dyn Fn() -> bool,
         ) -> Result<Option<Message>, PeerError> {
             Ok(None)
@@ -1106,18 +1117,15 @@ mod tests {
         let mut peer = ready_peer();
         let emitted = RefCell::new(Vec::new());
 
-        let result = dispatch_inbound_full(
+        let result = dispatch_inbound_with_chain(
             &mut peer,
             &Message::GetData(vec![known]),
             Some(&chain),
-            None,
-            &|| true,
             &|| false,
             &mut |response| {
                 emitted.borrow_mut().push(response);
                 Ok(())
             },
-            &mut |_| {},
         );
 
         assert!(matches!(
@@ -1166,19 +1174,16 @@ mod tests {
         };
         let mut peer = ready_peer();
 
-        let result = dispatch_inbound_full(
+        let result = dispatch_inbound_with_chain(
             &mut peer,
             &Message::GetData(vec![known; MAX_INV_PER_MSG]),
             Some(&chain),
-            None,
-            &|| true,
             &|| budget.has_block_production_headroom(),
             &mut |message| {
                 lease
                     .send(message)
                     .map_err(|_| PeerError::Protocol("outbound queue closed or saturated"))
             },
-            &mut |_| {},
         );
 
         assert!(matches!(
@@ -1214,19 +1219,16 @@ mod tests {
         };
         let mut peer = ready_peer();
 
-        let result = dispatch_inbound_full(
+        let result = dispatch_inbound_with_chain(
             &mut peer,
             &Message::GetData(vec![known; 4]),
             Some(&chain),
-            None,
-            &|| true,
             &|| true,
             &mut |message| {
                 lease
                     .send(message)
                     .map_err(|_| PeerError::Protocol("outbound queue closed or saturated"))
             },
-            &mut |_| {},
         );
 
         assert!(matches!(
@@ -1560,55 +1562,8 @@ mod tests {
         assert_eq!(gateway.get_tx_by_wtxid(tx.wtxid()), Some(tx));
     }
 
-    /// One inventory announcement against a gateway holding `item`'s body as
-    /// a pool entry or a resident orphan: only the identity the resident body
-    /// actually has is suppressed, and an unknown wtxid is always requested.
-    fn inv_announce_requests_only_unsuppressed_identity(
-        gateway: &bitcoin_rs_mempool::MempoolGateway,
-        orphan: bool,
-        item: Inventory,
-    ) {
-        let (_, remote_requested) = match item {
-            Inventory::WTx(_) => (true, false),
-            _ => (false, true),
-        };
-        let mut peer = ready_peer();
-        if remote_requested {
-            peer.wtxid_relay.mark_peer_supported();
-        }
-        // A resident orphan suppresses only its own witness identity:
-        // another witness of the same txid can still be valid, so a
-        // txid announcement stays requestable.
-        let suppressed = !orphan || matches!(item, Inventory::WTx(_));
-        let announced =
-            dispatch_collect_full(&mut peer, &Message::Inv(vec![item]), None, Some(gateway));
-        if suppressed {
-            assert!(
-                announced.is_empty(),
-                "inventory type must select the held body's identity in either relay direction"
-            );
-        } else {
-            assert_eq!(announced, vec![Message::GetData(vec![item])]);
-        }
-        let unknown = Inventory::WTx(bitcoin::Wtxid::from_byte_array([0xff; 32]));
-        let mut expected = Vec::new();
-        if !suppressed {
-            expected.push(item);
-        }
-        expected.push(unknown);
-        assert_eq!(
-            dispatch_collect_full(
-                &mut peer,
-                &Message::Inv(vec![item, unknown]),
-                None,
-                Some(gateway),
-            ),
-            vec![Message::GetData(expected)]
-        );
-    }
-
     #[test]
-    fn wtxid_negotiation_suppresses_only_the_identity_a_resident_body_has() {
+    fn one_sided_wtxid_negotiation_does_not_rerequest_pool_or_orphan_bodies() {
         use bitcoin_rs_primitives::Script;
         use std::sync::Arc;
 
@@ -1661,36 +1616,9 @@ mod tests {
                     Ok(SubmitOutcome::Held { .. })
                 ));
                 assert_eq!(gateway.orphan_count(), 1);
-                // A resident orphan is served only by its witness identity.
-                assert_eq!(gateway.get_tx(tx.txid()), None);
                 assert_eq!(
                     gateway.get_tx_by_wtxid(tx.wtxid()).as_ref(),
                     Some(tx.as_ref())
-                );
-                // The dispatch `getdata` path must express the same
-                // asymmetry: `WTx` serves the resident body while both
-                // txid-typed requests come back `NotFound`.
-                let mut peer = ready_peer();
-                peer.wtxid_relay.mark_peer_supported();
-                assert_eq!(
-                    dispatch_collect_full(
-                        &mut peer,
-                        &Message::GetData(vec![
-                            Inventory::WTx(wtxid),
-                            Inventory::Transaction(txid),
-                            Inventory::WitnessTransaction(txid),
-                        ]),
-                        None,
-                        Some(&gateway),
-                    ),
-                    vec![
-                        Message::Tx(Arc::as_ref(&tx).clone()),
-                        Message::NotFound(vec![
-                            Inventory::Transaction(txid),
-                            Inventory::WitnessTransaction(txid),
-                        ]),
-                    ],
-                    "an orphan body must answer only an exact-wtxid getdata"
                 );
             } else {
                 assert!(
@@ -1702,12 +1630,53 @@ mod tests {
                         .is_ok()
                 );
             }
-            for item in [
-                Inventory::WTx(wtxid),
-                Inventory::Transaction(txid),
-                Inventory::WitnessTransaction(txid),
+            for (local_requested, remote_requested, item) in [
+                (true, false, Inventory::WTx(wtxid)),
+                (false, true, Inventory::Transaction(txid)),
+                (false, true, Inventory::WitnessTransaction(txid)),
             ] {
-                inv_announce_requests_only_unsuppressed_identity(&gateway, orphan, item);
+                let mut peer = ready_peer();
+                if local_requested {
+                    peer.wtxid_relay.mark_local_advertised();
+                }
+                if remote_requested {
+                    peer.wtxid_relay.mark_peer_supported();
+                }
+                // A resident orphan suppresses only its own wtxid: a txid
+                // inventory stays requestable because another witness of the
+                // same txid can still be a valid body. Pool entries suppress
+                // either identity.
+                let held_suppresses = !orphan || matches!(item, Inventory::WTx(_));
+                let responses = dispatch_collect_full(
+                    &mut peer,
+                    &Message::Inv(vec![item]),
+                    None,
+                    Some(&gateway),
+                );
+                if held_suppresses {
+                    assert!(
+                        responses.is_empty(),
+                        "inventory type must select the held body's identity in either relay direction"
+                    );
+                } else {
+                    assert_eq!(responses, vec![Message::GetData(vec![item])]);
+                }
+
+                let unknown = Inventory::WTx(bitcoin::Wtxid::from_byte_array([0xff; 32]));
+                let expected = if held_suppresses {
+                    vec![unknown]
+                } else {
+                    vec![item, unknown]
+                };
+                assert_eq!(
+                    dispatch_collect_full(
+                        &mut peer,
+                        &Message::Inv(vec![item, unknown]),
+                        None,
+                        Some(&gateway),
+                    ),
+                    vec![Message::GetData(expected)]
+                );
             }
         }
     }

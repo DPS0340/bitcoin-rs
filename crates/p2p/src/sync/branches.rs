@@ -75,7 +75,12 @@ impl BlockSync {
                     // Only the delivered body is bad. Keep the header branch
                     // and its descendants, but free this slot for a new body;
                     // the tree-owned height keeps the retry cursor exact.
-                    let height = self.chain.block_tree().height_of_hash(hash);
+                    let height = {
+                        let tree = self.chain.block_tree();
+                        tree.lookup(hash)
+                            .and_then(|node_id| tree.node(node_id).ok())
+                            .map(|node| node.height)
+                    };
                     let mut scheduler = self.scheduler.lock();
                     scheduler.stager.retire_applied(&hash);
                     scheduler

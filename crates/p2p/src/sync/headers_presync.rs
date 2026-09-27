@@ -236,6 +236,66 @@ impl CompressedHeader {
     }
 }
 
+/// A FIFO of the one-bit commitments a PRESYNC pass leaves for the
+/// REDOWNLOAD check (`headerssync.h:198-201` keeps the same bits), packed
+/// 64 per word. A mainnet pass can retain millions of commitments — see the
+/// honest-chain estimate in [`HeadersSyncState::new`] — so one byte apiece
+/// would make every open sync state a memory-amplification surface per
+/// connection.
+#[derive(Default)]
+struct CommitmentBits {
+    /// Packed bit words; only `live` leading bits (from `head`) are live.
+    words: VecDeque<u64>,
+    /// Number of live bits in the queue.
+    live: u64,
+    /// Index of the oldest live bit inside `words[0]` (0..64).
+    head: u8,
+}
+
+impl CommitmentBits {
+    /// Appends one bit; allocates a new word when the tail crosses a
+    /// 64-bit boundary.
+    fn push_back(&mut self, bit: bool) {
+        let tail = u64::from(self.head).saturating_add(self.live);
+        let word = usize::try_from(tail / 64).unwrap_or(usize::MAX);
+        if word >= self.words.len() {
+            self.words.push_back(0);
+        }
+        if bit {
+            self.words[word] |= 1_u64 << (tail % 64);
+        }
+        self.live += 1;
+    }
+
+    /// Removes the oldest bit, dropping the front word once its last live
+    /// bit is consumed.
+    fn pop_front(&mut self) -> Option<bool> {
+        if self.live == 0 {
+            return None;
+        }
+        let bit = self.words[0] & (1_u64 << self.head) != 0;
+        self.live -= 1;
+        self.head += 1;
+        if self.head == 64 {
+            self.words.pop_front();
+            self.head = 0;
+        }
+        Some(bit)
+    }
+
+    /// Live bits currently held.
+    fn live_bits(&self) -> u64 {
+        self.live
+    }
+
+    /// Releases every retained bit (used at sync teardown).
+    fn clear(&mut self) {
+        self.words.clear();
+        self.live = 0;
+        self.head = 0;
+    }
+}
+
 /// One peer's download-twice header sync (`headerssync.h:103-149`).
 ///
 /// INVARIANT: no method on this type inserts into the block tree. Headers
@@ -261,7 +321,7 @@ pub struct HeadersSyncState {
     /// Bits of the last PRESYNC header (starts at the anchor's).
     last_header_bits: u32,
     /// One-bit commitments created during PRESYNC, consumed during REDOWNLOAD.
-    commitments: VecDeque<bool>,
+    commitments: CommitmentBits,
     /// Bound on [`Self::commitments`] from the honest-chain length estimate
     /// (`headerssync.cpp:33-49`).
     max_commitments: u64,
@@ -269,12 +329,20 @@ pub struct HeadersSyncState {
     redownloaded: VecDeque<CompressedHeader>,
     redownload_last_height: u32,
     redownload_last_hash: Hash256,
+    /// Bits of the last stored redownload header. The buffer can drain
+    /// below it, so the difficulty check reads this rather than the
+    /// buffer's tail — which would wrongly fall back to the anchor's bits
+    /// after a release emptied the buffer mid-retarget.
+    redownload_last_bits: CompactTarget,
     redownload_first_prev_hash: Hash256,
     redownload_work: Work,
     /// Set once the redownloaded chain itself crosses the minimum work: the
     /// target is reached and the whole buffer may drain
     /// (`headerssync.h:244-249`).
     process_all_remaining_headers: bool,
+    /// The header height the peer demonstrated before `finalize` reset the
+    /// cursors — the horizon it verifiably serves.
+    final_height: u32,
 }
 
 impl HeadersSyncState {
@@ -292,7 +360,7 @@ impl HeadersSyncState {
         params: HeadersSyncParams,
         salt: [u8; 16],
     ) -> Self {
-        assert!(
+        debug_assert!(
             params.commitment_period > 0,
             "commitment period must be nonzero"
         );
@@ -318,15 +386,17 @@ impl HeadersSyncState {
             current_height: chain_start.height,
             last_header_hash: chain_start.hash,
             last_header_bits,
-            commitments: VecDeque::new(),
+            commitments: CommitmentBits::default(),
             max_commitments,
             redownloaded: VecDeque::new(),
             redownload_last_height: chain_start.height,
             redownload_last_hash: chain_start.hash,
+            redownload_last_bits: chain_start.header.bits,
             redownload_first_prev_hash: chain_start.hash,
             redownload_work: chain_start.chain_work,
             process_all_remaining_headers: false,
             commit_offset: u32::try_from(commit_offset).unwrap_or(0),
+            final_height: chain_start.height,
             chain_start,
             params,
             minimum_work,
@@ -450,9 +520,6 @@ impl HeadersSyncState {
             });
         }
         let hash = Hash256::from(header.compute_hash());
-        // `validate_pow` also rejects zero and above-limit targets, which
-        // `compact_is_met_by` alone lets through — a test-network header
-        // could otherwise pass this gate with an inadmissible `bits`.
         if validate_pow(header, hash, self.chain_start.network).is_err() {
             return Err(HeaderSyncError::InvalidPow {
                 phase: HeadersSyncPhase::Presync,
@@ -462,7 +529,7 @@ impl HeadersSyncState {
         }
         if height % self.params.commitment_period == self.commit_offset {
             self.commitments.push_back(self.commitment_bit(hash));
-            if u64::try_from(self.commitments.len()).unwrap_or(u64::MAX) > self.max_commitments {
+            if self.commitments.live_bits() > self.max_commitments {
                 return Err(HeaderSyncError::MaxCommitments { height });
             }
         }
@@ -533,10 +600,7 @@ impl HeadersSyncState {
                 height,
             });
         }
-        let previous_bits = self
-            .redownloaded
-            .back()
-            .map_or(self.chain_start.header.bits, |last| last.bits);
+        let previous_bits = self.redownload_last_bits;
         if !permitted_difficulty_transition(
             self.chain_start.network,
             height,
@@ -573,6 +637,7 @@ impl HeadersSyncState {
             .push_back(CompressedHeader::compress(header));
         self.redownload_last_height = height;
         self.redownload_last_hash = hash;
+        self.redownload_last_bits = header.bits;
         Ok(())
     }
 
@@ -621,14 +686,14 @@ impl HeadersSyncState {
     /// The height this sync has reached, for request bookkeeping and logs.
     ///
     /// PRE: none.
-    /// POST: returns the cursor height of the live phase, or the anchor
-    ///   height once spent.
+    /// POST: returns the cursor height of the live phase, or the height the
+    ///   peer demonstrated once spent.
     #[must_use]
     pub(crate) const fn sync_height(&self) -> u32 {
         match self.phase {
             HeadersSyncPhase::Presync => self.current_height,
             HeadersSyncPhase::Redownload => self.redownload_last_height,
-            HeadersSyncPhase::Final => self.chain_start.height,
+            HeadersSyncPhase::Final => self.final_height,
         }
     }
 
@@ -655,6 +720,7 @@ impl HeadersSyncState {
         self.redownload_last_hash = Hash256::default();
         self.redownload_first_prev_hash = Hash256::default();
         self.process_all_remaining_headers = false;
+        self.final_height = self.sync_height();
         self.current_height = 0;
         self.phase = HeadersSyncPhase::Final;
     }

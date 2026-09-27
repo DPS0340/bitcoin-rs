@@ -153,17 +153,8 @@ impl PeerInfo {
     }
 }
 
-/// Decodes a Bitcoin service-flags bitmask into its name strings.
-///
-/// One table for every surface that renders service bits (P2P `getpeerinfo`
-/// and RPC `getnetworkinfo`), so the two cannot disagree about a bit. Order
-/// follows Bitcoin Core's bit assignment (`GetServiceNames`); unrecognized
-/// bits are dropped.
-///
-/// PRE: `flags` is a `MSG_...`-free service bitmask as sent on the wire.
-/// POST: the recognized names in bit order, empty when no bit is recognized.
-/// INVARIANT: the name for a bit is a compile-time constant; no allocation
-///   beyond the returned vector occurs.
+/// Bitcoin Core `GetServiceNames` names for a wire service bitmask, in bit
+/// order. Unrecognized bits are dropped.
 #[must_use]
 pub fn service_flag_names(flags: u64) -> Vec<&'static str> {
     [

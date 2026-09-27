@@ -6,6 +6,8 @@
 //! (`net_processing.cpp:6521`); afterwards a peer without `NODE_NETWORK`
 //! serves only the last `NODE_NETWORK_LIMITED_MIN_BLOCKS` — 288
 //! (`net_processing.cpp:159`, window applied at `:1637`) — of its own chain.
+//! The demonstrated-height clause used by the selection and hedge paths
+//! applies Core's two-block race buffer, so that window is 286 there.
 //! Both the selection path and the shared predicate are pinned here, because a
 //! fix that lands on one path alone leaves the other requesting undeliverable
 //! blocks.
@@ -36,8 +38,8 @@ fn full_peer(addr: SocketAddr, height: i32) -> PeerInfo {
 fn policy(ibd: Arc<InitialBlockDownload>, requested_height: u32) -> BlockDownloadPolicy {
     BlockDownloadPolicy {
         ibd,
-        network: Network::Regtest,
         requested_height,
+        network: Network::Regtest,
     }
 }
 
@@ -87,6 +89,27 @@ fn predicate_limits_pruned_peer_to_the_retained_window() -> Result<(), Box<dyn s
             ),
             accepted,
             "pruned peer at {height} asked for height {requested}"
+        );
+    }
+    Ok(())
+}
+
+/// A peer advertising only `WITNESS` — neither `NODE_NETWORK` nor
+/// `NODE_NETWORK_LIMITED` — serves no blocks at all: Core applies the retained
+/// window only to peers that set `NODE_NETWORK_LIMITED`, so this peer is
+/// refused even inside the 288-block window.
+#[test]
+fn predicate_refuses_witness_only_peer_inside_the_window() -> Result<(), Box<dyn std::error::Error>>
+{
+    let addr = test_addr(9603, 0)?;
+    let witness_only = PeerInfo {
+        services: ServiceFlags::WITNESS.to_u64(),
+        ..synthetic_peer(addr, 300)
+    };
+    for requested in [1_u32, 13, 288] {
+        assert!(
+            !statically_fanout_eligible(&witness_only, &policy(synced_ibd_latch(), requested)),
+            "a WITNESS-only peer must not be sent a getdata for height {requested}"
         );
     }
     Ok(())
@@ -142,13 +165,15 @@ fn tick_asks_no_bodies_from_limited_peer_during_initial_block_download()
 
 /// After initial block download the same peer serves the near-tip range, and
 /// the selection is the deep single-peer batch, so the body request proves the
-/// predicate ran inside the tick and not only in isolation.
+/// predicate ran inside the tick and not only in isolation. The peer's
+/// handshake height 286 keeps the required bodies inside the race-buffered
+/// window this node applies.
 #[test]
 fn tick_asks_bodies_from_limited_peer_inside_retained_window()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sync, peers, block_tree, applied_tip, expected) =
         sync_with_header_chain_and_ibd(4, synced_ibd_latch())?;
-    let rx = connect_peer(&peers, limited_peer(test_addr(9604, 0)?, 288));
+    let rx = connect_peer(&peers, limited_peer(test_addr(9604, 0)?, 286));
 
     sync.tick();
     assert_applied_genesis(&applied_tip, &block_tree)?;
@@ -169,7 +194,7 @@ fn tick_asks_no_bodies_from_limited_peer_beyond_retained_window()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sync, peers, block_tree, applied_tip, _expected) =
         sync_with_header_chain_and_ibd(4, synced_ibd_latch())?;
-    let rx = connect_peer(&peers, limited_peer(test_addr(9605, 0)?, 289));
+    let rx = connect_peer(&peers, limited_peer(test_addr(9605, 0)?, 287));
 
     sync.tick();
     assert_applied_genesis(&applied_tip, &block_tree)?;

@@ -62,12 +62,14 @@ fn verify_witness(
     witness: &[Vec<u8>],
     flags: VerifyFlags,
 ) -> Result<bool, ScriptError> {
+    // These legacy/v0 checks read only the selected input's prevout.
+    let prevouts = vec![prevout.clone(); tx.inputs.len()];
     Interpreter.execute_with_prevouts(
         &prevout.script_pubkey,
         &[],
         witness,
         flags,
-        std::slice::from_ref(prevout),
+        &prevouts,
         tx,
         INPUT,
     )
@@ -98,6 +100,8 @@ fn empty_signature_cannot_bypass_legacy_key_encoding() {
             value: Amount::from_sat(VALUE),
             script_pubkey: Script::from_bytes(script.clone()),
         };
+        // The test changes only INPUT's script; fill the other slot for the full-set API.
+        let prevouts = vec![prevout.clone(); tx.inputs.len()];
         let script_sig = if multisig {
             vec![0x00, 0x00]
         } else {
@@ -109,7 +113,7 @@ fn empty_signature_cannot_bypass_legacy_key_encoding() {
                 &script_sig,
                 &[],
                 VerifyFlags::NONE,
-                std::slice::from_ref(&prevout),
+                &prevouts,
                 &tx,
                 INPUT,
             ),
@@ -121,7 +125,7 @@ fn empty_signature_cannot_bypass_legacy_key_encoding() {
                 &script_sig,
                 &[],
                 VerifyFlags::STRICTENC,
-                std::slice::from_ref(&prevout),
+                &prevouts,
                 &tx,
                 INPUT,
             ),
@@ -273,13 +277,15 @@ fn zero_signature_multisig_does_not_validate_unexamined_keys() {
         value: Amount::from_sat(VALUE),
         script_pubkey: Script::from_bytes(script.clone()),
     };
+    // The fixture has two inputs, but these checks exercise only INPUT.
+    let legacy_prevouts = vec![legacy_prevout; tx.inputs.len()];
     assert_eq!(
         Interpreter.execute_with_prevouts(
             &script,
             &[0x00],
             &[],
             flags,
-            std::slice::from_ref(&legacy_prevout),
+            &legacy_prevouts,
             &tx,
             INPUT,
         ),
@@ -291,13 +297,14 @@ fn zero_signature_multisig_does_not_validate_unexamined_keys() {
         value: Amount::from_sat(VALUE),
         script_pubkey: Script::from_bytes(program),
     };
+    let witness_prevouts = vec![witness_prevout.clone(); tx.inputs.len()];
     assert_eq!(
         Interpreter.execute_with_prevouts(
             &witness_prevout.script_pubkey,
             &[],
             &[Vec::new(), script],
             flags,
-            std::slice::from_ref(&witness_prevout),
+            &witness_prevouts,
             &tx,
             INPUT,
         ),

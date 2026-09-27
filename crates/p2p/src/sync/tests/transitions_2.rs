@@ -84,19 +84,12 @@ fn two_branches() -> Result<TwoBranches, Box<dyn std::error::Error>> {
         crate::sync::syncing_ibd_latch(),
     );
     let peer = SocketAddr::from(([127, 0, 0, 1], 18_461));
-    let (tx, rx) = unbounded::<Message>();
-    peers.register(peer, PeerLease::new(tx));
+    let rx = connect_peer(&peers, synthetic_peer(peer, 100));
     let source = current_source(&sync.peer_table, peer);
 
     assert!(
-        sync.send_getdata_for_pending_blocks(
-            source,
-            false,
-            100,
-            &test_frontier(&sync),
-            Instant::now()
-        )
-        .sent
+        sync.send_getdata_for_pending_blocks(source, false, 100, &test_frontier(&sync))
+            .sent
     );
     assert_eq!(witness_block_inventory(next_getdata(&rx)?)?, losing_hashes);
     Ok(TwoBranches {
@@ -127,14 +120,8 @@ fn retargeting_pending_requests_drops_losing_branch_hashes()
 
     chain_tip.store(Some(Arc::new(winning_tip)));
     assert!(
-        sync.send_getdata_for_pending_blocks(
-            source,
-            false,
-            100,
-            &test_frontier(&sync),
-            Instant::now()
-        )
-        .sent
+        sync.send_getdata_for_pending_blocks(source, false, 100, &test_frontier(&sync))
+            .sent
     );
     let requested = witness_block_inventory(next_getdata(&rx)?)?;
     assert_eq!(requested, winning_hashes);
@@ -169,22 +156,13 @@ fn retarget_purges_staged_off_branch_bodies() -> Result<(), Box<dyn std::error::
         .try_into()
         .map_err(|_| "the fixture has two losing bodies")?;
     let mut delivery = vec![crate::InboundBlock::from_decoded(losing1)];
-    assert_eq!(
-        sync.buffer_received_block_chunk(&mut delivery, None, Instant::now()),
-        1
-    );
+    assert_eq!(sync.buffer_received_block_chunk(&mut delivery, None), 1);
     assert_eq!(sync.scheduler.lock().stager.received_len(), 1);
 
     chain_tip.store(Some(Arc::new(winning_tip)));
     assert!(
-        sync.send_getdata_for_pending_blocks(
-            source,
-            false,
-            100,
-            &test_frontier(&sync),
-            Instant::now()
-        )
-        .sent
+        sync.send_getdata_for_pending_blocks(source, false, 100, &test_frontier(&sync))
+            .sent
     );
     assert_eq!(witness_block_inventory(next_getdata(&rx)?)?, winning_hashes);
     assert_eq!(
@@ -195,7 +173,7 @@ fn retarget_purges_staged_off_branch_bodies() -> Result<(), Box<dyn std::error::
 
     let mut late = vec![crate::InboundBlock::from_decoded(losing2)];
     assert_eq!(
-        sync.buffer_received_block_chunk(&mut late, None, Instant::now()),
+        sync.buffer_received_block_chunk(&mut late, None),
         0,
         "the late losing-branch delivery must be discarded, not staged"
     );
@@ -229,10 +207,10 @@ fn outweighed_branch_target_accepts_shorter_higher_work_branch()
         let node = tree.node(main2_id)?;
         TipSnapshot {
             tip_id: main2_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
 
@@ -263,5 +241,95 @@ fn outweighed_branch_target_accepts_shorter_higher_work_branch()
     applied_tip.store(Some(Arc::new(applied)));
 
     assert_eq!(sync.outweighed_branch_target(), Some(high_work_id));
+    Ok(())
+}
+
+/// BLK-08: a retarget must run before the request-peer scan limit truncates
+/// the peer list. A losing-branch pending set that fills the window otherwise
+/// yields zero request peers, so `next_peer_request` — the only other place
+/// the purge runs — is never reached and the winning branch waits out the
+/// pending timeout.
+#[test]
+fn retarget_runs_before_the_peer_budget_truncates() -> Result<(), Box<dyn std::error::Error>> {
+    const LOSING_LEN: usize = 4;
+    let genesis = genesis_header();
+    let mut tree = BlockTree::new();
+    let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+    let snapshot = |tree: &BlockTree, tip_id| -> Result<TipSnapshot, Box<dyn std::error::Error>> {
+        let node = tree.node(tip_id)?;
+        Ok(TipSnapshot {
+            tip_id,
+            height: node.height,
+            chainwork: node.chainwork,
+            hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
+        })
+    };
+    let genesis_tip = snapshot(&tree, genesis_id)?;
+
+    let mut losing_tip_id = genesis_id;
+    let mut prev_hash = genesis.compute_hash();
+    for index in 0..LOSING_LEN {
+        let header = test_header(prev_hash, u32::try_from(index + 1)?);
+        losing_tip_id = tree.insert_node(Some(losing_tip_id), header, NodeStatus::HeaderValid)?;
+        prev_hash = header.compute_hash();
+    }
+    let losing_tip = snapshot(&tree, losing_tip_id)?;
+
+    let winning_header = test_header(genesis.compute_hash(), 101);
+    let winning_id = tree.insert_node(Some(genesis_id), winning_header, NodeStatus::HeaderValid)?;
+    let winning_tip = snapshot(&tree, winning_id)?;
+
+    let chain_tip = Arc::new(ArcSwapOption::empty());
+    chain_tip.store(Some(Arc::new(losing_tip)));
+    let applied_tip = Arc::new(ArcSwapOption::empty());
+    applied_tip.store(Some(Arc::new(genesis_tip)));
+    let block_tree = Arc::new(RwLock::new(tree));
+    let peers = Arc::new(PeerTable::new());
+    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
+    let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
+    let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<crate::InboundBlock>();
+    let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
+    let sync = BlockSync::new(
+        std::sync::Arc::new(TestChain::new(
+            Arc::clone(&chain_tip),
+            Arc::clone(&applied_tip),
+            block_tree,
+        )),
+        Arc::clone(&peers),
+        inbound_headers_rx,
+        inbound_blocks_rx,
+        crate::sync::syncing_ibd_latch(),
+    );
+    // Fill the window with losing-branch pending: a pending cap of the losing
+    // branch's length makes the scan limit exactly zero once it is full.
+    sync.install_budget(crate::sync::SyncBudget {
+        max_pending_blocks: LOSING_LEN,
+        ..crate::sync::default_sync_budget(Network::Regtest)
+    });
+    let peer = SocketAddr::from(([127, 0, 0, 1], 18_462));
+    let _rx = connect_peer(&peers, synthetic_peer(peer, 100));
+    let source = current_source(&sync.peer_table, peer);
+    assert!(
+        sync.send_getdata_for_pending_blocks(source, false, 100, &test_frontier(&sync))
+            .sent
+    );
+    assert_eq!(sync.scheduler.lock().window.pending_len(), LOSING_LEN);
+
+    chain_tip.store(Some(Arc::new(winning_tip)));
+    let now = Instant::now();
+    let frontier = sync.observe_frontier(test_frontier(&sync), now);
+    let selection = sync.sync_peer_selection(&frontier, now);
+    let scheduler = sync.scheduler.lock();
+    assert_eq!(
+        scheduler.window.pending_len(),
+        0,
+        "peer selection must purge the losing branch before measuring capacity"
+    );
+    drop(scheduler);
+    assert!(
+        !selection.request_peers.is_empty(),
+        "freed capacity must leave a request peer this tick, not wait out the pending timeout"
+    );
     Ok(())
 }

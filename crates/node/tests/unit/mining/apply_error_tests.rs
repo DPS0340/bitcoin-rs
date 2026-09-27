@@ -4,6 +4,7 @@
 use super::{map_apply_error, test_block_validity_error};
 use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::ChainWork;
+use bitcoin_rs_chain::NodeId;
 use bitcoin_rs_chainstate::ApplyError;
 use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_mining::BlockValidationResult;
@@ -132,7 +133,7 @@ fn apply_errors_delegate_consensus_and_chain_reasons() {
     );
     assert_eq!(
         rejected(ApplyError::Chain(ChainError::InvalidParent {
-            prev_hash: Hash256::default(),
+            parent: NodeId::new(3),
         })),
         "bad-prevblk"
     );

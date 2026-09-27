@@ -113,6 +113,14 @@ impl DerivedIndexHost {
             chainstate.applied_tip_reader(),
             chainstate.block_tree_reader(),
             chainstate.block_body_store_handle(),
+            bitcoin_rs_storage::pruning::HistoryAccess::new(
+                chainstate.retention_handle(),
+                // A stalled optional consumer is bounded by the reorg
+                // margin, so it never competes with the mandatory window.
+                bitcoin_rs_storage::pruning::RetentionBudget::from_blocks(
+                    bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN,
+                ),
+            ),
             spawn.block_source,
             Some(spawn.body_source),
             Arc::new(super::IndexChainCursorSource(

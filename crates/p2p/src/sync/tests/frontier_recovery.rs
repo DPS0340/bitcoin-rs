@@ -192,8 +192,7 @@ fn superseded_session_gets_no_probe_and_cannot_send_getheaders()
     let genesis = Network::Regtest.genesis_block().block_hash();
     let locator = vec![Hash256::from_le_bytes(genesis.as_bytes())];
     assert!(
-        sync.send_getheaders(old_source, 0, 10, locator, std::time::Instant::now())
-            != super::super::GetheadersOutcome::Sent,
+        sync.send_getheaders(old_source, 0, 10, locator) != super::super::GetheadersOutcome::Sent,
         "lease_source must reject a superseded session identity"
     );
     assert!(
@@ -303,78 +302,6 @@ fn failed_probe_send_excludes_dead_highest_peer_from_header_fallback()
         "the lower live peer must own the fallback request"
     );
     assert!(live_rx.try_recv().is_err());
-    Ok(())
-}
-
-/// An expired header request retires its owner before this tick plans work.
-/// Expiry disconnects the owner while a fallback peer exists, but the
-/// snapshot this tick plans from was observed before that disconnect: the
-/// fallback ask must land on a live peer in the same tick, not on the
-/// just-disconnected highest peer the stale snapshot still lists.
-///
-/// PRE: `slow` owns the pending `getheaders` and advertises a height more
-///   than one above `fallback`, so plain ranking prefers `slow` even after
-///   expiry's one-point penalty (5 - 1 still outranks 3).
-/// POST: the deadline tick disconnects `slow` and `fallback` receives the
-///   header request in that same tick and owns the pending gate after it.
-/// INVARIANT: a connection retired inside the tick is never selected by
-///   the same tick's header fallback.
-#[test]
-fn expired_request_excludes_its_disconnected_owner_from_the_same_tick_fallback()
--> Result<(), Box<dyn std::error::Error>> {
-    let (sync, peers, _, _, _) = sync_with_header_chain(0)?;
-    install_budget(
-        &sync,
-        super::super::SyncBudget {
-            max_pending_bytes: 0,
-            max_received_bytes: 0,
-            ..super::super::default_sync_budget(Network::Regtest)
-        },
-    );
-    let slow = test_addr(9775, 0)?;
-    let fallback = test_addr(9775, 1)?;
-    let slow_rx = connect_peer(&peers, synthetic_peer(slow, 5));
-    let fallback_rx = connect_peer(&peers, synthetic_peer(fallback, 3));
-
-    let t0 = std::time::Instant::now();
-    sync.tick_at(t0);
-    assert!(
-        next_getheaders(&slow_rx).is_ok(),
-        "the higher advertised peer must own the first request",
-    );
-    assert!(fallback_rx.try_recv().is_err());
-
-    // The deadline itself retires the request and disconnects its owner
-    // while a fallback peer remains.
-    sync.tick_at(t0 + super::super::HEADER_REQUEST_TIMEOUT);
-
-    assert!(
-        !peers.is_connected(slow),
-        "the expired owner must be rotated away while a fallback exists",
-    );
-    let request = next_getheaders(&fallback_rx)?;
-    assert_eq!(
-        request
-            .locator_hashes
-            .first()
-            .map(|hash| *hash.as_byte_array()),
-        Some(*Network::Regtest.genesis_block().block_hash().as_bytes()),
-        "the fallback must be asked in the very tick that retires the owner",
-    );
-    assert_eq!(
-        sync.scheduler
-            .lock()
-            .header_request
-            .as_ref()
-            .map(|request| request.source.addr),
-        Some(fallback),
-        "the live peer must own the pending request",
-    );
-    assert!(fallback_rx.try_recv().is_err());
-    assert!(
-        slow_rx.try_recv().is_err(),
-        "the disconnected owner must receive no further request",
-    );
     Ok(())
 }
 
@@ -520,10 +447,10 @@ fn reorg_probe_anchors_locator_on_active_chain_at_applied_height()
     let losing_tip = tree.node(losing_3_id)?;
     let losing_snapshot = TipSnapshot {
         tip_id: losing_3_id,
+        chain_tx_count: losing_tip.chain_tx_count,
         height: losing_tip.height,
         chainwork: losing_tip.chainwork,
         hash: losing_tip.hash,
-        chain_tx_count: losing_tip.chain_tx_count,
     };
 
     let SyncHarness {
@@ -592,10 +519,7 @@ fn unsolicited_staged_body_never_rewinds_request_cursor() -> Result<(), Box<dyn 
     );
     let orphan_hash = Hash256::from(orphan.block_hash());
     let mut inbound = vec![crate::InboundBlock::from_decoded(orphan)];
-    assert_eq!(
-        sync.buffer_received_block_chunk(&mut inbound, None, Instant::now()),
-        1
-    );
+    assert_eq!(sync.buffer_received_block_chunk(&mut inbound, None), 1);
     assert!(sync.scheduler.lock().stager.contains(&orphan_hash));
 
     sync.tick();

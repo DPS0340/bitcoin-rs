@@ -939,7 +939,9 @@ mod tests {
     fn getblocktemplate_proposal_skips_mainnet_connection_gates() {
         let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
         *control.proposal.lock() = BlockValidationResult::Accepted;
-        let ctx = Arc::new(Context::new().with_mining_control(control));
+        let mut ctx = Context::new();
+        ctx.mining_control = Some(control);
+        let ctx = Arc::new(ctx);
         let genesis = sample_block();
         let hex = hex_encode(&consensus_bytes(&genesis));
         let result = getblocktemplate(

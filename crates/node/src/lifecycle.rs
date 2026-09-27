@@ -83,7 +83,7 @@ fn bind_rpc(
             Arc::clone(ibd),
         ),
         mempool: MempoolHandles {
-            mempool: state.mempool_gateway(),
+            gateway: state.mempool_gateway(),
         },
         indexes: IndexHandles {
             derived_index: state.derived_index_query(),
@@ -569,9 +569,6 @@ pub(crate) fn start_node(
         tx_inventory: Some(tx_inventory),
         compact_hints: Some(compact_hints),
         inbound_tx: Some(state.inbound_tx_sender()),
-        // The latch answers against the configured consensus network, not a
-        // magic-derived one: a custom `--p2p-magic` can carry another
-        // network's bytes.
         ibd: Some((Arc::clone(&ibd), state.config().network)),
         // One orchestrator: the listener announces block inventory to the
         // same sync loop the event loop drives.
@@ -582,7 +579,7 @@ pub(crate) fn start_node(
     guard.services.tx_relay = Some(bitcoin_rs_p2p::spawn_tx_relay_worker(
         bitcoin_rs_p2p::PeerRelaySink::new(state.peer_table()),
         relay_rx,
-        Arc::clone(&gateway),
+        Arc::downgrade(&gateway),
         Arc::clone(&shutdown),
     )?);
     guard.services.tx_ingress = Some(crate::tx_ingress::spawn_tx_ingress_consumer(

@@ -83,8 +83,9 @@ fn invalidate_preflights_first_replacement_body_before_disconnect() -> anyhow::R
         .read()
         .lookup(Hash256::from(genesis.block_hash()))
         .ok_or_else(|| anyhow::anyhow!("missing genesis node"))?;
-    state.chainstate().block_tree().write().insert_node(
-        Some(genesis_id),
+    crate::sync::fixture_insert_header_node(
+        &state.chainstate(),
+        genesis_id,
         replacement.header,
         bitcoin_rs_chain::node::NodeStatus::HeaderValid,
     )?;
@@ -148,8 +149,9 @@ fn switch_to_branch_settles_disconnect_debt() -> anyhow::Result<()> {
     for height in 1..=2 {
         let block =
             mined_regtest_child_at(previous_hash, genesis.header.time + 10 + height, height)?;
-        let node_id = state.chainstate().block_tree().write().insert_node(
-            Some(parent),
+        let node_id = crate::sync::fixture_insert_header_node(
+            &state.chainstate(),
+            parent,
             block.header,
             bitcoin_rs_chain::node::NodeStatus::HeaderValid,
         )?;
@@ -305,8 +307,9 @@ fn forked_regtest_state() -> anyhow::Result<ForkFixture> {
     for height in 1..=2 {
         let block =
             mined_regtest_child_at(previous_hash, genesis.header.time + 10 + height, height)?;
-        let node_id = state.chainstate().block_tree().write().insert_node(
-            Some(parent),
+        let node_id = crate::sync::fixture_insert_header_node(
+            &state.chainstate(),
+            parent,
             block.header,
             bitcoin_rs_chain::node::NodeStatus::HeaderValid,
         )?;
@@ -348,7 +351,8 @@ fn switch_to_branch_refuses_history_the_prune_line_crossed() -> anyhow::Result<(
     let (_dir, state, fork_tip, fork_bodies) = forked_regtest_state()?;
     let handles = state.chainstate();
     let tip_before = handles.applied_tip().load_full().map(|tip| tip.hash);
-    handles.retention_handle().record_pruned_below(5);
+    let reservation = handles.retention_handle().reserve(5);
+    reservation.commit(5);
 
     let outcome = crate::reorg::switch_to_branch(
         &handles,
@@ -431,6 +435,74 @@ fn missing_checkpoint_replays_durable_head_chain_at_startup() -> anyhow::Result<
 }
 
 #[test]
+fn committed_frame_corruption_refuses_startup_and_preserves_all_bytes() -> anyhow::Result<()> {
+    for keep_checkpoint in [false, true] {
+        for corrupt_length in [false, true] {
+            let (_dir, state, config) = applied_regtest_chain(2, 2)?;
+            drop(state);
+            if !keep_checkpoint {
+                std::fs::remove_dir_all(config.data_dir.join("chainstate-checkpoints"))?;
+            }
+            let path = config.data_dir.join("blocks/blk00000.dat");
+            let mut damaged = std::fs::read(&path)?;
+            // Keep the complete genesis frame and damage only the middle frame.
+            // Both it and the untouched successor are below the durable extent.
+            // The record header is magic(4) + body length(4) + height(4) +
+            // block hash(32) = 44 bytes; the length occupies bytes 4..8.
+            let genesis_len = u32::from_le_bytes(damaged[4..8].try_into()?);
+            let middle = 44 + usize::try_from(genesis_len)?;
+            assert_eq!(&damaged[middle..middle + 4], b"BRSB");
+            if corrupt_length {
+                damaged[middle + 4..middle + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+            } else {
+                damaged[middle] ^= 0xff;
+            }
+            std::fs::write(&path, &damaged)?;
+            let error = NodeState::open(config, None)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("committed corruption was accepted"))?;
+            assert!(
+                matches!(
+                    error.downcast_ref::<bitcoin_rs_storage::StorageError>(),
+                    Some(bitcoin_rs_storage::StorageError::IncompatibleData(_))
+                ),
+                "unexpected refusal: {error:#}"
+            );
+            assert_eq!(std::fs::read(path)?, damaged);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn checkpoint_resume_discards_only_incomplete_uncommitted_tail() -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let (_dir, state, config) = applied_regtest_chain(2, 2)?;
+    let tip = state
+        .chainstate()
+        .applied_tip_snapshot()
+        .ok_or_else(|| anyhow::anyhow!("missing fixture tip"))?;
+    drop(state);
+    let path = config.data_dir.join("blocks/blk00000.dat");
+    let committed = std::fs::read(&path)?;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)?
+        .write_all(b"BR")?;
+    let reopened = NodeState::open(config, None)?;
+    assert_eq!(std::fs::read(&path)?, committed);
+    assert_eq!(
+        reopened
+            .chainstate()
+            .applied_tip_snapshot()
+            .map(|tip| tip.hash),
+        Some(tip.hash)
+    );
+    Ok(())
+}
+
+#[test]
 fn full_revalidation_marker_resumes_on_durable_head() -> anyhow::Result<()> {
     let (_dir, state, config) = applied_regtest_chain(2, 1)?;
     let remembered_tip = state
@@ -493,8 +565,9 @@ fn plan_fork(
     for height in fork_height + 1..=fork_height + depth {
         let block = mined_regtest_child_at(previous, time_base.wrapping_add(height), height)?;
         let hash = Hash256::from(block.block_hash());
-        let node_id = state.chainstate().block_tree().write().insert_node(
-            Some(parent),
+        let node_id = crate::sync::fixture_insert_header_node(
+            &state.chainstate(),
+            parent,
             block.header,
             bitcoin_rs_chain::node::NodeStatus::HeaderValid,
         )?;

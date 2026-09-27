@@ -26,15 +26,14 @@ use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::Magic;
-use bitcoin::p2p::message_compact_blocks::BlockTxn;
-use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Sequence, Tx,
     TxIn, TxOut, Txid, Witness, Wtxid, consensus_bytes,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use bitcoin_rs_p2p::peer::COMPACT_BLOCK_VERSION;
+use bitcoin_rs_p2p::compact_blocks::{COMPACT_BLOCK_VERSION, Outcome};
 use bitcoin_rs_p2p::wire::{Message, write_message};
 use bitcoin_rs_p2p::{CompactBlockHints, Reconstruction};
 
@@ -211,8 +210,6 @@ fn bench_block_txn(request: &BlockTransactionsRequest, body: &[Tx]) -> BlockTxn 
 /// after the `getblocktxn` answer.
 #[expect(clippy::expect_used, reason = "timed fixture calls must fail loudly")]
 fn bench_compact_reconstruction(c: &mut Criterion) {
-    use bitcoin_rs_p2p::compact_blocks::Outcome;
-
     let mut group = c.benchmark_group("compact_reconstruction");
     for (block_txs, decoys, missing) in [(100_usize, 5_000_usize, 0_usize), (100, 5_000, 5)] {
         let body: Vec<Tx> = (1..=u32::try_from(block_txs).expect("block size fits u32"))
@@ -221,11 +218,10 @@ fn bench_compact_reconstruction(c: &mut Criterion) {
         let mut pool: Vec<Tx> = (1..=u32::try_from(decoys).expect("decoy count fits u32"))
             .map(|seed| bench_tx(seed + 1_000_000))
             .collect();
-        // The first `missing` block transactions stay out of the pool, so
-        // the reconstruction requests them by absolute index. The coinbase
-        // is always prefilled, so `missing = 5` puts a 4-transaction
-        // `blocktxn` on the wire.
-        pool.extend(body.iter().skip(missing).cloned());
+        // The coinbase is a mandatory prefill and never needs a hint, so
+        // the `missing` transactions after it stay out of the pool: the
+        // reconstruction must then request exactly those indexes.
+        pool.extend(body.iter().skip(1 + missing).cloned());
         let hints = BenchHints::new(pool);
         let cmpct = bench_cmpctblock(&body, 0x1234);
         // One untimed pipeline run proves the fixture completes: the first

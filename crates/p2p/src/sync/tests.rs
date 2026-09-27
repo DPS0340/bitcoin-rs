@@ -9,8 +9,7 @@ use arc_swap::ArcSwapOption;
 // Wire seam: byte-array access on the retained bitcoin:: wire hash types.
 use bitcoin::hashes::Hash;
 use bitcoin_rs_chain::{
-    BlockTree, BlockTreeReader, ChainWork, InitialBlockDownload, NodeId, NodeStatus, TipReader,
-    TipSnapshot,
+    BlockTree, ChainWork, InitialBlockDownload, NodeId, NodeStatus, TipSnapshot,
 };
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{
@@ -150,10 +149,10 @@ impl SyncChain for TestChain {
         };
         let snapshot = Arc::new(TipSnapshot {
             tip_id: id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         });
         self.applied_tip.store(Some(Arc::clone(&snapshot)));
         if self.chain_tip.load_full().is_none() {
@@ -299,10 +298,10 @@ impl SyncChain for TestChain {
             };
             self.applied_tip.store(Some(Arc::new(TipSnapshot {
                 tip_id: node_id,
+                chain_tx_count: node.chain_tx_count,
                 height: node.height,
                 chainwork: node.chainwork,
                 hash: node.hash,
-                chain_tx_count: node.chain_tx_count,
             })));
             applied = applied.saturating_add(1);
         }
@@ -327,10 +326,10 @@ impl SyncChain for TestChain {
                         tree.node(node_id).ok().map(|node| {
                             Arc::new(TipSnapshot {
                                 tip_id: node_id,
+                                chain_tx_count: node.chain_tx_count,
                                 height: node.height,
                                 chainwork: node.chainwork,
                                 hash: node.hash,
-                                chain_tx_count: node.chain_tx_count,
                             })
                         })
                     })
@@ -401,6 +400,10 @@ impl SyncChain for RefusingChain {
         HeaderAdmission::Refused(Box::new(std::io::Error::other(
             "scripted admission refusal",
         )))
+    }
+
+    fn minimum_chain_work(&self) -> ChainWork {
+        self.0.minimum_chain_work()
     }
 
     fn check_body_binding(&self, block: &Block) -> Result<(), SyncChainError> {
@@ -477,7 +480,6 @@ fn check_sync_frontier_pair(
         true,
         100,
         &test_frontier(sync),
-        Instant::now(),
     );
     let expected_ids = expected
         .as_ref()
@@ -508,41 +510,34 @@ fn check_sync_frontier_pair(
 /// A batch forwarded out of a delivered body (`wire_response = false`) is
 /// not an answer to the pending `getheaders`, whatever admission does with
 /// it: neither a rejected batch (`TimestampTooFarAhead`) nor a refused one
-/// (paused admission) may re-arm the gate. An unconditional re-arm would
-/// stamp the gate answered and move its deadline forward at every body
-/// delivery, so a connection that silently ignored its wire request would
-/// age out of expiry without blame forever.
+/// (paused admission) may consume the gate. Unconditional consumption would
+/// free the gate at every body delivery, so a connection that silently
+/// ignored its wire request would never age the request out.
 ///
-/// PRE: `a` owns the header request registered at `t0` and `b` is a second
-///   usable peer, so expiry has a fallback; the batch from `a` is carried by
-///   a body delivery, not by the wire answer.
-/// POST: at `t0 + HEADER_REQUEST_TIMEOUT` the gate expires with blame: `a`
-///   is disconnected, penalised, and marked unresponsive, and `b` is asked
-///   in that same tick.
-/// INVARIANT: only a wire answer may move a header request's deadline or
-///   mark it answered.
+/// PRE: `a` owns the pending header request and `b` is a second usable
+///   peer, so expiry has a fallback; the batch from `a` is carried by a
+///   body delivery, not by the wire answer.
+/// POST: the gate keeps its owner and deadline through the body-forwarded
+///   batch; once the deadline lapses the probe rotates past `a` and `b` is
+///   asked on that tick.
+/// INVARIANT: only a wire answer may clear a pending header request.
 #[test]
-#[allow(clippy::too_many_lines)]
-fn body_forwarded_batch_does_not_rearm_the_pending_header_gate()
+fn body_forwarded_batch_does_not_consume_the_pending_header_gate()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Phase 1: admission rejects the body-forwarded header before it can
-    // attach (`TimestampTooFarAhead`, a non-fault, non-MissingParent
-    // rejection).
-    {
+    for build_fixture in [header_sync_with_genesis, header_sync_with_refusing_chain] {
         let HeaderSyncFixture {
             genesis,
             sync,
             inbound_headers_tx,
             peers,
-        } = header_sync_with_genesis()?;
+        } = build_fixture()?;
         let a = test_addr(9771, 0)?;
         let b = test_addr(9771, 1)?;
         let a_rx = connect_peer(&peers, synthetic_peer(a, 8));
         let b_rx = connect_peer(&peers, synthetic_peer(b, 8));
         let a_source = current_source(&peers, a);
-        let t0 = Instant::now();
 
-        sync.tick_at(t0);
+        sync.tick();
         assert!(
             a_rx.try_iter()
                 .any(|message| matches!(message, Message::GetHeaders(_))),
@@ -555,204 +550,45 @@ fn body_forwarded_batch_does_not_rearm_the_pending_header_gate()
             wire_response: false,
             body_fetch_owned: false,
         })?;
-        sync.tick_at(t0 + Duration::from_millis(1));
+        sync.tick();
 
-        {
-            let scheduler = sync.scheduler.lock();
-            let request = scheduler
-                .header_request
-                .as_ref()
-                .ok_or("the gate must stay registered after the rejection")?;
-            assert!(!request.answered, "a body-forwarded batch is not an answer");
-            assert_eq!(
-                request.requested_at, t0,
-                "a body-forwarded batch must not move the deadline",
-            );
-        }
-
-        let expiry = t0 + super::HEADER_REQUEST_TIMEOUT;
-        sync.tick_at(expiry);
-
-        assert!(
-            !peers.is_connected(a),
-            "a connection that silently ignored its getheaders must be rotated away",
-        );
-        assert!(
-            sync.scheduler
-                .lock()
-                .header_penalties
-                .contains_key(&a_source),
-            "the silent connection must carry the timeout penalty",
-        );
-        assert!(
-            b_rx.try_iter()
-                .any(|message| matches!(message, Message::GetHeaders(_))),
-            "the fallback peer must be asked in the very tick that rotates",
-        );
         assert!(
             sync.scheduler
                 .lock()
                 .header_request
-                .is_some_and(|request| request.source == current_source(&peers, b)),
-            "the gate must move to the fallback connection",
-        );
-    }
-
-    // Phase 2: admission refuses the body-forwarded header before
-    // validation (paused admission), and the paced ancestry re-request it
-    // paces must not move the pending deadline either.
-    {
-        let HeaderSyncFixture {
-            genesis,
-            sync,
-            inbound_headers_tx,
-            peers,
-        } = header_sync_with_refusing_chain()?;
-        let a = test_addr(9773, 0)?;
-        let b = test_addr(9773, 1)?;
-        let a_rx = connect_peer(&peers, synthetic_peer(a, 8));
-        let b_rx = connect_peer(&peers, synthetic_peer(b, 8));
-        let a_source = current_source(&peers, a);
-        let t0 = Instant::now();
-
-        sync.tick_at(t0);
-        assert!(
-            a_rx.try_iter()
-                .any(|message| matches!(message, Message::GetHeaders(_))),
-            "the first tick must ask `a`",
+                .is_some_and(|request| request.source == a_source),
+            "a body-forwarded batch is not an answer: the gate stays with `a`",
         );
 
-        inbound_headers_tx.send(InboundHeaders {
-            headers: vec![far_future_header(genesis.compute_hash(), 1)?],
-            source: Some(a_source),
-            wire_response: false,
-            body_fetch_owned: false,
-        })?;
-        sync.tick_at(t0 + Duration::from_millis(1));
-
-        {
-            let scheduler = sync.scheduler.lock();
-            let request = scheduler
-                .header_request
-                .as_ref()
-                .ok_or("the gate must stay registered after the refusal")?;
-            assert!(!request.answered, "a body-forwarded batch is not an answer");
-            assert_eq!(
-                request.requested_at, t0,
-                "a body-forwarded batch must not move the deadline",
-            );
-        }
-
-        let expiry = t0 + super::HEADER_REQUEST_TIMEOUT;
-        sync.tick_at(expiry);
-
-        assert!(
-            !peers.is_connected(a),
-            "a connection that silently ignored its getheaders must be rotated away",
-        );
-        assert!(
-            sync.scheduler
-                .lock()
-                .header_penalties
-                .contains_key(&a_source),
-            "the silent connection must carry the timeout penalty",
-        );
-        assert!(
-            b_rx.try_iter()
-                .any(|message| matches!(message, Message::GetHeaders(_))),
-            "the fallback peer must be asked in the very tick that rotates",
-        );
-        assert!(
-            sync.scheduler
-                .lock()
-                .header_request
-                .is_some_and(|request| request.source == current_source(&peers, b)),
-            "the gate must move to the fallback connection",
-        );
-    }
-    Ok(())
-}
-
-/// An empty wire `headers` answer is still an answer from the connection
-/// that sent it: the gate stays with its deadline so idle discovery keeps
-/// its pace and rotates on schedule, but the request is marked answered so
-/// expiry retires it without blaming a peer that responded.
-///
-/// PRE: `a` owns the header request registered at `t0` and `b` is a second
-///   usable peer, so expiry has a fallback; `a` answers with an empty wire
-///   batch ("nothing more").
-/// POST: the gate stays registered with its `t0` deadline and
-///   `answered == true`; at `t0 + HEADER_REQUEST_TIMEOUT` the gate expires
-///   without blame — `a` stays connected and carries no penalty.
-/// INVARIANT: an empty batch never consumes the gate and never moves its
-///   deadline; only the answered flag changes.
-#[test]
-fn empty_wire_batch_marks_the_pending_header_gate_answered()
--> Result<(), Box<dyn std::error::Error>> {
-    let HeaderSyncFixture {
-        sync,
-        inbound_headers_tx,
-        peers,
-        ..
-    } = header_sync_with_genesis()?;
-    let a = test_addr(9775, 0)?;
-    let b = test_addr(9775, 1)?;
-    let a_rx = connect_peer(&peers, synthetic_peer(a, 8));
-    let _b_rx = connect_peer(&peers, synthetic_peer(b, 8));
-    let a_source = current_source(&peers, a);
-    let t0 = Instant::now();
-
-    sync.tick_at(t0);
-    assert!(
-        a_rx.try_iter()
-            .any(|message| matches!(message, Message::GetHeaders(_))),
-        "the first tick must ask `a`",
-    );
-
-    inbound_headers_tx.send(InboundHeaders {
-        headers: Vec::new(),
-        source: Some(a_source),
-        wire_response: true,
-        body_fetch_owned: false,
-    })?;
-    sync.tick_at(t0 + Duration::from_millis(1));
-
-    {
-        let scheduler = sync.scheduler.lock();
-        let request = scheduler
-            .header_request
-            .as_ref()
-            .ok_or("an empty wire answer must not consume the gate")?;
-        assert_eq!(request.source, a_source, "the gate must stay with `a`");
-        assert!(request.answered, "an empty wire answer is still an answer");
-        assert_eq!(
-            request.requested_at, t0,
-            "an empty wire answer must not move the deadline",
-        );
-    }
-
-    sync.tick_at(t0 + super::HEADER_REQUEST_TIMEOUT);
-
-    assert!(
-        peers.is_connected(a),
-        "a connection that answered must not be rotated away with blame",
-    );
-    assert!(
-        !sync
-            .scheduler
-            .lock()
-            .header_penalties
-            .contains_key(&a_source),
-        "an answering connection must carry no timeout penalty",
-    );
-    assert!(
-        !sync
-            .scheduler
+        let backdated = Instant::now()
+            .checked_sub(super::HEADER_REQUEST_TIMEOUT)
+            .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
+        sync.scheduler
             .lock()
             .header_request
-            .is_some_and(|request| request.requested_at == t0 && !request.answered),
-        "the unanswered `t0` deadline must not survive the empty answer",
-    );
+            .as_mut()
+            .ok_or("the request must still be registered")?
+            .requested_at = backdated;
+        sync.tick();
+
+        let reasked_a = a_rx
+            .try_iter()
+            .any(|message| matches!(message, Message::GetHeaders(_)));
+        let reasked_b = b_rx
+            .try_iter()
+            .any(|message| matches!(message, Message::GetHeaders(_)));
+        assert!(
+            reasked_a || reasked_b,
+            "an expired gate must re-issue a header request this tick",
+        );
+        assert!(
+            sync.scheduler
+                .lock()
+                .header_request
+                .is_some_and(|request| request.requested_at > backdated),
+            "the re-issued request must carry a fresh deadline",
+        );
+    }
     Ok(())
 }
 
@@ -979,7 +815,7 @@ fn unsolicited_stale_block_retries_from_resolved_header_height()
     }
 
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block2))?;
-    sync.drain_inbound_blocks(Instant::now());
+    sync.drain_inbound_blocks();
 
     assert_eq!(sync.scheduler.lock().stager.received_len(), 0);
 
@@ -1534,7 +1370,7 @@ fn staging_exhaustion_fixture() -> Result<ExhaustionFixture, Box<dyn std::error:
     // stalled peer will never send) and exactly exhausts the staging byte
     // budget, closing the request gate.
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block2))?;
-    sync.drain_inbound_blocks(Instant::now());
+    sync.drain_inbound_blocks();
     assert!(!{
         let scheduler = sync.scheduler.lock();
         scheduler.window.has_request_capacity(&scheduler.stager)
@@ -1669,7 +1505,6 @@ fn apply_fixture_block(sync: &BlockSync, block: Block) -> Result<(), Box<dyn std
     sync.buffer_received_block_chunk(
         &mut vec![crate::InboundBlock::from_decoded(block)],
         Some(hash),
-        Instant::now(),
     );
     assert_eq!(sync.apply_buffered_blocks(Some(hash)), (1, 0));
     assert_eq!(
@@ -1729,7 +1564,6 @@ fn permanent_rejection_keeps_the_request_cursor_off_the_invalidated_block()
             crate::InboundBlock::from_decoded(follower),
         ],
         None,
-        Instant::now(),
     );
     assert_eq!(staged, 3, "all three delivered bodies must stage");
     let cursor_before = sync.scheduler.lock().window.request_cursor();
@@ -1768,10 +1602,10 @@ fn unrequested_body_admission_matches_core_acceptance() -> Result<(), Box<dyn st
         let node = tree.node(fork_parent)?;
         TipSnapshot {
             tip_id: fork_parent,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
     let SyncHarness {
@@ -1793,7 +1627,7 @@ fn unrequested_body_admission_matches_core_acceptance() -> Result<(), Box<dyn st
         crate::InboundBlock::from_decoded(far_body),
         crate::InboundBlock::from_decoded(fork_body),
     ];
-    sync.buffer_received_block_chunk(&mut delivery, None, Instant::now());
+    sync.buffer_received_block_chunk(&mut delivery, None);
 
     let scheduler = sync.scheduler.lock();
     assert!(
@@ -1827,10 +1661,10 @@ fn unrequested_body_gate_rejects_below_floor_and_below_applied_work()
         let node = tree.node(node_id)?;
         Ok(TipSnapshot {
             tip_id: node_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         })
     }
     let (tree, blocks) = mined_chain(8, 0)?;
@@ -1922,7 +1756,7 @@ impl SyncHarness {
         let (inbound_blocks_tx, inbound_blocks_rx) = unbounded();
         let chain = Arc::new(
             TestChain::new(chain_tip, Arc::clone(&applied_tip), Arc::clone(&block_tree))
-                .with_minimum_chain_work(ChainWork::from(minimum_chain_work)),
+                .with_minimum_chain_work(minimum_chain_work),
         );
         let sync = BlockSync::new(
             chain,
@@ -1990,8 +1824,8 @@ pub(crate) fn synced_ibd_latch() -> Arc<InitialBlockDownload> {
         .unwrap_or_else(|| unreachable!("the chain has a tip"));
     applied_tip.store(Some(Arc::clone(&tip)));
     Arc::new(InitialBlockDownload::new(
-        TipReader::new(applied_tip),
-        BlockTreeReader::new(block_tree),
+        bitcoin_rs_chain::TipReader::new(applied_tip),
+        bitcoin_rs_chain::BlockTreeReader::new(block_tree),
     ))
 }
 
@@ -2715,6 +2549,109 @@ pub(crate) fn connect_peer(
     rx
 }
 
+#[test]
+fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error::Error>> {
+    use super::frontier::{BodyState, ChainFrontier, RequiredBody, SyncFrontier, UsablePeer};
+
+    const WITNESS: u64 = 1 << 3;
+    const NETWORK_LIMITED: u64 = 1 << 10;
+    let mut tree = BlockTree::new();
+    let mut parent = None;
+    let mut previous = BlockHash::default();
+    let mut historical_hash = None;
+    let mut recent_hash = None;
+    // At tip 300, height 14 is at Core's 286-block cutoff; height 15 is recent enough.
+    for height in 0..=300 {
+        let header = test_header(previous, height);
+        previous = header.compute_hash();
+        let height_hash = Hash256::from_le_bytes(previous.as_bytes());
+        parent = Some(tree.insert_node(parent, header, NodeStatus::HeaderValid)?);
+        if height == 14 {
+            historical_hash = Some(height_hash);
+        } else if height == 15 {
+            recent_hash = Some(height_hash);
+        }
+    }
+    let historical_hash = historical_hash.ok_or("missing historical header")?;
+    let recent_hash = recent_hash.ok_or("missing recent header")?;
+    let SyncHarness { sync, peers, .. } = SyncHarness::with_ibd(tree, synced_ibd_latch());
+
+    let owner_addr = test_addr(18_900, 0)?;
+    let owner_info = synthetic_peer(owner_addr, 300);
+    let _owner_rx = connect_peer(&peers, owner_info);
+    let owner = current_source(&peers, owner_addr);
+    let limited_addr = test_addr(18_900, 1)?;
+    let mut limited_info = synthetic_peer(limited_addr, 300);
+    limited_info.services = WITNESS | NETWORK_LIMITED;
+    let limited_rx = connect_peer(&peers, limited_info.clone());
+    let no_service_addr = test_addr(18_900, 2)?;
+    let mut no_service_info = synthetic_peer(no_service_addr, 300);
+    // WITNESS alone advertises neither NODE_NETWORK nor NODE_NETWORK_LIMITED.
+    no_service_info.services = WITNESS;
+    let no_service_rx = connect_peer(&peers, no_service_info.clone());
+    let no_service = current_source(&peers, no_service_addr);
+    let usable_peer = |source: PeerSource, info: PeerInfo| UsablePeer {
+        source,
+        info,
+        demonstrated_tips: Vec::new(),
+        active_height: None,
+        headers_horizon: None,
+        role: crate::peer_info::PeerRole::FullRelay,
+        manual: false,
+        connected_at: Instant::now(),
+    };
+    let no_service_usable = usable_peer(no_service, no_service_info);
+    let limited = current_source(&peers, limited_addr);
+    let usable = usable_peer(limited, limited_info);
+    let frontier = |height, hash, usable_peer| SyncFrontier {
+        chain: ChainFrontier {
+            applied_tip: None,
+            chain_tip: None,
+            next_required: Some(RequiredBody { height, hash }),
+            apply_halted: false,
+        },
+        body_state: Some(BodyState::Unowned),
+        header_request: None,
+        header_request_live: false,
+        usable_peers: vec![usable_peer],
+    };
+
+    let historical = sync.sync_peer_selection(
+        &frontier(14, historical_hash, usable.clone()),
+        Instant::now(),
+    );
+    assert!(historical.request_peers.is_empty());
+    let no_service_selection = sync.sync_peer_selection(
+        &frontier(15, recent_hash, no_service_usable),
+        Instant::now(),
+    );
+    assert!(no_service_selection.request_peers.is_empty());
+    let recent = sync.sync_peer_selection(&frontier(15, recent_hash, usable), Instant::now());
+    assert_eq!(recent.request_peers.len(), 1);
+    assert_eq!(recent.request_peers[0].source, limited);
+
+    assert_eq!(
+        sync.send_cold_front_hedge(owner, historical_hash, 14, Instant::now()),
+        None
+    );
+    assert!(limited_rx.try_recv().is_err());
+    assert_eq!(
+        sync.send_cold_front_hedge(owner, recent_hash, 15, Instant::now()),
+        Some(limited)
+    );
+    let Message::GetData(items) = limited_rx.try_recv()? else {
+        panic!("recent limited peer must receive the cold-front request");
+    };
+    assert_eq!(
+        items,
+        vec![Inventory::WitnessBlock(
+            bitcoin::BlockHash::from_byte_array(*recent_hash.as_byte_array())
+        )]
+    );
+    assert!(no_service_rx.try_recv().is_err());
+    Ok(())
+}
+
 #[cfg(test)]
 mod behavior_1;
 
@@ -2766,6 +2703,7 @@ mod chain_sync;
 #[cfg(test)]
 mod frontier_model;
 mod head_sync;
+mod issue_1153;
 mod limited_peers;
 mod stale_tip;
 
@@ -2885,5 +2823,38 @@ fn binding_and_operational_failures_do_not_disconnect() -> Result<(), Box<dyn st
             "a {disposition:?} settlement failure must not disconnect the delivering connection"
         );
     }
+    Ok(())
+}
+
+/// Sync progress must publish the shared latch's initial-block-download
+/// answer, not a height heuristic (#1149 acceptance 1/12). The two fixtures
+/// below are the snapshots where the old `applied < header` rule disagreed
+/// with the latch: an active latch over an empty frontier, and a latched-off
+/// latch over headers ahead of an absent applied tip.
+#[test]
+fn telemetry_ibd_bit_agrees_with_the_shared_latch() -> Result<(), Box<dyn std::error::Error>> {
+    let now = crate::counters::now_seconds();
+
+    let syncing = SyncHarness::new(BlockTree::new());
+    assert!(
+        syncing.sync.ibd.is_active(now, Network::Regtest),
+        "the fixture latch must be active for this snapshot"
+    );
+    assert!(
+        syncing.sync.in_initial_block_download(),
+        "telemetry must report initial block download while the latch is active"
+    );
+
+    let (tree, _blocks) = mined_chain(0, 3)?;
+    let synced = SyncHarness::with_ibd(tree, synced_ibd_latch());
+    assert!(
+        !synced.sync.ibd.is_active(now, Network::Regtest),
+        "the fixture latch must have left initial block download"
+    );
+    assert!(
+        !synced.sync.in_initial_block_download(),
+        "telemetry must stay out of initial block download once the latch \
+         has left it, even with headers ahead of the applied tip"
+    );
     Ok(())
 }

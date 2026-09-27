@@ -6,6 +6,7 @@ use super::ExpectedBlockHashes;
 use super::GetdataRequestOutcome;
 use super::SchedulerState;
 use super::frontier::ChainFrontier;
+use super::frontier::body_capability;
 use super::peers::active_demonstrated_height;
 use super::telemetry::metric_count;
 use crate::Message;
@@ -13,6 +14,7 @@ use crate::connection::PeerSource;
 use crate::download_window::BlockDownloadPolicy;
 use crate::download_window::SyncPeer;
 use crate::download_window::statically_fanout_eligible;
+use crate::download_window::{peer_can_serve_height, servable_floor, serves_requested_height};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_primitives::Hash256;
@@ -136,16 +138,14 @@ impl BlockSync {
     /// Requests the next window batch from `source`, a usable peer from the
     /// frontier snapshot. The request start is the canonical next-required
     /// height — recovery and scheduling never disagree about the frontier.
-    /// PRE: `now` is the instant of the tick or drain driving this request,
-    ///   so the pending stamp shares the caller's clock.
     pub(super) fn send_getdata_for_pending_blocks(
         &self,
         source: PeerSource,
         allow_expired_retry_from_peer: bool,
         peer_best_height: u32,
         frontier: &ChainFrontier,
-        now: Instant,
     ) -> GetdataRequestOutcome {
+        let now = Instant::now();
         let (Some(chain_tip), Some(applied_tip), Some(required)) = (
             frontier.chain_tip.as_ref(),
             frontier.applied_tip.as_ref(),
@@ -154,6 +154,22 @@ impl BlockSync {
             return GetdataRequestOutcome::default();
         };
 
+        // The service clause that gates tick-time selection applies here
+        // too: header-drain fetches and stripe retries reach this function
+        // without passing the selector, so the gate is enforced at the one
+        // path every body request takes (net_processing.cpp:6521-6525).
+        let Some(info) = self.peer_table.info_of(source.addr) else {
+            return GetdataRequestOutcome::default();
+        };
+        let policy = BlockDownloadPolicy {
+            ibd: Arc::clone(&self.ibd),
+            network: self.chain.network(),
+            requested_height: required.height,
+        };
+        if !serves_requested_height(&info, &policy) {
+            return GetdataRequestOutcome::default();
+        }
+        let servable_floor = servable_floor(&info, &policy);
         let tree = self.chain.block_tree();
         let request = {
             let mut scheduler = self.scheduler.lock();
@@ -165,6 +181,7 @@ impl BlockSync {
                 chain_tip,
                 required.height,
                 peer_best_height,
+                servable_floor,
                 &tree,
                 now,
             )
@@ -258,18 +275,22 @@ impl BlockSync {
                 continue;
             };
             let source = session.lease.source(session.addr);
-            // Same capability rule as `UsablePeer::capability`: the
-            // handshake best-known while the peer has no branch evidence,
-            // else only a tip on the current active chain counts.
-            let capability = if session.demonstrated_tips.is_empty() {
+            // One capability rule for every path that asks for a body: the
+            // same `body_capability` the frontier's usable-peer view
+            // precomputes, so the hedge and the scheduler can never disagree
+            // about whom to ask.
+            let active_height = if session.demonstrated_tips.is_empty() {
                 u32::try_from(peer.best_known_height).ok()
             } else {
                 active_demonstrated_height(&tree, active_tip, &session.demonstrated_tips)
             };
+            let capability = body_capability(peer.best_known_height, active_height);
             if source == owner || !statically_fanout_eligible(&peer, &policy) {
                 continue;
             }
-            if capability.is_some_and(|height| height >= active_front_height) {
+            if capability
+                .is_some_and(|height| peer_can_serve_height(&peer, height, active_front_height))
+            {
                 eligible.push(source);
             }
         }

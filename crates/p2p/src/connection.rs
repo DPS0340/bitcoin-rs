@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, SendError, Sender, TrySendError};
+use parking_lot::Mutex;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Process-unique identity for one peer connection.
@@ -238,6 +239,11 @@ pub struct PeerLease {
     budget: Arc<OutboundBudget>,
     /// Live unsolicited block forwards admitted by this connection.
     unsolicited_forwards: Arc<AtomicUsize>,
+    /// Instant the writer queue last admitted a message on this connection.
+    /// The connection loop reads it so traffic from every sender — compact
+    /// follow-ups, transaction relay, dispatch replies — refreshes the
+    /// send-silence ledger, not just pings.
+    last_send: Arc<Mutex<Instant>>,
     inbound: bool,
     role: crate::peer_info::PeerRole,
     /// Whether the operator pinned this dial by hand (`--connect` or
@@ -299,6 +305,18 @@ impl PeerLease {
         Self::with_direction(outbound, true, crate::peer_info::PeerRole::FullRelay, false)
     }
 
+    /// Test constructor: an outbound lease already `connected_at` old, for
+    /// exercising rules gated on connection age without sleeping.
+    #[cfg(test)]
+    pub(crate) fn new_connected_at(
+        outbound: Sender<crate::Message>,
+        connected_at: Instant,
+    ) -> Self {
+        let mut lease = Self::new(outbound);
+        lease.backdate_for_test(connected_at);
+        lease
+    }
+
     fn with_direction(
         outbound: Sender<crate::Message>,
         inbound: bool,
@@ -330,6 +348,7 @@ impl PeerLease {
             close_rx,
             budget: Arc::new(budget),
             unsolicited_forwards: Arc::new(AtomicUsize::new(0)),
+            last_send: Arc::new(Mutex::new(Instant::now())),
             inbound,
             role,
             manual,
@@ -410,6 +429,7 @@ impl PeerLease {
     /// Moves this lease's connection instant into the past.
     #[cfg(test)]
     pub(crate) fn backdate_for_test(&mut self, at: Instant) {
+        debug_assert!(at <= Instant::now());
         self.connected = at;
     }
 
@@ -461,6 +481,12 @@ impl PeerLease {
         Some(BlockForwardCredit(Some(counter)))
     }
 
+    /// Instant the writer queue last admitted a message on this connection.
+    #[must_use]
+    pub(crate) fn last_send(&self) -> Instant {
+        *self.last_send.lock()
+    }
+
     /// Stamps an inbound event with this connection's identity and address.
     #[must_use]
     pub fn source(&self, addr: SocketAddr) -> PeerSource {
@@ -474,6 +500,8 @@ impl PeerLease {
     ///
     /// Saturation applies the disconnect policy documented on
     /// [`OutboundBudget`]: the lease is cancelled and the message is returned.
+    /// A successful queue admission is also this connection's `last_send`,
+    /// which the connection loop reads into its keepalive ledger.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, message: crate::Message) -> Result<(), SendError<crate::Message>> {
         if self.is_cancelled() {
@@ -490,7 +518,10 @@ impl PeerLease {
             return Err(SendError(message));
         }
         match self.outbound.try_send(message) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                *self.last_send.lock() = Instant::now();
+                Ok(())
+            }
             Err(TrySendError::Full(message) | TrySendError::Disconnected(message)) => {
                 self.budget.release(wire_len);
                 self.cancel();

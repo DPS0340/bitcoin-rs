@@ -119,7 +119,7 @@ impl ServerHarness {
                 ibd,
             ),
             mempool: MempoolHandles {
-                mempool: MempoolGateway::shared(state.mempool()),
+                gateway: MempoolGateway::shared(state.mempool()),
             },
             indexes: IndexHandles {
                 derived_index: state.derived_index_query(),

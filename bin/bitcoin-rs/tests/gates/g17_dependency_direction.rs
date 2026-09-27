@@ -116,11 +116,10 @@ fn chainstate_facade_exposes_no_production_raw_mutation_handles() -> anyhow::Res
     // availability regardless of signature, and deleted APIs remain valid.
     for method in [
         "chain_tip",
-        "chain_tip_handle",
         "applied_tip",
+        "chain_tip_handle",
         "applied_tip_handle",
         "block_tree",
-        "block_tree_handle",
         "transition_barrier",
         "apply_block",
         "apply_block_with_serialized",

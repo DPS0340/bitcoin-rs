@@ -332,15 +332,19 @@ impl ConnectionShared {
             metrics::counter!("node.sync.dropped_unsolicited_blocks").increment(1);
             return;
         };
-        self.forward_block(block, serialized, source, Some(credit));
-        self.send_headers(source, vec![header], false, false);
+        if self.forward_block(block, serialized, source, Some(credit)) {
+            self.send_headers(source, vec![header], false, false);
+        }
     }
 
     /// Queues an admitted body on the shared inbound block channel.
     ///
     /// PRE: `forward_credit` admits this body into the ingress path.
-    /// POST: the body is queued, or dropped because the session was cancelled
-    ///   or the channel disconnected.
+    /// POST: `true` when the body is queued; `false` when it was dropped
+    ///   because the session was cancelled or the channel disconnected. A
+    ///   caller that pairs the body with a header must send the header only
+    ///   on `true`, or sync admits a block announcement whose body never
+    ///   arrives — and whose forward credit never releases.
     /// INVARIANT: backpressure waits here, never in the admission step, and
     ///   the credit is released when sync drops the body it holds.
     fn forward_block(
@@ -349,7 +353,7 @@ impl ConnectionShared {
         serialized: bytes::Bytes,
         source: crate::PeerSource,
         forward_credit: Option<crate::connection::BlockForwardCredit>,
-    ) {
+    ) -> bool {
         let mut inbound = crate::InboundBlock {
             block,
             serialized,
@@ -362,12 +366,12 @@ impl ConnectionShared {
                     peer_addr = %source.addr,
                     "dropping inbound block: session cancelled"
                 );
-                return;
+                return false;
             }
             match self.blocks_tx.send_timeout(inbound, POLL_INTERVAL) {
                 Ok(()) => {
                     wake_sync(self.wake_tx.as_ref());
-                    break;
+                    return true;
                 }
                 Err(SendTimeoutError::Timeout(returned)) => inbound = returned,
                 Err(SendTimeoutError::Disconnected(_)) => {
@@ -375,7 +379,7 @@ impl ConnectionShared {
                         peer_addr = %source.addr,
                         "p2p inbound blocks channel disconnected"
                     );
-                    return;
+                    return false;
                 }
             }
         }
@@ -832,13 +836,34 @@ fn run_handshake(
     lease: crate::PeerLease,
     outbound_rx: crossbeam_channel::Receiver<crate::Message>,
 ) -> Result<(), crate::wire::PeerError> {
-    configure_peer_stream(&stream).map_err(crate::wire::PeerError::Io)?;
+    // The accept loop reserved this lease: every exit from here on must
+    // release it, or a failed setup would consume an admission slot forever.
+    if let Err(error) = configure_peer_stream(&stream).map_err(crate::wire::PeerError::Io) {
+        shared.peer_table.remove_current(peer_addr, &lease);
+        lease.cancel();
+        return Err(error);
+    }
 
     // Wrapped before the handshake, so the bytes it spends are counted too.
     let counters = std::sync::Arc::new(crate::PeerCounters::default());
-    let stream = crate::CountingStream::from_connected(stream, counters)
-        .map_err(crate::wire::PeerError::Io)?;
-    let addr_bind = stream.local_addr().map_err(crate::wire::PeerError::Io)?;
+    let stream = match crate::CountingStream::from_connected(stream, counters)
+        .map_err(crate::wire::PeerError::Io)
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            shared.peer_table.remove_current(peer_addr, &lease);
+            lease.cancel();
+            return Err(error);
+        }
+    };
+    let addr_bind = match stream.local_addr().map_err(crate::wire::PeerError::Io) {
+        Ok(addr) => addr,
+        Err(error) => {
+            shared.peer_table.remove_current(peer_addr, &lease);
+            lease.cancel();
+            return Err(error);
+        }
+    };
     let counters = std::sync::Arc::clone(stream.counters());
 
     // The accept loop already reserved this lease in the table — live
@@ -989,7 +1014,11 @@ fn run_connected_session(
 ///   nothing else. A `tx` message or a transaction `inv` is a protocol
 ///   violation and ends the connection, as Core's `RejectIncomingTxs`
 ///   requires (`net_processing.cpp:4706-4711`, and the `inv` branch at
-///   `net_processing.cpp:4385-4390`). `addr` and `addrv2` are dropped
+///   `net_processing.cpp:4385-4390`). A `getdata` from such a connection is
+///   answered with block inventory alone: transaction inventory is stripped
+///   before dispatch, and a request that asked for nothing else is dropped
+///   unheard, so the role cannot obtain a transaction body through
+///   `getdata`. `addr` and `addrv2` are dropped
 ///   without punishment, because Core declines address relay for such a
 ///   peer rather than faulting it (`SetupAddressRelay`,
 ///   `net_processing.cpp:5952-5970`). A full-relay connection is never
@@ -1002,22 +1031,31 @@ fn enforce_relay_role(
     if role.relays_transactions() {
         return Ok(Some(message));
     }
+    let is_transaction = |item: &Inventory| {
+        matches!(
+            item,
+            Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_)
+        )
+    };
     if matches!(message, crate::Message::Tx(_)) {
         return Err(crate::wire::PeerError::Protocol(
             "transaction sent in violation of protocol",
         ));
     }
     if let crate::Message::Inv(items) = &message
-        && items.iter().any(|item| {
-            matches!(
-                item,
-                Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_)
-            )
-        })
+        && items.iter().any(&is_transaction)
     {
         return Err(crate::wire::PeerError::Protocol(
             "transaction inv sent in violation of protocol",
         ));
+    }
+    if let crate::Message::GetData(mut items) = message {
+        items.retain(|item| !is_transaction(item));
+        if items.is_empty() {
+            tracing::trace!("p2p dropping transaction getdata from block-relay-only peer");
+            return Ok(None);
+        }
+        return Ok(Some(crate::Message::GetData(items)));
     }
     if matches!(message, crate::Message::Addr(_) | crate::Message::AddrV2(_)) {
         tracing::trace!("p2p dropping address message from block-relay-only peer");
@@ -1041,8 +1079,9 @@ enum KeepaliveAction {
 /// One connection's liveness ledger: when it last heard, last spoke, and
 /// last probed.
 ///
-/// PRE: [`Keepalive::record_recv`] runs for every message the loop reads and
-///   [`Keepalive::record_send`] for every message the loop queues.
+/// PRE: [`Keepalive::record_recv`] runs for every message the loop reads;
+///   every admitted `PeerLease::send` stamps the shared `last_send` the loop
+///   folds in via [`Keepalive::observe_send`].
 /// POST: [`Keepalive::next_action`] orders a `ping` once [`PING_INTERVAL`]
 ///   of quiet has passed since the previous probe, and an `Expired` end
 ///   once either direction has been silent past [`TIMEOUT_INTERVAL`].
@@ -1064,8 +1103,8 @@ impl Keepalive {
     /// Starts a ledger for a connection whose loop begins at `now`.
     ///
     /// PRE: `now` is the monotonic instant the session loop starts.
-    /// POST: both directions count as fresh at `now`, and the first probe is
-    ///   owed immediately.
+    /// POST: both directions count as fresh at `now`; the first probe is owed
+    ///   once a direction has been idle for one [`PING_INTERVAL`].
     fn starting(now: Instant) -> Self {
         Self {
             last_recv: now,
@@ -1084,6 +1123,22 @@ impl Keepalive {
         self.last_send = now;
     }
 
+    /// Folds a send timestamp recorded outside this loop (every admitted
+    /// `PeerLease::send`) into the ledger.
+    fn observe_send(&mut self, sent: Instant) {
+        if sent > self.last_send {
+            self.last_send = sent;
+        }
+    }
+
+    /// Records a probe actually queued at `now`: the interval counts from
+    /// the send, not the decision, so a probe skipped for a saturated queue
+    /// stays owed instead of being consumed unsent.
+    fn record_probe(&mut self, now: Instant) {
+        self.last_ping = Some(now);
+        self.record_send(now);
+    }
+
     /// Returns the action owed at `now`, ordering at most one probe per
     /// [`PING_INTERVAL`] and an end once either direction is silent past
     /// [`TIMEOUT_INTERVAL`].
@@ -1096,17 +1151,21 @@ impl Keepalive {
     /// [`crate::socket::HANDSHAKE_TIMEOUT`] bounds one blocking write at one
     /// minute, so this branch only covers a peer that takes our writes and
     /// never answers them.
-    fn next_action(&mut self, now: Instant) -> KeepaliveAction {
+    fn next_action(&self, now: Instant) -> KeepaliveAction {
         if now.saturating_duration_since(self.last_recv) > TIMEOUT_INTERVAL
             || now.saturating_duration_since(self.last_send) > TIMEOUT_INTERVAL
         {
             return KeepaliveAction::Expired;
         }
+        // A probe exists to detect a dead connection; a connection already
+        // carrying traffic in either direction inside this interval does not
+        // need one.
+        let idle = now.saturating_duration_since(self.last_recv) >= PING_INTERVAL
+            || now.saturating_duration_since(self.last_send) >= PING_INTERVAL;
         let probe_owed = self
             .last_ping
             .is_none_or(|last| now.saturating_duration_since(last) >= PING_INTERVAL);
-        if probe_owed {
-            self.last_ping = Some(now);
+        if probe_owed && idle {
             KeepaliveAction::Ping
         } else {
             KeepaliveAction::Idle
@@ -1119,19 +1178,31 @@ mod keepalive_tests {
     use super::{Keepalive, KeepaliveAction, PING_INTERVAL, TIMEOUT_INTERVAL};
     use std::time::{Duration, Instant};
 
-    /// A fresh connection is probed at once and then once per ping interval,
-    /// never twice inside one interval.
+    /// A fresh connection carries no probe obligation: a ping is owed only
+    /// once a direction has been idle for an interval, then at most once per
+    /// interval while it stays idle.
     #[test]
-    fn probes_owe_one_ping_per_interval() {
+    fn probes_owe_one_ping_per_idle_interval() {
         let t0 = Instant::now();
         let mut keepalive = Keepalive::starting(t0);
-        assert_eq!(keepalive.next_action(t0), KeepaliveAction::Ping);
         assert_eq!(
-            keepalive.next_action(t0 + PING_INTERVAL / 2),
+            keepalive.next_action(t0),
+            KeepaliveAction::Idle,
+            "a busy-enough connection sends no keepalive"
+        );
+        keepalive.record_send(t0);
+        assert_eq!(
+            keepalive.next_action(t0 + PING_INTERVAL),
+            KeepaliveAction::Ping,
+            "one silent direction for an interval owes a probe"
+        );
+        keepalive.record_probe(t0 + PING_INTERVAL);
+        assert_eq!(
+            keepalive.next_action(t0 + PING_INTERVAL + PING_INTERVAL / 2),
             KeepaliveAction::Idle
         );
         assert_eq!(
-            keepalive.next_action(t0 + PING_INTERVAL),
+            keepalive.next_action(t0 + PING_INTERVAL * 2),
             KeepaliveAction::Ping
         );
     }
@@ -1175,6 +1246,7 @@ mod keepalive_tests {
             keepalive.next_action(t0 + TIMEOUT_INTERVAL),
             KeepaliveAction::Ping
         );
+        keepalive.record_probe(t0 + TIMEOUT_INTERVAL);
         assert_eq!(
             keepalive.next_action(t0 + TIMEOUT_INTERVAL + PING_INTERVAL / 2),
             KeepaliveAction::Idle
@@ -1226,14 +1298,26 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             return Ok(());
         }
 
+        // Every admitted `lease.send` — compact follow-ups, relay `inv`s,
+        // dispatch replies — stamps `lease.last_send`, not just the ping and
+        // response paths below. Fold it in so sustained outbound traffic
+        // counts as send activity.
+        keepalive.observe_send(lease.last_send());
         match keepalive.next_action(Instant::now()) {
             KeepaliveAction::Idle => {}
             KeepaliveAction::Ping => {
-                let nonce = generate_nonce(peer_addr);
-                lease.send(crate::Message::Ping(nonce)).map_err(|_| {
-                    crate::wire::PeerError::Protocol("outbound queue closed or saturated")
-                })?;
-                keepalive.record_send(Instant::now());
+                // A probe queued behind a saturated outbound queue would
+                // cancel the lease for our own queue state, not for the
+                // peer's silence; skip it while the queue has no production
+                // headroom and let the timeout rule judge the connection on
+                // its next due probe.
+                if budget.has_block_production_headroom() {
+                    let nonce = generate_nonce(peer_addr);
+                    lease.send(crate::Message::Ping(nonce)).map_err(|_| {
+                        crate::wire::PeerError::Protocol("outbound queue closed or saturated")
+                    })?;
+                    keepalive.record_probe(Instant::now());
+                }
             }
             KeepaliveAction::Expired => {
                 tracing::debug!(
@@ -1243,6 +1327,11 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 return Ok(());
             }
         }
+
+        // The deadline is enforced on every loop pass — including read
+        // timeouts — so a peer that stops sending compact messages cannot
+        // pin pending reconstruction state past its deadline.
+        compact_reconstruction.prune(Instant::now());
 
         let read_result = crate::wire::read_message(&mut peer.stream, peer.magic);
         if lease.is_cancelled() {
@@ -1354,7 +1443,8 @@ fn process_compact_wire_message(
     peer_addr: SocketAddr,
     shared: &ConnectionShared,
 ) {
-    let identity_version = local_compact_version.unwrap_or(crate::peer::COMPACT_BLOCK_VERSION);
+    let identity_version =
+        local_compact_version.unwrap_or(crate::compact_blocks::COMPACT_BLOCK_VERSION);
     let outcome = process_compact_message(
         compact_reconstruction,
         message,
@@ -1365,36 +1455,38 @@ fn process_compact_wire_message(
     // A compact announcement is itself a tip announcement: when the outcome
     // emits no body (`Complete` already forwards its header via `send_block`),
     // this forward is the only path the embedded header takes to admission.
-    if let crate::Message::CmpctBlock(cmpct) = message
+    let announced_header = if let crate::Message::CmpctBlock(cmpct) = message
         && !matches!(outcome, crate::compact_blocks::Outcome::Complete(_))
-        && let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
     {
-        // When the outcome itself fetches the body (`RequestMissing` issues
-        // a `getblocktxn`, `Fallback` a full-block `getdata`), the window
-        // must record that in-flight fetch instead of scheduling a
-        // duplicate request for the freshly admitted tip.
-        let body_fetch_owned = matches!(
-            outcome,
-            crate::compact_blocks::Outcome::RequestMissing(_)
-                | crate::compact_blocks::Outcome::Fallback(_)
-        );
-        // Record the fetch before the follow-up leaves: a response landing
-        // before the header drains still counts as requested, not
-        // unsolicited (`SchedulerState::owned_body_fetches`).
-        if body_fetch_owned && let Some(sync) = shared.block_sync.as_ref() {
+        crate::compact_blocks::native_header(&cmpct.compact_block.header)
+    } else {
+        None
+    };
+    // When the outcome itself fetches the body (`RequestMissing` issues
+    // a `getblocktxn`, `Fallback` a full-block `getdata`), the window
+    // must record that in-flight fetch instead of scheduling a
+    // duplicate request for the freshly admitted tip.
+    let body_fetch_owned = matches!(
+        outcome,
+        crate::compact_blocks::Outcome::RequestMissing(_)
+            | crate::compact_blocks::Outcome::Fallback(_)
+    );
+    // Ownership — the header's `body_fetch_owned` flag and the scheduler
+    // mark alike — is recorded only once the follow-up request actually
+    // left on the connection: a failed send enqueues nothing, and marking
+    // either path anyway would suppress recovery of that block from
+    // another peer.
+    let fetch_issued = handle_compact_outcome(outcome, lease, peer_addr, shared);
+    if let Some(header) = announced_header {
+        let fetch_owned = body_fetch_owned && fetch_issued;
+        shared.send_headers(lease.source(peer_addr), vec![header], false, fetch_owned);
+        if fetch_owned && let Some(sync) = shared.block_sync.as_ref() {
             sync.record_owned_body_fetch(
                 lease.source(peer_addr),
                 bitcoin_rs_primitives::Hash256::from(header.compute_hash()),
             );
         }
-        shared.send_headers(
-            lease.source(peer_addr),
-            vec![header],
-            false,
-            body_fetch_owned,
-        );
     }
-    handle_compact_outcome(outcome, lease, peer_addr, shared);
 }
 
 /// Applies one BIP152 receive-side outcome: a finished block enters the
@@ -1414,9 +1506,11 @@ fn handle_compact_outcome(
     lease: &crate::PeerLease,
     peer_addr: SocketAddr,
     shared: &ConnectionShared,
-) {
-    let follow_up = |message: crate::Message| {
-        if let Err(error) = lease.send(message) {
+) -> bool {
+    let mut fetch_issued = false;
+    let mut follow_up = |message: crate::Message| match lease.send(message) {
+        Ok(()) => fetch_issued = true,
+        Err(error) => {
             tracing::debug!(peer_addr = %peer_addr, %error, "p2p compact-block follow-up dropped");
         }
     };
@@ -1440,6 +1534,7 @@ fn handle_compact_outcome(
         }
         crate::compact_blocks::Outcome::Idle => {}
     }
+    fetch_issued
 }
 
 /// Feeds one receive-side BIP152 message into the loop's reconstruction
@@ -2441,10 +2536,10 @@ mod writer_shutdown_tests {
         assert_eq!(reads.load(Ordering::Relaxed), 2);
     }
 
-    /// A quiet connection is probed with one `ping` before the peer is asked
-    /// to speak, so liveness never depends on inbound traffic.
+    /// A connection quiet for less than one `PING_INTERVAL` owes no probe:
+    /// its loop ends on the read error without emitting a `ping`.
     #[test]
-    fn message_loop_probes_a_quiet_peer() {
+    fn message_loop_does_not_probe_a_peer_inside_one_interval() {
         let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(outbound_tx);
         let reads = Arc::new(AtomicUsize::new(0));
@@ -2458,10 +2553,12 @@ mod writer_shutdown_tests {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_448));
 
         assert!(run_message_loop(&mut peer, addr, &lease, &shared, None).is_err());
-        let probe = outbound_rx.try_recv();
         assert!(
-            matches!(probe, Ok(crate::Message::Ping(_))),
-            "the loop must probe a quiet peer with one ping, got {probe:?}",
+            matches!(
+                outbound_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "a peer quiet for less than one interval owes no probe",
         );
     }
 
@@ -2796,11 +2893,12 @@ mod writer_shutdown_tests {
                     ),
                     Magic::BITCOIN,
                 );
-                // Receiving wtxidrelay chooses outbound inventory; a peer
-                // that never sent `wtxidrelay` must not be treated as a
-                // wtxid-relay peer.
+                // Receiving wtxidrelay chooses outbound inventory; our own
+                // advertisement alone must not switch the remote preference.
                 if peer_requested_wtxid {
                     peer.wtxid_relay.mark_peer_supported();
+                } else {
+                    peer.wtxid_relay.mark_local_advertised();
                 }
                 let result =
                     run_connected_session(&mut peer, peer_addr, &shared, lease, outbound_rx, info);
@@ -2835,6 +2933,8 @@ mod writer_shutdown_tests {
         let mut wire = Vec::new();
         crate::wire::write_message(&mut wire, Magic::BITCOIN, &crate::Message::Ping(41))
             .expect("ping encodes");
+        crate::wire::write_message(&mut wire, Magic::BITCOIN, &crate::Message::Ping(42))
+            .expect("ping encodes");
         let mut peer = Peer::new(
             ScriptedStream {
                 script: io::Cursor::new(wire),
@@ -2850,9 +2950,9 @@ mod writer_shutdown_tests {
         );
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_447));
 
-        // The loop's keepalive probe takes the one-frame budget, so the Pong
-        // response cannot be admitted and the saturation policy cancels the
-        // lease and ends the loop.
+        // The first Pong response takes the one-frame budget, so the second
+        // cannot be admitted and the saturation policy cancels the lease and
+        // ends the loop.
         let result = run_message_loop(&mut peer, addr, &lease, &shared, None);
         assert!(result.is_err(), "saturation must end the message loop");
         assert!(lease.is_cancelled());

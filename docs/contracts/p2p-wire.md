@@ -22,9 +22,14 @@ This page assigns ownership and cites proof under the
 - Message framing, envelope decoder, service flags, and network magic follow
   the inventory and the policy document. v1 frames for handshake and inventory
   commands are byte-identical to rust-bitcoin's `RawNetworkMessage`.
-  `getdata` block serving writes stored consensus payload bytes
-  (`Message::BlockPayload`) without a decode/re-encode round trip. The
-  decoder still types inbound `block` as `Message::Block`.
+  `getdata` block serving validates the stored body and answers
+  `MSG_WITNESS_BLOCK` with its exact stored consensus payload bytes
+  (`Message::BlockPayload`). `MSG_BLOCK` copies the checked header, transaction
+  count, and stripped transaction spans into its payload, following BIP144.
+  Both forms validate the complete borrowed layout without materializing
+  scripts or witnesses; malformed bodies are never forwarded. Both forms
+  recheck active-chain identity after preparing the payload. The decoder
+  still types inbound `block` as `Message::Block`.
 
 ### `P2P-02`: Connection lifecycle and peer lease ownership
 
@@ -61,11 +66,14 @@ This page assigns ownership and cites proof under the
   — `shared_active_height`: an on-active tip attests its own height, while a
   losing fork tip still attests the shared prefix it proved the peer holds.
   When a later announcement makes a previously losing retained tip active,
-  its delivering connection is re-evaluated before request selection. Until
-  a session has accepted a header tip, body and hedge selection may use its
-  handshake capability while header discovery is pending; after that point,
-  the requested height must not exceed the deepest shared ancestor across
-  its retained tips. Retained-tip evidence is compacted at each credit
+  its delivering connection is re-evaluated before request selection. Body
+  and hedge selection may ask a connection up to the greater of its
+  handshake credit and the deepest shared ancestor across its retained
+  tips: branch evidence can raise what a peer may serve, never lower it
+  below the credit the connection already carries. A peer that cannot serve
+  what it claimed is judged by the request that times out, not by being
+  skipped without ever being asked (issue #1153). Retained-tip evidence is
+  compacted at each credit
   refresh: a tip that resolves on the active chain at or below the recorded
   maximum can never raise it again, so only unresolved (fork) tips and the
   max-resolving tip are kept. Unresolved tips are deduplicated to the
@@ -234,6 +242,13 @@ covers the delivery-path forward.
 
 ## Proven by
 
+- `crates/p2p/src/chain_query.rs` tests
+  `getdata_block_encoding_matches_requested_inventory_on_wire`,
+  `getdata_block_encodings_keep_headroom_and_body_failure_rules`, and
+  `getdata_block_encodings_recheck_active_chain_after_body_load` cover BIP144
+  block encodings against the independent rust-bitcoin envelope, request
+  order, retained body immutability, headroom, corruption, and stale reads
+  (P2P-01).
 - `crates/p2p/src/inv.rs` test
   `cancelled_missing_parent_source_does_not_enqueue_a_request` and
   `crates/p2p/src/peer_table.rs` test
@@ -289,11 +304,119 @@ covers the delivery-path forward.
   two v1 frames decodes both without a second socket read, and a timed-out
   refill does not replay consumed bytes (`P2P-01`).
 
+### `P2P-05`: Canonical frontier recovery without invented peer credit
+
+- The applied chain and selected header ancestry own the next required body.
+  The download cursor is a scan hint. An unowned frontier behind that hint
+  becomes requestable again, including an applied rollback with unchanged
+  headers. Existing pending and staged bodies retain their ownership.
+- A known-header gap whose apply-frontier block is neither in flight nor
+  staged triggers a header probe from the applied chain; staged successors
+  behind an unowned frontier are stuck inventory, not progress. Beyond the
+  initial handshake capability (P2P-03), only a subsequent accepted
+  active-branch announcement grants body capability. Losing the last credited
+  peer must not require restart or an unsolicited announcement from a
+  surviving peer.
+- The existing header request and timeout pace discovery. Empty responses
+  preserve that deadline; expiry rotates among connected full witness peers.
+  Nonempty responses consume their matching request even when rejected.
+- Session validation and request publication hold the peer table before
+  download or header-request state. A cancelled ready event does not wait for
+  the download writer or modify its replacement's state.
+- Body/header binding failures reject the delivery, not the header branch.
+  Rejection logs carry source, byte/transaction counts and coinbase witness
+  shape. Compact reconstruction logs include the same block hash for joining
+  evidence. A header ahead of the applied chain is not evidence that the
+  applied-chain `getblockhash` RPC should return it.
+
+Proof: `crates/p2p/src/sync/tests/frontier_recovery.rs` covers applied
+rollback, duplicate request suppression, empty-response pacing/rotation and
+cancelled readiness under contention.
+`crates/p2p/src/sync/tests/witness_staging_gate.rs` covers bad delivery,
+peer replacement, relearned capability and eventual application. Existing
+branch-plan, attribution, timeout and bounded-staging suites remain required.
+
+### `P2P-06`: Body-carried announcements reach header admission
+
+- **Owner**: `ConnectionShared::send_block` (`crates/p2p/src/listener.rs`)
+  forwards every inbound body's embedded header through the headers sink;
+  `BlockSync::admit_staged_headers` (`crates/p2p/src/sync/receive.rs`) retries
+  admission for staged bodies still lacking a tree node.
+- A block body can never become the apply frontier's expected block while
+  the tree does not know its hash. Every delivery path — `block` messages
+  (`inv` getdata answers or unsolicited pushes), reconstructed compact
+  blocks, and `cmpctblock` announcements — routes its embedded header into
+  the same admission drain as `headers` messages, so credit (P2P-03),
+  peer-fault disconnection, and ancestry requests apply uniformly.
+- A batch that cannot attach (`MissingParent`) or cannot be admitted
+  (`Refused`) requests the header ancestry from the delivering peer — or an
+  eligible full-witness peer when no source was recorded — rather than
+  silently dropping the announcement and leaving the live tip wedged behind
+  one missed header. `Refused` re-requests are paced to the request timeout
+  (`refused_rerequest_at`): a paused admission would otherwise replay the
+  same locator at round-trip pace.
+- The forwarded header is marked as such (`InboundHeaders::wire_response =
+  false`): it is not a `getheaders` response, so it must not consume the
+  outstanding request's pending slot — otherwise every delivered body would
+  reset request pacing and emit duplicate `getheaders`.
+- The staged retry carries the delivering connection
+  (`ReceivedBlock::source`): a retry that admits credits that peer exactly
+  as the headers drain would (`note_announced_tip`), and a peer-fault
+  rejection discards the body, releases its download-window record outright
+  (`discard_received`, never re-queued), disconnects the source, and marks
+  it unresponsive — the same outcome a rejected `headers` batch produces.
+- A `cmpctblock` outcome that fetches the body itself (`RequestMissing`'s
+  `getblocktxn`, `Fallback`'s `getdata`) is marked
+  (`InboundHeaders::body_fetch_owned`): once the tip admits, the window
+  records the hash pending under the delivering connection
+  (`DownloadWindow::mark_owned_fetch`) so normal scheduling does not issue
+  a duplicate `getdata`. The mark honours the same gates a real request
+  faces — window request capacity, the owner's per-peer inflight share,
+  and the request frontier (a below-frontier mark could never be scheduled
+  and its expiry would drag `next_request_height` back into a re-request
+  sweep of applied heights). A tip that has not attached yet is retained
+  in the bounded `SchedulerState::owned_body_fetches` set and resolved
+  once ancestry admits it; marks whose source went stale are dropped, and
+  delivery resolves the mark like any window request while expiry or
+  disconnect hands it back to scheduling — a silently dropped compact
+  fetch re-requests instead of wedging the tip.
+- Every peer-removal path releases a `getheaders` gate the peer owned —
+  wire-response consumption, send failure, and peer-fault disconnects in
+  both the headers drain and the staged-header retry
+  (`clear_header_request_for`, identity-exact), and otherwise the live-set
+  sweep (P2P-02) — so a same-address reconnect cannot inherit a dead
+  request deadline.
+
+Proof: `crates/p2p/src/sync/tests/head_sync.rs` covers body-carried header
+admission and apply, gap-fill requests for staged bodies ahead of their
+header chain, announcer-directed `getheaders` on unattached batches,
+non-response forwards preserving pending-request state, staged-retry
+credit, shared-ancestor capability, bounded fork evidence, credit for
+already-known tips, the compact-owned pending mark, and the retained
+mark resolving once its tip header attaches.
+`crates/p2p/src/sync/tests/limited_peers.rs` pins the block-body service clause
+on both paths: the `statically_fanout_eligible` rows for the
+initial-block-download exclusion, the 287/288-block retained-window boundary,
+and the below-requested-height case, plus the tick rows that show a pruned peer
+receiving `getheaders` and no `getdata` while the node syncs, receiving the deep
+batch inside its window after it, and staying out of the fan-out set during
+initial block download. `crates/p2p/src/listener.rs` test
+`inbound_admission_over_cap_drops_stream` and the `crates/p2p/src/peer_table.rs`
+reservation cases pin the admission boundary: cap-minus-one accepted, cap
+refused with no lease registered, inbound-only counting, a removal that frees
+the slot, and a same-address replacement that keeps its own identity.
+Capacity and frontier gates
+on the owned-fetch mark are covered in
+`crates/p2p/src/download_window.rs` tests; fault-path gate cleanup is
+covered in `crates/p2p/src/sync/tests/transitions_4.rs`.
+`crates/p2p/src/listener.rs` test `send_block_forwards_the_blocks_header`
+covers the delivery-path forward.
+
 ### `P2P-07`: Block announcements lead with headers; ingress is bounded twice
 
 - **Owner**: the block branch of `dispatch_inbound_full`
   (`crates/p2p/src/dispatch.rs`), `BlockSync::announce_block`
-  (`crates/p2p/src/sync.rs`), and `BlockSync::drain_block_announcements`
+  (`crates/p2p/src/sync.rs`) and `BlockSync::drain_block_announcements`
   (`crates/p2p/src/sync/headers.rs`).
 - `MSG_BLOCK` and `MSG_WITNESS_BLOCK` inventory vectors are availability
   information, never a body request: each one is queued against the
@@ -341,7 +464,9 @@ covers the delivery-path forward.
   branch switch (`BranchSwitchError::ConnectFailed`, attributed through the
   staged entry's recorded source) —
   `BlockSync::punish_permanent_delivery_source` disconnects the delivering
-  connection after the invalidated hashes are purged, and releases its
+  connection — in the apply pass, after the invalidated hashes are purged;
+  in a branch switch, before the purge drops the staged entry that carries
+  the source — and releases its
   `getheaders` gate and marks it unresponsive only when that exact
   connection was current and removed (Core `net_processing.cpp:2031-2068`).
   Each punishment increments `node.sync.invalid_block_disconnects`. A
@@ -447,3 +572,11 @@ tests `permanent_consensus_body_disconnects_delivering_source` and
   node answers `getheaders` with the empty response
   (`ActiveChainQuery::headers_after`, `net_processing.cpp:3010-3018`), so a
   syncing node does not spread its low-work branch.
+
+Proof: `crates/p2p/src/sync/tests/headers_presync.rs` pins the presync
+lifecycle end to end — first-pass commitment collection, the work-floor
+crossing that restarts the sync at the fork point, commitment divergence
+on a substituted redownload header, salted-commitment spends, the benign
+lost-continuity break, and the disconnects every other failure costs the
+connection. `crates/p2p/benches/headers_presync.rs` measures the hashing
+bound the first pass pays per page.

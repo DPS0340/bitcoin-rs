@@ -208,8 +208,8 @@ pub use bitcoin_rs_index::{
     ScriptIndexSnapshot, SpendingRecord, TxQueryError,
 };
 
-/// Handles owned by the node and observed by the RPC context, grouped by
-/// node capability: chain, mempool, indexes, network, and mining.
+/// The complete description of one RPC context, grouped by node capability:
+/// chain, mempool, indexes, network, and mining.
 ///
 /// A struct-of-structs grouping, not a trait layer. `Context::from_handles`
 /// consumes one `ContextHandles` value and moves each group into the context
@@ -217,9 +217,10 @@ pub use bitcoin_rs_index::{
 /// backend or backend engine type.
 #[derive(Clone)]
 pub struct ContextHandles {
-    /// Chain capability: tips, block log, UTXO set, and block tree.
+    /// Chain capability: tips, block log, UTXO set, block tree, transition
+    /// barrier, and the chain-owned control surfaces.
     pub chain: ChainHandles,
-    /// Mempool capability: the in-memory transaction pool.
+    /// Mempool capability: the mutation gateway in front of the pool.
     pub mempool: MempoolHandles,
     /// Index capability: transaction and script index query adapters.
     pub indexes: IndexHandles,
@@ -236,9 +237,9 @@ pub struct ContextHandles {
 /// initial-block-download latch, and the readable stores behind them.
 #[derive(Clone)]
 pub struct ChainHandles {
-    /// Best header-chain tip.
+    /// Best header-chain tip. Read-only: only Chainstate publishes.
     pub chain_tip: TipReader,
-    /// Best fully-applied block tip.
+    /// Best fully-applied block tip. Read-only: only Chainstate publishes.
     pub applied_tip: TipReader,
     /// Serializes whole-chainstate RPC reads with node-owned connect/disconnect transitions.
     chain_transition: Arc<Mutex<()>>,
@@ -319,20 +320,20 @@ impl ChainHandles {
 /// mutex. The chain owner brackets authoritative mutations with the gateway's
 /// generation fence, and gateway generation/sequence revalidation discards any
 /// facts collected across such a mutation before they can affect admission.
-pub struct ChainAdmissionView<'a> {
-    utxo: &'a bitcoin_rs_utxo::UtxoSet,
-    applied_tip: &'a TipReader,
-    block_tree: &'a BlockTreeReader,
+pub struct ChainAdmissionView {
+    utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
+    applied_tip: TipReader,
+    block_tree: BlockTreeReader,
     network: Network,
 }
 
-impl<'a> ChainAdmissionView<'a> {
+impl ChainAdmissionView {
     /// Borrows the chain owner's existing handles without retaining state.
     #[must_use]
-    pub fn new(
-        utxo: &'a bitcoin_rs_utxo::UtxoSet,
-        applied_tip: &'a TipReader,
-        block_tree: &'a BlockTreeReader,
+    pub const fn new(
+        utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
+        applied_tip: TipReader,
+        block_tree: BlockTreeReader,
         network: Network,
     ) -> Self {
         Self {
@@ -344,7 +345,7 @@ impl<'a> ChainAdmissionView<'a> {
     }
 }
 
-impl AdmissionChain for ChainAdmissionView<'_> {
+impl AdmissionChain for ChainAdmissionView {
     fn snapshot(&self, tx: &Tx) -> Option<ChainAdmissionSnapshot> {
         let tip = self.applied_tip.load_full();
         let height = tip.as_ref().map_or(0, |tip| tip.height);
@@ -409,7 +410,7 @@ impl AdmissionChain for ChainAdmissionView<'_> {
 #[derive(Clone)]
 pub struct MempoolHandles {
     /// The process-wide mutation gateway in front of the in-memory pool.
-    pub mempool: Arc<MempoolGateway>,
+    pub gateway: Arc<MempoolGateway>,
 }
 
 /// Index capability handles.
@@ -452,7 +453,7 @@ pub struct NetworkHandles {
 }
 
 /// Mining capability handles.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MiningHandles {
     /// Node-owned mining coordinator. `None` when mining is not wired.
     pub mining_control: Option<Arc<dyn MiningControl>>,
@@ -495,6 +496,82 @@ impl fmt::Debug for Context {
     }
 }
 
+impl Default for ChainHandles {
+    /// Builds the empty synthetic chain world used by tests, including a
+    /// private transition barrier no chain owner shares.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn default() -> Self {
+        let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
+        );
+        let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
+        utxo.track_coin_stats(coin_stats_listener.clone());
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let block_tree = Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new()));
+        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
+            TipReader::new(Arc::clone(&applied_tip)),
+            BlockTreeReader::new(Arc::clone(&block_tree)),
+        ));
+        Self {
+            chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
+            applied_tip: TipReader::new(applied_tip),
+            ibd,
+            blocks: Arc::new(RwLock::new(BlockLog::new())),
+            transactions: Arc::new(RwLock::new(HashMap::new())),
+            utxo: Arc::new(utxo),
+            coin_stats: Arc::new(coin_stats_listener),
+            block_tree: BlockTreeReader::new(block_tree),
+            chain_network: Network::Mainnet,
+            chain_transition: Arc::new(Mutex::new(())),
+            block_body_source: None,
+            prune_service: None,
+            chain_control: None,
+            rollback_warnings: None,
+        }
+    }
+}
+
+impl Default for MempoolHandles {
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn default() -> Self {
+        Self {
+            gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+                MempoolLimits::default(),
+            )))),
+        }
+    }
+}
+
+impl Default for NetworkHandles {
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn default() -> Self {
+        Self {
+            network: Arc::new(RwLock::new(NetworkState::default())),
+            network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+            peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
+            p2p_outbound_sender: None,
+            banned: Arc::new(RwLock::new(Vec::new())),
+            added_nodes: Arc::new(RwLock::new(Vec::new())),
+            local_services: 0x09,
+        }
+    }
+}
+
+impl Default for ContextHandles {
+    /// Builds the empty synthetic capability set used by tests. Production
+    /// wiring supplies every capability it owns.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn default() -> Self {
+        Self {
+            chain: ChainHandles::default(),
+            mempool: MempoolHandles::default(),
+            indexes: IndexHandles::default(),
+            network: NetworkHandles::default(),
+            mining: MiningHandles::default(),
+        }
+    }
+}
+
 impl Default for Context {
     fn default() -> Self {
         Self::new()
@@ -502,7 +579,9 @@ impl Default for Context {
 }
 
 impl Context {
-    /// Builds an empty context suitable for tests and early startup.
+    /// Builds an empty context over the default synthetic handles. Test
+    /// convenience; production composes a complete [`ContextHandles`]
+    /// through [`Self::from_handles`].
     #[must_use]
     pub fn new() -> Self {
         Self::build_fixture(None)
@@ -591,7 +670,7 @@ impl Context {
     pub fn from_handles(handles: ContextHandles) -> Self {
         let ContextHandles {
             chain,
-            mempool: MempoolHandles { mempool },
+            mempool: MempoolHandles { gateway: mempool },
             indexes,
             network,
             mining: MiningHandles { mining_control },
@@ -944,11 +1023,11 @@ impl ChainHandles {
 
     /// Borrows the provisional chain capability shared with P2P admission.
     #[must_use]
-    pub(crate) fn admission_chain(&self) -> ChainAdmissionView<'_> {
+    pub(crate) fn admission_chain(&self) -> ChainAdmissionView {
         ChainAdmissionView::new(
-            &self.utxo,
-            &self.applied_tip,
-            &self.block_tree,
+            Arc::clone(&self.utxo),
+            self.applied_tip.clone(),
+            self.block_tree.clone(),
             self.chain_network,
         )
     }
@@ -1504,9 +1583,16 @@ mod tests {
         assert!(record_at_height(&records, 1).is_none());
     }
 
-    /// The latch the context hands out must read the same tree the context
-    /// exposes: a latch built over any other `BlockTree` finds no node for
-    /// the applied tip and keeps reporting initial block download forever.
+    /// The aggregate `Context` keeps Rust's auto-derived thread-safety traits:
+    /// every capability group is built from handles whose interior mutability
+    /// is already `Send` and `Sync`, so no `unsafe impl` is needed.
+    #[test]
+    fn context_derives_send_and_sync_without_an_unsafe_impl() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Context>();
+        assert_send_sync::<ContextHandles>();
+    }
+
     #[test]
     fn ibd_latch_judges_the_contexts_own_tree() {
         use alloc::sync::Arc;
@@ -1569,7 +1655,7 @@ mod tests {
                 rollback_warnings: None,
             },
             mempool: MempoolHandles {
-                mempool: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+                gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
                     MempoolLimits::default(),
                 )))),
             },

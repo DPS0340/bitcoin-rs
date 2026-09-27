@@ -343,6 +343,26 @@ pub(crate) enum WriterState {
     Compacted,
 }
 
+/// Advances a chain transaction count by one record's transactions,
+/// preserving the unknown marker: zero means unknown unless the base is
+/// genesis-empty (base height 0, no chain below it to total — the same rule
+/// as `bitcoin_rs_chainstate::publication::advanced_chain_tx_count_from`).
+/// A fresh log counts its first record; adding a suffix to an unknown base
+/// would fabricate a chain total, so unknown stays unknown through the
+/// writer and the replay side compares the preserved value.
+fn advance_chain_tx_count(
+    base_height: u32,
+    count: u64,
+    delta: u64,
+) -> Result<u64, JournalWriterError> {
+    if count == 0 && base_height != 0 {
+        return Ok(0);
+    }
+    count
+        .checked_add(delta)
+        .ok_or_else(|| JournalWriterError::CursorMismatch("chain_tx_count overflow".to_owned()))
+}
+
 /// The journal writer. One owner per node: the apply path appends; the
 /// publication primitive freezes/compacts/resumes.
 pub struct JournalWriter<S: KvStore> {

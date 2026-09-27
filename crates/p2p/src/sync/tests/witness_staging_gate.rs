@@ -113,7 +113,7 @@ fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::
 
     // Send the stripped (malformed) body first.
     let mut batch = vec![InboundBlock::from_decoded(stripped_block)];
-    let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash), Instant::now());
+    let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
     assert_eq!(received, 1, "malformed body should be processed (rejected)");
     assert!(
         batch.is_empty(),
@@ -127,7 +127,7 @@ fn malformed_body_dropped_then_correct_body_staged() -> Result<(), Box<dyn std::
 
     // Now send the correct body.
     let mut batch = vec![InboundBlock::from_decoded(correct_block)];
-    let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash), Instant::now());
+    let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
     assert_eq!(received, 1, "correct body should be processed (staged)");
     // The stager must now contain the correct body.
     assert!(
@@ -155,7 +155,7 @@ fn malformed_pending_owner_is_disconnected_and_other_peer_gets_same_hash()
     malformed.source = Some(source_a);
     let mut batch = vec![malformed];
     assert_eq!(
-        sync.buffer_received_block_chunk(&mut batch, Some(block_hash), Instant::now()),
+        sync.buffer_received_block_chunk(&mut batch, Some(block_hash)),
         1
     );
     assert!(!sync.peer_table.is_current(source_a));
@@ -192,14 +192,14 @@ fn altered_non_witness_body_dropped_then_correct_body_staged()
 
     let mut batch = vec![InboundBlock::from_decoded(altered_block)];
     assert_eq!(
-        sync.buffer_received_block_chunk(&mut batch, Some(block_hash), Instant::now()),
+        sync.buffer_received_block_chunk(&mut batch, Some(block_hash)),
         1
     );
     assert!(!sync.scheduler.lock().stager.contains(&block_hash));
 
     let mut batch = vec![InboundBlock::from_decoded(correct_block)];
     assert_eq!(
-        sync.buffer_received_block_chunk(&mut batch, Some(block_hash), Instant::now()),
+        sync.buffer_received_block_chunk(&mut batch, Some(block_hash)),
         1
     );
     assert!(sync.scheduler.lock().stager.contains(&block_hash));
@@ -219,7 +219,7 @@ fn correct_body_staged_then_malformed_duplicate_is_ignored()
 
     // Send the correct body first.
     let mut batch = vec![InboundBlock::from_decoded(correct_block)];
-    let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash), Instant::now());
+    let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
     assert_eq!(received, 1, "correct body should be staged");
     assert!(
         sync.scheduler.lock().stager.contains(&block_hash),
@@ -229,7 +229,7 @@ fn correct_body_staged_then_malformed_duplicate_is_ignored()
 
     // Send the stripped (malformed) duplicate.
     let mut batch = vec![InboundBlock::from_decoded(stripped_block)];
-    let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash), Instant::now());
+    let received = sync.buffer_received_block_chunk(&mut batch, Some(block_hash));
     assert_eq!(received, 1, "duplicate should be processed (AlreadyStaged)");
 
     // The stager must still contain the correct body — not displaced.
@@ -270,7 +270,7 @@ fn idle_frontier_relearns_stale_peer_credit_after_rejected_body()
     );
     let mut malformed = InboundBlock::from_decoded(stripped);
     malformed.source = Some(current_source(&sync.peer_table, bad));
-    sync.buffer_received_block_chunk(&mut vec![malformed], Some(hash), Instant::now());
+    sync.buffer_received_block_chunk(&mut vec![malformed], Some(hash));
     sync.tick();
 
     let Message::GetHeaders(request) = good_rx.try_recv()? else {
@@ -301,7 +301,7 @@ fn idle_frontier_relearns_stale_peer_credit_after_rejected_body()
     );
     let mut delivered = InboundBlock::from_decoded(correct);
     delivered.source = Some(current_source(&sync.peer_table, good));
-    sync.buffer_received_block_chunk(&mut vec![delivered], Some(hash), Instant::now());
+    sync.buffer_received_block_chunk(&mut vec![delivered], Some(hash));
     sync.tick();
     assert_eq!(
         sync.chain.applied_tip().ok_or("missing applied tip")?.hash,

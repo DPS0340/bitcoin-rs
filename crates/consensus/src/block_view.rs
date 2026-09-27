@@ -5,9 +5,10 @@
 
 use bitcoin_rs_primitives::{
     Tx, TxOut, Txid, Wtxid,
-    encode::double_sha256,
+    encode::{double_sha256, finalize_double_sha256},
     layout::{ByteSpan, ParsedBlock, ParsedTransaction},
 };
+use sha2::{Digest, Sha256};
 
 use crate::verify_block::merkle_root_and_mutation_borrowed;
 
@@ -36,7 +37,7 @@ impl BlockFacts {
         let mut has_witness = false;
 
         for tx in parsed.transactions() {
-            let txid = tx.txid();
+            let (txid, base_size) = txid_and_base_size(tx);
             if tx.is_segwit() {
                 has_witness = true;
                 let ids = wtxids.get_or_insert_with(|| {
@@ -48,7 +49,7 @@ impl BlockFacts {
             } else if let Some(ids) = wtxids.as_mut() {
                 ids.push(Wtxid(txid.0));
             }
-            base_sizes = base_sizes.saturating_add(len_u64(tx.base_size()));
+            base_sizes = base_sizes.saturating_add(base_size);
             txids.push(txid);
         }
 
@@ -280,6 +281,28 @@ fn decoded_block_weight(txs: &[Tx]) -> u64 {
 fn merkle_root_and_mutation(txids: &[Txid]) -> (Option<Txid>, bool) {
     merkle_root_and_mutation_borrowed(txids)
         .map_or((None, false), |(root, mutated)| (Some(root), mutated))
+}
+
+/// Hash the canonical base serialization without reconstructing its fields.
+///
+/// The layout parser has already checked `CompactSize` canonicality and wire
+/// order. Legacy bytes are contiguous; `SegWit` removes exactly the marker/flag
+/// and witness section, leaving version, the input/output range, and lock time.
+/// The same borrowed ranges own the stripped-size calculation, so there is no
+/// second traversal of input/output metadata and no transaction-sized scratch.
+fn txid_and_base_size(tx: &ParsedTransaction<'_>) -> (Txid, u64) {
+    let parts = tx.stripped_parts();
+    if !tx.is_segwit() {
+        return (Txid(double_sha256(parts[0])), u64::from(tx.span().len()));
+    }
+
+    let mut engine = Sha256::new();
+    let mut base_size = 0;
+    for part in parts {
+        engine.update(part);
+        base_size += len_u64(part.len());
+    }
+    (Txid(finalize_double_sha256(engine)), base_size)
 }
 
 fn wtxid_from_span(tx: &ParsedTransaction<'_>) -> Wtxid {

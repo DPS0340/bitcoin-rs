@@ -83,10 +83,8 @@ pub(crate) use crate::download_window::MIN_PEERS_FOR_FANOUT;
 /// Maximum number of locator entries we ever send.
 const LOCATOR_MAX_ENTRIES: usize = 32;
 
-/// Headers a single `headers` message can carry. Core's
-/// `MAX_HEADERS_RESULTS` (`net_processing.h:48-57`): a batch of exactly this
-/// many is a full page, so the peer almost certainly has more.
-const MAX_HEADERS_RESULTS: usize = 2_000;
+/// Wire protocol version we advertise on outbound `getheaders`.
+const PROTOCOL_VERSION: u32 = 70_016;
 
 /// Time after which an unanswered `getheaders` request may be retried.
 const HEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -105,11 +103,9 @@ const STALE_CHECK_INTERVAL: Duration = Duration::from_mins(10);
 /// chain moves again (`net_processing.cpp:5604-5668`).
 #[derive(Clone, Debug, Default)]
 struct StaleTipState {
-    /// Highest header tip height seen so far.
-    last_seen_height: u32,
-    /// Hash of the tip seen at `last_seen_height`; a same-height change is
-    /// a reorg and counts as tip progress.
-    last_seen_hash: Option<Hash256>,
+    /// The header tip identity last observed: height and hash together, so a
+    /// same-height replacement or a reorg to a lower tip is a change.
+    last_seen_tip: Option<(u32, Hash256)>,
     /// When the tip last advanced, `None` before the first observation.
     last_update: Option<Instant>,
     /// When the staleness question is next asked.
@@ -122,33 +118,30 @@ impl StaleTipState {
     /// Records what the tip did this tick and updates the extra-dial
     /// allowance.
     ///
-    /// PRE: `tip` is this tick's header tip, `blocks_in_flight` the
-    ///   bodies the window still expects, and `block_spacing` the network's
-    ///   target spacing.
-    /// POST: a tip that moved — higher, or a different hash at the same
-    ///   height — withdraws the allowance at once; a tip that has not moved
-    ///   is re-judged no more often than `STALE_CHECK_INTERVAL`.
+    /// PRE: `tip_height` and `tip_hash` are this tick's header tip identity,
+    ///   `blocks_in_flight` the bodies the window still expects, and
+    ///   `block_spacing` the network's target spacing.
+    /// POST: a tip whose height or hash changed withdraws the allowance at
+    ///   once and restarts the staleness clock on the new tip; a tip that
+    ///   has not moved is re-judged no more often than
+    ///   `STALE_CHECK_INTERVAL`.
     /// INVARIANT: the allowance is this record's only output, so the
     ///   connection manager never reads a staleness clock of its own.
     fn follow(
         &mut self,
-        tip: (u32, Hash256),
+        tip_height: u32,
+        tip_hash: Hash256,
         blocks_in_flight: usize,
         block_spacing: Duration,
         now: Instant,
     ) {
-        let (tip_height, tip_hash) = tip;
-        if tip_height > self.last_seen_height
-            || (tip_height == self.last_seen_height
-                && self.last_seen_hash.is_some_and(|seen| seen != tip_hash))
-        {
-            self.last_seen_height = tip_height;
-            self.last_seen_hash = Some(tip_hash);
+        let identity = (tip_height, tip_hash);
+        if self.last_seen_tip.is_none_or(|seen| seen != identity) {
+            self.last_seen_tip = Some(identity);
             self.last_update = Some(now);
             self.extra_dial_allowed = false;
             return;
         }
-        self.last_seen_hash = Some(tip_hash);
         if self.next_check.is_some_and(|due| now < due) {
             return;
         }
@@ -227,6 +220,27 @@ pub struct BlockSync {
 /// never admit. The oldest mark is evicted first.
 const MAX_DEFERRED_OWNED_FETCHES: usize = 16;
 
+/// Appends one deferred owned-fetch mark, keeping the queue deduplicated and
+/// bounded at every insertion point — the initial record, the header-drain
+/// deferral, and the post-resolve requeue all share this tail.
+///
+/// Dedup keys on `(source, hash)`: two live connections that each issued a
+/// compact fetch for the same hash both hold ownership, because inbound
+/// admission checks the exact source. The oldest mark is evicted first.
+fn defer_owned_body_fetch(scheduler: &mut SchedulerState, source: PeerSource, hash: Hash256) {
+    if scheduler
+        .owned_body_fetches
+        .iter()
+        .any(|(owner, owned)| *owner == source && *owned == hash)
+    {
+        return;
+    }
+    if scheduler.owned_body_fetches.len() >= MAX_DEFERRED_OWNED_FETCHES {
+        scheduler.owned_body_fetches.remove(0);
+    }
+    scheduler.owned_body_fetches.push((source, hash));
+}
+
 struct SchedulerState {
     window: DownloadWindow,
     stager: BlockStager,
@@ -242,10 +256,6 @@ struct SchedulerState {
     /// it can bring us to the tip. Keyed by exact connection identity, so a
     /// replacement at the same address is judged on its own record.
     chain_sync: hashbrown::HashMap<PeerSource, peers::ChainSyncState>,
-    /// Header requests each connection has failed to answer. Keyed by exact
-    /// connection identity, so a same-address replacement starts clean and a
-    /// timed-out peer is never blamed for its successor or the reverse.
-    header_penalties: hashbrown::HashMap<PeerSource, u32>,
     /// The download-twice header sync of every connection whose chain this
     /// node has not yet seen reach the network's minimum work. Keyed by
     /// exact connection identity, so a same-address replacement starts its
@@ -259,10 +269,11 @@ impl SchedulerState {
     /// Releases every scheduling fact owned by a connection not in `live`.
     ///
     /// PRE: `live` is the peer table's live-session snapshot.
-    /// POST: the window, the header request, the header-timeout penalties,
-    ///   the header presync states, and the deferred body fetches hold only
-    ///   facts owned by a connection in `live`.
+    /// POST: the window, the header request, the header presync states, and
+    ///   the deferred body fetches hold only facts owned by a connection in
+    ///   `live`.
     /// INVARIANT: ownership is compared by connection identity, never by
+    ///   address alone.
     fn release_unowned(&mut self, live: &[PeerSource]) {
         let owns = |source: &PeerSource| live.contains(source);
         self.window.retain_owned_by(owns);
@@ -274,7 +285,6 @@ impl SchedulerState {
         }
         self.owned_body_fetches.retain(|(source, _)| owns(source));
         self.chain_sync.retain(|source, _| owns(source));
-        self.header_penalties.retain(|source, _| owns(source));
         self.headers_sync.retain(|source, _| owns(source));
     }
 
@@ -307,11 +317,6 @@ pub(super) struct PendingHeaderRequest {
     locator_tip_hash: Hash256,
     target_height: u32,
     requested_at: Instant,
-    /// Whether this connection already answered the request with a batch
-    /// this node could not use. Such a request keeps its gate to pace the
-    /// retry, but its deadline is not silence: expiry retires it without
-    /// blame. A fresh send always starts unanswered.
-    answered: bool,
 }
 
 /// Whether `send_getheaders` reached the wire this tick.
@@ -322,6 +327,10 @@ pub(super) enum GetheadersOutcome {
     /// An identical request is already pending on that connection; nothing
     /// was sent.
     Suppressed,
+    /// Nothing was sent because the frontier body is already owned: the
+    /// capability question the probe exists to answer is resolved, and no
+    /// request is outstanding on this connection.
+    FrontierOwned,
     /// The connection's outbound channel is gone (the send failed or the
     /// lease no longer exists).
     Failed,
@@ -386,7 +395,6 @@ impl BlockSync {
                 header_request: None,
                 owned_body_fetches: Vec::new(),
                 chain_sync: hashbrown::HashMap::new(),
-                header_penalties: hashbrown::HashMap::new(),
                 headers_sync: hashbrown::HashMap::new(),
                 stale_tip: StaleTipState::default(),
             }),
@@ -407,7 +415,6 @@ impl BlockSync {
             header_request: None,
             owned_body_fetches: Vec::new(),
             chain_sync: hashbrown::HashMap::new(),
-            header_penalties: hashbrown::HashMap::new(),
             headers_sync: hashbrown::HashMap::new(),
             stale_tip: StaleTipState::default(),
         };
@@ -418,8 +425,8 @@ impl BlockSync {
     ///
     /// PRE: `source` identifies the current connection and `hash` is a
     /// `MSG_BLOCK` or `MSG_WITNESS_BLOCK` inventory hash.
-    /// POST: the announcement is queued and the sync loop is woken; no block
-    /// body request is emitted here.
+    /// POST: the announcement is queued; the caller wakes the sync loop. No
+    /// block body request is emitted here.
     /// INVARIANT: one entry per connection — the first unprocessed
     /// announcement wins, so a later vector cannot replace an unknown tip
     /// before header sync drains it — and a flooding peer cannot grow the
@@ -446,17 +453,7 @@ impl BlockSync {
             return;
         }
         let mut scheduler = self.scheduler.lock();
-        if scheduler
-            .owned_body_fetches
-            .iter()
-            .any(|(_, owned)| *owned == hash)
-        {
-            return;
-        }
-        if scheduler.owned_body_fetches.len() >= MAX_DEFERRED_OWNED_FETCHES {
-            scheduler.owned_body_fetches.remove(0);
-        }
-        scheduler.owned_body_fetches.push((source, hash));
+        defer_owned_body_fetch(&mut scheduler, source, hash);
     }
 
     /// Whether `source` already owns the download of `hash`.
@@ -478,30 +475,17 @@ impl BlockSync {
                 .any(|(owner, owned)| *owner == source && *owned == hash)
     }
 
-    /// Runs one orchestrator tick against the host clock.
-    pub fn tick(&self) {
-        self.tick_at(Instant::now());
-    }
-
     /// Runs one orchestrator tick as a single canonical frontier
-    /// reconciliation at the injected instant `now`: observe, recover what is
-    /// unowned, then schedule or name why progress is impossible.
-    ///
-    /// PRE: `now` is the instant this tick judges every timeout against.
-    /// POST: inbound headers and blocks are drained, dead connections are
-    ///   released, the frontier is observed once, an unanswered header request
-    ///   is rotated away, connections the rotation or the sweep retired are
-    ///   dropped from the observed snapshot before it is read, and the work
-    ///   that frontier names is scheduled — all timed against `now`.
-    /// INVARIANT: no expiry, blame, or selection path inside the tick reads the
-    ///   wall clock; `now` is the tick's only time source.
-    pub fn tick_at(&self, now: Instant) {
-        self.drain_inbound_headers(now);
+    /// reconciliation: observe, recover what is unowned, then schedule or
+    /// name why progress is impossible.
+    pub fn tick(&self) {
+        self.drain_inbound_headers();
         self.chain.bootstrap_genesis();
         // Remove dead racers before queued blocks can affect peer election.
         self.reconcile_peer_sessions();
-        self.drain_inbound_blocks(now);
+        self.drain_inbound_blocks();
 
+        let now = Instant::now();
         // One frontier observation feeds recovery, selection, and planning;
         // the observation reads tips once and resolves the canonical
         // next-required body exactly once per tick.
@@ -510,30 +494,15 @@ impl BlockSync {
         // Convicted connections must release their work before selection so
         // the same tick can re-request it.
         self.reconcile_peer_sessions();
-        let mut frontier = self.observe_frontier(chain, now);
-        // A `getheaders` that outlived its deadline is retired before any
-        // selection this tick, so the scheduler cannot re-ask the connection
-        // that ignored it.
-        self.expire_header_request(now, &frontier.usable_peers);
+        let frontier = self.observe_frontier(chain.clone(), now);
         // A connection that has had twenty minutes to bring a better chain and
         // two more to answer a probe is retired before this tick plans any
         // further work with it.
         self.sweep_chain_sync(&frontier, now);
-        // Both maintenance steps above can retire a connection after the
-        // observation. Drop the retired connections from the snapshot before
-        // planning or selection reads it, so the same tick's header fallback
-        // asks a live peer instead of replaying into the socket that just
-        // closed — the same conviction-before-selection rule
-        // `reconcile_peer_sessions` enforces above.
-        frontier
-            .usable_peers
-            .retain(|peer| self.peer_table.is_current(peer.source));
-        // Expiry, the sweep, and the retain above can retire the pending
-        // request's owner after the observation stamped it live; a stale
-        // `AwaitPending` would defer header recovery a whole tick.
-        frontier.header_request_live =
-            header_request_live(frontier.header_request, &frontier.usable_peers, now);
         self.follow_tip_progress(&frontier, now);
+        // The sweep can disconnect a peer; re-observe so selection and body
+        // planning never address a lease the sweep just removed.
+        let frontier = self.observe_frontier(chain, now);
         let plan = frontier.plan();
 
         if !frontier.usable_peers.is_empty() {
@@ -548,7 +517,6 @@ impl BlockSync {
                         peer_idx + 1 == request_peer_count,
                         peer_best_height,
                         &frontier.chain,
-                        now,
                     );
                     sent_getdata |= request_outcome.sent;
                     if request_outcome.sent && !request_outcome.has_request_capacity {
@@ -563,17 +531,17 @@ impl BlockSync {
         }
         match plan.header_action {
             HeaderAction::Idle | HeaderAction::AwaitPending => {}
-            HeaderAction::Probe(source) => match self.probe_frontier_peer(&frontier, source, now) {
+            HeaderAction::Probe(source) => match self.probe_frontier_peer(&frontier, source) {
                 GetheadersOutcome::Failed => {
-                    self.request_headers_from_best_peer(&frontier, Some(source), now);
+                    self.request_headers_from_best_peer(&frontier, Some(source));
                 }
-                GetheadersOutcome::Suppressed => {
-                    self.request_headers_from_best_peer(&frontier, None, now);
+                GetheadersOutcome::Suppressed | GetheadersOutcome::FrontierOwned => {
+                    self.request_headers_from_best_peer(&frontier, None);
                 }
                 GetheadersOutcome::Sent => {}
             },
             HeaderAction::Extend => {
-                self.request_headers_from_best_peer(&frontier, None, now);
+                self.request_headers_from_best_peer(&frontier, None);
             }
         }
         if let Some(reason) = plan.no_progress {
@@ -589,30 +557,18 @@ impl BlockSync {
     ///   `STALE_CHECK_INTERVAL`, so a stalled tip costs one dial rather than
     ///   one decision per tick.
     fn follow_tip_progress(&self, frontier: &SyncFrontier, now: Instant) {
-        let Some(tip) = frontier
-            .chain
-            .chain_tip
-            .as_ref()
-            .map(|tip| (tip.height, tip.hash))
-        else {
+        // The applied tip — not the header tip — marks real chain progress:
+        // headers can advance for an hour without one validated block.
+        let Some(tip) = frontier.chain.applied_tip.as_ref() else {
             return;
         };
         let block_spacing =
             Duration::from_secs(u64::from(self.chain.network().target_spacing_seconds()));
         let mut scheduler = self.scheduler.lock();
-        if self
-            .ibd
-            .is_active(crate::counters::now_seconds(), self.chain.network())
-        {
-            // Core withholds the extra full-relay dial until the node has
-            // left initial block download (`net_processing.cpp:1434-1448`).
-            scheduler.stale_tip.extra_dial_allowed = false;
-            return;
-        }
         let blocks_in_flight = scheduler.window.pending_len();
         scheduler
             .stale_tip
-            .follow(tip, blocks_in_flight, block_spacing, now);
+            .follow(tip.height, tip.hash, blocks_in_flight, block_spacing, now);
     }
 
     /// Whether the stale tip still justifies one extra full-relay dial.
@@ -732,6 +688,7 @@ impl BlockSync {
                     info,
                     demonstrated_tips,
                     active_height,
+                    headers_horizon: session.headers_horizon,
                     role: session.lease.role(),
                     manual: session.lease.is_manual(),
                     connected_at: session.lease.connected_at(),

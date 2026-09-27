@@ -62,9 +62,10 @@ impl bitcoin_rs_index::reconcile::ChainCursorSource for IndexChainCursorSource {
     }
 }
 
-// Outbound full-relay slots, and the one active generation of outbound
-// requests that keeps the drain fed: extra backlog is overload and must fail
-// fast at producers. Bitcoin Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`.
+// Outbound full-relay slots set the automatic target. The bounded channel
+// rejects DNS requests at producers when full; the parked retry queue is a
+// second bound, whose overflow clears the address's DNS backoff for retry.
+// Bitcoin Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`.
 pub(crate) const P2P_OUTBOUND_FULL_RELAY_SLOTS: usize = 8;
 
 // Outbound block-relay-only slots: connections that relay blocks and nothing
@@ -141,6 +142,10 @@ impl Drop for NodeState {
         // flag, and the index worker only reads chain handles, so releasing
         // the guard before the join is behavior-identical to holding it.
         let _admission = self.chainstate.close();
+        // Close the history boundary first, so a worker still reconciling
+        // stops on the owner's shutdown answer instead of pinning rows a
+        // process that is leaving will not serve.
+        self.chainstate.retention_handle().shutdown();
     }
 }
 

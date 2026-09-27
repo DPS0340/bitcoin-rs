@@ -6,10 +6,12 @@ use std::time::Duration;
 
 use super::*;
 use crate::peer_info::PeerRole;
+use crate::sync::GetheadersOutcome;
 use crate::sync::frontier::UsablePeer;
 use crate::sync::peers::{ChainSyncAction, ChainSyncState, chain_sync_subject, consider_eviction};
 
-use crate::download_window::MINIMUM_CONNECT_TIME;
+/// The minimum age at which a connection's silence may be held against it.
+const MINIMUM_CONNECT_TIME: Duration = Duration::from_secs(30);
 
 /// An outbound connection that demonstrated `height`.
 fn outbound(port: u16, height: u32, role: PeerRole, at: Instant) -> UsablePeer {
@@ -19,6 +21,7 @@ fn outbound(port: u16, height: u32, role: PeerRole, at: Instant) -> UsablePeer {
         info: synthetic_peer(addr, i32::try_from(height).unwrap_or(i32::MAX)),
         demonstrated_tips: vec![Hash256::from_le_bytes(&[0x7c; 32])],
         active_height: Some(height),
+        headers_horizon: None,
         role,
         manual: false,
         connected_at: at,
@@ -319,5 +322,176 @@ fn progress_to_the_benchmark_re_arms_the_timeout() {
         ),
         Some(ChainSyncAction::Evict),
         "and the response window still closes on it"
+    );
+}
+
+/// The response window starts only on a probe the connection was actually
+/// asked to answer. The chain-sync probe ignores frontier body ownership —
+/// the lagging peer owes an answer for its own silence — so the fixture's
+/// owned frontier does not suppress the send; the unregistered fixture
+/// connection fails the send instead, and the sweep must still restore the
+/// record untouched so the connection cannot be retired for ignoring a
+/// request it never received, and the operator counter does not count the
+/// silence as a probe.
+#[test]
+#[allow(clippy::expect_used)]
+fn an_unsent_chain_sync_probe_arms_no_response_window() {
+    let t0 = Instant::now();
+    // A mined tree whose tip is one header past the last body: the frontier
+    // owes a body, and genesis is applied so the probes below have tips and
+    // a locator to build from.
+    let (mut tree, blocks) = mined_chain(1, 1).expect("fixture chain mines");
+    let chain_tip = tree.tip_handle();
+    let sync = Arc::new(BlockSync::new(
+        Arc::new(TestChain::new(
+            chain_tip,
+            Arc::new(ArcSwapOption::empty()),
+            Arc::new(RwLock::new(tree)),
+        )),
+        Arc::new(PeerTable::new()),
+        Arc::new(Mutex::new({
+            let (_tx, rx) = unbounded::<crate::InboundHeaders>();
+            rx
+        })),
+        Arc::new(Mutex::new({
+            let (_tx, rx) = unbounded::<crate::InboundBlock>();
+            rx
+        })),
+        super::synced_ibd_latch(),
+    ));
+    sync.chain.bootstrap_genesis();
+    // Own the frontier body: pending in the window, so nothing may be sent.
+    stage_body(&sync, &blocks[0]);
+
+    let chain_frontier = sync.observe_chain_frontier();
+    let frontier = sync.observe_frontier(chain_frontier, t0);
+    let subject = outbound(9_630, 0, PeerRole::FullRelay, t0);
+
+    assert!(
+        frontier.chain.next_required.is_some(),
+        "premise: the fixture owes a body, so the frontier can be owned"
+    );
+    assert!(
+        !sync.probe_chain_sync(subject.source, &frontier),
+        "a probe that never reached the wire is not a probe"
+    );
+    assert!(
+        !sync
+            .scheduler
+            .lock()
+            .chain_sync
+            .contains_key(&subject.source),
+        "no response window is armed for a probe the connection never received"
+    );
+}
+
+/// The eviction benchmark is taken from the header tip, so the probe's
+/// locator anchors at the best header's parent — an applied-tip anchor
+/// cannot return the header tip while IBD lags a page behind it, and a
+/// correct answer would credit only the applied side.
+#[test]
+#[allow(clippy::expect_used)]
+fn chain_sync_probe_locator_anchors_at_the_header_tips_parent() {
+    let t0 = Instant::now();
+    // Bodies to 1, headers to 3, genesis applied: the applied anchor sits
+    // two headers under the benchmark.
+    let (tree, _blocks) = mined_chain(1, 2).expect("fixture chain mines");
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        ..
+    } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    let chain_frontier = sync.observe_chain_frontier();
+    let frontier = sync.observe_frontier(chain_frontier, t0);
+    let tip = frontier
+        .chain
+        .chain_tip
+        .as_ref()
+        .expect("the fixture mines a header tip")
+        .clone();
+    assert_eq!(tip.height, 3, "premise: header tip is height 3");
+
+    let addr = test_addr(9_900, 0).expect("test address builds");
+    let rx = connect_peer(&peers, synthetic_peer(addr, i32::MAX));
+    let outcome = sync.send_chain_sync_probe(&frontier, current_source(&peers, addr));
+    assert_eq!(outcome, GetheadersOutcome::Sent);
+
+    let Ok(Message::GetHeaders(getheaders)) = rx.try_recv() else {
+        panic!("the probe enqueues one getheaders");
+    };
+    let parent = block_tree
+        .read()
+        .node(tip.tip_id)
+        .expect("tip is in the tree")
+        .parent
+        .expect("a height-3 tip has a parent");
+    let expected = block_tree
+        .read()
+        .node(parent)
+        .expect("parent is in the tree")
+        .hash;
+    assert_eq!(
+        getheaders.locator_hashes.first(),
+        Some(&bitcoin::BlockHash::from_byte_array(
+            *expected.as_byte_array()
+        )),
+        "the locator roots at the header tip's parent so the answer carries the tip"
+    );
+}
+
+/// The sweep-level guarantee for the same contract
+/// `a_probe_that_never_reached_the_wire_is_not_a_probe` checks on
+/// `probe_chain_sync`: when the sweep's probe send fails — the lease's queue
+/// is gone — the connection's record is put back exactly as the sweep found
+/// it, so the next tick retries instead of holding a response window against
+/// a request that never arrived.
+#[test]
+#[allow(clippy::expect_used)]
+fn a_failed_sweep_probe_restores_the_armed_record() {
+    let t0 = Instant::now();
+    let (tree, _blocks) = mined_chain(1, 1).expect("chain fixture builds");
+    let SyncHarness { sync, peers, .. } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+
+    let addr = test_addr(9_920, 0).expect("test address");
+    let (tx, rx) = unbounded::<Message>();
+    // Old enough that the connection is a chain-sync subject on every tick.
+    let connected_at = t0
+        .checked_sub(MINIMUM_CONNECT_TIME)
+        .expect("the test clock predates the connect age");
+    let lease = PeerLease::new_connected_at(tx, connected_at);
+    peers.register(addr, lease.clone());
+    peers.publish_info(addr, &lease, synthetic_peer(addr, 0));
+    let source = current_source(&peers, addr);
+
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), t0);
+    sync.sweep_chain_sync(&frontier, t0);
+    {
+        let scheduler = sync.scheduler.lock();
+        let state = scheduler
+            .chain_sync
+            .get(&source)
+            .expect("the first sweep arms the lagging claimant");
+        assert!(
+            !state.probe_sent(),
+            "an armed window has not yet owed a probe"
+        );
+    }
+
+    // Kill the connection's outbound queue so the probe send must fail.
+    drop(rx);
+    let stale = sync.observe_frontier(sync.observe_chain_frontier(), t0);
+    sync.sweep_chain_sync(&stale, t0 + Duration::from_mins(20));
+
+    let scheduler = sync.scheduler.lock();
+    let state = scheduler
+        .chain_sync
+        .get(&source)
+        .expect("a failed probe restores the armed record rather than advancing it");
+    assert!(
+        !state.probe_sent(),
+        "the probe never reached the wire, so no response window is running"
     );
 }

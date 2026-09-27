@@ -24,7 +24,7 @@
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
@@ -32,8 +32,10 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_mempool::MempoolGateway;
-use bitcoin_rs_mining::FakeMiningControl;
-use bitcoin_rs_mining::MiningControl;
+use bitcoin_rs_mining::{
+    BlockTemplateRequest, BlockTemplateResult, BlockValidationResult, FakeMiningControl,
+    MiningControl, MiningControlError, MiningInfo,
+};
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_node::tx_ingress::spawn_tx_ingress_consumer;
 use bitcoin_rs_node::{Network, NodeConfig};
@@ -46,7 +48,7 @@ use bitcoin_rs_p2p::{
     TxRelayQueue, spawn_tx_relay_worker,
 };
 use bitcoin_rs_primitives::{
-    Amount, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
+    Amount, Block, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
 };
 use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use crossbeam_channel::Sender;
@@ -137,6 +139,69 @@ fn spending_tx(parent: Txid, output_value: u64) -> Tx {
             script_pubkey: Script::from_bytes(vec![0x6A, 0x04, 0xAA, 0xBB, 0xCC, 0xDD]),
         }],
         lock_time: LockTime::from_consensus(0),
+    }
+}
+
+/// Recording `MiningControl` counting accepted-path template wakes.
+#[derive(Default)]
+struct RecordingMining {
+    publishes: AtomicU64,
+}
+
+impl RecordingMining {
+    fn publish_count(&self) -> u64 {
+        self.publishes.load(Ordering::Relaxed)
+    }
+}
+
+impl MiningControl for RecordingMining {
+    fn get_block_template(
+        &self,
+        _request: BlockTemplateRequest,
+    ) -> Result<BlockTemplateResult, MiningControlError> {
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
+    }
+
+    fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
+    }
+
+    fn network_hash_ps(&self, _lookup: i64, _height: i64) -> Result<f64, MiningControlError> {
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
+    }
+
+    fn submit_block(&self, _block: Block) -> Result<BlockValidationResult, MiningControlError> {
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
+    }
+
+    fn submit_header(
+        &self,
+        _header: bitcoin_rs_primitives::Header,
+    ) -> Result<(), MiningControlError> {
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
+    }
+
+    fn publish_generation(&self) {
+        self.publishes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn generate(
+        &self,
+        _request: bitcoin_rs_mining::GenerateRequest,
+    ) -> Result<Vec<bitcoin_rs_mining::GeneratedBlock>, MiningControlError> {
+        Err(MiningControlError::Failed(
+            "not implemented".to_owned().into(),
+        ))
     }
 }
 
@@ -563,7 +628,7 @@ impl Harness {
         harness.relay = Some(spawn_tx_relay_worker(
             PeerRelaySink::new(harness.state.peer_table()),
             relay_rx,
-            Arc::clone(&harness.gateway),
+            Arc::downgrade(&harness.gateway),
             Arc::clone(&harness.shutdown),
         )?);
         harness.ingress = Some(spawn_tx_ingress_consumer(
@@ -628,9 +693,10 @@ fn full_relay_queue_does_not_block_peer_admission_or_mining_wake() -> anyhow::Re
     let gateway = state.mempool_gateway();
     let (relay, _relay_rx) = TxRelayQueue::new(1);
     let pending = spending_tx(parent_txid(0xEE), 40_000);
-    assert!(relay.announce(pending.txid(), pending.wtxid(), None));
-    let mining = FakeMiningControl::unavailable("not implemented");
-    let mining_control: Arc<dyn MiningControl> = mining.clone();
+    // The filler request is never admitted, so it carries no real epoch.
+    assert!(relay.announce(pending.txid(), pending.wtxid(), None, u64::MAX));
+    let mining = Arc::new(RecordingMining::default());
+    let mining_control: Arc<dyn MiningControl> = Arc::<RecordingMining>::clone(&mining);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (ingress_tx, ingress_rx) = crossbeam_channel::bounded(1);
     let tx = spending_tx(parent_txid(0xDD), 40_000);

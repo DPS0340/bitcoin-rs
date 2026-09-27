@@ -421,9 +421,16 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
         | ApplyError::DurableHeadCommit(_)
         | ApplyError::DurableHeadLineage { .. }
         | ApplyError::DurableHeadGapUnrecoverable { .. } => Fatal,
-        ApplyError::ProofOfWork { .. }
-        | ApplyError::TargetAboveLimit
-        | ApplyError::NbitsNonRetargetMismatch { .. } => Permanent,
+        ApplyError::ProofOfWork { .. } | ApplyError::TargetAboveLimit
+        // Deterministic contextual rejections: the header's branch can
+        // never become valid under these rules, so the subtree is
+        // invalidated rather than retried.
+        | ApplyError::Chain(
+            bitcoin_rs_chain::ChainError::BadVersion { .. }
+            | bitcoin_rs_chain::ChainError::TimewarpAttack { .. }
+            | bitcoin_rs_chain::ChainError::TimestampTooEarly { .. }
+            | bitcoin_rs_chain::ChainError::NbitsMismatch { .. },
+        ) => Permanent,
         ApplyError::Consensus(error) => match error {
             ConsensusError::MerkleRoot
             | ConsensusError::MerkleMutation

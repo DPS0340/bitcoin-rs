@@ -96,10 +96,10 @@ fn fork_getdata_starts_at_common_ancestor_child() -> Result<(), Box<dyn std::err
         let node = tree.node(losing2_id)?;
         TipSnapshot {
             tip_id: losing2_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
 
@@ -125,16 +125,14 @@ fn fork_getdata_starts_at_common_ancestor_child() -> Result<(), Box<dyn std::err
     } = SyncHarness::new(tree);
     applied_tip.store(Some(Arc::new(applied)));
     let peer = SocketAddr::from(([127, 0, 0, 1], 18_460));
-    let (tx, rx) = unbounded::<Message>();
-    peers.register(peer, PeerLease::new(tx));
+    let rx = connect_peer(&peers, synthetic_peer(peer, 100));
 
     assert!(
         sync.send_getdata_for_pending_blocks(
             current_source(&sync.peer_table, peer),
             false,
             100,
-            &test_frontier(&sync),
-            Instant::now(),
+            &test_frontier(&sync)
         )
         .sent
     );
@@ -161,10 +159,10 @@ fn pending_reorg_fixture()
         let node = tree.node(losing2_id)?;
         TipSnapshot {
             tip_id: losing2_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
 
@@ -212,7 +210,6 @@ fn apply_buffered_blocks_waits_for_pending_reorg() -> Result<(), Box<dyn std::er
     sync.buffer_received_block_chunk(
         &mut vec![crate::InboundBlock::from_decoded(head.clone())],
         Some(head_hash),
-        Instant::now(),
     );
     assert!(sync.scheduler.lock().stager.contains(&head_hash));
 
@@ -306,7 +303,8 @@ fn inbound_headers_response_releases_getheaders_gate() -> Result<(), Box<dyn std
 }
 
 #[test]
-fn unconnecting_headers_retain_gate_and_pace_retry() -> Result<(), Box<dyn std::error::Error>> {
+fn rejected_matching_peer_headers_release_gate_and_retry_immediately()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BlockTree::new();
     let genesis = genesis_header();
     let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
@@ -335,10 +333,8 @@ fn unconnecting_headers_retain_gate_and_pace_retry() -> Result<(), Box<dyn std::
         return Err(std::io::Error::other("expected first getheaders").into());
     }
 
-    // An unconnecting batch is not a valid answer, so the request stays
-    // registered. The live gate paces the retry instead of letting the same
-    // locator be replayed at round-trip pace against a peer that already said
-    // it cannot serve the ancestry.
+    // A syntactically valid response consumes the matching request even when
+    // acceptance rejects its headers. Otherwise one bad response stalls sync.
     let orphan_prev = BlockHash(Hash256::from_le_bytes(&[0x11; 32]));
     let orphan = test_header(orphan_prev, 5);
     inbound_headers_tx.send(InboundHeaders {
@@ -349,10 +345,8 @@ fn unconnecting_headers_retain_gate_and_pace_retry() -> Result<(), Box<dyn std::
         body_fetch_owned: false,
     })?;
     sync.tick();
-    assert!(
-        rx.try_recv().is_err(),
-        "a retained gate must not replay getheaders"
-    );
+    assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
+    assert!(rx.try_recv().is_err());
     let tip = chain_tip
         .load_full()
         .ok_or_else(|| std::io::Error::other("missing header tip"))?;

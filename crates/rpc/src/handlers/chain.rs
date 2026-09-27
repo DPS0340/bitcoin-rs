@@ -1013,38 +1013,54 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         ));
     }
     let want_muhash = hash_type == "muhash";
-    // The applied capture runs inside the stable-view barrier: a block
-    // apply takes the matching write authority, so the tip observed here
-    // and the UTXO set being scanned cannot come from different commits.
-    let (view, stats, txouts, transactions, set_hash) =
-        ctx.chain.utxo.with_stable_view(|stable| {
-            let view = ctx.chain.applied_view();
-            let applied_height = view.height();
-            let stats =
-                bitcoin_rs_utxo::stats::scan_coin_stats(stable, applied_height, want_muhash)
+    let (stats, txouts, transactions, set_hash, tip_height, tip_hash, disk_size) =
+        ctx.chain.with_stable_chainstate(|| {
+            ctx.chain.utxo.with_stable_view(|view| {
+                // One published-tip read for the whole response, under the
+                // chain-transition barrier the apply path holds across its
+                // UTXO commit and tip publication: `height` and `best_block`
+                // describe the tip of this pinned snapshot, and every scanned
+                // field below comes from the same stable view, so a connect
+                // landing mid-scan cannot mix two states into one response.
+                // The stable-view lock alone is not enough — the tip is
+                // published outside it — and the barrier nests outside the
+                // view, matching block apply's lock order.
+                let tip = ctx.chain.applied_tip.load_full();
+                let tip_height = tip.as_ref().map_or(0, |tip| tip.height);
+                let tip_hash = tip.as_ref().map_or_else(
+                    || ctx.chain.chain_network.genesis_block_hash(),
+                    |tip| tip.hash,
+                );
+                let stats = bitcoin_rs_utxo::stats::scan_coin_stats(view, tip_height, want_muhash)
                     .map_err(|err| RpcError::Internal(err.to_string()))?;
-            let set_hash = match hash_type {
-                "hash_serialized_3" => Some((
-                    "hash_serialized_3",
-                    stable
-                        .hash_serialized_3()
-                        .map_err(|err| RpcError::Internal(err.to_string()))?
-                        .to_string_be(),
-                )),
-                "muhash" => Some(("muhash", stats.muhash.finalize_hash().to_string_be())),
-                "none" => None,
-                _ => {
-                    return Err(RpcError::InvalidParams(
-                        "hash_type must be one of: hash_serialized_3, muhash, none",
-                    ));
-                }
-            };
-            Ok::<_, RpcError>((view, stats, stable.len(), stable.record_count(), set_hash))
+                let set_hash = match hash_type {
+                    "hash_serialized_3" => Some((
+                        "hash_serialized_3",
+                        view.hash_serialized_3()
+                            .map_err(|err| RpcError::Internal(err.to_string()))?
+                            .to_string_be(),
+                    )),
+                    "muhash" => Some(("muhash", stats.muhash.finalize_hash().to_string_be())),
+                    "none" => None,
+                    _ => {
+                        return Err(RpcError::InvalidParams(
+                            "hash_type must be one of: hash_serialized_3, muhash, none",
+                        ));
+                    }
+                };
+                let disk_size =
+                    u64::try_from(view.memory_report().accounted_bytes()).unwrap_or(u64::MAX);
+                Ok::<_, RpcError>((
+                    stats,
+                    view.len(),
+                    view.record_count(),
+                    set_hash,
+                    tip_height,
+                    tip_hash,
+                    disk_size,
+                ))
+            })
         })?;
-    let applied_height = view.height();
-    let disk_size = ctx.chain.utxo.with_stable_view(|stable| {
-        u64::try_from(stable.memory_report().accounted_bytes()).unwrap_or(u64::MAX)
-    });
     let (hash_serialized_3, muhash) = set_hash.map_or((None, None), |(name, hash)| {
         if name == "hash_serialized_3" {
             (Some(hash), None)
@@ -1053,8 +1069,8 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         }
     });
     typed_to_sonic_omitting_nulls(&v31::GetTxOutSetInfo {
-        height: i64::from(applied_height),
-        best_block: view.hash(ctx.chain.chain_network).to_string_be(),
+        height: i64::from(tip_height),
+        best_block: tip_hash.to_string_be(),
         transactions: Some(i64_saturated_len(transactions)),
         tx_outs: i64_saturated(u64::try_from(txouts).unwrap_or(u64::MAX)),
         bogo_size: i64_saturated(stats.bogo_size),
@@ -1388,7 +1404,7 @@ fn parse_hash(value: &str, label: &str) -> Result<Hash256, RpcError> {
 /// `m_chain` is the connected, fully-validated chain, and header-first sync
 /// keeps headers ahead of it; a block whose header is known but which has not
 /// been connected is not in it, so it is `-1` rather than `0`.
-fn confirmations(ctx: &Context, view: &AppliedView, hash: Hash256, height: u32) -> i64 {
+pub(super) fn confirmations(ctx: &Context, view: &AppliedView, hash: Hash256, height: u32) -> i64 {
     // Membership and depth come from the response's one captured publication.
     let Some(tip) = view.tip() else {
         return -1;
@@ -1810,14 +1826,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let genesis = fixture_genesis();
         let record = BlockRecord::from_block(0, &genesis);
-        let ctx = Arc::new(
-            Context::new().with_block_body_source(Arc::new(SingleBlockSource {
-                height: 0,
-                hash: record.hash,
-                body: consensus_bytes(&genesis),
-                calls: core::sync::atomic::AtomicUsize::new(0),
-            })),
-        );
+        let mut ctx = Context::new();
+        ctx.chain.block_body_source = Some(Arc::new(SingleBlockSource {
+            height: 0,
+            hash: record.hash,
+            body: consensus_bytes(&genesis),
+            calls: core::sync::atomic::AtomicUsize::new(0),
+        }));
+        let ctx = Arc::new(ctx);
         let block_hash_hex = record.hash.to_string();
         let block_size = u64::try_from(record.body_size)?;
         let tx_count = u64::try_from(record.tx_count)?;
@@ -1903,7 +1919,9 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let calls = Arc::clone(&source);
-        let ctx = Arc::new(Context::new().with_block_body_source(source));
+        let mut ctx = Context::new();
+        ctx.chain.block_body_source = Some(source);
+        let ctx = Arc::new(ctx);
         seed_block(&ctx, &genesis, record);
 
         let expected_hex = hex_encode(&body);
@@ -1933,14 +1951,14 @@ mod tests {
         let genesis = fixture_genesis();
         let record = BlockRecord::from_block(0, &genesis);
         let hash = record.hash.to_string();
-        let ctx = Arc::new(
-            Context::new().with_block_body_source(Arc::new(SingleBlockSource {
-                height: 0,
-                hash: record.hash,
-                body: vec![0x00],
-                calls: core::sync::atomic::AtomicUsize::new(0),
-            })),
-        );
+        let mut ctx = Context::new();
+        ctx.chain.block_body_source = Some(Arc::new(SingleBlockSource {
+            height: 0,
+            hash: record.hash,
+            body: vec![0x00],
+            calls: core::sync::atomic::AtomicUsize::new(0),
+        }));
+        let ctx = Arc::new(ctx);
         seed_block(&ctx, &genesis, record);
 
         assert!(matches!(
@@ -1954,14 +1972,14 @@ mod tests {
     fn getblock_verbosity_2_emits_tx_object_per_transaction() {
         let genesis = fixture_genesis();
         let record = BlockRecord::from_block(0, &genesis);
-        let ctx = Arc::new(
-            Context::new().with_block_body_source(Arc::new(SingleBlockSource {
-                height: 0,
-                hash: record.hash,
-                body: consensus_bytes(&genesis),
-                calls: core::sync::atomic::AtomicUsize::new(0),
-            })),
-        );
+        let mut ctx = Context::new();
+        ctx.chain.block_body_source = Some(Arc::new(SingleBlockSource {
+            height: 0,
+            hash: record.hash,
+            body: consensus_bytes(&genesis),
+            calls: core::sync::atomic::AtomicUsize::new(0),
+        }));
+        let ctx = Arc::new(ctx);
         seed_block(&ctx, &genesis, record);
         let block_hash = genesis.block_hash().0;
         let result = getblock(&ctx, &json!([block_hash.to_string_be(), 2]))
@@ -2009,6 +2027,30 @@ mod tests {
             "block_info should be absent for hash_type=none: {result:?}"
         );
         assert!(result.get("height").is_some());
+    }
+
+    #[test]
+    fn gettxoutsetinfo_waits_for_a_complete_chain_transition() {
+        use std::time::Duration;
+
+        let barrier = Arc::new(parking_lot::Mutex::new(()));
+        let ctx = Arc::new(Context::new().with_chain_transition(Arc::clone(&barrier)));
+        let transition = barrier.lock();
+        let worker = Arc::clone(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _ = tx.send(gettxoutsetinfo(&worker, &json!(["none"])));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "gettxoutsetinfo must not mix a transitioning tip with its UTXO scan"
+        );
+        drop(transition);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("gettxoutsetinfo answers once the transition completes");
+        join.join().expect("gettxoutsetinfo thread joins");
+        result.unwrap_or_else(|err| panic!("gettxoutsetinfo failed: {err}"));
     }
 
     #[test]
@@ -2834,33 +2876,6 @@ mod tests {
     }
 
     #[test]
-    fn getblockchaininfo_reports_initial_block_download_false_for_a_recent_regtest_tip() {
-        // A context is assembled before its network is chosen, and the chain
-        // latch must judge the live `chain_network`, not the network the
-        // context was born with. The regtest tip is recent but carries no
-        // chain work, so a latch still holding mainnet's work floor would
-        // answer true forever.
-        let now = unix_now();
-        let ctx = context_with_tip(
-            bitcoin_rs_primitives::Network::Regtest,
-            0x207f_ffff,
-            &[
-                u32::try_from(now.saturating_sub(7_200)).unwrap_or(u32::MAX),
-                u32::try_from(now.saturating_sub(3_600)).unwrap_or(u32::MAX),
-            ],
-        );
-        let result = getblockchaininfo(&ctx, &json!([]))
-            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
-
-        assert_eq!(
-            result
-                .get("initialblockdownload")
-                .and_then(JsonValueTrait::as_bool),
-            Some(false)
-        );
-    }
-
-    #[test]
     fn getblockchaininfo_size_on_disk_zero_for_empty_blocks() {
         let ctx = Arc::new(Context::new());
         let result = getblockchaininfo(&ctx, &json!([]))
@@ -3518,15 +3533,17 @@ mod pruneblockchain_tests {
     }
 
     fn pruning_context() -> Arc<Context> {
-        Arc::new(
-            Context::new().with_prune_service(Arc::new(FakePruneService {
+        {
+            let mut ctx = Context::new();
+            ctx.chain.prune_service = Some(Arc::new(FakePruneService {
                 status: crate::context::PruneStatus {
                     pruned: true,
                     pruneheight: None,
                 },
                 result_pruneheight: None,
-            })),
-        )
+            }));
+            Arc::new(ctx)
+        }
     }
 
     /// Regtest-shaped genesis header for header-only fixtures; only its
@@ -3555,15 +3572,15 @@ mod pruneblockchain_tests {
 
     #[test]
     fn pruneblockchain_returns_service_pruneheight() {
-        let ctx = Arc::new(
-            Context::new().with_prune_service(Arc::new(FakePruneService {
-                status: crate::context::PruneStatus {
-                    pruned: true,
-                    pruneheight: Some(150),
-                },
-                result_pruneheight: Some(150),
-            })),
-        );
+        let mut ctx = Context::new();
+        ctx.chain.prune_service = Some(Arc::new(FakePruneService {
+            status: crate::context::PruneStatus {
+                pruned: true,
+                pruneheight: Some(150),
+            },
+            result_pruneheight: Some(150),
+        }));
+        let ctx = Arc::new(ctx);
         set_applied_tip(&ctx, 400);
 
         let result = pruneblockchain(&ctx, &json!([100]))
@@ -3616,15 +3633,15 @@ mod pruneblockchain_tests {
 
     #[test]
     fn getblockchaininfo_reports_pruned_status_and_pruneheight() {
-        let ctx = Arc::new(
-            Context::new().with_prune_service(Arc::new(FakePruneService {
-                status: crate::context::PruneStatus {
-                    pruned: true,
-                    pruneheight: Some(42),
-                },
-                result_pruneheight: None,
-            })),
-        );
+        let mut ctx = Context::new();
+        ctx.chain.prune_service = Some(Arc::new(FakePruneService {
+            status: crate::context::PruneStatus {
+                pruned: true,
+                pruneheight: Some(42),
+            },
+            result_pruneheight: None,
+        }));
+        let ctx = Arc::new(ctx);
 
         let result = getblockchaininfo(&ctx, &json!([]))
             .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));

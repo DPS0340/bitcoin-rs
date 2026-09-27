@@ -1286,9 +1286,9 @@ mod tests {
 
     #[test]
     fn getrpcinfo_returns_active_commands_and_configured_log_path() {
-        let ctx = Arc::new(
-            Context::new().with_debug_log_path(std::path::PathBuf::from("/tmp/debug.log")),
-        );
+        let mut ctx = Context::new();
+        ctx.debug_log_path = Some(std::path::PathBuf::from("/tmp/debug.log"));
+        let ctx = Arc::new(ctx);
         let result =
             getrpcinfo(&ctx, &json!([])).unwrap_or_else(|err| panic!("getrpcinfo failed: {err}"));
         assert!(
@@ -1361,7 +1361,9 @@ mod tests {
             fn publish_rawblock(&self, _bytes: &[u8]) {}
             fn publish_rawtx(&self, _bytes: &[u8]) {}
         }
-        let ctx = Arc::new(Context::new().with_zmq_publisher(Arc::new(NotifierPublisher)));
+        let mut ctx = Context::new();
+        ctx.zmq_publisher = Arc::new(NotifierPublisher);
+        let ctx = Arc::new(ctx);
         let result = getzmqnotifications(&ctx, &json!([]))
             .unwrap_or_else(|err| panic!("getzmqnotifications failed: {err}"));
         let Some(arr) = result.as_array() else {

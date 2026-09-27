@@ -615,6 +615,23 @@ impl<'a> ParsedTransaction<'a> {
         &bytes[start..end]
     }
 
+    /// Borrowed parts of the canonical serialization without witness data.
+    ///
+    /// Concatenating these parts preserves the version, inputs, outputs, and
+    /// lock time while omitting the BIP144 marker/flag and witness section.
+    /// Legacy transactions occupy the first part; the other parts are empty.
+    #[must_use]
+    pub fn stripped_parts(&self) -> [&'a [u8]; 3] {
+        if !self.segwit {
+            return [slice_at(self.bytes, self.span), &[], &[]];
+        }
+        [
+            slice_at(self.bytes, self.version_span),
+            self.segwit_base_body(),
+            slice_at(self.bytes, self.lock_time_span),
+        ]
+    }
+
     /// Materializes the owned transaction from the validated spans.
     ///
     /// Infallible: every span was bounds-checked at parse time, so the scalar

@@ -390,8 +390,8 @@ pub enum ScriptError {
     /// The delegated consensus verifier rejected the script.
     #[error("script verification failed: {0}")]
     Verification(String),
-    /// Taproot key-path verification requires all prevouts for multi-input transactions.
-    #[error("taproot key-path verification requires all prevouts for multi-input transactions")]
+    /// The supplied prevout set does not match the transaction input count.
+    #[error("prevout count does not match transaction input count")]
     TaprootPrevoutsUnavailable,
     /// The script evaluated to a Core-named failure.
     #[error("script failed: {code}")]
@@ -410,16 +410,49 @@ pub enum ScriptError {
 pub struct Interpreter;
 
 impl Interpreter {
+    /// Executes a script spend through the enabled script backend.
+    ///
+    /// When `script_sig` and `witness` already match the bytes stored on
+    /// `tx.inputs[input_idx]` — true for every block/mempool validation caller,
+    /// which reads them straight off the transaction — `tx` is used as-is with
+    /// no clone. Only callers that pass substitute bytes (e.g. vector tests
+    /// grafting a foreign witness) pay for a clone to splice them in.
+    ///
+    /// This wrapper supplies one prevout and therefore only supports
+    /// single-input transactions. A multi-input transaction returns
+    /// [`ScriptError::TaprootPrevoutsUnavailable`]; use
+    /// [`Self::execute_with_prevouts`] with the complete ordered set instead.
+    pub fn execute(
+        &self,
+        script_pubkey: &[u8],
+        script_sig: &[u8],
+        witness: &[Vec<u8>],
+        flags: VerifyFlags,
+        prevout: &TxOut,
+        tx: &Tx,
+        input_idx: usize,
+    ) -> Result<bool, ScriptError> {
+        self.execute_with_prevouts(
+            script_pubkey,
+            script_sig,
+            witness,
+            flags,
+            std::slice::from_ref(prevout),
+            tx,
+            input_idx,
+        )
+    }
+
     /// Executes a script spend with the complete ordered prevout set.
     ///
-    /// PRE: `prevouts.len() == tx.inputs.len()`, in input order.
-    /// POST: returns the spend verdict for input `input_idx`; a prevout
-    ///       slice whose length differs from the input count is refused
-    ///       with [`ScriptError::TaprootPrevoutsUnavailable`] before any
-    ///       evaluation.
-    /// INVARIANT: every accepted call evaluates against the prevout of the
-    ///       input being spent; no length-mismatched slice is ever
-    ///       re-indexed.
+    /// `prevouts` must contain one spent output for each input, in input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::TaprootPrevoutsUnavailable`] if the prevout count
+    /// differs from the transaction input count. Returns
+    /// [`ScriptError::InputIndexOutOfRange`] if `input_idx` is invalid after
+    /// the count matches. The count check runs before script evaluation.
     pub fn execute_with_prevouts(
         &self,
         script_pubkey: &[u8],
@@ -431,6 +464,9 @@ impl Interpreter {
         input_idx: usize,
     ) -> Result<bool, ScriptError> {
         let inputs = tx.inputs.len();
+        if prevouts.len() != inputs {
+            return Err(ScriptError::TaprootPrevoutsUnavailable);
+        }
         let input = tx
             .inputs
             .get(input_idx)
@@ -438,16 +474,9 @@ impl Interpreter {
                 index: input_idx,
                 inputs,
             })?;
-        let prevout = if prevouts.len() == inputs {
-            &prevouts[input_idx]
-        } else if prevouts.len() == 1 {
-            // `execute` forwards a one-element slice for the current input.
-            prevouts
-                .first()
-                .ok_or(ScriptError::TaprootPrevoutsUnavailable)?
-        } else {
-            return Err(ScriptError::TaprootPrevoutsUnavailable);
-        };
+        let prevout = prevouts
+            .get(input_idx)
+            .ok_or(ScriptError::TaprootPrevoutsUnavailable)?;
 
         let matches_tx = input.script_sig.as_slice() == script_sig
             && input.witness.len() == witness.len()
@@ -728,11 +757,6 @@ fn verify_taproot(
     prevouts: &[TxOut],
     flags: VerifyFlags,
 ) -> Result<bool, ScriptError> {
-    if prevouts.len() != spending.inputs.len() {
-        return Err(ScriptError::TaprootPrevoutsUnavailable);
-    }
-
-    // The 32-byte output key is the witness program (bytes 2..34 of the
     // scriptPubKey). `is_p2tr` already confirmed the shape.
     let program = script_pubkey
         .get(2..34)

@@ -593,7 +593,7 @@ fn admit_to_mempool(state: &NodeState, tx: &Tx) -> Result<()> {
     let utxo = state.chainstate().utxo_handle();
     let applied_tip = state.chainstate().applied_tip_reader();
     let block_tree = state.chainstate().block_tree_reader();
-    let view = ChainAdmissionView::new(&utxo, &applied_tip, &block_tree, Network::Regtest);
+    let view = ChainAdmissionView::new(utxo, applied_tip, block_tree, Network::Regtest);
     let outcome = state.mempool_gateway().submit_transaction(
         Arc::new(tx.clone()),
         AdmissionOrigin::Rpc,
@@ -682,14 +682,9 @@ fn mining_handler(state: &NodeState) -> Handler {
             ibd,
         ),
         mempool: MempoolHandles {
-            mempool: MempoolGateway::shared(state.mempool()),
+            gateway: MempoolGateway::shared(state.mempool()),
         },
-        indexes: IndexHandles {
-            derived_index: None,
-            esplora_tx_index: None,
-            script_index: None,
-            derived_index_status: None,
-        },
+        indexes: IndexHandles::default(),
         network: NetworkHandles {
             network: state.network(),
             network_active: state.network_active(),
@@ -702,7 +697,8 @@ fn mining_handler(state: &NodeState) -> Handler {
         mining: MiningHandles {
             mining_control: Some(mining_control),
         },
-    });
+    })
+    .with_chain_transition(state.chainstate().read_fence());
     Handler::new(Arc::new(ctx))
 }
 

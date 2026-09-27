@@ -181,6 +181,16 @@ fn funded_fee_tx(ctx: &Context, label: u8, fee: u64) -> Tx {
     tx(fund_utxo(ctx, label, 10_000 + fee), 10_000, 0xffff_ffff)
 }
 
+/// Whether the context's pool currently holds `tx`.
+fn pool_holds(ctx: &Context, tx: &Tx) -> bool {
+    ctx.mempool.read().contains_txid(&rpc_txid(tx))
+}
+
+/// Raises the pool's minimum relay fee floor to `sat_per_kvb`.
+fn set_relay_floor(ctx: &Context, sat_per_kvb: u64) {
+    ctx.mempool.pool().write().limits.min_relay_fee_sat_per_kvb = sat_per_kvb;
+}
+
 #[test]
 fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
 -> Result<(), Box<dyn Error>> {
@@ -191,7 +201,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
     let handler = Handler::new(Arc::clone(&plain));
     handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&ordinary)]))?;
     assert!(
-        plain.mempool.read().contains_txid(&rpc_txid(&ordinary)),
+        pool_holds(&plain, &ordinary),
         "an ordinary between-the-guards tx must admit"
     );
 
@@ -201,12 +211,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
     // outlets — the order Core 31.1 uses (admission failure first, then the
     // fee cap).
     let strict = Arc::new(Context::new());
-    strict
-        .mempool
-        .pool()
-        .write()
-        .limits
-        .min_relay_fee_sat_per_kvb = 20_000_000;
+    set_relay_floor(&strict, 20_000_000);
     let both = funded_fee_tx(&strict, 0x81, 1_230);
     let handler = Handler::new(Arc::clone(&strict));
     let message = reject_message(
@@ -244,7 +249,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
         "testmempoolaccept must report the floor class, not max-fee"
     );
     assert!(
-        !strict.mempool.read().contains_txid(&rpc_txid(&both)),
+        !pool_holds(&strict, &both),
         "rejected tx must not enter the pool"
     );
 
@@ -1664,7 +1669,8 @@ fn reorg_mine_and_apply(
 }
 
 fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>> {
-    let Some(tip) = state.chainstate().applied_tip_snapshot() else {
+    let applied = state.chainstate().applied_tip_reader();
+    let Some(tip) = applied.load_full() else {
         return Err("applied tip must exist".into());
     };
     Ok((tip.hash, tip.height))
@@ -1687,7 +1693,7 @@ fn invalidation_handler(state: &NodeState) -> Handler {
                 ibd,
             ),
             mempool: MempoolHandles {
-                mempool: MempoolGateway::shared(state.mempool()),
+                gateway: MempoolGateway::shared(state.mempool()),
             },
             indexes: IndexHandles {
                 derived_index: None,
@@ -1777,12 +1783,10 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
         MempoolLimits::default(),
     ))));
     let chainstate = state.chainstate();
-    let applied_tip = chainstate.applied_tip_reader();
-    let block_tree = chainstate.block_tree_reader();
     let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
-        chainstate.utxo(),
-        &applied_tip,
-        &block_tree,
+        chainstate.utxo_handle(),
+        chainstate.applied_tip_reader(),
+        chainstate.block_tree_reader(),
         chainstate.network(),
     );
     let change = gateway.begin_chain_change()?;

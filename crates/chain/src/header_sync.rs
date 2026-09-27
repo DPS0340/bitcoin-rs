@@ -14,6 +14,28 @@ use crate::{
 /// current system time, per the Bitcoin consensus future-drift bound.
 const MAX_FUTURE_TIME_SECONDS: u32 = 7200;
 
+/// Outcome of admitting one inbound headers batch into the block tree.
+///
+/// The header-admission vocabulary lives beside [`accept_headers`] so the
+/// authoritative tree writer and every caller share one result type.
+pub enum HeaderAdmission {
+    /// Batch accepted into the block tree.
+    Accepted {
+        /// Headers accepted from the batch.
+        accepted: usize,
+        /// Hash of the last accepted header, when any were admitted.
+        announced_tip: Option<Hash256>,
+        /// Height of `announced_tip` on the active chain, when resolvable.
+        active_height: Option<i32>,
+    },
+    /// Header validation rejected the batch (peer-fault classification stays
+    /// with the caller).
+    Rejected(ChainError),
+    /// Admission refused before validation (chain transition lock
+    /// unavailable); batch dropped.
+    Refused(Box<dyn core::error::Error + Send + Sync>),
+}
+
 /// Accepts a contiguous batch of headers after proof-of-work validation.
 ///
 /// An already-present header not marked invalid is an idempotent input: the
@@ -70,7 +92,7 @@ pub fn accept_headers(
             // before any contextual rule runs
             // (`src/validation.cpp:4228-4231`), so the header never grows
             // the invalid subtree.
-            return Err(ChainError::InvalidParent { prev_hash });
+            return Err(ChainError::InvalidParent { parent: parent_id });
         }
         validate_contextual_header(tree, parent_id, header, network, now_secs)?;
         let id = tree.insert_header_with_hash(*header, hash, NodeStatus::HeaderValid)?;
@@ -111,7 +133,8 @@ fn unix_seconds_at(now: std::time::SystemTime) -> u32 {
 ///
 /// INVARIANT: header admission and direct block connection use this
 /// operation; no caller implements a second version, timewarp, or nBits
-/// predicate.
+/// predicate. The BIP94 boundary predicate and floor live in
+/// [`minimum_candidate_time`], which the mining candidate context shares.
 pub fn validate_contextual_header(
     tree: &BlockTree,
     parent_id: NodeId,
@@ -143,15 +166,18 @@ pub fn validate_contextual_header(
 
     // BIP94 timewarp floor at a difficulty-adjustment boundary: the
     // candidate may not fall more than `MAX_TIMEWARP` below its parent
-    // (`src/validation.cpp:4100-4110`).
-    if let Some(minimum) = bip94_timewarp_floor(network, height, parent.header.time) {
-        if header.time < minimum {
-            return Err(ChainError::TimewarpAttack {
-                height,
-                timestamp: header.time,
-                minimum,
-            });
-        }
+    // (`src/validation.cpp:4100-4110`). Consensus applies it only where the
+    // BIP94 deployment is active; the mining floor in
+    // [`minimum_candidate_time`] applies it on every network as policy.
+    if network.enforce_bip94()
+        && let Some(minimum) = minimum_candidate_time(parent.header.time, height, network)
+        && header.time < minimum
+    {
+        return Err(ChainError::TimewarpAttack {
+            height,
+            timestamp: header.time,
+            minimum,
+        });
     }
 
     // Future-drift ceiling.
@@ -180,6 +206,26 @@ pub fn validate_contextual_header(
         }
     }
     Ok(())
+}
+
+/// The timewarp floor a candidate at `height` inherits from a parent that
+/// carried `parent_time`.
+///
+/// PRE: `height` is the candidate's height, one above its parent.
+///
+/// POST: returns `Some(minimum)` at every difficulty-adjustment boundary,
+/// where `minimum` is `parent_time` minus [`MAX_TIMEWARP`]; `None` off the
+/// boundary.
+///
+/// INVARIANT: this operation is the one boundary predicate and floor, which
+/// Core's `GetMinimumTime` (`src/node/miner.cpp:42-49`) applies on every
+/// network as mining policy. Consensus rejection still requires the BIP94
+/// deployment: [`validate_contextual_header`] gates this floor on
+/// `network.enforce_bip94()` (`src/validation.cpp:4100-4110`).
+pub fn minimum_candidate_time(parent_time: u32, height: u32, network: Network) -> Option<u32> {
+    let retarget_interval = network.retarget_interval();
+    (retarget_interval != 0 && height.is_multiple_of(retarget_interval))
+        .then(|| parent_time.saturating_sub(MAX_TIMEWARP))
 }
 
 fn validate_empty_tree_root(
@@ -446,30 +492,6 @@ pub fn permitted_difficulty_transition(
     pow::compact_to_target(pow::target_to_compact(smallest)) <= observed
 }
 
-/// Whether `height` lands on a difficulty-adjustment boundary of `network`.
-///
-/// That boundary is the point where Core's `GetMinimumTime` applies the
-/// `parent.time - MAX_TIMEWARP` timewarp floor
-/// (`src/node/miner.cpp:42-49`); the floor is advisory on every network
-/// and a consensus rule only where [`Network::enforce_bip94`] holds
-/// (`src/validation.cpp:4100-4110`).
-#[must_use]
-pub fn at_retarget_boundary(network: Network, height: u32) -> bool {
-    let retarget_interval = network.retarget_interval();
-    retarget_interval != 0 && height.is_multiple_of(retarget_interval)
-}
-
-/// The consensus timewarp floor for a candidate at `height` extending a
-/// parent stamped `parent_time`.
-///
-/// `Some(parent_time - MAX_TIMEWARP)` at a difficulty-adjustment boundary
-/// on a BIP94 network, `None` elsewhere.
-#[must_use]
-pub fn bip94_timewarp_floor(network: Network, height: u32, parent_time: u32) -> Option<u32> {
-    (network.enforce_bip94() && at_retarget_boundary(network, height))
-        .then(|| parent_time.saturating_sub(MAX_TIMEWARP))
-}
-
 /// Compact proof-of-work target decode/encode and block-work helpers.
 ///
 /// These mirror Bitcoin Core's `arith_uint256::SetCompact`/`GetCompact`
@@ -732,6 +754,7 @@ mod timestamp_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod contextual_header_tests {
     use super::{
         MAX_FUTURE_TIME_SECONDS, accept_headers, compact_is_met_by, next_work_required,
@@ -928,7 +951,7 @@ mod contextual_header_tests {
         let child = mine_regtest(prev, 2, now, 4);
         assert_eq!(
             accept_headers(&mut tree, &[child], network, now),
-            Err(ChainError::InvalidParent { prev_hash: prev.0 }),
+            Err(ChainError::InvalidParent { parent: block_one }),
             "a child of an invalidated header is refused, not accepted as invalid"
         );
         assert_eq!(
