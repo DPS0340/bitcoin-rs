@@ -247,10 +247,12 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     remaining_time(deadline, Instant::now(), "P2P operation deadline")
 }
 
-/// Partial bytes of an in-flight wire frame carried between calls. A read
-/// interrupted by its deadline resumes here instead of leaving the socket
-/// mid-frame, so pump-slice deadlines can pause a frame without desyncing
-/// the stream. Cleared when the frame completes or the socket closes.
+/// Partial bytes of an in-flight wire frame carried between calls.
+///
+/// A read interrupted by its deadline resumes here instead of leaving the
+/// socket mid-frame, so pump-slice deadlines can pause a frame without
+/// desyncing the stream. Cleared when the frame completes or the socket
+/// closes.
 #[derive(Debug, Default)]
 pub struct FrameBuffer {
     bytes: Vec<u8>,
@@ -271,6 +273,7 @@ fn payload_length(header: &[u8]) -> Result<usize> {
 }
 
 /// Read one complete wire frame (header plus payload) before the deadline.
+///
 /// `pending` carries an in-flight frame between calls: an interrupt leaves
 /// the consumed bytes there and the next call resumes them, so a retry
 /// never reads a desynced offset.
@@ -282,22 +285,23 @@ pub fn read_frame(
     if pending.want == 0 {
         pending.want = HEADER_BYTES;
     }
-    let mut scratch = [0; 64 * 1024];
     while pending.bytes.len() < pending.want {
-        let want = (pending.want - pending.bytes.len()).min(scratch.len());
+        let want = (pending.want - pending.bytes.len()).min(64 * 1024);
+        let base = pending.bytes.len();
+        pending.bytes.resize(base + want, 0);
         // The deadline bounds every wait, with a floor for an already
         // lapsed deadline; a byte slipping in during that floor does not
         // renew it — the lapsed deadline interrupts after the read below.
         let wait = remaining(deadline).unwrap_or(Duration::from_millis(1));
         stream.set_read_timeout(Some(wait))?;
-        match stream.read(&mut scratch[..want]) {
+        match stream.read(&mut pending.bytes[base..]) {
             Ok(0) => {
                 pending.bytes.clear();
                 pending.want = 0;
                 return Err(Error::Protocol("truncated P2P frame".to_owned()));
             }
             Ok(count) => {
-                pending.bytes.extend_from_slice(&scratch[..count]);
+                pending.bytes.truncate(base + count);
                 if pending.want == HEADER_BYTES && pending.bytes.len() == HEADER_BYTES {
                     pending.want = HEADER_BYTES
                         + payload_length(&pending.bytes).inspect_err(|_| {
@@ -311,7 +315,10 @@ pub fn read_frame(
                     ));
                 }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                pending.bytes.truncate(base);
+                return Err(error.into());
+            }
         }
     }
     let frame = std::mem::take(&mut pending.bytes);
