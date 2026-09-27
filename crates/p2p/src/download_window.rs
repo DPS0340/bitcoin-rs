@@ -270,7 +270,6 @@ pub fn serves_requested_height(peer: &PeerInfo, policy: &BlockDownloadPolicy) ->
     let network = ServiceFlags::NETWORK.to_u64();
     let limited = ServiceFlags::NETWORK_LIMITED.to_u64();
     let witness = ServiceFlags::WITNESS.to_u64();
-    let limited = ServiceFlags::NETWORK_LIMITED.to_u64();
     if peer.services & witness == 0 {
         return false;
     }
