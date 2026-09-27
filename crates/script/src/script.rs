@@ -360,7 +360,11 @@ fn next_op<'a>(script: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
     let len = match opcode {
         0x01..=0x4b => usize::from(opcode),
         opcode::OP_PUSHDATA1 | opcode::OP_PUSHDATA2 | opcode::OP_PUSHDATA4 => {
-            let width = usize::from(opcode - opcode::OP_PUSHDATA1 + 1);
+            let width = if opcode == opcode::OP_PUSHDATA4 {
+                4
+            } else {
+                usize::from(opcode - opcode::OP_PUSHDATA1 + 1)
+            };
             let bytes = script.get(*pos..pos.checked_add(width)?)?;
             *pos += width;
             let mut len = 0usize;
@@ -377,18 +381,16 @@ fn next_op<'a>(script: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
 }
 
 /// Core `CheckMinimalPush`: the opcode must be the smallest push form
-/// that can carry `data.len()` bytes.
-fn minimal_push_opcode(opcode: u8, data_len: usize) -> bool {
-    match data_len {
-        0 => {
-            opcode == opcode::OP_0
-                || opcode == opcode::OP_1NEGATE
-                || opcode::decode_pushnum(opcode).is_some()
-        }
-        1..=75 => usize::from(opcode) == data_len,
+/// that can carry `data`, and one-byte small integers must use their
+/// dedicated opcodes (`OP_0`, `OP_1NEGATE`, `OP_1..=OP_16`).
+fn minimal_push(opcode: u8, data: &[u8]) -> bool {
+    match data.len() {
+        0 => opcode == opcode::OP_0,
+        1 if (1..=16).contains(&data[0]) || data[0] == 0x81 => false,
+        1..=75 => usize::from(opcode) == data.len(),
         76..=255 => opcode == opcode::OP_PUSHDATA1,
         256..=65_535 => opcode == opcode::OP_PUSHDATA2,
-        _ => opcode == opcode::OP_PUSHDATA4,
+        _ => true,
     }
 }
 
@@ -423,7 +425,7 @@ fn script_count(opcode: u8, data: &[u8], min: i64, max: i64) -> Option<u8> {
     let count = if let Some(pushnum) = opcode::decode_pushnum(opcode) {
         i64::from(pushnum)
     } else if opcode <= opcode::OP_PUSHDATA4 {
-        if !minimal_push_opcode(opcode, data.len()) {
+        if !minimal_push(opcode, data) {
             return None;
         }
         minimal_script_num(data)?
