@@ -43,6 +43,11 @@ const DEFAULT_MAX_PEER_CONNECTIONS: usize = 200;
 
 const FAILED_ADDR_BACKOFF: Duration = Duration::from_mins(1);
 
+/// How many capacity-blocked automatic dials the drain worker holds for
+/// retry. Comfortably above any reachable slot count, so a saturated cap
+/// cannot let the parked backlog grow without limit.
+const MAX_PARKED_DIALS: usize = 64;
+
 const DNS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
 const DNS_BOOTSTRAP_REFILL_INTERVAL: Duration = Duration::from_secs(1);
@@ -476,7 +481,9 @@ impl P2pService {
                         continue;
                     };
                     if !dial.manual && automatic_in_flight(&active) >= cap {
-                        parked.push_back(dial);
+                        if parked.len() < MAX_PARKED_DIALS {
+                            parked.push_back(dial);
+                        }
                         continue;
                     }
                     spawn_outbound_dial(
