@@ -1052,20 +1052,20 @@ fn retire_extra_full_relay_connection(
 ///   answers whether a candidate's body download is in flight, read from the
 ///   same window the scheduler fetches with.
 /// POST: return `None` while the table holds no more than `slots` such
-///   connections; otherwise return the newest automatic one in the excess
-///   slice past `slots` that is old enough to be judged and has no body
-///   download in flight.
+///   connections; otherwise return the newest automatic one among the newest
+///   `excess` non-pinned connections that is old enough to be judged and has
+///   no body download in flight.
 /// INVARIANT: a connection that never finished its handshake still holds a
 ///   slot, so it counts, but a hand-pinned one is never the victim: Core's
 ///   `EvictExtraOutboundPeers` looks only at `IsFullOutboundConn()` and
 ///   `IsBlockOnlyConn()`, neither of which includes
-///   `ConnectionType::MANUAL` (`net_processing.cpp:5558-5604`). The victim
-///   comes only from the excess slice, so a young extra connection can
-///   never divert retirement onto an in-slot peer, and a candidate with
+///   `ConnectionType::MANUAL` (`net_processing.cpp:5558-5604`). Pinned peers
+///   do not consume the victim budget either — a pinned tail still displaces
+///   the newest evictable automatic beneath it — while a candidate with
 ///   blocks in flight is passed over, as Core's rule does
 ///   (`net_processing.cpp:5604-5668`).
 ///   `PeerTable::sessions` is ordered by connection identity, which is dial
-///   order, so the newest is last and the excess slice is the tail.
+///   order, so the newest is last and the excess is taken from the tail.
 fn newest_excess_full_relay(
     peer_table: &crate::PeerTable,
     slots: usize,
@@ -1091,11 +1091,11 @@ fn newest_excess_full_relay(
     sessions
         .iter()
         .rev()
+        .filter(|session| !session.lease.is_manual())
         .take(excess)
         .find(|session| {
-            !session.lease.is_manual()
-                && now.saturating_duration_since(session.lease.connected_at())
-                    >= crate::download_window::MINIMUM_CONNECT_TIME
+            now.saturating_duration_since(session.lease.connected_at())
+                >= crate::download_window::MINIMUM_CONNECT_TIME
                 && !is_downloading(session.lease.source(session.addr))
         })
         .cloned()
@@ -1736,6 +1736,48 @@ mod tests {
                 .addr,
             addr(4),
             "the same peer is the victim once its download completes"
+        );
+    }
+
+    /// A pinned peer that connects on top of a full automatic set occupies
+    /// the only excess position, so position alone cannot name a victim:
+    /// the newest automatic connection beneath the pinned tail is retired,
+    /// matching `p2p-compatibility.md`'s rule that the pin counts toward
+    /// the slot total while never being the victim itself.
+    #[test]
+    fn a_pinned_tail_displaces_the_newest_automatic_peer() {
+        use crate::connection::PeerLease;
+        use crate::download_window::MINIMUM_CONNECT_TIME;
+        use crate::peer_info::PeerRole;
+
+        fn addr(port: u16) -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+
+        let now = Instant::now();
+        let aged = now
+            .checked_sub(MINIMUM_CONNECT_TIME)
+            .expect("test clock is past the minimum connect time");
+        let table = crate::PeerTable::new();
+
+        // The automatic set fills both slots before the operator's dial.
+        for port in 1..=2_u16 {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let mut lease = PeerLease::new(tx);
+            lease.backdate_for_test(aged);
+            table.register(addr(port), lease);
+        }
+        let (pinned_tx, _pinned_rx) = crossbeam_channel::unbounded();
+        let mut pinned_lease = PeerLease::new_manual(pinned_tx, PeerRole::FullRelay);
+        pinned_lease.backdate_for_test(aged);
+        table.register(addr(3), pinned_lease);
+
+        assert_eq!(
+            newest_excess_full_relay(&table, 2, now, |_| false)
+                .expect("a full set plus a pinned peer is one connection over")
+                .addr,
+            addr(2),
+            "the pinned tail is unevictable, so the newest automatic peer is displaced"
         );
     }
 }
