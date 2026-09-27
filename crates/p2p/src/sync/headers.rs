@@ -872,12 +872,20 @@ impl BlockSync {
             .peer_table
             .send_then(source, msg, || {
                 if track {
-                    self.scheduler.lock().header_request = Some(PendingHeaderRequest {
-                        source,
-                        locator_tip_hash,
-                        target_height,
-                        requested_at: now,
-                    });
+                    let mut scheduler = self.scheduler.lock();
+                    // A continuation from a different peer must not replace
+                    // the singleton request its current owner still owes.
+                    if scheduler
+                        .header_request
+                        .is_none_or(|pending| pending.source == source)
+                    {
+                        scheduler.header_request = Some(PendingHeaderRequest {
+                            source,
+                            locator_tip_hash,
+                            target_height,
+                            requested_at: now,
+                        });
+                    }
                 }
             })
             .is_err()

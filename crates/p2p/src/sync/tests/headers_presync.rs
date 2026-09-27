@@ -818,3 +818,43 @@ fn a_terminal_low_work_page_demotes_the_source() -> Result<(), Box<dyn std::erro
     );
     Ok(())
 }
+
+#[test]
+fn unsolicited_presync_continuation_keeps_another_peers_pending_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (owner_addr, _owner_lease, owner_rx) = connect(&peers, 9707, 100_000);
+    sync.tick();
+    let _ = next_locator(&owner_rx)
+        .ok_or_else(|| std::io::Error::other("the owner request was not sent"))?;
+    let owner = current_source(&peers, owner_addr);
+    assert!(
+        sync.scheduler
+            .lock()
+            .header_request
+            .is_some_and(|request| request.source == owner),
+        "the pending header request must belong to the first peer"
+    );
+
+    let (sender_addr, _sender_lease, sender_rx) = connect(&peers, 9708, 100_000);
+    let sender = current_source(&peers, sender_addr);
+    deliver_headers(&inbound_headers_tx, chain_on(&genesis, 0, PAGE), sender)?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, sender),
+        Some(HeadersSyncPhase::Presync),
+        "the unsolicited full page must enter presync"
+    );
+    let _ = next_locator(&sender_rx)
+        .ok_or_else(|| std::io::Error::other("the presync continuation was not sent"))?;
+
+    assert!(
+        sync.scheduler
+            .lock()
+            .header_request
+            .is_some_and(|request| request.source == owner),
+        "an unsolicited low-work continuation must not replace another peer's request"
+    );
+    Ok(())
+}
