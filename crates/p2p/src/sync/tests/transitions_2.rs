@@ -296,6 +296,7 @@ fn retarget_runs_before_the_peer_budget_truncates() -> Result<(), Box<dyn std::e
         Arc::clone(&peers),
         inbound_headers_rx,
         inbound_blocks_rx,
+        crate::sync::syncing_ibd_latch(),
     );
     // Fill the window with losing-branch pending: a pending cap of the losing
     // branch's length makes the scan limit exactly zero once it is full.
