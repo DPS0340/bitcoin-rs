@@ -1545,8 +1545,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
 
         let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
-        let status: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource> =
-            Arc::new(ReadySource);
+        let status: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource> = Arc::new(ReadySource);
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
                 chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
