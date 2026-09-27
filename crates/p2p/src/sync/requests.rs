@@ -13,9 +13,8 @@ use crate::Message;
 use crate::connection::PeerSource;
 use crate::download_window::BlockDownloadPolicy;
 use crate::download_window::SyncPeer;
-use crate::download_window::servable_floor;
-use crate::download_window::serves_requested_height;
 use crate::download_window::statically_fanout_eligible;
+use crate::download_window::{peer_can_serve_height, servable_floor, serves_requested_height};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_primitives::Hash256;
@@ -289,7 +288,9 @@ impl BlockSync {
             if source == owner || !statically_fanout_eligible(&peer, &policy) {
                 continue;
             }
-            if capability.is_some_and(|height| height >= active_front_height) {
+            if capability
+                .is_some_and(|height| peer_can_serve_height(&peer, height, active_front_height))
+            {
                 eligible.push(source);
             }
         }

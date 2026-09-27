@@ -15,7 +15,7 @@ use crate::download_window::SyncPeer;
 use crate::download_window::SyncPeerSelection;
 use crate::download_window::configure_request_mode;
 use crate::download_window::{
-    BlockDownloadPolicy, serves_requested_height, statically_fanout_eligible,
+    BlockDownloadPolicy, peer_can_serve_height, serves_requested_height, statically_fanout_eligible,
 };
 use crate::peer_info::PeerRole;
 use bitcoin_rs_chain::BlockTree;
@@ -530,6 +530,40 @@ impl BlockSync {
     /// frontier's usable-peer snapshot. The selection no longer re-walks the
     /// session table or the block tree: `observe_frontier` already resolved
     /// each peer's demonstrated capability once this tick.
+
+    /// The height- and service-eligible body candidates for one selection pass.
+    ///
+    /// PRE: `required_height` is the canonical next-required body height and
+    ///   `policy` carries the same height with the node's sync phase.
+    /// POST: every returned candidate's demonstrated chain covers
+    ///   `required_height` inside the peer's retained window, and each carries
+    ///   the two sealed service clauses separately.
+    fn body_candidates(
+        frontier: &SyncFrontier,
+        required_height: u32,
+        policy: &BlockDownloadPolicy,
+    ) -> Vec<FanoutCandidate> {
+        let mut candidates: Vec<FanoutCandidate> = Vec::new();
+        for peer in &frontier.usable_peers {
+            let Some(active_height) = peer.capability() else {
+                continue;
+            };
+            if !peer_can_serve_height(&peer.info, active_height, required_height) {
+                continue;
+            }
+            candidates.push(FanoutCandidate {
+                peer: SyncPeer {
+                    source: peer.source,
+                    best_known_height: i32::try_from(active_height).unwrap_or(i32::MAX),
+                },
+                serves_bodies: serves_requested_height(&peer.info, policy),
+                fanout_eligible: statically_fanout_eligible(&peer.info, policy),
+                soft_blocked: false,
+            });
+        }
+        candidates
+    }
+
     pub(super) fn sync_peer_selection(
         &self,
         frontier: &SyncFrontier,
@@ -589,8 +623,9 @@ impl BlockSync {
         // value alone — a long-lived at-tip peer would otherwise become
         // ineligible for every newly announced block (#617). Per-request
         // truncation by `peer_best_height` still bounds the damage of a
-        // stale value. With nothing required the clause reduces to the
-        // applied tip's successor, as before.
+        // stale value. `peer_can_serve_height` also keeps a limited-service
+        // peer inside its retained range. With nothing required the clause
+        // reduces to the applied tip's successor, as before.
         let required_height = frontier.chain.next_required.map_or_else(
             || {
                 frontier
@@ -612,7 +647,7 @@ impl BlockSync {
             let Some(active_height) = peer.capability() else {
                 continue;
             };
-            if active_height < required_height {
+            if !peer_can_serve_height(&peer.info, active_height, required_height) {
                 continue;
             }
             candidates.push(FanoutCandidate {

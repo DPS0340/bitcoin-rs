@@ -35,8 +35,18 @@ const BLOCK_DOWNLOAD_TIMEOUT_PER_PEER: u32 = 1;
 /// blocks: Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`
 /// (`net_processing.cpp:159`), the 288 blocks a `NODE_NETWORK_LIMITED` peer
 /// keeps past its pruning horizon. Core holds a two-block race buffer at
-/// `:1637`; this node keeps the plain 288.
+/// `:1637`; the handshake clause keeps the plain 288, and the
+/// demonstrated-height clause ([`peer_can_serve_height`]) applies the
+/// buffer.
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
+/// Core's limited-service race buffer (`net_processing.cpp:1637`): a peer
+/// that keeps only the retained window may have pruned two of its newest
+/// blocks by the time the request lands.
+const NODE_NETWORK_LIMITED_RACE_BUFFER: u32 = 2;
+/// `NODE_NETWORK_LIMITED` (bit 10) has no `ServiceFlags` variant in this
+/// `rust-bitcoin` version; the bit follows the protocol assignment also
+/// decoded in `PeerInfo::services_names`.
+const NETWORK_LIMITED: u64 = 1_u64 << 10;
 /// Maximum number of in-flight getdata requests we'll track per `BlockSync`.
 ///
 /// 256 is the measured single-peer IBD depth: a bounded 0–150,000 daemon
@@ -331,6 +341,25 @@ pub fn servable_floor(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> u32 {
 /// INVARIANT: this is the only fan-out service clause.
 pub fn statically_fanout_eligible(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> bool {
     !peer.inbound && serves_requested_height(peer, policy)
+}
+
+/// Whether a peer can serve one required body height.
+///
+/// Core leaves two blocks of race buffer inside the 288-block limited-service
+/// window (`net_processing.cpp:1636-1638`).
+pub(crate) fn peer_can_serve_height(
+    peer: &PeerInfo,
+    peer_height: u32,
+    required_height: u32,
+) -> bool {
+    if required_height > peer_height {
+        return false;
+    }
+    let limited_only =
+        peer.services & NETWORK_LIMITED != 0 && peer.services & ServiceFlags::NETWORK.to_u64() == 0;
+    !limited_only
+        || peer_height - required_height
+            < NODE_NETWORK_LIMITED_MIN_BLOCKS - NODE_NETWORK_LIMITED_RACE_BUFFER
 }
 
 /// Set the fan-out/request mode on the window from the current candidate set.

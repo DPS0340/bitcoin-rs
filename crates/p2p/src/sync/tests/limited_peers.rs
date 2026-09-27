@@ -6,6 +6,8 @@
 //! (`net_processing.cpp:6521`); afterwards a peer without `NODE_NETWORK`
 //! serves only the last `NODE_NETWORK_LIMITED_MIN_BLOCKS` — 288
 //! (`net_processing.cpp:159`, window applied at `:1637`) — of its own chain.
+//! The demonstrated-height clause used by the selection and hedge paths
+//! applies Core's two-block race buffer, so that window is 286 there.
 //! Both the selection path and the shared predicate are pinned here, because a
 //! fix that lands on one path alone leaves the other requesting undeliverable
 //! blocks.
@@ -163,13 +165,15 @@ fn tick_asks_no_bodies_from_limited_peer_during_initial_block_download()
 
 /// After initial block download the same peer serves the near-tip range, and
 /// the selection is the deep single-peer batch, so the body request proves the
-/// predicate ran inside the tick and not only in isolation.
+/// predicate ran inside the tick and not only in isolation. The peer's
+/// handshake height 286 keeps the required bodies inside the race-buffered
+/// window this node applies.
 #[test]
 fn tick_asks_bodies_from_limited_peer_inside_retained_window()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sync, peers, block_tree, applied_tip, expected) =
         sync_with_header_chain_and_ibd(4, synced_ibd_latch())?;
-    let rx = connect_peer(&peers, limited_peer(test_addr(9604, 0)?, 288));
+    let rx = connect_peer(&peers, limited_peer(test_addr(9604, 0)?, 286));
 
     sync.tick();
     assert_applied_genesis(&applied_tip, &block_tree)?;
@@ -190,7 +194,7 @@ fn tick_asks_no_bodies_from_limited_peer_beyond_retained_window()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sync, peers, block_tree, applied_tip, _expected) =
         sync_with_header_chain_and_ibd(4, synced_ibd_latch())?;
-    let rx = connect_peer(&peers, limited_peer(test_addr(9605, 0)?, 289));
+    let rx = connect_peer(&peers, limited_peer(test_addr(9605, 0)?, 287));
 
     sync.tick();
     assert_applied_genesis(&applied_tip, &block_tree)?;
