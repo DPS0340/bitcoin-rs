@@ -141,9 +141,19 @@ struct ReplayAccumulator {
     coin_stats: bitcoin_rs_utxo::stats::CoinStatsListener,
     applied_tip: bitcoin_rs_chain::TipSnapshot,
     chain_tx_count: u64,
+    /// The base carries an unknown count: zero at a non-genesis height.
+    /// A genesis-empty base (height 0, nothing below it to total) still
+    /// counts its records, matching the journal writer.
+    unknown_base: bool,
 }
 
 impl ReplayAccumulator {
+    /// Replays records above `base_tip`, whose cumulative transaction count
+    /// is `base_chain_tx_count` — or zero when the checkpoint never learned
+    /// it. Zero means unknown (the checkpoint convention the loader already
+    /// accepts): rejecting it would discard the committed journal suffix and
+    /// reprocess it from the checkpoint, so replay carries the unknown
+    /// through and preserves it per record instead.
     fn new(
         tree: BlockTree,
         mut utxo: UtxoSet,
@@ -151,11 +161,6 @@ impl ReplayAccumulator {
         base_tip: bitcoin_rs_chain::TipSnapshot,
         base_chain_tx_count: u64,
     ) -> Result<Self, JournalReplayError> {
-        if base_chain_tx_count == 0 {
-            return Err(JournalReplayError::CommittedRangeInvalid(
-                "checkpoint chain_tx_count is unknown".to_owned(),
-            ));
-        }
         let base_node = tree.node(base_tip.tip_id).map_err(|error| {
             JournalReplayError::HeaderRebuildRejected(format!(
                 "checkpoint tip node is unavailable: {error}"
@@ -171,24 +176,31 @@ impl ReplayAccumulator {
         }
         let coin_stats = bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
         utxo.track_coin_stats(coin_stats.clone());
+        let unknown_base = base_chain_tx_count == 0 && base_tip.height != 0;
         Ok(Self {
             tree,
             utxo,
             coin_stats,
             applied_tip: base_tip,
             chain_tx_count: base_chain_tx_count,
+            unknown_base,
         })
     }
 
     fn apply(&mut self, record: &JournalRecord) -> Result<(), JournalReplayError> {
-        self.chain_tx_count = self
-            .chain_tx_count
-            .checked_add(record.block_tx_count)
-            .ok_or_else(|| {
-                JournalReplayError::CommittedRangeInvalid(
-                    "chain transaction count overflow".to_owned(),
-                )
-            })?;
+        // An unknown base stays unknown: adding the suffix would fabricate
+        // a chain total, while the tip, UTXO set, and coin stats still
+        // advance per record.
+        if !self.unknown_base {
+            self.chain_tx_count = self
+                .chain_tx_count
+                .checked_add(record.block_tx_count)
+                .ok_or_else(|| {
+                    JournalReplayError::CommittedRangeInvalid(
+                        "chain transaction count overflow".to_owned(),
+                    )
+                })?;
+        }
         self.applied_tip = insert_replayed_header(
             &mut self.tree,
             record,

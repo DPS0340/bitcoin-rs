@@ -85,14 +85,11 @@ impl<S: KvStore> JournalWriter<S> {
         }
         let last = self.pending_records[target - 1];
         let target_offset = last.end_offset;
+        let base_height = self.base_height;
         let target_chain_tx_count = self.pending_records[..target].iter().try_fold(
             self.durable_chain_tx_count,
             |count, record| {
-                count.checked_add(record.block_tx_count).ok_or_else(|| {
-                    JournalWriterError::CursorMismatch(
-                        "chain transaction count overflow".to_owned(),
-                    )
-                })
+                super::advance_chain_tx_count(base_height, count, record.block_tx_count)
             },
         )?;
 

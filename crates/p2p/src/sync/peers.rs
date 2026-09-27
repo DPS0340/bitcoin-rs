@@ -15,7 +15,7 @@ use crate::download_window::SyncPeer;
 use crate::download_window::SyncPeerSelection;
 use crate::download_window::configure_request_mode;
 use crate::download_window::{
-    BlockDownloadPolicy, serves_requested_height, statically_fanout_eligible,
+    BlockDownloadPolicy, peer_can_serve_height, serves_requested_height, statically_fanout_eligible,
 };
 use crate::peer_info::PeerRole;
 use bitcoin_rs_chain::BlockTree;
@@ -595,8 +595,9 @@ impl BlockSync {
         // value alone — a long-lived at-tip peer would otherwise become
         // ineligible for every newly announced block (#617). Per-request
         // truncation by `peer_best_height` still bounds the damage of a
-        // stale value. With nothing required the clause reduces to the
-        // applied tip's successor, as before.
+        // stale value. `peer_can_serve_height` also keeps a limited-service
+        // peer inside its retained range. With nothing required the clause
+        // reduces to the applied tip's successor, as before.
         let required_height = frontier.chain.next_required.map_or_else(
             || {
                 frontier
@@ -618,7 +619,7 @@ impl BlockSync {
             let Some(active_height) = peer.capability() else {
                 continue;
             };
-            if active_height < required_height {
+            if !peer_can_serve_height(&peer.info, active_height, required_height) {
                 continue;
             }
             candidates.push(FanoutCandidate {

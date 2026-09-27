@@ -2544,6 +2544,115 @@ pub(crate) fn connect_peer(
     rx
 }
 
+#[test]
+fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error::Error>> {
+    use super::frontier::{BodyState, ChainFrontier, RequiredBody, SyncFrontier, UsablePeer};
+
+    const WITNESS: u64 = 1 << 3;
+    const NETWORK_LIMITED: u64 = 1 << 10;
+    let mut tree = BlockTree::new();
+    let mut parent = None;
+    let mut previous = BlockHash::default();
+    let mut historical_hash = None;
+    let mut recent_hash = None;
+    // At tip 300, height 14 is at Core's 286-block cutoff; height 15 is recent enough.
+    for height in 0..=300 {
+        let header = test_header(previous, height);
+        previous = header.compute_hash();
+        let height_hash = Hash256::from_le_bytes(previous.as_bytes());
+        parent = Some(tree.insert_node(parent, header, NodeStatus::HeaderValid)?);
+        if height == 14 {
+            historical_hash = Some(height_hash);
+        } else if height == 15 {
+            recent_hash = Some(height_hash);
+        }
+    }
+    let historical_hash = historical_hash.ok_or("missing historical header")?;
+    let recent_hash = recent_hash.ok_or("missing recent header")?;
+    let SyncHarness { sync, peers, .. } = SyncHarness::with_ibd(tree, synced_ibd_latch());
+
+    let owner_addr = test_addr(18_900, 0)?;
+    let owner_info = synthetic_peer(owner_addr, 300);
+    let _owner_rx = connect_peer(&peers, owner_info);
+    let owner = current_source(&peers, owner_addr);
+    let limited_addr = test_addr(18_900, 1)?;
+    let mut limited_info = synthetic_peer(limited_addr, 300);
+    limited_info.services = WITNESS | NETWORK_LIMITED;
+    let limited_rx = connect_peer(&peers, limited_info.clone());
+    let no_service_addr = test_addr(18_900, 2)?;
+    let mut no_service_info = synthetic_peer(no_service_addr, 300);
+    // WITNESS alone advertises neither NODE_NETWORK nor NODE_NETWORK_LIMITED.
+    no_service_info.services = WITNESS;
+    let no_service_rx = connect_peer(&peers, no_service_info.clone());
+    let no_service = current_source(&peers, no_service_addr);
+    let no_service_usable = UsablePeer {
+        source: no_service,
+        info: no_service_info,
+        demonstrated_tips: Vec::new(),
+        active_height: None,
+        role: crate::peer_info::PeerRole::FullRelay,
+        manual: false,
+        connected_at: Instant::now(),
+    };
+    let limited = current_source(&peers, limited_addr);
+    let usable = UsablePeer {
+        source: limited,
+        info: limited_info,
+        demonstrated_tips: Vec::new(),
+        active_height: None,
+        role: crate::peer_info::PeerRole::FullRelay,
+        manual: false,
+        connected_at: Instant::now(),
+    };
+    let frontier = |height, hash, usable_peer| SyncFrontier {
+        chain: ChainFrontier {
+            applied_tip: None,
+            chain_tip: None,
+            next_required: Some(RequiredBody { height, hash }),
+            apply_halted: false,
+        },
+        body_state: Some(BodyState::Unowned),
+        header_request: None,
+        header_request_live: false,
+        usable_peers: vec![usable_peer],
+    };
+
+    let historical = sync.sync_peer_selection(
+        &frontier(14, historical_hash, usable.clone()),
+        Instant::now(),
+    );
+    assert!(historical.request_peers.is_empty());
+    let no_service_selection = sync.sync_peer_selection(
+        &frontier(15, recent_hash, no_service_usable),
+        Instant::now(),
+    );
+    assert!(no_service_selection.request_peers.is_empty());
+    let recent = sync.sync_peer_selection(&frontier(15, recent_hash, usable), Instant::now());
+    assert_eq!(recent.request_peers.len(), 1);
+    assert_eq!(recent.request_peers[0].source, limited);
+
+    assert_eq!(
+        sync.send_cold_front_hedge(owner, historical_hash, 14, Instant::now()),
+        None
+    );
+    assert!(limited_rx.try_recv().is_err());
+    assert_eq!(
+        sync.send_cold_front_hedge(owner, recent_hash, 15, Instant::now()),
+        Some(limited)
+    );
+    let Message::GetData(items) = limited_rx.try_recv()? else {
+        panic!("recent limited peer must receive the cold-front request");
+    };
+    assert_eq!(
+        items,
+        vec![Inventory::WitnessBlock(
+            bitcoin::BlockHash::from_byte_array(*recent_hash.as_byte_array())
+        )]
+    );
+    assert!(no_service_rx.try_recv().is_err());
+    Ok(())
+}
+
 #[cfg(test)]
 mod behavior_1;
 

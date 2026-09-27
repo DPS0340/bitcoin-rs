@@ -999,30 +999,54 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         ));
     }
     let want_muhash = hash_type == "muhash";
-    let (stats, txouts, transactions, set_hash) = ctx.chain.utxo.with_stable_view(|view| {
-        let stats =
-            bitcoin_rs_utxo::stats::scan_coin_stats(view, ctx.applied_height(), want_muhash)
-                .map_err(|err| RpcError::Internal(err.to_string()))?;
-        let set_hash = match hash_type {
-            "hash_serialized_3" => Some((
-                "hash_serialized_3",
-                view.hash_serialized_3()
-                    .map_err(|err| RpcError::Internal(err.to_string()))?
-                    .to_string_be(),
-            )),
-            "muhash" => Some(("muhash", stats.muhash.finalize_hash().to_string_be())),
-            "none" => None,
-            _ => {
-                return Err(RpcError::InvalidParams(
-                    "hash_type must be one of: hash_serialized_3, muhash, none",
-                ));
-            }
-        };
-        Ok::<_, RpcError>((stats, view.len(), view.record_count(), set_hash))
-    })?;
-    let disk_size = ctx.chain.utxo.with_stable_view(|view| {
-        u64::try_from(view.memory_report().accounted_bytes()).unwrap_or(u64::MAX)
-    });
+    let (stats, txouts, transactions, set_hash, tip_height, tip_hash, disk_size) = ctx
+        .with_stable_chainstate(|| {
+            ctx.chain.utxo.with_stable_view(|view| {
+                // One published-tip read for the whole response, under the
+                // chain-transition barrier the apply path holds across its
+                // UTXO commit and tip publication: `height` and `best_block`
+                // describe the tip of this pinned snapshot, and every scanned
+                // field below comes from the same stable view, so a connect
+                // landing mid-scan cannot mix two states into one response.
+                // The stable-view lock alone is not enough — the tip is
+                // published outside it — and the barrier nests outside the
+                // view, matching block apply's lock order.
+                let tip = ctx.chain.applied_tip.load_full();
+                let tip_height = tip.as_ref().map_or(0, |tip| tip.height);
+                let tip_hash = tip.as_ref().map_or_else(
+                    || ctx.chain.chain_network.genesis_block_hash(),
+                    |tip| tip.hash,
+                );
+                let stats = bitcoin_rs_utxo::stats::scan_coin_stats(view, tip_height, want_muhash)
+                    .map_err(|err| RpcError::Internal(err.to_string()))?;
+                let set_hash = match hash_type {
+                    "hash_serialized_3" => Some((
+                        "hash_serialized_3",
+                        view.hash_serialized_3()
+                            .map_err(|err| RpcError::Internal(err.to_string()))?
+                            .to_string_be(),
+                    )),
+                    "muhash" => Some(("muhash", stats.muhash.finalize_hash().to_string_be())),
+                    "none" => None,
+                    _ => {
+                        return Err(RpcError::InvalidParams(
+                            "hash_type must be one of: hash_serialized_3, muhash, none",
+                        ));
+                    }
+                };
+                let disk_size =
+                    u64::try_from(view.memory_report().accounted_bytes()).unwrap_or(u64::MAX);
+                Ok::<_, RpcError>((
+                    stats,
+                    view.len(),
+                    view.record_count(),
+                    set_hash,
+                    tip_height,
+                    tip_hash,
+                    disk_size,
+                ))
+            })
+        })?;
     let (hash_serialized_3, muhash) = set_hash.map_or((None, None), |(name, hash)| {
         if name == "hash_serialized_3" {
             (Some(hash), None)
@@ -1031,8 +1055,8 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         }
     });
     typed_to_sonic_omitting_nulls(&v31::GetTxOutSetInfo {
-        height: i64::from(ctx.applied_height()),
-        best_block: ctx.applied_hash().to_string_be(),
+        height: i64::from(tip_height),
+        best_block: tip_hash.to_string_be(),
         transactions: Some(i64_saturated_len(transactions)),
         tx_outs: i64_saturated(u64::try_from(txouts).unwrap_or(u64::MAX)),
         bogo_size: i64_saturated(stats.bogo_size),
@@ -1973,6 +1997,36 @@ mod tests {
             "block_info should be absent for hash_type=none: {result:?}"
         );
         assert!(result.get("height").is_some());
+    }
+
+    #[test]
+    fn gettxoutsetinfo_waits_for_a_complete_chain_transition() {
+        use std::time::Duration;
+
+        let barrier = Arc::new(parking_lot::Mutex::new(()));
+        let ctx = Arc::new(Context::from_handles(crate::context::ContextHandles {
+            chain: crate::context::ChainHandles {
+                chain_transition: Arc::clone(&barrier),
+                ..crate::context::ChainHandles::default()
+            },
+            ..crate::context::ContextHandles::default()
+        }));
+        let transition = barrier.lock();
+        let worker = Arc::clone(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _ = tx.send(gettxoutsetinfo(&worker, &json!(["none"])));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "gettxoutsetinfo must not mix a transitioning tip with its UTXO scan"
+        );
+        drop(transition);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("gettxoutsetinfo answers once the transition completes");
+        join.join().expect("gettxoutsetinfo thread joins");
+        result.unwrap_or_else(|err| panic!("gettxoutsetinfo failed: {err}"));
     }
 
     #[test]
