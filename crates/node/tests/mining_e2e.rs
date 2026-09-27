@@ -593,7 +593,7 @@ fn admit_to_mempool(state: &NodeState, tx: &Tx) -> Result<()> {
     let utxo = state.chainstate().utxo_handle();
     let applied_tip = state.chainstate().applied_tip_reader();
     let block_tree = state.chainstate().block_tree_reader();
-    let view = ChainAdmissionView::new(&utxo, &applied_tip, &block_tree, Network::Regtest);
+    let view = ChainAdmissionView::new(utxo, applied_tip, block_tree, Network::Regtest);
     let outcome = state.mempool_gateway().submit_transaction(
         Arc::new(tx.clone()),
         AdmissionOrigin::Rpc,
@@ -669,26 +669,26 @@ fn mining_handler(state: &NodeState) -> Handler {
     );
     let mining_control: Arc<dyn MiningControl> = Arc::new(coordinator);
     let ibd = state.chainstate().ibd_latch();
+    let tips = state.chainstate().rpc_tip_bundle();
     let ctx = Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: state.chainstate().header_tip_reader(),
-            applied_tip: state.chainstate().applied_tip_reader(),
+            chain_tip: tips.chain_tip,
+            applied_tip: tips.applied_tip,
             chain_tx_count: state.chainstate().chain_tx_count_handle(),
             ibd,
             blocks: state.blocks(),
             transactions: state.transactions(),
             utxo: Arc::new(UtxoSet::new()),
             coin_stats: state.chainstate().coin_stats_handle(),
-            block_tree: state.chainstate().block_tree_reader(),
+            block_tree: state.chainstate().block_tree_handle(),
             chain_network: state.config().network,
+            chain_transition: state.chainstate().read_fence(),
+            ..ChainHandles::default()
         },
         mempool: MempoolHandles {
-            mempool: MempoolGateway::shared(state.mempool()),
+            gateway: MempoolGateway::shared(state.mempool()),
         },
-        indexes: IndexHandles {
-            derived_index: None,
-            script_index: None,
-        },
+        indexes: IndexHandles::default(),
         network: NetworkHandles {
             network: state.network(),
             network_active: state.network_active(),
@@ -700,7 +700,7 @@ fn mining_handler(state: &NodeState) -> Handler {
         mining: MiningHandles {
             mining_control: Some(mining_control),
         },
-        derived_index_status: None,
+        ..ContextHandles::default()
     });
     Handler::new(Arc::new(ctx))
 }
