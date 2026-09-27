@@ -18,7 +18,7 @@ use super::durable::{
 use super::prepare::parse_block_for_apply;
 use super::prepare::plan_block_transactions;
 use super::prepare::resolve_block_prevouts;
-use super::publication::publish_connect;
+use super::publication::publish_applied;
 use crate::error::ApplyError;
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
 use bitcoin_rs_primitives::Block;
@@ -49,27 +49,29 @@ pub const DURABLE_HEAD_GROUP_MAX_BYTES: usize = 8 << 20;
 /// [`PublishMode::Grouped`] buffers the commit facts in a [`WindowGroup`]:
 /// the window syncs once per group, lands one head batch per verified
 /// prefix, and publishes the prefix in order after the batch — one
-/// `commit_id` per committed prefix, never beyond it (`RCV-02`).
 pub(super) enum PublishMode<'a> {
     Now,
     Grouped(&'a mut WindowGroup),
     /// Crash-recovery replay of a block whose durable batch already
     /// committed. The stored head receipt covers it, so nothing syncs and
     /// nothing re-commits: replay rebuilds the derived state the crash
-    /// lost — coins, bookkeeping, journal tail — and publishes.
+    /// lost — coins, bookkeeping, journal tail — and publishes under the
+    /// receipt the head already issued.
     Replay {
-        commit_id: u64,
+        receipt: super::durable::DurableReceipt,
     },
 }
 
 /// One staged block awaiting its group's durable commit.
+///
+/// The staged outcome's tip carries this block's own cumulative chain tx
+/// count, which its publication uses; the group's receipt certifies the last
+/// staged tip.
 pub(super) struct PendingBlockCommit {
     /// Commit id 0 until the group's batch assigns the prefix id.
     pub outcome: ConnectOutcome,
     /// The block's encoded undo record, landed in the group's receipt.
     pub undo_record: bitcoin_rs_utxo::contract::UndoRecord,
-    pub tx_count_delta: u64,
-    pub chain_tx_count_after: u64,
     /// This block's parent; the group's first entry anchors the lineage
     /// fence.
     pub prev_hash: Hash256,
@@ -121,12 +123,6 @@ impl WindowGroup {
         Ok(Some((Arc::new(last.outcome.tip.clone()), height)))
     }
 
-    /// The cumulative chain tx count the next staged block advances, when a
-    /// prefix is staged: publication has not stored the staged deltas yet.
-    pub(super) fn chain_tx_count_base(&self) -> Option<u64> {
-        self.pending.last().map(|last| last.chain_tx_count_after)
-    }
-
     pub(super) fn stage(&mut self, pending: PendingBlockCommit) {
         self.staged_bytes += pending.outcome.block_bytes.len();
         if self.pending.is_empty() {
@@ -174,7 +170,7 @@ impl WindowGroup {
             prev_hash: first_prev,
             tip: last.outcome.hash,
             height: last.outcome.height,
-            chain_tx_count_after: last.chain_tx_count_after,
+            chain_tx_count_after: last.outcome.tip.chain_tx_count.to_wire(),
             undo_extent: Some((last.outcome.height, last.outcome.hash)),
         };
         let started = quanta::Instant::now();
@@ -182,13 +178,19 @@ impl WindowGroup {
             undo_rows,
             body_rows,
         };
-        let commit_id = commit_connect_head(handles, &facts, &records)?;
+        let receipt = commit_connect_head(handles, &facts, &records)?;
+        debug_assert!(
+            self.pending
+                .last()
+                .is_some_and(|last| last.outcome.tip.chain_tx_count == receipt.chain_tx_count),
+            "the batch certifies the last staged prefix count"
+        );
         metrics::histogram!("node.durable_head.group_commit_seconds")
             .record(started.elapsed().as_secs_f64());
         let staged = u32::try_from(self.pending.len()).unwrap_or(u32::MAX);
         metrics::histogram!("node.durable_head.group_blocks").record(f64::from(staged));
         for pending in &mut self.pending {
-            pending.outcome.commit_id = commit_id;
+            pending.outcome.commit_id = receipt.commit_id;
         }
         // The journal follows the receipt, block by block, before the
         // prefix publishes — the same derived-after-durable order as the
@@ -209,7 +211,11 @@ impl WindowGroup {
             .pending
             .drain(..)
             .map(|pending| {
-                publish_connect(handles, &pending.outcome.tip, pending.tx_count_delta);
+                publish_applied(
+                    handles,
+                    &pending.outcome.tip,
+                    crate::events::HintKind::Connected,
+                );
                 pending.outcome
             })
             .collect::<Vec<_>>();
@@ -276,7 +282,15 @@ pub(super) fn apply_window_admitted(
                         invalidated: Box::default(),
                     });
                 }
-                let invalidated = invalidate_failed_subtree(handles, block, disposition);
+                // Only permanent failures invalidate: operational failures
+                // (storage, UTXO commit, shutdown) leave the block retryable,
+                // and a body-mutated failure poisons only the delivered body.
+                let (invalidated, disposition) = if disposition == WindowApplyDisposition::Permanent
+                {
+                    invalidate_permanent_failure(handles, block.block_hash().0)
+                } else {
+                    (Box::default(), disposition)
+                };
                 // The prefix that committed in memory stays committed: flush
                 // its durable group before reporting, so the durable head
                 // and the published tip keep moving together. A flush
@@ -328,31 +342,40 @@ pub(super) fn apply_window_admitted(
     Ok(committed)
 }
 
-/// Marks the failed block's header subtree invalid while the chain transition
-/// is still held, so the window caller can purge download state without the
-/// frontier ever re-offering a descendant of a permanently invalid block.
+/// Invalidates a permanently invalid block's subtree through the shared
+/// chainstate operation, so the window caller can purge download state
+/// without the frontier ever re-offering a descendant of that block.
 ///
-/// Only permanent failures invalidate. Operational failures (storage, UTXO
-/// commit, shutdown) are transient: the block stays retryable, so nothing may
-/// be marked `Invalid` here. A header missing from the tree (rejected before
-/// insertion, e.g. prev-hash mismatch or `PoW` failure) has no subtree to
-/// invalidate, which leaves the list empty and the classification untouched.
-pub(super) fn invalidate_failed_subtree(
+/// Returns the marked hashes and the disposition to report. A header missing
+/// from the tree (rejected before insertion, e.g. prev-hash mismatch or `PoW`
+/// failure) has no subtree to invalidate, which leaves the list empty and the
+/// classification untouched. A tree-plan failure can leave the tree partially
+/// marked, so the best remaining tip is republished, the assume-valid gate is
+/// re-evaluated, and the batch escalates to `Fatal`: a permanently invalid
+/// block whose subtree could not be marked must not be retried in-process.
+///
+/// PRE: the caller holds the chain transition and `disposition` is `Permanent`.
+fn invalidate_permanent_failure(
     handles: &Chainstate,
-    block: &Block,
-    disposition: WindowApplyDisposition,
-) -> Box<[Hash256]> {
-    if disposition != WindowApplyDisposition::Permanent {
-        return Box::default();
+    hash: Hash256,
+) -> (Box<[Hash256]>, WindowApplyDisposition) {
+    match crate::reorg::invalidate_and_republish(handles, hash) {
+        Ok(invalidated) => (invalidated, WindowApplyDisposition::Permanent),
+        Err(crate::reorg::InvalidationError::UnknownBlock(_)) => {
+            (Box::default(), WindowApplyDisposition::Permanent)
+        }
+        Err(invalidation) => {
+            tracing::error!(
+                %invalidation,
+                "window subtree invalidation failed; requiring recovery"
+            );
+            let tree = handles.block_tree.read();
+            handles.chain_tip.store(tree.tip());
+            handles.reevaluate_assume_valid_with(&tree);
+            drop(tree);
+            (Box::default(), WindowApplyDisposition::Fatal)
+        }
     }
-    let hash = block.block_hash().0;
-    let mut tree = handles.block_tree.write();
-    let Some(node_id) = tree.lookup(hash) else {
-        return Box::default();
-    };
-    tree.invalidate_subtree(node_id)
-        .unwrap_or_default()
-        .into_boxed_slice()
 }
 
 /// Classifies an apply failure by what it proves about the header branch.
@@ -369,17 +392,16 @@ pub(super) fn invalidate_failed_subtree(
 /// must be dropped, not finished, so the mempool generation stays odd until
 /// recovery.
 ///
-/// Kernel-backed script verification failures are classified Operational
-/// because `bitcoinkernel` can reject a valid block depending on process
-/// state (issue #618): the same block applies successfully after restart.
-/// Treating these as Permanent would freeze the node at the tip and
-/// invalidate a valid header subtree with no retry path. The native
-/// interpreter path does not produce this spurious failure, so its
-/// `ConsensusError::Script` remains Permanent.
-///
+/// A kernel-backed script failure is Operational because `bitcoinkernel` can
+/// reject a valid block depending on process state (issue #618): the same
+/// block applies successfully after restart. Treating it as Permanent would
+/// freeze the node at the tip and invalidate a valid header subtree with no
+/// retry path. The native interpreter does not produce that spurious failure,
+/// so its `ConsensusError::Script` stays Permanent. The engine field decides
+/// this; the reason text is never inspected.
 pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
     use WindowApplyDisposition::{BodyMutated, Fatal, Operational, Permanent};
-    use bitcoin_rs_consensus::ConsensusError;
+    use bitcoin_rs_consensus::{ConsensusError, ScriptEngine};
     match error {
         ApplyError::UtxoCommit(_)
         | ApplyError::DurableHeadCommit(_)
@@ -403,12 +425,10 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
             | ConsensusError::UnexpectedWitness => BodyMutated,
             ConsensusError::PrevoutMatrixSize { .. }
             | ConsensusError::Kernel(_)
-            | ConsensusError::Encoding(_) => Operational,
-            ConsensusError::Script { reason, .. }
-                if reason.starts_with("kernel script verification failed:") =>
-            {
-                Operational
-            }
+            | ConsensusError::Script {
+                engine: ScriptEngine::Kernel,
+                ..
+            } => Operational,
             _ => Permanent,
         },
         _ => Operational,

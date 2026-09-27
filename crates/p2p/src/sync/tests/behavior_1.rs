@@ -40,6 +40,7 @@ fn indexed_sync_frontiers_match_parent_plans() -> Result<(), Box<dyn std::error:
                 height: node.height,
                 chainwork: node.chainwork,
                 hash: node.hash,
+                chain_tx_count: node.chain_tx_count,
             })
         })
         .collect::<Result<Vec<_>, bitcoin_rs_chain::ChainError>>()?;
@@ -109,6 +110,7 @@ fn fork_getdata_starts_at_common_ancestor_child() -> Result<(), Box<dyn std::err
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
         }
     };
 
@@ -176,6 +178,7 @@ fn pending_reorg_fixture()
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
         }
     };
 

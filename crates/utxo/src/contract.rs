@@ -570,8 +570,11 @@ pub fn decode_undo_record(bytes: &[u8], block_hash: Hash256) -> Result<UndoBatch
 /// must not be armed over, while a `RolledBack` marker is owed checkpoint
 /// debt that sequential disconnects carry into the next arm. On success the
 /// marker stays `RolledBack` until the caller durably publishes the
-/// rolled-back state. Per-coin coinstats follow the set's undo through the
-/// listener; only height and transaction count are rewound here.
+/// rolled-back state. A marker that survives to the next startup no longer
+/// refuses it: startup recovers automatically from the durable certified
+/// head before anything serves (`docs/contracts/recovery.md`). Per-coin
+/// coinstats follow the set's undo through the listener; only height and
+/// transaction count are rewound here.
 ///
 /// # Errors
 ///
@@ -600,10 +603,14 @@ pub fn rollback_block(
     store
         .arm_disconnect(height, hash)
         .map_err(RollbackError::Refused)?;
-    utxo.undo_block(undo).map_err(RollbackError::Utxo)?;
-    coin_stats
-        .rewind_block(height, parent_height, tx_count_delta)
-        .map_err(RollbackError::CoinStats)?;
+    rewind_applied_coins(
+        utxo,
+        coin_stats,
+        height,
+        parent_height,
+        tx_count_delta,
+        undo,
+    )?;
     store
         .complete_disconnect(height, hash)
         .map_err(RollbackError::Marker)?;
@@ -614,6 +621,58 @@ pub fn rollback_block(
             .map(|restored| restored.outpoint.txid)
             .collect(),
     })
+}
+
+/// The coins side of one rollback step: UTXO undo plus the coinstats
+/// rewind, shared by an ordinary disconnect and by marker recovery.
+fn rewind_applied_coins(
+    utxo: &UtxoSet,
+    coin_stats: &CoinStatsListener,
+    height: u32,
+    parent_height: u32,
+    tx_count_delta: u64,
+    undo: &UndoBatch,
+) -> Result<(), RollbackError> {
+    // Refuse mismatched stats before the UTXO mutation: a recovery that
+    // fails closed after undoing the block would retry against a partially
+    // rewound set.
+    coin_stats
+        .check_rewind(height, tx_count_delta)
+        .map_err(RollbackError::CoinStats)?;
+    utxo.undo_block(undo).map_err(RollbackError::Utxo)?;
+    coin_stats
+        .rewind_block(height, parent_height, tx_count_delta)
+        .map_err(RollbackError::CoinStats)
+}
+
+/// Recovery's rollback step: the coin rewind without the marker lifecycle.
+///
+/// The marker recovery carries is the evidence being reconciled — re-arming
+/// would overwrite its identity and completing would fake a finished
+/// rollback — so it stays `InFlight` until the checkpoint that publishes
+/// the repaired state retires it. That is also what makes a crash
+/// mid-rewind restartable: the same marker re-enters recovery.
+///
+/// # Errors
+///
+/// `RollbackError::Utxo` or `RollbackError::CoinStats`. Never `Refused`:
+/// the arming guard does not apply to a marker recovery already owns.
+pub fn rollback_block_recovery(
+    utxo: &UtxoSet,
+    coin_stats: &CoinStatsListener,
+    height: u32,
+    parent_height: u32,
+    tx_count_delta: u64,
+    undo: &UndoBatch,
+) -> Result<(), RollbackError> {
+    rewind_applied_coins(
+        utxo,
+        coin_stats,
+        height,
+        parent_height,
+        tx_count_delta,
+        undo,
+    )
 }
 
 #[cfg(test)]
@@ -790,6 +849,27 @@ mod tests {
         Ok(())
     }
 
+    /// Recovery rewinds under the marker it is reconciling: a surviving
+    /// `InFlight` marker neither refuses the step nor changes identity —
+    /// the recovery checkpoint retires it.
+    #[test]
+    fn recovery_rewind_preserves_the_surviving_marker() -> TestResult {
+        let (utxo, coin_stats, before, undo) = connected()?;
+        let store = InMemoryUndoStore::default();
+        let torn = Hash256::from_le_bytes(&[0x77; 32]);
+        store.arm_disconnect(HEIGHT - 1, torn)?;
+
+        rollback_block_recovery(&utxo, &coin_stats, HEIGHT, 1, 2, &undo)?;
+
+        assert_eq!(observe(&utxo, &coin_stats)?, before);
+        let marker = store.load_disconnect_marker()?.ok_or("marker missing")?;
+        assert_eq!(
+            (marker.phase, marker.height, marker.hash),
+            (DisconnectPhase::InFlight, HEIGHT - 1, torn)
+        );
+        Ok(())
+    }
+
     /// A `RolledBack` marker only owes a checkpoint of the rolled-back set, so
     /// the next disconnect re-arms over it and supersedes its identity.
     #[test]
@@ -841,6 +921,9 @@ mod tests {
         fn disarm_disconnect(&self) -> Result<(), StorageError> {
             self.inner.disarm_disconnect()
         }
+        fn retire_disconnect_marker(&self) -> Result<(), StorageError> {
+            self.inner.retire_disconnect_marker()
+        }
         fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError> {
             self.inner.load_disconnect_marker()
         }
@@ -881,16 +964,19 @@ mod tests {
         Ok(())
     }
 
+    /// Mismatched coinstats refuse the rollback before the undo runs: no
+    /// part of the connected set moves for a recovery that cannot commit.
     #[test]
-    fn coinstats_refusal_after_the_undo_is_fatal() -> TestResult {
+    fn coinstats_refusal_precedes_the_undo() -> TestResult {
         let (utxo, coin_stats, _, undo) = connected()?;
+        let connected_state = observe(&utxo, &coin_stats)?;
         let store = InMemoryUndoStore::default();
         let outcome = rollback_block(&store, &utxo, &coin_stats, HASH, HEIGHT + 1, 1, 2, &undo);
         assert!(
             matches!(outcome, Err(RollbackError::CoinStats(_))),
             "{outcome:?}"
         );
-        assert!(utxo.get_entry(&FUNDED).is_some(), "undo had already run");
+        assert_eq!(observe(&utxo, &coin_stats)?, connected_state);
         Ok(())
     }
 

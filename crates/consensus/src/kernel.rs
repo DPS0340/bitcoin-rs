@@ -1,9 +1,17 @@
+/// The prefix every `bitcoinkernel` script rejection carries.
+///
+/// It reaches clients inside the BIP22 reject reason, so the bytes are a
+/// boundary contract. Classification never reads it: a kernel rejection is
+/// identified by [`crate::ScriptEngine::Kernel`].
+#[cfg(feature = "kernel")]
+pub(crate) const KERNEL_SCRIPT_REJECT_PREFIX: &str = "kernel script verification failed: ";
+
 #[cfg(feature = "kernel")]
 mod enabled {
     use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxOut, Txid, consensus_bytes};
     use bitcoin_rs_script::VerifyFlags;
 
-    use crate::ConsensusError;
+    use crate::{ConsensusError, ScriptEngine};
 
     /// Verifies every input script of `tx` through bitcoinkernel.
     ///
@@ -155,7 +163,8 @@ mod enabled {
         )
         .map_err(|error| ConsensusError::Script {
             input_index,
-            reason: format!("kernel script verification failed: {error}"),
+            reason: format!("{}{error}", super::KERNEL_SCRIPT_REJECT_PREFIX),
+            engine: ScriptEngine::Kernel,
         })?;
         Ok(())
     }
