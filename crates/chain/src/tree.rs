@@ -10,7 +10,7 @@ use slab::Slab;
 use crate::{
     CachedState, ChainError, ChainTxCount,
     bip9_cache::Bip9Cache,
-    node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus},
+    node::{BlockHeader, BlockTreeNode, NodeId, NodeStatus},
     tip::TipSnapshot,
 };
 
@@ -183,28 +183,6 @@ impl BlockTree {
         None
     }
 
-    /// Returns up to `limit` parent `NodeId`s of `start` (excluding `start` itself).
-    ///
-    /// Walks parent pointers in order from nearest to farthest. Stops at the root
-    /// (no parent) or after `limit` ancestors. Used by header-distance queries and
-    /// reorg cost analysis.
-    #[must_use]
-    pub fn ancestors(&self, start: NodeId, limit: usize) -> Vec<NodeId> {
-        let mut out = Vec::with_capacity(limit);
-        let mut cursor = start;
-        while out.len() < limit {
-            let Ok(node) = self.node(cursor) else {
-                break;
-            };
-            let Some(parent_id) = node.parent else {
-                break;
-            };
-            out.push(parent_id);
-            cursor = parent_id;
-        }
-        out
-    }
-
     /// Looks up a node id by header hash.
     #[must_use]
     pub fn lookup(&self, hash: Hash256) -> Option<NodeId> {
@@ -323,8 +301,7 @@ impl BlockTree {
     }
 
     /// Builds a block locator starting from `tip_id`. For active tips, returns
-    /// header hashes at offsets 0, 1, 2, ..., 10, 11, 13, 17, 25, 41, ... —
-    /// the step doubles once the locator holds more than ten entries — by
+    /// header hashes at offsets 0, 1, 2, ..., 9, 10, 12, 16, 24, 40, ... by
     /// sampling the height index. Side-chain, malformed, and disconnected tips
     /// walk back through parents with exponential backoff. Stops at the genesis
     /// (no parent) or after `max_entries` hashes.
@@ -614,7 +591,7 @@ impl BlockTree {
             return Err(ChainError::DuplicateHeader { hash });
         }
 
-        let block_work = work_from_header(&header);
+        let block_work = crate::header_sync::pow::work_from_header(&header);
         let (height, chainwork, status) = match parent {
             Some(parent_id) => {
                 let parent_node = self.node(parent_id)?;
@@ -892,9 +869,6 @@ fn node_hash_key(nodes: &Slab<BlockTreeNode>, id: NodeId) -> u64 {
         .map_or(0, |node| hash_table_key(node.hash))
 }
 
-fn work_from_header(header: &BlockHeader) -> ChainWork {
-    crate::header_sync::pow::work_from_header(header)
-}
 #[cfg(test)]
 mod tests {
     use bitcoin_rs_primitives::{BlockHash, CompactTarget};
@@ -1367,6 +1341,10 @@ mod tests {
 
         assert_eq!(tree.tip_id(), Some(genesis_id));
         assert_eq!(tree.node(genesis_id)?.hash, genesis_hash);
+        // The published snapshot is coherent with the active insertion:
+        // genesis's height and hash, not hand-stored values.
+        assert_eq!(tree.tip_height(), Some(0));
+        assert_eq!(tree.tip_hash(), Some(genesis_hash));
         Ok(())
     }
 
@@ -1515,46 +1493,6 @@ mod tests {
             tree.node_at_height_from(main_tip_id, 1),
             Some(main_child_id)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn ancestors_returns_empty_for_root() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let result = tree.ancestors(genesis_id, 10);
-        assert!(result.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn ancestors_walks_parent_chain_in_order() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let child = test_header(BlockHash(hash_from_header(&genesis)), 1);
-        let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::HeaderValid)?;
-        let grandchild = test_header(BlockHash(hash_from_header(&child)), 2);
-        let grandchild_id =
-            tree.insert_node(Some(child_id), grandchild, NodeStatus::HeaderValid)?;
-        let result = tree.ancestors(grandchild_id, 10);
-        assert_eq!(result, vec![child_id, genesis_id]);
-        Ok(())
-    }
-
-    #[test]
-    fn ancestors_respects_limit() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let child = test_header(BlockHash(hash_from_header(&genesis)), 1);
-        let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::HeaderValid)?;
-        let grandchild = test_header(BlockHash(hash_from_header(&child)), 2);
-        let grandchild_id =
-            tree.insert_node(Some(child_id), grandchild, NodeStatus::HeaderValid)?;
-        let result = tree.ancestors(grandchild_id, 1);
-        assert_eq!(result, vec![child_id]);
         Ok(())
     }
 
@@ -1977,6 +1915,57 @@ mod tests {
         tree.restore_chain_tx_count(genesis_id, ChainTxCount::from_wire(0))?;
         assert_eq!(tree.node(genesis_id)?.chain_tx_count, ChainTxCount::UNKNOWN);
         assert_eq!(tree.node(genesis_id)?.chain_tx_count.to_wire(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recording_a_count_refreshes_only_the_published_tip() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::default(), 0);
+        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let genesis_hash = tree.node(genesis_id)?.hash;
+
+        let main_header = test_header(BlockHash(genesis_hash), 1);
+        let main_id = tree.insert_node(Some(genesis_id), main_header, NodeStatus::HeaderValid)?;
+        // Equal work means insertion order keeps `main` the published tip;
+        // `side` never is.
+        let side_header = test_header(BlockHash(genesis_hash), 101);
+        let side_id = tree.insert_node(Some(genesis_id), side_header, NodeStatus::HeaderValid)?;
+        assert_eq!(tree.tip_id(), Some(main_id));
+        assert_eq!(
+            tree.tip().map(|tip| tip.chain_tx_count),
+            Some(ChainTxCount::UNKNOWN)
+        );
+
+        // Recording on a non-tip ancestor first: the publication must stay
+        // pinned to the published tip's node, unknown count and all.
+        tree.record_applied_tx_count(genesis_id, 1)?;
+        assert_eq!(
+            tree.tip().map(|tip| (tip.tip_id, tip.chain_tx_count)),
+            Some((main_id, ChainTxCount::UNKNOWN))
+        );
+
+        tree.record_applied_tx_count(main_id, 2)?;
+        assert_eq!(
+            tree.tip().map(|tip| (tip.tip_id, tip.chain_tx_count)),
+            Some((main_id, ChainTxCount::established(3)))
+        );
+
+        // A count recorded on a non-tip node must not touch the published
+        // snapshot.
+        tree.restore_chain_tx_count(side_id, ChainTxCount::established(9))?;
+        assert_eq!(
+            tree.tip().map(|tip| (tip.tip_id, tip.chain_tx_count)),
+            Some((main_id, ChainTxCount::established(3)))
+        );
+
+        // And an authenticated restore on the tip itself refreshes it.
+        tree.restore_chain_tx_count(main_id, ChainTxCount::established(5))?;
+        assert_eq!(
+            tree.tip().map(|tip| tip.chain_tx_count),
+            Some(ChainTxCount::established(5))
+        );
         Ok(())
     }
 }

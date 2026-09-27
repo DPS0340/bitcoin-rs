@@ -97,7 +97,7 @@ fn coinbase_and_admitted_package_costs_share_one_inclusive_limit() -> TestResult
             assert_eq!(candidate.transactions.len(), 2);
             assert_eq!(candidate.sigop_cost, 12);
             let actual_cost = candidate
-                .into_unsolved_block()
+                .into_unsolved_block()?
                 .txs
                 .iter()
                 .map(oracle_sigop_cost)

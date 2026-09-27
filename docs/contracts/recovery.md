@@ -263,8 +263,9 @@ tests.
   increments only when the durable root format changes.
 - The fee estimator carries its own estimator-owned version. The P2P
   discovery store carries its own discovery-owned version. The index
-  carries its own `INDEX_FORMAT_VERSION`. None of these increment
-  `CURRENT_SCHEMA`.
+  carries its own durability marker (`[0x00, b'V']`, currently row-format 5),
+  which recovery full-resets for rebuild on a mismatch. None of these
+  increment `CURRENT_SCHEMA`.
 - A missing or unknown owner-local version does not fail node startup.
   The affected owner degrades to a typed, logged state and rebuilds from
   canonical or seeded data.
@@ -322,13 +323,15 @@ restored state allows, and the warning names it:
 
 - `cold-replay` — nothing was restored. The certified head chain is the
   whole state, and `reconcile_at_boot` replays it from genesis.
-- `gap-replay` — the restored tip sits below the head. The ordinary gap walk
-  closes the committed-but-unpublished lag onto it.
-- `checkpoint-rewind` — the restored tip leads the head, or meets its height
-  with another hash. The checkpoint outran the rewind, so recovery rolls the
-  restored coins back block by block against the undo rows the head batch
-  certified — to the head, or to the fork below it, where reconciliation
-  takes over — and never re-commits the head.
+- `gap-replay` — the restored tip lies on the certified head's ancestor
+  chain (the head itself included). The ordinary gap walk closes the
+  committed-but-unpublished lag onto it.
+- `checkpoint-rewind` — the restored tip is not on the head's ancestor
+  chain: it leads the head, meets its height with another hash, or sits
+  below it on a branch a reorg already left. Recovery rolls the restored
+  coins back block by block against the undo rows the head batch
+  certified — to the head, or to the fork it descends from, where
+  reconciliation takes over — and never re-commits the head.
 
 Every mode warns with the marker identity and the mode chosen, publishes a
 clean checkpoint, and retires the marker only after that publication is
@@ -405,14 +408,6 @@ durable.
   `checkpoint_fallback_replays_wide_gap_to_durable_head` proves an
   authenticated gap of any width replays from stored bodies (`RCV-10`).
 - `crates/node/tests/unit/state/tests/recovery.rs`:
-  `committed_frame_corruption_refuses_startup_and_preserves_all_bytes` covers
-  damaged committed magic/length with and without a checkpoint;
-  `checkpoint_resume_discards_only_incomplete_uncommitted_tail` preserves
-  the valid orphan-tail recovery path. Storage's extent tests cover missing
-  or truncated committed files, newer orphan files, and pruned older gaps.
-  `torn_disconnect_refusal_names_authoritative_stores_to_remove` proves an
-  armed disconnect marker refuses startup while naming the `chainstate`,
-  `chainstate-checkpoints`, and `txindex` paths the operator must remove;
   `restart_without_periodic_publication_restores_tip_and_commit_id` proves
   the durable head replays past the last checkpoint with `commit_id`
   preserved across restarts (`RCV-10`).

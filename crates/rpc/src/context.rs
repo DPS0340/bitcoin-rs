@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{BlockBodySource, BlockTreeReader, TipReader, TipSnapshot, softfork_state};
+use bitcoin_rs_chain::{
+    BlockBodySource, BlockTreeReader, LatchReader, TipReader, TipSnapshot, softfork_state,
+};
 use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
 use bitcoin_rs_mempool::{
     AdmissionChain, AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolGateway,
@@ -11,6 +13,7 @@ use bitcoin_rs_primitives::{
     BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
 };
 
+use bitcoin_rs_consensus::ValidationEngine;
 #[cfg(test)]
 use bitcoin_rs_primitives::{Amount, Script};
 use core::fmt;
@@ -242,10 +245,14 @@ pub struct ChainHandles {
     /// Best fully-applied block tip. Read-only: only Chainstate publishes.
     pub applied_tip: TipReader,
     /// Serializes whole-chainstate RPC reads with node-owned connect/disconnect transitions.
-    chain_transition: Arc<Mutex<()>>,
+    pub chain_transition: Arc<Mutex<()>>,
     /// Process-wide initial-block-download latch over the applied chain,
     /// shared with P2P so both surfaces answer identically.
     pub ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
+    /// Chain-mutation admission latch: the same fact
+    /// `Chainstate::is_closed_for_recovery` publishes, exposed read-only and
+    /// kept separate from [`Self::ibd`] by that fact's invariant.
+    pub closed_for_recovery: LatchReader,
     /// Applied block metadata log.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Transactions retained for direct RPC lookup.
@@ -298,6 +305,9 @@ impl ChainHandles {
             chain_tip,
             applied_tip,
             chain_transition: Arc::new(Mutex::new(())),
+            closed_for_recovery: LatchReader::new(Arc::new(core::sync::atomic::AtomicBool::new(
+                false,
+            ))),
             ibd,
             blocks,
             transactions,
@@ -516,6 +526,9 @@ impl Default for ChainHandles {
             chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
             applied_tip: TipReader::new(applied_tip),
             ibd,
+            closed_for_recovery: LatchReader::new(Arc::new(core::sync::atomic::AtomicBool::new(
+                false,
+            ))),
             blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::new(utxo),
@@ -535,9 +548,11 @@ impl Default for MempoolHandles {
     #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self {
-            gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                MempoolLimits::default(),
-            )))),
+            gateway: MempoolGateway::shared(
+                Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                ValidationEngine::Native,
+            )
+            .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
         }
     }
 }
@@ -614,9 +629,10 @@ impl Context {
         let coin_stats = Arc::new(coin_stats_listener);
         let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
         let mempool = match observer {
-            Some(observer) => MempoolGateway::shared_with(pool, observer),
-            None => MempoolGateway::shared(pool),
-        };
+            Some(observer) => MempoolGateway::shared_with(pool, observer, ValidationEngine::Native),
+            None => MempoolGateway::shared(pool, ValidationEngine::Native),
+        }
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let chain_tip = Arc::new(ArcSwapOption::empty());
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let blocks = Arc::new(RwLock::new(BlockLog::new()));
@@ -1594,6 +1610,128 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::too_many_lines)]
+    fn from_handles_shares_chain_handles_with_caller() {
+        use alloc::sync::Arc;
+
+        let chain_tip = Arc::new(ArcSwapOption::empty());
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
+            TipReader::new(Arc::clone(&applied_tip)),
+            BlockTreeReader::new(Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()))),
+        ));
+        let utxo = Arc::new(bitcoin_rs_utxo::UtxoSet::new());
+        let coin_stats = Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
+        ));
+        let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
+        let banned = Arc::new(RwLock::new(Vec::<bitcoin_rs_p2p::BannedSubnet>::new()));
+        let added_nodes = Arc::new(RwLock::new(Vec::new()));
+        let network_active = Arc::new(core::sync::atomic::AtomicBool::new(true));
+        let chain_transition = Arc::new(Mutex::new(()));
+        let ctx = Context::from_handles(ContextHandles {
+            chain: ChainHandles {
+                chain_tip: TipReader::new(Arc::clone(&chain_tip)),
+                applied_tip: TipReader::new(Arc::clone(&applied_tip)),
+                ibd: Arc::clone(&ibd),
+                blocks: Arc::new(RwLock::new(BlockLog::new())),
+                transactions: Arc::new(RwLock::new(HashMap::new())),
+                utxo: Arc::clone(&utxo),
+                coin_stats: Arc::clone(&coin_stats),
+                block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
+                chain_network: Network::Mainnet,
+                chain_transition: Arc::clone(&chain_transition),
+                ..ChainHandles::default()
+            },
+            mempool: MempoolHandles {
+                gateway: MempoolGateway::shared(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
+            },
+            network: NetworkHandles {
+                network_active: Arc::clone(&network_active),
+                banned: Arc::clone(&banned),
+                added_nodes: Arc::clone(&added_nodes),
+                ..NetworkHandles::default()
+            },
+            ..ContextHandles::default()
+        });
+        assert!(
+            Arc::ptr_eq(&ctx.chain.chain_transition, &chain_transition),
+            "the caller's transition barrier must be the one the context locks"
+        );
+        // The count travels inside the applied tip: one publication replaces
+        // tip and count together, through the cell the caller shares.
+        let snapshot = |count| {
+            Arc::new(TipSnapshot {
+                tip_id: bitcoin_rs_chain::NodeId::new(0),
+                height: 7,
+                chainwork: bitcoin_rs_chain::ChainWork::ZERO,
+                hash: Hash256::from_le_bytes(&[7; 32]),
+                chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(count),
+            })
+        };
+        chain_tip.store(Some(snapshot(1)));
+        assert_eq!(
+            ctx.chain.chain_tip.load_full().map(|tip| tip.height),
+            Some(7),
+            "chain_tip must be shared with caller"
+        );
+        applied_tip.store(Some(snapshot(1)));
+        assert_eq!(
+            ctx.chain.applied_tip.load_full().map(|tip| tip.height),
+            Some(7),
+            "applied_tip must be shared with caller"
+        );
+        assert_eq!(ctx.chain.chain_tx_count(), Some(1));
+        applied_tip.store(Some(snapshot(42)));
+        assert_eq!(ctx.chain.chain_tx_count(), Some(42));
+        assert!(
+            Arc::ptr_eq(&ctx.chain.ibd, &ibd),
+            "ibd must be shared with caller"
+        );
+        assert!(
+            Arc::ptr_eq(&ctx.chain.utxo, &utxo),
+            "utxo must be shared with caller"
+        );
+        assert!(
+            Arc::ptr_eq(&ctx.chain.coin_stats, &coin_stats),
+            "coin_stats must be shared with caller"
+        );
+        {
+            let genesis = Network::Regtest.genesis_block();
+            let genesis_id = block_tree
+                .write()
+                .insert_node(
+                    None,
+                    genesis.header,
+                    bitcoin_rs_chain::node::NodeStatus::Active,
+                )
+                .expect("genesis insert");
+            assert!(
+                ctx.chain.block_tree.read().node(genesis_id).is_ok(),
+                "block_tree must be shared with caller"
+            );
+        }
+        assert!(
+            Arc::ptr_eq(&ctx.network.network_active, &network_active),
+            "network activity must be shared with caller"
+        );
+        assert!(
+            Arc::ptr_eq(&ctx.network.banned, &banned),
+            "banned must be shared with caller"
+        );
+        assert!(
+            Arc::ptr_eq(&ctx.network.added_nodes, &added_nodes),
+            "added_nodes must be shared with caller"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn ibd_latch_judges_the_contexts_own_tree() {
         use alloc::sync::Arc;
 
@@ -1652,12 +1790,17 @@ mod tests {
                 block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
                 chain_network: Network::Mainnet,
                 block_body_source: None,
+                closed_for_recovery: LatchReader::new(Arc::new(
+                    core::sync::atomic::AtomicBool::new(false),
+                )),
                 rollback_warnings: None,
             },
             mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                    MempoolLimits::default(),
-                )))),
+                gateway: MempoolGateway::shared(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             indexes: IndexHandles {
                 derived_index: None,

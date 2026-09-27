@@ -57,6 +57,7 @@ pub use bitcoin_rs_rpc::zmq::{
 
 pub use chain_effects::ChainFollowers;
 
+pub use bitcoin_rs_consensus::ValidationEngine;
 pub use config::{
     Auth, IndexConfig, MiningConfig, NetworkSelection, NodeConfig, NotificationConfig,
     ObservabilityConfig, P2pConfig, RpcConfig, RuntimeInputs, ScriptIndexMode, StorageConfig,

@@ -384,7 +384,13 @@ impl MempoolGateway {
                 let prepared = requests
                     .iter()
                     .map(|request| {
-                        Self::prepare_admission(&pool, request, mode, AdmissionFence::Stable)
+                        Self::prepare_admission(
+                            &pool,
+                            request,
+                            mode,
+                            AdmissionFence::Stable,
+                            self.engine(),
+                        )
                     })
                     .collect::<Vec<_>>();
                 let checks = (mode == AdmissionMode::PackageTest
@@ -779,6 +785,7 @@ impl MempoolGateway {
 mod tests {
     use super::*;
     use crate::{Mempool, MempoolEntry};
+    use bitcoin_rs_consensus::ValidationEngine;
     use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, TxIn, Witness};
     use parking_lot::{Mutex, RwLock};
     use sha2::{Digest, Sha256};
@@ -809,6 +816,7 @@ mod tests {
         Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits::default()))),
             None,
+            ValidationEngine::Native,
         ))
     }
 
@@ -1891,6 +1899,7 @@ mod tests {
         let preview_gateway = Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits::default()))),
             Some(observer.clone()),
+            ValidationEngine::Native,
         ));
         let (valid, chain) = witness_spend();
         let mut invalid = (*valid).clone();
@@ -2495,6 +2504,7 @@ mod tests {
         Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits::default()))),
             Some(leg),
+            ValidationEngine::Native,
         ))
     }
 
@@ -2663,6 +2673,7 @@ mod tests {
         let gateway = Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(limits))),
             Some(leg),
+            ValidationEngine::Native,
         ));
         let (parent, child) = witness_parent_and_child();
         let parent_txid = parent.txid();
@@ -2787,6 +2798,7 @@ mod tests {
         let control = Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(limits))),
             None,
+            ValidationEngine::Native,
         ));
         let (control_parent, control_child) = witness_parent_and_child();
         let control_chain = funded_chain(control_parent.inputs[0].previous_output, 20_000);

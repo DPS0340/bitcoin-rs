@@ -42,8 +42,7 @@ fn torn_disconnect_replays_parent_tip() -> Result<()> {
     assert_eq!(
         state
             .chainstate()
-            .applied_tip_reader()
-            .load_full()
+            .applied_tip_snapshot()
             .map(|tip| (tip.hash, tip.height)),
         Some((Hash256::from(genesis.block_hash()), 0)),
         "recovery must land on the disconnect parent the durable head certifies"
@@ -66,8 +65,7 @@ fn torn_disconnect_cold_replays_head() -> Result<()> {
     assert_eq!(
         state
             .chainstate()
-            .applied_tip_reader()
-            .load_full()
+            .applied_tip_snapshot()
             .map(|tip| (tip.hash, tip.height)),
         Some((Hash256::from(block1.block_hash()), 1)),
         "cold replay must reconstruct the chain the durable head certifies"
@@ -95,8 +93,7 @@ fn torn_disconnect_checkpoint_above_head_rewinds_to_head() -> Result<()> {
     assert_eq!(
         state
             .chainstate()
-            .applied_tip_reader()
-            .load_full()
+            .applied_tip_snapshot()
             .map(|tip| (tip.hash, tip.height)),
         landed,
         "the rewind must land on the durable head the disconnect certified"
@@ -132,8 +129,7 @@ fn torn_disconnect_checkpoint_above_head_rewinds_to_head() -> Result<()> {
     assert_eq!(
         reopened
             .chainstate()
-            .applied_tip_reader()
-            .load_full()
+            .applied_tip_snapshot()
             .map(|tip| (tip.hash, tip.height)),
         landed,
         "the repaired state must be what the next restart restores"
@@ -184,8 +180,7 @@ fn checkpoint_fallback_replays_wide_gap_to_durable_head() -> Result<()> {
     let state = NodeState::open(config, None)?;
     let landed = state
         .chainstate()
-        .applied_tip_reader()
-        .load_full()
+        .applied_tip_snapshot()
         .context("recovery must publish a tip")?;
     assert_eq!(landed.hash, Hash256::from(parent));
     assert_eq!(landed.height, GAP_BLOCKS);
@@ -578,7 +573,6 @@ fn crash_child(scenario: &str, data_dir: &Path, budget: Duration) -> Result<()> 
     }
     Ok(())
 }
-
 fn test_config(data_dir: PathBuf) -> NodeConfig {
     let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = data_dir;

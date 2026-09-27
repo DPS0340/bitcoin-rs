@@ -26,7 +26,7 @@ use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::node::NodeId;
 use bitcoin_rs_consensus::MAX_SCRIPT_SIZE;
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
-use bitcoin_rs_consensus::rust_path::UtxoView;
+use bitcoin_rs_consensus::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Txid;
@@ -198,12 +198,17 @@ pub(super) fn apply_block_admitted<'b>(
         }
         Some(ProvenApply::AssumeValidSkipped(prepared)) => (prepared, false),
         Some(ProvenApply::Proven(_)) | None => (
-            prepare_apply(block, provided_serialized.clone(), handles.utxo.as_ref())?,
+            prepare_apply(
+                block,
+                provided_serialized.clone(),
+                handles.utxo.as_ref(),
+                handles.validation_engine,
+            )?,
             false,
         ),
     };
     let PreparedApply {
-        kernel_block,
+        parsed,
         mut view,
         tx_plan,
         resolved,
@@ -255,7 +260,7 @@ pub(super) fn apply_block_admitted<'b>(
             Arc::clone(&resolved),
             &validation_context,
             provenance,
-            &kernel_block,
+            &parsed,
         )
     };
     let script_verify_dur = script_verify_started.elapsed();
@@ -921,8 +926,19 @@ pub(super) fn applied_header_tip(
             },
         ));
     }
+    let parent_known = node
+        .parent
+        .and_then(|parent| tree.node(parent).ok())
+        .is_some_and(|parent| parent.chain_tx_count.get().is_some());
     tree.record_applied_tx_count(node_id, tx_count_delta_for(block))?;
     let node = tree.node(node_id)?;
+    if parent_known && node.chain_tx_count.get().is_none() {
+        tracing::warn!(
+            height,
+            hash = %block_hash,
+            "cumulative chain transaction count overflowed; marking it unknown"
+        );
+    }
     Ok(TipSnapshot {
         tip_id: node_id,
         height: node.height,

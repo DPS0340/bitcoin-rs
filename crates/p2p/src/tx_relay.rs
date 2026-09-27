@@ -380,6 +380,7 @@ pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
 mod tests {
     use super::*;
     use crate::PeerLease;
+    use bitcoin_rs_consensus::ValidationEngine;
     use bitcoin_rs_primitives::Hash256;
     use crossbeam_channel::bounded;
     use parking_lot::Mutex;
@@ -1021,7 +1022,12 @@ mod tests {
         use parking_lot::RwLock;
 
         let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-        let gateway = MempoolGateway::shared_with(pool, Arc::new(CompositeObserver::new()));
+        let gateway = MempoolGateway::shared_with(
+            pool,
+            Arc::new(CompositeObserver::new()),
+            ValidationEngine::Native,
+        )
+        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
         let (queue, rx) = TxRelayQueue::new(8);
         let observer = Arc::new(LocalTxRelayObserver::new(queue, Arc::downgrade(&gateway)));
         gateway
@@ -1156,7 +1162,6 @@ mod tests {
             .expect("fixture entry present")
             .wtxid
     }
-
     fn relay_identity_peer() -> AdmissionOrigin {
         AdmissionOrigin::Peer(bitcoin_rs_mempool::PeerToken {
             addr: SocketAddr::from(([127, 0, 0, 1], 8333)),
@@ -1171,6 +1176,7 @@ mod tests {
                 MempoolLimits::default(),
             ))),
             Some(Arc::new(CompositeObserver::new())),
+            ValidationEngine::Native,
         ))
     }
 

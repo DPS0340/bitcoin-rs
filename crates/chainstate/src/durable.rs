@@ -31,7 +31,7 @@ use bitcoin_rs_primitives::OutPoint;
 use bitcoin_rs_storage::{CommitRecords, DurableHead};
 use bitcoin_rs_utxo::UtxoCoin;
 use bitcoin_rs_utxo::contract::{
-    OutputSource, RollbackError, UndoLoadError, load_block_undo, rollback_block,
+    OutputSource, RollbackError, UndoLoadError, load_block_undo, rollback_block_recovery,
 };
 
 /// What one durable head commit certified.
@@ -68,6 +68,7 @@ impl DurableReceipt {
         tip
     }
 }
+
 /// Facts of one connected block that its durable head commit names.
 pub(super) struct ConnectCommitFacts {
     /// Parent the durable head must currently name — for a group, the
@@ -344,13 +345,25 @@ pub fn recover_disconnect_marker(handles: &Chainstate) -> Result<(), ApplyError>
     // roll back to the head the batch already certified. Every other shape
     // reconciles exactly as an ordinary boot would.
     let restored = handles.applied_tip.load_full();
-    let mode = match restored.as_ref().map(|tip| (tip.height, tip.hash)) {
+    // Gap replay is valid only when the restored tip already lies on the
+    // certified head chain. Height alone cannot answer that: a checkpointed
+    // tip can sit below the head on a branch a reorg already left, and
+    // replaying the head chain onto it is refused divergence. The head tip
+    // itself may be absent from the restored tree, so the tip is measured
+    // against the deepest head-chain point the tree resolves — recovered
+    // through the authenticated body chain when necessary. Anything else
+    // must first rewind to the fork through the stored undo rows.
+    let mode = match restored.as_deref() {
         None => "cold-replay",
-        Some((height, hash)) if hash != head.tip && height >= head.height => {
-            rewind_restored_to_head(handles, &head)?;
-            "checkpoint-rewind"
+        Some(tip) => {
+            let anchor = resolve_head_anchor(handles, &head)?;
+            if anchor.contains_tip(handles, tip) {
+                "gap-replay"
+            } else {
+                rewind_restored_to_head(handles, &head, &anchor)?;
+                "checkpoint-rewind"
+            }
         }
-        Some(_) => "gap-replay",
     };
     reconcile_at_boot(handles)?;
     tracing::warn!(
@@ -361,13 +374,126 @@ pub fn recover_disconnect_marker(handles: &Chainstate) -> Result<(), ApplyError>
         mode,
         "automatic disconnect recovery replayed the certified head chain"
     );
-    // Publication is the durability fence: `publish_recovery_checkpoint`
-    // retires the marker itself after the repaired state lands in a clean
-    // checkpoint, and a failure retains it.
+    // Publication is the durability fence: the recovery checkpoint retires
+    // the marker only after the repaired state, the journal compaction, and
+    // the resume all land. A failure retains it.
     if let Err(error) = handles.publish_recovery_checkpoint() {
         return Err(ApplyError::RecoveryPublication(Box::new(error)));
     }
     Ok(())
+}
+
+/// The deepest point of the certified head chain the restored block tree
+/// resolves.
+///
+/// When the head tip itself is a tree node the anchor is the head and
+/// `above` is empty. Otherwise the anchor is the first head-chain ancestor
+/// the tree knows, recovered by walking the durable body chain down from
+/// `head.tip`: each stored body self-authenticates against the hash that
+/// names it and names its own parent, so the chain evidence is the same the
+/// replay will apply.
+#[derive(Debug)]
+pub(super) struct HeadChainAnchor {
+    /// The height `anchor` sits at on the head chain.
+    pub(super) anchor_height: u32,
+    /// The deepest head-chain hash the restored block tree resolves.
+    pub(super) anchor: Hash256,
+    /// `(height, hash)` pairs on the head chain strictly above the anchor, in
+    /// ascending order — the segment the tree cannot resolve.
+    pub(super) above: Vec<(u32, Hash256)>,
+}
+
+impl HeadChainAnchor {
+    /// Whether `tip` lies on the head chain the anchor certifies: at or below
+    /// the anchor it must be its ancestor; above it the tip must equal the
+    /// descriptor the body walk recorded at that height.
+    pub(super) fn contains_tip(&self, handles: &Chainstate, tip: &TipSnapshot) -> bool {
+        if tip.height <= self.anchor_height {
+            let tree = handles.block_tree.read();
+            return tree.lookup(self.anchor).is_some_and(|anchor_id| {
+                tree.find_common_ancestor(anchor_id, tip.tip_id) == Some(tip.tip_id)
+            });
+        }
+        let index = usize::try_from(tip.height - self.anchor_height - 1).unwrap_or(usize::MAX);
+        self.above
+            .get(index)
+            .is_some_and(|(_, hash)| *hash == tip.hash)
+    }
+}
+
+/// Resolves the deepest head-chain point the restored block tree knows.
+///
+/// The fast path is the head tip itself. When it is absent — the durable
+/// head names a block the restored headers do not cover — the certified
+/// body chain is walked down from `head.tip`, one stored block at a time,
+/// until a hash resolves. The walk is durable-resolved exactly like the
+/// replay's: each body must hash to the identity that named it.
+///
+/// # Errors
+///
+/// Fails closed when no body store is attached, a walked body is missing,
+/// undecodable, or does not hash to the hash that named it, or when the walk
+/// reaches height 0 without a tree-resolvable hash: the fork is then
+/// unprovable from durable evidence and the marker is retained.
+pub(super) fn resolve_head_anchor(
+    handles: &Chainstate,
+    head: &DurableHead,
+) -> Result<HeadChainAnchor, ApplyError> {
+    if handles.block_tree.read().lookup(head.tip).is_some() {
+        return Ok(HeadChainAnchor {
+            anchor_height: head.height,
+            anchor: head.tip,
+            above: Vec::new(),
+        });
+    }
+    let Some(store) = handles.block_body_store.as_ref() else {
+        return Err(rewind_refused(
+            handles,
+            head,
+            "the durable head tip is absent from the block tree and no body store is attached",
+        ));
+    };
+    let mut above = Vec::new();
+    let mut cursor = (head.height, head.tip);
+    loop {
+        let bytes = store
+            .load_block_body(cursor.0, cursor.1)
+            .map_err(ApplyError::BlockBodyPersistence)?
+            .ok_or_else(|| {
+                rewind_refused(
+                    handles,
+                    head,
+                    "a durable head body is missing, so the head chain cannot be authenticated",
+                )
+            })?;
+        let block: Block = bitcoin_rs_primitives::deserialize(&bytes)
+            .map_err(|_| rewind_refused(handles, head, "a durable head body does not decode"))?;
+        if block.block_hash().0 != cursor.1 {
+            return Err(rewind_refused(
+                handles,
+                head,
+                "a durable head body does not hash to its committed hash",
+            ));
+        }
+        above.push(cursor);
+        if cursor.0 == 0 {
+            return Err(rewind_refused(
+                handles,
+                head,
+                "no durable head ancestor resolves in the restored block tree",
+            ));
+        }
+        let parent = block.header.prev_blockhash.0;
+        if handles.block_tree.read().lookup(parent).is_some() {
+            above.reverse();
+            return Ok(HeadChainAnchor {
+                anchor_height: cursor.0 - 1,
+                anchor: parent,
+                above,
+            });
+        }
+        cursor = (cursor.0 - 1, parent);
+    }
 }
 
 /// The fail-closed refusal one rewind step reports.
@@ -393,34 +519,44 @@ fn rewind_refused(handles: &Chainstate, head: &DurableHead, reason: &'static str
 /// PRE: the applied tip leads `head`, or meets its height with another hash,
 /// and no other applier can observe the chainstate.
 ///
-/// POST: the applied tip names `head.tip`, or descends from it below
-/// `head.height` with the UTXO set and coin statistics rewound by exactly
-/// the blocks the walk removed; reconciliation owns the forward step.
+/// POST: the applied tip lies on the certified head chain — at or below
+/// `anchor`, or on the authenticated segment above it — with the UTXO set
+/// and coin statistics rewound by exactly the blocks the walk removed;
+/// reconciliation owns the forward step.
 ///
 /// INVARIANT: a missing body or undo row, a body that does not hash to the
 /// applied tip, a parent that does not match the block's own previous hash,
 /// or a rewind the set refuses fails closed and retains the marker. A
 /// partial rewind never publishes.
-fn rewind_restored_to_head(handles: &Chainstate, head: &DurableHead) -> Result<(), ApplyError> {
+fn rewind_restored_to_head(
+    handles: &Chainstate,
+    head: &DurableHead,
+    anchor: &HeadChainAnchor,
+) -> Result<(), ApplyError> {
     let transition = handles.begin_transition()?;
-    rewind_walk(handles, head)?;
+    rewind_walk(handles, head, anchor)?;
     drop(transition);
     Ok(())
 }
 
-/// Steps the applied tip down one block at a time until it reaches the
-/// durable head or finds the fork point below it.
-fn rewind_walk(handles: &Chainstate, head: &DurableHead) -> Result<(), ApplyError> {
+/// Steps the applied tip down one block at a time until it lands on the
+/// certified head chain — the anchor, one of its tree-resolved ancestors,
+/// or a descriptor the body walk recorded above it.
+fn rewind_walk(
+    handles: &Chainstate,
+    head: &DurableHead,
+    anchor: &HeadChainAnchor,
+) -> Result<(), ApplyError> {
     loop {
         let applied = handles
             .applied_tip
             .load_full()
             .ok_or_else(|| rewind_refused(handles, head, "the applied tip vanished mid-rewind"))?;
-        // Landed on the head, or stepped below it onto the fork the head
-        // chain descends from: reconciliation replays the rest forward.
-        let landed_on_head = applied.hash == head.tip;
-        let onto_fork = applied.height < head.height;
-        if landed_on_head || onto_fork {
+        // Landed on the head chain — the fork the head descends from or a
+        // point the authenticated body walk recorded. Anything else keeps
+        // rewinding; the applied branch always shares the tree's genesis,
+        // so the walk cannot outrun the fork.
+        if anchor.contains_tip(handles, &applied) {
             return Ok(());
         }
         rewind_one_step(handles, head, &applied)?;
@@ -456,32 +592,32 @@ fn rewind_one_step(
             "a rewound block body does not hash to the applied tip",
         ));
     }
-    // The header hash binds the header, not the transaction list: an altered
-    // body under a matching header would rewind the wrong coins, so the
-    // stored body's merkle root must answer the header's before the count
-    // delta and undo are derived from it.
+    // A header-matching body can still carry altered transactions; the
+    // txid-level merkle check the ordinary disconnect path runs applies
+    // here for the same reason.
     let txids: Vec<bitcoin_rs_primitives::Txid> = block
         .txs
         .iter()
         .map(bitcoin_rs_primitives::Tx::txid)
         .collect();
-    bitcoin_rs_consensus::verify_merkle_root_with_txids(&block, &txids).map_err(|_| {
-        rewind_refused(
+    if bitcoin_rs_consensus::verify_merkle_root_with_txids(&block, &txids).is_err() {
+        return Err(rewind_refused(
             handles,
             head,
-            "a rewound block body does not match its header merkle root",
-        )
-    })?;
+            "a rewound block body does not match its header's merkle root",
+        ));
+    }
     let undo = load_block_undo(handles.undo_store.as_ref(), height, hash).map_err(|_| {
         rewind_refused(handles, head, "a rewound block's undo record does not load")
     })?;
     let tx_count_delta = tx_count_delta_for(&block);
     let parent_tip = rewound_parent(handles, head, applied, &block, tx_count_delta)?;
-    rollback_block(
-        handles.undo_store.as_ref(),
+    // Recovery owns the surviving marker — the ordinary path's arming
+    // guard would refuse every step under it, and overwriting it would
+    // erase the evidence being reconciled.
+    rollback_block_recovery(
         handles.utxo.as_ref(),
         handles.coin_stats.as_ref(),
-        hash,
         height,
         parent_tip.height,
         tx_count_delta,
@@ -607,21 +743,12 @@ fn replay_committed_gap(
         }
         None => 0,
     };
-    // Width bounds the speculative descriptor preallocation only — a head
-    // whose checksum is valid but whose height is inconsistent must not
-    // abort the process on a giant `with_capacity`. The vector still grows
-    // to whatever the authenticated chain needs, so wide replay is
-    // preserved; recoverability is decided by the body-identity and
-    // ancestry checks below, never by how wide the gap is.
-    // Compute in u64: `head.height + 1` overflows u32 on a cold replay whose
-    // head sits at the top of the range, before the clamp can apply.
-    let gap_width = usize::try_from(
-        u64::from(head.height)
-            .saturating_sub(u64::from(base_height))
-            .saturating_add(1)
-            .min(1 << 16),
-    )
-    .map_err(|_| unrecoverable("gap width exceeds the address space"))?;
+    // Width bounds the descriptor allocation only. Recoverability is decided
+    // by the body-identity and ancestry checks below, never by how wide the
+    // gap is: any authenticated ancestor chain above the restored tip
+    // replays, however many commit groups it spans.
+    let gap_width = usize::try_from(head.height - base_height + 1)
+        .map_err(|_| unrecoverable("gap width exceeds the address space"))?;
 
     let Some(store) = handles.block_body_store.as_ref() else {
         return Err(unrecoverable("no block body store is attached"));
@@ -707,6 +834,7 @@ fn replay_gap_chain(
                         &block,
                         Some(bytes.clone()),
                         &UndoRowSpends(&undo),
+                        handles.validation_engine,
                     )?,
                 )),
                 Err(UndoLoadError::Missing { .. }) => None,

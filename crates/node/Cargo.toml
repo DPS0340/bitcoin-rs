@@ -28,7 +28,10 @@ usdt = ["bitcoin-rs-trace/usdt", "bitcoin-rs-chainstate/usdt", "bitcoin-rs-mempo
 # Note: `--workspace --features "..."` in a virtual workspace (no root [package])
 # does NOT forward CLI features to library crates; always use -p when features
 # must reach a specific crate.
-default = ["fjall", "kernel", "zmq"]
+# `kernel` is capability ("bitcoinkernel support is compiled in"), not
+# selection: the engine a run uses is `validation.engine` at runtime. The
+# default is kernel-free so the C++ toolchain is opt-in.
+default = ["fjall", "zmq"]
 rocksdb = [
     "bitcoin-rs-chainstate/rocksdb",
     "bitcoin-rs-chain/rocksdb",
@@ -94,6 +97,7 @@ bitcoin-rs-trace.workspace = true
 [dev-dependencies]
 tempfile = ">=3.20.0, <4"
 bitcoin-rs-chain = { workspace = true, features = ["test-seam"] }
+bitcoin-rs-p2p = { workspace = true, features = ["test-seam"] }
 bitcoin-rs-chainstate = { workspace = true, features = ["test-seam"] }
 proptest.workspace = true
 criterion.workspace = true

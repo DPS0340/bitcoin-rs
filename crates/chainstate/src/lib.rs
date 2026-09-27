@@ -10,7 +10,7 @@ use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::{
     BlockTree, BlockTreeReader, ChainError, ChainTxCount, TipReader, TipSnapshot,
 };
-use bitcoin_rs_consensus::rust_path::UtxoView;
+use bitcoin_rs_consensus::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_primitives::OutPoint;
@@ -151,14 +151,14 @@ const LOCAL_OVERLAY_TXID_SET_THRESHOLD: usize = 8;
 
 /// Admission barrier shared by every cloned apply handle.
 pub(crate) struct ApplyAdmission {
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     barrier: RwLock<()>,
 }
 
 impl ApplyAdmission {
     pub(crate) fn new() -> Self {
         Self {
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             barrier: RwLock::new(()),
         }
     }
@@ -494,6 +494,10 @@ pub struct Chainstate {
     pub(crate) assume_valid_height: u32,
     pub(crate) assume_valid_gate: Arc<AssumeValidGate>,
     pub(crate) validation_mode: ValidationMode,
+    /// The one resolved script-verification engine selection. Owned by node
+    /// configuration (`validation.engine`); this handle passes it to the
+    /// engine-specific seams of the shared block/tx validation pipeline.
+    pub(crate) validation_engine: bitcoin_rs_consensus::ValidationEngine,
     /// Chainstate-journal writer, when the journal is enabled (issue #230).
     ///
     /// `None` = journal off: the apply path emits nothing and behaves exactly
@@ -554,6 +558,8 @@ pub struct ChainstateParts {
     pub assume_valid_height: u32,
     /// Historical script-verification policy.
     pub validation_mode: ValidationMode,
+    /// The one resolved script-verification engine selection.
+    pub validation_engine: bitcoin_rs_consensus::ValidationEngine,
     /// Chainstate journal writer, when journal recovery is enabled.
     pub journal: Option<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter>,
     /// Whether connects retain raw transaction bytes for node-owned consumers.
@@ -746,6 +752,7 @@ impl Chainstate {
             assume_valid_height: parts.assume_valid_height,
             assume_valid_gate,
             validation_mode: parts.validation_mode,
+            validation_engine: parts.validation_engine,
             journal: parts.journal,
             checkpoint_publisher: None,
             capture_rawtx: parts.capture_rawtx,
@@ -782,6 +789,17 @@ impl Chainstate {
     #[must_use]
     pub fn is_closed_for_recovery(&self) -> bool {
         self.admission.closed.load(Ordering::Acquire)
+    }
+
+    /// Shares the admission-closed latch with the read-only surfaces (RPC
+    /// and P2P), so every surface answers from one owner.
+    ///
+    /// PRE: none.
+    /// POST: the returned reader reports the same fact
+    ///   [`Self::is_closed_for_recovery`] reads and offers no writer.
+    #[must_use]
+    pub fn closed_for_recovery_reader(&self) -> bitcoin_rs_chain::LatchReader {
+        bitcoin_rs_chain::LatchReader::new(Arc::clone(&self.admission.closed))
     }
 
     /// Permanently closes mutation admission and waits for in-flight mutations.
@@ -1116,6 +1134,7 @@ impl Chainstate {
             assume_valid_height: 0,
             assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
             validation_mode: ValidationMode::AssumeValid,
+            validation_engine: bitcoin_rs_consensus::ValidationEngine::Native,
             journal: None,
             checkpoint_publisher: None,
             capture_rawtx: false,
@@ -1222,7 +1241,7 @@ impl Chainstate {
     /// INVARIANT: a missing publisher or a skipped tip is a recovery failure,
     /// never a silent skip: the marker must not survive without the
     /// checkpoint that makes the repaired state durable.
-    pub fn publish_recovery_checkpoint(&self) -> core::result::Result<(), CheckpointError> {
+    pub(crate) fn publish_recovery_checkpoint(&self) -> core::result::Result<(), CheckpointError> {
         let invalid = |reason: &str| {
             CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
                 reason.to_owned(),
@@ -1376,7 +1395,7 @@ struct DisconnectPlan {
 /// below the parallel threshold and wasted a further 11s above it. Sixty-four
 /// blocks turns roughly 21,000 dispatches into 330.
 ///
-/// Bounded by memory: the window holds every block's parsed kernel block and
+/// Bounded by memory: the window holds every block's engine-selected parse and
 /// resolved prevouts at once, which costs far more than the block bytes.
 /// Measured over `0..150_000`, pinned to 32 cores, medians of interleaved runs:
 ///
@@ -1573,9 +1592,10 @@ enum ProvenApply<'b> {
 /// Split out because a window of consecutive blocks can produce all of these
 /// at once, against one ordered overlay, and share a single script dispatch.
 /// The measured duplication that made an earlier batching attempt a wash was
-/// exactly the kernel parse and the prevout resolution below being done twice.
+/// exactly the one-shot block parse and the prevout resolution below being
+/// done twice.
 struct PreparedApply<'b> {
-    kernel_block: bitcoin_rs_consensus::kernel::KernelBlock,
+    parsed: bitcoin_rs_consensus::kernel::BlockParse,
     /// Parse-once transaction state: identities computed once in
     /// [`parse_block_for_apply`], witness IDs on demand, and the prevout
     /// matrix installed once right before script verification.
@@ -1846,6 +1866,10 @@ mod chain_tx_count_tests;
 #[cfg(test)]
 #[path = "../tests/unit/apply/persistence_tests.rs"]
 mod persistence_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/apply/window_disposition_tests.rs"]
+mod window_disposition_tests;
 
 #[cfg(test)]
 #[path = "../tests/unit/apply/window_tx_count_tests.rs"]

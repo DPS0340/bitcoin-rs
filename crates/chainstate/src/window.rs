@@ -413,6 +413,15 @@ fn invalidate_permanent_failure(
 /// retry path. The native interpreter does not produce that spurious failure,
 /// so its `ConsensusError::Script` stays Permanent. The engine field decides
 /// this; the reason text is never inspected.
+///
+/// Backend-neutral shape and selection failures — `PrevoutMatrixSize`,
+/// `PrevoutCount`, `UnsupportedEngine` — are caller wiring errors, not
+/// verdicts about the block or its header. They never prove the header
+/// invalid, so they stay Operational like every other wiring failure.
+/// `UnsupportedEngine` is unreachable through the node (configuration
+/// validation rejects the selection before any block applies); the arm
+/// exists so direct consensus callers cannot turn it into a header
+/// invalidation.
 pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
     use WindowApplyDisposition::{BodyMutated, Fatal, Operational, Permanent};
     use bitcoin_rs_consensus::{ConsensusError, ScriptEngine};
@@ -443,6 +452,8 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
             // subtree the way a consensus failure does.
             ConsensusError::Encoding(_)
             | ConsensusError::PrevoutMatrixSize { .. }
+            | ConsensusError::PrevoutCount { .. }
+            | ConsensusError::UnsupportedEngine { .. }
             | ConsensusError::Kernel(_)
             | ConsensusError::Script {
                 engine: ScriptEngine::Kernel,
@@ -536,7 +547,9 @@ pub(super) fn prove_window<'a>(
     let parsed: Vec<core::result::Result<_, ApplyError>> = blocks
         .par_iter()
         .zip(serialized.par_iter())
-        .map(|(block, raw)| parse_block_for_apply(block, Some(raw.clone())))
+        .map(|(block, raw)| {
+            parse_block_for_apply(block, Some(raw.clone()), handles.validation_engine)
+        })
         .collect();
     metrics::histogram!("node.window.parse_seconds").record(parse_started.elapsed().as_secs_f64());
 
@@ -547,11 +560,11 @@ pub(super) fn prove_window<'a>(
     );
     let mut prepared = Vec::with_capacity(blocks.len());
     for ((block, parsed), context) in blocks.iter().zip(parsed).zip(&contexts) {
-        let Ok((kernel_block, txids)) = parsed else {
+        let Ok((parsed, txids)) = parsed else {
             return Vec::new();
         };
         let tx_plan = plan_block_transactions(block, &txids);
-        let facts = kernel_block.derive_facts(&block.txs, &txids);
+        let facts = parsed.derive_facts(&block.txs, &txids);
         let view = bitcoin_rs_consensus::BlockView::from_facts(&block.txs, facts);
         let resolved = Arc::new(ResolvedUtxoView::resolve(&overlay, block, &tx_plan));
         if overlay
@@ -566,7 +579,7 @@ pub(super) fn prove_window<'a>(
             return Vec::new();
         }
         prepared.push(PreparedApply {
-            kernel_block,
+            parsed,
             view,
             tx_plan,
             resolved,
@@ -619,8 +632,9 @@ pub(super) fn prove_window<'a>(
     // One slot per input block, so a skipped unit leaves a hole rather than
     // shifting every later block onto the wrong prepared state.
     let mut skipped = vec![false; prepared.len()];
-    // One dispatch for the whole window. The check units borrow their kernel
-    // blocks, so they live and die inside this scope, before anything commits.
+    // One dispatch for the whole window. The check units borrow the selected
+    // engine's parsed blocks, so they live and die inside this scope, before
+    // anything commits.
     {
         // Each block's checks are built from its own prepared state, so the
         // window builds them all at once. The overlay walk above already fixed
@@ -667,7 +681,7 @@ pub(super) fn prove_window<'a>(
                 context.height,
                 context.locktime_cutoff,
                 context.flags,
-                &unit.kernel_block,
+                &unit.parsed,
             ) {
                 Ok(checks) => units.push(checks),
                 Err(_) => return Vec::new(),

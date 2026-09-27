@@ -3,6 +3,7 @@
 use crate::options::{ChainstateJournalOverrides, UserConfig};
 use anyhow::Result;
 use bitcoin_rs_chainstate::{ChainstateJournalConfig, ValidationMode};
+use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_index::IndexCapabilities;
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_storage::StorageBackend;
@@ -191,6 +192,11 @@ pub struct ValidationConfig {
     pub assume_valid_height: u32,
     /// Which script verification the apply path may skip.
     pub mode: ValidationMode,
+    /// The one script-verification engine this run executes: resolved here
+    /// exactly once from defaults -> file -> environment -> CLI, checked
+    /// against this build's capability in [`NodeConfig::validate`], and passed
+    /// down to the consensus seams that dispatch between script backends.
+    pub engine: ValidationEngine,
 }
 
 /// Resolved mining configuration.
@@ -296,6 +302,10 @@ impl NodeConfig {
                     .validation
                     .mode
                     .unwrap_or(ValidationMode::AssumeValid),
+                engine: settings
+                    .validation
+                    .engine
+                    .unwrap_or(ValidationEngine::Native),
             },
             mining: MiningConfig::default(),
         }
@@ -308,11 +318,21 @@ impl NodeConfig {
     }
 
     /// Validates backend availability and cross-field constraints.
+    ///
+    /// This is the fail-early gate for engine selection: an engine this build
+    /// cannot execute is rejected here — before the data directory opens,
+    /// chainstate exists, or any worker starts.
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.storage.backend.is_compiled_in(),
             "unsupported storage backend {}",
             self.storage.backend
+        );
+        anyhow::ensure!(
+            self.validation.engine.is_supported(),
+            "validation engine `{}` is not supported by this build: bitcoinkernel \
+             support is not compiled in (enable the `kernel` feature)",
+            self.validation.engine
         );
         if self.p2p.magic != self.network.magic() {
             anyhow::ensure!(

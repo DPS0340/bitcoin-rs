@@ -70,18 +70,28 @@ fn bind_rpc(
 ) -> Result<(Arc<Context>, RpcServer)> {
     let rpc_auth = Arc::new(state.config().rpc.auth.to_rpc_auth()?);
     let chainstate = state.chainstate();
-    let mut context = Context::from_handles(ContextHandles {
-        chain: ChainHandles::new(
-            chainstate.header_tip_reader(),
-            chainstate.applied_tip_reader(),
-            state.blocks(),
-            state.transactions(),
-            chainstate.utxo_handle(),
-            chainstate.coin_stats_handle(),
-            chainstate.block_tree_reader(),
-            state.config().network,
-            Arc::clone(ibd),
-        ),
+    let context = Context::from_handles(ContextHandles {
+        chain: ChainHandles {
+            chain_tip: chainstate.header_tip_reader(),
+            applied_tip: chainstate.applied_tip_reader(),
+            ibd: Arc::clone(ibd),
+            blocks: state.blocks(),
+            transactions: state.transactions(),
+            utxo: chainstate.utxo_handle(),
+            coin_stats: chainstate.coin_stats_handle(),
+            block_tree: chainstate.block_tree_reader(),
+            chain_network: state.config().network,
+            chain_transition: chainstate.read_fence(),
+            block_body_source: Some(block_body_source),
+            prune_service: state.prune_service(),
+            closed_for_recovery: chainstate.closed_for_recovery_reader(),
+            chain_control: Some(Arc::new(RpcChainControl {
+                handles: chainstate,
+                followers: state.chain_followers(),
+                sync: state.sync(),
+            })),
+            rollback_warnings: Some(state.recovery_reporter()),
+        },
         mempool: MempoolHandles {
             gateway: state.mempool_gateway(),
         },
@@ -105,20 +115,8 @@ fn bind_rpc(
         },
     })
     .with_esplora_derived_index(state.esplora_derived_index_query())
-    .with_block_body_source(block_body_source)
-    .with_chain_transition(chainstate.read_fence());
-    if let Some(prune_service) = state.prune_service() {
-        context = context.with_prune_service(prune_service);
-    }
-    context = context
-        .with_chain_control(Arc::new(RpcChainControl {
-            handles: chainstate,
-            followers: state.chain_followers(),
-            sync: state.sync(),
-        }))
-        .with_zmq_publisher(state.zmq_publisher())
-        .with_debug_log_path(state.data_dir().join("debug.log"))
-        .with_rollback_warnings(state.recovery_reporter());
+    .with_zmq_publisher(state.zmq_publisher())
+    .with_debug_log_path(state.data_dir().join("debug.log"));
     let context = Arc::new(context);
     let handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::clone(&context)));
     let server = RpcServer::bind(
@@ -204,12 +202,6 @@ pub(crate) struct NodeServices {
     tx_relay: Option<std::thread::JoinHandle<()>>,
     signal_handler: Option<crate::signal::ShutdownHandler>,
     teardown_started: bool,
-    /// Failure injection at the core-worker join boundary, not a P2P owner.
-    #[cfg(test)]
-    outbound_worker: Option<std::thread::JoinHandle<()>>,
-    /// Failure/delay injection at the bootstrap join boundary.
-    #[cfg(test)]
-    bootstrap_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NodeServices {
@@ -296,16 +288,6 @@ impl NodeServices {
                 set_first_error(first_error, anyhow::anyhow!("readiness sampler panicked"));
             }
         }
-        #[cfg(test)]
-        if let Some(handle) = self.outbound_worker.take() {
-            // Injected outbound-drain worker outcome.
-            if matches!(handle.join(), Ok(())) {
-                tracing::info!("P2P outbound drain exited cleanly");
-            } else {
-                tracing::error!("P2P outbound drain panicked");
-                set_first_error(first_error, anyhow::anyhow!("P2P outbound drain panicked"));
-            }
-        }
         if let Some(state) = state {
             // P2P core worker join failure.
             if let Err(error) = state.p2p().join_core_workers() {
@@ -343,25 +325,6 @@ impl NodeServices {
                 set_first_error(first_error, anyhow::Error::new(error));
             }
             mark_bootstrap_drain_reached();
-        }
-        #[cfg(test)]
-        if let Some(handle) = self.bootstrap_worker.take() {
-            mark_bootstrap_drain_reached();
-            let thread_name = handle
-                .thread()
-                .name()
-                .unwrap_or("bitcoin-rs-p2p-bootstrap")
-                .to_owned();
-            // Injected bootstrap worker outcome.
-            if matches!(handle.join(), Ok(())) {
-                tracing::info!(thread = %thread_name, "P2P bootstrap worker exited cleanly");
-            } else {
-                tracing::error!(thread = %thread_name, "P2P bootstrap worker panicked");
-                set_first_error(
-                    first_error,
-                    anyhow::anyhow!("P2P bootstrap worker panicked"),
-                );
-            }
         }
         if let Some(handle) = self.maintenance_worker.take() {
             // Chainstate maintenance worker panic.
@@ -479,6 +442,13 @@ pub(crate) fn start_node(
     runtime: RuntimeInputs,
     install_signals: bool,
 ) -> Result<Node> {
+    // The engine/build compatibility check is owned by configuration
+    // validation (`validation.engine`); repeat it on the direct embedding path
+    // so a caller that skips `resolve` cannot open chainstate or start workers
+    // on an engine this build cannot execute. It runs before anything else:
+    // not even the tracer or the rayon pool may be primed for a run that
+    // cannot start.
+    config.validate()?;
     // Registers the Bitcoin Core-compatible USDT probes with the platform
     // tracer so consumers (bpftrace, BCC, DTrace) can discover them — shared
     // startup, so daemon (`run`) and embedded (`Node::start`) nodes are
@@ -538,6 +508,7 @@ pub(crate) fn start_node(
     let p2p_chain_query: Arc<dyn bitcoin_rs_p2p::ChainQuery> = Arc::new(
         bitcoin_rs_p2p::ActiveChainQuery::new(
             chainstate.block_tree_reader(),
+            chainstate.applied_tip_reader(),
             state.config().network,
         )
         .with_block_body_source(Arc::clone(&block_body_source)),

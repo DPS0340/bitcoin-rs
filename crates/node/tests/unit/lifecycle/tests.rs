@@ -1,3 +1,4 @@
+use bitcoin_rs_consensus::ValidationEngine;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,7 +51,9 @@ fn disabled_zmq_still_seals_the_observer_slot() {
     )));
     let observer: Arc<dyn bitcoin_rs_mempool::MempoolObserver> =
         Arc::new(bitcoin_rs_mempool::CompositeObserver::new());
-    let gateway = bitcoin_rs_mempool::MempoolGateway::shared_with(pool, observer);
+    let gateway =
+        bitcoin_rs_mempool::MempoolGateway::shared_with(pool, observer, ValidationEngine::Native)
+            .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
     assert!(
         gateway.has_observer(),
         "startup must seal the observer slot even without a ZMQ endpoint"
@@ -142,7 +145,7 @@ fn teardown_join_failure_completes_cleanup_and_suppresses_checkpoint() -> anyhow
         .name("bitcoin-rs-outbound-drain".to_owned())
         .spawn(|| panic!("injected worker panic"))?;
     let mut services = NodeServices::default();
-    services.outbound_worker = Some(panicker);
+    state.p2p().test_install_outbound_worker(panicker);
 
     assert!(
         services
@@ -178,7 +181,7 @@ fn teardown_joins_bootstrap_worker_beyond_former_deadline() -> anyhow::Result<()
             let _ = exited_tx.send(());
         })?;
     let mut services = NodeServices::default();
-    services.bootstrap_worker = Some(worker);
+    state.p2p().test_install_bootstrap_worker(worker);
     let started = std::time::Instant::now();
     services.teardown(Some(&state), TeardownMode::CleanShutdown, None)?;
     let elapsed = started.elapsed();

@@ -505,6 +505,7 @@ fn ensure_inventory_request_within_bounds(items: &[Inventory]) -> Result<(), Pee
 
 #[cfg(test)]
 mod tests {
+    use bitcoin_rs_consensus::ValidationEngine;
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1507,6 +1508,7 @@ mod tests {
         let gateway = MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             None,
+            ValidationEngine::Native,
         );
         let mut tx = dummy_tx(0x42);
         tx.inputs[0].witness = Witness::from_stack(vec![vec![0x01]]);
@@ -1563,6 +1565,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn one_sided_wtxid_negotiation_does_not_rerequest_pool_or_orphan_bodies() {
         use bitcoin_rs_primitives::Script;
         use std::sync::Arc;
@@ -1591,6 +1594,7 @@ mod tests {
             let gateway = MempoolGateway::new(
                 Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                 None,
+                ValidationEngine::Native,
             );
             let mut tx = dummy_tx(0x51);
             tx.inputs[0].script_sig.clear();
@@ -1900,7 +1904,7 @@ mod tests {
             prev_blockhash,
             merkle_root: Hash256::from_le_bytes(&[0; 32]),
             time: nonce,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: CompactTarget::from_consensus(bitcoin_rs_chain::regtest_fixture::REGTEST_BITS),
             nonce,
         }
     }

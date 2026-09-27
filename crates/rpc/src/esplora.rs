@@ -1621,6 +1621,74 @@ mod tests {
         assert_eq!(stats.spent_txo_count, 1);
         assert_eq!(stats.spent_txo_sum, 125);
     }
+    #[test]
+    fn script_activity_retries_when_pool_changes_between_views() {
+        let target = vec![0x51];
+        let confirmed = ScriptIndexRecord {
+            txid: Txid(Hash256::from_le_bytes(&[3; 32])),
+            height: 42,
+            value: 125,
+            vout: 0,
+        };
+        let funder = Arc::new(paying_transaction(
+            &[unconfirmed_outpoint(1)],
+            &[(200, target.clone())],
+        ));
+        let spender = paying_transaction(
+            &[OutPoint::new(confirmed.txid, confirmed.vout)],
+            &[(100, vec![0x52])],
+        );
+        let funder_txid = funder.txid();
+        let spender_txid = spender.txid();
+        let mut context = Context::new();
+        context.indexes.script_index = Some(Arc::new(StaticScriptIndex {
+            history: Vec::new(),
+            funding: vec![confirmed],
+            unspent: vec![confirmed],
+        }));
+        context
+            .mempool
+            .pool()
+            .write()
+            .insert_entry(MempoolEntry::new(Arc::clone(&funder), 100, 1_000, 1, 0, 0))
+            .expect("seed funder");
+        let first_sequence = context.mempool.pool().read().sequence_number();
+        let context = Arc::new(context);
+        let handler = Handler::new(Arc::clone(&context));
+        let script_hash = ScriptHash::new(&target)
+            .to_byte_array()
+            .to_lower_hex_string();
+        let path = format!("/scripthash/{script_hash}");
+        let (entered_send, entered_recv) = channel();
+        let (release_send, release_recv) = channel();
+        let request = std::thread::spawn(move || {
+            arm_mempool_activity_gate(entered_send, release_recv);
+            route(&handler, &path, "")
+        });
+
+        assert!(
+            entered_recv.recv_timeout(GATE_TIMEOUT).is_ok(),
+            "request did not capture its first mempool view"
+        );
+        {
+            let mut pool = context.mempool.pool().write();
+            pool.remove_for_block(&[funder.as_ref()], &[funder_txid], 42);
+            assert!(!pool.contains_txid(&funder_txid));
+            pool.insert_entry(MempoolEntry::new(Arc::new(spender), 100, 1_000, 2, 0, 0))
+                .expect("seed spender");
+            assert_ne!(pool.sequence_number(), first_sequence);
+            assert!(pool.contains_txid(&spender_txid));
+        }
+        release_send.send(()).expect("release request");
+
+        let response = request.join().expect("route thread");
+        assert_eq!(
+            response.status,
+            503,
+            "mempool snapshots changed during projection: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+    }
 
     #[test]
     fn utxo_and_outspend_use_their_dedicated_index_queries() {
@@ -1771,6 +1839,10 @@ mod tests {
         /// thread that arms it is ever gated.
         static BINNING_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> =
             const { RefCell::new(None) };
+        /// The one-shot halves for a mempool activity read between its two pool
+        /// views. Installed per serving thread so unrelated requests are not gated.
+        static MEMPOOL_ACTIVITY_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> =
+            const { RefCell::new(None) };
     }
 
     /// How long the gated thread waits for release before continuing anyway, so
@@ -1789,6 +1861,19 @@ mod tests {
     /// in the suite is untouched.
     pub(crate) fn gate_mempool_binning_for_tests() {
         let armed = BINNING_GATE.with(|slot| slot.borrow_mut().take());
+        let Some((entered, release)) = armed else {
+            return;
+        };
+        let _ = entered.send(());
+        let _ = release.recv_timeout(GATE_TIMEOUT);
+    }
+    fn arm_mempool_activity_gate(entered: Sender<()>, release: Receiver<()>) {
+        MEMPOOL_ACTIVITY_GATE.with(|slot| *slot.borrow_mut() = Some((entered, release)));
+    }
+
+    /// Pauses after funders are captured and before the spender read.
+    pub(crate) fn gate_mempool_activity_for_tests() {
+        let armed = MEMPOOL_ACTIVITY_GATE.with(|slot| slot.borrow_mut().take());
         let Some((entered, release)) = armed else {
             return;
         };

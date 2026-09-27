@@ -95,8 +95,16 @@ pub(super) fn plan_disconnect(
     // answer: a checkpoint restore counts only its tip and leaves ancestors
     // unknown, and an unknown there would strand a count the next replay
     // recomputes. An unknown applied count stays unknown either way.
+    let rewound = applied.chain_tx_count.rewind(tx_count_delta);
+    if applied.chain_tx_count.get().is_some() && rewound.get().is_none() {
+        tracing::warn!(
+            height,
+            hash = %block.block_hash().0,
+            "cumulative chain transaction count rewound below zero; marking it unknown"
+        );
+    }
     let parent_tip = TipSnapshot {
-        chain_tx_count: applied.chain_tx_count.rewind(tx_count_delta),
+        chain_tx_count: rewound,
         ..parent_tip
     };
 
@@ -138,7 +146,7 @@ pub(super) fn disconnect_block_admitted(
     // Fenced per disconnect, not per reorg: an interrupted switch leaves a
     // consistent lower tip. `Refused` touched nothing; the rest may have torn
     // state and poison admission for recovery.
-    let rollback_receipt = rollback_block(
+    let rollback = rollback_block(
         handles.undo_store.as_ref(),
         handles.utxo.as_ref(),
         handles.coin_stats.as_ref(),
@@ -188,14 +196,14 @@ pub(super) fn disconnect_block_admitted(
     )
     .map_err(fatal)?;
     let parent_tip = receipt.certify(parent_tip);
-    // The certified count also belongs on the parent's tree node: a later
-    // connect of a competing child derives its count from that node, and a
-    // checkpoint restore deliberately leaves non-tip nodes unknown.
+    // A checkpoint restore counts only its tip; ancestors stay unknown, and a
+    // later connect derives its count from the parent's tree node. Write the
+    // certified parent count back so a reorg off a restored tip keeps it.
     handles
         .block_tree
         .write()
         .restore_chain_tx_count(parent_tip.tip_id, parent_tip.chain_tx_count)
-        .map_err(|error| fatal(ApplyError::from(error)))?;
+        .map_err(|error| fatal(ApplyError::Chain(error)))?;
     publish_applied(handles, &parent_tip, crate::events::HintKind::Disconnected);
     if journal_rewound {
         handles.undo_store.disarm_disconnect().map_err(|error| {
@@ -213,6 +221,6 @@ pub(super) fn disconnect_block_admitted(
     Ok(DisconnectOutcome {
         parent_tip,
         hash: block_hash,
-        restored_parents: rollback_receipt.restored_parents,
+        restored_parents: rollback.restored_parents,
     })
 }

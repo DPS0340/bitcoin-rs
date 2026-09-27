@@ -1011,6 +1011,7 @@ mod manifest_tests {
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Some(observer),
+            bitcoin_rs_consensus::ValidationEngine::Native,
         );
         (gateway, publisher)
     }
@@ -1092,6 +1093,7 @@ mod manifest_tests {
                 ..MempoolLimits::default()
             }))),
             Some(observer),
+            bitcoin_rs_consensus::ValidationEngine::Native,
         );
         let low = MempoolEntry::new(std::sync::Arc::new(sequence_tx(5)), 100, 100, 1, 7, 0);
         let high = MempoolEntry::new(std::sync::Arc::new(sequence_tx(6)), 100, 900, 1, 7, 0);
@@ -1120,6 +1122,7 @@ mod manifest_tests {
     fn composite_observer_fans_out_to_sequence_then_mining_wake() {
         use bitcoin_rs_mempool::{
             AdmissionOrigin, CompositeObserver, Mempool, MempoolGateway, MempoolLimits,
+            MempoolObserver,
         };
         use bitcoin_rs_mining::FakeMiningControl;
         use bitcoin_rs_mining::MempoolSequenceWake;
@@ -1143,7 +1146,8 @@ mod manifest_tests {
         composite.add_leg("mining", signal);
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Some(std::sync::Arc::new(composite)),
+            Some(std::sync::Arc::new(composite) as std::sync::Arc<dyn MempoolObserver>),
+            bitcoin_rs_consensus::ValidationEngine::Native,
         );
         gateway
             .insert_entry(AdmissionOrigin::Rpc, sequence_entry(&sequence_tx(7)))

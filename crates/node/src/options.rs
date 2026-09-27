@@ -29,6 +29,7 @@ use serde::de::{Error as _, MapAccess, Visitor};
 
 use crate::config::{NetworkSelection, NotificationConfig, ScriptIndexMode};
 use bitcoin_rs_chainstate::ValidationMode;
+use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_storage::StorageBackend;
 
 /// Parses a network selection spelling.
@@ -54,6 +55,13 @@ pub fn parse_validation_mode(value: &str) -> std::result::Result<ValidationMode,
         format!(
             "invalid validation-mode value `{value}`: expected `full`, `assume-valid`, or `fast`"
         )
+    })
+}
+
+/// Parses a validation engine name.
+pub fn parse_validation_engine(value: &str) -> std::result::Result<ValidationEngine, String> {
+    ValidationEngine::parse(value).ok_or_else(|| {
+        format!("invalid validation-engine value `{value}`: expected `native` or `kernel`")
     })
 }
 
@@ -594,6 +602,14 @@ macro_rules! option_rows {
                         cli[#[arg(long = "validation-mode", value_parser = parse_validation_mode)]]
                         env["BITCOIN_RS_VALIDATION_MODE", parse_validation_mode]
                         toml text("validation_mode", parse_validation_mode)
+                    }
+                    /// Which script-verification engine runs: `native` (default)
+                    /// or `kernel`. `kernel` requires a build with the `kernel`
+                    /// feature.
+                    engine as validation_engine: Option<ValidationEngine> {
+                        cli[#[arg(long = "validation-engine", value_parser = parse_validation_engine)]]
+                        env["BITCOIN_RS_VALIDATION_ENGINE", parse_validation_engine]
+                        toml text("validation_engine", parse_validation_engine)
                     }
                 }
                 /// User-supplied mining overrides.

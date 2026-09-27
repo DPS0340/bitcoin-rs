@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-use bitcoin_rs_mempool::MempoolGateway;
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_rpc::context::{
     ChainHandles, Context, ContextHandles, IndexHandles, MempoolHandles, NetworkHandles,
@@ -107,19 +106,25 @@ impl ServerHarness {
         let chainstate = state.chainstate();
         let ibd = state.ibd();
         let ctx = Context::from_handles(ContextHandles {
-            chain: ChainHandles::new(
-                chainstate.header_tip_reader(),
-                chainstate.applied_tip_reader(),
-                state.blocks(),
-                state.transactions(),
-                chainstate.utxo_handle(),
-                chainstate.coin_stats_handle(),
-                chainstate.block_tree_reader(),
-                state.config().network,
+            chain: ChainHandles {
+                chain_tip: chainstate.header_tip_reader(),
+                applied_tip: chainstate.applied_tip_reader(),
                 ibd,
-            ),
+                blocks: state.blocks(),
+                transactions: state.transactions(),
+                utxo: chainstate.utxo_handle(),
+                coin_stats: chainstate.coin_stats_handle(),
+                block_tree: chainstate.block_tree_reader(),
+                chain_network: state.config().network,
+                closed_for_recovery: chainstate.closed_for_recovery_reader(),
+                chain_transition: chainstate.read_fence(),
+                ..ChainHandles::default()
+            },
             mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(state.mempool()),
+                // The daemon wires this handle as `state.mempool_gateway()`
+                // (lifecycle.rs): the gateway interned under the resolved
+                // `config.validation.engine`, not a re-interned Native one.
+                gateway: state.mempool_gateway(),
             },
             indexes: IndexHandles {
                 derived_index: state.derived_index_query(),

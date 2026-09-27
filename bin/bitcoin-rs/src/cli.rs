@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use bitcoin_rs_chainstate::ValidationMode;
 use bitcoin_rs_node::options::{
     parse_connect_endpoint, parse_network, parse_p2p_magic, parse_script_index,
-    parse_storage_backend, parse_validation_mode,
+    parse_storage_backend, parse_validation_engine, parse_validation_mode,
 };
 use bitcoin_rs_node::{
     ChainstateJournalOverrides, IndexOverrides, MiningOverrides, NetworkSelection,
     NotificationConfig, ObservabilityOverrides, P2pOverrides, RpcOverrides, ScriptIndexMode,
-    StorageOverrides, UserConfig, ValidationOverrides,
+    StorageOverrides, UserConfig, ValidationEngine, ValidationOverrides,
 };
 use bitcoin_rs_storage::StorageBackend;
 use clap::Parser;

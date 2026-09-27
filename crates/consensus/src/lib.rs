@@ -2,13 +2,14 @@
 //!
 //! Script verification has two backends. The native Rust interpreter in
 //! `bitcoin-rs-script` executes every consensus spend class: legacy, P2SH,
-//! `SegWit` v0, and Taproot key-path and script-path. The `kernel` feature
-//! routes the same checks through bitcoinkernel (Bitcoin Core's C++ engine)
-//! and is the production default in this crate and in `bitcoin-rs-node`.
-//! The `bin/bitcoin-rs` binary defaults to `["fjall", "redb", "zmq"]` (no
-//! `kernel`), so `cargo build -p bitcoin-rs` uses the native interpreter.
-//! Issue #213 keeps `kernel` as the library default until native wins the
-//! signed-spend and full-replay gates; see
+//! `SegWit` v0, and Taproot key-path and script-path. The `kernel` feature is
+//! a capability ("bitcoinkernel support is compiled in"), not a selection:
+//! which backend runs is the runtime `validation.engine` setting
+//! (`bitcoin_rs_consensus::ValidationEngine`, default `Native`). Enabling
+//! `kernel` compiles the bitcoinkernel backend (Bitcoin Core's C++ engine)
+//! in alongside the native one; selecting `Kernel` without the feature fails
+//! closed with the unsupported-build error. Every crate is kernel-free by
+//! default, so a plain `cargo build` links no C++ engine; see
 //! `docs/contracts/validation-default.md`.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -32,10 +33,10 @@ pub mod bip68;
 pub mod bip9;
 /// Parse-once block state shared by the native apply path.
 pub mod block_view;
+/// The one runtime validation-engine selector.
+pub mod engine;
 /// Feature-gated bitcoinkernel wrapper.
 pub mod kernel;
-/// Portable Rust validator.
-pub mod rust_path;
 /// Private AVX2 SHA256d64 kernel for Merkle hashing.
 mod sha256d64;
 /// Shared transaction-level BIP141 sigop accounting.
@@ -51,9 +52,8 @@ pub use bip9::{
 };
 pub use bip113::{MEDIAN_TIME_PAST_WINDOW, locktime_cutoff};
 pub use block_view::BlockView;
-pub use rust_path::UtxoView;
+pub use engine::ValidationEngine;
 pub use sigops::transaction_sigop_cost;
-pub use sigops::transaction_sigop_cost as total_sigop_cost;
 pub use verify_block::{
     BlockRuleContext, MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_WEIGHT, check_block_body_binding,
     compute_merkle_root, verify_block_rules, verify_block_rules_precomputed, verify_flags,
@@ -65,7 +65,27 @@ pub use verify_tx::{
     verify_transaction_non_script,
 };
 
+use bitcoin_rs_primitives::{OutPoint, TxOut};
 use thiserror::Error;
+
+/// Minimal UTXO lookup contract used by the portable validator.
+///
+/// PRE: `outpoint` identifies the requested previous output.
+/// POST: `lookup` returns that output, or `None` if this view has no output.
+/// INVARIANT: A reference view returns the same result as its referent.
+pub trait UtxoView {
+    /// Looks up a previous output by outpoint.
+    fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut>;
+}
+
+impl<T> UtxoView for &T
+where
+    T: UtxoView + ?Sized,
+{
+    fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
+        (*self).lookup(outpoint)
+    }
+}
 
 /// The engine that rejected a script.
 ///
@@ -214,6 +234,31 @@ pub enum ConsensusError {
         expected: usize,
         /// Number of supplied prevout rows.
         actual: usize,
+    },
+    /// A transaction's script checks received the wrong number of prevout rows.
+    ///
+    /// A caller wiring bug, not a verdict about the transaction: a short row
+    /// set would leave trailing inputs silently unverified and a long one
+    /// would index past the input set. Backend-neutral — no script backend
+    /// ran — so consumers classify it on its own, never as a script failure.
+    #[error("transaction has {input_count} inputs but {prevout_count} prevouts")]
+    PrevoutCount {
+        /// Number of transaction inputs.
+        input_count: usize,
+        /// Number of supplied prevout rows.
+        prevout_count: usize,
+    },
+    /// The requested [`ValidationEngine`] is not compiled into this build.
+    ///
+    /// A build/wiring error, not a verdict about the transaction: this build
+    /// lacks the capability (`kernel` feature) the selection requires. The
+    /// node refuses such a selection at configuration validation before any
+    /// state or worker exists; seams reachable without that gate fail closed
+    /// with this error instead of substituting another backend.
+    #[error("unsupported validation engine: {engine}")]
+    UnsupportedEngine {
+        /// The refused engine.
+        engine: ValidationEngine,
     },
     /// Kernel path failed or is not configured for the requested operation.
     #[error("kernel validation failed: {0}")]

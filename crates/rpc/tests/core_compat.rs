@@ -3,13 +3,21 @@
 //! Every dispatched response covered by a `corepc_types` structured type must
 //! deserialize into that exact upstream type under the crate's strict
 //! `serde-deny-unknown-fields` feature. Hardcoded key-set equality is gone:
-//! the versioned type is the schema.
+//! the versioned type is the schema. `getblockchaininfo` additionally carries
+//! declared extension keys: its decoder strips exactly that declared set
+//! before the strict decode, so any other unlisted key still fails the gate.
 //!
 //! Schema-proof surface named by `docs/policies/source-compatibility.md`
 //! §5.2 (RPC methods match current Bitcoin Core schemas; clean cutover, no
 //! deprecation shims).
 
 extern crate alloc;
+
+#[expect(
+    dead_code,
+    reason = "core_compat reaches only the chaininfo decoder from this shared test-support module"
+)]
+mod support;
 
 use alloc::sync::Arc;
 
@@ -48,8 +56,9 @@ fn tipped_context() -> Arc<Context> {
 fn chain_state_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::error::Error>> {
     let handler = Handler::new(tipped_context());
 
-    let info: corepc_types::v31::GetBlockchainInfo =
-        typed(&handler.dispatch("getblockchaininfo", &json!([]))?)?;
+    let info = support::compare::typed_getblockchain_info(
+        sonic_rs::to_string(&handler.dispatch("getblockchaininfo", &json!([]))?)?.as_bytes(),
+    )?;
     assert_eq!(info.chain, "main");
     assert_eq!(info.blocks, 42);
     assert_eq!(info.headers, 42);

@@ -159,24 +159,6 @@ impl<S: KvStore> Indexer<S> {
         let iter = self.store.iter_prefix(ColumnFamily::Spending, &prefix)?;
         collect_prefix_rows(iter)
     }
-
-    /// Iterates confirmed transaction-id rows matching `txid`.
-    ///
-    /// Returns every `HashPrefixRow` whose 8-byte prefix matches the txid's scan
-    /// prefix, decoded from `ColumnFamily::TxConfirmed`. The 8-byte prefix is
-    /// lossy; multiple txids can share a prefix.
-    ///
-    /// **Height ordering:** same as [`Self::iter_funding_rows`]: the 4-byte
-    /// height suffix is big-endian (format 5), so prefix-range scans arrive
-    /// in chronological order.
-    pub(crate) fn iter_txid_rows(
-        &self,
-        txid: &Txid,
-    ) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
-        let prefix = TxidRow::scan_prefix(txid);
-        let iter = self.store.iter_prefix(ColumnFamily::TxConfirmed, &prefix)?;
-        collect_prefix_rows(iter)
-    }
 }
 
 fn collect_prefix_rows_with_values(
