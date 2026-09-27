@@ -7,7 +7,7 @@
 
 Surface contract of bitcoin-rs against Bitcoin Core 31.x.
 
-- **Supported** - differentially verified against the pinned Bitcoin Core reference; requires `reference.differential_harness` in `docs/api/core-compat.toml`.
+- **Supported** - differentially verified against the pinned Bitcoin Core reference; requires `reference.differential_harness` in `crates/rpc/core-compat.toml`.
 - **Deviation** - shipped with a recorded difference from Core; notes cite the source file.
 - **Implemented (unverified)** - shipped; not compared against the pinned reference.
 - **Extension** - bitcoin-rs-specific surface with no Core counterpart.
@@ -96,7 +96,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 
 | surface | since | notes |
 |---|---|---|
-| `getcapabilities` | 0.4.0 | bitcoin-rs reporting of compiled/enabled concrete service capabilities and index lifecycle state (crates/rpc/src/handlers/chain.rs, crates/rpc/src/capabilities.rs). |
+| `getcapabilities` | 0.4.0 | bitcoin-rs reporting of compiled/enabled concrete service capabilities and index lifecycle state (crates/rpc/src/handlers/chain.rs, crates/index/src/capabilities.rs). |
 
 ### Unimplemented
 

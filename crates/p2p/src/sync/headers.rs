@@ -6,7 +6,6 @@ use super::HEADER_REQUEST_TIMEOUT;
 use super::LOCATOR_MAX_ENTRIES;
 use super::MAX_DEFERRED_OWNED_FETCHES;
 use super::MAX_HEADERS_RESULTS;
-use super::PROTOCOL_VERSION;
 use super::PendingHeaderRequest;
 use super::chain::HeaderAdmission;
 use super::chain::SyncChainError;
@@ -27,6 +26,7 @@ use crate::InboundHeaders;
 use crate::Message;
 use crate::PeerSource;
 use crate::download_window::SyncPeer;
+use crate::wire::PROTOCOL_VERSION;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
 use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus};
@@ -91,7 +91,7 @@ impl BlockSync {
                     self.continue_full_page(Some(source), batch_len, Some(tip_hash), now);
                 }
                 if body_fetch_owned {
-                    self.note_owned_body_fetch(source, headers.last());
+                    self.note_owned_body_fetch(source, headers.last(), now);
                 }
                 continue;
             }
@@ -105,7 +105,7 @@ impl BlockSync {
                 self.route_headers_batch(&headers, source, wire_response, batch_len, now)
             else {
                 if body_fetch_owned {
-                    self.note_owned_body_fetch(source, headers.last());
+                    self.note_owned_body_fetch(source, headers.last(), now);
                 }
                 continue;
             };
@@ -133,8 +133,24 @@ impl BlockSync {
                     if !source.is_some_and(|source| {
                         self.scheduler.lock().headers_sync.contains_key(&source)
                     }) {
-                        self.consume_header_request(source, wire_response, headers.is_empty());
+                        if wire_response && headers.is_empty() {
+                            // An empty wire page answers the pending request
+                            // with a batch this node cannot use: the gate
+                            // stays with its deadline so idle discovery keeps
+                            // its pace and rotates on schedule, but the
+                            // request is marked answered so expiry retires it
+                            // without blaming a peer that did respond.
+                            self.note_empty_wire_answer(source);
+                        } else {
+                            self.consume_header_request(source, wire_response, headers.is_empty());
+                        }
                         self.continue_full_page(source, batch_len, announced_tip, now);
+                    } else if wire_response && headers.is_empty() {
+                        // The live-state bypass leaves the sync cursor alone;
+                        // the gate still learns the answer, or the untouched
+                        // deadline would expire into blame for a silence the
+                        // peer did not cause.
+                        self.note_empty_wire_answer(source);
                     }
                     tracing::debug!(
                         accepted,
@@ -240,7 +256,7 @@ impl BlockSync {
                 }
             }
             if body_fetch_owned {
-                self.note_owned_body_fetch(source, headers.last());
+                self.note_owned_body_fetch(source, headers.last(), now);
             }
         }
         if credit_refresh_needed {
@@ -248,7 +264,7 @@ impl BlockSync {
         }
         // The drain may have attached the ancestry a deferred owned fetch
         // was waiting on — resolve it against the tree now.
-        self.resolve_owned_body_fetches();
+        self.resolve_owned_body_fetches(now);
         if !direct_fetch.is_empty() {
             let chain = self.observe_chain_frontier();
             for (source, announced_tip) in direct_fetch {
@@ -457,6 +473,28 @@ impl BlockSync {
         }
     }
 
+    /// Marks the exact owner's pending request answered for a wire batch
+    /// that carries no usable headers, without moving its deadline.
+    ///
+    /// PRE: `source` is the connection that delivered the batch, if any.
+    /// POST: the request stays registered with its original deadline, so
+    ///   the gate keeps pacing duplicate `getheaders` and expiry still
+    ///   rotates on schedule — but retires without blame, because the peer
+    ///   answered.
+    /// INVARIANT: only a wire answer marks a request answered; a
+    ///   source-less or body-forwarded batch marks nothing.
+    fn note_empty_wire_answer(&self, source: Option<PeerSource>) {
+        let Some(source) = source else {
+            return;
+        };
+        let mut scheduler = self.scheduler.lock();
+        if let Some(request) = &mut scheduler.header_request {
+            if request.source == source {
+                request.answered = true;
+            }
+        }
+    }
+
     /// Releases a `getheaders` gate owned by `source`. Every disconnect
     /// path — send failure, window or staged-header blame — clears the
     /// owner so a same-address reconnect cannot inherit a stale deadline.
@@ -484,6 +522,7 @@ impl BlockSync {
         &self,
         source: Option<PeerSource>,
         header: Option<&bitcoin_rs_primitives::Header>,
+        now: Instant,
     ) {
         let (Some(source), Some(header)) = (source, header) else {
             return;
@@ -515,7 +554,7 @@ impl BlockSync {
             return;
         };
         let SchedulerState { window, stager, .. } = &mut *scheduler;
-        if !window.mark_owned_fetch(stager, source, hash, height, Instant::now()) {
+        if !window.mark_owned_fetch(stager, source, hash, height, now) {
             scheduler.owned_body_fetches.push((source, hash));
         }
     }
@@ -524,7 +563,7 @@ impl BlockSync {
     /// admitted the ancestry their tips were waiting on. Marks whose source
     /// went stale are dropped: the dead connection's fetch died with it and
     /// normal scheduling asks a live peer instead.
-    pub(super) fn resolve_owned_body_fetches(&self) {
+    pub(super) fn resolve_owned_body_fetches(&self, now: Instant) {
         let deferred = {
             let mut scheduler = self.scheduler.lock();
             if scheduler.owned_body_fetches.is_empty() {
@@ -553,7 +592,6 @@ impl BlockSync {
             }
         }
         let mut scheduler = self.scheduler.lock();
-        let now = Instant::now();
         let SchedulerState { window, stager, .. } = &mut *scheduler;
         for (source, hash, height) in resolved {
             // A refusal leaves the fetch in flight: keep the deferred mark so

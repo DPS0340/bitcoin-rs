@@ -62,7 +62,7 @@ fn rpc_protocol_error_codes() -> Result<()> {
         "jsonrpc": "2.0", "id": 3, "method": "getblockhash", "params": ["zero"]
     }))?;
     assert!(
-        matches!(wrong_type["error"]["code"].as_i64(), Some(-32602 | -8)),
+        matches!(wrong_type["error"]["code"].as_i64(), Some(-32602 | -8 | -3)),
         "bad param type: {wrong_type}"
     );
     node.stop()

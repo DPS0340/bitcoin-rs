@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use bitcoin_rs_rpc::capabilities::{CapabilityState, DerivedIndexCapabilitySource};
+use bitcoin_rs_index::{CapabilityState, DerivedIndexCapabilitySource};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 
@@ -296,11 +296,7 @@ impl MetricsServer {
     }
 
     /// Signals the scrape thread and waits for it to exit.
-    pub fn join(mut self) {
-        self.stop_and_join();
-    }
-
-    fn stop_and_join(&mut self) {
+    pub(crate) fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

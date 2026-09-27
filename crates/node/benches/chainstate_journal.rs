@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use bitcoin_rs_consensus::block_subsidy;
 use bitcoin_rs_node::{Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::{
@@ -48,7 +48,10 @@ fn replay_10k_records_with_bounded_time_and_memory() -> Result<()> {
     let genesis = Network::Regtest.genesis_block();
     let state = NodeState::open(config, None)?;
     state.apply_block(&genesis)?;
-    state.publish_checkpoint()?;
+    ensure!(
+        state.publish_checkpoint()?.is_some(),
+        "checkpoint must publish at genesis before the 10k replay"
+    );
 
     let mut previous = genesis.block_hash();
     for height in 1..=RECORDS {
@@ -156,6 +159,8 @@ fn mined_regtest_child_at(prev_blockhash: BlockHash, height: u32) -> Result<Bloc
     };
     let mut block = Block {
         header: Header {
+            // Version 4 keeps the block legal once regtest BIP65 activates
+            // (version < 4 is rejected at height 1351).
             version: 4,
             prev_blockhash,
             merkle_root: Hash256::default(),

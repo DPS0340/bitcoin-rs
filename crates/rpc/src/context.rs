@@ -427,7 +427,7 @@ pub struct IndexHandles {
     /// Generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
     /// Live txindex status for the `getcapabilities` projection.
-    pub derived_index_status: Option<Arc<dyn crate::capabilities::DerivedIndexCapabilitySource>>,
+    pub derived_index_status: Option<Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource>>,
 }
 
 /// Network capability handles.
@@ -990,15 +990,6 @@ impl ChainHandles {
         self.applied_view().hash(self.chain_network)
     }
 
-    /// Returns the current best block hash, or the genesis hash before the
-    /// header tree publishes its first tip — genesis is always that base.
-    #[must_use]
-    pub(crate) fn best_hash(&self) -> Hash256 {
-        self.chain_tip
-            .load_full()
-            .map_or_else(|| self.chain_network.genesis_block_hash(), |tip| tip.hash)
-    }
-
     /// Returns the current best-chain chainwork as a 64-character lowercase
     /// big-endian hex string. Returns "00" when no tip is published yet (a
     /// 2-char placeholder matching `bitcoind`'s pre-genesis behavior).
@@ -1337,12 +1328,9 @@ mod tests {
     /// capability travels to `indexes` without a live index runtime.
     struct ReadySource;
 
-    impl crate::capabilities::DerivedIndexCapabilitySource for ReadySource {
-        fn capability(&self) -> crate::capabilities::CapabilityStatus {
-            crate::capabilities::derived_index_status(
-                true,
-                crate::capabilities::CapabilityState::Ready,
-            )
+    impl bitcoin_rs_index::DerivedIndexCapabilitySource for ReadySource {
+        fn capability(&self) -> bitcoin_rs_index::CapabilityStatus {
+            bitcoin_rs_index::derived_index_status(true, bitcoin_rs_index::CapabilityState::Ready)
         }
     }
 
@@ -1557,8 +1545,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
 
         let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
-        let status: Arc<dyn crate::capabilities::DerivedIndexCapabilitySource> =
-            Arc::new(ReadySource);
+        let status: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource> = Arc::new(ReadySource);
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
                 chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
