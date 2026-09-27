@@ -501,30 +501,21 @@ fn blocks(ctx: &Context, start_height: Option<u32>) -> Response {
     json_ok(&values)
 }
 /// PRE: The gateway supplies one readable pool view.
-/// POST: Capture aggregate values and `(fee_rate, vsize)` from that view.
-/// POST: Release the read guard before fee binning and JSON encoding.
-/// INVARIANT: Count, vsize, total fee and histogram come from one view.
+/// POST: Capture aggregate statistics and one `(fee_rate, total_vsize)` row per distinct rate.
+/// POST: Release the read guard before fee-rate formatting and JSON encoding.
+/// INVARIANT: Count, vsize, total fee and histogram come from one pool view.
 fn mempool(ctx: &Context) -> Response {
-    let (stats, entries) = {
+    let (stats, fee_histogram) = {
         let pool = ctx.mempool.gateway.read();
-        let stats = pool.stats();
-        let mut entries = Vec::with_capacity(usize::try_from(stats.txs).unwrap_or(0));
-        for entry in pool.iter_entries() {
-            entries.push((entry.fee_rate, entry.vsize));
-        }
-        (stats, entries)
+        (pool.stats(), pool.fee_rate_histogram().collect::<Vec<_>>())
     };
     #[cfg(test)]
-    crate::esplora::tests::gate_mempool_binning_for_tests();
-    let mut bins = std::collections::BTreeMap::new();
-    for (fee_rate, vsize) in entries {
-        *bins.entry(fee_rate).or_insert(0_u64) += u64::from(vsize);
-    }
+    crate::esplora::tests::gate_mempool_summary_for_tests();
     json_ok(&MempoolSummary {
         count: stats.txs,
         vsize: stats.bytes,
         total_fee: stats.total_fee,
-        fee_histogram: bins
+        fee_histogram: fee_histogram
             .into_iter()
             .rev()
             .map(|(rate, size)| (rate as f64 / 1000.0, size))

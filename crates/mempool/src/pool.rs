@@ -113,6 +113,12 @@ pub struct PrioritisedTransaction {
     pub modified_fee: Option<i128>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FeeRateAggregate {
+    count: u64,
+    vsize: u64,
+}
+
 /// In-memory transaction pool with txid, funding, spending, and fee-priority indexes.
 #[derive(Debug)]
 pub struct Mempool {
@@ -131,6 +137,7 @@ pub struct Mempool {
     graph_steps: AtomicU64,
     /// Active mempool policy limits.
     pub limits: MempoolLimits,
+
     /// Signed additive mining-only fee overlay, keyed by txid. A delta may be
     /// stored before its transaction is admitted, accumulates across calls,
     /// survives ordinary removal and replacement, and is erased only when the
@@ -197,12 +204,12 @@ struct Derived {
     /// Exact running sum of `fee` over `entries`. A `u32` entry id bounds the
     /// successful-entry sum below `u128::MAX`.
     total_fee: u128,
-    /// Ordered multiset of live `MempoolEntry.fee_rate` values keyed to their
-    /// occurrence count. Mutation paths use it to advance `fee_rate_floor`
-    /// when the last entry at the current floor leaves.
-    fee_rate_counts: std::collections::BTreeMap<u64, u64>,
-    /// Cached first key of `fee_rate_counts`. Reads are `O(1)`; inserts and
-    /// removals maintain it together with the multiset.
+    /// Fee-rate counts and vsize sums keyed by each live `MempoolEntry.fee_rate`.
+    /// Mutation paths maintain both values; the first key also maintains
+    /// `fee_rate_floor`, and the vsize sums feed Esplora histograms.
+    fee_rate_aggregates: std::collections::BTreeMap<u64, FeeRateAggregate>,
+    /// Cached first key of `fee_rate_aggregates`. Reads are `O(1)`; inserts and
+    /// removals maintain it together with the aggregates.
     fee_rate_floor: Option<u64>,
 }
 
@@ -223,13 +230,16 @@ impl Derived {
     fn account_remove(&mut self, id: EntryId, entry: &MempoolEntry) {
         self.total_vsize = self.total_vsize.saturating_sub(u64::from(entry.vsize));
         self.total_fee -= u128::from(entry.fee);
-        let removed_floor = match self.fee_rate_counts.entry(entry.fee_rate) {
+        let removed_floor = match self.fee_rate_aggregates.entry(entry.fee_rate) {
             std::collections::btree_map::Entry::Occupied(mut occupied) => {
-                let count = occupied.get_mut();
-                if *count > 1 {
-                    *count -= 1;
+                let aggregate = occupied.get_mut();
+                if aggregate.count > 1 {
+                    debug_assert!(aggregate.vsize >= u64::from(entry.vsize));
+                    aggregate.count -= 1;
+                    aggregate.vsize -= u64::from(entry.vsize);
                     false
                 } else {
+                    debug_assert_eq!(aggregate.vsize, u64::from(entry.vsize));
                     let removed_floor = self.fee_rate_floor == Some(entry.fee_rate);
                     occupied.remove();
                     removed_floor
@@ -245,9 +255,9 @@ impl Derived {
         };
         if removed_floor {
             self.fee_rate_floor = self
-                .fee_rate_counts
+                .fee_rate_aggregates
                 .first_key_value()
-                .map(|(&rate, _count)| rate);
+                .map(|(&rate, _aggregate)| rate);
         }
         self.by_txid.remove(&entry.txid);
         self.by_wtxid.remove(&entry.wtxid);
@@ -610,6 +620,7 @@ impl Mempool {
             derived: Derived::default(),
             graph_steps: AtomicU64::new(0),
             limits,
+
             fee_deltas: HashMap::new(),
             fee_delta_sequence: 0,
             estimator: FeeEstimator::new(),
@@ -654,6 +665,7 @@ impl Mempool {
         // list having to learn about it.
         self.derived = Derived::default();
         self.graph_steps.store(0, Ordering::Relaxed);
+
         if !self.fee_deltas.is_empty() {
             self.fee_delta_sequence = MutationSequence::advance(self.fee_delta_sequence);
             self.fee_deltas.clear();
@@ -864,6 +876,7 @@ impl Mempool {
         if let Some(slot) = self.entries.slot_mut(id) {
             slot.links = GraphLinks { parents, children };
         }
+
         let mut changes = Vec::new();
         self.push_change(&mut changes, txid, MutationOutcome::Accepted);
         let admitted_sequence = self.mempool_sequence;
@@ -909,11 +922,13 @@ impl Mempool {
         let added_fee_rate = entry.fee_rate;
         self.derived.total_vsize = self.derived.total_vsize.saturating_add(added_vsize);
         self.derived.total_fee += u128::from(added_fee);
-        *self
+        let aggregate = self
             .derived
-            .fee_rate_counts
+            .fee_rate_aggregates
             .entry(added_fee_rate)
-            .or_insert(0) += 1;
+            .or_default();
+        aggregate.count += 1;
+        aggregate.vsize += added_vsize;
         self.derived.fee_rate_floor = Some(
             self.derived
                 .fee_rate_floor
@@ -1494,6 +1509,18 @@ impl Mempool {
         self.entries.iter().map(|(_id, entry)| entry)
     }
 
+    /// Returns one ascending `(fee_rate, total_vsize)` pair per distinct actual rate.
+    ///
+    /// PRE: The caller retains this pool view while consuming the iterator.
+    /// POST: Each vsize sums entries at that actual fee rate.
+    /// INVARIANT: Rates are unique and the vsize sums equal `stats().bytes`.
+    pub fn fee_rate_histogram(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.derived
+            .fee_rate_aggregates
+            .iter()
+            .map(|(&rate, aggregate)| (rate, aggregate.vsize))
+    }
+
     /// Returns every in-pool entry that funds `script_hash`.
     ///
     /// Walks the funding index rather than the entry arena, so a script with
@@ -1563,9 +1590,9 @@ impl Mempool {
         debug_assert_eq!(
             self.derived.fee_rate_floor,
             self.derived
-                .fee_rate_counts
+                .fee_rate_aggregates
                 .first_key_value()
-                .map(|(&rate, _count)| rate),
+                .map(|(&rate, _aggregate)| rate),
             "cached fee-rate floor drifted from its multiset"
         );
         self.derived.fee_rate_floor
@@ -2891,6 +2918,69 @@ mod tests {
         pool.insert_entry(low)?;
 
         assert_eq!(pool.lowest_fee_rate(), Some(1_500));
+        Ok(())
+    }
+
+    #[test]
+    fn fee_rate_aggregate_tracks_duplicate_rates_and_removals() -> Result<(), MempoolError> {
+        let mut pool = Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        });
+        let first = Arc::new(tx(10, Vec::new()));
+        let second = Arc::new(tx(11, Vec::new()));
+        let other_rate = Arc::new(tx(12, Vec::new()));
+        let first_txid = first.txid();
+        let second_txid = second.txid();
+
+        pool.insert_entry(MempoolEntry::new(Arc::clone(&first), 100, 1_000, 1, 7, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::clone(&second), 200, 2_000, 2, 7, 0))?;
+        pool.insert_entry(MempoolEntry::new(
+            Arc::clone(&other_rate),
+            100,
+            3_000,
+            3,
+            7,
+            0,
+        ))?;
+
+        let ten_k = pool
+            .derived
+            .fee_rate_aggregates
+            .get(&10_000)
+            .expect("duplicate rate aggregate");
+        assert_eq!((ten_k.count, ten_k.vsize), (2, 300));
+        assert_eq!(
+            pool.fee_rate_histogram().collect::<Vec<_>>(),
+            vec![(10_000, 300), (30_000, 100)]
+        );
+
+        assert_eq!(
+            pool.remove_for_block(&[first.as_ref()], &[first_txid], 4)
+                .len(),
+            1
+        );
+        let ten_k = pool
+            .derived
+            .fee_rate_aggregates
+            .get(&10_000)
+            .expect("remaining duplicate rate aggregate");
+        assert_eq!((ten_k.count, ten_k.vsize), (1, 200));
+        assert_eq!(
+            pool.fee_rate_histogram().collect::<Vec<_>>(),
+            vec![(10_000, 200), (30_000, 100)]
+        );
+
+        assert_eq!(
+            pool.remove_for_block(&[second.as_ref()], &[second_txid], 5)
+                .len(),
+            1
+        );
+        assert!(!pool.derived.fee_rate_aggregates.contains_key(&10_000));
+        assert_eq!(
+            pool.fee_rate_histogram().collect::<Vec<_>>(),
+            vec![(30_000, 100)]
+        );
         Ok(())
     }
 
