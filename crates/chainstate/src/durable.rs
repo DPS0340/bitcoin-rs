@@ -223,7 +223,7 @@ const REPLAY_GAP_BLOCK_LIMIT: usize = super::window::DURABLE_HEAD_GROUP_BLOCKS;
 ///
 /// The stored head certifies the undo record in the same batch as the body,
 /// so the coins it restores are exactly the inputs the committed block saw.
-struct UndoRowSpends<'a>(&'a bitcoin_rs_utxo::contract::UndoBatch);
+pub(super) struct UndoRowSpends<'a>(pub(super) &'a bitcoin_rs_utxo::contract::UndoBatch);
 
 impl OutputSource for UndoRowSpends<'_> {
     fn get_entry(&self, outpoint: &OutPoint) -> Option<UtxoCoin> {
@@ -416,13 +416,14 @@ fn replay_gap_chain(
             tracing::debug!(height, hash = %hash.to_string_be(), "replayed committed gap block");
         }
         let published = handles.applied_tip.load_full();
+        // A head stored before counts were tracked records the unknown
+        // marker (wire 0): replay may reconstruct a real count, so the count
+        // is part of the landing check only when the head actually knows it.
         let landed = published.as_ref().is_some_and(|tip| {
-            (
-                tip.hash,
-                tip.height,
-                tip.chain_tx_count.to_wire(),
-                commit_id,
-            ) == (head.tip, head.height, head.chain_tx_count, head.commit_id)
+            tip.hash == head.tip
+                && tip.height == head.height
+                && commit_id == head.commit_id
+                && (head.chain_tx_count == 0 || tip.chain_tx_count.to_wire() == head.chain_tx_count)
         });
         if !landed {
             return Err(unrecoverable("replay finished short of the stored head"));
