@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use bitcoin::Address;
 use bitcoin_rs_primitives::{CompactTarget, Network, Tx, TxIn, TxOut, consensus_bytes};
 use bitcoin_rs_script::{
-    is_multisig, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, multisig_key_count,
+    is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_push_only, multisig_key_count,
     witness_program,
 };
 use sonic_rs::{JsonValueMutTrait as _, JsonValueTrait as _, Value};
@@ -186,7 +186,10 @@ pub(crate) fn classify(script: &[u8]) -> ScriptShape {
             _ => ScriptShape::Nonstandard,
         };
     }
-    if is_op_return(script) {
+    // Core's Solver classifies an `OP_RETURN` output `nulldata` only when the
+    // bytes after the opcode are all pushes; an interleaved opcode is
+    // `nonstandard`.
+    if is_op_return(script) && is_push_only(&script[1..]) {
         return ScriptShape::NullData;
     }
     if is_p2pk(script) {
@@ -195,9 +198,10 @@ pub(crate) fn classify(script: &[u8]) -> ScriptShape {
     if is_p2pkh(script) {
         return ScriptShape::PubkeyHash;
     }
-    // Core's Solver classifies multisig only when every key push is a
-    // serialized pubkey (33 or 65 bytes); `is_multisig` is the shape alone.
-    if is_multisig(script) && multisig_key_count(script).is_some() {
+    // `multisig_key_count` is Core's `MatchMultisig`: it already requires
+    // valid count operands and serialized pubkeys, so the shape check alone
+    // adds nothing here.
+    if multisig_key_count(script).is_some() {
         return ScriptShape::Multisig;
     }
     ScriptShape::Nonstandard

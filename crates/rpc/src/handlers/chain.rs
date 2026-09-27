@@ -1011,11 +1011,12 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         ));
     }
     let want_muhash = hash_type == "muhash";
-    // The tip capture precedes the scan; `with_stable_view` holds the UTXO
-    // read lock for the scan's duration, so holding the chain transition lock
-    // on top would delay connect and disconnect for the whole set walk.
-    let view = ctx.chain.applied_view();
-    let (stats, txouts, transactions, set_hash, disk_size) =
+    // Capture the tip, scan, then re-check the tip: a connect landing between
+    // capture and scan would otherwise report the pre-connect height and
+    // bestblock over post-connect UTXOs. The scan stays outside the chain
+    // transition lock so connect and disconnect are not delayed for the whole
+    // set walk; only a contested chain pays the locked final attempt.
+    let scan = |view: &AppliedView| {
         ctx.chain.utxo.with_stable_view(|stable| {
             let stats = bitcoin_rs_utxo::stats::scan_coin_stats(stable, view.height(), want_muhash)
                 .map_err(|err| RpcError::Internal(err.to_string()))?;
@@ -1042,7 +1043,23 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
                 set_hash,
                 u64::try_from(stable.memory_report().accounted_bytes()).unwrap_or(u64::MAX),
             ))
-        })?;
+        })
+    };
+    let mut contested = 0usize;
+    let (view, (stats, txouts, transactions, set_hash, disk_size)) = loop {
+        let view = ctx.chain.applied_view();
+        let scanned = scan(&view)?;
+        if ctx.chain.applied_view().tip() == view.tip() {
+            break (view, scanned);
+        }
+        contested += 1;
+        if contested == 4 {
+            break ctx.chain.with_stable_chainstate(|| {
+                let view = ctx.chain.applied_view();
+                scan(&view).map(|scanned| (view, scanned))
+            })?;
+        }
+    };
     let applied_height = view.height();
     let best_block = view.hash(ctx.chain.chain_network);
     let (hash_serialized_3, muhash) = set_hash.map_or((None, None), |(name, hash)| {

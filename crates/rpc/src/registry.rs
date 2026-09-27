@@ -82,7 +82,7 @@ macro_rules! declare_rows {
 
 declare_rows! {
     // -- JSON-RPC: shipped methods (registration order) --------------
-    "getblockchaininfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Core declares warnings as a string; this node emits an array. Optional prune and signet fields serialize as null rather than omitted (automatic_pruning, prune_target_size, pruneheight, signet_challenge). Tracked in #160.", "0.4.0", Some(chain::getblockchaininfo);
+    "getblockchaininfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Optional prune and signet fields serialize as null rather than omitted (automatic_pruning, prune_target_size, pruneheight, signet_challenge). Tracked in #160.", "0.4.0", Some(chain::getblockchaininfo);
     "getdifficulty", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getdifficulty);
     "getchaintips", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getchaintips);
     "getchaintxstats", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getchaintxstats);
@@ -92,7 +92,7 @@ declare_rows! {
     "getblock", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Response is the pinned corepc v31 verbose contract; verbosity 3 serves the verbosity-2 shape because no prevout source exists — Core returns prevouts at verbosity 3 (crates/rpc/src/handlers/chain.rs).", "0.4.0", Some(chain::getblock);
     "getblockheader", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getblockheader);
     "getblockstats", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getblockstats);
-    "verifychain", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::verifychain);
+    "verifychain", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Levels 3 and 4 omit Core's block disconnect and reconnect checks; level 3 behaves as level 2 and level 4 does not replay the UTXO set (crates/rpc/src/handlers/chain.rs).", "0.4.0", Some(chain::verifychain);
     "gettxoutsetinfo", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::gettxoutsetinfo);
     "getindexinfo", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getindexinfo);
     "pruneblockchain", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::pruneblockchain);
@@ -122,7 +122,7 @@ declare_rows! {
     "validateaddress", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "local_shape (invalid branch): a malformed or wrong-network address is hand-built as Core's sparse {isvalid:false} object because corepc-types models the valid-only fields (address, scriptPubKey, isscript, iswitness) as required and cannot represent that wire shape; valid addresses round-trip the typed v31 contract (crates/rpc/src/handlers/util.rs).", "0.4.0", Some(util::validateaddress);
     "getdescriptorinfo", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(util::getdescriptorinfo);
     "deriveaddresses", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(util::deriveaddresses);
-    "getnetworkinfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Core declares warnings as a string; this node emits an array. Tracked in #160.", "0.4.0", Some(network::getnetworkinfo);
+    "getnetworkinfo", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(network::getnetworkinfo);
     "getpeerinfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Pinned v31 shape; aggregate byte totals are measured, while per-message byte breakdowns report empty maps and last_transaction/last_block/minimum_fee_filter/last_inv_sequence report Core's zero-value defaults; unmeasured telemetry (ping times, addr relay stats, starting_height, address_local, mapped_as) is null-omitted (crates/rpc/src/handlers/network.rs).", "0.4.0", Some(network::getpeerinfo);
     "ping", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Answers immediately; Core schedules a P2P ping and reports the seen pong (crates/rpc/src/handlers/network.rs).", "0.4.0", Some(network::ping);
     "addnode", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(network::addnode);
@@ -136,7 +136,7 @@ declare_rows! {
     "setnetworkactive", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(network::setnetworkactive);
     "getnodeaddresses", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(network::getnodeaddresses);
     "getblocktemplate", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "BIP22/BIP23 template: client must advertise segwit (and signet on signet); submitold after long-poll, signet_challenge on signet, capabilities proposal+longpoll, coinbaseaux.flags empty hex.", "0.4.0", Some(mining::getblocktemplate);
-    "getmininginfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Pinned v30 shape including bits/target and next-block facts. Unset currentblocktx, currentblockweight, and signet_challenge are omitted like Core. warnings is an array here and a string in Core's declaration. Tracked in #160.", "0.4.0", Some(mining::getmininginfo);
+    "getmininginfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Pinned v30 shape including bits/target and next-block facts. Unset currentblocktx, currentblockweight, and signet_challenge are omitted like Core.", "0.4.0", Some(mining::getmininginfo);
     "submitblock", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "Decode failures are -22 (Block decode failed). Extra bytes after a complete block and BIP22's dummy second argument are ignored. A header already admitted by submitheader still accepts the body; a previously connected body (scripts-valid), including after a later reorg, is duplicate.", "0.4.0", Some(mining::submitblock);
     "submitheader", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "See API-13 in docs/contracts/external-api.md for submitheader behavior.", "0.4.0", Some(mining::submitheader);
     "prioritisetransaction", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "Dummy (params[1]) must be 0 or null; fee_delta is params[2]. Non-zero dummy is Core -8. Pooled dust outputs are -8 except on regtest. See API-23 in docs/contracts/external-api.md for dummy and fee_delta compatibility.", "0.4.0", Some(mining::prioritisetransaction);
