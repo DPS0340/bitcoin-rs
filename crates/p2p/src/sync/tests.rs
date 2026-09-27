@@ -2585,25 +2585,19 @@ fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error:
     no_service_info.services = WITNESS;
     let no_service_rx = connect_peer(&peers, no_service_info.clone());
     let no_service = current_source(&peers, no_service_addr);
-    let no_service_usable = UsablePeer {
-        source: no_service,
-        info: no_service_info,
+    let usable_peer = |source, info| UsablePeer {
+        source,
+        info,
         demonstrated_tips: Vec::new(),
         active_height: None,
+        headers_horizon: None,
         role: crate::peer_info::PeerRole::FullRelay,
         manual: false,
         connected_at: Instant::now(),
     };
+    let no_service_usable = usable_peer(no_service, no_service_info);
     let limited = current_source(&peers, limited_addr);
-    let usable = UsablePeer {
-        source: limited,
-        info: limited_info,
-        demonstrated_tips: Vec::new(),
-        active_height: None,
-        role: crate::peer_info::PeerRole::FullRelay,
-        manual: false,
-        connected_at: Instant::now(),
-    };
+    let usable = usable_peer(limited, limited_info);
     let frontier = |height, hash, usable_peer| SyncFrontier {
         chain: ChainFrontier {
             applied_tip: None,
