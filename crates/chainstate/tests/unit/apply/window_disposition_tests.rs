@@ -2,7 +2,7 @@
 //! turn a caller wiring error into a header invalidation, and must never
 //! soften a real native script verdict into a retry loop.
 
-use bitcoin_rs_consensus::{ConsensusError, ValidationEngine};
+use bitcoin_rs_consensus::{ConsensusError, ScriptEngine, ValidationEngine};
 
 use crate::{ApplyError, WindowApplyDisposition, classify_apply_error};
 
@@ -48,6 +48,7 @@ fn native_script_verdicts_remain_permanent() {
         classify_apply_error(&ApplyError::Consensus(ConsensusError::Script {
             input_index: 0,
             reason: "script failed: false".to_owned(),
+            engine: ScriptEngine::Native,
         })),
         WindowApplyDisposition::Permanent
     );
@@ -77,6 +78,7 @@ fn kernel_script_verdicts_stay_operational() {
         classify_apply_error(&ApplyError::Consensus(ConsensusError::Script {
             input_index: 0,
             reason: "kernel script verification failed: test".to_owned(),
+            engine: ScriptEngine::Kernel,
         })),
         WindowApplyDisposition::Operational
     );

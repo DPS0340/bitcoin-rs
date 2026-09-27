@@ -243,8 +243,6 @@ pub struct ChainHandles {
     pub chain_tip: TipReader,
     /// Best fully-applied block tip. Read-only: only Chainstate publishes.
     pub applied_tip: TipReader,
-    /// Cumulative transaction count for the fully-applied chain.
-    pub chain_tx_count: Arc<core::sync::atomic::AtomicU64>,
     /// Process-wide initial-block-download latch over the applied chain,
     /// shared with P2P so both surfaces answer identically.
     pub ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
@@ -472,7 +470,6 @@ impl Default for ChainHandles {
         Self {
             chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
             applied_tip: TipReader::new(applied_tip),
-            chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             ibd,
             blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
@@ -622,7 +619,13 @@ impl Context {
     }
 
     fn applied_progress_snapshot(&self) -> (Option<Arc<TipSnapshot>>, Option<u64>) {
-        self.with_stable_chainstate(|| (self.chain.applied_tip.load_full(), self.chain_tx_count()))
+        // One tip load: a second read could observe the next publication's
+        // count beside this tip's height.
+        self.with_stable_chainstate(|| {
+            let tip = self.chain.applied_tip.load_full();
+            let count = tip.as_ref().and_then(|tip| tip.chain_tx_count.get());
+            (tip, count)
+        })
     }
 
     /// Acquires a bounded full-block REST render slot, if one is available.
@@ -817,14 +820,10 @@ impl Context {
     /// two differ by an entire chain.
     #[must_use]
     pub fn chain_tx_count(&self) -> Option<u64> {
-        match self
-            .chain
-            .chain_tx_count
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            0 => None,
-            count => Some(count),
-        }
+        self.chain
+            .applied_tip
+            .load_full()
+            .and_then(|tip| tip.chain_tx_count.get())
     }
 
     /// Returns the current best-applied-block hash.
@@ -1225,12 +1224,12 @@ mod tests {
 
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::too_many_lines)]
     fn from_handles_shares_chain_handles_with_caller() {
         use alloc::sync::Arc;
 
         let chain_tip = Arc::new(ArcSwapOption::empty());
         let applied_tip = Arc::new(ArcSwapOption::empty());
-        let chain_tx_count = Arc::new(core::sync::atomic::AtomicU64::new(1));
         let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
             TipReader::new(Arc::clone(&applied_tip)),
             BlockTreeReader::new(Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()))),
@@ -1248,7 +1247,6 @@ mod tests {
             chain: ChainHandles {
                 chain_tip: TipReader::new(Arc::clone(&chain_tip)),
                 applied_tip: TipReader::new(Arc::clone(&applied_tip)),
-                chain_tx_count: Arc::clone(&chain_tx_count),
                 ibd: Arc::clone(&ibd),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
                 transactions: Arc::new(RwLock::new(HashMap::new())),
@@ -1278,26 +1276,31 @@ mod tests {
             Arc::ptr_eq(&ctx.chain.chain_transition, &chain_transition),
             "the caller's transition barrier must be the one the context locks"
         );
-        let marker = || TipSnapshot {
-            tip_id: bitcoin_rs_chain::NodeId::new(0),
-            height: 7,
-            chainwork: bitcoin_rs_chain::ChainWork::ZERO,
-            hash: Hash256::from_le_bytes(&[7; 32]),
+        // The count travels inside the applied tip: one publication replaces
+        // tip and count together, through the cell the caller shares.
+        let snapshot = |count| {
+            Arc::new(TipSnapshot {
+                tip_id: bitcoin_rs_chain::NodeId::new(0),
+                height: 7,
+                chainwork: bitcoin_rs_chain::ChainWork::ZERO,
+                hash: Hash256::from_le_bytes(&[7; 32]),
+                chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(count),
+            })
         };
-        chain_tip.store(Some(Arc::new(marker())));
+        chain_tip.store(Some(snapshot(1)));
         assert_eq!(
             ctx.chain.chain_tip.load_full().map(|tip| tip.height),
             Some(7),
             "chain_tip must be shared with caller"
         );
-        applied_tip.store(Some(Arc::new(marker())));
+        applied_tip.store(Some(snapshot(1)));
         assert_eq!(
             ctx.chain.applied_tip.load_full().map(|tip| tip.height),
             Some(7),
             "applied_tip must be shared with caller"
         );
         assert_eq!(ctx.chain_tx_count(), Some(1));
-        chain_tx_count.store(42, core::sync::atomic::Ordering::Relaxed);
+        applied_tip.store(Some(snapshot(42)));
         assert_eq!(ctx.chain_tx_count(), Some(42));
         assert!(
             Arc::ptr_eq(&ctx.chain.ibd, &ibd),
@@ -1331,15 +1334,12 @@ mod tests {
 
     #[test]
     fn progress_snapshot_waits_for_a_complete_chain_transition() -> anyhow::Result<()> {
-        use core::sync::atomic::{AtomicU64, Ordering};
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let chain_tx_count = Arc::new(AtomicU64::new(1));
         let barrier = Arc::new(Mutex::new(()));
         let ctx = Arc::new(Context::from_handles(ContextHandles {
             chain: ChainHandles {
-                chain_tx_count: Arc::clone(&chain_tx_count),
                 chain_transition: Arc::clone(&barrier),
                 ..ChainHandles::default()
             },
@@ -1359,7 +1359,12 @@ mod tests {
                 height: node.height,
                 chainwork: node.chainwork,
                 hash: node.hash,
+                chain_tx_count: node.chain_tx_count,
             }
+        };
+        let tip = TipSnapshot {
+            chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(42),
+            ..tip
         };
 
         let transition = barrier.lock();
@@ -1373,7 +1378,6 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(20)).is_err(),
             "RPC progress must not observe a half-published transition"
         );
-        chain_tx_count.store(42, Ordering::Release);
         drop(transition);
 
         let (published_tip, published_count) = rx.recv_timeout(Duration::from_secs(1))?;
@@ -1815,6 +1819,7 @@ mod admission_chain_tests {
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
+            chain_tx_count: node.chain_tx_count,
         })));
         Ok(())
     }

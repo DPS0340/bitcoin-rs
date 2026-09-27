@@ -3417,6 +3417,7 @@ mod tests {
             &ConsensusError::Script {
                 input_index: 0,
                 reason: "script failed: false".to_owned(),
+                engine: bitcoin_rs_consensus::ScriptEngine::Native,
             },
             &prevouts,
         ));

@@ -179,8 +179,8 @@ mod kernel_backend {
     use bitcoin_rs_primitives::{Hash256, Network, OutPoint, Tx, TxOut, Txid, consensus_bytes};
     use bitcoin_rs_script::VerifyFlags;
 
-    use crate::ConsensusError;
     use crate::rust_path::UtxoView;
+    use crate::{ConsensusError, ScriptEngine};
 
     /// Verifies every input script of `tx` through bitcoinkernel.
     ///
@@ -344,7 +344,8 @@ mod kernel_backend {
         )
         .map_err(|error| ConsensusError::Script {
             input_index,
-            reason: format!("kernel script verification failed: {error}"),
+            reason: format!("{}{error}", super::KERNEL_SCRIPT_REJECT_PREFIX),
+            engine: ScriptEngine::Kernel,
         })?;
         Ok(())
     }

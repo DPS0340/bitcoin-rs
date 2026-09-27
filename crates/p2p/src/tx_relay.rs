@@ -1162,7 +1162,6 @@ mod tests {
             .expect("fixture entry present")
             .wtxid
     }
-
     fn relay_identity_peer() -> AdmissionOrigin {
         AdmissionOrigin::Peer(bitcoin_rs_mempool::PeerToken {
             addr: SocketAddr::from(([127, 0, 0, 1], 8333)),

@@ -109,7 +109,6 @@ impl ServerHarness {
             chain: ChainHandles {
                 chain_tip: chainstate.header_tip_reader(),
                 applied_tip: chainstate.applied_tip_reader(),
-                chain_tx_count: chainstate.chain_tx_count_handle(),
                 ibd,
                 blocks: state.blocks(),
                 transactions: state.transactions(),
