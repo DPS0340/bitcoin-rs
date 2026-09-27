@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{Hash as _, sha256};
-use bitcoin_rs_consensus::{UtxoView, verify_transaction, verify_transaction_non_script};
+use libfuzzer_sys::fuzz_target;
+use bitcoin_rs_consensus::{
+    UtxoView, ValidationEngine, verify_transaction, verify_transaction_non_script,
+};
 use bitcoin_rs_mempool::{StandardnessPolicy, is_standard_tx};
 use bitcoin_rs_primitives::{
     Amount, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
@@ -109,6 +112,7 @@ fn validate_native(tx: Tx) {
         HEIGHT.saturating_add(1),
         LOCKTIME_CUTOFF,
         VerifyFlags::STANDARD,
+        ValidationEngine::Native,
     );
     // Policy leg.
     let _ = is_standard_tx(&tx, &StandardnessPolicy::default());

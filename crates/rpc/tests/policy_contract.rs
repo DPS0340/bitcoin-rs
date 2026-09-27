@@ -1645,7 +1645,9 @@ fn invalidation_handler(state: &NodeState) -> Handler {
             ..ChainHandles::default()
         },
         mempool: MempoolHandles {
-            gateway: MempoolGateway::shared(state.mempool()),
+            // The daemon wires this handle as `state.mempool_gateway()`:
+            // the gateway interned under `config.validation.engine`.
+            gateway: state.mempool_gateway(),
         },
         indexes: IndexHandles {
             derived_index: None,
@@ -1724,10 +1726,16 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
     );
 
     // Pool-path agreement: the same structural filter over a bare gateway
-    // admits the spend once and keeps the coinbase out.
-    let gateway = MempoolGateway::shared(Arc::new(parking_lot::RwLock::new(Mempool::new(
-        MempoolLimits::default(),
-    ))));
+    // admits the spend once and keeps the coinbase out. The bare gateway
+    // takes the resolved config engine so it mirrors the RPC path under any
+    // selection, not only the regtest default.
+    let gateway = MempoolGateway::shared(
+        Arc::new(parking_lot::RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))),
+        state.config().validation.engine,
+    )
+    .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
     let chainstate = state.chainstate();
     let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
         chainstate.utxo_handle(),

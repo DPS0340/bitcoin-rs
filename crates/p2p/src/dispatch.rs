@@ -505,6 +505,7 @@ fn ensure_inventory_request_within_bounds(items: &[Inventory]) -> Result<(), Pee
 
 #[cfg(test)]
 mod tests {
+    use bitcoin_rs_consensus::ValidationEngine;
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1507,6 +1508,7 @@ mod tests {
         let gateway = MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             None,
+            ValidationEngine::Native,
         );
         let mut tx = dummy_tx(0x42);
         tx.inputs[0].witness = Witness::from_stack(vec![vec![0x01]]);
@@ -1591,6 +1593,7 @@ mod tests {
             let gateway = MempoolGateway::new(
                 Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                 None,
+                ValidationEngine::Native,
             );
             let mut tx = dummy_tx(0x51);
             tx.inputs[0].script_sig.clear();

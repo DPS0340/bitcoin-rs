@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-use bitcoin_rs_mempool::MempoolGateway;
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_rpc::context::{
     ChainHandles, Context, ContextHandles, IndexHandles, MempoolHandles, NetworkHandles,
@@ -122,7 +121,10 @@ impl ServerHarness {
                 ..ChainHandles::default()
             },
             mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(state.mempool()),
+                // The daemon wires this handle as `state.mempool_gateway()`
+                // (lifecycle.rs): the gateway interned under the resolved
+                // `config.validation.engine`, not a re-interned Native one.
+                gateway: state.mempool_gateway(),
             },
             indexes: IndexHandles {
                 derived_index: state.derived_index_query(),

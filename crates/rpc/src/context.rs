@@ -12,6 +12,7 @@ use bitcoin_rs_primitives::{
     BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
 };
 
+use bitcoin_rs_consensus::ValidationEngine;
 #[cfg(test)]
 use bitcoin_rs_primitives::{Amount, Script};
 use core::fmt;
@@ -498,9 +499,11 @@ impl Default for MempoolHandles {
     #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self {
-            gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                MempoolLimits::default(),
-            )))),
+            gateway: MempoolGateway::shared(
+                Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                ValidationEngine::Native,
+            )
+            .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
         }
     }
 }
@@ -564,7 +567,9 @@ impl Context {
                 gateway: MempoolGateway::shared_with(
                     Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                     observer,
-                ),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             ..ContextHandles::default()
         })
@@ -1228,6 +1233,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::too_many_lines)]
     fn from_handles_shares_chain_handles_with_caller() {
         use alloc::sync::Arc;
 
@@ -1261,9 +1267,11 @@ mod tests {
                 ..ChainHandles::default()
             },
             mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-                    MempoolLimits::default(),
-                )))),
+                gateway: MempoolGateway::shared(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
             network: NetworkHandles {
                 network_active: Arc::clone(&network_active),

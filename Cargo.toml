@@ -63,10 +63,10 @@ mimalloc = { version = ">=0.1.50, <0.2", default-features = false }
 # bitcoin 0.32 line; 0.33 is still beta. `default = [std, secp-recovery]`.
 # Keep `bitcoinconsensus-std` out of the workspace-wide dependency: the
 # `bitcoinconsensus` opt-in was removed and bitcoinkernel is the optional
-# consensus oracle, gated by the consensus crate's `kernel` feature. The
-# `kernel` feature defaults ON in `crates/consensus` and `crates/node` but
-# OFF in `bin/bitcoin-rs`. Issue #213 keeps that split until native wins
-# the signed-spend and full-replay gates (see docs/contracts/validation-default.md).
+# consensus oracle, gated by the consensus crate's `kernel` feature. `kernel`
+# is a capability ("bitcoinkernel support is compiled in") and is off by
+# default in every crate; the engine a run uses is selected at runtime by
+# `validation.engine` (see docs/contracts/validation-default.md).
 bitcoin = { version = ">=0.32.9, <0.33", default-features = false, features = [
     "std", "secp-recovery", "serde", "rand-std",
 ] }

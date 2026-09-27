@@ -12,9 +12,11 @@ SegWit v0 uses BIP143 sighashes, and Taproot uses local BIP341/BIP342
 verification. The `sigops` module counts signature operations; the signature
 checker verifies signatures. Failures surface as `ScriptError`. Core's
 `script_tests`, `tx_valid`, and `tx_invalid` vectors pin zero native mismatches
-in `tests/core_vectors.rs`.
-The kernel feature on `bitcoin-rs-consensus` remains the library production default;
-see [`docs/contracts/validation-default.md`](../../docs/contracts/validation-default.md).
+in `tests/core_vectors.rs`. This interpreter is the `native` engine — compiled
+in every build and the default `validation.engine`; the `kernel` feature on
+`bitcoin-rs-consensus` is an opt-in capability that compiles bitcoinkernel in
+alongside it (selection is runtime, see
+[`docs/contracts/validation-default.md`](../../docs/contracts/validation-default.md)).
 
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the
 project vocabulary.
