@@ -1878,13 +1878,13 @@ mod tests {
         assert_eq!(
             removed
                 .iter()
-                .map(|out| out.as_ref().unwrap().vout)
+                .map(|out| out.as_ref().map(|kept| kept.vout))
                 .collect::<Vec<_>>(),
-            vec![2, 0, 1]
+            vec![Some(2), Some(0), Some(1)]
         );
-        assert_eq!(removed[0].as_ref().unwrap().value, 12);
-        assert_eq!(removed[1].as_ref().unwrap().value, 10);
-        assert_eq!(removed[2].as_ref().unwrap().value, 11);
+        assert_eq!(removed[0].as_ref().map(|kept| kept.value), Some(12));
+        assert_eq!(removed[1].as_ref().map(|kept| kept.value), Some(10));
+        assert_eq!(removed[2].as_ref().map(|kept| kept.value), Some(11));
         Ok(())
     }
 
