@@ -67,11 +67,10 @@ fn bind_rpc(
 ) -> Result<(Arc<Context>, RpcServer)> {
     let rpc_auth = Arc::new(state.config().rpc.auth.to_rpc_auth()?);
     let chainstate = state.chainstate();
-    let tips = chainstate.rpc_tip_bundle();
     let context = Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: tips.chain_tip,
-            applied_tip: tips.applied_tip,
+            chain_tip: chainstate.header_tip_reader(),
+            applied_tip: chainstate.applied_tip_reader(),
             chain_tx_count: chainstate.chain_tx_count_handle(),
             ibd: Arc::clone(ibd),
             blocks: state.blocks(),

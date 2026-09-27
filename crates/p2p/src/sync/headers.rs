@@ -141,18 +141,17 @@ impl BlockSync {
                         error,
                         ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. }
                     ) {
-                        if !wire_response {
-                            // A header carried by a delivered body is not a
-                            // response to the pending request, and the
-                            // delivery itself is the new evidence that this
-                            // connection holds the missing ancestry: retire
-                            // the stale gate so the recovery ask reaches the
-                            // wire with this delivery instead of waiting for
-                            // the deadline to clear first.
-                            if let Some(source) = source {
-                                self.clear_header_request_for(source);
-                            }
-                        }
+                        // A header carried by a delivered body is not a
+                        // response to the pending request, and the delivery
+                        // itself is the new evidence that this connection
+                        // holds the missing ancestry. The pending gate is
+                        // left alone either way: `send_getheaders` suppresses
+                        // an identical ask while one is unexpired, so an
+                        // unanswering peer's original deadline keeps ticking
+                        // and `header_request_live` still frees the slot when
+                        // it elapses. Clearing a live gate here would let
+                        // every delivered body install a fresh `requested_at`
+                        // and pin header sync to a peer that never answers.
                         self.request_headers_from(source);
                     }
                     tracing::warn!(
