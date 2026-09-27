@@ -1681,7 +1681,7 @@ fn reorg_mine_and_apply(
 }
 
 fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>> {
-    let applied = state.chainstate().rpc_tip_bundle().applied_tip;
+    let applied = state.chainstate().applied_tip_reader();
     let Some(tip) = applied.load_full() else {
         return Err("applied tip must exist".into());
     };
@@ -1690,15 +1690,14 @@ fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>>
 
 fn invalidation_handler(state: &NodeState) -> Handler {
     let chainstate = state.chainstate();
-    let tips = chainstate.rpc_tip_bundle();
     let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-        bitcoin_rs_chain::TipReader::new(Arc::clone(&tips.applied_tip)),
+        chainstate.applied_tip_reader(),
         bitcoin_rs_chain::BlockTreeReader::new(chainstate.block_tree_handle()),
     ));
     Handler::new(Arc::new(Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: tips.chain_tip,
-            applied_tip: tips.applied_tip,
+            chain_tip: chainstate.header_tip_reader(),
+            applied_tip: chainstate.applied_tip_reader(),
             ibd,
             blocks: state.blocks(),
             transactions: state.transactions(),
@@ -1894,13 +1893,13 @@ fn immature_coinbase_spends_reject_on_both_rpcs_and_admit_at_maturity() -> Resul
     );
 
     // At depth 100 the same spend admits through the same outlet.
-    ctx.chain.set_applied_tip(TipSnapshot {
+    ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
         tip_id: NodeId::new(0),
         height: 119,
         chainwork: ChainWork::ZERO,
         hash: Hash256::from_le_bytes(&[0x71; 32]),
         chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
-    });
+    })));
     handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&spend)]))?;
     assert!(
         ctx.mempool.gateway.read().contains_txid(&rpc_txid(&spend)),

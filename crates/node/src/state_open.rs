@@ -29,7 +29,6 @@ use bitcoin_rs_mempool::MempoolLimits;
 use bitcoin_rs_p2p::download_window::FAST_OUTBOUND_PEER_TARGET;
 use bitcoin_rs_p2p::download_window::fast_sync_budget;
 use bitcoin_rs_rpc::context::NetworkState;
-use bitcoin_rs_storage::FlatFileBlockStore;
 use hashbrown::HashMap;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -66,9 +65,7 @@ impl NodeState {
         );
         let chainstate_cache_bytes = cache_shares[0].bytes;
         let txindex_cache_bytes = cache_shares[1].bytes;
-        let block_files =
-            Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
-        let storage = NodeStorage::open(&config, chainstate_cache_bytes, Arc::clone(&block_files))?;
+        let (storage, block_files) = NodeStorage::open(&config, chainstate_cache_bytes)?;
         let undo_store = storage.undo_store();
         let durable_head = storage.durable_head();
 
@@ -384,8 +381,18 @@ impl NodeState {
         // starts on a torn chainstate builds on it, and every block it adds
         // makes the damage harder to find; a recovery that fails closed
         // retains the marker and stops startup (#655).
-        bitcoin_rs_chainstate::recover_disconnect_marker(&chainstate)
-            .map_err(anyhow::Error::new)?;
+        match bitcoin_rs_chainstate::recover_disconnect_marker(&chainstate) {
+            Ok(()) => {}
+            Err(error @ bitcoin_rs_chainstate::ApplyError::DurableHeadGapUnrecoverable { .. }) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "The node cannot repair this in place. Remove or quarantine {}, {}, and {}, then resync.",
+                    config.data_dir.join("chainstate").display(),
+                    config.data_dir.join("chainstate-checkpoints").display(),
+                    config.data_dir.join("txindex").display(),
+                )));
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
         let chainstate = Arc::new(chainstate);
         // One chain-owned latch for the whole process: the block-download
         // executor, the RPC context, and the P2P listener all hold this same

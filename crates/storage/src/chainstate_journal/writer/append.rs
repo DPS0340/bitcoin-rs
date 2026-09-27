@@ -69,12 +69,11 @@ impl<S: KvStore> JournalWriter<S> {
             .next_height
             .checked_add(1)
             .ok_or_else(|| JournalWriterError::CursorMismatch("height overflow".to_owned()))?;
-        let next_chain_tx_count = self
-            .chain_tx_count
-            .checked_add(record.block_tx_count)
-            .ok_or_else(|| {
-                JournalWriterError::CursorMismatch("chain_tx_count overflow".to_owned())
-            })?;
+        let next_chain_tx_count = super::advance_chain_tx_count(
+            self.base_height,
+            self.chain_tx_count,
+            record.block_tx_count,
+        )?;
         Ok((next_height, next_chain_tx_count))
     }
 

@@ -70,11 +70,10 @@ fn bind_rpc(
 ) -> Result<(Arc<Context>, RpcServer)> {
     let rpc_auth = Arc::new(state.config().rpc.auth.to_rpc_auth()?);
     let chainstate = state.chainstate();
-    let tips = chainstate.rpc_tip_bundle();
     let context = Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: tips.chain_tip,
-            applied_tip: tips.applied_tip,
+            chain_tip: chainstate.header_tip_reader(),
+            applied_tip: chainstate.applied_tip_reader(),
             ibd: Arc::clone(ibd),
             blocks: state.blocks(),
             transactions: state.transactions(),
@@ -578,7 +577,7 @@ pub(crate) fn start_node(
     guard.services.tx_relay = Some(bitcoin_rs_p2p::spawn_tx_relay_worker(
         bitcoin_rs_p2p::PeerRelaySink::new(state.peer_table()),
         relay_rx,
-        Arc::clone(&gateway),
+        Arc::downgrade(&gateway),
         Arc::clone(&shutdown),
     )?);
     guard.services.tx_ingress = Some(crate::tx_ingress::spawn_tx_ingress_consumer(

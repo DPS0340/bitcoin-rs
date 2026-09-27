@@ -15,7 +15,7 @@ use crate::download_window::SyncPeer;
 use crate::download_window::SyncPeerSelection;
 use crate::download_window::configure_request_mode;
 use crate::download_window::{
-    BlockDownloadPolicy, serves_requested_height, statically_fanout_eligible,
+    BlockDownloadPolicy, peer_can_serve_height, serves_requested_height, statically_fanout_eligible,
 };
 use crate::peer_info::PeerRole;
 use bitcoin_rs_chain::BlockTree;
@@ -94,6 +94,35 @@ pub(super) fn sync_peer_candidate(
 /// height; first-wins on ties.
 pub(super) fn outranks(current: SyncPeer, candidate: SyncPeer) -> bool {
     candidate.best_known_height > current.best_known_height
+}
+
+/// Fallback, single deep peer: the highest peer that may serve block bodies
+/// and that the window does not currently soft-block (expired pendings /
+/// staller cooldown) fills the window; a soft-blocked peer serves only as
+/// the last resort when no alternative exists. Without the preference, a
+/// disconnected staller that reconnects with an inflated demonstrated
+/// best-known height would out-sort every honest peer and re-acquire the
+/// window front (RE-ADV-2 / first-audit ADV-2).
+fn fallback_request_peer(
+    candidates: &[FanoutCandidate],
+    request_peer_limit: usize,
+) -> Vec<SyncPeer> {
+    let mut preferred: Option<SyncPeer> = None;
+    let servers: Vec<&FanoutCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.serves_bodies)
+        .collect();
+    let allow_soft = servers.iter().all(|candidate| candidate.soft_blocked);
+    for candidate in servers
+        .iter()
+        .filter(|candidate| allow_soft || !candidate.soft_blocked)
+    {
+        // First-wins on equal heights, matching the header-peer fold.
+        if preferred.is_none_or(|current| outranks(current, candidate.peer)) {
+            preferred = Some(candidate.peer);
+        }
+    }
+    preferred.into_iter().take(request_peer_limit).collect()
 }
 
 /// Height of the deepest active-chain node that is an ancestor of `hash` —
@@ -361,7 +390,6 @@ impl BlockSync {
                 next_apply_height,
                 frontier_hash,
                 apply_side_busy: frontier_hash.is_some_and(|hash| stager.contains(&hash)),
-                active_downloading_peers: window.active_downloading_peers(),
             };
             let decision = window.observe_blocked(ctx, stager, &tree, now);
             let stall_seconds = window
@@ -513,6 +541,48 @@ impl BlockSync {
         frontier: &SyncFrontier,
         now: Instant,
     ) -> SyncPeerSelection {
+        let mut candidates = self.fanout_candidates(frontier);
+        let (request_peer_limit, fanout_active, cold_preferred) =
+            self.window_selection_limits(frontier, &mut candidates, now);
+        let probe_peers = candidates
+            .iter()
+            .filter(|candidate| candidate.fanout_eligible && !candidate.soft_blocked)
+            .map(|candidate| candidate.peer)
+            .collect();
+        let mut request_peers: Vec<SyncPeer> = if let Some(preferred) = cold_preferred {
+            std::vec![preferred]
+        } else if fanout_active {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.fanout_eligible && !candidate.soft_blocked)
+                .map(|candidate| candidate.peer)
+                .collect()
+        } else if request_peer_limit > 1 {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.serves_bodies)
+                .map(|candidate| candidate.peer)
+                .collect()
+        } else {
+            fallback_request_peer(&candidates, request_peer_limit)
+        };
+        if request_peers.len() > 1 {
+            request_peers.sort_by_key(|peer| std::cmp::Reverse(peer.best_known_height));
+        }
+        request_peers.truncate(request_peer_limit);
+        SyncPeerSelection {
+            request_peers,
+            probe_peers,
+        }
+    }
+
+    /// Collects the fan-out candidates from the frontier's usable peers.
+    ///
+    /// PRE: `frontier.usable_peers` is this tick's capability-resolved
+    ///   snapshot and no scheduler lock is held.
+    /// POST: every candidate carries its demonstrated height, its
+    ///   body-serving and fan-out eligibility, and no soft-block mark.
+    fn fanout_candidates(&self, frontier: &SyncFrontier) -> Vec<FanoutCandidate> {
         // Height clause of the fan-out eligibility predicate (KTD6) and
         // the pre-existing candidate filter: the peer's demonstrated chain
         // must cover the canonical next-required body — on a reorg whose
@@ -525,8 +595,9 @@ impl BlockSync {
         // value alone — a long-lived at-tip peer would otherwise become
         // ineligible for every newly announced block (#617). Per-request
         // truncation by `peer_best_height` still bounds the damage of a
-        // stale value. With nothing required the clause reduces to the
-        // applied tip's successor, as before.
+        // stale value. `peer_can_serve_height` also keeps a limited-service
+        // peer inside its retained range. With nothing required the clause
+        // reduces to the applied tip's successor, as before.
         let required_height = frontier.chain.next_required.map_or_else(
             || {
                 frontier
@@ -548,7 +619,7 @@ impl BlockSync {
             let Some(active_height) = peer.capability() else {
                 continue;
             };
-            if active_height < required_height {
+            if !peer_can_serve_height(&peer.info, active_height, required_height) {
                 continue;
             }
             candidates.push(FanoutCandidate {
@@ -561,74 +632,58 @@ impl BlockSync {
                 soft_blocked: false,
             });
         }
-        let (request_peer_limit, fanout_active, cold_preferred) = {
-            let mut scheduler = self.scheduler.lock();
-            let SchedulerState { window, stager, .. } = &mut *scheduler;
-            for candidate in &mut candidates {
-                candidate.soft_blocked = window
-                    .peer_has_expired_pending(candidate.peer.source, now)
-                    || window.peer_in_staller_cooldown(candidate.peer.source.addr, now);
-            }
-            let cold_preferred = configure_request_mode(window, &candidates, now);
-            (
-                window.request_peer_scan_limit(stager, now),
-                window.fanout_active(),
-                cold_preferred,
+        candidates
+    }
+
+    /// Runs the window's request-mode decision under the scheduler lock and
+    /// marks the candidates the window soft-blocks.
+    ///
+    /// PRE: `candidates` are the collected fan-out candidates, unmarked, and
+    ///   no scheduler lock is held.
+    /// POST: every candidate carries its soft-block mark and the return is
+    ///   the request-peer scan limit, the fan-out activity, and the cold
+    ///   preference.
+    /// INVARIANT: the tree guard precedes the scheduler lock.
+    fn window_selection_limits(
+        &self,
+        frontier: &SyncFrontier,
+        candidates: &mut [FanoutCandidate],
+        now: Instant,
+    ) -> (usize, bool, Option<SyncPeer>) {
+        // The tree guard comes before the scheduler lock, matching the
+        // tree -> scheduler order the request path follows.
+        let tree = (!frontier.chain.apply_halted
+            && frontier.chain.chain_tip.is_some()
+            && frontier.chain.next_required.is_some())
+        .then(|| self.chain.block_tree());
+        let mut scheduler = self.scheduler.lock();
+        let SchedulerState { window, stager, .. } = &mut *scheduler;
+        // Purge state the old request branch left behind before the peer
+        // budget is measured: `next_peer_request` is the only other place
+        // a retarget runs, and a stale pending/staged set that fills the
+        // window would truncate `request_peers` to zero and never reach
+        // it, leaving the winning branch unwired until the pending
+        // timeout fires. A halted apply side keeps its staged bodies —
+        // the retarget would discard state the halted path still needs.
+        if !frontier.chain.apply_halted
+            && let (Some(tree), Some(chain_tip), Some(required)) = (
+                tree.as_deref(),
+                frontier.chain.chain_tip.as_ref(),
+                frontier.chain.next_required.as_ref(),
             )
-        };
-        let probe_peers = candidates
-            .iter()
-            .filter(|candidate| candidate.fanout_eligible && !candidate.soft_blocked)
-            .map(|candidate| candidate.peer)
-            .collect();
-        let mut request_peers: Vec<SyncPeer> = if let Some(preferred) = cold_preferred {
-            std::vec![preferred]
-        } else if fanout_active {
-            candidates
-                .iter()
-                .filter(|candidate| candidate.fanout_eligible && !candidate.soft_blocked)
-                .map(|candidate| candidate.peer)
-                .collect()
-        } else if request_peer_limit > 1 {
-            candidates
-                .iter()
-                .filter(|candidate| candidate.serves_bodies)
-                .map(|candidate| candidate.peer)
-                .collect()
-        } else {
-            // Fallback, single deep peer: the highest peer that may serve
-            // block bodies and that the window does not currently soft-block
-            // (expired pendings / staller cooldown) fills the window; a
-            // soft-blocked peer serves only as the last resort when no
-            // alternative exists. Without the preference, a disconnected
-            // staller that reconnects with an inflated demonstrated
-            // best-known height would out-sort every honest peer and
-            // re-acquire the window front (RE-ADV-2 / first-audit ADV-2).
-            let mut preferred: Option<SyncPeer> = None;
-            let servers: Vec<&FanoutCandidate> = candidates
-                .iter()
-                .filter(|candidate| candidate.serves_bodies)
-                .collect();
-            let allow_soft = servers.iter().all(|candidate| candidate.soft_blocked);
-            for candidate in servers
-                .iter()
-                .filter(|candidate| allow_soft || !candidate.soft_blocked)
-            {
-                // First-wins on equal heights, matching the header-peer fold.
-                if preferred.is_none_or(|current| outranks(current, candidate.peer)) {
-                    preferred = Some(candidate.peer);
-                }
-            }
-            preferred.into_iter().take(request_peer_limit).collect()
-        };
-        if request_peers.len() > 1 {
-            request_peers.sort_by_key(|peer| std::cmp::Reverse(peer.best_known_height));
+        {
+            window.retarget_request_branch(stager, chain_tip, required.height, tree, now);
         }
-        request_peers.truncate(request_peer_limit);
-        SyncPeerSelection {
-            request_peers,
-            probe_peers,
+        for candidate in &mut *candidates {
+            candidate.soft_blocked = window.peer_has_expired_pending(candidate.peer.source, now)
+                || window.peer_in_staller_cooldown(candidate.peer.source.addr, now);
         }
+        let cold_preferred = configure_request_mode(window, candidates, now);
+        (
+            window.request_peer_scan_limit(stager, now),
+            window.fanout_active(),
+            cold_preferred,
+        )
     }
 
     /// Runs the chain-sync rule over this tick's connections and performs the

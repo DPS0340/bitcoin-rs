@@ -4,7 +4,6 @@ use super::GetdataRequestOutcome;
 use super::GetheadersOutcome;
 use super::HEADER_REQUEST_TIMEOUT;
 use super::LOCATOR_MAX_ENTRIES;
-use super::MAX_DEFERRED_OWNED_FETCHES;
 use super::PROTOCOL_VERSION;
 use super::PendingHeaderRequest;
 use super::chain::HeaderAdmission;
@@ -21,6 +20,7 @@ use super::peers::shared_active_height;
 use super::peers::sync_peer_candidate;
 use super::requests::COMPACT_RELAY_NEAR_TIP_BLOCKS;
 use super::{BlockSync, SchedulerState};
+use super::{MAX_DEFERRED_OWNED_FETCHES, defer_owned_body_fetch};
 use crate::InboundHeaders;
 use crate::Message;
 use crate::PeerSource;
@@ -28,7 +28,7 @@ use crate::download_window::SyncPeer;
 use crate::peer_info::PeerInfo;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
-use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus};
+use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus, validate_pow};
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
@@ -178,18 +178,17 @@ impl BlockSync {
                         error,
                         ChainError::MissingParent { .. } | ChainError::NoCommonAncestor { .. }
                     ) {
-                        if !wire_response {
-                            // A header carried by a delivered body is not a
-                            // response to the pending request, and the
-                            // delivery itself is the new evidence that this
-                            // connection holds the missing ancestry: retire
-                            // the stale gate so the recovery ask reaches the
-                            // wire with this delivery instead of waiting for
-                            // the deadline to clear first.
-                            if let Some(source) = source {
-                                self.clear_header_request_for(source);
-                            }
-                        }
+                        // A header carried by a delivered body is not a
+                        // response to the pending request, and the delivery
+                        // itself is the new evidence that this connection
+                        // holds the missing ancestry. The pending gate is
+                        // left alone either way: `send_getheaders` suppresses
+                        // an identical ask while one is unexpired, so an
+                        // unanswering peer's original deadline keeps ticking
+                        // and `header_request_live` still frees the slot when
+                        // it elapses. Clearing a live gate here would let
+                        // every delivered body install a fresh `requested_at`
+                        // and pin header sync to a peer that never answers.
                         self.request_headers_from(source);
                     }
                     tracing::warn!(
@@ -277,7 +276,11 @@ impl BlockSync {
         if !deferred.is_empty() {
             let mut announcements = self.block_announcements.lock();
             for (source, hash) in deferred {
-                announcements.entry(source).or_insert(hash);
+                // The captured announcement predates anything the listener
+                // queued while this drain ran — the first unprocessed
+                // announcement wins, so it must overwrite, not defer to, a
+                // hash enqueued mid-drain.
+                announcements.insert(source, hash);
             }
         }
         if credit_refresh_needed {
@@ -435,21 +438,12 @@ impl BlockSync {
         };
         let mut scheduler = self.scheduler.lock();
         let Some(height) = height else {
-            if !scheduler
-                .owned_body_fetches
-                .iter()
-                .any(|(_, known)| *known == hash)
-            {
-                if scheduler.owned_body_fetches.len() >= MAX_DEFERRED_OWNED_FETCHES {
-                    scheduler.owned_body_fetches.remove(0);
-                }
-                scheduler.owned_body_fetches.push((source, hash));
-            }
+            defer_owned_body_fetch(&mut scheduler, source, hash);
             return;
         };
         let SchedulerState { window, stager, .. } = &mut *scheduler;
         if !window.mark_owned_fetch(stager, source, hash, height, Instant::now()) {
-            scheduler.owned_body_fetches.push((source, hash));
+            defer_owned_body_fetch(&mut scheduler, source, hash);
         }
     }
 
@@ -487,15 +481,38 @@ impl BlockSync {
         }
         let mut scheduler = self.scheduler.lock();
         let now = Instant::now();
-        let SchedulerState { window, stager, .. } = &mut *scheduler;
+        let SchedulerState {
+            window,
+            stager,
+            owned_body_fetches,
+            ..
+        } = &mut *scheduler;
         for (source, hash, height) in resolved {
             // A refusal leaves the fetch in flight: keep the deferred mark so
-            // the delivered body still classifies as requested.
-            if !window.mark_owned_fetch(stager, source, hash, height, now) {
+            // the delivered body still classifies as requested. So does a
+            // hash already pending under a different owner — `mark_owned_fetch`
+            // resolves it without recording this owner, and dropping the mark
+            // would disown the second connection's in-flight fetch.
+            if !window.mark_owned_fetch(stager, source, hash, height, now)
+                || window
+                    .pending_owner(&hash)
+                    .is_some_and(|owner| owner != source)
+            {
                 unresolved.push((source, hash));
             }
         }
-        scheduler.owned_body_fetches.extend(unresolved);
+        // Unresolved marks predate anything recorded during this resolve:
+        // they merge back ahead of the queue in their original order, and the
+        // cap then drops the newest marks — the same oldest-first policy
+        // `defer_owned_body_fetch` applies.
+        let mut merged = unresolved;
+        for mark in owned_body_fetches.drain(..) {
+            if !merged.contains(&mark) {
+                merged.push(mark);
+            }
+        }
+        merged.truncate(MAX_DEFERRED_OWNED_FETCHES);
+        *owned_body_fetches = merged;
     }
 
     /// `(announced_tip, active_height)` when every header in `headers` is
@@ -855,12 +872,20 @@ impl BlockSync {
             .peer_table
             .send_then(source, msg, || {
                 if track {
-                    self.scheduler.lock().header_request = Some(PendingHeaderRequest {
-                        source,
-                        locator_tip_hash,
-                        target_height,
-                        requested_at: now,
-                    });
+                    let mut scheduler = self.scheduler.lock();
+                    // A continuation from a different peer must not replace
+                    // the singleton request its current owner still owes.
+                    if scheduler
+                        .header_request
+                        .is_none_or(|pending| pending.source == source)
+                    {
+                        scheduler.header_request = Some(PendingHeaderRequest {
+                            source,
+                            locator_tip_hash,
+                            target_height,
+                            requested_at: now,
+                        });
+                    }
                 }
             })
             .is_err()
@@ -922,17 +947,19 @@ impl BlockSync {
     ///   state, not the tree, owns the connection's chain — and a wire
     ///   batch on a below-floor fork opens one. A body-carried batch
     ///   (`wire_response = false`) never opens or feeds the state: below
-    ///   the work floor it returns `None`, retiring to retry once the
-    ///   wire sync commits it; at or above the floor it takes direct
-    ///   admission. Otherwise return `Some` with the admission outcome
-    ///   when the batch may be admitted directly — an empty batch, a
-    ///   source-less delivery, an unknown fork, or a fork already at the
-    ///   network minimum — or when the committed phase released headers;
-    ///   and `None` when the sync state retained the batch, in which case
-    ///   this call already retired the answered request, sent the
-    ///   state-cursor continuation, or ran the fault path.
-    /// INVARIANT: a batch below the work threshold reaches
-    ///   [`SyncChain::admit_headers`] only as
+    ///   the work floor, a valid one-header batch returns `None` and retries
+    ///   after the wire sync commits it; invalid body-carried headers and
+    ///   batches at or above the floor take direct admission. Otherwise
+    ///   return `Some` with the admission outcome when the batch may be
+    ///   admitted directly — an empty batch, source-less delivery, unknown
+    ///   fork, or fork already at the network minimum — or when the
+    ///   committed phase released headers; and `None` when the sync state
+    ///   retained the batch, in which case this call already retired the
+    ///   answered request, sent the state-cursor continuation, or ran the
+    ///   fault path.
+    /// INVARIANT: a body-carried header is deferred below the work floor
+    ///   only after standalone `PoW` and contextual validation pass; wire
+    ///   batches reach admission below the floor only as
     ///   [`super::headers_presync::HeaderSyncResult::ready_headers`], and
     ///   only a wire `headers` message mutates `headers_sync`.
     pub(super) fn route_headers_batch(
@@ -967,10 +994,12 @@ impl BlockSync {
         // commits it; at or above the floor, direct admission applies as
         // to any batch.
         if !wire_response {
-            if self.presync_anchor(headers).is_some() {
-                return None;
+            if self.presync_anchor(headers).is_none()
+                || self.body_carried_header_needs_admission(headers)
+            {
+                return Some(self.chain.admit_headers(headers));
             }
-            return Some(self.chain.admit_headers(headers));
+            return None;
         }
         let outcome = {
             // Page validation runs without the scheduler lock: hashing a
@@ -1039,20 +1068,55 @@ impl BlockSync {
         }
         if !outcome.ready_headers.is_empty() {
             let admission = self.chain.admit_headers(&outcome.ready_headers);
-            if matches!(admission, HeaderAdmission::Refused(_)) {
-                // Admission is paused: return the released prefix to the
-                // live state so the next page's release re-emits it once
-                // admission reopens. The sync's own continuation is already
-                // in flight, so no tree-anchored re-request runs here — one
-                // would restart the whole sync.
-                if let Some(state) = self.scheduler.lock().headers_sync.get_mut(&source) {
-                    state.requeue_released(&outcome.ready_headers);
-                    return None;
+            if let HeaderAdmission::Refused(error) = admission {
+                // Admission is paused (checkpoint publish or shutdown):
+                // retaining the released prefix in the live state grows
+                // without bound — every refused page requeues the whole
+                // excess and the next page adds another page's worth. Drop
+                // the sync instead; the paced ancestry re-request restarts
+                // it once admission reopens, the same retry the direct path
+                // gets.
+                let dropped = self.scheduler.lock().headers_sync.remove(&source);
+                if let Some(mut state) = dropped {
+                    state.finalize();
                 }
+                self.request_ancestry_after_refusal(Some(source), &error);
+                return None;
             }
             return Some(admission);
         }
         None
+    }
+    /// Checks a body-carried header before deferring it below the work floor.
+    ///
+    /// PRE: `headers` is a body-carried batch whose parent was anchored by
+    ///   [`Self::presync_anchor`].
+    /// POST: return `true` when the batch is not one header, its parent is
+    ///   no longer known, or its header fails proof-of-work or contextual
+    ///   checks against that parent.
+    /// INVARIANT: the block-tree read guard is released before the caller
+    ///   enters ordinary admission.
+    fn body_carried_header_needs_admission(&self, headers: &[Header]) -> bool {
+        let [header] = headers else {
+            return true;
+        };
+        let tree = self.chain.block_tree();
+        let Some(parent_id) = tree.lookup(Hash256::from(header.prev_blockhash)) else {
+            return true;
+        };
+        let network = self.chain.network();
+        let hash = Hash256::from(header.compute_hash());
+        validate_pow(header, hash, network)
+            .and_then(|()| {
+                bitcoin_rs_chain::validate_contextual_header(
+                    &tree,
+                    parent_id,
+                    header,
+                    network,
+                    bitcoin_rs_chain::current_unix_seconds(),
+                )
+            })
+            .is_err()
     }
 
     /// Feeds one batch to one connection's sync state.
@@ -1122,11 +1186,30 @@ impl BlockSync {
         // batch that crosses the floor on its own admits directly instead
         // of opening a presync that re-requests the same page after the
         // crossing.
-        let claimed = headers.iter().fold(fork.chainwork, |sum, header| {
-            sum.saturating_add(bitcoin_rs_chain::block_work(header))
+        //
+        // The claim counts declared `bits`, so it is honest only when every
+        // header actually meets its target: a page ending in an unmet
+        // tiny-target header inflates `claimed` and takes the direct path,
+        // where admission inserts each valid prefix as it goes and never
+        // rolls back on the failure — letting a reconnecting peer fill the
+        // tree below the floor. The same splice inflates the sum through a
+        // disconnected tail of genuine headers pasted after the break, so
+        // the whole page must also link prev-to-hash before the sum is
+        // trusted. A page failing either check falls through to the presync,
+        // which faults the peer on it without mutating the tree.
+        let page_self_valid = headers.iter().all(|header| {
+            let hash = Hash256::from(header.compute_hash());
+            validate_pow(header, hash, network).is_ok()
+        }) && headers.windows(2).all(|pair| {
+            Hash256::from(pair[1].prev_blockhash) == Hash256::from(pair[0].compute_hash())
         });
-        if claimed >= minimum_work {
-            return None;
+        if page_self_valid {
+            let claimed = headers.iter().fold(fork.chainwork, |sum, header| {
+                sum.saturating_add(bitcoin_rs_chain::block_work(header))
+            });
+            if claimed >= minimum_work {
+                return None;
+            }
         }
         let median_time_past = tree.median_time_past_at(fork_id, MEDIAN_TIME_PAST_WINDOW)?;
         Some(HeaderAnchor {

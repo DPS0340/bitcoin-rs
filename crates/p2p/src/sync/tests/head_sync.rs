@@ -147,6 +147,72 @@ fn headers_batch_missing_parent_requests_ancestry() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn body_carried_rejection_keeps_the_live_pending_gate() -> Result<(), Box<dyn std::error::Error>> {
+    // A body-carried header that rejects `MissingParent` asks the
+    // delivering peer for the missing ancestry, but the ask must respect
+    // the pending gate: an unexpired `getheaders` to the same connection
+    // suppresses the identical re-request and keeps its original deadline,
+    // so a peer that never answers the wire request still rotates once the
+    // timeout elapses. Retiring a live gate on each body delivery let every
+    // rejection install a fresh `requested_at` and pin the slot forever.
+    let mut tree = BlockTree::new();
+    let genesis = genesis_header();
+    tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+
+    let peer = test_addr(9768, 0)?;
+    let rx = connect_peer(&peers, synthetic_peer(peer, 10));
+
+    let gap_parent = test_header(genesis.compute_hash(), 1);
+    let orphan_tip = test_header(gap_parent.compute_hash(), 2);
+    let batch = || InboundHeaders {
+        headers: vec![orphan_tip],
+        source: Some(current_source(&peers, peer)),
+        wire_response: false,
+        body_fetch_owned: false,
+    };
+
+    // The first rejection installs the pending gate on this connection.
+    inbound_headers_tx.send(batch())?;
+    sync.drain_inbound_headers();
+    next_getheaders(&rx)?;
+    let first_requested_at = sync
+        .scheduler
+        .lock()
+        .header_request
+        .map(|request| request.requested_at)
+        .ok_or("the first rejection must install the pending gate")?;
+
+    // The identical body-carried rejection while the gate is live emits no
+    // second `getheaders` and leaves the original deadline untouched: it is
+    // the pending request's own expiry that frees the slot.
+    std::thread::sleep(Duration::from_millis(20));
+    while rx.try_recv().is_ok() {}
+    inbound_headers_tx.send(batch())?;
+    sync.drain_inbound_headers();
+    assert!(
+        rx.try_recv().is_err(),
+        "a live pending gate must suppress the identical re-request"
+    );
+    let second_requested_at = sync
+        .scheduler
+        .lock()
+        .header_request
+        .map(|request| request.requested_at)
+        .ok_or("the suppressed re-request must leave the gate installed")?;
+    assert_eq!(
+        first_requested_at, second_requested_at,
+        "the pending deadline must survive an identical body-carried rejection"
+    );
+    Ok(())
+}
+
+#[test]
 fn known_header_batch_still_credits_the_announcer() -> Result<(), Box<dyn std::error::Error>> {
     // The all-known fast path must keep the announced-tip credit the
     // admission path produced — the delivering peer's demonstrated height

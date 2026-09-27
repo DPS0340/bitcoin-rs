@@ -1047,8 +1047,8 @@ mod tests {
             chain_tx_count: tip_node.chain_tx_count,
         };
         drop(tree);
-        ctx.chain.set_applied_tip(tip.clone());
-        ctx.chain.set_chain_tip(tip);
+        ctx.chain.applied_tip.store(Some(Arc::new(tip.clone())));
+        ctx.chain.chain_tip.store(Some(Arc::new(tip)));
         hashes
     }
 
@@ -1296,7 +1296,7 @@ mod tests {
                 .expect("header tip");
             applied_tip
         };
-        ctx.chain.set_applied_tip(applied_tip);
+        ctx.chain.applied_tip.store(Some(Arc::new(applied_tip)));
         let header_tip_hash = Hash256::from(header_tip.compute_hash());
 
         let response = route(
@@ -1473,8 +1473,8 @@ mod tests {
             chain_tx_count: broken_node.chain_tx_count,
         };
         drop(tree);
-        ctx.chain.set_applied_tip(tip.clone());
-        ctx.chain.set_chain_tip(tip);
+        ctx.chain.applied_tip.store(Some(Arc::new(tip.clone())));
+        ctx.chain.chain_tip.store(Some(Arc::new(tip)));
 
         let path = format!("/rest/headers/{}.json", genesis.block_hash());
         let response = route(&ctx, &path, "count=2", true);
@@ -1834,7 +1834,7 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let (cell, swap_a, swap_b, flag) = (
-            Arc::clone(&ctx.chain.applied_tip),
+            ctx.chain.applied_tip.clone(),
             Arc::clone(&a),
             Arc::clone(&b),
             Arc::clone(&stop),

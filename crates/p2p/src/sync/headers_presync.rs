@@ -641,25 +641,6 @@ impl HeadersSyncState {
         Ok(())
     }
 
-    /// Returns a released prefix to the buffer when the admission path
-    /// refused it, so the next release emits it again rather than losing a
-    /// verified span.
-    ///
-    /// PRE: `headers` are exactly the most recently popped prefix, in
-    ///   order, and the state is still in REDOWNLOAD (not finalized).
-    /// POST: the buffer's front is that prefix again and
-    ///   `redownload_first_prev_hash` points at its first header's parent.
-    pub(crate) fn requeue_released(&mut self, headers: &[Header]) {
-        let Some(first) = headers.first() else {
-            return;
-        };
-        self.redownload_first_prev_hash = Hash256::from(first.prev_blockhash);
-        for header in headers.iter().rev() {
-            self.redownloaded
-                .push_front(CompressedHeader::compress(header));
-        }
-    }
-
     /// Releases headers the verified commitments cover
     /// (`headerssync.cpp:231-249`): everything past the buffer bound, and
     /// once the redownloaded chain itself crosses the minimum work,
