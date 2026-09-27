@@ -181,6 +181,27 @@ impl NodeState {
         self.storage.kind()
     }
 
+    /// Returns the undo store that owns disconnect markers: the recovery
+    /// evidence the startup path consumes.
+    #[must_use]
+    /// Crash-recovery test seam: exposes the undo/marker store so harnesses
+    /// can arm and inspect disconnect markers. Not a supported mutation
+    /// surface for node owners.
+    #[doc(hidden)]
+    pub fn undo_store(&self) -> Arc<dyn bitcoin_rs_chainstate::UndoStore> {
+        self.storage.undo_store()
+    }
+
+    /// Returns the durable-head store: the chain's commit point.
+    #[must_use]
+    /// Crash-recovery test seam: exposes the durable head store so
+    /// harnesses can read the commit point. Not a supported mutation
+    /// surface for node owners.
+    #[doc(hidden)]
+    pub fn durable_head(&self) -> Arc<dyn bitcoin_rs_storage::DurableHeadStore> {
+        self.storage.durable_head()
+    }
+
     /// Returns the manual pruning service when pruning is enabled.
     #[must_use]
     pub fn prune_service(&self) -> Option<Arc<dyn PruneService>> {

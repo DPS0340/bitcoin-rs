@@ -275,7 +275,6 @@ mod tests {
         assert_eq!(regtest.min_time, last.time - 600);
         Ok(())
     }
-
     fn append_chain(
         tree: &mut BlockTree,
         len: u32,

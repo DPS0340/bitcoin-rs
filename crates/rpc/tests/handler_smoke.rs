@@ -306,6 +306,7 @@ fn getblockchaininfo_surfaces_published_chainwork_hex() -> Result<(), Box<dyn st
         height: 42,
         hash: Hash256::from_le_bytes(&[0xff; 32]),
         chainwork: ChainWork::from_be_bytes([0x11; 32]),
+        chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
     };
     ctx.chain.chain_tip.store(Some(Arc::new(tip.clone())));
     ctx.chain.applied_tip.store(Some(Arc::new(tip)));
@@ -568,12 +569,14 @@ fn chain_rpcs_report_applied_tip_separately_from_headers() -> Result<(), Box<dyn
         height: 10,
         hash: Hash256::from_le_bytes(&[0xaa; 32]),
         chainwork: ChainWork::default(),
+        chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
     };
     let applied_tip = TipSnapshot {
         tip_id: NodeId::new(0),
         height: 7,
         hash: Hash256::from_le_bytes(&[0xbb; 32]),
         chainwork: ChainWork::default(),
+        chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
     };
     ctx.chain.chain_tip.store(Some(Arc::new(headers_tip)));
     ctx.chain.applied_tip.store(Some(Arc::new(applied_tip)));

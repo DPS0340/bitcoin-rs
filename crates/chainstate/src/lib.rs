@@ -7,7 +7,9 @@
 
 pub use crate::error::{ApplyError, DisconnectError};
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{BlockTree, BlockTreeReader, ChainError, TipReader, TipSnapshot};
+use bitcoin_rs_chain::{
+    BlockTree, BlockTreeReader, ChainError, ChainTxCount, TipReader, TipSnapshot,
+};
 use bitcoin_rs_consensus::rust_path::UtxoView;
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_primitives::Network;
@@ -26,25 +28,20 @@ use bitcoin_rs_utxo::UtxoCoin;
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::contract::{SpentOutputLookup, is_coinbase_tx};
 use connect::apply_block_admitted;
-use connect::apply_block_with_serialized_admitted;
 use connect::apply_committed_block_admitted;
 use disconnect::disconnect_block_admitted;
 pub use durable::reconcile_at_boot;
+pub use durable::recover_disconnect_marker;
 use hashbrown::HashMap;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
 use parking_lot::RwLock;
 use parking_lot::RwLockReadGuard;
 use parking_lot::RwLockWriteGuard;
-#[cfg(test)]
-use publication::advance_chain_tx_count;
-#[cfg(test)]
-use publication::rewind_chain_tx_count;
 use scratch::ApplyScratchCapacities;
 use scratch::SameBlockSpentSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 pub use window::DURABLE_HEAD_GROUP_BLOCKS;
 pub use window::DURABLE_HEAD_GROUP_MAX_BYTES;
@@ -412,28 +409,33 @@ enum ApplyIntent {
 }
 
 /// Outcome of [`apply_block_admitted`] once intent is known.
+#[allow(clippy::large_enum_variant)]
 enum ApplyFinish {
     /// Commit path: the new applied tip, already published.
-    Committed(ConnectOutcome),
+    ///
+    /// Boxed so the propose path's unit variant does not pay the outcome's
+    /// width on every match.
+    Committed(Box<ConnectOutcome>),
     /// See `ARCH-07` in `docs/contracts/architecture.md`.
     Proposed,
 }
 
-/// Coherent read of header tip, applied tip, and chain-tx count.
+/// Coherent read of the header tip and the applied tip.
 ///
-/// Produced by [`Chainstate::snapshot`]. Applied tip and `chain_tx_count` are
-/// one publication. Header tip is a separate cell and may legitimately be
-/// ahead of the applied chain. The snapshot cannot mutate chainstate.
+/// Produced by [`Chainstate::snapshot`]. Each tip is one cell, and an applied
+/// tip carries its own certified cumulative transaction count, so one load
+/// supplies both. Header tip is a separate cell and may legitimately be ahead
+/// of the applied chain. The snapshot cannot mutate chainstate.
 #[derive(Clone, Debug)]
 pub struct ChainstateSnapshot {
     /// Best-work header tip, if the tree has one.
     pub header: Option<TipSnapshot>,
     /// Authoritative applied tip, if any block has committed.
     pub applied: Option<TipSnapshot>,
-    /// Cumulative transaction count of the applied chain, or `0` when unknown.
+    /// Cumulative transaction count of the applied chain.
     ///
-    /// Published with `applied`, never independently of it.
-    pub chain_tx_count: u64,
+    /// Derived from `applied`, never stored beside it independently.
+    pub chain_tx_count: ChainTxCount,
 }
 
 /// Facts returned after Chainstate admits one contiguous header batch.
@@ -467,22 +469,6 @@ pub struct Chainstate {
     pub(crate) network: Network,
     pub(crate) chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     pub(crate) applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    /// Cumulative transaction count of the applied chain, or `0` when unknown.
-    ///
-    /// Bitcoin Core's `CBlockIndex::m_chain_tx_count`, including its convention
-    /// that zero means *unset* rather than *empty* (`HaveNumChainTxs()`). Only a
-    /// chain applied from genesis by a node that maintains this counter can know
-    /// it; a cold start before genesis or an arithmetic inconsistency leaves it
-    /// unknown until the chain is applied again.
-    ///
-    /// Kept beside `applied_tip`. Connect and disconnect publish the pair
-    /// under `applied_seq` so [`Chainstate::snapshot`] copies one view.
-    pub(crate) chain_tx_count: Arc<AtomicU64>,
-    /// Seqlock for the applied-tip / chain-tx-count pair.
-    ///
-    /// Odd means a writer is between the two stores; even is a stable pair.
-    /// Snapshot readers retry instead of taking the transition lock.
-    pub(crate) applied_seq: Arc<AtomicU64>,
     pub(crate) block_tree: Arc<RwLock<BlockTree>>,
     pub(crate) utxo: Arc<UtxoSet>,
     pub(crate) coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
@@ -548,8 +534,6 @@ pub struct ChainstateParts {
     pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Authoritative applied-tip publication cell.
     pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    /// Cumulative transaction count through the applied tip.
-    pub chain_tx_count: Arc<AtomicU64>,
     /// Shared header/block tree.
     pub block_tree: Arc<RwLock<BlockTree>>,
     /// Authoritative UTXO set.
@@ -641,31 +625,48 @@ impl<'a> ChainTransition<'a> {
 
     /// Connects `block` as the next applied tip.
     ///
-    /// Consensus refusal happens before the first write. See the type-level
-    /// persistence notes for the commit point and retry rules.
-    pub fn connect(&self, block: &Block) -> core::result::Result<ConnectOutcome, ApplyError> {
+    /// `serialized` is `Some` when the caller holds the block's wire bytes,
+    /// which skips re-serialization and validates those bytes; `None` keeps
+    /// serialization lazy. Both arms share one commit and publication order.
+    ///
+    /// PRE: the caller holds admission and the chain-transition guard, and
+    /// present bytes encode `block`.
+    ///
+    /// POST: `Ok` is a durable commit followed by publication; an error keeps
+    /// the existing refusal and recovery semantics.
+    ///
+    /// INVARIANT: `None` and `Some` commit and publish in the same order.
+    pub fn connect(
+        &self,
+        block: &Block,
+        serialized: Option<bytes::Bytes>,
+    ) -> core::result::Result<ConnectOutcome, ApplyError> {
         self.settle_apply(apply_committed_block_admitted(
             self.chainstate,
             block,
-            None,
+            serialized,
             None,
             BlockProvenance::Network,
             PublishMode::Now,
         ))
     }
 
-    /// Connects `block` reusing preserved wire-format bytes.
+    /// Re-applies a body this node already validated and persisted before a crash.
     ///
-    /// Same commit point and retry rules as [`Self::connect`].
-    pub fn connect_serialized(
+    /// Scripts do not run again (`BlockProvenance::LocalReplay`). Persistence
+    /// otherwise matches [`Self::connect`].
+    pub fn replay_local(
         &self,
         block: &Block,
         serialized: bytes::Bytes,
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
-        self.settle_apply(apply_block_with_serialized_admitted(
+        self.settle_apply(apply_committed_block_admitted(
             self.chainstate,
             block,
-            serialized,
+            Some(serialized),
+            None,
+            BlockProvenance::LocalReplay,
+            PublishMode::Now,
         ))
     }
 
@@ -732,8 +733,6 @@ impl Chainstate {
             network: parts.network,
             chain_tip: parts.chain_tip,
             applied_tip: parts.applied_tip,
-            chain_tx_count: parts.chain_tx_count,
-            applied_seq: Arc::new(AtomicU64::new(0)),
             block_tree: parts.block_tree,
             utxo: parts.utxo,
             coin_stats: parts.coin_stats,
@@ -921,14 +920,7 @@ impl Chainstate {
         Arc::clone(&self.coin_stats)
     }
 
-    /// Clones the cumulative chain transaction-count handle.
-    #[must_use]
-    pub fn chain_tx_count_handle(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.chain_tx_count)
-    }
-
     /// Clones the authoritative chain-event publisher.
-    #[must_use]
     pub fn chain_events_handle(&self) -> Arc<crate::events::ChainEventPublisher> {
         Arc::clone(&self.chain_events)
     }
@@ -1122,8 +1114,6 @@ impl Chainstate {
             network,
             chain_tip,
             applied_tip,
-            chain_tx_count: Arc::new(AtomicU64::new(0)),
-            applied_seq: Arc::new(AtomicU64::new(0)),
             block_tree,
             utxo,
             coin_stats,
@@ -1155,33 +1145,22 @@ impl Chainstate {
         self
     }
 
-    /// Copies the published header tip and a coherent applied-tip / chain-tx
-    /// count pair.
+    /// Copies the published header tip and the published applied tip.
     ///
-    /// Does not take the transition lock. Header tip is a separate cell and
-    /// may be ahead of the applied chain. Applied tip and `chain_tx_count`
-    /// are published together under `applied_seq`; this method retries until
-    /// it observes a stable pair.
+    /// Does not take the transition lock. Each tip is one cell, and an applied
+    /// tip carries its own certified count, so one load per cell cannot
+    /// observe a tip and a count from different publications. Header tip is a
+    /// separate cell and may be ahead of the applied chain.
     #[must_use]
     pub fn snapshot(&self) -> ChainstateSnapshot {
-        loop {
-            let seq1 = self.applied_seq.load(Ordering::Acquire);
-            if seq1 & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let header = self.chain_tip.load_full().as_deref().cloned();
-            let applied = self.applied_tip.load_full().as_deref().cloned();
-            let chain_tx_count = self.chain_tx_count.load(Ordering::Acquire);
-            let seq2 = self.applied_seq.load(Ordering::Acquire);
-            if seq1 == seq2 {
-                return ChainstateSnapshot {
-                    header,
-                    applied,
-                    chain_tx_count,
-                };
-            }
-            std::hint::spin_loop();
+        let applied = self.applied_tip.load_full().as_deref().cloned();
+        let chain_tx_count = applied
+            .as_ref()
+            .map_or(ChainTxCount::UNKNOWN, |tip| tip.chain_tx_count);
+        ChainstateSnapshot {
+            header: self.chain_tip.load_full().as_deref().cloned(),
+            applied,
+            chain_tx_count,
         }
     }
 
@@ -1222,7 +1201,6 @@ impl Chainstate {
                 block_tree: Arc::clone(&self.block_tree),
                 utxo: Arc::clone(&self.utxo),
                 coin_stats: Arc::clone(&self.coin_stats),
-                chain_tx_count: Arc::clone(&self.chain_tx_count),
                 journal: self.journal.clone(),
                 data_dir: data_dir.to_path_buf(),
                 chain_events: Arc::clone(&self.chain_events),
@@ -1243,34 +1221,59 @@ impl Chainstate {
         }
     }
 
-    /// Admits a transition, connects `block`, then releases the transition lock.
-    /// A refusal releases the same chainstate locks; retry semantics come from
-    /// [`ChainTransition::connect`].
+    /// Publishes the recovery checkpoint of the disconnect-marker recovery
+    /// transaction.
     ///
-    /// Persistence matches [`ChainTransition::connect`]. Derived consumers are
-    /// not invoked. Production paths with followers must dispatch while the
-    /// the chain transition is still held (`ARCH-07`). Node-owned followers
-    /// consume the returned outcome outside this crate.
-    #[cfg(any(test, feature = "test-seam"))]
-    pub fn apply_block(&self, block: &Block) -> core::result::Result<ConnectOutcome, ApplyError> {
-        let transition = self.begin_transition()?;
-        let result = transition.connect(block);
-        drop(transition);
-        result
+    /// PRE: recovery has reconstructed a coherent applied tip at the durable
+    /// head.
+    ///
+    /// POST: success has published the clean checkpoint and retired the
+    /// disconnect marker.
+    ///
+    /// INVARIANT: a missing publisher or a skipped tip is a recovery failure,
+    /// never a silent skip: the marker must not survive without the
+    /// checkpoint that makes the repaired state durable.
+    pub(crate) fn publish_recovery_checkpoint(&self) -> core::result::Result<(), CheckpointError> {
+        let invalid = |reason: &str| {
+            CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
+                reason.to_owned(),
+            ))
+        };
+        let Some(publisher) = &self.checkpoint_publisher else {
+            return Err(invalid(
+                "disconnect recovery requires a configured checkpoint publisher",
+            ));
+        };
+        match publisher.publish_recovered()? {
+            crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => {
+                Err(invalid("recovery found no applied tip to checkpoint"))
+            }
+            crate::checkpoint::CheckpointWrite::Published { .. } => Ok(()),
+        }
     }
 
-    /// Admits a transition, connects `block` from preserved bytes, then releases
-    /// the transition lock.
+    /// Admits a transition, connects `block`, then releases the transition lock.
+    /// A refusal releases the same chainstate locks; retry semantics come from
+    /// [`ChainTransition::connect`], whose `serialized` rules this method
+    /// inherits: `Some` reuses the caller's wire bytes, `None` serializes
+    /// lazily, and both share one commit and publication order.
     ///
-    /// Persistence matches [`ChainTransition::connect`].
+    /// PRE: present bytes encode `block`.
+    ///
+    /// POST: `Ok` is a durable commit followed by publication.
+    ///
+    /// INVARIANT: derived consumers are not invoked. Production paths with
+    /// followers must dispatch while the chain transition is still held
+    /// (`ARCH-07`); node-owned followers consume the returned outcome outside
+    /// this crate.
     #[cfg(any(test, feature = "test-seam"))]
-    pub fn apply_block_with_serialized(
+    pub fn apply_block(
         &self,
         block: &Block,
-        serialized: bytes::Bytes,
+        serialized: Option<bytes::Bytes>,
     ) -> core::result::Result<ConnectOutcome, ApplyError> {
         let transition = self.begin_transition()?;
-        let result = transition.connect_serialized(block, serialized);
+        let result = transition.connect(block, serialized);
         drop(transition);
         result
     }
@@ -1366,28 +1369,13 @@ impl Chainstate {
 /// added to `disconnect_block` that can fail belongs here unless it physically
 /// cannot run this early.
 struct DisconnectPlan {
+    /// Parent tip with the cumulative count its tree node carries, which the
+    /// disconnect commits and publishes unchanged.
     parent_tip: TipSnapshot,
     parent_prev_hash: Hash256,
-    parent_chain_tx_count: u64,
     undo: bitcoin_rs_utxo::contract::UndoBatch,
     height: u32,
     tx_count_delta: u64,
-}
-
-/// Seqlock guard for the applied-tip / chain-tx-count pair.
-///
-/// [`Chainstate::snapshot`] retries while the sequence is odd. Dropping the
-/// guard stores the matching even value, including on panic, so readers do
-/// not spin forever. A panic between the two stores can still expose a mixed
-/// pair; the transition lock already treats that as fatal process state.
-struct AppliedPublication<'a> {
-    seq: &'a AtomicU64,
-}
-
-impl Drop for AppliedPublication<'_> {
-    fn drop(&mut self) {
-        self.seq.fetch_add(1, Ordering::Release);
-    }
 }
 
 /// How many consecutive blocks share one script-verification dispatch.
@@ -1473,13 +1461,16 @@ pub struct WindowApplyError {
     pub source: ApplyError,
     /// How the caller must treat this failure: `Permanent` failures poisoned
     /// the failed block's header subtree while the chain transition was still
-    /// held; `BodyMutated` discards only the delivered body; `Operational`
-    /// failures poisoned nothing; `Fatal` means mutation or durable-head
-    /// state may be torn, so recovery must run before another mutation.
+    /// held, and the published tip and assume-valid gate were re-synchronized
+    /// with the mutated tree; `BodyMutated` discards only the delivered body;
+    /// `Operational` failures poisoned nothing; `Fatal` means mutation or
+    /// durable-head state may be torn, so recovery must run before another
+    /// mutation.
     pub disposition: WindowApplyDisposition,
     /// Hashes marked invalid under the held transition when `disposition` is
     /// [`WindowApplyDisposition::Permanent`]: the failed block and every
-    /// descendant, in deterministic slab order. Empty otherwise.
+    /// descendant, in deterministic slab order. Empty otherwise, including a
+    /// header that was never in the tree.
     pub invalidated: Box<[Hash256]>,
 }
 
@@ -1521,8 +1512,10 @@ impl WindowApplyError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowApplyDisposition {
     /// The failed block and its descendants can never be valid. Their header
-    /// subtrees were invalidated under the window's chain transition; purge
-    /// every returned hash from staged/download state without retrying.
+    /// subtrees were invalidated under the window's chain transition, the
+    /// best valid tip was republished from the mutated tree, and the
+    /// assume-valid gate was re-evaluated; purge every returned hash from
+    /// staged/download state without retrying.
     Permanent,
     /// The delivered body is mutated or not bound to its header. Discard this
     /// body and retry the same header/hash from another source; do not poison
@@ -1533,8 +1526,10 @@ pub enum WindowApplyDisposition {
     Operational,
     /// Mutation or durable-head state may already have changed without a
     /// reliable commit receipt. Do not retry in-process; recovery must
-    /// re-establish authoritative chainstate first. Nothing about the blocks is
-    /// necessarily invalid, so no header subtree is purged.
+    /// re-establish authoritative chainstate first. Nothing about the blocks
+    /// is necessarily invalid, so no header subtree is purged — except a
+    /// permanent failure whose subtree could not be marked, which escalates
+    /// here because the tree may be partially marked.
     Fatal,
 }
 
@@ -1862,6 +1857,14 @@ mod chain_tx_count_tests;
 #[cfg(test)]
 #[path = "../tests/unit/apply/persistence_tests.rs"]
 mod persistence_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/apply/window_tx_count_tests.rs"]
+mod window_tx_count_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/apply/window_invalidation_tests.rs"]
+mod window_invalidation_tests;
 
 #[cfg(test)]
 #[path = "../tests/unit/checkpoint_debt_tests.rs"]

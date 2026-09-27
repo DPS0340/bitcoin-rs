@@ -36,10 +36,13 @@ fn restored_chainstate() -> Result<(Chainstate, Block), Box<dyn std::error::Erro
         &genesis,
         0,
     )?;
+    let genesis_tip = bitcoin_rs_chain::TipSnapshot {
+        chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(1),
+        ..genesis_tip
+    };
     handles
         .applied_tip
         .store(Some(Arc::new(genesis_tip.clone())));
-    handles.chain_tx_count.store(1, Ordering::Release);
 
     let tx = Tx {
         version: 2,
@@ -128,7 +131,10 @@ fn committed_gap_replays_to_head_without_recommitting_it() -> Result<(), Box<dyn
         .load_full()
         .ok_or("replay did not publish an applied tip")?;
     assert_eq!((landed.height, landed.hash), (head.height, head.tip));
-    assert_eq!(handles.chain_tx_count.load(Ordering::Acquire), 2);
+    assert_eq!(
+        landed.chain_tx_count,
+        bitcoin_rs_chain::ChainTxCount::established(2)
+    );
     assert_eq!(handles.durable_head.load()?, Some(head));
     assert_eq!(
         handles.durable_head.load()?.map(|head| head.commit_id),
@@ -214,7 +220,6 @@ fn committed_gap_with_missing_body_fails_closed() -> Result<(), Box<dyn std::err
 fn cold_chainstate_replays_head_chain_from_genesis() -> Result<(), Box<dyn std::error::Error>> {
     let (mut handles, child) = restored_chainstate()?;
     handles.applied_tip.store(None);
-    handles.chain_tx_count.store(0, Ordering::Release);
     let genesis = Network::Regtest.genesis_block();
     let bodies = Arc::new(MemoryBodies::default());
     bodies.persist_block_body(
@@ -236,7 +241,10 @@ fn cold_chainstate_replays_head_chain_from_genesis() -> Result<(), Box<dyn std::
         .load_full()
         .ok_or("cold replay did not publish an applied tip")?;
     assert_eq!((landed.height, landed.hash), (1, head.tip));
-    assert_eq!(handles.chain_tx_count.load(Ordering::Acquire), 2);
+    assert_eq!(
+        landed.chain_tx_count,
+        bitcoin_rs_chain::ChainTxCount::established(2)
+    );
     assert_eq!(
         handles.durable_head.load()?,
         Some(head),
@@ -250,7 +258,6 @@ fn cold_chainstate_with_missing_genesis_body_fails_closed() -> Result<(), Box<dy
 {
     let (mut handles, child) = restored_chainstate()?;
     handles.applied_tip.store(None);
-    handles.chain_tx_count.store(0, Ordering::Release);
     let bodies = Arc::new(MemoryBodies::default());
     bodies.persist_block_body(
         1,
@@ -333,33 +340,95 @@ fn durable_head_at_or_below_restored_tip_is_not_a_replay_gap()
     Ok(())
 }
 
+/// Mines one regtest block at `height` whose coinbase names the height, on
+/// top of the block at `prev`.
+fn mined_child(
+    prev: Hash256,
+    prev_time: u32,
+    height: u32,
+) -> Result<Block, Box<dyn std::error::Error>> {
+    let tx = Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            script_sig: Script::from_bytes(vec![1, u8::try_from(height)?, 0]),
+            sequence: Sequence::from_consensus(u32::MAX),
+            witness: Witness::new(),
+        }],
+        outputs: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: Script::new(),
+        }],
+        lock_time: LockTime::from_consensus(0),
+    };
+    let mut leaves = vec![*tx.txid().as_bytes()];
+    let merkle = bitcoin_rs_consensus::verify_block::compute_merkle_root(&mut leaves)
+        .ok_or("coinbase merkle root missing")?;
+    let mut block = Block {
+        header: Header {
+            version: 1,
+            prev_blockhash: BlockHash(prev),
+            merkle_root: Hash256::from_le_bytes(&merkle),
+            time: prev_time.saturating_add(1),
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txs: vec![tx],
+    };
+    while !compact_is_met_by(block.header.bits, block.header.compute_hash().0) {
+        block.header.nonce = block
+            .header
+            .nonce
+            .checked_add(1)
+            .ok_or("test nonce exhausted")?;
+    }
+    Ok(block)
+}
+
+/// A certified body chain wider than one commit group replays to the durable
+/// head: recoverability is the body-identity and ancestry walk, not the gap
+/// width. The replay lands on the stored head and preserves its `commit_id`
+/// (`P3`).
 #[test]
-fn durable_gap_wider_than_one_group_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
-    let (handles, child) = restored_chainstate()?;
-    let restored = handles
-        .applied_tip
-        .load_full()
-        .ok_or("restored tip missing")?;
-    let head_height = u32::try_from(super::REPLAY_GAP_BLOCK_LIMIT)?.saturating_add(1);
+fn wide_authenticated_gap_replays_to_durable_head() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, first) = restored_chainstate()?;
+    let width = crate::window::DURABLE_HEAD_GROUP_BLOCKS + 1;
+    let bodies = Arc::new(MemoryBodies::default());
+    let mut tip_hash = Hash256::from(first.block_hash());
+    let mut prev_time = first.header.time;
+    bodies.persist_block_body(1, tip_hash, &consensus_bytes(&first))?;
+    for height in 2..=u32::try_from(width)? {
+        let block = mined_child(tip_hash, prev_time, height)?;
+        tip_hash = Hash256::from(block.block_hash());
+        prev_time = block.header.time;
+        bodies.persist_block_body(height, tip_hash, &consensus_bytes(&block))?;
+    }
     let head = DurableHead {
         commit_id: 5,
-        height: head_height,
-        tip: Hash256::from(child.block_hash()),
-        chain_tx_count: 2,
+        height: u32::try_from(width)?,
+        tip: tip_hash,
+        chain_tx_count: u64::try_from(width)? + 1,
         body_extent: None,
         undo_extent: None,
     };
+    let certified = (head.height, head.tip, head.chain_tx_count);
+    install_arbitrary_head(&mut handles, head, bodies)?;
 
-    let Err(error) = super::replay_committed_gap(&handles, head, Some(&restored)) else {
-        panic!("gap beyond the commit-group bound must fail");
-    };
-    assert!(matches!(
-        error,
-        ApplyError::DurableHeadGapUnrecoverable {
-            reason: "the gap is wider than one commit group",
-            ..
-        }
-    ));
+    super::reconcile_at_boot(&handles)?;
+
+    let landed = handles
+        .applied_tip
+        .load_full()
+        .ok_or("wide replay did not publish an applied tip")?;
+    assert_eq!(
+        (landed.height, landed.hash, landed.chain_tx_count.to_wire()),
+        certified
+    );
+    assert_eq!(
+        handles.durable_head.load()?.map(|head| head.commit_id),
+        Some(5),
+        "replay must consume the durable receipt rather than creating a new one"
+    );
     Ok(())
 }
 
@@ -467,6 +536,96 @@ fn committed_gap_replay_failure_fails_closed() -> Result<(), Box<dyn std::error:
     assert!(
         matches!(handles.begin_transition(), Err(ApplyError::Shutdown)),
         "admission must stay closed after a failed replay"
+    );
+    Ok(())
+}
+
+/// A durable head whose tip is absent from the restored block tree still
+/// resolves: the certified body chain is walked down from the head tip until
+/// a hash lands in the tree — here the head's own genesis parent — and that
+/// anchor is what the rewind aims at. An applied tip at the same height on a
+/// branch the head chain does not descend from reads as rewind work, while a
+/// tip equal to the walked descriptor reads as already on the head chain.
+#[test]
+fn absent_head_tip_resolves_anchor_through_stored_bodies() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut handles, child) = restored_chainstate()?;
+    let child_hash = Hash256::from(child.block_hash());
+    // The head body is stored — the receipt evidence the anchor walk
+    // authenticates — but its header is never admitted to the block tree.
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.persist_block_body(1, child_hash, &consensus_bytes(&child))?;
+    let head = install_head(&mut handles, &child, bodies)?;
+
+    let anchor = crate::durable::resolve_head_anchor(&handles, &head)?;
+    let genesis = Network::Regtest.genesis_block();
+    assert_eq!(anchor.anchor_height, 0);
+    assert_eq!(anchor.anchor, Hash256::from(genesis.block_hash()));
+    assert_eq!(anchor.above, vec![(1, child_hash)]);
+
+    // The restored tip (genesis) is the anchor itself: on the head chain.
+    let restored = handles
+        .applied_tip
+        .load_full()
+        .ok_or("restored tip missing")?;
+    assert!(anchor.contains_tip(&handles, &restored));
+    // A tip on the walked segment above the anchor is on the head chain.
+    let on_head_segment = bitcoin_rs_chain::TipSnapshot {
+        height: 1,
+        hash: child_hash,
+        ..(*restored).clone()
+    };
+    assert!(anchor.contains_tip(&handles, &on_head_segment));
+    // A different tip at the same height is not, whatever its node says.
+    let off_chain = bitcoin_rs_chain::TipSnapshot {
+        height: 1,
+        hash: Hash256::from_le_bytes(&[0xab; 32]),
+        ..(*restored).clone()
+    };
+    assert!(!anchor.contains_tip(&handles, &off_chain));
+    Ok(())
+}
+
+/// A head tip the tree cannot resolve fails closed when the body evidence
+/// needed to authenticate the chain is missing — the anchor walk must not
+/// guess a fork.
+#[test]
+fn absent_head_tip_with_missing_body_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, child) = restored_chainstate()?;
+    let bodies = Arc::new(MemoryBodies::default());
+    let head = install_head(&mut handles, &child, bodies)?;
+
+    let Err(error) = crate::durable::resolve_head_anchor(&handles, &head) else {
+        panic!("a missing head body must fail the anchor walk closed");
+    };
+    assert!(
+        matches!(error, ApplyError::DurableHeadGapUnrecoverable { .. }),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+/// When the head tip is itself a tree node, the anchor is the head and the
+/// walked segment above it is empty — the ordinary ancestry shape.
+#[test]
+fn tree_known_head_tip_anchors_on_itself() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, child) = restored_chainstate()?;
+    let child_hash = Hash256::from(child.block_hash());
+    let child_tip = crate::connect::applied_header_tip(&handles, child_hash, &child, 1)?;
+    let head = install_head(&mut handles, &child, Arc::new(MemoryBodies::default()))?;
+
+    let anchor = crate::durable::resolve_head_anchor(&handles, &head)?;
+    assert_eq!(anchor.anchor_height, 1);
+    assert_eq!(anchor.anchor, child_hash);
+    assert!(anchor.above.is_empty());
+    assert!(anchor.contains_tip(&handles, &child_tip));
+    let restored = handles
+        .applied_tip
+        .load_full()
+        .ok_or("restored tip missing")?;
+    assert!(
+        anchor.contains_tip(&handles, &restored),
+        "genesis is the head tip's ancestor and reads as on the head chain"
     );
     Ok(())
 }

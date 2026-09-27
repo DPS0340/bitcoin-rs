@@ -13,7 +13,7 @@ use super::storage::StoredBlockBodySource;
 use crate::NodeConfig;
 use anyhow::Context as _;
 use anyhow::Result;
-use anyhow::bail;
+
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::TipSnapshot;
@@ -21,7 +21,7 @@ use bitcoin_rs_chainstate::ChainstateParts;
 use bitcoin_rs_chainstate::events::{ChainEventPublisher, ChainSnapshot, initialize_data_dir};
 use bitcoin_rs_chainstate::recovery::{
     InitialChainstate, ResumeSource, STALE_RESTORE_ERROR_THRESHOLD, open_journal_dir,
-    prepare_initial_chainstate, requires_full_revalidation,
+    prepare_initial_chainstate,
 };
 use bitcoin_rs_index::block_log::BlockLog;
 use bitcoin_rs_mempool::Mempool;
@@ -35,7 +35,6 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::AtomicU64;
 
 impl NodeState {
     /// Opens (or creates) the node's data directory and configured storage
@@ -69,47 +68,7 @@ impl NodeState {
         let (storage, block_files) = NodeStorage::open(&config, chainstate_cache_bytes)?;
         let undo_store = storage.undo_store();
         let durable_head = storage.durable_head();
-        // Before anything reads the chainstate, let alone serves or syncs it.
-        // A node that starts on a torn chainstate builds on it, and every block
-        // it adds makes the damage harder to find.
-        if let Some(marker) = undo_store
-            .load_disconnect_marker()
-            .map_err(anyhow::Error::new)?
-        {
-            let force_full_revalidation = requires_full_revalidation(&config.data_dir);
-            if marker.phase == bitcoin_rs_chainstate::DisconnectPhase::RolledBack
-                && force_full_revalidation
-            {
-                undo_store.disarm_disconnect().map_err(anyhow::Error::new)?;
-                tracing::warn!(
-                    height = marker.height,
-                    hash = %marker.hash,
-                    "accepting completed deep reorg; full chain validation is required"
-                );
-            } else {
-                // Names directories rather than a `-reindex` option, because this
-                // node has no reindex. An instruction the operator cannot follow is
-                // worse than none.
-                //
-                // Remove the authoritative views. The marker covers a disconnect
-                // that did not reach a clean UTXO-and-tip checkpoint. TxIndex rows
-                // are derived state outside this marker, but a retained TxIndex
-                // watermark can stall rollback because wiping the chainstate
-                // removes the body positions the index refers to. Include the txindex
-                // path so the operator action is complete.
-                bail!(
-                    "refusing to start: a disconnect of block {hash} at height {height} did not \
-                     reach a clean checkpoint, so the UTXO set and chain tip cannot be trusted \
-                     together. The node cannot repair this in place. Remove or quarantine \
-                     {chainstate}, {checkpoints}, and {txindex}, then resync.",
-                    hash = marker.hash,
-                    height = marker.height,
-                    chainstate = config.data_dir.join("chainstate").display(),
-                    checkpoints = config.data_dir.join("chainstate-checkpoints").display(),
-                    txindex = config.data_dir.join("txindex").display(),
-                );
-            }
-        }
+
         let block_body_store = storage.block_body_store();
 
         let zmq_endpoints = config.zmq_endpoints();
@@ -129,7 +88,6 @@ impl NodeState {
             coin_stats: initial_coin_stats,
             tree: mut block_tree_value,
             applied_tip: restored_applied_tip,
-            chain_tx_count: restored_chain_tx_count,
             resume_source,
             journal_bootstrap,
         } = prepare_initial_chainstate(
@@ -243,7 +201,6 @@ impl NodeState {
             applied_tip.store(Some(Arc::new(restored_applied_tip)));
         }
         let blocks = Arc::new(RwLock::new(BlockLog::new()));
-        let chain_tx_count = Arc::new(AtomicU64::new(restored_chain_tx_count));
         let transactions = Arc::new(RwLock::new(HashMap::new()));
         // Created before the txindex worker spawn: the worker mirrors this
         // publisher's snapshot into its persisted consumer cursor.
@@ -254,7 +211,6 @@ impl NodeState {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
             applied_tip: Arc::clone(&applied_tip),
-            chain_tx_count: Arc::clone(&chain_tx_count),
             block_tree: Arc::clone(&block_tree),
             utxo: Arc::clone(&utxo),
             coin_stats: Arc::clone(&coin_stats),
@@ -411,19 +367,34 @@ impl NodeState {
         );
         let (capture_rawtx, capture_block_bytes) = followers.capture_flags();
         chainstate.set_capture_flags(capture_rawtx, capture_block_bytes);
-        // The durable head is the chain's commit point: an unreadable row
-        // fails startup, and a committed-but-unpublished gap (crash between
-        // the head batch and publication) is replayed here from the durable
-        // bodies it certified, so ordinary operation starts on a state the
-        // head fully names (#655). A gap that is not an ancestor prefix of
-        // stored bodies fails startup closed.
-        bitcoin_rs_chainstate::reconcile_at_boot(&chainstate).map_err(anyhow::Error::new)?;
         // A restored checkpoint is durable at its own height by definition, so
-        // start there rather than at zero, which would refuse all undo pruning.
+        // start there rather than at zero, which would refuse all undo
+        // pruning. Recovery publication advances it to the reconstructed tip.
         let durable_tip_height = Arc::new(AtomicU32::new(
             applied_tip.load().as_ref().map_or(0, |tip| tip.height),
         ));
         chainstate.configure_checkpointing(&config.data_dir, Arc::clone(&durable_tip_height))?;
+        // Before anything reads the chainstate, let alone serves or syncs it.
+        // A committed-but-unpublished gap (crash between the head batch and
+        // publication) is replayed from the durable bodies the head
+        // certified, and a disconnect marker selects marker-aware recovery:
+        // parent reconciliation or cold replay, then a clean checkpoint, then
+        // marker retirement (`docs/contracts/recovery.md`). A node that
+        // starts on a torn chainstate builds on it, and every block it adds
+        // makes the damage harder to find; a recovery that fails closed
+        // retains the marker and stops startup (#655).
+        match bitcoin_rs_chainstate::recover_disconnect_marker(&chainstate) {
+            Ok(()) => {}
+            Err(error @ bitcoin_rs_chainstate::ApplyError::DurableHeadGapUnrecoverable { .. }) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "The node cannot repair this in place. Remove or quarantine {}, {}, and {}, then resync.",
+                    config.data_dir.join("chainstate").display(),
+                    config.data_dir.join("chainstate-checkpoints").display(),
+                    config.data_dir.join("txindex").display(),
+                )));
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
         let chainstate = Arc::new(chainstate);
         // One chain-owned latch for the whole process: the chainstate builds
         // it once, and the block-download executor, the RPC context, and the
