@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::arc_with_non_send_sync, clippy::too_many_lines)]
     fn from_handles_shares_chain_handles_with_caller() {
         use alloc::sync::Arc;
 
