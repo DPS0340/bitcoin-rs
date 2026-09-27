@@ -714,13 +714,9 @@ mod tests {
         );
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        let worker = spawn_tx_relay_worker(
-            sink,
-            rx,
-            Arc::downgrade(&gateway),
-            Arc::clone(&shutdown),
-        )
-        .expect("relay worker spawns");
+        let worker =
+            spawn_tx_relay_worker(sink, rx, Arc::downgrade(&gateway), Arc::clone(&shutdown))
+                .expect("relay worker spawns");
         // Deterministic release: dropping the last sender disconnects the
         // queue once the two buffered requests are consumed. No sleeping.
         drop(queue);
@@ -746,13 +742,9 @@ mod tests {
             .expect("observer slot");
         let sink = FakeSink::new(Vec::new());
         let shutdown = Arc::new(AtomicBool::new(false));
-        let worker = spawn_tx_relay_worker(
-            sink,
-            rx,
-            Arc::downgrade(&gateway),
-            Arc::clone(&shutdown),
-        )
-        .expect("relay worker spawns");
+        let worker =
+            spawn_tx_relay_worker(sink, rx, Arc::downgrade(&gateway), Arc::clone(&shutdown))
+                .expect("relay worker spawns");
 
         drop(queue);
         drop(gateway);
