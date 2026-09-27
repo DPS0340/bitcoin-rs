@@ -8,9 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use bitcoin::p2p::Magic;
+use bitcoin_rs_p2p::PeerRole;
 use bitcoin_rs_p2p::listener::{ConnectionShared, bind_listener, serve, spawn_outbound_connection};
 use bitcoin_rs_p2p::{
-    BannedSubnet, IpSubnet, ListenerExtras, NetworkActivity, PeerError, PeerRole, PeerTable,
+    BannedSubnet, IpSubnet, ListenerExtras, NetworkActivity, PeerError, PeerTable,
 };
 use parking_lot::RwLock;
 

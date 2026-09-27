@@ -11,8 +11,9 @@ use bitcoin::blockdata::block::Block as RegistryBlock;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock};
-use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader};
-use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
+use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader, ChainWork, TipReader};
+use bitcoin_rs_primitives::layout::{ParsedBlock, ParsedTransaction};
+use bitcoin_rs_primitives::{BlockHash, Hash256, Header, Network};
 #[cfg(test)]
 use parking_lot::RwLock;
 
@@ -34,16 +35,28 @@ const MAX_BLOCKTXN_DEPTH: u32 = 10;
 #[derive(Clone)]
 pub struct ActiveChainQuery {
     block_tree: BlockTreeReader,
+    applied_tip: TipReader,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
+    network: Network,
 }
 
 impl ActiveChainQuery {
-    /// Builds a P2P chain query view over shared active-chain state.
+    /// Builds a P2P chain query view over shared active-chain state of one
+    /// network.
+    ///
+    /// PRE: `block_tree` holds only headers of `network`, and `applied_tip`
+    ///   publishes the chain owner's fully-applied tip.
+    /// POST: returns the view; serving queries refuse below the network's
+    ///   minimum chain work, and tip-age reads (`best_block_time`) report
+    ///   the applied tip, never a fresher-but-unapplied header.
+    /// INVARIANT: the view's network never changes after construction.
     #[must_use]
-    pub fn new(block_tree: BlockTreeReader) -> Self {
+    pub fn new(block_tree: BlockTreeReader, applied_tip: TipReader, network: Network) -> Self {
         Self {
             block_tree,
+            applied_tip,
             block_body_source: None,
+            network,
         }
     }
 
@@ -71,11 +84,17 @@ impl ActiveChainQuery {
     /// PRE: `height` is the block's active height as first observed.
     /// POST: return the raw consensus payload and the observing tip height
     /// only while the block is still active at `height`; `None` leaves the
-    /// request unanswered.
+    /// request unanswered. With `include_witness` false, transaction
+    /// witnesses are stripped from the returned payload.
     /// INVARIANT: no body is served for a block that left the active chain,
     /// and the tip height comes from the same guard as that proof, so a
     /// depth decision is never made from two different tree states.
-    fn load_active_block(&self, height: u32, hash: BlockHash) -> Option<(bytes::Bytes, u32)> {
+    fn load_active_block(
+        &self,
+        height: u32,
+        hash: BlockHash,
+        include_witness: bool,
+    ) -> Option<(bytes::Bytes, u32)> {
         let bytes = self.block_body_source.as_ref()?.block_body(height, hash)?;
         let header = bytes
             .get(..80)
@@ -83,9 +102,29 @@ impl ActiveChainQuery {
         if header.compute_hash() != hash {
             return None;
         }
-        // Validate the complete stored body before serving its raw bytes. This
-        // preserves the wire-byte optimization without forwarding corruption.
-        Block::consensus_decode(&bytes).ok()?;
+        // Use the complete consensus layout parser without materializing
+        // scripts or witnesses. Both serving forms reject malformed bodies.
+        let block = ParsedBlock::parse_exact(&bytes).ok()?;
+        let stripped = if !include_witness
+            && block
+                .transactions()
+                .iter()
+                .any(ParsedTransaction::is_segwit)
+        {
+            let mut payload = Vec::with_capacity(bytes.len());
+            payload.extend_from_slice(block.span_bytes(block.header_span())?);
+            payload.extend_from_slice(block.span_bytes(block.tx_count_span())?);
+            for tx in block.transactions() {
+                for part in tx.stripped_parts() {
+                    payload.extend_from_slice(part);
+                }
+            }
+            Some(payload)
+        } else {
+            None
+        };
+        drop(block);
+        let bytes = stripped.unwrap_or(bytes);
         let tree = self.block_tree.read();
         let tip = tree.tip()?;
         (tree.active_height_of(tip.tip_id, hash.into()) == Some(height))
@@ -93,8 +132,13 @@ impl ActiveChainQuery {
     }
 
     /// The stored body as a `block` payload, witnesses retained.
-    fn full_block_response(&self, height: u32, hash: BlockHash) -> Option<Message> {
-        self.load_active_block(height, hash)
+    fn full_block_response(
+        &self,
+        height: u32,
+        hash: BlockHash,
+        include_witness: bool,
+    ) -> Option<Message> {
+        self.load_active_block(height, hash, include_witness)
             .map(|(body, _)| Message::BlockPayload(body))
     }
 }
@@ -116,6 +160,14 @@ impl ChainQuery for ActiveChainQuery {
         let Some(tip) = tree.tip() else {
             return Vec::new();
         };
+        // A node whose active chain has not reached the network's minimum
+        // work is still syncing: it answers `getheaders` with the empty
+        // response rather than feeding a peer its low-work branch, exactly
+        // as Core refuses to serve headers below the assumed-valid floor
+        // (`net_processing.cpp:3010-3018,4648-4657`).
+        if tip.chainwork < ChainWork::from_be_bytes(self.network.minimum_chain_work()) {
+            return Vec::new();
+        }
         if limit == 0 {
             return Vec::new();
         }
@@ -155,11 +207,14 @@ impl ChainQuery for ActiveChainQuery {
         headers
     }
 
-    /// The active tip's header time, read from the same tree the serving
-    /// paths use.
+    /// The applied tip's header time. Limited-peer admission derives the
+    /// local depth from it, so it must read the fully-applied tip the
+    /// download policy serves, not the header tip: fresh-but-unapplied
+    /// headers would make a lagging node look current and admit
+    /// `NODE_NETWORK_LIMITED` peers it cannot download bodies from.
     fn best_block_time(&self) -> Option<u32> {
+        let tip = self.applied_tip.load_full()?;
         let tree = self.block_tree.read();
-        let tip = tree.tip()?;
         tree.node(tip.tip_id).ok().map(|node| node.header.time)
     }
 
@@ -194,12 +249,14 @@ impl ChainQuery for ActiveChainQuery {
     }
 
     /// PRE: `request` carries decoded absolute, strictly increasing
-    /// transaction indexes for one block.
+    /// transaction indexes for one block. `compact_version` is the peer's
+    /// servable BIP152 profile.
     /// POST: return the `blocktxn` reply for a block within
-    /// [`MAX_BLOCKTXN_DEPTH`] of the active tip, the whole witness-bearing
-    /// `block` for a deeper one, and `None` for a block this node cannot
-    /// serve or while the `headroom` gate is saturated; `Err` reports an
-    /// index past the end of the body.
+    /// [`MAX_BLOCKTXN_DEPTH`] of the active tip, encoded for
+    /// `compact_version` (v1 strips witnesses, any other profile keeps
+    /// them), the whole witness-bearing `block` for a deeper one, and
+    /// `None` for a block this node cannot serve or while the `headroom`
+    /// gate is saturated; `Err` reports an index past the end of the body.
     /// INVARIANT: a deep request is never answered with a small `blocktxn`
     /// and never left unanswered while its body is available (Core 31.1
     /// `net_processing.cpp:4590-4624`); `headroom` is evaluated immediately
@@ -207,6 +264,7 @@ impl ChainQuery for ActiveChainQuery {
     fn block_transactions(
         &self,
         request: &BlockTransactionsRequest,
+        compact_version: Option<u64>,
         headroom: &dyn Fn() -> bool,
     ) -> Result<Option<Message>, PeerError> {
         let hash = native_block_hash(request.block_hash);
@@ -217,7 +275,7 @@ impl ChainQuery for ActiveChainQuery {
         if !headroom() {
             return Ok(None);
         }
-        let Some((payload, tip_height)) = self.load_active_block(height, hash) else {
+        let Some((payload, tip_height)) = self.load_active_block(height, hash, true) else {
             return Ok(None);
         };
         // The tip may have moved while the body was read; the re-observed
@@ -231,8 +289,24 @@ impl ChainQuery for ActiveChainQuery {
             return Ok(None);
         };
         BlockTransactions::from_request(request, &block)
-            .map(|transactions| Some(Message::BlockTxn(BlockTxn { transactions })))
+            .map(|mut transactions| {
+                if compact_version == Some(1) {
+                    strip_witnesses(&mut transactions);
+                }
+                Some(Message::BlockTxn(BlockTxn { transactions }))
+            })
             .map_err(|_| PeerError::Protocol("getblocktxn index out of range"))
+    }
+}
+
+/// Clear every witness in a `blocktxn` response for the v1 serving profile.
+/// PRE: `transactions` came from the requested block. POST: all inputs carry
+/// empty witnesses; transaction IDs are unchanged.
+fn strip_witnesses(transactions: &mut BlockTransactions) {
+    for tx in &mut transactions.transactions {
+        for input in &mut tx.input {
+            input.witness.clear();
+        }
     }
 }
 
@@ -250,7 +324,7 @@ impl ActiveChainQuery {
         if version != 1 && version != 2 {
             return None;
         }
-        let (payload, tip_height) = self.load_active_block(height, hash)?;
+        let (payload, tip_height) = self.load_active_block(height, hash, true)?;
         if beyond_depth(tip_height, height, MAX_CMPCTBLOCK_DEPTH) {
             return Some(Message::BlockPayload(payload));
         }
@@ -272,14 +346,17 @@ impl ActiveChainQuery {
         compact_version: Option<u64>,
     ) -> Option<Message> {
         match request {
-            BlockRequest::Full(hash) => self.full_block_response(height, hash),
+            BlockRequest::Full {
+                hash,
+                include_witness,
+            } => self.full_block_response(height, hash, include_witness),
             // A peer asking for an old block almost certainly cannot match it
             // against a useful mempool, so the compact request is served as
             // the whole body, whatever it negotiated.
             BlockRequest::Compact(hash)
                 if beyond_depth(tip_height, height, MAX_CMPCTBLOCK_DEPTH) =>
             {
-                self.full_block_response(height, hash)
+                self.full_block_response(height, hash, true)
             }
             BlockRequest::Compact(hash) => self.compact_block_for(height, hash, compact_version),
         }
@@ -294,14 +371,17 @@ const fn beyond_depth(tip_height: u32, height: u32, limit: u32) -> bool {
 /// Which active-chain body one block-typed inventory item asks for.
 #[derive(Clone, Copy, Debug)]
 enum BlockRequest {
-    Full(BlockHash),
+    Full {
+        hash: BlockHash,
+        include_witness: bool,
+    },
     Compact(BlockHash),
 }
 
 impl BlockRequest {
     const fn hash(self) -> BlockHash {
         match self {
-            Self::Full(hash) | Self::Compact(hash) => hash,
+            Self::Full { hash, .. } | Self::Compact(hash) => hash,
         }
     }
 }
@@ -312,9 +392,10 @@ fn native_block_hash(hash: bitcoin::BlockHash) -> BlockHash {
 
 fn inventory_block_request(item: &Inventory) -> Option<BlockRequest> {
     match *item {
-        Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
-            Some(BlockRequest::Full(native_block_hash(hash)))
-        }
+        Inventory::Block(hash) | Inventory::WitnessBlock(hash) => Some(BlockRequest::Full {
+            hash: native_block_hash(hash),
+            include_witness: matches!(item, Inventory::WitnessBlock(_)),
+        }),
         Inventory::CompactBlock(hash) => Some(BlockRequest::Compact(native_block_hash(hash))),
         Inventory::Error
         | Inventory::Transaction(_)
@@ -480,7 +561,7 @@ mod tests {
         let active1_id = tree.insert_node(Some(genesis_id), active1, NodeStatus::Active)?;
         tree.insert_node(Some(active1_id), active2, NodeStatus::Active)?;
         tree.insert_node(Some(genesis_id), fork1, NodeStatus::Stale)?;
-        let query = ActiveChainQuery::new(BlockTreeReader::new(Arc::new(RwLock::new(tree))));
+        let query = query_over(tree, Network::Regtest);
 
         let response = query.headers_after(&[fork1.compute_hash()], BlockHash::default(), 10);
 
@@ -492,6 +573,51 @@ mod tests {
             query
                 .headers_after(&[], fork1.compute_hash(), 10)
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    /// A node whose active chain sits below its network's assumed-work
+    /// floor is still syncing: it must answer `getheaders` with the empty
+    /// response rather than serve its low-work branch to the rest of the
+    /// network (`net_processing.cpp:3010-3018,4648-4657`).
+    #[test]
+    fn low_work_chain_serves_no_headers() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = test_header(BlockHash::default(), 0);
+        let first = test_header(genesis.compute_hash(), 1);
+        let second = test_header(first.compute_hash(), 2);
+        let low_work_tree = || -> Result<BlockTree, bitcoin_rs_chain::ChainError> {
+            let mut tree = BlockTree::new();
+            let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
+            let first_id = tree.insert_node(Some(genesis_id), first, NodeStatus::Active)?;
+            tree.insert_node(Some(first_id), second, NodeStatus::Active)?;
+            Ok(tree)
+        };
+        // Mainnet's floor is far above three regtest-easy headers: the
+        // serving path must go quiet below it.
+        let mainnet = query_over(low_work_tree()?, Network::Mainnet);
+        assert!(
+            mainnet
+                .headers_after(&[genesis.compute_hash()], BlockHash::default(), 10)
+                .is_empty(),
+            "a below-floor node must answer getheaders with nothing"
+        );
+        assert!(
+            mainnet
+                .headers_after(&[], second.compute_hash(), 10)
+                .is_empty(),
+            "the empty-locator stop-hash path must refuse too"
+        );
+
+        let regtest = query_over(low_work_tree()?, Network::Regtest);
+        assert_eq!(
+            header_hashes(&regtest.headers_after(
+                &[genesis.compute_hash()],
+                BlockHash::default(),
+                10
+            )),
+            vec![first.compute_hash(), second.compute_hash()],
+            "a network with a zero floor must keep serving its chain"
         );
         Ok(())
     }
@@ -529,6 +655,205 @@ mod tests {
             vec![Inventory::Transaction(txid), missing]
         );
         assert!(!outcome.halted);
+        Ok(())
+    }
+
+    // BIP144 and Core 31.1 ProcessGetBlockData use TX_NO_WITNESS for
+    // MSG_BLOCK and TX_WITH_WITNESS for MSG_WITNESS_BLOCK. The independent
+    // rust-bitcoin envelope/serializer below checks the actual emitted bytes.
+    #[test]
+    fn getdata_block_encoding_matches_requested_inventory_on_wire()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::p2p::Magic;
+        use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+
+        for (tx_count, witness_modulus) in [(2_u8, 0), (2, 1), (3, 2), (253, 2)] {
+            let headers = seed_headers(2);
+            let mut block = Block {
+                header: headers[1],
+                txs: (0..tx_count).map(test_tx).collect(),
+            };
+            for (index, tx) in block.txs.iter_mut().enumerate() {
+                if witness_modulus != 0 && index % witness_modulus == 0 {
+                    tx.inputs[0].witness = vec![vec![0x51; 32]].into();
+                }
+                // Exercise the base-body boundary with and without a final
+                // output, including its empty script CompactSize prefix.
+                if index % 2 == 0 {
+                    tx.outputs.clear();
+                } else {
+                    tx.outputs[0].script_pubkey.clear();
+                }
+            }
+            let body = consensus_bytes(&block);
+            let source = Arc::new(SingleBlockSource {
+                height: 1,
+                hash: block.block_hash(),
+                body: body.clone(),
+            });
+            let query = query_with(headers)?.with_block_body_source(source.clone());
+            let full: RegistryBlock = bitcoin::consensus::deserialize(&body)?;
+            let mut stripped = full.clone();
+            for tx in &mut stripped.txdata {
+                for input in &mut tx.input {
+                    input.witness.clear();
+                }
+            }
+            let legacy = Inventory::Block(wire_hash(block.block_hash()));
+            let witness = Inventory::WitnessBlock(wire_hash(block.block_hash()));
+            let missing = Inventory::Block(WireBlockHash::from_byte_array([9; 32]));
+            for items in [[legacy, witness, legacy], [witness, legacy, witness]] {
+                let mut served = Vec::new();
+                let mut batch = items.to_vec();
+                batch.insert(1, missing);
+                let outcome =
+                    query.serve_inventory_blocks(&batch, None, &|| true, &mut |message| {
+                        let mut bytes = Vec::new();
+                        crate::wire::write_message(&mut bytes, Magic::REGTEST, &message)?;
+                        served.push(bytes);
+                        Ok(())
+                    })?;
+                assert_eq!(outcome.not_found, vec![missing]);
+                assert!(!outcome.halted);
+                assert_eq!(served.len(), items.len());
+                for (item, actual) in items.iter().zip(served) {
+                    let expected = if matches!(item, Inventory::Block(_)) {
+                        &stripped
+                    } else {
+                        &full
+                    };
+                    let envelope = RawNetworkMessage::new(
+                        Magic::REGTEST,
+                        NetworkMessage::Block(expected.clone()),
+                    );
+                    assert_eq!(actual, bitcoin::consensus::serialize(&envelope));
+                    assert_eq!(expected.block_hash(), full.block_hash());
+                    for (tx, original) in expected.txdata.iter().zip(&full.txdata) {
+                        assert_eq!(tx.compute_txid(), original.compute_txid());
+                    }
+                }
+                assert_eq!(
+                    source.body, body,
+                    "serving never rewrites retained witness data"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn getdata_block_encodings_keep_headroom_and_body_failure_rules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let headers = seed_headers(2);
+        let block = Block {
+            header: headers[1],
+            txs: vec![test_tx(1)],
+        };
+        let body = consensus_bytes(&block);
+        for item in [
+            Inventory::Block(wire_hash(block.block_hash())),
+            Inventory::WitnessBlock(wire_hash(block.block_hash())),
+        ] {
+            let source = Arc::new(CountingBodySource {
+                bodies: vec![(1, block.block_hash(), body.clone())],
+                loads: AtomicUsize::new(0),
+                tripwire: Some(0),
+            });
+            let query = query_with(headers.clone())?.with_block_body_source(source.clone());
+            let outcome = query.serve_inventory_blocks(&[item], None, &|| false, &mut |_| {
+                panic!("denied headroom cannot serve")
+            })?;
+            assert!(outcome.halted);
+            assert!(outcome.not_found.is_empty());
+            assert_eq!(source.loads.load(Ordering::Relaxed), 0);
+
+            let mut corrupt = body.clone();
+            corrupt.pop();
+            let mut wrong_header = body.clone();
+            wrong_header[0] ^= 1;
+            let mut trailing = body.clone();
+            trailing.push(0);
+            // One transaction follows the 80-byte header and one-byte count.
+            // Insert marker/flag after its four-byte version, and an empty
+            // witness stack for its single input before the lock time.
+            let mut superfluous_witness = body.clone();
+            superfluous_witness.splice(Header::LEN + 5..Header::LEN + 5, [0, 1]);
+            superfluous_witness.insert(superfluous_witness.len() - 4, 0);
+            let mut unknown_flag = superfluous_witness.clone();
+            unknown_flag[Header::LEN + 6] = 2;
+            for malformed in [&trailing, &superfluous_witness, &unknown_flag] {
+                assert!(Block::consensus_decode(malformed).is_err());
+                assert!(bitcoin::consensus::deserialize::<RegistryBlock>(malformed).is_err());
+            }
+            for unavailable in [
+                None,
+                Some(corrupt),
+                Some(wrong_header),
+                Some(trailing),
+                Some(superfluous_witness),
+                Some(unknown_flag),
+            ] {
+                let mut query = query_with(headers.clone())?;
+                if let Some(body) = unavailable {
+                    query = query.with_block_body_source(Arc::new(SingleBlockSource {
+                        height: 1,
+                        hash: block.block_hash(),
+                        body,
+                    }));
+                }
+                let outcome = query.serve_inventory_blocks(&[item], None, &|| true, &mut |_| {
+                    panic!("unavailable body cannot serve")
+                })?;
+                assert_eq!(outcome.not_found, vec![item]);
+                assert!(!outcome.halted);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn getdata_block_encodings_recheck_active_chain_after_body_load()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct SwitchingSource {
+            tree: Arc<RwLock<BlockTree>>,
+            body: Vec<u8>,
+        }
+        impl BlockBodySource for SwitchingSource {
+            fn block_body(&self, _height: u32, _hash: BlockHash) -> Option<Vec<u8>> {
+                *self.tree.write() = BlockTree::new();
+                Some(self.body.clone())
+            }
+        }
+        let header = seed_headers(1)[0];
+        let mut block = Block {
+            header,
+            txs: vec![test_tx(1)],
+        };
+        block.txs[0].inputs[0].witness = vec![vec![0x51; 32]].into();
+        for item in [
+            Inventory::Block(wire_hash(block.block_hash())),
+            Inventory::WitnessBlock(wire_hash(block.block_hash())),
+        ] {
+            let mut tree = BlockTree::new();
+            tree.insert_node(None, header, NodeStatus::Active)?;
+            let tree = Arc::new(RwLock::new(tree));
+            let applied_tip = TipReader::new(Arc::new(arc_swap::ArcSwapOption::empty()));
+            applied_tip.store(tree.read().tip());
+            let query = ActiveChainQuery::new(
+                BlockTreeReader::new(tree.clone()),
+                applied_tip,
+                Network::Regtest,
+            )
+            .with_block_body_source(Arc::new(SwitchingSource {
+                tree,
+                body: consensus_bytes(&block),
+            }));
+            let outcome = query.serve_inventory_blocks(&[item], None, &|| true, &mut |_| {
+                panic!("stale body cannot serve")
+            })?;
+            assert_eq!(outcome.not_found, vec![item]);
+            assert!(!outcome.halted);
+        }
         Ok(())
     }
 
@@ -717,7 +1042,7 @@ mod tests {
         };
         let headroom_calls = AtomicUsize::new(0);
 
-        let reply = query.block_transactions(&request, &|| {
+        let reply = query.block_transactions(&request, None, &|| {
             headroom_calls.fetch_add(1, Ordering::Relaxed);
             false
         })?;
@@ -814,7 +1139,7 @@ mod tests {
             indexes: vec![1],
         };
         Ok(query
-            .block_transactions(&request, &|| true)?
+            .block_transactions(&request, None, &|| true)?
             .ok_or("an active body is always answered")?)
     }
 
@@ -858,6 +1183,7 @@ mod tests {
                 block_hash: wire,
                 indexes: vec![1],
             },
+            None,
             &|| true,
         )?;
         let Some(Message::BlockTxn(txn)) = &reply else {
@@ -871,6 +1197,7 @@ mod tests {
                 block_hash: wire,
                 indexes: vec![7],
             },
+            None,
             &|| true,
         );
         assert!(
@@ -883,6 +1210,7 @@ mod tests {
                 block_hash: bitcoin::BlockHash::from_byte_array([9; 32]),
                 indexes: vec![0],
             },
+            None,
             &|| true,
         )?;
         assert!(unknown.is_none(), "an unservable block stays unanswered");
@@ -967,6 +1295,223 @@ mod tests {
         Ok(())
     }
 
+    // BIP152's blocktransactions format uses legacy MSG_TX encoding for v1
+    // and witness encoding for v2. Exercise negotiation and both response
+    // types through the production dispatcher and an independent wire decoder.
+    #[test]
+    fn compact_exchange_uses_peer_version_for_prefills_and_blocktxn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::dispatch::dispatch_inbound_with_chain;
+        use crate::peer::{Peer, PeerState};
+        use bitcoin::p2p::Magic;
+        use bitcoin::p2p::message::NetworkMessage;
+        use bitcoin::p2p::message_compact_blocks::{GetBlockTxn, SendCmpct};
+
+        let headers = seed_headers(2);
+        let mut block = Block {
+            header: headers[1],
+            txs: vec![test_tx(1), test_tx(2), test_tx(3)],
+        };
+        for (index, tx) in block.txs.iter_mut().enumerate() {
+            tx.inputs[0].witness = vec![vec![u8::try_from(index)?; 32]].into();
+        }
+        let body = consensus_bytes(&block);
+        let original: RegistryBlock = bitcoin::consensus::deserialize(&body)?;
+        let source = Arc::new(SingleBlockSource {
+            height: 1,
+            hash: block.block_hash(),
+            body: body.clone(),
+        });
+        let query = query_with(headers)?.with_block_body_source(source.clone());
+        let hash = wire_hash(block.block_hash());
+        let compact_item = Inventory::CompactBlock(hash);
+        for versions in [[Some(1), Some(2)], [Some(2), Some(1)], [None, Some(99)]] {
+            let mut peer = Peer::new(std::io::Cursor::new(Vec::<u8>::new()), Magic::REGTEST);
+            peer.state = PeerState::Ready;
+            for version in versions {
+                if let Some(version) = version {
+                    dispatch_inbound_with_chain(
+                        &mut peer,
+                        &Message::SendCmpct(SendCmpct {
+                            send_compact: false,
+                            version,
+                        }),
+                        Some(&query),
+                        &|| true,
+                        &mut |_| panic!("sendcmpct does not emit a response"),
+                    )?;
+                }
+                let strip_witness = matches!(version, Some(1 | 99));
+                let compact = dispatched_wire_response(
+                    &mut peer,
+                    &query,
+                    &Message::GetData(vec![compact_item]),
+                )?;
+                if version.is_none() {
+                    assert_eq!(
+                        compact.payload(),
+                        &NetworkMessage::NotFound(vec![compact_item])
+                    );
+                } else {
+                    let NetworkMessage::CmpctBlock(compact) = compact.payload() else {
+                        panic!("negotiated compact request must produce cmpctblock");
+                    };
+                    let prefill = &compact.compact_block.prefilled_txs[0].tx;
+                    assert_eq!(prefill.input[0].witness.is_empty(), strip_witness);
+                    assert_eq!(prefill.compute_txid(), original.txdata[0].compute_txid());
+                    if !strip_witness {
+                        assert_eq!(prefill.compute_wtxid(), original.txdata[0].compute_wtxid());
+                    }
+                }
+
+                let indexes = vec![1, 2];
+                let decoded = dispatched_wire_response(
+                    &mut peer,
+                    &query,
+                    &Message::GetBlockTxn(GetBlockTxn {
+                        txs_request: BlockTransactionsRequest {
+                            block_hash: hash,
+                            indexes: indexes.clone(),
+                        },
+                    }),
+                )?;
+                let NetworkMessage::BlockTxn(response) = decoded.payload() else {
+                    panic!("available request must produce blocktxn");
+                };
+                assert_blocktxn_profile(
+                    &response.transactions,
+                    &original,
+                    &indexes,
+                    strip_witness,
+                )?;
+                assert_eq!(
+                    source.body, body,
+                    "version selection leaves the stored body intact"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn getblocktxn_versions_preserve_missing_body_and_invalid_index_outcomes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::dispatch::dispatch_inbound_with_chain;
+        use crate::peer::{Peer, PeerState};
+        use bitcoin::p2p::Magic;
+        use bitcoin::p2p::message_compact_blocks::{GetBlockTxn, SendCmpct};
+
+        let headers = seed_headers(2);
+        let block = Block {
+            header: headers[1],
+            txs: vec![test_tx(1)],
+        };
+        let query = query_with(headers)?.with_block_body_source(Arc::new(SingleBlockSource {
+            height: 1,
+            hash: block.block_hash(),
+            body: consensus_bytes(&block),
+        }));
+        let hash = wire_hash(block.block_hash());
+        for version in [None, Some(1), Some(2), Some(99)] {
+            let mut peer = Peer::new(std::io::Cursor::new(Vec::<u8>::new()), Magic::REGTEST);
+            peer.state = PeerState::Ready;
+            if let Some(version) = version {
+                dispatch_inbound_with_chain(
+                    &mut peer,
+                    &Message::SendCmpct(SendCmpct {
+                        send_compact: false,
+                        version,
+                    }),
+                    Some(&query),
+                    &|| true,
+                    &mut |_| panic!("sendcmpct does not emit a response"),
+                )?;
+            }
+            for (requested_hash, indexes, invalid) in [
+                (hash, vec![7], true),
+                (hash, Vec::new(), true),
+                (WireBlockHash::from_byte_array([9; 32]), vec![1], false),
+            ] {
+                let expected = if invalid {
+                    Some(if indexes.is_empty() {
+                        "getblocktxn with empty index list"
+                    } else {
+                        "getblocktxn index out of range"
+                    })
+                } else {
+                    None
+                };
+                let result = dispatch_inbound_with_chain(
+                    &mut peer,
+                    &Message::GetBlockTxn(GetBlockTxn {
+                        txs_request: BlockTransactionsRequest {
+                            block_hash: requested_hash,
+                            indexes,
+                        },
+                    }),
+                    Some(&query),
+                    &|| true,
+                    &mut |_| panic!("missing or invalid request cannot emit transactions"),
+                );
+                if let Some(expected) = expected {
+                    assert!(
+                        matches!(result, Err(PeerError::Protocol(message)) if message == expected),
+                        "invalid request must disconnect, got {result:?}"
+                    );
+                } else {
+                    result?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_blocktxn_profile(
+        response: &BlockTransactions,
+        original: &RegistryBlock,
+        indexes: &[u64],
+        strip_witness: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut expected = Vec::new();
+        for index in indexes {
+            let mut tx = original.txdata[usize::try_from(*index)?].clone();
+            if strip_witness {
+                for input in &mut tx.input {
+                    input.witness.clear();
+                }
+            }
+            expected.push(tx);
+        }
+        assert_eq!(response.block_hash, original.block_hash());
+        assert_eq!(response.transactions, expected);
+        for (tx, index) in response.transactions.iter().zip(indexes) {
+            assert_eq!(
+                tx.compute_txid(),
+                original.txdata[usize::try_from(*index)?].compute_txid()
+            );
+        }
+        Ok(())
+    }
+
+    fn dispatched_wire_response(
+        peer: &mut crate::peer::Peer<std::io::Cursor<Vec<u8>>>,
+        query: &ActiveChainQuery,
+        request: &Message,
+    ) -> Result<bitcoin::p2p::message::RawNetworkMessage, Box<dyn std::error::Error>> {
+        let mut wire = Vec::new();
+        crate::dispatch::dispatch_inbound_with_chain(
+            peer,
+            request,
+            Some(query),
+            &|| true,
+            &mut |response| {
+                crate::wire::write_message(&mut wire, bitcoin::p2p::Magic::REGTEST, &response)?;
+                Ok(())
+            },
+        )?;
+        Ok(bitcoin::consensus::deserialize(&wire)?)
+    }
+
     fn test_tx(byte: u8) -> Tx {
         use bitcoin_rs_primitives::{
             Amount, LockTime, OutPoint, Sequence, Tx, TxIn, TxOut, Txid, Witness,
@@ -990,15 +1535,22 @@ mod tests {
         }
     }
 
+    /// A query over `tree` whose applied tip publishes the tree tip:
+    /// fixture trees mark every node `Active`, so the two tips coincide.
+    fn query_over(tree: BlockTree, network: Network) -> ActiveChainQuery {
+        let block_tree = BlockTreeReader::new(Arc::new(RwLock::new(tree)));
+        let applied_tip = TipReader::new(Arc::new(arc_swap::ArcSwapOption::empty()));
+        applied_tip.store(block_tree.read().tip());
+        ActiveChainQuery::new(block_tree, applied_tip, network)
+    }
+
     fn query_with(headers: Vec<Header>) -> Result<ActiveChainQuery, bitcoin_rs_chain::ChainError> {
         let mut tree = BlockTree::new();
         let mut parent = None;
         for header in headers {
             parent = Some(tree.insert_node(parent, header, NodeStatus::Active)?);
         }
-        Ok(ActiveChainQuery::new(BlockTreeReader::new(Arc::new(
-            RwLock::new(tree),
-        ))))
+        Ok(query_over(tree, Network::Regtest))
     }
 
     fn seed_headers(count: u32) -> Vec<Header> {

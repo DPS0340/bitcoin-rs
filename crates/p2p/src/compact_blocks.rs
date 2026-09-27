@@ -29,7 +29,6 @@ use bitcoin::bip152::{BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn};
 use bitcoin_rs_primitives::deserialize;
-use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, Tx, Txid, Wtxid};
 
 /// Compact-block protocol version this node advertises: the identity
@@ -94,9 +93,6 @@ struct Pending {
     filled: Vec<Option<Tx>>,
     /// Absolute slot indexes still missing, ascending.
     missing: Vec<u64>,
-    /// Number of short IDs the message declared for the non-prefilled slots;
-    /// the accounting [`complete_block`] re-checks before delivery.
-    short_id_count: usize,
     /// Approximate retained bytes (prefill bodies + short IDs + filled bodies).
     retained_bytes: usize,
     deadline: Instant,
@@ -176,7 +172,7 @@ impl Reconstruction {
             .map(|(index, _)| u64::try_from(index).unwrap_or(u64::MAX))
             .collect();
         if missing.is_empty() {
-            return match complete_block(header, filled, compact.short_ids.len()) {
+            return match complete_block(header, filled) {
                 Ok(block) => Outcome::Complete(block),
                 Err(()) => Outcome::Fallback(hash),
             };
@@ -190,7 +186,6 @@ impl Reconstruction {
                 header,
                 filled,
                 missing: missing.clone(),
-                short_id_count: compact.short_ids.len(),
                 retained_bytes,
                 deadline: now + PENDING_DEADLINE,
                 fallback: false,
@@ -239,7 +234,12 @@ impl Reconstruction {
             entry.filled[slot] = Some(body);
         }
         let filled = std::mem::take(&mut entry.filled);
-        let Ok(block) = complete_block(entry.header, filled, entry.short_id_count) else {
+        let Ok(block) = complete_block(entry.header, filled) else {
+            // The taken bodies are dropped, so no byte stays retained: without
+            // this reset the dead entry keeps its charge until the deadline
+            // and later compact reconstructions can be refused for bytes that
+            // no longer exist.
+            entry.retained_bytes = 0;
             entry.fallback = true;
             return Outcome::Fallback(hash);
         };
@@ -263,10 +263,13 @@ impl Reconstruction {
 /// PRE: `filled` holds the declared prefill plus one slot per declared short
 /// ID for one reconstruction whose transaction request, if any, has been
 /// answered.
-/// POST: return a block only when every slot exists, no more slots than
-/// `short_id_count` plus the prefills were declared, the transaction-ID
-/// merkle root of the assembled body equals `header.merkle_root`, and the
-/// transaction-ID tree is not mutated; otherwise return `Err`.
+/// POST: return a block only when every slot holds a body, the
+/// transaction-ID merkle root of the assembled body equals
+/// `header.merkle_root`, and the transaction-ID tree is not mutated;
+/// otherwise return `Err`. The slot count needs no re-check here: the vector
+/// is sized from the declared short IDs and prefills, `place_prefills`
+/// rejects a prefill outside the declared slots, and `fill_from_hints`
+/// rejects a short-ID count that does not match the unfilled slots.
 /// INVARIANT: no unverified compact reconstruction reaches
 /// [`Outcome::Complete`]. The root check alone cannot detect the
 /// duplicate-final-transaction collision (CVE-2012-2459): `[a, b, c]` and
@@ -274,78 +277,15 @@ impl Reconstruction {
 /// mutated tree and the caller answers with the same-peer full-block
 /// fallback (Core 31.1 `READ_STATUS_FAILED` before delivery,
 /// `blockencodings.cpp:207-219`).
-fn complete_block(
-    header: Header,
-    filled: Vec<Option<Tx>>,
-    short_id_count: usize,
-) -> Result<Block, ()> {
-    if filled.iter().any(Option::is_none) || filled.len() < short_id_count {
+fn complete_block(header: Header, filled: Vec<Option<Tx>>) -> Result<Block, ()> {
+    if filled.iter().any(Option::is_none) {
         return Err(());
     }
     let txs: Vec<Tx> = filled.into_iter().flatten().collect();
-    let (root, mutated) = merkle_root_and_mutation(txs.iter().map(Tx::txid)).ok_or(())?;
-    if mutated || root != Txid(header.merkle_root) {
-        return Err(());
-    }
-    Ok(Block { header, txs })
-}
-
-/// Mutation-aware transaction-ID merkle reduction over borrowed leaves:
-/// `(root, mutated)`, or `None` for an empty tree. Mirrors the consensus
-/// walker (`bitcoin_rs_consensus` `merkle_root_spine`): two equal *real*
-/// adjacent nodes at any level flag the tree as mutated, while the odd
-/// leftover paired with its duplicate-last copy never does — the property
-/// that makes `[a, b, c, c]` colliding with `[a, b, c]` a detected mutation
-/// rather than a silent pass.
-fn merkle_root_and_mutation(leaves: impl ExactSizeIterator<Item = Txid>) -> Option<(Txid, bool)> {
-    if leaves.len() == 0 {
-        return None;
-    }
-    let hash_pair = |left: Txid, right: Txid| {
-        let mut pair = [0_u8; 64];
-        pair[..32].copy_from_slice(left.as_bytes());
-        pair[32..].copy_from_slice(right.as_bytes());
-        Txid(double_sha256(&pair))
-    };
-    // One pending node per level; a block holds far fewer than 2^64 leaves.
-    let mut spine: [Option<Txid>; 64] = [None; 64];
-    let mut mutated = false;
-    for leaf in leaves {
-        let mut current = leaf;
-        let mut height = 0;
-        while let Some(left) = spine[height] {
-            spine[height] = None;
-            if left == current {
-                mutated = true;
-            }
-            current = hash_pair(left, current);
-            height += 1;
-        }
-        spine[height] = Some(current);
-    }
-    // Fold the right spine bottom-up: the carry rises to each pending height
-    // through duplicate-last self-pairs (never a mutation), then joins that
-    // pending node as its right sibling.
-    let mut carry: Option<(Txid, usize)> = None;
-    for (height, slot) in spine.iter().enumerate() {
-        let Some(node) = *slot else { continue };
-        carry = Some(match carry {
-            None => (node, height),
-            Some((accumulated, accumulated_height)) => {
-                let mut right = accumulated;
-                let mut right_height = accumulated_height;
-                while right_height < height {
-                    right = hash_pair(right, right);
-                    right_height += 1;
-                }
-                if node == right {
-                    mutated = true;
-                }
-                (hash_pair(node, right), height + 1)
-            }
-        });
-    }
-    carry.map(|(root, _height)| (root, mutated))
+    let block = Block { header, txs };
+    let txids: Vec<Txid> = block.txs.iter().map(Tx::txid).collect();
+    bitcoin_rs_consensus::verify_merkle_root_with_txids(&block, &txids).map_err(|_| ())?;
+    Ok(block)
 }
 
 /// Matches the message's short IDs against the hint identities and fills
@@ -1124,6 +1064,56 @@ mod tests {
         assert!(
             matches!(outcome, Outcome::Fallback(_)),
             "a wrong-body completion must fall back, got {outcome:?}"
+        );
+
+        let late = BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: request.txs_request.block_hash,
+                transactions: vec![registry_tx(&test_tx(2))],
+            },
+        };
+        assert!(matches!(
+            reconstruction.receive_blocktxn(&late, now()),
+            Outcome::Idle
+        ));
+    }
+
+    /// A `blocktxn` that fails verification drops its bodies, so the dead
+    /// entry must release its byte charge: until the deadline the pool would
+    /// otherwise refuse later reconstructions for bytes that no longer
+    /// exist, while the entry itself stays closed for late responses.
+    #[test]
+    fn failed_verification_releases_retained_bytes() {
+        let (native, cmpct) = sample_cmpct(vec![test_tx(1), test_tx(2)], 2, 0x78);
+        let hints = SetHints {
+            txs: vec![native.txs[0].clone()],
+        };
+        let mut reconstruction = Reconstruction::new();
+
+        let outcome =
+            reconstruction.receive_cmpctblock(&cmpct, COMPACT_BLOCK_VERSION, &hints, now());
+        let Outcome::RequestMissing(request) = outcome else {
+            panic!("expected a getblocktxn request, got {outcome:?}");
+        };
+        assert!(
+            reconstruction.retained_bytes() > 0,
+            "the pending entry must charge its bodies"
+        );
+
+        let wrong_body = BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: request.txs_request.block_hash,
+                transactions: vec![registry_tx(&test_tx(9))],
+            },
+        };
+        assert!(matches!(
+            reconstruction.receive_blocktxn(&wrong_body, now()),
+            Outcome::Fallback(_)
+        ));
+        assert_eq!(
+            reconstruction.retained_bytes(),
+            0,
+            "a failed verification keeps no body behind"
         );
 
         let late = BlockTxn {

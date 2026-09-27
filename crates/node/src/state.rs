@@ -61,9 +61,10 @@ impl bitcoin_rs_index::reconcile::ChainCursorSource for IndexChainCursorSource {
     }
 }
 
-// Outbound full-relay slots, and the one active generation of outbound
-// requests that keeps the drain fed: extra backlog is overload and must fail
-// fast at producers. Bitcoin Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`.
+// Outbound full-relay slots set the automatic target. The bounded channel
+// rejects DNS requests at producers when full; the parked retry queue is a
+// second bound, whose overflow clears the address's DNS backoff for retry.
+// Bitcoin Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`.
 pub(crate) const P2P_OUTBOUND_FULL_RELAY_SLOTS: usize = 8;
 
 // Outbound block-relay-only slots: connections that relay blocks and nothing
@@ -140,6 +141,10 @@ pub struct NodeState {
 impl Drop for NodeState {
     fn drop(&mut self) {
         let _admission = self.chainstate.close();
+        // Close the history boundary first, so a worker still reconciling
+        // stops on the owner's shutdown answer instead of pinning rows a
+        // process that is leaving will not serve.
+        self.chainstate.retention_handle().shutdown();
         // Safety net: if `bounded_index_shutdown` was not called (e.g. in
         // tests that drop `NodeState` directly), request shutdown and join
         // any worker not already taken by `bounded_index_shutdown`.
@@ -420,6 +425,14 @@ impl NodeState {
             self.chainstate.applied_tip_reader(),
             self.chainstate.block_tree_reader(),
             self.chainstate.block_body_store_handle(),
+            bitcoin_rs_storage::pruning::HistoryAccess::new(
+                self.chainstate.retention_handle(),
+                // A stalled optional consumer is bounded by the reorg
+                // margin, so it never competes with the mandatory window.
+                bitcoin_rs_storage::pruning::RetentionBudget::from_blocks(
+                    bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN,
+                ),
+            ),
             spawn.block_source,
             Some(spawn.body_source),
             Arc::new(IndexChainCursorSource(

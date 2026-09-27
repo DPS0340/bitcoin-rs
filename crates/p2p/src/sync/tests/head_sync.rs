@@ -89,8 +89,8 @@ fn body_arriving_ahead_of_its_header_chain_requests_the_gap()
     // `getheaders` on this connection (a `tick` tail could also queue one
     // via `request_headers_from_best_peer` and mask a regression).
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(block3.clone()))?;
-    sync.drain_inbound_blocks(Instant::now());
-    sync.drain_inbound_blocks(Instant::now());
+    sync.drain_inbound_blocks();
+    sync.drain_inbound_blocks();
     next_getheaders(&rx)?;
 
     // The ancestry fill lands: the gap headers admit, both bodies stage,
@@ -140,9 +140,75 @@ fn headers_batch_missing_parent_requests_ancestry() -> Result<(), Box<dyn std::e
         body_fetch_owned: false,
     })?;
 
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
 
     next_getheaders(&rx)?;
+    Ok(())
+}
+
+#[test]
+fn body_carried_rejection_keeps_the_live_pending_gate() -> Result<(), Box<dyn std::error::Error>> {
+    // A body-carried header that rejects `MissingParent` asks the
+    // delivering peer for the missing ancestry, but the ask must respect
+    // the pending gate: an unexpired `getheaders` to the same connection
+    // suppresses the identical re-request and keeps its original deadline,
+    // so a peer that never answers the wire request still rotates once the
+    // timeout elapses. Retiring a live gate on each body delivery let every
+    // rejection install a fresh `requested_at` and pin the slot forever.
+    let mut tree = BlockTree::new();
+    let genesis = genesis_header();
+    tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+    let SyncHarness {
+        sync,
+        peers,
+        inbound_headers_tx,
+        ..
+    } = SyncHarness::new(tree);
+
+    let peer = test_addr(9768, 0)?;
+    let rx = connect_peer(&peers, synthetic_peer(peer, 10));
+
+    let gap_parent = test_header(genesis.compute_hash(), 1);
+    let orphan_tip = test_header(gap_parent.compute_hash(), 2);
+    let batch = || InboundHeaders {
+        headers: vec![orphan_tip],
+        source: Some(current_source(&peers, peer)),
+        wire_response: false,
+        body_fetch_owned: false,
+    };
+
+    // The first rejection installs the pending gate on this connection.
+    inbound_headers_tx.send(batch())?;
+    sync.drain_inbound_headers();
+    next_getheaders(&rx)?;
+    let first_requested_at = sync
+        .scheduler
+        .lock()
+        .header_request
+        .map(|request| request.requested_at)
+        .ok_or("the first rejection must install the pending gate")?;
+
+    // The identical body-carried rejection while the gate is live emits no
+    // second `getheaders` and leaves the original deadline untouched: it is
+    // the pending request's own expiry that frees the slot.
+    std::thread::sleep(Duration::from_millis(20));
+    while rx.try_recv().is_ok() {}
+    inbound_headers_tx.send(batch())?;
+    sync.drain_inbound_headers();
+    assert!(
+        rx.try_recv().is_err(),
+        "a live pending gate must suppress the identical re-request"
+    );
+    let second_requested_at = sync
+        .scheduler
+        .lock()
+        .header_request
+        .map(|request| request.requested_at)
+        .ok_or("the suppressed re-request must leave the gate installed")?;
+    assert_eq!(
+        first_requested_at, second_requested_at,
+        "the pending deadline must survive an identical body-carried rejection"
+    );
     Ok(())
 }
 
@@ -172,7 +238,7 @@ fn known_header_batch_still_credits_the_announcer() -> Result<(), Box<dyn std::e
         wire_response: true,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
 
     assert_eq!(
         peers
@@ -219,7 +285,7 @@ fn headers_batch_too_far_ahead_does_not_replay_a_request() -> Result<(), Box<dyn
         wire_response: true,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
 
     assert!(
         next_getheaders(&rx).is_err(),
@@ -468,7 +534,7 @@ fn unrequested_body_at_the_count_budget_is_refused() -> Result<(), Box<dyn std::
     // on every clause except the free slot it does not have.
     let refused_hash = Hash256::from(blocks[2].block_hash());
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(blocks[2].clone()))?;
-    sync.drain_inbound_blocks(Instant::now());
+    sync.drain_inbound_blocks();
 
     let scheduler = sync.scheduler.lock();
     assert_eq!(
@@ -562,7 +628,7 @@ fn binding_failure_does_not_burn_the_last_staging_slot() -> Result<(), Box<dyn s
     let good_hash = Hash256::from(blocks[1].block_hash());
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(bad))?;
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(blocks[1].clone()))?;
-    sync.drain_inbound_blocks(Instant::now());
+    sync.drain_inbound_blocks();
 
     let scheduler = sync.scheduler.lock();
     assert_eq!(
@@ -665,7 +731,6 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
         locator_tip_hash: Hash256::default(),
         target_height: 1,
         requested_at: Instant::now(),
-        answered: false,
     });
 
     let body_tip = test_header(genesis.compute_hash(), 1);
@@ -675,7 +740,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
         wire_response: false,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
     assert!(
         sync.scheduler.lock().header_request.is_some(),
         "a body-carried header must not consume the pending request"
@@ -687,7 +752,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
         wire_response: true,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
     assert!(
         sync.scheduler.lock().header_request.is_none(),
         "a wire `headers` response consumes the pending request"
@@ -766,7 +831,7 @@ fn fork_tip_attests_its_shared_active_ancestor() -> Result<(), Box<dyn std::erro
         wire_response: true,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
 
     assert_eq!(
         peers
@@ -817,7 +882,7 @@ fn retained_unresolved_tips_are_deduplicated_and_capped() -> Result<(), Box<dyn 
         wire_response: true,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
     assert_eq!(
         peers
             .sessions()
@@ -844,7 +909,7 @@ fn retained_unresolved_tips_are_deduplicated_and_capped() -> Result<(), Box<dyn 
             body_fetch_owned: false,
         })?;
     }
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
 
     let retained = peers
         .sessions()
@@ -903,7 +968,7 @@ fn delivered_tip_evidence_is_compacted_to_the_max_resolving_tip()
         wire_response: true,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
 
     assert_eq!(
         peers
@@ -945,7 +1010,7 @@ fn compact_owned_body_fetch_marks_the_tip_pending() -> Result<(), Box<dyn std::e
         wire_response: false,
         body_fetch_owned: true,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
 
     assert!(
         sync.scheduler.lock().window.contains_pending(&tip_hash),
@@ -985,7 +1050,7 @@ fn owned_fetch_mark_survives_until_its_tip_header_attaches()
         wire_response: false,
         body_fetch_owned: true,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
     assert!(
         !sync.scheduler.lock().window.contains_pending(&tip_hash),
         "an unattached tip cannot be window-pending yet"
@@ -998,7 +1063,7 @@ fn owned_fetch_mark_survives_until_its_tip_header_attaches()
         wire_response: true,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
     assert!(
         sync.scheduler.lock().window.contains_pending(&tip_hash),
         "the retained owned fetch must mark once its tip attaches"
@@ -1041,7 +1106,7 @@ fn announced_near_tip_is_direct_fetched_before_tick() -> Result<(), Box<dyn std:
         body_fetch_owned: false,
     })?;
 
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
     assert_eq!(
         witness_block_inventory(next_getdata(&rx)?)?,
         vec![block2.block_hash()],
@@ -1065,10 +1130,15 @@ fn announced_near_tip_is_direct_fetched_before_tick() -> Result<(), Box<dyn std:
         wire_response: true,
         body_fetch_owned: false,
     })?;
-    sync.drain_inbound_headers(Instant::now());
+    sync.drain_inbound_headers();
     assert!(
-        matches!(next_getdata(&rx)?.first(), Some(Inventory::CompactBlock(_))),
-        "a compact-relay peer's single near-tip fetch rides the compact flavor"
+        matches!(
+            next_getdata(&rx)?.first(),
+            Some(Inventory::CompactBlock(hash))
+                if Hash256::from_le_bytes(hash.as_byte_array())
+                    == Hash256::from(block3.block_hash())
+        ),
+        "a compact-relay peer's single near-tip fetch rides the compact flavor for the announced block"
     );
     Ok(())
 }

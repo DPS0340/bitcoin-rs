@@ -57,18 +57,7 @@ enum BodyAdmission {
 }
 
 impl BlockSync {
-    /// Drains delivered bodies, admits their carried headers, and prunes
-    /// staging timeouts.
-    ///
-    /// PRE: `now` is the tick's clock reading, or the reading of the caller
-    ///   that owns the pacing decision.
-    /// POST: every header blame, cooldown stamp, and follow-up header request
-    ///   the drain makes is evaluated at `now`. Expired staging bodies are
-    ///   pruned against a wall reading taken after this drain stages them, so
-    ///   a body delivered now is never judged expired by the caller's clock.
-    /// INVARIANT: no peer-facing timing decision in this path reads
-    ///   `Instant::now()` while its counterpart on the tick path reads `now`.
-    pub(super) fn drain_inbound_blocks(&self, now: Instant) {
+    pub(super) fn drain_inbound_blocks(&self) {
         let mut apply_head_check = None;
         let mut next_expected_hash = None;
         let mut blocks = Vec::with_capacity(INBOUND_BLOCK_STAGE_CHUNK);
@@ -92,7 +81,7 @@ impl BlockSync {
             return;
         }
 
-        self.admit_staged_headers(now);
+        self.admit_staged_headers();
 
         let now = Instant::now();
         let dropped = self.scheduler.lock().stager.prune_expired(now);
@@ -189,11 +178,7 @@ impl BlockSync {
     /// the peer's fault, same as a rejected `headers` batch. `PeerTable`
     /// operations precede the scheduler lock to preserve the `PeerTable` ->
     /// scheduler ordering used elsewhere.
-    fn discard_inadmissible_header_bodies(
-        &self,
-        invalid: &[(Hash256, Option<crate::PeerSource>)],
-        now: Instant,
-    ) {
+    fn discard_inadmissible_header_bodies(&self, invalid: &[(Hash256, Option<crate::PeerSource>)]) {
         let blamed: Vec<std::net::SocketAddr> = invalid
             .iter()
             .filter_map(|(_, source)| *source)
@@ -215,7 +200,9 @@ impl BlockSync {
             scheduler.stager.discard(hash);
         }
         for peer_addr in &blamed {
-            scheduler.window.mark_peer_unresponsive(*peer_addr, now);
+            scheduler
+                .window
+                .mark_peer_unresponsive(*peer_addr, Instant::now());
         }
         tracing::debug!(
             discarded = invalid.len(),
@@ -248,7 +235,7 @@ impl BlockSync {
     /// the same clauses a resolved arrival faced, unless request evidence
     /// exists — a live pending mark, or an owned fetch resolved by
     /// `resolve_owned_body_fetches` (which settles the flag directly).
-    fn admit_staged_headers(&self, now: Instant) {
+    fn admit_staged_headers(&self) {
         let unadmitted: Vec<(Hash256, Header, Option<crate::PeerSource>)> = {
             let tree = self.chain.block_tree();
             let scheduler = self.scheduler.lock();
@@ -258,13 +245,19 @@ impl BlockSync {
                 .filter(|(hash, _, _)| tree.lookup(*hash).is_none())
                 .collect()
         };
-        // Every staged header reaches `admit_headers`, and a rejection can
-        // still commit a valid prefix.
+        // Every staged header reaches `route_headers_batch` as a
+        // synthetic single-header batch, which never opens or feeds a
+        // download-twice sync state: below the committed-work floor it
+        // retires here and retries once the wire sync commits the header,
+        // and a rejection can still commit a valid prefix.
         let mut missing_parent = false;
         let mut credit_refresh_needed = false;
         let mut invalid: Vec<(Hash256, Option<crate::PeerSource>)> = Vec::new();
         for (hash, header, source) in unadmitted {
-            match self.chain.admit_headers(&[header]) {
+            let Some(admission) = self.route_headers_batch(&[header], source, false, 1) else {
+                continue;
+            };
+            match admission {
                 HeaderAdmission::Accepted {
                     announced_tip: Some(tip_hash),
                     active_height,
@@ -294,7 +287,7 @@ impl BlockSync {
             }
         }
         if !invalid.is_empty() {
-            self.discard_inadmissible_header_bodies(&invalid, now);
+            self.discard_inadmissible_header_bodies(&invalid);
         }
         // A staged retry that just admitted may have attached the ancestry
         // a deferred owned fetch was waiting on — resolve it now. A mark
@@ -305,7 +298,7 @@ impl BlockSync {
             self.refresh_active_peer_credit();
         }
         if missing_parent {
-            self.request_headers_from_eligible(now);
+            self.request_headers_from_eligible();
         }
     }
 
@@ -468,15 +461,6 @@ impl BlockSync {
                     return false;
                 }
                 let header_unknown = tree.lookup(hash).is_none();
-                if !requested
-                    && header_unknown
-                    && scheduler.stager.gate_pending_count() >= MAX_UNRESOLVED_STAGED_BODIES
-                {
-                    // The shared orphan-body quota is full: drop this
-                    // unresolvable body rather than let a flood evict staged
-                    // progress.
-                    return false;
-                }
                 // A body staged while its header is unknown passed the
                 // gate's missing-header arm without facing the clauses —
                 // flag it so `recheck_staged_gates` re-gates it once the
@@ -521,6 +505,7 @@ impl BlockSync {
         let mut staged_blocks = Vec::with_capacity(blocks.len());
         let mut reject_deliveries = Vec::new();
         let mut refused_at_budget = 0_usize;
+        let mut refused_at_quota = 0_usize;
         let now = Instant::now();
         {
             let mut scheduler = self.scheduler.lock();
@@ -578,6 +563,18 @@ impl BlockSync {
                     refused_at_budget = refused_at_budget.saturating_add(1);
                     continue;
                 }
+                // The unresolved-body quota is enforced here too — after
+                // binding and the same-chunk recheck, on the entry that will
+                // actually occupy staging — so dropped predecessors cannot
+                // burn the chunk's quota, and one chunk still cannot stage a
+                // burst past `MAX_UNRESOLVED_STAGED_BODIES`: each insert
+                // raises `gate_pending_count` before the next body is seen.
+                if matches!(admission, BodyAdmission::Unrequested { gate_pending: true })
+                    && stager.gate_pending_count() >= MAX_UNRESOLVED_STAGED_BODIES
+                {
+                    refused_at_quota = refused_at_quota.saturating_add(1);
+                    continue;
+                }
                 let staged = stager.insert(
                     hash,
                     next_expected_hash,
@@ -598,6 +595,12 @@ impl BlockSync {
             tracing::debug!(
                 refused_at_budget,
                 "block sync: refused unrequested bodies at the staging count budget"
+            );
+        }
+        if refused_at_quota > 0 {
+            tracing::debug!(
+                refused_at_quota,
+                "block sync: refused unresolved bodies at the gate-pending quota"
             );
         }
 

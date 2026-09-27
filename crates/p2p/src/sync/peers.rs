@@ -15,7 +15,7 @@ use crate::download_window::SyncPeer;
 use crate::download_window::SyncPeerSelection;
 use crate::download_window::configure_request_mode;
 use crate::download_window::{
-    BlockDownloadPolicy, serves_requested_height, statically_fanout_eligible,
+    BlockDownloadPolicy, peer_can_serve_height, serves_requested_height, statically_fanout_eligible,
 };
 use crate::peer_info::PeerRole;
 use bitcoin_rs_chain::BlockTree;
@@ -38,26 +38,33 @@ pub(super) fn is_peer_fault(error: &ChainError) -> bool {
         | ChainError::HeightOverflow { .. }
         // A median-time-past violation is decided entirely by the chain the peer
         // itself sent, so it is unambiguously the peer's fault. The same holds
-        // for the version floors, the BIP94 timewarp bound, and the
-        // invalid-parent refusal: each compares the candidate against the
-        // chain the peer itself announced or a block this node already
-        // rejected, so blaming the sender cannot ban an honest peer.
+        // for the version floors and the BIP94 timewarp bound: each compares
+        // the candidate against the chain the peer itself announced, so
+        // blaming the sender cannot ban an honest peer.
         | ChainError::TimestampTooEarly { .. }
         | ChainError::BadVersion { .. }
         | ChainError::TimewarpAttack { .. }
-        // Re-announcing a header we already know is invalid or extending a
-        // known-invalid parent is unambiguously peer-invalid data.
-        | ChainError::KnownInvalidHeader { .. }
-        | ChainError::InvalidParent { .. } => true,
+        // Re-announcing a header already marked invalid is unambiguously
+        // peer-invalid data.
+        | ChainError::KnownInvalidHeader { .. } => true,
         // Future drift is judged against OUR clock, so a wrong local clock
         // would otherwise let us ban every honest peer and partition
         // ourselves. The header is rejected without blaming the sender.
+        //
+        // The invalid-parent refusal joins them: the parent is marked invalid
+        // both by a block this node rejected on peer-relayed data and by a
+        // local `invalidateblock`, and the refusal carries no origin, so
+        // blaming the sender would disconnect honest peers relaying
+        // descendants of an operator-invalidated block. Until the tree
+        // records the invalidation origin, the sender punishment for
+        // relaying a peer-invalidated subtree is given up.
         ChainError::TimestampTooFarAhead { .. }
         | ChainError::DuplicateHeader { .. }
         | ChainError::MissingParent { .. }
         | ChainError::NodeIdOverflow { .. }
         | ChainError::UnknownNode { .. }
-        | ChainError::NoCommonAncestor { .. } => false,
+        | ChainError::NoCommonAncestor { .. }
+        | ChainError::InvalidParent { .. } => false,
     }
 }
 
@@ -68,44 +75,54 @@ pub(super) fn is_peer_fault(error: &ChainError) -> bool {
 pub(super) fn sync_peer_candidate(
     source: PeerSource,
     peer: &PeerInfo,
+    headers_horizon: Option<u32>,
     floor: u32,
 ) -> Option<SyncPeer> {
-    let height = u32::try_from(peer.best_known_height).ok()?;
+    // The eligibility read is `min(best_known_height, headers_horizon)`: a
+    // connection whose download-twice sync already proved its headers end
+    // at the horizon stays selectable for what it can serve, but no
+    // longer outranks peers with a taller proven chain.
+    let claimed = u32::try_from(peer.best_known_height).ok()?;
+    let height = headers_horizon.map_or(claimed, |cap| claimed.min(cap));
     (height > floor).then_some(SyncPeer {
         source,
-        best_known_height: peer.best_known_height,
+        best_known_height: i32::try_from(height).unwrap_or(i32::MAX),
     })
 }
 
-/// Effective header-request rank of `peer`: its advertised height minus the
-/// number of header requests this exact connection has failed to answer.
-///
-/// PRE: none.
-/// POST: returns a signed rank that cannot underflow, so a heavily penalised
-///   peer still compares against an unpenalised one.
-/// INVARIANT: the penalty is keyed by connection identity and `peer`'s own
-///   advertised height is never rewritten by it.
-pub(super) fn header_rank(peer: &SyncPeer, penalties: &hashbrown::HashMap<PeerSource, u32>) -> i64 {
-    let timeouts = penalties.get(&peer.source).copied().unwrap_or(0);
-    i64::from(peer.best_known_height) - i64::from(timeouts)
+/// Whether `candidate` outranks `current`: strictly greater demonstrated
+/// height; first-wins on ties.
+pub(super) fn outranks(current: SyncPeer, candidate: SyncPeer) -> bool {
+    candidate.best_known_height > current.best_known_height
 }
 
-/// Whether `candidate` outranks `current`: strictly greater effective rank, so
-/// a connection that timed out on its last request loses to one at the same
-/// advertised height that has not. First-wins on equal effective rank.
-///
-/// PRE: none.
-/// POST: returns the comparison only; no state is read or written beyond
-///   `penalties`.
-/// INVARIANT: this is the single ordering rule for request-bearing peer
-///   choice, so header and body selection can never disagree about who is
-///   better.
-pub(super) fn outranks(
-    current: &SyncPeer,
-    candidate: &SyncPeer,
-    penalties: &hashbrown::HashMap<PeerSource, u32>,
-) -> bool {
-    header_rank(candidate, penalties) > header_rank(current, penalties)
+/// Fallback, single deep peer: the highest peer that may serve block bodies
+/// and that the window does not currently soft-block (expired pendings /
+/// staller cooldown) fills the window; a soft-blocked peer serves only as
+/// the last resort when no alternative exists. Without the preference, a
+/// disconnected staller that reconnects with an inflated demonstrated
+/// best-known height would out-sort every honest peer and re-acquire the
+/// window front (RE-ADV-2 / first-audit ADV-2).
+fn fallback_request_peer(
+    candidates: &[FanoutCandidate],
+    request_peer_limit: usize,
+) -> Vec<SyncPeer> {
+    let mut preferred: Option<SyncPeer> = None;
+    let servers: Vec<&FanoutCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.serves_bodies)
+        .collect();
+    let allow_soft = servers.iter().all(|candidate| candidate.soft_blocked);
+    for candidate in servers
+        .iter()
+        .filter(|candidate| allow_soft || !candidate.soft_blocked)
+    {
+        // First-wins on equal heights, matching the header-peer fold.
+        if preferred.is_none_or(|current| outranks(current, candidate.peer)) {
+            preferred = Some(candidate.peer);
+        }
+    }
+    preferred.into_iter().take(request_peer_limit).collect()
 }
 
 /// Height of the deepest active-chain node that is an ancestor of `hash` —
@@ -185,6 +202,13 @@ impl ChainSyncState {
     #[must_use]
     pub(super) const fn is_protected(&self) -> bool {
         self.protected
+    }
+
+    /// Whether a probe has been marked sent in the running window.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) const fn probe_sent(&self) -> bool {
+        self.probe_sent
     }
 
     /// Starts a fresh window against the current tip, as Core's
@@ -366,7 +390,6 @@ impl BlockSync {
                 next_apply_height,
                 frontier_hash,
                 apply_side_busy: frontier_hash.is_some_and(|hash| stager.contains(&hash)),
-                active_downloading_peers: window.active_downloading_peers(),
             };
             let decision = window.observe_blocked(ctx, stager, &tree, now);
             let stall_seconds = window
@@ -518,69 +541,9 @@ impl BlockSync {
         frontier: &SyncFrontier,
         now: Instant,
     ) -> SyncPeerSelection {
-        // Height clause of the fan-out eligibility predicate (KTD6) and
-        // the pre-existing candidate filter: the peer's demonstrated chain
-        // must cover the canonical next-required body — on a reorg whose
-        // first connect node sits below the applied tip, that is lower
-        // than the applied height, so gating on the applied height would
-        // declare the body requestable yet never pick a peer for it.
-        // Like Core's `pindexBestKnownBlock`, eligibility reads the
-        // demonstrated best-known height (handshake snapshot, raised as
-        // the peer hands us accepted headers) rather than the handshake
-        // value alone — a long-lived at-tip peer would otherwise become
-        // ineligible for every newly announced block (#617). Per-request
-        // truncation by `peer_best_height` still bounds the damage of a
-        // stale value. With nothing required the clause reduces to the
-        // applied tip's successor, as before.
-        let required_height = frontier.chain.next_required.map_or_else(
-            || {
-                frontier
-                    .chain
-                    .applied_tip
-                    .as_ref()
-                    .map_or(0, |tip| tip.height)
-                    .saturating_add(1)
-            },
-            |body| body.height,
-        );
-        let policy = BlockDownloadPolicy {
-            ibd: Arc::clone(&self.ibd),
-            requested_height: required_height,
-            network: self.chain.network(),
-        };
-        let mut candidates: Vec<FanoutCandidate> = Vec::new();
-        for peer in &frontier.usable_peers {
-            let Some(active_height) = peer.capability() else {
-                continue;
-            };
-            if active_height < required_height {
-                continue;
-            }
-            candidates.push(FanoutCandidate {
-                peer: SyncPeer {
-                    source: peer.source,
-                    best_known_height: i32::try_from(active_height).unwrap_or(i32::MAX),
-                },
-                serves_bodies: serves_requested_height(&peer.info, &policy),
-                fanout_eligible: statically_fanout_eligible(&peer.info, &policy),
-                soft_blocked: false,
-            });
-        }
-        let (request_peer_limit, fanout_active, cold_preferred) = {
-            let mut scheduler = self.scheduler.lock();
-            let SchedulerState { window, stager, .. } = &mut *scheduler;
-            for candidate in &mut candidates {
-                candidate.soft_blocked = window
-                    .peer_has_expired_pending(candidate.peer.source, now)
-                    || window.peer_in_staller_cooldown(candidate.peer.source.addr, now);
-            }
-            let cold_preferred = configure_request_mode(window, &candidates, now);
-            (
-                window.request_peer_scan_limit(stager, now),
-                window.fanout_active(),
-                cold_preferred,
-            )
-        };
+        let mut candidates = self.fanout_candidates(frontier);
+        let (request_peer_limit, fanout_active, cold_preferred) =
+            self.window_selection_limits(frontier, &mut candidates, now);
         let probe_peers = candidates
             .iter()
             .filter(|candidate| candidate.fanout_eligible && !candidate.soft_blocked)
@@ -601,31 +564,7 @@ impl BlockSync {
                 .map(|candidate| candidate.peer)
                 .collect()
         } else {
-            // Fallback, single deep peer: the highest peer that may serve
-            // block bodies and that the window does not currently soft-block
-            // (expired pendings / staller cooldown) fills the window; a
-            // soft-blocked peer serves only as the last resort when no
-            // alternative exists. Without the preference, a disconnected
-            // staller that reconnects with an inflated demonstrated
-            // best-known height would out-sort every honest peer and
-            // re-acquire the window front (RE-ADV-2 / first-audit ADV-2).
-            let mut preferred: Option<SyncPeer> = None;
-            let penalties = self.header_penalties();
-            let servers: Vec<&FanoutCandidate> = candidates
-                .iter()
-                .filter(|candidate| candidate.serves_bodies)
-                .collect();
-            let allow_soft = servers.iter().all(|candidate| candidate.soft_blocked);
-            for candidate in servers
-                .iter()
-                .filter(|candidate| allow_soft || !candidate.soft_blocked)
-            {
-                // First-wins on equal effective rank, matching the header-peer fold.
-                if preferred.is_none_or(|current| outranks(&current, &candidate.peer, &penalties)) {
-                    preferred = Some(candidate.peer);
-                }
-            }
-            preferred.into_iter().take(request_peer_limit).collect()
+            fallback_request_peer(&candidates, request_peer_limit)
         };
         if request_peers.len() > 1 {
             request_peers.sort_by_key(|peer| std::cmp::Reverse(peer.best_known_height));
@@ -635,6 +574,116 @@ impl BlockSync {
             request_peers,
             probe_peers,
         }
+    }
+
+    /// Collects the fan-out candidates from the frontier's usable peers.
+    ///
+    /// PRE: `frontier.usable_peers` is this tick's capability-resolved
+    ///   snapshot and no scheduler lock is held.
+    /// POST: every candidate carries its demonstrated height, its
+    ///   body-serving and fan-out eligibility, and no soft-block mark.
+    fn fanout_candidates(&self, frontier: &SyncFrontier) -> Vec<FanoutCandidate> {
+        // Height clause of the fan-out eligibility predicate (KTD6) and
+        // the pre-existing candidate filter: the peer's demonstrated chain
+        // must cover the canonical next-required body — on a reorg whose
+        // first connect node sits below the applied tip, that is lower
+        // than the applied height, so gating on the applied height would
+        // declare the body requestable yet never pick a peer for it.
+        // Like Core's `pindexBestKnownBlock`, eligibility reads the
+        // demonstrated best-known height (handshake snapshot, raised as
+        // the peer hands us accepted headers) rather than the handshake
+        // value alone — a long-lived at-tip peer would otherwise become
+        // ineligible for every newly announced block (#617). Per-request
+        // truncation by `peer_best_height` still bounds the damage of a
+        // stale value. `peer_can_serve_height` also keeps a limited-service
+        // peer inside its retained range. With nothing required the clause
+        // reduces to the applied tip's successor, as before.
+        let required_height = frontier.chain.next_required.map_or_else(
+            || {
+                frontier
+                    .chain
+                    .applied_tip
+                    .as_ref()
+                    .map_or(0, |tip| tip.height)
+                    .saturating_add(1)
+            },
+            |body| body.height,
+        );
+        let policy = BlockDownloadPolicy {
+            ibd: Arc::clone(&self.ibd),
+            network: self.chain.network(),
+            requested_height: required_height,
+        };
+        let mut candidates: Vec<FanoutCandidate> = Vec::new();
+        for peer in &frontier.usable_peers {
+            let Some(active_height) = peer.capability() else {
+                continue;
+            };
+            if !peer_can_serve_height(&peer.info, active_height, required_height) {
+                continue;
+            }
+            candidates.push(FanoutCandidate {
+                peer: SyncPeer {
+                    source: peer.source,
+                    best_known_height: i32::try_from(active_height).unwrap_or(i32::MAX),
+                },
+                serves_bodies: serves_requested_height(&peer.info, &policy),
+                fanout_eligible: statically_fanout_eligible(&peer.info, &policy),
+                soft_blocked: false,
+            });
+        }
+        candidates
+    }
+
+    /// Runs the window's request-mode decision under the scheduler lock and
+    /// marks the candidates the window soft-blocks.
+    ///
+    /// PRE: `candidates` are the collected fan-out candidates, unmarked, and
+    ///   no scheduler lock is held.
+    /// POST: every candidate carries its soft-block mark and the return is
+    ///   the request-peer scan limit, the fan-out activity, and the cold
+    ///   preference.
+    /// INVARIANT: the tree guard precedes the scheduler lock.
+    fn window_selection_limits(
+        &self,
+        frontier: &SyncFrontier,
+        candidates: &mut [FanoutCandidate],
+        now: Instant,
+    ) -> (usize, bool, Option<SyncPeer>) {
+        // The tree guard comes before the scheduler lock, matching the
+        // tree -> scheduler order the request path follows.
+        let tree = (!frontier.chain.apply_halted
+            && frontier.chain.chain_tip.is_some()
+            && frontier.chain.next_required.is_some())
+        .then(|| self.chain.block_tree());
+        let mut scheduler = self.scheduler.lock();
+        let SchedulerState { window, stager, .. } = &mut *scheduler;
+        // Purge state the old request branch left behind before the peer
+        // budget is measured: `next_peer_request` is the only other place
+        // a retarget runs, and a stale pending/staged set that fills the
+        // window would truncate `request_peers` to zero and never reach
+        // it, leaving the winning branch unwired until the pending
+        // timeout fires. A halted apply side keeps its staged bodies —
+        // the retarget would discard state the halted path still needs.
+        if !frontier.chain.apply_halted
+            && let (Some(tree), Some(chain_tip), Some(required)) = (
+                tree.as_deref(),
+                frontier.chain.chain_tip.as_ref(),
+                frontier.chain.next_required.as_ref(),
+            )
+        {
+            window.retarget_request_branch(stager, chain_tip, required.height, tree, now);
+        }
+        for candidate in &mut *candidates {
+            candidate.soft_blocked = window.peer_has_expired_pending(candidate.peer.source, now)
+                || window.peer_in_staller_cooldown(candidate.peer.source.addr, now);
+        }
+        let cold_preferred = configure_request_mode(window, candidates, now);
+        (
+            window.request_peer_scan_limit(stager, now),
+            window.fanout_active(),
+            cold_preferred,
+        )
     }
 
     /// Runs the chain-sync rule over this tick's connections and performs the
@@ -682,7 +731,7 @@ impl BlockSync {
         for (source, prior, action) in outcomes {
             match action {
                 Some(ChainSyncAction::Probe) => {
-                    if !self.probe_chain_sync(source, frontier, now) {
+                    if !self.probe_chain_sync(source, frontier) {
                         self.scheduler.lock().restore_chain_sync(source, prior);
                     }
                 }
@@ -713,25 +762,29 @@ impl BlockSync {
     /// is now outstanding.
     ///
     /// PRE: `source` names a live subject connection.
-    /// POST: return true when a `getheaders` was sent or already pending for
-    ///   this locator, false when nothing could be sent.
-    /// INVARIANT: a suppressed probe still counts, because the pending request
-    ///   it suppressed is the very question the response window waits on.
-    fn probe_chain_sync(&self, source: PeerSource, frontier: &SyncFrontier, now: Instant) -> bool {
-        let outcome = self.probe_frontier_peer(frontier, source, now);
-        if outcome == GetheadersOutcome::Failed {
-            return false;
+    /// POST: return true when a `getheaders` was sent or an identical one is
+    ///   already pending for this locator, false when nothing was sent and
+    ///   nothing is pending.
+    /// INVARIANT: a suppression counts only when the pending request it
+    ///   suppressed is the very question the response window waits on. The
+    ///   frontier-owned outcome sent nothing at all, so it neither counts a
+    ///   probe nor arms a response window, and no connection is retired for
+    ///   ignoring a request it never received.
+    pub(super) fn probe_chain_sync(&self, source: PeerSource, frontier: &SyncFrontier) -> bool {
+        match self.send_chain_sync_probe(frontier, source) {
+            GetheadersOutcome::Sent | GetheadersOutcome::Suppressed => true,
+            GetheadersOutcome::FrontierOwned | GetheadersOutcome::Failed => false,
         }
-        metrics::counter!("node.sync.chain_sync_probes").increment(1);
-        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::is_peer_fault;
-    use bitcoin_rs_chain::{ChainError, NodeId};
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_chain::{
+        BlockTree, ChainError, NodeId, NodeStatus, accept_headers, compact_is_met_by,
+    };
+    use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Header, Network};
 
     #[test]
     fn header_contextual_refusals_blame_the_sender() {
@@ -747,7 +800,6 @@ mod tests {
                 timestamp: 1,
                 minimum: 601,
             },
-            ChainError::InvalidParent { prev_hash: hash },
             ChainError::TimestampTooEarly {
                 hash,
                 timestamp: 1,
@@ -774,6 +826,11 @@ mod tests {
                 timestamp: 9,
                 max_allowed: 1,
             },
+            // The invalid parent may be the operator's `invalidateblock`
+            // choice: the refusal names no origin, so the sender is spared.
+            ChainError::InvalidParent {
+                parent: NodeId::new(3),
+            },
             // A missing parent is a sync-ordering fact, not misconduct: the
             // same headers may arrive from a peer that already has them.
             ChainError::MissingParent { prev_hash: hash },
@@ -781,5 +838,53 @@ mod tests {
         ] {
             assert!(!is_peer_fault(&error), "{error:?} must spare the peer");
         }
+    }
+
+    /// Builds a header extending `prev_blockhash`, mined to the regtest
+    /// proof-of-work limit so `accept_headers` passes its `PoW` gate.
+    fn mined_header(prev_blockhash: BlockHash, time: u32) -> Header {
+        let mut header = Header {
+            version: 4,
+            prev_blockhash,
+            merkle_root: Hash256::default(),
+            time,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        };
+        while !compact_is_met_by(header.bits, header.compute_hash().0) {
+            header.nonce = header
+                .nonce
+                .checked_add(1)
+                .unwrap_or_else(|| panic!("test nonce exhausted"));
+        }
+        header
+    }
+
+    // An operator invalidation must not disconnect the honest peers that keep
+    // relaying the retired branch: the invalid-parent refusal they hit
+    // carries no origin, so the sender is spared.
+    #[test]
+    fn descendant_of_an_invalidated_block_spares_the_sender()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = mined_header(BlockHash::default(), 900_000);
+        let genesis_id = tree.insert_header(genesis, NodeStatus::HeaderValid)?;
+        let child = mined_header(BlockHash::from(tree.node(genesis_id)?.hash), 900_600);
+        let child_id = tree.insert_header(child, NodeStatus::HeaderValid)?;
+
+        // The operator retires the block; the `invalidateblock` RPC drives
+        // exactly this entry point (chainstate `reorg::invalidate_block`).
+        tree.invalidate_subtree(child_id)?;
+
+        let grandchild = mined_header(BlockHash::from(tree.node(child_id)?.hash), 901_200);
+        let error = accept_headers(&mut tree, &[grandchild], Network::Regtest, 901_800)
+            .err()
+            .ok_or("a descendant of an invalidated block must be refused")?;
+        assert_eq!(error, ChainError::InvalidParent { parent: child_id });
+        assert!(
+            !is_peer_fault(&error),
+            "an operator invalidation must not retire the peer relaying a descendant"
+        );
+        Ok(())
     }
 }

@@ -229,8 +229,7 @@ fn getblockchaininfo_reports_the_closed_for_recovery_fact() -> Result<(), Box<dy
     let handler = Handler::new(Arc::clone(&ctx));
     let open = handler.dispatch("getblockchaininfo", &json!([]))?;
     assert_eq!(open["is_closed_for_recovery"], json!(false));
-    ctx.closed_for_recovery
-        .store(true, core::sync::atomic::Ordering::Release);
+    ctx.chain.closed_for_recovery.store(true);
     let closed = handler.dispatch("getblockchaininfo", &json!([]))?;
     assert_eq!(closed["is_closed_for_recovery"], json!(true));
     Ok(())
@@ -259,8 +258,9 @@ fn invalidateblock_delegates_to_node_control_and_returns_null() -> Result<(), Rp
         called: Arc::clone(&called),
         error: None,
     };
-    let mut ctx = Context::new().with_chain_control(Arc::new(control));
-    ctx.chain_network = Network::Regtest;
+    let mut ctx = Context::new();
+    ctx.chain.chain_control = Some(Arc::new(control));
+    ctx.chain.chain_network = Network::Regtest;
     let handler = Handler::new(Arc::new(ctx));
     let result = handler.dispatch(
         "invalidateblock",
@@ -284,8 +284,9 @@ fn invalidateblock_maps_unknown_block_to_core_not_found() {
         called: Arc::clone(&called),
         error: Some(ChainControlError::UnknownBlock),
     };
-    let mut ctx = Context::new().with_chain_control(Arc::new(control));
-    ctx.chain_network = Network::Regtest;
+    let mut ctx = Context::new();
+    ctx.chain.chain_control = Some(Arc::new(control));
+    ctx.chain.chain_network = Network::Regtest;
     let handler = Handler::new(Arc::new(ctx));
     let err = handler
         .dispatch(
@@ -306,8 +307,8 @@ fn getblockchaininfo_surfaces_published_chainwork_hex() -> Result<(), Box<dyn st
         hash: Hash256::from_le_bytes(&[0xff; 32]),
         chainwork: ChainWork::from_be_bytes([0x11; 32]),
     };
-    ctx.chain_tip.store(Some(Arc::new(tip.clone())));
-    ctx.applied_tip.store(Some(Arc::new(tip)));
+    ctx.chain.chain_tip.store(Some(Arc::new(tip.clone())));
+    ctx.chain.applied_tip.store(Some(Arc::new(tip)));
     let handler = Handler::new(Arc::clone(&ctx));
     let result = handler.dispatch("getblockchaininfo", &json!([]))?;
     let chainwork = result
@@ -335,7 +336,7 @@ fn gettxoutsetinfo_returns_real_utxo_counts() -> Result<(), Box<dyn std::error::
         1,
     ));
     bitcoin_rs_utxo::contract::commit_block_changes(
-        &ctx.utxo,
+        &ctx.chain.utxo,
         &changes,
         &Hash256::from_le_bytes(&[0xaa; 32]),
     )?;
@@ -427,7 +428,7 @@ fn getindexinfo_returns_available_indexes() -> Result<(), Box<dyn std::error::Er
 fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut ctx = Context::new();
-    ctx.derived_index = Some(Arc::new(FakeTxIndex {
+    ctx.indexes.derived_index = Some(Arc::new(FakeTxIndex {
         transactions: HashMap::new(),
         values: HashMap::new(),
         info: bitcoin_rs_rpc::context::DerivedIndexInfo {
@@ -454,7 +455,7 @@ fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dy
 #[test]
 fn getindexinfo_named_request_returns_only_that_index() -> Result<(), Box<dyn std::error::Error>> {
     let mut ctx = Context::new();
-    ctx.derived_index = Some(Arc::new(FakeTxIndex {
+    ctx.indexes.derived_index = Some(Arc::new(FakeTxIndex {
         transactions: HashMap::new(),
         values: HashMap::new(),
         info: bitcoin_rs_rpc::context::DerivedIndexInfo {
@@ -503,6 +504,7 @@ fn getblockstats_uses_indexer_for_fee_fields() -> Result<(), Box<dyn std::error:
     let (ctx, _low_tx, _high_tx) = fee_stats_context(Some(values));
     let handler = Handler::new(Arc::clone(&ctx));
     let tip_hash = ctx
+        .chain
         .block_tree
         .read()
         .tip()
@@ -529,6 +531,7 @@ fn getblockstats_errors_when_any_prevout_missing() {
     let (ctx, _low_tx, _high_tx) = fee_stats_context(None);
     let handler = Handler::new(Arc::clone(&ctx));
     let tip_hash = ctx
+        .chain
         .block_tree
         .read()
         .tip()
@@ -572,8 +575,8 @@ fn chain_rpcs_report_applied_tip_separately_from_headers() -> Result<(), Box<dyn
         hash: Hash256::from_le_bytes(&[0xbb; 32]),
         chainwork: ChainWork::default(),
     };
-    ctx.chain_tip.store(Some(Arc::new(headers_tip)));
-    ctx.applied_tip.store(Some(Arc::new(applied_tip)));
+    ctx.chain.chain_tip.store(Some(Arc::new(headers_tip)));
+    ctx.chain.applied_tip.store(Some(Arc::new(applied_tip)));
     let handler = Handler::new(Arc::clone(&ctx));
     let result = handler.dispatch("getblockchaininfo", &json!([]))?;
     assert_eq!(
@@ -694,7 +697,7 @@ fn fee_stats_context(values: Option<HashMap<OutPoint, u64>>) -> (Arc<Context>, T
                 },
             );
         }
-        ctx.derived_index = Some(Arc::new(FakeTxIndex {
+        ctx.indexes.derived_index = Some(Arc::new(FakeTxIndex {
             transactions,
             values,
             info: bitcoin_rs_rpc::context::DerivedIndexInfo {
@@ -705,7 +708,7 @@ fn fee_stats_context(values: Option<HashMap<OutPoint, u64>>) -> (Arc<Context>, T
     }
     let block = seed_tree_chain(&ctx, &block);
     let record = BlockRecord::from_block(7, &block);
-    ctx.block_body_source = Some(Arc::new(SingleBlockSource {
+    ctx.chain.block_body_source = Some(Arc::new(SingleBlockSource {
         height: record.height,
         hash: record.hash,
         body: consensus_bytes(&block),
@@ -715,7 +718,7 @@ fn fee_stats_context(values: Option<HashMap<OutPoint, u64>>) -> (Arc<Context>, T
 }
 
 fn seed_tree_chain(ctx: &Context, block: &Block) -> Block {
-    let mut tree = ctx.block_tree.write();
+    let mut tree = ctx.chain.block_tree.write();
     let mut parent = None;
     let mut prev_blockhash = BlockHash::default();
 
@@ -840,9 +843,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut ctx = Context::new().with_mining_control(Arc::new(SmokeMiningControl::new()));
+        let mut ctx = Context::new();
+        ctx.mining.mining_control = Some(Arc::new(SmokeMiningControl::new()));
 
-        ctx.chain_network = Network::Regtest;
+        ctx.chain.chain_network = Network::Regtest;
         let tx = tx(1, vec![0x51]);
         let merkle_root = fixture_merkle_root(std::slice::from_ref(&tx));
         let block = Block {
@@ -859,15 +863,16 @@ impl Fixture {
         let block = seed_tree_chain(&ctx, &block);
         let block_hash = block.block_hash();
         let tip = ctx
+            .chain
             .block_tree
             .read()
             .tip()
             .expect("fixture tip missing")
             .as_ref()
             .clone();
-        ctx.chain_tip.store(Some(Arc::new(tip.clone())));
-        ctx.applied_tip.store(Some(Arc::new(tip)));
-        ctx.block_body_source = Some(Arc::new(SingleBlockSource {
+        ctx.chain.chain_tip.store(Some(Arc::new(tip.clone())));
+        ctx.chain.applied_tip.store(Some(Arc::new(tip)));
+        ctx.chain.block_body_source = Some(Arc::new(SingleBlockSource {
             height: 7,
             hash: block_hash,
             body: consensus_bytes(&block),
@@ -875,7 +880,7 @@ impl Fixture {
         ctx.add_block(BlockRecord::from_block(7, &block));
         let mut values = HashMap::new();
         values.insert(outpoint(1), 6_000);
-        ctx.derived_index = Some(Arc::new(FakeTxIndex {
+        ctx.indexes.derived_index = Some(Arc::new(FakeTxIndex {
             transactions: HashMap::new(),
             values,
             info: bitcoin_rs_rpc::context::DerivedIndexInfo {
@@ -886,7 +891,7 @@ impl Fixture {
         let block_hex = hex_encode(&consensus_bytes(&block));
         let txid = ctx.add_transaction(tx.clone());
         let entry = MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7);
-        ctx.mempool.pool().write().insert_entry(entry)?;
+        ctx.mempool.gateway.pool().write().insert_entry(entry)?;
         Ok(Self {
             ctx: Arc::new(ctx),
             tx,
@@ -899,7 +904,7 @@ impl Fixture {
 #[allow(clippy::arc_with_non_send_sync)]
 fn context_with_peers(peer_table: Arc<PeerTable>) -> Arc<Context> {
     let mut ctx = Context::new();
-    ctx.peer_table = peer_table;
+    ctx.network.peer_table = peer_table;
     Arc::new(ctx)
 }
 

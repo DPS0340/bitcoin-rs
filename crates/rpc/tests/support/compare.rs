@@ -1164,33 +1164,15 @@ fn json_kind(value: &Value) -> u8 {
 /// Typed corepc v31 decode of a live `getblockchaininfo` body; a body that
 /// does not deserialize into the versioned wire struct fails the gate.
 ///
-/// Core 31.1's `getblockchaininfo` wire keys — the exact set the corpus
-/// fixture's `current` object pins. The typed decode sees this Core shape;
-/// extension keys (for example `is_closed_for_recovery`) ride alongside and
-/// carry their own tests, so they are retained out of the strict decode.
-const CHAININFO_WIRE_KEYS: [&str; 19] = [
-    "automatic_pruning",
-    "bestblockhash",
-    "bits",
-    "blocks",
-    "chain",
-    "chainwork",
-    "difficulty",
-    "headers",
-    "initialblockdownload",
-    "mediantime",
-    "prune_target_size",
-    "pruned",
-    "pruneheight",
-    "signet_challenge",
-    "size_on_disk",
-    "target",
-    "time",
-    "verificationprogress",
-    "warnings",
-];
+/// Keys this node's `getblockchaininfo` emits beyond Core 31.1's wire. Each
+/// declared extension carries its own behavior test; the typed decode strips
+/// exactly this set, so any other unlisted key — a renamed Core key or a
+/// second undeclared extension — still fails the strict decode.
+const CHAININFO_EXTENSION_KEYS: [&str; 1] = ["is_closed_for_recovery"];
 
 /// Decodes one `getblockchaininfo` result into the typed corepc v31 struct.
+/// Only [`CHAININFO_EXTENSION_KEYS`] are removed first; every remaining key
+/// must satisfy the versioned wire struct's strict field set.
 ///
 /// # Errors
 /// Propagates the sonic-rs decode error.
@@ -1199,7 +1181,7 @@ pub(crate) fn typed_getblockchain_info(
 ) -> Result<corepc_types::v31::GetBlockchainInfo, sonic_rs::Error> {
     let mut value: sonic_rs::Value = sonic_rs::from_slice(body)?;
     if let Some(object) = value.as_object_mut() {
-        object.retain(|key, _| CHAININFO_WIRE_KEYS.contains(&key));
+        object.retain(|key, _| !CHAININFO_EXTENSION_KEYS.contains(&key));
     }
     sonic_rs::from_slice(sonic_rs::to_string(&value)?.as_bytes())
 }

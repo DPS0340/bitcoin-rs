@@ -107,6 +107,9 @@ fn strip_dir<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
 mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::cell::RefCell;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::time::Duration;
 
     use bitcoin::hex::DisplayHex as _;
     use bitcoin_rs_chain::NodeStatus;
@@ -274,7 +277,7 @@ mod tests {
             1,
         ));
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &ctx.utxo,
+            &ctx.chain.utxo,
             &changes,
             &Hash256::from_le_bytes(&[0xaa; 32]),
         )
@@ -538,30 +541,31 @@ mod tests {
         let record = bitcoin_rs_index::block_log::BlockRecord::from_block(0, &block);
         let txid = transaction.txid();
         let mut context = Context::new();
-        context.chain_network = bitcoin_rs_primitives::Network::Regtest;
-        context.block_body_source = Some(Arc::new(SingleBlockSource {
+        context.chain.chain_network = bitcoin_rs_primitives::Network::Regtest;
+        context.chain.block_body_source = Some(Arc::new(SingleBlockSource {
             height: 0,
             hash: record.hash,
             body: consensus_bytes(&block),
         }));
         context.add_block(record);
         let tip = {
-            let mut tree = context.block_tree.write();
+            let mut tree = context.chain.block_tree.write();
             tree.insert_node(None, block.header, NodeStatus::Active)?;
             tree.tip()
                 .ok_or_else(|| std::io::Error::other("fixture tip missing"))?
                 .as_ref()
                 .clone()
         };
-        context.applied_tip.store(Some(Arc::new(tip)));
-        context.esplora_tx_index = Some(Arc::new(FixtureTxIndex(vec![(transaction.clone(), 0)])));
+        context.chain.applied_tip.store(Some(Arc::new(tip)));
+        context.indexes.esplora_tx_index =
+            Some(Arc::new(FixtureTxIndex(vec![(transaction.clone(), 0)])));
         let funding = vec![ScriptIndexRecord {
             txid,
             height: 0,
             value: 5_000_000_000,
             vout: 0,
         }];
-        context.script_index = Some(Arc::new(StaticScriptIndex {
+        context.indexes.script_index = Some(Arc::new(StaticScriptIndex {
             history: vec![ScriptHistoryRecord { txid, height: 0 }],
             funding: funding.clone(),
             unspent: funding,
@@ -1004,23 +1008,25 @@ mod tests {
             0, &block,
         ));
         let tip = {
-            let mut tree = context.block_tree.write();
+            let mut tree = context.chain.block_tree.write();
             tree.insert_node(None, block.header, NodeStatus::Active)
                 .expect("insert applied tip");
             tree.tip().expect("applied tip")
         };
-        context.applied_tip.store(Some(tip));
-        context.script_index = Some(Arc::new(RepublishTipScriptIndex {
-            applied_tip: context.applied_tip.clone(),
+        context.chain.applied_tip.store(Some(tip));
+        context.indexes.script_index = Some(Arc::new(RepublishTipScriptIndex {
+            applied_tip: context.chain.applied_tip.clone(),
         }));
         let handler = Handler::new(Arc::new(context));
 
-        let response = route(
-            &handler,
-            "/scripthash/0000000000000000000000000000000000000000000000000000000000000000",
-            "",
-        );
-        assert_eq!(response.status, 503);
+        for suffix in ["", "/txs/chain/not-a-txid"] {
+            let response = route(
+                &handler,
+                &format!("/scripthash/{0}{suffix}", "00".repeat(32)),
+                "",
+            );
+            assert_eq!(response.status, 503);
+        }
     }
 
     #[test]
@@ -1035,6 +1041,7 @@ mod tests {
         let txid = transaction.txid();
         let ctx = Arc::new(Context::new());
         ctx.mempool
+            .gateway
             .pool()
             .write()
             .insert_entry(MempoolEntry::new(Arc::new(transaction), 100, 1_000, 0, 0))
@@ -1102,6 +1109,97 @@ mod tests {
     }
 
     #[test]
+    fn history_cursors_follow_api_09_on_both_esplora_surfaces()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // API-09 and WF-02 own exact textual cursor equality and restart
+        // behavior. The expected page comes from the cursor-free public route.
+        let (handler, transaction, _, address) = contract_fixture()?;
+        let txid = transaction.txid().to_string();
+        let script_hash = ScriptHash::new(&transaction.outputs[0].script_pubkey)
+            .to_byte_array()
+            .to_lower_hex_string();
+        let mut unavailable = Context::new();
+        unavailable.chain.chain_network = bitcoin_rs_primitives::Network::Regtest;
+        let unavailable = Handler::new(Arc::new(unavailable));
+        for prefix in ["/api", "/esplora"] {
+            for target in [
+                format!("address/{address}"),
+                format!("scripthash/{script_hash}"),
+            ] {
+                let path = format!("{prefix}/{target}/txs/chain");
+                let first = dispatch(&handler, &path, "");
+                assert_eq!(first.status, 200);
+                let first_page: Value = serde_json::from_slice(&first.body)?;
+                assert_eq!(first_page.as_array().map(Vec::len), Some(1));
+                for cursor in [
+                    "00".repeat(32),
+                    "not-a-txid".to_owned(),
+                    txid.to_uppercase(),
+                    format!("0x{txid}"),
+                ] {
+                    let cursor_path = format!("{path}/{cursor}");
+                    let response = dispatch(&handler, &cursor_path, "");
+                    assert_eq!(response.status, 200, "{cursor_path}");
+                    assert_eq!(response.body, first.body, "{cursor_path}");
+                    assert_eq!(dispatch(&unavailable, &cursor_path, "").status, 503);
+                }
+                let end = dispatch(&handler, &format!("{path}/{txid}"), "");
+                assert_eq!(end.status, 200);
+                assert_eq!(serde_json::from_slice::<Value>(&end.body)?, json!([]));
+                let mempool = dispatch(&handler, &format!("{prefix}/{target}/txs/mempool"), "");
+                assert_eq!(mempool.status, 200);
+                assert_eq!(serde_json::from_slice::<Value>(&mempool.body)?, json!([]));
+                assert_eq!(
+                    dispatch(&handler, &format!("{path}/{txid}/extra"), "").status,
+                    404
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn history_mempool_sentinel_keeps_the_fifty_transaction_bound() {
+        let target = vec![0x51];
+        let mut ctx = Context::new();
+        ctx.indexes.script_index = Some(Arc::new(StaticScriptIndex {
+            history: Vec::new(),
+            funding: Vec::new(),
+            unspent: Vec::new(),
+        }));
+        for value in 1..=60 {
+            let tx = Arc::new(transaction(
+                None,
+                TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: target.clone().into(),
+                },
+            ));
+            ctx.mempool
+                .gateway
+                .pool()
+                .write()
+                .insert_entry(MempoolEntry::new(tx, 100, 100, 0, 0))
+                .expect("insert mempool fixture");
+        }
+        // API-09: the router's empty sentinel selects only the mempool page.
+        let mempool = history(&ctx, ScriptHash::new(&target), Some(""), false);
+        assert_eq!(mempool.status, 200);
+        let values: Value = serde_json::from_slice(&mempool.body).expect("mempool page json");
+        assert_eq!(values.as_array().map(Vec::len), Some(50));
+        assert!(
+            values
+                .as_array()
+                .expect("page")
+                .iter()
+                .all(|tx| tx["status"]["confirmed"] == false)
+        );
+        let chain = history(&ctx, ScriptHash::new(&target), Some("not-a-txid"), false);
+        assert_eq!(chain.status, 200);
+        assert_eq!(chain.body, b"[]");
+    }
+
+    #[test]
     fn history_hydrates_only_the_requested_chain_page() {
         let target = vec![0x51];
         let transactions = (1_u64..=30)
@@ -1131,12 +1229,12 @@ mod tests {
                 BlockHash::default(),
             ));
         }
-        ctx.script_index = Some(Arc::new(StaticScriptIndex {
-            history: records,
+        ctx.indexes.script_index = Some(Arc::new(StaticScriptIndex {
+            history: records.clone(),
             funding: Vec::new(),
             unspent: Vec::new(),
         }));
-        ctx.esplora_tx_index = Some(Arc::new(CountingTxIndex {
+        ctx.indexes.esplora_tx_index = Some(Arc::new(CountingTxIndex {
             transactions,
             calls: Arc::clone(&calls),
         }));
@@ -1145,6 +1243,43 @@ mod tests {
         assert_eq!(response.status, 200);
         let values: Value = serde_json::from_slice(&response.body).expect("history response json");
         assert_eq!(values.as_array().map(Vec::len), Some(CHAIN_PAGE));
+        assert_eq!(calls.load(Ordering::Relaxed), CHAIN_PAGE);
+
+        // API-09 fixes the chain page at 25 rows and excludes the known cursor.
+        // Heights 30..6 are page one, 5..1 page two, independent of txid order.
+        let cursor = records[5].txid.to_string();
+        let second = history(&ctx, ScriptHash::new(&target), Some(&cursor), false);
+        assert_eq!(second.status, 200);
+        let second: Value = serde_json::from_slice(&second.body).expect("second page json");
+        assert_eq!(second.as_array().map(Vec::len), Some(5));
+        assert_eq!(second[0]["txid"], records[4].txid.to_string());
+        assert_eq!(second[4]["txid"], records[0].txid.to_string());
+        assert_eq!(calls.load(Ordering::Relaxed), 30);
+        let end = history(
+            &ctx,
+            ScriptHash::new(&target),
+            Some(&records[0].txid.to_string()),
+            false,
+        );
+        assert_eq!(end.status, 200);
+        assert_eq!(end.body, b"[]");
+        assert_eq!(calls.load(Ordering::Relaxed), 30);
+
+        // A ready post-reorg index no longer contains this previously valid
+        // cursor. Its history must restart using the same bounded renderer.
+        ctx.indexes.script_index = Some(Arc::new(StaticScriptIndex {
+            history: records
+                .into_iter()
+                .filter(|row| row.txid.to_string() != cursor)
+                .collect(),
+            funding: Vec::new(),
+            unspent: Vec::new(),
+        }));
+        let first = history(&ctx, ScriptHash::new(&target), None, false);
+        calls.store(0, Ordering::Relaxed);
+        let restarted = history(&ctx, ScriptHash::new(&target), Some(&cursor), false);
+        assert_eq!(restarted.status, 200);
+        assert_eq!(restarted.body, first.body);
         assert_eq!(calls.load(Ordering::Relaxed), CHAIN_PAGE);
     }
 
@@ -1189,12 +1324,12 @@ mod tests {
                 BlockHash::default(),
             ));
         }
-        ctx.script_index = Some(Arc::new(StaticScriptIndex {
+        ctx.indexes.script_index = Some(Arc::new(StaticScriptIndex {
             history,
             funding: funding.clone(),
             unspent: vec![funding[0]],
         }));
-        ctx.esplora_tx_index = Some(Arc::new(CountingTxIndex {
+        ctx.indexes.esplora_tx_index = Some(Arc::new(CountingTxIndex {
             transactions,
             calls: Arc::clone(&calls),
         }));
@@ -1239,12 +1374,13 @@ mod tests {
             },
         );
         let mut ctx = Context::new();
-        ctx.script_index = Some(Arc::new(StaticScriptIndex {
+        ctx.indexes.script_index = Some(Arc::new(StaticScriptIndex {
             history: Vec::new(),
             funding: vec![confirmed],
             unspent: vec![confirmed],
         }));
         ctx.mempool
+            .gateway
             .pool()
             .write()
             .insert_entry(MempoolEntry::new(
@@ -1286,7 +1422,7 @@ mod tests {
         let unspent_calls = Arc::new(AtomicUsize::new(0));
         let spender_calls = Arc::new(AtomicUsize::new(0));
         let mut ctx = Context::new();
-        ctx.script_index = Some(Arc::new(CountingScriptIndex {
+        ctx.indexes.script_index = Some(Arc::new(CountingScriptIndex {
             history_calls: Arc::clone(&history_calls),
             unspent_calls: Arc::clone(&unspent_calls),
             spender_calls: Arc::clone(&spender_calls),
@@ -1327,7 +1463,7 @@ mod tests {
             },
         );
         let mut ctx = Context::new();
-        ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(parent)));
+        ctx.indexes.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(parent)));
 
         let rendered = Projection::new(&ctx)
             .transaction_value(&child, None)
@@ -1377,14 +1513,14 @@ mod tests {
         };
         let stale_record = bitcoin_rs_index::block_log::BlockRecord::from_block(1, &stale_block);
         let mut ctx = Context::new();
-        ctx.block_body_source = Some(Arc::new(SingleBlockSource {
+        ctx.chain.block_body_source = Some(Arc::new(SingleBlockSource {
             height: 1,
             hash: stale_record.hash,
             body: consensus_bytes(&stale_block),
         }));
         ctx.add_block(stale_record.clone());
         {
-            let mut tree = ctx.block_tree.write();
+            let mut tree = ctx.chain.block_tree.write();
             let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
             tree.insert_node(
                 Some(genesis_id),
@@ -1407,9 +1543,9 @@ mod tests {
             let tip = tree
                 .tip()
                 .ok_or_else(|| std::io::Error::other("missing active tip"))?;
-            ctx.applied_tip.store(Some(tip));
+            ctx.chain.applied_tip.store(Some(Arc::new((*tip).clone())));
         }
-        ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(transaction)));
+        ctx.indexes.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(transaction)));
 
         let response = block_txs(&ctx, &stale_record.hash.to_string(), 0);
         assert_eq!(
@@ -1420,6 +1556,413 @@ mod tests {
         );
         let rendered: Value = serde_json::from_slice(&response.body)?;
         assert_eq!(rendered[0]["status"], json!({"confirmed":false}));
+        Ok(())
+    }
+
+    thread_local! {
+        /// The one-shot halves that let a test observe the Esplora summary
+        /// reaching its fee-binning loop. Installed per thread, so only the
+        /// thread that arms it is ever gated.
+        static BINNING_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> =
+            const { RefCell::new(None) };
+    }
+
+    /// How long the gated thread waits for release before continuing anyway, so
+    /// a failed assertion cannot hang the suite.
+    const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Records the halves [`gate_mempool_binning_for_tests`] uses to announce
+    /// the binning loop and wait to leave it. Call on the serving thread.
+    fn arm_binning_gate(entered: Sender<()>, release: Receiver<()>) {
+        BINNING_GATE.with(|slot| *slot.borrow_mut() = Some((entered, release)));
+    }
+
+    /// Test-only observation of the histogram-binning call site: announce that
+    /// this thread is inside the loop, then wait to be let out of it. With no
+    /// gate armed on this thread it returns immediately, so every other request
+    /// in the suite is untouched.
+    pub(crate) fn gate_mempool_binning_for_tests() {
+        let armed = BINNING_GATE.with(|slot| slot.borrow_mut().take());
+        let Some((entered, release)) = armed else {
+            return;
+        };
+        let _ = entered.send(());
+        let _ = release.recv_timeout(GATE_TIMEOUT);
+    }
+
+    /// A v2 transaction with one input per `inputs` and the given
+    /// `(value, scriptPubKey)` outputs, in order.
+    fn paying_transaction(inputs: &[OutPoint], outputs: &[(u64, Vec<u8>)]) -> Tx {
+        Tx {
+            version: 2,
+            inputs: inputs
+                .iter()
+                .copied()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    script_sig: Script::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|(value, script)| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: script.clone().into(),
+                })
+                .collect(),
+            lock_time: LockTime::ZERO,
+        }
+    }
+
+    /// A funding outpoint that no other fixture transaction spends.
+    fn unconfirmed_outpoint(marker: u8) -> OutPoint {
+        OutPoint::new(Txid(Hash256::from_le_bytes(&[marker; 32])), 0)
+    }
+
+    /// One planned mempool entry: the transaction plus the policy facts the
+    /// mempool routes report for it.
+    #[derive(Clone)]
+    struct Seed {
+        transaction: Tx,
+        vsize: u32,
+        fee: u64,
+        time: u64,
+    }
+
+    impl Seed {
+        fn txid(&self) -> Txid {
+            self.transaction.txid()
+        }
+
+        /// The route's output total for this entry: saturated sum of its
+        /// output values.
+        fn value(&self) -> u64 {
+            self.transaction.outputs.iter().fold(0_u64, |sum, output| {
+                sum.saturating_add(output.value.to_sat())
+            })
+        }
+    }
+
+    /// `ctx` with every `seed` admitted, in order.
+    fn seed_mempool(ctx: Context, seeds: &[Seed]) -> Arc<Context> {
+        for seed in seeds {
+            ctx.mempool
+                .gateway
+                .pool()
+                .write()
+                .insert_entry(MempoolEntry::new(
+                    Arc::new(seed.transaction.clone()),
+                    seed.vsize,
+                    seed.fee,
+                    seed.time,
+                    0,
+                ))
+                .expect("seed entry admitted");
+        }
+        Arc::new(ctx)
+    }
+
+    /// The summary must not hold the pool read guard while it bins fee rates: a
+    /// writer waiting behind that guard is the reported live failure. The gate
+    /// hands control back to this thread from inside the binning loop, which the
+    /// old code ran with the guard held, so the write attempt below fails at the
+    /// base and succeeds once the capture is released first.
+    #[test]
+    fn mempool_projection_releases_read_guard_before_binning() {
+        let target = vec![0x51_u8];
+        let seeds = [
+            Seed {
+                transaction: paying_transaction(
+                    &[unconfirmed_outpoint(1)],
+                    &[(1_000, target.clone())],
+                ),
+                vsize: 100,
+                fee: 1_000,
+                time: 1,
+            },
+            Seed {
+                transaction: paying_transaction(
+                    &[unconfirmed_outpoint(2)],
+                    &[(1_000, target.clone())],
+                ),
+                vsize: 100,
+                fee: 2_000,
+                time: 2,
+            },
+            Seed {
+                transaction: paying_transaction(&[unconfirmed_outpoint(3)], &[(1_000, target)]),
+                vsize: 200,
+                fee: 2_000,
+                time: 3,
+            },
+        ];
+        let ctx = seed_mempool(Context::new(), &seeds);
+        let serving_ctx = Arc::clone(&ctx);
+        let (entered_send, entered_recv) = channel();
+        let (release_send, release_recv) = channel();
+        let request = std::thread::spawn(move || {
+            arm_binning_gate(entered_send, release_recv);
+            let handler = Handler::new(serving_ctx);
+            route(&handler, "/mempool", "")
+        });
+
+        let reached_binning = entered_recv.recv_timeout(GATE_TIMEOUT).is_ok();
+        let writer_progress = ctx.mempool.gateway.pool().try_write().is_some();
+        let _ = release_send.send(());
+        let response = request.join().expect("gated request completes");
+
+        assert!(
+            reached_binning,
+            "the request thread never reached the fee-binning loop"
+        );
+        assert!(
+            writer_progress,
+            "the summary held the mempool read guard while it binned fee rates"
+        );
+        assert_eq!(response.status, 200);
+        // Releasing the guard early must cost nothing: two entries share
+        // 10 sat/vB, so their vsizes merge into one bin and the rates stay
+        // descending.
+        let rendered: Value = serde_json::from_slice(&response.body).expect("summary json");
+        assert_eq!(
+            rendered,
+            json!({
+                "count": 3,
+                "vsize": 400,
+                "total_fee": 5_000,
+                "fee_histogram": [[20.0, 100_u64], [10.0, 300_u64]],
+            })
+        );
+    }
+
+    /// One seeded pool shared by the projection parity tests: a funder with two
+    /// target outputs and one unrelated output, the spender of its first target
+    /// output, and eight fillers.
+    struct ParityFixture {
+        ctx: Arc<Context>,
+        handler: Handler,
+        target: Vec<u8>,
+        seeds: Vec<Seed>,
+        script_hash: String,
+    }
+
+    fn parity_fixture() -> ParityFixture {
+        const TOP: u64 = 1_700_000_050;
+        let target = vec![0x51_u8];
+        let unrelated = vec![0x52_u8];
+        // The overlay must drop the funder's spent output, keep its other
+        // target output, and append the spender's own.
+        let funder = paying_transaction(
+            &[unconfirmed_outpoint(1)],
+            &[
+                (1_000, target.clone()),
+                (2_000, target.clone()),
+                (3_000, unrelated.clone()),
+            ],
+        );
+        let spender =
+            paying_transaction(&[OutPoint::new(funder.txid(), 0)], &[(900, target.clone())]);
+        let mut seeds = vec![
+            Seed {
+                transaction: funder,
+                vsize: 100,
+                fee: 1_000,
+                time: TOP,
+            },
+            Seed {
+                transaction: spender,
+                vsize: 100,
+                fee: 1_000,
+                time: TOP,
+            },
+        ];
+        // Two fillers share the top acceptance time, so the recent list has to
+        // break a `(time, txid)` tie; twelve entries are two wider than the ten
+        // the route emits, so the oldest pair drops out. The first four fillers
+        // join the funder and spender in the 10 sat/vB bin, so six entries merge
+        // into one histogram bucket.
+        for index in 0..10_u8 {
+            let vsize = 100 + u32::from(index) * 10;
+            seeds.push(Seed {
+                transaction: paying_transaction(
+                    &[unconfirmed_outpoint(10 + index)],
+                    &[(500, unrelated.clone())],
+                ),
+                vsize,
+                fee: u64::from(vsize) * if index < 4 { 10 } else { 5 },
+                time: TOP - u64::from(index / 2),
+            });
+        }
+        let mut ctx = Context::new();
+        ctx.indexes.script_index = Some(Arc::new(StaticScriptIndex {
+            history: Vec::new(),
+            funding: Vec::new(),
+            unspent: Vec::new(),
+        }));
+        let ctx = seed_mempool(ctx, &seeds);
+        let handler = Handler::new(Arc::clone(&ctx));
+        let script_hash = ScriptHash::new(&target)
+            .to_byte_array()
+            .to_lower_hex_string();
+        ParityFixture {
+            ctx,
+            handler,
+            target,
+            seeds,
+            script_hash,
+        }
+    }
+
+    /// The bytes `path` returns on both Esplora prefixes, asserting the two
+    /// surfaces agree and answer as JSON.
+    fn routed_bytes(fixture: &ParityFixture, path: &str) -> Vec<u8> {
+        let public = route(&fixture.handler, path, "");
+        let backend = backend_route(&fixture.handler, path, "");
+        assert_eq!(
+            public.status,
+            200,
+            "{path}: {}",
+            String::from_utf8_lossy(&public.body)
+        );
+        assert_eq!(backend.status, 200, "{path}");
+        assert_eq!(public.content_type, "application/json", "{path}");
+        assert_eq!(
+            public.body, backend.body,
+            "{path} differs between /api and /esplora"
+        );
+        public.body
+    }
+
+    /// Indices of `seeds` in the order the recent list emits them: descending
+    /// `(time, txid)`.
+    fn descending_recent(seeds: &[Seed]) -> Vec<usize> {
+        let mut order = (0..seeds.len()).collect::<Vec<_>>();
+        order.sort_by(|left, right| {
+            let (left, right) = (&seeds[*left], &seeds[*right]);
+            right
+                .time
+                .cmp(&left.time)
+                .then_with(|| right.txid().cmp(&left.txid()))
+        });
+        order
+    }
+
+    /// Every mempool projection the two Esplora prefixes share, on one seeded
+    /// pool: identical bytes, and the same counts, bins, tie order, and listed
+    /// ids the routes emitted before the capture was split out of the guard.
+    #[test]
+    fn esplora_mempool_summary_recent_and_txids_match_the_seeded_pool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = parity_fixture();
+        let mut bins = std::collections::BTreeMap::new();
+        for seed in &fixture.seeds {
+            let rate = seed.fee.saturating_mul(1_000) / u64::from(seed.vsize);
+            *bins.entry(rate).or_insert(0_u64) += u64::from(seed.vsize);
+        }
+        let summary: Value = serde_json::from_slice(&routed_bytes(&fixture, "/mempool"))?;
+        assert_eq!(
+            summary,
+            json!({
+                "count": fixture.seeds.len(),
+                "vsize": fixture
+                    .seeds
+                    .iter()
+                    .map(|seed| u64::from(seed.vsize))
+                    .sum::<u64>(),
+                "total_fee": fixture.seeds.iter().map(|seed| seed.fee).sum::<u64>(),
+                "fee_histogram": bins
+                    .iter()
+                    .rev()
+                    .map(|(rate, size)| {
+                        let rate = u32::try_from(*rate).expect("fixture fee rate fits u32");
+                        json!([f64::from(rate) / 1000.0, size])
+                    })
+                    .collect::<Vec<Value>>(),
+            })
+        );
+
+        let recent: Vec<Value> =
+            serde_json::from_slice(&routed_bytes(&fixture, "/mempool/recent"))?;
+        assert_eq!(
+            recent,
+            descending_recent(&fixture.seeds)
+                .iter()
+                .take(10)
+                .map(|index| {
+                    let seed = &fixture.seeds[*index];
+                    json!({
+                        "txid": seed.txid().to_string(),
+                        "fee": seed.fee,
+                        "vsize": seed.vsize,
+                        "value": seed.value(),
+                    })
+                })
+                .collect::<Vec<Value>>()
+        );
+
+        let mut listed: Vec<String> =
+            serde_json::from_slice(&routed_bytes(&fixture, "/mempool/txids"))?;
+        listed.sort();
+        let mut expected = fixture
+            .seeds
+            .iter()
+            .map(|seed| seed.txid().to_string())
+            .collect::<Vec<String>>();
+        expected.sort();
+        assert_eq!(listed, expected);
+        Ok(())
+    }
+
+    /// The script UTXO overlay and the script activity that one funder plus its
+    /// spender produce, on the same seeded pool: the spent output is gone, the
+    /// pool's own order is kept, and both prefixes answer with the same bytes.
+    #[test]
+    fn esplora_script_overlay_and_activity_match_the_seeded_pool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = parity_fixture();
+        let unconfirmed = json!({ "confirmed": false });
+        let utxos: Value = serde_json::from_slice(&routed_bytes(
+            &fixture,
+            &format!("/scripthash/{}/utxo", fixture.script_hash),
+        ))?;
+        assert_eq!(
+            utxos,
+            json!([
+                {
+                    "txid": fixture.seeds[0].txid().to_string(),
+                    "vout": 1,
+                    "status": unconfirmed,
+                    "value": 2_000,
+                },
+                {
+                    "txid": fixture.seeds[1].txid().to_string(),
+                    "vout": 0,
+                    "status": unconfirmed,
+                    "value": 900,
+                },
+            ])
+        );
+
+        // The history route needs a transaction index this fixture does not
+        // carry, so the projection that feeds it is the observable: the funder
+        // and the spender, each selected once, in descending `(time, txid)`.
+        let activity = Projection::new(&fixture.ctx)
+            .script_activity(ScriptHash::new(&fixture.target))
+            .expect("script activity resolves");
+        assert_eq!(
+            activity
+                .mempool
+                .iter()
+                .map(|transaction| transaction.txid())
+                .collect::<Vec<Txid>>(),
+            descending_recent(&fixture.seeds)
+                .iter()
+                .filter(|index| **index < 2)
+                .map(|index| fixture.seeds[*index].txid())
+                .collect::<Vec<Txid>>()
+        );
         Ok(())
     }
 }

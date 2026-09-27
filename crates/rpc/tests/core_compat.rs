@@ -3,7 +3,9 @@
 //! Every dispatched response covered by a `corepc_types` structured type must
 //! deserialize into that exact upstream type under the crate's strict
 //! `serde-deny-unknown-fields` feature. Hardcoded key-set equality is gone:
-//! the versioned type is the schema.
+//! the versioned type is the schema. `getblockchaininfo` additionally carries
+//! declared extension keys: its decoder strips exactly that declared set
+//! before the strict decode, so any other unlisted key still fails the gate.
 //!
 //! Schema-proof surface named by `docs/policies/source-compatibility.md`
 //! §5.2 (RPC methods match current Bitcoin Core schemas; clean cutover, no
@@ -48,8 +50,8 @@ fn tipped_context() -> Arc<Context> {
         chainwork: ChainWork::ZERO,
         hash: Hash256::from_le_bytes(&[42_u8; 32]),
     };
-    ctx.chain_tip.store(Some(Arc::new(tip.clone())));
-    ctx.applied_tip.store(Some(Arc::new(tip)));
+    ctx.chain.chain_tip.store(Some(Arc::new(tip.clone())));
+    ctx.chain.applied_tip.store(Some(Arc::new(tip)));
     ctx
 }
 
@@ -376,10 +378,9 @@ fn mining_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::e
     // API-12 mainnet gates (peers + IBD) live in the handler unit tests.
     // This rendering proof runs off-mainnet so it reaches the template.
     let mut ctx = Context::new();
-    ctx.chain_network = Network::Regtest;
-    let handler = Handler::new(Arc::new(
-        ctx.with_mining_control(Arc::new(CompatMiningControl)),
-    ));
+    ctx.chain.chain_network = Network::Regtest;
+    ctx.mining.mining_control = Some(Arc::new(CompatMiningControl));
+    let handler = Handler::new(Arc::new(ctx));
 
     let template: corepc_types::v31::GetBlockTemplate =
         typed(&handler.dispatch("getblocktemplate", &json!([{"rules": ["segwit"]}]))?)?;

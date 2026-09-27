@@ -141,16 +141,17 @@ impl<'a> Projection<'a> {
         &self,
         txid: &Txid,
     ) -> Result<Option<(Tx, Option<Confirmation>)>, Response> {
-        if let Some(transaction) = self.ctx.mempool.read().transaction_by_txid(txid) {
+        if let Some(transaction) = self.ctx.mempool.gateway.read().transaction_by_txid(txid) {
             return Ok(Some(((*transaction).clone(), None)));
         }
-        if let Some(transaction) = self.ctx.transactions.read().get(txid).cloned() {
+        if let Some(transaction) = self.ctx.chain.transactions.read().get(txid).cloned() {
             return self
                 .cached_confirmation(txid)
                 .map(|confirmation| Some((transaction, confirmation)));
         }
         let index = self
             .ctx
+            .indexes
             .esplora_tx_index
             .as_ref()
             .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
@@ -167,6 +168,7 @@ impl<'a> Projection<'a> {
 
     pub(super) fn confirmed_transaction(&self, txid: &Txid) -> Result<Tx, Response> {
         self.ctx
+            .indexes
             .esplora_tx_index
             .as_ref()
             .ok_or_else(|| unavailable("transaction lookup index is disabled"))?
@@ -177,14 +179,22 @@ impl<'a> Projection<'a> {
 
     /// Resolves confirmation only against the current applied chain.
     pub(super) fn confirmation(&self, txid: &Txid) -> Result<Option<Confirmation>, Response> {
-        if self.ctx.mempool.read().transaction_by_txid(txid).is_some() {
+        if self
+            .ctx
+            .mempool
+            .gateway
+            .read()
+            .transaction_by_txid(txid)
+            .is_some()
+        {
             return Ok(None);
         }
-        if self.ctx.transactions.read().contains_key(txid) {
+        if self.ctx.chain.transactions.read().contains_key(txid) {
             return self.cached_confirmation(txid);
         }
         let index = self
             .ctx
+            .indexes
             .esplora_tx_index
             .as_ref()
             .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
@@ -202,7 +212,7 @@ impl<'a> Projection<'a> {
     /// disabled this reports "unconfirmed", which is also the only reason
     /// `/tx/:id` works at all in that configuration.
     fn cached_confirmation(&self, txid: &Txid) -> Result<Option<Confirmation>, Response> {
-        let Some(index) = self.ctx.esplora_tx_index.as_ref() else {
+        let Some(index) = self.ctx.indexes.esplora_tx_index.as_ref() else {
             return Ok(None);
         };
         Ok(index
@@ -305,13 +315,19 @@ impl<'a> Projection<'a> {
     }
 
     pub(super) fn prevout(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, Response> {
-        if let Some(transaction) = self.ctx.mempool.read().transaction_by_txid(&outpoint.txid) {
+        if let Some(transaction) = self
+            .ctx
+            .mempool
+            .gateway
+            .read()
+            .transaction_by_txid(&outpoint.txid)
+        {
             return Ok(transaction
                 .outputs
                 .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
                 .cloned());
         }
-        if let Some(transaction) = self.ctx.transactions.read().get(&outpoint.txid) {
+        if let Some(transaction) = self.ctx.chain.transactions.read().get(&outpoint.txid) {
             return Ok(transaction
                 .outputs
                 .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
@@ -319,6 +335,7 @@ impl<'a> Projection<'a> {
         }
         let index = self
             .ctx
+            .indexes
             .esplora_tx_index
             .as_ref()
             .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
@@ -394,6 +411,7 @@ impl<'a> Projection<'a> {
     ) -> Result<ScriptActivity, Response> {
         let index = self
             .ctx
+            .indexes
             .script_index
             .as_ref()
             .ok_or_else(|| unavailable("script index is disabled"))?;
@@ -430,17 +448,37 @@ impl<'a> Projection<'a> {
         })
     }
 
+    /// PRE: `script_hash` and the script index identify one script.
+    /// POST: Capture the unspent pool overlay under one read guard.
+    /// POST: Release the guard before building statuses and output strings.
+    /// INVARIANT: Confirmed and mempool outputs retain the prior order.
     pub(super) fn script_utxos(&self, script_hash: ScriptHash) -> Result<Vec<UtxoValue>, Response> {
         let mut confirmed = self
             .ctx
+            .indexes
             .script_index
             .as_ref()
             .ok_or_else(|| unavailable("script index is disabled"))?
             .unspent_outputs(script_hash)
             .map_err(query_error)?;
-        let pool = self.ctx.mempool.read();
-        confirmed
-            .retain(|record| !pool.is_outpoint_spent(&OutPoint::new(record.txid, record.vout)));
+        let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
+        // The read guard protects pool facts only: which of a funder's outputs
+        // the pool already spends. Script hashing, statuses, and output
+        // strings are derived from those facts and run after the release.
+        let funding = {
+            let pool = self.ctx.mempool.gateway.read();
+            confirmed
+                .retain(|record| !pool.is_outpoint_spent(&OutPoint::new(record.txid, record.vout)));
+            pool.entries_funding_script(mempool_hash)
+                .map(|entry| {
+                    let spent = (0..entry.tx.outputs.len())
+                        .filter_map(|position| u32::try_from(position).ok())
+                        .map(|vout| pool.is_outpoint_spent(&OutPoint::new(entry.txid, vout)))
+                        .collect::<Vec<_>>();
+                    (entry.txid, Arc::clone(&entry.tx), spent)
+                })
+                .collect::<Vec<_>>()
+        };
         let mut outputs = confirmed
             .into_iter()
             .map(|record| {
@@ -456,37 +494,31 @@ impl<'a> Projection<'a> {
                 })
             })
             .collect::<Result<Vec<_>, Response>>()?;
-        let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
-        for entry in pool.entries_funding_script(mempool_hash) {
-            for (vout, output) in entry.tx.outputs.iter().enumerate() {
-                let Ok(vout) = u32::try_from(vout) else {
+        for (txid, transaction, spent) in &funding {
+            for (position, vout, output) in Self::outputs_paying(transaction, mempool_hash) {
+                if spent[position] {
                     continue;
-                };
-                if MempoolScriptHash::from_script(&output.script_pubkey) == mempool_hash
-                    && !pool.is_outpoint_spent(&OutPoint::new(entry.txid, vout))
-                {
-                    outputs.push(UtxoValue {
-                        txid: entry.txid.to_string(),
-                        vout,
-                        status: TransactionStatus::unconfirmed(),
-                        value: output.value.to_sat(),
-                    });
                 }
+                outputs.push(UtxoValue {
+                    txid: txid.to_string(),
+                    vout,
+                    status: TransactionStatus::unconfirmed(),
+                    value: output.value.to_sat(),
+                });
             }
         }
-        drop(pool);
         Ok(outputs)
     }
 
     pub(super) fn capture_chain_view(&self) -> Option<Arc<TipSnapshot>> {
-        self.ctx.applied_tip.load_full()
+        self.ctx.chain.applied_tip.load_full()
     }
 
     pub(super) fn ensure_chain_view(
         &self,
         expected: Option<&Arc<TipSnapshot>>,
     ) -> Result<(), Response> {
-        let current = self.ctx.applied_tip.load_full();
+        let current = self.ctx.chain.applied_tip.load_full();
         let unchanged = match (expected, current.as_ref()) {
             (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
             (None, None) => true,
@@ -499,41 +531,74 @@ impl<'a> Projection<'a> {
         }
     }
 
+    /// PRE: `confirmed_unspent` contains the script index's current records.
+    /// POST: Capture funders under one pool view, then spenders under a
+    ///   fresh one after output matching releases the first.
+    /// POST: Release the guard before hashing scripts, deduplicating and sorting.
+    /// INVARIANT: Each txid appears once in descending `(time, txid)` order.
     fn mempool_activity(
         &self,
         script_hash: ScriptHash,
         confirmed_unspent: &[ScriptIndexRecord],
     ) -> Vec<Arc<Tx>> {
-        let pool = self.ctx.mempool.read();
         let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
-        // Keyed by txid so a transaction reached through both the funding index
-        // and the spend scan is selected once. The entry is captured here rather
-        // than its txid alone: resolving a txid back to an entry afterwards
-        // costs a scan of the whole pool per selected transaction.
-        let mut selected = std::collections::BTreeMap::new();
+        // The guard covers pool facts only. Funders are captured as `Arc`
+        // clones rather than txids alone: resolving a txid back to an entry
+        // afterwards costs a scan of the whole pool per selected
+        // transaction.
+        let funders = {
+            let pool = self.ctx.mempool.gateway.read();
+            pool.entries_funding_script(mempool_hash)
+                .map(|entry| (entry.txid, entry.time, Arc::clone(&entry.tx)))
+                .collect::<Vec<_>>()
+        };
+        // Candidates are the confirmed unspent outpoints plus the
+        // script-matching outputs of every funder — probing the spend index
+        // for a funder's unrelated outputs would let a wide funding
+        // transaction amplify work. Output matching hashes every output, so
+        // it runs after the first guard releases; the spend index is then
+        // probed under a fresh read, where `outpoint_spender` simply finds
+        // no spender for an entry that left the pool between the two reads.
         let mut outputs = confirmed_unspent
             .iter()
             .map(|record| (record.txid, record.vout))
             .collect::<std::collections::BTreeSet<_>>();
-        for entry in pool.entries_funding_script(mempool_hash) {
-            selected.insert(entry.txid, (entry.time, Arc::clone(&entry.tx)));
-            for (vout, output) in entry.tx.outputs.iter().enumerate() {
-                if MempoolScriptHash::from_script(&output.script_pubkey) == mempool_hash
-                    && let Ok(vout) = u32::try_from(vout)
-                {
-                    outputs.insert((entry.txid, vout));
-                }
-            }
+        for (txid, _time, transaction) in &funders {
+            outputs.extend(
+                Self::outputs_paying(transaction, mempool_hash).map(|(_, vout, _)| (*txid, vout)),
+            );
+        }
+        let spenders = {
+            let pool = self.ctx.mempool.gateway.read();
+            outputs
+                .iter()
+                .filter_map(|(txid, vout)| {
+                    let Ok(Some(spender)) = pool.outpoint_spender(OutPoint::new(*txid, *vout))
+                    else {
+                        return None;
+                    };
+                    Some((
+                        (*txid, *vout),
+                        (
+                            spender.entry.time,
+                            spender.entry.txid,
+                            Arc::clone(&spender.entry.tx),
+                        ),
+                    ))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        // Keyed by txid so a transaction reached through both the funding index
+        // and the spend scan is selected once.
+        let mut selected = std::collections::BTreeMap::new();
+        for (txid, time, transaction) in &funders {
+            selected.insert(*txid, (*time, Arc::clone(transaction)));
         }
         for (txid, vout) in &outputs {
-            if let Ok(Some(spender)) = pool.outpoint_spender(OutPoint::new(*txid, *vout)) {
-                selected.insert(
-                    spender.entry.txid,
-                    (spender.entry.time, Arc::clone(&spender.entry.tx)),
-                );
+            if let Some((time, spender_txid, transaction)) = spenders.get(&(*txid, *vout)) {
+                selected.insert(*spender_txid, (*time, Arc::clone(transaction)));
             }
         }
-        drop(pool);
         let mut entries = selected
             .into_iter()
             .map(|(txid, (time, transaction))| (time, txid, transaction))
@@ -547,8 +612,26 @@ impl<'a> Projection<'a> {
             .collect()
     }
 
+    /// The outputs of `transaction` that pay `script`, as their position in the
+    /// output list, their `vout`, and the output itself. A position that cannot
+    /// be addressed as a `vout` has no output here.
+    fn outputs_paying(
+        transaction: &Tx,
+        script: MempoolScriptHash,
+    ) -> impl Iterator<Item = (usize, u32, &TxOut)> {
+        transaction
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(move |(position, output)| {
+                let vout = u32::try_from(position).ok()?;
+                (MempoolScriptHash::from_script(&output.script_pubkey) == script)
+                    .then_some((position, vout, output))
+            })
+    }
+
     pub(super) const fn bitcoin_network(&self) -> BitcoinNetwork {
-        match self.ctx.chain_network {
+        match self.ctx.chain.chain_network {
             Network::Mainnet => BitcoinNetwork::Bitcoin,
             Network::Testnet3 => BitcoinNetwork::Testnet,
             Network::Testnet4 => BitcoinNetwork::Testnet4,

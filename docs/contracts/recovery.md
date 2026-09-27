@@ -141,6 +141,14 @@ recovery contract.
   The root is installed only after the required file and directory syncs and
   the atomic batch finish.
 - A partial append after the head is not a valid connect or disconnect.
+- Startup loads the durable head before opening block files for tail recovery.
+  The head's extent file must contain complete frames through its committed
+  offset; a missing file, short prefix, or malformed frame refuses open with
+  `StorageError::IncompatibleData`, preserving every block file. Only a torn
+  append beyond that extent may be discarded, even if the restored checkpoint
+  already matches the head. This framing admission scans the extent file and
+  current append tail, not the historical archive; earlier pruned file gaps
+  remain valid and locator/body integrity checks keep their existing owners.
 - On disconnect, `DurableHead.commit_id` advances to a new value that is
   greater than the previous value. Monotonicity holds for both connect and
   disconnect.
@@ -351,6 +359,11 @@ state is harmless and keeps the node operating until replay closes the gap.
   points — SIGKILL restart across journal, reorg, and publication scenarios,
   partial-write handling, and upgrade-matrix fallback.
 - `crates/node/tests/unit/state/tests/recovery.rs`:
+  `committed_frame_corruption_refuses_startup_and_preserves_all_bytes` covers
+  damaged committed magic/length with and without a checkpoint;
+  `checkpoint_resume_discards_only_incomplete_uncommitted_tail` preserves
+  the valid orphan-tail recovery path. Storage's extent tests cover missing
+  or truncated committed files, newer orphan files, and pruned older gaps.
   `torn_disconnect_refusal_names_authoritative_stores_to_remove` proves an
   armed disconnect marker refuses startup while naming the `chainstate`,
   `chainstate-checkpoints`, and `txindex` paths the operator must remove;
@@ -361,6 +374,23 @@ state is harmless and keeps the node operating until replay closes the gap.
   cover `RCV-05` and bounded disconnect/reorg memory; `RCV-08`'s bounded
   stream windows and retention leases are exercised by the node sync/recovery
   scenarios together with the #655 boot-replay tests above.
+
+- Pruning and retained-history authority (#1151): `node:prune_executed` holds
+  the executed frontier — one past the highest row a committed pass deleted —
+  written in the same durable batch as its deletions, so a restart
+  reconstructs exactly the committed boundary and refuses a lease over
+  deleted history. A legacy datadir reconstructs the bound from its lowest
+  surviving rows; only a legacy datadir with no rows surviving in either
+  family falls back to the requested `node:pruneheight`, which is intent.
+  `RetentionRegistry::reserve` is the single prune/retention
+  linearization point, and `PruneReservation::commit` is the only path that
+  moves the executed line. `crates/storage/tests/prune_then_reorg.rs` proves
+  the race (`history_request_between_planning_and_commit_is_refused`), the
+  restart law (`executed_frontier_survives_restart_and_refuses_deleted_heights`),
+  monotonicity across passes and reorg-reintroduced rows
+  (`executed_frontier_is_monotonic_across_passes_and_reintroduced_rows`), and
+  the legacy migration (`legacy_datadir_reconstructs_from_surviving_rows_not_the_requested_line`,
+  `legacy_datadir_with_no_rows_falls_back_to_the_requested_line`).
 - Checkpoint publication and recovery:
   `crates/chainstate/tests/unit/checkpoint/tests/` covers consensus-valid active-chain
   replay, applied-ancestry selection, competing-fork rejection, and

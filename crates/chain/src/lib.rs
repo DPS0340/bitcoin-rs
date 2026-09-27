@@ -34,15 +34,15 @@ pub use deployment::{
     softfork_state,
 };
 pub use header_sync::{
-    HeaderAdmission, accept_headers, compact_is_met_by, current_unix_seconds,
-    validate_contextual_header, validate_pow,
+    HeaderAdmission, accept_headers, block_work, compact_is_met_by, current_unix_seconds,
+    permitted_difficulty_transition, validate_contextual_header, validate_pow,
 };
 pub use ibd::InitialBlockDownload;
 pub use node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus};
 pub use reorg::{ReorgPlan, plan_reorg};
 pub use tip::TipSnapshot;
 pub use tree::BlockTree;
-pub use view::{BlockTreeReader, TipReader};
+pub use view::{BlockTreeReader, LatchReader, TipReader};
 
 /// Errors returned by header sync, block-tree, and reorg planning operations.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -77,12 +77,14 @@ pub enum ChainError {
         /// Previous-block hash referenced by the child header.
         prev_hash: Hash256,
     },
-    /// The parent header is present but was previously marked invalid, so no
-    /// descendant may extend it.
-    #[error("parent header {prev_hash} is invalid")]
+    /// The candidate extends a header that this node has marked invalid.
+    ///
+    /// Core refuses it with `bad-prevblk` before any contextual check runs
+    /// (`src/validation.cpp:4228-4231`), so the header never enters the tree.
+    #[error("header extends invalid parent {parent:?}")]
     InvalidParent {
-        /// Previous-block hash referenced by the child header.
-        prev_hash: Hash256,
+        /// Resolved identity of the invalid parent.
+        parent: NodeId,
     },
     /// The header version is below the floor a buried deployment requires.
     ///
@@ -114,6 +116,7 @@ pub enum ChainError {
         /// Lowest legal timestamp: parent time minus `MAX_TIMEWARP`.
         minimum: u32,
     },
+
     /// A supplied parent does not match the header's previous-block hash.
     #[error("header prev hash {actual_prev} does not match expected parent {expected_prev}")]
     NonContinuousHeader {

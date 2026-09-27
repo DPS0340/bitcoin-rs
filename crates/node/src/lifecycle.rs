@@ -67,7 +67,7 @@ fn bind_rpc(
 ) -> Result<(Arc<Context>, RpcServer)> {
     let rpc_auth = Arc::new(state.config().rpc.auth.to_rpc_auth()?);
     let chainstate = state.chainstate();
-    let mut context = Context::from_handles(ContextHandles {
+    let context = Context::from_handles(ContextHandles {
         chain: ChainHandles {
             chain_tip: chainstate.header_tip_reader(),
             applied_tip: chainstate.applied_tip_reader(),
@@ -77,16 +77,27 @@ fn bind_rpc(
             transactions: state.transactions(),
             utxo: chainstate.utxo_handle(),
             coin_stats: chainstate.coin_stats_handle(),
-            block_tree: chainstate.block_tree_reader(),
+            block_tree: chainstate.block_tree_handle(),
             chain_network: state.config().network,
-            closed_for_recovery: chainstate.closed_for_recovery_flag(),
+            chain_transition: chainstate.read_fence(),
+            block_body_source: Some(block_body_source),
+            prune_service: state.prune_service(),
+            closed_for_recovery: chainstate.closed_for_recovery_reader(),
+            chain_control: Some(Arc::new(RpcChainControl {
+                handles: chainstate,
+                followers: state.chain_followers(),
+                sync: state.sync(),
+            })),
+            rollback_warnings: Some(state.recovery_reporter()),
         },
         mempool: MempoolHandles {
-            mempool: state.mempool_gateway(),
+            gateway: state.mempool_gateway(),
         },
         indexes: IndexHandles {
             derived_index: state.derived_index_query(),
             script_index: state.script_index_query(),
+            esplora_tx_index: state.esplora_derived_index_query(),
+            derived_index_status: Some(state.derived_index_status()),
         },
         network: NetworkHandles {
             network: state.network(),
@@ -99,23 +110,9 @@ fn bind_rpc(
         mining: MiningHandles {
             mining_control: Some(Arc::clone(mining_control)),
         },
-        derived_index_status: Some(state.derived_index_status()),
-    })
-    .with_esplora_derived_index(state.esplora_derived_index_query())
-    .with_block_body_source(block_body_source)
-    .with_chain_transition(chainstate.read_fence());
-    if let Some(prune_service) = state.prune_service() {
-        context = context.with_prune_service(prune_service);
-    }
-    context = context
-        .with_chain_control(Arc::new(RpcChainControl {
-            handles: chainstate,
-            followers: state.chain_followers(),
-            sync: state.sync(),
-        }))
-        .with_zmq_publisher(state.zmq_publisher())
-        .with_debug_log_path(state.data_dir().join("debug.log"))
-        .with_rollback_warnings(state.recovery_reporter());
+        zmq_publisher: state.zmq_publisher(),
+        debug_log_path: Some(state.data_dir().join("debug.log")),
+    });
     let context = Arc::new(context);
     let handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::clone(&context)));
     let server = RpcServer::bind(
@@ -525,8 +522,12 @@ pub(crate) fn start_node(
     let block_body_source = state.block_body_source()?;
     let chainstate = state.chainstate();
     let p2p_chain_query: Arc<dyn bitcoin_rs_p2p::ChainQuery> = Arc::new(
-        bitcoin_rs_p2p::ActiveChainQuery::new(chainstate.block_tree_reader())
-            .with_block_body_source(Arc::clone(&block_body_source)),
+        bitcoin_rs_p2p::ActiveChainQuery::new(
+            chainstate.block_tree_reader(),
+            chainstate.applied_tip_reader(),
+            state.config().network,
+        )
+        .with_block_body_source(Arc::clone(&block_body_source)),
     );
     let (sync_wake_tx, sync_wake_rx) = bounded(1);
     let sync = state.sync();
@@ -545,18 +546,16 @@ pub(crate) fn start_node(
     signal.attach(&mining_control);
     signal.attach_sequence_wake(&sequence_wake);
     let gateway = state.mempool_gateway();
-    // One chain-owned latch, shared by the RPC context and the P2P listener:
-    // `initialblockdownload` and the transaction-relay gate can never disagree.
-    let ibd = chainstate.ibd_latch();
+    // The node's one latch, built with the chainstate at open and already
+    // held by the block-download executor: `initialblockdownload`, the
+    // transaction-relay gate, and block-peer eligibility read one signal.
+    let ibd = state.ibd();
     let tx_inventory: Arc<dyn bitcoin_rs_p2p::TxInventory> = gateway.clone();
     let compact_hints: Arc<dyn bitcoin_rs_p2p::CompactBlockHints> = gateway.clone();
     let listener_extras = bitcoin_rs_p2p::ListenerExtras {
         tx_inventory: Some(tx_inventory),
         compact_hints: Some(compact_hints),
         inbound_tx: Some(state.inbound_tx_sender()),
-        // The latch answers against the configured consensus network, not a
-        // magic-derived one: a custom `--p2p-magic` can carry another
-        // network's bytes.
         ibd: Some((Arc::clone(&ibd), state.config().network)),
         // One orchestrator: the listener announces block inventory to the
         // same sync loop the event loop drives.
@@ -567,6 +566,7 @@ pub(crate) fn start_node(
     guard.services.tx_relay = Some(bitcoin_rs_p2p::spawn_tx_relay_worker(
         bitcoin_rs_p2p::PeerRelaySink::new(state.peer_table()),
         relay_rx,
+        Arc::downgrade(&gateway),
         Arc::clone(&shutdown),
     )?);
     guard.services.tx_ingress = Some(crate::tx_ingress::spawn_tx_ingress_consumer(
