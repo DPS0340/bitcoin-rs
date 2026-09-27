@@ -1143,10 +1143,17 @@ fn park_automatic_dial(
     true
 }
 
-/// Releases a DNS-pending address when its dial leaves the retry queue.
+/// Releases a DNS-pending address when its dial leaves the retry queue,
+/// re-arming the one-minute suppression: a dial parked longer than
+/// `FAILED_ADDR_BACKOFF` has already expired from `recently_queued`, so
+/// clearing `pending` alone would let the next DNS pass re-offer an
+/// address whose connection attempt is still in flight.
 fn clear_pending_auto_dial(dns_queue: &Mutex<DnsQueueState>, dial: OutboundDial) {
     if !dial.manual {
-        let _ = dns_queue.lock().pending.remove(&dial.addr);
+        let mut queue = dns_queue.lock();
+        if queue.pending.remove(&dial.addr) {
+            queue.recently_queued.insert(dial.addr, Instant::now());
+        }
     }
 }
 
