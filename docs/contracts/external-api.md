@@ -42,13 +42,9 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
   `Deviation`, `Implemented (unverified)`, `Extension`, `Disabled`,
   `Unimplemented`. `[reference].differential_harness` in
   [core-compat.toml](../../crates/rpc/core-compat.toml) gates `Supported`: no row
-  may claim it while that flag is false.
-- Compatibility class, runtime readiness, and observed proof stay
-  separate row facts. The `Status` vocabulary is: `Supported`,
-  `Deviation`, `Implemented (unverified)`, `Extension`, `Disabled`,
-  `Unimplemented`. `Supported` is claimable only while
-  `[reference].differential_harness` in `crates/rpc/core-compat.toml` is
-  enabled; an unverified implementation never reads as verified parity.
+  may claim it while that flag is false. Compatibility class, runtime
+  readiness, and observed proof stay separate row facts; an unverified
+  implementation never reads as verified parity.
 - Unsupported Core surfaces stay declared `Unimplemented` and answer
   `RpcError::MethodNotFound` (code `-32601`). No wallet-only RPC is a
   disguised successful no-op.
