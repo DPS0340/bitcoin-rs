@@ -106,7 +106,7 @@ fn strip_dir<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
 #[allow(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::cell::RefCell;
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Duration;
@@ -1044,8 +1044,6 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn block_status_and_block_list_never_straddle_two_applied_branches()
     -> Result<(), Box<dyn std::error::Error>> {
-        use std::sync::atomic::AtomicBool;
-
         use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
         use bitcoin_rs_primitives::Header;
 
@@ -1145,6 +1143,10 @@ mod tests {
                 cell.store(Some(Arc::clone(tip)));
             }
         });
+        let mut swapper = SwapperGuard {
+            stop: Arc::clone(&stop),
+            handle: Some(swapper),
+        };
 
         let status_path = format!("/block/{a1_hash}/status");
         let (a1_text, b1_text) = (a1_hash.to_string(), b1_hash.to_string());
@@ -1220,7 +1222,12 @@ mod tests {
             std::thread::yield_now();
         }
         stop.store(true, Ordering::Relaxed);
-        swapper.join().expect("swapper thread panicked");
+        swapper
+            .handle
+            .take()
+            .expect("swapper handle")
+            .join()
+            .expect("swapper thread panicked");
         assert!(
             seen_a && seen_b,
             "a publication was never observed, so coherence proved nothing"
@@ -1240,6 +1247,7 @@ mod tests {
         let txid = transaction.txid();
         let ctx = Arc::new(Context::new());
         ctx.mempool
+            .gateway
             .pool()
             .write()
             .insert_entry(MempoolEntry::new(
@@ -1381,6 +1389,7 @@ mod tests {
                 },
             ));
             ctx.mempool
+                .gateway
                 .pool()
                 .write()
                 .insert_entry(MempoolEntry::new(tx, 100, 100, 0, 0, 0))
@@ -1586,6 +1595,7 @@ mod tests {
             unspent: vec![confirmed],
         }));
         ctx.mempool
+            .gateway
             .pool()
             .write()
             .insert_entry(MempoolEntry::new(
@@ -1648,11 +1658,12 @@ mod tests {
         }));
         context
             .mempool
+            .gateway
             .pool()
             .write()
             .insert_entry(MempoolEntry::new(Arc::clone(&funder), 100, 1_000, 1, 0, 0))
             .expect("seed funder");
-        let first_sequence = context.mempool.pool().read().sequence_number();
+        let first_sequence = context.mempool.gateway.pool().read().sequence_number();
         let context = Arc::new(context);
         let handler = Handler::new(Arc::clone(&context));
         let script_hash = ScriptHash::new(&target)
@@ -1671,7 +1682,7 @@ mod tests {
             "request did not capture its first mempool view"
         );
         {
-            let mut pool = context.mempool.pool().write();
+            let mut pool = context.mempool.gateway.pool().write();
             pool.remove_for_block(&[funder.as_ref()], &[funder_txid], 42);
             assert!(!pool.contains_txid(&funder_txid));
             pool.insert_entry(MempoolEntry::new(Arc::new(spender), 100, 1_000, 2, 0, 0))
@@ -1817,7 +1828,7 @@ mod tests {
             let tip = tree
                 .tip()
                 .ok_or_else(|| std::io::Error::other("missing active tip"))?;
-            ctx.chain.applied_tip.store(Some(tip));
+            ctx.chain.applied_tip.store(Some(Arc::new((*tip).clone())));
         }
         ctx.indexes.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(transaction)));
 
@@ -1853,6 +1864,22 @@ mod tests {
     /// the binning loop and wait to leave it. Call on the serving thread.
     fn arm_binning_gate(entered: Sender<()>, release: Receiver<()>) {
         BINNING_GATE.with(|slot| *slot.borrow_mut() = Some((entered, release)));
+    }
+
+    /// Stops and joins a busy helper thread even when an assertion unwinds, so
+    /// a failed check never leaves a spinning thread for later tests.
+    struct SwapperGuard {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for SwapperGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     /// Test-only observation of the histogram-binning call site: announce that
@@ -1940,6 +1967,7 @@ mod tests {
     fn seed_mempool(ctx: Context, seeds: &[Seed]) -> Arc<Context> {
         for seed in seeds {
             ctx.mempool
+                .gateway
                 .pool()
                 .write()
                 .insert_entry(MempoolEntry::new(
@@ -2000,7 +2028,7 @@ mod tests {
         });
 
         let reached_binning = entered_recv.recv_timeout(GATE_TIMEOUT).is_ok();
-        let writer_progress = ctx.mempool.pool().try_write().is_some();
+        let writer_progress = ctx.mempool.gateway.pool().try_write().is_some();
         let _ = release_send.send(());
         let response = request.join().expect("gated request completes");
 

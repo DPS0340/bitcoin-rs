@@ -24,7 +24,9 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 
 | surface | since | notes |
 |---|---|---|
-| `getblockchaininfo` | 0.4.0 | Core declares warnings as a string; this node emits an array. Optional prune and signet fields serialize as null rather than omitted (automatic_pruning, prune_target_size, pruneheight, signet_challenge). Tracked in #160. |
+| `getblockchaininfo` | 0.4.0 | Optional prune and signet fields serialize as null rather than omitted (automatic_pruning, prune_target_size, pruneheight, signet_challenge). Tracked in #160. |
+| `getblock` | 0.4.0 | Response is the pinned corepc v31 verbose contract; verbosity 3 serves the verbosity-2 shape because no prevout source exists — Core returns prevouts at verbosity 3 (crates/rpc/src/handlers/chain.rs). |
+| `verifychain` | 0.4.0 | Levels 3 and 4 omit Core's block disconnect and reconnect checks; level 3 behaves as level 2 and level 4 does not replay the UTXO set (crates/rpc/src/handlers/chain.rs). |
 | `scantxoutset` | 0.4.0 | Accepts only addr() scan descriptors; Core supports the full descriptor set (crates/rpc/src/handlers/chain.rs). Response uses the v28 scan contract; the status action answers null. |
 | `sendrawtransaction` | 0.4.0 | Core 31.1 replacement, modified-fee, cluster and TRUC cases are process-verified in overhaul_process_harness::policy_cases. Exact optimal graph ordering does not emulate Core transient SFL work-budget states. Capacity/floor accounting and generic consensus error details retain the differences in docs/policies/mempool-policy.md; aggregate package submission is unsupported. |
 | `testmempoolaccept` | 0.4.0 | Single preview shares committed admission verification. Core 31.1 package shape, dependency, fail-fast and replacement-disallowed cases are process-verified in overhaul_process_harness::policy_cases. Exact graph ordering, capacity/floor behavior and generic error details retain the differences in docs/policies/mempool-policy.md. Aggregate package submission is unsupported. |
@@ -33,9 +35,10 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `getrpcinfo` | 0.4.0 | active_commands is always an empty array; this node does not track in-flight RPC calls. logpath reports the configured debug log path (crates/rpc/src/handlers/util.rs). |
 | `getmemoryinfo` | 0.4.0 | mode=mallocinfo is rejected with an invalid-parameter error instead of returning allocator XML (crates/rpc/src/handlers/util.rs). The figures are resident set size read from the OS, not Core's locked-pool allocator accounting. |
 | `estimaterawfee` | 0.4.0 | local_shape: the fee estimator does not expose Core decay/scale/pass/fail internals, so horizon objects carry feerate only and the no-estimate branch stays {} (crates/rpc/src/handlers/util.rs). All three horizons carry the same feerate where Core computes three independent estimates. |
-| `getnetworkinfo` | 0.4.0 | Core declares warnings as a string; this node emits an array. Tracked in #160. |
+| `validateaddress` | 0.4.0 | local_shape (invalid branch): a malformed or wrong-network address is hand-built as Core's sparse {isvalid:false} object because corepc-types models the valid-only fields (address, scriptPubKey, isscript, iswitness) as required and cannot represent that wire shape; valid addresses round-trip the typed v31 contract (crates/rpc/src/handlers/util.rs). |
+| `getpeerinfo` | 0.4.0 | Pinned v31 shape; aggregate byte totals are measured, while per-message byte breakdowns report empty maps and last_transaction/last_block/minimum_fee_filter/last_inv_sequence report Core's zero-value defaults; unmeasured telemetry (ping times, addr relay stats, starting_height, address_local, mapped_as) is null-omitted (crates/rpc/src/handlers/network.rs). |
 | `ping` | 0.4.0 | Answers immediately; Core schedules a P2P ping and reports the seen pong (crates/rpc/src/handlers/network.rs). |
-| `getmininginfo` | 0.4.0 | Pinned v30 shape including bits/target and next-block facts. Unset currentblocktx, currentblockweight, and signet_challenge are omitted like Core. warnings is an array here and a string in Core's declaration. Tracked in #160. |
+| `getmininginfo` | 0.4.0 | Pinned v30 shape including bits/target and next-block facts. Unset currentblocktx, currentblockweight, and signet_challenge are omitted like Core. |
 
 ### Implemented (unverified)
 
@@ -47,10 +50,8 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `getblockcount` | 0.4.0 |  |
 | `getblockhash` | 0.4.0 |  |
 | `getbestblockhash` | 0.4.0 |  |
-| `getblock` | 0.4.0 | Response is the pinned corepc v31 verbose contract; verbosity 3 serves the verbosity-2 shape (no prevout source). |
 | `getblockheader` | 0.4.0 |  |
 | `getblockstats` | 0.4.0 |  |
-| `verifychain` | 0.4.0 |  |
 | `gettxoutsetinfo` | 0.4.0 |  |
 | `getindexinfo` | 0.4.0 |  |
 | `pruneblockchain` | 0.4.0 |  |
@@ -69,10 +70,9 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `getmempooldescendants` | 0.4.0 |  |
 | `uptime` | 0.4.0 |  |
 | `getzmqnotifications` | 0.4.0 | Requires the zmq feature and --enablezmq* startup flags. |
-| `validateaddress` | 0.4.0 | local_shape (invalid branch): a malformed or wrong-network address is hand-built as Core's sparse {isvalid:false} object because corepc-types models the valid-only fields (address, scriptPubKey, isscript, iswitness) as required and cannot represent that wire shape; valid addresses round-trip the typed v31 contract (crates/rpc/src/handlers/util.rs). |
 | `getdescriptorinfo` | 0.4.0 |  |
 | `deriveaddresses` | 0.4.0 |  |
-| `getpeerinfo` | 0.4.0 | Pinned v31 shape; telemetry this node does not measure (byte counters, pingwait, addr relay stats) reports Core's zero-value defaults. |
+| `getnetworkinfo` | 0.4.0 |  |
 | `addnode` | 0.4.0 |  |
 | `disconnectnode` | 0.4.0 |  |
 | `getconnectioncount` | 0.4.0 |  |
@@ -238,4 +238,4 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `rawtx` | 0.4.0 | Requires the zmq feature and a --zmqpubrawtx endpoint. |
 | `sequence` | 0.4.0 | Requires the zmq feature and a --zmqpubsequence endpoint. Publishes C/D block events and A/R mempool events; A/R carry reversed txid, the label byte, and the mempool sequence as u64 LE (crates/rpc/src/zmq.rs). |
 
-Row counts: Supported 0, Deviation 15, Implemented (unverified) 64, Extension 2, Disabled 0, Unimplemented 93 - total 174.
+Row counts: Supported 0, Deviation 18, Implemented (unverified) 61, Extension 2, Disabled 0, Unimplemented 93 - total 174.

@@ -19,8 +19,10 @@ the first embedder — there is one lifecycle implementation, not two.
   derived-index worker is stopped under a bounded join before `teardown`
   runs, so the clean checkpoint publishes and chainstate closes only
   after the index released its stores. A join abandoned at the deadline
-  records a teardown error, so the clean checkpoint never publishes while
-  a detached worker can still write.
+  records a teardown error, and so does a worker whose backend open was
+  abandoned: its supervisor can exit while the detached open thread still
+  touches the store. Either way the clean checkpoint never publishes
+  while detached index I/O can still write.
   `TeardownMode` distinguishes `StartupAbort` from `CleanShutdown`.
   An aborted or dropped run never publishes a clean checkpoint. Clean
   shutdown publishes only after every prior cleanup stage succeeded. The
@@ -36,11 +38,11 @@ the first embedder — there is one lifecycle implementation, not two.
 - **EMB-04 — Typed reads mirror the RPC facts.** `snapshot()` returns the
   coherent `ChainSnapshot`; `sync_progress()` derives the
   `getblockchaininfo` fields from the same handles without RPC JSON. The
-  calculation is `Context::sync_progress` in `crates/rpc/src/context.rs`, the
+  calculation is `ChainHandles::sync_progress` in `crates/rpc/src/context.rs`, the
   identical computation `getblockchaininfo` runs. `capabilities()` returns
   the node's concrete-service `CapabilitySnapshot`. Owners:
   `crates/node/src/embed.rs` and `crates/rpc/src/context.rs`; wire types:
-  `crates/index/src/capabilities.rs`.
+  `crates/rpc/src/capabilities.rs`.
 - **EMB-05 — Broadcast is the shared admission.** `Node::broadcast` runs
   `Context::admit_transaction` (`crates/rpc/src/context.rs`) — the identical
   typed admission `sendrawtransaction` runs (`crates/rpc/src/handlers/tx.rs`):

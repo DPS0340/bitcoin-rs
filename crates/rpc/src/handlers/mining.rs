@@ -41,6 +41,7 @@ const GENERATE_INVALID_ADDRESS: &str = "Error: Invalid address";
 
 pub(crate) fn getblocktemplate(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let control = ctx
+        .mining
         .mining_control
         .as_ref()
         .ok_or_else(|| RpcError::MethodNotFound("getblocktemplate".to_owned()))?;
@@ -63,6 +64,7 @@ pub(crate) fn getblocktemplate(ctx: &Arc<Context>, params: &Value) -> Result<Val
 pub(crate) fn getmininginfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let control = ctx
+        .mining
         .mining_control
         .as_ref()
         .ok_or_else(|| RpcError::MethodNotFound("getmininginfo".to_owned()))?;
@@ -72,6 +74,7 @@ pub(crate) fn getmininginfo(ctx: &Arc<Context>, params: &Value) -> Result<Value,
 
 pub(crate) fn submitblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let control = ctx
+        .mining
         .mining_control
         .as_ref()
         .ok_or_else(|| RpcError::MethodNotFound("submitblock".to_owned()))?;
@@ -122,6 +125,7 @@ fn decode_block_header(hex: &str) -> Result<Header, RpcError> {
 
 pub(crate) fn submitheader(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let control = ctx
+        .mining
         .mining_control
         .as_ref()
         .ok_or_else(|| RpcError::MethodNotFound("submitheader".to_owned()))?;
@@ -180,21 +184,26 @@ pub(crate) fn prioritisetransaction(ctx: &Arc<Context>, params: &Value) -> Resul
     }
     // See the authoritative API-24 contract for this network-dependent rule.
     let prioritised = if ctx.chain.chain_network == Network::Regtest {
-        ctx.mempool.prioritise(txid, fee_delta).map(|()| true)
+        ctx.mempool
+            .gateway
+            .prioritise(txid, fee_delta)
+            .map(|()| true)
     } else {
         let dust_relay_fee = ctx
             .mempool
+            .gateway
             .read()
             .policy_snapshot()
             .standardness
             .dust_relay_fee;
         ctx.mempool
+            .gateway
             .prioritise_if_not_dust(txid, fee_delta, dust_relay_fee)
     };
     if !prioritised.map_err(|_| RpcError::InvalidParams("fee delta would overflow"))? {
         return Err(RpcError::InvalidParameter(PRIORITISE_DUST_ERROR.to_owned()));
     }
-    if let Some(control) = ctx.mining_control.as_ref() {
+    if let Some(control) = ctx.mining.mining_control.as_ref() {
         control.publish_generation();
     }
     Ok(json!(true))
@@ -203,6 +212,7 @@ pub(crate) fn prioritisetransaction(ctx: &Arc<Context>, params: &Value) -> Resul
 pub(crate) fn generatetoaddress(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_at_most_params(params, 3)?;
     let control = ctx
+        .mining
         .mining_control
         .as_ref()
         .ok_or_else(|| RpcError::MethodNotFound("generatetoaddress".to_owned()))?;
@@ -234,6 +244,7 @@ pub(crate) fn generatetoaddress(ctx: &Arc<Context>, params: &Value) -> Result<Va
 pub(crate) fn generateblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_at_most_params(params, 3)?;
     let control = ctx
+        .mining
         .mining_control
         .as_ref()
         .ok_or_else(|| RpcError::MethodNotFound("generateblock".to_owned()))?;
@@ -268,6 +279,7 @@ pub(crate) fn generateblock(ctx: &Arc<Context>, params: &Value) -> Result<Value,
 
 pub(crate) fn getnetworkhashps(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let control = ctx
+        .mining
         .mining_control
         .as_ref()
         .ok_or_else(|| RpcError::MethodNotFound("getnetworkhashps".to_owned()))?;
@@ -287,7 +299,7 @@ pub(crate) fn getprioritisedtransactions(
 ) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let mut object = sonic_rs::Object::new();
-    for entry in ctx.mempool.prioritised_transactions() {
+    for entry in ctx.mempool.gateway.prioritised_transactions() {
         let txid = entry.txid.to_string();
         let mut row = sonic_rs::Object::new();
         let _ = row.insert("fee_delta", json!(entry.fee_delta));
@@ -387,7 +399,7 @@ fn parse_generateblock_transactions(
         };
         if let Ok(txid) = Txid::from_str(text) {
             let snapshot = snapshot
-                .get_or_insert_with(|| ctx.mempool.read().mining_snapshot())
+                .get_or_insert_with(|| ctx.mempool.gateway.read().mining_snapshot())
                 .entries
                 .iter()
                 .find(|entry| entry.txid == txid)
@@ -940,7 +952,7 @@ mod tests {
         let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
         *control.proposal.lock() = BlockValidationResult::Accepted;
         let mut ctx = Context::new();
-        ctx.mining_control = Some(control);
+        ctx.mining.mining_control = Some(control);
         let ctx = Arc::new(ctx);
         let genesis = sample_block();
         let hex = hex_encode(&consensus_bytes(&genesis));
@@ -1416,7 +1428,7 @@ mod tests {
         };
         let txid = tx.txid();
         {
-            let mut pool = ctx.mempool.pool().write();
+            let mut pool = ctx.mempool.gateway.pool().write();
             pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7, 0))
                 .unwrap_or_else(|err| panic!("insert failed: {err}"));
         }
@@ -1436,7 +1448,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("zero dummy float must be accepted: {err}"));
         prioritisetransaction(&ctx, &json!([txid_hex.as_str(), null, 0]))
             .unwrap_or_else(|err| panic!("null dummy must be accepted: {err}"));
-        let pool = ctx.mempool.read();
+        let pool = ctx.mempool.gateway.read();
         let entry = pool
             .entry_by_txid(&txid)
             .expect("entry remains after prioritise");
@@ -1488,7 +1500,7 @@ mod tests {
         let tx = dust_priority_tx();
         let txid = tx.txid();
         {
-            let mut pool = ctx.mempool.pool().write();
+            let mut pool = ctx.mempool.gateway.pool().write();
             pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7, 0))
                 .unwrap_or_else(|err| panic!("insert failed: {err}"));
         }
@@ -1511,7 +1523,7 @@ mod tests {
         let tx = dust_priority_tx();
         let txid = tx.txid();
         {
-            let mut pool = ctx.mempool.pool().write();
+            let mut pool = ctx.mempool.gateway.pool().write();
             pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7, 0))
                 .unwrap_or_else(|err| panic!("insert failed: {err}"));
         }
@@ -1762,15 +1774,17 @@ mod tests {
         };
         let pooled = pooled_tx.txid();
         {
-            let mut pool = ctx.mempool.pool().write();
+            let mut pool = ctx.mempool.gateway.pool().write();
             pool.insert_entry(MempoolEntry::new(Arc::new(pooled_tx), 100, 1_000, 1, 7, 0))
                 .unwrap_or_else(|err| panic!("insert failed: {err}"));
         }
         let absent = Txid::from(Hash256::from_le_bytes(&[0x22; 32]));
         ctx.mempool
+            .gateway
             .prioritise(pooled, 500)
             .unwrap_or_else(|err| panic!("pooled overlay: {err}"));
         ctx.mempool
+            .gateway
             .prioritise(absent, -25)
             .unwrap_or_else(|err| panic!("absent overlay: {err}"));
         let result = getprioritisedtransactions(&ctx, &json!([]))
@@ -1976,7 +1990,7 @@ mod tests {
         let pooled = sample_raw_tx();
         let txid = pooled.txid();
         {
-            let mut pool = ctx.mempool.pool().write();
+            let mut pool = ctx.mempool.gateway.pool().write();
             pool.insert_entry(MempoolEntry::new(Arc::new(pooled), 100, 1_000, 1, 7, 0))
                 .unwrap_or_else(|err| panic!("insert failed: {err}"));
         }
@@ -1992,6 +2006,7 @@ mod tests {
             .unwrap_or_else(|| panic!("generateblock must call generate"));
         let pooled_entry = ctx
             .mempool
+            .gateway
             .read()
             .mining_snapshot()
             .entries

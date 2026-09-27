@@ -16,7 +16,8 @@ use alloc::vec::Vec;
 use bitcoin::Address;
 use bitcoin_rs_primitives::{CompactTarget, Network, Tx, TxIn, TxOut, consensus_bytes};
 use bitcoin_rs_script::{
-    is_multisig, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, witness_program,
+    is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_push_only, multisig_key_count,
+    witness_program,
 };
 use sonic_rs::{JsonValueMutTrait as _, JsonValueTrait as _, Value};
 
@@ -172,11 +173,6 @@ pub(crate) fn classify(script: &[u8]) -> ScriptShape {
     if script.is_empty() {
         return ScriptShape::Empty;
     }
-    // Core's `Solver` returns `UNSPENDABLE` for any script longer than
-    // `MAX_SCRIPT_SIZE`, and `UNSPENDABLE` renders as `nulldata`.
-    if script.len() > 10_000 {
-        return ScriptShape::NullData;
-    }
     if is_p2sh(script) {
         return ScriptShape::ScriptHash;
     }
@@ -190,7 +186,10 @@ pub(crate) fn classify(script: &[u8]) -> ScriptShape {
             _ => ScriptShape::Nonstandard,
         };
     }
-    if is_op_return(script) {
+    // Core's Solver classifies an `OP_RETURN` output `nulldata` only when the
+    // bytes after the opcode are all pushes; an interleaved opcode is
+    // `nonstandard`.
+    if is_op_return(script) && is_push_only(&script[1..]) {
         return ScriptShape::NullData;
     }
     if is_p2pk(script) {
@@ -199,7 +198,10 @@ pub(crate) fn classify(script: &[u8]) -> ScriptShape {
     if is_p2pkh(script) {
         return ScriptShape::PubkeyHash;
     }
-    if is_multisig(script) {
+    // `multisig_key_count` is Core's `MatchMultisig`: it already requires
+    // valid count operands and serialized pubkeys, so the shape check alone
+    // adds nothing here.
+    if multisig_key_count(script).is_some() {
         return ScriptShape::Multisig;
     }
     ScriptShape::Nonstandard
@@ -692,6 +694,27 @@ mod tests {
         for ((shape, script), (want_shape, name)) in cases.iter().zip(expected) {
             assert_eq!(classify(script), *want_shape, "classify {script:?}");
             assert_eq!(core_type_name(*shape), *name);
+        }
+    }
+
+    #[test]
+    fn multisig_shape_without_valid_keys_is_nonstandard() {
+        // OP_1 <4 bytes> OP_1 OP_CHECKMULTISIG: the template shape of bare
+        // multisig with a push that is not pubkey-sized at all.
+        let short_push = [0x51, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x51, 0xae];
+        // OP_1 <33 bytes starting 0x04> OP_1 OP_CHECKMULTISIG: pubkey-sized
+        // but a 0x04 header promises a 65-byte key, so `CPubKey::IsValid`
+        // (and `multisig_key_count`) rejects it.
+        let mut wrong_prefix = vec![0x51, 0x21, 0x04];
+        wrong_prefix.extend([0x11; 32]);
+        wrong_prefix.extend([0x51, 0xae]);
+        for script in [&short_push[..], &wrong_prefix[..]] {
+            assert_eq!(classify(script), ScriptShape::Nonstandard, "{script:?}");
+            assert_eq!(
+                core_type_name(classify(script)),
+                "nonstandard",
+                "{script:?}"
+            );
         }
     }
 

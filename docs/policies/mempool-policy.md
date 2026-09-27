@@ -4,6 +4,7 @@
 
 The [policy contract](../contracts/mempool-policy.md) owns the rules below;
 this page maps them to evidence and intentional compatibility differences.
+<<<<<<< HEAD
 [core-compat.toml](../../crates/rpc/core-compat.toml) pins the Core source and binary identities.
 
 The process policy tests explicitly configure Core with

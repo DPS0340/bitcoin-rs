@@ -158,6 +158,77 @@ fn blocked_open_abandonment_detaches_and_poisons() {
     drop(open_tx);
 }
 
+/// An interrupted open detaches the backend open thread: the supervisor
+/// still exits, so `open_was_abandoned` is the caller's only signal that a
+/// detached thread may still touch the store.
+#[test]
+fn shutdown_during_open_reports_abandonment_after_supervisor_exit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let (open_tx, open_rx) = crossbeam_channel::bounded::<()>(0);
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded::<()>(0);
+    let mut inputs = build_worker_inputs(dir.path(), 43);
+    let open_store = Arc::clone(&inputs.spec.open_store);
+    inputs.spec.open_store = Arc::new(move |dir| {
+        let _ = entered_tx.send(());
+        let _ = open_rx.recv();
+        open_store(dir)
+    });
+
+    let worker = DerivedIndexWorker::spawn_with_open(
+        Arc::clone(&inputs.runtime),
+        inputs.spec,
+        Arc::clone(&inputs.lifecycle),
+        inputs.generation.clone(),
+        bitcoin_rs_chain::TipReader::new(Arc::clone(&inputs.applied_tip)),
+        bitcoin_rs_chain::BlockTreeReader::new(Arc::clone(&inputs.block_tree)),
+        None,
+        bitcoin_rs_storage::pruning::HistoryAccess::new(
+            Arc::new(bitcoin_rs_storage::pruning::RetentionRegistry::new()),
+            bitcoin_rs_storage::pruning::RetentionBudget::Unlimited,
+        ),
+        inputs.block_source,
+        None,
+        Arc::clone(&inputs.chain_events),
+        RecordedIndexAhead::new(),
+        Arc::clone(&inputs.shutdown),
+        inputs.wake_rx,
+    )
+    .expect("spawn");
+
+    // Entry is signaled from inside `open_store`, so the shutdown below lands
+    // on the abandoned-open path rather than the pre-spawn stop check.
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("open thread entered open_store");
+    assert!(
+        !worker.is_finished(),
+        "worker should still be blocked on open"
+    );
+
+    inputs.shutdown.store(true, Ordering::Release);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !worker.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shutdown during open must exit the supervisor promptly"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // The open thread is still parked on `open_rx` here; the worker-local
+    // flag records the abandonment durably.
+    assert!(worker.open_was_abandoned());
+    assert!(NAMESPACE_REGISTRY.is_poisoned(&dir.path().join("txindex")));
+    worker.join();
+
+    // The detached opener's completion is not observable (its handle is
+    // dropped at detach), so it is never released: leaking the sender parks
+    // it on `open_rx` forever, which keeps it from reaching the real
+    // `open_store` on a tempdir the test scope is about to remove.
+    std::mem::forget(open_tx);
+}
+
 #[test]
 fn open_timeout_publishes_error_not_infinite_spin() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -668,6 +668,7 @@ fn mining_handler(state: &NodeState) -> Handler {
         mining: MiningHandles {
             mining_control: Some(mining_control),
         },
+        ..ContextHandles::default()
     })
     .with_chain_transition(state.chainstate().read_fence());
     Handler::new(Arc::new(ctx))

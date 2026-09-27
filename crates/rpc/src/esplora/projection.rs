@@ -140,7 +140,7 @@ impl<'a> Projection<'a> {
         &self,
         txid: &Txid,
     ) -> Result<Option<(Tx, Option<Confirmation>)>, Response> {
-        if let Some(transaction) = self.ctx.mempool.read().transaction_by_txid(txid) {
+        if let Some(transaction) = self.ctx.mempool.gateway.read().transaction_by_txid(txid) {
             return Ok(Some(((*transaction).clone(), None)));
         }
         if let Some(transaction) = self.ctx.chain.transactions.read().get(txid).cloned() {
@@ -178,7 +178,14 @@ impl<'a> Projection<'a> {
 
     /// Resolves confirmation only against the current applied chain.
     pub(super) fn confirmation(&self, txid: &Txid) -> Result<Option<Confirmation>, Response> {
-        if self.ctx.mempool.read().transaction_by_txid(txid).is_some() {
+        if self
+            .ctx
+            .mempool
+            .gateway
+            .read()
+            .transaction_by_txid(txid)
+            .is_some()
+        {
             return Ok(None);
         }
         if self.ctx.chain.transactions.read().contains_key(txid) {
@@ -302,7 +309,13 @@ impl<'a> Projection<'a> {
     }
 
     pub(super) fn prevout(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, Response> {
-        if let Some(transaction) = self.ctx.mempool.read().transaction_by_txid(&outpoint.txid) {
+        if let Some(transaction) = self
+            .ctx
+            .mempool
+            .gateway
+            .read()
+            .transaction_by_txid(&outpoint.txid)
+        {
             return Ok(transaction
                 .outputs
                 .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
@@ -451,7 +464,7 @@ impl<'a> Projection<'a> {
         // the pool already spends. Script hashing, statuses, and output
         // strings are derived from those facts and run after the release.
         let funding = {
-            let pool = self.ctx.mempool.read();
+            let pool = self.ctx.mempool.gateway.read();
             confirmed
                 .retain(|record| !pool.is_outpoint_spent(&OutPoint::new(record.txid, record.vout)));
             pool.entries_funding_script(mempool_hash)
@@ -531,7 +544,7 @@ impl<'a> Projection<'a> {
         // afterwards costs a scan of the whole pool per selected
         // transaction.
         let (sequence, funders) = {
-            let pool = self.ctx.mempool.read();
+            let pool = self.ctx.mempool.gateway.read();
             let sequence = pool.sequence_number();
             let funders = pool
                 .entries_funding_script(mempool_hash)
@@ -554,7 +567,7 @@ impl<'a> Projection<'a> {
             );
         }
         let spenders = {
-            let pool = self.ctx.mempool.read();
+            let pool = self.ctx.mempool.gateway.read();
             if pool.sequence_number() != sequence {
                 return Err(query_error(TxQueryError::Retry));
             }

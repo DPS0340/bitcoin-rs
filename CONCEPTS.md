@@ -1,3 +1,267 @@
+# Concepts
+
+Shared domain vocabulary for this project: entities, named processes, and status concepts with project-specific meaning. Glossary only, not a spec, changelog, or benchmark ledger; measured numbers belong in the PR that produced them.
+
+## Node interfaces
+
+### Wallet-free RPC boundary
+The node has no in-tree wallet and owns no private keys. Wallet funding,
+signing, import, and fee-bump methods are absent. Key-free descriptor helpers,
+`scantxoutset`, `combinepsbt`, and `finalizepsbt` remain node RPCs so an external
+signer can drive a PSBT workflow without giving key custody to the node.
+
+### Watch-only mining payout
+An operator-configured address whose `scriptPubKey` is the candidate coinbase
+payout. The node decodes it at config resolve time and never holds keys. Empty
+configuration keeps transport-only GBT assembly: miners supply their own
+coinbase.
+
+### Mining generation
+The `(applied_tip_hash, mempool_sequence)` key that identifies one block
+template. The node-owned coordinator is the single cache and long-poll waiter
+for that key. RPC does not keep a second template cache.
+
+### Wallet-facing public surface
+What an external wallet is allowed to call: native Esplora HTTP at `/api`
+on the JSON-RPC listener (tip, fees, block-height checkpoints,
+address/script history and UTXOs, `POST /tx`) and the key-free node RPCs
+above. The consumer is a separate process — or the embeddable `Node`
+API — and does not receive `NodeState`, `UtxoSet`, or index types. See
+`docs/contracts/wallet-facing.md`.
+
+### Stable chainstate RPC read
+A whole-UTXO RPC read that shares the node's chain-transition mutex. The mutex
+spans both UTXO mutation and applied-tip publication, so `scantxoutset` cannot
+combine outputs from one committed state with height, hash, or confirmation
+metadata from another.
+
+### REST gateway
+The optional, unauthenticated Bitcoin Core-compatible HTTP surface served on
+the existing JSON-RPC listener. It is enabled with `rest=1`; JSON-RPC requests
+on the same listener retain their configured authentication.
+
+### Esplora request chain view
+The applied-tip identity captured when an Esplora GET request begins. One
+Esplora response may compose several index, mempool, and block queries, so the
+router returns `503` if the applied-tip identity changed before composition
+finished, rather than mixing answers from opposite sides of a reorg.
+
+### Sequence stream
+The Core-compatible `pubsequence` ZMQ stream. Block events carry the 32-byte
+reversed block hash and label byte (`C` connect, `D` disconnect). Mempool
+events carry the 32-byte reversed txid, label byte (`A` admission, `R`
+removal), and the 8-byte little-endian mempool sequence number assigned to the
+change. A transaction mined in a connected block emits no `R`: the block's `C`
+event covers it, matching Core. Every event concludes with a topic-local
+little-endian `u32` sequence counter frame. Reorg disconnects are emitted
+tip-first before connects on the replacement branch. Each socket owns
+`DEFAULT_ZMQ_HWM = 1_000`.
+`bitcoin_rs_rpc::zmq` owns the compatibility payload and transport;
+`ChainFollowers` owns emission timing relative to committed
+chain transitions.
+
+### Post-commit chain effects
+Derived work that follows a committed connect or disconnect: RPC `BlockLog`,
+ZMQ projections, TxIndex wake, mining generation, and mempool admission-state
+notifications. `ChainFollowers` owns dispatch timing after
+the tip is published, while the chain transition is still held. Transaction
+ownership follows [ARCH-05](docs/contracts/architecture.md#arch-05-node-composition-and-orchestration-boundary).
+Derived work cannot fail the authoritative transition.
+Index recovery still uses `ChainEventPublisher` hints (`EVT-02`); this is not
+a second event log.
+
+### Peer socket
+A connected P2P TCP stream after accept or connect. `CountingStream::from_connected`
+is the owner of socket posture: it disables Nagle (`TCP_NODELAY`) once, then wraps
+the stream so handshake, reader, and writer-clone I/O all count into one
+`PeerCounters`. Vectored writes go through the same wrapper, so a framed message
+stays one `writev` instead of a header syscall plus a payload syscall.
+
+### Authoritative peer table
+The single owner of live peer connections and their published handshake
+metadata (`bitcoin_rs_p2p::PeerTable`). It enforces one connection per remote
+address, cancels predecessors atomically on replacement, prevents stale
+connection handles from evicting newer sessions via connection-identity checks,
+and ties handshake metadata strictly to the live connection identity.
+
+### Embedded node
+The typed in-process surface (`bitcoin_rs_node::Node`) over the same
+lifecycle the daemon runs: start against a data dir, typed
+snapshot/progress/capability reads, mempool statistics, fee estimates,
+gateway-routed broadcast, and a consuming shutdown that publishes the clean
+checkpoint. `start`, `shutdown`, `broadcast`, and the typed lookups are
+`async fn` by contract with synchronous bodies that drive the node's own
+threads; the node depends on no async runtime and never creates, enters,
+or retains one, so the embedder supplies whatever executor it owns
+(`crates/node/src/embed.rs`, EMB-02 in `docs/contracts/embedding.md`).
+No second lifecycle exists: the daemon's `run()` is a signal wrapper around
+the identical start and shutdown path.
+
+## Initial Block Download
+
+### Initial Block Download (IBD)
+The one-time bulk process of downloading and fully validating the chain from the start point (genesis, or a trusted snapshot) up to the network's current best tip. Live IBD is the download-bound regime (*Sync regimes*); the repository's sync measurements use a local seed and do not measure Internet bandwidth aggregation across peers (`docs/benchmarks/end-to-end-sync.md`, Limitations), so it pins no claim about which cost dominates at high heights.
+
+### Apply frontier
+The greatest height up to which every block has been validated and committed to the UTXO set in one unbroken run — distinct from the header tip and from blocks downloaded but not yet applied. It advances only over a contiguous run: one missing block at the frontier stalls all apply progress, which is how a slow peer can freeze sync.
+
+### Download window
+The bounded set of blocks in flight — requested but not yet received. Capped jointly by a block count and an estimated-bytes budget (see *Count-and-byte bound*) and refilled as blocks arrive.
+
+### Staller
+A peer holding up the apply frontier by failing to deliver a frontier block it was assigned. Stalling detection identifies it by window-blocked detection (not raw `applied_tip+1` stagnation), does not blame a peer when local apply/stager backpressure is the bottleneck, and disconnects it so another peer can supply the block.
+
+### Peer lifecycle ownership
+`P2pService` owns P2P control state and workers. Live sessions live in one
+`PeerTable`, which `P2pService` holds directly and uses for its send and
+disconnect helpers. Ready snapshots carry `PeerSource`, and identity-checked
+table methods are what authorize a mutation. Address equality alone never does.
+`BlockSync` drives the P2P-owned [`DownloadWindow`] and [`BlockStager`] and may
+call identity-checked [`PeerTable`] methods directly. `P2pService` does not
+hold a second window. See `P2P-02` in `docs/contracts/p2p-wire.md`.
+
+### assumevalid
+Skipping script-signature verification for blocks at or below a trusted height while performing every other consensus check. Mainnet defaults to the hash-pinned anchor below; other networks default to height 0. `--assume-valid-height 0` requests full verification; a custom nonzero height skips without hash gating.
+
+### Hash-pinned assume-valid anchor
+The mainnet checkpoint (height 938343, block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`). Script verification is skipped at or below it only after the active header chain is shown to contain this exact hash; sub-anchor header tips and diverged chains verify fully.
+
+### Optimized default posture
+The default mainnet configuration: `fjall` backend, multi-peer download (outbound target 8, pending block budget 256, 16 in-flight per peer once fan-out engages), hash-pinned assume-valid, 450 MiB `dbcache`, `txindex` and pruning off. The checked-in Compose specialization compiles `fjall` + `bitcoinkernel`, runs unprivileged, and namespaces node and enforcer data by `BITCOIN_RS_NETWORK`.
+
+### Node network selection
+`BITCOIN_RS_NETWORK`/`--network` atomically selects consensus rules and P2P bootstrap identity while preserving later low-level overrides. The internal consensus `Network` remains the consensus selector: `drynet4` keeps mainnet consensus with message start `eca5d404`, no Bitcoin DNS seeds, and `drynet4.drivechain.dev:8533`. Owner: `apply_network_selection` in `crates/node/src/config.rs`; layering is `ARCH-05` in `docs/contracts/architecture.md`.
+
+### Sync regimes (download-bound vs processing-bound)
+The two cost regimes a sync measurement must name before its numbers mean anything. **Download-bound:** wall is decided by the network path — live IBD. **Processing-bound:** blocks are local and wall is decided by validation plus storage commit — reindex and replay. A node can rank differently in the two, so a faster-than-X claim needs the regime and validation posture stated.
+
+## Consensus validation
+
+### Native protocol primitives
+The owned Bitcoin protocol vocabulary in `crates/primitives`: `Tx`, `Block`,
+`Header`, `OutPoint`, `Amount`, `Sequence`, `LockTime`, `CompactTarget`,
+`Script`, `Witness`, hashes, sighash, compact-size encoding, and network
+constants. These types are implemented here; they are not `rust-bitcoin`
+aliases, wrappers, or conversion shims. Field types on `Tx`/`Header` are the
+same native newtypes — satoshis, nBits, scripts, and locktime are not raw
+integers at the protocol boundary. Durable tests pin Core vectors,
+published genesis hashes, and golden fixtures. RPC address/`asm` rendering
+may still use `rust-bitcoin` at the RPC boundary only.
+
+### bitcoinkernel
+Bitcoin Core's C++ consensus engine (`libbitcoinkernel`), compiled in when the `kernel` Cargo feature is enabled. The `kernel` feature is a capability ("bitcoinkernel support is compiled in"), not a selection; the engine that runs is chosen at runtime by `validation.engine` (`native` by default, `kernel` to route input-script verification and the one-shot block parse through `bitcoinkernel`). Rust performs the surrounding non-script transaction and block checks. `native` is the default engine in every build; the `bin/bitcoin-rs` binary and all library crates default to kernel-free, so `cargo build -p bitcoin-rs` uses the native interpreter and links no C++ engine. Builds with `kernel` need `cmake` and `libboost-dev`. Selecting `kernel` without the feature fails at startup with an unsupported-build error, never with silent engine substitution (`docs/contracts/validation-default.md`).
+
+### Native Rust interpreter
+The pure-Rust script path in `crates/script`, the default `validation.engine` in every build — including `kernel` builds, where `validation.engine = "native"` still reaches it. It executes legacy, P2SH, SegWit v0, and Taproot key-path and script-path spends through the opcode evaluator. Core's `script_tests`, `tx_valid`, and `tx_invalid` vectors currently pin zero native mismatches. Signature checks reuse the process-wide `secp256k1::SECP256K1` context. It is the C++-free quickstart engine and the default production engine.
+
+### One-shot block parse
+Parsing each block exactly once on the apply path and reusing that parse downstream for txids and, on the `Kernel` arm only, the borrowed `TransactionRef` transaction objects that script preparation reuses (the `Native` arm reads the view's decoded transactions). `kernel::BlockParse` (`crates/consensus/src/kernel.rs`) is the one-shot parse; its parse engine follows the selected `validation.engine`, so `Native` parses with the Rust parser and `Kernel` with `bitcoinkernel::Block::new`. The `Native` variant is compiled in every build; the `Kernel` variant exists only in `kernel`-feature builds, where selecting `validation.engine = "kernel"` reaches it and the selection parse fails closed with the unsupported-build error anywhere else. Price a replacement by everything it subsumes, not by the line item that motivated it.
+
+### Runtime-dispatched AVX2 Merkle
+Parent hashing of Merkle pairs uses Bitcoin Core's 8-way AVX2 SHA-256d kernel on x86-64 hosts that advertise AVX2, selected at runtime. Hosts without AVX2, and trees too small to fill one 8-pair batch, use the allocation-free scalar spine. Both paths implement Bitcoin's odd-leaf duplication and mutated-tree rule.
+
+### Script-flag exceptions (BIP16Exception)
+Blocks Core hardcodes in `consensus.script_flag_exceptions` to validate under a reduced flag set. As of Core v29: mainnet 170060 (P2SH) and 692261 (Taproot); testnet3 394. The P2SH waivers are reproduced by `Network::is_bip16_p2sh_exception` (by block hash); missing them wedges full-validation sync. The Taproot override needs no exception because `is_taproot_active` already height-gates TAPROOT. Compare *effective* flag sets, not raw overrides.
+
+### Difficulty-1 target
+The network-independent reference target in Core's difficulty calculation:
+compact nBits `0x1d00ffff`, not the selected network's PoW limit. Confusing
+the two makes every network report difficulty `1.0` at its easiest target.
+
+### Float value/text parity
+Equal IEEE-754 values versus equal serialized spellings. Core's UniValue uses
+`%.16g`; the RPC path's sonic-rs serializer uses shortest round-trip. Compatibility
+means preserving value and operation order, not forcing JSON text to match.
+Owners: `crates/rpc/tests/support/compare.rs` (bitwise numeric comparison) and `crates/rpc/tests/policy_contract.rs`.
+
+### Provably unspendable outputs (UTXO admission)
+Outputs the UTXO set never admits: a `scriptPubKey` starting with `OP_RETURN`, or longer than `MAX_SCRIPT_SIZE`. Excluding them changes no consensus outcome, so the snapshot codec carries the version tag `bitcoin-rs-utxo-spendable-v1`; a change to admission semantics is a codec change.
+
+### Notification configuration
+
+Node configuration groups external notification adapters below
+`NotificationConfig`. ZMQ configuration follows the socket ownership boundary:
+one endpoint group contains its endpoint, all topics published by that socket,
+and an optional socket HWM override. Topics that share an endpoint therefore
+cannot claim different HWM values. The ZMQ publisher owns the default HWM of
+1,000; configuration mentions HWM only when an endpoint needs an operational
+override.
+
+The supported file form is `[[notifications.zmq]]` with `endpoint`, `topics`,
+and optional `hwm`. The former topic-specific `zmqpub*` endpoint and HWM fields
+are not part of node configuration, including CLI, environment, TOML, and
+`bitcoin.conf` adapters.
+
+## Block apply
+### Window script batching
+Verifying the ordered transaction unit of several consecutive blocks in one parallel dispatch. The window prepares each block against an ordered overlay, dispatches once, and issues a private, single-use `BlockValidationProof` that owns the `PreparedApply` it certifies and binds block hash, predecessor, height, flags, and locktime cutoff. Blocks then commit one at a time, in order; commit re-derives all five fields and on mismatch discards proof and prepared state and rebuilds from the live UTXO set. The proof bypasses only the transaction-validation slot: block rules and BIP30 stay before it, coinbase maturity and BIP68 after. Assume-valid produces a distinct `AssumeValidSkipped` state that never takes the bypass.
+
+### Front-half duplication
+The failure mode where a batched fast path recomputes the sequential path's preparation instead of replacing it, so the saving is paid straight back. The tell is that the accelerated stage shrinks by roughly what the new stage costs. The fix is splitting the sequential path into a prepare half and a commit half, never a cheaper second pass.
+
+### Dispatch-bound parallelism
+A stage that is parallel in shape but serial in effect because each dispatch is too small to amortise waking the workers. Diagnose with a scaling sweep (1, 4, 32 threads), not a profiler. On the apply path, coarsening each dispatch (`with_min_len`) and bounded splits for small blocks both measured worse; issuing fewer, larger dispatches (*Window script batching*) is what fixed it.
+
+### Parallel granularity (per-item cost rule)
+Whether a fan-out pays is decided by per-item work against dispatch cost, not by how parallelizable the loop looks: ~100 µs script checks want more parallelism (`MIN_PARALLEL_SCRIPT_CHECKS` = 32, `crates/consensus/src/verify_tx.rs`), ~500 ns UTXO lookups want none, ~2.6 µs Merkle nodes gain from SIMD batching rather than task fan-out. Thresholds have an interior optimum in both directions. Gate on **elapsed**, never on the stage being targeted.
+
+### Global rayon pool cap
+The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_global_thread_pool` (`crates/node/src/lifecycle.rs`). It serves the apply-path parse and non-script checks, UTXO commit, coinstats, and index preparation fan-outs, while `SCRIPT_VERIFY_POOL` separately holds up to 32 threads; uncapped, its workers oversubscribe a many-core host and spin. The cap measured better on both wall and CPU for a loopback sync to height 150,000 and cost a full-verification replay nothing (rationale and table at the constant's doc comment).
+
+### Chain generation
+The even/odd atomic counter on `MempoolGateway` that fences admission
+against chain changes (`crates/mempool/src/gateway.rs`). Even values mean
+the chain is stable and admission is open; odd values mean a connect,
+disconnect, or reorg is in progress and admission is closed.
+`stable_generation` returns `Some(even)` when stable, `None` when a chain
+change is active. `begin_chain_change` takes the pool write lock, stores the
+next odd value, and returns a `ChainChangeGuard` that owns the reservation.
+Only `finish` may compare-exchange the odd value to the reserved even value,
+reopening admission. A clean refusal before the UTXO commit-of-record finishes
+and reopens admission (retryable, no restart); a `UtxoCommit` refusal, panic,
+crash, or torn state leaves the generation odd until recovery establishes a
+consistent chainstate. A generation-settlement failure itself (`finish` CAS
+failure / `GenerationMoved`) is an invariant violation: admission stays closed
+and the failure is surfaced as fatal — the node does not retry until recovery
+or restart re-establishes a consistent gateway.
+
+### Admission origin
+The `AdmissionOrigin` enum on `MutationEnvelope` that identifies how a
+transaction entered the node (`crates/mempool/src/mutation.rs`): `Rpc`
+(submitted through `sendrawtransaction`), `Peer` (relayed from a network
+peer, carrying a `PeerToken`), `Reorg` (re-admitted by a disconnect walk via
+`reconsider_disconnected`), or `Block` (confirmed by block application). The
+observer receives the origin alongside the committed `MutationResult` so
+downstream consumers (ZMQ publisher, metrics) can distinguish relay from
+reorg re-admission without inspecting call sites.
+
+### Chainstate facade
+The in-process owner of applied-tip mutation (`bitcoin_rs_node::Chainstate`).
+Callers copy a `ChainstateSnapshot` or obtain a `ChainTransition`; they do
+not hold the raw UTXO, tip, and lock cells and reproduce a partial
+transition. `chain` still plans the branch. Node-level reorg still sequences
+disconnect then connect. UTXO, storage, and index still own their operations.
+
+### Chain-change proof
+The type-level binding of a `TransitionLock` to the `TransitionGuard` that
+reserved the active odd generation (`crates/chainstate/src/lib.rs`). The
+caller-facing mutation capability is `ChainTransition`, which promotion of
+the lock produces. Apply-path helpers accept `&ChainTransition`, not
+independent lock and guard arguments, so a call without an active odd
+generation cannot compile. The proof owns the guard, so the reserved
+generation is fixed for the whole transition rather than read from a
+snapshot that may have moved.
+
+### Count-and-byte bound
+A window sized by whichever of a count cap and a byte cap binds first, because item size varies by orders of magnitude across the chain. The script window (`window_len`, `crates/node/src/sync.rs`) and the download window's pending and staging budgets (`SyncBudget` in `crates/p2p/src/download_window.rs`) both use it. In the script window one block larger than the whole byte cap still goes through alone rather than stalling the chain.
+
+## Chain state and reorg
+
+### Chain control
+Consensus-affecting RPCs never mutate the block tree directly; they delegate through the node-owned `ChainControl` so the same apply-admission and chain-transition locks protect RPC- and sync-triggered reorganizations. `invalidateblock` previews the replacement tip, loads every body the disconnect/connect plan needs, then holds the chain-transition witness through header invalidation and branch switching; its disconnects emit the same `pubsequence` `D` events as an organic reorg. `PruneAuthority` takes the same locks before reading the applied tip.
+
+### Commit point (multi-store mutation)
+The mutation that makes a multi-store operation visible; it does not make preceding mutations atomic. For an authoritative disconnect it is the `applied_tip` rollback, after the UTXO undo and coinstats rewind. The UTXO undo can fail after some shards changed and cannot be retried, so `DisconnectError` (`crates/node/src/state.rs`) splits `Refused` (nothing touched) from `Fatal` (partly rolled back) and `MarkerStuck` (rolled back cleanly, but the in-flight disconnect marker could not be cleared, so the next start recovers from it automatically). `Fatal` and `MarkerStuck` both close apply admission; `Fatal` shuts the process down.
 
 ### Disconnect marker phase
 The durable record that an authoritative disconnect started and how far it got. Armed and flushed before the UTXO mutation, not on the error path, because a process that dies mid-rollback writes no error. `InFlight`: rollback started, completion unreported; an ordinary checkpoint must not clear it. `RolledBack`: UTXO set and applied tip moved together and need one clean checkpoint. Startup recovers automatically from either phase: it reconciles the certified durable-head chain with the restored state — rewinding a checkpoint the disconnect outran, replaying a gap that trails it — warns with the mode chosen, publishes a clean checkpoint, and retires the marker only after that publication is durable; durable evidence the head chain cannot authenticate still fails closed.

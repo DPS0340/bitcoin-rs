@@ -113,10 +113,10 @@ fn bind_rpc(
         mining: MiningHandles {
             mining_control: Some(Arc::clone(mining_control)),
         },
+        zmq_publisher: state.zmq_publisher(),
+        debug_log_path: Some(state.data_dir().join("debug.log")),
     })
-    .with_esplora_derived_index(state.esplora_derived_index_query())
-    .with_zmq_publisher(state.zmq_publisher())
-    .with_debug_log_path(state.data_dir().join("debug.log"));
+    .with_esplora_derived_index(state.esplora_derived_index_query());
     let context = Arc::new(context);
     let handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::clone(&context)));
     let server = RpcServer::bind(
@@ -206,13 +206,13 @@ pub(crate) struct NodeServices {
 
 impl NodeServices {
     /// Raises shutdown, wakes and joins the event loop, joins core services,
-    /// joins bootstrap/maintenance/signal workers, and only
-    /// then publishes a clean checkpoint. The derived-index worker is
-    /// stopped and joined by the caller before this teardown runs; a
-    /// caller-supplied `first_error` — e.g. an index join abandoned at the
-    /// deadline — seeds the remembered error and suppresses the checkpoint
-    /// just like a cleanup-stage failure. The first
-    /// error is returned after all remaining cleanup stages run.
+    /// drains subsystems, joins bootstrap/maintenance/signal workers, and only
+    /// then publishes a clean checkpoint. The derived-index worker is stopped
+    /// and joined by the caller before this teardown runs; a caller-supplied
+    /// `first_error` — e.g. an index join abandoned at the deadline — seeds
+    /// the remembered error and suppresses the checkpoint just like a
+    /// cleanup-stage failure. The first error is returned after all remaining
+    /// cleanup stages run.
     pub(crate) fn teardown(
         &mut self,
         state: Option<&NodeState>,

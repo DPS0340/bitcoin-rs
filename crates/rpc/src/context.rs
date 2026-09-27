@@ -118,8 +118,6 @@ pub struct SyncProgress {
     pub time: u64,
     /// Median time past of the last eleven applied blocks.
     pub median_time: u64,
-    /// Compact target of the applied tip header (zero before the first tip).
-    pub tip_bits: CompactTarget,
     /// Core `GuessVerificationProgress` in the inclusive range `[0, 1]`.
     pub verification_progress: f64,
     /// Whether the node is still in initial block download.
@@ -214,10 +212,14 @@ pub use bitcoin_rs_index::{
 /// The complete description of one RPC context, grouped by node capability:
 /// chain, mempool, indexes, network, and mining.
 ///
-/// A struct-of-structs grouping, not a trait layer. `Context::from_handles`
-/// consumes one `ContextHandles` value and moves each group into the context
-/// unchanged — RPC consumes node capabilities and never names a storage
-/// backend or backend engine type.
+/// A struct-of-structs grouping, not a trait layer. [`Context::from_handles`]
+/// is the single composition point: one `ContextHandles` value carries every
+/// production capability, including the authoritative chain-transition
+/// barrier, the durable block-body reader, and the optional surfaces (prune,
+/// chain control, ZMQ publisher, debug log). The handler surface reads only
+/// these capability groups — RPC consumes node capabilities and never names a
+/// storage backend or backend engine type, and production wiring attaches
+/// nothing to a constructed `Context` afterwards.
 #[derive(Clone)]
 pub struct ContextHandles {
     /// Chain capability: tips, block log, UTXO set, block tree, transition
@@ -231,21 +233,19 @@ pub struct ContextHandles {
     pub network: NetworkHandles,
     /// Mining capability: the template coordinator, when one is attached.
     pub mining: MiningHandles,
+    /// Live ZMQ notification publisher backing the notifier surface.
+    pub zmq_publisher: Arc<dyn crate::zmq::ZmqPublisher>,
+    /// Configured node debug-log path for `getrpcinfo`.
+    pub debug_log_path: Option<PathBuf>,
 }
 
 /// Chain capability handles.
-///
-/// The group owns the node's applied-chain authorities: the two published
-/// tips, the transition barrier that brackets them, the shared
-/// initial-block-download latch, and the readable stores behind them.
 #[derive(Clone)]
 pub struct ChainHandles {
     /// Best header-chain tip. Read-only: only Chainstate publishes.
     pub chain_tip: TipReader,
     /// Best fully-applied block tip. Read-only: only Chainstate publishes.
     pub applied_tip: TipReader,
-    /// Serializes whole-chainstate RPC reads with node-owned connect/disconnect transitions.
-    pub chain_transition: Arc<Mutex<()>>,
     /// Process-wide initial-block-download latch over the applied chain,
     /// shared with P2P so both surfaces answer identically.
     pub ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
@@ -261,66 +261,22 @@ pub struct ChainHandles {
     pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
     /// Incremental UTXO statistics.
     pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
+    /// Shared block tree.
+    pub block_tree: BlockTreeReader,
+    /// Consensus network.
+    pub chain_network: Network,
+    /// Authoritative chain connect/disconnect transition barrier. Production
+    /// supplies the chain owner's barrier; the synthetic `Default` builds a
+    /// private one for tests.
+    pub chain_transition: Arc<Mutex<()>>,
+    /// Durable block-body reader for metadata-only block records.
+    pub block_body_source: Option<Arc<dyn BlockBodySource>>,
     /// Optional storage pruning mutator.
     pub prune_service: Option<Arc<dyn PruneService>>,
     /// Optional node-owned chain mutation service.
     pub chain_control: Option<Arc<dyn ChainControl>>,
-    /// Consensus network.
-    pub chain_network: Network,
-    /// Shared block tree.
-    pub block_tree: BlockTreeReader,
-    /// Optional durable block body reader for metadata-only block records.
-    pub block_body_source: Option<Arc<dyn BlockBodySource>>,
     /// Rollback-evidence warning source for `getblockchaininfo`.
-    ///
-    /// `None` in test contexts; populated by `NodeState` with the process-wide
-    /// `WarningStore`. Each request loads one immutable snapshot.
     pub rollback_warnings: Option<Arc<dyn RollbackWarningSource>>,
-}
-
-impl ChainHandles {
-    /// Builds the chain capability group over handles owned elsewhere.
-    ///
-    /// PRE: the supplied handles belong to the same node; `ibd` is that node's
-    ///   shared initial-block-download decision.
-    /// POST: the group owns these exact handles, the optional adapters are
-    ///   `None`, and the unattached transition barrier is the empty-context
-    ///   default.
-    /// INVARIANT: construction copies no subsystem state and creates no second
-    ///   initial-block-download latch or transaction-count authority.
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        chain_tip: TipReader,
-        applied_tip: TipReader,
-        blocks: Arc<RwLock<BlockLog>>,
-        transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
-        utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
-        coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
-        block_tree: BlockTreeReader,
-        chain_network: Network,
-        ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
-    ) -> Self {
-        Self {
-            chain_tip,
-            applied_tip,
-            chain_transition: Arc::new(Mutex::new(())),
-            closed_for_recovery: LatchReader::new(Arc::new(core::sync::atomic::AtomicBool::new(
-                false,
-            ))),
-            ibd,
-            blocks,
-            transactions,
-            utxo,
-            coin_stats,
-            prune_service: None,
-            chain_control: None,
-            chain_network,
-            block_tree,
-            block_body_source: None,
-            rollback_warnings: None,
-        }
-    }
 }
 
 /// Borrowed provisional chain facts used by both RPC and P2P admission.
@@ -427,16 +383,13 @@ pub struct MempoolHandles {
 #[derive(Clone, Default)]
 pub struct IndexHandles {
     /// Complete transaction-index query adapter.
-    ///
-    /// `None` when transaction indexing is disabled.
     pub derived_index: Option<Arc<dyn DerivedIndexQuery>>,
-    /// Complete transaction lookup used internally by Esplora projections.
-    ///
-    /// This may be available with `--scriptindex` even when `derived_index` is
-    /// absent, because it does not advertise the Core `--txindex` contract.
-    pub esplora_tx_index: Option<Arc<dyn DerivedIndexQuery>>,
     /// Generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
+    /// Complete transaction lookup used by Esplora output projections. It may
+    /// exist without [`Self::derived_index`] because it does not advertise
+    /// the Core `--txindex` contract.
+    pub esplora_tx_index: Option<Arc<dyn DerivedIndexQuery>>,
     /// Live txindex status for the `getcapabilities` projection.
     pub derived_index_status: Option<Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource>>,
 }
@@ -471,31 +424,33 @@ pub struct MiningHandles {
 
 /// Shared state consumed by JSON-RPC handlers.
 ///
-/// The context holds one capability group per node subsystem plus the fields
-/// that belong to no subsystem. It stores no subsystem state of its own: a new
-/// capability extends its own group instead of widening this declaration.
+/// The subsystem graph lives behind the capability groups ([`ChainHandles`],
+/// [`MempoolHandles`], [`IndexHandles`], [`NetworkHandles`], [`MiningHandles`]);
+/// `Context` itself carries only those groups plus presentation-local state
+/// (the ZMQ publisher surface, the debug-log path, the REST render budget,
+/// and the listener bind epoch). Handlers read capabilities through the
+/// groups; production wiring attaches nothing after construction.
 pub struct Context {
-    /// Chain capabilities: published tips, block log, UTXO set, block tree,
-    /// and the shared initial-block-download latch.
+    /// Chain capability: tips, block log, UTXO set, block tree, transition
+    /// barrier, and the chain-owned control surfaces.
     pub chain: ChainHandles,
-    /// Mempool mutation gateway: the only production route that takes the
-    /// pool write lock, publishing ordered mutation events to observers.
-    pub mempool: Arc<MempoolGateway>,
-    /// Index capabilities: transaction and script index query adapters.
+    /// Mempool capability: the mutation gateway in front of the pool.
+    pub mempool: MempoolHandles,
+    /// Index capability: transaction, script, and Esplora query adapters.
     pub indexes: IndexHandles,
-    /// Network capabilities: peer sessions, counters, and connection control.
+    /// Network capability: peer registry, reachability, and connection control.
     pub network: NetworkHandles,
-    /// Optional node-owned mining coordinator.
-    pub mining_control: Option<Arc<dyn MiningControl>>,
+    /// Mining capability: the template coordinator, when one is attached.
+    pub mining: MiningHandles,
+    /// Live ZMQ publisher, also the source of active notifier metadata.
+    pub zmq_publisher: Arc<dyn crate::zmq::ZmqPublisher>,
+    /// Configured node debug-log path for `getrpcinfo`.
+    pub debug_log_path: Option<PathBuf>,
     /// Instant this context's RPC listener bound, set by `RpcServer::bind`
     /// and read by `uptime`. Kept per context rather than process-global so
     /// two servers in one process report their own epochs; `None` (never
     /// bound, e.g. unit tests) makes `uptime` measure from its first call.
     server_bound_at: Mutex<Option<Instant>>,
-    /// Live ZMQ publisher, also the source of active notifier metadata.
-    pub zmq_publisher: Arc<dyn crate::zmq::ZmqPublisher>,
-    /// Configured node debug-log path for `getrpcinfo`.
-    pub debug_log_path: Option<PathBuf>,
     /// Limits concurrent full-block REST response materializations.
     rest_render_budget: Arc<RestRenderBudget>,
 }
@@ -583,6 +538,8 @@ impl Default for ContextHandles {
             indexes: IndexHandles::default(),
             network: NetworkHandles::default(),
             mining: MiningHandles::default(),
+            zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
+            debug_log_path: None,
         }
     }
 }
@@ -599,7 +556,7 @@ impl Context {
     /// through [`Self::from_handles`].
     #[must_use]
     pub fn new() -> Self {
-        Self::build_fixture(None)
+        Self::from_handles(ContextHandles::default())
     }
 
     /// Builds an empty context whose mempool gateway carries `observer`.
@@ -608,98 +565,51 @@ impl Context {
     /// observer instead of `None`. Test-only: production wiring constructs
     /// the gateway through `NodeState::open`.
     #[must_use]
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new_with_mempool_observer(observer: Arc<dyn MempoolObserver>) -> Self {
-        Self::build_fixture(Some(observer))
-    }
-
-    /// Assembles one internally consistent fixture set.
-    ///
-    /// PRE: `observer` is this fixture's mempool observer, or `None`.
-    /// POST: every capability group owns fresh, unattached handles on
-    ///   `Network::Mainnet`, and the mempool gateway carries `observer`.
-    /// INVARIANT: the shared initial-block-download latch reads the same
-    ///   applied-tip cell and block tree the chain group owns, so publishing a
-    ///   tip through the group moves both readers.
-    fn build_fixture(observer: Option<Arc<dyn MempoolObserver>>) -> Self {
-        let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
-            bitcoin_rs_utxo::stats::CoinStats::default(),
-        );
-        let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
-        utxo.track_coin_stats(coin_stats_listener.clone());
-        let coin_stats = Arc::new(coin_stats_listener);
-        let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-        let mempool = match observer {
-            Some(observer) => MempoolGateway::shared_with(pool, observer, ValidationEngine::Native),
-            None => MempoolGateway::shared(pool, ValidationEngine::Native),
-        }
-        .unwrap_or_else(|error| panic!("mempool gateway intern: {error}"));
-        let chain_tip = Arc::new(ArcSwapOption::empty());
-        let applied_tip = Arc::new(ArcSwapOption::empty());
-        let blocks = Arc::new(RwLock::new(BlockLog::new()));
-        let transactions = Arc::new(RwLock::new(HashMap::new()));
-        let block_tree = Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new()));
-        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-            TipReader::new(Arc::clone(&applied_tip)),
-            BlockTreeReader::new(Arc::clone(&block_tree)),
-        ));
-        let chain = ChainHandles::new(
-            TipReader::new(chain_tip),
-            TipReader::new(applied_tip),
-            blocks,
-            transactions,
-            Arc::new(utxo),
-            coin_stats,
-            BlockTreeReader::new(block_tree),
-            Network::Mainnet,
-            ibd,
-        );
-        Self {
-            chain,
-            mempool,
-            indexes: IndexHandles::default(),
-            network: NetworkHandles {
-                network: Arc::new(RwLock::new(NetworkState::default())),
-                network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
-                peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
-                p2p_outbound_sender: None,
-                banned: Arc::new(RwLock::new(Vec::new())),
-                added_nodes: Arc::new(RwLock::new(Vec::new())),
-                // The unpruned default: `NETWORK | WITNESS`.
-                local_services: 0x09,
+        Self::from_handles(ContextHandles {
+            mempool: MempoolHandles {
+                gateway: MempoolGateway::shared_with(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    observer,
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
             },
-            mining_control: None,
-            server_bound_at: Mutex::new(None),
-            zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
-            debug_log_path: None,
-            rest_render_budget: Arc::new(RestRenderBudget::new()),
-        }
+            ..ContextHandles::default()
+        })
     }
 
-    /// Builds a context that shares pre-existing handles owned elsewhere.
+    /// Composes one context from a complete [`ContextHandles`] value.
     ///
-    /// PRE: `handles` groups the node's live capability objects.
-    /// POST: the context owns those exact groups and unwraps the two
-    ///   single-handle input groups; the RPC-local fields are fresh.
-    /// INVARIANT: no group is flattened or rebuilt, so a publication through
-    ///   the node's own handle is visible to every RPC worker.
+    /// This is the single production composition point. PRE: `handles` names
+    /// every capability the context will use, including the authoritative
+    /// chain-transition barrier supplied by the chain owner. POST: the
+    /// context carries that full set; the groups' `pub` fields still permit
+    /// post-hoc attachment, which only test fixtures use.
+    /// INVARIANT: production wiring supplies the chain owner's barrier
+    /// (e.g. `chainstate.transition_barrier()`); the synthetic
+    /// [`ContextHandles::default`] path builds a private barrier for tests.
     #[must_use]
     pub fn from_handles(handles: ContextHandles) -> Self {
         let ContextHandles {
             chain,
-            mempool: MempoolHandles { gateway: mempool },
+            mempool,
             indexes,
             network,
-            mining: MiningHandles { mining_control },
+            mining,
+            zmq_publisher,
+            debug_log_path,
         } = handles;
         Self {
             chain,
             mempool,
             indexes,
             network,
-            mining_control,
+            mining,
+            zmq_publisher,
+            debug_log_path,
             server_bound_at: Mutex::new(None),
-            zmq_publisher: Arc::new(crate::zmq::NoOpZmqPublisher),
-            debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
         }
     }
@@ -753,7 +663,7 @@ impl Context {
     /// through `ContextHandles::mining` instead.
     #[must_use]
     pub fn with_mining_control(mut self, mining_control: Arc<dyn MiningControl>) -> Self {
-        self.mining_control = Some(mining_control);
+        self.mining.mining_control = Some(mining_control);
         self
     }
 
@@ -764,7 +674,13 @@ impl Context {
         self
     }
 
-    /// Shares the node's authoritative connect/disconnect lock with RPC readers.
+    /// Attaches the node's authoritative connect/disconnect mutex.
+    ///
+    /// PRE: `chain_transition` is the node's own transition mutex.
+    /// POST: exclusive chainstate reads use it; see
+    ///   [`ChainHandles::with_stable_chainstate`].
+    /// INVARIANT: published status reads do not acquire it, so a block
+    ///   transition cannot stall `getblockchaininfo` or `getchaintxstats`.
     #[must_use]
     pub fn with_chain_transition(mut self, chain_transition: Arc<Mutex<()>>) -> Self {
         self.chain.chain_transition = chain_transition;
@@ -827,8 +743,13 @@ impl Context {
         tx: Tx,
         max_feerate_sat_per_kvb: Option<u64>,
     ) -> Result<MutationResult, String> {
-        admit_transaction(&self.mempool, &self.chain, &tx, max_feerate_sat_per_kvb)
-            .map_err(AdmissionFailure::into_string)
+        admit_transaction(
+            &self.mempool.gateway,
+            &self.chain,
+            &tx,
+            max_feerate_sat_per_kvb,
+        )
+        .map_err(AdmissionFailure::into_string)
     }
 }
 
@@ -903,23 +824,17 @@ fn unix_time_secs() -> u64 {
 }
 
 impl ChainHandles {
-    /// Runs a read while authoritative UTXO and applied-tip transitions are excluded.
+    /// Runs a read with authoritative UTXO and applied-tip transitions excluded.
+    ///
+    /// PRE: `read` does not reacquire the transition mutex.
+    /// POST: `read` completes before the mutex is released, so its live tip and
+    ///   UTXO observations describe one uninterrupted chainstate.
+    /// INVARIANT: this is mutable-chainstate exclusion, not status
+    ///   synchronization: published status reads answer from a retained
+    ///   `AppliedView` capture and never call it.
     pub fn with_stable_chainstate<R>(&self, read: impl FnOnce() -> R) -> R {
         let _transition = self.chain_transition.lock();
         read()
-    }
-
-    /// Captures the applied publication behind `getblockchaininfo`, with the
-    /// node's connect/disconnect transition excluded.
-    ///
-    /// PRE: none.
-    /// POST: one applied-tip load taken while the transition barrier is held,
-    ///   so the height, hash, work, and count projected from it describe a
-    ///   state the node actually reached.
-    /// INVARIANT: the barrier is still required here; removing it is the status
-    ///   reader's own change, tracked separately from this grouping.
-    fn applied_progress_snapshot(&self) -> AppliedView {
-        self.with_stable_chainstate(|| self.applied_view())
     }
 
     /// Returns the pruning state reported by `getblockchaininfo`.
@@ -932,36 +847,45 @@ impl ChainHandles {
 
     /// Typed synchronization progress: the `getblockchaininfo` facts without
     /// RPC JSON. Chainwork is the applied tip's when one exists.
+    ///
+    /// PRE: none.
+    /// POST: progress projected from one applied publication captured here.
+    /// INVARIANT: neither capture nor projection acquires `chain_transition`,
+    ///   so a block transition in progress cannot stall this response.
     #[must_use]
     pub fn sync_progress(&self) -> SyncProgress {
-        let applied_tip = self.applied_progress_snapshot();
-        let applied = applied_tip.height();
+        let applied = self.applied_view();
+        self.sync_progress_at(&applied)
+    }
+
+    /// Synchronization progress projected from a retained applied publication.
+    ///
+    /// PRE: `applied` is the view this response is built from.
+    /// POST: applied fields use that view's tip and count; the header height is
+    ///   sampled separately, so best-header may lead applied.
+    /// INVARIANT: the projection never reloads the applied publication.
+    #[must_use]
+    pub(crate) fn sync_progress_at(&self, applied: &AppliedView) -> SyncProgress {
+        let height = applied.height();
         let headers = self.height();
-        let (difficulty, time, median_time, tip_bits) = applied_tip.tip().map_or(
-            (0.0, 0_u64, 0_u64, CompactTarget::from_consensus(0)),
-            |tip| {
-                let tree = self.block_tree.read();
-                tree.node(tip.tip_id).map_or(
-                    (0.0, 0, 0, CompactTarget::from_consensus(0)),
-                    |node| {
-                        (
-                            self.difficulty_for_bits(node.header.bits),
-                            u64::from(node.header.time),
-                            u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
-                            node.header.bits,
-                        )
-                    },
+        let (difficulty, time, median_time) = applied.tip().map_or((0.0, 0_u64, 0_u64), |tip| {
+            let tree = self.block_tree.read();
+            tree.node(tip.tip_id).map_or((0.0, 0, 0), |node| {
+                (
+                    self.difficulty_for_bits(node.header.bits),
+                    u64::from(node.header.time),
+                    u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
                 )
-            },
-        );
+            })
+        });
         let now = crate::handlers::chain::unix_now();
         // Core's estimate when the verified-transaction count is known, the
         // height ratio when it is not; `None` is a pre-tracking datadir and
         // means unknown, never zero.
-        let verification_progress = applied_tip.chain_tx_count().map_or_else(
+        let verification_progress = applied.chain_tx_count().map_or_else(
             || {
                 if headers > 0 {
-                    (f64::from(applied) / f64::from(headers)).min(1.0)
+                    (f64::from(height) / f64::from(headers)).min(1.0)
                 } else {
                     0.0
                 }
@@ -970,7 +894,7 @@ impl ChainHandles {
                 crate::handlers::chain::verification_progress(
                     self.chain_network,
                     chain_tx_count,
-                    applied,
+                    height,
                     headers,
                     time,
                     now,
@@ -980,19 +904,18 @@ impl ChainHandles {
         let prune_status = self.prune_status();
         SyncProgress {
             network: self.chain_network,
-            blocks: applied,
+            blocks: height,
             headers,
-            best_block_hash: applied_tip.hash(self.chain_network),
+            best_block_hash: applied.hash(self.chain_network),
             difficulty,
             time,
             median_time,
-            tip_bits,
             verification_progress,
             initial_block_download: self.ibd.is_active(now, self.chain_network),
             // The applied chain's work once one block is connected; before the
             // first applied tip, the header chain's, which is all such a node has.
-            chain_work: match applied_tip.tip() {
-                Some(_) => applied_tip.chainwork_hex(),
+            chain_work: match applied.tip() {
+                Some(_) => applied.chainwork_hex(),
                 None => self.chainwork_hex(),
             },
             size_on_disk: self
@@ -1113,24 +1036,6 @@ impl ChainHandles {
         self.active_hash_in_view(&self.applied_view(), height)
     }
 
-    /// Publishes a new best-chain tip.
-    ///
-    /// Fixture-only like the [`TipReader`] publication it writes: production
-    /// tips arrive through chain validation, never through RPC.
-    #[cfg(test)]
-    pub fn set_chain_tip(&self, tip: TipSnapshot) {
-        self.chain_tip.store(Some(Arc::new(tip)));
-    }
-
-    /// Publishes a new best-applied-block tip.
-    ///
-    /// Fixture-only like the [`TipReader`] publication it writes: production
-    /// tips arrive through block application, never through RPC.
-    #[cfg(test)]
-    pub fn set_applied_tip(&self, tip: TipSnapshot) {
-        self.applied_tip.store(Some(Arc::new(tip)));
-    }
-
     fn header_record(&self, hash: Hash256) -> Option<BlockRecord> {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
@@ -1197,6 +1102,29 @@ impl ChainHandles {
     pub(crate) fn block_hash_at_height(&self, height: u32) -> Option<Hash256> {
         if let Some(tip) = self.applied_tip.load_full() {
             return self.hash_at_height_from_tip(&tip, height);
+        }
+        if height == 0 {
+            return Some(self.chain_network.genesis_block_hash());
+        }
+        record_at_height(&self.blocks.read(), height).map(|candidate| Hash256::from(candidate.hash))
+    }
+
+    /// Returns the applied-chain hash at `height` within a retained view.
+    ///
+    /// PRE: `view` is the response's retained applied publication.
+    /// POST: that branch's hash at `height`; with no applied tip yet, the
+    ///   genesis hash at height 0 or the block-log record's hash, which is the
+    ///   cache-only fallback such contexts use.
+    /// INVARIANT: reads the tree and the log as necessary but never reloads
+    ///   `applied_tip`, so one response cannot straddle two applied branches.
+    #[must_use]
+    pub(crate) fn block_hash_at_height_in_view(
+        &self,
+        view: &AppliedView,
+        height: u32,
+    ) -> Option<Hash256> {
+        if let Some(tip) = view.tip() {
+            return self.hash_at_height_from_tip(tip, height);
         }
         if height == 0 {
             return Some(self.chain_network.genesis_block_hash());
@@ -1446,6 +1374,128 @@ mod tests {
         assert_send_sync::<bitcoin_rs_chain::InitialBlockDownload>();
     }
 
+    /// The count travels inside the applied tip: one publication replaces
+    /// tip and count together, so no reader can pair one with the other's
+    /// successor.
+    #[test]
+    fn applied_tip_publication_carries_the_transaction_count() {
+        let ctx = Context::new();
+        let counted = |count| {
+            Arc::new(TipSnapshot {
+                tip_id: bitcoin_rs_chain::NodeId::new(0),
+                height: 0,
+                chainwork: bitcoin_rs_chain::ChainWork::ZERO,
+                hash: bitcoin_rs_primitives::Hash256::default(),
+                chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(count),
+            })
+        };
+        ctx.chain.applied_tip.store(Some(counted(1)));
+        assert_eq!(ctx.chain.chain_tx_count(), Some(1));
+        ctx.chain.applied_tip.store(Some(counted(42)));
+        assert_eq!(ctx.chain.chain_tx_count(), Some(42));
+    }
+
+    /// Every fact projected from one view describes the publication that view
+    /// captured, even after the publisher advances to a new tip.
+    #[test]
+    fn applied_view_uses_one_publication() {
+        use bitcoin_rs_chain::{ChainTxCount, ChainWork, NodeId};
+
+        let ctx = Context::new();
+        let tip = |height: u32, byte: u8, work: u64, count| {
+            Arc::new(TipSnapshot {
+                tip_id: NodeId::new(height),
+                height,
+                chainwork: ChainWork::from(work),
+                hash: Hash256::from_le_bytes(&[byte; 32]),
+                chain_tx_count: count,
+            })
+        };
+
+        // Before the first publication every projection answers with its
+        // documented empty default.
+        let empty = ctx.chain.applied_view();
+        assert_eq!(empty.tip(), None);
+        assert_eq!(empty.height(), 0);
+        assert_eq!(
+            empty.hash(Network::Mainnet),
+            Network::Mainnet.genesis_block_hash()
+        );
+        assert_eq!(empty.chainwork_hex(), "00");
+        assert_eq!(empty.chain_tx_count(), None);
+
+        let a = tip(10, 0xaa, 7, ChainTxCount::established(100));
+        let b = tip(20, 0xbb, 9, ChainTxCount::established(200));
+        ctx.chain.applied_tip.store(Some(Arc::clone(&a)));
+        let view = ctx.chain.applied_view();
+        // The publisher advances while the response is still being built.
+        ctx.chain.applied_tip.store(Some(b));
+
+        assert_eq!(view.height(), 10, "height must stay at the capture");
+        assert_eq!(
+            view.hash(Network::Mainnet),
+            Hash256::from_le_bytes(&[0xaa_u8; 32]),
+            "hash must stay at the capture"
+        );
+        assert_eq!(
+            view.chainwork_hex(),
+            format!("{:064x}", ChainWork::from(7_u64)),
+            "work must stay at the capture"
+        );
+        assert_eq!(view.chain_tx_count(), Some(100), "count must stay");
+
+        // A fresh capture sees the newer publication.
+        assert_eq!(ctx.chain.applied_view().height(), 20);
+
+        // A present tip whose count is unknown stays unknown: it is never
+        // guessed as zero, which would differ from it by an entire chain.
+        ctx.chain
+            .applied_tip
+            .store(Some(tip(30, 0xcc, 11, ChainTxCount::UNKNOWN)));
+        let unknown = ctx.chain.applied_view();
+        assert_eq!(unknown.height(), 30);
+        assert_eq!(unknown.chain_tx_count(), None);
+    }
+
+    /// Capturing a view never waits on the transition barrier. This pins the
+    /// primitive only; the status readers keep their own barrier until their
+    /// separate change.
+    #[test]
+    fn applied_view_does_not_wait_for_transition() -> anyhow::Result<()> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let barrier = Arc::new(Mutex::new(()));
+        let ctx = Arc::new(Context::new().with_chain_transition(Arc::clone(&barrier)));
+        ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(0),
+            height: 5,
+            chainwork: bitcoin_rs_chain::ChainWork::ZERO,
+            hash: bitcoin_rs_primitives::Hash256::default(),
+            chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(1),
+        })));
+
+        let transition = barrier.lock();
+        let worker = Arc::clone(&ctx);
+        let (tx, rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _sent = tx.send(worker.chain.applied_view().height());
+        });
+        let height = rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| anyhow::anyhow!("capture blocked behind the transition barrier"))?;
+        assert_eq!(height, 5, "the capture must see the published tip");
+        join.join()
+            .map_err(|_| anyhow::anyhow!("capture worker panicked"))?;
+        drop(transition);
+        Ok(())
+    }
+
+    /// The embedded call and the RPC handler reach the gateway through the
+    /// one shared admission operation. The same accepted transaction commits
+    /// on both surfaces, the same policy refusal is reported by both, and
+    /// neither surface inserts a refused transaction.
+    ///
     /// A log whose heights are non-decreasing but not a clean `0..n`.
     ///
     /// Height 3 is recorded three times, as two reorgs leave it; the log starts
@@ -1506,6 +1556,7 @@ mod tests {
     /// published, and nothing covered it: a mutation replacing it with "the last
     /// record in the log" stayed green.
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn block_by_height_without_an_applied_tip_reads_the_log() {
         let ctx = Context::new();
         for record in shaped_records() {
@@ -1655,6 +1706,7 @@ mod tests {
                 network_active: Arc::clone(&network_active),
                 banned: Arc::clone(&banned),
                 added_nodes: Arc::clone(&added_nodes),
+                local_services: 0x09,
                 ..NetworkHandles::default()
             },
             ..ContextHandles::default()
@@ -1730,285 +1782,47 @@ mod tests {
         );
     }
 
+    /// One retained publication answers a whole status response: after the
+    /// publisher advances to a second tip, the view captured at the first still
+    /// reports that first tip's height, hash, work, and count together.
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn ibd_latch_judges_the_contexts_own_tree() {
-        use alloc::sync::Arc;
-
-        fn insert_recent_tip(ctx: &Context, now: u64) -> TipSnapshot {
-            let genesis = Network::Regtest.genesis_block();
-            let mut tree = ctx.chain.block_tree.write();
-            let genesis_id = tree
-                .insert_node(
-                    None,
-                    genesis.header,
-                    bitcoin_rs_chain::node::NodeStatus::Active,
-                )
-                .expect("genesis insert");
-            let mut child = genesis.header;
-            child.prev_blockhash = genesis.block_hash();
-            child.time = u32::try_from(now - 60).unwrap_or(u32::MAX);
-            child.nonce = 1;
-            let child_id = tree
-                .insert_node(
-                    Some(genesis_id),
-                    child,
-                    bitcoin_rs_chain::node::NodeStatus::Active,
-                )
-                .expect("child insert");
-            let node = tree.node(child_id).expect("inserted node");
-            TipSnapshot {
-                tip_id: child_id,
-                height: node.height,
-                chainwork: node.chainwork,
-                hash: node.hash,
-                chain_tx_count: node.chain_tx_count,
-            }
-        }
-
-        let applied_tip = Arc::new(ArcSwapOption::empty());
-
-        let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
-        let status: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource> = Arc::new(ReadySource);
-        let ctx = Context::from_handles(ContextHandles {
-            chain: ChainHandles {
-                chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
-                applied_tip: TipReader::new(Arc::clone(&applied_tip)),
-                chain_transition: Arc::new(Mutex::new(())),
-                ibd: Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-                    TipReader::new(Arc::clone(&applied_tip)),
-                    BlockTreeReader::new(Arc::clone(&block_tree)),
-                )),
-                blocks: Arc::new(RwLock::new(BlockLog::new())),
-                transactions: Arc::new(RwLock::new(HashMap::new())),
-                utxo: Arc::new(bitcoin_rs_utxo::UtxoSet::new()),
-                coin_stats: Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
-                    bitcoin_rs_utxo::stats::CoinStats::default(),
-                )),
-                prune_service: None,
-                chain_control: None,
-                block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
-                chain_network: Network::Mainnet,
-                block_body_source: None,
-                closed_for_recovery: LatchReader::new(Arc::new(
-                    core::sync::atomic::AtomicBool::new(false),
-                )),
-                rollback_warnings: None,
-            },
-            mempool: MempoolHandles {
-                gateway: MempoolGateway::shared(
-                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-                    ValidationEngine::Native,
-                )
-                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
-            },
-            indexes: IndexHandles {
-                derived_index: None,
-                esplora_tx_index: None,
-                script_index: None,
-                derived_index_status: Some(Arc::clone(&status)),
-            },
-            network: NetworkHandles {
-                network: Arc::new(RwLock::new(NetworkState::default())),
-                network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
-                peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
-                p2p_outbound_sender: None,
-                banned: Arc::new(RwLock::new(Vec::new())),
-                added_nodes: Arc::new(RwLock::new(Vec::new())),
-                local_services: 0x09,
-            },
-            mining: MiningHandles {
-                mining_control: None,
-            },
-        });
-
-        // With the regtest work floor at zero and the tip recent, only the
-        // tree lookup can make `is_active` answer false; a latch holding any
-        // other tree finds no node and keeps reporting true.
-        let now = 1_800_000_000_u64;
-        let tip = insert_recent_tip(&ctx, now);
-        ctx.chain.applied_tip.store(Some(Arc::new(tip)));
-        assert!(
-            !ctx.chain.ibd.is_active(now, Network::Regtest),
-            "the latch must judge the tip it reaches through the context's tree"
-        );
-        assert!(
-            Arc::ptr_eq(
-                ctx.indexes
-                    .derived_index_status
-                    .as_ref()
-                    .expect("index status keeps its own slot"),
-                &status
-            ),
-            "the txindex status source must be shared with caller"
-        );
-    }
-
-    /// The count travels inside the applied tip: one publication replaces
-    /// tip and count together, so no reader can pair one with the other's
-    /// successor.
-    #[test]
-    fn applied_tip_publication_carries_the_transaction_count() {
-        let ctx = Context::new();
-        let counted = |count| {
-            Arc::new(TipSnapshot {
-                tip_id: bitcoin_rs_chain::NodeId::new(0),
-                height: 0,
-                chainwork: bitcoin_rs_chain::ChainWork::ZERO,
-                hash: bitcoin_rs_primitives::Hash256::default(),
-                chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(count),
-            })
-        };
-        ctx.chain.applied_tip.store(Some(counted(1)));
-        assert_eq!(ctx.chain.chain_tx_count(), Some(1));
-        ctx.chain.applied_tip.store(Some(counted(42)));
-        assert_eq!(ctx.chain.chain_tx_count(), Some(42));
-    }
-
-    #[test]
-    fn progress_snapshot_waits_for_a_complete_chain_transition() -> anyhow::Result<()> {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let barrier = Arc::new(Mutex::new(()));
-        let ctx = Arc::new(Context::new().with_chain_transition(Arc::clone(&barrier)));
-        let genesis = Network::Regtest.genesis_block();
-        let tip = {
-            let mut tree = ctx.chain.block_tree.write();
-            let tip_id = tree.insert_node(
-                None,
-                genesis.header,
-                bitcoin_rs_chain::node::NodeStatus::Active,
-            )?;
-            let node = tree.node(tip_id)?;
-            TipSnapshot {
-                tip_id,
-                height: node.height,
-                chainwork: node.chainwork,
-                hash: node.hash,
-                chain_tx_count: node.chain_tx_count,
-            }
-        };
-
-        let tip = TipSnapshot {
-            chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(42),
-            ..tip
-        };
-        let transition = barrier.lock();
-        ctx.chain.applied_tip.store(Some(Arc::new(tip.clone())));
-        let worker = Arc::clone(&ctx);
-        let (tx, rx) = mpsc::channel();
-        let join = std::thread::spawn(move || {
-            let _ = tx.send(worker.chain.applied_progress_snapshot());
-        });
-        assert!(
-            rx.recv_timeout(Duration::from_millis(20)).is_err(),
-            "RPC progress must not observe a half-published transition"
-        );
-        drop(transition);
-
-        let published = rx.recv_timeout(Duration::from_secs(1))?;
-        join.join()
-            .map_err(|_| anyhow::anyhow!("snapshot worker panicked"))?;
-        assert_eq!(published.tip(), Some(&tip));
-        assert_eq!(published.chain_tx_count(), Some(42));
-        Ok(())
-    }
-
-    /// Every fact projected from one view describes the publication that view
-    /// captured, even after the publisher advances to a new tip.
-    #[test]
-    fn applied_view_uses_one_publication() {
-        use bitcoin_rs_chain::{ChainTxCount, ChainWork, NodeId};
-
+    fn status_keeps_the_captured_applied_pair() {
         let ctx = Context::new();
         let tip = |height: u32, byte: u8, work: u64, count| {
             Arc::new(TipSnapshot {
-                tip_id: NodeId::new(height),
+                tip_id: bitcoin_rs_chain::NodeId::new(height),
                 height,
-                chainwork: ChainWork::from(work),
+                chainwork: bitcoin_rs_chain::ChainWork::from(work),
                 hash: Hash256::from_le_bytes(&[byte; 32]),
-                chain_tx_count: count,
+                chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(count),
             })
         };
+        ctx.chain.applied_tip.store(Some(tip(3, 0xaa, 7, 42)));
+        let captured = ctx.chain.applied_view();
 
-        // Before the first publication every projection answers with its
-        // documented empty default.
-        let empty = ctx.chain.applied_view();
-        assert_eq!(empty.tip(), None);
-        assert_eq!(empty.height(), 0);
-        assert_eq!(
-            empty.hash(Network::Mainnet),
-            Network::Mainnet.genesis_block_hash()
-        );
-        assert_eq!(empty.chainwork_hex(), "00");
-        assert_eq!(empty.chain_tx_count(), None);
-
-        let a = tip(10, 0xaa, 7, ChainTxCount::established(100));
-        let b = tip(20, 0xbb, 9, ChainTxCount::established(200));
-        ctx.chain.applied_tip.store(Some(Arc::clone(&a)));
-        let view = ctx.chain.applied_view();
         // The publisher advances while the response is still being built.
-        ctx.chain.applied_tip.store(Some(b));
+        ctx.chain.applied_tip.store(Some(tip(9, 0xbb, 9, 84)));
 
-        assert_eq!(view.height(), 10, "height must stay at the capture");
+        let progress = ctx.chain.sync_progress_at(&captured);
+        assert_eq!(progress.blocks, 3, "blocks must stay at the capture");
         assert_eq!(
-            view.hash(Network::Mainnet),
+            progress.best_block_hash,
             Hash256::from_le_bytes(&[0xaa_u8; 32]),
-            "hash must stay at the capture"
+            "the applied hash must stay at the capture"
         );
         assert_eq!(
-            view.chainwork_hex(),
-            format!("{:064x}", ChainWork::from(7_u64)),
-            "work must stay at the capture"
+            progress.chain_work,
+            format!("{:064x}", bitcoin_rs_chain::ChainWork::from(7_u64)),
+            "chainwork must stay at the capture"
         );
-        assert_eq!(view.chain_tx_count(), Some(100), "count must stay");
+        assert_eq!(
+            captured.chain_tx_count(),
+            Some(42),
+            "the captured count must stay paired with the captured tip"
+        );
 
-        // A fresh capture sees the newer publication.
-        assert_eq!(ctx.chain.applied_view().height(), 20);
-
-        // A present tip whose count is unknown stays unknown: it is never
-        // guessed as zero, which would differ from it by an entire chain.
-        ctx.chain
-            .applied_tip
-            .store(Some(tip(30, 0xcc, 11, ChainTxCount::UNKNOWN)));
-        let unknown = ctx.chain.applied_view();
-        assert_eq!(unknown.height(), 30);
-        assert_eq!(unknown.chain_tx_count(), None);
-    }
-
-    /// Capturing a view never waits on the transition barrier. This pins the
-    /// primitive only; the status readers keep their own barrier until their
-    /// separate change.
-    #[test]
-    fn applied_view_does_not_wait_for_transition() -> anyhow::Result<()> {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let barrier = Arc::new(Mutex::new(()));
-        let ctx = Arc::new(Context::new().with_chain_transition(Arc::clone(&barrier)));
-        ctx.chain.set_applied_tip(TipSnapshot {
-            tip_id: bitcoin_rs_chain::NodeId::new(0),
-            height: 5,
-            chainwork: bitcoin_rs_chain::ChainWork::ZERO,
-            hash: bitcoin_rs_primitives::Hash256::default(),
-            chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(1),
-        });
-
-        let transition = barrier.lock();
-        let worker = Arc::clone(&ctx);
-        let (tx, rx) = mpsc::channel();
-        let join = std::thread::spawn(move || {
-            let _sent = tx.send(worker.chain.applied_view().height());
-        });
-        let height = rx
-            .recv_timeout(Duration::from_secs(1))
-            .map_err(|_| anyhow::anyhow!("capture blocked behind the transition barrier"))?;
-        assert_eq!(height, 5, "the capture must see the published tip");
-        join.join()
-            .map_err(|_| anyhow::anyhow!("capture worker panicked"))?;
-        drop(transition);
-        Ok(())
+        // A fresh capture follows the publisher; header height is sampled apart.
+        assert_eq!(ctx.chain.sync_progress().blocks, 9);
     }
 
     #[test]
@@ -2083,7 +1897,13 @@ mod tests {
             hash: record.hash,
             body: body.clone(),
         });
-        let ctx = Context::new().with_block_body_source(source);
+        let ctx = Context::from_handles(ContextHandles {
+            chain: ChainHandles {
+                block_body_source: Some(source),
+                ..ChainHandles::default()
+            },
+            ..ContextHandles::default()
+        });
         ctx.chain.add_block(record.clone());
 
         assert_eq!(record.body_size, consensus_bytes(&block).len());
@@ -2105,6 +1925,7 @@ mod tests {
     /// from: the tree, via `record_for_hash`. A record built straight from a
     /// block has none.
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn header_hex_is_unchanged_by_sourcing_the_header_from_the_tree() {
         let block = Network::Regtest.genesis_block();
         let ctx = Arc::new(Context::new());
@@ -2131,6 +1952,7 @@ mod tests {
     /// it unchanged would answer with none, which is what an earlier revision of
     /// this change did until this test caught it.
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn record_for_hash_answers_with_the_tree_header_for_a_cached_record() {
         let block = Network::Regtest.genesis_block();
         let ctx = Arc::new(Context::new());
@@ -2272,7 +2094,9 @@ mod tests {
             let applied_tip = tree
                 .tip()
                 .ok_or_else(|| std::io::Error::other("missing child tip"))?;
-            ctx.chain.applied_tip.store(Some(applied_tip));
+            ctx.chain
+                .applied_tip
+                .store(Some(Arc::new((*applied_tip).clone())));
             // Stale cache entry at the SAME height as the tree child but with a
             // different hash. The active-tree identity must win over this cache.
             let stale_hash = Hash256::from_le_bytes(&[0xa5_u8; 32]);
@@ -2353,8 +2177,12 @@ mod tests {
             (applied_tip, header_tip)
         };
 
-        ctx.chain.applied_tip.store(Some(Arc::clone(&applied_tip)));
-        ctx.chain.chain_tip.store(Some(Arc::clone(&header_tip)));
+        ctx.chain
+            .applied_tip
+            .store(Some(Arc::new((*applied_tip).clone())));
+        ctx.chain
+            .chain_tip
+            .store(Some(Arc::new((*header_tip).clone())));
         ctx.chain
             .add_block(BlockRecord::synthetic(2, BlockHash::from(header_tip.hash)));
 
@@ -2373,6 +2201,121 @@ mod tests {
         assert!(ctx.chain.block_hash_at_height(2).is_none());
         assert!(ctx.chain.block_by_height(2).is_none());
         Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ibd_latch_judges_the_contexts_own_tree() {
+        use alloc::sync::Arc;
+
+        fn insert_recent_tip(ctx: &Context, now: u64) -> TipSnapshot {
+            let genesis = Network::Regtest.genesis_block();
+            let mut tree = ctx.chain.block_tree.write();
+            let genesis_id = tree
+                .insert_node(
+                    None,
+                    genesis.header,
+                    bitcoin_rs_chain::node::NodeStatus::Active,
+                )
+                .expect("genesis insert");
+            let mut child = genesis.header;
+            child.prev_blockhash = genesis.block_hash();
+            child.time = u32::try_from(now - 60).unwrap_or(u32::MAX);
+            child.nonce = 1;
+            let child_id = tree
+                .insert_node(
+                    Some(genesis_id),
+                    child,
+                    bitcoin_rs_chain::node::NodeStatus::Active,
+                )
+                .expect("child insert");
+            let node = tree.node(child_id).expect("inserted node");
+            TipSnapshot {
+                tip_id: child_id,
+                height: node.height,
+                chainwork: node.chainwork,
+                hash: node.hash,
+                chain_tx_count: node.chain_tx_count,
+            }
+        }
+
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+
+        let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
+        let status: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource> = Arc::new(ReadySource);
+        let ctx = Context::from_handles(ContextHandles {
+            chain: ChainHandles {
+                chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
+                applied_tip: TipReader::new(Arc::clone(&applied_tip)),
+                chain_transition: Arc::new(Mutex::new(())),
+                ibd: Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
+                    TipReader::new(Arc::clone(&applied_tip)),
+                    BlockTreeReader::new(Arc::clone(&block_tree)),
+                )),
+                blocks: Arc::new(RwLock::new(BlockLog::new())),
+                transactions: Arc::new(RwLock::new(HashMap::new())),
+                utxo: Arc::new(bitcoin_rs_utxo::UtxoSet::new()),
+                coin_stats: Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+                    bitcoin_rs_utxo::stats::CoinStats::default(),
+                )),
+                prune_service: None,
+                chain_control: None,
+                block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
+                chain_network: Network::Mainnet,
+                block_body_source: None,
+                closed_for_recovery: LatchReader::new(Arc::new(
+                    core::sync::atomic::AtomicBool::new(false),
+                )),
+                rollback_warnings: None,
+            },
+            mempool: MempoolHandles {
+                gateway: MempoolGateway::shared(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
+            },
+            indexes: IndexHandles {
+                derived_index: None,
+                esplora_tx_index: None,
+                script_index: None,
+                derived_index_status: Some(Arc::clone(&status)),
+            },
+            network: NetworkHandles {
+                network: Arc::new(RwLock::new(NetworkState::default())),
+                network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+                peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
+                p2p_outbound_sender: None,
+                banned: Arc::new(RwLock::new(Vec::new())),
+                added_nodes: Arc::new(RwLock::new(Vec::new())),
+                local_services: 0x09,
+            },
+            mining: MiningHandles {
+                mining_control: None,
+            },
+            ..ContextHandles::default()
+        });
+
+        // With the regtest work floor at zero and the tip recent, only the
+        // tree lookup can make `is_active` answer false; a latch holding any
+        // other tree finds no node and keeps reporting true.
+        let now = 1_800_000_000_u64;
+        let tip = insert_recent_tip(&ctx, now);
+        ctx.chain.applied_tip.store(Some(Arc::new(tip)));
+        assert!(
+            !ctx.chain.ibd.is_active(now, Network::Regtest),
+            "the latch must judge the tip it reaches through the context's tree"
+        );
+        assert!(
+            Arc::ptr_eq(
+                ctx.indexes
+                    .derived_index_status
+                    .as_ref()
+                    .expect("index status keeps its own slot"),
+                &status
+            ),
+            "the txindex status source must be shared with caller"
+        );
     }
 }
 
@@ -2472,7 +2415,7 @@ mod admission_chain_tests {
             .with_stable_chainstate(|| ctx.admit_transaction(tx, None))
             .map_err(anyhow::Error::msg)?;
         assert_eq!(result.changes.len(), 1);
-        assert!(ctx.mempool.read().contains_txid(&txid));
+        assert!(ctx.mempool.gateway.read().contains_txid(&txid));
         Ok(())
     }
 
@@ -2506,7 +2449,7 @@ mod admission_chain_tests {
                 .context("snapshot")?
                 .confirmed
         );
-        let result = ctx.mempool.submit_transaction(
+        let result = ctx.mempool.gateway.submit_transaction(
             Arc::new(tx),
             AdmissionOrigin::Peer(PeerToken {
                 addr: std::net::SocketAddr::from(([127, 0, 0, 1], 18444)),
@@ -2517,99 +2460,7 @@ mod admission_chain_tests {
             &ctx.chain.admission_chain(),
         )?;
         assert!(matches!(result, SubmitOutcome::Committed(_)));
-        assert!(ctx.mempool.read().contains_txid(&txid));
-        Ok(())
-    }
-
-    /// The embedded call and the RPC handler reach the gateway through the
-    /// one shared admission operation. The same accepted transaction commits
-    /// on both surfaces, the same policy refusal is reported by both, and
-    /// neither surface inserts a refused transaction.
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn admission_envelopes_share_gateway_outcomes() -> anyhow::Result<()> {
-        use sonic_rs::{JsonValueTrait as _, Value, json};
-
-        use crate::error::RpcError;
-        use crate::handlers::tx;
-
-        let outpoint = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[21; 32])), 0);
-        let spend = spending(outpoint);
-        let raw = hex_encode(&consensus_bytes(&spend));
-        let mut changes = BlockChanges::default();
-        changes.add(UtxoAdd::new(
-            outpoint,
-            TxOut {
-                value: Amount::from_sat(10_000),
-                script_pubkey: Script::from_bytes(spendable_script()),
-            },
-            false,
-            0,
-        ));
-
-        // Accepted: the embedded call and the RPC handler commit the same
-        // funded transaction through the one operation.
-        let embedded_ctx = Context::new();
-        bitcoin_rs_utxo::contract::commit_block_changes(
-            &embedded_ctx.chain.utxo,
-            &changes,
-            &Hash256::default(),
-        )?;
-        let embedded = embedded_ctx
-            .admit_transaction(spend.clone(), None)
-            .map_err(anyhow::Error::msg)?;
-        assert_eq!(embedded.changes.len(), 1);
-        assert!(embedded_ctx.mempool.read().contains_txid(&spend.txid()));
-        let rpc_ctx = Arc::new(Context::new());
-        bitcoin_rs_utxo::contract::commit_block_changes(
-            &rpc_ctx.chain.utxo,
-            &changes,
-            &Hash256::default(),
-        )?;
-        let accepted = tx::sendrawtransaction(&rpc_ctx, &json!([raw]))?;
-        assert_eq!(accepted.as_str(), Some(spend.txid().to_string()).as_deref());
-        assert!(rpc_ctx.mempool.read().contains_txid(&spend.txid()));
-
-        // Refused: an unknown prevout is refused on both surfaces and
-        // inserted on neither.
-        let orphan = spending(OutPoint::new(
-            Txid::from(Hash256::from_le_bytes(&[22; 32])),
-            0,
-        ));
-        let refusal = embedded_ctx
-            .admit_transaction(orphan.clone(), None)
-            .expect_err("an unknown prevout must be refused");
-        assert_eq!(
-            refusal,
-            bitcoin_rs_mempool::standardness::AcceptanceRejectReason::MissingInputs.to_string(),
-            "the embedded envelope maps the shared policy failure verbatim"
-        );
-        let orphan_raw = hex_encode(&consensus_bytes(&orphan));
-        let refused = tx::sendrawtransaction(&rpc_ctx, &json!([orphan_raw]))
-            .expect_err("the RPC surface refuses the same transaction");
-        assert_eq!(refused.code(), RpcError::CORE_VERIFY_ERROR);
-        assert!(!embedded_ctx.mempool.read().contains_txid(&orphan.txid()));
-        assert!(!rpc_ctx.mempool.read().contains_txid(&orphan.txid()));
-
-        // Preview: testmempoolaccept answers for the funded transaction
-        // without inserting it.
-        let preview_ctx = Arc::new(Context::new());
-        bitcoin_rs_utxo::contract::commit_block_changes(
-            &preview_ctx.chain.utxo,
-            &changes,
-            &Hash256::default(),
-        )?;
-        let rows = tx::testmempoolaccept(&preview_ctx, &json!([[raw]]))?;
-        assert_eq!(
-            rows.get(0)
-                .and_then(|row| row.get("allowed"))
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert!(
-            !preview_ctx.mempool.read().contains_txid(&spend.txid()),
-            "the accepted preview must not insert"
-        );
+        assert!(ctx.mempool.gateway.read().contains_txid(&txid));
         Ok(())
     }
 
@@ -2689,6 +2540,110 @@ mod admission_chain_tests {
         assert!(
             !snapshot.confirmed,
             "lookup-cache membership is not chain evidence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn admission_envelopes_share_gateway_outcomes() -> anyhow::Result<()> {
+        use sonic_rs::{JsonValueTrait as _, Value, json};
+
+        use crate::error::RpcError;
+        use crate::handlers::tx;
+
+        let outpoint = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[21; 32])), 0);
+        let spend = spending(outpoint);
+        let raw = hex_encode(&consensus_bytes(&spend));
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(
+            outpoint,
+            TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: Script::from_bytes(spendable_script()),
+            },
+            false,
+            0,
+        ));
+
+        // Accepted: the embedded call and the RPC handler commit the same
+        // funded transaction through the one operation.
+        let embedded_ctx = Context::new();
+        bitcoin_rs_utxo::contract::commit_block_changes(
+            &embedded_ctx.chain.utxo,
+            &changes,
+            &Hash256::default(),
+        )?;
+        let embedded = embedded_ctx
+            .admit_transaction(spend.clone(), None)
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(embedded.changes.len(), 1);
+        assert!(
+            embedded_ctx
+                .mempool
+                .gateway
+                .read()
+                .contains_txid(&spend.txid())
+        );
+        let rpc_ctx = Arc::new(Context::new());
+        bitcoin_rs_utxo::contract::commit_block_changes(
+            &rpc_ctx.chain.utxo,
+            &changes,
+            &Hash256::default(),
+        )?;
+        let accepted = tx::sendrawtransaction(&rpc_ctx, &json!([raw]))?;
+        assert_eq!(accepted.as_str(), Some(spend.txid().to_string()).as_deref());
+        assert!(rpc_ctx.mempool.gateway.read().contains_txid(&spend.txid()));
+
+        // Refused: an unknown prevout is refused on both surfaces and
+        // inserted on neither.
+        let orphan = spending(OutPoint::new(
+            Txid::from(Hash256::from_le_bytes(&[22; 32])),
+            0,
+        ));
+        let refusal = embedded_ctx
+            .admit_transaction(orphan.clone(), None)
+            .expect_err("an unknown prevout must be refused");
+        assert_eq!(
+            refusal,
+            bitcoin_rs_mempool::standardness::AcceptanceRejectReason::MissingInputs.to_string(),
+            "the embedded envelope maps the shared policy failure verbatim"
+        );
+        let orphan_raw = hex_encode(&consensus_bytes(&orphan));
+        let refused = tx::sendrawtransaction(&rpc_ctx, &json!([orphan_raw]))
+            .expect_err("the RPC surface refuses the same transaction");
+        assert_eq!(refused.code(), RpcError::CORE_VERIFY_ERROR);
+        assert!(
+            !embedded_ctx
+                .mempool
+                .gateway
+                .read()
+                .contains_txid(&orphan.txid())
+        );
+        assert!(!rpc_ctx.mempool.gateway.read().contains_txid(&orphan.txid()));
+
+        // Preview: testmempoolaccept answers for the funded transaction
+        // without inserting it.
+        let preview_ctx = Arc::new(Context::new());
+        bitcoin_rs_utxo::contract::commit_block_changes(
+            &preview_ctx.chain.utxo,
+            &changes,
+            &Hash256::default(),
+        )?;
+        let rows = tx::testmempoolaccept(&preview_ctx, &json!([[raw]]))?;
+        assert_eq!(
+            rows.get(0)
+                .and_then(|row| row.get("allowed"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            !preview_ctx
+                .mempool
+                .gateway
+                .read()
+                .contains_txid(&spend.txid()),
+            "the accepted preview must not insert"
         );
         Ok(())
     }

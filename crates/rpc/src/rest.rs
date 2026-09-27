@@ -406,7 +406,7 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     // transition between the reads could confirm a spend the transition
     // already reversed. The entry check refuses while a change is active.
     let entry_generation = if check_mempool {
-        match ctx.mempool.stable_generation() {
+        match ctx.mempool.gateway.stable_generation() {
             Some(generation) => Some(generation),
             None => return service_unavailable("chain generation is odd; retry"),
         }
@@ -416,7 +416,7 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     // The pool read fence is taken first: a chain transition between the
     // tip capture and the UTXO reads could otherwise pair UTXOs committed
     // under tip B with the height and hash of tip A.
-    let pool = ctx.mempool.read();
+    let pool = ctx.mempool.gateway.read();
     // Height and hash describe one publication, so a response cannot pair one
     // block's height with another block's hash.
     let view = ctx.chain.applied_view();
@@ -444,7 +444,8 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     // The end check compares for exact equality only; a generation that
     // moved while the reads ran discards the assembled results and asks the
     // client to retry.
-    if entry_generation.is_some_and(|entry| ctx.mempool.stable_generation() != Some(entry)) {
+    if entry_generation.is_some_and(|entry| ctx.mempool.gateway.stable_generation() != Some(entry))
+    {
         return service_unavailable("chain generation is odd; retry");
     }
     // Bitmap packs the least-significant hit bit first per byte, matching Core.
@@ -1984,7 +1985,7 @@ mod tests {
     #[test]
     fn getutxos_checkmempool_returns_503_on_unstable_generation() {
         let ctx = Arc::new(Context::new());
-        ctx.mempool.force_chain_generation(3);
+        ctx.mempool.gateway.force_chain_generation(3);
         let response = route(&ctx, CHECKMEMPOOL_JSON, "", true);
         assert_eq!(response.status, 503);
         assert_eq!(response.reason, "Service Unavailable");
@@ -1997,9 +1998,9 @@ mod tests {
     #[test]
     fn getutxos_checkmempool_rejects_moved_generation() {
         let ctx = Arc::new(Context::new());
-        ctx.mempool.force_chain_generation(4);
+        ctx.mempool.gateway.force_chain_generation(4);
         let mover = Arc::clone(&ctx);
-        arm_capture_hook(move || mover.mempool.force_chain_generation(6));
+        arm_capture_hook(move || mover.mempool.gateway.force_chain_generation(6));
         let response = route(&ctx, CHECKMEMPOOL_JSON, "", true);
         assert_eq!(response.status, 503);
         assert_eq!(response.body, b"chain generation is odd; retry".to_vec());
@@ -2010,7 +2011,7 @@ mod tests {
     #[test]
     fn plain_tip_routes_ignore_mempool_generation() {
         let ctx = Arc::new(Context::new());
-        ctx.mempool.force_chain_generation(3);
+        ctx.mempool.gateway.force_chain_generation(3);
         assert_eq!(route(&ctx, GETUTXOS_JSON, "", true).status, 200);
         assert_eq!(
             route(&ctx, "/rest/deploymentinfo.json", "", true).status,
