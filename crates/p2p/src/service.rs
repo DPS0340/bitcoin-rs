@@ -1303,13 +1303,9 @@ mod tests {
         service.join().expect("clean join");
     }
 
-
     #[test]
     fn active_manual_dial_occupies_an_automatic_slot() {
-        fn accept_for(
-            listener: &TcpListener,
-            timeout: Duration,
-        ) -> Option<std::net::TcpStream> {
+        fn accept_for(listener: &TcpListener, timeout: Duration) -> Option<std::net::TcpStream> {
             let deadline = Instant::now() + timeout;
             loop {
                 match listener.accept() {
@@ -1326,13 +1322,13 @@ mod tests {
             }
         }
 
-        let manual_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .expect("manual listener");
+        let manual_listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("manual listener");
         manual_listener
             .set_nonblocking(true)
             .expect("nonblocking manual listener");
-        let automatic_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .expect("auto listener");
+        let automatic_listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("auto listener");
         automatic_listener
             .set_nonblocking(true)
             .expect("nonblocking auto listener");
@@ -1356,14 +1352,11 @@ mod tests {
             )
             .expect("service starts");
         service
-            .add_node(
-                manual_listener.local_addr().expect("manual address"),
-                false,
-            )
+            .add_node(manual_listener.local_addr().expect("manual address"), false)
             .expect("manual dial queued");
 
-        let manual_connection = accept_for(&manual_listener, Duration::from_secs(5))
-            .expect("manual dial starts");
+        let manual_connection =
+            accept_for(&manual_listener, Duration::from_secs(5)).expect("manual dial starts");
         service
             .outbound_sender()
             .send(OutboundDial::auto(
@@ -1371,8 +1364,7 @@ mod tests {
             ))
             .expect("automatic dial queued");
 
-        let automatic_before_release =
-            accept_for(&automatic_listener, Duration::from_secs(1));
+        let automatic_before_release = accept_for(&automatic_listener, Duration::from_secs(1));
         drop(manual_connection);
         let automatic_after_release = if automatic_before_release.is_none() {
             accept_for(&automatic_listener, Duration::from_secs(5))
