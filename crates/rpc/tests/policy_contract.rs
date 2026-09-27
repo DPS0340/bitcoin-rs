@@ -1699,7 +1699,6 @@ fn invalidation_handler(state: &NodeState) -> Handler {
         chain: ChainHandles {
             chain_tip: tips.chain_tip,
             applied_tip: tips.applied_tip,
-            chain_tx_count: chainstate.chain_tx_count_handle(),
             ibd,
             blocks: state.blocks(),
             transactions: state.transactions(),

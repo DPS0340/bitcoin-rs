@@ -654,7 +654,8 @@ fn deep_reorg_streams_bounded_prefixes_to_the_exact_reference() -> anyhow::Resul
     assert_eq!(landed.height, reference_tip.height);
     let restored = state
         .chainstate()
-        .applied_tip_handle()
+        .rpc_tip_bundle()
+        .applied_tip
         .load_full()
         .ok_or_else(|| anyhow::anyhow!("restored node must publish a tip"))?;
     assert_eq!(restored.chain_tx_count, reference_tip.chain_tx_count);

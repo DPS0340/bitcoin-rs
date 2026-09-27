@@ -18,7 +18,8 @@ fn the_chain_transaction_count_survives_a_checkpoint_restart() -> anyhow::Result
         assert_eq!(
             state
                 .chainstate()
-                .applied_tip_handle()
+                .rpc_tip_bundle()
+                .applied_tip
                 .load_full()
                 .map_or(bitcoin_rs_chain::ChainTxCount::UNKNOWN, |tip| tip
                     .chain_tx_count),
@@ -31,7 +32,8 @@ fn the_chain_transaction_count_survives_a_checkpoint_restart() -> anyhow::Result
         let _tip = state.apply_block(&genesis)?;
         let counted = state
             .chainstate()
-            .applied_tip_handle()
+            .rpc_tip_bundle()
+            .applied_tip
             .load_full()
             .map_or(bitcoin_rs_chain::ChainTxCount::UNKNOWN, |tip| {
                 tip.chain_tx_count
@@ -59,7 +61,8 @@ fn the_chain_transaction_count_survives_a_checkpoint_restart() -> anyhow::Result
     assert_eq!(
         resumed
             .chainstate()
-            .applied_tip_handle()
+            .rpc_tip_bundle()
+            .applied_tip
             .load_full()
             .map_or(bitcoin_rs_chain::ChainTxCount::UNKNOWN, |tip| tip
                 .chain_tx_count),

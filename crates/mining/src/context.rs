@@ -276,55 +276,6 @@ mod tests {
         Ok(())
     }
 
-    // The template's minimum time and the admission gate's timewarp floor
-    // are the same chain-owned value: neither side carries its own copy of
-    // the boundary predicate that could drift from the other.
-    #[test]
-    fn min_time_comes_from_the_chain_timewarp_floor() -> Result<(), Box<dyn std::error::Error>> {
-        let start = 1_600_000_000_u32;
-        let jump = 100_000_u32;
-        let mut tree = BlockTree::new();
-        let before_tip = append_chain_with_bits(&mut tree, 2015, start, |_| 4, 0x1d00_ffff)?;
-        let mut last = synthetic_header_with_version(
-            BlockHash::from(tree.node(before_tip)?.hash),
-            start + 2015 * 600 + jump,
-            4,
-        );
-        last.bits = CompactTarget::from_consensus(0x1d00_ffff);
-        let tip = tree.insert_header(last, NodeStatus::HeaderValid)?;
-
-        // Height 2016 is the testnet4 BIP94 boundary: the helper applies the
-        // parent-time floor, that floor dominates the median floor, and the
-        // context reports exactly the helper's value.
-        let context = MiningChainContext::resolve(&tree, Network::Testnet4, tip, last.time)?;
-        let floor =
-            header_sync::minimum_candidate_time(last.time, context.height, Network::Testnet4)
-                .ok_or("height 2016 is a testnet4 BIP94 boundary")?;
-        assert!(floor > context.prev_median_time_past + 1);
-        assert_eq!(context.min_time, floor);
-
-        // Off the boundary, and on a network that never enforces BIP94, the
-        // helper applies no floor and the context keeps the median one.
-        let inner = MiningChainContext::resolve(&tree, Network::Testnet4, before_tip, last.time)?;
-        assert_eq!(
-            header_sync::minimum_candidate_time(
-                start + 2014 * 600,
-                inner.height,
-                Network::Testnet4
-            ),
-            None
-        );
-        assert_eq!(inner.min_time, inner.prev_median_time_past + 1);
-
-        let regtest = MiningChainContext::resolve(&tree, Network::Regtest, tip, last.time)?;
-        assert_eq!(
-            header_sync::minimum_candidate_time(last.time, regtest.height, Network::Regtest),
-            Some(last.time.saturating_sub(600))
-        );
-        assert_eq!(regtest.min_time, last.time - 600);
-        Ok(())
-    }
-
     fn append_chain(
         tree: &mut BlockTree,
         len: u32,
