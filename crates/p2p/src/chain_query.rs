@@ -839,7 +839,7 @@ mod tests {
             let mut tree = BlockTree::new();
             tree.insert_node(None, header, NodeStatus::Active)?;
             let tree = Arc::new(RwLock::new(tree));
-            let query = ActiveChainQuery::new(BlockTreeReader::new(tree.clone()))
+            let query = ActiveChainQuery::new(BlockTreeReader::new(tree.clone()), Network::Regtest)
                 .with_block_body_source(Arc::new(SwitchingSource {
                     tree,
                     body: consensus_bytes(&block),
