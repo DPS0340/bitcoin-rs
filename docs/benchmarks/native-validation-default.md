@@ -20,13 +20,18 @@ with matching manifests and packaging. `bitcoinkernel` remains an explicit
 opt-in oracle only. It is never a silent fallback and it is never the default
 after promotion.
 
+The promotion target moved with #1263: every crate manifest is kernel-free and
+`validation.engine` defaults to `native`, while the shipped image selects
+`kernel` through `/etc/bitcoin-rs/default.toml`. Promotion below means changing
+that documented production selection, not manifest defaults.
+
 ## Ordering
 
 1. T16 (strict-Rust cryptography lane) must pass first. The verifier is one general BIP340 operation composed over maintained `k256 0.14.0` arithmetic and ECDSA primitives. The `k256` high-level Schnorr signature type is withdrawn because its `Signature` stores a `NonZeroScalar` and cannot represent the whole BIP340 input domain. No custom field or group arithmetic. Overflowing TapTweak is canonically rejected, never reduced. Hybrid-key parity and historical DER and high-S rules are preserved.
 2. T17 then measures the actual final strict artifact. Earlier candidate measurements, including every number in the prior-evidence section, are not promotion proof.
 3. Promotion happens in one changeset: complete the measured end-state cells
-   below, drop `kernel` from all three validation-library defaults, update
-   `Dockerfile`, and prove kernel-free transitive closure with the explicit
+   below, change the shipped engine selection (`/etc/bitcoin-rs/default.toml`,
+   `Dockerfile`), and prove kernel-free transitive closure with the explicit
    `cargo tree` lane below plus the native profiles in `scripts/ci-pr.sh`.
 
 ## End-state cells
@@ -126,15 +131,13 @@ not flip the default.
 | Surface | Script engine |
 |---|---|
 | `bin/bitcoin-rs` default features (`fjall,redb,zmq`) | Native interpreter |
-| `bitcoin-rs-consensus` / `bitcoin-rs-node` crate defaults | Native (kernel-free; `validation.engine` defaults to `native`) |
-| Compose image (`Dockerfile --features fjall,kernel`) | `kernel`, selected through `/etc/bitcoin-rs/default.toml` |
+| `bitcoin-rs-consensus` / `bitcoin-rs-node` crate defaults | `kernel` (`libbitcoinkernel`) |
+| Compose image (`Dockerfile --features fjall,kernel`) | `kernel` |
 
-The library crates are kernel-free by default. The image compiles `kernel`
-support and selects it through `/etc/bitcoin-rs/default.toml`, so the
-documented production engine stays `kernel` until promotion. The binary
-already builds native so a default `cargo build -p bitcoin-rs` needs no C++
-toolchain. Promoting native is one coordinated change under `VAL-01`: change
-the documented production engine selection, not the manifest defaults.
+Until the gates pass, the library crates and the image keep `kernel`. The
+binary already builds native so a default `cargo build -p bitcoin-rs` needs
+no C++ toolchain. Promoting native is one coordinated change: drop
+`kernel` from the two library defaults in the same commit.
 
 ### Measured observations
 
