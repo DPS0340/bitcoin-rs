@@ -78,9 +78,10 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         let applied_tip_height = authority
             .applied_tip_height()
             .ok_or_else(|| PruneServiceError::failed("applied tip is unavailable"))?;
-        let mut pruneheight = self.pruneheight.lock();
-        let updated_pruneheight =
-            pruneheight.map_or(requested_height, |height| height.max(requested_height));
+        let updated_pruneheight = self
+            .pruneheight
+            .lock()
+            .map_or(requested_height, |height| height.max(requested_height));
         let durable_tip_height = self.durable_tip_height.load(Ordering::Acquire);
         let mut pruned_txids = Vec::new();
         let staged = bitcoin_rs_storage::pruning::prune_to_height(
@@ -132,7 +133,12 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             }
         }
 
-        *pruneheight = Some(updated_pruneheight);
+        {
+            let mut published = self.pruneheight.lock();
+            *published = Some(published.map_or(updated_pruneheight, |height| {
+                height.max(updated_pruneheight)
+            }));
+        }
 
         Ok(PruneResult {
             requested_height,

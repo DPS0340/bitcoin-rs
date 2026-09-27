@@ -86,11 +86,13 @@ impl NodeHarness {
 }
 
 /// The real `RpcServer` on `127.0.0.1:0`, driven from one worker thread and
-/// shut down by `Drop`.
+/// shut down by `Drop`. The RPC context holds the node's actual chain
+/// transition barrier, the same mutex the daemon's block transitions take.
 pub(crate) struct ServerHarness {
     address: SocketAddr,
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    transition: Arc<parking_lot::Mutex<()>>,
 }
 
 impl ServerHarness {
@@ -105,6 +107,7 @@ impl ServerHarness {
         let state = &node.state;
         let chainstate = state.chainstate();
         let ibd = chainstate.ibd_latch();
+        let transition = chainstate.read_fence();
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
                 chain_tip: chainstate.header_tip_reader(),
@@ -117,7 +120,7 @@ impl ServerHarness {
                 block_tree: chainstate.block_tree_handle(),
                 chain_network: state.config().network,
                 closed_for_recovery: chainstate.closed_for_recovery_reader(),
-                chain_transition: chainstate.read_fence(),
+                chain_transition: Arc::clone(&transition),
                 ..ChainHandles::default()
             },
             mempool: MempoolHandles {
@@ -167,6 +170,7 @@ impl ServerHarness {
             address,
             shutdown,
             join: Some(join),
+            transition,
         })
     }
 
@@ -174,6 +178,15 @@ impl ServerHarness {
     #[must_use]
     pub(crate) fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// The node's authoritative connect/disconnect barrier, wired into the
+    /// RPC context by `start` exactly as the daemon wires it. A test that holds
+    /// this mutex observes the server the way a status client does while a
+    /// block transition is running.
+    #[must_use]
+    pub(crate) fn chain_transition(&self) -> Arc<parking_lot::Mutex<()>> {
+        Arc::clone(&self.transition)
     }
 
     /// Base64 token of the correct `user:password` credentials.
