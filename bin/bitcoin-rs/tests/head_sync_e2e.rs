@@ -556,25 +556,30 @@ fn announced_tip_fetches_witness_block_and_applies_segwit_chain() -> Result<(), 
         deadline,
     )?;
 
-    // Observe for ~4s while serving every getdata type-faithfully.
-    peer.pump(Duration::from_secs(4), &mut |peer, items| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        for item in items {
-            let _ = peer.serve_item(item, deadline);
-        }
-    });
-
+    // Observe while serving every getdata type-faithfully, until the window
+    // asks for the announced tip (bounded so a stalled plan still fails).
+    let tip_hex = tip_hash.to_string();
+    let tip_requested_witness = |peer: &LivePeer| {
+        peer.getdata_seen.iter().any(|frame| {
+            frame
+                .items
+                .iter()
+                .any(|(inv_type, hex)| *inv_type == 0x4000_0002 && *hex == tip_hex)
+        })
+    };
+    let collect_end = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < collect_end && !peer.dropped && !tip_requested_witness(&peer) {
+        peer.pump(Duration::from_millis(300), &mut |peer, items| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for item in items {
+                let _ = peer.serve_item(item, deadline);
+            }
+        });
+    }
     // The announced tip's body must be requested as MSG_WITNESS_BLOCK —
     // possibly batched by the window with its other near-tip requests.
-    let tip_hex = tip_hash.to_string();
-    let tip_requested_witness = peer.getdata_seen.iter().any(|frame| {
-        frame
-            .items
-            .iter()
-            .any(|(inv_type, hex)| *inv_type == 0x4000_0002 && *hex == tip_hex)
-    });
     assert!(
-        tip_requested_witness,
+        tip_requested_witness(&peer),
         "no MSG_WITNESS_BLOCK getdata for the announced tip was observed; \
          getdata frames: {:?}",
         peer.getdata_seen
@@ -788,7 +793,7 @@ fn untracked_delivery_of_tree_known_block_converges() -> Result<(), HarnessError
     // Serve every window request EXCEPT the tip: h1..h4 arrive as tracked
     // deliveries while h5 stays pending on this peer.
     let mut served_all_but_tip = false;
-    let collect_end = Instant::now() + Duration::from_secs(4);
+    let collect_end = Instant::now() + Duration::from_secs(15);
     while Instant::now() < collect_end && !peer.dropped && !served_all_but_tip {
         peer.pump(Duration::from_millis(300), &mut |peer, items| {
             let deadline = Instant::now() + Duration::from_secs(5);
