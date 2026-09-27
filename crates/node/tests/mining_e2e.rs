@@ -669,11 +669,10 @@ fn mining_handler(state: &NodeState) -> Handler {
     );
     let mining_control: Arc<dyn MiningControl> = Arc::new(coordinator);
     let ibd = state.chainstate().ibd_latch();
-    let tips = state.chainstate().rpc_tip_bundle();
     let ctx = Context::from_handles(ContextHandles {
         chain: ChainHandles {
-            chain_tip: bitcoin_rs_chain::TipReader::new(tips.chain_tip),
-            applied_tip: bitcoin_rs_chain::TipReader::new(tips.applied_tip),
+            chain_tip: state.chainstate().header_tip_reader(),
+            applied_tip: state.chainstate().applied_tip_reader(),
             chain_tx_count: state.chainstate().chain_tx_count_handle(),
             ibd,
             blocks: state.blocks(),
