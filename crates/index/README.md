@@ -30,7 +30,7 @@ script-history resolution.
 (`block`, `prepared`), canonical row mutation (`rows`), durable writes (`write`),
 and coherent fences/reset recovery (`state`). Read-side scans (`reader`,
 `snapshot`) and exact resolution (`resolve`) remain separate from mutations;
-`capability`, `format`, and `error` own shared representations and typed outcomes.
+`capability` and `error` own shared representations and typed outcomes.
 Public paths and on-disk encodings do not depend on this layout.
 
 ## Features

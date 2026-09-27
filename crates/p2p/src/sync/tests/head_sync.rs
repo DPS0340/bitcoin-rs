@@ -41,8 +41,12 @@ fn body_delivered_without_headers_announcement_admits_and_applies()
         Hash256::from(blocks[0].block_hash()),
     );
 
-    let unannounced =
-        mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(2)]);
+    let unannounced = regtest_fixture::mined_block_with_prev_hash(
+        blocks[0].block_hash(),
+        2,
+        vec![regtest_fixture::coinbase(2)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture block: {error}"));
     let expected = unannounced.block_hash();
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(unannounced))?;
     sync.tick();
@@ -80,9 +84,18 @@ fn body_arriving_ahead_of_its_header_chain_requests_the_gap()
     let peer = test_addr(9700, 0)?;
     let rx = connect_peer(&peers, synthetic_peer(peer, 3));
 
-    let block2 =
-        mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(2)]);
-    let block3 = mined_block_with_prev_hash(block2.block_hash(), 3, vec![coinbase_transaction(3)]);
+    let block2 = regtest_fixture::mined_block_with_prev_hash(
+        blocks[0].block_hash(),
+        2,
+        vec![regtest_fixture::coinbase(2)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture block: {error}"));
+    let block3 = regtest_fixture::mined_block_with_prev_hash(
+        block2.block_hash(),
+        3,
+        vec![regtest_fixture::coinbase(3)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture block: {error}"));
     // Only the tip-of-gap body arrives — its parent's header is unknown.
     // Draining twice isolates the ancestry request: the first buffers the
     // body, the second's staged-header retry must emit the only possible
@@ -130,8 +143,10 @@ fn headers_batch_missing_parent_requests_ancestry() -> Result<(), Box<dyn std::e
     let peer = test_addr(9701, 0)?;
     let rx = connect_peer(&peers, synthetic_peer(peer, 10));
 
-    let gap_parent = test_header(genesis.compute_hash(), 1);
-    let orphan_tip = test_header(gap_parent.compute_hash(), 2);
+    let gap_parent = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
+    let orphan_tip = regtest_fixture::mined_regtest_header(gap_parent.compute_hash(), 2)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![orphan_tip],
         source: Some(current_source(&peers, peer)),
@@ -168,8 +183,8 @@ fn body_carried_rejection_keeps_the_live_pending_gate() -> Result<(), Box<dyn st
     let peer = test_addr(9768, 0)?;
     let rx = connect_peer(&peers, synthetic_peer(peer, 10));
 
-    let gap_parent = test_header(genesis.compute_hash(), 1);
-    let orphan_tip = test_header(gap_parent.compute_hash(), 2);
+    let gap_parent = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)?;
+    let orphan_tip = regtest_fixture::mined_regtest_header(gap_parent.compute_hash(), 2)?;
     let batch = || InboundHeaders {
         headers: vec![orphan_tip],
         source: Some(current_source(&peers, peer)),
@@ -220,7 +235,8 @@ fn known_header_batch_still_credits_the_announcer() -> Result<(), Box<dyn std::e
     let mut tree = BlockTree::new();
     let genesis = genesis_header();
     let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-    let tip1 = test_header(genesis.compute_hash(), 1);
+    let tip1 = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     tree.insert_node(Some(genesis_id), tip1, NodeStatus::HeaderValid)?;
     let SyncHarness {
         sync,
@@ -316,8 +332,12 @@ fn staged_body_with_permanently_inadmissible_header_is_discarded()
         Hash256::from(blocks[0].block_hash()),
     );
 
-    let mut bad =
-        mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(2)]);
+    let mut bad = regtest_fixture::mined_block_with_prev_hash(
+        blocks[0].block_hash(),
+        2,
+        vec![regtest_fixture::coinbase(2)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture block: {error}"));
     bad.header.bits = CompactTarget::from_consensus(0x1e0f_ff00);
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(bad))?;
     // The body stages in the first drain; the staged-header retry runs
@@ -366,8 +386,12 @@ fn staged_body_whose_resolved_header_is_inadmissible_is_evicted()
     // arrival (the missing-header path), and its header extends the losing
     // height-2 branch — once the header resolves it is off the active
     // branch and inadmissible.
-    let fork =
-        mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(60)]);
+    let fork = regtest_fixture::mined_block_with_prev_hash(
+        blocks[0].block_hash(),
+        2,
+        vec![regtest_fixture::coinbase(60)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
     let fork_hash = Hash256::from(fork.block_hash());
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(fork))?;
     sync.tick();
@@ -408,9 +432,14 @@ fn staged_body_gated_when_the_headers_drain_resolves_its_header()
 
     // A losing fork: a side header at height 1 and a height-2 body on it,
     // so the body's header cannot attach until the side header admits.
-    let fork_root = test_header(genesis_header().compute_hash(), 1);
-    let orphan_body =
-        mined_block_with_prev_hash(fork_root.compute_hash(), 2, vec![coinbase_transaction(70)]);
+    let fork_root = regtest_fixture::mined_regtest_header(genesis_header().compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
+    let orphan_body = regtest_fixture::mined_block_with_prev_hash(
+        fork_root.compute_hash(),
+        2,
+        vec![regtest_fixture::coinbase(70)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
     let orphan_hash = Hash256::from(orphan_body.block_hash());
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(orphan_body.clone()))?;
     sync.tick();
@@ -458,9 +487,14 @@ fn deferred_owned_body_fetch_settles_the_staged_gate() -> Result<(), Box<dyn std
     let _rx = connect_peer(&peers, synthetic_peer(peer, 2));
     let source = current_source(&peers, peer);
 
-    let fork_root = test_header(genesis_header().compute_hash(), 1);
-    let orphan_body =
-        mined_block_with_prev_hash(fork_root.compute_hash(), 2, vec![coinbase_transaction(71)]);
+    let fork_root = regtest_fixture::mined_regtest_header(genesis_header().compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
+    let orphan_body = regtest_fixture::mined_block_with_prev_hash(
+        fork_root.compute_hash(),
+        2,
+        vec![regtest_fixture::coinbase(71)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
     let orphan_hash = Hash256::from(orphan_body.block_hash());
 
     // The owned-fetch announcement arrives before the batch can attach:
@@ -568,9 +602,14 @@ fn stale_owned_fetch_source_does_not_settle_the_gate() -> Result<(), Box<dyn std
     let _rx = connect_peer(&peers, synthetic_peer(peer, 2));
     let source = current_source(&peers, peer);
 
-    let fork_root = test_header(genesis_header().compute_hash(), 1);
-    let orphan_body =
-        mined_block_with_prev_hash(fork_root.compute_hash(), 2, vec![coinbase_transaction(72)]);
+    let fork_root = regtest_fixture::mined_regtest_header(genesis_header().compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
+    let orphan_body = regtest_fixture::mined_block_with_prev_hash(
+        fork_root.compute_hash(),
+        2,
+        vec![regtest_fixture::coinbase(72)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
     let orphan_hash = Hash256::from(orphan_body.block_hash());
 
     // Defer the mark, stage the body, then drop the owning connection.
@@ -623,7 +662,7 @@ fn binding_failure_does_not_burn_the_last_staging_slot() -> Result<(), Box<dyn s
     // A body whose header is tree-known and admissible, but whose mutated
     // transactions fail the body/header binding: it may never stage.
     let mut bad = blocks[2].clone();
-    bad.txs.push(coinbase_transaction(90));
+    bad.txs.push(regtest_fixture::coinbase(90));
     let bad_hash = Hash256::from(bad.block_hash());
     let good_hash = Hash256::from(blocks[1].block_hash());
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(bad))?;
@@ -671,12 +710,19 @@ fn gate_pending_body_survives_a_pending_branch_switch() -> Result<(), Box<dyn st
 
     // A heavier fork: one real body at height 2 plus header-only links, so
     // the switch stalls on missing bodies exactly when the body resolves.
-    let fork_root = test_header(genesis_header().compute_hash(), 1);
-    let winner_body =
-        mined_block_with_prev_hash(fork_root.compute_hash(), 2, vec![coinbase_transaction(73)]);
+    let fork_root = regtest_fixture::mined_regtest_header(genesis_header().compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
+    let winner_body = regtest_fixture::mined_block_with_prev_hash(
+        fork_root.compute_hash(),
+        2,
+        vec![regtest_fixture::coinbase(73)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
     let winner_hash = Hash256::from(winner_body.block_hash());
-    let fork_h3 = test_header(winner_body.header.compute_hash(), 3);
-    let fork_h4 = test_header(fork_h3.compute_hash(), 4);
+    let fork_h3 = regtest_fixture::mined_regtest_header(winner_body.header.compute_hash(), 3)
+        .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
+    let fork_h4 = regtest_fixture::mined_regtest_header(fork_h3.compute_hash(), 4)
+        .unwrap_or_else(|error| panic!("regtest fixture: {error}"));
     inbound_blocks_tx.send(crate::InboundBlock::from_decoded(winner_body.clone()))?;
     sync.tick();
     assert!(
@@ -733,7 +779,8 @@ fn body_carried_header_does_not_consume_a_pending_getheaders()
         requested_at: Instant::now(),
     });
 
-    let body_tip = test_header(genesis.compute_hash(), 1);
+    let body_tip = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![body_tip],
         source: Some(source),
@@ -780,8 +827,12 @@ fn staged_retry_acceptance_credits_the_delivering_peer() -> Result<(), Box<dyn s
     let peer = test_addr(9706, 0)?;
     let _rx = connect_peer(&peers, synthetic_peer(peer, 0));
 
-    let unannounced =
-        mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(2)]);
+    let unannounced = regtest_fixture::mined_block_with_prev_hash(
+        blocks[0].block_hash(),
+        2,
+        vec![regtest_fixture::coinbase(2)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture block: {error}"));
     let expected = unannounced.block_hash();
     let mut inbound = crate::InboundBlock::from_decoded(unannounced);
     inbound.source = Some(current_source(&peers, peer));
@@ -823,8 +874,10 @@ fn fork_tip_attests_its_shared_active_ancestor() -> Result<(), Box<dyn std::erro
     // An equal-work fork rooted at height 1 stays off the active chain
     // (first-seen wins a tie), so the batch's tip is retained as fork
     // evidence while its shared ancestor — height 1 — still credits.
-    let fork1 = test_header(blocks[0].block_hash(), 2);
-    let fork2 = test_header(fork1.compute_hash(), 3);
+    let fork1 = regtest_fixture::mined_regtest_header(blocks[0].block_hash(), 2)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
+    let fork2 = regtest_fixture::mined_regtest_header(fork1.compute_hash(), 3)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![fork1, fork2],
         source: Some(current_source(&peers, peer)),
@@ -868,8 +921,10 @@ fn retained_unresolved_tips_are_deduplicated_and_capped() -> Result<(), Box<dyn 
 
     // An ancestor and its descendant on the same fork branch: the retained
     // set keeps only the descendant.
-    let fork_base = test_header(blocks[0].block_hash(), 2);
-    let fork_tip = test_header(fork_base.compute_hash(), 3);
+    let fork_base = regtest_fixture::mined_regtest_header(blocks[0].block_hash(), 2)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
+    let fork_tip = regtest_fixture::mined_regtest_header(fork_base.compute_hash(), 3)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![fork_base],
         source: Some(source),
@@ -900,7 +955,8 @@ fn retained_unresolved_tips_are_deduplicated_and_capped() -> Result<(), Box<dyn 
     let mut branch_tips = Vec::new();
     for (index, parent) in blocks.iter().enumerate().skip(1).take(8) {
         let height = u32::try_from(index + 2)?;
-        let tip = test_header(parent.block_hash(), height);
+        let tip = regtest_fixture::mined_regtest_header(parent.block_hash(), height)
+            .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
         branch_tips.push(tip);
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![tip],
@@ -941,9 +997,11 @@ fn delivered_tip_evidence_is_compacted_to_the_max_resolving_tip()
     let mut tree = BlockTree::new();
     let genesis = genesis_header();
     let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-    let tip1 = test_header(genesis.compute_hash(), 1);
+    let tip1 = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let tip1_id = tree.insert_node(Some(genesis_id), tip1, NodeStatus::HeaderValid)?;
-    let tip2 = test_header(tip1.compute_hash(), 2);
+    let tip2 = regtest_fixture::mined_regtest_header(tip1.compute_hash(), 2)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     tree.insert_node(Some(tip1_id), tip2, NodeStatus::HeaderValid)?;
     let SyncHarness {
         sync,
@@ -1001,7 +1059,8 @@ fn compact_owned_body_fetch_marks_the_tip_pending() -> Result<(), Box<dyn std::e
     } = SyncHarness::new(tree);
     let peer = test_addr(9706, 0)?;
     let _rx = connect_peer(&peers, synthetic_peer(peer, 0));
-    let tip = test_header(genesis.compute_hash(), 1);
+    let tip = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let tip_hash = Hash256::from(tip.compute_hash());
 
     inbound_headers_tx.send(InboundHeaders {
@@ -1038,8 +1097,10 @@ fn owned_fetch_mark_survives_until_its_tip_header_attaches()
     } = SyncHarness::new(tree);
     let peer = test_addr(9707, 0)?;
     let _rx = connect_peer(&peers, synthetic_peer(peer, 0));
-    let mid = test_header(genesis.compute_hash(), 1);
-    let tip = test_header(mid.compute_hash(), 2);
+    let mid = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
+    let tip = regtest_fixture::mined_regtest_header(mid.compute_hash(), 2)
+        .unwrap_or_else(|error| panic!("regtest fixture header: {error}"));
     let tip_hash = Hash256::from(tip.compute_hash());
 
     // The tip arrives ahead of `mid`: admission reports MissingParent and
@@ -1097,8 +1158,12 @@ fn announced_near_tip_is_direct_fetched_before_tick() -> Result<(), Box<dyn std:
     // The outbound receiver stays alive: dropping it would cancel the lease.
     let rx = connect_peer(&peers, synthetic_peer(peer, 3));
     let source = current_source(&peers, peer);
-    let block2 =
-        mined_block_with_prev_hash(blocks[0].block_hash(), 2, vec![coinbase_transaction(2)]);
+    let block2 = regtest_fixture::mined_block_with_prev_hash(
+        blocks[0].block_hash(),
+        2,
+        vec![regtest_fixture::coinbase(2)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture block: {error}"));
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![block2.header],
         source: Some(source),
@@ -1123,7 +1188,12 @@ fn announced_near_tip_is_direct_fetched_before_tick() -> Result<(), Box<dyn std:
     // The same path rides the compact flavor for a peer that announced BIP152
     // relay, because the fetch is the single near-tip request.
     peers.note_compact_relay(source);
-    let block3 = mined_block_with_prev_hash(block2.block_hash(), 3, vec![coinbase_transaction(3)]);
+    let block3 = regtest_fixture::mined_block_with_prev_hash(
+        block2.block_hash(),
+        3,
+        vec![regtest_fixture::coinbase(3)],
+    )
+    .unwrap_or_else(|error| panic!("regtest fixture block: {error}"));
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![block3.header],
         source: Some(source),

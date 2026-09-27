@@ -49,6 +49,7 @@ fn answer_requests(
 /// afterwards. The replacements must be driven into header sync past the
 /// stuck tip and serve the requeued bodies, so the apply frontier advances.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn replacements_carry_frontier_after_serving_peer_timeouts()
 -> Result<(), Box<dyn std::error::Error>> {
     // Header tip at 6, bodies for 1..=6; the public tip sits at 8, two
@@ -57,7 +58,11 @@ fn replacements_carry_frontier_after_serving_peer_timeouts()
     let (tree, mut blocks) = mined_chain(6, 0)?;
     let mut prev = blocks[5].block_hash();
     for height in 7..=8_u32 {
-        let block = mined_block_with_prev_hash(prev, height, vec![coinbase_transaction(height)]);
+        let block = regtest_fixture::mined_block_with_prev_hash(
+            prev,
+            height,
+            vec![regtest_fixture::coinbase(height)],
+        )?;
         prev = block.block_hash();
         blocks.push(block);
     }
@@ -216,8 +221,11 @@ fn losing_fork_evidence_never_revokes_the_height_a_peer_was_asked_at()
     let p = test_addr(9823, 0)?;
     let p_rx = connect_peer(&peers, synthetic_peer(p, 6));
     let p_source = current_source(&peers, p);
-    let fork2 = test_header(blocks[0].block_hash(), 2);
-    let fork: Vec<Header> = vec![fork2, test_header(fork2.compute_hash(), 3)];
+    let fork2 = regtest_fixture::mined_regtest_header(blocks[0].block_hash(), 2)?;
+    let fork: Vec<Header> = vec![
+        fork2,
+        regtest_fixture::mined_regtest_header(fork2.compute_hash(), 3)?,
+    ];
     inbound_headers_tx.send(InboundHeaders {
         headers: fork.clone(),
         source: Some(p_source),
