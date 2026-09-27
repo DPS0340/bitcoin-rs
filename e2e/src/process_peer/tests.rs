@@ -146,11 +146,11 @@ fn a_paused_frame_resumes_from_where_it_stopped() {
     // Wait for the partial header to be queued so the first call consumes
     // it before its deadline interrupts.
     peer.stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_millis(50)))
         .expect("peek timeout");
     let mut ten = [0u8; 10];
     let wait_until = Instant::now() + Duration::from_secs(5);
-    while peer.stream.peek(&mut ten).expect("peek") < ten.len() {
+    while !matches!(peer.stream.peek(&mut ten), Ok(10)) {
         assert!(
             Instant::now() < wait_until,
             "the header bytes never arrived"
