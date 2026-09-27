@@ -157,10 +157,13 @@ fn shutdown_exits_the_listener_thread() {
     // deadline proves the shutdown-driven exit.
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpListener::bind(addr).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "listener never exited on the shutdown flag"
-        );
+        if Instant::now() >= deadline {
+            // The regression under test keeps the scrape thread alive, and
+            // `Drop` joins it; detach the handle so unwinding fails the
+            // test instead of hanging on the join.
+            drop(server.thread.take());
+            panic!("listener never exited on the shutdown flag");
+        }
         thread::sleep(Duration::from_millis(20));
     }
     server.stop_and_join();
