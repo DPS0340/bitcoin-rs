@@ -1522,9 +1522,9 @@ fn proposal_of_a_disconnected_scripts_valid_block_is_duplicate() -> anyhow::Resu
             .ok_or_else(|| anyhow::anyhow!("disconnected child missing from tree"))?
             .chain_tx_count
     };
-    assert_ne!(
-        chain_tx_count,
-        bitcoin_rs_chain::ChainTxCount::UNKNOWN,
+    assert_eq!(
+        chain_tx_count.get(),
+        Some(2),
         "disconnect must keep the scripts-valid chain_tx_count"
     );
     let tip = state
