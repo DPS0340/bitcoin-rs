@@ -1149,14 +1149,18 @@ impl BlockSync {
         // tiny-target header inflates `claimed` and takes the direct path,
         // where admission inserts each valid prefix as it goes and never
         // rolls back on the failure — letting a reconnecting peer fill the
-        // tree below the floor. Pre-validate the whole page's proof of work
-        // before trusting the sum; a page with an unmet target falls through
-        // to the presync, which faults the peer on it instead.
-        let page_pow_valid = headers.iter().all(|header| {
+        // tree below the floor. The same splice inflates the sum through a
+        // disconnected tail of genuine headers pasted after the break, so
+        // the whole page must also link prev-to-hash before the sum is
+        // trusted. A page failing either check falls through to the presync,
+        // which faults the peer on it without mutating the tree.
+        let page_self_valid = headers.iter().all(|header| {
             let hash = Hash256::from(header.compute_hash());
             validate_pow(header, hash, network).is_ok()
+        }) && headers.windows(2).all(|pair| {
+            Hash256::from(pair[1].prev_blockhash) == Hash256::from(pair[0].compute_hash())
         });
-        if page_pow_valid {
+        if page_self_valid {
             let claimed = headers.iter().fold(fork.chainwork, |sum, header| {
                 sum.saturating_add(bitcoin_rs_chain::block_work(header))
             });

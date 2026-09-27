@@ -368,6 +368,21 @@ fn a_substituted_redownload_header_disconnects_the_connection()
     }
     let mut substituted = chain;
     substituted[commitment_index - 1] = rogue;
+    // Re-anchor the tail so only the salted commitment can fail: without
+    // this, `substituted[commitment_index]` still chains to the replaced
+    // header's hash and the asserted punishment is reachable on the bare
+    // continuity break alone.
+    for index in commitment_index..chain_len {
+        let mut header = substituted[index];
+        header.prev_blockhash = substituted[index - 1].compute_hash();
+        while !pow_met(
+            header.bits.to_consensus(),
+            Hash256::from(header.compute_hash()),
+        ) {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        substituted[index] = header;
+    }
 
     deliver_headers(&inbound_headers_tx, substituted, source)?;
     sync.tick();

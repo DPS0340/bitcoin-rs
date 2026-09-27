@@ -415,7 +415,7 @@ pub(crate) fn deliver_headers(
     Ok(())
 }
 
-/// The locator anchors a `getheaders` carries, as raw consensus bytes, or
+/// The `getheaders` locators a message carries, as raw consensus bytes, or
 /// `None` for another message.
 pub(crate) fn locator_of(message: &Message) -> Option<Vec<[u8; 32]>> {
     match message {

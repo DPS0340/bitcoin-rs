@@ -435,3 +435,11 @@ tests `permanent_consensus_body_disconnects_delivering_source` and
   node answers `getheaders` with the empty response
   (`ActiveChainQuery::headers_after`, `net_processing.cpp:3010-3018`), so a
   syncing node does not spread its low-work branch.
+
+Proof: `crates/p2p/src/sync/tests/headers_presync.rs` pins the presync
+lifecycle end to end — first-pass commitment collection, the work-floor
+crossing that restarts the sync at the fork point, commitment divergence
+on a substituted redownload header, salted-commitment spends, the benign
+lost-continuity break, and the disconnects every other failure costs the
+connection. `crates/p2p/benches/headers_presync.rs` measures the hashing
+bound the first pass pays per page.
