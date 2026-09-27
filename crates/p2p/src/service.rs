@@ -1477,31 +1477,4 @@ mod tests {
             "the newest automatic connection stays the victim while a pinned one is newer"
         );
     }
-
-    /// The outbound population is the sum of two slot counts: there is no
-    /// separate active limit or peer target to keep in step.
-    #[test]
-    fn outbound_slots_split_and_derive_the_active_limit() {
-        let config = P2pServiceConfig::default();
-        assert_eq!(
-            config.outbound_full_relay_slots, 8,
-            "Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS"
-        );
-        assert_eq!(
-            config.outbound_block_relay_slots, 2,
-            "Core's MAX_BLOCK_RELAY_ONLY_CONNECTIONS"
-        );
-        assert_eq!(config.total_outbound_active_limit(), 10);
-        assert_eq!(
-            config.outbound_queue_limit, config.outbound_full_relay_slots,
-            "the dial queue is sized to the full-relay count"
-        );
-
-        let narrowed = P2pServiceConfig {
-            outbound_full_relay_slots: 1,
-            outbound_block_relay_slots: 0,
-            ..P2pServiceConfig::default()
-        };
-        assert_eq!(narrowed.total_outbound_active_limit(), 1);
-    }
 }

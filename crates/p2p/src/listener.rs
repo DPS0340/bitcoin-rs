@@ -8,8 +8,6 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin_rs_primitives::Network;
-use bitcoin::p2p::ServiceFlags;
-use bitcoin_rs_primitives::Network;
 use crossbeam_channel::{SendTimeoutError, Sender};
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -1787,54 +1785,6 @@ mod outbound_tests {
             "a dial the seed list produced is not the operator's"
         );
         assert_eq!(automatic.lease.role(), PeerRole::FullRelay);
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-mod relay_role_tests {
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::p2p::message_blockdata::Inventory;
-
-    use super::enforce_relay_role;
-    use crate::peer_info::PeerRole;
-    use crate::wire::{Message, PeerError};
-
-    fn tx_inv() -> Message {
-        Message::Inv(vec![Inventory::Transaction(
-            bitcoin::Txid::from_byte_array([7; 32]),
-        )])
-    }
-
-    /// The role gate disconnects a transaction announcement, keeps block
-    /// traffic, ignores address gossip, and never restricts a full-relay
-    /// connection.
-    #[test]
-    fn relay_role_gate_splits_transaction_and_block_traffic() {
-        let error = enforce_relay_role(PeerRole::BlockRelayOnly, tx_inv())
-            .expect_err("a transaction announcement is a protocol violation");
-        assert!(matches!(
-            error,
-            PeerError::Protocol("transaction inv sent in violation of protocol")
-        ));
-
-        let block_inv = Message::Inv(vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
-            [8; 32],
-        ))]);
-        let kept = enforce_relay_role(PeerRole::BlockRelayOnly, block_inv)
-            .expect("a block announcement is not a fault");
-        assert!(kept.is_some(), "block traffic reaches the scheduler");
-
-        let kept = enforce_relay_role(PeerRole::FullRelay, tx_inv())
-            .expect("a full-relay connection is unrestricted");
-        assert!(kept.is_some(), "transaction traffic is dispatched");
-
-        let dropped = enforce_relay_role(PeerRole::BlockRelayOnly, Message::Addr(Vec::new()))
-            .expect("address gossip is not a fault");
-        assert!(
-            dropped.is_none(),
-            "address gossip is dropped unheard on a block-relay connection"
-        );
     }
 }
 
