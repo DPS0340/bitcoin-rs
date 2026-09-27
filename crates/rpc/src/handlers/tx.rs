@@ -1204,7 +1204,7 @@ mod tests {
                 chainwork: node.chainwork,
             }
         };
-        ctx.set_applied_tip(active_tip);
+        ctx.chain.applied_tip.store(Some(Arc::new(active_tip)));
         let ctx = Arc::new(ctx);
         for (block, depth) in [(&genesis, 2), (&active, 1), (&sibling, 0), (&higher, 0)] {
             let tx = &block.txs[0];
@@ -1301,7 +1301,7 @@ mod tests {
                 .expect("genesis");
             tree.tip().expect("genesis tip")
         };
-        ctx.set_applied_tip((*tip).clone());
+        ctx.chain.applied_tip.store(Some(Arc::new((*tip).clone())));
         let ctx = Arc::new(ctx);
 
         assert!(
@@ -2767,18 +2767,18 @@ mod acceptance_tests {
             let best_id = ids[11];
             let applied_node = tree.node(applied_id).expect("applied node exists");
             let best_node = tree.node(best_id).expect("best node exists");
-            ctx.set_applied_tip(TipSnapshot {
+            ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
                 tip_id: applied_id,
                 height: applied_node.height,
                 chainwork: applied_node.chainwork,
                 hash: applied_node.hash,
-            });
-            ctx.set_chain_tip(TipSnapshot {
+            })));
+            ctx.chain.chain_tip.store(Some(Arc::new(TipSnapshot {
                 tip_id: best_id,
                 height: best_node.height,
                 chainwork: best_node.chainwork,
                 hash: best_node.hash,
-            });
+            })));
             (applied_node.hash, best_node.hash)
         };
 
