@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, never, select, tick};
-
-use crate::shutdown;
+use crossbeam_channel::{Receiver, select, tick};
 
 const STATS_INTERVAL: u64 = 1024;
 
@@ -26,13 +24,14 @@ pub struct EventLoop {
 }
 
 impl EventLoop {
-    /// Builds an event loop from an already-bridged shutdown signal receiver.
-    #[must_use]
-    pub fn new(shutdown_signal: Receiver<()>, sync: Arc<crate::BlockSync>) -> Self {
-        Self::with_sync_wake(shutdown_signal, sync, never())
-    }
-
-    /// Builds an event loop that can also wake sync work from inbound P2P data.
+    /// Builds an event loop that wakes sync work from inbound P2P data.
+    ///
+    /// PRE: the shutdown receiver is bridged and the sync orchestrator is
+    /// constructed.
+    /// POST: `spin` runs sync ticks and telemetry while shutdown remains
+    /// unset.
+    /// INVARIANT: every caller supplies a wake receiver, and sync work
+    /// progresses on both the wake and the one-second sync tick.
     #[must_use]
     pub fn with_sync_wake(
         shutdown_signal: Receiver<()>,
@@ -49,7 +48,6 @@ impl EventLoop {
 
     /// Runs the event loop until a shutdown notification arrives.
     pub fn spin(self, shutdown: &AtomicBool) -> Result<()> {
-        shutdown::mark_draining();
         let mut iterations: u64 = 0;
         let mut sync_ticks: u64 = 0;
         let mut last_progress = Instant::now();
@@ -84,7 +82,6 @@ impl EventLoop {
                 last_progress = now;
             }
         }
-        shutdown::notify_drained();
         Ok(())
     }
 

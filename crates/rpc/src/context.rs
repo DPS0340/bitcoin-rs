@@ -262,7 +262,7 @@ pub struct ChainHandles {
     /// Incremental UTXO statistics.
     pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     /// Shared block tree.
-    pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
+    pub block_tree: BlockTreeReader,
     /// Consensus network.
     pub chain_network: Network,
     /// Authoritative chain connect/disconnect transition barrier. Production
@@ -391,7 +391,7 @@ pub struct IndexHandles {
     /// the Core `--txindex` contract.
     pub esplora_tx_index: Option<Arc<dyn DerivedIndexQuery>>,
     /// Live txindex status for the `getcapabilities` projection.
-    pub derived_index_status: Option<Arc<dyn crate::capabilities::DerivedIndexCapabilitySource>>,
+    pub derived_index_status: Option<Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource>>,
 }
 
 /// Network capability handles.
@@ -410,6 +410,9 @@ pub struct NetworkHandles {
     pub banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     /// Persisted `addnode add` entries.
     pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
+    /// Service flags the node advertises, as resolved at P2P startup —
+    /// `NETWORK` on an unpruned node, `NETWORK_LIMITED` on a pruned one.
+    pub local_services: u64,
 }
 
 /// Mining capability handles.
@@ -485,7 +488,7 @@ impl Default for ChainHandles {
             transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::new(utxo),
             coin_stats: Arc::new(coin_stats_listener),
-            block_tree,
+            block_tree: BlockTreeReader::new(block_tree),
             chain_network: Network::Mainnet,
             chain_transition: Arc::new(Mutex::new(())),
             block_body_source: None,
@@ -519,6 +522,7 @@ impl Default for NetworkHandles {
             p2p_outbound_sender: None,
             banned: Arc::new(RwLock::new(Vec::new())),
             added_nodes: Arc::new(RwLock::new(Vec::new())),
+            local_services: 0x09,
         }
     }
 }
@@ -962,7 +966,7 @@ impl ChainHandles {
         ChainAdmissionView::new(
             Arc::clone(&self.utxo),
             self.applied_tip.clone(),
-            BlockTreeReader::new(Arc::clone(&self.block_tree)),
+            self.block_tree.clone(),
             self.chain_network,
         )
     }
@@ -1343,6 +1347,16 @@ impl AppliedView {
 mod tests {
     use super::*;
 
+    /// A txindex status source stand-in, so the identity test can prove the
+    /// capability travels to `indexes` without a live index runtime.
+    struct ReadySource;
+
+    impl bitcoin_rs_index::DerivedIndexCapabilitySource for ReadySource {
+        fn capability(&self) -> bitcoin_rs_index::CapabilityStatus {
+            bitcoin_rs_index::derived_index_status(true, bitcoin_rs_index::CapabilityState::Ready)
+        }
+    }
+
     /// The context and every capability group are shareable because the
     /// compiler derives it, not because a `SAFETY` comment claims it.
     ///
@@ -1676,7 +1690,7 @@ mod tests {
                 transactions: Arc::new(RwLock::new(HashMap::new())),
                 utxo: Arc::clone(&utxo),
                 coin_stats: Arc::clone(&coin_stats),
-                block_tree: Arc::clone(&block_tree),
+                block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
                 chain_network: Network::Mainnet,
                 chain_transition: Arc::clone(&chain_transition),
                 ..ChainHandles::default()
@@ -1692,6 +1706,7 @@ mod tests {
                 network_active: Arc::clone(&network_active),
                 banned: Arc::clone(&banned),
                 added_nodes: Arc::clone(&added_nodes),
+                local_services: 0x09,
                 ..NetworkHandles::default()
             },
             ..ContextHandles::default()
@@ -1738,10 +1753,21 @@ mod tests {
             Arc::ptr_eq(&ctx.chain.coin_stats, &coin_stats),
             "coin_stats must be shared with caller"
         );
-        assert!(
-            Arc::ptr_eq(&ctx.chain.block_tree, &block_tree),
-            "block_tree must be shared with caller"
-        );
+        {
+            let genesis = Network::Regtest.genesis_block();
+            let genesis_id = block_tree
+                .write()
+                .insert_node(
+                    None,
+                    genesis.header,
+                    bitcoin_rs_chain::node::NodeStatus::Active,
+                )
+                .expect("genesis insert");
+            assert!(
+                ctx.chain.block_tree.read().node(genesis_id).is_ok(),
+                "block_tree must be shared with caller"
+            );
+        }
         assert!(
             Arc::ptr_eq(&ctx.network.network_active, &network_active),
             "network activity must be shared with caller"
@@ -2176,6 +2202,121 @@ mod tests {
         assert!(ctx.chain.block_by_height(2).is_none());
         Ok(())
     }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ibd_latch_judges_the_contexts_own_tree() {
+        use alloc::sync::Arc;
+
+        fn insert_recent_tip(ctx: &Context, now: u64) -> TipSnapshot {
+            let genesis = Network::Regtest.genesis_block();
+            let mut tree = ctx.chain.block_tree.write();
+            let genesis_id = tree
+                .insert_node(
+                    None,
+                    genesis.header,
+                    bitcoin_rs_chain::node::NodeStatus::Active,
+                )
+                .expect("genesis insert");
+            let mut child = genesis.header;
+            child.prev_blockhash = genesis.block_hash();
+            child.time = u32::try_from(now - 60).unwrap_or(u32::MAX);
+            child.nonce = 1;
+            let child_id = tree
+                .insert_node(
+                    Some(genesis_id),
+                    child,
+                    bitcoin_rs_chain::node::NodeStatus::Active,
+                )
+                .expect("child insert");
+            let node = tree.node(child_id).expect("inserted node");
+            TipSnapshot {
+                tip_id: child_id,
+                height: node.height,
+                chainwork: node.chainwork,
+                hash: node.hash,
+                chain_tx_count: node.chain_tx_count,
+            }
+        }
+
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+
+        let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
+        let status: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource> = Arc::new(ReadySource);
+        let ctx = Context::from_handles(ContextHandles {
+            chain: ChainHandles {
+                chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
+                applied_tip: TipReader::new(Arc::clone(&applied_tip)),
+                chain_transition: Arc::new(Mutex::new(())),
+                ibd: Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
+                    TipReader::new(Arc::clone(&applied_tip)),
+                    BlockTreeReader::new(Arc::clone(&block_tree)),
+                )),
+                blocks: Arc::new(RwLock::new(BlockLog::new())),
+                transactions: Arc::new(RwLock::new(HashMap::new())),
+                utxo: Arc::new(bitcoin_rs_utxo::UtxoSet::new()),
+                coin_stats: Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+                    bitcoin_rs_utxo::stats::CoinStats::default(),
+                )),
+                prune_service: None,
+                chain_control: None,
+                block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
+                chain_network: Network::Mainnet,
+                block_body_source: None,
+                closed_for_recovery: LatchReader::new(Arc::new(
+                    core::sync::atomic::AtomicBool::new(false),
+                )),
+                rollback_warnings: None,
+            },
+            mempool: MempoolHandles {
+                gateway: MempoolGateway::shared(
+                    Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                    ValidationEngine::Native,
+                )
+                .unwrap_or_else(|error| panic!("mempool gateway intern: {error}")),
+            },
+            indexes: IndexHandles {
+                derived_index: None,
+                esplora_tx_index: None,
+                script_index: None,
+                derived_index_status: Some(Arc::clone(&status)),
+            },
+            network: NetworkHandles {
+                network: Arc::new(RwLock::new(NetworkState::default())),
+                network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+                peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
+                p2p_outbound_sender: None,
+                banned: Arc::new(RwLock::new(Vec::new())),
+                added_nodes: Arc::new(RwLock::new(Vec::new())),
+                local_services: 0x09,
+            },
+            mining: MiningHandles {
+                mining_control: None,
+            },
+            ..ContextHandles::default()
+        });
+
+        // With the regtest work floor at zero and the tip recent, only the
+        // tree lookup can make `is_active` answer false; a latch holding any
+        // other tree finds no node and keeps reporting true.
+        let now = 1_800_000_000_u64;
+        let tip = insert_recent_tip(&ctx, now);
+        ctx.chain.applied_tip.store(Some(Arc::new(tip)));
+        assert!(
+            !ctx.chain.ibd.is_active(now, Network::Regtest),
+            "the latch must judge the tip it reaches through the context's tree"
+        );
+        assert!(
+            Arc::ptr_eq(
+                ctx.indexes
+                    .derived_index_status
+                    .as_ref()
+                    .expect("index status keeps its own slot"),
+                &status
+            ),
+            "the txindex status source must be shared with caller"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2402,6 +2543,7 @@ mod admission_chain_tests {
         );
         Ok(())
     }
+
     #[test]
     #[allow(clippy::expect_used)]
     fn admission_envelopes_share_gateway_outcomes() -> anyhow::Result<()> {

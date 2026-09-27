@@ -11,7 +11,8 @@ use bitcoin_rs_index::types::{TxPosition, TxPositionValue};
 use bitcoin_rs_index::{ScriptHash, ScriptHashRow, SpendingPrefixRow};
 use bitcoin_rs_primitives::OutPoint;
 use bitcoin_rs_storage::{
-    ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition,
+    BatchOp, BufferedWriteBatch, ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError,
+    WriteCondition,
 };
 use parking_lot::RwLock;
 
@@ -20,9 +21,30 @@ pub(crate) struct MemoryStore {
     cfs: RwLock<[BTreeMap<Vec<u8>, Vec<u8>>; ColumnFamily::ALL.len()]>,
 }
 
-impl KvStore for MemoryStore {
-    type WriteBatch = MemoryBatch;
+/// Folds one batch's recorded operations into the column families, in order.
+fn apply_ops(cfs: &mut [BTreeMap<Vec<u8>, Vec<u8>>; ColumnFamily::ALL.len()], ops: Vec<BatchOp>) {
+    for op in ops {
+        match op {
+            BatchOp::Put { cf, key, value } => {
+                cfs[cf.index()].insert(key, value.into());
+            }
+            BatchOp::Delete { cf, key } => {
+                cfs[cf.index()].remove(&key);
+            }
+            BatchOp::DeleteRange { cf, start, end } => {
+                let doomed: Vec<Vec<u8>> = cfs[cf.index()]
+                    .range(start..end)
+                    .map(|(key, _value)| key.clone())
+                    .collect();
+                for key in doomed {
+                    cfs[cf.index()].remove(&key);
+                }
+            }
+        }
+    }
+}
 
+impl KvStore for MemoryStore {
     fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         let guard = self.cfs.read();
         Ok(guard[cf.index()].get(key).cloned())
@@ -43,24 +65,26 @@ impl KvStore for MemoryStore {
         Ok(Box::new(rows.into_iter()))
     }
 
-    fn new_batch(&self) -> Self::WriteBatch {
-        MemoryBatch::default()
+    fn new_batch(&self) -> BufferedWriteBatch {
+        BufferedWriteBatch::default()
     }
 
-    fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+    fn write(&self, batch: BufferedWriteBatch) -> Result<(), StorageError> {
         let mut guard = self.cfs.write();
-        apply_ops(&mut guard, batch.ops.into_iter());
+        apply_ops(&mut guard, batch.into_ops());
         Ok(())
     }
 
     fn write_durable_if(
         &self,
         conditions: &[WriteCondition<'_>],
-        batch: Self::WriteBatch,
+        batch: BufferedWriteBatch,
     ) -> Result<bool, StorageError> {
-        let mut guard = self.cfs.write();
         // Every condition observes pre-batch state; the batch is allowed to
-        // put or delete a condition key itself.
+        // put or delete a condition key itself. The check and the apply run
+        // under one write lock, matching the backend's atomic conditional
+        // write.
+        let mut guard = self.cfs.write();
         let matched = conditions.iter().all(|condition| {
             let (cf, key) = condition.location();
             condition.matches(guard[cf.index()].get(key).map(Vec::as_slice))
@@ -68,7 +92,7 @@ impl KvStore for MemoryStore {
         if !matched {
             return Ok(false);
         }
-        apply_ops(&mut guard, batch.ops.into_iter());
+        apply_ops(&mut guard, batch.into_ops());
         Ok(true)
     }
 
@@ -84,53 +108,6 @@ impl KvStore for MemoryStore {
     fn arm_persist_fault(&self, _fault: bitcoin_rs_storage::PersistFault) {
         // In-memory double: no persistence boundary exists to fault.
     }
-}
-
-#[derive(Default)]
-pub(crate) struct MemoryBatch {
-    ops: Vec<MemoryOp>,
-}
-
-impl WriteBatch for MemoryBatch {
-    fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) {
-        self.ops.push(MemoryOp::Put {
-            cf,
-            key: key.to_vec(),
-            value: value.to_vec(),
-        });
-    }
-
-    fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
-        self.ops.push(MemoryOp::Delete {
-            cf,
-            key: key.to_vec(),
-        });
-    }
-
-    fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
-        self.ops.push(MemoryOp::DeleteRange {
-            cf,
-            start: start.to_vec(),
-            end: end.to_vec(),
-        });
-    }
-}
-
-enum MemoryOp {
-    Put {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    Delete {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-    },
-    DeleteRange {
-        cf: ColumnFamily,
-        start: Vec<u8>,
-        end: Vec<u8>,
-    },
 }
 
 pub(crate) struct MemorySnapshot {
@@ -210,33 +187,4 @@ pub(crate) fn put_spending_row(
         &SpendingPrefixRow::row(outpoint, height).to_db_row(),
         &[],
     )
-}
-
-/// Folds one batch's operations into the column families, in order.
-fn apply_ops(
-    cfs: &mut [BTreeMap<Vec<u8>, Vec<u8>>; ColumnFamily::ALL.len()],
-    ops: std::vec::IntoIter<MemoryOp>,
-) {
-    for op in ops {
-        match op {
-            MemoryOp::Put { cf, key, value } => {
-                cfs[cf.index()].insert(key, value);
-            }
-            MemoryOp::Delete { cf, key } => {
-                cfs[cf.index()].remove(&key);
-            }
-            MemoryOp::DeleteRange { cf, start, end } => {
-                let keys = cfs[cf.index()]
-                    .keys()
-                    .filter(|key| {
-                        key.as_slice() >= start.as_slice() && key.as_slice() < end.as_slice()
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for key in keys {
-                    cfs[cf.index()].remove(&key);
-                }
-            }
-        }
-    }
 }

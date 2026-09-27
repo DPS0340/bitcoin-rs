@@ -55,6 +55,7 @@ bitcoin-rs-node       = { path = "crates/node",       version = "0.9.0", default
 # USDT probe emission is optional everywhere the crate is used (feature
 # `usdt`, off by default); see crates/trace.
 bitcoin-rs-trace      = { path = "crates/trace",      version = "0.9.0", default-features = false }
+bitcoin-rs-e2e        = { path = "e2e",               version = "0.9.0" }
 
 # Allocator. Defaults pull `secure` and `extended` overhead — disable for perf.
 mimalloc = { version = ">=0.1.50, <0.2", default-features = false }
@@ -95,12 +96,6 @@ rustix = { version = "=1.1.5", features = ["fs"] }
 miniscript = { version = ">=13, <14", default-features = false, features = ["std"] }
 corepc-types = { version = "0.15.0", default-features = false, features = [
     "std", "serde-deny-unknown-fields",
-] }
-
-# bitcoin_slices: zero-alloc block visitor. Default features list is empty;
-# enable bitcoin + sha2 explicitly.
-bitcoin_slices = { version = ">=0.12, <0.13", default-features = false, features = [
-    "bitcoin", "sha2",
 ] }
 
 # Note: `payjoin` is intentionally NOT declared at the workspace level. Task 14
@@ -197,8 +192,8 @@ tracing-subscriber = { version = ">=0.3.23, <0.4", default-features = false, fea
 ] }
 # metrics 0.24 has NO features at all.
 metrics                     = { version = ">=0.24.6, <0.25" }
-# metrics-exporter-prometheus default pulls tokio+hyper+rustls; disable defaults
-# and let crates/node opt in to `http-listener` if/when wired (Task 18).
+# metrics-exporter-prometheus default pulls tokio+hyper+rustls; disable
+# defaults; crates/node serves Prometheus text over its own listener.
 metrics-exporter-prometheus = { version = ">=0.18, <0.19", default-features = false }
 # quanta: monotonic TSC clock for hot-path timing. No special features needed.
 quanta                      = { version = ">=0.12.6, <0.13", default-features = false }

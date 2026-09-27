@@ -4,7 +4,7 @@ use super::error::IndexError;
 use crate::{
     reconcile::SelectedWatermark, reconcile::selected_watermark as reconcile_selected_watermark,
 };
-use bitcoin_rs_storage::{ColumnFamily, KvSnapshot, WriteBatch};
+use bitcoin_rs_storage::{BufferedWriteBatch, ColumnFamily, KvSnapshot};
 
 pub(super) const TX_LOOKUP_WATERMARK_KEY: &[u8] = &[0x00, b'T'];
 
@@ -187,6 +187,14 @@ impl IndexCapabilities {
     }
 
     /// PRE: none.
+    /// POST: `capability` is unselected in the result; every other selection
+    /// bit is unchanged.
+    #[must_use]
+    pub const fn without(self, capability: IndexCapability) -> Self {
+        Self(self.0 & !capability.bit())
+    }
+
+    /// PRE: none.
     /// POST: the selected capabilities in [`IndexCapability::ALL`] order.
     pub fn iter(self) -> impl Iterator<Item = IndexCapability> {
         IndexCapability::ALL
@@ -319,8 +327,8 @@ pub(super) fn read_coverage_floor(
 
 /// Stamps `floor` as the first covered height for each selected capability in
 /// `batch`. Only history-derived capabilities carry a floor.
-pub(super) fn put_selected_floors<B: WriteBatch>(
-    batch: &mut B,
+pub(super) fn put_selected_floors(
+    batch: &mut BufferedWriteBatch,
     capabilities: IndexCapabilities,
     floor: u32,
 ) {
@@ -336,8 +344,8 @@ pub(super) fn put_selected_floors<B: WriteBatch>(
 
 /// Drops the coverage-floor records of the selected capabilities; a reset
 /// rebuilds from genesis, which covers everything.
-pub(super) fn delete_selected_floors<B: WriteBatch>(
-    batch: &mut B,
+pub(super) fn delete_selected_floors(
+    batch: &mut BufferedWriteBatch,
     capabilities: IndexCapabilities,
 ) {
     for capability in [IndexCapability::TxLookup, IndexCapability::ScriptHistory] {
@@ -350,8 +358,8 @@ pub(super) fn delete_selected_floors<B: WriteBatch>(
     }
 }
 
-pub(super) fn put_selected_watermarks<B: WriteBatch>(
-    batch: &mut B,
+pub(super) fn put_selected_watermarks(
+    batch: &mut BufferedWriteBatch,
     capabilities: IndexCapabilities,
     watermark: Option<IndexWatermark>,
 ) {

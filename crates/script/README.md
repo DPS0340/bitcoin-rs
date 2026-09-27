@@ -1,8 +1,3 @@
-# bitcoin-rs-script
-
-Native script verification for every consensus spend class, plus the sigop
-counters that surround execution.
-
 `Interpreter::execute` is a single-input convenience method. For a multi-input
 transaction, use `Interpreter::execute_with_prevouts` and pass one spent output
 per input in transaction order. Both methods verify one input under a

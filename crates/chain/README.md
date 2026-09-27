@@ -10,9 +10,14 @@ atomically swappable `TipSnapshot` (`tip`, `tip_id`, `tip_height`) for
 lock-free readers. `accept_headers` admits a header batch after proof of work, the
 invalid-parent refusal, and one shared contextual gate (`validate_contextual_header`):
 compact-target validation against the network's difficulty rules
-(`validate_header_nbits`), the median-time-past bound, the future-drift bound against
-the wall clock (`current_unix_seconds`), the BIP94 timewarp floor at an adjustment
-boundary, and the version floors of the buried deployments — returning the new `NodeId`s.
+(`validate_header_nbits`), the median-time-past floor from ancestor
+timestamps and the future-drift ceiling (`current_unix_seconds`), the BIP94
+timewarp floor at an adjustment boundary, and the
+version floors of the buried deployments — returning the new `NodeId`s.
+lock-free readers. `accept_headers` admits a header batch after the contextual checks —
+proof of work, compact-target validation against the network's difficulty rules
+(`validate_header_nbits`), median-time-past and future-drift bounds
+(`validate_header_timestamp`, `current_unix_seconds`) — returning the new `NodeId`s.
 `plan_reorg` walks parent pointers to the common ancestor and returns a `ReorgPlan`
 naming the blocks to disconnect and connect. An internal `Bip9Cache` memoizes
 versionbits deployment states per node and is invalidated on reorg. `BlockTreeNode` carries

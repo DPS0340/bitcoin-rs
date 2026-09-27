@@ -117,7 +117,7 @@ impl ServerHarness {
                 transactions: state.transactions(),
                 utxo: chainstate.utxo_handle(),
                 coin_stats: chainstate.coin_stats_handle(),
-                block_tree: chainstate.block_tree_handle(),
+                block_tree: chainstate.block_tree_reader(),
                 chain_network: state.config().network,
                 closed_for_recovery: chainstate.closed_for_recovery_reader(),
                 chain_transition: Arc::clone(&transition),
@@ -142,6 +142,7 @@ impl ServerHarness {
                 p2p_outbound_sender: Some(state.p2p_outbound_sender()),
                 banned: state.banned_subnets(),
                 added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+                local_services: state.p2p().local_services().to_u64(),
             },
             mining: bitcoin_rs_rpc::context::MiningHandles {
                 mining_control: None,

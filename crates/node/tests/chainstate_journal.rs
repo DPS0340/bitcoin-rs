@@ -30,7 +30,7 @@ fn restart_replays_durable_journal_suffix_above_checkpoint() -> Result<()> {
     let genesis = Network::Regtest.genesis_block();
     let initial = NodeState::open(config.clone(), None)?;
     initial.apply_block(&genesis)?;
-    initial.publish_checkpoint()?;
+    let _ = initial.publish_checkpoint()?;
 
     // Publication must rebase the live writer in the same process.
     let child = regtest_fixture::mined_regtest_child_at(genesis.block_hash(), 1)?;
@@ -97,7 +97,7 @@ fn disconnect_rewrites_durable_head_before_restart() -> Result<()> {
     let genesis = Network::Regtest.genesis_block();
     let initial = NodeState::open(config.clone(), None)?;
     initial.apply_block(&genesis)?;
-    initial.publish_checkpoint()?;
+    let _ = initial.publish_checkpoint()?;
     drop(initial);
 
     let state = NodeState::open(config.clone(), None)?;
@@ -161,7 +161,7 @@ fn disconnect_below_checkpoint_base_forces_full_validation() -> Result<()> {
     let initial = NodeState::open(config.clone(), None)?;
     let genesis_tip = initial.apply_block(&genesis)?;
     initial.apply_block(&block1)?;
-    initial.publish_checkpoint()?;
+    let _ = initial.publish_checkpoint()?;
     drop(initial);
 
     let state = NodeState::open(config.clone(), None)?;
@@ -191,7 +191,7 @@ fn disconnect_below_checkpoint_base_forces_full_validation() -> Result<()> {
         "full validation must remain sticky until a replacement checkpoint"
     );
     let replacement_tip = resumed_again.apply_block(&block1)?;
-    resumed_again.publish_checkpoint()?;
+    let _ = resumed_again.publish_checkpoint()?;
     drop(resumed_again);
 
     let recovered = NodeState::open(config, None)?;
@@ -252,7 +252,10 @@ fn maintenance_worker_drains_retention_pressure_with_a_publication() -> Result<(
     let genesis = Network::Regtest.genesis_block();
     let state = NodeState::open(config.clone(), None)?;
     state.apply_block(&genesis)?;
-    state.publish_checkpoint()?;
+    assert!(
+        state.publish_checkpoint()?.is_some(),
+        "the baseline checkpoint must publish"
+    );
     let current = config.data_dir.join("chainstate-checkpoints/CURRENT");
     let baseline = std::fs::read_to_string(&current)?;
 
@@ -300,7 +303,7 @@ fn retention_pressure_stops_apply_before_tip_mutation() -> Result<()> {
     let genesis = Network::Regtest.genesis_block();
     let state = NodeState::open(config.clone(), None)?;
     let genesis_tip = state.apply_block(&genesis)?;
-    state.publish_checkpoint()?;
+    let _ = state.publish_checkpoint()?;
     let pressure = config
         .data_dir
         .join("chainstate-journal/segment-9999999999.log");

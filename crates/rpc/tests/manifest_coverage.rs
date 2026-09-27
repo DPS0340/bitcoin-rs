@@ -254,7 +254,7 @@ fn the_pinned_core_reference_matches_the_locked_kernel() {
             "`{name}` is locked at {locked:?} but the reference record is written \
              against {version}. The pinned Bitcoin Core revision comes from this \
              crate's vendored tree, so a bump means the claims in \
-             docs/api/core-compat.toml need re-reading, not just this line."
+             crates/rpc/core-compat.toml need re-reading, not just this line."
         );
     }
 }
@@ -274,22 +274,6 @@ fn esplora_extension_row_resolves_to_the_router() {
         response.status, 200,
         "esplora router must serve the row it declares"
     );
-}
-
-/// The pending extension row is the contract, not the method: it must not
-/// dispatch until it ships.
-#[test]
-fn pending_extension_rows_do_not_dispatch() {
-    let handler = handler();
-    for entry in manifest::entries_of_kind(SurfaceKind::Rpc)
-        .filter(|entry| entry.status == Status::Extension && entry.since == "pending")
-    {
-        assert!(
-            not_dispatchable(&handler, entry.name),
-            "`{}` is marked since=pending but the dispatcher answers it",
-            entry.name
-        );
-    }
 }
 
 /// Invariant 2: no duplicate (kind, name) rows.

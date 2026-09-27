@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use bitcoin_rs_storage::{
-    ColumnFamily, KvPair, KvStore, PersistFault, StorageError, WriteBatch, WriteCondition,
+    BufferedWriteBatch, ColumnFamily, KvPair, KvStore, PersistFault, StorageError, WriteCondition,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -30,7 +30,7 @@ fn seed_rows(store: &impl KvStore) -> Result<(), StorageError> {
     store.write_durable(batch)
 }
 
-fn ordered_batch<S: KvStore>(store: &S) -> S::WriteBatch {
+fn ordered_batch<S: KvStore>(store: &S) -> BufferedWriteBatch {
     let mut batch = store.new_batch();
     batch.put(CF, b"put-range:m", b"removed");
     batch.delete_range(CF, b"put-range:a", b"put-range:z");

@@ -149,19 +149,26 @@ impl PeerInfo {
     /// Order follows Bitcoin Core's bit assignment. Unrecognized bits are dropped.
     #[must_use]
     pub fn services_names(&self) -> Vec<&'static str> {
-        [
-            (0, "NETWORK"),
-            (1, "GETUTXO"),
-            (2, "BLOOM"),
-            (3, "WITNESS"),
-            (6, "COMPACT_FILTERS"),
-            (10, "NETWORK_LIMITED"),
-            (11, "P2P_V2"),
-        ]
-        .into_iter()
-        .filter_map(|(bit, name)| (self.services & (1_u64 << bit) != 0).then_some(name))
-        .collect()
+        service_flag_names(self.services)
     }
+}
+
+/// Bitcoin Core `GetServiceNames` names for a wire service bitmask, in bit
+/// order. Unrecognized bits are dropped.
+#[must_use]
+pub fn service_flag_names(flags: u64) -> Vec<&'static str> {
+    [
+        (0, "NETWORK"),
+        (1, "GETUTXO"),
+        (2, "BLOOM"),
+        (3, "WITNESS"),
+        (6, "COMPACT_FILTERS"),
+        (10, "NETWORK_LIMITED"),
+        (11, "P2P_V2"),
+    ]
+    .into_iter()
+    .filter_map(|(bit, name)| (flags & (1_u64 << bit) != 0).then_some(name))
+    .collect()
 }
 #[cfg(test)]
 mod tests {

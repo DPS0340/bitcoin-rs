@@ -16,10 +16,10 @@ fn tick_skips_getheaders_when_header_tip_matches_peer_height()
         let node = tree.node(node_id)?;
         TipSnapshot {
             tip_id: node_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
     applied_tip.store(Some(Arc::new(applied_snapshot)));

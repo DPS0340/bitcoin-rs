@@ -644,7 +644,7 @@ fn mining_handler(state: &NodeState) -> Handler {
             transactions: state.transactions(),
             utxo: Arc::new(UtxoSet::new()),
             coin_stats: state.chainstate().coin_stats_handle(),
-            block_tree: state.chainstate().block_tree_handle(),
+            block_tree: state.chainstate().block_tree_reader(),
             chain_network: state.config().network,
             chain_transition: state.chainstate().read_fence(),
             closed_for_recovery: state.chainstate().closed_for_recovery_reader(),
@@ -663,12 +663,14 @@ fn mining_handler(state: &NodeState) -> Handler {
             p2p_outbound_sender: Some(state.p2p_outbound_sender()),
             banned: state.banned_subnets(),
             added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            local_services: state.p2p().local_services().to_u64(),
         },
         mining: MiningHandles {
             mining_control: Some(mining_control),
         },
         ..ContextHandles::default()
-    });
+    })
+    .with_chain_transition(state.chainstate().read_fence());
     Handler::new(Arc::new(ctx))
 }
 
@@ -985,14 +987,15 @@ fn invalidateblock_readmission_publishes_a_events_through_shared_gateway() -> Re
 }
 
 #[test]
-fn invalidateblock_keeps_a_below_floor_parent_and_its_child_out_of_the_mempool() -> Result<()> {
+fn invalidateblock_readmits_a_below_floor_family_through_the_deferred_fence() -> Result<()> {
     let (state, _guard) = open_regtest()?;
     apply_genesis(&state)?;
     let seed_tip_hash = seed_chain(&state, SEED_BLOCKS)?;
 
     // The parent spends the matured seed coinbase but offers a 1-sat fee,
-    // far below the 1 000 sat/kvB relay floor. The child pays well and is
-    // kept out only by its refused parent.
+    // far below the 1 000 sat/kvB relay floor. Reorg re-admission bypasses
+    // the floor, the way Core's `bypassLimits` skips `GetMinFee`: the family
+    // already paid for its place when it was mined.
     let parent = seed_coinbase_spend_with_fee(1);
     let parent_txid = parent.txid();
     let child = Tx {
@@ -1009,6 +1012,7 @@ fn invalidateblock_keeps_a_below_floor_parent_and_its_child_out_of_the_mempool()
         }],
         lock_time: LockTime::from_consensus(0),
     };
+    let child_txid = child.txid();
 
     let block = mine_regtest_block(&state, seed_tip_hash, SEED_BLOCKS + 1, vec![parent, child])?;
     let mined_hash = Hash256::from(block.block_hash());
@@ -1024,10 +1028,13 @@ fn invalidateblock_keeps_a_below_floor_parent_and_its_child_out_of_the_mempool()
     let mempool = state.mempool();
     let pool = mempool.read();
     assert!(
-        pool.is_empty(),
-        "a refused parent and its withheld child must stay out"
+        pool.contains_txid(&parent_txid),
+        "the deferred fence must re-admit the below-floor parent"
     );
-    assert!(!pool.contains_txid(&parent_txid));
+    assert!(
+        pool.contains_txid(&child_txid),
+        "the child must re-enter once its parent is back"
+    );
     Ok(())
 }
 

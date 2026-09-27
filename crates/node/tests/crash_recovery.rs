@@ -309,14 +309,12 @@ fn crash_recovery_subprocess_worker() -> Result<()> {
     }
     let data_dir = PathBuf::from(std::env::var(DATA_DIR_ENV)?);
     let scenario = std::env::var(SCENARIO_ENV)?;
-    let genesis = Network::Regtest.genesis_block();
-    // The prune scenario needs the manual prune service, which exists only
-    // when a prune target is configured.
     let config = if scenario == "prune" {
         prune_test_config(data_dir.clone())
     } else {
         crash_config(&scenario, data_dir.clone())
     };
+    let genesis = Network::Regtest.genesis_block();
     let state = NodeState::open(config, None)?;
     let block1 = mined_regtest_child_at(genesis.block_hash(), 1)?;
 
@@ -334,25 +332,6 @@ fn crash_recovery_subprocess_worker() -> Result<()> {
             state.apply_block(&genesis)?;
             state.publish_checkpoint()?;
             state.apply_block(&block1)?;
-        }
-        "prune" => {
-            // A chain long enough that the durable checkpoint leaves a real
-            // deletion range below the Core reorg margin, then one manual
-            // prune whose frontier must outlive the process.
-            state.apply_block(&genesis)?;
-            let mut previous = genesis.block_hash();
-            for height in 1..=300_u32 {
-                let block = mined_regtest_child_at(previous, height)?;
-                state.apply_block(&block)?;
-                previous = block.block_hash();
-            }
-            state.publish_checkpoint()?;
-            let Some(service) = state.prune_service() else {
-                bail!("prune scenario needs the prune service");
-            };
-            service
-                .prune_to_height(12)
-                .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
         }
         "disconnect-rolledback" => {
             state.apply_block(&block1)?;
@@ -378,6 +357,25 @@ fn crash_recovery_subprocess_worker() -> Result<()> {
             // clears the marker on the way down.
             state.chainstate().disconnect_block(&block1)?;
         }
+        "prune" => {
+            // A chain long enough that the durable checkpoint leaves a real
+            // deletion range below the Core reorg margin, then one manual
+            // prune whose frontier must outlive the process.
+            state.apply_block(&genesis)?;
+            let mut previous = genesis.block_hash();
+            for height in 1..=300_u32 {
+                let block = mined_regtest_child_at(previous, height)?;
+                state.apply_block(&block)?;
+                previous = block.block_hash();
+            }
+            state.publish_checkpoint()?;
+            let Some(service) = state.prune_service() else {
+                bail!("prune scenario needs the prune service");
+            };
+            service
+                .prune_to_height(12)
+                .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+        }
         other => bail!("unknown crash scenario {other}"),
     }
 
@@ -399,7 +397,7 @@ fn run_sigkill_scenario(scenario: &str) -> Result<()> {
         drop(base);
     }
 
-    crash_child(scenario, &data_dir, Duration::from_secs(15))?;
+    spawn_and_kill_worker(scenario, &data_dir, Duration::from_secs(15))?;
 
     let resumed = NodeState::open(config, None)
         .with_context(|| format!("restart after SIGKILL in {scenario}"))?;
@@ -412,6 +410,118 @@ fn run_sigkill_scenario(scenario: &str) -> Result<()> {
     assert_eq!(tip.height, 1, "scenario {scenario}");
     assert_eq!(tip.hash, expected_hash, "scenario {scenario}");
     Ok(())
+}
+/// Spawns the parked crash worker for `scenario` against `data_dir`, waits
+/// for its ready marker, SIGKILLs it, and asserts it did not exit cleanly.
+fn spawn_and_kill_worker(scenario: &str, data_dir: &Path, ready_after: Duration) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut child = Command::new(executable)
+        .args([
+            "--ignored",
+            "--exact",
+            "crash_recovery_subprocess_worker",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .env(DATA_DIR_ENV, data_dir)
+        .env(SCENARIO_ENV, scenario)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn crash worker for {scenario}"))?;
+
+    let ready = data_dir.join("crash-test-ready");
+    let deadline = Instant::now() + ready_after;
+    while !ready.exists() {
+        if let Some(status) = child.try_wait()? {
+            let stderr = child
+                .stderr
+                .take()
+                .map(read_stderr)
+                .transpose()?
+                .unwrap_or_default();
+            bail!("crash worker {scenario} died before ready: {status}: {stderr}");
+        }
+        if Instant::now() > deadline {
+            child.kill()?;
+            let _ = child.wait();
+            bail!("crash worker for {scenario} did not become ready");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    child.kill()?;
+    let status = child.wait()?;
+    if status.success() {
+        bail!("crash worker for {scenario} exited successfully instead of being killed");
+    }
+    Ok(())
+}
+
+/// The scenario's node config. A marker that survives the kill must not be
+/// disarmed by journal rewind on the way down, so the marker scenarios run
+/// without the journal.
+fn crash_config(scenario: &str, data_dir: PathBuf) -> NodeConfig {
+    let mut config = test_config(data_dir);
+    if matches!(
+        scenario,
+        "disconnect-rolledback" | "inflight-cold" | "disconnect-above-head"
+    ) {
+        config.chainstate_journal.enabled = false;
+    }
+    config
+}
+
+/// Build the checkpointed base, let a parked child drive the node to the
+/// marker state and die to `SIGKILL`, then reopen in this process.
+fn run_marker_scenario(scenario: &str) -> Result<(tempfile::TempDir, NodeConfig, NodeState)> {
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join(format!("{scenario}-node"));
+    let config = crash_config(scenario, data_dir.clone());
+    let genesis = Network::Regtest.genesis_block();
+    let base = NodeState::open(config.clone(), None)?;
+    base.apply_block(&genesis)?;
+    base.publish_checkpoint()?;
+    drop(base);
+
+    spawn_and_kill_worker(scenario, &data_dir, Duration::from_secs(30))?;
+
+    let resumed = NodeState::open(config.clone(), None)
+        .with_context(|| format!("reopening {scenario} after SIGKILL must complete recovery"))?;
+    Ok((temp, config, resumed))
+}
+
+#[derive(Clone, Default)]
+struct SharedLog(Arc<Mutex<Vec<u8>>>);
+
+impl SharedLog {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
+    }
+}
+
+impl std::io::Write for SharedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Captures `tracing` events for one assertion. Each nextest test runs in
+/// its own process, so the global subscriber set here sees only this
+/// test's events; under plain `cargo test` an already-set subscriber wins
+/// and is ignored.
+fn install_log_capture(log: SharedLog) {
+    let _already_set = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || log.clone())
+            .finish(),
+    );
 }
 
 fn read_stderr(mut stderr: std::process::ChildStderr) -> std::io::Result<String> {
@@ -463,76 +573,6 @@ fn crash_child(scenario: &str, data_dir: &Path, budget: Duration) -> Result<()> 
     }
     Ok(())
 }
-/// The scenario's node config. A marker that survives the kill must not be
-/// disarmed by journal rewind on the way down, so the marker scenarios run
-/// without the journal.
-fn crash_config(scenario: &str, data_dir: PathBuf) -> NodeConfig {
-    let mut config = test_config(data_dir);
-    if matches!(
-        scenario,
-        "disconnect-rolledback" | "inflight-cold" | "disconnect-above-head"
-    ) {
-        config.chainstate_journal.enabled = false;
-    }
-    config
-}
-
-/// Build the checkpointed base, let a parked child drive the node to the
-/// marker state and die to `SIGKILL`, then reopen in this process.
-fn run_marker_scenario(scenario: &str) -> Result<(tempfile::TempDir, NodeConfig, NodeState)> {
-    let temp = tempfile::tempdir()?;
-    let data_dir = temp.path().join(format!("{scenario}-node"));
-    let config = crash_config(scenario, data_dir.clone());
-    let genesis = Network::Regtest.genesis_block();
-    let base = NodeState::open(config.clone(), None)?;
-    base.apply_block(&genesis)?;
-    base.publish_checkpoint()?;
-    drop(base);
-
-    crash_child(scenario, &data_dir, Duration::from_secs(30))?;
-
-    let resumed = NodeState::open(config.clone(), None)
-        .with_context(|| format!("reopening {scenario} after SIGKILL must complete recovery"))?;
-    Ok((temp, config, resumed))
-}
-
-#[derive(Clone, Default)]
-struct SharedLog(Arc<Mutex<Vec<u8>>>);
-
-impl SharedLog {
-    fn contents(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock()).into_owned()
-    }
-}
-
-impl std::io::Write for SharedLog {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Captures `tracing` events for one assertion. Each nextest test runs in
-/// its own process, so the global subscriber set here sees only this
-/// test's events; an install failure panics rather than letting a
-/// warning assertion fail on an empty capture.
-fn install_log_capture(log: SharedLog) {
-    if let Err(error) = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || log.clone())
-            .finish(),
-    ) {
-        panic!(
-            "nextest gives each test its own process; the global subscriber must be installable: {error}"
-        );
-    }
-}
-
 fn test_config(data_dir: PathBuf) -> NodeConfig {
     let mut config = NodeConfig::default_for_network(Network::Regtest);
     config.data_dir = data_dir;

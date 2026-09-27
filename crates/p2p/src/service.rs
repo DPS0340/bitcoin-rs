@@ -675,6 +675,13 @@ impl P2pService {
         Arc::clone(&self.peer_table)
     }
 
+    /// The service flags this node advertises in every `version` (Core
+    /// `init.cpp:2022-2026`): what RPC reports as `localservices`.
+    #[must_use]
+    pub fn local_services(&self) -> bitcoin::p2p::ServiceFlags {
+        self.config.local_services
+    }
+
     /// Returns whether P2P network activity is enabled.
     #[must_use]
     pub fn network_active(&self) -> bool {

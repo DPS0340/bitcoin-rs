@@ -12,9 +12,9 @@ use bitcoin_rs_storage::pruning::{
     load_pruneheight, prune_to_height, reclaim_staged_flat_block_files, stage_block_and_undo_prune,
 };
 use bitcoin_rs_storage::{
-    BlockFilePosition, ColumnFamily, FlatFileBlockStore, KvIter, KvSnapshot, KvStore, KvUndoStore,
-    StorageError, UndoStore, WriteBatch, WriteCondition, block_file_max_height_key,
-    decode_block_file_max_height, encode_block_file_max_height,
+    BatchOp, BlockFilePosition, BufferedWriteBatch, ColumnFamily, FlatFileBlockStore, KvIter,
+    KvSnapshot, KvStore, KvUndoStore, StorageError, UndoStore, WriteCondition,
+    block_file_max_height_key, decode_block_file_max_height, encode_block_file_max_height,
 };
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -1125,8 +1125,6 @@ impl MemoryStore {
 }
 
 impl KvStore for MemoryStore {
-    type WriteBatch = MemoryBatch;
-
     fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         if cf == ColumnFamily::UtxoMeta && key == EXECUTED_FRONTIER_KEY {
             let remaining = self
@@ -1169,21 +1167,21 @@ impl KvStore for MemoryStore {
         Ok(Box::new(rows.into_iter()))
     }
 
-    fn new_batch(&self) -> Self::WriteBatch {
-        MemoryBatch::default()
+    fn new_batch(&self) -> BufferedWriteBatch {
+        BufferedWriteBatch::default()
     }
 
-    fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+    fn write(&self, batch: BufferedWriteBatch) -> Result<(), StorageError> {
         let mut guard = self.cfs.write();
-        for op in batch.ops {
+        for op in batch.into_ops() {
             match op {
-                MemoryOp::Put { cf, key, value } => {
-                    guard[cf.index()].insert(key, value);
+                BatchOp::Put { cf, key, value } => {
+                    guard[cf.index()].insert(key, value.into());
                 }
-                MemoryOp::Delete { cf, key } => {
+                BatchOp::Delete { cf, key } => {
                     guard[cf.index()].remove(&key);
                 }
-                MemoryOp::DeleteRange { cf, start, end } => {
+                BatchOp::DeleteRange { cf, start, end } => {
                     let keys = guard[cf.index()]
                         .range(start..end)
                         .map(|(key, _value)| key.clone())
@@ -1197,7 +1195,7 @@ impl KvStore for MemoryStore {
         Ok(())
     }
 
-    fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+    fn write_durable(&self, batch: BufferedWriteBatch) -> Result<(), StorageError> {
         let armed = self.write_durable_outcome.lock().take();
         match armed {
             // The ambiguous post-application case: the whole atomic batch is
@@ -1218,7 +1216,7 @@ impl KvStore for MemoryStore {
     fn write_durable_if(
         &self,
         conditions: &[WriteCondition<'_>],
-        batch: MemoryBatch,
+        batch: BufferedWriteBatch,
     ) -> Result<bool, StorageError> {
         let mut guard = self.cfs.write();
         for condition in conditions {
@@ -1228,15 +1226,15 @@ impl KvStore for MemoryStore {
                 return Ok(false);
             }
         }
-        for op in batch.ops {
+        for op in batch.into_ops() {
             match op {
-                MemoryOp::Put { cf, key, value } => {
-                    guard[cf.index()].insert(key, value);
+                BatchOp::Put { cf, key, value } => {
+                    guard[cf.index()].insert(key, value.into());
                 }
-                MemoryOp::Delete { cf, key } => {
+                BatchOp::Delete { cf, key } => {
                     guard[cf.index()].remove(&key);
                 }
-                MemoryOp::DeleteRange { cf, start, end } => {
+                BatchOp::DeleteRange { cf, start, end } => {
                     let keys = guard[cf.index()]
                         .range(start..end)
                         .map(|(key, _value)| key.clone())
@@ -1261,53 +1259,6 @@ impl KvStore for MemoryStore {
 
     fn arm_persist_fault(&self, _fault: bitcoin_rs_storage::PersistFault) {
         // In-memory double: no persistence boundary exists to fault.
-    }
-}
-
-#[derive(Default)]
-struct MemoryBatch {
-    ops: Vec<MemoryOp>,
-}
-
-enum MemoryOp {
-    Put {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    Delete {
-        cf: ColumnFamily,
-        key: Vec<u8>,
-    },
-    DeleteRange {
-        cf: ColumnFamily,
-        start: Vec<u8>,
-        end: Vec<u8>,
-    },
-}
-
-impl WriteBatch for MemoryBatch {
-    fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) {
-        self.ops.push(MemoryOp::Put {
-            cf,
-            key: key.to_vec(),
-            value: value.to_vec(),
-        });
-    }
-
-    fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
-        self.ops.push(MemoryOp::Delete {
-            cf,
-            key: key.to_vec(),
-        });
-    }
-
-    fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
-        self.ops.push(MemoryOp::DeleteRange {
-            cf,
-            start: start.to_vec(),
-            end: end.to_vec(),
-        });
     }
 }
 

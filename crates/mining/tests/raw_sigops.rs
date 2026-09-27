@@ -83,6 +83,7 @@ fn raw_children_resolve_only_earlier_selected_outputs() -> TestResult {
             1_000,
             1,
             1,
+            0,
         ))?;
         let admitted = pool.mining_snapshot().entries[0].clone();
         for parent_selection in [

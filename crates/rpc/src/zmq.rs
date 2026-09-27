@@ -155,6 +155,7 @@ pub enum SequenceEvent {
 }
 
 impl SequenceEvent {
+    #[cfg(any(feature = "zmq", test))]
     const fn label(self) -> u8 {
         match self {
             Self::Connected(_) => b'C',
@@ -268,62 +269,6 @@ impl ZmqPublisher for NoOpZmqPublisher {
     fn publish_rawtx(&self, _bytes: &[u8]) {}
 
     fn publish_sequence(&self, _event: SequenceEvent) {}
-}
-
-/// `ZmqPublisher` that emits each event via `tracing::info!`.
-///
-/// Useful in tests and diagnostics that want notification visibility without
-/// opening sockets.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TracingZmqPublisher;
-
-impl ZmqPublisher for TracingZmqPublisher {
-    fn publish_hashblock(&self, hash: Hash256) {
-        tracing::info!(
-            target: "bitcoin_rs_rpc::zmq",
-            topic = "hashblock",
-            hash = %hash.to_string_be(),
-        );
-    }
-
-    fn publish_hashtx(&self, txid: Txid) {
-        tracing::info!(
-            target: "bitcoin_rs_rpc::zmq",
-            topic = "hashtx",
-            txid = %txid,
-        );
-    }
-
-    fn publish_rawblock(&self, bytes: &[u8]) {
-        tracing::info!(
-            target: "bitcoin_rs_rpc::zmq",
-            topic = "rawblock",
-            len = bytes.len(),
-        );
-    }
-
-    fn publish_rawtx(&self, bytes: &[u8]) {
-        tracing::info!(
-            target: "bitcoin_rs_rpc::zmq",
-            topic = "rawtx",
-            len = bytes.len(),
-        );
-    }
-
-    fn publish_sequence(&self, event: SequenceEvent) {
-        let subject = match event {
-            SequenceEvent::Connected(hash) | SequenceEvent::Disconnected(hash) => {
-                hash.to_string_be()
-            }
-            SequenceEvent::Added(txid, _) | SequenceEvent::Removed(txid, _) => txid.to_string(),
-        };
-        tracing::info!(
-            target: "bitcoin_rs_rpc::zmq",
-            topic = "sequence",
-            hash = %subject,
-            label = char::from(event.label()).to_string(),
-        );
-    }
 }
 
 #[cfg(feature = "zmq")]
@@ -891,8 +836,6 @@ mod tests {
             noop.active_notifiers().is_empty(),
             "a publisher with no bound endpoints has no live notifier"
         );
-        let tracing: Arc<dyn ZmqPublisher> = Arc::new(TracingZmqPublisher);
-        assert!(tracing.active_notifiers().is_empty());
     }
 
     #[cfg(feature = "zmq")]
@@ -972,6 +915,24 @@ mod manifest_tests {
             published, declared,
             "published ZMQ topics and the declared ZMQ rows must name the same set"
         );
+
+        // getzmqnotifications names each topic `pub<topic>`; the manifest
+        // row is keyed by the bare topic, so the wire-visible notifier
+        // name must derive from it exactly.
+        for topic in [
+            ZmqTopic::HashBlock,
+            ZmqTopic::HashTx,
+            ZmqTopic::RawBlock,
+            ZmqTopic::RawTx,
+            ZmqTopic::Sequence,
+        ] {
+            assert_eq!(
+                topic.notifier_type(),
+                format!("pub{}", topic.as_str()),
+                "the notifier name for `{}` no longer follows pub<topic>",
+                topic.as_str()
+            );
+        }
     }
 
     #[derive(Default)]
@@ -1026,7 +987,7 @@ mod manifest_tests {
     }
 
     fn sequence_entry(tx: &bitcoin_rs_primitives::Tx) -> bitcoin_rs_mempool::MempoolEntry {
-        bitcoin_rs_mempool::MempoolEntry::new(std::sync::Arc::new(tx.clone()), 100, 1_000, 1, 7)
+        bitcoin_rs_mempool::MempoolEntry::new(std::sync::Arc::new(tx.clone()), 100, 1_000, 1, 7, 0)
     }
 
     fn expected_sequence_body(txid: &Txid, label: u8, sequence: u64) -> Vec<u8> {
@@ -1045,9 +1006,8 @@ mod manifest_tests {
         use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits, MempoolObserver};
         use parking_lot::RwLock;
         let publisher = std::sync::Arc::new(RecordingPublisher::default());
-        let observer: std::sync::Arc<dyn MempoolObserver> = std::sync::Arc::new(
-            MempoolSequenceObserver::new(std::sync::Arc::clone(&publisher) as _),
-        );
+        let observer: std::sync::Arc<dyn MempoolObserver> =
+            std::sync::Arc::new(MempoolSequenceObserver::new(publisher.clone()));
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Some(observer),
@@ -1124,9 +1084,8 @@ mod manifest_tests {
         };
         use parking_lot::RwLock;
         let publisher = std::sync::Arc::new(RecordingPublisher::default());
-        let observer: std::sync::Arc<dyn MempoolObserver> = std::sync::Arc::new(
-            MempoolSequenceObserver::new(std::sync::Arc::clone(&publisher) as _),
-        );
+        let observer: std::sync::Arc<dyn MempoolObserver> =
+            std::sync::Arc::new(MempoolSequenceObserver::new(publisher.clone()));
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits {
                 min_relay_fee_sat_per_kvb: 0,
@@ -1136,8 +1095,8 @@ mod manifest_tests {
             Some(observer),
             bitcoin_rs_consensus::ValidationEngine::Native,
         );
-        let low = MempoolEntry::new(std::sync::Arc::new(sequence_tx(5)), 100, 100, 1, 7);
-        let high = MempoolEntry::new(std::sync::Arc::new(sequence_tx(6)), 100, 900, 1, 7);
+        let low = MempoolEntry::new(std::sync::Arc::new(sequence_tx(5)), 100, 100, 1, 7, 0);
+        let high = MempoolEntry::new(std::sync::Arc::new(sequence_tx(6)), 100, 900, 1, 7, 0);
         gateway
             .insert_entry(AdmissionOrigin::Rpc, low)
             .expect("low in");
@@ -1165,81 +1124,15 @@ mod manifest_tests {
             AdmissionOrigin, CompositeObserver, Mempool, MempoolGateway, MempoolLimits,
             MempoolObserver,
         };
+        use bitcoin_rs_mining::FakeMiningControl;
         use bitcoin_rs_mining::MempoolSequenceWake;
-        use bitcoin_rs_mining::{
-            BlockTemplateRequest, BlockTemplateResult, MiningControl, MiningControlError,
-        };
+        use bitcoin_rs_mining::MiningControl;
         use bitcoin_rs_node::mining::MiningGenerationSignal;
-        use compact_str::CompactString;
-        use parking_lot::{Mutex, RwLock};
-
-        struct RecordingControl {
-            published: Mutex<usize>,
-            published_from: Mutex<Vec<u64>>,
-        }
-
-        fn unavailable() -> MiningControlError {
-            MiningControlError::Unavailable(CompactString::from("not wired in this test"))
-        }
-
-        impl MiningControl for RecordingControl {
-            fn get_block_template(
-                &self,
-                _request: BlockTemplateRequest,
-            ) -> Result<BlockTemplateResult, MiningControlError> {
-                Err(unavailable())
-            }
-
-            fn mining_info(&self) -> Result<bitcoin_rs_mining::MiningInfo, MiningControlError> {
-                Err(unavailable())
-            }
-
-            fn network_hash_ps(
-                &self,
-                _lookup: i64,
-                _height: i64,
-            ) -> Result<f64, MiningControlError> {
-                Err(unavailable())
-            }
-
-            fn submit_block(
-                &self,
-                _block: bitcoin_rs_primitives::Block,
-            ) -> Result<bitcoin_rs_mining::BlockValidationResult, MiningControlError> {
-                Err(unavailable())
-            }
-
-            fn submit_header(
-                &self,
-                _header: bitcoin_rs_primitives::Header,
-            ) -> Result<(), MiningControlError> {
-                Err(unavailable())
-            }
-
-            fn publish_generation(&self) {
-                *self.published.lock() += 1;
-            }
-
-            fn generate(
-                &self,
-                _request: bitcoin_rs_mining::GenerateRequest,
-            ) -> Result<Vec<bitcoin_rs_mining::GeneratedBlock>, MiningControlError> {
-                Err(unavailable())
-            }
-        }
-
-        impl MempoolSequenceWake for RecordingControl {
-            fn publish_generation_from(&self, sequence: u64) {
-                self.published_from.lock().push(sequence);
-            }
-        }
+        use parking_lot::RwLock;
 
         let publisher = std::sync::Arc::new(RecordingPublisher::default());
         let signal = std::sync::Arc::new(MiningGenerationSignal::new());
-        let control = std::sync::Arc::new(RecordingControl {
-            published: Mutex::new(0),
-            published_from: Mutex::new(Vec::new()),
-        });
+        let control = FakeMiningControl::unavailable("not wired in this test");
         let control_dyn: std::sync::Arc<dyn MiningControl> = control.clone();
         let wake_dyn: std::sync::Arc<dyn MempoolSequenceWake> = control.clone();
         signal.attach(&control_dyn);
@@ -1248,11 +1141,9 @@ mod manifest_tests {
         let composite = CompositeObserver::new();
         composite.add_leg(
             "sequence",
-            std::sync::Arc::new(MempoolSequenceObserver::new(
-                std::sync::Arc::clone(&publisher) as _,
-            )),
+            std::sync::Arc::new(MempoolSequenceObserver::new(publisher.clone())),
         );
-        composite.add_leg("mining", std::sync::Arc::clone(&signal) as _);
+        composite.add_leg("mining", signal);
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Some(std::sync::Arc::new(composite) as std::sync::Arc<dyn MempoolObserver>),
@@ -1272,7 +1163,7 @@ mod manifest_tests {
             "the mining leg wakes the coordinator with the mutation's sequence"
         );
         assert_eq!(
-            *control.published.lock(),
+            control.publish_count(),
             0,
             "the lock-free path is used, not the publish_generation fallback"
         );

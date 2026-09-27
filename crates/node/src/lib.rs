@@ -18,6 +18,8 @@ pub mod config;
 pub mod embed;
 /// Central synchronous event loop.
 pub mod event_loop;
+/// The node option table and the source-layer types generated from it.
+pub mod options;
 
 /// Owned startup, rollback, and ordered service shutdown.
 mod lifecycle;
@@ -50,17 +52,21 @@ pub mod tx_ingress;
 pub use bitcoin_rs_primitives::Network;
 
 pub use bitcoin_rs_rpc::zmq::{
-    NoOpZmqPublisher, SequenceEvent, TracingZmqPublisher, ZmqEndpointConfig, ZmqPublisher, ZmqTopic,
+    NoOpZmqPublisher, SequenceEvent, ZmqEndpointConfig, ZmqPublisher, ZmqTopic,
 };
 
 pub use chain_effects::ChainFollowers;
 
 pub use bitcoin_rs_consensus::ValidationEngine;
 pub use config::{
-    Auth, ChainstateJournalOverrides, IndexConfig, IndexOverrides, MiningConfig, MiningOverrides,
-    NetworkSelection, NodeConfig, NotificationConfig, ObservabilityConfig, ObservabilityOverrides,
-    P2pConfig, P2pOverrides, RpcConfig, RpcOverrides, RuntimeInputs, ScriptIndexMode,
-    StorageConfig, StorageOverrides, UserConfig, ValidationConfig, ValidationOverrides, resolve,
+    Auth, IndexConfig, MiningConfig, NetworkSelection, NodeConfig, NotificationConfig,
+    ObservabilityConfig, P2pConfig, RpcConfig, RuntimeInputs, ScriptIndexMode, StorageConfig,
+    ValidationConfig, resolve,
+};
+
+pub use options::{
+    ChainstateJournalOverrides, IndexOverrides, MiningOverrides, ObservabilityOverrides,
+    P2pOverrides, RpcOverrides, StorageOverrides, UserConfig, ValidationOverrides,
 };
 
 pub use embed::{Node, NodeError, SyncProgress};

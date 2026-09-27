@@ -41,11 +41,10 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
   budget, and evidence scenario. The `Status` vocabulary is `Supported`,
   `Deviation`, `Implemented (unverified)`, `Extension`, `Disabled`,
   `Unimplemented`. `[reference].differential_harness` in
-  [core-compat.toml](../api/core-compat.toml) gates `Supported`: no row
-  may claim it while that flag is false.
-- Compatibility class, runtime readiness, and observed proof stay
-  separate row facts. An unverified implementation never reads as
-  verified parity.
+  [core-compat.toml](../../crates/rpc/core-compat.toml) gates `Supported`: no row
+  may claim it while that flag is false. Compatibility class, runtime
+  readiness, and observed proof stay separate row facts; an unverified
+  implementation never reads as verified parity.
 - Unsupported Core surfaces stay declared `Unimplemented` and answer
   `RpcError::MethodNotFound` (code `-32601`). No wallet-only RPC is a
   disguised successful no-op.
@@ -258,10 +257,11 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 
 - **Owner**: `ensure_template_ready` in `crates/rpc/src/handlers/mining.rs`.
 - Template mode on mainnet requires at least one live peer (`PeerTable`) and
-  that the node has left IBD (`ctx.chain.ibd.is_active(now, network)`, the
-  chain-crate latch in `crates/chain/src/ibd.rs`). Failures are Core `-9` (`bitcoin-rs
-  is not connected!`) and `-10` (`bitcoin-rs is in initial sync and waiting
-  for blocks...`).
+  that the node has left IBD
+  (`!ctx.chain.ibd.is_active(now, ctx.chain.chain_network)`, the chain-crate
+  latch in `crates/chain/src/ibd.rs` negated by the gate).
+  Failures are Core `-9` (`bitcoin-rs is not connected!`) and `-10`
+  (`bitcoin-rs is in initial sync and waiting for blocks...`).
 - Proposal mode does not apply these gates. Networks other than mainnet skip
   them, matching Core `IsTestChain()`.
 

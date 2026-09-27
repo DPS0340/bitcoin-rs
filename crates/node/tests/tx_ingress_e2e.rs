@@ -33,8 +33,8 @@ use bitcoin::p2p::Magic;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_mempool::MempoolGateway;
 use bitcoin_rs_mining::{
-    BlockTemplateRequest, BlockTemplateResult, BlockValidationResult, MiningControl,
-    MiningControlError, MiningInfo,
+    BlockTemplateRequest, BlockTemplateResult, BlockValidationResult, FakeMiningControl,
+    MiningControl, MiningControlError, MiningInfo,
 };
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_node::tx_ingress::spawn_tx_ingress_consumer;
@@ -563,7 +563,7 @@ struct Harness {
     state: NodeState,
     magic: Magic,
     gateway: Arc<MempoolGateway>,
-    mining: Arc<RecordingMining>,
+    mining: Arc<FakeMiningControl>,
     shutdown: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     source: LoopbackPeer,
@@ -585,8 +585,8 @@ impl Harness {
         let ingress_tx = state.inbound_tx_sender();
         let ingress_rx = state.inbound_tx_rx_handle();
         let (relay, relay_rx) = TxRelayQueue::new(DEFAULT_TX_RELAY_QUEUE_CAPACITY);
-        let mining = Arc::new(RecordingMining::default());
-        let mining_control: Arc<dyn MiningControl> = Arc::<RecordingMining>::clone(&mining);
+        let mining = FakeMiningControl::unavailable("not implemented");
+        let mining_control: Arc<dyn MiningControl> = mining.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let wiring = PeerWiring {

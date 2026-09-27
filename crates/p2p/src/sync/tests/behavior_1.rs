@@ -107,10 +107,10 @@ fn fork_getdata_starts_at_common_ancestor_child() -> Result<(), Box<dyn std::err
         let node = tree.node(losing2_id)?;
         TipSnapshot {
             tip_id: losing2_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
 
@@ -175,10 +175,10 @@ fn pending_reorg_fixture()
         let node = tree.node(losing2_id)?;
         TipSnapshot {
             tip_id: losing2_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
 

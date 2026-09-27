@@ -1522,7 +1522,7 @@ mod tests {
             gateway
                 .insert_entry(
                     AdmissionOrigin::Rpc,
-                    MempoolEntry::new(Arc::new(tx.clone()), 100, 10_000, 1, 0),
+                    MempoolEntry::new(Arc::new(tx.clone()), 100, 10_000, 1, 0, 0),
                 )
                 .is_ok()
         );
@@ -1565,6 +1565,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn one_sided_wtxid_negotiation_does_not_rerequest_pool_or_orphan_bodies() {
         use bitcoin_rs_primitives::Script;
         use std::sync::Arc;
@@ -1619,13 +1620,16 @@ mod tests {
                     Ok(SubmitOutcome::Held { .. })
                 ));
                 assert_eq!(gateway.orphan_count(), 1);
-                assert_eq!(gateway.get_tx(tx.txid()).as_ref(), Some(tx.as_ref()));
+                assert_eq!(
+                    gateway.get_tx_by_wtxid(tx.wtxid()).as_ref(),
+                    Some(tx.as_ref())
+                );
             } else {
                 assert!(
                     gateway
                         .insert_entry(
                             AdmissionOrigin::Rpc,
-                            MempoolEntry::new(Arc::clone(&tx), 100, 10_000, 1, 0),
+                            MempoolEntry::new(Arc::clone(&tx), 100, 10_000, 1, 0, 0),
                         )
                         .is_ok()
                 );
@@ -1642,18 +1646,32 @@ mod tests {
                 if remote_requested {
                     peer.wtxid_relay.mark_peer_supported();
                 }
-                assert!(
-                    dispatch_collect_full(
-                        &mut peer,
-                        &Message::Inv(vec![item]),
-                        None,
-                        Some(&gateway),
-                    )
-                    .is_empty(),
-                    "inventory type must select the held body's identity in either relay direction"
+                // A resident orphan suppresses only its own wtxid: a txid
+                // inventory stays requestable because another witness of the
+                // same txid can still be a valid body. Pool entries suppress
+                // either identity.
+                let held_suppresses = !orphan || matches!(item, Inventory::WTx(_));
+                let responses = dispatch_collect_full(
+                    &mut peer,
+                    &Message::Inv(vec![item]),
+                    None,
+                    Some(&gateway),
                 );
+                if held_suppresses {
+                    assert!(
+                        responses.is_empty(),
+                        "inventory type must select the held body's identity in either relay direction"
+                    );
+                } else {
+                    assert_eq!(responses, vec![Message::GetData(vec![item])]);
+                }
 
                 let unknown = Inventory::WTx(bitcoin::Wtxid::from_byte_array([0xff; 32]));
+                let expected = if held_suppresses {
+                    vec![unknown]
+                } else {
+                    vec![item, unknown]
+                };
                 assert_eq!(
                     dispatch_collect_full(
                         &mut peer,
@@ -1661,7 +1679,7 @@ mod tests {
                         None,
                         Some(&gateway),
                     ),
-                    vec![Message::GetData(vec![unknown])]
+                    vec![Message::GetData(expected)]
                 );
             }
         }

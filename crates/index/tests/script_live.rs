@@ -28,8 +28,8 @@ use bitcoin_rs_index::{
 };
 use bitcoin_rs_primitives::{Hash256, OutPoint as NativeOutPoint, Txid as NativeTxid};
 use bitcoin_rs_storage::{
-    ColumnFamily, KvIter, KvSnapshot, KvStore, PrefixScanLimit, StorageError, WriteBatch,
-    WriteCondition,
+    BatchOp, BufferedWriteBatch, ColumnFamily, KvIter, KvSnapshot, KvStore, PrefixScanLimit,
+    StorageError, WriteCondition,
 };
 use parking_lot::RwLock;
 
@@ -58,56 +58,64 @@ struct MemoryStore {
     cfs: RwLock<[BTreeMap<Vec<u8>, Vec<u8>>; ColumnFamily::ALL.len()]>,
     fail_next_durable: AtomicBool,
 }
+type CfsGuard<'a> =
+    parking_lot::RwLockWriteGuard<'a, [BTreeMap<Vec<u8>, Vec<u8>>; ColumnFamily::ALL.len()]>;
 
-struct MemoryBatch {
-    ops: Vec<(ColumnFamily, Vec<u8>, Option<Vec<u8>>)>,
-}
+impl MemoryStore {
+    /// Folds one batch's recorded operations into the column families, in order.
+    fn apply(&self, ops: Vec<BatchOp>) {
+        let mut guard = self.cfs.write();
+        Self::apply_locked(&mut guard, ops);
+    }
 
-impl WriteBatch for MemoryBatch {
-    fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) {
-        self.ops.push((cf, key.to_vec(), Some(value.to_vec())));
-    }
-    fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
-        self.ops.push((cf, key.to_vec(), None));
-    }
-    fn delete_range(&mut self, _cf: ColumnFamily, _start: &[u8], _end: &[u8]) {
-        panic!("range deletes are not exercised by these tests")
+    /// Folds `ops` into a guard the caller already holds, so a conditional
+    /// write can check and apply under one lock.
+    fn apply_locked(guard: &mut CfsGuard<'_>, ops: Vec<BatchOp>) {
+        for op in ops {
+            match op {
+                BatchOp::Put { cf, key, value } => {
+                    guard[cf.index()].insert(key, value.into());
+                }
+                BatchOp::Delete { cf, key } => {
+                    guard[cf.index()].remove(&key);
+                }
+                BatchOp::DeleteRange { cf, start, end } => {
+                    let doomed: Vec<Vec<u8>> = guard[cf.index()]
+                        .range(start..end)
+                        .map(|(key, _value)| key.clone())
+                        .collect();
+                    for key in doomed {
+                        guard[cf.index()].remove(&key);
+                    }
+                }
+            }
+        }
     }
 }
 
 impl KvStore for MemoryStore {
-    type WriteBatch = MemoryBatch;
-
     fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(self.cfs.read()[cf.index()].get(key).cloned())
     }
-    fn new_batch(&self) -> Self::WriteBatch {
-        MemoryBatch { ops: Vec::new() }
+    fn new_batch(&self) -> BufferedWriteBatch {
+        BufferedWriteBatch::default()
     }
-    fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
-        let mut guard = self.cfs.write();
-        for (cf, key, value) in batch.ops {
-            match value {
-                Some(value) => {
-                    guard[cf.index()].insert(key, value);
-                }
-                None => {
-                    guard[cf.index()].remove(&key);
-                }
-            }
-        }
+    fn write(&self, batch: BufferedWriteBatch) -> Result<(), StorageError> {
+        self.apply(batch.into_ops());
         Ok(())
     }
     fn write_durable_if(
         &self,
         conditions: &[WriteCondition<'_>],
-        batch: Self::WriteBatch,
+        batch: BufferedWriteBatch,
     ) -> Result<bool, StorageError> {
         if self.fail_next_durable.swap(false, Ordering::SeqCst) {
             return Err(StorageError::Backend(
                 "injected durable write failure".into(),
             ));
         }
+        // The check and the apply run under one write lock, matching the
+        // backend's atomic conditional write.
         let mut guard = self.cfs.write();
         let matched = conditions.iter().all(|condition| {
             let (cf, key) = condition.location();
@@ -116,22 +124,13 @@ impl KvStore for MemoryStore {
         if !matched {
             return Ok(false);
         }
-        for (cf, key, value) in batch.ops {
-            match value {
-                Some(value) => {
-                    guard[cf.index()].insert(key, value);
-                }
-                None => {
-                    guard[cf.index()].remove(&key);
-                }
-            }
-        }
+        Self::apply_locked(&mut guard, batch.into_ops());
         Ok(true)
     }
-    fn write_deferred(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+    fn write_deferred(&self, batch: BufferedWriteBatch) -> Result<(), StorageError> {
         self.write(batch)
     }
-    fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+    fn write_durable(&self, batch: BufferedWriteBatch) -> Result<(), StorageError> {
         self.write(batch)
     }
     fn flush(&self) -> Result<(), StorageError> {

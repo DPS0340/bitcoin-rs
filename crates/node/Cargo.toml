@@ -58,7 +58,6 @@ redb = [
 ]
 kernel = ["bitcoin-rs-chainstate/kernel", "bitcoin-rs-consensus/kernel"]
 zmq = ["bitcoin-rs-rpc/zmq"]
-prometheus-http = ["metrics-exporter-prometheus/http-listener"]
 
 [dependencies]
 hashbrown.workspace = true
@@ -108,6 +107,7 @@ toml.workspace = true
 rustix.workspace = true
 bitcoin-rs-script.workspace = true
 bitcoin-rs-mempool = { workspace = true, features = ["test-seam"] }
+bitcoin-rs-mining = { workspace = true, features = ["test-seam"] }
 bitcoin-rs-index = { workspace = true, features = ["test-seam"] }
 
 [[bench]]

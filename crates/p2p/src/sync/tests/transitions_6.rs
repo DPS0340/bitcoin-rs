@@ -35,10 +35,10 @@ fn apply_cache_invalidated_on_chain_tip_move() -> Result<(), Box<dyn std::error:
         hash_bytes[0] ^= 0xff;
         TipSnapshot {
             tip_id: current.tip_id,
+            chain_tx_count: current.chain_tx_count,
             height: current.height,
             chainwork: current.chainwork,
             hash: Hash256::from_le_bytes(&hash_bytes),
-            chain_tx_count: current.chain_tx_count,
         }
     };
     fixture.chain_tip.store(Some(Arc::new(moved_tip)));

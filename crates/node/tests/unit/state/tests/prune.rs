@@ -176,7 +176,6 @@ fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
     use bitcoin_rs_rpc::context::PruneService;
     use bitcoin_rs_storage::FlatFileBlockStore;
     use bitcoin_rs_storage::KvStore;
-    use bitcoin_rs_storage::WriteBatch as _;
     use bitcoin_rs_storage::pruning::load_pruneheight;
     use parking_lot::RwLock;
     use std::sync::Barrier;
@@ -268,7 +267,7 @@ fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
         &bitcoin_rs_storage::encode_block_file_max_height(10),
     );
     store.write(seed)?;
-    let service = Arc::new(NodePruneService::new(
+    let service = Arc::new(super::super::prune::NodePruneService::new(
         Arc::clone(&store),
         block_files,
         body_handle,

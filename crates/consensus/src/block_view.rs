@@ -8,7 +8,6 @@ use bitcoin_rs_primitives::{
     encode::{double_sha256, finalize_double_sha256},
     layout::{ByteSpan, ParsedBlock, ParsedTransaction},
 };
-
 use sha2::{Digest, Sha256};
 
 use crate::verify_block::merkle_root_and_mutation_borrowed;

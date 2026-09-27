@@ -334,7 +334,8 @@ impl UtxoRecord {
     /// POST: returns the canonical replacement. If `overwritten` is Some, it
     /// has one entry per addition in addition order; an append has a None
     /// entry.
-    /// INVARIANT: an error leaves the source record and shard table unchanged.
+    /// INVARIANT: an error leaves the source record, shard table, and any
+    /// `overwritten` sink unchanged.
     pub(crate) fn add_run_replacement<'p>(
         existing: Option<&Self>,
         txid: Hash256,
@@ -370,14 +371,23 @@ impl UtxoRecord {
             Some(record) => (record.output_parts(), record.header().inline_len),
             None => (Vec::with_capacity(additions.len()), 0),
         };
+        // Overwrite events are staged locally: `from_output_parts` can still
+        // fail, and a failed add must leave the caller's sink untouched.
+        let mut staged = overwritten
+            .is_some()
+            .then(|| Vec::with_capacity(additions.len()));
         apply_additions(
             &mut parts,
             &mut inline_len,
             additions,
             add_unique,
-            overwritten,
+            staged.as_mut(),
         );
-        Self::from_output_parts(txid, inline_len, &parts)
+        let record = Self::from_output_parts(txid, inline_len, &parts)?;
+        if let (Some(sink), Some(events)) = (overwritten, staged) {
+            sink.extend(events);
+        }
+        Ok(record)
     }
 
     /// Increasing-unique append-copy fast path. Returns `None` when appending
@@ -491,11 +501,10 @@ impl UtxoRecord {
         vouts: &[u32],
         mut removed: Option<&mut Vec<Option<OwnedUtxoOut>>>,
     ) -> Result<RemovedRecord, UtxoError> {
-        if self.is_full_removal(vouts) {
+        if let Some(outputs) = self.full_removal_outputs(vouts) {
             if let Some(sink) = removed.as_deref_mut() {
-                for &vout in vouts {
-                    let output = self.find_output(vout).ok_or(UtxoError::CorruptRecord)?;
-                    sink.push(Some(OutputParts::from_view(&output).into_owned()));
+                for output in &outputs {
+                    sink.push(Some(OutputParts::from_view(output).into_owned()));
                 }
             }
             return Ok(RemovedRecord::Emptied);
@@ -588,8 +597,24 @@ impl UtxoRecord {
         true
     }
 
-    /// Returns the encoded length, which is the complete requested owner
-    /// length.
+    /// The exact-cover check plus the located outputs in request order, so the
+    /// caller's materialization does not repeat the per-vout lookup.
+    fn full_removal_outputs(&self, vouts: &[u32]) -> Option<Vec<OneUtxoOut<'_>>> {
+        if self.output_count() != vouts.len() {
+            return None;
+        }
+        let mut outputs = Vec::with_capacity(vouts.len());
+        for (index, &vout) in vouts.iter().enumerate() {
+            if vouts[..index].contains(&vout) {
+                return None;
+            }
+            outputs.push(self.find_output(vout)?);
+        }
+        Some(outputs)
+    }
+
+    /// Live encoded payload length, excluding the allocation header and any
+    /// spare capacity.
     pub(crate) fn payload_bytes(&self) -> usize {
         self.buf.len()
     }
@@ -1521,17 +1546,16 @@ mod tests {
             record.remove_run_replacement(&[2, 0, 1], Some(&mut removed))?,
             RemovedRecord::Emptied
         ));
-        let removed = removed
-            .iter()
-            .map(|out| out.as_ref().ok_or(UtxoError::CorruptRecord))
-            .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(
-            removed.iter().map(|out| out.vout).collect::<Vec<_>>(),
-            vec![2, 0, 1]
+            removed
+                .iter()
+                .map(|out| out.as_ref().map(|kept| kept.vout))
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(0), Some(1)]
         );
-        assert_eq!(removed[0].value, 12);
-        assert_eq!(removed[1].value, 10);
-        assert_eq!(removed[2].value, 11);
+        assert_eq!(removed[0].as_ref().map(|kept| kept.value), Some(12));
+        assert_eq!(removed[1].as_ref().map(|kept| kept.value), Some(10));
+        assert_eq!(removed[2].as_ref().map(|kept| kept.value), Some(11));
         Ok(())
     }
 
@@ -1861,6 +1885,36 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A failed non-unique add must leave the caller's overwrite sink
+    /// untouched: the events are staged locally and reach the sink only after
+    /// the replacement encodes. The oversized script fails the encode after
+    /// the duplicate vout has already been merged.
+    #[test]
+    fn failed_non_unique_add_leaves_the_overwrite_sink_untouched() -> Result<(), UtxoError> {
+        let existing = output(0, &[0x51], 10);
+        let record =
+            UtxoRecord::from_owned_outputs(Hash256::default(), std::slice::from_ref(&existing))?;
+        let oversized = vec![0x51; usize::from(u16::MAX) + 1];
+        let addition = OutputParts::new(0, 20, &oversized, false, 0);
+        let mut overwritten = Vec::new();
+        let result = UtxoRecord::add_run_replacement(
+            Some(&record),
+            Hash256::default(),
+            &[addition],
+            false,
+            Some(&mut overwritten),
+        );
+        assert!(
+            matches!(result, Err(UtxoError::ScriptTooLarge { .. })),
+            "the oversized script must fail the encode"
+        );
+        assert!(
+            overwritten.is_empty(),
+            "a failed add must leave the overwrite sink untouched"
+        );
         Ok(())
     }
 }

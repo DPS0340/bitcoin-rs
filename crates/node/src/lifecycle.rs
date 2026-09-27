@@ -79,7 +79,7 @@ fn bind_rpc(
             transactions: state.transactions(),
             utxo: chainstate.utxo_handle(),
             coin_stats: chainstate.coin_stats_handle(),
-            block_tree: chainstate.block_tree_handle(),
+            block_tree: chainstate.block_tree_reader(),
             chain_network: state.config().network,
             chain_transition: chainstate.read_fence(),
             block_body_source: Some(block_body_source),
@@ -97,8 +97,8 @@ fn bind_rpc(
         },
         indexes: IndexHandles {
             derived_index: state.derived_index_query(),
+            esplora_tx_index: None,
             script_index: state.script_index_query(),
-            esplora_tx_index: state.esplora_derived_index_query(),
             derived_index_status: Some(state.derived_index_status()),
         },
         network: NetworkHandles {
@@ -108,13 +108,15 @@ fn bind_rpc(
             p2p_outbound_sender: Some(state.p2p_outbound_sender()),
             banned: state.banned_subnets(),
             added_nodes: state.added_nodes(),
+            local_services: state.p2p().local_services().to_u64(),
         },
         mining: MiningHandles {
             mining_control: Some(Arc::clone(mining_control)),
         },
         zmq_publisher: state.zmq_publisher(),
         debug_log_path: Some(state.data_dir().join("debug.log")),
-    });
+    })
+    .with_esplora_derived_index(state.esplora_derived_index_query());
     let context = Arc::new(context);
     let handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::clone(&context)));
     let server = RpcServer::bind(
@@ -233,9 +235,6 @@ impl NodeServices {
         }
 
         self.join_core_services(state, &mut first_error);
-        // Drain wait is deadline-bounded and never fails; it only bounds how
-        // long teardown parks before joining the remaining workers.
-        shutdown::drain_and_shutdown(DRAIN_DEADLINE);
         self.join_bootstrap_and_signal_workers(state, &mut first_error);
         publish_clean_checkpoint_if_eligible(state, mode, &mut first_error);
         // Owner-local fee-estimator history: the event loop has drained, so
@@ -356,7 +355,7 @@ fn publish_clean_checkpoint_if_eligible(
 ) {
     if let (Some(state), TeardownMode::CleanShutdown, None) = (state, mode, first_error.as_ref()) {
         run_before_clean_checkpoint_hook();
-        match state.write_clean_checkpoint() {
+        match state.publish_checkpoint() {
             Ok(None) => {
                 tracing::info!("no applied tip; clean checkpoint publication skipped");
             }

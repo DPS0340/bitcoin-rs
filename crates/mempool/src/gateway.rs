@@ -18,6 +18,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use crate::entry::MempoolEntry;
 use bitcoin_rs_consensus::{
     ConsensusError, UtxoView, ValidationEngine, transaction_sigop_cost, verify_transaction,
 };
@@ -191,7 +192,7 @@ pub(crate) struct PreparedAdmission {
     pub(crate) fact: crate::standardness::TxAcceptanceFact,
     prevouts: Vec<(OutPoint, TxOut)>,
     rejection: Option<(AdmitError, RejectScope)>,
-    stamp: crate::pool::fee_policy::PolicyStamp,
+    pub(crate) stamp: crate::pool::fee_policy::PolicyStamp,
     replacement: ReplacementStage,
     /// Engine for this attempt's script checks; set by the gateway that
     /// prepared it, so the deferred `verify` phase cannot run under another.
@@ -212,10 +213,6 @@ enum ReplacementStage {
 }
 
 impl PreparedAdmission {
-    pub(crate) fn matches_pool(&self, pool: &Mempool) -> bool {
-        self.stamp.matches(pool)
-    }
-
     fn reject(&mut self, error: AdmitError, scope: RejectScope) {
         self.replacement = ReplacementStage::Rejected;
         self.fact.allowed = Some(false);
@@ -390,12 +387,10 @@ fn witness_strippable_failure(error: &ConsensusError, prevouts: &[(OutPoint, TxO
 /// pool alive. Handoff note for ING-R34: once `Chainstate` gains a
 /// `mempool_gateway` field, the reorg caller can read the handle instead
 /// and `shared` shrinks to run-time composition plus tests.
-#[cfg(any(test, feature = "test-seam"))]
-use crate::entry::MempoolEntry;
 use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationResult};
 use crate::orphan::RejectScope;
 use crate::pool::{Mempool, MempoolError, PrioritiseError, PrioritisedTransaction};
-use crate::rbf::{RbfError, ReplacementCandidate};
+use crate::rbf::{LimitEnforcement, RbfError, ReplacementCandidate};
 
 static REGISTRY: LazyLock<Mutex<Vec<Weak<MempoolGateway>>>> =
     LazyLock::new(|| Mutex::new(alloc::vec::Vec::new()));
@@ -801,7 +796,11 @@ impl MempoolGateway {
             let inputs = self
                 .pool
                 .read()
-                .capture_insertion(entry.clone())
+                .capture_insertion(
+                    entry.clone(),
+                    crate::rbf::FeeEstimation::Estimate,
+                    crate::rbf::LimitEnforcement::Full,
+                )
                 .map_err(RbfError::into_pool_error)?;
             let plan = inputs.verify().map_err(RbfError::into_pool_error)?;
             let result = self.commit(origin, move |pool| {
@@ -817,20 +816,21 @@ impl MempoolGateway {
 
     /// Verifies replacement outside the writer, then commits and publishes
     /// only while the captured pool and fee state is still current.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn replace_transaction(
         &self,
         origin: AdmissionOrigin,
-        mut candidate: ReplacementCandidate,
+        candidate: &ReplacementCandidate,
         time: u64,
         height: u32,
-        sigop_cost: u32,
     ) -> Result<crate::mutation::MutationResult, RbfError> {
-        candidate.sigop_cost = sigop_cost;
         for _ in 0..crate::admission::MAX_ADMISSION_RETRIES {
-            let inputs = self
-                .pool
-                .read()
-                .capture_replacement(&candidate, time, height)?;
+            let inputs = self.pool.read().capture_replacement(
+                candidate,
+                time,
+                height,
+                crate::rbf::FeeEstimation::Estimate,
+            )?;
             let plan = inputs.verify()?;
             let result = self.commit(origin, move |pool| pool.commit_pool_change(plan));
             if !matches!(result, Err(RbfError::StalePlan)) {
@@ -861,13 +861,19 @@ impl MempoolGateway {
     pub(crate) fn admit_transaction_claimed(
         &self,
         request: &AdmissionRequest,
-        claim: Option<&crate::orphan::HeldOrphan>,
+        claim: Option<(&crate::orphan::HeldOrphan, &crate::PeerToken)>,
         fence: crate::admission::AdmissionFence,
     ) -> Result<AdmitOutcome, AdmitError> {
         let mut prepared = {
             let pool = self.pool.read();
-            self.check_admission_state(&pool, request, fence)?;
-            Self::prepare_admission(&pool, request, AdmissionMode::Single, self.engine())
+            self.check_admission_state(
+                &pool,
+                request.expected_generation,
+                request.expected_sequence,
+                fence,
+                None,
+            )?;
+            Self::prepare_admission(&pool, request, AdmissionMode::Single, fence, self.engine())
         };
         prepared.verify(request);
 
@@ -878,16 +884,24 @@ impl MempoolGateway {
         ordering_gate::park_if_armed(std::ptr::from_ref(self).expose_provenance());
 
         let mut pool = self.pool.write();
-        self.check_admission_state(&pool, request, fence)?;
-        if !prepared.matches_pool(&pool) {
-            return Err(AdmitError::MempoolChanged);
-        }
-        if claim.is_some_and(|claim| !self.lifecycle.lock().orphans.is_current(claim)) {
+        self.check_admission_state(
+            &pool,
+            request.expected_generation,
+            request.expected_sequence,
+            fence,
+            Some(prepared.stamp),
+        )?;
+        if claim.is_some_and(|(claim, announcer)| {
+            !self.lifecycle.lock().orphans.is_current(claim, announcer)
+        }) {
             return Ok(AdmitOutcome::AlreadyKnown);
         }
         let txid = request.tx.txid();
         if pool.contains_txid(&txid) {
-            self.lifecycle.lock().orphans.remove(txid);
+            self.lifecycle
+                .lock()
+                .orphans
+                .remove_transaction_variants(txid);
             return Ok(AdmitOutcome::AlreadyKnown);
         }
         if let Some((error, scope)) = prepared.rejection {
@@ -930,23 +944,38 @@ impl MempoolGateway {
         Ok(AdmitOutcome::Committed(result))
     }
 
-    /// Rejects a request whose captured generation no longer matches.
+    /// Rejects an attempt whose captured admittance facts no longer hold.
     ///
-    /// Authority to admit comes from the fence, not from a caller-supplied
-    /// integer: the stable fence admits only the even value returned by
-    /// [`Self::stable_generation`], and the chain-change fence admits only
-    /// the odd value reserved by its own [`ChainChangeGuard`]. A request
-    /// carrying the right number under the wrong fence is refused.
+    /// PRE: `pool` is borrowed under a guard the caller holds on this gateway's
+    /// pool; `expected_generation` came from `fence` on this gateway during this
+    /// attempt; `expected_sequence` and `stamp`, when present, were captured
+    /// under that same fence-held generation.
+    ///
+    /// POST: `Ok(())` means the fence currently admits `expected_generation`,
+    /// the pool membership sequence still equals `expected_sequence`, and
+    /// `stamp`, when present, still matches the pool. `Err(GenerationChanged)`
+    /// or `Err(MempoolChanged)` means the caller must rebuild the attempt; no
+    /// pool or lifecycle state changed.
+    ///
+    /// INVARIANT: every commit path validates its write through this one check
+    /// under its lock immediately before mutating; no other function compares
+    /// admission tokens; generation gating reads go through
+    /// `AdmissionFence::current` or `stable_generation` only.
     pub(crate) fn check_admission_state(
         &self,
         pool: &Mempool,
-        request: &AdmissionRequest,
+        expected_generation: u64,
+        expected_sequence: u64,
         fence: crate::admission::AdmissionFence,
+        stamp: Option<crate::pool::fee_policy::PolicyStamp>,
     ) -> Result<(), AdmitError> {
-        if fence.current(self) != Some(request.expected_generation) {
+        if fence.current(self) != Some(expected_generation) {
             return Err(AdmitError::GenerationChanged);
         }
-        if pool.sequence_number() != request.expected_sequence {
+        if pool.sequence_number() != expected_sequence {
+            return Err(AdmitError::MempoolChanged);
+        }
+        if stamp.is_some_and(|stamp| !stamp.matches(pool)) {
             return Err(AdmitError::MempoolChanged);
         }
         Ok(())
@@ -962,6 +991,7 @@ impl MempoolGateway {
         pool: &Mempool,
         request: &AdmissionRequest,
         mode: AdmissionMode,
+        fence: crate::admission::AdmissionFence,
         engine: ValidationEngine,
     ) -> PreparedAdmission {
         let policy = pool.policy_snapshot();
@@ -997,10 +1027,34 @@ impl MempoolGateway {
                 context.sigop_cost,
             ));
         }
-        let floor = crate::eviction::mempool_min_fee_sat_per_kvb(
-            pool,
-            policy.incremental_relay_fee_sat_per_kvb,
-        );
+        // Core re-admits a disconnected transaction with `bypassLimits = true`
+        // on `AcceptToMemoryPool` (validation.cpp), which skips the
+        // `GetMinFee()` floor and the mempool size limit while ancestor
+        // topology, TRUC, and ephemeral-spend checks still run. `Deferred` is
+        // that bypass: the fee floor is skipped here and the per-acceptance
+        // size trim downstream, with one size trim at settlement instead.
+        // It derives from the chain-change fence, not the caller-declared
+        // origin: `AdmissionOrigin::Reorg` is public metadata, so only a
+        // submission that actually runs under `AdmissionFence::ChainChange`
+        // may defer — anything else enforces in full.
+        let enforcement = match (request.origin, fence) {
+            (AdmissionOrigin::Reorg, crate::admission::AdmissionFence::ChainChange(_)) => {
+                LimitEnforcement::Deferred
+            }
+            _ => LimitEnforcement::Full,
+        };
+        let deferred = enforcement == LimitEnforcement::Deferred;
+        let floor = if deferred {
+            // `None`, not a zero floor: the comparison itself must not run,
+            // else a negative `prioritisetransaction` overlay could still
+            // fail a bypassed re-admission on `fee < 0`.
+            None
+        } else {
+            Some(crate::eviction::mempool_min_fee_sat_per_kvb(
+                pool,
+                policy.incremental_relay_fee_sat_per_kvb,
+            ))
+        };
         // BIP68 is evaluated at the next block. A resolved input that is not
         // present in the confirmed metadata is an unconfirmed (mempool/package)
         // parent and is encoded as the next block.
@@ -1071,22 +1125,50 @@ impl MempoolGateway {
                 }
             }
         } else if prepared.rejection.is_none() {
-            let candidate = ReplacementCandidate::new(
-                Arc::clone(&request.tx),
-                prepared.fact.vsize,
-                prepared.fact.base_fee.unwrap_or(0),
-                policy.incremental_relay_fee_sat_per_kvb,
-            )
-            .with_sigop_cost(prepared.fact.sigop_cost)
             // Reorg re-admissions must not double-count the estimator: the
             // transaction already spent time in the pool before disconnect.
-            .with_fee_estimate(!matches!(request.origin, AdmissionOrigin::Reorg));
-            match pool.capture_replacement(&candidate, request.time, request.height) {
+            let fee_estimation = crate::rbf::FeeEstimation::from_origin(&request.origin);
+            // Core's `bypassLimits` re-acceptance still runs
+            // `SingleTRUCChecks` (validation.cpp): the pool the disconnect
+            // changed decides the topology now, so the TRUC conflict walk —
+            // which also returns the direct conflicts the BIP125 fee rules
+            // need — applies under Deferred exactly as under Full.
+            let conflict_set = pool.truc_conflicts(&request.tx, prepared.fact.vsize, true);
+            let captured = conflict_set.and_then(|(conflicts, sibling_eviction)| {
+                let entry = MempoolEntry::new(
+                    Arc::clone(&request.tx),
+                    prepared.fact.vsize,
+                    prepared.fact.base_fee.unwrap_or(0),
+                    request.time,
+                    request.height,
+                    prepared.fact.sigop_cost,
+                );
+                // The conflict set returned above decides the door, not a
+                // second direct lookup: a v3 sibling eviction has an
+                // empty direct set yet must pay the replacement rules.
+                if conflicts.is_empty() {
+                    pool.capture_insertion(entry, fee_estimation, enforcement)
+                } else {
+                    pool.capture_admission(
+                        entry,
+                        conflicts,
+                        policy.incremental_relay_fee_sat_per_kvb,
+                        sibling_eviction,
+                        fee_estimation,
+                        enforcement,
+                    )
+                }
+            });
+            match captured {
                 Ok(inputs) => prepared.replacement = ReplacementStage::Captured(inputs),
                 Err(error) => {
                     prepared.reject(replacement_rejection(error), rejection_scope(&request.tx));
                 }
             }
+            // Core's `CheckEphemeralSpends` is not gated on `bypassLimits`:
+            // a disconnected spend of ephemeral dust that no longer has its
+            // parent in the pool is refused on re-acceptance as on first
+            // admission.
             if prepared.rejection.is_none()
                 && crate::package::missing_ephemeral_spends(
                     pool,
@@ -1181,7 +1263,8 @@ impl MempoolGateway {
             }
         }
         self.commit(AdmissionOrigin::Reorg, |pool| {
-            if self.chain_generation.load(Ordering::Acquire) != change.odd_generation() {
+            let fence = crate::admission::AdmissionFence::ChainChange(change.odd_generation());
+            if fence.current(self) != Some(change.odd_generation()) {
                 return Err(ChainChangeError::GenerationMoved);
             }
             Ok(pool.remove_for_reorg(&failing))
@@ -1210,6 +1293,18 @@ impl MempoolGateway {
         self.commit_infallible(origin, |pool| {
             pool.evict_below_fee_rate(threshold_sat_per_kvb)
         })
+    }
+
+    /// The configured total-size ceiling of the underlying pool, in vbytes.
+    ///
+    /// PRE: none.
+    /// POST: the value is the pool's `max_total_bytes` at the moment of the
+    /// read; zero means unlimited. Callers pass it to
+    /// [`MempoolGateway::enforce_size_limit`] to trim to the configured limit
+    /// rather than a caller-invented target.
+    #[must_use]
+    pub fn max_total_bytes(&self) -> u64 {
+        self.pool.read().limits.max_total_bytes
     }
 
     /// Commits `pool.enforce_size_limit` and publishes its result.
@@ -1342,7 +1437,7 @@ impl MempoolGateway {
         for change in &result.changes {
             if matches!(change.outcome, crate::mutation::MutationOutcome::Accepted) {
                 let txid = Txid::from(change.txid);
-                lifecycle.orphans.remove(txid);
+                lifecycle.orphans.remove_transaction_variants(txid);
                 if pool.contains_txid(&txid) {
                     lifecycle.orphans.parent_ready(txid);
                 }
@@ -1568,7 +1663,7 @@ mod tests {
     }
 
     fn entry(tx: &Tx) -> MempoolEntry {
-        MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7)
+        MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7, 0)
     }
 
     fn hash(txid: &Txid) -> Hash256 {
@@ -1794,7 +1889,7 @@ mod tests {
 
         // Below the default min-relay floor (1_000 sat/kvB): rejected before
         // any commit.
-        let poor = MempoolEntry::new(Arc::new(tx(4)), 100, 50, 1, 7);
+        let poor = MempoolEntry::new(Arc::new(tx(4)), 100, 50, 1, 7, 0);
         assert!(gateway.insert_entry(AdmissionOrigin::Rpc, poor).is_err());
         let stranger = tx(5);
         let stranger_txid = stranger.txid();
@@ -1845,10 +1940,9 @@ mod tests {
         let result = gateway
             .replace_transaction(
                 AdmissionOrigin::Rpc,
-                crate::ReplacementCandidate::new(Arc::new(replacement), 100, 5_000, 1),
+                &crate::ReplacementCandidate::new(Arc::new(replacement), 100, 5_000, 1),
                 1,
                 7,
-                0,
             )
             .expect("replacement lands");
 
@@ -1936,8 +2030,8 @@ mod tests {
             ValidationEngine::Native,
         );
 
-        let low = MempoolEntry::new(Arc::new(tx(13)), 100, 100, 1, 7);
-        let high = MempoolEntry::new(Arc::new(tx(14)), 100, 900, 1, 7);
+        let low = MempoolEntry::new(Arc::new(tx(13)), 100, 100, 1, 7, 0);
+        let high = MempoolEntry::new(Arc::new(tx(14)), 100, 900, 1, 7, 0);
         gateway
             .insert_entry(AdmissionOrigin::Rpc, low)
             .expect("low in");
@@ -2401,7 +2495,7 @@ mod tests {
         gateway
             .insert_entry(
                 AdmissionOrigin::Rpc,
-                MempoolEntry::new(Arc::new(filler), 100, 9_000, 1, 7),
+                MempoolEntry::new(Arc::new(filler), 100, 9_000, 1, 7, 0),
             )
             .expect("filler in");
         observer.seen.lock().clear();
@@ -2415,7 +2509,7 @@ mod tests {
         let error = gateway
             .insert_entry(
                 AdmissionOrigin::Rpc,
-                MempoolEntry::new(Arc::new(shed), 100, 100, 1, 7),
+                MempoolEntry::new(Arc::new(shed), 100, 100, 1, 7, 0),
             )
             .expect_err("entry cannot survive trimming");
         assert_eq!(error, crate::MempoolError::Full);
@@ -2449,7 +2543,7 @@ mod tests {
         gateway
             .insert_entry(
                 AdmissionOrigin::Rpc,
-                MempoolEntry::new(Arc::new(original), 100, 10_000, 1, 7),
+                MempoolEntry::new(Arc::new(original), 100, 10_000, 1, 7, 0),
             )
             .expect("original in");
 
@@ -2458,7 +2552,7 @@ mod tests {
         gateway
             .insert_entry(
                 AdmissionOrigin::Rpc,
-                MempoolEntry::new(Arc::new(bystander), 850, 8_500_000, 1, 7),
+                MempoolEntry::new(Arc::new(bystander), 850, 8_500_000, 1, 7, 0),
             )
             .expect("bystander in");
 
@@ -2483,10 +2577,10 @@ mod tests {
         let error = gateway
             .replace_transaction(
                 AdmissionOrigin::Rpc,
-                crate::ReplacementCandidate::new(Arc::new(replacement), 900, 100_000, 1),
+                &crate::ReplacementCandidate::new(Arc::new(replacement), 900, 100_000, 1)
+                    .with_sigop_cost(4),
                 2,
                 7,
-                4,
             )
             .expect_err("replacement cannot survive capacity trimming");
         assert_eq!(error, crate::RbfError::Mempool(crate::MempoolError::Full));
@@ -2711,6 +2805,76 @@ mod tests {
             1,
             "only the removal publication, no extra observer call from admission"
         );
+    }
+
+    /// The writer recheck's fee-delta leg. An overlay applied after
+    /// preparation moves the fee-delta sequence alone, so only the stamp can
+    /// reject the attempt: the fence and the membership sequence still hold.
+    /// A rebuilt attempt commits.
+    #[test]
+    fn admit_write_gate_retries_when_the_stamp_moved_after_prepare()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        let resident = tx(60);
+        let resident_txid = resident.txid();
+        gateway.insert_entry(AdmissionOrigin::Rpc, entry(&resident))?;
+        observer.seen.lock().clear();
+
+        let candidate = standard_tx(61);
+        let candidate_txid = candidate.txid();
+        let request = admit_request(&gateway, &candidate, AdmissionOrigin::Rpc);
+        let prepared = {
+            let pool = gateway.read();
+            MempoolGateway::prepare_admission(
+                &pool,
+                &request,
+                AdmissionMode::Single,
+                crate::admission::AdmissionFence::Stable,
+                gateway.engine(),
+            )
+        };
+
+        // The overlay moves the fee-delta sequence alone.
+        gateway.prioritise(resident_txid, 500)?;
+        assert_eq!(
+            gateway.read().sequence_number(),
+            request.expected_sequence,
+            "prioritisation must leave the membership sequence alone"
+        );
+
+        // Under the writer's own guard, the one gate call is the only leg
+        // that can see the moved overlay.
+        let pool = gateway.pool.write();
+        assert_eq!(
+            gateway.check_admission_state(
+                &pool,
+                request.expected_generation,
+                request.expected_sequence,
+                crate::admission::AdmissionFence::Stable,
+                Some(prepared.stamp),
+            ),
+            Err(AdmitError::MempoolChanged),
+            "a moved fee-delta stamp must reject the writer recheck"
+        );
+        drop(pool);
+        assert!(
+            !gateway.read().contains_txid(&candidate_txid),
+            "the rejected attempt mutates nothing"
+        );
+        assert!(
+            observer.seen.lock().is_empty(),
+            "the rejected attempt publishes nothing"
+        );
+
+        // Rebuilt under the moved stamp, the same transaction commits.
+        let retry = admit_request(&gateway, &candidate, AdmissionOrigin::Rpc);
+        assert!(matches!(
+            gateway.admit_transaction(retry),
+            Ok(AdmitOutcome::Committed(_))
+        ));
+        assert!(gateway.read().contains_txid(&candidate_txid));
+        Ok(())
     }
 
     #[test]
@@ -3385,8 +3549,13 @@ mod tests {
         let mut request = admit_request(&gateway, &candidate, AdmissionOrigin::Rpc);
         request.prevouts = vec![(request.prevouts[0].0, p2sh_prevout())];
         let guard = pool.read();
-        let mut prepared =
-            MempoolGateway::prepare_admission(&guard, &request, AdmissionMode::Single, engine);
+        let mut prepared = MempoolGateway::prepare_admission(
+            &guard,
+            &request,
+            AdmissionMode::Single,
+            crate::admission::AdmissionFence::Stable,
+            engine,
+        );
         prepared.verify(&request);
         prepared.rejection
     }

@@ -12,7 +12,7 @@ use super::super::frontier::{
 };
 use crate::BlockStager;
 use crate::download_window::{BlameReason, BlockedContext, BlockedDecision, DownloadWindow};
-use bitcoin_rs_chain::{ChainTxCount, ChainWork, NodeId};
+use bitcoin_rs_chain::{ChainWork, NodeId};
 
 /// Advances the unified blockage observation one tick and returns the
 /// stall blame's owner, if this tick convicted one.
@@ -51,10 +51,10 @@ fn stall_blame(
 fn snap(tip_id: u32, height: u32, hash_byte: u8) -> Arc<TipSnapshot> {
     Arc::new(TipSnapshot {
         tip_id: NodeId::new(tip_id),
+        chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
         height,
         chainwork: ChainWork::from(u64::from(height) + 1),
         hash: Hash256::from_le_bytes(&[hash_byte; 32]),
-        chain_tx_count: ChainTxCount::UNKNOWN,
     })
 }
 

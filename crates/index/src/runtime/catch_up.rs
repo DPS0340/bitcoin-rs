@@ -397,10 +397,7 @@ impl Worker {
             // rows and waits rather than churning a reset every pass.
             return Ok(ReconcileAction::Stalled);
         }
-        let anchored = capabilities
-            .iter()
-            .filter(|capability| *capability != IndexCapability::ScriptLive)
-            .collect::<IndexCapabilities>();
+        let anchored = capabilities.without(IndexCapability::ScriptLive);
         // Resolve the anchor identity before the durable reset: it is a pure
         // read — the block tree keeps headers for pruned heights — so a
         // missing node fails before any derived row is erased, not after.

@@ -16,12 +16,7 @@ fn the_chain_transaction_count_survives_a_checkpoint_restart() -> anyhow::Result
     let expected = {
         let state = NodeState::open(config.clone(), None)?;
         assert_eq!(
-            state
-                .chainstate()
-                .applied_tip_reader()
-                .load_full()
-                .map_or(bitcoin_rs_chain::ChainTxCount::UNKNOWN, |tip| tip
-                    .chain_tx_count),
+            applied_chain_tx_count(&state),
             bitcoin_rs_chain::ChainTxCount::UNKNOWN,
             "a node that has applied nothing cannot know the count"
         );
@@ -29,20 +24,14 @@ fn the_chain_transaction_count_survives_a_checkpoint_restart() -> anyhow::Result
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let genesis_tx_count = u64::try_from(genesis.txs.len())?;
         let _tip = state.apply_block(&genesis)?;
-        let counted = state
-            .chainstate()
-            .applied_tip_reader()
-            .load_full()
-            .map_or(bitcoin_rs_chain::ChainTxCount::UNKNOWN, |tip| {
-                tip.chain_tx_count
-            });
+        let counted = applied_chain_tx_count(&state);
         assert_eq!(
             counted,
             bitcoin_rs_chain::ChainTxCount::established(genesis_tx_count),
             "genesis establishes the count"
         );
 
-        assert!(state.write_clean_checkpoint()?.is_some());
+        assert!(state.publish_checkpoint()?.is_some());
         counted
     };
 
@@ -56,15 +45,7 @@ fn the_chain_transaction_count_survives_a_checkpoint_restart() -> anyhow::Result
         resumed.blocks().read().is_empty(),
         "the record log really does start empty; the count cannot come from it"
     );
-    assert_eq!(
-        resumed
-            .chainstate()
-            .applied_tip_reader()
-            .load_full()
-            .map_or(bitcoin_rs_chain::ChainTxCount::UNKNOWN, |tip| tip
-                .chain_tx_count),
-        expected
-    );
+    assert_eq!(applied_chain_tx_count(&resumed), expected);
     Ok(())
 }
 
@@ -88,7 +69,7 @@ fn clean_checkpoint_reopens_and_applies_the_next_block() -> anyhow::Result<()> {
         .utxo_handle()
         .with_stable_view(stable_hash)?;
     let expected_stats = state.chainstate().coin_stats_handle().snapshot();
-    assert!(state.write_clean_checkpoint()?.is_some());
+    assert!(state.publish_checkpoint()?.is_some());
     drop(state);
 
     let mut reopen_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
@@ -140,7 +121,7 @@ fn clean_checkpoint_reopens_and_applies_the_next_block() -> anyhow::Result<()> {
         listener_after_apply.total_amount, rescanned.total_amount,
         "checkpoint resume must keep rolling CoinStats attached to UTXO commits"
     );
-    resumed.write_clean_checkpoint()?;
+    let _ = resumed.publish_checkpoint()?;
 
     let root = data_dir.join("chainstate-checkpoints");
     let current: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("CURRENT"))?)?;
@@ -184,7 +165,7 @@ fn clean_checkpoint_lifecycle_is_backend_neutral() -> anyhow::Result<()> {
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let state = NodeState::open(config.clone(), None)?;
         state.apply_block(&genesis)?;
-        state.write_clean_checkpoint()?;
+        let _ = state.publish_checkpoint()?;
         drop(state);
 
         let resumed = NodeState::open(config, None)?;
@@ -208,7 +189,7 @@ fn rolling_coinstats_resume_continues_through_next_block() -> anyhow::Result<()>
     let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
     state.apply_block(&genesis)?;
     let before = state.chainstate().coin_stats_handle().snapshot();
-    state.write_clean_checkpoint()?;
+    let _ = state.publish_checkpoint()?;
     drop(state);
 
     let mut reopen_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
@@ -256,7 +237,7 @@ fn journal_replay_restores_state_above_checkpoint() -> anyhow::Result<()> {
     let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
     let first = NodeState::open(config.clone(), None)?;
     first.apply_block(&genesis)?;
-    first.write_clean_checkpoint()?;
+    let _ = first.publish_checkpoint()?;
     drop(first);
 
     // The first reopen discards the pre-checkpoint journal generation and
@@ -296,18 +277,17 @@ fn journal_replay_restores_state_above_checkpoint() -> anyhow::Result<()> {
 }
 
 #[test]
-fn publish_checkpoint_refuses_when_no_applied_tip() -> anyhow::Result<()> {
+// CONTRACT: docs/contracts/architecture.md#ARCH-05
+fn publish_checkpoint_returns_none_when_no_applied_tip() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
     config.data_dir = dir.path().join("node");
     config.p2p.listen.clear();
     let state = NodeState::open(config, None)?;
-    let Err(error) = state.publish_checkpoint() else {
-        anyhow::bail!("checkpoint publication succeeded without an applied tip");
-    };
-    assert!(
-        error.to_string().contains("no applied tip"),
-        "unexpected error: {error}"
+    assert_eq!(
+        state.publish_checkpoint()?,
+        None,
+        "a node that applied no block has no tip to checkpoint"
     );
     Ok(())
 }
@@ -324,7 +304,7 @@ fn publish_checkpoint_returns_generation_and_reopens() -> anyhow::Result<()> {
     let tip = state.apply_block(&genesis)?;
     let generation = state.publish_checkpoint()?;
     assert!(
-        generation > 0,
+        generation.is_some_and(|published| published > 0),
         "published checkpoint must have a positive generation"
     );
     drop(state);

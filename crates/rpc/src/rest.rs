@@ -9,6 +9,7 @@
 use alloc::sync::Arc;
 use std::str::FromStr;
 
+use bitcoin::hex::FromHex as _;
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, TxOut, Txid, consensus_bytes, deserialize,
 };
@@ -148,7 +149,7 @@ fn route_tx(ctx: &Arc<Context>, suffix: &str) -> Response {
                 if format == "hex" {
                     text_response("text/plain", format!("{hex}\n").into_bytes())
                 } else {
-                    let bytes: Vec<u8> = hex_decode(hex);
+                    let bytes = Vec::<u8>::from_hex(hex).unwrap_or_default();
                     binary_response("application/octet-stream", &bytes)
                 }
             }
@@ -390,8 +391,8 @@ pub(crate) fn arm_capture_hook(hook: impl FnOnce() + 'static) {
 /// POST: the `checkmempool` branch answers only while the gateway's chain
 /// generation is stable across the whole read; an unstable or moved
 /// generation returns the retry response instead of a body.
-/// INVARIANT: the plain branch never reads the generation; the tip capture
-/// and UTXO reads run under the chain-transition barrier instead.
+/// INVARIANT: the plain branch never reads the generation and acquires no
+/// new lock.
 fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     let (path, format) = split_format(suffix);
     let (check_mempool, outpoints) = match parse_getutxos_outpoints(path) {
@@ -412,41 +413,40 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     } else {
         None
     };
-    // The transition barrier pins the tip capture and every UTXO read to one
-    // chain state: without it a connect between the capture and the reads
-    // could pair an old chainHeight/chaintipHash with new-chain UTXOs.
-    let fenced = ctx.chain.with_stable_chainstate(|| {
-        let view = ctx.chain.applied_view();
-        release_applied_capture();
-        let active_height = view.height();
-        let active_hash = view.hash(ctx.chain.chain_network);
+    // The pool read fence is taken first: a chain transition between the
+    // tip capture and the UTXO reads could otherwise pair UTXOs committed
+    // under tip B with the height and hash of tip A.
+    let pool = ctx.mempool.gateway.read();
+    // Height and hash describe one publication, so a response cannot pair one
+    // block's height with another block's hash.
+    let view = ctx.chain.applied_view();
+    release_applied_capture();
+    let active_height = view.height();
+    let active_hash = view.hash(ctx.chain.chain_network);
 
-        let mut outs = Vec::with_capacity(outpoints.len());
-        let mut hits = Vec::with_capacity(outpoints.len());
-        let pool = ctx.mempool.gateway.read();
-        for (txid, vout) in &outpoints {
-            let outpoint = bitcoin_rs_primitives::OutPoint::new(*txid, *vout);
-            let mempool_spent = check_mempool && pool.is_outpoint_spent(&outpoint);
-            let live = if mempool_spent {
-                None
-            } else {
-                ctx.chain.utxo.get_entry(&outpoint)
-            };
-            hits.push(live.is_some());
-            if let Some(entry) = live {
-                outs.push((entry.height, entry.txout));
-            }
-        }
-        drop(pool);
-        (active_height, active_hash, hits, outs)
-    });
-    let (active_height, active_hash, hits, outs) = fenced;
     let mut bitmap = vec![0_u8; outpoints.len().div_ceil(8)];
+    let mut outs = Vec::with_capacity(outpoints.len());
+    let mut hits = Vec::with_capacity(outpoints.len());
+    for (txid, vout) in &outpoints {
+        let outpoint = bitcoin_rs_primitives::OutPoint::new(*txid, *vout);
+        let mempool_spent = check_mempool && pool.is_outpoint_spent(&outpoint);
+        let live = if mempool_spent {
+            None
+        } else {
+            ctx.chain.utxo.get_entry(&outpoint)
+        };
+        hits.push(live.is_some());
+        if let Some(entry) = live {
+            outs.push((entry.height, entry.txout));
+        }
+    }
+    drop(pool);
     // The end check compares for exact equality only; a generation that
     // moved while the reads ran discards the assembled results and asks the
     // client to retry.
-    if let Some(response) = end_generation_refusal(ctx, entry_generation) {
-        return response;
+    if entry_generation.is_some_and(|entry| ctx.mempool.gateway.stable_generation() != Some(entry))
+    {
+        return service_unavailable("chain generation is odd; retry");
     }
     // Bitmap packs the least-significant hit bit first per byte, matching Core.
     for (index, hit) in hits.iter().enumerate() {
@@ -500,18 +500,6 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
             &serialize_getutxos_bin(active_height, active_hash, &bitmap, &outs),
         ),
         _ => format_not_found(available_formats()),
-    }
-}
-
-/// Second generation check after the fenced reads: a moved generation
-/// discards the assembled body and a missing one refuses too, but the two
-/// events carry distinct retry messages.
-fn end_generation_refusal(ctx: &Arc<Context>, entry_generation: Option<u64>) -> Option<Response> {
-    let entry = entry_generation?;
-    match ctx.mempool.gateway.stable_generation() {
-        None => Some(service_unavailable("chain generation is odd; retry")),
-        Some(now) if now != entry => Some(service_unavailable("chain generation moved; retry")),
-        Some(_) => None,
     }
 }
 
@@ -902,35 +890,35 @@ fn sonic_bytes(value: &Value) -> Vec<u8> {
         .into_bytes()
 }
 
-fn hex_decode(hex: &str) -> Vec<u8> {
-    fn nibble(byte: u8) -> u8 {
-        match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
-            _ => 0xff,
-        }
-    }
-    let bytes = hex.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.as_chunks::<2>().0 {
-        let hi = nibble(chunk[0]);
-        let lo = nibble(chunk[1]);
-        if hi == 0xff || lo == 0xff {
-            return Vec::new();
-        }
-        out.push((hi << 4) | lo);
-    }
-    out
-}
 // ---------------------------------------------------------------------------
 // Response constructors
 // ---------------------------------------------------------------------------
+//
+// One owner for every HTTP response the RPC crate emits. REST and Esplora
+// routes both build responses here, so status, reason phrase, content type,
+// and body encoding cannot drift between the two surfaces.
+//
+// PRE: `message`/`body` bytes are already in their final wire encoding.
+// POST: a [`Response`] carrying exactly the named status and reason, with
+//   the named content type and the message or body as its payload.
+// INVARIANT: no constructor inspects handler state or mutates shared state;
+//   the same arguments always produce the same bytes.
 
-fn json_response(result: Result<Value, RpcError>) -> Response {
+/// Answers a serialized value as a 200 JSON response.
+///
+/// PRE: `value` serializes losslessly for the response's JSON visitor set.
+/// POST: a 200 `application/json` response carrying the sonic-rs encoding,
+///   or the internal-error response when serialization fails.
+/// INVARIANT: the encoding is sonic-rs output for the same value on every
+///   call; no handler state is read.
+pub(crate) fn json_ok<T: serde::Serialize>(value: T) -> Response {
+    match sonic_rs::to_string(&value) {
+        Ok(body) => text_response("application/json", body.into_bytes()),
+        Err(_) => internal_error("failed to serialize response"),
+    }
+}
+
+pub(crate) fn json_response(result: Result<Value, RpcError>) -> Response {
     match result {
         Ok(value) => text_response("application/json", sonic_bytes(&value)),
         Err(error) => match error {
@@ -946,7 +934,7 @@ fn json_response(result: Result<Value, RpcError>) -> Response {
     }
 }
 
-fn text_response(content_type: &'static str, body: Vec<u8>) -> Response {
+pub(crate) fn text_response(content_type: &'static str, body: Vec<u8>) -> Response {
     Response {
         status: 200,
         reason: "OK",
@@ -955,11 +943,11 @@ fn text_response(content_type: &'static str, body: Vec<u8>) -> Response {
     }
 }
 
-fn binary_response(content_type: &'static str, body: &[u8]) -> Response {
+pub(crate) fn binary_response(content_type: &'static str, body: &[u8]) -> Response {
     text_response(content_type, body.to_vec())
 }
 
-fn service_unavailable(message: &'static str) -> Response {
+pub(crate) fn service_unavailable(message: &'static str) -> Response {
     Response {
         status: 503,
         reason: "Service Unavailable",
@@ -968,7 +956,17 @@ fn service_unavailable(message: &'static str) -> Response {
     }
 }
 
-fn internal_error(message: &'static str) -> Response {
+/// Answers 503 with a message built at the failure site.
+pub(crate) fn service_unavailable_owned(message: String) -> Response {
+    Response {
+        status: 503,
+        reason: "Service Unavailable",
+        content_type: "text/plain",
+        body: message.into_bytes(),
+    }
+}
+
+pub(crate) fn internal_error(message: &'static str) -> Response {
     Response {
         status: 500,
         reason: "Internal Server Error",
@@ -976,7 +974,17 @@ fn internal_error(message: &'static str) -> Response {
         body: message.as_bytes().to_vec(),
     }
 }
-fn bad_request(message: &'static str) -> Response {
+
+/// Answers 500 with a message built at the failure site.
+pub(crate) fn internal_error_owned(message: String) -> Response {
+    Response {
+        status: 500,
+        reason: "Internal Server Error",
+        content_type: "text/plain",
+        body: message.into_bytes(),
+    }
+}
+pub(crate) fn bad_request(message: &'static str) -> Response {
     Response {
         status: 400,
         reason: "Bad Request",
@@ -985,7 +993,7 @@ fn bad_request(message: &'static str) -> Response {
     }
 }
 
-fn bad_request_owned(message: String) -> Response {
+pub(crate) fn bad_request_owned(message: String) -> Response {
     Response {
         status: 400,
         reason: "Bad Request",
@@ -994,15 +1002,15 @@ fn bad_request_owned(message: String) -> Response {
     }
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     not_found_with("not found")
 }
 
-fn not_found_with(message: &'static str) -> Response {
+pub(crate) fn not_found_with(message: &'static str) -> Response {
     not_found_owned(message.to_owned())
 }
 
-fn not_found_owned(message: String) -> Response {
+pub(crate) fn not_found_owned(message: String) -> Response {
     Response {
         status: 404,
         reason: "Not Found",
@@ -1986,8 +1994,7 @@ mod tests {
     }
 
     /// A generation that moves between the entry check and the end check
-    /// discards the assembled body and returns the retry response naming the
-    /// move rather than a missing generation.
+    /// discards the assembled body and returns the same retry response.
     #[test]
     fn getutxos_checkmempool_rejects_moved_generation() {
         let ctx = Arc::new(Context::new());
@@ -1996,7 +2003,7 @@ mod tests {
         arm_capture_hook(move || mover.mempool.gateway.force_chain_generation(6));
         let response = route(&ctx, CHECKMEMPOOL_JSON, "", true);
         assert_eq!(response.status, 503);
-        assert_eq!(response.body, b"chain generation moved; retry".to_vec());
+        assert_eq!(response.body, b"chain generation is odd; retry".to_vec());
     }
 
     /// The plain branch reads no mempool fact and deploymentinfo never reads

@@ -6,7 +6,9 @@ use super::{
     capability::SCRIPT_LIVE_WATERMARK_KEY, capability::TX_LOOKUP_WATERMARK_KEY,
     capability::WATERMARK_LEN, error::IndexError,
 };
-use bitcoin_rs_storage::{ColumnFamily, KvStore, PrefixScanLimit, WriteBatch, WriteCondition};
+use bitcoin_rs_storage::{
+    BufferedWriteBatch, ColumnFamily, KvStore, PrefixScanLimit, WriteCondition,
+};
 use tracing::debug;
 
 // Reserved metadata keys in `ColumnFamily::UtxoMeta`. The 0x00 prefix is reserved for
@@ -404,7 +406,7 @@ pub(super) fn commit_ordinary<S: KvStore>(
     store: &S,
     generation: u64,
     fence: &IndexWriteFence,
-    mut batch: S::WriteBatch,
+    mut batch: BufferedWriteBatch,
 ) -> Result<(), IndexError> {
     let next_revision = fence
         .revision

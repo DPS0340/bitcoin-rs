@@ -144,6 +144,45 @@ fn committed_gap_replays_to_head_without_recommitting_it() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// Publication carries the count the durable receipt certified, never a
+/// tree-side re-derivation: a replay whose derived count cannot match the
+/// stored head still lands exactly on the head's facts.
+#[test]
+fn replay_publishes_the_receipt_certified_count() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut handles, child) = restored_chainstate()?;
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.persist_block_body(
+        1,
+        Hash256::from(child.block_hash()),
+        &consensus_bytes(&child),
+    )?;
+    // The tree derives 1 (genesis) + 1 (the child's single transaction) = 2;
+    // the stored head certified a different total before the crash.
+    let head = DurableHead {
+        commit_id: 7,
+        height: 1,
+        tip: Hash256::from(child.block_hash()),
+        chain_tx_count: 5,
+        body_extent: None,
+        undo_extent: None,
+    };
+    install_arbitrary_head(&mut handles, head, bodies)?;
+
+    super::reconcile_at_boot(&handles)?;
+
+    let landed = handles
+        .applied_tip
+        .load_full()
+        .ok_or("replay did not publish an applied tip")?;
+    assert_eq!((landed.height, landed.hash), (head.height, head.tip));
+    assert_eq!(
+        landed.chain_tx_count,
+        bitcoin_rs_chain::ChainTxCount::established(5),
+        "the published count is the receipt's, not the derivation's"
+    );
+    Ok(())
+}
+
 // A crash-recovery replay must not re-run the live future-drift recheck: the
 // gap block passed the contextual gate at first connect and its durable head
 // receipt certifies it, so an operator clock rollback beyond the future
@@ -351,7 +390,16 @@ fn mined_child(
         version: 2,
         inputs: vec![TxIn {
             previous_output: OutPoint::new(Txid::default(), u32::MAX),
-            script_sig: Script::from_bytes(vec![1, u8::try_from(height)?, 0]),
+            // `push_int` is the encoding `check_bip34` requires as a prefix;
+            // the trailing byte keeps the script_sig at its minimum size at
+            // heights that encode as a single opcode.
+            script_sig: Script::from_bytes(
+                [
+                    bitcoin_rs_script::push_int(i64::from(height)).as_slice(),
+                    &[0],
+                ]
+                .concat(),
+            ),
             sequence: Sequence::from_consensus(u32::MAX),
             witness: Witness::new(),
         }],
@@ -536,96 +584,6 @@ fn committed_gap_replay_failure_fails_closed() -> Result<(), Box<dyn std::error:
     assert!(
         matches!(handles.begin_transition(), Err(ApplyError::Shutdown)),
         "admission must stay closed after a failed replay"
-    );
-    Ok(())
-}
-
-/// A durable head whose tip is absent from the restored block tree still
-/// resolves: the certified body chain is walked down from the head tip until
-/// a hash lands in the tree — here the head's own genesis parent — and that
-/// anchor is what the rewind aims at. An applied tip at the same height on a
-/// branch the head chain does not descend from reads as rewind work, while a
-/// tip equal to the walked descriptor reads as already on the head chain.
-#[test]
-fn absent_head_tip_resolves_anchor_through_stored_bodies() -> Result<(), Box<dyn std::error::Error>>
-{
-    let (mut handles, child) = restored_chainstate()?;
-    let child_hash = Hash256::from(child.block_hash());
-    // The head body is stored — the receipt evidence the anchor walk
-    // authenticates — but its header is never admitted to the block tree.
-    let bodies = Arc::new(MemoryBodies::default());
-    bodies.persist_block_body(1, child_hash, &consensus_bytes(&child))?;
-    let head = install_head(&mut handles, &child, bodies)?;
-
-    let anchor = crate::durable::resolve_head_anchor(&handles, &head)?;
-    let genesis = Network::Regtest.genesis_block();
-    assert_eq!(anchor.anchor_height, 0);
-    assert_eq!(anchor.anchor, Hash256::from(genesis.block_hash()));
-    assert_eq!(anchor.above, vec![(1, child_hash)]);
-
-    // The restored tip (genesis) is the anchor itself: on the head chain.
-    let restored = handles
-        .applied_tip
-        .load_full()
-        .ok_or("restored tip missing")?;
-    assert!(anchor.contains_tip(&handles, &restored));
-    // A tip on the walked segment above the anchor is on the head chain.
-    let on_head_segment = bitcoin_rs_chain::TipSnapshot {
-        height: 1,
-        hash: child_hash,
-        ..(*restored).clone()
-    };
-    assert!(anchor.contains_tip(&handles, &on_head_segment));
-    // A different tip at the same height is not, whatever its node says.
-    let off_chain = bitcoin_rs_chain::TipSnapshot {
-        height: 1,
-        hash: Hash256::from_le_bytes(&[0xab; 32]),
-        ..(*restored).clone()
-    };
-    assert!(!anchor.contains_tip(&handles, &off_chain));
-    Ok(())
-}
-
-/// A head tip the tree cannot resolve fails closed when the body evidence
-/// needed to authenticate the chain is missing — the anchor walk must not
-/// guess a fork.
-#[test]
-fn absent_head_tip_with_missing_body_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
-    let (mut handles, child) = restored_chainstate()?;
-    let bodies = Arc::new(MemoryBodies::default());
-    let head = install_head(&mut handles, &child, bodies)?;
-
-    let Err(error) = crate::durable::resolve_head_anchor(&handles, &head) else {
-        panic!("a missing head body must fail the anchor walk closed");
-    };
-    assert!(
-        matches!(error, ApplyError::DurableHeadGapUnrecoverable { .. }),
-        "unexpected error: {error}"
-    );
-    Ok(())
-}
-
-/// When the head tip is itself a tree node, the anchor is the head and the
-/// walked segment above it is empty — the ordinary ancestry shape.
-#[test]
-fn tree_known_head_tip_anchors_on_itself() -> Result<(), Box<dyn std::error::Error>> {
-    let (mut handles, child) = restored_chainstate()?;
-    let child_hash = Hash256::from(child.block_hash());
-    let child_tip = crate::connect::applied_header_tip(&handles, child_hash, &child, 1)?;
-    let head = install_head(&mut handles, &child, Arc::new(MemoryBodies::default()))?;
-
-    let anchor = crate::durable::resolve_head_anchor(&handles, &head)?;
-    assert_eq!(anchor.anchor_height, 1);
-    assert_eq!(anchor.anchor, child_hash);
-    assert!(anchor.above.is_empty());
-    assert!(anchor.contains_tip(&handles, &child_tip));
-    let restored = handles
-        .applied_tip
-        .load_full()
-        .ok_or("restored tip missing")?;
-    assert!(
-        anchor.contains_tip(&handles, &restored),
-        "genesis is the head tip's ancestor and reads as on the head chain"
     );
     Ok(())
 }

@@ -161,10 +161,10 @@ fn tick_fetches_reorg_fork_announced_by_at_tip_peer() -> Result<(), Box<dyn std:
         let node = tree.node(losing2_id)?;
         TipSnapshot {
             tip_id: losing2_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
 
@@ -249,10 +249,10 @@ fn losing_fork_credit_survives_winner_disconnect() -> Result<(), Box<dyn std::er
     let genesis_node = tree.node(genesis_id)?;
     let applied = TipSnapshot {
         tip_id: genesis_id,
+        chain_tx_count: genesis_node.chain_tx_count,
         height: genesis_node.height,
         chainwork: genesis_node.chainwork,
         hash: genesis_node.hash,
-        chain_tx_count: genesis_node.chain_tx_count,
     };
 
     let fork1 = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 101)

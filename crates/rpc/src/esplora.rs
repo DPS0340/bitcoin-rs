@@ -1250,7 +1250,14 @@ mod tests {
             .gateway
             .pool()
             .write()
-            .insert_entry(MempoolEntry::new(Arc::new(transaction), 100, 1_000, 0, 0))
+            .insert_entry(MempoolEntry::new(
+                Arc::new(transaction),
+                100,
+                1_000,
+                0,
+                0,
+                0,
+            ))
             .expect("mempool entry accepted");
         let handler = Handler::new(Arc::clone(&ctx));
         let body = serde_json::to_vec(&vec![txid.to_string()]).expect("txids serialize");
@@ -1385,7 +1392,7 @@ mod tests {
                 .gateway
                 .pool()
                 .write()
-                .insert_entry(MempoolEntry::new(tx, 100, 100, 0, 0))
+                .insert_entry(MempoolEntry::new(tx, 100, 100, 0, 0, 0))
                 .expect("insert mempool fixture");
         }
         // API-09: the router's empty sentinel selects only the mempool page.
@@ -1597,6 +1604,7 @@ mod tests {
                 1_000,
                 0,
                 0,
+                0,
             ))
             .expect("mempool entry accepted");
 
@@ -1653,7 +1661,7 @@ mod tests {
             .gateway
             .pool()
             .write()
-            .insert_entry(MempoolEntry::new(Arc::clone(&funder), 100, 1_000, 1, 0))
+            .insert_entry(MempoolEntry::new(Arc::clone(&funder), 100, 1_000, 1, 0, 0))
             .expect("seed funder");
         let first_sequence = context.mempool.gateway.pool().read().sequence_number();
         let context = Arc::new(context);
@@ -1677,7 +1685,7 @@ mod tests {
             let mut pool = context.mempool.gateway.pool().write();
             pool.remove_for_block(&[funder.as_ref()], &[funder_txid], 42);
             assert!(!pool.contains_txid(&funder_txid));
-            pool.insert_entry(MempoolEntry::new(Arc::new(spender), 100, 1_000, 2, 0))
+            pool.insert_entry(MempoolEntry::new(Arc::new(spender), 100, 1_000, 2, 0, 0))
                 .expect("seed spender");
             assert_ne!(pool.sequence_number(), first_sequence);
             assert!(pool.contains_txid(&spender_txid));
@@ -1967,6 +1975,7 @@ mod tests {
                     seed.vsize,
                     seed.fee,
                     seed.time,
+                    0,
                     0,
                 ))
                 .expect("seed entry admitted");

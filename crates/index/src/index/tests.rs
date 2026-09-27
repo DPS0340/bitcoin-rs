@@ -5,7 +5,7 @@ use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
     Sequence, Tx, TxIn, TxOut, Txid, Witness, consensus_bytes,
 };
-use bitcoin_rs_storage::{ColumnFamily, KvStore, RocksDbStore, WriteBatch};
+use bitcoin_rs_storage::{BufferedWriteBatch, ColumnFamily, KvStore, RocksDbStore};
 
 use super::{BlockSource, IndexError, IndexWatermark, IndexWriter, Indexer};
 use crate::{ScriptHash, ScriptHashRow, ScriptHistoryEntry, ScriptLiveRow, SpendingPrefixRow};
@@ -460,8 +460,6 @@ fn a_second_rollback_is_rejected_once_the_watermark_is_gone()
 struct FailingWriteStore(RocksDbStore);
 
 impl bitcoin_rs_storage::KvStore for FailingWriteStore {
-    type WriteBatch = <RocksDbStore as KvStore>::WriteBatch;
-
     fn get(
         &self,
         cf: ColumnFamily,
@@ -478,11 +476,11 @@ impl bitcoin_rs_storage::KvStore for FailingWriteStore {
         self.0.iter_prefix(cf, prefix)
     }
 
-    fn new_batch(&self) -> Self::WriteBatch {
+    fn new_batch(&self) -> BufferedWriteBatch {
         self.0.new_batch()
     }
 
-    fn write(&self, _batch: Self::WriteBatch) -> Result<(), bitcoin_rs_storage::StorageError> {
+    fn write(&self, _batch: BufferedWriteBatch) -> Result<(), bitcoin_rs_storage::StorageError> {
         Err(bitcoin_rs_storage::StorageError::Backend(
             "injected write failure".to_owned(),
         ))
@@ -491,7 +489,7 @@ impl bitcoin_rs_storage::KvStore for FailingWriteStore {
     fn write_durable_if(
         &self,
         _conditions: &[bitcoin_rs_storage::WriteCondition<'_>],
-        _batch: Self::WriteBatch,
+        _batch: BufferedWriteBatch,
     ) -> Result<bool, bitcoin_rs_storage::StorageError> {
         Err(bitcoin_rs_storage::StorageError::Backend(
             "injected write failure".to_owned(),

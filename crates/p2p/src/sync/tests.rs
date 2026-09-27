@@ -148,10 +148,10 @@ impl SyncChain for TestChain {
         };
         let snapshot = Arc::new(TipSnapshot {
             tip_id: id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         });
         self.applied_tip.store(Some(Arc::clone(&snapshot)));
         if self.chain_tip.load_full().is_none() {
@@ -297,10 +297,10 @@ impl SyncChain for TestChain {
             };
             self.applied_tip.store(Some(Arc::new(TipSnapshot {
                 tip_id: node_id,
+                chain_tx_count: node.chain_tx_count,
                 height: node.height,
                 chainwork: node.chainwork,
                 hash: node.hash,
-                chain_tx_count: node.chain_tx_count,
             })));
             applied = applied.saturating_add(1);
         }
@@ -325,10 +325,10 @@ impl SyncChain for TestChain {
                         tree.node(node_id).ok().map(|node| {
                             Arc::new(TipSnapshot {
                                 tip_id: node_id,
+                                chain_tx_count: node.chain_tx_count,
                                 height: node.height,
                                 chainwork: node.chainwork,
                                 hash: node.hash,
-                                chain_tx_count: node.chain_tx_count,
                             })
                         })
                     })
@@ -1662,10 +1662,10 @@ fn unrequested_body_admission_matches_core_acceptance() -> Result<(), Box<dyn st
         let node = tree.node(fork_parent)?;
         TipSnapshot {
             tip_id: fork_parent,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
     let SyncHarness {
@@ -1721,9 +1721,9 @@ fn unrequested_body_gate_rejects_below_floor_and_below_applied_work()
         let node = tree.node(node_id)?;
         Ok(TipSnapshot {
             tip_id: node_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
-            chain_tx_count: node.chain_tx_count,
             hash: node.hash,
         })
     }

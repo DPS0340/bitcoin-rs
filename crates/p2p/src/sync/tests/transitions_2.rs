@@ -220,10 +220,10 @@ fn outweighed_branch_target_accepts_shorter_higher_work_branch()
         let node = tree.node(main2_id)?;
         TipSnapshot {
             tip_id: main2_id,
+            chain_tx_count: node.chain_tx_count,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
         }
     };
 
