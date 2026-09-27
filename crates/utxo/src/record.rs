@@ -463,10 +463,14 @@ impl UtxoRecord {
         for addition in additions {
             write_payload(&mut buf, addition)?;
         }
-        debug_assert_eq!(buf.len(), payload_len);
+        if buf.len() != payload_len {
+            return Err(UtxoError::CorruptRecord);
+        }
         // Invariant: the copied prefix came from this validated record and every
         // appended addition was size-checked above, so the payload is canonical
-        // and needs no re-decode.
+        // and needs no re-decode. The length check above is fail-fast in every
+        // profile: a release build never constructs a validated record whose
+        // written length disagrees with the sizing pass.
         Ok(Some(Self {
             buf: buf.into_boxed_slice(),
         }))
