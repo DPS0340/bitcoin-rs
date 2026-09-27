@@ -1,9 +1,10 @@
 //! Coherent write fences and cooperative, versioned capability-reset recovery.
 
 use super::{
-    capability::IndexCapabilities, capability::IndexWatermark, capability::IndexWatermarks,
-    capability::SCRIPT_HISTORY_WATERMARK_KEY, capability::SCRIPT_LIVE_WATERMARK_KEY,
-    capability::TX_LOOKUP_WATERMARK_KEY, capability::WATERMARK_LEN, error::IndexError,
+    capability::IndexCapabilities, capability::IndexCapability, capability::IndexWatermark,
+    capability::IndexWatermarks, capability::SCRIPT_HISTORY_WATERMARK_KEY,
+    capability::SCRIPT_LIVE_WATERMARK_KEY, capability::TX_LOOKUP_WATERMARK_KEY,
+    capability::WATERMARK_LEN, error::IndexError,
 };
 use bitcoin_rs_storage::{ColumnFamily, KvStore, PrefixScanLimit, WriteBatch, WriteCondition};
 use tracing::debug;
@@ -561,14 +562,8 @@ fn acquire_capability_reset<S: KvStore>(
             &FORMAT_VERSION_VALUE,
         );
         let capabilities = IndexCapabilities::from_mask(mask)?;
-        if capabilities.tx_lookup {
-            batch.delete(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY);
-        }
-        if capabilities.script_history {
-            batch.delete(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY);
-        }
-        if capabilities.script_live {
-            batch.delete(ColumnFamily::UtxoMeta, SCRIPT_LIVE_WATERMARK_KEY);
+        for capability in capabilities.iter() {
+            batch.delete(ColumnFamily::UtxoMeta, capability.watermark_key());
         }
         crate::index::capability::delete_selected_floors(&mut batch, capabilities);
         batch.delete(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY);
@@ -593,29 +588,22 @@ pub(super) fn resume_capability_reset<S: KvStore>(
         requested_mask = 0;
 
         let capabilities = IndexCapabilities::from_mask(work.mask)?;
-        let mut column_families = Vec::with_capacity(4);
-        if capabilities.tx_lookup {
-            column_families.push(ColumnFamily::TxConfirmed);
-        }
-        if capabilities.script_history {
-            column_families.push(ColumnFamily::Funding);
-            column_families.push(ColumnFamily::Spending);
-        }
-        if capabilities.script_live {
-            column_families.push(ColumnFamily::ScriptLive);
-        }
-        let unselected_cursor_remains = (!capabilities.tx_lookup
-            && store
-                .get(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY)?
-                .is_some())
-            || (!capabilities.script_history
-                && store
-                    .get(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY)?
+        let mut column_families: Vec<ColumnFamily> = capabilities
+            .iter()
+            .flat_map(IndexCapability::column_families)
+            .copied()
+            .collect();
+        let unselected_cursor_remains = IndexCapability::ALL.into_iter().try_fold(
+            false,
+            |remains, capability| -> Result<bool, IndexError> {
+                if remains || capabilities.contains(capability) {
+                    return Ok(remains);
+                }
+                Ok(store
+                    .get(ColumnFamily::UtxoMeta, capability.watermark_key())?
                     .is_some())
-            || (!capabilities.script_live
-                && store
-                    .get(ColumnFamily::UtxoMeta, SCRIPT_LIVE_WATERMARK_KEY)?
-                    .is_some());
+            },
+        )?;
         if !unselected_cursor_remains {
             column_families.push(ColumnFamily::BlockHeaders);
         }

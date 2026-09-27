@@ -258,8 +258,7 @@ fn invalidateblock_delegates_to_node_control_and_returns_null() -> Result<(), Rp
         called: Arc::clone(&called),
         error: None,
     };
-    let mut ctx = Context::new();
-    ctx.chain.chain_control = Some(Arc::new(control));
+    let mut ctx = Context::new().with_chain_control(Arc::new(control));
     ctx.chain.chain_network = Network::Regtest;
     let handler = Handler::new(Arc::new(ctx));
     let result = handler.dispatch(
@@ -284,8 +283,7 @@ fn invalidateblock_maps_unknown_block_to_core_not_found() {
         called: Arc::clone(&called),
         error: Some(ChainControlError::UnknownBlock),
     };
-    let mut ctx = Context::new();
-    ctx.chain.chain_control = Some(Arc::new(control));
+    let mut ctx = Context::new().with_chain_control(Arc::new(control));
     ctx.chain.chain_network = Network::Regtest;
     let handler = Handler::new(Arc::new(ctx));
     let err = handler
@@ -678,7 +676,6 @@ impl bitcoin_rs_rpc::context::DerivedIndexQuery for FakeTxIndex {
     }
 }
 
-#[allow(clippy::arc_with_non_send_sync)]
 fn fee_stats_context(values: Option<HashMap<OutPoint, u64>>) -> (Arc<Context>, Tx, Tx) {
     let low_tx = fee_tx(21, 10_000);
     let high_tx = fee_tx(22, 20_000);
@@ -716,7 +713,7 @@ fn fee_stats_context(values: Option<HashMap<OutPoint, u64>>) -> (Arc<Context>, T
         hash: record.hash,
         body: consensus_bytes(&block),
     }));
-    ctx.add_block(record);
+    ctx.chain.add_block(record);
     (Arc::new(ctx), low_tx, high_tx)
 }
 
@@ -880,7 +877,7 @@ impl Fixture {
             hash: block_hash,
             body: consensus_bytes(&block),
         }));
-        ctx.add_block(BlockRecord::from_block(7, &block));
+        ctx.chain.add_block(BlockRecord::from_block(7, &block));
         let mut values = HashMap::new();
         values.insert(outpoint(1), 6_000);
         ctx.indexes.derived_index = Some(Arc::new(FakeTxIndex {
@@ -892,7 +889,7 @@ impl Fixture {
             },
         }));
         let block_hex = hex_encode(&consensus_bytes(&block));
-        let txid = ctx.add_transaction(tx.clone());
+        let txid = ctx.chain.add_transaction(tx.clone());
         let entry = MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7);
         ctx.mempool.gateway.pool().write().insert_entry(entry)?;
         Ok(Self {
@@ -904,7 +901,6 @@ impl Fixture {
         })
     }
 }
-#[allow(clippy::arc_with_non_send_sync)]
 fn context_with_peers(peer_table: Arc<PeerTable>) -> Arc<Context> {
     let mut ctx = Context::new();
     ctx.network.peer_table = peer_table;

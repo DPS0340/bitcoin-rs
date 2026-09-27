@@ -53,7 +53,7 @@ pub use bitcoin_rs_rpc::zmq::{
     NoOpZmqPublisher, SequenceEvent, TracingZmqPublisher, ZmqEndpointConfig, ZmqPublisher, ZmqTopic,
 };
 
-pub use chain_effects::{ChainEffects, ChainFollowers};
+pub use chain_effects::ChainFollowers;
 
 pub use bitcoin_rs_consensus::ValidationEngine;
 pub use config::{

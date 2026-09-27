@@ -18,7 +18,7 @@ use bitcoin_rs_primitives::{Amount, CompactTarget, LockTime, Script, Sequence, W
 use sonic_rs::{JsonValueTrait as _, Value, json};
 
 use crate::compat::convert::hex_encode;
-use crate::context::Context;
+use crate::context::{AppliedView, Context};
 use crate::error::RpcError;
 use crate::handlers::chain::getblockchaininfo;
 use crate::handlers::mempool::{getmempoolinfo, getrawmempool};
@@ -169,7 +169,7 @@ fn route_block(ctx: &Arc<Context>, suffix: &str, with_details: bool) -> Response
     let Some(format) = format else {
         return format_not_found(available_formats());
     };
-    let Some(record) = ctx.record_for_hash(hash) else {
+    let Some(record) = ctx.chain.record_for_hash(hash) else {
         return not_found_owned(format!("{hash_text} not found"));
     };
     let Some(_render) = ctx.try_acquire_rest_render() else {
@@ -190,7 +190,8 @@ fn route_block(ctx: &Arc<Context>, suffix: &str, with_details: bool) -> Response
                 Ok(block) => block,
                 Err(_) => return not_found_owned(format!("{hash_text} not found")),
             };
-            let context = build_chain_context(ctx, &record, &block.header);
+            let view = ctx.chain.applied_view();
+            let context = build_chain_context(ctx, &view, &record, &block.header);
             let verbosity = if with_details {
                 BlockTxVerbosity::Full
             } else {
@@ -214,7 +215,7 @@ fn route_block_part(ctx: &Arc<Context>, suffix: &str) -> Response {
     let Some(format) = format else {
         return format_not_found(available_formats());
     };
-    let Some(record) = ctx.record_for_hash(hash) else {
+    let Some(record) = ctx.chain.record_for_hash(hash) else {
         return not_found_owned(format!("{hash_text} not found"));
     };
     let Some(_render) = ctx.try_acquire_rest_render() else {
@@ -240,7 +241,7 @@ fn bounded_block_body(ctx: &Context, record: &BlockRecord) -> Result<Vec<u8>, Re
             "stored block exceeds the REST response limit",
         ));
     }
-    let Some(body) = ctx.block_body_bytes(record) else {
+    let Some(body) = ctx.chain.block_body_bytes(record) else {
         return Err(not_found_owned(format!(
             "{} not available (pruned data)",
             record.hash
@@ -319,13 +320,20 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     let Some(format) = format else {
         return not_found_with("output format not found");
     };
-    let records = header_records(ctx, hash, count);
+    // One capture serves the run selection and every returned header, so the
+    // response cannot describe two different applied publications.
+    let view = ctx.chain.applied_view();
+    release_applied_capture();
+    let records = header_records(ctx, &view, hash, count);
     match format {
         "json" => {
             let values = records
                 .iter()
                 .map(|record| {
-                    crate::render::header_json(&record.header, &header_chain_context(ctx, record))
+                    crate::render::header_json(
+                        &record.header,
+                        &header_chain_context(ctx, &view, record),
+                    )
                 })
                 .collect::<Vec<_>>();
             text_response("application/json", sonic_bytes(&Value::from(values)))
@@ -348,10 +356,42 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     }
 }
 
+// Records that a route has captured its applied view, so a test can publish a
+// competing tip at that exact instant. This seam never adds state or an API to
+// production builds.
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_APPLIED_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Fires and clears the request-local hook, when a test armed one.
+fn release_applied_capture() {
+    #[cfg(test)]
+    AFTER_APPLIED_CAPTURE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+/// Arms a one-shot closure that runs immediately after the next route capture.
+#[cfg(test)]
+pub(crate) fn arm_capture_hook(hook: impl FnOnce() + 'static) {
+    AFTER_APPLIED_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
 /// Core `/rest/getutxos[/checkmempool]/<txid>-<n>....{bin,hex,json}`.
 ///
 /// Only the URI-scheme input form is implemented (Core's raw-body form is not
 /// served). Responses follow Core's BIP64-ish shape.
+///
+/// PRE: parsing and format resolution have succeeded.
+/// POST: the `checkmempool` branch answers only while the gateway's chain
+/// generation is stable across the whole read; an unstable or moved
+/// generation returns the retry response instead of a body.
+/// INVARIANT: the plain branch never reads the generation; the tip capture
+/// and UTXO reads run under the chain-transition barrier instead.
 fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     let (path, format) = split_format(suffix);
     let (check_mempool, outpoints) = match parse_getutxos_outpoints(path) {
@@ -361,28 +401,53 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     let Some(format) = format else {
         return format_not_found(available_formats());
     };
-
-    let active_height = ctx.applied_height();
-    let active_hash = ctx.applied_hash();
-
-    let mut bitmap = vec![0_u8; outpoints.len().div_ceil(8)];
-    let mut outs = Vec::with_capacity(outpoints.len());
-    let mut hits = Vec::with_capacity(outpoints.len());
-    let pool = ctx.mempool.gateway.read();
-    for (txid, vout) in &outpoints {
-        let outpoint = bitcoin_rs_primitives::OutPoint::new(*txid, *vout);
-        let mempool_spent = check_mempool && pool.is_outpoint_spent(&outpoint);
-        let live = if mempool_spent {
-            None
-        } else {
-            ctx.chain.utxo.get_entry(&outpoint)
-        };
-        hits.push(live.is_some());
-        if let Some(entry) = live {
-            outs.push((entry.height, entry.txout));
+    // The checkmempool branch pairs UTXO facts with pool facts, so a chain
+    // transition between the reads could confirm a spend the transition
+    // already reversed. The entry check refuses while a change is active.
+    let entry_generation = if check_mempool {
+        match ctx.mempool.gateway.stable_generation() {
+            Some(generation) => Some(generation),
+            None => return service_unavailable("chain generation is odd; retry"),
         }
+    } else {
+        None
+    };
+    // The transition barrier pins the tip capture and every UTXO read to one
+    // chain state: without it a connect between the capture and the reads
+    // could pair an old chainHeight/chaintipHash with new-chain UTXOs.
+    let fenced = ctx.chain.with_stable_chainstate(|| {
+        let view = ctx.chain.applied_view();
+        release_applied_capture();
+        let active_height = view.height();
+        let active_hash = view.hash(ctx.chain.chain_network);
+
+        let mut outs = Vec::with_capacity(outpoints.len());
+        let mut hits = Vec::with_capacity(outpoints.len());
+        let pool = ctx.mempool.gateway.read();
+        for (txid, vout) in &outpoints {
+            let outpoint = bitcoin_rs_primitives::OutPoint::new(*txid, *vout);
+            let mempool_spent = check_mempool && pool.is_outpoint_spent(&outpoint);
+            let live = if mempool_spent {
+                None
+            } else {
+                ctx.chain.utxo.get_entry(&outpoint)
+            };
+            hits.push(live.is_some());
+            if let Some(entry) = live {
+                outs.push((entry.height, entry.txout));
+            }
+        }
+        drop(pool);
+        (active_height, active_hash, hits, outs)
+    });
+    let (active_height, active_hash, hits, outs) = fenced;
+    let mut bitmap = vec![0_u8; outpoints.len().div_ceil(8)];
+    // The end check compares for exact equality only; a generation that
+    // moved while the reads ran discards the assembled results and asks the
+    // client to retry.
+    if let Some(response) = end_generation_refusal(ctx, entry_generation) {
+        return response;
     }
-    drop(pool);
     // Bitmap packs the least-significant hit bit first per byte, matching Core.
     for (index, hit) in hits.iter().enumerate() {
         if *hit {
@@ -438,6 +503,18 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     }
 }
 
+/// Second generation check after the fenced reads: a moved generation
+/// discards the assembled body and a missing one refuses too, but the two
+/// events carry distinct retry messages.
+fn end_generation_refusal(ctx: &Arc<Context>, entry_generation: Option<u64>) -> Option<Response> {
+    let entry = entry_generation?;
+    match ctx.mempool.gateway.stable_generation() {
+        None => Some(service_unavailable("chain generation is odd; retry")),
+        Some(now) if now != entry => Some(service_unavailable("chain generation moved; retry")),
+        Some(_) => None,
+    }
+}
+
 /// Core `/rest/deploymentinfo[/<blockhash>].json` (JSON only).
 ///
 /// No RPC handler exists for this surface, so the projection is Core-shaped
@@ -448,9 +525,13 @@ fn route_deploymentinfo(ctx: &Arc<Context>, suffix: &str) -> Response {
         return format_not_found("json");
     }
     let object = if hash_text.is_empty() {
+        // Hash and height describe one publication; the explicit-hash branch
+        // reports a named block and needs no applied tip at all.
+        let view = ctx.chain.applied_view();
+        release_applied_capture();
         json!({
-            "hash": ctx.applied_hash().to_string_be(),
-            "height": ctx.applied_height(),
+            "hash": view.hash(ctx.chain.chain_network).to_string_be(),
+            "height": view.height(),
             "deployments": {}
         })
     } else {
@@ -458,7 +539,7 @@ fn route_deploymentinfo(ctx: &Arc<Context>, suffix: &str) -> Response {
         let Ok(hash) = Hash256::from_str(hash_text) else {
             return bad_request_owned(format!("Invalid hash: {hash_text}"));
         };
-        let Some(record) = ctx.record_for_hash(hash) else {
+        let Some(record) = ctx.chain.record_for_hash(hash) else {
             return bad_request_owned("Block not found".to_owned());
         };
         json!({
@@ -479,7 +560,7 @@ fn route_blockhash_by_height(ctx: &Arc<Context>, suffix: &str) -> Response {
     let Some(format) = format else {
         return format_not_found(available_formats());
     };
-    let Some(hash) = ctx.block_hash_at_height(height) else {
+    let Some(hash) = ctx.chain.block_hash_at_height(height) else {
         return not_found_owned("Block height out of range".to_owned());
     };
     match format {
@@ -515,8 +596,18 @@ fn route_spent_txouts(suffix: &str) -> Response {
 // Header chain walk
 // ---------------------------------------------------------------------------
 
-fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord> {
-    let applied_tip = ctx.chain.applied_tip.load_full();
+/// Walks the applied chain from `hash`, bounded by the response's captured
+/// publication.
+///
+/// PRE: `view` is the response's one captured applied publication.
+/// POST: the returned run is selected against that tip alone.
+/// INVARIANT: this helper never loads `applied_tip`.
+fn header_records(
+    ctx: &Context,
+    view: &AppliedView,
+    hash: Hash256,
+    count: u32,
+) -> Vec<HeaderRecord> {
     let tree = ctx.chain.block_tree.read();
     if let Some(start_id) = tree.lookup(hash)
         && let Ok(start_node) = tree.node(start_id)
@@ -526,7 +617,7 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
             height: start_node.height,
             header: start_node.header,
         };
-        let Some(tip) = applied_tip else {
+        let Some(tip) = view.tip() else {
             return Vec::new();
         };
         let Ok(tip_node) = tree.node(tip.tip_id) else {
@@ -710,22 +801,36 @@ fn append_compact_size(body: &mut Vec<u8>, len: usize) {
 
 /// Builds the applied-chain facts [`crate::render`] needs to project a block or
 /// header.
-fn build_chain_context(ctx: &Context, record: &BlockRecord, header: &Header) -> BlockChainContext {
-    let applied_height = ctx.applied_height();
-    let on_active = ctx.active_hash_at_height(record.height) == Some(Hash256::from(record.hash));
+///
+/// PRE: `view` is the response's one captured applied publication.
+/// POST: confirmation and active-membership facts come from that view; the
+///   header-relative next-block hash keeps its own header-tip source.
+/// INVARIANT: this helper never loads `applied_tip`, so a response cannot mix
+///   two publications.
+fn build_chain_context(
+    ctx: &Context,
+    view: &AppliedView,
+    record: &BlockRecord,
+    header: &Header,
+) -> BlockChainContext {
+    let on_active =
+        ctx.chain.active_hash_in_view(view, record.height) == Some(Hash256::from(record.hash));
     let n_tx = u32::try_from(record.tx_count).unwrap_or(u32::MAX);
     BlockChainContext {
         height: record.height,
-        confirmations: crate::render::confirmations(applied_height, record.height, on_active),
+        confirmations: crate::render::confirmations(view.height(), record.height, on_active),
         mediantime: ctx
+            .chain
             .median_time_past_for_hash(Hash256::from(record.hash))
             .unwrap_or(0),
-        difficulty: ctx.difficulty_for_bits(header.bits),
+        difficulty: ctx.chain.difficulty_for_bits(header.bits),
         chainwork_hex: ctx
+            .chain
             .chain_work_hex_for_hash(Hash256::from(record.hash))
             .unwrap_or_else(|| "00".to_owned()),
         n_tx,
         next_block_hash: ctx
+            .chain
             .next_block_hash_for_height(record.height)
             .map(BlockHash::from),
     }
@@ -733,8 +838,17 @@ fn build_chain_context(ctx: &Context, record: &BlockRecord, header: &Header) -> 
 
 /// Applied-chain facts for a header record, resolving the real record (and its
 /// transaction count) through the tree/log when available.
-fn header_chain_context(ctx: &Context, record: &HeaderRecord) -> BlockChainContext {
+///
+/// PRE: `view` is the response's one captured applied publication.
+/// POST: every applied fact comes from that view.
+/// INVARIANT: this helper never loads `applied_tip`.
+fn header_chain_context(
+    ctx: &Context,
+    view: &AppliedView,
+    record: &HeaderRecord,
+) -> BlockChainContext {
     let real = ctx
+        .chain
         .record_for_hash(record.hash)
         .unwrap_or_else(|| BlockRecord {
             hash: BlockHash::from(record.hash),
@@ -744,7 +858,7 @@ fn header_chain_context(ctx: &Context, record: &HeaderRecord) -> BlockChainConte
             tx_count: 0,
             time: record.header.time,
         });
-    build_chain_context(ctx, &real, &record.header)
+    build_chain_context(ctx, view, &real, &record.header)
 }
 
 // ---------------------------------------------------------------------------
@@ -980,7 +1094,7 @@ mod tests {
         };
         let record = BlockRecord::from_block(0, &block);
         let hash = record.hash.to_string();
-        ctx.add_block(record);
+        ctx.chain.add_block(record);
         ctx.chain.block_body_source = Some(Arc::new(PanicBlockSource));
         publish_active_chain(&ctx, &[block.header]);
         let _first = ctx.try_acquire_rest_render().expect("first permit");
@@ -1117,9 +1231,9 @@ mod tests {
             header: tip_header,
             txs: Vec::new(),
         };
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
-        ctx.add_block(BlockRecord::from_block(1, &child));
-        ctx.add_block(BlockRecord::from_block(2, &tip));
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(1, &child));
+        ctx.chain.add_block(BlockRecord::from_block(2, &tip));
         publish_active_chain(&ctx, &[genesis.header, child.header, tip.header]);
 
         let path = format!("/rest/headers/{}.json", child.block_hash());
@@ -1325,8 +1439,9 @@ mod tests {
             },
             txs: Vec::new(),
         };
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
-        ctx.add_block(BlockRecord::from_block(1, &broken_child));
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain
+            .add_block(BlockRecord::from_block(1, &broken_child));
         let genesis_id = {
             let mut tree = ctx.chain.block_tree.write();
             tree.insert_node(None, genesis.header, NodeStatus::Active)
@@ -1472,7 +1587,7 @@ mod tests {
     fn headers_serve_the_block_header_bytes_verbatim() {
         let ctx = Arc::new(Context::new());
         let genesis = regtest_genesis();
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
         let _ = publish_active_chain(&ctx, &[genesis.header]);
 
         let expected = consensus_bytes(&genesis.header);
@@ -1500,7 +1615,7 @@ mod tests {
     fn headers_for_a_record_the_tree_does_not_know_serve_nothing() {
         let ctx = Arc::new(Context::new());
         let genesis = regtest_genesis();
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
 
         for (format, expected) in [
             ("json", b"[]".as_slice()),
@@ -1689,6 +1804,212 @@ mod tests {
         assert_eq!(value.get("bitmap").and_then(Value::as_str), Some("0"));
         let utxos = value.get("utxos").expect("utxos field");
         assert!(utxos.as_array().expect("utxos array").is_empty());
+    }
+
+    /// An applied-tip publication with a distinctive height, hash, and count.
+    fn tip_snapshot(height: u32, byte: u8, count: u64) -> Arc<TipSnapshot> {
+        Arc::new(TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(height),
+            height,
+            chainwork: bitcoin_rs_chain::ChainWork::from(u128::from(count)),
+            hash: Hash256::from_le_bytes(&[byte; 32]),
+            chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(count),
+        })
+    }
+
+    const GETUTXOS_JSON: &str = "/rest/getutxos/\
+        0000000000000000000000000000000000000000000000000000000000000001-0.json";
+
+    /// Height and hash used to come from two separate applied loads, so a
+    /// publication between them could be reported as one block's height paired
+    /// with another block's hash.
+    #[test]
+    fn getutxos_reports_one_coherent_tip_pair_under_concurrent_swap() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctx = Arc::new(Context::new());
+        let a = tip_snapshot(10, 0xaa, 100);
+        let b = tip_snapshot(20, 0xbb, 200);
+        ctx.chain.applied_tip.store(Some(Arc::clone(&a)));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (cell, swap_a, swap_b, flag) = (
+            ctx.chain.applied_tip.clone(),
+            Arc::clone(&a),
+            Arc::clone(&b),
+            Arc::clone(&stop),
+        );
+        let swapper = std::thread::spawn(move || {
+            let mut flip = false;
+            while !flag.load(Ordering::Relaxed) {
+                flip = !flip;
+                let tip = if flip { &swap_b } else { &swap_a };
+                cell.store(Some(Arc::clone(tip)));
+            }
+        });
+
+        let mut seen_a = false;
+        let mut seen_b = false;
+        // Sampling runs until both publications have answered, not for a fixed
+        // count: the swapper's first store publishes the new tip, but thread
+        // startup is the scheduler's call, so a fixed budget can expire before
+        // the new publication is ever observed.
+        for iteration in 0..100_000 {
+            let response = route(&ctx, GETUTXOS_JSON, "", true);
+            assert_eq!(response.status, 200);
+            let value: Value = sonic_rs::from_slice(&response.body).expect("getutxos JSON");
+            let height = u32::try_from(
+                value
+                    .get("chainHeight")
+                    .and_then(Value::as_u64)
+                    .expect("chainHeight"),
+            )
+            .expect("height fits u32");
+            let hash = value
+                .get("chaintipHash")
+                .and_then(Value::as_str)
+                .expect("chaintipHash");
+            if height == 20 {
+                assert_eq!(hash, b.hash.to_string_be(), "a foreign hash rode height 20");
+                seen_b = true;
+            } else {
+                assert_eq!(height, 10, "the route reported an unpublished height");
+                assert_eq!(hash, a.hash.to_string_be(), "a foreign hash rode height 10");
+                seen_a = true;
+            }
+            if iteration >= 199 && seen_a && seen_b {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().expect("swapper thread panicked");
+        assert!(
+            seen_a && seen_b,
+            "a publication was never observed, so coherence proved nothing"
+        );
+    }
+
+    /// The response keeps the publication it captured rather than following one
+    /// that lands while the response is still being assembled.
+    #[test]
+    fn getutxos_keeps_captured_tip_after_publication() {
+        let ctx = Arc::new(Context::new());
+        let a = tip_snapshot(10, 0xaa, 100);
+        ctx.chain.applied_tip.store(Some(Arc::clone(&a)));
+
+        let publisher = Arc::clone(&ctx);
+        arm_capture_hook(move || {
+            publisher
+                .chain
+                .applied_tip
+                .store(Some(tip_snapshot(20, 0xbb, 200)));
+        });
+        let response = route(&ctx, GETUTXOS_JSON, "", true);
+
+        assert_eq!(response.status, 200);
+        let value: Value = sonic_rs::from_slice(&response.body).expect("getutxos JSON");
+        assert_eq!(
+            value.get("chainHeight").and_then(Value::as_u64),
+            Some(10),
+            "the answer must describe the captured tip"
+        );
+        assert_eq!(
+            value.get("chaintipHash").and_then(Value::as_str),
+            Some(a.hash.to_string_be().as_str())
+        );
+        assert_eq!(
+            ctx.chain.applied_tip.load_full().map(|tip| tip.height),
+            Some(20),
+            "the hook must really have published mid-response"
+        );
+    }
+
+    /// Deploymentinfo captures once, so a publication landing while the response
+    /// is assembled cannot change the pair it reports.
+    #[test]
+    fn deploymentinfo_keeps_captured_tip_after_publication() {
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let ctx = Arc::new(Context::new());
+        publish_active_chain(&ctx, &[genesis.header]);
+        let applied_height = ctx
+            .chain
+            .applied_tip
+            .load_full()
+            .expect("published applied tip")
+            .height;
+
+        let arm_rival = |ctx: &Arc<Context>| {
+            let publisher = Arc::clone(ctx);
+            let height = applied_height + 40;
+            arm_capture_hook(move || {
+                publisher
+                    .chain
+                    .applied_tip
+                    .store(Some(tip_snapshot(height, 0xee, 9_000)));
+            });
+        };
+
+        arm_rival(&ctx);
+        let response = route(&ctx, "/rest/deploymentinfo.json", "", true);
+        let value: Value = sonic_rs::from_slice(&response.body).expect("deploymentinfo JSON");
+        assert_eq!(
+            value.get("height").and_then(Value::as_u64),
+            Some(u64::from(applied_height)),
+            "deploymentinfo must report the captured height"
+        );
+        assert_eq!(
+            ctx.chain
+                .applied_tip
+                .load_full()
+                .map(|published| published.height),
+            Some(applied_height + 40),
+            "the hook must really have published mid-response"
+        );
+    }
+
+    const CHECKMEMPOOL_JSON: &str = "/rest/getutxos/checkmempool/\
+        0000000000000000000000000000000000000000000000000000000000000001-0.json";
+
+    /// The checkmempool branch mixes UTXO and mempool facts, so it refuses
+    /// while a chain change is active. The refusal is the documented retry
+    /// response: 503, `text/plain`, no trailing newline.
+    #[test]
+    fn getutxos_checkmempool_returns_503_on_unstable_generation() {
+        let ctx = Arc::new(Context::new());
+        ctx.mempool.gateway.force_chain_generation(3);
+        let response = route(&ctx, CHECKMEMPOOL_JSON, "", true);
+        assert_eq!(response.status, 503);
+        assert_eq!(response.reason, "Service Unavailable");
+        assert_eq!(response.content_type, "text/plain");
+        assert_eq!(response.body, b"chain generation is odd; retry".to_vec());
+    }
+
+    /// A generation that moves between the entry check and the end check
+    /// discards the assembled body and returns the retry response naming the
+    /// move rather than a missing generation.
+    #[test]
+    fn getutxos_checkmempool_rejects_moved_generation() {
+        let ctx = Arc::new(Context::new());
+        ctx.mempool.gateway.force_chain_generation(4);
+        let mover = Arc::clone(&ctx);
+        arm_capture_hook(move || mover.mempool.gateway.force_chain_generation(6));
+        let response = route(&ctx, CHECKMEMPOOL_JSON, "", true);
+        assert_eq!(response.status, 503);
+        assert_eq!(response.body, b"chain generation moved; retry".to_vec());
+    }
+
+    /// The plain branch reads no mempool fact and deploymentinfo never reads
+    /// the generation, so an odd generation must not refuse either one.
+    #[test]
+    fn plain_tip_routes_ignore_mempool_generation() {
+        let ctx = Arc::new(Context::new());
+        ctx.mempool.gateway.force_chain_generation(3);
+        assert_eq!(route(&ctx, GETUTXOS_JSON, "", true).status, 200);
+        assert_eq!(
+            route(&ctx, "/rest/deploymentinfo.json", "", true).status,
+            200
+        );
     }
 
     #[test]

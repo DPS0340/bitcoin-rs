@@ -1,13 +1,12 @@
 use alloc::sync::Arc;
 use core::str::FromStr as _;
 use hashbrown::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::encode::serialize as bitcoin_serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
+use bitcoin_rs_mempool::SubmitError;
 use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
-use bitcoin_rs_mempool::{AdmissionOrigin, MutationResult, SubmitError, SubmitOutcome};
 use bitcoin_rs_primitives::{
     Amount, Block as NativeBlock, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes, deserialize as native_deserialize,
@@ -19,7 +18,7 @@ use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 use crate::compat::convert::{
     self, VerboseTxChain, hex_encode, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
 };
-use crate::context::Context;
+use crate::context::{self, AdmissionFailure, Context};
 use crate::error::RpcError;
 use crate::handlers::{optional_bool, params_array, parse_txid, required_str, required_u64};
 use bitcoin_rs_index::block_log::BlockRecord;
@@ -68,6 +67,7 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
 
     if let Some(hash) = blockhash {
         let record = ctx
+            .chain
             .block_by_hash(hash)
             .ok_or(RpcError::NotFound("block not found"))?;
         let block = load_block(ctx, &record)?;
@@ -91,7 +91,7 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
             let record = derived_index
                 .transaction_height(&txid)
                 .map_err(RpcError::from)?
-                .and_then(|height| ctx.block_by_height(height));
+                .and_then(|height| ctx.chain.block_by_height(height));
             return render_raw_transaction(ctx, &tx, verbose, record.as_ref(), false);
         }
     }
@@ -126,6 +126,7 @@ fn raw_transaction_verbosity(params: &Value) -> Result<bool, RpcError> {
 
 fn load_block(ctx: &Context, record: &BlockRecord) -> Result<NativeBlock, RpcError> {
     let bytes = ctx
+        .chain
         .block_body_bytes(record)
         .ok_or(RpcError::NotFound("block data pruned"))?;
     native_deserialize(&bytes)
@@ -143,7 +144,12 @@ fn render_raw_transaction(
         return typed_to_sonic(&v31::GetRawTransaction(hex_encode(&consensus_bytes(tx))));
     }
     let chain = record.map(|record| {
-        let confirmations = super::chain::confirmations(ctx, record.hash.into(), record.height);
+        let confirmations = super::chain::confirmations(
+            ctx,
+            &ctx.chain.applied_view(),
+            record.hash.into(),
+            record.height,
+        );
         VerboseTxChain {
             block_hash: record.hash.to_string(),
             confirmations: u64::try_from(confirmations).unwrap_or(0),
@@ -177,19 +183,30 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
             && let Ok(vout) = usize::try_from(vout_u32)
             && let Some(output) = entry.tx.outputs.get(vout)
         {
-            return txout_typed(ctx, output, 0, false);
+            return txout_typed(ctx, output, 0, false, ctx.chain.applied_hash());
         }
     }
 
-    let Some(live) = ctx.chain.utxo.get_entry(&outpoint) else {
+    // Core: the UTXO lookup and the chainstate tip (`coins_view->GetBestBlock`)
+    // are read under `cs_main`; capture both inside the stability barrier so a
+    // tip advance cannot interleave between the coin and its `bestblock`.
+    let Some((live, view)) = ctx.chain.with_stable_chainstate(|| {
+        ctx.chain
+            .utxo
+            .get_entry(&outpoint)
+            .map(|live| (live, ctx.chain.applied_view()))
+    }) else {
         // Spent or never existed: Core-spec returns JSON null.
         return Ok(Value::new_null());
     };
-    let confirmations = ctx
-        .applied_height()
-        .saturating_sub(live.height)
-        .saturating_add(1);
-    txout_typed(ctx, &live.txout, confirmations, live.coinbase)
+    let confirmations = view.height().saturating_sub(live.height).saturating_add(1);
+    txout_typed(
+        ctx,
+        &live.txout,
+        confirmations,
+        live.coinbase,
+        view.hash(ctx.chain.chain_network),
+    )
 }
 
 fn txout_typed(
@@ -197,9 +214,10 @@ fn txout_typed(
     output: &TxOut,
     confirmations: u32,
     coinbase: bool,
+    best_block: Hash256,
 ) -> Result<Value, RpcError> {
     typed_to_sonic(&v31::GetTxOut {
-        best_block: ctx.best_hash().to_string(),
+        best_block: best_block.to_string(),
         confirmations,
         value: sat_to_btc(output.value.to_sat()),
         script_pubkey: convert::script_pub_key_typed(
@@ -231,7 +249,7 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     if let Some(hash_str) = array.get(1).and_then(JsonValueTrait::as_str) {
         let hash = Hash256::from_str(hash_str)
             .map_err(|_| RpcError::InvalidParams("blockhash must be 64 hex characters"))?;
-        let Some(record) = ctx.block_by_hash(hash) else {
+        let Some(record) = ctx.chain.block_by_hash(hash) else {
             return Err(RpcError::NotFound("block not found"));
         };
         return proof_from_single_record(ctx, &record, &wanted);
@@ -285,7 +303,7 @@ fn proof_via_index(ctx: &Arc<Context>, wanted: &hashbrown::HashSet<Txid>) -> Opt
                 return None;
             }
         };
-        let Some(record) = ctx.block_by_height(height) else {
+        let Some(record) = ctx.chain.block_by_height(height) else {
             continue;
         };
         if let Some(proof) = proof_from_record(ctx, &record, wanted) {
@@ -306,7 +324,7 @@ fn proof_from_single_record(
     record: &bitcoin_rs_index::block_log::BlockRecord,
     wanted: &hashbrown::HashSet<Txid>,
 ) -> Result<Value, RpcError> {
-    let Some(bytes) = ctx.block_body_bytes(record) else {
+    let Some(bytes) = ctx.chain.block_body_bytes(record) else {
         return Err(RpcError::NotFound("block data pruned"));
     };
     proof_from_body(&bytes, wanted)
@@ -336,7 +354,7 @@ fn proof_from_block_log(
         let Some(record) = ctx.chain.blocks.read().get(index).cloned() else {
             break;
         };
-        let Some(bytes) = ctx.block_body_bytes(&record) else {
+        let Some(bytes) = ctx.chain.block_body_bytes(&record) else {
             saw_pruned_block = true;
             continue;
         };
@@ -359,7 +377,7 @@ fn proof_from_record(
     record: &bitcoin_rs_index::block_log::BlockRecord,
     wanted: &hashbrown::HashSet<Txid>,
 ) -> Option<Value> {
-    let bytes = ctx.block_body_bytes(record)?;
+    let bytes = ctx.chain.block_body_bytes(record)?;
     proof_from_body(&bytes, wanted)
 }
 
@@ -414,66 +432,6 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
     typed_to_sonic(&v31::VerifyTxOutProof(result))
 }
 
-/// Failure from the one shared admission operation.
-///
-/// `sendrawtransaction` and [`crate::context::Context::admit_transaction`]
-/// map this into their respective envelopes.
-pub(crate) enum AdmissionFailure {
-    /// Mempool or standardness policy refused the transaction.
-    Policy(AcceptanceRejectReason),
-    /// Consensus verification failed.
-    Consensus,
-    /// Generation or mempool tokens kept changing across the retry budget.
-    RetryExhausted,
-}
-
-impl AdmissionFailure {
-    const RETRY_EXHAUSTED: &'static str =
-        "admission retry exhausted: chain or mempool changed during submission";
-
-    /// Maps this failure to the string envelope used by
-    /// [`crate::context::Context::admit_transaction`].
-    pub(crate) fn into_string(self) -> String {
-        match self {
-            Self::Policy(reason) => reason.to_string(),
-            Self::Consensus => "consensus-verification-failed".to_owned(),
-            Self::RetryExhausted => Self::RETRY_EXHAUSTED.to_owned(),
-        }
-    }
-}
-
-/// Maps the shared mempool submission verdict into the RPC/embedded envelope.
-///
-/// Preparation, bounded retry, policy evaluation, and the authoritative commit
-/// belong to the gateway. RPC only supplies its origin, fee option, current
-/// chain capability, and caller-facing error semantics.
-pub(crate) fn admit_transaction(
-    ctx: &Context,
-    tx: &Tx,
-    max_feerate_sat_per_kvb: Option<u64>,
-) -> Result<MutationResult, AdmissionFailure> {
-    match ctx.mempool.gateway.submit_transaction(
-        Arc::new(tx.clone()),
-        AdmissionOrigin::Rpc,
-        max_feerate_sat_per_kvb,
-        unix_time_secs(),
-        &ctx.admission_chain(),
-    ) {
-        Ok(SubmitOutcome::Committed(result)) => Ok(result),
-        Ok(SubmitOutcome::AlreadyKnown) => Ok(MutationResult::empty()),
-        Ok(SubmitOutcome::AlreadyConfirmed | SubmitOutcome::Held { .. }) => {
-            // RPC never holds orphans or treats the transaction lookup cache
-            // as a successful submission. Preserve its missing-input refusal.
-            Err(AdmissionFailure::Policy(
-                AcceptanceRejectReason::MissingInputs,
-            ))
-        }
-        Err(SubmitError::Policy(reason)) => Err(AdmissionFailure::Policy(reason)),
-        Err(SubmitError::Consensus) => Err(AdmissionFailure::Consensus),
-        Err(SubmitError::RetryExhausted) => Err(AdmissionFailure::RetryExhausted),
-    }
-}
-
 /// Fee rate above which `sendrawtransaction` refuses by default, in sat/kvB.
 ///
 /// Bitcoin Core's `DEFAULT_MAX_RAW_TX_FEE_RATE`, `COIN / 10` — 0.1 BTC per kvB.
@@ -490,7 +448,7 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
     )?;
     let txid = tx.txid();
 
-    match admit_transaction(ctx, &tx, max_feerate) {
+    match context::admit_transaction(&ctx.mempool.gateway, &ctx.chain, &tx, max_feerate) {
         Ok(_) => typed_to_sonic(&v31::SendRawTransaction(txid.to_string())),
         Err(AdmissionFailure::Policy(reason)) => Err(reject_reason_to_rpc_error(reason)),
         Err(AdmissionFailure::Consensus) => Err(RpcError::TxRejected(
@@ -543,7 +501,7 @@ pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let facts = ctx
         .mempool
         .gateway
-        .preview_transactions(&txs, max_feerate, &ctx.admission_chain())
+        .preview_transactions(&txs, max_feerate, &ctx.chain.admission_chain())
         .map_err(|error| match error {
             SubmitError::Policy(reason) => reject_reason_to_rpc_error(reason),
             SubmitError::Consensus => {
@@ -706,12 +664,6 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
 fn decode_tx(raw: &str, message: String) -> Result<Tx, RpcError> {
     let bytes = hex_decode(raw).map_err(|_| RpcError::Deserialization(message.clone()))?;
     native_deserialize(&bytes).map_err(|_| RpcError::Deserialization(message))
-}
-
-fn unix_time_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 /// f64 nearest to 2^64 — the value `u64::MAX` rounds to as a float, and the
@@ -1123,7 +1075,7 @@ mod tests {
             .write()
             .insert_node(None, genesis.header, NodeStatus::Active)
             .expect("insert genesis header");
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
         let ctx = Arc::new(ctx);
         let handler = Handler::new(Arc::clone(&ctx));
         let result = handler
@@ -1157,7 +1109,7 @@ mod tests {
                 .collect(),
         }));
         for (block, height) in blocks {
-            ctx.add_block(BlockRecord::from_block(height, block));
+            ctx.chain.add_block(BlockRecord::from_block(height, block));
         }
         let active_tip = {
             let mut tree = ctx.chain.block_tree.write();
@@ -1271,7 +1223,7 @@ mod tests {
         ctx.indexes.derived_index = Some(Arc::new(StaticQuery {
             tx: coinbase.clone(),
         }));
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
         let tip = {
             let mut tree = ctx.chain.block_tree.write();
             tree.insert_node(None, genesis.header, NodeStatus::Active)
@@ -1314,7 +1266,7 @@ mod tests {
             .write()
             .insert_node(None, genesis.header, NodeStatus::Active)
             .expect("insert genesis header");
-        ctx.add_block(record);
+        ctx.chain.add_block(record);
 
         let result = getrawtransaction(
             &ctx,
@@ -1407,8 +1359,8 @@ mod tests {
                 Some(consensus_bytes(&genesis)),
             ])),
         }));
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
         let ctx = Arc::new(ctx);
         let handler = Handler::new(Arc::clone(&ctx));
 
@@ -1441,8 +1393,9 @@ mod tests {
             .write()
             .insert_node(None, genesis.header, NodeStatus::Active)
             .expect("insert genesis header");
-        ctx.add_block(BlockRecord::synthetic(0, unrelated_hash));
-        ctx.add_block(record);
+        ctx.chain
+            .add_block(BlockRecord::synthetic(0, unrelated_hash));
+        ctx.chain.add_block(record);
         let ctx = Arc::new(ctx);
         let handler = Handler::new(Arc::clone(&ctx));
 
@@ -1472,7 +1425,7 @@ mod tests {
             .insert_node(None, genesis.header, NodeStatus::Active)
             .expect("insert genesis header");
         let block_hash = record.hash;
-        ctx.add_block(record);
+        ctx.chain.add_block(record);
         let handler = Handler::new(Arc::clone(&ctx));
 
         let result = handler.dispatch(
@@ -1650,7 +1603,7 @@ mod tests {
         }
         ctx.chain.block_body_source = Some(Arc::new(SeededBodySource { bodies }));
         for record in records {
-            ctx.add_block(record);
+            ctx.chain.add_block(record);
         }
     }
 
@@ -1689,15 +1642,15 @@ mod tests {
             hash: indexed.hash,
             body: consensus_bytes(&block),
         }));
-        ctx.add_block(BlockRecord::synthetic(
+        ctx.chain.add_block(BlockRecord::synthetic(
             0,
             BlockHash::from(Hash256::from_le_bytes(&[7_u8; 32])),
         ));
-        ctx.add_block(BlockRecord::synthetic(
+        ctx.chain.add_block(BlockRecord::synthetic(
             1,
             BlockHash::from(Hash256::from_le_bytes(&[8_u8; 32])),
         ));
-        ctx.add_block(indexed);
+        ctx.chain.add_block(indexed);
         let ctx = Arc::new(ctx);
 
         let result = proof_for(&ctx, &[wanted]);
@@ -1792,11 +1745,11 @@ mod tests {
             hash: indexed.hash,
             body: consensus_bytes(&block),
         }));
-        ctx.add_block(BlockRecord::synthetic(
+        ctx.chain.add_block(BlockRecord::synthetic(
             0,
             BlockHash::from(Hash256::from_le_bytes(&[5_u8; 32])),
         ));
-        ctx.add_block(indexed);
+        ctx.chain.add_block(indexed);
         let ctx = Arc::new(ctx);
 
         let result = proof_for(&ctx, &wanted);
@@ -1827,11 +1780,11 @@ mod tests {
             hash: indexed.hash,
             body: consensus_bytes(&block),
         }));
-        ctx.add_block(BlockRecord::synthetic(
+        ctx.chain.add_block(BlockRecord::synthetic(
             0,
             BlockHash::from(Hash256::from_le_bytes(&[6_u8; 32])),
         ));
-        ctx.add_block(indexed);
+        ctx.chain.add_block(indexed);
         let ctx = Arc::new(ctx);
 
         let result = proof_for(&ctx, &wanted);
@@ -1909,7 +1862,7 @@ mod tests {
             .write()
             .insert_node(None, block.header, NodeStatus::Active)
             .expect("insert block header");
-        ctx.add_block(record);
+        ctx.chain.add_block(record);
         let ctx = Arc::new(ctx);
 
         let result =
@@ -2047,7 +2000,7 @@ mod tests {
         for (height, block) in blocks.iter().enumerate() {
             let height = u32::try_from(height).unwrap_or_else(|err| panic!("height: {err}"));
             let hash = block.block_hash();
-            ctx.add_block(BlockRecord::synthetic(height, hash));
+            ctx.chain.add_block(BlockRecord::synthetic(height, hash));
         }
 
         let result = proof_for(&ctx, &[wanted]);
@@ -2252,7 +2205,7 @@ mod gettxout_via_utxo_tests {
                 script_pubkey: Script::from_bytes(vec![0x51]),
             }],
         };
-        let txid = ctx.add_transaction(tx);
+        let txid = ctx.chain.add_transaction(tx);
         let params = json!([txid.to_string(), 0_u64]);
         let value = gettxout(&ctx, &params).unwrap_or_else(|err| panic!("gettxout failed: {err}"));
         assert!(
@@ -2766,9 +2719,11 @@ mod acceptance_tests {
         };
 
         (
-            ctx.median_time_past_for_hash(applied_hash)
+            ctx.chain
+                .median_time_past_for_hash(applied_hash)
                 .expect("applied MTP exists"),
-            ctx.median_time_past_for_hash(best_hash)
+            ctx.chain
+                .median_time_past_for_hash(best_hash)
                 .expect("best MTP exists"),
         )
     }

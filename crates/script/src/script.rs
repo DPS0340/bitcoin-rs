@@ -225,11 +225,20 @@ pub fn is_p2sh(script: &[u8]) -> bool {
 
 /// Returns the public-key bytes of a bare P2PK script
 /// (`<33 or 65 bytes> OP_CHECKSIG`), or `None` for any other shape.
+///
+/// The push must decode as a `CPubKey` (`ValidSize`: 33-byte keys start
+/// `0x02`/`0x03`, 65-byte keys `0x04`/`0x06`/`0x07`), the strictness Core's
+/// `Solver` applies before classifying `pubkey`.
 #[must_use]
 pub fn p2pk_pubkey_bytes(script: &[u8]) -> Option<&[u8]> {
-    match script.len() {
-        67 if script[0] == 0x41 && script[66] == opcode::OP_CHECKSIG => Some(&script[1..66]),
-        35 if script[0] == 0x21 && script[34] == opcode::OP_CHECKSIG => Some(&script[1..34]),
+    let key = match script.len() {
+        67 if script[0] == 0x41 && script[66] == opcode::OP_CHECKSIG => &script[1..66],
+        35 if script[0] == 0x21 && script[34] == opcode::OP_CHECKSIG => &script[1..34],
+        _ => return None,
+    };
+    match key.len() {
+        33 if matches!(key[0], 0x02 | 0x03) => Some(key),
+        65 if matches!(key[0], 0x04 | 0x06 | 0x07) => Some(key),
         _ => None,
     }
 }
@@ -311,10 +320,11 @@ pub fn is_multisig(script: &[u8]) -> bool {
         match instruction {
             Instruction::PushBytes(_) => num_pubkeys = num_pubkeys.saturating_add(1),
             Instruction::Op(op) => {
-                if let Some(pushnum) = opcode::decode_pushnum(op) {
-                    if pushnum != num_pubkeys {
-                        return false;
-                    }
+                // The opcode after the key pushes must be the OP_n key count;
+                // any other opcode makes the script malformed, not multisig.
+                match opcode::decode_pushnum(op) {
+                    Some(pushnum) if pushnum == num_pubkeys => {}
+                    _ => return false,
                 }
                 break;
             }
@@ -329,6 +339,146 @@ pub fn is_multisig(script: &[u8]) -> bool {
         _ => return false,
     }
     iter.next().is_none()
+}
+
+/// Counts the pubkeys in a bare multisig script, or `None` unless it matches
+/// Core's `MatchMultisig` exactly.
+///
+/// `m` and `n` are small integers in `1..=MAX_PUBKEYS_PER_MULTISIG` encoded as
+/// `OP_1..=OP_16` or minimally encoded script-number pushes, every key push
+/// decodes as a `CPubKey` (33 bytes starting `0x02`/`0x03`, 65 bytes starting
+/// `0x04`/`0x06`/`0x07`), `m <= n` equals the number of key pushes, and
+/// `OP_CHECKMULTISIG` ends the script.
+/// Core `MAX_PUBKEYS_PER_MULTISIG`.
+const MAX_BARE_MULTISIG_PUBKEYS: i64 = 20;
+
+/// Yields the next element as Core's `CScript::GetOp` does: the opcode
+/// byte and its pushed data (empty for non-push opcodes).
+fn next_op<'a>(script: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
+    let &opcode = script.get(*pos)?;
+    *pos += 1;
+    let len = match opcode {
+        0x01..=0x4b => usize::from(opcode),
+        opcode::OP_PUSHDATA1 | opcode::OP_PUSHDATA2 | opcode::OP_PUSHDATA4 => {
+            let width = if opcode == opcode::OP_PUSHDATA4 {
+                4
+            } else {
+                usize::from(opcode - opcode::OP_PUSHDATA1 + 1)
+            };
+            let bytes = script.get(*pos..pos.checked_add(width)?)?;
+            *pos += width;
+            let mut len = 0usize;
+            for (shift, byte) in bytes.iter().enumerate() {
+                len |= usize::from(*byte) << (8 * shift);
+            }
+            len
+        }
+        _ => 0,
+    };
+    let data = script.get(*pos..pos.checked_add(len)?)?;
+    *pos += len;
+    Some((opcode, data))
+}
+
+/// Core `CheckMinimalPush`: the opcode must be the smallest push form
+/// that can carry `data`, and one-byte small integers must use their
+/// dedicated opcodes (`OP_0`, `OP_1NEGATE`, `OP_1..=OP_16`).
+fn minimal_push(opcode: u8, data: &[u8]) -> bool {
+    match data.len() {
+        0 => opcode == opcode::OP_0,
+        1 if (1..=16).contains(&data[0]) || data[0] == 0x81 => false,
+        1..=75 => usize::from(opcode) == data.len(),
+        76..=255 => opcode == opcode::OP_PUSHDATA1,
+        256..=65_535 => opcode == opcode::OP_PUSHDATA2,
+        _ => true,
+    }
+}
+
+/// Core `CScriptNum` with `fRequireMinimal`: the sign-magnitude value of
+/// a little-endian byte string of at most 4 bytes.
+fn minimal_script_num(data: &[u8]) -> Option<i64> {
+    if data.is_empty() {
+        return Some(0);
+    }
+    if data.len() > 4 {
+        return None;
+    }
+    let last = *data.last()?;
+    if last.trailing_zeros() >= 7 && (data.len() == 1 || data[data.len() - 2] & 0x80 == 0) {
+        return None;
+    }
+    let mut value = 0i64;
+    for (shift, byte) in data.iter().enumerate() {
+        let bits = if shift == data.len() - 1 {
+            i64::from(*byte & 0x7f)
+        } else {
+            i64::from(*byte)
+        };
+        value |= bits << (8 * shift);
+    }
+    Some(if last & 0x80 != 0 { -value } else { value })
+}
+
+/// Core `GetScriptNumber`: a minimally encoded count in `min..=max`,
+/// whether carried by an `OP_n` opcode or a data push.
+fn script_count(opcode: u8, data: &[u8], min: i64, max: i64) -> Option<u8> {
+    let count = if let Some(pushnum) = opcode::decode_pushnum(opcode) {
+        i64::from(pushnum)
+    } else if opcode <= opcode::OP_PUSHDATA4 {
+        if !minimal_push(opcode, data) {
+            return None;
+        }
+        minimal_script_num(data)?
+    } else {
+        return None;
+    };
+    if count < min || count > max {
+        return None;
+    }
+    u8::try_from(count).ok()
+}
+
+/// Core `CPubKey::ValidSize`.
+fn pubkey_valid_size(data: &[u8]) -> bool {
+    match data.len() {
+        33 => matches!(data[0], 0x02 | 0x03),
+        65 => matches!(data[0], 0x04 | 0x06 | 0x07),
+        _ => false,
+    }
+}
+
+/// Counts the pubkeys in a bare multisig script, or `None` unless it matches
+/// Core's `MatchMultisig` exactly.
+///
+/// `m` and `n` are small integers in `1..=MAX_PUBKEYS_PER_MULTISIG` encoded as
+/// `OP_1..=OP_16` or minimally encoded script-number pushes, every key push
+/// decodes as a `CPubKey` (33 bytes starting `0x02`/`0x03`, 65 bytes starting
+/// `0x04`/`0x06`/`0x07`), `m <= n` equals the number of key pushes, and
+/// `OP_CHECKMULTISIG` ends the script.
+#[must_use]
+pub fn multisig_key_count(script: &[u8]) -> Option<u8> {
+    if *script.last()? != opcode::OP_CHECKMULTISIG {
+        return None;
+    }
+    let mut pos = 0usize;
+    let (op, data) = next_op(script, &mut pos)?;
+    let required = i64::from(script_count(op, data, 1, MAX_BARE_MULTISIG_PUBKEYS)?);
+    let mut keys = 0usize;
+    let (op, data) = loop {
+        let (op, data) = next_op(script, &mut pos)?;
+        if !pubkey_valid_size(data) {
+            break (op, data);
+        }
+        keys = keys.checked_add(1)?;
+    };
+    let declared = script_count(op, data, required, MAX_BARE_MULTISIG_PUBKEYS)?;
+    if usize::from(declared) != keys {
+        return None;
+    }
+    if script.get(pos) != Some(&opcode::OP_CHECKMULTISIG) || pos + 1 != script.len() {
+        return None;
+    }
+    Some(declared)
 }
 
 /// Returns the smallest non-dust value in satoshis for an output paying
@@ -433,7 +583,7 @@ mod tests {
     use super::{
         EarlyEndOfScript, Instruction, instructions, is_multisig, is_op_return, is_p2a, is_p2pk,
         is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, is_push_only, is_witness_program,
-        minimal_non_dust, opcode, push_data, push_int,
+        minimal_non_dust, multisig_key_count, opcode, push_data, push_int,
     };
 
     const fn pushnum(n: u8) -> u8 {
@@ -496,7 +646,10 @@ mod tests {
         let p2sh: Vec<u8> = [vec![0xa9, 0x14], vec![7; 20], vec![0x87]].concat();
         assert!(is_p2sh(&p2sh));
         assert!(is_p2pk(
-            &[vec![0x21], vec![9; 33], vec![opcode::OP_CHECKSIG]].concat()
+            &[vec![0x21], vec![0x02; 33], vec![opcode::OP_CHECKSIG]].concat()
+        ));
+        assert!(!is_p2pk(
+            &[vec![0x21], vec![0x09; 33], vec![opcode::OP_CHECKSIG]].concat()
         ));
         assert!(!is_p2pk(
             &[vec![0x20], vec![9; 32], vec![opcode::OP_CHECKSIG]].concat()
@@ -540,6 +693,62 @@ mod tests {
         ]
         .concat();
         assert!(!is_multisig(&missing_trailer));
+    }
+
+    #[test]
+    fn multisig_key_count_matches_core_strictness() {
+        let keys = vec![0x02_u8; 33];
+        let two_of_two: Vec<u8> = [
+            vec![pushnum(2)],
+            push_data(&keys),
+            push_data(&keys),
+            vec![pushnum(2), opcode::OP_CHECKMULTISIG],
+        ]
+        .concat();
+        assert_eq!(multisig_key_count(&two_of_two), Some(2));
+
+        // A key push that is not a serialized pubkey fails the match.
+        let bad_key: Vec<u8> = [
+            vec![opcode::OP_PUSHNUM_1],
+            push_data(&[0_u8; 4]),
+            vec![opcode::OP_PUSHNUM_1, opcode::OP_CHECKMULTISIG],
+        ]
+        .concat();
+        assert!(is_multisig(&bad_key));
+        assert_eq!(multisig_key_count(&bad_key), None);
+
+        // Counts may be minimal script-number pushes, reaching past OP_16.
+        let mut seventeen_of_seventeen = vec![0x01, 0x11];
+        for _ in 0..17 {
+            seventeen_of_seventeen.extend(push_data(&keys));
+        }
+        seventeen_of_seventeen.extend([0x01, 0x11, opcode::OP_CHECKMULTISIG]);
+        assert_eq!(multisig_key_count(&seventeen_of_seventeen), Some(17));
+
+        // Twenty-one keys exceeds `MAX_PUBKEYS_PER_MULTISIG`.
+        let mut twenty_one = vec![opcode::OP_PUSHNUM_1];
+        for _ in 0..21 {
+            twenty_one.extend(push_data(&keys));
+        }
+        twenty_one.extend([0x01, 0x15, opcode::OP_CHECKMULTISIG]);
+        assert_eq!(multisig_key_count(&twenty_one), None);
+
+        // Non-minimal count encodings fail: PUSHDATA1 for one byte, and a
+        // redundant sign byte in the value.
+        let padded_push: Vec<u8> = [
+            vec![opcode::OP_PUSHDATA1, 0x01, 0x01],
+            push_data(&keys),
+            vec![opcode::OP_PUSHNUM_1, opcode::OP_CHECKMULTISIG],
+        ]
+        .concat();
+        assert_eq!(multisig_key_count(&padded_push), None);
+        let nonminimal_num: Vec<u8> = [
+            vec![0x02, 0x01, 0x00],
+            push_data(&keys),
+            vec![opcode::OP_PUSHNUM_1, opcode::OP_CHECKMULTISIG],
+        ]
+        .concat();
+        assert_eq!(multisig_key_count(&nonminimal_num), None);
     }
 
     #[test]

@@ -999,16 +999,14 @@ mod tests {
     fn ctx_with_control(control: Arc<dyn MiningControl>) -> Arc<Context> {
         let mut ctx = Context::new();
         ctx.chain.chain_network = Network::Regtest;
-        ctx.mining.mining_control = Some(control);
-        Arc::new(ctx)
+        Arc::new(ctx.with_mining_control(control))
     }
 
     fn ctx_with_control_on_network(
         control: Arc<dyn MiningControl>,
         network: Network,
     ) -> Arc<Context> {
-        let mut ctx = Context::new();
-        ctx.mining.mining_control = Some(control);
+        let mut ctx = Context::new().with_mining_control(control);
         ctx.chain.chain_network = network;
         Arc::new(ctx)
     }
@@ -1067,9 +1065,7 @@ mod tests {
     #[test]
     fn getblocktemplate_rejects_mainnet_without_peers() {
         let control = FakeMiningControl::with_template(sample_template());
-        let mut ctx = Context::new();
-        ctx.mining.mining_control = Some(control);
-        let ctx = Arc::new(ctx);
+        let ctx = Arc::new(Context::new().with_mining_control(control));
         assert_eq!(ctx.chain.chain_network, Network::Mainnet);
         let error = getblocktemplate(&ctx, &json!([{"rules":["segwit"]}]))
             .expect_err("mainnet without peers must fail");
