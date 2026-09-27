@@ -745,7 +745,11 @@ fn owned_parts(outputs: &[OwnedUtxoOut]) -> Vec<OutputParts<'_>> {
 
 /// Applies a coalesced add run to `parts` with overwrite semantics, preserving
 /// the inline/overflow partition order. When `overwritten` is supplied,
-/// each displaced output is cloned owned into it in addition order.
+/// each displaced output is cloned owned into it in addition order. The
+/// caller commits the sink only after the replacement record encodes: the
+/// displaced outputs are staged locally and appended to the sink after the
+/// whole run is applied, so an encoding failure in the caller never leaves
+/// the sink partially filled.
 fn apply_additions<'a>(
     parts: &mut Vec<OutputParts<'a>>,
     inline_len: &mut usize,
@@ -753,6 +757,7 @@ fn apply_additions<'a>(
     add_unique: bool,
     mut overwritten: Option<&mut Vec<Option<OwnedUtxoOut>>>,
 ) {
+    let mut displaced = Vec::with_capacity(additions.len());
     for &addition in additions {
         let old = if add_unique {
             debug_assert!(parts.iter().all(|part| part.vout != addition.vout));
@@ -764,9 +769,10 @@ fn apply_additions<'a>(
                 .map(|index| remove_part_at(parts, inline_len, index))
         };
         push_part(parts, inline_len, addition);
-        if let Some(sink) = overwritten.as_deref_mut() {
-            sink.push(old.map(OutputParts::into_owned));
-        }
+        displaced.push(old.map(OutputParts::into_owned));
+    }
+    if let Some(sink) = overwritten.as_deref_mut() {
+        sink.extend(displaced);
     }
 }
 
