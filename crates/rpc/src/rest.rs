@@ -405,7 +405,7 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
     // transition between the reads could confirm a spend the transition
     // already reversed. The entry check refuses while a change is active.
     let entry_generation = if check_mempool {
-        match ctx.mempool.stable_generation() {
+        match ctx.mempool.gateway.stable_generation() {
             Some(generation) => Some(generation),
             None => return service_unavailable("chain generation is odd; retry"),
         }
@@ -423,7 +423,7 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
 
         let mut outs = Vec::with_capacity(outpoints.len());
         let mut hits = Vec::with_capacity(outpoints.len());
-        let pool = ctx.mempool.read();
+        let pool = ctx.mempool.gateway.read();
         for (txid, vout) in &outpoints {
             let outpoint = bitcoin_rs_primitives::OutPoint::new(*txid, *vout);
             let mempool_spent = check_mempool && pool.is_outpoint_spent(&outpoint);
@@ -508,7 +508,7 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
 /// events carry distinct retry messages.
 fn end_generation_refusal(ctx: &Arc<Context>, entry_generation: Option<u64>) -> Option<Response> {
     let entry = entry_generation?;
-    match ctx.mempool.stable_generation() {
+    match ctx.mempool.gateway.stable_generation() {
         None => Some(service_unavailable("chain generation is odd; retry")),
         Some(now) if now != entry => Some(service_unavailable("chain generation moved; retry")),
         Some(_) => None,
@@ -1977,7 +1977,7 @@ mod tests {
     #[test]
     fn getutxos_checkmempool_returns_503_on_unstable_generation() {
         let ctx = Arc::new(Context::new());
-        ctx.mempool.force_chain_generation(3);
+        ctx.mempool.gateway.force_chain_generation(3);
         let response = route(&ctx, CHECKMEMPOOL_JSON, "", true);
         assert_eq!(response.status, 503);
         assert_eq!(response.reason, "Service Unavailable");
@@ -1991,9 +1991,9 @@ mod tests {
     #[test]
     fn getutxos_checkmempool_rejects_moved_generation() {
         let ctx = Arc::new(Context::new());
-        ctx.mempool.force_chain_generation(4);
+        ctx.mempool.gateway.force_chain_generation(4);
         let mover = Arc::clone(&ctx);
-        arm_capture_hook(move || mover.mempool.force_chain_generation(6));
+        arm_capture_hook(move || mover.mempool.gateway.force_chain_generation(6));
         let response = route(&ctx, CHECKMEMPOOL_JSON, "", true);
         assert_eq!(response.status, 503);
         assert_eq!(response.body, b"chain generation moved; retry".to_vec());
@@ -2004,7 +2004,7 @@ mod tests {
     #[test]
     fn plain_tip_routes_ignore_mempool_generation() {
         let ctx = Arc::new(Context::new());
-        ctx.mempool.force_chain_generation(3);
+        ctx.mempool.gateway.force_chain_generation(3);
         assert_eq!(route(&ctx, GETUTXOS_JSON, "", true).status, 200);
         assert_eq!(
             route(&ctx, "/rest/deploymentinfo.json", "", true).status,

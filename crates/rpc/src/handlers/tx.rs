@@ -80,7 +80,7 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
     }
 
     {
-        let pool = ctx.mempool.read();
+        let pool = ctx.mempool.gateway.read();
         if let Some(entry) = pool.entry_by_txid(&txid) {
             return render_raw_transaction(ctx, entry.tx.as_ref(), verbose, None);
         }
@@ -169,7 +169,7 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
     let outpoint = OutPoint::new(txid, vout_u32);
 
     if include_mempool {
-        let pool = ctx.mempool.read();
+        let pool = ctx.mempool.gateway.read();
         if pool.is_outpoint_spent(&outpoint) {
             return Ok(Value::new_null());
         }
@@ -442,7 +442,7 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
     )?;
     let txid = tx.txid();
 
-    match context::admit_transaction(&ctx.mempool, &ctx.chain, &tx, max_feerate) {
+    match context::admit_transaction(&ctx.mempool.gateway, &ctx.chain, &tx, max_feerate) {
         Ok(_) => typed_to_sonic(&v31::SendRawTransaction(txid.to_string())),
         Err(AdmissionFailure::Policy(reason)) => Err(reject_reason_to_rpc_error(reason)),
         Err(AdmissionFailure::Consensus) => Err(RpcError::TxRejected(
@@ -494,6 +494,7 @@ pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Va
 
     let facts = ctx
         .mempool
+        .gateway
         .preview_transactions(&txs, max_feerate, &ctx.chain.admission_chain())
         .map_err(|error| match error {
             SubmitError::Policy(reason) => reject_reason_to_rpc_error(reason),
@@ -1016,7 +1017,7 @@ mod tests {
             .clone();
         let txid = coinbase.txid();
         {
-            let mut pool = ctx.mempool.pool().write();
+            let mut pool = ctx.mempool.gateway.pool().write();
             let vsize = u32::try_from(coinbase.vsize())?;
             let entry =
                 MempoolEntry::new(Arc::new(coinbase.clone()), vsize, u64::from(vsize), 0, 0);
@@ -1063,7 +1064,7 @@ mod tests {
             .clone();
         let txid = coinbase.txid();
         {
-            let mut pool = ctx.mempool.pool().write();
+            let mut pool = ctx.mempool.gateway.pool().write();
             let vsize = u32::try_from(coinbase.vsize())?;
             let entry =
                 MempoolEntry::new(Arc::new(coinbase.clone()), vsize, u64::from(vsize), 0, 0);
@@ -1997,7 +1998,7 @@ mod tests {
         // for `release`.
         let (parked_tx, parked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let target = Arc::as_ptr(&ctx.mempool).expose_provenance();
+        let target = Arc::as_ptr(&ctx.mempool.gateway).expose_provenance();
         arm_admission_park(target, parked_tx, release_rx);
 
         let ctx_clone = Arc::clone(&ctx);
@@ -2016,6 +2017,7 @@ mod tests {
         // mempool sequence bumps and the parent's output is available.
         let guard = ctx_clone
             .mempool
+            .gateway
             .begin_chain_change()
             .expect("begin chain change on even generation");
         guard
@@ -2025,6 +2027,7 @@ mod tests {
         let parent_vsize = u32::try_from(parent.vsize()).unwrap_or(u32::MAX);
         ctx_clone
             .mempool
+            .gateway
             .insert_entry(
                 AdmissionOrigin::Rpc,
                 MempoolEntry::new(Arc::new(parent), parent_vsize, 10_000, 0, 1),
@@ -2060,12 +2063,12 @@ mod tests {
 
         // The child must be in the mempool.
         assert!(
-            ctx.mempool.read().contains_txid(&child_txid),
+            ctx.mempool.gateway.read().contains_txid(&child_txid),
             "the child must be pooled after successful retry"
         );
         // The parent must still be in the mempool.
         assert!(
-            ctx.mempool.read().contains_txid(&parent_txid),
+            ctx.mempool.gateway.read().contains_txid(&parent_txid),
             "the parent must remain pooled"
         );
     }
@@ -2201,8 +2204,8 @@ mod acceptance_tests {
         };
 
         assert_eq!(value.as_str(), Some(tx.txid().to_string().as_str()));
-        assert_eq!(ctx.mempool.read().len(), 1, "the pool must hold it");
-        assert!(ctx.mempool.read().contains_txid(&tx.txid()));
+        assert_eq!(ctx.mempool.gateway.read().len(), 1, "the pool must hold it");
+        assert!(ctx.mempool.gateway.read().contains_txid(&tx.txid()));
     }
 
     /// The default fee guard stops a transaction that burns its change.
@@ -2228,7 +2231,11 @@ mod acceptance_tests {
             RpcError::INVALID_PARAMS,
             "max-fee-exceeded is a parameter error: {error:?}"
         );
-        assert_eq!(ctx.mempool.read().len(), 0, "and nothing was admitted");
+        assert_eq!(
+            ctx.mempool.gateway.read().len(),
+            0,
+            "and nothing was admitted"
+        );
     }
 
     /// The guard is the caller's to lift, and the ceiling is a *rate*.
@@ -2245,7 +2252,11 @@ mod acceptance_tests {
             seed_utxo(&ctx, 9, 100_000_000);
             let tx = spending_tx(9, 1_000_000);
             let sent = sendrawtransaction(&ctx, &json!([hex_of(&tx), 0]));
-            assert_eq!(ctx.mempool.read().len(), 1, "zero sends it: {sent:?}");
+            assert_eq!(
+                ctx.mempool.gateway.read().len(),
+                1,
+                "zero sends it: {sent:?}"
+            );
             sent
         };
         assert!(disabled.is_ok(), "{disabled:?}");
@@ -2257,7 +2268,7 @@ mod acceptance_tests {
             .err()
             .unwrap_or_else(|| panic!("0.99 BTC/kvB is a ceiling, not a fee allowance"));
         assert_eq!(error.code(), RpcError::INVALID_PARAMS, "{error:?}");
-        assert_eq!(ctx.mempool.read().len(), 0);
+        assert_eq!(ctx.mempool.gateway.read().len(), 0);
     }
 
     /// A ceiling the transaction stays under changes nothing.
@@ -2271,7 +2282,7 @@ mod acceptance_tests {
         let sent = sendrawtransaction(&ctx, &json!([hex_of(&tx)]));
 
         assert!(sent.is_ok(), "an ordinary fee is not capped: {sent:?}");
-        assert_eq!(ctx.mempool.read().len(), 1);
+        assert_eq!(ctx.mempool.gateway.read().len(), 1);
     }
 
     /// Core's `ParseFeeRate` refuses ceilings at or above one whole coin per
@@ -2287,7 +2298,11 @@ mod acceptance_tests {
             .unwrap_or_else(|| panic!("1 BTC/kvB is not an accepted ceiling"));
 
         assert_eq!(error.code(), RpcError::INVALID_PARAMS, "{error:?}");
-        assert_eq!(ctx.mempool.read().len(), 0, "nothing admitted: {error:?}");
+        assert_eq!(
+            ctx.mempool.gateway.read().len(),
+            0,
+            "nothing admitted: {error:?}"
+        );
     }
 
     /// Missing inputs are Core's `RPC_VERIFY_ERROR` (-25), not the policy
@@ -2307,7 +2322,7 @@ mod acceptance_tests {
             "expected a verify error, got {error:?}"
         );
         assert_eq!(error.code(), RpcError::CORE_VERIFY_ERROR);
-        assert!(ctx.mempool.read().is_empty());
+        assert!(ctx.mempool.gateway.read().is_empty());
     }
 
     /// A transaction with duplicate inputs must be rejected by consensus
@@ -2349,7 +2364,7 @@ mod acceptance_tests {
             matches!(error, RpcError::TxRejected(_)),
             "expected a rejection, got {error:?}"
         );
-        assert!(ctx.mempool.read().is_empty());
+        assert!(ctx.mempool.gateway.read().is_empty());
     }
 
     /// Core rebroadcasts rather than failing, and callers retry on a dropped
@@ -2368,7 +2383,11 @@ mod acceptance_tests {
         };
 
         assert_eq!(first.as_str(), second.as_str());
-        assert_eq!(ctx.mempool.read().len(), 1, "it must not be inserted twice");
+        assert_eq!(
+            ctx.mempool.gateway.read().len(),
+            1,
+            "it must not be inserted twice"
+        );
     }
 
     /// An RBF-evicted transaction is no longer known.
@@ -2393,7 +2412,7 @@ mod acceptance_tests {
             panic!("the RBF-signaling original must be accepted");
         };
         assert!(
-            ctx.mempool.read().contains_txid(&original_txid),
+            ctx.mempool.gateway.read().contains_txid(&original_txid),
             "the original must enter the pool"
         );
 
@@ -2403,11 +2422,14 @@ mod acceptance_tests {
             panic!("the higher-fee replacement must be accepted");
         };
         assert!(
-            !ctx.mempool.read().contains_txid(&original_txid),
+            !ctx.mempool.gateway.read().contains_txid(&original_txid),
             "the original must be swept by the replacement"
         );
         assert!(
-            ctx.mempool.read().contains_txid(&replacement.txid()),
+            ctx.mempool
+                .gateway
+                .read()
+                .contains_txid(&replacement.txid()),
             "the replacement must occupy the pool"
         );
 
@@ -2417,7 +2439,7 @@ mod acceptance_tests {
             "resubmitting the evicted original must re-evaluate, not succeed as already-known: {resent:?}"
         );
         assert!(
-            !ctx.mempool.read().contains_txid(&original_txid),
+            !ctx.mempool.gateway.read().contains_txid(&original_txid),
             "the evicted original must still be absent after the failed retry"
         );
 
@@ -2477,7 +2499,7 @@ mod acceptance_tests {
             "vsize must be the transaction's, not a placeholder"
         );
         assert!(
-            ctx.mempool.read().is_empty(),
+            ctx.mempool.gateway.read().is_empty(),
             "testing acceptance must not accept"
         );
     }
@@ -2633,7 +2655,7 @@ mod acceptance_tests {
             "a tx final only under the header-tip MTP must be rejected; got {result:?}"
         );
         assert_eq!(
-            ctx.mempool.read().len(),
+            ctx.mempool.gateway.read().len(),
             0,
             "rejected tx must not enter the pool"
         );

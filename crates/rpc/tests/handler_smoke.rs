@@ -831,7 +831,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let mut ctx = Context::new();
-        ctx.mining_control = Some(Arc::new(SmokeMiningControl::new()));
+        ctx.mining.mining_control = Some(Arc::new(SmokeMiningControl::new()));
 
         ctx.chain.chain_network = Network::Regtest;
         let tx = tx(1, vec![0x51]);
@@ -878,7 +878,7 @@ impl Fixture {
         let block_hex = hex_encode(&consensus_bytes(&block));
         let txid = ctx.chain.add_transaction(tx.clone());
         let entry = MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7);
-        ctx.mempool.pool().write().insert_entry(entry)?;
+        ctx.mempool.gateway.pool().write().insert_entry(entry)?;
         Ok(Self {
             ctx: Arc::new(ctx),
             tx,

@@ -72,6 +72,7 @@ pub(super) fn get(handler: &Handler, ctx: &Context, path: &str, _query: &str) ->
         ["mempool"] => mempool(&ctx),
         ["mempool", "txids"] => json_response(
             ctx.mempool
+                .gateway
                 .read()
                 .iter_txids()
                 .into_iter()
@@ -311,7 +312,7 @@ pub(super) fn outspend(
     outpoint: OutPoint,
 ) -> Result<Outspend, Response> {
     let ctx = projection.ctx;
-    let pool = ctx.mempool.read();
+    let pool = ctx.mempool.gateway.read();
     if let Some(spender) = pool
         .outpoint_spender(outpoint)
         .map_err(|_| internal("mempool spending index is inconsistent"))?
@@ -490,7 +491,7 @@ fn blocks(ctx: &Context, start_height: Option<u32>) -> Response {
 /// INVARIANT: Count, vsize, total fee and histogram come from one view.
 fn mempool(ctx: &Context) -> Response {
     let (stats, entries) = {
-        let pool = ctx.mempool.read();
+        let pool = ctx.mempool.gateway.read();
         let stats = pool.stats();
         let mut entries = Vec::with_capacity(usize::try_from(stats.txs).unwrap_or(0));
         for entry in pool.iter_entries() {

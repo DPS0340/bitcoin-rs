@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, never, select, tick};
 
+use crate::shutdown;
+
 const STATS_INTERVAL: u64 = 1024;
 
 const SYNC_TICK: Duration = Duration::from_secs(1);
@@ -47,6 +49,7 @@ impl EventLoop {
 
     /// Runs the event loop until a shutdown notification arrives.
     pub fn spin(self, shutdown: &AtomicBool) -> Result<()> {
+        shutdown::mark_draining();
         let mut iterations: u64 = 0;
         let mut sync_ticks: u64 = 0;
         let mut last_progress = Instant::now();
@@ -81,6 +84,7 @@ impl EventLoop {
                 last_progress = now;
             }
         }
+        shutdown::notify_drained();
         Ok(())
     }
 

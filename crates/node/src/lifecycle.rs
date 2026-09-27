@@ -93,12 +93,12 @@ fn bind_rpc(
             rollback_warnings: Some(state.recovery_reporter()),
         },
         mempool: MempoolHandles {
-            mempool: state.mempool_gateway(),
+            gateway: state.mempool_gateway(),
         },
         indexes: IndexHandles {
             derived_index: state.derived_index_query(),
-            esplora_tx_index: None,
             script_index: state.script_index_query(),
+            esplora_tx_index: state.esplora_derived_index_query(),
             derived_index_status: Some(state.derived_index_status()),
         },
         network: NetworkHandles {
@@ -112,22 +112,9 @@ fn bind_rpc(
         mining: MiningHandles {
             mining_control: Some(Arc::clone(mining_control)),
         },
-    })
-    .with_esplora_derived_index(state.esplora_derived_index_query())
-    .with_block_body_source(block_body_source)
-    .with_chain_transition(chainstate.read_fence());
-    if let Some(prune_service) = state.prune_service() {
-        context = context.with_prune_service(prune_service);
-    }
-    context = context
-        .with_chain_control(Arc::new(RpcChainControl {
-            handles: chainstate,
-            followers: state.chain_followers(),
-            sync: state.sync(),
-        }))
-        .with_zmq_publisher(state.zmq_publisher())
-        .with_debug_log_path(state.data_dir().join("debug.log"))
-        .with_rollback_warnings(state.recovery_reporter());
+        zmq_publisher: state.zmq_publisher(),
+        debug_log_path: Some(state.data_dir().join("debug.log")),
+    });
     let context = Arc::new(context);
     let handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::clone(&context)));
     let server = RpcServer::bind(
@@ -223,13 +210,13 @@ pub(crate) struct NodeServices {
 
 impl NodeServices {
     /// Raises shutdown, wakes and joins the event loop, joins core services,
-    /// joins bootstrap/maintenance/signal workers, and only
-    /// then publishes a clean checkpoint. The derived-index worker is
-    /// stopped and joined by the caller before this teardown runs; a
-    /// caller-supplied `first_error` — e.g. an index join abandoned at the
-    /// deadline — seeds the remembered error and suppresses the checkpoint
-    /// just like a cleanup-stage failure. The first
-    /// error is returned after all remaining cleanup stages run.
+    /// drains subsystems, joins bootstrap/maintenance/signal workers, and only
+    /// then publishes a clean checkpoint. The derived-index worker is stopped
+    /// and joined by the caller before this teardown runs; a caller-supplied
+    /// `first_error` — e.g. an index join abandoned at the deadline — seeds
+    /// the remembered error and suppresses the checkpoint just like a
+    /// cleanup-stage failure. The first error is returned after all remaining
+    /// cleanup stages run.
     pub(crate) fn teardown(
         &mut self,
         state: Option<&NodeState>,
@@ -252,6 +239,9 @@ impl NodeServices {
         }
 
         self.join_core_services(state, &mut first_error);
+        // Drain wait is deadline-bounded and never fails; it only bounds how
+        // long teardown parks before joining the remaining workers.
+        shutdown::drain_and_shutdown(DRAIN_DEADLINE);
         self.join_bootstrap_and_signal_workers(state, &mut first_error);
         publish_clean_checkpoint_if_eligible(state, mode, &mut first_error);
         // Owner-local fee-estimator history: the event loop has drained, so
