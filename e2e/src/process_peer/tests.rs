@@ -116,11 +116,20 @@ fn bytes_past_the_deadline_do_not_renew_it() {
     // Wait for the byte to reach the socket so the lapsed deadline pauses on
     // real progress instead of timing out on an empty queue.
     peer.stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_millis(50)))
         .expect("peek timeout");
     let mut one = [0u8; 1];
     let wait_until = Instant::now() + Duration::from_secs(5);
-    while peer.stream.peek(&mut one).expect("peek") == 0 {
+    loop {
+        match peer.stream.peek(&mut one) {
+            Ok(1) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            result => panic!("the test byte was not delivered cleanly: {result:?}"),
+        }
         assert!(Instant::now() < wait_until, "the byte never arrived");
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -150,7 +159,17 @@ fn a_paused_frame_resumes_from_where_it_stopped() {
         .expect("peek timeout");
     let mut ten = [0u8; 10];
     let wait_until = Instant::now() + Duration::from_secs(5);
-    while !matches!(peer.stream.peek(&mut ten), Ok(10)) {
+    loop {
+        match peer.stream.peek(&mut ten) {
+            Ok(10) => break,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("peek failed: {error}"),
+        }
         assert!(
             Instant::now() < wait_until,
             "the header bytes never arrived"
