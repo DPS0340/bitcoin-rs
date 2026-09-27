@@ -42,7 +42,7 @@ fn torn_disconnect_replays_parent_tip() -> Result<()> {
     assert_eq!(
         state
             .chainstate()
-            .applied_tip_handle()
+            .applied_tip()
             .load_full()
             .map(|tip| (tip.hash, tip.height)),
         Some((Hash256::from(genesis.block_hash()), 0)),
@@ -66,7 +66,7 @@ fn torn_disconnect_cold_replays_head() -> Result<()> {
     assert_eq!(
         state
             .chainstate()
-            .applied_tip_handle()
+            .applied_tip()
             .load_full()
             .map(|tip| (tip.hash, tip.height)),
         Some((Hash256::from(block1.block_hash()), 1)),
@@ -95,7 +95,7 @@ fn torn_disconnect_checkpoint_above_head_rewinds_to_head() -> Result<()> {
     assert_eq!(
         state
             .chainstate()
-            .applied_tip_handle()
+            .applied_tip()
             .load_full()
             .map(|tip| (tip.hash, tip.height)),
         landed,
@@ -132,7 +132,7 @@ fn torn_disconnect_checkpoint_above_head_rewinds_to_head() -> Result<()> {
     assert_eq!(
         reopened
             .chainstate()
-            .applied_tip_handle()
+            .applied_tip()
             .load_full()
             .map(|tip| (tip.hash, tip.height)),
         landed,
@@ -184,7 +184,7 @@ fn checkpoint_fallback_replays_wide_gap_to_durable_head() -> Result<()> {
     let state = NodeState::open(config, None)?;
     let landed = state
         .chainstate()
-        .applied_tip_handle()
+        .applied_tip()
         .load_full()
         .context("recovery must publish a tip")?;
     assert_eq!(landed.hash, Hash256::from(parent));

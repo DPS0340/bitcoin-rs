@@ -431,8 +431,17 @@ fn branch_hashes(
 /// INVARIANT: the log is mutable without transition exclusion — a reorg
 ///   displaces its records — so a prefix that no longer matches the selected
 ///   branch is reported as unknown rather than as a chain total.
-fn log_prefix_count(log: &BlockLog, branch: &[Hash256], height: u32) -> Option<u64> {
+fn log_prefix_count(
+    log: &BlockLog,
+    tree: &bitcoin_rs_chain::BlockTree,
+    branch_tip: bitcoin_rs_chain::NodeId,
+    branch: &OnceCell<Option<Vec<Hash256>>>,
+    height: u32,
+) -> Option<u64> {
     let total = cumulative_tx_count_through(log, height)?;
+    let branch = branch
+        .get_or_init(|| branch_hashes(tree, branch_tip))
+        .as_deref()?;
     let records: &[BlockRecord] = log;
     for record in &records[..records.partition_point(|candidate| candidate.height <= height)] {
         let index = usize::try_from(record.height).ok()?;
@@ -473,10 +482,7 @@ fn count_through(
         return Some(count);
     }
     let log = ctx.chain.blocks.read();
-    let branch = branch
-        .get_or_init(|| branch_hashes(tree, node_id))
-        .as_deref()?;
-    log_prefix_count(&log, branch, node.height)
+    log_prefix_count(&log, tree, node_id, branch, node.height)
 }
 
 /// Transactions inside the window, from one source for both ends.
@@ -501,11 +507,8 @@ fn window_tx_count_between(
         return Some(end_count.saturating_sub(start_count));
     }
     let log = ctx.chain.blocks.read();
-    let branch = branch
-        .get_or_init(|| branch_hashes(tree, end_id))
-        .as_deref()?;
-    let end_count = log_prefix_count(&log, branch, end.height)?;
-    let start_count = log_prefix_count(&log, branch, start.height)?;
+    let end_count = log_prefix_count(&log, tree, end_id, branch, end.height)?;
+    let start_count = log_prefix_count(&log, tree, end_id, branch, start.height)?;
     Some(end_count.saturating_sub(start_count))
 }
 
