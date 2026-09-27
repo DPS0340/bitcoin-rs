@@ -90,6 +90,35 @@ pub(super) fn outranks(current: SyncPeer, candidate: SyncPeer) -> bool {
     candidate.best_known_height > current.best_known_height
 }
 
+/// Fallback, single deep peer: the highest peer that may serve block bodies
+/// and that the window does not currently soft-block (expired pendings /
+/// staller cooldown) fills the window; a soft-blocked peer serves only as
+/// the last resort when no alternative exists. Without the preference, a
+/// disconnected staller that reconnects with an inflated demonstrated
+/// best-known height would out-sort every honest peer and re-acquire the
+/// window front (RE-ADV-2 / first-audit ADV-2).
+fn fallback_request_peer(
+    candidates: &[FanoutCandidate],
+    request_peer_limit: usize,
+) -> Vec<SyncPeer> {
+    let mut preferred: Option<SyncPeer> = None;
+    let servers: Vec<&FanoutCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.serves_bodies)
+        .collect();
+    let allow_soft = servers.iter().all(|candidate| candidate.soft_blocked);
+    for candidate in servers
+        .iter()
+        .filter(|candidate| allow_soft || !candidate.soft_blocked)
+    {
+        // First-wins on equal heights, matching the header-peer fold.
+        if preferred.is_none_or(|current| outranks(current, candidate.peer)) {
+            preferred = Some(candidate.peer);
+        }
+    }
+    preferred.into_iter().take(request_peer_limit).collect()
+}
+
 /// Height of the deepest active-chain node that is an ancestor of `hash` —
 /// `hash`'s own height when it is on the active chain, `None` only when
 /// `hash` is unknown to the tree. A demonstrated tip implies capability for
@@ -611,30 +640,7 @@ impl BlockSync {
                 .map(|candidate| candidate.peer)
                 .collect()
         } else {
-            // Fallback, single deep peer: the highest peer that may serve
-            // block bodies and that the window does not currently soft-block
-            // (expired pendings / staller cooldown) fills the window; a
-            // soft-blocked peer serves only as the last resort when no
-            // alternative exists. Without the preference, a disconnected
-            // staller that reconnects with an inflated demonstrated
-            // best-known height would out-sort every honest peer and
-            // re-acquire the window front (RE-ADV-2 / first-audit ADV-2).
-            let mut preferred: Option<SyncPeer> = None;
-            let servers: Vec<&FanoutCandidate> = candidates
-                .iter()
-                .filter(|candidate| candidate.serves_bodies)
-                .collect();
-            let allow_soft = servers.iter().all(|candidate| candidate.soft_blocked);
-            for candidate in servers
-                .iter()
-                .filter(|candidate| allow_soft || !candidate.soft_blocked)
-            {
-                // First-wins on equal heights, matching the header-peer fold.
-                if preferred.is_none_or(|current| outranks(current, candidate.peer)) {
-                    preferred = Some(candidate.peer);
-                }
-            }
-            preferred.into_iter().take(request_peer_limit).collect()
+            fallback_request_peer(&candidates, request_peer_limit)
         };
         if request_peers.len() > 1 {
             request_peers.sort_by_key(|peer| std::cmp::Reverse(peer.best_known_height));
