@@ -295,8 +295,8 @@ fn getblockchaininfo_surfaces_published_chainwork_hex() -> Result<(), Box<dyn st
         chainwork: ChainWork::from_be_bytes([0x11; 32]),
         chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
     };
-    ctx.set_chain_tip(tip.clone());
-    ctx.set_applied_tip(tip);
+    ctx.chain.chain_tip.store(Some(Arc::new(tip.clone())));
+    ctx.chain.applied_tip.store(Some(Arc::new(tip)));
     let handler = Handler::new(Arc::clone(&ctx));
     let result = handler.dispatch("getblockchaininfo", &json!([]))?;
     let chainwork = result
@@ -565,8 +565,8 @@ fn chain_rpcs_report_applied_tip_separately_from_headers() -> Result<(), Box<dyn
         chainwork: ChainWork::default(),
         chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
     };
-    ctx.set_chain_tip(headers_tip);
-    ctx.set_applied_tip(applied_tip);
+    ctx.chain.chain_tip.store(Some(Arc::new(headers_tip)));
+    ctx.chain.applied_tip.store(Some(Arc::new(applied_tip)));
     let handler = Handler::new(Arc::clone(&ctx));
     let result = handler.dispatch("getblockchaininfo", &json!([]))?;
     assert_eq!(
@@ -860,8 +860,8 @@ impl Fixture {
             .expect("fixture tip missing")
             .as_ref()
             .clone();
-        ctx.set_chain_tip(tip.clone());
-        ctx.set_applied_tip(tip);
+        ctx.chain.chain_tip.store(Some(Arc::new(tip.clone())));
+        ctx.chain.applied_tip.store(Some(Arc::new(tip)));
         ctx.chain.block_body_source = Some(Arc::new(SingleBlockSource {
             height: 7,
             hash: block_hash,

@@ -4,7 +4,7 @@
 //! acts on it. The node supplies chain read/query and inbound event sinks, but
 //! does not construct listener, dial, DNS, or fixed-peer workers itself.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -42,6 +42,11 @@ const DEFAULT_INBOUND_BLOCK_QUEUE_LIMIT: usize = 256;
 const DEFAULT_MAX_PEER_CONNECTIONS: usize = 200;
 
 const FAILED_ADDR_BACKOFF: Duration = Duration::from_mins(1);
+
+/// How many capacity-blocked automatic dials the drain worker holds for
+/// retry. Comfortably above any reachable slot count, so a saturated cap
+/// cannot let the parked backlog grow without limit.
+const MAX_PARKED_DIALS: usize = 64;
 
 const DNS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -346,15 +351,16 @@ impl P2pService {
             listeners.push(handle);
         }
 
+        let dns_queue = Arc::new(Mutex::new(DnsQueueState::default()));
         let dial_allowance = shared.block_sync.clone();
-        let outbound = match self.spawn_outbound_worker(shared) {
+        let outbound = match self.spawn_outbound_worker(shared, Arc::clone(&dns_queue)) {
             Ok(handle) => handle,
             Err(error) => {
                 self.rollback_startup(listeners, None);
                 return Err(error.into());
             }
         };
-        let bootstrap = match self.spawn_bootstrap_worker(dial_allowance) {
+        let bootstrap = match self.spawn_bootstrap_worker(dial_allowance, dns_queue) {
             Ok(handle) => handle,
             Err(error) => {
                 self.rollback_startup(listeners, Some(outbound));
@@ -390,6 +396,7 @@ impl P2pService {
     fn spawn_outbound_worker(
         &self,
         shared: crate::listener::ConnectionShared,
+        dns_queue: Arc<Mutex<DnsQueueState>>,
     ) -> Result<JoinHandle<()>, io::Error> {
         let outbound_rx = Arc::clone(&self.outbound_rx);
         let peer_table = Arc::clone(&self.peer_table);
@@ -400,7 +407,11 @@ impl P2pService {
         thread::Builder::new()
             .name("bitcoin-rs-p2p-outbound-drain".to_owned())
             .spawn(move || {
-                let mut active: HashMap<SocketAddr, crate::peer_info::PeerRole> = HashMap::new();
+                let mut active: HashMap<SocketAddr, crate::peer_info::PeerRole> =
+                    HashMap::new();
+                // Automatic dials that arrived while the automatic cap was
+                // full, retried in order once a slot opens.
+                let mut parked: VecDeque<OutboundDial> = VecDeque::new();
                 let mut handles = Vec::new();
                 let mut next_extra_peer_check = Instant::now() + EXTRA_PEER_CHECK_INTERVAL;
                 while !shutdown.load(Ordering::Acquire)
@@ -425,13 +436,33 @@ impl P2pService {
                         .block_sync
                         .as_ref()
                         .is_some_and(|sync| sync.allow_extra_full_relay_dial());
-                    // A stale tip raises the total cap by one, so the extra
-                    // full-relay peer can form beside a full slot set: Core
-                    // opens it on top of both populations
-                    // (`net.cpp:2786-2806`).
-                    if active.len() >= active_limit + usize::from(extra_dial) {
-                        thread::sleep(Duration::from_millis(100));
-                        continue;
+                    // Manual dials bypass admission, but every active
+                    // outbound connection occupies a full-relay slot for
+                    // later automatic dials, matching Core's
+                    // `nOutboundFullRelay` census (`net_processing.cpp:5558-5604`).
+                    // Automatic dials at capacity are parked and retried
+                    // once a slot opens. When the parked queue is full, the
+                    // request is shed and its DNS backoff is cleared so the
+                    // resolver can retry an address that was never dialed.
+                    // A stale tip raises the cap by one so an extra
+                    // full-relay peer can form beside a full slot set.
+                    let cap = active_limit + usize::from(extra_dial);
+                    while let Some(&dial) = parked.front() {
+                        if active.len() >= cap {
+                            break;
+                        }
+                        parked.pop_front();
+                        clear_pending_auto_dial(&dns_queue, dial);
+                        spawn_outbound_dial(
+                            &dial,
+                            &shared,
+                            &peer_table,
+                            &mut active,
+                            &mut handles,
+                            full_relay_slots,
+                            block_relay_slots,
+                            extra_dial,
+                        );
                     }
                     let received = outbound_rx.lock().recv_timeout(Duration::from_secs(1));
                     let Ok(dial) = received else {
@@ -443,32 +474,26 @@ impl P2pService {
                         }
                         continue;
                     };
-                    if active.contains_key(&dial.addr) || peer_table.is_connected(dial.addr) {
-                        tracing::debug!(
-                            addr = %dial.addr,
-                            "p2p outbound request skipped: already active"
-                        );
+                    if !dial.manual && active.len() >= cap {
+                        if !park_automatic_dial(&mut parked, dial, &dns_queue) {
+                            tracing::warn!(
+                                peer_addr = %dial.addr,
+                                "p2p outbound request shed: parked automatic queue full; DNS backoff cleared"
+                            );
+                        }
                         continue;
                     }
-                    let role = dial_outbound_role(
+                    clear_pending_auto_dial(&dns_queue, dial);
+                    spawn_outbound_dial(
                         &dial,
+                        &shared,
                         &peer_table,
-                        &active,
+                        &mut active,
+                        &mut handles,
                         full_relay_slots,
                         block_relay_slots,
                         extra_dial,
                     );
-                    let handle = if dial.manual {
-                        crate::listener::spawn_pinned_outbound_connection(
-                            dial.addr,
-                            shared.clone(),
-                            role,
-                        )
-                    } else {
-                        crate::listener::spawn_outbound_connection(dial.addr, shared.clone(), role)
-                    };
-                    active.insert(dial.addr, role);
-                    handles.push((dial.addr, handle));
                 }
                 for (_, handle) in handles {
                     let _ = handle.join();
@@ -479,6 +504,7 @@ impl P2pService {
     fn spawn_bootstrap_worker(
         &self,
         block_sync: Option<Arc<crate::sync::BlockSync>>,
+        dns_queue: Arc<Mutex<DnsQueueState>>,
     ) -> Result<Option<JoinHandle<()>>, io::Error> {
         if !self.config.fixed_peers.is_empty() {
             let shutdown = Arc::clone(&self.worker_shutdown);
@@ -510,20 +536,20 @@ impl P2pService {
         let port = self.config.dns_port;
         let seeds = self.config.dns_seeds.clone();
         let target = self.config.total_outbound_active_limit();
+        let maintenance = DnsPeerMaintenance {
+            shutdown,
+            network_active,
+            peer_table,
+            outbound_tx,
+            port,
+            seeds,
+            target,
+            block_sync,
+            dns_queue,
+        };
         thread::Builder::new()
             .name("bitcoin-rs-dns-maintenance".to_owned())
-            .spawn(move || {
-                run_dns_peer_maintenance(
-                    shutdown,
-                    network_active,
-                    peer_table,
-                    outbound_tx,
-                    port,
-                    seeds,
-                    target,
-                    block_sync,
-                );
-            })
+            .spawn(move || run_dns_peer_maintenance(maintenance))
             .map(Some)
     }
 
@@ -886,6 +912,42 @@ fn dial_outbound_role(
     )
 }
 
+/// Starts one accepted dial: skips addresses already running or connected,
+/// picks the relay role, and records the in-flight attempt.
+fn spawn_outbound_dial(
+    dial: &OutboundDial,
+    shared: &crate::listener::ConnectionShared,
+    peer_table: &crate::PeerTable,
+    active: &mut HashMap<SocketAddr, crate::peer_info::PeerRole>,
+    handles: &mut Vec<(SocketAddr, JoinHandle<Result<(), crate::PeerError>>)>,
+    full_relay_slots: usize,
+    block_relay_slots: usize,
+    extra_dial: bool,
+) {
+    if active.contains_key(&dial.addr) || peer_table.is_connected(dial.addr) {
+        tracing::debug!(
+            addr = %dial.addr,
+            "p2p outbound request skipped: already active"
+        );
+        return;
+    }
+    let role = dial_outbound_role(
+        dial,
+        peer_table,
+        active,
+        full_relay_slots,
+        block_relay_slots,
+        extra_dial,
+    );
+    let handle = if dial.manual {
+        crate::listener::spawn_pinned_outbound_connection(dial.addr, shared.clone(), role)
+    } else {
+        crate::listener::spawn_outbound_connection(dial.addr, shared.clone(), role)
+    };
+    active.insert(dial.addr, role);
+    handles.push((dial.addr, handle));
+}
+
 /// Chooses the relay role of the next outbound connection.
 ///
 /// PRE: `peer_table` holds the live connections of the current epoch,
@@ -997,20 +1059,20 @@ fn retire_extra_full_relay_connection(
 ///   answers whether a candidate's body download is in flight, read from the
 ///   same window the scheduler fetches with.
 /// POST: return `None` while the table holds no more than `slots` such
-///   connections; otherwise return the newest automatic one in the excess
-///   slice past `slots` that is old enough to be judged and has no body
-///   download in flight.
+///   connections; otherwise return the newest automatic one among the newest
+///   `excess` non-pinned connections that is old enough to be judged and has
+///   no body download in flight.
 /// INVARIANT: a connection that never finished its handshake still holds a
 ///   slot, so it counts, but a hand-pinned one is never the victim: Core's
 ///   `EvictExtraOutboundPeers` looks only at `IsFullOutboundConn()` and
 ///   `IsBlockOnlyConn()`, neither of which includes
-///   `ConnectionType::MANUAL` (`net_processing.cpp:5558-5604`). The victim
-///   comes only from the excess slice, so a young extra connection can
-///   never divert retirement onto an in-slot peer, and a candidate with
+///   `ConnectionType::MANUAL` (`net_processing.cpp:5558-5604`). Pinned peers
+///   do not consume the victim budget either — a pinned tail still displaces
+///   the newest evictable automatic beneath it — while a candidate with
 ///   blocks in flight is passed over, as Core's rule does
 ///   (`net_processing.cpp:5604-5668`).
 ///   `PeerTable::sessions` is ordered by connection identity, which is dial
-///   order, so the newest is last and the excess slice is the tail.
+///   order, so the newest is last and the excess is taken from the tail.
 fn newest_excess_full_relay(
     peer_table: &crate::PeerTable,
     slots: usize,
@@ -1036,18 +1098,23 @@ fn newest_excess_full_relay(
     sessions
         .iter()
         .rev()
+        .filter(|session| !session.lease.is_manual())
         .take(excess)
         .find(|session| {
-            !session.lease.is_manual()
-                && now.saturating_duration_since(session.lease.connected_at())
-                    >= crate::download_window::MINIMUM_CONNECT_TIME
+            now.saturating_duration_since(session.lease.connected_at())
+                >= crate::download_window::MINIMUM_CONNECT_TIME
                 && !is_downloading(session.lease.source(session.addr))
         })
         .cloned()
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn run_dns_peer_maintenance(
+#[derive(Default)]
+struct DnsQueueState {
+    recently_queued: HashMap<SocketAddr, Instant>,
+    pending: HashSet<SocketAddr>,
+}
+
+struct DnsPeerMaintenance {
     shutdown: Arc<AtomicBool>,
     network_active: Arc<AtomicBool>,
     peer_table: Arc<crate::PeerTable>,
@@ -1056,10 +1123,56 @@ fn run_dns_peer_maintenance(
     seeds: Vec<String>,
     target: usize,
     block_sync: Option<Arc<crate::sync::BlockSync>>,
+    dns_queue: Arc<Mutex<DnsQueueState>>,
+}
+
+/// Parks one automatic dial, or sheds it when the bounded retry queue is full.
+fn park_automatic_dial(
+    parked: &mut VecDeque<OutboundDial>,
+    dial: OutboundDial,
+    dns_queue: &Mutex<DnsQueueState>,
+) -> bool {
+    if parked.len() >= MAX_PARKED_DIALS {
+        let mut queue = dns_queue.lock();
+        if queue.pending.remove(&dial.addr) {
+            let _ = queue.recently_queued.remove(&dial.addr);
+        }
+        return false;
+    }
+    parked.push_back(dial);
+    true
+}
+
+/// Releases a DNS-pending address when its dial leaves the retry queue,
+/// re-arming the one-minute suppression: a dial parked longer than
+/// `FAILED_ADDR_BACKOFF` has already expired from `recently_queued`, so
+/// clearing `pending` alone would let the next DNS pass re-offer an
+/// address whose connection attempt is still in flight.
+fn clear_pending_auto_dial(dns_queue: &Mutex<DnsQueueState>, dial: OutboundDial) {
+    if !dial.manual {
+        let mut queue = dns_queue.lock();
+        if queue.pending.remove(&dial.addr) {
+            queue.recently_queued.insert(dial.addr, Instant::now());
+        }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_dns_peer_maintenance(
+    DnsPeerMaintenance {
+        shutdown,
+        network_active,
+        peer_table,
+        outbound_tx,
+        port,
+        seeds,
+        target,
+        block_sync,
+        dns_queue,
+    }: DnsPeerMaintenance,
 ) {
     let resolver = crate::SystemDnsResolver::new(port);
     let seeds: Vec<&str> = seeds.iter().map(String::as_str).collect();
-    let mut failed_backoff = HashMap::new();
     let mut cursor = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -1072,7 +1185,7 @@ fn run_dns_peer_maintenance(
         &network_active,
         &peer_table,
         &outbound_tx,
-        &mut failed_backoff,
+        &dns_queue,
         cursor,
         target,
     );
@@ -1118,7 +1231,7 @@ fn run_dns_peer_maintenance(
             &network_active,
             &peer_table,
             &outbound_tx,
-            &mut failed_backoff,
+            &dns_queue,
             cursor,
             needed,
         );
@@ -1140,7 +1253,7 @@ fn drain_dns_peer_deficit<R>(
     network_active: &AtomicBool,
     peer_table: &crate::PeerTable,
     outbound_tx: &Sender<OutboundDial>,
-    recently_queued: &mut HashMap<SocketAddr, Instant>,
+    dns_queue: &Mutex<DnsQueueState>,
     cursor: usize,
     needed: usize,
 ) -> usize
@@ -1151,7 +1264,10 @@ where
         return 0;
     }
     let now = Instant::now();
-    recently_queued.retain(|_, queued_at| now.duration_since(*queued_at) < FAILED_ADDR_BACKOFF);
+    dns_queue
+        .lock()
+        .recently_queued
+        .retain(|_, queued_at| now.duration_since(*queued_at) < FAILED_ADDR_BACKOFF);
     let mut queued = 0;
     let mut seen = HashSet::new();
     'seeds: for offset in 0..seeds.len() {
@@ -1168,15 +1284,17 @@ where
             addresses.rotate_left(offset);
         }
         for addr in addresses {
-            if !seen.insert(addr)
-                || peer_table.is_connected(addr)
-                || recently_queued.contains_key(&addr)
-            {
+            if !seen.insert(addr) || peer_table.is_connected(addr) {
+                continue;
+            }
+            let mut queue = dns_queue.lock();
+            if queue.pending.contains(&addr) || queue.recently_queued.contains_key(&addr) {
                 continue;
             }
             match outbound_tx.try_send(OutboundDial::auto(addr)) {
                 Ok(()) => {
-                    recently_queued.insert(addr, now);
+                    queue.recently_queued.insert(addr, now);
+                    queue.pending.insert(addr);
                     queued += 1;
                     if queued >= needed {
                         break 'seeds;
@@ -1197,6 +1315,15 @@ mod tests {
 
     fn idle_ready() -> Arc<dyn Fn(PeerSource) + Send + Sync> {
         Arc::new(|_source: PeerSource| {})
+    }
+
+    /// Every DNS lookup answers with this single address.
+    struct OneAddrResolver(SocketAddr);
+
+    impl crate::DnsResolver for OneAddrResolver {
+        fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
+            Ok(vec![self.0])
+        }
     }
 
     #[test]
@@ -1249,6 +1376,92 @@ mod tests {
     }
 
     #[test]
+    fn active_manual_dial_occupies_an_automatic_slot() {
+        fn accept_for(listener: &TcpListener, timeout: Duration) -> Option<std::net::TcpStream> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return Some(stream),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+        }
+
+        let manual_listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("manual listener");
+        manual_listener
+            .set_nonblocking(true)
+            .expect("nonblocking manual listener");
+        let automatic_listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("auto listener");
+        automatic_listener
+            .set_nonblocking(true)
+            .expect("nonblocking auto listener");
+
+        let service = P2pService::new(
+            P2pServiceConfig {
+                listen_addrs: Vec::new(),
+                dns_seeds: Vec::new(),
+                outbound_full_relay_slots: 1,
+                outbound_block_relay_slots: 0,
+                ..P2pServiceConfig::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        service
+            .start(
+                None,
+                None,
+                &idle_ready(),
+                crate::listener::ListenerExtras::default(),
+            )
+            .expect("service starts");
+        service
+            .add_node(manual_listener.local_addr().expect("manual address"), false)
+            .expect("manual dial queued");
+
+        let manual_connection =
+            accept_for(&manual_listener, Duration::from_secs(5)).expect("manual dial starts");
+        service
+            .outbound_sender()
+            .send(OutboundDial::auto(
+                automatic_listener.local_addr().expect("automatic address"),
+            ))
+            .expect("automatic dial queued");
+
+        let automatic_before_release = accept_for(&automatic_listener, Duration::from_secs(1));
+        drop(manual_connection);
+        let automatic_after_release = if automatic_before_release.is_none() {
+            accept_for(&automatic_listener, Duration::from_secs(5))
+        } else {
+            None
+        };
+        let connected_too_early = automatic_before_release.is_some();
+        let automatic_resumed = automatic_after_release.is_some();
+
+        drop(automatic_before_release);
+        drop(automatic_after_release);
+        service.shutdown();
+        service.join().expect("service joins");
+
+        assert!(
+            !connected_too_early,
+            "an active manual connection must occupy the configured outbound slot"
+        );
+        assert!(
+            automatic_resumed,
+            "the queued automatic dial starts after the manual connection leaves"
+        );
+    }
+
+    #[test]
     fn apply_network_active_cancels_leases_only_when_disabled() {
         let table = crate::PeerTable::new();
         let (tx, _rx) = crossbeam_channel::unbounded();
@@ -1271,17 +1484,6 @@ mod tests {
         // drain cannot skip it as already connected.
         const REPLACEMENT_PORT: u16 = 9;
 
-        struct OneAddrResolver;
-
-        impl crate::DnsResolver for OneAddrResolver {
-            fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
-                Ok(vec![SocketAddr::from((
-                    Ipv4Addr::LOCALHOST,
-                    REPLACEMENT_PORT,
-                ))])
-            }
-        }
-
         let table = crate::PeerTable::new();
         let (tx, _rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(tx);
@@ -1299,14 +1501,14 @@ mod tests {
         // maintenance sees the full deficit instead of a satisfied target.
         let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
         let active = AtomicBool::new(true);
-        let mut recently_queued = HashMap::new();
+        let dns_queue = Mutex::new(DnsQueueState::default());
         let queued = drain_dns_peer_deficit(
-            &OneAddrResolver,
+            &OneAddrResolver(SocketAddr::from((Ipv4Addr::LOCALHOST, REPLACEMENT_PORT))),
             &["seed.example"],
             &active,
             &table,
             &outbound_tx,
-            &mut recently_queued,
+            &dns_queue,
             0,
             DEFAULT_OUTBOUND_FULL_RELAY_SLOTS + DEFAULT_OUTBOUND_BLOCK_RELAY_SLOTS,
         );
@@ -1317,6 +1519,108 @@ mod tests {
                 Ipv4Addr::LOCALHOST,
                 REPLACEMENT_PORT,
             )))),
+        );
+    }
+
+    #[test]
+    fn parked_dial_overflow_releases_dns_backoff_for_retry() {
+        let table = crate::PeerTable::new();
+        let active = AtomicBool::new(true);
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 65));
+        let now = Instant::now();
+        let parked_limit = u16::try_from(MAX_PARKED_DIALS).expect("parked limit fits a port");
+        let mut parked: VecDeque<OutboundDial> = (1..=parked_limit)
+            .map(|port| OutboundDial::auto(SocketAddr::from((Ipv4Addr::LOCALHOST, port))))
+            .collect();
+        let dns_queue = Mutex::new(DnsQueueState::default());
+        {
+            let mut queue = dns_queue.lock();
+            queue.recently_queued.insert(address, now);
+            queue.pending.insert(address);
+        }
+
+        assert!(!park_automatic_dial(
+            &mut parked,
+            OutboundDial::auto(address),
+            &dns_queue
+        ));
+        assert!(
+            !dns_queue.lock().recently_queued.contains_key(&address),
+            "a shed dial must not retain the 60-second DNS backoff"
+        );
+        assert!(
+            !dns_queue.lock().pending.contains(&address),
+            "a shed dial must leave the pending-address set"
+        );
+
+        let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(1);
+        assert_eq!(
+            drain_dns_peer_deficit(
+                &OneAddrResolver(address),
+                &["seed.example"],
+                &active,
+                &table,
+                &outbound_tx,
+                &dns_queue,
+                0,
+                1,
+            ),
+            1,
+            "the address can be queued again immediately instead of waiting 60 seconds"
+        );
+        assert_eq!(
+            outbound_rx.try_recv().ok(),
+            Some(OutboundDial::auto(address))
+        );
+    }
+
+    #[test]
+    fn release_after_park_rearms_dns_backoff() {
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 66));
+        let expired_at = Instant::now()
+            .checked_sub(FAILED_ADDR_BACKOFF + Duration::from_secs(1))
+            .expect("test clock is past the DNS backoff");
+        let dns_queue = Mutex::new(DnsQueueState::default());
+        {
+            let mut queue = dns_queue.lock();
+            queue.recently_queued.insert(address, expired_at);
+            queue.pending.insert(address);
+        }
+        clear_pending_auto_dial(&dns_queue, OutboundDial::auto(address));
+
+        let table = crate::PeerTable::new();
+        let active = AtomicBool::new(true);
+        let (outbound_tx, outbound_rx) = crossbeam_channel::bounded(1);
+        assert_eq!(
+            drain_dns_peer_deficit(
+                &OneAddrResolver(address),
+                &["seed.example"],
+                &active,
+                &table,
+                &outbound_tx,
+                &dns_queue,
+                0,
+                1,
+            ),
+            0,
+            "release re-arms suppression for the new connection attempt"
+        );
+        assert!(
+            matches!(
+                outbound_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "a still-suppressed address must not be enqueued again"
+        );
+        let rearmed_at = dns_queue
+            .lock()
+            .recently_queued
+            .get(&address)
+            .copied()
+            .expect("release records the new suppression time");
+        assert!(
+            Instant::now().duration_since(rearmed_at) < FAILED_ADDR_BACKOFF,
+            "the connection attempt receives a fresh one-minute suppression"
         );
     }
 
@@ -1595,6 +1899,48 @@ mod tests {
                 .addr,
             addr(4),
             "the same peer is the victim once its download completes"
+        );
+    }
+
+    /// A pinned peer that connects on top of a full automatic set occupies
+    /// the only excess position, so position alone cannot name a victim:
+    /// the newest automatic connection beneath the pinned tail is retired,
+    /// matching `p2p-compatibility.md`'s rule that the pin counts toward
+    /// the slot total while never being the victim itself.
+    #[test]
+    fn a_pinned_tail_displaces_the_newest_automatic_peer() {
+        use crate::connection::PeerLease;
+        use crate::download_window::MINIMUM_CONNECT_TIME;
+        use crate::peer_info::PeerRole;
+
+        fn addr(port: u16) -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+
+        let now = Instant::now();
+        let aged = now
+            .checked_sub(MINIMUM_CONNECT_TIME)
+            .expect("test clock is past the minimum connect time");
+        let table = crate::PeerTable::new();
+
+        // The automatic set fills both slots before the operator's dial.
+        for port in 1..=2_u16 {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let mut lease = PeerLease::new(tx);
+            lease.backdate_for_test(aged);
+            table.register(addr(port), lease);
+        }
+        let (pinned_tx, _pinned_rx) = crossbeam_channel::unbounded();
+        let mut pinned_lease = PeerLease::new_manual(pinned_tx, PeerRole::FullRelay);
+        pinned_lease.backdate_for_test(aged);
+        table.register(addr(3), pinned_lease);
+
+        assert_eq!(
+            newest_excess_full_relay(&table, 2, now, |_| false)
+                .expect("a full set plus a pinned peer is one connection over")
+                .addr,
+            addr(2),
+            "the pinned tail is unevictable, so the newest automatic peer is displaced"
         );
     }
 }

@@ -19,11 +19,10 @@ use std::net::SocketAddr;
 
 use super::behavior_5::deliver_headers;
 use super::behavior_5::next_locator;
-use bitcoin_rs_primitives::{Hash256, HeadersSyncParams};
+use bitcoin_rs_primitives::Hash256;
 
 use super::super::SyncBudget;
 use super::super::default_sync_budget;
-use super::super::headers_presync::HeaderAnchor;
 use super::super::headers_presync::HeadersSyncPhase;
 use super::super::headers_presync::HeadersSyncState;
 use super::*;
@@ -369,6 +368,21 @@ fn a_substituted_redownload_header_disconnects_the_connection()
     }
     let mut substituted = chain;
     substituted[commitment_index - 1] = rogue;
+    // Re-anchor the tail so only the salted commitment can fail: without
+    // this, `substituted[commitment_index]` still chains to the replaced
+    // header's hash and the asserted punishment is reachable on the bare
+    // continuity break alone.
+    for index in commitment_index..chain_len {
+        let mut header = substituted[index];
+        header.prev_blockhash = substituted[index - 1].compute_hash();
+        while !pow_met(
+            header.bits.to_consensus(),
+            Hash256::from(header.compute_hash()),
+        ) {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        substituted[index] = header;
+    }
 
     deliver_headers(&inbound_headers_tx, substituted, source)?;
     sync.tick();
@@ -593,54 +607,90 @@ fn a_forwarded_body_header_leaves_the_live_sync_state_alone()
     Ok(())
 }
 
-/// A released prefix that admission refuses must not be lost: the caller
-/// returns it to the live state, and the next page's release emits that
-/// same prefix again — in order — before anything buffered behind it.
-#[test]
-fn a_refused_release_reemits_on_the_next_pop() -> Result<(), Box<dyn std::error::Error>> {
+/// [`presync_fixture`] over a chain whose admission is always refused:
+/// the released prefix lands on the paused-admission path.
+fn presync_fixture_refusing(
+    minimum_work: ChainWork,
+) -> Result<PresyncFixture, Box<dyn std::error::Error>> {
+    let mut tree = BlockTree::new();
     let genesis = genesis_header();
-    let anchor = HeaderAnchor {
-        network: Network::Regtest,
-        height: 0,
-        hash: Hash256::from(genesis.compute_hash()),
-        header: genesis,
-        chain_work: ChainWork::ZERO,
-        median_time_past: genesis.time,
-        locator: Vec::new(),
-    };
-    // Small fixtures: a commitment every other header and a four-deep
-    // buffer, so a handful of mined pages exercise a mid-sync release.
-    let params = HeadersSyncParams {
-        commitment_period: 2,
-        redownload_buffer_size: 4,
-    };
-    let chain = chain_on(&genesis, 0, 12);
-    let floor = chain_work(&chain[..8]);
-    let mut state = HeadersSyncState::new(anchor, floor, params, [7_u8; 16]);
+    tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+    let chain_tip = tree.tip_handle();
+    let block_tree = Arc::new(RwLock::new(tree));
+    let applied_tip = Arc::new(ArcSwapOption::empty());
+    let peers = Arc::new(PeerTable::new());
+    let (inbound_headers_tx, inbound_headers_rx) = unbounded();
+    let (_inbound_blocks_tx, inbound_blocks_rx) = unbounded();
+    let sync = BlockSync::new(
+        Arc::new(RefusingChain(Arc::new(
+            TestChain::new(chain_tip, Arc::clone(&applied_tip), Arc::clone(&block_tree))
+                .with_minimum_chain_work(minimum_work),
+        ))),
+        Arc::clone(&peers),
+        Arc::new(Mutex::new(inbound_headers_rx)),
+        Arc::new(Mutex::new(inbound_blocks_rx)),
+        crate::sync::syncing_ibd_latch(),
+    );
+    install_budget(
+        &sync,
+        SyncBudget {
+            max_pending_blocks: 0,
+            ..default_sync_budget(Network::Regtest)
+        },
+    );
+    Ok((genesis, sync, inbound_headers_tx, peers))
+}
 
-    // PRESYNC collects through the crossing at the eighth header.
-    let collected = state
-        .process(&chain[..8], true)
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    assert_eq!(collected.phase, HeadersSyncPhase::Redownload);
+/// A release refused by paused admission must not park the released prefix
+/// inside the live state: while refusals persist, every new page would
+/// requeue the excess and grow the buffer without bound. The sync state is
+/// dropped instead, and the paced ancestry re-request — the same retry the
+/// direct path gets — restarts the sync once admission reopens.
+#[test]
+fn a_refused_release_drops_the_sync() -> Result<(), Box<dyn std::error::Error>> {
+    let chain = chain_on(&genesis_header(), 0, PAGE + 500);
+    let threshold = chain_work(&chain);
+    let (_genesis, sync, inbound_headers_tx, peers) = presync_fixture_refusing(threshold)?;
+    let (addr, _lease, rx) = connect(&peers, 9706, 100_000);
+    let source = current_source(&peers, addr);
+    sync.tick();
+    assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
 
-    // REDOWNLOAD of the first five headers overflows the buffer by one: the
-    // release emits exactly the chain's first header.
-    let released = state
-        .process(&chain[..5], true)
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    assert_eq!(released.ready_headers.len(), 1);
+    // The collected pass stays under presync; the crossing page commits
+    // the sync to its download-twice pass.
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    assert_eq!(sync_phase(&sync, source), Some(HeadersSyncPhase::Presync),);
+    deliver_headers(&inbound_headers_tx, chain[PAGE..].to_vec(), source)?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Redownload),
+    );
+    let _ = rx.try_iter().count();
 
-    // The caller's admission is refused: the prefix returns to the live
-    // state, and the next page's release must emit it again — first and in
-    // order — rather than stranding it.
-    state.requeue_released(&released.ready_headers);
-    let next = state
-        .process(&chain[5..9], true)
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    // The second pass's final partial page releases the whole verified
+    // chain into a refusal: the sync must drop, the tree must stay at its
+    // genesis, and the paced ancestry retry must reach the wire.
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    deliver_headers(&inbound_headers_tx, chain[PAGE..].to_vec(), source)?;
+    sync.tick();
+
+    assert_eq!(
+        sync_phase(&sync, source),
+        None,
+        "a refused release drops the sync rather than requeueing the prefix",
+    );
+    assert_eq!(
+        tree_node_count(&sync),
+        1,
+        "a refused release admits nothing",
+    );
     assert!(
-        next.ready_headers.starts_with(&chain[..5]),
-        "the requeued prefix must lead the next release"
+        rx.try_iter()
+            .any(|message| matches!(message, Message::GetHeaders(_))),
+        "the paced ancestry retry must be on the wire",
     );
     Ok(())
 }
@@ -765,6 +815,145 @@ fn a_terminal_low_work_page_demotes_the_source() -> Result<(), Box<dyn std::erro
     assert!(
         peers.is_connected(addr),
         "a short sync below the floor is not a peer fault"
+    );
+    Ok(())
+}
+
+#[test]
+fn unsolicited_presync_continuation_keeps_another_peers_pending_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (owner_addr, _owner_lease, owner_rx) = connect(&peers, 9707, 100_000);
+    sync.tick();
+    let _ = next_locator(&owner_rx)
+        .ok_or_else(|| std::io::Error::other("the owner request was not sent"))?;
+    let owner = current_source(&peers, owner_addr);
+    assert!(
+        sync.scheduler
+            .lock()
+            .header_request
+            .is_some_and(|request| request.source == owner),
+        "the pending header request must belong to the first peer"
+    );
+
+    let (sender_addr, _sender_lease, sender_rx) = connect(&peers, 9708, 100_000);
+    let sender = current_source(&peers, sender_addr);
+    deliver_headers(&inbound_headers_tx, chain_on(&genesis, 0, PAGE), sender)?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, sender),
+        Some(HeadersSyncPhase::Presync),
+        "the unsolicited full page must enter presync"
+    );
+    let _ = next_locator(&sender_rx)
+        .ok_or_else(|| std::io::Error::other("the presync continuation was not sent"))?;
+
+    assert!(
+        sync.scheduler
+            .lock()
+            .header_request
+            .is_some_and(|request| request.source == owner),
+        "an unsolicited low-work continuation must not replace another peer's request"
+    );
+    Ok(())
+}
+
+fn assert_invalid_body_header_is_discarded(
+    block: Block,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let floor = ChainWork::from(u64::MAX);
+    let (_genesis, sync, _inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, _rx) = connect(&peers, port, 100_000);
+    let source = current_source(&peers, addr);
+    let hash = Hash256::from(block.block_hash());
+    let mut batch = vec![crate::InboundBlock::from_decoded(block)];
+    batch[0].source = Some(source);
+    assert_eq!(sync.buffer_received_block_chunk(&mut batch, None), 1);
+    assert!(
+        sync.scheduler.lock().stager.contains(&hash),
+        "the unresolved body must stage before its carried header is retried"
+    );
+
+    sync.drain_inbound_blocks();
+
+    assert!(
+        !sync.scheduler.lock().stager.contains(&hash),
+        "an inadmissible carried header must release its staged body"
+    );
+    assert!(
+        !peers.is_connected(addr),
+        "a permanent header fault must disconnect the delivering peer"
+    );
+    assert_eq!(
+        tree_node_count(&sync),
+        1,
+        "the invalid header must not be admitted"
+    );
+    Ok(())
+}
+
+#[test]
+fn body_carried_low_work_bad_pow_is_discarded_and_faults_peer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block().header;
+    let mut block =
+        mined_block_with_prev_hash(genesis.compute_hash(), 1, vec![coinbase_transaction(1)]);
+    while pow_met(
+        block.header.bits.to_consensus(),
+        Hash256::from(block.block_hash()),
+    ) {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+
+    assert_invalid_body_header_is_discarded(block, 9711)
+}
+
+#[test]
+fn body_carried_low_work_bad_nbits_is_discarded_and_faults_peer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let genesis = Network::Regtest.genesis_block().header;
+    let mut block =
+        mined_block_with_prev_hash(genesis.compute_hash(), 1, vec![coinbase_transaction(2)]);
+    block.header.bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x207f_fffe);
+    while !pow_met(
+        block.header.bits.to_consensus(),
+        Hash256::from(block.block_hash()),
+    ) {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+
+    assert_invalid_body_header_is_discarded(block, 9712)
+}
+
+#[test]
+fn body_carried_low_work_valid_header_stays_deferred() -> Result<(), Box<dyn std::error::Error>> {
+    let floor = ChainWork::from(u64::MAX);
+    let (_genesis, sync, _inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, _rx) = connect(&peers, 9713, 100_000);
+    let source = current_source(&peers, addr);
+    let genesis = Network::Regtest.genesis_block();
+    let block = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(3)]);
+    let hash = Hash256::from(block.block_hash());
+    let mut batch = vec![crate::InboundBlock::from_decoded(block)];
+    batch[0].source = Some(source);
+    assert_eq!(sync.buffer_received_block_chunk(&mut batch, None), 1);
+
+    sync.drain_inbound_blocks();
+
+    assert!(
+        sync.scheduler.lock().stager.contains(&hash),
+        "a valid below-floor body must wait for the wire presync admission"
+    );
+    assert!(
+        peers.is_connected(addr),
+        "valid carried headers do not fault the peer"
+    );
+    assert_eq!(
+        tree_node_count(&sync),
+        1,
+        "the low-work header remains unadmitted"
     );
     Ok(())
 }

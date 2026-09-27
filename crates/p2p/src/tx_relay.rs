@@ -340,17 +340,19 @@ pub fn drain_relay_queue(
 /// in `gateway`. It exits when `shutdown` is set or the queue sender is
 /// dropped.
 ///
-/// PRE: `gateway` is the shared gateway for the node's live mempool.
+/// PRE: `gateway` is a weak handle to the shared gateway for the node's live
+/// mempool; it remains upgradeable while the node is running.
 /// POST: each request is announced exactly when its transaction is resident
 /// with its queued wtxid at the send; a request for a removed or
 /// witness-mutated transaction is consumed with no announcement. The
 /// thread ends on `shutdown` or queue close.
 /// INVARIANT: no mempool guard is held while `sink` sends to peers. The
-/// worker applies the same send-time rule as [`drain_relay_queue`].
+/// worker applies the same send-time rule as [`drain_relay_queue`] and never
+/// retains a strong gateway reference while it waits for queue input.
 pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
     sink: S,
     rx: Receiver<RelayRequest>,
-    gateway: Arc<MempoolGateway>,
+    gateway: Weak<MempoolGateway>,
     shutdown: Arc<AtomicBool>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
@@ -359,6 +361,9 @@ pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
             while !shutdown.load(Ordering::Relaxed) {
                 match rx.recv_timeout(RELAY_POLL) {
                     Ok(request) => {
+                        let Some(gateway) = gateway.upgrade() else {
+                            break;
+                        };
                         if transaction_is_live(&gateway, &request) {
                             sink.announce_inv(request.txid, request.wtxid, request.source);
                         }
@@ -708,8 +713,9 @@ mod tests {
         );
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        let worker = spawn_tx_relay_worker(sink, rx, Arc::clone(&gateway), Arc::clone(&shutdown))
-            .expect("relay worker spawns");
+        let worker =
+            spawn_tx_relay_worker(sink, rx, Arc::downgrade(&gateway), Arc::clone(&shutdown))
+                .expect("relay worker spawns");
         // Deterministic release: dropping the last sender disconnects the
         // queue once the two buffered requests are consumed. No sleeping.
         drop(queue);
@@ -718,6 +724,48 @@ mod tests {
         let entries = log.lock().clone();
         assert_eq!(entries.len(), 1, "only the live tx is announced");
         assert_eq!(entries[0].0, live.txid());
+    }
+
+    #[test]
+    fn relay_worker_exits_when_queue_closes_with_observer_attached() {
+        let gateway = relay_identity_gateway();
+        let (queue, rx) = TxRelayQueue::new(1);
+        gateway
+            .attach_observer_leg(
+                "relay",
+                Arc::new(LocalTxRelayObserver::new(
+                    queue.clone(),
+                    Arc::downgrade(&gateway),
+                )),
+            )
+            .expect("observer slot");
+        let sink = FakeSink::new(Vec::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker =
+            spawn_tx_relay_worker(sink, rx, Arc::downgrade(&gateway), Arc::clone(&shutdown))
+                .expect("relay worker spawns");
+
+        drop(queue);
+        drop(gateway);
+        let (joined_tx, joined_rx) = bounded(1);
+        let joiner = std::thread::spawn(move || {
+            let _ = joined_tx.send(worker.join().is_ok());
+        });
+        let queue_close = joined_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let exited_on_queue_close = matches!(&queue_close, Ok(true));
+        if !exited_on_queue_close {
+            shutdown.store(true, Ordering::Relaxed);
+            let stopped = joined_rx.recv_timeout(std::time::Duration::from_secs(1));
+            assert!(
+                matches!(&stopped, Ok(true)),
+                "explicit shutdown must still stop the relay worker"
+            );
+        }
+        assert!(
+            exited_on_queue_close,
+            "dropping the last queue sender must stop the worker without shutdown"
+        );
+        joiner.join().expect("relay worker join coordinator exits");
     }
 
     #[test]

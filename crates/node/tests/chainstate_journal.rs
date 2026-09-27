@@ -46,8 +46,7 @@ fn restart_replays_durable_journal_suffix_above_checkpoint() -> Result<()> {
     let expected_stats = initial.chainstate().coin_stats_handle().snapshot();
     let expected_tx_count = initial
         .chainstate()
-        .rpc_tip_bundle()
-        .applied_tip
+        .applied_tip_reader()
         .load_full()
         .ok_or_else(|| std::io::Error::other("applied tip must exist after apply_block"))?
         .chain_tx_count;
@@ -82,8 +81,7 @@ fn restart_replays_durable_journal_suffix_above_checkpoint() -> Result<()> {
     assert_eq!(
         resumed
             .chainstate()
-            .rpc_tip_bundle()
-            .applied_tip
+            .applied_tip_reader()
             .load_full()
             .map_or(bitcoin_rs_chain::ChainTxCount::UNKNOWN, |tip| tip
                 .chain_tx_count),

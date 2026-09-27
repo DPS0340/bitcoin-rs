@@ -408,8 +408,8 @@ pub enum ScriptError {
     /// The delegated consensus verifier rejected the script.
     #[error("script verification failed: {0}")]
     Verification(String),
-    /// Taproot key-path verification requires all prevouts for multi-input transactions.
-    #[error("taproot key-path verification requires all prevouts for multi-input transactions")]
+    /// The supplied prevout set does not match the transaction input count.
+    #[error("prevout count does not match transaction input count")]
     TaprootPrevoutsUnavailable,
     /// The script evaluated to a Core-named failure.
     #[error("script failed: {code}")]
@@ -436,12 +436,10 @@ impl Interpreter {
     /// no clone. Only callers that pass substitute bytes (e.g. vector tests
     /// grafting a foreign witness) pay for a clone to splice them in.
     ///
-    /// Taproot key-path verification needs every spent output. Callers that only
-    /// have the current input's prevout should prefer
-    /// [`Self::execute_with_prevouts`] when the full ordered set is available;
-    /// this wrapper forwards a one-element slice and therefore still rejects
-    /// multi-input taproot key-path spends with
-    /// [`ScriptError::TaprootPrevoutsUnavailable`].
+    /// This wrapper supplies one prevout and therefore only supports
+    /// single-input transactions. A multi-input transaction returns
+    /// [`ScriptError::TaprootPrevoutsUnavailable`]; use
+    /// [`Self::execute_with_prevouts`] with the complete ordered set instead.
     pub fn execute(
         &self,
         script_pubkey: &[u8],
@@ -465,9 +463,14 @@ impl Interpreter {
 
     /// Executes a script spend with the complete ordered prevout set.
     ///
-    /// `prevouts` must be aligned with `tx.inputs` (same length, input order).
-    /// BIP341 key-path sighashes commit to every spent output, so multi-input
-    /// taproot spends require the full slice.
+    /// `prevouts` must contain one spent output for each input, in input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::TaprootPrevoutsUnavailable`] if the prevout count
+    /// differs from the transaction input count. Returns
+    /// [`ScriptError::InputIndexOutOfRange`] if `input_idx` is invalid after
+    /// the count matches. The count check runs before script evaluation.
     pub fn execute_with_prevouts(
         &self,
         script_pubkey: &[u8],
@@ -479,6 +482,9 @@ impl Interpreter {
         input_idx: usize,
     ) -> Result<bool, ScriptError> {
         let inputs = tx.inputs.len();
+        if prevouts.len() != inputs {
+            return Err(ScriptError::TaprootPrevoutsUnavailable);
+        }
         let input = tx
             .inputs
             .get(input_idx)
@@ -486,19 +492,9 @@ impl Interpreter {
                 index: input_idx,
                 inputs,
             })?;
-        // `execute` forwards a one-element slice for the current input. Full-set
-        // callers pass `prevouts.len() == tx.inputs.len()` in input order.
-        let prevout = if prevouts.len() == inputs {
-            prevouts
-                .get(input_idx)
-                .ok_or(ScriptError::TaprootPrevoutsUnavailable)?
-        } else if prevouts.len() == 1 {
-            prevouts
-                .first()
-                .ok_or(ScriptError::TaprootPrevoutsUnavailable)?
-        } else {
-            return Err(ScriptError::TaprootPrevoutsUnavailable);
-        };
+        let prevout = prevouts
+            .get(input_idx)
+            .ok_or(ScriptError::TaprootPrevoutsUnavailable)?;
 
         let matches_tx = input.script_sig.as_slice() == script_sig
             && input.witness.len() == witness.len()
@@ -779,11 +775,6 @@ fn verify_taproot(
     prevouts: &[TxOut],
     flags: VerifyFlags,
 ) -> Result<bool, ScriptError> {
-    if prevouts.len() != spending.inputs.len() {
-        return Err(ScriptError::TaprootPrevoutsUnavailable);
-    }
-
-    // The 32-byte output key is the witness program (bytes 2..34 of the
     // scriptPubKey). `is_p2tr` already confirmed the shape.
     let program = script_pubkey
         .get(2..34)
