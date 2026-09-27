@@ -1602,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::arc_with_non_send_sync, clippy::too_many_lines)]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn from_handles_shares_chain_handles_with_caller() {
         use alloc::sync::Arc;
 
@@ -1652,39 +1652,31 @@ mod tests {
             Arc::ptr_eq(&ctx.chain.chain_transition, &chain_transition),
             "the caller's transition barrier must be the one the context locks"
         );
-        let marker = || TipSnapshot {
-            tip_id: bitcoin_rs_chain::NodeId::new(0),
-            height: 7,
-            chainwork: bitcoin_rs_chain::ChainWork::ZERO,
-            hash: Hash256::from_le_bytes(&[7; 32]),
-            chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
+        // The count travels inside the applied tip: one publication replaces
+        // tip and count together, through the cell the caller shares.
+        let snapshot = |count| {
+            Arc::new(TipSnapshot {
+                tip_id: bitcoin_rs_chain::NodeId::new(0),
+                height: 7,
+                chainwork: bitcoin_rs_chain::ChainWork::ZERO,
+                hash: Hash256::from_le_bytes(&[7; 32]),
+                chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(count),
+            })
         };
-        chain_tip.store(Some(Arc::new(marker())));
+        chain_tip.store(Some(snapshot(1)));
         assert_eq!(
             ctx.chain.chain_tip.load_full().map(|tip| tip.height),
             Some(7),
             "chain_tip must be shared with caller"
         );
-        applied_tip.store(Some(Arc::new(marker())));
+        applied_tip.store(Some(snapshot(1)));
         assert_eq!(
             ctx.chain.applied_tip.load_full().map(|tip| tip.height),
             Some(7),
             "applied_tip must be shared with caller"
         );
-        // The count travels inside the applied tip: one publication replaces
-        // tip and count together, through the cell the caller shares.
-        let counted = |count| {
-            Arc::new(TipSnapshot {
-                tip_id: bitcoin_rs_chain::NodeId::new(0),
-                height: 0,
-                chainwork: bitcoin_rs_chain::ChainWork::ZERO,
-                hash: bitcoin_rs_primitives::Hash256::default(),
-                chain_tx_count: bitcoin_rs_chain::ChainTxCount::established(count),
-            })
-        };
-        applied_tip.store(Some(counted(1)));
         assert_eq!(ctx.chain.chain_tx_count(), Some(1));
-        applied_tip.store(Some(counted(42)));
+        applied_tip.store(Some(snapshot(42)));
         assert_eq!(ctx.chain.chain_tx_count(), Some(42));
         assert!(
             Arc::ptr_eq(&ctx.chain.ibd, &ibd),
