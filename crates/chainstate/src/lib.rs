@@ -1927,3 +1927,7 @@ mod window_invalidation_tests;
 #[cfg(test)]
 #[path = "../tests/unit/checkpoint_debt_tests.rs"]
 mod checkpoint_debt_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/recovery_marker_order_tests.rs"]
+mod recovery_marker_order_tests;
