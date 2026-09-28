@@ -88,19 +88,6 @@ impl Drop for RestRenderPermit {
 use bitcoin_rs_index::block_log::{BlockLog, BlockRecord, record_at_height, record_at_height_hash};
 use bitcoin_rs_index::query_api::RollbackWarningSource;
 
-/// Network counters and peer metadata exposed by network RPCs.
-#[derive(Clone, Debug, Default)]
-pub struct NetworkState {
-    /// Number of connected peers.
-    pub connection_count: u64,
-    /// Total bytes received since startup.
-    pub bytes_recv: u64,
-    /// Total bytes sent since startup.
-    pub bytes_sent: u64,
-    /// Unix timestamp for the counters.
-    pub timestamp: u64,
-}
-
 /// Typed synchronization progress behind `getblockchaininfo`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SyncProgress {
@@ -395,8 +382,6 @@ pub struct IndexHandles {
 /// Network capability handles.
 #[derive(Clone)]
 pub struct NetworkHandles {
-    /// Network state.
-    pub network: Arc<RwLock<NetworkState>>,
     /// Whether the node accepts or starts P2P connections.
     pub network_active: Arc<core::sync::atomic::AtomicBool>,
     /// Authoritative live peer sessions.
@@ -513,7 +498,6 @@ impl Default for NetworkHandles {
     #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self {
-            network: Arc::new(RwLock::new(NetworkState::default())),
             network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
             peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
             p2p_outbound_sender: None,
@@ -2256,7 +2240,6 @@ mod tests {
                 derived_index_status: Some(Arc::clone(&status)),
             },
             network: NetworkHandles {
-                network: Arc::new(RwLock::new(NetworkState::default())),
                 network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
                 peer_table: Arc::new(bitcoin_rs_p2p::PeerTable::new()),
                 p2p_outbound_sender: None,

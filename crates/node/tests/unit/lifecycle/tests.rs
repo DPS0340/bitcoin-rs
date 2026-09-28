@@ -20,6 +20,30 @@ fn isolated_config(data_dir: &Path) -> NodeConfig {
     config
 }
 
+#[test]
+fn rpc_network_handles_borrow_p2p_service_state() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = NodeState::open(isolated_config(dir.path()), None)?;
+    let p2p = state.p2p();
+    let handles = rpc_network_handles(&state);
+
+    assert!(Arc::ptr_eq(
+        &handles.network_active,
+        &p2p.network_active_handle()
+    ));
+    assert!(Arc::ptr_eq(&handles.peer_table, &p2p.table()));
+    assert!(Arc::ptr_eq(&handles.banned, &p2p.banned_handle()));
+    assert!(Arc::ptr_eq(&handles.added_nodes, &p2p.added_nodes_handle()));
+    assert!(
+        handles
+            .p2p_outbound_sender
+            .as_ref()
+            .is_some_and(|sender| sender.same_channel(&p2p.outbound_sender()))
+    );
+    assert_eq!(handles.local_services, p2p.local_services().to_u64());
+    Ok(())
+}
+
 fn seed_checkpoint(state: &NodeState) -> anyhow::Result<(PathBuf, Vec<u8>)> {
     state.apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block())?;
     let _ = state.publish_checkpoint()?;
