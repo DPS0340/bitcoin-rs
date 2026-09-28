@@ -1,5 +1,40 @@
 use super::*;
 
+#[test]
+fn runtime_accessors_borrow_their_subsystem_owner() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+    config.data_dir = dir.path().join("node");
+    config.p2p.listen.clear();
+    let state = NodeState::open(config, None)?;
+    let p2p = state.p2p();
+    let followers = state.chain_followers();
+
+    assert!(Arc::ptr_eq(&state.peer_table(), &p2p.table()));
+    assert!(Arc::ptr_eq(
+        &state.network_active(),
+        &p2p.network_active_handle()
+    ));
+    assert!(Arc::ptr_eq(&state.banned_subnets(), &p2p.banned_handle()));
+    assert!(
+        state
+            .p2p_outbound_sender()
+            .same_channel(&p2p.outbound_sender())
+    );
+    assert!(
+        state
+            .inbound_blocks_sender()
+            .same_channel(&p2p.inbound_blocks_sender())
+    );
+    assert!(Arc::ptr_eq(&state.blocks(), followers.block_log()));
+    assert!(Arc::ptr_eq(
+        &state.mining_generation_signal(),
+        followers.mining()
+    ));
+    assert!(Arc::ptr_eq(&state.ibd(), &state.chainstate().ibd_latch()));
+    Ok(())
+}
+
 #[cfg(feature = "zmq")]
 #[test]
 fn zmq_publisher_handle_reports_active_metadata() -> anyhow::Result<()> {

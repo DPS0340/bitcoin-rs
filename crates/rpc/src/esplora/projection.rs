@@ -143,11 +143,6 @@ impl<'a> Projection<'a> {
         if let Some(transaction) = self.ctx.mempool.gateway.read().transaction_by_txid(txid) {
             return Ok(Some(((*transaction).clone(), None)));
         }
-        if let Some(transaction) = self.ctx.chain.transactions.read().get(txid).cloned() {
-            return self
-                .cached_confirmation(txid)
-                .map(|confirmation| Some((transaction, confirmation)));
-        }
         let index = self
             .ctx
             .indexes
@@ -188,32 +183,12 @@ impl<'a> Projection<'a> {
         {
             return Ok(None);
         }
-        if self.ctx.chain.transactions.read().contains_key(txid) {
-            return self.cached_confirmation(txid);
-        }
         let index = self
             .ctx
             .indexes
             .esplora_tx_index
             .as_ref()
             .ok_or_else(|| service_unavailable("transaction lookup index is disabled"))?;
-        Ok(index
-            .transaction_height(txid)
-            .map_err(query_error)?
-            .and_then(|height| self.confirmation_at_height(height)))
-    }
-
-    /// Resolves a broadcast-cached transaction's confirmation, if it can.
-    ///
-    /// The cache is a broadcast staging area, not chain state: it proves the
-    /// node accepted the transaction, never that the chain did or did not
-    /// confirm it. Only the transaction index answers that, so with the index
-    /// disabled this reports "unconfirmed", which is also the only reason
-    /// `/tx/:id` works at all in that configuration.
-    fn cached_confirmation(&self, txid: &Txid) -> Result<Option<Confirmation>, Response> {
-        let Some(index) = self.ctx.indexes.esplora_tx_index.as_ref() else {
-            return Ok(None);
-        };
         Ok(index
             .transaction_height(txid)
             .map_err(query_error)?
@@ -316,12 +291,6 @@ impl<'a> Projection<'a> {
             .read()
             .transaction_by_txid(&outpoint.txid)
         {
-            return Ok(transaction
-                .outputs
-                .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
-                .cloned());
-        }
-        if let Some(transaction) = self.ctx.chain.transactions.read().get(&outpoint.txid) {
             return Ok(transaction
                 .outputs
                 .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))

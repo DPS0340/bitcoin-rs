@@ -28,8 +28,6 @@ use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolLimits;
 use bitcoin_rs_p2p::download_window::FAST_OUTBOUND_PEER_TARGET;
 use bitcoin_rs_p2p::download_window::fast_sync_budget;
-use bitcoin_rs_rpc::context::NetworkState;
-use hashbrown::HashMap;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -201,7 +199,6 @@ impl NodeState {
             applied_tip.store(Some(Arc::new(restored_applied_tip)));
         }
         let blocks = Arc::new(RwLock::new(BlockLog::new()));
-        let transactions = Arc::new(RwLock::new(HashMap::new()));
         // Created before the txindex worker spawn: the worker mirrors this
         // publisher's snapshot into its persisted consumer cursor.
         let chain_events_raw = ChainEventPublisher::new(initial_snapshot);
@@ -277,7 +274,6 @@ impl NodeState {
                     .map(|(runtime, _, _, _)| Arc::clone(runtime)),
                 derived_index_capabilities(&config),
             ));
-        let network = Arc::new(RwLock::new(NetworkState::default()));
         // Two outbound populations: full-relay slots carry transactions,
         // addresses, and blocks; block-relay-only slots carry blocks alone.
         // Fast sync deepens the download stripe across more full-relay peers,
@@ -318,12 +314,8 @@ impl NodeState {
             },
             Arc::clone(&shutdown),
         ));
-        let network_active = p2p.network_active_handle();
-        let banned = p2p.banned_handle();
         let peer_table = p2p.table();
-        let p2p_outbound_tx = p2p.outbound_sender();
         let inbound_headers_rx = p2p.inbound_headers_receiver();
-        let inbound_blocks_tx = p2p.inbound_blocks_sender();
         let inbound_blocks_rx = p2p.inbound_blocks_receiver();
         let (inbound_tx_tx, inbound_tx_rx_raw) =
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundTx>(INBOUND_TX_CHANNEL_LIMIT);
@@ -418,9 +410,6 @@ impl NodeState {
         let prune_service = if config.storage.prune_target_mb > 0 {
             Some(storage.deferred.prune_service(
                 Arc::clone(&block_files),
-                Arc::clone(&block_body_store),
-                Arc::clone(&blocks),
-                Arc::clone(&transactions),
                 chainstate.prune_authority(),
                 Arc::clone(&durable_tip_height),
                 chainstate.retention_handle(),
@@ -446,25 +435,13 @@ impl NodeState {
                 derived_index_status,
             ),
             prune_service,
-            zmq_publisher,
-            mempool,
             mempool_gateway,
-            mining_generation,
-            blocks,
-            transactions,
-            network,
-            network_active,
             p2p,
-            peer_table,
-            banned,
-            p2p_outbound_tx,
-            inbound_blocks_tx,
             inbound_tx_tx,
             inbound_tx_rx,
             chainstate,
             followers,
             sync,
-            ibd,
             recovery_reporter,
         })
     }

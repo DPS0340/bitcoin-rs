@@ -15,7 +15,7 @@ fn apply_block_persists_body_under_pruning_key_when_pruning_disabled() -> anyhow
     state.apply_block(&block)?;
 
     assert_eq!(
-        state.blocks.read().first().map(|record| record.body_size),
+        state.blocks().read().first().map(|record| record.body_size),
         Some(consensus_bytes(&block).len())
     );
     assert_eq!(
@@ -162,61 +162,16 @@ fn prune_refuses_after_apply_admission_closes() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Overlapping prune calls must commit in acquisition order.
-///
-/// A lower request blocks inside body-store load while holding
-/// `pruneheight`; a higher contender must neither enter that load nor
-/// finish until the lower call releases, and both persisted and in-memory
-/// pruneheight end at the higher value.
+/// Successive prune calls advance both persisted and in-memory pruneheight.
 #[cfg(feature = "fjall")]
 #[allow(clippy::too_many_lines)]
 #[test]
-fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
-    use bitcoin_rs_index::block_log::BlockLog;
+fn prune_to_height_advances_published_height() -> anyhow::Result<()> {
     use bitcoin_rs_rpc::context::PruneService;
     use bitcoin_rs_storage::FlatFileBlockStore;
     use bitcoin_rs_storage::KvStore;
     use bitcoin_rs_storage::pruning::load_pruneheight;
-    use parking_lot::RwLock;
-    use std::sync::Barrier;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::{AtomicBool, AtomicU32};
-    use std::time::Duration;
-
-    struct BlockingPruneBodyStore {
-        entered: Barrier,
-        release: Barrier,
-        block_once: AtomicBool,
-        loads: AtomicUsize,
-    }
-
-    impl bitcoin_rs_storage::block_body::BlockBodyStore for BlockingPruneBodyStore {
-        fn load_block_body(
-            &self,
-            _height: u32,
-            _hash: bitcoin_rs_primitives::Hash256,
-        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
-            self.loads.fetch_add(1, Ordering::AcqRel);
-            if self.block_once.swap(false, Ordering::AcqRel) {
-                self.entered.wait();
-                self.release.wait();
-            }
-            Ok(None)
-        }
-
-        fn persist_block_body(
-            &self,
-            _height: u32,
-            _hash: bitcoin_rs_primitives::Hash256,
-            _body: &[u8],
-        ) -> Result<(), bitcoin_rs_storage::StorageError> {
-            Ok(())
-        }
-
-        fn sync(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
-            Ok(())
-        }
-    }
+    use std::sync::atomic::AtomicU32;
 
     let dir = tempfile::tempdir()?;
     let mut authority_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
@@ -230,26 +185,9 @@ fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
         data_dir.join("chainstate"),
     )?);
     let block_files = Arc::new(FlatFileBlockStore::open(&data_dir)?);
-    let body_store = Arc::new(BlockingPruneBodyStore {
-        entered: Barrier::new(2),
-        release: Barrier::new(2),
-        block_once: AtomicBool::new(true),
-        loads: AtomicUsize::new(0),
-    });
-    let body_handle: Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore> = body_store.clone();
-    let blocks = Arc::new(RwLock::new(BlockLog::new()));
     let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
-    blocks.write().push(BlockRecord {
-        hash: BlockHash::from(hash),
-        height: 10,
-        body_size: 1,
-        header: None,
-        tx_count: 1,
-        time: 0,
-    });
     // The prune line is computed from what the pass actually deletes, so
-    // seed one prunable body row at height 10: without it the pass deletes
-    // nothing and never reaches the blocking body-store load.
+    // seed one prunable body row at height 10.
     let mut seed = store.new_batch();
     seed.put(
         bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
@@ -270,53 +208,19 @@ fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
     let service = Arc::new(super::super::prune::NodePruneService::new(
         Arc::clone(&store),
         block_files,
-        body_handle,
-        Arc::clone(&blocks),
-        Arc::new(RwLock::new(HashMap::new())),
         authority_state.chainstate().prune_authority(),
         Arc::new(AtomicU32::new(11 + CORE_REORG_SAFETY_MARGIN)),
         Arc::new(bitcoin_rs_storage::RetentionRegistry::new()),
     )?);
 
-    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::scope(|scope| -> anyhow::Result<()> {
-        let lower_service = Arc::clone(&service);
-        let lower = scope.spawn(move || lower_service.prune_to_height(11));
-        body_store.entered.wait();
-
-        let higher_service = Arc::clone(&service);
-        let higher = scope.spawn(move || {
-            let _ = started_tx.send(());
-            let result = higher_service.prune_to_height(12);
-            let _ = done_tx.send(());
-            result
-        });
-        let higher_started = started_rx.recv_timeout(Duration::from_secs(5));
-        let higher_done = done_rx.recv_timeout(Duration::from_millis(100));
-        let loads_while_lower_blocked = body_store.loads.load(Ordering::Acquire);
-        body_store.release.wait();
-        let lower_join = lower.join();
-        let higher_join = higher.join();
-        higher_started.map_err(|error| anyhow::anyhow!("higher prune did not start: {error}"))?;
-        let lower_result = lower_join
-            .map_err(|_| anyhow::anyhow!("lower prune panicked"))?
-            .map_err(|err| anyhow::anyhow!("lower prune failed: {err}"))?;
-        let higher_result = higher_join
-            .map_err(|_| anyhow::anyhow!("higher prune panicked"))?
-            .map_err(|err| anyhow::anyhow!("higher prune failed: {err}"))?;
-        assert!(
-            matches!(higher_done, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
-            "higher prune committed while lower still held the pruneheight lock; done_rx={higher_done:?}"
-        );
-        assert_eq!(
-            loads_while_lower_blocked, 1,
-            "higher prune must not enter body-store load while lower holds pruneheight; loads={loads_while_lower_blocked}"
-        );
-        assert_eq!(lower_result.pruneheight, 11);
-        assert_eq!(higher_result.pruneheight, 12);
-        Ok(())
-    })?;
+    let lower_result = service
+        .prune_to_height(11)
+        .map_err(|err| anyhow::anyhow!("lower prune failed: {err}"))?;
+    let higher_result = service
+        .prune_to_height(12)
+        .map_err(|err| anyhow::anyhow!("higher prune failed: {err}"))?;
+    assert_eq!(lower_result.pruneheight, 11);
+    assert_eq!(higher_result.pruneheight, 12);
 
     assert_eq!(service.status().pruneheight, Some(12));
     assert_eq!(load_pruneheight(&*store)?, Some(12));

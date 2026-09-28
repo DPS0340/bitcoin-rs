@@ -45,8 +45,6 @@ use bitcoin_rs_primitives::BlockHash;
 
 use bitcoin_rs_primitives::consensus_bytes;
 
-use bitcoin_rs_index::block_log::BlockRecord;
-
 fn publish_applied_tip_height(state: &NodeState, height: u32) {
     let mut hash = [0_u8; 32];
     hash[..size_of::<u32>()].copy_from_slice(&height.to_le_bytes());

@@ -99,7 +99,6 @@ fn clean_checkpoint_reopens_and_applies_the_next_block() -> anyhow::Result<()> {
         expected_stats
     );
     assert!(resumed.blocks().read().is_empty());
-    assert!(resumed.transactions().read().is_empty());
     assert!(resumed.mempool().read().is_empty());
 
     let next = regtest_fixture::mined_regtest_child_at(genesis.block_hash(), 1)?;

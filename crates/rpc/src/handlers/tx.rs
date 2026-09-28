@@ -106,11 +106,6 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
         }
     }
 
-    // Compatibility cache used by tests and early wiring; not confirmation proof.
-    if let Some(tx) = ctx.chain.transactions.read().get(&txid) {
-        return render_raw_transaction(ctx, tx, verbose, None, false);
-    }
-
     Err(RpcError::NotFound("transaction not found"))
 }
 
@@ -1171,10 +1166,6 @@ mod tests {
         ctx.chain.applied_tip.store(Some(Arc::new((*tip).clone())));
         let ctx = Arc::new(ctx);
 
-        assert!(
-            ctx.chain.transactions.read().is_empty(),
-            "confirmed transaction cache must stay empty"
-        );
         let result = getrawtransaction(&ctx, &json!([txid.to_string()]))
             .unwrap_or_else(|err| panic!("txindex lookup failed: {err}"));
 
@@ -2143,7 +2134,7 @@ mod gettxout_via_utxo_tests {
                 script_pubkey: Script::from_bytes(vec![0x51]),
             }],
         };
-        let txid = ctx.chain.add_transaction(tx);
+        let txid = tx.txid();
         let params = json!([txid.to_string(), 0_u64]);
         let value = gettxout(&ctx, &params).unwrap_or_else(|err| panic!("gettxout failed: {err}"));
         assert!(
@@ -2701,11 +2692,6 @@ mod acceptance_tests {
             ctx.mempool.gateway.read().len(),
             0,
             "rejected tx must not enter the pool"
-        );
-        assert_eq!(
-            ctx.chain.transactions.read().len(),
-            0,
-            "rejected tx must not be recorded as accepted"
         );
     }
 }

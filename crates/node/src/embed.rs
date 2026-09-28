@@ -109,7 +109,7 @@ impl Node {
         Ok(Some(block))
     }
 
-    /// Resolves a transaction through the mempool, cache, then confirmed index.
+    /// Resolves a transaction through the mempool, then the confirmed index.
     ///
     /// A disabled or unhealthy confirmed index is unavailable, not an answer
     /// that the transaction does not exist. A complete negative lookup is
@@ -118,10 +118,6 @@ impl Node {
         let pooled = self.state.mempool().read().transaction_by_txid(&txid);
         if let Some(tx) = pooled {
             return Ok((*tx).clone());
-        }
-        let cached = self.context.chain.transactions.read().get(&txid).cloned();
-        if let Some(tx) = cached {
-            return Ok(tx);
         }
         let Some(query) = self.state.esplora_derived_index_query() else {
             return Err(NodeError::Unavailable(

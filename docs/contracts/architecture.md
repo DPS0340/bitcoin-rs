@@ -260,6 +260,23 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   a `ReorgObserver` for mempool/follower effects and holds the mempool
   generation fence around the operation. Reorg body memory is bounded by the
   chainstate streaming window; no whole departed branch is retained.
+- Runtime capability ownership remains with the subsystem that mutates it.
+  `P2pService` owns peer sessions, bans, the network-active latch, and its
+  header/block/outbound channels; `ChainFollowers` owns the RPC block log,
+  ZMQ publisher, and mining-generation signal; `Chainstate` owns the IBD
+  latch. `NodeState` composes those services and returns their handles without
+  retaining parallel fields. Its inbound transaction channel is node-owned
+  because node orchestration drains it into `MempoolGateway`. Confirmed
+  transaction bodies are queried through the derived index and durable block
+  storage, never through a second node/RPC transaction map.
+- `MempoolGateway` owns the process mempool handle; `NodeState::mempool` is a
+  read/composition capability borrowed from that gateway, not a parallel
+  retained `Arc`. Gateway interning remains the public one-gateway-per-pool
+  enforcement boundary for test seams and downstream composition; production
+  constructs that same owner once. `NodeState` retains `PruneService` as a
+  node/storage mutation capability because it is created only after
+  chainstate supplies prune authority and is handed to the later RPC
+  lifecycle; it contains no duplicate block or transaction projection.
 
 ### `ARCH-07a`: Chainstate mutates `utxo` through one narrow contract
 

@@ -390,7 +390,9 @@ fn witness_strippable_failure(error: &ConsensusError, prevouts: &[(OutPoint, TxO
 use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationResult};
 use crate::orphan::RejectScope;
 use crate::pool::{Mempool, MempoolError, PrioritiseError, PrioritisedTransaction};
-use crate::rbf::{LimitEnforcement, RbfError, ReplacementCandidate};
+#[cfg(any(test, feature = "test-seam"))]
+use crate::rbf::ReplacementCandidate;
+use crate::rbf::{LimitEnforcement, RbfError};
 
 static REGISTRY: LazyLock<Mutex<Vec<Weak<MempoolGateway>>>> =
     LazyLock::new(|| Mutex::new(alloc::vec::Vec::new()));

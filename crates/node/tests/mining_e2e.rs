@@ -641,7 +641,6 @@ fn mining_handler(state: &NodeState) -> Handler {
             applied_tip: state.chainstate().applied_tip_reader(),
             ibd,
             blocks: state.blocks(),
-            transactions: state.transactions(),
             utxo: Arc::new(UtxoSet::new()),
             coin_stats: state.chainstate().coin_stats_handle(),
             block_tree: state.chainstate().block_tree_reader(),
@@ -657,7 +656,9 @@ fn mining_handler(state: &NodeState) -> Handler {
         },
         indexes: IndexHandles::default(),
         network: NetworkHandles {
-            network: state.network(),
+            network: Arc::new(parking_lot::RwLock::new(
+                bitcoin_rs_rpc::context::NetworkState::default(),
+            )),
             network_active: state.network_active(),
             peer_table: state.peer_table(),
             p2p_outbound_sender: Some(state.p2p_outbound_sender()),
