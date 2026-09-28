@@ -17,6 +17,14 @@ name: ci-merge-gate
 on:
   merge_group:
     types: [checks_requested]
+  # GitHub registers dispatchable workflows from the default branch only, so
+  # a brand-new gate file would otherwise land never-having-run. A
+  # path-scoped pull_request trigger executes the gate on PRs that touch the
+  # gate itself -- including the one that introduces it -- while ordinary
+  # PRs never see it.
+  pull_request:
+    paths:
+      - '.github/workflows/ci-merge-gate.yml'
   # Manual runs for validating gate changes without queuing a merge.
   workflow_dispatch:
 
