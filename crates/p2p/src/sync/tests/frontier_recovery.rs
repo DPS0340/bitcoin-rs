@@ -220,10 +220,10 @@ fn frontier_probe_preserves_another_live_header_request() -> Result<(), Box<dyn 
         super::super::HeaderAction::Probe(source) => source,
         action => return Err(format!("expected a frontier probe, got {action:?}").into()),
     };
-    let (existing_source, existing_rx) = if probe_source == first_source {
-        (second_source, &second_rx)
+    let (existing_source, existing_rx, probe_rx) = if probe_source == first_source {
+        (second_source, &second_rx, &first_rx)
     } else {
-        (first_source, &first_rx)
+        (first_source, &first_rx, &second_rx)
     };
 
     let genesis = Network::Regtest.genesis_block().block_hash();
@@ -239,7 +239,15 @@ fn frontier_probe_preserves_another_live_header_request() -> Result<(), Box<dyn 
     );
     assert!(matches!(existing_rx.try_recv()?, Message::GetHeaders(_)));
 
-    sync.probe_frontier_peer(&frontier, probe_source);
+    assert_eq!(
+        sync.probe_frontier_peer(&frontier, probe_source),
+        super::super::GetheadersOutcome::Sent,
+        "the frontier probe must send its request"
+    );
+    assert!(
+        matches!(probe_rx.try_recv()?, Message::GetHeaders(_)),
+        "the probe peer must receive the probe getheaders"
+    );
 
     assert_eq!(
         sync.scheduler
