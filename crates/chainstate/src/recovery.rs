@@ -151,8 +151,13 @@ pub fn prepare_initial_chainstate(
         network,
         genesis: network.genesis_block_hash(),
     };
-    let checkpoint_load =
-        crate::checkpoint::load_checkpoint_from_dir(&checkpoint_data_dir, checkpoint_config)?;
+    // Check the full-revalidation marker BEFORE opening the checkpoint: the
+    // marker contract says incremental recovery must be ignored, so the
+    // checkpoint must not be part of the decision once the marker is present.
+    // Opening it first would validate a large artifact only to discard it, and
+    // a corrupt checkpoint could fail startup before the marker gets a chance
+    // to force cold replay — making a checkpoint artifact stronger than the
+    // marker that explicitly says not to trust incremental recovery.
     if requires_full_revalidation(data_dir) {
         metrics::counter!(
             "node.chainstate_journal.fallback_total",
@@ -166,6 +171,8 @@ pub fn prepare_initial_chainstate(
         );
         return cold_initial_chainstate(data_dir, network, journal_config, false);
     }
+    let checkpoint_load =
+        crate::checkpoint::load_checkpoint_from_dir(&checkpoint_data_dir, checkpoint_config)?;
     let crate::checkpoint::CheckpointLoad::Complete(restored) = checkpoint_load else {
         if journal_config.enabled {
             metrics::counter!(
