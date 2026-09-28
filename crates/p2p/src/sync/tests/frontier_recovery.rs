@@ -203,6 +203,64 @@ fn superseded_session_gets_no_probe_and_cannot_send_getheaders()
 }
 
 #[test]
+fn frontier_probe_preserves_another_live_header_request() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (sync, peers, _, _, _) = sync_with_header_chain(1)?;
+    let first = test_addr(9764, 0)?;
+    let second = test_addr(9764, 1)?;
+    let first_rx = connect_peer(&peers, synthetic_peer(first, 1));
+    let second_rx = connect_peer(&peers, synthetic_peer(second, 1));
+    let first_source = current_source(&peers, first);
+    let second_source = current_source(&peers, second);
+
+    sync.chain.bootstrap_genesis();
+    let now = Instant::now();
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), now);
+    let probe_source = match frontier.plan().header_action {
+        super::super::HeaderAction::Probe(source) => source,
+        action => return Err(format!("expected a frontier probe, got {action:?}").into()),
+    };
+    let (existing_source, existing_rx, probe_rx) = if probe_source == first_source {
+        (second_source, &second_rx, &first_rx)
+    } else {
+        (first_source, &first_rx, &second_rx)
+    };
+
+    let genesis = Network::Regtest.genesis_block().block_hash();
+    assert_eq!(
+        sync.send_getheaders(
+            existing_source,
+            0,
+            1,
+            vec![Hash256::from_le_bytes(genesis.as_bytes())],
+        ),
+        super::super::GetheadersOutcome::Sent,
+        "the other peer must own a live request before the stale probe runs"
+    );
+    assert!(matches!(existing_rx.try_recv()?, Message::GetHeaders(_)));
+
+    assert_eq!(
+        sync.probe_frontier_peer(&frontier, probe_source),
+        super::super::GetheadersOutcome::Sent,
+        "the frontier probe must send its request"
+    );
+    assert!(
+        matches!(probe_rx.try_recv()?, Message::GetHeaders(_)),
+        "the probe peer must receive the probe getheaders"
+    );
+
+    assert_eq!(
+        sync.scheduler
+            .lock()
+            .header_request
+            .map(|request| request.source),
+        Some(existing_source),
+        "the frontier probe must not replace the other peer's live request"
+    );
+    Ok(())
+}
+
+#[test]
 fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sync, peers, _, _, expected) = sync_with_header_chain(1)?;

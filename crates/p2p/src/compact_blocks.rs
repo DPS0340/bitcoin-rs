@@ -1130,6 +1130,50 @@ mod tests {
         ));
     }
 
+    /// A failed delayed completion frees the retained-byte budget for a
+    /// later compact block before the original entry's deadline.
+    #[test]
+    fn failed_blocktxn_completion_releases_retained_byte_budget() {
+        let mut first_prefill = test_tx(1);
+        first_prefill.outputs[0].script_pubkey = vec![1; 4_300_000].into();
+        let (first_block, first_cmpct) =
+            sample_cmpct(vec![first_prefill, test_tx(2)], COMPACT_BLOCK_VERSION, 0x78);
+        let hints = SetHints { txs: vec![] };
+        let mut reconstruction = Reconstruction::new();
+
+        let outcome =
+            reconstruction.receive_cmpctblock(&first_cmpct, COMPACT_BLOCK_VERSION, &hints, now());
+        let Outcome::RequestMissing(request) = outcome else {
+            panic!("expected a getblocktxn request, got {outcome:?}");
+        };
+        let wrong_body = BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: request.txs_request.block_hash,
+                transactions: vec![registry_tx(&test_tx(9))],
+            },
+        };
+        assert!(matches!(
+            reconstruction.receive_blocktxn(&wrong_body, now()),
+            Outcome::Fallback(_)
+        ));
+        drop(first_block);
+        drop(first_cmpct);
+
+        let mut second_prefill = test_tx(3);
+        second_prefill.outputs[0].script_pubkey = vec![3; 4_300_000].into();
+        let (_second_block, second_cmpct) = sample_cmpct(
+            vec![second_prefill, test_tx(4)],
+            COMPACT_BLOCK_VERSION,
+            0x79,
+        );
+        let outcome =
+            reconstruction.receive_cmpctblock(&second_cmpct, COMPACT_BLOCK_VERSION, &hints, now());
+        assert!(
+            matches!(outcome, Outcome::RequestMissing(_)),
+            "a failed completion must release retained-byte capacity, got {outcome:?}"
+        );
+    }
+
     /// Serializes the precomputed colliding fixture transaction; only the
     /// payload bytes separate the two inputs.
     fn colliding_tx_bytes(branch: u8, payload: u32) -> Vec<u8> {

@@ -664,19 +664,19 @@ impl PeerTable {
         sessions
     }
 
-    /// Counts live outbound connections by relay role, including those still
-    /// handshaking.
+    /// Counts automatic outbound connections by relay role, including those
+    /// still handshaking.
     ///
     /// PRE: none.
-    /// POST: `(full_relay, block_relay)` counts of outbound connections;
-    ///   inbound connections are never counted.
-    /// INVARIANT: a cancelled lease holds no slot, so a dying connection
-    ///   cannot keep its role occupied past its own teardown.
+    /// POST: `(full_relay, block_relay)` counts of automatic outbound
+    ///   connections; inbound connections are never counted.
+    /// INVARIANT: inbound, manual, and cancelled leases hold no automatic
+    ///   slot, so none can displace an automatic dial.
     #[must_use]
     pub fn outbound_role_counts(&self) -> (usize, usize) {
         let mut counts = (0_usize, 0_usize);
         for entry in self.entries.read().values() {
-            if entry.lease.is_inbound() || entry.lease.is_cancelled() {
+            if entry.lease.is_inbound() || entry.lease.is_cancelled() || entry.lease.is_manual() {
                 continue;
             }
             match entry.lease.role() {
@@ -1306,8 +1306,8 @@ mod tests {
         assert_eq!(table.traffic_totals(), (0, 42));
     }
 
-    /// Slot arithmetic counts outbound connections by relay role. Inbound
-    /// connections and cancelled leases hold no outbound slot.
+    /// Slot arithmetic counts automatic outbound connections by relay role.
+    /// Inbound, manual, and cancelled leases hold no automatic slot.
     #[test]
     fn outbound_role_counts_split_by_relay_role() {
         let table = PeerTable::new();
@@ -1324,10 +1324,16 @@ mod tests {
         cancelled.cancel();
         table.register(addr(5), cancelled);
 
+        let (manual_tx, _manual_rx) = crossbeam_channel::unbounded();
+        table.register(
+            addr(6),
+            PeerLease::new_manual(manual_tx, crate::peer_info::PeerRole::FullRelay),
+        );
+
         assert_eq!(
             table.outbound_role_counts(),
             (2, 1),
-            "two full-relay and one block-relay outbound connection"
+            "two automatic full-relay and one automatic block-relay connection"
         );
     }
 }
