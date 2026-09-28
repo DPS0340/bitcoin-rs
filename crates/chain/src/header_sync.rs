@@ -72,10 +72,15 @@ pub enum HeaderAdmission {
 /// `TimestampTooFarAhead` documents a network-adjusted limit, and a host clock
 /// running an hour slow would reject a header ninety minutes ahead of network
 /// time even though it is well inside the two-hour window — across every peer,
-/// stalling the sync. This node tracks no peer time offset yet, so every caller
-/// passes [`current_unix_seconds`] today; the parameter is what lets one
+/// stalling the sync. This node tracks no peer time offset yet, so live
+/// callers pass [`current_unix_seconds`] today; the parameter is what lets one
 /// callsite change when it does, and what makes the bound testable without
 /// moving the system clock.
+///
+/// Under [`HeaderValidationMode::HistoricalReplay`] `now_secs` is ignored
+/// entirely: checkpoint and journal replay pass a placeholder value because
+/// the wall-clock future-drift ceiling does not apply to already-committed
+/// history.
 pub fn accept_headers(
     tree: &mut BlockTree,
     headers: &[BlockHeader],
