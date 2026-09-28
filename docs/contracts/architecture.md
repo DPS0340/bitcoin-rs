@@ -268,7 +268,10 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   retaining parallel fields. Its inbound transaction channel is node-owned
   because node orchestration drains it into `MempoolGateway`. Confirmed
   transaction bodies are queried through the derived index and durable block
-  storage, never through a second node/RPC transaction map.
+  storage, never through a second node/RPC transaction map. RPC network
+  answers likewise read the P2P-owned peer table, traffic counters, ban list,
+  added-node list, and network-active latch directly; there is no parallel
+  RPC-local network-state projection.
 - `MempoolGateway` owns the process mempool handle; `NodeState::mempool` is a
   read/composition capability borrowed from that gateway, not a parallel
   retained `Arc`. Gateway interning remains the public one-gateway-per-pool
@@ -371,6 +374,12 @@ composition seam.
 - `crates/node/src/chain_effects.rs` and node mining/sync/reorg integration
   tests prove that mempool/follower work consumes committed chainstate outcomes
   without making chainstate depend on those consumers.
+- `crates/node/tests/unit/state/tests/construction.rs` test
+  `runtime_accessors_borrow_their_subsystem_owner` and
+  `crates/node/tests/unit/lifecycle/tests.rs` test
+  `rpc_network_handles_borrow_p2p_service_state` prove that node and RPC
+  composition reuse the owning service's handles rather than retaining
+  parallel runtime projections.
 - `crates/node/src/chain_effects.rs` tests `noop_asks_for_no_payloads`,
   `connect_then_disconnect_rewinds_the_rpc_log_and_emits_in_order`,
   `disconnect_does_not_pop_a_different_tail`: post-commit RPC/ZMQ work is

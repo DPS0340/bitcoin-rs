@@ -42,6 +42,17 @@ struct RpcChainControl {
     sync: Arc<crate::BlockSync>,
 }
 
+fn rpc_network_handles(state: &NodeState) -> NetworkHandles {
+    NetworkHandles {
+        network_active: state.network_active(),
+        peer_table: state.peer_table(),
+        p2p_outbound_sender: Some(state.p2p_outbound_sender()),
+        banned: state.banned_subnets(),
+        added_nodes: state.added_nodes(),
+        local_services: state.p2p().local_services().to_u64(),
+    }
+}
+
 impl ChainControl for RpcChainControl {
     fn invalidate_block(
         &self,
@@ -100,17 +111,7 @@ fn bind_rpc(
             script_index: state.script_index_query(),
             derived_index_status: Some(state.derived_index_status()),
         },
-        network: NetworkHandles {
-            network: Arc::new(parking_lot::RwLock::new(
-                bitcoin_rs_rpc::context::NetworkState::default(),
-            )),
-            network_active: state.network_active(),
-            peer_table: state.peer_table(),
-            p2p_outbound_sender: Some(state.p2p_outbound_sender()),
-            banned: state.banned_subnets(),
-            added_nodes: state.added_nodes(),
-            local_services: state.p2p().local_services().to_u64(),
-        },
+        network: rpc_network_handles(state),
         mining: MiningHandles {
             mining_control: Some(Arc::clone(mining_control)),
         },

@@ -656,9 +656,6 @@ fn mining_handler(state: &NodeState) -> Handler {
         },
         indexes: IndexHandles::default(),
         network: NetworkHandles {
-            network: Arc::new(parking_lot::RwLock::new(
-                bitcoin_rs_rpc::context::NetworkState::default(),
-            )),
             network_active: state.network_active(),
             peer_table: state.peer_table(),
             p2p_outbound_sender: Some(state.p2p_outbound_sender()),
