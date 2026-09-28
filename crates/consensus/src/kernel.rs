@@ -286,6 +286,10 @@ mod kernel_backend {
         /// in one pass over the decoded transactions — the same IDs the
         /// parse produced, without a second kernel FFI crossing. Byte
         /// positions are a native-layout fact and stay empty on this path.
+        #[expect(
+            clippy::unused_self,
+            reason = "shape parity with the native backend's derive_facts"
+        )]
         #[must_use]
         pub fn derive_facts(&self, txs: &[Tx], txids: &[Txid]) -> crate::block_view::BlockFacts {
             crate::block_view::BlockFacts::from_txids(txs, txids.to_vec())

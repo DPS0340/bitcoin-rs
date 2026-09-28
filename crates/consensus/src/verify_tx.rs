@@ -10,7 +10,6 @@ use bitcoin_rs_script::Interpreter;
 use bitcoin_rs_script::VerifyFlags;
 use rayon::prelude::*;
 
-#[cfg(not(feature = "kernel"))]
 use crate::ScriptEngine;
 use crate::UtxoView;
 use crate::{ConsensusError, MAX_BLOCK_SIGOPS_COST, ValidationEngine};
