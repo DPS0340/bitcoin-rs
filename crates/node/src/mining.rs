@@ -190,48 +190,17 @@ impl MiningCoordinator {
             block,
             serialized,
         ) {
-            Ok(outcome) => Ok(self.accept_committed_submission(&outcome, None)),
+            Ok(_) => Ok(BlockValidationResult::Accepted),
             Err(ConnectMutationError::CommittedButSettlementFailed { outcome, source }) => {
-                Ok(self.accept_committed_submission(&outcome, Some(&source)))
+                tracing::error!(
+                    committed = %outcome.hash,
+                    %source,
+                    "submitblock committed but node settlement failed; retry is forbidden"
+                );
+                Ok(BlockValidationResult::Accepted)
             }
             Err(ConnectMutationError::NotCommitted(error)) => map_apply_error(error),
         }
-    }
-
-    /// A successful authoritative commit is always reported as accepted.
-    /// Post-commit publication/settlement failures close the node and are
-    /// logged, but must not turn into a rejection that invites resubmission.
-    fn accept_committed_submission(
-        &self,
-        outcome: &bitcoin_rs_chainstate::ConnectOutcome,
-        settlement: Option<&ApplyError>,
-    ) -> BlockValidationResult {
-        match self.chainstate.applied_tip_snapshot() {
-            Some(visible) if visible.hash == outcome.tip.hash => {}
-            Some(visible) => {
-                self.chainstate.fail_closed_for_recovery();
-                tracing::error!(
-                    committed = %outcome.tip.hash,
-                    visible = %visible.hash,
-                    "applied tip was not published before submit_block returned"
-                );
-            }
-            None => {
-                self.chainstate.fail_closed_for_recovery();
-                tracing::error!(
-                    committed = %outcome.tip.hash,
-                    "applied tip missing after accepted submission"
-                );
-            }
-        }
-        if let Some(source) = settlement {
-            tracing::error!(
-                committed = %outcome.hash,
-                %source,
-                "submitblock committed but node settlement failed; retry is forbidden"
-            );
-        }
-        BlockValidationResult::Accepted
     }
 }
 
