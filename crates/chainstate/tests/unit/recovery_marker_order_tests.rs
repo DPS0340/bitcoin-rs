@@ -35,7 +35,9 @@ fn corrupt_checkpoint_with_marker_selects_cold_replay() -> Result<(), Box<dyn st
     let checkpoint_root = data_dir.join("chainstate-checkpoints");
     fs::create_dir_all(checkpoint_root.join(gen_name.as_str()))?;
     fs::write(
-        checkpoint_root.join(gen_name.as_str()).join("manifest-v1.json"),
+        checkpoint_root
+            .join(gen_name.as_str())
+            .join("manifest-v1.json"),
         b"not valid json",
     )?;
     let current_json = format!(
