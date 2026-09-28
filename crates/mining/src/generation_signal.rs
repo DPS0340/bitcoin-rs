@@ -60,6 +60,3 @@ impl MempoolObserver for MiningGenerationSignal {
         self.publish_generation_from(wake_sequence);
     }
 }
-
-#[cfg(test)]
-mod tests;

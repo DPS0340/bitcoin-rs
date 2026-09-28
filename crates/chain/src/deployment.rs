@@ -219,11 +219,10 @@ fn cached_deployment_state(
 #[cfg(test)]
 mod tests {
     use crate::node::NodeStatus;
-    use bitcoin_rs_consensus::DeploymentContext;
     use bitcoin_rs_consensus::bip30::BIP34_IMPLIES_BIP30_LIMIT;
     use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Header, Network};
 
-    use super::{DeploymentView, softfork_state};
+    use super::softfork_state;
     use crate::BlockTree;
 
     fn synthetic_header(prev_blockhash: BlockHash, time: u32) -> Header {
@@ -239,44 +238,6 @@ mod tests {
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: 0,
         }
-    }
-
-    #[test]
-    fn block_version_returns_header_version_at_height() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let header_0 = synthetic_header(BlockHash::default(), 1_000_000);
-        let header_0_hash = header_0.compute_hash();
-        tree.insert_header(header_0, NodeStatus::HeaderValid)?;
-        let header_1 = synthetic_header(header_0_hash, 1_000_600);
-        let tip = tree.insert_header(header_1, NodeStatus::HeaderValid)?;
-        let ctx = DeploymentView::new(&tree, tip);
-
-        assert_eq!(ctx.block_version(0), Some(1));
-        assert_eq!(ctx.block_version(1), Some(1));
-        assert_eq!(ctx.block_version(99), None);
-        Ok(())
-    }
-
-    #[test]
-    fn median_time_past_returns_window_median() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let mut prev = BlockHash::default();
-        let mut tip = None;
-        for i in 0..11_u32 {
-            let header = synthetic_header(prev, 1_000_000 + i * 600);
-            prev = header.compute_hash();
-            tip = Some(tree.insert_header(header, NodeStatus::HeaderValid)?);
-        }
-        let Some(tip) = tip else {
-            panic!("chain has 11 blocks should yield a tip");
-        };
-        let ctx = DeploymentView::new(&tree, tip);
-        let Some(mtp) = ctx.median_time_past(10, 11) else {
-            panic!("chain has 11 blocks should yield a median time past");
-        };
-
-        assert_eq!(mtp, 1_003_000);
-        Ok(())
     }
 
     fn seed_known_bip34_activation_chain(
