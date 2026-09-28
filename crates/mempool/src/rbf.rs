@@ -332,6 +332,7 @@ impl Mempool {
     /// INVARIANT: this door enforces in full. The admission owner that derives
     /// enforcement from the origin owns the deferred path: it collects the
     /// conflict set itself and calls `capture_admission` with it.
+    #[cfg(any(test, feature = "test-seam"))]
     pub(crate) fn capture_replacement(
         &self,
         candidate: &ReplacementCandidate,
