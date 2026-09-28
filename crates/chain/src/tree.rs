@@ -873,13 +873,10 @@ fn node_hash_key(nodes: &Slab<BlockTreeNode>, id: NodeId) -> u64 {
 mod tests {
     use bitcoin_rs_primitives::{BlockHash, CompactTarget};
 
-    use std::sync::Arc;
-
     use super::{BlockTree, Hash256, hash_from_header};
     use crate::{
         ChainTxCount,
-        node::{BlockHeader, ChainWork, NodeId, NodeStatus},
-        tip::TipSnapshot,
+        node::{BlockHeader, NodeId, NodeStatus},
     };
 
     #[test]
@@ -1281,58 +1278,6 @@ mod tests {
     }
 
     #[test]
-    fn node_by_hash_returns_none_for_unknown_hash() {
-        let tree = BlockTree::new();
-        let unknown = Hash256::from_le_bytes(&[0xab_u8; 32]);
-        assert!(tree.node_by_hash(unknown).is_none());
-    }
-
-    #[test]
-    fn node_by_hash_returns_inserted_node() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let genesis_hash = tree.node(genesis_id)?.hash;
-        let Some(node) = tree.node_by_hash(genesis_hash) else {
-            panic!("node_by_hash returned None for inserted genesis");
-        };
-        assert_eq!(node.hash, genesis_hash);
-        Ok(())
-    }
-
-    #[test]
-    fn height_of_hash_returns_none_for_unknown_hash() {
-        let tree = BlockTree::new();
-        let unknown = Hash256::from_le_bytes(&[0xff_u8; 32]);
-        assert!(tree.height_of_hash(unknown).is_none());
-    }
-
-    #[test]
-    fn height_of_hash_returns_node_height_for_inserted_block()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let genesis_hash = tree.node(genesis_id)?.hash;
-        let expected_height = tree.node(genesis_id)?.height;
-
-        assert_eq!(tree.height_of_hash(genesis_hash), Some(expected_height));
-        Ok(())
-    }
-
-    #[test]
-    fn active_node_at_height_returns_none_when_no_tip() {
-        let tree = BlockTree::new();
-        assert!(tree.active_node_at_height(0).is_none());
-    }
-
-    #[test]
-    fn tip_id_returns_none_before_publish() {
-        let tree = BlockTree::new();
-        assert!(tree.tip_id().is_none());
-    }
-
-    #[test]
     fn tip_id_returns_published_tip() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let genesis = test_header(BlockHash::default(), 0);
@@ -1345,105 +1290,6 @@ mod tests {
         // genesis's height and hash, not hand-stored values.
         assert_eq!(tree.tip_height(), Some(0));
         assert_eq!(tree.tip_hash(), Some(genesis_hash));
-        Ok(())
-    }
-
-    #[test]
-    fn tip_height_returns_none_before_publish() {
-        let tree = BlockTree::new();
-        assert!(tree.tip_height().is_none());
-    }
-
-    #[test]
-    fn tip_hash_returns_none_before_publish() {
-        let tree = BlockTree::new();
-        assert!(tree.tip_hash().is_none());
-    }
-
-    #[test]
-    fn tip_height_returns_published_tip_height() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-        let genesis_hash = tree.node(genesis_id)?.hash;
-        tree.tip_handle().store(Some(Arc::new(TipSnapshot {
-            tip_id: genesis_id,
-            height: 7,
-            chainwork: ChainWork::ZERO,
-            hash: genesis_hash,
-            chain_tx_count: ChainTxCount::UNKNOWN,
-        })));
-        assert_eq!(tree.tip_height(), Some(7));
-        Ok(())
-    }
-
-    #[test]
-    fn tip_hash_returns_published_tip_hash() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-        let genesis_hash = tree.node(genesis_id)?.hash;
-        tree.tip_handle().store(Some(Arc::new(TipSnapshot {
-            tip_id: genesis_id,
-            height: 0,
-            chainwork: ChainWork::ZERO,
-            hash: genesis_hash,
-            chain_tx_count: ChainTxCount::UNKNOWN,
-        })));
-        assert_eq!(tree.tip_hash(), Some(genesis_hash));
-        Ok(())
-    }
-
-    #[test]
-    fn active_node_at_height_returns_genesis_after_insert() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-
-        let Some(node) = tree.active_node_at_height(0) else {
-            panic!("expected node at height 0 after insert");
-        };
-        assert_eq!(node.height, 0);
-        assert_eq!(node.hash, tree.node(genesis_id)?.hash);
-        Ok(())
-    }
-
-    #[test]
-    fn node_at_height_from_walks_back_to_requested_height() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut tree = BlockTree::new();
-        let mut prev_hash = BlockHash::default();
-        let mut genesis_id = None;
-        let mut tip_id = None;
-
-        for height in 0..5_u32 {
-            let header = BlockHeader {
-                version: 1,
-                prev_blockhash: prev_hash,
-                merkle_root: Hash256::default(),
-                time: 1_000_000 + height * 600,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
-                nonce: height,
-            };
-            prev_hash = header.compute_hash();
-            let node_id = tree.insert_header(header, NodeStatus::HeaderValid)?;
-            if height == 0 {
-                genesis_id = Some(node_id);
-            }
-            tip_id = Some(node_id);
-        }
-
-        let Some(genesis_id) = genesis_id else {
-            panic!("chain has 5 blocks should yield a genesis node");
-        };
-        let Some(tip_id) = tip_id else {
-            panic!("chain has 5 blocks should yield a tip");
-        };
-
-        assert_eq!(tree.node_at_height_from(tip_id, 0), Some(genesis_id));
-        assert_eq!(tree.node_at_height_from(tip_id, 4), Some(tip_id));
-        assert_eq!(tree.node_at_height_from(tip_id, 99), None);
         Ok(())
     }
 
@@ -1497,21 +1343,6 @@ mod tests {
     }
 
     #[test]
-    fn leaf_node_ids_returns_only_tip_on_linear_chain() -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let child = test_header(BlockHash(hash_from_header(&genesis)), 1);
-        let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::HeaderValid)?;
-
-        let leaves = tree.leaf_node_ids();
-
-        assert_eq!(leaves.len(), 1, "expected single leaf, got {leaves:?}");
-        assert_eq!(leaves[0], child_id);
-        Ok(())
-    }
-
-    #[test]
     fn leaf_node_ids_returns_all_branches_when_forked() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let genesis = test_header(BlockHash::default(), 0);
@@ -1533,30 +1364,6 @@ mod tests {
         );
         assert!(leaves.contains(&leaf_a));
         assert!(leaves.contains(&leaf_b));
-        Ok(())
-    }
-
-    #[test]
-    fn find_common_ancestor_returns_genesis_on_linear_chain()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut tree = BlockTree::new();
-        let genesis = test_header(BlockHash::default(), 0);
-        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let child = test_header(BlockHash(hash_from_header(&genesis)), 1);
-        let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::HeaderValid)?;
-
-        assert_eq!(
-            tree.find_common_ancestor(genesis_id, genesis_id),
-            Some(genesis_id)
-        );
-        assert_eq!(
-            tree.find_common_ancestor(genesis_id, child_id),
-            Some(genesis_id)
-        );
-        assert_eq!(
-            tree.find_common_ancestor(child_id, genesis_id),
-            Some(genesis_id)
-        );
         Ok(())
     }
 

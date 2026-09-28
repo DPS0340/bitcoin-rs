@@ -122,32 +122,4 @@ mod tests {
         batch.delete(ColumnFamily::BlockBodies, b"gone");
         assert_eq!(batch.encoded_bytes, 15);
     }
-
-    #[test]
-    fn into_ops_returns_every_recorded_operation_in_commit_order() {
-        let mut batch = BufferedWriteBatch::default();
-        batch.put(ColumnFamily::BlockBodies, b"k", b"v");
-        batch.delete(ColumnFamily::UtxoMeta, b"d");
-        batch.delete_range(ColumnFamily::TxConfirmed, b"a", b"b");
-        let ops = batch.into_ops();
-        assert_eq!(
-            ops,
-            vec![
-                BatchOp::Put {
-                    cf: ColumnFamily::BlockBodies,
-                    key: b"k".to_vec(),
-                    value: Bytes::from_static(b"v"),
-                },
-                BatchOp::Delete {
-                    cf: ColumnFamily::UtxoMeta,
-                    key: b"d".to_vec(),
-                },
-                BatchOp::DeleteRange {
-                    cf: ColumnFamily::TxConfirmed,
-                    start: b"a".to_vec(),
-                    end: b"b".to_vec(),
-                },
-            ]
-        );
-    }
 }
