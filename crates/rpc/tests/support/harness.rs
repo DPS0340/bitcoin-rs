@@ -114,7 +114,6 @@ impl ServerHarness {
                 applied_tip: chainstate.applied_tip_reader(),
                 ibd,
                 blocks: state.blocks(),
-                transactions: state.transactions(),
                 utxo: chainstate.utxo_handle(),
                 coin_stats: chainstate.coin_stats_handle(),
                 block_tree: chainstate.block_tree_reader(),
@@ -136,7 +135,9 @@ impl ServerHarness {
                 derived_index_status: Some(state.derived_index_status()),
             },
             network: NetworkHandles {
-                network: state.network(),
+                network: Arc::new(parking_lot::RwLock::new(
+                    bitcoin_rs_rpc::context::NetworkState::default(),
+                )),
                 network_active: state.network_active(),
                 peer_table: state.peer_table(),
                 p2p_outbound_sender: Some(state.p2p_outbound_sender()),

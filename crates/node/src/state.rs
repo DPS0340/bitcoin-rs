@@ -21,15 +21,11 @@ use bitcoin_rs_index::runtime::REDB_BATCH_LIMITS;
 use bitcoin_rs_index::runtime::open_derived_index_store_on_worker;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::Tx;
-use bitcoin_rs_primitives::Txid;
-use bitcoin_rs_rpc::context::NetworkState;
 use bitcoin_rs_rpc::context::PruneService;
 use bitcoin_rs_storage::KvStore;
 use bitcoin_rs_storage::StorageBackend;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
-use hashbrown::HashMap;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::path::Path;
@@ -100,35 +96,18 @@ pub struct NodeState {
     /// parts, and the one worker state-machine slot.
     derived_index: index::DerivedIndexHost,
     prune_service: Option<Arc<dyn PruneService>>,
-    zmq_publisher: Arc<dyn crate::ZmqPublisher>,
-    mempool: Arc<RwLock<Mempool>>,
     /// The single mutation gateway in front of `mempool`.
     mempool_gateway: Arc<bitcoin_rs_mempool::MempoolGateway>,
-    /// Template-coordinator wake for authoritative mutations and tip moves.
-    mining_generation: Arc<crate::mining::MiningGenerationSignal>,
-    /// Cumulative transaction count through `applied_tip`, `0` when unknown.
-    /// Shared with `Chainstate`, which maintains it, and with the RPC context.
-    blocks: Arc<RwLock<BlockLog>>,
-    transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
-    network: Arc<RwLock<NetworkState>>,
-    /// Shared P2P admission switch controlled by `setnetworkactive`.
-    network_active: Arc<AtomicBool>,
     /// Runtime owner of P2P workers, session table, and inbound channels.
     p2p: Arc<bitcoin_rs_p2p::P2pService>,
-    peer_table: Arc<bitcoin_rs_p2p::PeerTable>,
-    banned: Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
-    p2p_outbound_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::OutboundDial>,
-    inbound_blocks_tx: Sender<bitcoin_rs_p2p::InboundBlock>,
+    /// Node-owned P2P-to-mempool ingress bridge. Unlike the service-owned
+    /// header/block channels, this receiver is drained by node orchestration.
     inbound_tx_tx: Sender<bitcoin_rs_p2p::InboundTx>,
     inbound_tx_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundTx>>>,
     chainstate: Arc<bitcoin_rs_chainstate::Chainstate>,
     /// Derived consumers of committed chain events. Not held by `Chainstate`.
     followers: crate::chain_effects::ChainFollowers,
     sync: Arc<crate::BlockSync>,
-    /// The one initial-block-download latch: chain-owned state shared by the
-    /// block-download executor, the RPC context, and the P2P listener, so no
-    /// two surfaces can disagree about whether this node is still syncing.
-    ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
     /// Process-wide rollback-evidence reporter (warning snapshot + marker).
     recovery_reporter: Arc<crate::recovery_reporter::RecoveryReporter>,
 }
@@ -205,13 +184,13 @@ impl NodeState {
     /// Returns the configured ZMQ publisher handle (default: `NoOpZmqPublisher`).
     #[must_use]
     pub fn zmq_publisher(&self) -> Arc<dyn crate::ZmqPublisher> {
-        Arc::clone(&self.zmq_publisher)
+        self.followers.zmq_publisher()
     }
 
     /// Returns the shared mempool handle.
     #[must_use]
     pub fn mempool(&self) -> Arc<RwLock<Mempool>> {
-        Arc::clone(&self.mempool)
+        Arc::clone(self.mempool_gateway.pool())
     }
 
     /// Returns the node-owned mutation gateway in front of `mempool`.
@@ -229,13 +208,13 @@ impl NodeState {
     /// gateway observer. The template coordinator attaches itself here.
     #[must_use]
     pub fn mining_generation_signal(&self) -> Arc<crate::mining::MiningGenerationSignal> {
-        Arc::clone(&self.mining_generation)
+        Arc::clone(self.followers.mining())
     }
 
     /// Returns the shared block-records handle exposed to RPC handlers.
     #[must_use]
     pub fn blocks(&self) -> Arc<RwLock<BlockLog>> {
-        Arc::clone(&self.blocks)
+        Arc::clone(self.followers.block_log())
     }
 
     /// Returns a durable block body reader for metadata-only block records.
@@ -247,28 +226,16 @@ impl NodeState {
         Ok(Arc::new(StoredBlockBodySource::new(store)))
     }
 
-    /// Returns the shared txid → transaction map exposed to RPC handlers.
-    #[must_use]
-    pub fn transactions(&self) -> Arc<RwLock<HashMap<Txid, Tx>>> {
-        Arc::clone(&self.transactions)
-    }
-
-    /// Returns the shared network-counters handle exposed to RPC handlers.
-    #[must_use]
-    pub fn network(&self) -> Arc<RwLock<NetworkState>> {
-        Arc::clone(&self.network)
-    }
-
     /// Returns the shared P2P admission switch exposed to RPC and P2P workers.
     #[must_use]
     pub fn network_active(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.network_active)
+        self.p2p.network_active_handle()
     }
 
     /// Returns the shared manual IP/subnet ban list exposed to RPC and P2P.
     #[must_use]
     pub fn banned_subnets(&self) -> Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>> {
-        Arc::clone(&self.banned)
+        self.p2p.banned_handle()
     }
 
     /// Returns the P2P runtime that owns workers and the session table.
@@ -280,7 +247,7 @@ impl NodeState {
     #[must_use]
     /// Returns the authoritative table of live peer sessions.
     pub fn peer_table(&self) -> Arc<bitcoin_rs_p2p::PeerTable> {
-        Arc::clone(&self.peer_table)
+        self.p2p.table()
     }
 
     /// Returns the service-owned persistent addnode view.
@@ -291,13 +258,13 @@ impl NodeState {
     /// Returns a cloned sender that RPC `addnode` uses to request outbound P2P connections.
     #[must_use]
     pub fn p2p_outbound_sender(&self) -> crossbeam_channel::Sender<bitcoin_rs_p2p::OutboundDial> {
-        self.p2p_outbound_tx.clone()
+        self.p2p.outbound_sender()
     }
 
     /// Returns a cloned `Sender` that the P2P listener pushes inbound
     /// blocks into for verification and relay.
     pub fn inbound_blocks_sender(&self) -> Sender<bitcoin_rs_p2p::InboundBlock> {
-        self.inbound_blocks_tx.clone()
+        self.p2p.inbound_blocks_sender()
     }
 
     /// Returns the rollback-evidence reporter for `getblockchaininfo`.
@@ -327,7 +294,7 @@ impl NodeState {
     /// Returns the node's one initial-block-download latch.
     #[must_use]
     pub fn ibd(&self) -> Arc<bitcoin_rs_chain::InitialBlockDownload> {
-        Arc::clone(&self.ibd)
+        self.chainstate.ibd_latch()
     }
 
     /// Returns the process-wide shutdown signal shared by all runtime workers.

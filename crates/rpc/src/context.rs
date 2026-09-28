@@ -10,12 +10,12 @@ use bitcoin_rs_mempool::{
 };
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_primitives::{
-    BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
+    BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, consensus_bytes,
 };
 
 use bitcoin_rs_consensus::ValidationEngine;
 #[cfg(test)]
-use bitcoin_rs_primitives::{Amount, Script};
+use bitcoin_rs_primitives::{Amount, Script, Txid};
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
@@ -255,8 +255,6 @@ pub struct ChainHandles {
     pub closed_for_recovery: LatchReader,
     /// Applied block metadata log.
     pub blocks: Arc<RwLock<BlockLog>>,
-    /// Transactions retained for direct RPC lookup.
-    pub transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
     /// Authoritative UTXO set.
     pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
     /// Incremental UTXO statistics.
@@ -485,7 +483,6 @@ impl Default for ChainHandles {
                 false,
             ))),
             blocks: Arc::new(RwLock::new(BlockLog::new())),
-            transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::new(utxo),
             coin_stats: Arc::new(coin_stats_listener),
             block_tree: BlockTreeReader::new(block_tree),
@@ -951,13 +948,6 @@ impl ChainHandles {
     /// Stores a block record for block and header RPCs.
     pub fn add_block(&self, record: BlockRecord) {
         self.blocks.write().push(record);
-    }
-
-    /// Stores a decoded transaction for transaction lookup RPCs.
-    pub fn add_transaction(&self, tx: Tx) -> Txid {
-        let txid = tx.txid();
-        self.transactions.write().insert(txid, tx);
-        txid
     }
 
     /// Borrows the provisional chain capability shared with P2P admission.
@@ -1673,7 +1663,6 @@ mod tests {
                 applied_tip: TipReader::new(Arc::clone(&applied_tip)),
                 ibd: Arc::clone(&ibd),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
-                transactions: Arc::new(RwLock::new(HashMap::new())),
                 utxo: Arc::clone(&utxo),
                 coin_stats: Arc::clone(&coin_stats),
                 block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
@@ -2239,7 +2228,6 @@ mod tests {
                     BlockTreeReader::new(Arc::clone(&block_tree)),
                 )),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
-                transactions: Arc::new(RwLock::new(HashMap::new())),
                 utxo: Arc::new(bitcoin_rs_utxo::UtxoSet::new()),
                 coin_stats: Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
                     bitcoin_rs_utxo::stats::CoinStats::default(),
@@ -2406,7 +2394,7 @@ mod admission_chain_tests {
     }
 
     #[test]
-    fn cached_unconfirmed_transaction_is_still_admitted_from_a_peer() -> anyhow::Result<()> {
+    fn unconfirmed_transaction_is_admitted_from_a_peer() -> anyhow::Result<()> {
         use bitcoin_rs_mempool::{AdmissionOrigin, PeerToken, SubmitOutcome};
         let ctx = Context::new();
         let outpoint = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[9; 32])), 0);
@@ -2427,7 +2415,6 @@ mod admission_chain_tests {
             &changes,
             &Hash256::default(),
         )?;
-        ctx.chain.add_transaction(tx.clone());
         assert!(
             !ctx.chain
                 .admission_chain()
@@ -2451,7 +2438,7 @@ mod admission_chain_tests {
     }
 
     #[test]
-    fn confirmed_hint_requires_live_chain_outputs_and_survives_no_cache() -> anyhow::Result<()> {
+    fn confirmed_hint_requires_live_chain_outputs() -> anyhow::Result<()> {
         let ctx = Context::new();
         let tx = spending(OutPoint::new(
             Txid::from(Hash256::from_le_bytes(&[10; 32])),
@@ -2465,7 +2452,6 @@ mod admission_chain_tests {
             &changes,
             &Hash256::default(),
         )?;
-        assert!(ctx.chain.transactions.read().is_empty());
         assert!(
             ctx.chain
                 .admission_chain()
@@ -2511,8 +2497,6 @@ mod admission_chain_tests {
         .context("fund input")?;
         publish_tip(&ctx, 100)?;
         publish_tip(&ctx, 200)?;
-        ctx.chain.transactions.write().insert(tx.txid(), tx.clone());
-
         let snapshot = ctx
             .chain
             .admission_chain()
@@ -2525,7 +2509,7 @@ mod admission_chain_tests {
         assert_eq!(snapshot.prevouts[0].1.value, 10_000);
         assert!(
             !snapshot.confirmed,
-            "lookup-cache membership is not chain evidence"
+            "an input UTXO is not evidence that the spending transaction is confirmed"
         );
         Ok(())
     }

@@ -730,13 +730,11 @@ impl BlockSync {
 
         for (source, prior, action) in outcomes {
             match action {
-                Some(ChainSyncAction::Probe) => {
-                    if !self.probe_chain_sync(source, frontier) {
-                        self.scheduler.lock().restore_chain_sync(source, prior);
-                    }
+                Some(ChainSyncAction::Probe) if !self.probe_chain_sync(source, frontier) => {
+                    self.scheduler.lock().restore_chain_sync(source, prior);
                 }
                 Some(ChainSyncAction::Evict) => self.retire_chain_sync_peer(source),
-                None => {}
+                Some(ChainSyncAction::Probe) | None => {}
             }
         }
     }

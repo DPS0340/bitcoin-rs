@@ -6,16 +6,11 @@ use anyhow::Context as _;
 use anyhow::Result;
 use bitcoin_rs_chain::BlockBodyMetadata;
 use bitcoin_rs_chain::BlockBodySource;
-use bitcoin_rs_index::block_log::BlockLog;
-use bitcoin_rs_primitives::Tx;
-use bitcoin_rs_primitives::Txid;
 use bitcoin_rs_rpc::context::PruneService;
 use bitcoin_rs_storage::DurableHeadStore as _;
 use bitcoin_rs_storage::FlatFileBlockStore;
 use bitcoin_rs_storage::KvStore;
 use bitcoin_rs_storage::StorageBackend;
-use hashbrown::HashMap;
-use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
@@ -140,9 +135,6 @@ pub(super) trait DeferredChainstateServices: Send + Sync {
     fn prune_service(
         &self,
         block_files: Arc<FlatFileBlockStore>,
-        block_body_store: Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore>,
-        blocks: Arc<RwLock<BlockLog>>,
-        transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: bitcoin_rs_chainstate::PruneAuthority,
         durable_tip_height: Arc<AtomicU32>,
         retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
@@ -162,9 +154,6 @@ impl<S: KvStore> DeferredChainstateServices for ChainstateStoreServices<S> {
     fn prune_service(
         &self,
         block_files: Arc<FlatFileBlockStore>,
-        block_body_store: Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore>,
-        blocks: Arc<RwLock<BlockLog>>,
-        transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: bitcoin_rs_chainstate::PruneAuthority,
         durable_tip_height: Arc<AtomicU32>,
         retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
@@ -172,9 +161,6 @@ impl<S: KvStore> DeferredChainstateServices for ChainstateStoreServices<S> {
         Ok(Arc::new(NodePruneService::new(
             Arc::clone(&self.store),
             block_files,
-            block_body_store,
-            blocks,
-            transactions,
             authority,
             durable_tip_height,
             retention,

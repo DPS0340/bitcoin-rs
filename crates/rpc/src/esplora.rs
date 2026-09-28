@@ -252,7 +252,7 @@ mod tests {
         block
     }
 
-    fn transaction_with_funded_input(ctx: &Context) -> Tx {
+    fn transaction_with_funded_input(ctx: &Context) -> (Tx, Tx) {
         // OP_TRUE: an anyone-can-spend funding script, so the broadcast
         // fixture's empty scriptSig satisfies script verification. The output
         // stays P2WPKH: standardness only allows known output templates.
@@ -265,7 +265,7 @@ mod tests {
                 script_pubkey: spendable.clone().into(),
             },
         );
-        let txid = ctx.chain.add_transaction(funding);
+        let txid = funding.txid();
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
             OutPoint::new(txid, 0),
@@ -282,12 +282,15 @@ mod tests {
             &Hash256::from_le_bytes(&[0xaa; 32]),
         )
         .expect("fund test UTXO");
-        transaction(
-            Some(OutPoint::new(txid, 0)),
-            TxOut {
-                value: Amount::from_sat(9_000),
-                script_pubkey: script.into(),
-            },
+        (
+            transaction(
+                Some(OutPoint::new(txid, 0)),
+                TxOut {
+                    value: Amount::from_sat(9_000),
+                    script_pubkey: script.into(),
+                },
+            ),
+            funding,
         )
     }
 
@@ -707,7 +710,7 @@ mod tests {
             );
         }
 
-        let broadcast_transaction = transaction_with_funded_input(handler.context().as_ref());
+        let (broadcast_transaction, _) = transaction_with_funded_input(handler.context().as_ref());
         let raw = consensus_bytes(&broadcast_transaction).to_lower_hex_string();
         let broadcast = route_post(&handler, "/tx", raw.as_bytes());
         assert_eq!(
@@ -1308,8 +1311,10 @@ mod tests {
 
     #[test]
     fn broadcast_transaction_is_immediately_visible_as_unconfirmed() {
-        let ctx = Arc::new(Context::new());
-        let transaction = transaction_with_funded_input(&ctx);
+        let mut ctx = Context::new();
+        let (transaction, funding) = transaction_with_funded_input(&ctx);
+        ctx.indexes.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(funding)));
+        let ctx = Arc::new(ctx);
         let txid = transaction.txid();
         let handler = Handler::new(ctx);
         let raw = consensus_bytes(&transaction).to_lower_hex_string();

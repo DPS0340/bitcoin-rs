@@ -104,10 +104,16 @@ impl ChainFollowers {
         self.derived_index.is_some() || self.zmq.wants_rawblock()
     }
 
-    /// Shared RPC block log. Production RPC reads `NodeState::blocks`.
+    /// Shared RPC block log owned by this committed-effect dispatcher.
     #[must_use]
     pub fn block_log(&self) -> &Arc<RwLock<BlockLog>> {
         &self.blocks
+    }
+
+    /// Publisher used by committed chain effects and RPC notifier discovery.
+    #[must_use]
+    pub fn zmq_publisher(&self) -> Arc<dyn ZmqPublisher> {
+        Arc::clone(&self.zmq)
     }
 
     /// `TxIndex` runtime, when one is wired.

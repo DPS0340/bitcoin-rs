@@ -208,6 +208,9 @@ pub(crate) struct ReplacementInputs {
 
 pub(crate) struct PreparedPoolChange {
     pub(crate) stamp: crate::pool::fee_policy::PolicyStamp,
+    // Retained in production plans so the test-seam policy oracle observes
+    // the exact plan shape without a second replacement implementation.
+    #[allow(dead_code)]
     pub(crate) evicted: Vec<EntryId>,
     pub(crate) removals: Vec<(EntryId, RemovalReason)>,
     pub(crate) entry: Option<crate::pool::PreparedInsert>,
