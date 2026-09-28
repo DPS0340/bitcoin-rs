@@ -9,6 +9,14 @@ on:
     # construction -- five open PRs had never been built or tested, while
     # reporting no failing checks, which reads exactly like green.
     branches: ['**']
+  # Re-run these lanes on the merge-queue boundary (issue #1279): a queue
+  # entry fires `merge_group`, not `pull_request`, so without this trigger a
+  # queued merge commit would only see the ci-merge-gate workflow and the
+  # portable lanes below would not gate entry into `main`. The concurrency
+  # expression below already handles it: a `merge_group` run falls into the
+  # `run_id` branch (unique group, never cancelled), same as `main` pushes.
+  merge_group:
+    types: [checks_requested]
 
 # The PR gate only needs to read repository contents. Keep the token scope
 # explicit so repository-level default permissions cannot grant more access.

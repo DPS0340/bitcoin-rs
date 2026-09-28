@@ -1,0 +1,78 @@
+name: ci-merge-gate
+
+# Pre-merge kernel/native compile gate (issue #1279).
+#
+# The deep native/kernel lanes live in ci-main and run on `main` pushes only,
+# so a PR could merge with a kernel-gated compile break and take main down
+# immediately after (#1276 landed exactly such a break: `ScriptEngine` was
+# imported only under `cfg(not(feature = "kernel"))` while the kernel build
+# still referenced it). This workflow runs at the merge-queue boundary
+# instead: ordinary PR iteration keeps the fast portable gate in ci.yml,
+# while a broken kernel/native graph cannot enter main.
+#
+# Compile-only by design: tests, fixture provisioning, parity evidence, and
+# benchmarks stay main-only (ci-main). Compiling IS the gate -- a
+# feature-gated compile break surfaces here without paying for the evidence
+# lanes.
+on:
+  merge_group:
+    types: [checks_requested]
+  # Manual runs for validating gate changes without queuing a merge.
+  workflow_dispatch:
+
+# The gate only needs to read repository contents. Keep the token scope
+# explicit instead of inheriting repository defaults.
+permissions:
+  contents: read
+
+# One group per ref: merge-queue entries each get their own ref, and a
+# superseded entry's stale run is cancelled when its ref re-runs. Unlike the
+# `main` push lanes there is no queueing concern to protect here.
+concurrency:
+  group: ci-merge-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: 0
+  # Same production feature set as ci-main's full-node lane: all three
+  # storage backends plus the bitcoinkernel script-verification engine.
+  FULL_NODE_FEATURES: "rocksdb,fjall,redb,kernel"
+
+jobs:
+  # Fastest signal for the #1276-class break: consensus is where the
+  # kernel-gated code lives, and its clippy pass compiles every target
+  # including the kernel-gated tests and examples.
+  kernel-consensus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The kernel engine is built from C++; install its prerequisites even
+      # for a compile-only pass.
+      - uses: ./.github/actions/native-deps
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Consensus compiles with kernel enabled
+        run: cargo check --locked -p bitcoin-rs-consensus --features kernel
+      - name: Kernel-gated consensus Clippy
+        run: cargo clippy --locked -p bitcoin-rs-consensus --all-targets --features kernel -- -D warnings
+
+  # The production binary graph (all three storage backends plus kernel),
+  # compile-only. `--locked` and `-p bitcoin-rs` reuse the full-node lane's
+  # command shape (the binary's feature table propagates backends and kernel
+  # through the workspace); dropping nextest/tests/benches keeps this to a
+  # compile, which is all the merge boundary needs.
+  full-node-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # rocksdb's bindgen needs libclang; the kernel needs the C++ toolchain.
+      - uses: ./.github/actions/native-deps
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Production full-node graph compiles
+        run: |
+          cargo check --locked -p bitcoin-rs \
+            --no-default-features --features "${FULL_NODE_FEATURES}"
