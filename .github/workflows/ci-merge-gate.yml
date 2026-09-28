@@ -66,6 +66,11 @@ jobs:
         run: cargo check --locked -p bitcoin-rs-consensus --features kernel
       - name: Kernel-gated consensus Clippy
         run: cargo clippy --locked -p bitcoin-rs-consensus --all-targets --features kernel -- -D warnings
+      # Script's `kernel` feature only forwards to consensus's, so the
+      # consensus pass above does not compile script's own kernel-gated
+      # targets (`core_vectors`, `segwit_v0_sighash_edges`).
+      - name: Kernel-gated script targets Clippy
+        run: cargo clippy --locked -p bitcoin-rs-script --all-targets --features kernel -- -D warnings
 
   # The production binary graph (all three storage backends plus kernel),
   # compile-only. `--locked` and `-p bitcoin-rs` reuse the full-node lane's

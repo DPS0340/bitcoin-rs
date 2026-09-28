@@ -286,10 +286,10 @@ mod kernel_backend {
         /// in one pass over the decoded transactions — the same IDs the
         /// parse produced, without a second kernel FFI crossing. Byte
         /// positions are a native-layout fact and stay empty on this path.
-        // The receiver exists for signature parity with `NativeBlock::
-        // derive_facts`: `ConsensusBlock::derive_facts` dispatches both
-        // backends as methods, and the kernel path needs no engine state.
-        #[allow(clippy::unused_self)]
+        #[expect(
+            clippy::unused_self,
+            reason = "shape parity with the native backend's derive_facts"
+        )]
         #[must_use]
         pub fn derive_facts(&self, txs: &[Tx], txids: &[Txid]) -> crate::block_view::BlockFacts {
             crate::block_view::BlockFacts::from_txids(txs, txids.to_vec())
