@@ -10,7 +10,6 @@ use anyhow::Result;
 use anyhow::bail;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_chainstate::ApplyError;
 use bitcoin_rs_chainstate::events::ChainEventPublisher;
 #[cfg(test)]
 pub(crate) use bitcoin_rs_chainstate::recovery::ResumeSource;
@@ -351,7 +350,12 @@ impl NodeState {
     /// Synthetically applies `block` as the next tip after consensus checks.
     ///
     /// Holds the chain transition through follower dispatch (`ARCH-07`).
-    pub fn apply_block(&self, block: &Block) -> core::result::Result<TipSnapshot, ApplyError> {
+    /// A post-commit settlement failure remains distinguishable in
+    /// [`crate::ConnectMutationError`] and retains the authoritative outcome.
+    pub fn apply_block(
+        &self,
+        block: &Block,
+    ) -> core::result::Result<TipSnapshot, crate::chain_effects::ConnectMutationError> {
         let outcome = self.followers.apply_connect(&self.chainstate, block)?;
         Ok(outcome.tip)
     }

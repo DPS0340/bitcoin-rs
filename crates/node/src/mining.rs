@@ -3,7 +3,7 @@
 //! Header admission and proposal/submission projection over the authoritative
 //! chainstate. Candidate lifecycle lives in `bitcoin_rs_mining`.
 
-use crate::chain_effects::ChainFollowers;
+use crate::chain_effects::{ChainFollowers, ConnectMutationError};
 use alloc::sync::Arc;
 use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::NodeStatus;
@@ -183,50 +183,23 @@ impl MiningCoordinator {
             Err(error) => return map_apply_error(error),
         };
         let transition = lock.into_transition();
-        match transition.connect(block, serialized) {
-            Ok(outcome) => {
-                self.followers.on_connect(block, &outcome);
-                let tip = outcome.tip;
-                let Some(visible) = self.chainstate.applied_tip_snapshot() else {
-                    self.chainstate.fail_closed_for_recovery();
-                    return Err(MiningControlError::Failed(CompactString::from(
-                        "applied tip missing after accepted submission",
-                    )));
-                };
-                if visible.hash != tip.hash {
-                    self.chainstate.fail_closed_for_recovery();
-                    return Err(MiningControlError::Failed(CompactString::from(
-                        "applied tip was not published before submit_block returned",
-                    )));
-                }
-                if let Err(error) = crate::chain_effects::ChainFollowers::finish_transition(
-                    &self.chainstate,
-                    transition,
-                    mempool_change,
-                ) {
-                    return Err(MiningControlError::Failed(CompactString::from(
-                        error.to_string(),
-                    )));
-                }
+        match self.followers.apply_connect_in_transition(
+            &self.chainstate,
+            transition,
+            mempool_change,
+            block,
+            serialized,
+        ) {
+            Ok(_) => Ok(BlockValidationResult::Accepted),
+            Err(ConnectMutationError::CommittedButSettlementFailed { outcome, source }) => {
+                tracing::error!(
+                    committed = %outcome.hash,
+                    %source,
+                    "submitblock committed but node settlement failed; retry is forbidden"
+                );
                 Ok(BlockValidationResult::Accepted)
             }
-            Err(error) => {
-                if bitcoin_rs_chainstate::classify_apply_error(&error)
-                    == bitcoin_rs_chainstate::WindowApplyDisposition::Fatal
-                {
-                } else if let Err(finish_error) =
-                    crate::chain_effects::ChainFollowers::finish_transition(
-                        &self.chainstate,
-                        transition,
-                        mempool_change,
-                    )
-                {
-                    return Err(MiningControlError::Failed(CompactString::from(
-                        finish_error.to_string(),
-                    )));
-                }
-                map_apply_error(error)
-            }
+            Err(ConnectMutationError::NotCommitted(error)) => map_apply_error(error),
         }
     }
 }

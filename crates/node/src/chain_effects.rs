@@ -17,6 +17,45 @@ use bitcoin_rs_mempool::ChainChangeGuard;
 use bitcoin_rs_mempool::MempoolGateway;
 use bitcoin_rs_rpc::zmq::{SequenceEvent, ZmqPublisher};
 
+/// Failure of a node-owned single-block connect.
+///
+/// The authoritative chainstate failure and a failure after a successful
+/// commit are deliberately different variants. Callers must not retry the
+/// latter as though the block had been refused.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectMutationError {
+    /// No complete authoritative commit was returned.
+    #[error("connect did not produce a committed outcome: {0}")]
+    NotCommitted(#[source] bitcoin_rs_chainstate::ApplyError),
+    /// Chainstate committed, but the node-owned mempool fence did not settle.
+    #[error("authoritative connect committed, but node settlement failed: {source}")]
+    CommittedButSettlementFailed {
+        /// The authoritative outcome, retained so no caller has to infer it
+        /// by rereading mutable global state.
+        outcome: Box<ConnectOutcome>,
+        /// Failure that forced the node into recovery-required shutdown.
+        #[source]
+        source: bitcoin_rs_chainstate::ApplyError,
+    },
+}
+
+/// Failure of a node-owned single-block disconnect.
+#[derive(Debug, thiserror::Error)]
+pub enum DisconnectMutationError {
+    /// No complete authoritative commit was returned.
+    #[error("disconnect did not produce a committed outcome: {0}")]
+    NotCommitted(#[source] bitcoin_rs_chainstate::DisconnectError),
+    /// Chainstate committed, but node-owned post-commit work did not settle.
+    #[error("authoritative disconnect committed, but node settlement failed: {source}")]
+    CommittedButSettlementFailed {
+        /// The authoritative outcome retained across settlement failure.
+        outcome: Box<DisconnectOutcome>,
+        /// Failure that forced the node into recovery-required shutdown.
+        #[source]
+        source: bitcoin_rs_chainstate::ApplyError,
+    },
+}
+
 /// Node-owned derived work that follows a committed chain event.
 ///
 /// `Chainstate` does not hold this. The composition root dispatches after
@@ -274,9 +313,10 @@ impl ChainFollowers {
     ///
     /// PRE: no transition or fence is held.
     ///
-    /// POST: on success the block is committed, `on_connect` has run, and the
-    /// transition settled; on refusal nothing is dispatched and settlement is
-    /// attempted.
+    /// POST: `Ok` means the block committed and settlement completed;
+    /// [`ConnectMutationError::CommittedButSettlementFailed`] retains the
+    /// committed outcome when only settlement failed; on refusal nothing is
+    /// dispatched and settlement is attempted.
     ///
     /// INVARIANT: fatal errors drop guards without settlement; operational
     /// refusal attempts settlement.
@@ -284,14 +324,34 @@ impl ChainFollowers {
         &self,
         handles: &bitcoin_rs_chainstate::Chainstate,
         block: &Block,
-    ) -> core::result::Result<ConnectOutcome, bitcoin_rs_chainstate::ApplyError> {
-        let transition = handles.begin_transition()?;
-        let mempool_change = self.begin_mempool_change()?;
-        match transition.connect(block, None) {
+    ) -> core::result::Result<ConnectOutcome, ConnectMutationError> {
+        let transition = handles
+            .begin_transition()
+            .map_err(ConnectMutationError::NotCommitted)?;
+        let mempool_change = self
+            .begin_mempool_change()
+            .map_err(ConnectMutationError::NotCommitted)?;
+        self.apply_connect_in_transition(handles, transition, mempool_change, block, None)
+    }
+
+    pub(crate) fn apply_connect_in_transition(
+        &self,
+        handles: &bitcoin_rs_chainstate::Chainstate,
+        transition: bitcoin_rs_chainstate::ChainTransition<'_>,
+        mempool_change: Option<ChainChangeGuard>,
+        block: &Block,
+        serialized: Option<bytes::Bytes>,
+    ) -> core::result::Result<ConnectOutcome, ConnectMutationError> {
+        match transition.connect(block, serialized) {
             Ok(outcome) => {
                 self.on_connect(block, &outcome);
-                Self::finish_transition(handles, transition, mempool_change)?;
-                Ok(outcome)
+                match Self::finish_transition(handles, transition, mempool_change) {
+                    Ok(()) => Ok(outcome),
+                    Err(source) => Err(ConnectMutationError::CommittedButSettlementFailed {
+                        outcome: Box::new(outcome),
+                        source,
+                    }),
+                }
             }
             Err(error) => {
                 if bitcoin_rs_chainstate::classify_apply_error(&error)
@@ -299,7 +359,7 @@ impl ChainFollowers {
                 {
                     drop(mempool_change);
                     drop(transition);
-                    return Err(error);
+                    return Err(ConnectMutationError::NotCommitted(error));
                 }
                 if let Err(settlement) =
                     Self::finish_transition(handles, transition, mempool_change)
@@ -309,27 +369,33 @@ impl ChainFollowers {
                         finish = %settlement,
                         "chain transition could not be settled after connect refusal"
                     );
-                    return Err(settlement);
+                    return Err(ConnectMutationError::NotCommitted(settlement));
                 }
-                Err(error)
+                Err(ConnectMutationError::NotCommitted(error))
             }
         }
     }
 
     /// Disconnects `block` and dispatches this set before the transition ends.
     ///
-    /// See `ARCH-07`. An admission failure is `DisconnectError::Refused`.
+    /// See `ARCH-07`. [`DisconnectMutationError::NotCommitted`] contains an
+    /// authoritative refusal/failure; a later node settlement failure retains
+    /// the committed [`DisconnectOutcome`] in the other variant.
     pub fn apply_disconnect(
         &self,
         handles: &bitcoin_rs_chainstate::Chainstate,
         block: &Block,
-    ) -> core::result::Result<DisconnectOutcome, bitcoin_rs_chainstate::DisconnectError> {
-        let transition = handles
-            .begin_transition()
-            .map_err(|error| bitcoin_rs_chainstate::DisconnectError::Refused(Box::new(error)))?;
-        let mut mempool_change = self
-            .begin_mempool_change()
-            .map_err(|error| bitcoin_rs_chainstate::DisconnectError::Refused(Box::new(error)))?;
+    ) -> core::result::Result<DisconnectOutcome, DisconnectMutationError> {
+        let transition = handles.begin_transition().map_err(|error| {
+            DisconnectMutationError::NotCommitted(bitcoin_rs_chainstate::DisconnectError::Refused(
+                Box::new(error),
+            ))
+        })?;
+        let mut mempool_change = self.begin_mempool_change().map_err(|error| {
+            DisconnectMutationError::NotCommitted(bitcoin_rs_chainstate::DisconnectError::Refused(
+                Box::new(error),
+            ))
+        })?;
         match transition.disconnect(block) {
             Ok(outcome) => {
                 self.on_disconnect(&outcome);
@@ -345,23 +411,22 @@ impl ChainFollowers {
                         handles.network(),
                     );
                     if gateway.remove_for_reorg(change, &chain).is_err() {
+                        handles.fail_closed_for_recovery();
                         drop(mempool_change.take());
                         drop(transition);
-                        return Err(bitcoin_rs_chainstate::DisconnectError::Fatal {
-                            hash: outcome.hash,
-                            height: outcome.parent_tip.height.saturating_add(1),
-                            source: Box::new(bitcoin_rs_chainstate::ApplyError::Shutdown),
+                        return Err(DisconnectMutationError::CommittedButSettlementFailed {
+                            outcome: Box::new(outcome),
+                            source: bitcoin_rs_chainstate::ApplyError::Shutdown,
                         });
                     }
                 }
-                Self::finish_transition(handles, transition, mempool_change).map_err(|error| {
-                    bitcoin_rs_chainstate::DisconnectError::Fatal {
-                        hash: outcome.hash,
-                        height: outcome.parent_tip.height.saturating_add(1),
-                        source: Box::new(error),
-                    }
-                })?;
-                Ok(outcome)
+                match Self::finish_transition(handles, transition, mempool_change) {
+                    Ok(()) => Ok(outcome),
+                    Err(source) => Err(DisconnectMutationError::CommittedButSettlementFailed {
+                        outcome: Box::new(outcome),
+                        source,
+                    }),
+                }
             }
             Err(error @ bitcoin_rs_chainstate::DisconnectError::Refused(_)) => {
                 let hash = Hash256::from(block.block_hash());
@@ -374,18 +439,20 @@ impl ChainFollowers {
                         finish = %settlement,
                         "chain transition could not be settled after disconnect refusal"
                     );
-                    return Err(bitcoin_rs_chainstate::DisconnectError::Fatal {
-                        hash,
-                        height,
-                        source: Box::new(settlement),
-                    });
+                    return Err(DisconnectMutationError::NotCommitted(
+                        bitcoin_rs_chainstate::DisconnectError::Fatal {
+                            hash,
+                            height,
+                            source: Box::new(settlement),
+                        },
+                    ));
                 }
-                Err(error)
+                Err(DisconnectMutationError::NotCommitted(error))
             }
             Err(error) => {
                 drop(mempool_change);
                 drop(transition);
-                Err(error)
+                Err(DisconnectMutationError::NotCommitted(error))
             }
         }
     }
@@ -394,12 +461,13 @@ impl ChainFollowers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
+    use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot, regtest_fixture};
     use bitcoin_rs_consensus::ValidationEngine;
     use bitcoin_rs_mempool::{
         AdmissionChain, AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolLimits,
         MutationOutcome, PeerToken, SubmitError, SubmitOutcome,
     };
+    use bitcoin_rs_mining::{BlockValidationResult, MiningControl};
     use bitcoin_rs_primitives::{
         Amount, LockTime, Network, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness,
     };
@@ -445,6 +513,55 @@ mod tests {
             };
             self.events.lock().push(label);
         }
+    }
+
+    #[derive(Debug)]
+    struct MoveGenerationOnBlockEvent {
+        gateway: Arc<MempoolGateway>,
+        generation: u64,
+    }
+
+    impl ZmqPublisher for MoveGenerationOnBlockEvent {
+        fn wants_rawtx(&self) -> bool {
+            false
+        }
+
+        fn wants_rawblock(&self) -> bool {
+            false
+        }
+
+        fn publish_hashblock(&self, _: Hash256) {}
+
+        fn publish_hashtx(&self, _: bitcoin_rs_primitives::Txid) {}
+
+        fn publish_rawblock(&self, _: &[u8]) {}
+
+        fn publish_rawtx(&self, _: &[u8]) {}
+
+        fn publish_sequence(&self, event: SequenceEvent) {
+            if matches!(
+                event,
+                SequenceEvent::Connected(_) | SequenceEvent::Disconnected(_)
+            ) {
+                self.gateway.force_chain_generation(self.generation);
+            }
+        }
+    }
+
+    fn settlement_breaking_followers(
+        gateway: Arc<MempoolGateway>,
+        generation: u64,
+    ) -> ChainFollowers {
+        ChainFollowers::new(
+            Arc::new(RwLock::new(BlockLog::new())),
+            Arc::new(MoveGenerationOnBlockEvent {
+                gateway: Arc::clone(&gateway),
+                generation,
+            }),
+            None,
+            Arc::new(crate::mining::MiningGenerationSignal::new()),
+            Some(gateway),
+        )
     }
 
     /// `ARCH-07`: a no-op follower set asks for no derived payloads.
@@ -714,6 +831,110 @@ mod tests {
         ));
         active.finish()?;
         assert!(followers.begin_mempool_change()?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_connect_settlement_failure_retains_outcome_and_forbids_retry() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p.listen.clear();
+        let state = crate::state::NodeState::open(config, None)?;
+        let followers = settlement_breaking_followers(state.mempool_gateway(), 3);
+        let genesis = Network::Regtest.genesis_block();
+        let hash = Hash256::from(genesis.block_hash());
+
+        let error = match followers.apply_connect(&state.chainstate(), &genesis) {
+            Ok(outcome) => panic!("forced generation move settled connect {outcome:?}"),
+            Err(error) => error,
+        };
+        let (outcome, source) = match error {
+            ConnectMutationError::CommittedButSettlementFailed { outcome, source } => {
+                (outcome, source)
+            }
+            other @ ConnectMutationError::NotCommitted(_) => {
+                panic!("committed connect must retain its outcome: {other}")
+            }
+        };
+        assert_eq!(outcome.hash, hash);
+        assert!(matches!(
+            source,
+            bitcoin_rs_chainstate::ApplyError::Shutdown
+        ));
+        let Some(committed_tip) = state.chainstate().applied_tip_snapshot() else {
+            panic!("committed tip missing");
+        };
+        assert_eq!(committed_tip.hash, hash);
+        assert!(matches!(
+            followers.apply_connect(&state.chainstate(), &genesis),
+            Err(ConnectMutationError::NotCommitted(
+                bitcoin_rs_chainstate::ApplyError::Shutdown
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn committed_disconnect_settlement_failure_retains_outcome() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p.listen.clear();
+        let state = crate::state::NodeState::open(config, None)?;
+        let genesis = Network::Regtest.genesis_block();
+        state.apply_block(&genesis)?;
+        let child = regtest_fixture::mined_regtest_child_at(genesis.block_hash(), 1)?;
+        state.apply_block(&child)?;
+        let child_hash = Hash256::from(child.block_hash());
+        let followers = settlement_breaking_followers(state.mempool_gateway(), 7);
+
+        let error = match followers.apply_disconnect(&state.chainstate(), &child) {
+            Ok(outcome) => panic!("forced generation move settled disconnect {outcome:?}"),
+            Err(error) => error,
+        };
+        let (outcome, source) = match error {
+            DisconnectMutationError::CommittedButSettlementFailed { outcome, source } => {
+                (outcome, source)
+            }
+            other @ DisconnectMutationError::NotCommitted(_) => {
+                panic!("committed disconnect must retain its outcome: {other}")
+            }
+        };
+        assert_eq!(outcome.hash, child_hash);
+        assert!(matches!(
+            source,
+            bitcoin_rs_chainstate::ApplyError::Shutdown
+        ));
+        let Some(parent_tip) = state.chainstate().applied_tip_snapshot() else {
+            panic!("parent tip missing");
+        };
+        assert_eq!(parent_tip.hash, Hash256::from(genesis.block_hash()));
+        Ok(())
+    }
+
+    #[test]
+    fn mining_reports_a_committed_settlement_failure_as_accepted() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::NodeConfig::default_for_network(Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p.listen.clear();
+        let state = crate::state::NodeState::open(config, None)?;
+        let followers = settlement_breaking_followers(state.mempool_gateway(), 3);
+        let mining = crate::MiningCoordinator::new(
+            state.mempool(),
+            state.chainstate(),
+            followers,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            mining.submit_block(Network::Regtest.genesis_block())?,
+            BlockValidationResult::Accepted,
+            "submitblock must not invite retry after authoritative commit"
+        );
+        assert!(state.shutdown().load(std::sync::atomic::Ordering::Acquire));
         Ok(())
     }
 }

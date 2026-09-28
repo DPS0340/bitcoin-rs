@@ -316,7 +316,9 @@ fn retention_pressure_stops_apply_before_tip_mutation() -> Result<()> {
     let child = regtest_fixture::mined_regtest_child_at(genesis.block_hash(), 1)?;
     assert!(matches!(
         state.apply_block(&child),
-        Err(ApplyError::JournalBackpressure(_))
+        Err(bitcoin_rs_node::ConnectMutationError::NotCommitted(
+            ApplyError::JournalBackpressure(_)
+        ))
     ));
     let tip = state
         .chainstate()
