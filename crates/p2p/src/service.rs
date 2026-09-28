@@ -1109,23 +1109,23 @@ fn retire_extra_full_relay_connection(
     }
 }
 
-/// The newest full-relay outbound connection beyond the configured slots.
+/// The newest automatic full-relay outbound connection beyond the configured
+/// slots.
 ///
 /// PRE: `slots` is the configured full-relay count, and `is_downloading`
 ///   answers whether a candidate's body download is in flight, read from the
 ///   same window the scheduler fetches with.
 /// POST: return `None` while the table holds no more than `slots` such
-///   connections; otherwise return the newest automatic one among the newest
-///   `excess` non-pinned connections that is old enough to be judged and has
-///   no body download in flight.
-/// INVARIANT: a connection that never finished its handshake still holds a
-///   slot, so it counts, but a hand-pinned one is never the victim: Core's
-///   `EvictExtraOutboundPeers` looks only at `IsFullOutboundConn()` and
-///   `IsBlockOnlyConn()`, neither of which includes
-///   `ConnectionType::MANUAL` (`net_processing.cpp:5558-5604`). Pinned peers
-///   do not consume the victim budget either — a pinned tail still displaces
-///   the newest evictable automatic beneath it — while a candidate with
-///   blocks in flight is passed over, as Core's rule does
+///   connections; otherwise return the newest one among the newest `excess`
+///   connections that is old enough to be judged and has no body download
+///   in flight.
+/// INVARIANT: the census and the victim set hold automatic connections only:
+///   a hand-pinned full-relay connection counts in neither, as Core's
+///   `IsFullOutboundConn()` excludes `ConnectionType::MANUAL`
+///   (`net_processing.cpp:5558-5604`). An operator's peer therefore never
+///   forces the retirement of an automatic one. A connection that never
+///   finished its handshake still holds a slot, so it counts, while a
+///   candidate with blocks in flight is passed over, as Core's rule does
 ///   (`net_processing.cpp:5604-5668`).
 ///   `PeerTable::sessions` is ordered by connection identity, which is dial
 ///   order, so the newest is last and the excess is taken from the tail.
@@ -1135,15 +1135,17 @@ fn newest_excess_full_relay(
     now: Instant,
     is_downloading: impl Fn(crate::PeerSource) -> bool,
 ) -> Option<crate::PeerSession> {
-    // The census counts every slot occupant — a hand-pinned connection
-    // holds a slot the same as an automatic one — but the victim selection
-    // keeps `is_manual` out, as Core's rule does.
+    // A hand-pinned full-relay connection is outside the census, as Core's
+    // `IsFullOutboundConn()` excludes `ConnectionType::MANUAL`
+    // (`net_processing.cpp:5558-5604`): it creates no excess and the victim
+    // selection below only ever sees automatic connections.
     let sessions: Vec<crate::PeerSession> = peer_table
         .sessions()
         .into_iter()
         .filter(|session| {
             !session.lease.is_inbound()
                 && !session.lease.is_cancelled()
+                && !session.lease.is_manual()
                 && session.lease.role() == crate::peer_info::PeerRole::FullRelay
         })
         .collect();
@@ -1154,7 +1156,6 @@ fn newest_excess_full_relay(
     sessions
         .iter()
         .rev()
-        .filter(|session| !session.lease.is_manual())
         .take(excess)
         .find(|session| {
             now.saturating_duration_since(session.lease.connected_at())
@@ -1947,13 +1948,13 @@ mod tests {
         );
     }
 
-    /// A pinned peer that connects on top of a full automatic set occupies
-    /// the only excess position, so position alone cannot name a victim:
-    /// the newest automatic connection beneath the pinned tail is retired,
-    /// matching `p2p-compatibility.md`'s rule that the pin counts toward
-    /// the slot total while never being the victim itself.
+    /// A pinned peer that connects on top of a full automatic set sits
+    /// outside the extra-peer census: it creates no excess, so a full
+    /// automatic set keeps every peer, matching `p2p-compatibility.md`
+    /// item 10. Only a further automatic connection beyond the slots is
+    /// retired, never an automatic displaced by the operator's pin.
     #[test]
-    fn a_pinned_tail_displaces_the_newest_automatic_peer() {
+    fn a_pinned_peer_beyond_a_full_set_creates_no_excess() {
         use crate::connection::PeerLease;
         use crate::download_window::MINIMUM_CONNECT_TIME;
         use crate::peer_info::PeerRole;
@@ -1980,12 +1981,25 @@ mod tests {
         pinned_lease.backdate_for_test(aged);
         table.register(addr(3), pinned_lease);
 
+        assert!(
+            newest_excess_full_relay(&table, 2, now, |_| false).is_none(),
+            "a full automatic set plus a pinned peer is still no connection over"
+        );
+
+        // The census still fires on automatic excess: one more aged
+        // automatic beyond the slots is the victim, while the pinned peer
+        // stays out of the count and the candidate set both.
+        let (extra_tx, _extra_rx) = crossbeam_channel::unbounded();
+        let mut extra_lease = PeerLease::new(extra_tx);
+        extra_lease.backdate_for_test(aged);
+        table.register(addr(4), extra_lease);
+
         assert_eq!(
             newest_excess_full_relay(&table, 2, now, |_| false)
-                .expect("a full set plus a pinned peer is one connection over")
+                .expect("three automatic connections are one extra")
                 .addr,
-            addr(2),
-            "the pinned tail is unevictable, so the newest automatic peer is displaced"
+            addr(4),
+            "a real automatic excess still retires its newest aged peer"
         );
     }
 }
