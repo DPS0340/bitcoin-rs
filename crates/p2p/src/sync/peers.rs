@@ -875,9 +875,15 @@ mod tests {
         tree.invalidate_subtree(child_id)?;
 
         let grandchild = mined_header(BlockHash::from(tree.node(child_id)?.hash), 901_200);
-        let error = accept_headers(&mut tree, &[grandchild], Network::Regtest, 901_800, bitcoin_rs_chain::HeaderValidationMode::LiveAdmission)
-            .err()
-            .ok_or("a descendant of an invalidated block must be refused")?;
+        let error = accept_headers(
+            &mut tree,
+            &[grandchild],
+            Network::Regtest,
+            901_800,
+            bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
+        )
+        .err()
+        .ok_or("a descendant of an invalidated block must be refused")?;
         assert_eq!(error, ChainError::InvalidParent { parent: child_id });
         assert!(
             !is_peer_fault(&error),
