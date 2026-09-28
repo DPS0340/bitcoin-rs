@@ -14,7 +14,6 @@ use bitcoin_rs_primitives::{
     deserialize as native_deserialize,
 };
 use bitcoin_rs_script::VerifyFlags;
-use libfuzzer_sys::fuzz_target;
 
 /// Applied chain context shared by every validation path below, so the
 /// consensus and policy legs can never silently disagree on height or
