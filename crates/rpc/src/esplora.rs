@@ -1845,10 +1845,9 @@ mod tests {
     }
 
     thread_local! {
-        /// The one-shot halves that let a test observe the Esplora summary
-        /// reaching its fee-binning loop. Installed per thread, so only the
-        /// thread that arms it is ever gated.
-        static BINNING_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> =
+        /// One-shot halves for a summary request after its aggregate snapshot is captured.
+        /// Installed per-thread so unrelated requests are not held.
+        static MEMPOOL_SUMMARY_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> =
             const { RefCell::new(None) };
         /// The one-shot halves for a mempool activity read between its two pool
         /// views. Installed per serving thread so unrelated requests are not gated.
@@ -1860,10 +1859,9 @@ mod tests {
     /// a failed assertion cannot hang the suite.
     const GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Records the halves [`gate_mempool_binning_for_tests`] uses to announce
-    /// the binning loop and wait to leave it. Call on the serving thread.
-    fn arm_binning_gate(entered: Sender<()>, release: Receiver<()>) {
-        BINNING_GATE.with(|slot| *slot.borrow_mut() = Some((entered, release)));
+    /// Records the gate halves used to pause summary encoding. Call on the serving thread.
+    fn arm_mempool_summary_gate(entered: Sender<()>, release: Receiver<()>) {
+        MEMPOOL_SUMMARY_GATE.with(|slot| *slot.borrow_mut() = Some((entered, release)));
     }
 
     /// Stops and joins a busy helper thread even when an assertion unwinds, so
@@ -1882,12 +1880,9 @@ mod tests {
         }
     }
 
-    /// Test-only observation of the histogram-binning call site: announce that
-    /// this thread is inside the loop, then wait to be let out of it. With no
-    /// gate armed on this thread it returns immediately, so every other request
-    /// in the suite is untouched.
-    pub(crate) fn gate_mempool_binning_for_tests() {
-        let armed = BINNING_GATE.with(|slot| slot.borrow_mut().take());
+    /// Pauses after capturing stats and aggregated bins, before JSON encoding.
+    pub(crate) fn gate_mempool_summary_for_tests() {
+        let armed = MEMPOOL_SUMMARY_GATE.with(|slot| slot.borrow_mut().take());
         let Some((entered, release)) = armed else {
             return;
         };
@@ -1983,13 +1978,11 @@ mod tests {
         Arc::new(ctx)
     }
 
-    /// The summary must not hold the pool read guard while it bins fee rates: a
-    /// writer waiting behind that guard is the reported live failure. The gate
-    /// hands control back to this thread from inside the binning loop, which the
-    /// old code ran with the guard held, so the write attempt below fails at the
-    /// base and succeeds once the capture is released first.
+    /// The public summary captures stats and pre-aggregated fee-rate bins under
+    /// one pool view, then releases the guard before JSON encoding. The gate
+    /// parks after that capture so a writer can acquire the pool lock.
     #[test]
-    fn mempool_projection_releases_read_guard_before_binning() {
+    fn mempool_projection_releases_read_guard_before_encoding() {
         let target = vec![0x51_u8];
         let seeds = [
             Seed {
@@ -2022,28 +2015,27 @@ mod tests {
         let (entered_send, entered_recv) = channel();
         let (release_send, release_recv) = channel();
         let request = std::thread::spawn(move || {
-            arm_binning_gate(entered_send, release_recv);
+            arm_mempool_summary_gate(entered_send, release_recv);
             let handler = Handler::new(serving_ctx);
             route(&handler, "/mempool", "")
         });
 
-        let reached_binning = entered_recv.recv_timeout(GATE_TIMEOUT).is_ok();
+        let reached_encoding = entered_recv.recv_timeout(GATE_TIMEOUT).is_ok();
         let writer_progress = ctx.mempool.gateway.pool().try_write().is_some();
         let _ = release_send.send(());
         let response = request.join().expect("gated request completes");
 
         assert!(
-            reached_binning,
-            "the request thread never reached the fee-binning loop"
+            reached_encoding,
+            "the request thread never reached summary encoding"
         );
         assert!(
             writer_progress,
-            "the summary held the mempool read guard while it binned fee rates"
+            "the summary held the pool read guard during JSON encoding"
         );
         assert_eq!(response.status, 200);
-        // Releasing the guard early must cost nothing: two entries share
-        // 10 sat/vB, so their vsizes merge into one bin and the rates stay
-        // descending.
+        // The captured per-rate vsize sums preserve the descending histogram:
+        // the two 10 sat/vB entries share 300 vbytes.
         let rendered: Value = serde_json::from_slice(&response.body).expect("summary json");
         assert_eq!(
             rendered,
