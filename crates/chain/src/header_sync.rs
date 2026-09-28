@@ -14,6 +14,25 @@ use crate::{
 /// current system time, per the Bitcoin consensus future-drift bound.
 const MAX_FUTURE_TIME_SECONDS: u32 = 7200;
 
+/// Selects which contextual header checks apply to a batch of headers.
+///
+/// Every mode runs the same shared contextual-validation implementation
+/// (PoW/target validity, contextual nBits, median-time-past, BIP94 timewarp
+/// floor, version floors, ancestry, and chainwork). The only rule that differs
+/// is the wall-clock future-drift ceiling, which depends on startup wall time
+/// rather than persisted chain history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderValidationMode {
+    /// Live header admission: enforce the future-drift ceiling against the
+    /// caller-supplied `now_secs`.
+    LiveAdmission,
+    /// Historical replay (checkpoint or journal restore): skip only the
+    /// wall-clock future-drift check. Already-committed history must not
+    /// become invalid solely because the host clock rolled backwards after
+    /// publication.
+    HistoricalReplay,
+}
+
 /// Outcome of admitting one inbound headers batch into the block tree.
 ///
 /// The header-admission vocabulary lives beside [`accept_headers`] so the
@@ -53,15 +72,21 @@ pub enum HeaderAdmission {
 /// `TimestampTooFarAhead` documents a network-adjusted limit, and a host clock
 /// running an hour slow would reject a header ninety minutes ahead of network
 /// time even though it is well inside the two-hour window — across every peer,
-/// stalling the sync. This node tracks no peer time offset yet, so every caller
-/// passes [`current_unix_seconds`] today; the parameter is what lets one
+/// stalling the sync. This node tracks no peer time offset yet, so live
+/// callers pass [`current_unix_seconds`] today; the parameter is what lets one
 /// callsite change when it does, and what makes the bound testable without
 /// moving the system clock.
+///
+/// Under [`HeaderValidationMode::HistoricalReplay`] `now_secs` is ignored
+/// entirely: checkpoint and journal replay pass a placeholder value because
+/// the wall-clock future-drift ceiling does not apply to already-committed
+/// history.
 pub fn accept_headers(
     tree: &mut BlockTree,
     headers: &[BlockHeader],
     network: Network,
     now_secs: u32,
+    mode: HeaderValidationMode,
 ) -> Result<Vec<NodeId>, ChainError> {
     let mut accepted = Vec::with_capacity(headers.len());
     for header in headers {
@@ -94,7 +119,7 @@ pub fn accept_headers(
             // the invalid subtree.
             return Err(ChainError::InvalidParent { parent: parent_id });
         }
-        validate_contextual_header(tree, parent_id, header, network, now_secs)?;
+        validate_contextual_header(tree, parent_id, header, network, now_secs, mode)?;
         let id = tree.insert_header_with_hash(*header, hash, NodeStatus::HeaderValid)?;
         accepted.push(id);
     }
@@ -141,6 +166,7 @@ pub fn validate_contextual_header(
     header: &BlockHeader,
     network: Network,
     now_secs: u32,
+    mode: HeaderValidationMode,
 ) -> Result<(), ChainError> {
     let parent = tree.node(parent_id)?;
     let height = parent
@@ -180,14 +206,18 @@ pub fn validate_contextual_header(
         });
     }
 
-    // Future-drift ceiling.
-    let max_allowed = now_secs.saturating_add(MAX_FUTURE_TIME_SECONDS);
-    if header.time > max_allowed {
-        return Err(ChainError::TimestampTooFarAhead {
-            hash: hash_from_header(header),
-            timestamp: header.time,
-            max_allowed,
-        });
+    // Future-drift ceiling. Historical replay skips only this check: a
+    // checkpoint or journal record must not become invalid solely because
+    // the host clock rolled backwards after publication.
+    if mode == HeaderValidationMode::LiveAdmission {
+        let max_allowed = now_secs.saturating_add(MAX_FUTURE_TIME_SECONDS);
+        if header.time > max_allowed {
+            return Err(ChainError::TimestampTooFarAhead {
+                hash: hash_from_header(header),
+                timestamp: header.time,
+                max_allowed,
+            });
+        }
     }
 
     // Version floors for the buried deployments, in Core's order
@@ -609,7 +639,10 @@ pub(crate) mod pow {
 
 #[cfg(test)]
 mod timestamp_tests {
-    use super::{MAX_FUTURE_TIME_SECONDS, compact_is_met_by, validate_contextual_header};
+    use super::{
+        HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, compact_is_met_by,
+        validate_contextual_header,
+    };
     use crate::{
         ChainError,
         node::{BlockHeader, NodeStatus},
@@ -704,7 +737,14 @@ mod timestamp_tests {
             .ok_or(ChainError::MissingParent {
                 prev_hash: header.prev_blockhash.0,
             })?;
-        validate_contextual_header(tree, parent_id, header, Network::Regtest, now)
+        validate_contextual_header(
+            tree,
+            parent_id,
+            header,
+            Network::Regtest,
+            now,
+            HeaderValidationMode::LiveAdmission,
+        )
     }
 
     #[test]
@@ -755,14 +795,85 @@ mod timestamp_tests {
         let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
         assert_eq!(super::unix_seconds_at(before_epoch), 0);
     }
+
+    #[test]
+    fn historical_replay_skips_future_drift_but_live_admission_rejects() {
+        let (tree, tip) = chain_with_median_five();
+        // Simulate a host clock rollback: `now` is far behind the header
+        // time, so the live future-drift ceiling rejects it.
+        let rolled_back_now = 1_000_u32;
+        let candidate = mine(
+            tip.compute_hash(),
+            11,
+            rolled_back_now + MAX_FUTURE_TIME_SECONDS + 100,
+        );
+        let parent_id = tree
+            .lookup(tip.compute_hash().0)
+            .ok_or_else(|| ChainError::MissingParent {
+                prev_hash: tip.compute_hash().0,
+            })
+            .unwrap_or_else(|e| panic!("tip not in tree: {e:?}"));
+
+        // LiveAdmission rejects: header time exceeds now + 2h.
+        assert!(matches!(
+            validate_contextual_header(
+                &tree,
+                parent_id,
+                &candidate,
+                Network::Regtest,
+                rolled_back_now,
+                HeaderValidationMode::LiveAdmission
+            ),
+            Err(ChainError::TimestampTooFarAhead { .. })
+        ));
+
+        // HistoricalReplay accepts: the same header is valid historical
+        // history — the wall clock rolling back must not invalidate it.
+        assert!(
+            validate_contextual_header(
+                &tree,
+                parent_id,
+                &candidate,
+                Network::Regtest,
+                rolled_back_now,
+                HeaderValidationMode::HistoricalReplay
+            )
+            .is_ok(),
+            "HistoricalReplay must not enforce the future-drift ceiling"
+        );
+    }
+
+    #[test]
+    fn historical_replay_still_enforces_median_time_past() {
+        let (tree, tip) = chain_with_median_five();
+        let parent_id = tree
+            .lookup(tip.compute_hash().0)
+            .ok_or_else(|| ChainError::MissingParent {
+                prev_hash: tip.compute_hash().0,
+            })
+            .unwrap_or_else(|e| panic!("tip not in tree: {e:?}"));
+        // Candidate with time <= median (5): rejected in BOTH modes.
+        let candidate = mine(tip.compute_hash(), 11, 5);
+        assert!(matches!(
+            validate_contextual_header(
+                &tree,
+                parent_id,
+                &candidate,
+                Network::Regtest,
+                1_000_000,
+                HeaderValidationMode::HistoricalReplay
+            ),
+            Err(ChainError::TimestampTooEarly { .. })
+        ));
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod contextual_header_tests {
     use super::{
-        MAX_FUTURE_TIME_SECONDS, accept_headers, compact_is_met_by, next_work_required,
-        validate_contextual_header,
+        HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, accept_headers, compact_is_met_by,
+        next_work_required, validate_contextual_header,
     };
     use crate::{
         ChainError,
@@ -806,19 +917,32 @@ mod contextual_header_tests {
         let network = Network::Regtest;
         let time = base_time + height * 600;
         let header = mine_regtest(*prev, height, time, version);
-        accept_headers(tree, &[header], network, time)
-            .unwrap_or_else(|e| panic!("fixture header at height {height} rejected: {e:?}"));
+        accept_headers(
+            tree,
+            &[header],
+            network,
+            time,
+            HeaderValidationMode::LiveAdmission,
+        )
+        .unwrap_or_else(|e| panic!("fixture header at height {height} rejected: {e:?}"));
         *prev = header.compute_hash();
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn rejects_outdated_versions_after_activation() -> Result<(), Box<dyn std::error::Error>> {
         let network = Network::Regtest;
         let genesis = network.genesis_block();
         let base_time = genesis.header.time;
         let mut prev = genesis.block_hash();
         let mut tree = BlockTree::new();
-        accept_headers(&mut tree, &[genesis.header], network, base_time)?;
+        accept_headers(
+            &mut tree,
+            &[genesis.header],
+            network,
+            base_time,
+            HeaderValidationMode::LiveAdmission,
+        )?;
 
         // Heights 1..=499 sit below every regtest activation height.
         for height in 1..=499_u32 {
@@ -829,7 +953,13 @@ mod contextual_header_tests {
         let now = base_time + 500 * 600;
         let rejected = mine_regtest(prev, 500, now, 1);
         assert_eq!(
-            accept_headers(&mut tree, &[rejected], network, now),
+            accept_headers(
+                &mut tree,
+                &[rejected],
+                network,
+                now,
+                HeaderValidationMode::LiveAdmission
+            ),
             Err(ChainError::BadVersion {
                 version: 1,
                 required: 2,
@@ -842,8 +972,14 @@ mod contextual_header_tests {
             "a rejected header must not enter the tree"
         );
         let accepted = mine_regtest(prev, 500, now, 2);
-        accept_headers(&mut tree, &[accepted], network, now)
-            .map_err(|error| format!("version 2 is legal at height 500: {error:?}"))?;
+        accept_headers(
+            &mut tree,
+            &[accepted],
+            network,
+            now,
+            HeaderValidationMode::LiveAdmission,
+        )
+        .map_err(|error| format!("version 2 is legal at height 500: {error:?}"))?;
         prev = accepted.compute_hash();
 
         // BIP66: version 2 is rejected at height 1251.
@@ -853,7 +989,13 @@ mod contextual_header_tests {
         let now = base_time + 1251 * 600;
         let rejected = mine_regtest(prev, 1251, now, 2);
         assert_eq!(
-            accept_headers(&mut tree, &[rejected], network, now),
+            accept_headers(
+                &mut tree,
+                &[rejected],
+                network,
+                now,
+                HeaderValidationMode::LiveAdmission
+            ),
             Err(ChainError::BadVersion {
                 version: 2,
                 required: 3,
@@ -861,8 +1003,14 @@ mod contextual_header_tests {
             })
         );
         let accepted = mine_regtest(prev, 1251, now, 3);
-        accept_headers(&mut tree, &[accepted], network, now)
-            .map_err(|error| format!("version 3 is legal at height 1251: {error:?}"))?;
+        accept_headers(
+            &mut tree,
+            &[accepted],
+            network,
+            now,
+            HeaderValidationMode::LiveAdmission,
+        )
+        .map_err(|error| format!("version 3 is legal at height 1251: {error:?}"))?;
         prev = accepted.compute_hash();
 
         // BIP65: version 3 is rejected at height 1351.
@@ -872,7 +1020,13 @@ mod contextual_header_tests {
         let now = base_time + 1351 * 600;
         let rejected = mine_regtest(prev, 1351, now, 3);
         assert_eq!(
-            accept_headers(&mut tree, &[rejected], network, now),
+            accept_headers(
+                &mut tree,
+                &[rejected],
+                network,
+                now,
+                HeaderValidationMode::LiveAdmission
+            ),
             Err(ChainError::BadVersion {
                 version: 3,
                 required: 4,
@@ -880,8 +1034,14 @@ mod contextual_header_tests {
             })
         );
         let accepted = mine_regtest(prev, 1351, now, 4);
-        accept_headers(&mut tree, &[accepted], network, now)
-            .map_err(|error| format!("version 4 is legal at height 1351: {error:?}"))?;
+        accept_headers(
+            &mut tree,
+            &[accepted],
+            network,
+            now,
+            HeaderValidationMode::LiveAdmission,
+        )
+        .map_err(|error| format!("version 4 is legal at height 1351: {error:?}"))?;
         Ok(())
     }
 
@@ -924,7 +1084,14 @@ mod contextual_header_tests {
 
         // More than `MAX_TIMEWARP` below the parent: rejected.
         assert_eq!(
-            validate_contextual_header(&tree, parent_id, &candidate(tip_time - 601), network, now),
+            validate_contextual_header(
+                &tree,
+                parent_id,
+                &candidate(tip_time - 601),
+                network,
+                now,
+                HeaderValidationMode::LiveAdmission
+            ),
             Err(ChainError::TimewarpAttack {
                 height: 2016,
                 timestamp: tip_time - 601,
@@ -932,10 +1099,17 @@ mod contextual_header_tests {
             })
         );
         // Exactly `MAX_TIMEWARP` below the parent: still valid.
-        validate_contextual_header(&tree, parent_id, &candidate(tip_time - 600), network, now)
-            .map_err(|error| {
-                format!("a timestamp exactly at the timewarp floor is legal: {error:?}")
-            })?;
+        validate_contextual_header(
+            &tree,
+            parent_id,
+            &candidate(tip_time - 600),
+            network,
+            now,
+            HeaderValidationMode::LiveAdmission,
+        )
+        .map_err(|error| {
+            format!("a timestamp exactly at the timewarp floor is legal: {error:?}")
+        })?;
         Ok(())
     }
 
@@ -946,7 +1120,13 @@ mod contextual_header_tests {
         let base_time = genesis.header.time;
         let mut prev = genesis.block_hash();
         let mut tree = BlockTree::new();
-        accept_headers(&mut tree, &[genesis.header], network, base_time)?;
+        accept_headers(
+            &mut tree,
+            &[genesis.header],
+            network,
+            base_time,
+            HeaderValidationMode::LiveAdmission,
+        )?;
         extend_regtest(&mut tree, &mut prev, 1, 4, base_time);
         let block_one = tree.lookup(prev.0).ok_or("block one is in the tree")?;
         tree.invalidate_subtree(block_one)?;
@@ -954,7 +1134,13 @@ mod contextual_header_tests {
         let now = base_time + 2 * 600;
         let child = mine_regtest(prev, 2, now, 4);
         assert_eq!(
-            accept_headers(&mut tree, &[child], network, now),
+            accept_headers(
+                &mut tree,
+                &[child],
+                network,
+                now,
+                HeaderValidationMode::LiveAdmission
+            ),
             Err(ChainError::InvalidParent { parent: block_one }),
             "a child of an invalidated header is refused, not accepted as invalid"
         );

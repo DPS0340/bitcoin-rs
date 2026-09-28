@@ -115,6 +115,7 @@ fn publication_selects_applied_ancestry_and_forgets_competing_fork()
             core::slice::from_ref(&header),
             NETWORK,
             bitcoin_rs_chain::current_unix_seconds(),
+            bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
         )?[0];
         prev = BlockHash(tree.node(fork_best_id)?.hash);
     }

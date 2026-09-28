@@ -867,6 +867,7 @@ fn validate_contextual_block_header(
         &block.header,
         handles.network,
         bitcoin_rs_chain::current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )
     .map_err(ApplyError::Chain)
 }

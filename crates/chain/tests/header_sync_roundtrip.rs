@@ -19,12 +19,14 @@ fn accepts_valid_headers_across_batches_and_rejects_bad_bits()
         &headers[..40],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
     let second = accept_headers(
         &mut tree,
         &headers[40..],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
 
     assert_eq!(first.len(), 40);
@@ -43,6 +45,7 @@ fn accepts_valid_headers_across_batches_and_rejects_bad_bits()
         &[tampered],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     ) {
         Ok(_) => panic!("oversized target must be rejected"),
         Err(error) => error,
@@ -69,6 +72,7 @@ fn rejects_post_genesis_header_as_empty_tree_root() {
         &[child],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     ) {
         Ok(_) => panic!("post-genesis header must not become an empty-tree root"),
         Err(error) => error,
@@ -98,6 +102,7 @@ fn rejects_non_retarget_header_that_does_not_inherit_parent_bits_before_insertio
         &[child],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     ) {
         Ok(_) => panic!("non-retarget header must inherit parent nBits before insertion"),
         Err(error) => error,
@@ -218,6 +223,7 @@ fn duplicate_genesis_in_overlapping_batch_returns_original_ids_and_inserts_only_
         &headers[..2],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
     assert_eq!(first.len(), 2);
     let genesis_id = first[0];
@@ -231,6 +237,7 @@ fn duplicate_genesis_in_overlapping_batch_returns_original_ids_and_inserts_only_
         &overlapping,
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
 
     assert_eq!(second.len(), 5, "one returned id per input header");
@@ -281,6 +288,7 @@ fn duplicate_equal_work_competing_child_returns_original_id_and_does_not_reorg()
         &[genesis, active_child],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
     assert_eq!(first.len(), 2);
     let active_tip_id = first[1];
@@ -306,6 +314,7 @@ fn duplicate_equal_work_competing_child_returns_original_id_and_does_not_reorg()
         &[competing],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
     assert_eq!(second.len(), 1);
     let competing_id = second[0];
@@ -334,6 +343,7 @@ fn duplicate_equal_work_competing_child_returns_original_id_and_does_not_reorg()
         &[competing],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
     assert_eq!(third.len(), 1);
     assert_eq!(
@@ -364,6 +374,7 @@ fn invalid_unknown_suffix_after_duplicate_inputs_propagates_consensus_error_with
         &headers[..2],
         Network::Regtest,
         current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
     let genesis_id = first[0];
     let first_child_id = first[1];
@@ -374,7 +385,13 @@ fn invalid_unknown_suffix_after_duplicate_inputs_propagates_consensus_error_with
     invalid_unknown.bits = CompactTarget::from_consensus(0x2200_ffff);
 
     let batch = [headers[0], headers[1], invalid_unknown];
-    let err = match accept_headers(&mut tree, &batch, Network::Regtest, current_unix_seconds()) {
+    let err = match accept_headers(
+        &mut tree,
+        &batch,
+        Network::Regtest,
+        current_unix_seconds(),
+        bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
+    ) {
         Ok(_) => panic!("oversized-target suffix must be rejected"),
         Err(error) => error,
     };
