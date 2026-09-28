@@ -1114,6 +1114,7 @@ impl BlockSync {
                     header,
                     network,
                     bitcoin_rs_chain::current_unix_seconds(),
+                    bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
                 )
             })
             .is_err()

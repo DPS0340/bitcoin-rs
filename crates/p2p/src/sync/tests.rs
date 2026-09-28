@@ -170,6 +170,7 @@ impl SyncChain for TestChain {
             headers,
             self.network,
             bitcoin_rs_chain::current_unix_seconds(),
+            bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
         ) {
             Ok(node_ids) => {
                 let announced_tip = node_ids
