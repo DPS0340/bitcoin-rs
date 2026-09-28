@@ -55,6 +55,7 @@ fn a_grouped_window_publishes_each_blocks_own_prefix_count()
             &[first.header, second.header, third.header],
             Network::Regtest,
             bitcoin_rs_chain::current_unix_seconds(),
+            bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
         )?;
     }
     let blocks = [&first, &second, &third];

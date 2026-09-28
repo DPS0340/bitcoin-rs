@@ -1032,6 +1032,7 @@ impl Chainstate {
             headers,
             self.network,
             bitcoin_rs_chain::current_unix_seconds(),
+            bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
         );
         // A rejected batch can still have inserted a valid prefix and moved
         // the tip; the gate follows whatever active chain exists now.
