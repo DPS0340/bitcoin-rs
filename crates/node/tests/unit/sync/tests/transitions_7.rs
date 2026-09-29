@@ -269,6 +269,10 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
             undo_store: Arc::new(bitcoin_rs_storage::undo::InMemoryUndoStore::default()),
             durable_head: Arc::new(bitcoin_rs_storage::InMemoryDurableHeadStore::new()),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // This fixture drives chainstate alone: nothing reads through the
+            // other role, so the domain it mints loses nothing when only the
+            // mutation role is taken from it.
+            chain_transition: bitcoin_rs_chain::TransitionDomain::new().authority(),
             assume_valid_height: 0,
             validation_mode: bitcoin_rs_chainstate::ValidationMode::AssumeValid,
             validation_engine: bitcoin_rs_consensus::ValidationEngine::Native,

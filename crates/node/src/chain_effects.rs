@@ -931,6 +931,7 @@ mod tests {
         let mining = crate::MiningCoordinator::new(
             state.mempool(),
             state.chainstate(),
+            state.stable_read(),
             followers,
             Vec::new(),
         );

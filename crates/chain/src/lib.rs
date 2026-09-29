@@ -23,6 +23,8 @@ pub mod regtest_fixture;
 pub mod reorg;
 /// Best-tip snapshot type.
 pub mod tip;
+/// One transition domain split into mutation and stable-read roles.
+mod transition;
 /// In-memory block tree.
 pub mod tree;
 /// Read-only capabilities over chain publications and topology.
@@ -49,6 +51,9 @@ pub use ibd::InitialBlockDownload;
 pub use node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus};
 pub use reorg::{ReorgPlan, plan_reorg};
 pub use tip::TipSnapshot;
+pub use transition::{
+    StableRead, StableReadGuard, TransitionAuthority, TransitionAuthorityGuard, TransitionDomain,
+};
 pub use tree::BlockTree;
 pub use view::{BlockTreeReader, LatchReader, TipReader};
 

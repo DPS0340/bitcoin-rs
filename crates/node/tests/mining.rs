@@ -49,6 +49,7 @@ fn coordinator(state: &NodeState) -> MiningCoordinator {
     MiningCoordinator::new(
         state.mempool(),
         state.chainstate(),
+        state.stable_read(),
         state.chain_followers(),
         state.config().mining.payout_script.clone(),
     )
@@ -1014,6 +1015,7 @@ fn shutdown_ends_long_poll_without_wake() -> anyhow::Result<()> {
     let mining = Arc::new(MiningCoordinator::new(
         state.mempool(),
         state.chainstate(),
+        state.stable_read(),
         state.chain_followers(),
         state.config().mining.payout_script.clone(),
     ));
@@ -1632,6 +1634,7 @@ fn long_poll_returns_quickly_on_mempool_sequence_wake() -> anyhow::Result<()> {
     let mining = Arc::new(MiningCoordinator::new(
         state.mempool(),
         state.chainstate(),
+        state.stable_read(),
         state.chain_followers(),
         state.config().mining.payout_script.clone(),
     ));
@@ -1839,6 +1842,7 @@ fn generateblock_raw_p2sh_costs_use_confirmed_prevouts() -> anyhow::Result<()> {
     let mining = MiningCoordinator::new(
         state.mempool(),
         state.chainstate(),
+        state.stable_read(),
         state.chain_followers(),
         payout,
     );

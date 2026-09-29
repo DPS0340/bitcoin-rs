@@ -7,6 +7,7 @@ use crate::chain_effects::{ChainFollowers, ConnectMutationError};
 use alloc::sync::Arc;
 use bitcoin_rs_chain::ChainError;
 use bitcoin_rs_chain::NodeStatus;
+use bitcoin_rs_chain::StableRead;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::signalling_deployments;
 use bitcoin_rs_chain::{BlockTreeReader, TipReader};
@@ -65,6 +66,7 @@ impl MiningCoordinator {
     pub fn new(
         mempool: Arc<RwLock<Mempool>>,
         chainstate: Arc<Chainstate>,
+        stable: StableRead,
         followers: ChainFollowers,
         coinbase_script: Vec<u8>,
     ) -> Self {
@@ -78,6 +80,7 @@ impl MiningCoordinator {
             Arc::new(MempoolAdapter {
                 mempool,
                 chainstate: Arc::clone(&chainstate),
+                stable,
             }),
             Arc::new(ChainContextAdapter {
                 block_tree,
@@ -219,6 +222,9 @@ impl AppliedTipSource for AppliedTipAdapter {
 struct MempoolAdapter {
     mempool: Arc<RwLock<Mempool>>,
     chainstate: Arc<Chainstate>,
+    /// Read role over the same domain chainstate's mutation role uses, so a
+    /// candidate assembly cannot observe a tip and UTXO set mid-transition.
+    stable: StableRead,
 }
 
 impl MempoolSnapshotSource for MempoolAdapter {
@@ -255,8 +261,7 @@ impl MempoolSnapshotSource for MempoolAdapter {
         // Keep chain inputs tied to the context tip. Match the existing
         // transition -> mempool lock order, then release both before counting.
         let (snapshot, prevouts) = {
-            let fence = self.chainstate.read_fence();
-            let _guard = fence.lock();
+            let _guard = self.stable.lock();
             if self
                 .chainstate
                 .applied_tip_snapshot()

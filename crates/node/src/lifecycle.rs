@@ -91,7 +91,7 @@ fn bind_rpc(
             coin_stats: chainstate.coin_stats_handle(),
             block_tree: chainstate.block_tree_reader(),
             chain_network: state.config().network,
-            chain_transition: chainstate.read_fence(),
+            chain_transition: state.stable_read(),
             block_body_source: Some(block_body_source),
             prune_service: state.prune_service(),
             closed_for_recovery: chainstate.closed_for_recovery_reader(),
@@ -522,6 +522,7 @@ pub(crate) fn start_node(
     let coordinator = Arc::new(crate::MiningCoordinator::new(
         state.mempool(),
         Arc::clone(&chainstate),
+        state.stable_read(),
         state.chain_followers(),
         state.config().mining.payout_script.clone(),
     ));

@@ -84,7 +84,12 @@ fn prune_waits_for_chain_transition_and_revalidates_applied_tip() -> anyhow::Res
     };
 
     let handles = state.chainstate();
-    let barrier = handles.read_fence();
+    // Cross-role wiring proof: this read role is what bind_rpc hands RPC, and
+    // the pruning pass below enters through `PruneAuthority::begin`, which
+    // takes the mutation role from the same domain. The pass stalls until this
+    // guard drops, so the two roles provably name one domain — by behaviour,
+    // not by an identity comparison the architecture would then depend on.
+    let barrier = state.stable_read();
     let transition = barrier.lock();
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);

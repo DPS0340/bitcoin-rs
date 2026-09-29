@@ -9,6 +9,7 @@ pub use crate::error::{ApplyError, DisconnectError};
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::{
     BlockTree, BlockTreeReader, ChainError, ChainTxCount, TipReader, TipSnapshot,
+    TransitionAuthority, TransitionAuthorityGuard, TransitionDomain,
 };
 use bitcoin_rs_consensus::UtxoView;
 use bitcoin_rs_primitives::Block;
@@ -33,8 +34,6 @@ use disconnect::disconnect_block_admitted;
 pub use durable::reconcile_at_boot;
 pub use durable::recover_disconnect_marker;
 use hashbrown::HashMap;
-use parking_lot::Mutex;
-use parking_lot::MutexGuard;
 use parking_lot::RwLock;
 use parking_lot::RwLockReadGuard;
 use parking_lot::RwLockWriteGuard;
@@ -205,13 +204,13 @@ impl ApplyAdmission {
 ///
 /// Field order releases the transition lock before the admission permit.
 struct TransitionGuard<'a> {
-    _transition: MutexGuard<'a, ()>,
+    _transition: TransitionAuthorityGuard<'a>,
     _admission: RwLockReadGuard<'a, ()>,
 }
 
 fn begin_chain_transition<'a>(
     admission: &'a ApplyAdmission,
-    chain_transition: &'a Mutex<()>,
+    chain_transition: &'a TransitionAuthority,
 ) -> core::result::Result<TransitionGuard<'a>, ApplyError> {
     let admission_guard = admission.enter()?;
     let transition = chain_transition.lock();
@@ -246,7 +245,7 @@ impl<'a> TransitionLock<'a> {
 #[derive(Clone)]
 pub struct PruneAuthority {
     admission: Arc<ApplyAdmission>,
-    chain_transition: Arc<Mutex<()>>,
+    chain_transition: TransitionAuthority,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
 }
 
@@ -490,7 +489,12 @@ pub struct Chainstate {
     /// result. Two such operations interleaved can both validate against the
     /// same tip and then invalidate each other's retention or publication
     /// decisions. This lock spans connects, windows, disconnects, and pruning.
-    pub(crate) chain_transition: Arc<parking_lot::Mutex<()>>,
+    ///
+    /// Composition mints the domain and hands chainstate this role; readers
+    /// receive the matching [`bitcoin_rs_chain::StableRead`]. Chainstate cannot
+    /// mint a domain and does not hand the read role out, so a reader can never
+    /// be wired to a transition nobody performs.
+    pub(crate) chain_transition: TransitionAuthority,
     pub(crate) assume_valid_height: u32,
     pub(crate) assume_valid_gate: Arc<AssumeValidGate>,
     pub(crate) validation_mode: ValidationMode,
@@ -554,6 +558,13 @@ pub struct ChainstateParts {
     pub durable_head: Arc<dyn DurableHeadStore>,
     /// Process shutdown signal.
     pub shutdown: Arc<AtomicBool>,
+    /// The mutation role over the transition domain composition minted.
+    ///
+    /// Node startup mints one [`TransitionDomain`] per process and splits it:
+    /// this role arrives here, and the matching [`bitcoin_rs_chain::StableRead`]
+    /// goes to the readers that must exclude a transition. Chainstate neither
+    /// mints the domain nor hands the read role out.
+    pub chain_transition: TransitionAuthority,
     /// Highest assume-valid height.
     pub assume_valid_height: u32,
     /// Historical script-verification policy.
@@ -791,7 +802,7 @@ impl Chainstate {
             durable_head: parts.durable_head,
             admission: Arc::new(ApplyAdmission::new()),
             shutdown: parts.shutdown,
-            chain_transition: Arc::new(Mutex::new(())),
+            chain_transition: parts.chain_transition,
             assume_valid_height: parts.assume_valid_height,
             assume_valid_gate,
             validation_mode: parts.validation_mode,
@@ -997,16 +1008,6 @@ impl Chainstate {
         Arc::clone(&self.shutdown)
     }
 
-    /// Returns the stable-view fence used by lower-layer live-view consumers.
-    ///
-    /// Locking this mutex prevents an authoritative transition from starting;
-    /// it grants no mutation capability: all it can do is delay the next
-    /// transition until the guard is dropped.
-    #[must_use]
-    pub fn read_fence(&self) -> Arc<Mutex<()>> {
-        Arc::clone(&self.chain_transition)
-    }
-
     /// Admits headers and publishes the best-work header tip under Chainstate's
     /// transition authority.
     pub fn admit_headers(
@@ -1097,11 +1098,11 @@ impl Chainstate {
         }
     }
 
-    /// Returns pruning authority coupled to this chainstate transition lock.
+    /// Returns pruning authority coupled to this chainstate's transition role.
     pub fn prune_authority(&self) -> PruneAuthority {
         PruneAuthority {
             admission: Arc::clone(&self.admission),
-            chain_transition: Arc::clone(&self.chain_transition),
+            chain_transition: self.chain_transition.clone(),
             applied_tip: Arc::clone(&self.applied_tip),
         }
     }
@@ -1138,6 +1139,11 @@ impl Chainstate {
     /// Derived consumers are not attached. Capture flags default off; set them
     /// with [`Self::capturing`] when a caller will dispatch `rawtx` or block
     /// bytes after the commit.
+    ///
+    /// The facade mints its own transition domain and keeps only the mutation
+    /// role, so nothing can read through the matching role. A caller that needs
+    /// both roles must compose through `NodeState::open`, which mints one
+    /// domain for the process and hands each side its role.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -1166,7 +1172,7 @@ impl Chainstate {
             durable_head: Arc::new(bitcoin_rs_storage::InMemoryDurableHeadStore::new()),
             admission: Arc::new(ApplyAdmission::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
-            chain_transition: Arc::new(parking_lot::Mutex::new(())),
+            chain_transition: TransitionDomain::new().authority(),
             assume_valid_height: 0,
             assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
             validation_mode: ValidationMode::AssumeValid,
