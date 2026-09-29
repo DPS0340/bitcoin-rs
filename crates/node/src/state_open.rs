@@ -203,6 +203,9 @@ impl NodeState {
         // publisher's snapshot into its persisted consumer cursor.
         let chain_events_raw = ChainEventPublisher::new(initial_snapshot);
         let shutdown = Arc::new(AtomicBool::new(false));
+        // One domain for this node: chainstate takes the mutation role, and
+        // the readers below take the matching stable-read role from it.
+        let transition = bitcoin_rs_chain::TransitionDomain::new();
         let chain_events = Arc::new(chain_events_raw);
         let mut chainstate = bitcoin_rs_chainstate::Chainstate::from_parts(ChainstateParts {
             network: config.network,
@@ -216,6 +219,7 @@ impl NodeState {
             undo_store,
             durable_head,
             shutdown: Arc::clone(&shutdown),
+            chain_transition: transition.authority(),
             assume_valid_height: config.validation.assume_valid_height,
             validation_mode: config.validation.mode,
             validation_engine: config.validation.engine,
@@ -229,7 +233,7 @@ impl NodeState {
         let derived_index_parts = match derived_index_open_spec {
             Some(mut spec) => {
                 spec.utxo = Some(Arc::clone(&utxo));
-                spec.chain_transition = Some(chainstate.read_fence());
+                spec.chain_transition = Some(transition.stable_read());
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
                 let runtime =
                     Arc::new(bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx));
@@ -439,6 +443,7 @@ impl NodeState {
             p2p,
             inbound_tx_tx,
             inbound_tx_rx,
+            transition,
             chainstate,
             followers,
             sync,

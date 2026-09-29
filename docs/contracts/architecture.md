@@ -116,7 +116,7 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   `MempoolHandles`, `IndexHandles`, `NetworkHandles`, `MiningHandles`), never
   through direct database access. `Context::from_handles(ContextHandles)` is
   the single composition point: one `ContextHandles` value carries every
-  capability, including the chain owner's transition barrier, and production
+  capability, including the transition-exclusion read role, and production
   wiring attaches nothing to a built `Context`.
 - `bitcoin-rs-rpc` defines and forwards zero backend features. (The bench-only
   dev-dependency used for offline `txoutproof` fixtures is isolated to test
@@ -236,12 +236,23 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   take the transition lock and cannot mutate chainstate. `ChainEventPublisher`
   cells remain a separate coherent snapshot of the applied tip for index
   consumers (`EVT-01`).
-- Long-lived RPC, P2P, index, and mining consumers receive `TipReader` and
-  `BlockTreeReader` capabilities plus the stable-view fence (`Arc<Mutex<()>>`).
-  The readers expose snapshot load and tree read guards respectively; every
-  `&self` tree accessor is a pure read, and the tip publication cell is only
-  shareable through `&mut BlockTree`. The fence's only verb is `lock()`, which
-  can delay a transition but grants no mutation path. Header admission uses
+- Long-lived RPC, P2P, index, and mining consumers receive `TipReader`,
+  `BlockTreeReader`, and `StableRead` capabilities. The readers expose
+  snapshot load and tree read guards respectively; every `&self` tree
+  accessor is a pure read, and the tip publication cell is only shareable
+  through `&mut BlockTree`. `StableRead` excludes authoritative transitions
+  for as long as a read that needs one coherent chainstate runs; its only
+  verbs are `lock` and `try_lock`, it hands back an opaque guard, and it has
+  no way to reveal its matching `TransitionAuthority` — the role chainstate
+  and destructive pruning hold across a mutation. `NodeState::open` mints one
+  `TransitionDomain` for that node and distributes matching roles to its
+  production consumers. `Chainstate` does not republish a fence:
+  `Chainstate::read_fence` does not exist and the g17 facade gate denies it.
+  This is a production wiring guarantee, not a type-level provenance guarantee:
+  `TransitionDomain::new`, `Default`, and `stable_read` are public, and
+  `ChainHandles::default` in the public `Context::new` fixture mints a private
+  domain. Passing such a role to a live node reader does not exclude that
+  node's transitions. Header admission uses
   `Chainstate::admit_headers`; normal genesis connect publishes through the
   tree's shared tip cell without a separate publication fallback.
   Short-lived `ChainAdmissionView` values borrow readers; the P2P transaction
@@ -377,7 +388,10 @@ composition seam.
     must compile; raw mutation handles, reader write/publication methods,
     mutable tip-cell access through a read guard, and `SyncChain` fixture
     methods must fail with the intended compiler diagnostics. Removing an
-    obsolete accessor or private field remains allowed.
+    obsolete accessor or private field remains allowed, and the deleted
+    `Chainstate::retention_handle` and `Chainstate::read_fence` accessors stay
+    deleted: retained-history authority and the transition domain are owned
+    elsewhere and chainstate must not broker either.
 - Manifest enforcement:
   - Root `Cargo.toml`: workspace member list and package versions.
   - `crates/storage/Cargo.toml`: engine dependency definitions.

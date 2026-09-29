@@ -630,6 +630,7 @@ fn mining_handler(state: &NodeState) -> Handler {
     let coordinator = MiningCoordinator::new(
         state.mempool(),
         state.chainstate(),
+        state.stable_read(),
         state.chain_followers(),
         state.config().mining.payout_script.clone(),
     );
@@ -645,7 +646,7 @@ fn mining_handler(state: &NodeState) -> Handler {
             coin_stats: state.chainstate().coin_stats_handle(),
             block_tree: state.chainstate().block_tree_reader(),
             chain_network: state.config().network,
-            chain_transition: state.chainstate().read_fence(),
+            chain_transition: state.stable_read(),
             closed_for_recovery: state.chainstate().closed_for_recovery_reader(),
             ..ChainHandles::default()
         },
@@ -668,7 +669,7 @@ fn mining_handler(state: &NodeState) -> Handler {
         },
         ..ContextHandles::default()
     })
-    .with_chain_transition(state.chainstate().read_fence());
+    .with_chain_transition(state.stable_read());
     Handler::new(Arc::new(ctx))
 }
 

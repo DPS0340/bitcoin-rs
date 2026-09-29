@@ -124,6 +124,9 @@ fn chainstate_facade_exposes_no_production_raw_mutation_handles() -> anyhow::Res
         // Retained-history authority lives in storage/pruning; chainstate
         // keeps only `MandatoryRetention` and must not broker the registry.
         "retention_handle",
+        // The transition domain is minted by composition and split into roles;
+        // chainstate holds one role and must not republish a fence.
+        "read_fence",
         "apply_block",
         "apply_block_with_serialized",
         "disconnect_block",

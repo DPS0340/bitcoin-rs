@@ -250,10 +250,13 @@ pub struct ChainHandles {
     pub block_tree: BlockTreeReader,
     /// Consensus network.
     pub chain_network: Network,
-    /// Authoritative chain connect/disconnect transition barrier. Production
-    /// supplies the chain owner's barrier; the synthetic `Default` builds a
-    /// private one for tests.
-    pub chain_transition: Arc<Mutex<()>>,
+    /// Excludes authoritative chain transitions while a read runs.
+    ///
+    /// Production supplies the role minted alongside chainstate's mutation
+    /// role. [`Self::with_transition`] accepts a caller-supplied role but cannot
+    /// verify its provenance; callers can mint an unrelated domain through
+    /// [`bitcoin_rs_chain::TransitionDomain::new`].
+    pub chain_transition: bitcoin_rs_chain::StableRead,
     /// Durable block-body reader for metadata-only block records.
     pub block_body_source: Option<Arc<dyn BlockBodySource>>,
     /// Optional storage pruning mutator.
@@ -445,10 +448,30 @@ impl fmt::Debug for Context {
 }
 
 impl Default for ChainHandles {
-    /// Builds the empty synthetic chain world used by tests, including a
-    /// private transition barrier no chain owner shares.
+    /// Builds the empty synthetic chain world used by tests.
+    ///
+    /// The transition role here is minted from a private domain nothing else in
+    /// the process shares, so a context built this way excludes no transition
+    /// at all. That is correct for a fixture and wrong for a node: production
+    /// wiring supplies the role from the node's transition domain when it
+    /// builds `ChainHandles`. Reader capability types expose no constructor
+    /// of their own; the domain is what creates each role.
     #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
+        Self::with_transition(bitcoin_rs_chain::TransitionDomain::new().stable_read())
+    }
+}
+
+impl ChainHandles {
+    /// Builds the synthetic chain world over a caller-supplied transition role.
+    ///
+    /// This is what a test that also drives a real node uses: it passes the
+    /// role composition minted for that node, so the resulting context and the
+    /// chainstate it reads exclude each other's transitions. The other fields
+    /// are empty publications with no owner behind them.
+    #[allow(clippy::arc_with_non_send_sync)]
+    #[must_use]
+    pub fn with_transition(chain_transition: bitcoin_rs_chain::StableRead) -> Self {
         let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
             bitcoin_rs_utxo::stats::CoinStats::default(),
         );
@@ -472,7 +495,7 @@ impl Default for ChainHandles {
             coin_stats: Arc::new(coin_stats_listener),
             block_tree: BlockTreeReader::new(block_tree),
             chain_network: Network::Mainnet,
-            chain_transition: Arc::new(Mutex::new(())),
+            chain_transition,
             block_body_source: None,
             prune_service: None,
             chain_control: None,
@@ -655,15 +678,16 @@ impl Context {
         self
     }
 
-    /// Attaches the node's authoritative connect/disconnect mutex.
+    /// Attaches the transition-exclusion role composition minted for this node.
     ///
-    /// PRE: `chain_transition` is the node's own transition mutex.
+    /// PRE: `chain_transition` is the read role over the same
+    ///   [`bitcoin_rs_chain::TransitionDomain`] chainstate's mutation role uses.
     /// POST: exclusive chainstate reads use it; see
     ///   [`ChainHandles::with_stable_chainstate`].
     /// INVARIANT: published status reads do not acquire it, so a block
     ///   transition cannot stall `getblockchaininfo` or `getchaintxstats`.
     #[must_use]
-    pub fn with_chain_transition(mut self, chain_transition: Arc<Mutex<()>>) -> Self {
+    pub fn with_chain_transition(mut self, chain_transition: bitcoin_rs_chain::StableRead) -> Self {
         self.chain.chain_transition = chain_transition;
         self
     }
@@ -807,9 +831,9 @@ fn unix_time_secs() -> u64 {
 impl ChainHandles {
     /// Runs a read with authoritative UTXO and applied-tip transitions excluded.
     ///
-    /// PRE: `read` does not reacquire the transition mutex.
-    /// POST: `read` completes before the mutex is released, so its live tip and
-    ///   UTXO observations describe one uninterrupted chainstate.
+    /// PRE: `read` does not reacquire the transition role.
+    /// POST: `read` completes before the exclusion guard is released, so its
+    ///   live tip and UTXO observations describe one uninterrupted chainstate.
     /// INVARIANT: this is mutable-chainstate exclusion, not status
     ///   synchronization: published status reads answer from a retained
     ///   `AppliedView` capture and never call it.
@@ -1205,7 +1229,7 @@ impl ChainHandles {
 ///
 /// PRE: the publisher stores complete immutable [`TipSnapshot`] values.
 /// POST: the view retains the result of exactly one `applied_tip` load; no
-///   transition mutex, tree lock, UTXO lock, count-register read, or retry
+///   transition exclusion, tree lock, UTXO lock, count-register read, or retry
 ///   loop occurs in capture.
 /// INVARIANT: the facts projected from this view describe the same
 ///   publication even if the publisher advances afterward.
@@ -1425,8 +1449,8 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let barrier = Arc::new(Mutex::new(()));
-        let ctx = Arc::new(Context::new().with_chain_transition(Arc::clone(&barrier)));
+        let barrier = bitcoin_rs_chain::TransitionDomain::new().stable_read();
+        let ctx = Arc::new(Context::new().with_chain_transition(barrier.clone()));
         ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
             tip_id: bitcoin_rs_chain::NodeId::new(0),
             height: 5,
@@ -1640,7 +1664,7 @@ mod tests {
         let banned = Arc::new(RwLock::new(Vec::<bitcoin_rs_p2p::BannedSubnet>::new()));
         let added_nodes = Arc::new(RwLock::new(Vec::new()));
         let network_active = Arc::new(core::sync::atomic::AtomicBool::new(true));
-        let chain_transition = Arc::new(Mutex::new(()));
+        let chain_transition = bitcoin_rs_chain::TransitionDomain::new().stable_read();
         let ctx = Context::from_handles(ContextHandles {
             chain: ChainHandles {
                 chain_tip: TipReader::new(Arc::clone(&chain_tip)),
@@ -1651,7 +1675,7 @@ mod tests {
                 coin_stats: Arc::clone(&coin_stats),
                 block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
                 chain_network: Network::Mainnet,
-                chain_transition: Arc::clone(&chain_transition),
+                chain_transition: chain_transition.clone(),
                 ..ChainHandles::default()
             },
             mempool: MempoolHandles {
@@ -1670,10 +1694,16 @@ mod tests {
             },
             ..ContextHandles::default()
         });
+        // Identity is not observable: the two roles are distinct types with no
+        // comparison. Exclusion is, and exclusion is what the wiring has to
+        // guarantee — a guard taken from the context must block the caller's
+        // own role, which fails if the context was wired to another domain.
+        let held = ctx.chain.chain_transition.lock();
         assert!(
-            Arc::ptr_eq(&ctx.chain.chain_transition, &chain_transition),
-            "the caller's transition barrier must be the one the context locks"
+            chain_transition.try_lock().is_none(),
+            "the caller's role must exclude the same transitions the context does"
         );
+        drop(held);
         // The count travels inside the applied tip: one publication replaces
         // tip and count together, through the cell the caller shares.
         let snapshot = |count| {
@@ -2206,7 +2236,7 @@ mod tests {
             chain: ChainHandles {
                 chain_tip: TipReader::new(Arc::new(ArcSwapOption::empty())),
                 applied_tip: TipReader::new(Arc::clone(&applied_tip)),
-                chain_transition: Arc::new(Mutex::new(())),
+                chain_transition: bitcoin_rs_chain::TransitionDomain::new().stable_read(),
                 ibd: Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
                     TipReader::new(Arc::clone(&applied_tip)),
                     BlockTreeReader::new(Arc::clone(&block_tree)),

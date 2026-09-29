@@ -412,7 +412,12 @@ pub struct DerivedIndexOpenSpec {
     /// Test-only open specs may leave this unset; live queries then fail closed.
     pub utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
     /// Serializes a live-view query or seed against a chain transition.
-    pub chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
+    ///
+    /// Production node composition passes the read role over the same
+    /// [`bitcoin_rs_chain::TransitionDomain`] as chainstate's mutation role.
+    /// Callers constructing this spec can also supply an unrelated domain, so
+    /// matching provenance is required for live queries.
+    pub chain_transition: Option<bitcoin_rs_chain::StableRead>,
 }
 
 /// Handle used to spawn and join the supervised reconciliation worker.
@@ -577,8 +582,8 @@ struct Worker {
     rollback_rebuild_cutover: u32,
     /// Authoritative UTXO source for live-view seeding.
     utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
-    /// Chain transition authority shared with apply and RPC reads.
-    chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
+    /// Read role over the transition domain shared with apply and RPC reads.
+    chain_transition: Option<bitcoin_rs_chain::StableRead>,
 }
 
 /// Uncommitted contiguous rows based on one unchanged durable watermark.
