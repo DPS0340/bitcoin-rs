@@ -20,7 +20,6 @@ mod public;
 use crate::context::Context;
 use crate::handlers::Handler;
 use crate::rest::Response;
-use crate::rest::service_unavailable_owned;
 
 use self::projection::Projection;
 
@@ -56,10 +55,9 @@ pub fn route(handler: &Handler, surface: Surface, path: &str, query: &str) -> Re
         {
             readiness_headers(response, &snapshot)
         }
-        Ok(_) => service_unavailable_owned(
-            "capability tip does not match the Esplora response view; retry".to_owned(),
-        ),
-        Err(error) => service_unavailable_owned(error.to_string()),
+        // Readiness metadata must not invalidate an already coherent response.
+        // Its publisher can move independently after the route's view check.
+        Ok(_) | Err(_) => response,
     }
 }
 
@@ -105,11 +103,10 @@ fn readiness_headers(
             .with_header(
                 "X-Bitcoin-Rs-Index-Health",
                 revision.index_owner.health.wire_name(),
-            )
-            .with_header(
-                "X-Bitcoin-Rs-Index-Phase",
-                format!("{:?}", revision.index_owner.phase),
             );
+        if let Ok(phase) = serde_json::to_string(&revision.index_owner.phase) {
+            response = response.with_header("X-Bitcoin-Rs-Index-Phase", phase);
+        }
         if let Some(index_state) = revision.index_state {
             response =
                 response.with_header("X-Bitcoin-Rs-Index-State-Revision", index_state.to_string());
@@ -759,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_headers_require_the_owner_tip_to_match_the_esplora_view() {
+    fn readiness_mismatch_preserves_response_without_authority_headers() {
         for state in [
             CapabilityState::Disabled,
             CapabilityState::Opening,
@@ -767,13 +764,46 @@ mod tests {
                 reason: "injected failure".to_owned(),
             },
         ] {
-            let (handler, _, _, _) =
+            let (handler, _, block, _) =
                 contract_fixture_with_status(Some(mismatched_owner_source(state.clone())))
                     .expect("fixture");
             let response = route(&handler, "/blocks/tip/hash", "");
-            assert_eq!(
-                response.status, 503,
-                "{state:?} must not label a response built from another applied tip"
+            assert_eq!(response.status, 200, "{state:?}");
+            assert_eq!(response.body, block.block_hash().to_string().as_bytes());
+            assert!(
+                response
+                    .headers
+                    .iter()
+                    .all(|(name, _)| !name.starts_with("X-Bitcoin-Rs-"))
+            );
+        }
+    }
+
+    struct ChangingReadiness;
+
+    impl DerivedIndexCapabilitySource for ChangingReadiness {
+        fn snapshot(&self) -> Result<CapabilitySnapshot, CapabilitySnapshotError> {
+            Err(CapabilitySnapshotError::Changed)
+        }
+    }
+
+    #[test]
+    fn readiness_capture_failure_preserves_chain_and_mempool_responses() {
+        let (handler, _, block, _) =
+            contract_fixture_with_status(Some(Arc::new(ChangingReadiness))).expect("fixture");
+        let tip = route(&handler, "/blocks/tip/hash", "");
+        assert_eq!(tip.status, 200);
+        assert_eq!(tip.body, block.block_hash().to_string().as_bytes());
+        let mempool = route(&handler, "/mempool", "");
+        assert_eq!(mempool.status, 200);
+        let stats: Value = serde_json::from_slice(&mempool.body).expect("mempool statistics");
+        assert_eq!(stats["count"], 0);
+        for response in [tip, mempool] {
+            assert!(
+                response
+                    .headers
+                    .iter()
+                    .all(|(name, _)| !name.starts_with("X-Bitcoin-Rs-"))
             );
         }
     }

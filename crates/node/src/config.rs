@@ -524,9 +524,9 @@ impl Auth {
 impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Basic { user, .. } => f
+            Self::Basic { .. } => f
                 .debug_struct("Auth::Basic")
-                .field("user", user)
+                .field("user", &"<redacted>")
                 .field("password", &"<redacted>")
                 .finish(),
             Self::Cookie { .. } => f

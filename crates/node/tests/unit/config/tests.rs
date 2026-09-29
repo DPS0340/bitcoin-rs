@@ -10,16 +10,13 @@ use crate::options::{
 fn auth_debug_redacts_secrets() {
     let auth = Auth::basic("operator", "s3cret");
     let rendered = format!("{auth:?}");
-    assert!(rendered.contains("operator"));
     assert!(!rendered.contains("s3cret"));
-    assert!(rendered.contains("<redacted>"));
 
     let auth = Auth::Cookie {
         path: PathBuf::from("/secret/.cookie"),
     };
     let rendered = format!("{auth:?}");
     assert!(!rendered.contains("/secret/.cookie"));
-    assert!(rendered.contains("<redacted>"));
 }
 
 // ---- #653 named config-option coverage --------------------------------

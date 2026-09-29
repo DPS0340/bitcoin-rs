@@ -1176,6 +1176,13 @@ fn assert_esplora_readiness(node: &mut ProcessNode, row: &Value) {
             "{header}"
         );
     }
+    let phase: Value = serde_json::from_str(
+        response
+            .header("X-Bitcoin-Rs-Index-Phase")
+            .expect("phase header"),
+    )
+    .expect("phase header is JSON");
+    assert_eq!(Some(&phase), row.pointer("/revision/index_owner/phase"));
     assert_eq!(
         response.header("X-Bitcoin-Rs-Txindex-Compiled"),
         Some("true")

@@ -54,6 +54,22 @@ fn user_config_debug_redacts_nested_rpc_auth_values() {
 }
 
 #[test]
+fn resolved_config_debug_redacts_rpc_auth_values() -> Result<()> {
+    for cookie in [None, Some(RPC_COOKIE_TEST_SENTINEL.into())] {
+        let layer = UserConfig {
+            rpc: RpcOverrides {
+                cookie,
+                ..rpc_overrides_with_test_sentinels()
+            },
+            ..UserConfig::default()
+        };
+        let config = resolve(&[&layer])?;
+        assert_rpc_test_sentinels_redacted(&format!("{config:?}"));
+    }
+    Ok(())
+}
+
+#[test]
 fn standard_network_uses_builtin_defaults() -> Result<()> {
     let layer = UserConfig {
         network: Some(NetworkSelection::Testnet4),

@@ -93,20 +93,24 @@ only scheduling mechanics.
   reports `revision` and `tip` as null, never as an authoritative all-zero
   chain.
 - JSON-RPC serializes that complete snapshot. A read-only Esplora response is
-  returned only when its route-owned chain view stays fixed and the one
-  post-dispatch capability snapshot names that same tip. Unrelated History
-  progress does not invalidate successful chain, mempool, or ready Live
-  reads. Esplora carries the chain revision, durable index-state revision,
-  index-owner lifecycle/health identity, tip, and txindex state in
-  `X-Bitcoin-Rs-*` headers when authority is available; a standalone context
-  omits authority headers. Metrics render compiled/enabled facts, all
-  readiness labels, and the same revisions, owner identity, and tip from one
-  source snapshot per scrape; 64-bit revisions are split into exact 32-bit
-  halves and the hash into eight fixed-label words.
-  Structured readiness logs carry the same fields and are emitted from the
-  event loop's existing elapsed-time tick. Snapshot capture failure is exposed
-  as RPC/Esplora unavailability or `node_capability_snapshot_available 0`, not
-  as stale facts.
+  returned only when its route-owned chain view stays fixed. Readiness headers
+  are attached only when the post-dispatch capability snapshot names that same
+  tip; a capture failure or tip mismatch omits the metadata, not the response.
+  Unrelated History progress does not invalidate successful chain, mempool, or
+  ready Live reads. Esplora carries the chain revision, durable index-state
+  revision, index-owner lifecycle/health/phase identity, tip, and txindex state
+  in `X-Bitcoin-Rs-*` headers when authority is available; a standalone context
+  omits authority headers. `X-Bitcoin-Rs-Index-Phase` uses the JSON encoding of
+  `revision.index_owner.phase`: a three-element array in TxLookup, ScriptLive,
+  ScriptHistory order. Each element is `"Forward"`, `"Rebuilding"`, or
+  `{"RollingBack":{"from_height":9,"to_height":3}}` with the owner heights.
+  Metrics render compiled/enabled facts, all readiness labels, and the same
+  revisions, owner identity, and tip from one source snapshot per scrape;
+  64-bit revisions are split into exact 32-bit halves and the hash into eight
+  fixed-label words. Structured readiness logs carry the same fields and are
+  emitted from the event loop's existing elapsed-time tick. Snapshot capture
+  failure is exposed as RPC unavailability, omitted Esplora readiness headers,
+  or `node_capability_snapshot_available 0`, not as stale facts.
 
 `ScriptLive` is not a duplicate coin table. Its empty-valued key is
 `script-hash-prefix || full-outpoint`; the prefix is only a scan accelerator.
