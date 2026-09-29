@@ -8,7 +8,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin_rs_primitives::Network;
-use crossbeam_channel::{SendTimeoutError, Sender};
+use crossbeam_channel::{SendTimeoutError, Sender, TrySendError};
 use parking_lot::RwLock;
 use thiserror::Error;
 
@@ -263,15 +263,30 @@ impl ConnectionShared {
         wire_response: bool,
         body_fetch_owned: bool,
     ) {
-        if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
+        let inbound = crate::InboundHeaders {
             headers,
             source: Some(source),
             wire_response,
             body_fetch_owned,
-        }) {
-            tracing::warn!(peer_addr = %source.addr, %error, "p2p inbound headers channel disconnected");
-        } else {
-            wake_sync(self.wake_tx.as_ref());
+        };
+        match self.headers_tx.try_send(inbound) {
+            Ok(()) => wake_sync(self.wake_tx.as_ref()),
+            Err(TrySendError::Full(_)) => {
+                metrics::counter!("node.sync.dropped_header_batches").increment(1);
+                let disconnected = self.peer_table.disconnect_source(source);
+                wake_sync(self.wake_tx.as_ref());
+                tracing::warn!(
+                    peer_addr = %source.addr,
+                    disconnected,
+                    "p2p inbound headers queue full; dropping batch and disconnecting source"
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::warn!(
+                    peer_addr = %source.addr,
+                    "p2p inbound headers channel disconnected"
+                );
+            }
         }
     }
 
@@ -2304,6 +2319,49 @@ mod writer_shutdown_tests {
         assert_eq!(received.source, Some(source));
         assert_eq!(received.serialized, serialized);
         Ok(())
+    }
+
+    /// Header ingress saturation drops the newest batch and revokes only the
+    /// connection that supplied it, leaving unrelated peers available for
+    /// sync reassignment.
+    #[test]
+    fn full_header_ingress_disconnects_only_overflowing_source() {
+        let (headers_tx, headers_rx) = crossbeam_channel::bounded(1);
+        headers_tx
+            .send(crate::InboundHeaders {
+                headers: Vec::new(),
+                source: None,
+                wire_response: false,
+                body_fetch_owned: false,
+            })
+            .expect("header queue open");
+        let peer_table = Arc::new(crate::PeerTable::new());
+        let shared = test_shared(
+            Arc::clone(&peer_table),
+            headers_tx,
+            crossbeam_channel::unbounded().0,
+        );
+        let first_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_451));
+        let second_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_452));
+        let (first_tx, _first_rx) = crossbeam_channel::unbounded();
+        let (second_tx, _second_rx) = crossbeam_channel::unbounded();
+        let first = crate::PeerLease::new(first_tx);
+        let second = crate::PeerLease::new(second_tx);
+        let first_source = first.source(first_addr);
+        let second_source = second.source(second_addr);
+        peer_table.register(first_addr, first.clone());
+        peer_table.register(second_addr, second.clone());
+
+        shared.send_headers(first_source, Vec::new(), true, false);
+
+        let retained = headers_rx
+            .try_recv()
+            .expect("original queued batch retained");
+        assert_eq!(retained.source, None, "the newest batch is dropped");
+        assert!(first.is_cancelled());
+        assert!(!peer_table.is_current(first_source));
+        assert!(!second.is_cancelled());
+        assert!(peer_table.is_current(second_source));
     }
 
     #[test]

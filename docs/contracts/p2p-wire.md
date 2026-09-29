@@ -443,8 +443,11 @@ covers the delivery-path forward.
   that is not on the branch the header tip ends at, or that leaves the apply
   frontier more than `COMPACT_RELAY_NEAR_TIP_BLOCKS` below it, is a bulk
   download or a large reorg and stays with the ordinary scheduler.
-- **Ingress bounds**: the shared inbound block channel is bounded once for
-  the node (`P2pServiceConfig::inbound_block_queue_limit`, set from
+- **Ingress bounds**: the shared inbound header channel retains at most 256
+  decoded batches. An overflowing batch is dropped with a counter and only
+  its exact source connection is disconnected, releasing any source-owned
+  sync request for reassignment. The shared inbound block channel is bounded
+  once for the node (`P2pServiceConfig::inbound_block_queue_limit`, set from
   `INBOUND_BLOCK_CHANNEL_LIMIT`), and
   `PeerLease::admit_block_forward` bounds each connection's unsolicited
   share of it at `MAX_UNSOLICITED_BLOCK_FORWARDS`
