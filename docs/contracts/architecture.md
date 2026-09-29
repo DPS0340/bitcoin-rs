@@ -393,9 +393,9 @@ claims:
 - Every `gettxoutsetinfo` scan calls `UtxoSet::with_stable_view`, holding
   `stable_view_lock.read()` for the entire traversal; authoritative UTXO
   commits need its write lock. Even an uncontested scan can therefore delay
-  mutation for the full scan. `scantxoutset` and the fourth, contested
-  `gettxoutsetinfo` attempt additionally hold `StableRead`. These finite
-  in-memory walks scale with UTXO size and have no hard latency bound.
+  mutation for the full scan. `scantxoutset` and the final `gettxoutsetinfo`
+  retry, after four changed-tip scans, additionally hold `StableRead`. These
+  finite in-memory walks scale with UTXO size and have no hard latency bound.
 - `getchaintxstats` avoids the transition mutex, but its fallback can walk a
   retained `BlockLog` prefix while holding the log read lock and the block-tree
   read guard. A committed follower append may wait for that RPC; no immutable

@@ -67,7 +67,10 @@ Owners:
   transition is held to preserve ordering, but releases the mempool writer and
   publication lock before invoking any callback. A full queue retains the
   ordered prefix and coalesces later batches into one latest-sequence gap;
-  concurrent commits continue without waiting or growing the queue. Production
+  concurrent mempool mutations can enqueue without waiting for the elected
+  drainer or growing the queue. The elected drainer runs callbacks inline;
+  when invoked during chain settlement, a blocked callback can delay releasing
+  the chain transition and therefore subsequent chain commits. Production
   legs perform a short in-memory mining wake or best-effort ZMQ send. The
   socket send uses `DONTWAIT`, but endpoint-lock contention can still wait.
 - Canonical estimator accounting is part of the mempool lifecycle in step 6.
