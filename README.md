@@ -179,6 +179,26 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## External compatibility
+
+Compatibility claims are tied to external evidence, not only to in-tree
+implementation status. The [ecosystem compatibility
+contract](docs/contracts/ecosystem-compatibility.md) states the strategy —
+Core-compatible protocol/API boundaries, independent internals, black-box
+evidence from real ecosystem consumers — and the
+[evidence matrix](docs/api/ecosystem-compat.toml) records per surface what
+has actually been exercised by an external consumer. A surface is called
+*externally verified* only when a real external consumer has run against it;
+everything else is reported honestly as implemented or weaker.
+
+Today the one real external-consumer lane is live interoperability with an
+unmodified Bitcoin Core peer ([Core differential
+contract](docs/contracts/core-differential.md)): black-box handshake, sync,
+relay, and chain identity. JSON-RPC, REST, ZMQ, GBT/mining, and the
+Core-compatible USDT probes are implemented and covered by in-tree tests,
+but not yet externally verified; the matrix names the evidence and the
+planned representative consumers.
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for local
@@ -189,6 +209,8 @@ verification commands, CI workflows, and crate architecture conventions.
 - [docs/getting-started.md](docs/getting-started.md) — Node setup and configuration
 - [docs/README.md](docs/README.md) — Documentation index
 - [docs/contracts/](docs/contracts/) — Normative architecture and protocol contracts
+- [docs/contracts/ecosystem-compatibility.md](docs/contracts/ecosystem-compatibility.md) — External ecosystem compatibility strategy
+- [docs/api/ecosystem-compat.toml](docs/api/ecosystem-compat.toml) — External compatibility evidence matrix
 - [CONCEPTS.md](CONCEPTS.md) — Domain terminology and concepts
 
 ## License
