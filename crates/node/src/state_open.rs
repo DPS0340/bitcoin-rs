@@ -107,7 +107,7 @@ impl NodeState {
         // txindex worker detects later — through one warning snapshot and one
         // event marker.
         let genesis_hex = config.network.genesis_block_hash().to_string_be();
-        let recovery_reporter = Arc::new(crate::recovery_reporter::RecoveryReporter(
+        let recovery_reporter = Arc::new(super::storage::RecoveryReporter(
             bitcoin_rs_storage::recovery_evidence::RecoveryEvidencePublisher::new(
                 config.data_dir.clone(),
                 genesis_hex.clone(),

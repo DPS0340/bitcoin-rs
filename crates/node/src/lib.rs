@@ -23,21 +23,15 @@ pub mod options;
 
 /// Owned startup, rollback, and ordered service shutdown.
 mod lifecycle;
-/// Tracing initialization.
-mod logging;
 /// Metrics instrumentation and optional exposition.
 pub mod metrics;
 /// Node-owned mining candidate lifecycle coordinator.
 pub mod mining;
-/// Node-owned adapter wiring recovery evidence into index and RPC sinks.
-mod recovery_reporter;
-
-/// Switching the applied chain from one branch to another.
+/// Node-owned effects around authoritative chainstate reorgs.
+#[path = "reorg_effects.rs"]
 pub mod reorg;
 /// Top-level node runner.
 pub mod run;
-/// Graceful shutdown.
-mod shutdown;
 /// Signal handling.
 mod signal;
 /// Shared node state.
@@ -45,7 +39,8 @@ pub mod state;
 mod storage_backend;
 /// Custody-grade data-directory storage-footprint evidence.
 pub mod storage_footprint;
-/// Block download orchestrator.
+/// Adapter between the P2P block-download executor and Chainstate.
+#[path = "p2p_chain_adapter.rs"]
 pub mod sync;
 /// P2P transaction ingress consumer.
 pub mod tx_ingress;
