@@ -18,6 +18,8 @@ crates that do not own storage are not combinations.
   capability builds — `kernel` compiled in — and engine selection stays
   runtime (`validation.engine`); the lane says nothing about which engine
   runs. `bitcoin-rs-node`'s crate default (`fjall,zmq`) is a pure row.
+- The checker selects the repository-root workspace even when invoked from
+  a nested workspace such as `fuzz/`.
 - Adding a Cargo feature is not enough to support a combination. Add a
   row here in the same commit, or do not add the feature.
 
