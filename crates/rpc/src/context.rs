@@ -252,10 +252,10 @@ pub struct ChainHandles {
     pub chain_network: Network,
     /// Excludes authoritative chain transitions while a read runs.
     ///
-    /// Production supplies the role composition minted alongside chainstate's
-    /// mutation role, so the two name one domain. Readers receive this role and
-    /// cannot mint a domain of their own; [`Self::fixture`] takes one as input
-    /// for the same reason.
+    /// Production supplies the role minted alongside chainstate's mutation
+    /// role. [`Self::with_transition`] accepts a caller-supplied role but cannot
+    /// verify its provenance; callers can mint an unrelated domain through
+    /// [`bitcoin_rs_chain::TransitionDomain::new`].
     pub chain_transition: bitcoin_rs_chain::StableRead,
     /// Durable block-body reader for metadata-only block records.
     pub block_body_source: Option<Arc<dyn BlockBodySource>>,
@@ -453,11 +453,9 @@ impl Default for ChainHandles {
     /// The transition role here is minted from a private domain nothing else in
     /// the process shares, so a context built this way excludes no transition
     /// at all. That is correct for a fixture and wrong for a node: production
-    /// wiring passes [`NodeState::stable_read`]'s role through
-    /// [`Context::with_chain_transition`] instead. Reader capability types
-    /// expose no constructor of their own, so this and
-    /// [`bitcoin_rs_chain::TransitionDomain`] are the only ways a role can come
-    /// into being.
+    /// wiring supplies the role from the node's transition domain when it
+    /// builds `ChainHandles`. Reader capability types expose no constructor
+    /// of their own; the domain is what creates each role.
     #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self::with_transition(bitcoin_rs_chain::TransitionDomain::new().stable_read())

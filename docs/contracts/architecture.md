@@ -243,11 +243,16 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   through `&mut BlockTree`. `StableRead` excludes authoritative transitions
   for as long as a read that needs one coherent chainstate runs; its only
   verbs are `lock` and `try_lock`, it hands back an opaque guard, and it has
-  no path to `TransitionAuthority` — the role chainstate and destructive
-  pruning hold across a mutation. Node composition mints one
-  `TransitionDomain` per process and splits it, so `Chainstate` never
-  republishes a fence: `Chainstate::read_fence` does not exist and the g17
-  facade gate denies it. Header admission uses
+  no way to reveal its matching `TransitionAuthority` — the role chainstate
+  and destructive pruning hold across a mutation. `NodeState::open` mints one
+  `TransitionDomain` for that node and distributes matching roles to its
+  production consumers. `Chainstate` does not republish a fence:
+  `Chainstate::read_fence` does not exist and the g17 facade gate denies it.
+  This is a production wiring guarantee, not a type-level provenance guarantee:
+  `TransitionDomain::new`, `Default`, and `stable_read` are public, and
+  `ChainHandles::default` in the public `Context::new` fixture mints a private
+  domain. Passing such a role to a live node reader does not exclude that
+  node's transitions. Header admission uses
   `Chainstate::admit_headers`; normal genesis connect publishes through the
   tree's shared tip cell without a separate publication fallback.
   Short-lived `ChainAdmissionView` values borrow readers; the P2P transaction

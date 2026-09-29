@@ -3,17 +3,16 @@
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::Arc;
 
-/// The one domain authoritative chain transitions and stable reads exclude each other through.
+/// A domain authoritative chain transitions and stable reads exclude each other through.
 ///
-/// Composition mints this once per node and splits it into [`TransitionAuthority`]
-/// for the mutation side and [`StableRead`] for readers. Neither role can mint a
-/// domain of its own, so a reader cannot end up excluding transitions that no
-/// chainstate performs: correctness comes from the wiring, not from comparing
-/// domains after the fact.
+/// Node composition mints one domain for each opened node and splits it into
+/// [`TransitionAuthority`] for mutation and [`StableRead`] for readers. The
+/// roles cannot produce each other or expose the mutex. Their provenance is
+/// still a wiring requirement: `new` and `Default` are public, so another
+/// caller can mint a disconnected domain and pass its read role to a consumer.
 ///
-/// The mutex itself never leaves this type. Callers receive roles, and roles
-/// hand back guards, so no consumer can reach the shared cell or the other
-/// role's protocol.
+/// The mutex itself never leaves this type. A holder of only one role cannot
+/// reach the shared cell or obtain the other role from that value.
 #[derive(Clone, Default)]
 pub struct TransitionDomain {
     inner: Arc<Mutex<()>>,
@@ -22,8 +21,9 @@ pub struct TransitionDomain {
 impl TransitionDomain {
     /// Mints a fresh domain that no other component shares yet.
     ///
-    /// Composition calls this once while opening a node; readers receive a role
-    /// instead of constructing a domain.
+    /// Node composition calls this once while opening a node. Public callers
+    /// can also mint independent domains; test fixtures do so, but a role from
+    /// one of those domains does not exclude transitions of a live node.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -48,9 +48,9 @@ impl TransitionDomain {
 
 /// Mutation-side role: excludes stable reads for as long as a chain transition runs.
 ///
-/// Held only by chainstate and by destructive pruning, which take it through
-/// their own admission first. Readers never receive this type, so they cannot
-/// enter the mutation-side lock order.
+/// Production composition passes this role only to chainstate and destructive
+/// pruning, which take it through their own admission first. The public domain
+/// constructor allows other callers to produce independent mutation roles.
 #[derive(Clone)]
 pub struct TransitionAuthority {
     inner: Arc<Mutex<()>>,
@@ -68,8 +68,9 @@ impl TransitionAuthority {
 /// Read-side role: excludes authoritative transitions for as long as a stable read runs.
 ///
 /// This is the capability RPC, index, and mining receive. It offers `lock` and
-/// `try_lock` and nothing else: no access to the shared cell, no path to a
-/// [`TransitionAuthority`], and no way to mint a domain.
+/// `try_lock` and nothing else: no access to the shared cell and no path to a
+/// [`TransitionAuthority`]. A caller with access to [`TransitionDomain::new`]
+/// can still mint an unrelated read role.
 #[derive(Clone)]
 pub struct StableRead {
     inner: Arc<Mutex<()>>,

@@ -490,10 +490,11 @@ pub struct Chainstate {
     /// same tip and then invalidate each other's retention or publication
     /// decisions. This lock spans connects, windows, disconnects, and pruning.
     ///
-    /// Composition mints the domain and hands chainstate this role; readers
-    /// receive the matching [`bitcoin_rs_chain::StableRead`]. Chainstate cannot
-    /// mint a domain and does not hand the read role out, so a reader can never
-    /// be wired to a transition nobody performs.
+    /// In production, `NodeState::open` gives chainstate this role and
+    /// distributes the matching [`bitcoin_rs_chain::StableRead`] to readers.
+    /// Chainstate does not hand out the read role. The public domain constructor
+    /// still permits a caller to create an unrelated role, so matching
+    /// provenance remains a composition requirement.
     pub(crate) chain_transition: TransitionAuthority,
     pub(crate) assume_valid_height: u32,
     pub(crate) assume_valid_gate: Arc<AssumeValidGate>,
@@ -560,10 +561,10 @@ pub struct ChainstateParts {
     pub shutdown: Arc<AtomicBool>,
     /// The mutation role over the transition domain composition minted.
     ///
-    /// Node startup mints one [`TransitionDomain`] per process and splits it:
-    /// this role arrives here, and the matching [`bitcoin_rs_chain::StableRead`]
-    /// goes to the readers that must exclude a transition. Chainstate neither
-    /// mints the domain nor hands the read role out.
+    /// `NodeState::open` mints a [`TransitionDomain`] for that node and splits
+    /// it: this role arrives here, and the matching
+    /// [`bitcoin_rs_chain::StableRead`] goes to its readers. This constructor
+    /// accepts the supplied role without proving its provenance.
     pub chain_transition: TransitionAuthority,
     /// Highest assume-valid height.
     pub assume_valid_height: u32,

@@ -413,10 +413,10 @@ pub struct DerivedIndexOpenSpec {
     pub utxo: Option<Arc<bitcoin_rs_utxo::UtxoSet>>,
     /// Serializes a live-view query or seed against a chain transition.
     ///
-    /// Composition passes the read role over the same
-    /// [`bitcoin_rs_chain::TransitionDomain`] chainstate's mutation role uses;
-    /// the index cannot mint one, so a live query cannot end up excluding
-    /// transitions nobody performs.
+    /// Production node composition passes the read role over the same
+    /// [`bitcoin_rs_chain::TransitionDomain`] as chainstate's mutation role.
+    /// Callers constructing this spec can also supply an unrelated domain, so
+    /// matching provenance is required for live queries.
     pub chain_transition: Option<bitcoin_rs_chain::StableRead>,
 }
 

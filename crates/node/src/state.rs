@@ -103,12 +103,12 @@ pub struct NodeState {
     /// header/block channels, this receiver is drained by node orchestration.
     inbound_tx_tx: Sender<bitcoin_rs_p2p::InboundTx>,
     inbound_tx_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundTx>>>,
-    /// The one transition domain this process minted.
+    /// The transition domain minted for this node.
     ///
     /// Composition splits it: chainstate holds the mutation role, and every
-    /// reader asks this type for the matching stable-read role. Keeping the
-    /// domain here is what makes "one process, one domain" a wiring property
-    /// instead of a convention.
+    /// reader asking this type gets the matching stable-read role. This field
+    /// preserves provenance for those production paths; the public domain
+    /// constructor still allows unrelated roles outside this wiring.
     transition: bitcoin_rs_chain::TransitionDomain,
     chainstate: Arc<bitcoin_rs_chainstate::Chainstate>,
     /// Derived consumers of committed chain events. Not held by `Chainstate`.
@@ -315,11 +315,11 @@ impl NodeState {
         Arc::clone(&self.chainstate)
     }
 
-    /// The stable-read role over this process's transition domain.
+    /// The stable-read role over this node's transition domain.
     ///
-    /// Readers take the fence from here rather than from chainstate, so a read
-    /// can exclude an authoritative transition without receiving the
-    /// mutation-side protocol, and cannot mint a domain nobody performs.
+    /// Readers taking this role exclude this node's authoritative transitions
+    /// without receiving the mutation-side protocol. A separately constructed
+    /// domain is not interchangeable with this one.
     #[must_use]
     pub fn stable_read(&self) -> bitcoin_rs_chain::StableRead {
         self.transition.stable_read()

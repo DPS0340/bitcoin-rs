@@ -203,8 +203,8 @@ impl NodeState {
         // publisher's snapshot into its persisted consumer cursor.
         let chain_events_raw = ChainEventPublisher::new(initial_snapshot);
         let shutdown = Arc::new(AtomicBool::new(false));
-        // One domain per process: chainstate takes the mutation role, and the
-        // readers below take the matching stable-read role from this value.
+        // One domain for this node: chainstate takes the mutation role, and
+        // the readers below take the matching stable-read role from it.
         let transition = bitcoin_rs_chain::TransitionDomain::new();
         let chain_events = Arc::new(chain_events_raw);
         let mut chainstate = bitcoin_rs_chainstate::Chainstate::from_parts(ChainstateParts {
