@@ -1,7 +1,7 @@
 //! Metrics server and readiness gauge behaviour.
 //!
-//! The Prometheus recorder is process-global: identity-bearing tests must
-//! not run concurrently in one test binary. `SERVER_TEST_LOCK` enforces it.
+//! The Prometheus recorder is process-global, so server tests must not run
+//! concurrently in one test binary. `SERVER_TEST_LOCK` enforces it.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -104,7 +104,7 @@ fn occupied_address_bind_errors_and_in_process_retry_succeeds() {
 }
 
 #[test]
-fn scrape_returns_prometheus_text_with_recorded_metrics() {
+fn scrape_returns_operator_metrics_without_evidence_identity_labels() {
     let _guard = SERVER_TEST_LOCK.lock();
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut server = MetricsServer::bind(unused_ephemeral(), shutdown, &identity())
@@ -120,6 +120,25 @@ fn scrape_returns_prometheus_text_with_recorded_metrics() {
         body.contains("node_metrics_scrape_probe"),
         "body must include recorded metric: {body}"
     );
+    let sample = body
+        .lines()
+        .find(|line| !line.starts_with('#') && line.starts_with("node_metrics_scrape_probe"))
+        .unwrap_or_else(|| panic!("probe sample missing from scrape: {body}"));
+    for retired_label in [
+        "binary_sha256=",
+        "version=",
+        "config_sha256=",
+        "backend=",
+        "durability=",
+        "corpus_id=",
+        "corpus_manifest_sha256=",
+        "hardware=",
+    ] {
+        assert!(
+            !sample.contains(retired_label),
+            "operator metrics must not carry evidence label {retired_label}: {sample}"
+        );
+    }
     server.stop_and_join();
 }
 

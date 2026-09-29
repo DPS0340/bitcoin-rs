@@ -3,7 +3,11 @@
 bitcoin-rs can emit User-space Statically Defined Tracing probes whose
 provider names, probe names, and argument ABI match Bitcoin Core's
 `doc/tracing.md`, so Core-oriented tooling consumes a bitcoin-rs node without
-any bitcoin-rs-specific runtime. The probes are compiled in only with the
+any bitcoin-rs-specific runtime. Where probe payloads sit relative to
+`metrics::` signals and `tracing::` diagnostics is owned by
+[`observability.md`](observability.md) (OBS-03): detailed per-event data —
+payloads, hashes, durations — belongs in probe arguments and must not pollute
+metrics cardinality. The probes are compiled in only with the
 `usdt` cargo feature (default **off**):
 
 ```bash

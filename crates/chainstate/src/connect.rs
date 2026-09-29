@@ -112,8 +112,6 @@ pub(super) fn apply_block_admitted<'b>(
         let contextual_header_result =
             validate_contextual_block_header(handles, block, height, prior.as_deref());
         contextual_header_dur = contextual_header_started.elapsed();
-        metrics::histogram!("node.apply_block.contextual_header_seconds")
-            .record(contextual_header_dur.as_secs_f64());
         contextual_header_result?;
     }
     if intent == ApplyIntent::Commit
@@ -140,8 +138,6 @@ pub(super) fn apply_block_admitted<'b>(
     let pow_self_result =
         bitcoin_rs_chain::header_sync::validate_pow(&block.header, block_hash, handles.network);
     let pow_self_dur = pow_self_started.elapsed();
-    metrics::histogram!("node.apply_block.pow_self_consistency_seconds")
-        .record(pow_self_dur.as_secs_f64());
     match pow_self_result {
         // Declared target above the network limit is refused for proposals too.
         Err(bitcoin_rs_chain::ChainError::TargetExceedsLimit { .. }) => {
@@ -267,23 +263,22 @@ pub(super) fn apply_block_admitted<'b>(
     metrics::histogram!("node.apply_block.script_verify_seconds")
         .record(script_verify_dur.as_secs_f64());
     // Same duration split by dispatch path, so replay decompositions can
-    // attribute time to the serial overlay walk vs the rayon fan-out.
-    let script_verify_path = if tx_plan.only_coinbase {
-        "node.apply_block.script_verify_coinbase_only_seconds"
+    // attribute time to the serial overlay walk vs the rayon fan-out. This
+    // split is a development diagnostic (`docs/observability.md`): it stays
+    // on the tracing profile event below, not on the metrics API.
+    let script_dispatch = if tx_plan.only_coinbase {
+        "coinbase_only"
     } else if tx_plan.needs_local_utxo_overlay {
-        "node.apply_block.script_verify_serial_overlay_seconds"
+        "serial_overlay"
     } else {
-        "node.apply_block.script_verify_parallel_seconds"
+        "parallel"
     };
-    metrics::histogram!(script_verify_path).record(script_verify_dur.as_secs_f64());
     script_verify_result?;
 
     let coinbase_maturity_started = quanta::Instant::now();
     let coinbase_maturity_result =
         check_coinbase_maturity(block, &tx_plan, view.txids(), Arc::clone(&resolved), height);
     let coinbase_maturity_dur = coinbase_maturity_started.elapsed();
-    metrics::histogram!("node.apply_block.coinbase_maturity_seconds")
-        .record(coinbase_maturity_dur.as_secs_f64());
     coinbase_maturity_result?;
     let bip68_started = quanta::Instant::now();
     let previous_tip_id = prior.as_deref().map(|tip| tip.tip_id);
@@ -301,7 +296,6 @@ pub(super) fn apply_block_admitted<'b>(
         },
     );
     let bip68_dur = bip68_started.elapsed();
-    metrics::histogram!("node.apply_block.bip68_seconds").record(bip68_dur.as_secs_f64());
     bip68_result?;
     let wants_rawtx = handles.capture_rawtx;
     let (txids, scratch_capacities, same_block_spent, same_block_spent_input_count) =
@@ -331,8 +325,6 @@ pub(super) fn apply_block_admitted<'b>(
     )
     .map_err(|e| map_block_change_error(&e))?;
     let utxo_changes_dur = utxo_changes_started.elapsed();
-    metrics::histogram!("node.apply_block.utxo_changes_seconds")
-        .record(utxo_changes_dur.as_secs_f64());
 
     // The last consensus gate, and the one that keeps a miner from creating
     // money. Nothing above bounds what the coinbase pays itself: block rules
@@ -488,8 +480,10 @@ pub(super) fn apply_block_admitted<'b>(
         block_rules_us = block_rules_dur.as_micros(),
         bip30_bip34_us = bip30_bip34_dur.as_micros(),
         script_verify_us = script_verify_dur.as_micros(),
+        script_dispatch,
         coinbase_maturity_us = coinbase_maturity_dur.as_micros(),
         bip68_us = bip68_dur.as_micros(),
+        utxo_changes_us = utxo_changes_dur.as_micros(),
         utxo_commit_us = utxo_commit_dur.as_micros(),
         block_body_persist_us = block_body_persist_dur.as_micros(),
         block_tree_insert_us = block_tree_insert_dur.as_micros(),
@@ -520,8 +514,7 @@ pub(super) fn apply_block_admitted<'b>(
             // through recovery.
             let durable_sync_started = quanta::Instant::now();
             sync_appended_blocks(handles)?;
-            metrics::histogram!("node.apply_block.durable_sync_seconds")
-                .record(durable_sync_started.elapsed().as_secs_f64());
+            let durable_sync_us = durable_sync_started.elapsed().as_micros();
             let undo_rows = vec![(height, block_hash, undo_record.as_bytes())];
             let body_rows = stored_body_row(handles, height, block_hash)?
                 .into_iter()
@@ -543,8 +536,13 @@ pub(super) fn apply_block_admitted<'b>(
                     body_rows,
                 },
             )?;
-            metrics::histogram!("node.apply_block.durable_commit_seconds")
-                .record(durable_commit_started.elapsed().as_secs_f64());
+            tracing::debug!(
+                height,
+                %block_hash,
+                durable_sync_us,
+                durable_commit_us = durable_commit_started.elapsed().as_micros(),
+                "apply_block: publish profile"
+            );
             outcome.tip = receipt.certify(outcome.tip);
             receipt.commit_id
         }
