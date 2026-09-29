@@ -2,7 +2,7 @@
 
 use super::{
     capability::IndexCapability, capability::IndexWatermark, error::IndexError, reader::Indexer,
-    write::IndexWriter,
+    state::ORDINARY_STATE_REVISION_KEY, state::decode_state_revision, write::IndexWriter,
 };
 use crate::{
     types::HashPrefixRow, types::ScriptHash, types::ScriptHashRow, types::SpendingPrefixRow,
@@ -44,6 +44,11 @@ pub struct ScriptLiveScan {
 
 /// Point-in-time, typed view of durable `TxIndex` rows.
 pub trait TxIndexSnapshot: Send + Sync {
+    /// Loads the durable ordinary-state revision from this snapshot. `None`
+    /// means no ordinary index mutation has committed yet.
+    fn state_revision(&self) -> Result<Option<u64>, IndexError> {
+        Ok(None)
+    }
     /// Loads the transaction lookup watermark from this snapshot.
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
     /// Loads one capability's exact durable watermark from this snapshot.
@@ -122,6 +127,14 @@ impl StoreTxIndexSnapshot<'_> {
 }
 
 impl TxIndexSnapshot for StoreTxIndexSnapshot<'_> {
+    fn state_revision(&self) -> Result<Option<u64>, IndexError> {
+        self.snapshot
+            .get(ColumnFamily::UtxoMeta, ORDINARY_STATE_REVISION_KEY)?
+            .as_deref()
+            .map(decode_state_revision)
+            .transpose()
+    }
+
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
         self.capability_watermark(IndexCapability::TxLookup)
     }

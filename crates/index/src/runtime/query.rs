@@ -389,6 +389,9 @@ impl DerivedIndexQueryEngine {
         let snapshot = reader
             .snapshot()
             .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
+        let state_revision = snapshot
+            .state_revision()
+            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
         let mut marks = [None; 3];
         for capability in IndexCapability::ALL {
             if !required.contains(capability) {
@@ -426,17 +429,31 @@ impl DerivedIndexQueryEngine {
         }
 
         Ok(IndexProgress {
+            state_revision,
             synced,
             processed_height: best_block_height,
             target_height: tip_before.height,
             target_hash: tip_before.hash,
         })
     }
+
+    /// Reads only the existing durable ordinary-state revision. Lifecycle,
+    /// phase, health, and chain-owner identity are bracketed by the capability
+    /// owner around this point-in-time store snapshot.
+    pub(crate) fn index_state_revision(&self) -> Result<Option<u64>, TxQueryError> {
+        let reader: &dyn IndexReader = self.reader.as_ref();
+        reader
+            .snapshot()
+            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?
+            .state_revision()
+            .map_err(|e| TxQueryError::Storage(e.to_string().into()))
+    }
 }
 
 /// One coherent read of index progress against a single applied tip.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IndexProgress {
+    pub state_revision: Option<u64>,
     pub synced: bool,
     pub processed_height: u32,
     pub target_height: u32,

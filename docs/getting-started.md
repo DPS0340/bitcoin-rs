@@ -34,6 +34,12 @@ Precedence, low to high:
 
 A later layer overrides only fields it supplies. Network-dependent validation, including mining payout addresses, runs after merge. Runtime test controls are not public configuration.
 
+RPC authentication values are redacted in both source-layer and resolved
+configuration debug output. Invalid TOML reports the configuration path and
+line/column, but omits source excerpts, supplied keys, and value-bearing parser
+messages because they may contain credentials. Inspect the reported location
+locally rather than copying credential-bearing configuration into logs.
+
 Common network names are `mainnet`, `signet`, `testnet4`, and `regtest`; retained aliases are documented by the compatibility contracts.
 
 ## Storage

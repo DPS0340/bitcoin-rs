@@ -976,7 +976,7 @@ fn readiness_samples(body: &str) -> Vec<(String, f64)> {
 fn metric_u64(body: &str, name: &str, labels: &[(&str, &str)]) -> u64 {
     let prefix = format!("{name}{{");
     body.lines()
-        .filter_map(|line| {
+        .find_map(|line| {
             let rest = line.strip_prefix(&prefix)?;
             let (rendered_labels, value) = rest.split_once('}')?;
             if labels
@@ -988,7 +988,6 @@ fn metric_u64(body: &str, name: &str, labels: &[(&str, &str)]) -> u64 {
                 None
             }
         })
-        .next()
         .unwrap_or_else(|| panic!("missing {name} sample with {labels:?}: {body}"))
 }
 
@@ -1009,20 +1008,26 @@ fn metrics_revision(body: &str) -> (u64, u64) {
     (value("epoch"), value("sequence"))
 }
 
+fn metrics_index_state_revision(body: &str) -> u64 {
+    let part = |part| {
+        metric_u64(
+            body,
+            "node_capability_index_state_revision",
+            &[("part", part)],
+        )
+    };
+    (part("high") << 32) | part("low")
+}
+
 fn metrics_tip_hash(body: &str) -> String {
-    (0..8)
-        .map(|word| {
-            let word = word.to_string();
-            format!(
-                "{:08x}",
-                metric_u64(
-                    body,
-                    "node_capability_tip_hash_word",
-                    &[("word", word.as_str())],
-                )
-            )
-        })
-        .collect()
+    use std::fmt::Write as _;
+    let mut hash = String::with_capacity(64);
+    for word in 0..8 {
+        let word = word.to_string();
+        let value = metric_u64(body, "node_capability_tip_hash_word", &[("word", &word)]);
+        write!(hash, "{value:08x}").expect("writing to a String is infallible");
+    }
+    hash
 }
 
 /// Exact one/zero gauge values: outcomes are set from `bool`, so exact bit
@@ -1092,38 +1097,143 @@ fn wait_gauge_active(addr: SocketAddr, expected: &str, deadline: Instant) -> Str
     }
 }
 
-fn wait_readiness_log(evidence: &Path, snapshot: &Value, deadline: Instant) {
-    let epoch = snapshot.pointer("/revision/epoch").and_then(Value::as_u64);
-    let sequence = snapshot
-        .pointer("/revision/sequence")
-        .and_then(Value::as_u64);
-    let height = snapshot.pointer("/tip/height").and_then(Value::as_u64);
-    let hash = snapshot.pointer("/tip/hash").and_then(Value::as_str);
+fn assert_readiness_log(evidence: &Path, snapshot: &Value) {
+    let stderr = std::fs::read_to_string(evidence.join("stderr.log"))
+        .expect("stopped process materializes its captured stderr");
     let state = readiness_outcome(snapshot);
-    loop {
-        let stderr = std::fs::read_to_string(evidence.join("stderr.log")).unwrap_or_default();
-        let matched = stderr
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .any(|event| {
-                let fields = &event["fields"];
-                fields["message"].as_str() == Some("capability readiness snapshot")
-                    && fields["capability"].as_str() == Some("txindex")
-                    && fields["state"].as_str() == Some(state.as_str())
-                    && fields["chain_epoch"].as_u64() == epoch
-                    && fields["chain_sequence"].as_u64() == sequence
-                    && fields["tip_height"].as_u64() == height
-                    && fields["tip_hash"].as_str() == hash
-            });
-        if matched {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "readiness log never rendered RPC snapshot {snapshot}: {stderr}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+    let matched = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|event| {
+            let fields = &event["fields"];
+            fields["message"].as_str() == Some("capability readiness snapshot")
+                && fields["state"].as_str() == Some(state.as_str())
+                && [
+                    ("chain_epoch", "/revision/epoch"),
+                    ("chain_sequence", "/revision/sequence"),
+                    ("index_state_revision", "/revision/index_state"),
+                    ("tip_height", "/tip/height"),
+                ]
+                .iter()
+                .all(|(field, pointer)| {
+                    fields[field].as_u64() == snapshot.pointer(pointer).and_then(Value::as_u64)
+                })
+                && [
+                    ("index_lifecycle", "/revision/index_owner/lifecycle"),
+                    ("index_health", "/revision/index_owner/health"),
+                    ("tip_hash", "/tip/hash"),
+                ]
+                .iter()
+                .all(|(field, pointer)| {
+                    fields[field].as_str() == snapshot.pointer(pointer).and_then(Value::as_str)
+                })
+        });
+    assert!(
+        matched,
+        "retained log did not render snapshot {snapshot}: {stderr}"
+    );
+}
+
+fn assert_esplora_readiness(node: &mut ProcessNode, row: &Value) {
+    let response = node
+        .http_get("/api/blocks/tip/height")
+        .expect("Esplora tip");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response
+            .text()
+            .expect("text height")
+            .parse::<u64>()
+            .expect("height"),
+        row.pointer("/tip/height")
+            .and_then(Value::as_u64)
+            .expect("RPC tip height")
+    );
+    for (header, pointer) in [
+        ("X-Bitcoin-Rs-Chain-Epoch", "/revision/epoch"),
+        ("X-Bitcoin-Rs-Chain-Sequence", "/revision/sequence"),
+        ("X-Bitcoin-Rs-Index-State-Revision", "/revision/index_state"),
+        ("X-Bitcoin-Rs-Tip-Height", "/tip/height"),
+    ] {
+        let expected = row
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .expect("RPC numeric fact")
+            .to_string();
+        assert_eq!(response.header(header), Some(expected.as_str()), "{header}");
     }
+    for (header, pointer) in [
+        (
+            "X-Bitcoin-Rs-Index-Lifecycle",
+            "/revision/index_owner/lifecycle",
+        ),
+        ("X-Bitcoin-Rs-Index-Health", "/revision/index_owner/health"),
+        ("X-Bitcoin-Rs-Tip-Hash", "/tip/hash"),
+    ] {
+        assert_eq!(
+            response.header(header),
+            row.pointer(pointer).and_then(Value::as_str),
+            "{header}"
+        );
+    }
+    assert_eq!(
+        response.header("X-Bitcoin-Rs-Txindex-Compiled"),
+        Some("true")
+    );
+    assert_eq!(
+        response.header("X-Bitcoin-Rs-Txindex-Enabled"),
+        Some("true")
+    );
+    assert_eq!(response.header("X-Bitcoin-Rs-Txindex-State"), Some("Ready"));
+}
+
+fn assert_metrics_readiness(metrics: &str, row: &Value) {
+    assert_one_active(&readiness_samples(metrics), "Ready");
+    for metric in [
+        "node_capability_snapshot_available",
+        "node_capability_txindex_compiled",
+        "node_capability_txindex_enabled",
+        "node_capability_index_state_revision_available",
+    ] {
+        assert_eq!(metric_u64(metrics, metric, &[]), 1, "{metric}");
+    }
+    let value = |path| {
+        row.pointer(path)
+            .and_then(Value::as_u64)
+            .expect("RPC numeric fact")
+    };
+    assert_eq!(
+        metrics_revision(metrics),
+        (value("/revision/epoch"), value("/revision/sequence"))
+    );
+    assert_eq!(
+        metrics_index_state_revision(metrics),
+        value("/revision/index_state")
+    );
+    assert_eq!(
+        metric_u64(metrics, "node_capability_tip_height", &[]),
+        value("/tip/height")
+    );
+    assert_eq!(
+        Some(metrics_tip_hash(metrics).as_str()),
+        row.pointer("/tip/hash").and_then(Value::as_str)
+    );
+    let lifecycle = row
+        .pointer("/revision/index_owner/lifecycle")
+        .and_then(Value::as_str)
+        .expect("lifecycle");
+    let health = row
+        .pointer("/revision/index_owner/health")
+        .and_then(Value::as_str)
+        .expect("health");
+    assert_eq!(
+        metric_u64(
+            metrics,
+            "node_capability_index_owner",
+            &[("lifecycle", lifecycle), ("health", health)]
+        ),
+        1
+    );
 }
 
 /// #653 startup: at one captured tip, RPC, Esplora, metrics, and logs agree.
@@ -1152,13 +1262,10 @@ fn startup_readiness_agrees_across_rpc_esplora_and_metrics() {
     .expect("node with txindex must start");
     let (core_pid, node_pid) = (core.pid(), node.pid());
     let deadline = readiness_deadline();
-
     mine_common_chain(&mut core, &mut node, COMMON_BLOCKS).expect("common chain");
     wait_until_ready(&mut node, deadline).expect("node readiness");
     wait_txindex_synced(&mut core, deadline).expect("core txindex synced");
     wait_txindex_synced(&mut node, deadline).expect("node txindex synced");
-
-    // The capability row: enabled and Ready at the captured tip.
     let row = node
         .rpc("getcapabilities", &json!([]))
         .expect("capabilities");
@@ -1166,104 +1273,19 @@ fn startup_readiness_agrees_across_rpc_esplora_and_metrics() {
     assert_eq!(row.pointer("/capabilities/0/compiled"), Some(&json!(true)));
     assert_eq!(row.pointer("/capabilities/0/enabled"), Some(&json!(true)));
     assert_eq!(readiness_outcome(&row), "Ready");
-
-    // Core parity: both binaries render the same synced index report.
     let synced = compare_rpc(&mut core, &mut node, "getindexinfo", &json!(["txindex"]))
         .expect("index report parity");
-    assert_eq!(
-        synced.pointer("/txindex/synced"),
-        Some(&json!(true)),
-        "parity reply: {synced}"
-    );
-
-    let epoch = row
-        .pointer("/revision/epoch")
-        .and_then(Value::as_u64)
-        .expect("capability revision epoch");
-    let sequence = row
-        .pointer("/revision/sequence")
-        .and_then(Value::as_u64)
-        .expect("capability revision sequence");
-    let snapshot_height = row
-        .pointer("/tip/height")
-        .and_then(Value::as_u64)
-        .expect("capability tip height");
-    let snapshot_hash = row
-        .pointer("/tip/hash")
-        .and_then(Value::as_str)
-        .expect("capability tip hash");
-    let epoch_header = epoch.to_string();
-    let sequence_header = sequence.to_string();
-    let height_header = snapshot_height.to_string();
-
-    // Esplora renders the same tip and carries the exact owner revision and
-    // readiness token that RPC captured.
-    let tip = node.rpc("getblockcount", &json!([])).expect("tip height");
-    let esplora = node
-        .http_get("/api/blocks/tip/height")
-        .expect("esplora tip height");
-    assert_eq!(esplora.status, 200);
-    let esplora_height = esplora
-        .text()
-        .expect("text height")
-        .parse::<u64>()
-        .expect("numeric height");
-    assert_eq!(
-        tip,
-        json!(esplora_height),
-        "RPC and Esplora must agree on the tip"
-    );
-    assert_eq!(
-        esplora.header("X-Bitcoin-Rs-Chain-Epoch"),
-        Some(epoch_header.as_str())
-    );
-    assert_eq!(
-        esplora.header("X-Bitcoin-Rs-Chain-Sequence"),
-        Some(sequence_header.as_str())
-    );
-    assert_eq!(
-        esplora.header("X-Bitcoin-Rs-Tip-Height"),
-        Some(height_header.as_str())
-    );
-    assert_eq!(esplora.header("X-Bitcoin-Rs-Tip-Hash"), Some(snapshot_hash));
-    assert_eq!(
-        esplora.header("X-Bitcoin-Rs-Txindex-Compiled"),
-        Some("true")
-    );
-    assert_eq!(esplora.header("X-Bitcoin-Rs-Txindex-Enabled"), Some("true"));
-    assert_eq!(esplora.header("X-Bitcoin-Rs-Txindex-State"), Some("Ready"));
-
-    // One scrape carries readiness, revision, and tip from one immutable
-    // snapshot; no convergence between independently published gauges is
-    // accepted as evidence.
+    assert_eq!(synced.pointer("/txindex/synced"), Some(&json!(true)));
+    assert_esplora_readiness(&mut node, &row);
     let metrics = wait_gauge_active(metrics_addr, "Ready", deadline);
-    let samples = readiness_samples(&metrics);
-    assert_one_active(&samples, "Ready");
-    assert_eq!(
-        metric_u64(&metrics, "node_capability_snapshot_available", &[]),
-        1
-    );
-    assert_eq!(
-        metric_u64(&metrics, "node_capability_txindex_compiled", &[]),
-        1
-    );
-    assert_eq!(
-        metric_u64(&metrics, "node_capability_txindex_enabled", &[]),
-        1
-    );
-    assert_eq!(metrics_revision(&metrics), (epoch, sequence));
-    assert_eq!(
-        metric_u64(&metrics, "node_capability_tip_height", &[]),
-        snapshot_height
-    );
-    assert_eq!(metrics_tip_hash(&metrics), snapshot_hash);
-
-    // The structured transition log carries the same owner revision, tip,
-    // and readiness token, so operators can join it to either public view.
-    wait_readiness_log(&node.evidence, &row, deadline);
-
+    assert_metrics_readiness(&metrics, &row);
+    // Allow the existing one-second telemetry tick to observe the stationary
+    // Ready state. ProcessNode retains output in memory until child EOF.
+    std::thread::sleep(Duration::from_secs(2));
+    let evidence = node.evidence.clone();
     core.stop().expect("core stop");
     node.stop().expect("node stop");
+    assert_readiness_log(&evidence, &row);
     assert_reaped(core_pid);
     assert_reaped(node_pid);
 }

@@ -1341,11 +1341,18 @@ mod tests {
         ) -> Result<bitcoin_rs_index::CapabilitySnapshot, bitcoin_rs_index::CapabilitySnapshotError>
         {
             Ok(bitcoin_rs_index::CapabilitySnapshot {
-                revision: bitcoin_rs_index::CapabilityRevision::default(),
-                tip: bitcoin_rs_index::CapabilityTip {
+                revision: Some(bitcoin_rs_index::CapabilityRevision {
+                    index_owner: bitcoin_rs_index::CapabilityOwnerRevision {
+                        lifecycle: bitcoin_rs_index::CapabilityOwnerLifecycle::Serving,
+                        health: bitcoin_rs_index::CapabilityOwnerHealth::Healthy,
+                        phase: bitcoin_rs_index::reconcile::ReconcilePhase::default(),
+                    },
+                    ..bitcoin_rs_index::CapabilityRevision::default()
+                }),
+                tip: Some(bitcoin_rs_index::CapabilityTip {
                     height: 0,
-                    hash: "0".repeat(64),
-                },
+                    hash: Network::Mainnet.genesis_block_hash().to_string(),
+                }),
                 capabilities: vec![bitcoin_rs_index::derived_index_status(
                     true,
                     bitcoin_rs_index::CapabilityState::Ready,

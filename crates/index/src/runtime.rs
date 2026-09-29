@@ -17,7 +17,7 @@
 //! A snapshot-gated query engine serves `crate::query_api::DerivedIndexQuery`
 //! and the generic [`ScriptIndexQuery`] without raw index mutex paths.
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader, TipReader, TipSnapshot};
 
@@ -34,7 +34,8 @@ use bitcoin_rs_primitives::{Block, BlockHash, Hash256, OutPoint, Tx, Txid, deser
 
 use crate::block_log::{BlockLog, record_at_height};
 use crate::capabilities::{
-    CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource, derived_index_status,
+    CapabilityOwnerHealth, CapabilityOwnerLifecycle, CapabilityOwnerRevision, CapabilityState,
+    CapabilityStatus, DerivedIndexCapabilitySource, derived_index_status,
 };
 use crate::query_api::{
     DerivedIndexInfo, DerivedIndexQuery, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
@@ -101,7 +102,7 @@ pub struct DerivedIndexRuntime {
     pub(super) shutdown: AtomicBool,
     pub(super) failed: AtomicBool,
     wake_tx: Sender<()>,
-    failure_message: RwLock<Option<CompactString>>,
+    failure_message: ArcSwapOption<CompactString>,
     phase: arc_swap::ArcSwap<ReconcilePhase>,
 }
 
@@ -114,7 +115,7 @@ impl DerivedIndexRuntime {
             shutdown: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             wake_tx,
-            failure_message: RwLock::new(None),
+            failure_message: ArcSwapOption::empty(),
             phase: arc_swap::ArcSwap::from_pointee(ReconcilePhase::FORWARD),
         }
     }
@@ -155,7 +156,7 @@ impl DerivedIndexRuntime {
 
     /// Marks the worker as failed with an explanatory message.
     pub fn publish_failed(&self, message: impl Into<CompactString>) {
-        *self.failure_message.write() = Some(message.into());
+        self.failure_message.store(Some(Arc::new(message.into())));
         self.failed.store(true, Ordering::Release);
     }
 
@@ -180,7 +181,13 @@ impl DerivedIndexRuntime {
     /// Reads the published failure message.
     #[must_use]
     pub fn failure_message(&self) -> Option<CompactString> {
-        self.failure_message.read().clone()
+        self.failure_message.load_full().as_deref().cloned()
+    }
+
+    /// Loads the immutable health publication so capability assembly can
+    /// reject an away-and-back replacement by allocation identity.
+    pub(super) fn failure_snapshot(&self) -> Option<Arc<CompactString>> {
+        self.failure_message.load_full()
     }
 }
 

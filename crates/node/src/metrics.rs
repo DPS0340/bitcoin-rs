@@ -453,7 +453,11 @@ fn render_capability_metrics(
         write_sample(body, "node_capability_snapshot_available", identity, &[], 0);
         return;
     };
-    let Some(words) = hash_words(&snapshot.tip.hash) else {
+    let (Some(revision), Some(tip)) = (snapshot.revision, snapshot.tip.as_ref()) else {
+        write_sample(body, "node_capability_snapshot_available", identity, &[], 0);
+        return;
+    };
+    let Some(words) = hash_words(&tip.hash) else {
         write_sample(body, "node_capability_snapshot_available", identity, &[], 0);
         return;
     };
@@ -494,22 +498,7 @@ fn render_capability_metrics(
         );
     }
 
-    body.push_str("# HELP node_capability_chain_revision Authoritative chain revision split into exact 32-bit parts.\n");
-    body.push_str("# TYPE node_capability_chain_revision gauge\n");
-    for (field, value) in [
-        ("epoch", snapshot.revision.epoch),
-        ("sequence", snapshot.revision.sequence),
-    ] {
-        for (part, half) in [("high", value >> 32), ("low", value & u64::from(u32::MAX))] {
-            write_sample(
-                body,
-                "node_capability_chain_revision",
-                identity,
-                &[("field", field), ("part", part)],
-                half,
-            );
-        }
-    }
+    render_owner_revision(body, identity, revision);
     body.push_str(
         "# HELP node_capability_tip_height Applied tip height in this capability snapshot.\n",
     );
@@ -519,7 +508,7 @@ fn render_capability_metrics(
         "node_capability_tip_height",
         identity,
         &[],
-        u64::from(snapshot.tip.height),
+        u64::from(tip.height),
     );
     body.push_str("# HELP node_capability_tip_hash_word Applied tip hash as eight exact big-endian 32-bit words.\n");
     body.push_str("# TYPE node_capability_tip_hash_word gauge\n");
@@ -532,6 +521,93 @@ fn render_capability_metrics(
             &[("word", &word_index)],
             u64::from(word),
         );
+    }
+}
+
+fn render_owner_revision(
+    body: &mut String,
+    identity: &EvidenceIdentity,
+    revision: bitcoin_rs_index::CapabilityRevision,
+) {
+    body.push_str("# HELP node_capability_chain_revision Authoritative chain revision split into exact 32-bit parts.\n");
+    body.push_str("# TYPE node_capability_chain_revision gauge\n");
+    for (field, value) in [("epoch", revision.epoch), ("sequence", revision.sequence)] {
+        for (part, half) in [("high", value >> 32), ("low", value & u64::from(u32::MAX))] {
+            write_sample(
+                body,
+                "node_capability_chain_revision",
+                identity,
+                &[("field", field), ("part", part)],
+                half,
+            );
+        }
+    }
+    body.push_str("# HELP node_capability_index_state_revision_available Whether the durable index-state revision is available in this capability snapshot.\n");
+    body.push_str("# TYPE node_capability_index_state_revision_available gauge\n");
+    write_sample(
+        body,
+        "node_capability_index_state_revision_available",
+        identity,
+        &[],
+        u64::from(revision.index_state.is_some()),
+    );
+    if let Some(index_state) = revision.index_state {
+        body.push_str("# HELP node_capability_index_state_revision Durable ordinary index-state revision split into exact 32-bit parts.\n");
+        body.push_str("# TYPE node_capability_index_state_revision gauge\n");
+        for (part, half) in [
+            ("high", index_state >> 32),
+            ("low", index_state & u64::from(u32::MAX)),
+        ] {
+            write_sample(
+                body,
+                "node_capability_index_state_revision",
+                identity,
+                &[("part", part)],
+                half,
+            );
+        }
+    }
+    body.push_str(
+        "# HELP node_capability_index_owner Captured index-owner lifecycle and health identity.\n",
+    );
+    body.push_str("# TYPE node_capability_index_owner gauge\n");
+    write_sample(
+        body,
+        "node_capability_index_owner",
+        identity,
+        &[
+            ("lifecycle", revision.index_owner.lifecycle.wire_name()),
+            ("health", revision.index_owner.health.wire_name()),
+        ],
+        1,
+    );
+    body.push_str("# HELP node_capability_index_phase Captured reconciliation phase: 0 forward, 1 rebuilding, 2 rolling back.\n");
+    body.push_str("# TYPE node_capability_index_phase gauge\n");
+    for (capability, name) in [
+        (bitcoin_rs_index::IndexCapability::TxLookup, "tx_lookup"),
+        (
+            bitcoin_rs_index::IndexCapability::ScriptHistory,
+            "script_history",
+        ),
+        (bitcoin_rs_index::IndexCapability::ScriptLive, "script_live"),
+    ] {
+        let (phase, from, to) = match revision.index_owner.phase.leg(capability) {
+            bitcoin_rs_index::reconcile::ReconcileLeg::Forward => (0, 0, 0),
+            bitcoin_rs_index::reconcile::ReconcileLeg::Rebuilding => (1, 0, 0),
+            bitcoin_rs_index::reconcile::ReconcileLeg::RollingBack {
+                from_height,
+                to_height,
+            } => (2, from_height, to_height),
+        };
+        for (field, value) in [("kind", phase), ("from_height", from), ("to_height", to)] {
+            write_sample(
+                body,
+                "node_capability_index_phase",
+                identity,
+                &[("capability", name), ("field", field)],
+                u64::from(value),
+            );
+        }
     }
 }
 

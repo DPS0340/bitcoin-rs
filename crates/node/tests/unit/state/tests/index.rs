@@ -130,16 +130,21 @@ fn derived_index_status_answers_when_disabled() -> anyhow::Result<()> {
         "a disabled config must answer a concrete Disabled row"
     );
     let chain_snapshot = state.chainstate().chain_snapshot();
-    assert_eq!(capability_snapshot.revision.epoch, chain_snapshot.epoch);
+    let revision = capability_snapshot
+        .revision
+        .ok_or_else(|| anyhow::anyhow!("production capability source has no owner revision"))?;
+    let tip = capability_snapshot
+        .tip
+        .ok_or_else(|| anyhow::anyhow!("production capability source has no owner tip"))?;
+    assert_eq!(revision.epoch, chain_snapshot.epoch);
+    assert_eq!(revision.sequence, chain_snapshot.sequence);
     assert_eq!(
-        capability_snapshot.revision.sequence,
-        chain_snapshot.sequence
+        revision.index_owner,
+        bitcoin_rs_index::CapabilityOwnerRevision::default(),
+        "disabled ownership is explicit rather than inferred from a missing row"
     );
-    assert_eq!(capability_snapshot.tip.height, chain_snapshot.tip_height);
-    assert_eq!(
-        capability_snapshot.tip.hash,
-        chain_snapshot.tip_hash.to_string()
-    );
+    assert_eq!(tip.height, chain_snapshot.tip_height);
+    assert_eq!(tip.hash, chain_snapshot.tip_hash.to_string());
     Ok(())
 }
 

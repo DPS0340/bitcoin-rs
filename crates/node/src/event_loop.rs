@@ -108,15 +108,23 @@ impl EventLoop {
         let Some(status) = snapshot.capabilities.first() else {
             return;
         };
+        let (Some(revision), Some(tip)) = (snapshot.revision, snapshot.tip.as_ref()) else {
+            tracing::debug!("capability snapshot has no owner authority");
+            return;
+        };
         tracing::info!(
             capability = %status.id,
             compiled = status.compiled,
             enabled = status.enabled,
             state = status.state.wire_name(),
-            chain_epoch = snapshot.revision.epoch,
-            chain_sequence = snapshot.revision.sequence,
-            tip_height = snapshot.tip.height,
-            tip_hash = %snapshot.tip.hash,
+            chain_epoch = revision.epoch,
+            chain_sequence = revision.sequence,
+            index_state_revision = revision.index_state,
+            index_lifecycle = revision.index_owner.lifecycle.wire_name(),
+            index_health = revision.index_owner.health.wire_name(),
+            index_phase = ?revision.index_owner.phase,
+            tip_height = tip.height,
+            tip_hash = %tip.hash,
             "capability readiness snapshot"
         );
         *last = Some(snapshot);

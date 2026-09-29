@@ -78,19 +78,31 @@ only scheduling mechanics.
   `enabled: false` / `Disabled`; an attached worker supplies the row through
   `DerivedIndexCapabilitySource`. Proof: `crates/index/src/capabilities.rs` tests
   `missing_source_is_the_disabled_txindex_row`, `attached_source_is_the_worker_row`.
-- A capability snapshot also carries the chain event publisher's authoritative
-  `revision { epoch, sequence }` and its paired `tip { height, hash }`. The
-  index wake counter is not a public revision and no surface owns a parallel
-  clock. Snapshot assembly brackets lifecycle, phase, failure, watermark, and
-  owner-cursor reads; a move during assembly produces a typed retry instead of
-  guessed status.
+- An attached capability snapshot carries the chain event publisher's
+  authoritative `revision { epoch, sequence }`, the existing durable
+  `revision.index_state` from the index write fence, the captured
+  `revision.index_owner { lifecycle, health, phase }` values, and the paired
+  `tip { height, hash }`. Before the first ordinary index commit,
+  `revision.index_state` is null. Lifecycle, health, and per-capability phase
+  identity comes directly from owner publications; it is not an adapter clock.
+  The index wake counter is not a public revision and no surface owns a parallel
+  clock. Snapshot assembly brackets the durable index snapshot with the owner
+  publications for lifecycle, reconciliation phase, health, and chain cursor;
+  a move during assembly produces a typed retry instead of guessed status. A
+  standalone RPC context with no source retains the Disabled inventory row but
+  reports `revision` and `tip` as null, never as an authoritative all-zero
+  chain.
 - JSON-RPC serializes that complete snapshot. A read-only Esplora response is
-  returned only when its chain view and before/after capability snapshots are
-  unchanged, and carries the revision, tip, and txindex state in
-  `X-Bitcoin-Rs-*` headers. Metrics render compiled/enabled facts, all
-  readiness labels, and the same revision and tip from one source snapshot
-  per scrape; 64-bit revisions are split into exact 32-bit halves and the hash
-  into eight fixed-label words.
+  returned only when its route-owned chain view stays fixed and the one
+  post-dispatch capability snapshot names that same tip. Unrelated History
+  progress does not invalidate successful chain, mempool, or ready Live
+  reads. Esplora carries the chain revision, durable index-state revision,
+  index-owner lifecycle/health identity, tip, and txindex state in
+  `X-Bitcoin-Rs-*` headers when authority is available; a standalone context
+  omits authority headers. Metrics render compiled/enabled facts, all
+  readiness labels, and the same revisions, owner identity, and tip from one
+  source snapshot per scrape; 64-bit revisions are split into exact 32-bit
+  halves and the hash into eight fixed-label words.
   Structured readiness logs carry the same fields and are emitted from the
   event loop's existing elapsed-time tick. Snapshot capture failure is exposed
   as RPC/Esplora unavailability or `node_capability_snapshot_available 0`, not
@@ -266,6 +278,14 @@ remove another script's output.
 - `crates/index/src/capabilities.rs` tests `missing_source_is_the_disabled_txindex_row`,
   `attached_source_is_the_worker_row`: `getcapabilities` advertises one
   txindex row from `derived_index_status` (`IDX-02`).
+- `crates/index/src/runtime/recovery_tests.rs`
+  `capability_snapshot_tracks_owner_state_at_a_fixed_chain_tip` drives the
+  actual worker and durable store through Opening, CatchingUp, Ready, and
+  Failed without moving the chain tip; durable progress and owner health have
+  distinct revision identity (`IDX-02`).
+- `crates/rpc/src/esplora.rs` tests reject owner-tip mismatch for Disabled,
+  Opening, and Failed while preserving successful chain, mempool, and Live
+  reads across unrelated History progress (`IDX-02`).
 - `bin/bitcoin-rs/tests/overhaul_process_harness.rs`
   `startup_readiness_agrees_across_rpc_esplora_and_metrics` joins RPC, Esplora,
   one Prometheus scrape, and a structured log record by exact owner revision,

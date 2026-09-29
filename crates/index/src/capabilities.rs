@@ -108,40 +108,45 @@ pub struct CapabilityStatus {
 /// Point-in-time status report for concrete node capabilities.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
-    /// Authoritative chain-owner revision at which the status rows were captured.
-    pub revision: CapabilityRevision,
-    /// Authoritative applied tip belonging to `revision`.
-    pub tip: CapabilityTip,
+    /// Owner revisions at which the status rows were captured, or `None`
+    /// when no authoritative capability source is attached.
+    pub revision: Option<CapabilityRevision>,
+    /// Authoritative applied tip belonging to `revision`, or `None` when no
+    /// authoritative capability source is attached.
+    pub tip: Option<CapabilityTip>,
     /// Status rows in the node's stable capability order.
     pub capabilities: Vec<CapabilityStatus>,
 }
 
 impl CapabilitySnapshot {
     /// Builds the wire projection from the authoritative chain-owner cursor.
-    pub(crate) fn from_cursor(cursor: ConsumerCursor, capabilities: Vec<CapabilityStatus>) -> Self {
+    pub(crate) fn from_cursor(
+        cursor: ConsumerCursor,
+        index_state_revision: Option<u64>,
+        index_owner: CapabilityOwnerRevision,
+        capabilities: Vec<CapabilityStatus>,
+    ) -> Self {
         Self {
-            revision: CapabilityRevision {
+            revision: Some(CapabilityRevision {
                 epoch: cursor.epoch,
                 sequence: cursor.sequence,
-            },
-            tip: CapabilityTip {
+                index_state: index_state_revision,
+                index_owner,
+            }),
+            tip: Some(CapabilityTip {
                 height: cursor.height,
                 hash: cursor.hash.to_string(),
-            },
+            }),
             capabilities,
         }
     }
 
     fn detached(capabilities: Vec<CapabilityStatus>) -> Self {
-        Self::from_cursor(
-            ConsumerCursor {
-                epoch: 0,
-                sequence: 0,
-                height: 0,
-                hash: bitcoin_rs_primitives::Hash256::default(),
-            },
+        Self {
+            revision: None,
+            tip: None,
             capabilities,
-        )
+        }
     }
 }
 
@@ -151,16 +156,84 @@ impl Default for CapabilitySnapshot {
     }
 }
 
-/// Revision owned and advanced by the chain event publisher.
+/// Existing owner revisions identifying one capability observation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityRevision {
     /// Process epoch persisted by the chain event owner.
     pub epoch: u64,
     /// Commit sequence within `epoch`.
     pub sequence: u64,
+    /// Durable ordinary-state revision owned by the derived index. `None`
+    /// before its first ordinary commit or while the durable owner is unavailable.
+    pub index_state: Option<u64>,
+    /// Lifecycle and health identity read directly from their owner publications.
+    pub index_owner: CapabilityOwnerRevision,
 }
 
-/// Applied tip paired with a capability revision.
+/// Index-owner publications that complete the capability revision without a
+/// parallel adapter clock.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityOwnerRevision {
+    /// Identity of the captured lifecycle publication.
+    pub lifecycle: CapabilityOwnerLifecycle,
+    /// Identity of the captured health publication.
+    pub health: CapabilityOwnerHealth,
+    /// Reconciliation facts from the existing phase owner, including phase-only changes.
+    pub phase: crate::reconcile::ReconcilePhase,
+}
+
+/// Stable lifecycle identity owned by the derived-index host.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CapabilityOwnerLifecycle {
+    /// No index runtime is configured.
+    #[default]
+    Disabled,
+    /// The durable store has not opened yet.
+    Opening,
+    /// A query engine is published.
+    Serving,
+    /// Store open or startup failed.
+    Failed,
+    /// Shutdown abandoned the worker.
+    ShutdownAbandoned,
+}
+
+impl CapabilityOwnerLifecycle {
+    /// Stable wire and telemetry spelling.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled",
+            Self::Opening => "Opening",
+            Self::Serving => "Serving",
+            Self::Failed => "Failed",
+            Self::ShutdownAbandoned => "ShutdownAbandoned",
+        }
+    }
+}
+
+/// Stable health identity owned by the derived-index runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CapabilityOwnerHealth {
+    /// No owner failure is published.
+    #[default]
+    Healthy,
+    /// The owner published a terminal failure.
+    Failed,
+}
+
+impl CapabilityOwnerHealth {
+    /// Stable wire and telemetry spelling.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Healthy => "Healthy",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// Applied tip paired with the chain portion of a capability revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityTip {
     /// Applied-chain height.
@@ -187,9 +260,9 @@ pub enum CapabilitySnapshotError {
 }
 
 /// Live txindex snapshot. The worker maps its lifecycle onto [`CapabilityStatus`]
-/// while retaining the chain owner's revision and tip.
+/// while retaining the chain cursor and durable index-state revision.
 pub trait DerivedIndexCapabilitySource: Send + Sync {
-    /// Captures the row together with the authoritative chain-owner revision.
+    /// Captures the row together with its authoritative owner revisions.
     fn snapshot(&self) -> Result<CapabilitySnapshot, CapabilitySnapshotError>;
 }
 
@@ -240,9 +313,8 @@ mod tests {
     fn missing_source_is_the_disabled_txindex_row() -> Result<(), CapabilitySnapshotError> {
         let snapshot = txindex_snapshot(None)?;
         assert_eq!(snapshot.capabilities, vec![disabled_txindex()]);
-        assert_eq!(snapshot.revision, CapabilityRevision::default());
-        assert_eq!(snapshot.tip.height, 0);
-        assert_eq!(snapshot.tip.hash, "0".repeat(64));
+        assert_eq!(snapshot.revision, None);
+        assert_eq!(snapshot.tip, None);
         Ok(())
     }
 
@@ -287,7 +359,8 @@ mod tests {
             snapshot.capabilities,
             vec![derived_index_status(true, CapabilityState::Ready)]
         );
-        assert_eq!(snapshot.revision, CapabilityRevision::default());
+        assert_eq!(snapshot.revision, None);
+        assert_eq!(snapshot.tip, None);
         Ok(())
     }
 }

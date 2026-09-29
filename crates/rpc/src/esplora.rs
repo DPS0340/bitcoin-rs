@@ -42,22 +42,40 @@ pub fn route(handler: &Handler, surface: Surface, path: &str, query: &str) -> Re
     let ctx = handler.context();
     let projection = Projection::new(&ctx);
     let chain_view = projection.capture_chain_view();
-    let readiness =
-        match bitcoin_rs_index::txindex_snapshot(ctx.indexes.derived_index_status.as_deref()) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return service_unavailable_owned(error.to_string()),
-        };
     let response = dispatch_get(handler, &ctx, surface, path, query);
     if let Err(response) = projection.ensure_chain_view(chain_view.as_ref()) {
         return response;
     }
     match bitcoin_rs_index::txindex_snapshot(ctx.indexes.derived_index_status.as_deref()) {
-        Ok(after) if after == readiness => readiness_headers(response, &readiness),
+        Ok(snapshot)
+            if readiness_authority_matches(
+                &snapshot,
+                chain_view.as_deref(),
+                ctx.chain.chain_network,
+            ) =>
+        {
+            readiness_headers(response, &snapshot)
+        }
         Ok(_) => service_unavailable_owned(
-            "capability status changed during Esplora response; retry".to_owned(),
+            "capability tip does not match the Esplora response view; retry".to_owned(),
         ),
         Err(error) => service_unavailable_owned(error.to_string()),
     }
+}
+
+fn readiness_authority_matches(
+    snapshot: &bitcoin_rs_index::CapabilitySnapshot,
+    chain_view: Option<&bitcoin_rs_chain::TipSnapshot>,
+    network: bitcoin_rs_primitives::Network,
+) -> bool {
+    let (Some(_), Some(tip)) = (snapshot.revision, snapshot.tip.as_ref()) else {
+        return snapshot.revision.is_none() && snapshot.tip.is_none();
+    };
+    let (height, hash) = chain_view.map_or_else(
+        || (0, network.genesis_block_hash()),
+        |view| (view.height, view.hash),
+    );
+    tip.height == height && tip.hash == hash.to_string()
 }
 
 fn readiness_headers(
@@ -66,17 +84,7 @@ fn readiness_headers(
 ) -> Response {
     let status = snapshot.capabilities.first();
     let state = status.map_or("Disabled", |status| status.state.wire_name());
-    response
-        .with_header(
-            "X-Bitcoin-Rs-Chain-Epoch",
-            snapshot.revision.epoch.to_string(),
-        )
-        .with_header(
-            "X-Bitcoin-Rs-Chain-Sequence",
-            snapshot.revision.sequence.to_string(),
-        )
-        .with_header("X-Bitcoin-Rs-Tip-Height", snapshot.tip.height.to_string())
-        .with_header("X-Bitcoin-Rs-Tip-Hash", snapshot.tip.hash.clone())
+    let mut response = response
         .with_header(
             "X-Bitcoin-Rs-Txindex-Compiled",
             status.is_some_and(|status| status.compiled).to_string(),
@@ -85,7 +93,34 @@ fn readiness_headers(
             "X-Bitcoin-Rs-Txindex-Enabled",
             status.is_some_and(|status| status.enabled).to_string(),
         )
-        .with_header("X-Bitcoin-Rs-Txindex-State", state)
+        .with_header("X-Bitcoin-Rs-Txindex-State", state);
+    if let Some(revision) = snapshot.revision {
+        response = response
+            .with_header("X-Bitcoin-Rs-Chain-Epoch", revision.epoch.to_string())
+            .with_header("X-Bitcoin-Rs-Chain-Sequence", revision.sequence.to_string())
+            .with_header(
+                "X-Bitcoin-Rs-Index-Lifecycle",
+                revision.index_owner.lifecycle.wire_name(),
+            )
+            .with_header(
+                "X-Bitcoin-Rs-Index-Health",
+                revision.index_owner.health.wire_name(),
+            )
+            .with_header(
+                "X-Bitcoin-Rs-Index-Phase",
+                format!("{:?}", revision.index_owner.phase),
+            );
+        if let Some(index_state) = revision.index_state {
+            response =
+                response.with_header("X-Bitcoin-Rs-Index-State-Revision", index_state.to_string());
+        }
+    }
+    if let Some(tip) = &snapshot.tip {
+        response = response
+            .with_header("X-Bitcoin-Rs-Tip-Height", tip.height.to_string())
+            .with_header("X-Bitcoin-Rs-Tip-Hash", tip.hash.clone());
+    }
+    response
 }
 
 fn dispatch_get(
@@ -151,9 +186,14 @@ mod tests {
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Duration;
 
+    use arc_swap::ArcSwap;
     use bitcoin::hex::DisplayHex as _;
     use bitcoin_rs_chain::NodeStatus;
-    use bitcoin_rs_index::ScriptHash;
+    use bitcoin_rs_index::{
+        CapabilityOwnerHealth, CapabilityOwnerLifecycle, CapabilityOwnerRevision,
+        CapabilityRevision, CapabilitySnapshot, CapabilitySnapshotError, CapabilityState,
+        CapabilityTip, DerivedIndexCapabilitySource, IndexCapabilities, ScriptHash,
+    };
     use bitcoin_rs_mempool::MempoolEntry;
     use bitcoin_rs_primitives::encode::double_sha256;
     use bitcoin_rs_primitives::{
@@ -542,6 +582,12 @@ mod tests {
     }
 
     fn contract_fixture() -> Result<(Handler, Tx, Block, String), Box<dyn std::error::Error>> {
+        contract_fixture_with_status(None)
+    }
+
+    fn contract_fixture_with_status(
+        status: Option<Arc<dyn DerivedIndexCapabilitySource>>,
+    ) -> Result<(Handler, Tx, Block, String), Box<dyn std::error::Error>> {
         // p2wpkh scriptPubKey for key hash [2; 20]; the address string rides
         // the sanctioned rust-bitcoin Address seam.
         let target = {
@@ -600,6 +646,7 @@ mod tests {
                 .clone()
         };
         context.chain.applied_tip.store(Some(Arc::new(tip)));
+        context.indexes.derived_index_status = status;
         context.indexes.esplora_tx_index =
             Some(Arc::new(FixtureTxIndex(vec![(transaction.clone(), 0)])));
         let funding = vec![ScriptIndexRecord {
@@ -619,7 +666,29 @@ mod tests {
     #[test]
     fn tip_routes_remain_available_without_script_index() {
         let handler = Handler::new(Arc::new(Context::new()));
-        assert_eq!(route(&handler, "/blocks/tip/height", "").status, 200);
+        let tip = route(&handler, "/blocks/tip/height", "");
+        assert_eq!(tip.status, 200);
+        for authority_header in [
+            "X-Bitcoin-Rs-Chain-Epoch",
+            "X-Bitcoin-Rs-Chain-Sequence",
+            "X-Bitcoin-Rs-Index-Lifecycle",
+            "X-Bitcoin-Rs-Index-Health",
+            "X-Bitcoin-Rs-Index-State-Revision",
+            "X-Bitcoin-Rs-Tip-Height",
+            "X-Bitcoin-Rs-Tip-Hash",
+        ] {
+            assert!(
+                tip.headers
+                    .iter()
+                    .all(|(name, _)| *name != authority_header),
+                "a missing authority must not fabricate {authority_header}"
+            );
+        }
+        assert!(
+            tip.headers.iter().any(|(name, value)| {
+                *name == "X-Bitcoin-Rs-Txindex-State" && value == "Disabled"
+            })
+        );
         assert_eq!(
             route(
                 &handler,
@@ -629,6 +698,167 @@ mod tests {
             .status,
             503
         );
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedCursor(bitcoin_rs_index::reconcile::ConsumerCursor);
+
+    impl bitcoin_rs_index::reconcile::ChainCursorSource for FixedCursor {
+        fn cursor(&self) -> bitcoin_rs_index::reconcile::ConsumerCursor {
+            self.0
+        }
+    }
+
+    fn mismatched_owner_source(state: CapabilityState) -> Arc<dyn DerivedIndexCapabilitySource> {
+        let chain: Arc<dyn bitcoin_rs_index::reconcile::ChainCursorSource> =
+            Arc::new(FixedCursor(bitcoin_rs_index::reconcile::ConsumerCursor {
+                epoch: 1,
+                sequence: 2,
+                height: 0,
+                hash: Hash256::default(),
+            }));
+        match state {
+            CapabilityState::Disabled => {
+                Arc::new(bitcoin_rs_index::runtime::DerivedIndexCapability::new(
+                    None,
+                    None,
+                    IndexCapabilities::NONE,
+                    chain,
+                ))
+            }
+            CapabilityState::Opening => {
+                let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
+                Arc::new(bitcoin_rs_index::runtime::DerivedIndexCapability::new(
+                    Some(Arc::new(ArcSwap::from_pointee(
+                        bitcoin_rs_index::runtime::DerivedIndexLifecycle::Opening,
+                    ))),
+                    Some(Arc::new(
+                        bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx),
+                    )),
+                    IndexCapabilities::TX_LOOKUP,
+                    chain,
+                ))
+            }
+            CapabilityState::Failed { .. } => {
+                let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
+                Arc::new(bitcoin_rs_index::runtime::DerivedIndexCapability::new(
+                    Some(Arc::new(ArcSwap::from_pointee(
+                        bitcoin_rs_index::runtime::DerivedIndexLifecycle::Failed(
+                            "injected failure".into(),
+                        ),
+                    ))),
+                    Some(Arc::new(
+                        bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx),
+                    )),
+                    IndexCapabilities::TX_LOOKUP,
+                    chain,
+                ))
+            }
+            other => panic!("unsupported mismatch fixture state: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readiness_headers_require_the_owner_tip_to_match_the_esplora_view() {
+        for state in [
+            CapabilityState::Disabled,
+            CapabilityState::Opening,
+            CapabilityState::Failed {
+                reason: "injected failure".to_owned(),
+            },
+        ] {
+            let (handler, _, _, _) =
+                contract_fixture_with_status(Some(mismatched_owner_source(state.clone())))
+                    .expect("fixture");
+            let response = route(&handler, "/blocks/tip/hash", "");
+            assert_eq!(
+                response.status, 503,
+                "{state:?} must not label a response built from another applied tip"
+            );
+        }
+    }
+
+    struct AdvancingHistoryStatus {
+        cursor: parking_lot::Mutex<bitcoin_rs_index::reconcile::ConsumerCursor>,
+        calls: AtomicUsize,
+    }
+
+    impl AdvancingHistoryStatus {
+        fn new() -> Self {
+            Self {
+                cursor: parking_lot::Mutex::new(bitcoin_rs_index::reconcile::ConsumerCursor {
+                    epoch: 7,
+                    sequence: 11,
+                    height: 0,
+                    hash: Hash256::default(),
+                }),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn set_tip(&self, height: u32, hash: Hash256) {
+            let mut cursor = self.cursor.lock();
+            cursor.height = height;
+            cursor.hash = hash;
+        }
+    }
+
+    impl DerivedIndexCapabilitySource for AdvancingHistoryStatus {
+        fn snapshot(&self) -> Result<CapabilitySnapshot, CapabilitySnapshotError> {
+            let publication = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+            let cursor = *self.cursor.lock();
+            Ok(CapabilitySnapshot {
+                revision: Some(CapabilityRevision {
+                    epoch: cursor.epoch,
+                    sequence: cursor.sequence,
+                    index_state: Some(u64::try_from(publication).unwrap_or(u64::MAX)),
+                    index_owner: CapabilityOwnerRevision {
+                        lifecycle: CapabilityOwnerLifecycle::Serving,
+                        health: CapabilityOwnerHealth::Healthy,
+                        phase: bitcoin_rs_index::reconcile::ReconcilePhase::default(),
+                    },
+                }),
+                tip: Some(CapabilityTip {
+                    height: cursor.height,
+                    hash: cursor.hash.to_string(),
+                }),
+                capabilities: vec![bitcoin_rs_index::derived_index_status(
+                    true,
+                    CapabilityState::CatchingUp {
+                        processed_height: u32::try_from(publication).unwrap_or(u32::MAX),
+                        target_height: cursor.height,
+                    },
+                )],
+            })
+        }
+    }
+
+    #[test]
+    fn history_progress_does_not_invalidate_live_chain_or_mempool_routes() {
+        let status = Arc::new(AdvancingHistoryStatus::new());
+        let source: Arc<dyn DerivedIndexCapabilitySource> = status.clone();
+        let (handler, _, block, address) =
+            contract_fixture_with_status(Some(source)).expect("fixture");
+        let ctx = handler.context();
+        let current = ctx.chain.applied_tip.load_full().expect("fixture tip");
+        let mut fixed_tip = (*current).clone();
+        fixed_tip.height = 100;
+        ctx.chain.applied_tip.store(Some(Arc::new(fixed_tip)));
+        status.set_tip(100, Hash256::from(block.block_hash()));
+
+        for path in [
+            "/blocks/tip/height".to_owned(),
+            "/mempool".to_owned(),
+            format!("/address/{address}/utxo"),
+        ] {
+            let response = route(&handler, &path, "");
+            assert_eq!(
+                response.status,
+                200,
+                "unrelated History progress must not discard {path}: {}",
+                String::from_utf8_lossy(&response.body)
+            );
+        }
     }
 
     #[test]

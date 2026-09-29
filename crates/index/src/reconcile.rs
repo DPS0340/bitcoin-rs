@@ -79,7 +79,7 @@ pub(crate) fn rollback_depth(
 /// Reconciliation leg one capability's rows are executing against the
 /// applied tip. Forward is the resting leg: a watermark that names the
 /// applied tip is ready; one below it is catching up.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ReconcileLeg {
     /// Rows extend the active chain from the durable watermark.
     #[default]
@@ -97,12 +97,18 @@ pub enum ReconcileLeg {
 }
 
 /// Reconciliation legs of every capability the worker owns.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReconcilePhase([ReconcileLeg; 3]);
 
 impl ReconcilePhase {
     /// Every capability moving forward.
     pub(crate) const FORWARD: Self = Self([ReconcileLeg::Forward; 3]);
+
+    /// The captured owner leg for one capability.
+    #[must_use]
+    pub const fn leg(self, capability: IndexCapability) -> ReconcileLeg {
+        self.0[capability.index()]
+    }
 
     /// Returns the phase with `leg` assigned to every capability in
     /// `capabilities`.

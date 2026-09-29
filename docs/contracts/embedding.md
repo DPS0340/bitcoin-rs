@@ -41,8 +41,12 @@ the first embedder — there is one lifecycle implementation, not two.
   calculation is `ChainHandles::sync_progress` in `crates/rpc/src/context.rs`, the
   identical computation `getblockchaininfo` runs. `capabilities()` returns a
   `Result` containing the same revision-stamped, concrete-service
-  `CapabilitySnapshot` used by `getcapabilities`; a concurrent publication
-  move is `NodeError::Unavailable`, never a guessed snapshot. Owners:
+  `CapabilitySnapshot` used by `getcapabilities`, including the chain-owner
+  revision, durable index-state revision, lifecycle/health owner identity, and
+  paired applied tip; a concurrent publication move is
+  `NodeError::Unavailable`, never a guessed snapshot.
+  Production embedding always attaches the owner source, so the standalone
+  RPC context's explicit null authority is not returned here. Owners:
   `crates/node/src/embed.rs` and `crates/rpc/src/context.rs`; wire types:
   `crates/index/src/capabilities.rs`.
 - **EMB-05 — Broadcast is the shared admission.** `Node::broadcast` runs

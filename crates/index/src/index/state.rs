@@ -22,7 +22,7 @@ pub(super) const FORMAT_VERSION_KEY: &[u8] = &[0x00, b'V'];
 pub(super) const FORMAT_VERSION_VALUE: [u8; 4] = [0x05, 0x00, 0x00, 0x00];
 
 /// Monotonic revision shared by every ordinary index mutation.
-const ORDINARY_STATE_REVISION_KEY: &[u8] = &[0x00, b'O'];
+pub(super) const ORDINARY_STATE_REVISION_KEY: &[u8] = &[0x00, b'O'];
 
 /// Permanent versioned capability-reset state (`0x00, b'R'`). Absent only
 /// before the first reset; afterwards the key always exists, either as
@@ -130,7 +130,7 @@ fn decode_le_u64(bytes: &[u8]) -> Result<u64, IndexError> {
     Ok(u64::from_le_bytes(raw))
 }
 
-fn decode_state_revision(bytes: &[u8]) -> Result<u64, IndexError> {
+pub(super) fn decode_state_revision(bytes: &[u8]) -> Result<u64, IndexError> {
     let raw: [u8; size_of::<u64>()] = bytes
         .try_into()
         .map_err(|_| IndexError::InvalidStateRevision)?;

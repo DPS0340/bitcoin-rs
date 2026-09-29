@@ -209,6 +209,41 @@ fn toml_error<E: fmt::Display, F: serde::de::Error>(error: E) -> F {
     F::custom(error)
 }
 
+/// Generates source-group debugging, with RPC authentication fail-closed.
+///
+/// The RPC arm names every field it exposes so a future authentication field
+/// cannot become printable merely by being added to the option table.
+macro_rules! impl_source_group_debug {
+    (RpcOverrides { $($field:ident)* }) => {
+        impl fmt::Debug for RpcOverrides {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct("RpcOverrides")
+                    .field("bind", &self.bind)
+                    .field("rest", &self.rest)
+                    .field("user", &self.user.as_ref().map(|_| "<redacted>"))
+                    .field(
+                        "password",
+                        &self.password.as_ref().map(|_| "<redacted>"),
+                    )
+                    .field("cookie", &self.cookie.as_ref().map(|_| "<redacted>"))
+                    .finish()
+            }
+        }
+    };
+    ($group:ident { $($field:ident)* }) => {
+        impl fmt::Debug for $group {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut debug = formatter.debug_struct(stringify!($group));
+                $(
+                    debug.field(stringify!($field), &self.$field);
+                )*
+                debug.finish()
+            }
+        }
+    };
+}
+
 /// Generates the source-layer types, the environment surface, and the flat
 /// TOML surface from the option table.
 macro_rules! emit_user_config {
@@ -244,7 +279,7 @@ macro_rules! emit_user_config {
     ) => {
         $(
             $(#[$gdoc])*
-            #[derive(Clone, Debug, Default)]
+            #[derive(Clone, Default)]
             $(#[$gattr])*
             pub struct $gty {
                 $(
@@ -252,6 +287,8 @@ macro_rules! emit_user_config {
                     pub $rfield: $rty,
                 )*
             }
+
+            impl_source_group_debug!($gty { $($rfield)* });
         )*
 
         /// One parser-independent configuration layer: every option is a slot

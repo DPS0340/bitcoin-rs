@@ -11,8 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bitcoin_rs_index::{
-    CapabilityRevision, CapabilitySnapshot, CapabilitySnapshotError, CapabilityState,
-    CapabilityTip, DerivedIndexCapabilitySource, derived_index_status,
+    CapabilityOwnerHealth, CapabilityOwnerLifecycle, CapabilityOwnerRevision, CapabilityRevision,
+    CapabilitySnapshot, CapabilitySnapshotError, CapabilityState, CapabilityTip,
+    DerivedIndexCapabilitySource, derived_index_status,
 };
 use parking_lot::{Mutex, const_mutex};
 
@@ -201,15 +202,21 @@ impl FixedSource {
     fn enabled(state: CapabilityState) -> Self {
         Self {
             snapshot: Mutex::new(CapabilitySnapshot {
-                revision: CapabilityRevision {
+                revision: Some(CapabilityRevision {
                     epoch: 7,
                     sequence: 19,
-                },
-                tip: CapabilityTip {
+                    index_state: Some(23),
+                    index_owner: CapabilityOwnerRevision {
+                        lifecycle: CapabilityOwnerLifecycle::Serving,
+                        health: CapabilityOwnerHealth::Healthy,
+                        phase: bitcoin_rs_index::reconcile::ReconcilePhase::default(),
+                    },
+                }),
+                tip: Some(CapabilityTip {
                     height: 101,
                     hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                         .to_owned(),
-                },
+                }),
                 capabilities: vec![derived_index_status(true, state)],
             }),
         }
@@ -288,6 +295,12 @@ fn published_gauge_flips_its_active_label_with_the_rpc_source() {
     assert!(body.contains("node_capability_txindex_enabled{"));
     assert!(body.contains("field=\"epoch\",part=\"low\"} 7"));
     assert!(body.contains("field=\"sequence\",part=\"low\"} 19"));
+    assert!(body.contains("node_capability_index_state_revision_available{"));
+    assert!(body.contains("node_capability_index_state_revision{"));
+    assert!(body.contains("part=\"low\"} 23"));
+    assert!(body.contains("node_capability_index_owner{"));
+    assert!(body.contains("lifecycle=\"Serving\""));
+    assert!(body.contains("health=\"Healthy\""));
     assert!(body.contains("node_capability_tip_height{"));
     assert!(body.contains("} 101\n"));
     assert!(body.contains("word=\"0\"} 19088743"));

@@ -4,11 +4,54 @@ use std::str::FromStr as _;
 
 use anyhow::Result;
 use bitcoin_rs_node::{
-    NetworkSelection, NodeConfig, NotificationConfig, P2pOverrides, ScriptIndexMode, UserConfig,
-    ValidationOverrides, ZmqEndpointConfig, resolve,
+    NetworkSelection, NodeConfig, NotificationConfig, P2pOverrides, RpcOverrides, ScriptIndexMode,
+    UserConfig, ValidationOverrides, ZmqEndpointConfig, resolve,
 };
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_rpc::zmq::ZmqTopic;
+
+const RPC_USER_TEST_SENTINEL: &str = "rpc-user-test-sentinel";
+const RPC_PASSWORD_TEST_SENTINEL: &str = "rpc-password-test-sentinel";
+const RPC_COOKIE_TEST_SENTINEL: &str = "/rpc-cookie-test-sentinel";
+
+fn rpc_overrides_with_test_sentinels() -> RpcOverrides {
+    RpcOverrides {
+        bind: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 18_443))),
+        rest: Some(true),
+        user: Some(RPC_USER_TEST_SENTINEL.to_owned()),
+        password: Some(RPC_PASSWORD_TEST_SENTINEL.to_owned()),
+        cookie: Some(RPC_COOKIE_TEST_SENTINEL.into()),
+    }
+}
+
+fn assert_rpc_test_sentinels_redacted(rendered: &str) {
+    for sentinel in [
+        RPC_USER_TEST_SENTINEL,
+        RPC_PASSWORD_TEST_SENTINEL,
+        RPC_COOKIE_TEST_SENTINEL,
+    ] {
+        assert!(!rendered.contains(sentinel));
+    }
+}
+
+#[test]
+fn rpc_overrides_debug_redacts_auth_values() {
+    let overrides = rpc_overrides_with_test_sentinels();
+    let rendered = format!("{overrides:?}");
+
+    assert_rpc_test_sentinels_redacted(&rendered);
+}
+
+#[test]
+fn user_config_debug_redacts_nested_rpc_auth_values() {
+    let config = UserConfig {
+        rpc: rpc_overrides_with_test_sentinels(),
+        ..UserConfig::default()
+    };
+    let rendered = format!("{config:?}");
+
+    assert_rpc_test_sentinels_redacted(&rendered);
+}
 
 #[test]
 fn standard_network_uses_builtin_defaults() -> Result<()> {

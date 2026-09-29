@@ -171,6 +171,7 @@ impl ForkFixture {
 struct Harness {
     _index_dir: tempfile::TempDir,
     writer: Arc<dyn TxIndexWriter>,
+    reader: Arc<dyn IndexReader>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     runtime: Arc<DerivedIndexRuntime>,
     evidence: Arc<RecordedIndexAhead>,
@@ -195,6 +196,7 @@ impl Harness {
     ) -> Self {
         let index_dir = tempfile::tempdir().expect("index dir");
         let store = Arc::new(FjallStore::open(index_dir.path()).expect("fjall open"));
+        let reader: Arc<dyn IndexReader> = Arc::new(crate::Indexer::new(Arc::clone(&store)));
         let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::RwLock::new(
             crate::IndexWriter::open(store, 1).expect("index writer open"),
         ));
@@ -232,6 +234,7 @@ impl Harness {
         Self {
             _index_dir: index_dir,
             writer,
+            reader,
             applied_tip,
             runtime,
             evidence,
@@ -287,6 +290,146 @@ impl Harness {
                 (cap.clone(), *ih, *th, thb.clone(), ihb.clone(), *d)
             })
     }
+}
+
+#[derive(Clone, Copy)]
+struct FixedChainCursor(crate::reconcile::ConsumerCursor);
+
+impl crate::reconcile::ChainCursorSource for FixedChainCursor {
+    fn cursor(&self) -> crate::reconcile::ConsumerCursor {
+        self.0
+    }
+}
+
+fn capability_query_engine(
+    harness: &Harness,
+    fixture: &ForkFixture,
+) -> Arc<DerivedIndexQueryEngine> {
+    Arc::new(DerivedIndexQueryEngine::new(
+        Arc::clone(&harness.runtime),
+        Arc::clone(&harness.reader),
+        IndexBlockSource::new(Arc::new(RwLock::new(crate::block_log::BlockLog::new()))),
+        bitcoin_rs_chain::BlockTreeReader::new(Arc::clone(&fixture.tree)),
+        bitcoin_rs_chain::TipReader::new(Arc::clone(&harness.applied_tip)),
+        None,
+        QueryEngineLive {
+            utxo: None,
+            chain_transition: None,
+            enabled: IndexCapabilities::HISTORICAL,
+        },
+    ))
+}
+
+/// A stationary applied chain does not freeze capability identity: lifecycle
+/// and health remain owner publications, while each successful worker commit
+/// advances the existing durable ordinary-state revision.
+#[test]
+fn capability_snapshot_tracks_owner_state_at_a_fixed_chain_tip() {
+    let fixture = ForkFixture::new(3);
+    let harness = Harness::new(&fixture, u32::MAX);
+    let tip = fixture.tip(fixture.a[2]);
+    harness.set_tip(&tip);
+
+    let lifecycle = Arc::new(ArcSwap::from_pointee(DerivedIndexLifecycle::Opening));
+    let chain_cursor = crate::reconcile::ConsumerCursor {
+        epoch: 41,
+        sequence: 9,
+        height: tip.height,
+        hash: tip.hash,
+    };
+    let source = DerivedIndexCapability::new(
+        Some(Arc::clone(&lifecycle)),
+        Some(Arc::clone(&harness.runtime)),
+        IndexCapabilities::HISTORICAL,
+        Arc::new(FixedChainCursor(chain_cursor)),
+    );
+
+    let opening = source.snapshot().expect("opening snapshot");
+    assert_eq!(
+        opening.capabilities[0].state,
+        crate::CapabilityState::Opening
+    );
+    let opening_revision = opening.revision.expect("chain owner revision");
+    assert_eq!((opening_revision.epoch, opening_revision.sequence), (41, 9));
+    assert_eq!(opening_revision.index_state, None);
+    assert_eq!(
+        opening_revision.index_owner,
+        CapabilityOwnerRevision {
+            lifecycle: CapabilityOwnerLifecycle::Opening,
+            health: CapabilityOwnerHealth::Healthy,
+            phase: ReconcilePhase::default(),
+        }
+    );
+
+    let engine = capability_query_engine(&harness, &fixture);
+    lifecycle.store(Arc::new(DerivedIndexLifecycle::Serving(engine)));
+
+    let catching_up = source.snapshot().expect("catching-up snapshot");
+    assert!(matches!(
+        catching_up.capabilities[0].state,
+        crate::CapabilityState::CatchingUp {
+            processed_height: 0,
+            target_height: 3
+        }
+    ));
+    let catching_up_revision = catching_up.revision.expect("owner revision");
+    assert_eq!(
+        catching_up_revision.index_owner,
+        CapabilityOwnerRevision {
+            lifecycle: CapabilityOwnerLifecycle::Serving,
+            health: CapabilityOwnerHealth::Healthy,
+            phase: ReconcilePhase::default(),
+        }
+    );
+
+    let mut pending = None;
+    harness.settle(&mut pending);
+    let ready = source.snapshot().expect("ready snapshot");
+    assert_eq!(ready.capabilities[0].state, crate::CapabilityState::Ready);
+    let ready_revision = ready.revision.expect("owner revision");
+    assert_eq!((ready_revision.epoch, ready_revision.sequence), (41, 9));
+    assert_ne!(
+        ready_revision.index_state, catching_up_revision.index_state,
+        "durable worker progress at a fixed chain tip must change index identity"
+    );
+    assert!(ready_revision.index_state.is_some());
+
+    harness
+        .runtime
+        .publish_leg(IndexCapabilities::HISTORICAL, ReconcileLeg::Rebuilding);
+    let rebuilding = source.snapshot().expect("phase-only rebuilding snapshot");
+    let rebuilding_revision = rebuilding.revision.expect("owner revision");
+    assert_eq!(rebuilding_revision.index_state, ready_revision.index_state);
+    assert_ne!(rebuilding_revision, ready_revision);
+    assert!(matches!(
+        rebuilding.capabilities[0].state,
+        CapabilityState::Rebuilding { .. }
+    ));
+    harness.runtime.publish_phase(ReconcilePhase::default());
+    let forward = source.snapshot().expect("phase-only forward snapshot");
+    assert_eq!(forward.capabilities[0].state, CapabilityState::Ready);
+    assert_eq!(forward.revision, ready.revision);
+
+    harness.runtime.publish_failed("injected fixed-tip failure");
+    let failed = source.snapshot().expect("failed snapshot");
+    assert!(matches!(
+        &failed.capabilities[0].state,
+        crate::CapabilityState::Failed { reason }
+            if reason == "injected fixed-tip failure"
+    ));
+    let failed_revision = failed.revision.expect("owner revision");
+    assert_eq!(failed_revision.index_state, ready_revision.index_state);
+    assert_eq!(
+        failed_revision.index_owner,
+        CapabilityOwnerRevision {
+            lifecycle: CapabilityOwnerLifecycle::Serving,
+            health: CapabilityOwnerHealth::Failed,
+            phase: ReconcilePhase::default(),
+        },
+        "health publication changes owner identity without fabricating an index commit"
+    );
+    assert_ne!(failed_revision, ready_revision);
+    assert_eq!(failed.tip, ready.tip, "the chain stayed fixed throughout");
 }
 
 /// `RCV-04`: a watermark above the applied tip is an operator-visible
