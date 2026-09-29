@@ -521,6 +521,12 @@ tests `permanent_consensus_body_disconnects_delivering_source` and
   `storage.prune_target_mb > 0`, and both handshake paths use the same set from
   `P2pServiceConfig::local_services`.
 
+Proof: `crates/p2p/src/service.rs` tests
+`network_disable_between_precheck_and_admission_rejects_both_directions`,
+`network_disable_and_reenable_preserve_same_address_lease_ownership`, and
+`apply_network_active_cancels_leases_only_when_disabled` cover admission
+serialization, exact lease identity, and cancellation.
+
 ### `P2P-09`: Block-body service eligibility
 
 - **Owner**: `statically_fanout_eligible` (`crates/p2p/src/download_window.rs`)
