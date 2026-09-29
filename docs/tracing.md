@@ -118,6 +118,34 @@ re-diagnose them: bpftrace 0.25.0 as shipped on Ubuntu 26.04 asserts in
 the file script and fires `validation:block_connected` but delivered no
 `net:*` events.
 
+**bpftrace 0.27 follow-up: both implementations emitted `net:*`.** A
+same-host comparison on 2026-09-29 used x86-64 Linux 6.8.0-117-generic,
+bpftrace v0.27.0, the pinned Core 31.1 release, and bitcoin-rs source
+`73f9ee62115de60e6b89f1a05a97a71cd2032674` built with
+`--release --no-default-features --features fjall,usdt`. Each implementation
+ran two isolated regtest nodes. The tracer attached before `addnode onetry`
+connected them; both nodes received `ping` calls and the traced node mined
+three blocks. The same `smoke.bt` program was supplied with `-e` and `-p`,
+changing only its binary selector path between implementations.
+
+| Implementation | Inbound events | Outbound events | Block-connected events |
+| --- | ---: | ---: | ---: |
+| Bitcoin Core 31.1 | 54 | 54 | 10 |
+| bitcoin-rs | 20 | 14 | 10 |
+
+Both runs retained one peer per node and the tracer exited successfully.
+Event counts describe these runs, not a parity requirement. The earlier
+Ubuntu 26.04/kernel 7.0 file-script silence was **not reproduced**; this
+result does not isolate its cause or certify that original environment.
+It does show that bpftrace 0.27 can consume both implementations' `net:*`
+probes in the tested environment. No mempool event delivery is claimed.
+
+Artifact identities (SHA-256):
+
+- bpftrace: `16194f713ba1fbff2dd76b7abffad4cd61f91e5663b116a5b03c907ae3e20cd8`
+- Core `bitcoind`: `986e63b3c8770f08d0059820ad3dd085d1ab9e1bea23946c243f858a06888a08`
+- bitcoin-rs: `edda12332fb24361f70db758e08b705832f91cdd40af929fb075f48b2ac9e9ac`
+
 The static evidence shipped alongside the live run is the SDT note
 assertion in `crates/trace/tests/sdt_notes.rs`, which reads the built
 binary's `.note.stapsdt` section and checks provider, probe name, and the
