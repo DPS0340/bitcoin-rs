@@ -321,6 +321,11 @@ impl FramedMessage {
     fn wire_len(&self) -> usize {
         HEADER_LEN + self.payload.len()
     }
+
+    /// The encoded payload bytes the vectored write emits.
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
 }
 
 /// Encodes `message` into its wire frame.

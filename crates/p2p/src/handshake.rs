@@ -11,7 +11,7 @@ use crate::connection::PeerLease;
 use crate::dispatch::dispatch_inbound;
 use crate::peer::{COMPACT_BLOCK_VERSION, Peer, PeerState};
 use crate::peer_info::PeerRole;
-use crate::wire::{Message, PROTOCOL_VERSION, PeerError, read_message};
+use crate::wire::{Message, PROTOCOL_VERSION, PeerError};
 use bitcoin::p2p::message_compact_blocks::SendCmpct;
 
 /// Build a local version message for handshake initiation.
@@ -218,7 +218,7 @@ pub(crate) fn read_handshake_message<S: Read>(
                 std::io::ErrorKind::TimedOut,
             )));
         }
-        match read_message(&mut peer.stream, peer.magic) {
+        match peer.read_message() {
             Ok((message, raw)) => {
                 if matches!(message, Message::Version(_)) {
                     peer.version_received_time = Some(
@@ -269,9 +269,9 @@ mod tests {
 
     use super::{
         COMPACT_BLOCK_VERSION, Message, Peer, PeerError, PeerRole, PeerState, feature_messages,
-        post_verack_messages, read_message, run_inbound_handshake, start, version_message,
+        post_verack_messages, run_inbound_handshake, start, version_message,
     };
-    use crate::wire::write_message;
+    use crate::wire::{read_message, write_message};
 
     struct ScriptedStream {
         inbound: Cursor<Vec<u8>>,

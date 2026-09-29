@@ -16,9 +16,10 @@
 //                                 # refcounts. Without that support, start the
 //                                 # node first and use `-p $(pgrep bitcoin-rs)`.
 //
-// Live run status (docs/tracing.md): NOT_RUN on the development host (macOS;
-// needs a Linux kernel and root). No bitcoin-rs runtime or library is
-// involved in consuming the probes.
+// Live run status (docs/tracing.md): RUN — all five probes verified live on
+// x86-64 Linux (bpftrace v0.25.0, 2026-09-29); see docs/tracing.md for the
+// environment and the inline `-e "$(cat ...)"` invocation. No bitcoin-rs
+// runtime or library is involved in consuming the probes.
 
 BEGIN
 {
