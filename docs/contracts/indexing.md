@@ -220,6 +220,11 @@ remove another script's output.
   clears it. It stores the required identity and typed failure reason, never a
   pruning frontier. The index neither copies nor compares the frontier to make
   the decision—the storage-owned `HistoryAccess` result is authoritative.
+- Every `TxIndexWriter` implementation must capture the exact write fence,
+  all capability watermarks, and all persisted terminal history failures in
+  one coherent `fenced_state` snapshot. Reconciliation uses this required
+  capture even for writers with custom failure persistence; unknown or
+  unreadable history state is an error, never an empty failure set.
 - A missing or unreadable undo record is fatal only for `ScriptLive`. The
   worker resets that capability and reseeds from the authoritative UTXO view;
   `TxLookup` and `ScriptHistory` continue their body-only rollback.

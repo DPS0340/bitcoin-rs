@@ -27,15 +27,15 @@ pub type ScriptLiveSeedProduce<'a> = dyn FnMut(&mut dyn FnMut(OutPoint, ScriptHa
 /// owned by [`IndexWriter::commit_rollback_one_for_with_cursor_with_spent_scripts`]
 /// (`IDX-06` / `IDX-07`).
 pub trait TxIndexWriter: Send + Sync {
-    /// Captures the exact write fence and all capability watermarks together.
-    fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError>;
-    /// Captures the exact write fence, watermarks, and terminal history states.
+    /// Captures the exact write fence, all capability watermarks, and terminal
+    /// history states together from one coherent snapshot.
+    ///
+    /// Implementations must include every persisted terminal history failure,
+    /// including those written by [`Self::mark_history_unavailable`]. Unknown
+    /// or unreadable state must return an error, never an empty failure set.
     fn fenced_state(
         &self,
-    ) -> Result<(IndexWriteFence, IndexWatermarks, IndexHistoryFailures), IndexError> {
-        let (fence, watermarks) = self.fenced_watermarks()?;
-        Ok((fence, watermarks, IndexHistoryFailures::default()))
-    }
+    ) -> Result<(IndexWriteFence, IndexWatermarks, IndexHistoryFailures), IndexError>;
     /// Prepares rows using the supplied spent-coin script authority.
     fn prepare_block_with_spent_scripts(
         &self,
@@ -99,16 +99,12 @@ pub trait TxIndexWriter: Send + Sync {
 /// `RwLock`-backed writer: `prepare_block_with_spent_scripts` and
 /// `consumer_cursor` take a shared read lock so the CPU-bound decode/row-build
 /// can run concurrently across the rayon pool, while `commit_*`,
-/// `fenced_watermarks`, and `reset_capabilities` take an exclusive write lock
+/// `fenced_state`, and `reset_capabilities` take an exclusive write lock
 /// to preserve the single-writer atomic commit and watermark semantics.
 impl<S> TxIndexWriter for RwLock<IndexWriter<S>>
 where
     S: bitcoin_rs_storage::KvStore + Send + Sync + 'static,
 {
-    fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError> {
-        self.write().fenced_watermarks()
-    }
-
     fn fenced_state(
         &self,
     ) -> Result<(IndexWriteFence, IndexWatermarks, IndexHistoryFailures), IndexError> {

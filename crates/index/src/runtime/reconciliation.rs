@@ -235,9 +235,9 @@ impl Worker {
             );
             match self.rollback_one(fence, watermarks, capabilities, watermark) {
                 Ok(_) => {
-                    let (next_fence, next_watermarks) = self
+                    let (next_fence, next_watermarks, _) = self
                         .writer
-                        .fenced_watermarks()
+                        .fenced_state()
                         .map_err(DerivedIndexWorkerError::Index)?;
                     fence = next_fence;
                     watermarks = next_watermarks;

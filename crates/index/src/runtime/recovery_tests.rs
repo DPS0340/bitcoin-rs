@@ -258,7 +258,7 @@ impl Harness {
     }
 
     fn watermarks(&self) -> IndexWatermarks {
-        self.writer.fenced_watermarks().expect("watermarks").1
+        self.writer.fenced_state().expect("index state").1
     }
 
     fn history_failures(&self) -> crate::IndexHistoryFailures {

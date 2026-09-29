@@ -90,9 +90,11 @@ impl Worker {
             .map_err(DerivedIndexWorkerError::Index)?;
         self.runtime
             .publish_leg(capabilities, ReconcileLeg::Rebuilding);
-        self.writer
-            .fenced_watermarks()
-            .map_err(DerivedIndexWorkerError::Index)
+        let (fence, watermarks, _) = self
+            .writer
+            .fenced_state()
+            .map_err(DerivedIndexWorkerError::Index)?;
+        Ok((fence, watermarks))
     }
 
     /// Persists terminal loss for body-history families while routing
