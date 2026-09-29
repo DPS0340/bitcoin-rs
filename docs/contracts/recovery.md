@@ -130,6 +130,23 @@ seconds at IBD rates, and a crash-redo bound of at most 64 body re-applies.
 This is the ordered commit protocol. It is also called the durable root
 recovery contract.
 
+Boot-time durable-head replay runs before the journal maintenance worker is
+started. If journal backpressure refuses a replay block, recovery releases its
+transition, publishes a marker-preserving progress checkpoint to compact the
+journal, reacquires the transition, verifies that the applied tip is unchanged,
+and retries that same block once. The progress checkpoint does not retire the
+disconnect or full-revalidation marker. Intermediate replay tips retain the
+cumulative transaction count reconstructed from their parent; only the landing
+tip adopts the durable head's certified count, so every progress checkpoint
+agrees with CoinStats. Failure to publish the checkpoint, reacquire the
+transition, preserve the captured tip, or apply the retry fails closed.
+Before genesis, no progress checkpoint is possible. If an empty cold writer
+hits retention pressure while the full-revalidation marker is present, it
+removes only invalidated, non-active journal segment generations and syncs
+the journal directory. It preserves the marker, head, and active cursor;
+append-gap admission and filesystem errors still fail closed.
+
+
 ### `RCV-03`: Prior-or-whole-proposed and orphan tails
 
 - The storage engine resolves an outstanding atomic batch to the prior root

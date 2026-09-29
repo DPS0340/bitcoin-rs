@@ -242,10 +242,65 @@ fn freeze_rejects_appends_and_compaction_flow_completes() -> TestResult {
         return Err("frozen writer accepted an append".into());
     };
     assert!(matches!(error, JournalWriterError::NotOpen { .. }));
-    writer.compact_to_checkpoint(1, 1, [1; 32], [0; 32], 3)?;
+    writer.compact_to_checkpoint(1, 1, [1; 32], [0; 32], 3, true)?;
     writer.resume()?;
     assert_eq!(writer.state(), WriterState::Open);
     writer.append(&sample_record(2))?;
+    Ok(())
+}
+
+// Contract: docs/contracts/chainstate-journal-v1.md, JW-MARK-2.
+#[test]
+fn recovery_progress_compaction_preserves_full_revalidation_marker() -> TestResult {
+    let store = Arc::new(CountingStore::new());
+    let mut writer = open_fresh("progress-marker", store)?;
+    writer.dir.write(
+        FULL_REVALIDATION_MARKER,
+        b"journal fork crossed below checkpoint base\n",
+    )?;
+
+    writer.freeze()?;
+    writer.compact_to_checkpoint(1, 0, [1; 32], [0; 32], 0, false)?;
+    writer.resume()?;
+
+    assert!(writer.dir.open(FULL_REVALIDATION_MARKER).is_ok());
+    Ok(())
+}
+
+// Contract: docs/contracts/chainstate-journal-v1.md, JW-ORDER-1.
+#[test]
+fn recovery_compaction_cannot_clear_an_append_gap() -> TestResult {
+    let store = Arc::new(CountingStore::new());
+    let mut writer = open_fresh("progress-append-gap", store)?;
+    writer.mark_append_gap(1);
+
+    assert!(matches!(
+        writer.freeze(),
+        Err(JournalWriterError::AppendGap { height: 1 })
+    ));
+    assert_eq!(writer.state(), WriterState::Open);
+    assert!(matches!(
+        writer.compact_to_checkpoint(1, 0, [1; 32], [0; 32], 0, false),
+        Err(JournalWriterError::NotOpen {
+            state: "not frozen"
+        })
+    ));
+    assert!(matches!(
+        writer.prepare_for_apply(),
+        Err(JournalWriterError::AppendGap { height: 1 })
+    ));
+
+    // Compaction itself also owns the guard. Even if an internal caller
+    // poisons an already-frozen writer, it cannot commit a new base that a
+    // restart would reopen without the in-memory append-gap latch.
+    let store = Arc::new(CountingStore::new());
+    let mut frozen = open_fresh("frozen-progress-append-gap", store)?;
+    frozen.freeze()?;
+    frozen.mark_append_gap(1);
+    assert!(matches!(
+        frozen.compact_to_checkpoint(1, 0, [1; 32], [0; 32], 0, false),
+        Err(JournalWriterError::AppendGap { height: 1 })
+    ));
     Ok(())
 }
 
