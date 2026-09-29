@@ -84,9 +84,11 @@ pub enum BranchSwitchError {
         /// Height the missing body sits at.
         height: u32,
     },
-    /// A connect failed after some of the new branch was applied; the
-    /// implementation has already evaluated the assume-valid gate over the
-    /// post-invalidation tree when `invalidated` is non-empty.
+    /// A connect failed while applying the new branch. When the first body
+    /// was permanently invalid, the previously applied branch is restored
+    /// before this outcome is returned. The implementation has evaluated the
+    /// assume-valid gate over the post-invalidation tree when `invalidated`
+    /// is non-empty.
     ConnectFailed {
         /// Hash of the block that failed to connect.
         hash: Hash256,
@@ -115,8 +117,8 @@ pub enum BranchSwitchError {
         /// Height the applied tip reached before stopping.
         stopped_at: u32,
     },
-    /// Chainstate torn by a failed disconnect; the implementation has
-    /// already closed admission and requested shutdown.
+    /// A disconnect or old-branch restoration failed; the implementation has
+    /// already closed admission and requested shutdown for recovery.
     Fatal(SyncChainError),
     /// The walk concluded but its stable generation could not be published.
     TransitionSettlement(SyncChainError),

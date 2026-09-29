@@ -74,8 +74,8 @@ clippy_profiles() {
 }
 
 test_crates_profiles() {
-  # Fixture-free per-crate profiles; only the binary's tests read the pinned
-  # Core fixture. Smallest first.
+  # Fixture-free per-crate profiles. Process tests requiring the pinned Core
+  # fixture run in the workspace lane below. Smallest first.
   profile "test: bitcoin-rs-consensus (native)" \
     cargo_test -p bitcoin-rs-consensus --no-default-features
   profile "test: bitcoin-rs-chainstate (native,fjall)" \
@@ -103,7 +103,21 @@ test_workspace_profiles() {
   profile "test: workspace (kernel-free)" \
     cargo_test --workspace \
       --exclude bitcoin-rs-consensus --exclude bitcoin-rs-chainstate \
-      --exclude bitcoin-rs-node
+      --exclude bitcoin-rs-node --exclude bitcoin-rs-rpc
+  # The RPC package owns libzmq. Its feature-gated process subscriber must
+  # run explicitly so feature resolution cannot turn it into a zero-test
+  # binary. Build and identify the daemon with the same default zmq profile.
+  profile "test: bitcoin-rs-rpc (zmq, process notifications)" test_rpc_reorg_notifications
+}
+
+test_rpc_reorg_notifications() {
+  cargo build --locked -p bitcoin-rs || return $?
+  local target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
+  if [[ "$target_dir" != /* ]]; then
+    target_dir="$PWD/$target_dir"
+  fi
+  BITCOIN_RS_NODE="$target_dir/debug/bitcoin-rs" \
+    cargo_test -p bitcoin-rs-rpc --features zmq
 }
 
 case "$1" in

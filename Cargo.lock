@@ -475,6 +475,7 @@ dependencies = [
  "bitcoin-rs-chain",
  "bitcoin-rs-chainstate",
  "bitcoin-rs-consensus",
+ "bitcoin-rs-e2e",
  "bitcoin-rs-index",
  "bitcoin-rs-mempool",
  "bitcoin-rs-mining",
