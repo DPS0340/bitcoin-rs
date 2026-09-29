@@ -101,8 +101,8 @@ only scheduling mechanics.
   revision, index-owner lifecycle/health/phase identity, tip, and txindex state
   in `X-Bitcoin-Rs-*` headers when authority is available; a standalone context
   omits authority headers. `X-Bitcoin-Rs-Index-Phase` uses the JSON encoding of
-  `revision.index_owner.phase`: a three-element array in TxLookup, ScriptLive,
-  ScriptHistory order. Each element is `"Forward"`, `"Rebuilding"`, or
+  `revision.index_owner.phase`: a three-element array in TxLookup, ScriptHistory,
+  ScriptLive order. Each element is `"Forward"`, `"Rebuilding"`, or
   `{"RollingBack":{"from_height":9,"to_height":3}}` with the owner heights.
   Metrics render compiled/enabled facts, all readiness labels, and the same
   revisions, owner identity, and tip from one source snapshot per scrape;
