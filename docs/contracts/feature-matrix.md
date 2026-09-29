@@ -34,5 +34,6 @@ crates that do not own storage are not combinations.
 
 ## Proven by
 
-- `scripts/check-feature-matrix.sh` (main workflow `feature-combinations`).
+- `scripts/check-feature-matrix.sh` (`compatibility-campaign.yml`
+  `feature-combinations` job).
 - `cargo test -p bitcoin-rs --test g17_dependency_direction`.

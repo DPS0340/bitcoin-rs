@@ -20,8 +20,9 @@ contract.
   lane enables every feature, so it compiles the optional native storage
   engines at the oldest resolve. The named combinations themselves are
   owned by `FEAT-01`.
-- Both lanes mutate `Cargo.lock`. They run on `main` only, never on a
-  pull-request checkout.
+- Both lanes mutate `Cargo.lock`. The scheduled compatibility workflow checks
+  out `main` in a disposable runner; local/manual runs need disposable checkouts
+  too. They are not pull-request merge gates.
 
 ### `DEP-02`: One copy of each consensus-stack crate
 
@@ -41,6 +42,6 @@ contract.
 ## Proven by
 
 - `scripts/check-dep-range.sh minimal` and
-  `scripts/check-dep-range.sh maximum` (main workflow `dependency-range`
-  job).
+  `scripts/check-dep-range.sh maximum` (`compatibility-campaign.yml`
+  `dependency-range` job).
 - `cargo deny check bans` (`deny.toml` `[bans] multiple-versions = "deny"`).

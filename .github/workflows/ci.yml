@@ -45,9 +45,9 @@ concurrency:
 # other profile. Each lane's rust-cache key includes the job id, so a lane
 # restores only its own dependency graph instead of the single 2.4 GB archive
 # the old `rust` job restored on every run. Every command lives in
-# scripts/ci-pr.sh. The kernel C++ surface, MSRV compile, native-script
-# evidence, comparator corpus, and bench smoke are deep lanes in main.yml and
-# run on `main` only.
+# scripts/ci-pr.sh. The kernel C++ production lint graph is checked at the
+# merge queue in ci-merge-gate.yml; post-merge behavior and reference lanes
+# live in main.yml, with version/feature campaigns on a separate schedule.
 #
 # Test lanes link with mold (`-C link-arg=-fuse-ld=mold` via RUSTFLAGS) and
 # schedule tests under cargo-nextest, both installed by

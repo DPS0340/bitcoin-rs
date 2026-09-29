@@ -48,6 +48,8 @@ local execution instructions live here in `bitcoin-rs`. A daily campaign runs
 each target for one hour, minimizes its corpus, and commits through
 `github-actions[bot]` only when the minimized set changes. Reports and crash
 inputs are retained with the workflow run.
+Pull requests that change `fuzz/**` compile every target in
+[`fuzz-build.yml`](../.github/workflows/fuzz-build.yml).
 
 For a longer local run, clone the companion repository next to bitcoin-rs and
 use its target directory as the writable corpus. For example, from the
