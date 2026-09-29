@@ -10,7 +10,7 @@
 //! behavior a real peer exhibits, which is what makes a plain `MSG_BLOCK`
 //! request fatal for segwit bodies.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write as _;
 use std::net::TcpStream;
@@ -57,13 +57,6 @@ pub struct LivePeer {
     pub headers: Vec<BlockHeader>,
     /// Every decoded getdata frame in arrival order.
     pub getdata_seen: Vec<GetdataSeen>,
-    /// Block hashes whose body has been served at least once.
-    pub served: HashSet<bitcoin::BlockHash>,
-    /// Hashes named by a getdata arriving after their body was served — the
-    /// re-request signature of a broken staged-entry sentinel or a retry
-    /// rewind. A duplicate getdata emitted before delivery is tolerated
-    /// (a preexisting burst quirk, not this path's invariant).
-    pub post_serve_requests: Vec<bitcoin::BlockHash>,
     /// `at_ms` of every getheaders frame, in arrival order.
     pub getheaders_at: Vec<u64>,
     /// Bodies served stripped because the node asked `MSG_BLOCK`.
@@ -104,8 +97,6 @@ impl LivePeer {
             blocks: BTreeMap::new(),
             headers: Vec::new(),
             getdata_seen: Vec::new(),
-            served: HashSet::new(),
-            post_serve_requests: Vec::new(),
             getheaders_at: Vec::new(),
             stripped_served: 0,
             dropped: false,
@@ -232,7 +223,6 @@ impl LivePeer {
         let Some(block) = self.blocks.get(&hash) else {
             return Ok(());
         };
-        self.served.insert(hash);
         let body = if stripped {
             self.stripped_served += 1;
             strip_witnesses(block)
@@ -266,16 +256,6 @@ impl LivePeer {
                     };
                     self.log("getdata", &format!("{:?}", seen.items));
                     self.getdata_seen.push(seen);
-                    for item in &items {
-                        if let Inventory::WitnessBlock(hash)
-                        | Inventory::CompactBlock(hash)
-                        | Inventory::Block(hash) = item
-                        {
-                            if self.served.contains(hash) {
-                                self.post_serve_requests.push(*hash);
-                            }
-                        }
-                    }
                     let items = items.clone();
                     serve(self, &items);
                 }

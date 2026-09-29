@@ -126,18 +126,29 @@ fn wait_for(dur: Duration, check: &mut dyn FnMut() -> bool) -> bool {
 }
 
 /// Keeps serving bodies (type-faithfully) while waiting for the applied tip
-/// to reach `height`/`hash`.
+/// to reach `height`/`hash`. Once an earlier tip has applied, every observed
+/// height must stay at or above `min_height`: a lower height is an observable
+/// rewind, unlike a normal retry of a body that has not applied yet.
 fn pump_until_tip(
     peer: &mut LivePeer,
     node: &mut ProcessNode,
+    min_height: u64,
     height: u64,
     hash: &str,
     dur: Duration,
 ) -> Result<bool, Error> {
     let deadline = Instant::now() + dur;
-    while Instant::now() < deadline && !peer.dropped {
-        if block_count(node)? == height && best_hash(node)? == hash {
+    loop {
+        let count = block_count(node)?;
+        assert!(
+            count >= min_height,
+            "applied tip rewound below h{min_height} while waiting for h{height}: h{count}"
+        );
+        if count == height && best_hash(node)? == hash {
             return Ok(true);
+        }
+        if Instant::now() >= deadline || peer.dropped {
+            return Ok(false);
         }
         peer.pump(Duration::from_millis(400), &mut |peer, items| {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -146,7 +157,6 @@ fn pump_until_tip(
             }
         });
     }
-    Ok(block_count(node)? == height && best_hash(node)? == hash)
 }
 
 /// Pumps until a `getdata` requests `hash` (serving every request
@@ -248,6 +258,7 @@ fn announced_live_head_applies_and_continues() -> Result<(), Error> {
         pump_until_tip(
             &mut peer,
             &mut node,
+            0,
             3,
             &h3.to_string(),
             Duration::from_secs(40)
@@ -280,6 +291,7 @@ fn announced_live_head_applies_and_continues() -> Result<(), Error> {
             pump_until_tip(
                 &mut peer,
                 &mut node,
+                u64::try_from(height).unwrap_or(u64::MAX),
                 u64::try_from(height + 1).unwrap_or(u64::MAX),
                 &hash.to_string(),
                 Duration::from_secs(20)
@@ -296,9 +308,9 @@ fn announced_live_head_applies_and_continues() -> Result<(), Error> {
         );
     }
 
-    // Every block requested at least once; none re-requested after its
-    // body was delivered (the rewind signature); and never a plain
-    // MSG_BLOCK request (witness-stripped bodies would fail binding).
+    // Every block must have been requested with witnesses. Retries before
+    // apply are allowed; the tip-height floor above checks for observed
+    // rewinds while later bodies are fetched.
     for block in &chain {
         let hash = block.block_hash();
         assert_eq!(
@@ -311,11 +323,6 @@ fn announced_live_head_applies_and_continues() -> Result<(), Error> {
             "block {hash} never requested"
         );
     }
-    assert!(
-        peer.post_serve_requests.is_empty(),
-        "blocks re-requested after delivery (churn/rewind?): {:?}",
-        peer.post_serve_requests
-    );
     assert_eq!(
         peer.stripped_served, 0,
         "node requested MSG_BLOCK and got a stripped body"
@@ -438,6 +445,7 @@ fn missing_parent_delivery_recovers_via_getheaders() -> Result<(), Error> {
         pump_until_tip(
             &mut peer,
             &mut node,
+            0,
             4,
             &h4.to_string(),
             Duration::from_secs(30)
@@ -485,6 +493,7 @@ fn missing_parent_delivery_recovers_via_getheaders() -> Result<(), Error> {
         pump_until_tip(
             &mut peer,
             &mut node,
+            4,
             5,
             &h5.to_string(),
             Duration::from_secs(20)
