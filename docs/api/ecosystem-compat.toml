@@ -54,7 +54,7 @@ surface = "Compact block relay (BIP152)"
 core_reference = "Bitcoin Core 31.1 BIP152"
 status = "externally verified"
 representative_consumer = "unmodified Bitcoin Core 31.1 bitcoind + scripted wire probe (scripts/run-p2p-core-interop.sh phases A-C)"
-evidence = "black-box request/response and relay outcomes: reconstruction/serving against live Core and the raw MSG_CMPCT_BLOCK probe (docs/contracts/core-differential.md CORE-03; assert_bip152_relay in crates/p2p/tests/core_interop_live.rs). Log-marker-derived reconstruction counts are diagnostic per ECO-09 and not part of this claim."
+evidence = "black-box request/response and relay outcomes: Core serving responses for compact-block fetches (getblocktxn recovery observed) and the raw MSG_CMPCT_BLOCK wire probe (docs/contracts/core-differential.md CORE-03; assert_bip152_relay in crates/p2p/tests/core_interop_live.rs). Reconstruction itself is not part of this claim: its completion counts come from bitcoin-rs log markers, which ECO-09 excludes from compatibility evidence; they are diagnostic only."
 
 [[row]]
 surface = "Compact block filters (BIP157/BIP158)"
