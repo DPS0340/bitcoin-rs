@@ -11,6 +11,7 @@
 | Inspect gate and evidence status | [Constraint register](../CONSTRAINTS.md) |
 | Change the repository | [Agent guidelines](../AGENTS.md) and [contributing](../CONTRIBUTING.md) |
 | Operate recovery or REST | [Recovery contract](contracts/recovery.md) and [REST guide](rest-interface.md) |
+| Check sync test coverage against Core regressions | [Sync coverage map](../e2e/SYNC-COVERAGE.md) and its reorg slice [REORG-COVERAGE](../e2e/REORG-COVERAGE.md) |
 
 The contract index owns the clause/proof map; this page does not maintain a
 second inventory. Contracts take precedence over local source comments,

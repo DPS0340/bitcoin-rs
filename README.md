@@ -211,6 +211,7 @@ verification commands, CI workflows, and crate architecture conventions.
 - [docs/contracts/](docs/contracts/) — Normative architecture and protocol contracts
 - [docs/contracts/ecosystem-compatibility.md](docs/contracts/ecosystem-compatibility.md) — External ecosystem compatibility strategy
 - [docs/api/ecosystem-compat.toml](docs/api/ecosystem-compat.toml) — External compatibility evidence matrix
+- [e2e/SYNC-COVERAGE.md](e2e/SYNC-COVERAGE.md) — Synchronization regression domains mapped to Bitcoin Core functional tests
 - [CONCEPTS.md](CONCEPTS.md) — Domain terminology and concepts
 
 ## License
