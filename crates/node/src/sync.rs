@@ -292,10 +292,12 @@ impl SyncChain for NodeSyncChain {
             Err(crate::reorg::ReorgError::MissingBody { height, .. }) => {
                 Err(BranchSwitchError::MissingBody { height })
             }
-            // A disconnect failure left chainstate torn and requires shutdown.
-            Err(error @ crate::reorg::ReorgError::Fatal(_)) => {
-                Err(BranchSwitchError::Fatal(Box::new(error)))
-            }
+            // A disconnect or old-branch restoration failure requires
+            // recovery; chainstate has already closed admission.
+            Err(
+                error @ (crate::reorg::ReorgError::Fatal(_)
+                | crate::reorg::ReorgError::RestorationFailed { .. }),
+            ) => Err(BranchSwitchError::Fatal(Box::new(error))),
             // The transition generation could not be settled after reorg work.
             Err(error @ crate::reorg::ReorgError::TransitionSettlement { .. }) => {
                 Err(BranchSwitchError::TransitionSettlement(Box::new(error)))

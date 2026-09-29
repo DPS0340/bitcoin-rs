@@ -46,7 +46,7 @@ impl BlockSync {
                 // requested shutdown.
                 tracing::error!(
                     %error,
-                    "block sync: chainstate torn by a failed disconnect, shutting down"
+                    "block sync: branch switch requires chainstate recovery, shutting down"
                 );
             }
             Err(error @ BranchSwitchError::TransitionSettlement(_)) => {

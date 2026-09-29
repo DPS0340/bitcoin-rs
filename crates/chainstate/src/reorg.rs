@@ -353,16 +353,17 @@ pub enum ReorgError {
         #[source]
         source: Box<Self>,
     },
-    /// A connect failed after some of the new branch was applied.
+    /// A connect failed while applying the new branch.
     ///
     /// Every block before this one committed fully. A refusal before the UTXO
     /// commit leaves a consistent prefix of the target branch; a
     /// [`ApplyError::UtxoCommit`] or durable-head failure may leave partial
-    /// or unconfirmed state and requires recovery with admission closed. The switch is abandoned
-    /// rather than rolled back — undoing the prefix means disconnecting blocks that just
-    /// applied, which can fail Fatal and turn a recoverable stop into an
-    /// unrecoverable one. A later switch can continue from a coherent prefix;
-    /// a failed UTXO or durable-head commit must first recover its authoritative state.
+    /// or unconfirmed state and requires recovery with admission closed. A
+    /// later switch can continue from a coherent prefix; a failed UTXO or
+    /// durable-head commit must first recover its authoritative state. If the
+    /// first target body is permanently invalid after disconnecting the old
+    /// branch, the old branch is reconnected under the same transition before
+    /// this error is returned. A failed restoration closes admission.
     ///
     /// When the failure is permanently branch-invalid (`PoW`, `nBits`, or
     /// non-mutation consensus),
@@ -371,7 +372,7 @@ pub enum ReorgError {
     /// `Invalid` so the caller can purge staged/download state after releasing
     /// the transition. Body mutation and operational failures leave
     /// `invalidated` empty; `disposition` distinguishes their retry handling.
-    #[error("reorg stopped after connecting to height {stopped_at} at block {hash}: {source}")]
+    #[error("reorg target connect failed at height {stopped_at} at block {hash}: {source}")]
     ConnectFailed {
         /// Fully disconnected blocks before the failure, in plan order.
         disconnected: usize,
@@ -379,7 +380,8 @@ pub enum ReorgError {
         connected: usize,
         /// Hash of the block that failed to connect.
         hash: Hash256,
-        /// Height the applied tip reached before stopping.
+        /// Height the applied tip reached when the target connect failed.
+        /// A successful first-body restoration can leave the final tip higher.
         stopped_at: u32,
         /// Why the connect failed.
         #[source]
@@ -405,6 +407,19 @@ pub enum ReorgError {
         #[source]
         source: Box<Self>,
         /// The connect failure that triggered the invalidation.
+        original: Box<Self>,
+    },
+    /// Reconnecting the old branch after a permanently invalid first target
+    /// body failed. Some restoration steps may have committed, so admission
+    /// stays closed until recovery reconciles the durable head and UTXO set.
+    #[error(
+        "reorg could not restore the previously applied branch: {source}; original: {original}"
+    )]
+    RestorationFailed {
+        /// Read, validation, or durable failure during old-branch restoration.
+        #[source]
+        source: Box<Self>,
+        /// Permanent target-connect failure that triggered restoration.
         original: Box<Self>,
     },
     /// A disconnect died partway. The chainstate is torn.
@@ -470,7 +485,9 @@ impl ReorgError {
     /// disposition that can drift from it.
     pub fn requires_recovery(&self) -> bool {
         match self {
-            Self::Fatal(_) | Self::TransitionSettlement { .. } => true,
+            Self::Fatal(_) | Self::RestorationFailed { .. } | Self::TransitionSettlement { .. } => {
+                true
+            }
             Self::ConnectFailed { source, .. } => {
                 crate::classify_apply_error(source) == crate::WindowApplyDisposition::Fatal
             }
@@ -698,6 +715,33 @@ where
             &prepared.connect,
             &mut staged_body,
         );
+        // A permanently invalid first target body has committed no rival
+        // prefix. Reconnect the old, preflighted branch before releasing this
+        // transition so a rejected header branch cannot strand the applied
+        // UTXO set at its fork ancestor. Once a rival prefix has committed,
+        // the existing coherent-prefix contract remains in force.
+        let outcome = match outcome {
+            Err(
+                original @ ReorgError::ConnectFailed {
+                    disposition: crate::WindowApplyDisposition::Permanent,
+                    ..
+                },
+            ) if progress.disconnected > 0 && progress.connected == 0 => {
+                match restore_disconnected_branch(
+                    &transition,
+                    observer,
+                    &prepared.disconnect_nodes[..progress.disconnected],
+                    &mut staged_body,
+                ) {
+                    Ok(()) => Err(original),
+                    Err(source) => Err(ReorgError::RestorationFailed {
+                        source: Box::new(source),
+                        original: Box::new(original),
+                    }),
+                }
+            }
+            outcome => outcome,
+        };
         let outcome = if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
             outcome
         } else {
@@ -872,6 +916,42 @@ where
 /// Returns the current applied-tip height, or 0 when no tip is set.
 fn applied_tip_height(handles: &Chainstate) -> u32 {
     handles.applied_tip.load_full().map_or(0, |tip| tip.height)
+}
+
+/// Reconnects the fully disconnected old branch, oldest first, under the
+/// caller's transition and retention lease. A failed body read or connect is
+/// wrapped by `RestorationFailed` at the call site: even if no restoration
+/// step committed, the old branch is no longer the applied chain and normal
+/// settlement must not publish a stable generation.
+fn restore_disconnected_branch<F, O>(
+    transition: &ChainTransition<'_>,
+    observer: &mut O,
+    disconnected: &[(Hash256, u32)],
+    staged_body: &mut F,
+) -> core::result::Result<(), ReorgError>
+where
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    O: ReorgObserver + ?Sized,
+{
+    let handles = transition.chainstate();
+    for (connected, &(hash, height)) in disconnected.iter().rev().enumerate() {
+        let body = load_branch_body(handles, hash, height, staged_body)?;
+        match transition.connect(&body.block, Some(body.serialized)) {
+            Ok(outcome) => observer.connected(&body.block, &outcome),
+            Err(source) => {
+                return Err(ReorgError::ConnectFailed {
+                    disconnected: disconnected.len(),
+                    connected,
+                    hash,
+                    stopped_at: applied_tip_height(handles),
+                    disposition: crate::classify_apply_error(&source),
+                    source: Box::new(source),
+                    invalidated: Vec::new(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn execute_streamed_plan<F, O>(

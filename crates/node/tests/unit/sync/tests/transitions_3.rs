@@ -100,6 +100,10 @@ fn permanent_reorg_failure_invalidates_descendants() -> Result<(), Box<dyn std::
     let applied_tip = handles.applied_tip_reader();
 
     let main_tip_hash = Hash256::from_le_bytes(main[100].block_hash().as_bytes());
+    let main_coin = OutPoint::new(main[100].txs[1].txid(), 0);
+    let main_coin_before = handles.utxo().get_entry(&main_coin);
+    let utxo_len_before = handles.utxo().len();
+    assert!(main_coin_before.is_some(), "main-tip spend must be live");
     let fork_root_hash = main[99].block_hash();
     let fork_root_id = handles
         .block_tree()
@@ -161,13 +165,80 @@ fn permanent_reorg_failure_invalidates_descendants() -> Result<(), Box<dyn std::
             "the valid main branch must win after subtree invalidation"
         );
     }
-    // Rejecting the invalid branch must still allow the selected valid main
-    // branch to reconnect through ordinary forward apply.
-    handles.apply_block(&main[100], None)?;
+    // Rejecting the first rival body restores the old applied branch within
+    // the same transition, including its exact UTXO entries. A later sync
+    // tick or manual apply must not be needed to recover this valid tip.
     assert_eq!(
         applied_tip.load_full().map(|tip| tip.hash),
         Some(main_tip_hash)
     );
+    assert_eq!(handles.utxo().len(), utxo_len_before);
+    assert_eq!(handles.utxo().get_entry(&main_coin), main_coin_before);
+    Ok(())
+}
+
+#[test]
+fn invalid_first_reorg_body_closes_if_old_body_disappears_during_restoration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (handles, main, mut bodies) = matured_chain(101)?;
+    let old_tip_hash = Hash256::from_le_bytes(main[100].block_hash().as_bytes());
+    let fork_root_hash = main[99].block_hash();
+    let fork_root_id = handles
+        .block_tree()
+        .read()
+        .lookup(Hash256::from_le_bytes(fork_root_hash.as_bytes()))
+        .ok_or("missing fork root")?;
+    let invalid = mined_block_with_prev_hash(fork_root_hash, 101, Vec::new());
+    let invalid_id = crate::sync::fixture_insert_header_node(
+        &handles,
+        fork_root_id,
+        invalid.header,
+        NodeStatus::HeaderValid,
+    )?;
+    bodies.insert(
+        Hash256::from_le_bytes(invalid.block_hash().as_bytes()),
+        (
+            invalid.clone(),
+            bytes::Bytes::from(consensus_bytes(&invalid)),
+        ),
+    );
+
+    // The old body passes preflight and the disconnect-side reload, then
+    // disappears before restoration. The transition must fail closed rather
+    // than settle the fork ancestor as a normal stable result.
+    let mut old_body_reads = 0;
+    let outcome = crate::reorg::switch_to_branch(
+        &handles,
+        &crate::chain_effects::ChainFollowers::noop(),
+        invalid_id,
+        |hash| {
+            if hash == old_tip_hash {
+                old_body_reads += 1;
+                if old_body_reads == 3 {
+                    return None;
+                }
+            }
+            bodies.get(&hash).cloned()
+        },
+        |_| {},
+    );
+    let Err(crate::reorg::ReorgError::RestorationFailed { source, original }) = outcome else {
+        panic!("restoration body loss must require recovery, got {outcome:?}");
+    };
+    assert!(matches!(
+        *source,
+        crate::reorg::ReorgError::MissingBody { hash, height: 101 }
+            if hash == old_tip_hash
+    ));
+    assert!(matches!(
+        *original,
+        crate::reorg::ReorgError::ConnectFailed {
+            disposition: bitcoin_rs_chainstate::WindowApplyDisposition::Permanent,
+            ..
+        }
+    ));
+    assert_eq!(old_body_reads, 3);
+    assert!(handles.is_closed_for_recovery());
     Ok(())
 }
 
