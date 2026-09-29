@@ -130,11 +130,13 @@ changing only its binary selector path between implementations.
 
 | Implementation | Inbound events | Outbound events | Block-connected events |
 | --- | ---: | ---: | ---: |
-| Bitcoin Core 31.1 | 54 | 54 | 10 |
-| bitcoin-rs | 20 | 14 | 10 |
+| Bitcoin Core 31.1 | 52 | 52 | 6 |
+| bitcoin-rs | 18 | 12 | 6 |
 
 Both runs retained one peer per node and the tracer exited successfully.
-Event counts describe these runs, not a parity requirement. The earlier
+Counts include only complete runtime event lines, excluding compiler-warning
+excerpts that echo the script's `printf` calls. They are not a parity
+requirement. The earlier
 Ubuntu 26.04/kernel 7.0 file-script silence was **not reproduced**; this
 result does not isolate its cause or certify that original environment.
 It does show that bpftrace 0.27 can consume both implementations' `net:*`
