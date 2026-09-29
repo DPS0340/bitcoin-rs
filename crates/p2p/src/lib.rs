@@ -29,6 +29,8 @@ pub mod inv;
 pub mod listener;
 
 /// Bitcoin Core `net:*` tracepoint payload mapping.
+mod net_trace;
+
 /// Peer state and peer manager types.
 pub mod peer;
 /// Peer metadata published after a successful handshake.
