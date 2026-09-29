@@ -1,6 +1,6 @@
 name: ci-merge-gate
 
-# Pre-merge kernel/native compile gate (issue #1279).
+# Pre-merge kernel/native lint gate (issues #1279 and #1282).
 #
 # The deep native/kernel lanes live in ci-main and run on `main` pushes only,
 # so a PR could merge with a kernel-gated compile break and take main down
@@ -10,10 +10,9 @@ name: ci-merge-gate
 # instead: ordinary PR iteration keeps the fast portable gate in ci.yml,
 # while a broken kernel/native graph cannot enter main.
 #
-# Compile-only by design: tests, fixture provisioning, parity evidence, and
-# benchmarks stay main-only (ci-main). Compiling IS the gate -- a
-# feature-gated compile break surfaces here without paying for the evidence
-# lanes.
+# Clippy compiles the kernel/native targets and rejects production lint
+# warnings. Tests, fixture provisioning, parity evidence, and benchmarks stay
+# main-only (ci-main).
 on:
   merge_group:
     types: [checks_requested]
@@ -62,8 +61,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - name: Consensus compiles with kernel enabled
-        run: cargo check --locked -p bitcoin-rs-consensus --features kernel
       - name: Kernel-gated consensus Clippy
         run: cargo clippy --locked -p bitcoin-rs-consensus --all-targets --features kernel -- -D warnings
       # Script's `kernel` feature only forwards to consensus's, so the
@@ -72,11 +69,9 @@ jobs:
       - name: Kernel-gated script targets Clippy
         run: cargo clippy --locked -p bitcoin-rs-script --all-targets --features kernel -- -D warnings
 
-  # The production binary graph (all three storage backends plus kernel),
-  # compile-only. `--locked` and `-p bitcoin-rs` reuse the full-node lane's
-  # command shape (the binary's feature table propagates backends and kernel
-  # through the workspace); dropping nextest/tests/benches keeps this to a
-  # compile, which is all the merge boundary needs.
+  # Match ci-main's production binary lint graph exactly. A cargo check here
+  # misses dead-code and other warnings that fail ci-main after merge.
+  # Keep the job id stable for the existing merge-queue required check.
   full-node-compile:
     runs-on: ubuntu-latest
     steps:
@@ -84,8 +79,11 @@ jobs:
       # rocksdb's bindgen needs libclang; the kernel needs the C++ toolchain.
       - uses: ./.github/actions/native-deps
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - name: Production full-node graph compiles
+      - name: Production full-node Clippy
         run: |
-          cargo check --locked -p bitcoin-rs \
-            --no-default-features --features "${FULL_NODE_FEATURES}"
+          cargo clippy --locked -p bitcoin-rs --all-targets \
+            --no-default-features --features "${FULL_NODE_FEATURES}" \
+            -- -D warnings

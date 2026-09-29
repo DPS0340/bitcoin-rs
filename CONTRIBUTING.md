@@ -85,21 +85,26 @@ not model properties. Benchmark evidence checks run with
 The [pre-commit configuration](.pre-commit-config.yaml) runs the same script,
 so local hooks are the kernel-free PR gate, not the C++ full-node lane.
 
-Deep lanes -- the kernel C++ surface (full-node tests, bench smoke with the
-witness-activation regression and the SegWit-v0 kernel oracle), the MSRV
-compile, native-script evidence, the comparator corpus, fuzzing, and the
-dependency/feature matrices -- run on `main` only; see the next section and
-the jobs in [`.github/workflows/main.yml`](.github/workflows/main.yml).
+The production kernel/native Clippy graph runs at the merge queue in
+[`ci-merge-gate.yml`](.github/workflows/ci-merge-gate.yml). Full-node tests,
+benchmark smoke, native-script evidence, the comparator corpus, and Core
+reference lanes run on `main` in
+[`main.yml`](.github/workflows/main.yml). Dependency ranges, feature
+combinations, and MSRV checks run daily in
+[`compatibility-campaign.yml`](.github/workflows/compatibility-campaign.yml).
+Fuzz target builds run on `fuzz/**` pull requests; execution has its own
+daily campaign.
 
-## Deep CI lanes (main workflow)
+## Post-merge CI lanes
 
 [`.github/workflows/main.yml`](.github/workflows/main.yml) runs kernel-enabled
-tests, fuzzing, dependency/feature matrices, and the main-only verification
-lanes -- bench smoke (with the witness-activation kernel regression and the
-SegWit-v0 kernel oracle), the MSRV compile, native-script evidence, and the
-comparator corpus -- on pushes to `main` and manual dispatch.
+tests and the main-only verification lanes -- bench smoke (with the
+witness-activation kernel regression and the SegWit-v0 kernel oracle),
+native-script evidence, the comparator corpus, and Core differential -- on
+pushes to `main` and manual dispatch.
 Pull-request-triggered checks are defined in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) and the path-scoped
+[`fuzz-build.yml`](.github/workflows/fuzz-build.yml).
 
 ### Full-node feature set
 
@@ -168,9 +173,11 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run block_validate --target x86_64-unknown-linux-gnu -- -runs=10000
 ```
 
-CI builds and runs all five targets: `p2p_message`, `block_validate`,
-`tx_validate`, `script_eval`, and `utxo_snapshot`. See [`fuzz/README.md`](fuzz/README.md) for
-local fuzzing and corpus guidance.
+The path-scoped [`fuzz-build.yml`](.github/workflows/fuzz-build.yml) builds all
+five targets on `fuzz/**` pull requests. The daily campaign runs
+`p2p_message`, `block_validate`, `tx_validate`, `script_eval`, and
+`utxo_snapshot`. See [`fuzz/README.md`](fuzz/README.md) for local fuzzing and
+corpus guidance.
 
 The companion corpus repository is
 [gosuda/bitcoin-rs-fuzz-corpus](https://github.com/gosuda/bitcoin-rs-fuzz-corpus).
@@ -197,6 +204,8 @@ The original `Cargo.lock` is restored on exit unless `KEEP_LOCK=1`.
 Each lane also runs `cargo deny check bans` against the mutated lockfile.
 Optional native storage backends are owned by the named feature matrix, not
 this script.
+CI runs these endpoints in the scheduled/manual
+[`compatibility-campaign.yml`](.github/workflows/compatibility-campaign.yml).
 
 ### Bitcoin Core differential
 
