@@ -449,8 +449,10 @@ Missing:
 
 Recorded so absence of coverage is not mistaken for a gap. These are Core
 surfaces bitcoin-rs intentionally omits — optional behavior not required for
-consensus or normal full-node participation — and are
-[`Unimplemented`](../crates/rpc/src/registry.rs) by declaration:
+consensus or normal full-node participation.
+
+**RPC registry entries** — [`Unimplemented`](../crates/rpc/src/registry.rs)
+by declaration:
 
 - `preciousblock`, `reconsiderblock` (manual block preference) — see §4
 - `savemempool`, `importmempool` (mempool dump/reload) — see §7
@@ -458,6 +460,10 @@ consensus or normal full-node participation — and are
   [`feature_assumeutxo.py`](https://github.com/bitcoin/bitcoin/blob/v31.1/test/functional/feature_assumeutxo.py)
 - `getblockfrompeer`, `waitforblock`/`waitforblockheight`/`waitfornewblock`,
   `scanblocks`, `getmempoolcluster`, `getaddrmaninfo`
+
+**Non-RPC omissions** (no such surface exists in bitcoin-rs; recorded as
+gaps/omissions, not as registry declarations):
+
 - wallet-facing reorg tests
   ([`wallet_reorgsrestore.py`](https://github.com/bitcoin/bitcoin/blob/v31.1/test/functional/wallet_reorgsrestore.py),
   [`wallet_listsinceblock.py`](https://github.com/bitcoin/bitcoin/blob/v31.1/test/functional/wallet_listsinceblock.py)):
