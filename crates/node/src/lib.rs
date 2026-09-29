@@ -23,8 +23,6 @@ pub mod options;
 
 /// Owned startup, rollback, and ordered service shutdown.
 mod lifecycle;
-/// Tracing initialization.
-mod logging;
 /// Metrics instrumentation and optional exposition.
 pub mod metrics;
 /// Node-owned mining candidate lifecycle coordinator.
