@@ -34,6 +34,7 @@ When code and a contract disagree, fix the drift in the same change. Do not dupl
 | [dependency-range.md](dependency-range.md) | `DEP-01`–`DEP-02` | Declared Cargo ranges compile at their minimum and maximum resolvable versions; one copy each of `bitcoin`, `bitcoin_hashes`, `secp256k1`, `secp256k1-sys` | `scripts/check-dep-range.sh`; `cargo deny check bans` |
 | [feature-matrix.md](feature-matrix.md) | `FEAT-01`–`FEAT-02` | Named supported feature combinations; no empty backend markers on crates that do not own storage | `scripts/check-feature-matrix.sh`; `g17_dependency_direction` |
 | [reference-set.md](reference-set.md) | `REF-01`–`REF-07` | Released Core, kernel, corpus, and formal-tool identities | reference record and `overhaul_reference_set` |
+| [ecosystem-compatibility.md](ecosystem-compatibility.md) | `ECO-01`–`ECO-09` | External ecosystem compatibility strategy: black-box evidence, one representative consumer, evidence matrix and status vocabulary | [api/ecosystem-compat.toml](../api/ecosystem-compat.toml) rows; live Core interop lane (`core-differential.md`) |
 
 ## Permanent suite traceability
 

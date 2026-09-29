@@ -1,0 +1,141 @@
+# External ecosystem compatibility evidence matrix
+#
+# The maintained evidence record for
+# `docs/contracts/ecosystem-compatibility.md` (`ECO-08`): one row per
+# independently tracked compatibility surface, with the columns
+# `surface | core_reference | status | representative_consumer | evidence`
+# from issue #1122.
+#
+# This matrix is a different axis from `crates/rpc/core-compat.toml` (Core
+# reference identity pins) and `crates/rpc/src/registry.rs` (per-method
+# Core-schema status). Those own what the API shape claims against Core;
+# this file owns which real external consumers have exercised the surface.
+# Neither substitutes for the other.
+#
+# `status` uses exactly the vocabulary in `ECO-08`:
+#
+#   implemented             - shipped and in-tree tested; no real external
+#                             consumer has exercised it.
+#   externally verified     - a real external consumer exercised it and the
+#                             run is recorded in `evidence`. Scoped to the
+#                             black-box outcomes named there, never to
+#                             unlisted behavior of the same surface.
+#   partially compatible    - consumable with recorded differences; the
+#                             `evidence` field names the deviation owner.
+#   intentionally unsupported - out of scope by recorded policy; the
+#                             `evidence` field names the non-goal owner.
+#   experimental            - present but not a compatibility commitment.
+#
+# An implementation is NEVER `externally verified` on in-tree tests,
+# schema-shape comparison, or self-authored harnesses alone. Rows that name a
+# planned consumer in `representative_consumer` describe intent (#1122
+# follow-up work); the status still reads `implemented` or weaker until a
+# recorded run exists. Tooling that lives in this repository counts as
+# external evidence only when it speaks exclusively the documented public
+# surface — the live Core peer lane does; in-tree harnesses and log-derived
+# counts do not (`ECO-03`, `ECO-09`).
+
+[[row]]
+surface = "P2P v1 wire protocol"
+core_reference = "Bitcoin Core 31.1 net protocol (docs/policies/p2p-compatibility.md pin)"
+status = "externally verified"
+representative_consumer = "unmodified Bitcoin Core 31.1 bitcoind (scripts/run-p2p-core-interop.sh)"
+evidence = "black-box interop: handshake, IBD sync, relay, disconnect behavior, externally visible chain identity (docs/contracts/core-differential.md CORE-02/CORE-03; evidence schema bitcoin-rs-core-differential-v2 verified by crates/p2p/tests/core_interop_live.rs). Bounded to those outcomes. Per CORE-03, compact-block relay counters are still derived from internal bitcoin-rs log markers (scripts/run-p2p-core-interop.sh count_marker); per ECO-09 that derivation is diagnostic only and must trend to observable protocol outcomes before it is relied on as a compatibility contract."
+
+[[row]]
+surface = "BIP324 / P2P v2 transport"
+core_reference = "BIP324"
+status = "intentionally unsupported"
+representative_consumer = "none"
+evidence = "no usable bip324 feature in this checkout (docs/README.md); tracked as future work in issue #1122. Not claimed."
+
+[[row]]
+surface = "Compact block relay (BIP152)"
+core_reference = "Bitcoin Core 31.1 BIP152"
+status = "externally verified"
+representative_consumer = "unmodified Bitcoin Core 31.1 bitcoind + scripted wire probe (scripts/run-p2p-core-interop.sh phases A-C)"
+evidence = "black-box request/response and relay outcomes: reconstruction/serving against live Core and the raw MSG_CMPCT_BLOCK probe (docs/contracts/core-differential.md CORE-03; assert_bip152_relay in crates/p2p/tests/core_interop_live.rs). Log-marker-derived reconstruction counts are diagnostic per ECO-09 and not part of this claim."
+
+[[row]]
+surface = "Compact block filters (BIP157/BIP158)"
+core_reference = "BIP157/BIP158"
+status = "intentionally unsupported"
+representative_consumer = "none"
+evidence = "NODE_COMPACT_FILTERS not advertised, filter P2P commands ignored (docs/policies/p2p-compatibility.md section 5 message table)."
+
+[[row]]
+surface = "Peer lifecycle and address management"
+core_reference = "Bitcoin Core 31.1 net behavior"
+status = "partially compatible"
+representative_consumer = "unmodified Bitcoin Core 31.1 bitcoind (one lane)"
+evidence = "externally observed: handshake, relay, serving, disconnect behavior and chain identity via the live Core lane (docs/contracts/core-differential.md CORE-02/CORE-03). Deliberately absent internals: no address store or gossip, no getaddr response, no proactive block announcements (docs/policies/p2p-compatibility.md section 7 deviation ledger). Peer-visible reorg/restart behavior is owned by internal tests (docs/contracts/p2p-wire.md)."
+
+[[row]]
+surface = "JSON-RPC"
+core_reference = "Bitcoin Core 31.0 RPC schema (crates/rpc/core-compat.toml reference pins)"
+status = "implemented"
+representative_consumer = "planned: an existing Core-compatible RPC client (issue #1122 follow-up)"
+evidence = "in-tree only: dispatch, handler, and pinned-shape suites (crates/rpc/tests/*), per-method schema status in crates/rpc/src/registry.rs. A scripted in-repo client does not upgrade this row; see ECO-08."
+
+[[row]]
+surface = "REST"
+core_reference = "Bitcoin Core REST interface (twelve Core route prefixes, crates/rpc/src/rest.rs)"
+status = "implemented"
+representative_consumer = "planned: an existing REST client (issue #1122 follow-up)"
+evidence = "in-tree only: crates/rpc/tests/rest_routes.rs and manifest coverage; per-route status in crates/rpc/src/registry.rs."
+
+[[row]]
+surface = "ZMQ notifications"
+core_reference = "Bitcoin Core ZMQ notifications (hashblock/hashtx/rawblock/rawtx/sequence)"
+status = "implemented"
+representative_consumer = "planned: an existing ZMQ indexer or subscriber (issue #1122 follow-up)"
+evidence = "in-tree only: crates/rpc/tests/reorg_notifications.rs and manifest coverage; per-topic status in crates/rpc/src/registry.rs, payload mapping in crates/rpc/src/zmq.rs."
+
+[[row]]
+surface = "Esplora-compatible HTTP API"
+core_reference = "Blockstream Esplora API (bitcoin-rs-specific surface, no Core counterpart)"
+status = "implemented"
+representative_consumer = "planned: an existing Esplora client (issue #1122 follow-up)"
+evidence = "in-tree only: crates/rpc/src/esplora.rs projection and handler tests (crates/rpc/tests/*). Extension surface per crates/rpc/src/registry.rs (docs/contracts/wallet-facing.md WF-01)."
+
+[[row]]
+surface = "GetBlockTemplate (BIP22/BIP23)"
+core_reference = "Bitcoin Core mining RPC"
+status = "implemented"
+representative_consumer = "planned: an existing mining consumer via GBT (issue #1122 follow-up)"
+evidence = "in-tree only: template-shape and mining fixture suites (crates/mining/tests/*, crates/rpc/tests/mining_fixture). The in-repo external-miner harness (bin/bitcoin-rs/tests/overhaul_external_miner.rs) exercises the public HTTP surface but is a self-authored harness, not a real external consumer."
+
+[[row]]
+surface = "Block submission and proposal (submitblock, BIP22 proposal mode)"
+core_reference = "Bitcoin Core mining RPC"
+status = "implemented"
+representative_consumer = "planned: an existing mining consumer (issue #1122 follow-up)"
+evidence = "in-tree only: crates/mining/src/control.rs proposal/solved-block vocabulary and mining suites; external-miner harness as above (implemented evidence only)."
+
+[[row]]
+surface = "Mining IPC / Stratum V2 adapters"
+core_reference = "selected Core IPC / mining protocol interfaces"
+status = "experimental"
+representative_consumer = "none"
+evidence = "future adapter work only (issue #1122 compatibility surfaces); no shipped adapter, so nothing to verify. When built, IPC stays an adapter, not an internal architecture template (ECO-01)."
+
+[[row]]
+surface = "USDT tracepoints (validation/mempool/net providers)"
+core_reference = "Bitcoin Core doc/tracing.md probe ABI"
+status = "implemented"
+representative_consumer = "planned: bpftrace/BCC or bitcoin-dev-tools/usdt-dash workflow (issue #1122, #1121)"
+evidence = "in-tree only: crates/trace/src/probe_abi.rs table asserted against built SDT notes by crates/trace/tests/sdt_notes.rs; docs/tracing/smoke.bt is adapted from Core's contrib/tracing script but no external-tool run is recorded. ABI table alone is not external verification (ECO-08)."
+
+[[row]]
+surface = "Observability via bpftrace/BCC and bitcoin-dev-tools"
+core_reference = "Bitcoin Core tracing/benchmark tooling conventions"
+status = "implemented"
+representative_consumer = "planned: bitcoin-dev-tools/usdt-dash or benchkit against bitcoin-rs (issue #1122 follow-up)"
+evidence = "no external tool has been run against bitcoin-rs in the recorded evidence (issue #1122 follow-up work). Benchmark story is owned by docs/benchmarks/ and docs/contracts/hot-path-attribution.md; those are internal evidence."
+
+[[row]]
+surface = "Core IPC component interfaces"
+core_reference = "selected Bitcoin Core IPC interfaces"
+status = "intentionally unsupported"
+representative_consumer = "none"
+evidence = "not a goal in the current surface set: IPC compatibility is not pursued (docs/tracing.md not-implemented note); the non-goals forbid cloning Core interfaces or importing Core's ownership model (docs/contracts/ecosystem-compatibility.md ECO-01). Any future IPC is a narrowly scoped adapter, not an architecture template."

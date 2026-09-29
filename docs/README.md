@@ -35,6 +35,12 @@ Treat [core-rpc-schema.json](api/core-rpc-schema.json) and the
 inputs too. [RPC reference](rpc-reference.md) is generated from that
 registry; do not edit it by hand.
 
+External evidence is a separate axis: [ecosystem-compat.toml](api/ecosystem-compat.toml)
+tracks which real external consumers have exercised each compatibility
+surface, under the [ecosystem compatibility
+contract](contracts/ecosystem-compatibility.md). Core-schema status in the
+registry is not external verification; the two must not be conflated.
+
 ## Evidence and implementation status
 
 [Benchmarks](benchmarks/) retain methods, measurements, and decisions. The
