@@ -29,16 +29,11 @@ mod logging;
 pub mod metrics;
 /// Node-owned mining candidate lifecycle coordinator.
 pub mod mining;
-/// Node-owned adapter wiring recovery evidence into index and RPC sinks.
-mod recovery_reporter;
-
 /// Node-owned effects around authoritative chainstate reorgs.
 #[path = "reorg_effects.rs"]
 pub mod reorg;
 /// Top-level node runner.
 pub mod run;
-/// Graceful shutdown.
-mod shutdown;
 /// Signal handling.
 mod signal;
 /// Shared node state.

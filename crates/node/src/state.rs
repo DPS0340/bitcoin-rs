@@ -34,9 +34,11 @@ use std::time::Duration;
 use storage::NodeStorage;
 use storage::StoredBlockBodySource;
 
+#[path = "state_index.rs"]
 mod index;
+#[path = "state_open.rs"]
 mod open;
-mod prune;
+#[path = "state_storage.rs"]
 mod storage;
 
 struct IndexChainCursorSource(Arc<ChainEventPublisher>);
@@ -111,7 +113,7 @@ pub struct NodeState {
     followers: crate::chain_effects::ChainFollowers,
     sync: Arc<crate::BlockSync>,
     /// Process-wide rollback-evidence reporter (warning snapshot + marker).
-    recovery_reporter: Arc<crate::recovery_reporter::RecoveryReporter>,
+    recovery_reporter: Arc<storage::RecoveryReporter>,
 }
 
 impl Drop for NodeState {
@@ -271,7 +273,7 @@ impl NodeState {
 
     /// Returns the rollback-evidence reporter for `getblockchaininfo`.
     #[must_use]
-    pub(crate) fn recovery_reporter(&self) -> Arc<crate::recovery_reporter::RecoveryReporter> {
+    pub(crate) fn recovery_reporter(&self) -> Arc<storage::RecoveryReporter> {
         Arc::clone(&self.recovery_reporter)
     }
 
@@ -502,7 +504,7 @@ pub(crate) struct TxIndexSpawn {
     block_source: bitcoin_rs_index::runtime::IndexBlockSource,
     body_source: Arc<dyn BlockBodySource>,
     wake_rx: Receiver<()>,
-    recovery_reporter: Arc<crate::recovery_reporter::RecoveryReporter>,
+    recovery_reporter: Arc<storage::RecoveryReporter>,
 }
 
 #[cfg(test)]
