@@ -68,8 +68,8 @@ Owners:
   publication lock before invoking any callback. A full queue retains the
   ordered prefix and coalesces later batches into one latest-sequence gap;
   concurrent commits continue without waiting or growing the queue. Production
-  legs perform only a short in-memory mining wake or non-blocking ZMQ
-  publication.
+  legs perform a short in-memory mining wake or best-effort ZMQ send. The
+  socket send uses `DONTWAIT`, but endpoint-lock contention can still wait.
 - Canonical estimator accounting is part of the mempool lifecycle in step 6.
   It is not an observer and is never dropped.
 
