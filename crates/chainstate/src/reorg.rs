@@ -372,7 +372,9 @@ pub enum ReorgError {
     /// `Invalid` so the caller can purge staged/download state after releasing
     /// the transition. Body mutation and operational failures leave
     /// `invalidated` empty; `disposition` distinguishes their retry handling.
-    #[error("reorg target connect failed at height {stopped_at} at block {hash}: {source}")]
+    #[error(
+        "reorg target connect failed after reaching height {stopped_at} at block {hash}: {source}"
+    )]
     ConnectFailed {
         /// Fully disconnected blocks before the failure, in plan order.
         disconnected: usize,

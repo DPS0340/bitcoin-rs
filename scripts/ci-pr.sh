@@ -111,7 +111,7 @@ test_workspace_profiles() {
 }
 
 test_rpc_reorg_notifications() {
-  cargo build --locked -p bitcoin-rs
+  cargo build --locked -p bitcoin-rs || return $?
   local target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
   if [[ "$target_dir" != /* ]]; then
     target_dir="$PWD/$target_dir"
