@@ -515,10 +515,10 @@ pub struct Chainstate {
     /// and required readers pin old-branch bodies here so pruning cannot
     /// delete data an active transition still re-reads (#655, `RCV-08`).
     ///
-    /// It starts from the executed prune frontier the store reports, so a
-    /// restart grants no lease over history the previous process deleted
-    /// (#1151).
-    pub(crate) retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
+    /// Storage/pruning owns the registry and the executed frontier; this is
+    /// the acquisition capability it granted, so a restart still refuses
+    /// lease over history the previous process deleted (#1151).
+    pub(crate) retention: bitcoin_rs_storage::MandatoryRetention,
     /// Process-wide initial-block-download latch owned by the chainstate.
     ///
     /// RPC and P2P receive this one read-only answer rather than building
@@ -566,15 +566,13 @@ pub struct ChainstateParts {
     pub capture_rawtx: bool,
     /// Whether connects retain canonical block bytes for node-owned consumers.
     pub capture_block_bytes: bool,
-    /// The executed prune frontier a previous process committed.
+    /// The mandatory retained-history capability storage/pruning granted.
     ///
-    /// The node reconstructs it from the store when it opens, so the
-    /// retention registry starts from the deletions that actually happened
-    /// rather than from the requested prune height.
-    /// [`bitcoin_rs_storage::pruning::ExecutedFrontier::NONE`] is correct for
-    /// a store that never pruned and for a facade with no durable prune
-    /// families.
-    pub executed_frontier: bitcoin_rs_storage::pruning::ExecutedFrontier,
+    /// Composition builds it from the executed frontier the store reports,
+    /// so the service starts from the deletions that actually committed
+    /// rather than from the requested prune height. Chainstate acquires and
+    /// releases pins through it; it carries no reserve/commit/shutdown path.
+    pub retention: bitcoin_rs_storage::MandatoryRetention,
 }
 
 /// Held while new chain mutations are blocked.
@@ -802,9 +800,7 @@ impl Chainstate {
             checkpoint_publisher: None,
             capture_rawtx: parts.capture_rawtx,
             capture_block_bytes: parts.capture_block_bytes,
-            retention: Arc::new(bitcoin_rs_storage::RetentionRegistry::seeded(
-                parts.executed_frontier,
-            )),
+            retention: parts.retention,
             ibd,
         }
     }
@@ -1001,12 +997,6 @@ impl Chainstate {
         Arc::clone(&self.shutdown)
     }
 
-    /// Clones the pruning retention registry.
-    #[must_use]
-    pub fn retention_handle(&self) -> Arc<bitcoin_rs_storage::RetentionRegistry> {
-        Arc::clone(&self.retention)
-    }
-
     /// Returns the stable-view fence used by lower-layer live-view consumers.
     ///
     /// Locking this mutex prevents an authoritative transition from starting;
@@ -1185,7 +1175,7 @@ impl Chainstate {
             checkpoint_publisher: None,
             capture_rawtx: false,
             capture_block_bytes: false,
-            retention: Arc::new(bitcoin_rs_storage::RetentionRegistry::new()),
+            retention: bitcoin_rs_storage::MandatoryRetention::in_memory(),
             ibd,
         }
     }

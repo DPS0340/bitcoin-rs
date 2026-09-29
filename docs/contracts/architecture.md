@@ -166,8 +166,13 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   on each process-input surface; the `bitcoin-rs` binary expands that table into
   its argv, environment, TOML, and `bitcoin.conf` readers. Applied-tip mutation,
   recovery, checkpoint publication,
-  retention, and branch switching are owned by `bitcoin-rs-chainstate`
-  (`ARCH-07`), not by a public field bag of subsystem handles.
+  mandatory retention consumption, and branch switching are owned by
+  `bitcoin-rs-chainstate`
+  (`ARCH-07`), not by a public field bag of subsystem handles. The
+  retained-history authority itself — the registry, the executed frontier, and
+  prune reserve/commit — is owned by `bitcoin-rs-storage::pruning`; node
+  composes that one authority into chainstate, the prune service, and bounded
+  index history.
 - `bitcoin-rs-rpc::zmq` owns ZMQ topics, framing, HWM validation, socket
   transport, mempool sequence projection, and live notifier enumeration.
   `bitcoin-rs-node` constructs and wires the publisher and continues to own when
@@ -210,9 +215,17 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
 ### `ARCH-07`: Chainstate owns authoritative applied-chain mutation
 
 - `bitcoin_rs_chainstate::Chainstate` is the in-process owner of applied-tip
-  mutation, recovery, branch switching, checkpoint publication, and retention.
-  `NodeState`, `BlockSync`, mining, and RPC chain-control hold or clone that
-  service; they do not assemble a transition from independent locks.
+  mutation, recovery, branch switching, checkpoint publication, and mandatory
+  retention consumption. `NodeState`, `BlockSync`, mining, and RPC
+  chain-control hold or clone that service; they do not assemble a transition
+  from independent locks.
+  Retained-history *authority* is not chainstate's:
+  `bitcoin-rs-storage::pruning` owns the `RetentionRegistry`, the executed
+  frontier, and prune reserve/commit, and node composition seeds that one
+  registry and distributes it. Chainstate receives only
+  [`bitcoin_rs_storage::MandatoryRetention`], which can acquire and release
+  the pins a transition re-reads and reports what is already gone; it has no
+  prune, commit, or shutdown path and is not a broker for the registry.
 - `Chainstate::begin_transition` and `TransitionLock::into_transition` are the
   only constructors of a `ChainTransition`. Reorg planning that must abort
   without mutating takes `lock_transition` first and promotes the lock with
@@ -334,10 +347,14 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
 ## Remaining composition boundary
 
 `crates/chainstate` owns authoritative applied-chain mutation, recovery,
-checkpoint payload assembly/publication, reorg, and retention. Storage still
-owns generic journal/checkpoint formats, filesystem operations, backend
+checkpoint payload assembly/publication, reorg, and the mandatory retention
+it takes into those transitions. Storage owns the retained-history
+authority — `RetentionRegistry`, the executed frontier, prune reserve/commit,
+and the bounded `HistoryAccess` it hands optional consumers — as well as
+generic journal/checkpoint formats, filesystem operations, backend
 drivers, and durability primitives. Node owns process configuration, concrete
-backend selection, mempool/P2P/index/mining/RPC wiring, and post-commit
+backend selection, seeding that one retention registry and distributing its
+capabilities, mempool/P2P/index/mining/RPC wiring, and post-commit
 cross-domain effects. Backend construction stays at the `ARCH-03`
 composition seam.
 

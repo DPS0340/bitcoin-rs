@@ -222,11 +222,13 @@ tests.
   intermediate committed ancestor is valid.
 - Streaming reorg uses bounded descriptors, before-images, and committed
   ancestors with exact inverse transitions; no whole-branch preload.
-- Chainstate owns planning, body retention/loading, mutation, invalidation, and
-  disconnect-debt settlement. Node-owned observers receive each committed
-  connect/disconnect to reconcile mempool, mining, RPC/ZMQ, and index wakes.
-  Those observers are not recovery authority and cannot widen chainstate's
-  dependency graph.
+- Chainstate owns planning, body loading, mutation, invalidation, and
+  disconnect-debt settlement, and takes the mandatory retention pin each of
+  those transitions needs; storage/pruning owns the retained-history
+  authority those pins draw on (`RCV-08`). Node-owned observers receive
+  each committed connect/disconnect to reconcile mempool, mining, RPC/ZMQ,
+  and index wakes. Those observers are not recovery authority and cannot
+  widen chainstate's dependency graph.
 
 ### `RCV-09`: Fresh replay and schema refusal
 

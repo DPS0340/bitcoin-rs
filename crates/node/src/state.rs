@@ -123,7 +123,7 @@ impl Drop for NodeState {
         // Close the history boundary first, so a worker still reconciling
         // stops on the owner's shutdown answer instead of pinning rows a
         // process that is leaving will not serve.
-        self.chainstate.retention_handle().shutdown();
+        self.storage.retention().shutdown();
     }
 }
 
@@ -308,6 +308,18 @@ impl NodeState {
         Arc::clone(&self.chainstate)
     }
 
+    /// The mandatory retained-history capability this node composes.
+    ///
+    /// Node seeds storage/pruning's registry from the executed frontier the
+    /// store reports and hands the acquisition capability to chainstate, so
+    /// both observe the same authority. It answers what is already gone and
+    /// pins what a transition re-reads; it carries no prune, commit, or
+    /// shutdown path (`#1151`, `RCV-08`).
+    #[must_use]
+    pub fn mandatory_retention(&self) -> bitcoin_rs_storage::MandatoryRetention {
+        self.storage.mandatory_retention()
+    }
+
     /// Clone of the derived-consumer set used after committed transitions.
     #[must_use]
     pub fn chain_followers(&self) -> crate::chain_effects::ChainFollowers {
@@ -387,7 +399,8 @@ impl NodeState {
     /// authoritative — after crash recovery — so the index reconciles against
     /// the real chainstate and never mistakes a recovered gap for a stale branch.
     pub fn start_index_workers(&mut self) -> anyhow::Result<()> {
-        self.derived_index.start(&self.chainstate)
+        let history = self.storage.index_history();
+        self.derived_index.start(&self.chainstate, history)
     }
 
     /// Returns the live txindex status source for `getcapabilities`.

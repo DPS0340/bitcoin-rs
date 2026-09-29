@@ -222,7 +222,7 @@ impl NodeState {
             journal,
             capture_rawtx: false,
             capture_block_bytes: false,
-            executed_frontier: storage.executed_frontier(),
+            retention: storage.mandatory_retention(),
         });
         let derived_index_open_spec =
             build_derived_index_open_spec(&config, txindex_cache_bytes, epoch)?;
@@ -412,7 +412,7 @@ impl NodeState {
                 Arc::clone(&block_files),
                 chainstate.prune_authority(),
                 Arc::clone(&durable_tip_height),
-                chainstate.retention_handle(),
+                storage.retention(),
             )?)
         } else {
             None

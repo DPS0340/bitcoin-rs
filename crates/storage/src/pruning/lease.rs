@@ -474,6 +474,56 @@ impl RetentionRegistry {
     }
 }
 
+/// Chainstate's retained-history capability: mandatory acquisition only.
+///
+/// The full registry authority — prune reserve and commit, the executed
+/// frontier, optional history grants, and the shutdown boundary — stays with
+/// [`RetentionRegistry`]'s owner and its composition root. A chain transition
+/// only ever needs to pin the rows it is about to re-read, so it receives this
+/// capability rather than the registry itself: there is no path from here to
+/// reserving, committing, or closing retained history (#1151).
+#[derive(Clone)]
+pub struct MandatoryRetention {
+    registry: Arc<RetentionRegistry>,
+}
+
+impl MandatoryRetention {
+    /// Wraps the owner's registry for one mandatory consumer.
+    #[must_use]
+    pub const fn new(registry: Arc<RetentionRegistry>) -> Self {
+        Self { registry }
+    }
+
+    /// Builds a detached capability over a private in-memory registry.
+    ///
+    /// For facades with no durable prune families: nothing else can reserve
+    /// or commit against this registry, so the pin it grants is authoritative
+    /// only for the facade that holds it.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self::new(Arc::new(RetentionRegistry::new()))
+    }
+
+    /// Acquires a lease pinning rows at `floor` and above against pruning.
+    ///
+    /// Fails when the floor is below the executed prune line or below the
+    /// deletion line of an outstanding [`PruneReservation`]: those rows are
+    /// gone or already claimed for deletion.
+    pub fn acquire(&self, floor: u32) -> Result<RetentionLease, RetentionError> {
+        self.registry.acquire(floor)
+    }
+
+    /// The highest prune line a completed pass recorded.
+    ///
+    /// The read-only companion to [`Self::acquire`]: rows below it are gone,
+    /// so a mandatory consumer learns what it may no longer pin without
+    /// having to provoke the refusal.
+    #[must_use]
+    pub fn pruned_below(&self) -> u32 {
+        self.registry.pruned_below()
+    }
+}
+
 /// One prune pass's claim on the rows it is about to delete.
 ///
 /// A pass reserves its folded deletion line before it stages rows, holds

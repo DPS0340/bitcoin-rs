@@ -26,6 +26,18 @@ and commit.
 
 Note that `block_body_key` and `BLOCK_DATA_CF` are not only pruning concerns: they are the block-body key schema, and the node reads bodies through them on the ordinary path.
 
+`RetentionRegistry` is the retained-history authority: it owns the executed
+frontier and the prune reserve/commit protocol, and it is the only type that
+grants retention. Composition seeds it once from the frontier the store
+reports and then hands out roles rather than the registry -- chainstate gets
+`MandatoryRetention`, which can only acquire and release the pins a
+transition re-reads and report what is already gone; an optional consumer
+gets `HistoryAccess`, bounded by the budget it was granted, so a stalled one
+stops binding the prune line instead of blocking it. `node:prune_executed`
+rows are written in the same durable batch as their deletions, so a restart
+reconstructs exactly the committed boundary and refuses a lease over deleted
+history.
+
 ## Cache budget
 
 `dbcache` is one process-wide budget. `cache_budget::split_cache_budget` divides
