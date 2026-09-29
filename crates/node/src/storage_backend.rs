@@ -129,7 +129,6 @@ mod tests {
     const RUNTIME_CONSUMERS: &[(&str, &str)] = &[
         ("state.rs", include_str!("state.rs")),
         ("state_open.rs", include_str!("state_open.rs")),
-        ("state_prune.rs", include_str!("state_prune.rs")),
         ("state_storage.rs", include_str!("state_storage.rs")),
         ("storage_footprint.rs", include_str!("storage_footprint.rs")),
         (
