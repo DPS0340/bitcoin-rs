@@ -337,6 +337,13 @@ fn check_query(
     }
     match snapshot.get_many_sorted(cf, keys) {
         Ok(values) => {
+            if values.len() != keys.len() {
+                failures.push(format!(
+                    "round {round} {view}: multi-get returned {} values for {} keys",
+                    values.len(),
+                    keys.len()
+                ));
+            }
             for (key, value) in keys.iter().zip(values.iter()) {
                 if value.as_deref() != Some(expected) {
                     failures.push(format!(

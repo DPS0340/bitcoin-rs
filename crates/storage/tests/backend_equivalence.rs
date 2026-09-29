@@ -764,8 +764,8 @@ fn redb_txindex_atomic_batch_and_reader_version_laws() -> TestResult<()> {
         b"uncertain-other",
     )?;
 
-    // Explicit unsupported capability: this store serves six families with
-    // fixed-width keys; everything else is rejected, not weakened.
+    // Unsupported families are rejected. Key-width validation applies to
+    // fixed-width families such as TxConfirmed, not byte-addressed UtxoMeta.
     let unsupported = store.get(ColumnFamily::BlockBodies, b"key");
     assert!(
         matches!(&unsupported, Err(StorageError::InvalidOperation(_))),
