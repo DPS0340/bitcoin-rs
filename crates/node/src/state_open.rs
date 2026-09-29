@@ -268,6 +268,9 @@ impl NodeState {
             }
             None => None,
         };
+        let index_chain_cursor: Arc<dyn bitcoin_rs_index::reconcile::ChainCursorSource> = Arc::new(
+            super::IndexChainCursorSource(chainstate.chain_events_handle()),
+        );
         let derived_index_status =
             Arc::new(bitcoin_rs_index::runtime::DerivedIndexCapability::new(
                 derived_index_parts
@@ -277,6 +280,7 @@ impl NodeState {
                     .as_ref()
                     .map(|(runtime, _, _, _)| Arc::clone(runtime)),
                 derived_index_capabilities(&config),
+                Arc::clone(&index_chain_cursor),
             ));
         // Two outbound populations: full-relay slots carry transactions,
         // addresses, and blocks; block-relay-only slots carry blocks alone.
@@ -437,6 +441,7 @@ impl NodeState {
             derived_index: super::index::DerivedIndexHost::from_parts(
                 derived_index_parts,
                 derived_index_status,
+                index_chain_cursor,
             ),
             prune_service,
             mempool_gateway,

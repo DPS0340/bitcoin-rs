@@ -1,15 +1,16 @@
 //! Metrics instrumentation and optional exposition.
 //!
-//! `MetricsServer` serves the Prometheus text scrape; the readiness sampler
-//! projects the txindex capability source into a gauge; `EvidenceIdentity`
-//! carries the artifact/configuration/durability every sample is labeled with.
+//! `MetricsServer` serves the Prometheus text scrape and projects one coherent
+//! txindex capability snapshot per request; `EvidenceIdentity` carries the
+//! artifact/configuration/durability every sample is labeled with.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use bitcoin_rs_index::{CapabilityState, DerivedIndexCapabilitySource};
@@ -223,10 +224,6 @@ fn describe_node_metrics() {
         "storage.cache_capacity_bytes",
         "configured per-engine cache capacity in bytes"
     );
-    metrics::describe_gauge!(
-        TXINDEX_READINESS_GAUGE,
-        "txindex capability readiness from the live getcapabilities source; 1 for the active state label, 0 for the others"
-    );
 }
 
 static PROMETHEUS_HANDLE: Mutex<Option<(EvidenceIdentity, PrometheusHandle)>> = Mutex::new(None);
@@ -272,6 +269,17 @@ impl MetricsServer {
         shutdown: Arc<AtomicBool>,
         identity: &EvidenceIdentity,
     ) -> Result<Self> {
+        Self::bind_with_source(addr, shutdown, identity, None)
+    }
+
+    /// Binds a listener whose readiness families are rendered from `source`
+    /// once per scrape rather than copied through process-global gauges.
+    pub(crate) fn bind_with_source(
+        addr: SocketAddr,
+        shutdown: Arc<AtomicBool>,
+        identity: &EvidenceIdentity,
+        source: Option<Arc<dyn DerivedIndexCapabilitySource>>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         let handle = prometheus_handle(identity)?;
@@ -279,9 +287,19 @@ impl MetricsServer {
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let identity = identity.clone();
         let thread = thread::Builder::new()
             .name("bitcoin-rs-metrics".into())
-            .spawn(move || serve_metrics(&listener, &handle, &thread_stop, &shutdown))?;
+            .spawn(move || {
+                serve_metrics(
+                    &listener,
+                    &handle,
+                    &thread_stop,
+                    &shutdown,
+                    &identity,
+                    source.as_deref(),
+                );
+            })?;
         Ok(Self {
             local_addr,
             stop,
@@ -317,8 +335,9 @@ pub(crate) fn start_metrics(
     bind: Option<SocketAddr>,
     shutdown: Arc<AtomicBool>,
     identity: &EvidenceIdentity,
+    source: Arc<dyn DerivedIndexCapabilitySource>,
 ) -> Result<Option<MetricsServer>> {
-    bind.map(|addr| MetricsServer::bind(addr, shutdown, identity))
+    bind.map(|addr| MetricsServer::bind_with_source(addr, shutdown, identity, Some(source)))
         .transpose()
 }
 
@@ -327,6 +346,8 @@ fn serve_metrics(
     handle: &PrometheusHandle,
     stop: &Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
+    identity: &EvidenceIdentity,
+    source: Option<&dyn DerivedIndexCapabilitySource>,
 ) {
     loop {
         if stop.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
@@ -338,7 +359,7 @@ fn serve_metrics(
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                serve_scrape(&mut stream, handle);
+                serve_scrape(&mut stream, handle, identity, source);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -349,10 +370,18 @@ fn serve_metrics(
     }
 }
 
-fn serve_scrape(stream: &mut TcpStream, handle: &PrometheusHandle) {
+fn serve_scrape(
+    stream: &mut TcpStream,
+    handle: &PrometheusHandle,
+    identity: &EvidenceIdentity,
+    source: Option<&dyn DerivedIndexCapabilitySource>,
+) {
     let mut buf = [0_u8; 1024];
     let _ = stream.read(&mut buf);
-    let body = handle.render();
+    let mut body = handle.render();
+    if let Some(source) = source {
+        render_capability_metrics(&mut body, source, identity);
+    }
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len(),
@@ -362,47 +391,148 @@ fn serve_scrape(stream: &mut TcpStream, handle: &PrometheusHandle) {
 }
 
 /// Gauge name for the txindex readiness outcome.
-pub(crate) const TXINDEX_READINESS_GAUGE: &str = "node.capability.txindex_readiness";
+pub(crate) const TXINDEX_READINESS_GAUGE: &str = "node_capability_txindex_readiness";
 
-/// How often the sampler republishes the readiness gauge.
-const READINESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Publishes one readiness sample from the RPC capability source.
-///
-/// Outcome labels are the `getcapabilities` wire spellings and are set
-/// independently, so a scrape during a transition may observe zero or two
-/// active outcomes; the 1s sample interval bounds the window. Treat a single
-/// scrape as approximate and the RPC source as authoritative.
-pub(crate) fn publish_txindex_readiness(source: &dyn DerivedIndexCapabilitySource) {
-    let status = source.capability();
-    let active = status.state.wire_name();
-    for outcome in CapabilityState::ALL {
-        metrics::gauge!(TXINDEX_READINESS_GAUGE, "state" => outcome.wire_name())
-            .set(f64::from(outcome.wire_name() == active));
-    }
+fn escaped_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
 }
 
-/// Spawns the one-hertz readiness sampler.
-///
-/// The thread owns clones of the shared status source and the shutdown flag;
-/// teardown joins it through `NodeServices` before `NodeState` closes, so it
-/// never touches closed storage.
-pub(crate) fn spawn_readiness_sampler(
-    source: Arc<dyn DerivedIndexCapabilitySource>,
-    shutdown: Arc<AtomicBool>,
-) -> anyhow::Result<JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("bitcoin-rs-metrics-readiness".into())
-        .spawn(move || {
-            while !shutdown.load(Ordering::Acquire) {
-                publish_txindex_readiness(source.as_ref());
-                let deadline = Instant::now() + READINESS_SAMPLE_INTERVAL;
-                while !shutdown.load(Ordering::Acquire) && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        })
-        .map_err(|error| anyhow::anyhow!("spawn readiness sampler: {error}"))
+fn labels(identity: &EvidenceIdentity, extra: &[(&str, &str)]) -> String {
+    let mut rendered = identity
+        .labels()
+        .into_iter()
+        .map(|(name, value)| format!("{name}=\"{}\"", escaped_label(&value)))
+        .collect::<Vec<_>>();
+    rendered.extend(
+        extra
+            .iter()
+            .map(|(name, value)| format!("{name}=\"{}\"", escaped_label(value))),
+    );
+    rendered.join(",")
+}
+
+fn hash_words(hash: &str) -> Option<[u32; 8]> {
+    if hash.len() != 64 {
+        return None;
+    }
+    let mut words = [0_u32; 8];
+    for (index, word) in words.iter_mut().enumerate() {
+        let start = index * 8;
+        *word = u32::from_str_radix(&hash[start..start + 8], 16).ok()?;
+    }
+    Some(words)
+}
+
+fn write_sample(
+    body: &mut String,
+    name: &str,
+    identity: &EvidenceIdentity,
+    extra: &[(&str, &str)],
+    value: u64,
+) {
+    let _ = writeln!(body, "{name}{{{}}} {value}", labels(identity, extra));
+}
+
+/// Appends all readiness facts from one immutable source snapshot. Revision
+/// halves and hash words stay within Prometheus' exact integer range and use
+/// bounded labels, avoiding both precision loss and hash-label cardinality.
+fn render_capability_metrics(
+    body: &mut String,
+    source: &dyn DerivedIndexCapabilitySource,
+    identity: &EvidenceIdentity,
+) {
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str("# HELP node_capability_snapshot_available Whether one coherent capability snapshot was captured for this scrape.\n");
+    body.push_str("# TYPE node_capability_snapshot_available gauge\n");
+    let Ok(snapshot) = source.snapshot() else {
+        write_sample(body, "node_capability_snapshot_available", identity, &[], 0);
+        return;
+    };
+    let Some(words) = hash_words(&snapshot.tip.hash) else {
+        write_sample(body, "node_capability_snapshot_available", identity, &[], 0);
+        return;
+    };
+    write_sample(body, "node_capability_snapshot_available", identity, &[], 1);
+
+    let status = snapshot.capabilities.first();
+    let active = status.map_or("Disabled", |status| status.state.wire_name());
+    body.push_str(
+        "# HELP node_capability_txindex_compiled Whether txindex is compiled into this node.\n",
+    );
+    body.push_str("# TYPE node_capability_txindex_compiled gauge\n");
+    body.push_str(
+        "# HELP node_capability_txindex_enabled Whether txindex is enabled for this node.\n",
+    );
+    body.push_str("# TYPE node_capability_txindex_enabled gauge\n");
+    for (name, value) in [
+        (
+            "node_capability_txindex_compiled",
+            status.is_some_and(|status| status.compiled),
+        ),
+        (
+            "node_capability_txindex_enabled",
+            status.is_some_and(|status| status.enabled),
+        ),
+    ] {
+        write_sample(body, name, identity, &[], u64::from(value));
+    }
+    body.push_str("# HELP node_capability_txindex_readiness Txindex lifecycle outcome from this scrape's capability snapshot.\n");
+    body.push_str("# TYPE node_capability_txindex_readiness gauge\n");
+    for outcome in CapabilityState::ALL {
+        let state = outcome.wire_name();
+        write_sample(
+            body,
+            TXINDEX_READINESS_GAUGE,
+            identity,
+            &[("state", state)],
+            u64::from(state == active),
+        );
+    }
+
+    body.push_str("# HELP node_capability_chain_revision Authoritative chain revision split into exact 32-bit parts.\n");
+    body.push_str("# TYPE node_capability_chain_revision gauge\n");
+    for (field, value) in [
+        ("epoch", snapshot.revision.epoch),
+        ("sequence", snapshot.revision.sequence),
+    ] {
+        for (part, half) in [("high", value >> 32), ("low", value & u64::from(u32::MAX))] {
+            write_sample(
+                body,
+                "node_capability_chain_revision",
+                identity,
+                &[("field", field), ("part", part)],
+                half,
+            );
+        }
+    }
+    body.push_str(
+        "# HELP node_capability_tip_height Applied tip height in this capability snapshot.\n",
+    );
+    body.push_str("# TYPE node_capability_tip_height gauge\n");
+    write_sample(
+        body,
+        "node_capability_tip_height",
+        identity,
+        &[],
+        u64::from(snapshot.tip.height),
+    );
+    body.push_str("# HELP node_capability_tip_hash_word Applied tip hash as eight exact big-endian 32-bit words.\n");
+    body.push_str("# TYPE node_capability_tip_hash_word gauge\n");
+    for (index, word) in words.into_iter().enumerate() {
+        let word_index = index.to_string();
+        write_sample(
+            body,
+            "node_capability_tip_hash_word",
+            identity,
+            &[("word", &word_index)],
+            u64::from(word),
+        );
+    }
 }
 
 #[cfg(test)]

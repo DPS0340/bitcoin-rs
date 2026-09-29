@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::reconcile::ConsumerCursor;
+
 /// Stable identifier used by the RPC capability report.
 pub const TXINDEX_CAPABILITY: &str = "txindex";
 
@@ -104,16 +106,91 @@ pub struct CapabilityStatus {
 }
 
 /// Point-in-time status report for concrete node capabilities.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
+    /// Authoritative chain-owner revision at which the status rows were captured.
+    pub revision: CapabilityRevision,
+    /// Authoritative applied tip belonging to `revision`.
+    pub tip: CapabilityTip,
     /// Status rows in the node's stable capability order.
     pub capabilities: Vec<CapabilityStatus>,
 }
 
-/// Live txindex row. The worker maps its own lifecycle onto [`CapabilityStatus`].
+impl CapabilitySnapshot {
+    /// Builds the wire projection from the authoritative chain-owner cursor.
+    pub(crate) fn from_cursor(cursor: ConsumerCursor, capabilities: Vec<CapabilityStatus>) -> Self {
+        Self {
+            revision: CapabilityRevision {
+                epoch: cursor.epoch,
+                sequence: cursor.sequence,
+            },
+            tip: CapabilityTip {
+                height: cursor.height,
+                hash: cursor.hash.to_string(),
+            },
+            capabilities,
+        }
+    }
+
+    fn detached(capabilities: Vec<CapabilityStatus>) -> Self {
+        Self::from_cursor(
+            ConsumerCursor {
+                epoch: 0,
+                sequence: 0,
+                height: 0,
+                hash: bitcoin_rs_primitives::Hash256::default(),
+            },
+            capabilities,
+        )
+    }
+}
+
+impl Default for CapabilitySnapshot {
+    fn default() -> Self {
+        Self::detached(Vec::new())
+    }
+}
+
+/// Revision owned and advanced by the chain event publisher.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityRevision {
+    /// Process epoch persisted by the chain event owner.
+    pub epoch: u64,
+    /// Commit sequence within `epoch`.
+    pub sequence: u64,
+}
+
+/// Applied tip paired with a capability revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityTip {
+    /// Applied-chain height.
+    pub height: u32,
+    /// Conventional big-endian block hash.
+    pub hash: String,
+}
+
+impl Default for CapabilityTip {
+    fn default() -> Self {
+        Self {
+            height: 0,
+            hash: bitcoin_rs_primitives::Hash256::default().to_string(),
+        }
+    }
+}
+
+/// A coherent capability snapshot could not be captured within the bounded retry window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CapabilitySnapshotError {
+    /// Chain or index publication changed while the snapshot was assembled.
+    #[error("capability status changed during snapshot; retry")]
+    Changed,
+}
+
+/// Live txindex snapshot. The worker maps its lifecycle onto [`CapabilityStatus`]
+/// while retaining the chain owner's revision and tip.
 pub trait DerivedIndexCapabilitySource: Send + Sync {
-    /// Compiled/enabled/lifecycle row for the txindex capability.
-    fn capability(&self) -> CapabilityStatus;
+    /// Captures the row together with the authoritative chain-owner revision.
+    fn snapshot(&self) -> Result<CapabilitySnapshot, CapabilitySnapshotError>;
 }
 
 /// Construct the stable txindex row from its enablement and lifecycle state.
@@ -134,13 +211,13 @@ pub fn disabled_txindex() -> CapabilityStatus {
 }
 
 /// Point-in-time `getcapabilities` snapshot for the concrete txindex row.
-#[must_use]
-pub fn txindex_snapshot(source: Option<&dyn DerivedIndexCapabilitySource>) -> CapabilitySnapshot {
-    CapabilitySnapshot {
-        capabilities: vec![
-            source.map_or_else(disabled_txindex, DerivedIndexCapabilitySource::capability),
-        ],
-    }
+pub fn txindex_snapshot(
+    source: Option<&dyn DerivedIndexCapabilitySource>,
+) -> Result<CapabilitySnapshot, CapabilitySnapshotError> {
+    source.map_or_else(
+        || Ok(CapabilitySnapshot::detached(vec![disabled_txindex()])),
+        DerivedIndexCapabilitySource::snapshot,
+    )
 }
 
 #[cfg(test)]
@@ -150,16 +227,23 @@ mod tests {
     struct ReadyEnabled;
 
     impl DerivedIndexCapabilitySource for ReadyEnabled {
-        fn capability(&self) -> CapabilityStatus {
-            derived_index_status(true, CapabilityState::Ready)
+        fn snapshot(&self) -> Result<CapabilitySnapshot, CapabilitySnapshotError> {
+            Ok(CapabilitySnapshot::detached(vec![derived_index_status(
+                true,
+                CapabilityState::Ready,
+            )]))
         }
     }
 
     #[test]
     // CONTRACT: docs/contracts/indexing.md#IDX-02
-    fn missing_source_is_the_disabled_txindex_row() {
-        let snapshot = txindex_snapshot(None);
+    fn missing_source_is_the_disabled_txindex_row() -> Result<(), CapabilitySnapshotError> {
+        let snapshot = txindex_snapshot(None)?;
         assert_eq!(snapshot.capabilities, vec![disabled_txindex()]);
+        assert_eq!(snapshot.revision, CapabilityRevision::default());
+        assert_eq!(snapshot.tip.height, 0);
+        assert_eq!(snapshot.tip.hash, "0".repeat(64));
+        Ok(())
     }
 
     /// Extracts the serde tag of a rendered `CapabilityState`: a bare string
@@ -197,11 +281,13 @@ mod tests {
 
     #[test]
     // CONTRACT: docs/contracts/indexing.md#IDX-02
-    fn attached_source_is_the_worker_row() {
-        let snapshot = txindex_snapshot(Some(&ReadyEnabled));
+    fn attached_source_is_the_worker_row() -> Result<(), CapabilitySnapshotError> {
+        let snapshot = txindex_snapshot(Some(&ReadyEnabled))?;
         assert_eq!(
             snapshot.capabilities,
             vec![derived_index_status(true, CapabilityState::Ready)]
         );
+        assert_eq!(snapshot.revision, CapabilityRevision::default());
+        Ok(())
     }
 }

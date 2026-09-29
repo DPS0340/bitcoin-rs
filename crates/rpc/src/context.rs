@@ -1336,8 +1336,21 @@ mod tests {
     struct ReadySource;
 
     impl bitcoin_rs_index::DerivedIndexCapabilitySource for ReadySource {
-        fn capability(&self) -> bitcoin_rs_index::CapabilityStatus {
-            bitcoin_rs_index::derived_index_status(true, bitcoin_rs_index::CapabilityState::Ready)
+        fn snapshot(
+            &self,
+        ) -> Result<bitcoin_rs_index::CapabilitySnapshot, bitcoin_rs_index::CapabilitySnapshotError>
+        {
+            Ok(bitcoin_rs_index::CapabilitySnapshot {
+                revision: bitcoin_rs_index::CapabilityRevision::default(),
+                tip: bitcoin_rs_index::CapabilityTip {
+                    height: 0,
+                    hash: "0".repeat(64),
+                },
+                capabilities: vec![bitcoin_rs_index::derived_index_status(
+                    true,
+                    bitcoin_rs_index::CapabilityState::Ready,
+                )],
+            })
         }
     }
 

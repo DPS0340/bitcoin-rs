@@ -160,7 +160,7 @@ fn assert_embedded_node_readiness(
 
     // Capability snapshot comes from the node registry: both compiled
     // capabilities are reported even while disabled by runtime toggles.
-    let capabilities = node.capabilities();
+    let capabilities = node.capabilities()?;
     assert!(
         !capabilities.capabilities.is_empty(),
         "the registry reports its compiled capabilities"

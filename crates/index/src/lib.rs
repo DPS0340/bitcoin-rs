@@ -21,8 +21,9 @@ pub mod types;
 pub mod writer;
 
 pub use capabilities::{
-    CapabilitySnapshot, CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource,
-    TXINDEX_CAPABILITY, derived_index_status, disabled_txindex, txindex_snapshot,
+    CapabilityRevision, CapabilitySnapshot, CapabilitySnapshotError, CapabilityState,
+    CapabilityStatus, CapabilityTip, DerivedIndexCapabilitySource, TXINDEX_CAPABILITY,
+    derived_index_status, disabled_txindex, txindex_snapshot,
 };
 pub use index::{
     BlockSource, ConsumerCursorUpdate, IndexCapabilities, IndexCapability, IndexError, IndexReader,

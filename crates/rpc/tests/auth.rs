@@ -180,6 +180,33 @@ fn non_rest_get_returns_not_found_without_authentication() -> Result<(), Box<dyn
     Ok(())
 }
 
+fn assert_public_headers_exposed(response: &str) {
+    let headers = response.split("\r\n\r\n").next().unwrap_or_default();
+    let exposed: Vec<&str> = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("Access-Control-Expose-Headers"))
+        .flat_map(|(_, values)| values.split(',').map(str::trim))
+        .collect();
+    for required in [
+        "X-Total-Results",
+        "X-Bitcoin-Rs-Chain-Epoch",
+        "X-Bitcoin-Rs-Chain-Sequence",
+        "X-Bitcoin-Rs-Tip-Height",
+        "X-Bitcoin-Rs-Tip-Hash",
+        "X-Bitcoin-Rs-Txindex-Compiled",
+        "X-Bitcoin-Rs-Txindex-Enabled",
+        "X-Bitcoin-Rs-Txindex-State",
+    ] {
+        assert!(
+            exposed
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(required)),
+            "browser clients cannot read {required}: {exposed:?}"
+        );
+    }
+}
+
 #[test]
 fn public_esplora_success_and_error_responses_allow_cross_origin_reads()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -187,7 +214,7 @@ fn public_esplora_success_and_error_responses_allow_cross_origin_reads()
     for path in ["/api/blocks/tip/height", "/api/not-an-esplora-route"] {
         let response = request_get(address, path, "close")?;
         assert!(response.contains("Access-Control-Allow-Origin: *\r\n"));
-        assert!(response.contains("Access-Control-Expose-Headers: X-Total-Results\r\n"));
+        assert_public_headers_exposed(&response);
     }
     Ok(())
 }
@@ -214,7 +241,7 @@ fn public_esplora_options_returns_cors_preflight_response() -> Result<(), Box<dy
 
     assert!(response.starts_with("HTTP/1.1 204 No Content"));
     assert!(response.contains("Access-Control-Allow-Origin: *\r\n"));
-    assert!(response.contains("Access-Control-Expose-Headers: X-Total-Results\r\n"));
+    assert_public_headers_exposed(&response);
     assert!(response.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"));
     assert!(response.contains("Access-Control-Allow-Headers: Content-Type\r\n"));
     assert!(!response.contains("Content-Length:"));

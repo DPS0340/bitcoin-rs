@@ -20,6 +20,7 @@ mod public;
 use crate::context::Context;
 use crate::handlers::Handler;
 use crate::rest::Response;
+use crate::rest::service_unavailable_owned;
 
 use self::projection::Projection;
 
@@ -41,11 +42,50 @@ pub fn route(handler: &Handler, surface: Surface, path: &str, query: &str) -> Re
     let ctx = handler.context();
     let projection = Projection::new(&ctx);
     let chain_view = projection.capture_chain_view();
+    let readiness =
+        match bitcoin_rs_index::txindex_snapshot(ctx.indexes.derived_index_status.as_deref()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return service_unavailable_owned(error.to_string()),
+        };
     let response = dispatch_get(handler, &ctx, surface, path, query);
-    match projection.ensure_chain_view(chain_view.as_ref()) {
-        Ok(()) => response,
-        Err(response) => response,
+    if let Err(response) = projection.ensure_chain_view(chain_view.as_ref()) {
+        return response;
     }
+    match bitcoin_rs_index::txindex_snapshot(ctx.indexes.derived_index_status.as_deref()) {
+        Ok(after) if after == readiness => readiness_headers(response, &readiness),
+        Ok(_) => service_unavailable_owned(
+            "capability status changed during Esplora response; retry".to_owned(),
+        ),
+        Err(error) => service_unavailable_owned(error.to_string()),
+    }
+}
+
+fn readiness_headers(
+    response: Response,
+    snapshot: &bitcoin_rs_index::CapabilitySnapshot,
+) -> Response {
+    let status = snapshot.capabilities.first();
+    let state = status.map_or("Disabled", |status| status.state.wire_name());
+    response
+        .with_header(
+            "X-Bitcoin-Rs-Chain-Epoch",
+            snapshot.revision.epoch.to_string(),
+        )
+        .with_header(
+            "X-Bitcoin-Rs-Chain-Sequence",
+            snapshot.revision.sequence.to_string(),
+        )
+        .with_header("X-Bitcoin-Rs-Tip-Height", snapshot.tip.height.to_string())
+        .with_header("X-Bitcoin-Rs-Tip-Hash", snapshot.tip.hash.clone())
+        .with_header(
+            "X-Bitcoin-Rs-Txindex-Compiled",
+            status.is_some_and(|status| status.compiled).to_string(),
+        )
+        .with_header(
+            "X-Bitcoin-Rs-Txindex-Enabled",
+            status.is_some_and(|status| status.enabled).to_string(),
+        )
+        .with_header("X-Bitcoin-Rs-Txindex-State", state)
 }
 
 fn dispatch_get(

@@ -766,8 +766,8 @@ fn stalled_response_respects_the_request_deadline() {
 // ---------------------------------------------------------------------------
 // #653 readiness scenarios: the txindex capability's readiness facts must be
 // one fact everywhere they render — the `getcapabilities` row, the
-// `getindexinfo` report Core parity checks, the Esplora tip, and the
-// Prometheus readiness gauge all read the same node-owned status snapshot.
+// `getindexinfo` report Core parity checks, Esplora headers, one Prometheus
+// scrape, and structured logs all carry the same node-owned revision and tip.
 // ---------------------------------------------------------------------------
 
 /// Regtest payout for single-node block production. No readiness scenario
@@ -835,7 +835,24 @@ fn readiness_outcome(row: &Value) -> String {
 fn wait_until_ready(node: &mut ProcessNode, deadline: Instant) -> Result<Vec<String>, Error> {
     let mut observed = Vec::new();
     loop {
-        let row = node.rpc("getcapabilities", &json!([]))?;
+        let row = match node.rpc("getcapabilities", &json!([])) {
+            Ok(row) => row,
+            Err(Error::Rpc { message, .. })
+                if message.contains("capability status changed during snapshot") =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(Error::Timeout {
+                        pid: node.pid(),
+                        operation: "readiness snapshot",
+                        evidence: node.evidence.clone(),
+                        detail: message,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let outcome = readiness_outcome(&row);
         if observed.last() != Some(&outcome) {
             observed.push(outcome.clone());
@@ -917,9 +934,8 @@ fn reserved_metrics_addr() -> SocketAddr {
     listener.local_addr().expect("reserved metrics address")
 }
 
-/// Scrapes the readiness gauge series from a node's metrics listener.
-fn scrape_readiness(addr: SocketAddr) -> Vec<(String, f64)> {
-    let prefix = "node_capability_txindex_readiness{";
+/// Scrapes one complete Prometheus response from a node's metrics listener.
+fn scrape_metrics(addr: SocketAddr) -> String {
     let mut last = None;
     for _ in 0..50 {
         if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
@@ -930,28 +946,83 @@ fn scrape_readiness(addr: SocketAddr) -> Vec<(String, f64)> {
             stream
                 .read_to_string(&mut body)
                 .expect("read metrics scrape");
-            return body
-                .lines()
-                .filter_map(|line| {
-                    let rest = line.strip_prefix(prefix)?;
-                    let (labels, value) = rest.split_once('}')?;
-                    let state = labels
-                        .split(',')
-                        .find_map(|pair| {
-                            pair.trim()
-                                .strip_prefix("state=\"")
-                                .and_then(|spelled| spelled.strip_suffix('"'))
-                        })?
-                        .to_owned();
-                    let value = value.trim().parse::<f64>().ok()?;
-                    Some((state, value))
-                })
-                .collect();
+            return body;
         }
         last = Some(());
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("metrics scrape failed after retries: {last:?}");
+}
+
+/// Extracts the readiness family from one scrape so every compared metric
+/// below belongs to the same immutable capability snapshot.
+fn readiness_samples(body: &str) -> Vec<(String, f64)> {
+    let prefix = "node_capability_txindex_readiness{";
+    body.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix(prefix)?;
+            let (labels, value) = rest.split_once('}')?;
+            let state = labels.split(',').find_map(|pair| {
+                pair.trim()
+                    .strip_prefix("state=\"")
+                    .and_then(|spelled| spelled.strip_suffix('"'))
+            })?;
+            let value = value.trim().parse::<f64>().ok()?;
+            Some((state.to_owned(), value))
+        })
+        .collect()
+}
+
+fn metric_u64(body: &str, name: &str, labels: &[(&str, &str)]) -> u64 {
+    let prefix = format!("{name}{{");
+    body.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix(&prefix)?;
+            let (rendered_labels, value) = rest.split_once('}')?;
+            if labels
+                .iter()
+                .all(|(name, value)| rendered_labels.contains(&format!("{name}=\"{value}\"")))
+            {
+                value.trim().parse::<u64>().ok()
+            } else {
+                None
+            }
+        })
+        .next()
+        .unwrap_or_else(|| panic!("missing {name} sample with {labels:?}: {body}"))
+}
+
+fn metrics_revision(body: &str) -> (u64, u64) {
+    let value = |field| {
+        let high = metric_u64(
+            body,
+            "node_capability_chain_revision",
+            &[("field", field), ("part", "high")],
+        );
+        let low = metric_u64(
+            body,
+            "node_capability_chain_revision",
+            &[("field", field), ("part", "low")],
+        );
+        (high << 32) | low
+    };
+    (value("epoch"), value("sequence"))
+}
+
+fn metrics_tip_hash(body: &str) -> String {
+    (0..8)
+        .map(|word| {
+            let word = word.to_string();
+            format!(
+                "{:08x}",
+                metric_u64(
+                    body,
+                    "node_capability_tip_hash_word",
+                    &[("word", word.as_str())],
+                )
+            )
+        })
+        .collect()
 }
 
 /// Exact one/zero gauge values: outcomes are set from `bool`, so exact bit
@@ -1004,14 +1075,14 @@ fn first_block_txid(process: &mut ProcessNode, height: u32) -> String {
         .to_owned()
 }
 
-/// Polls the scrape until exactly one outcome is active and it is
-/// `expected`: the sampled gauge converging on the RPC row.
-fn wait_gauge_active(addr: SocketAddr, expected: &str, deadline: Instant) -> Vec<(String, f64)> {
+/// Polls until one immutable scrape reports exactly the expected active state.
+fn wait_gauge_active(addr: SocketAddr, expected: &str, deadline: Instant) -> String {
     loop {
-        let samples = scrape_readiness(addr);
+        let body = scrape_metrics(addr);
+        let samples = readiness_samples(&body);
         let active: Vec<_> = samples.iter().filter(|(_, value)| is_one(*value)).collect();
         if active.len() == 1 && active.first().map(|(state, _)| state.as_str()) == Some(expected) {
-            return samples;
+            return body;
         }
         assert!(
             Instant::now() < deadline,
@@ -1021,8 +1092,41 @@ fn wait_gauge_active(addr: SocketAddr, expected: &str, deadline: Instant) -> Vec
     }
 }
 
-/// #653 startup: at one captured tip, the capability row, the Core-parity
-/// index report, the Esplora tip, and the Prometheus gauge all agree.
+fn wait_readiness_log(evidence: &Path, snapshot: &Value, deadline: Instant) {
+    let epoch = snapshot.pointer("/revision/epoch").and_then(Value::as_u64);
+    let sequence = snapshot
+        .pointer("/revision/sequence")
+        .and_then(Value::as_u64);
+    let height = snapshot.pointer("/tip/height").and_then(Value::as_u64);
+    let hash = snapshot.pointer("/tip/hash").and_then(Value::as_str);
+    let state = readiness_outcome(snapshot);
+    loop {
+        let stderr = std::fs::read_to_string(evidence.join("stderr.log")).unwrap_or_default();
+        let matched = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| {
+                let fields = &event["fields"];
+                fields["message"].as_str() == Some("capability readiness snapshot")
+                    && fields["capability"].as_str() == Some("txindex")
+                    && fields["state"].as_str() == Some(state.as_str())
+                    && fields["chain_epoch"].as_u64() == epoch
+                    && fields["chain_sequence"].as_u64() == sequence
+                    && fields["tip_height"].as_u64() == height
+                    && fields["tip_hash"].as_str() == hash
+            });
+        if matched {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "readiness log never rendered RPC snapshot {snapshot}: {stderr}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// #653 startup: at one captured tip, RPC, Esplora, metrics, and logs agree.
 #[test]
 fn startup_readiness_agrees_across_rpc_esplora_and_metrics() {
     let metrics_addr = reserved_metrics_addr();
@@ -1072,18 +1176,91 @@ fn startup_readiness_agrees_across_rpc_esplora_and_metrics() {
         "parity reply: {synced}"
     );
 
-    // Esplora renders the same tip the RPC reports.
+    let epoch = row
+        .pointer("/revision/epoch")
+        .and_then(Value::as_u64)
+        .expect("capability revision epoch");
+    let sequence = row
+        .pointer("/revision/sequence")
+        .and_then(Value::as_u64)
+        .expect("capability revision sequence");
+    let snapshot_height = row
+        .pointer("/tip/height")
+        .and_then(Value::as_u64)
+        .expect("capability tip height");
+    let snapshot_hash = row
+        .pointer("/tip/hash")
+        .and_then(Value::as_str)
+        .expect("capability tip hash");
+    let epoch_header = epoch.to_string();
+    let sequence_header = sequence.to_string();
+    let height_header = snapshot_height.to_string();
+
+    // Esplora renders the same tip and carries the exact owner revision and
+    // readiness token that RPC captured.
     let tip = node.rpc("getblockcount", &json!([])).expect("tip height");
     let esplora = node
-        .http_get_json("/api/blocks/tip/height")
+        .http_get("/api/blocks/tip/height")
         .expect("esplora tip height");
-    assert_eq!(tip, esplora, "RPC and Esplora must agree on the tip");
+    assert_eq!(esplora.status, 200);
+    let esplora_height = esplora
+        .text()
+        .expect("text height")
+        .parse::<u64>()
+        .expect("numeric height");
+    assert_eq!(
+        tip,
+        json!(esplora_height),
+        "RPC and Esplora must agree on the tip"
+    );
+    assert_eq!(
+        esplora.header("X-Bitcoin-Rs-Chain-Epoch"),
+        Some(epoch_header.as_str())
+    );
+    assert_eq!(
+        esplora.header("X-Bitcoin-Rs-Chain-Sequence"),
+        Some(sequence_header.as_str())
+    );
+    assert_eq!(
+        esplora.header("X-Bitcoin-Rs-Tip-Height"),
+        Some(height_header.as_str())
+    );
+    assert_eq!(esplora.header("X-Bitcoin-Rs-Tip-Hash"), Some(snapshot_hash));
+    assert_eq!(
+        esplora.header("X-Bitcoin-Rs-Txindex-Compiled"),
+        Some("true")
+    );
+    assert_eq!(esplora.header("X-Bitcoin-Rs-Txindex-Enabled"), Some("true"));
+    assert_eq!(esplora.header("X-Bitcoin-Rs-Txindex-State"), Some("Ready"));
 
-    // The readiness gauge is that same fact in Prometheus form. The gauge
-    // is a sampled view, so require convergence with the RPC outcome within
-    // the deadline, then assert the full one-active rendering.
-    let samples = wait_gauge_active(metrics_addr, "Ready", deadline);
+    // One scrape carries readiness, revision, and tip from one immutable
+    // snapshot; no convergence between independently published gauges is
+    // accepted as evidence.
+    let metrics = wait_gauge_active(metrics_addr, "Ready", deadline);
+    let samples = readiness_samples(&metrics);
     assert_one_active(&samples, "Ready");
+    assert_eq!(
+        metric_u64(&metrics, "node_capability_snapshot_available", &[]),
+        1
+    );
+    assert_eq!(
+        metric_u64(&metrics, "node_capability_txindex_compiled", &[]),
+        1
+    );
+    assert_eq!(
+        metric_u64(&metrics, "node_capability_txindex_enabled", &[]),
+        1
+    );
+    assert_eq!(metrics_revision(&metrics), (epoch, sequence));
+    assert_eq!(
+        metric_u64(&metrics, "node_capability_tip_height", &[]),
+        snapshot_height
+    );
+    assert_eq!(metrics_tip_hash(&metrics), snapshot_hash);
+
+    // The structured transition log carries the same owner revision, tip,
+    // and readiness token, so operators can join it to either public view.
+    wait_readiness_log(&node.evidence, &row, deadline);
 
     core.stop().expect("core stop");
     node.stop().expect("node stop");

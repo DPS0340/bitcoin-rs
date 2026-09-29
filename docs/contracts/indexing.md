@@ -1,13 +1,14 @@
 # Indexing contract
 
-**Contract version: 1.1** (2025-02-14)
+**Contract version: 1.2** (2026-09-29)
 
 The normative contract for node-owned indexing runtimes, capability gating, and
 asynchronous reconciliation across restarts, reorganizations, and selective
 rebuilds.
 
-This version adds the scheduling requirements in `IDX-08`; changes to those
-requirements must update this clause and its executable proof together.
+This version adds the cross-surface capability snapshot requirements in
+`IDX-02`; changes to those requirements must update that clause and its
+executable proof together.
 
 Owners:
 - `DerivedIndexRuntime` and worker state in `crates/index/src/runtime.rs`;
@@ -77,6 +78,23 @@ only scheduling mechanics.
   `enabled: false` / `Disabled`; an attached worker supplies the row through
   `DerivedIndexCapabilitySource`. Proof: `crates/index/src/capabilities.rs` tests
   `missing_source_is_the_disabled_txindex_row`, `attached_source_is_the_worker_row`.
+- A capability snapshot also carries the chain event publisher's authoritative
+  `revision { epoch, sequence }` and its paired `tip { height, hash }`. The
+  index wake counter is not a public revision and no surface owns a parallel
+  clock. Snapshot assembly brackets lifecycle, phase, failure, watermark, and
+  owner-cursor reads; a move during assembly produces a typed retry instead of
+  guessed status.
+- JSON-RPC serializes that complete snapshot. A read-only Esplora response is
+  returned only when its chain view and before/after capability snapshots are
+  unchanged, and carries the revision, tip, and txindex state in
+  `X-Bitcoin-Rs-*` headers. Metrics render compiled/enabled facts, all
+  readiness labels, and the same revision and tip from one source snapshot
+  per scrape; 64-bit revisions are split into exact 32-bit halves and the hash
+  into eight fixed-label words.
+  Structured readiness logs carry the same fields and are emitted from the
+  event loop's existing elapsed-time tick. Snapshot capture failure is exposed
+  as RPC/Esplora unavailability or `node_capability_snapshot_available 0`, not
+  as stale facts.
 
 `ScriptLive` is not a duplicate coin table. Its empty-valued key is
 `script-hash-prefix || full-outpoint`; the prefix is only a scan accelerator.
@@ -248,6 +266,10 @@ remove another script's output.
 - `crates/index/src/capabilities.rs` tests `missing_source_is_the_disabled_txindex_row`,
   `attached_source_is_the_worker_row`: `getcapabilities` advertises one
   txindex row from `derived_index_status` (`IDX-02`).
+- `bin/bitcoin-rs/tests/overhaul_process_harness.rs`
+  `startup_readiness_agrees_across_rpc_esplora_and_metrics` joins RPC, Esplora,
+  one Prometheus scrape, and a structured log record by exact owner revision,
+  tip, and readiness token (`IDX-02`).
 
 ### Query-budget regression evidence
 

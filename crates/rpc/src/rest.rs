@@ -61,8 +61,19 @@ pub struct Response {
     pub reason: &'static str,
     /// MIME type.
     pub content_type: &'static str,
+    /// Additional response headers owned by the route.
+    pub headers: Vec<(&'static str, String)>,
     /// Response body.
     pub body: Vec<u8>,
+}
+
+impl Response {
+    /// Adds one route-owned response header.
+    #[must_use]
+    pub(crate) fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -933,6 +944,7 @@ pub(crate) fn json_response(result: Result<Value, RpcError>) -> Response {
                 status: 500,
                 reason: "Internal Server Error",
                 content_type: "text/plain",
+                headers: Vec::new(),
                 body: error.to_string().into_bytes(),
             },
         },
@@ -944,6 +956,7 @@ pub(crate) fn text_response(content_type: &'static str, body: Vec<u8>) -> Respon
         status: 200,
         reason: "OK",
         content_type,
+        headers: Vec::new(),
         body,
     }
 }
@@ -957,6 +970,7 @@ pub(crate) fn service_unavailable(message: &'static str) -> Response {
         status: 503,
         reason: "Service Unavailable",
         content_type: "text/plain",
+        headers: Vec::new(),
         body: message.as_bytes().to_vec(),
     }
 }
@@ -967,6 +981,7 @@ pub(crate) fn service_unavailable_owned(message: String) -> Response {
         status: 503,
         reason: "Service Unavailable",
         content_type: "text/plain",
+        headers: Vec::new(),
         body: message.into_bytes(),
     }
 }
@@ -976,6 +991,7 @@ pub(crate) fn internal_error(message: &'static str) -> Response {
         status: 500,
         reason: "Internal Server Error",
         content_type: "text/plain",
+        headers: Vec::new(),
         body: message.as_bytes().to_vec(),
     }
 }
@@ -986,6 +1002,7 @@ pub(crate) fn internal_error_owned(message: String) -> Response {
         status: 500,
         reason: "Internal Server Error",
         content_type: "text/plain",
+        headers: Vec::new(),
         body: message.into_bytes(),
     }
 }
@@ -994,6 +1011,7 @@ pub(crate) fn bad_request(message: &'static str) -> Response {
         status: 400,
         reason: "Bad Request",
         content_type: "text/plain",
+        headers: Vec::new(),
         body: message.as_bytes().to_vec(),
     }
 }
@@ -1003,6 +1021,7 @@ pub(crate) fn bad_request_owned(message: String) -> Response {
         status: 400,
         reason: "Bad Request",
         content_type: "text/plain",
+        headers: Vec::new(),
         body: message.into_bytes(),
     }
 }
@@ -1020,6 +1039,7 @@ pub(crate) fn not_found_owned(message: String) -> Response {
         status: 404,
         reason: "Not Found",
         content_type: "text/plain",
+        headers: Vec::new(),
         body: message.into_bytes(),
     }
 }

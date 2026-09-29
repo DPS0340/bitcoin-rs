@@ -21,6 +21,7 @@ pub struct EventLoop {
     sync_tick: Receiver<Instant>,
     sync_wake: Receiver<()>,
     sync: Arc<crate::BlockSync>,
+    readiness: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource>,
 }
 
 impl EventLoop {
@@ -37,12 +38,14 @@ impl EventLoop {
         shutdown_signal: Receiver<()>,
         sync: Arc<crate::BlockSync>,
         sync_wake: Receiver<()>,
+        readiness: Arc<dyn bitcoin_rs_index::DerivedIndexCapabilitySource>,
     ) -> Self {
         Self {
             shutdown_signal,
             sync_tick: tick(SYNC_TICK),
             sync_wake,
             sync,
+            readiness,
         }
     }
 
@@ -51,6 +54,7 @@ impl EventLoop {
         let mut iterations: u64 = 0;
         let mut sync_ticks: u64 = 0;
         let mut last_progress = Instant::now();
+        let mut last_readiness = None;
         while !shutdown.load(Ordering::Acquire) {
             iterations += 1;
             if iterations.is_multiple_of(STATS_INTERVAL) {
@@ -66,6 +70,7 @@ impl EventLoop {
                     if ticked.is_ok() {
                         sync_ticks += 1;
                         self.on_sync_tick();
+                        self.emit_readiness(&mut last_readiness);
                     }
                 }
                 recv(self.sync_wake) -> woke => {
@@ -90,6 +95,31 @@ impl EventLoop {
         metrics::counter!("node.event_loop.sync_ticks").increment(1);
         self.sync.tick();
         metrics::histogram!("node.event_loop.tick_seconds").record(started.elapsed().as_secs_f64());
+    }
+
+    fn emit_readiness(&self, last: &mut Option<bitcoin_rs_index::CapabilitySnapshot>) {
+        let Ok(snapshot) = self.readiness.snapshot() else {
+            tracing::debug!("capability snapshot changed before readiness log emission");
+            return;
+        };
+        if last.as_ref() == Some(&snapshot) {
+            return;
+        }
+        let Some(status) = snapshot.capabilities.first() else {
+            return;
+        };
+        tracing::info!(
+            capability = %status.id,
+            compiled = status.compiled,
+            enabled = status.enabled,
+            state = status.state.wire_name(),
+            chain_epoch = snapshot.revision.epoch,
+            chain_sequence = snapshot.revision.sequence,
+            tip_height = snapshot.tip.height,
+            tip_hash = %snapshot.tip.hash,
+            "capability readiness snapshot"
+        );
+        *last = Some(snapshot);
     }
 }
 

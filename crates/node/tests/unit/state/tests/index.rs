@@ -123,10 +123,22 @@ fn derived_index_status_answers_when_disabled() -> anyhow::Result<()> {
     let state = NodeState::open(config, None)?;
 
     let status = state.derived_index_status();
+    let capability_snapshot = status.snapshot()?;
     assert_eq!(
-        status.capability().state,
+        capability_snapshot.capabilities[0].state,
         CapabilityState::Disabled,
         "a disabled config must answer a concrete Disabled row"
+    );
+    let chain_snapshot = state.chainstate().chain_snapshot();
+    assert_eq!(capability_snapshot.revision.epoch, chain_snapshot.epoch);
+    assert_eq!(
+        capability_snapshot.revision.sequence,
+        chain_snapshot.sequence
+    );
+    assert_eq!(capability_snapshot.tip.height, chain_snapshot.tip_height);
+    assert_eq!(
+        capability_snapshot.tip.hash,
+        chain_snapshot.tip_hash.to_string()
     );
     Ok(())
 }

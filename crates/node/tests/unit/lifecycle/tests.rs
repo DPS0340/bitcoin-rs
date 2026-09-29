@@ -321,10 +321,16 @@ fn explicit_shutdown_joins_index_worker_before_clean_checkpoint() -> anyhow::Res
     // Wait until the worker's store is open (the lifecycle leaves Opening),
     // so shutdown exercises the live-worker join, not an open race.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while matches!(
-        node.state.derived_index_status().capability().state,
-        bitcoin_rs_index::CapabilityState::Opening
-    ) {
+    let status = node.state.derived_index_status();
+    loop {
+        if status.snapshot().is_ok_and(|snapshot| {
+            !matches!(
+                snapshot.capabilities[0].state,
+                bitcoin_rs_index::CapabilityState::Opening
+            )
+        }) {
+            break;
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "txindex lifecycle remained Opening"

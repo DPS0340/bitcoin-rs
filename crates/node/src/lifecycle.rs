@@ -199,8 +199,6 @@ pub(crate) struct NodeServices {
     /// before the final clean checkpoint publication.
     maintenance_worker: Option<std::thread::JoinHandle<()>>,
     tx_ingress: Option<std::thread::JoinHandle<()>>,
-    /// Publishes the capability readiness gauge until shutdown.
-    readiness_sampler: Option<std::thread::JoinHandle<()>>,
     tx_relay: Option<std::thread::JoinHandle<()>>,
     signal_handler: Option<crate::signal::ShutdownHandler>,
     teardown_started: bool,
@@ -283,13 +281,6 @@ impl NodeServices {
             }
         }
         self.metrics.take();
-        if let Some(handle) = self.readiness_sampler.take() {
-            // Readiness sampler thread panic.
-            if handle.join().is_err() {
-                tracing::error!("readiness sampler panicked");
-                set_first_error(first_error, anyhow::anyhow!("readiness sampler panicked"));
-            }
-        }
         if let Some(state) = state {
             // P2P core worker join failure.
             if let Err(error) = state.p2p().join_core_workers() {
@@ -475,22 +466,15 @@ pub(crate) fn start_node(
     tracing::info!(config = ?state.config(), "bitcoin-rs node booting");
     guard.services.metrics = if let Some(bind) = state.config().observability.metrics_bind {
         let identity = crate::metrics::EvidenceIdentity::of_process(state.config())?;
-        crate::metrics::start_metrics(Some(bind), state.shutdown(), &identity)?
-    } else {
-        None
-    };
-    // The sampler only publishes to the metrics recorder: without a bound
-    // server its writes go nowhere, so do not spend the thread (and its
-    // join latency in every start_node test) when metrics are off.
-    guard.services.readiness_sampler = if guard.services.metrics.is_some() {
-        Some(crate::metrics::spawn_readiness_sampler(
-            state.derived_index_status(),
+        crate::metrics::start_metrics(
+            Some(bind),
             state.shutdown(),
-        )?)
+            &identity,
+            state.derived_index_status(),
+        )?
     } else {
         None
     };
-
     let shutdown = state.shutdown();
     let (shutdown_rx, event_loop_signal) = if let Some(rx) = injected_shutdown {
         (rx, None)
@@ -518,7 +502,12 @@ pub(crate) fn start_node(
     let (sync_wake_tx, sync_wake_rx) = bounded(1);
     let sync = state.sync();
     let peer_ready_sync = Arc::clone(&sync);
-    let loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
+    let loop_handle = EventLoop::with_sync_wake(
+        shutdown_rx,
+        sync,
+        sync_wake_rx,
+        state.derived_index_status(),
+    );
     let coordinator = Arc::new(crate::MiningCoordinator::new(
         state.mempool(),
         Arc::clone(&chainstate),

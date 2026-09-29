@@ -21,6 +21,7 @@ use super::TxIndexSpawn;
 /// a concrete `Disabled` row in every phase.
 pub(crate) struct DerivedIndexHost {
     status: Arc<bitcoin_rs_index::runtime::DerivedIndexCapability>,
+    chain: Arc<dyn bitcoin_rs_index::reconcile::ChainCursorSource>,
     enabled: Option<EnabledDerivedIndex>,
     /// Workers this host has spawned; the idempotence contract needs a
     /// measure that distinguishes one worker from two.
@@ -68,6 +69,7 @@ impl DerivedIndexHost {
     pub(crate) fn from_parts(
         enabled: Option<DerivedIndexParts>,
         status: Arc<bitcoin_rs_index::runtime::DerivedIndexCapability>,
+        chain: Arc<dyn bitcoin_rs_index::reconcile::ChainCursorSource>,
     ) -> Self {
         let enabled = enabled.map(|(runtime, spawn, lifecycle, adapter)| EnabledDerivedIndex {
             runtime,
@@ -77,6 +79,7 @@ impl DerivedIndexHost {
         });
         Self {
             status,
+            chain,
             enabled,
             #[cfg(test)]
             spawned_workers: 0,
@@ -120,9 +123,7 @@ impl DerivedIndexHost {
             history,
             spawn.block_source,
             Some(spawn.body_source),
-            Arc::new(super::IndexChainCursorSource(
-                chainstate.chain_events_handle(),
-            )),
+            Arc::clone(&self.chain),
             spawn.recovery_reporter,
             chainstate.shutdown_handle(),
             spawn.wake_rx,

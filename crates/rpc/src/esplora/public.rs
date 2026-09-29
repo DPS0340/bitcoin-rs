@@ -184,6 +184,7 @@ fn tx_raw(ctx: &Context, id: &str) -> Response {
             status: 200,
             reason: "OK",
             content_type: "application/octet-stream",
+            headers: Vec::new(),
             body: consensus_bytes(&tx),
         },
     )
@@ -415,6 +416,7 @@ fn block_raw(ctx: &Context, text_hash: &str) -> Response {
         status: 200,
         reason: "OK",
         content_type: "application/octet-stream",
+        headers: Vec::new(),
         body: bytes,
     }
 }

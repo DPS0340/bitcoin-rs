@@ -22,7 +22,16 @@ const PUBLIC_ESPLORA_METHODS: &[&str] = &["GET", "POST", "OPTIONS"];
 
 const PUBLIC_ESPLORA_HEADERS: &[&str] = &["Content-Type"];
 
-const PUBLIC_ESPLORA_EXPOSE_HEADERS: &[&str] = &["X-Total-Results"];
+const PUBLIC_ESPLORA_EXPOSE_HEADERS: &[&str] = &[
+    "X-Total-Results",
+    "X-Bitcoin-Rs-Chain-Epoch",
+    "X-Bitcoin-Rs-Chain-Sequence",
+    "X-Bitcoin-Rs-Tip-Height",
+    "X-Bitcoin-Rs-Tip-Hash",
+    "X-Bitcoin-Rs-Txindex-Compiled",
+    "X-Bitcoin-Rs-Txindex-Enabled",
+    "X-Bitcoin-Rs-Txindex-State",
+];
 
 /// Synchronous HTTP/1.1 JSON-RPC server.
 pub struct RpcServer {
@@ -205,6 +214,7 @@ fn dispatch_http_request(
                 status: 204,
                 reason: "No Content",
                 content_type: "text/plain",
+                headers: Vec::new(),
                 body: Vec::new(),
             };
             write_response(stream, &response, keep_alive, surface.cors_policy())?;
@@ -572,6 +582,7 @@ fn write_status(
         status,
         reason,
         content_type: "application/json",
+        additional_headers: &[],
         content_length: body.len(),
         keep_alive,
         cors_policy: CorsPolicy::Disabled,
@@ -685,6 +696,7 @@ fn write_not_found(stream: &mut TcpStream, keep_alive: bool) -> io::Result<()> {
             status: 404,
             reason: "Not Found",
             content_type: "text/plain",
+            headers: Vec::new(),
             body: b"not found".to_vec(),
         },
         keep_alive,
@@ -702,6 +714,7 @@ fn write_response(
         status: response.status,
         reason: response.reason,
         content_type: response.content_type,
+        additional_headers: &response.headers,
         content_length: response.body.len(),
         keep_alive,
         cors_policy,
@@ -748,6 +761,12 @@ fn render_response_head(head: &ResponseHead<'_>) -> String {
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
         head.status, head.reason, head.content_type
     );
+    for (name, value) in head.additional_headers {
+        header.push_str(name);
+        header.push_str(": ");
+        header.push_str(value);
+        header.push_str("\r\n");
+    }
     if let CorsPolicy::Public {
         methods,
         headers,
@@ -776,6 +795,7 @@ struct ResponseHead<'a> {
     status: u16,
     reason: &'a str,
     content_type: &'a str,
+    additional_headers: &'a [(&'static str, String)],
     content_length: usize,
     keep_alive: bool,
     cors_policy: CorsPolicy,

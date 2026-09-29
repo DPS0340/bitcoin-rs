@@ -76,9 +76,9 @@ impl Node {
     }
 
     /// Returns the live txindex capability report.
-    #[must_use]
-    pub fn capabilities(&self) -> CapabilitySnapshot {
+    pub fn capabilities(&self) -> Result<CapabilitySnapshot, NodeError> {
         bitcoin_rs_index::txindex_snapshot(Some(self.state.derived_index_status().as_ref()))
+            .map_err(|error| NodeError::Unavailable(error.to_string()))
     }
 
     /// Returns typed synchronization progress without touching RPC JSON.

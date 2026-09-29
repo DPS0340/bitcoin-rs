@@ -137,6 +137,12 @@ impl DerivedIndexRuntime {
         **self.phase.load()
     }
 
+    /// Loads the immutable phase publication so snapshot assembly can reject
+    /// an away-and-back transition by allocation identity, not only value.
+    pub(super) fn phase_snapshot(&self) -> Arc<ReconcilePhase> {
+        self.phase.load_full()
+    }
+
     /// Called immediately after a committed `applied_tip.store`.
     ///
     /// Increments the revision with `Release` ordering and `try_send`s one

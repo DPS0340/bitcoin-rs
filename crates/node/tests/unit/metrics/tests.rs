@@ -11,13 +11,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bitcoin_rs_index::{
-    CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource, derived_index_status,
+    CapabilityRevision, CapabilitySnapshot, CapabilitySnapshotError, CapabilityState,
+    CapabilityTip, DerivedIndexCapabilitySource, derived_index_status,
 };
 use parking_lot::{Mutex, const_mutex};
 
 use super::{
     EvidenceIdentity, MetricsServer, PROMETHEUS_HANDLE, Sha256Hex, TXINDEX_READINESS_GAUGE,
-    publish_txindex_readiness, start_metrics,
+    start_metrics,
 };
 
 pub(super) static SERVER_TEST_LOCK: Mutex<()> = const_mutex(());
@@ -81,7 +82,12 @@ fn occupied_address_bind_errors_and_in_process_retry_succeeds() {
         .unwrap_or_else(|error| panic!("occupied local addr: {error}"));
     let installed_before = PROMETHEUS_HANDLE.lock().is_some();
 
-    let first = start_metrics(Some(addr), Arc::clone(&shutdown), &identity());
+    let first = start_metrics(
+        Some(addr),
+        Arc::clone(&shutdown),
+        &identity(),
+        Arc::new(FixedSource::enabled(CapabilityState::Ready)),
+    );
     assert!(first.is_err(), "occupied bind must fail");
     assert_eq!(
         PROMETHEUS_HANDLE.lock().is_some(),
@@ -90,9 +96,14 @@ fn occupied_address_bind_errors_and_in_process_retry_succeeds() {
     );
 
     drop(occupied);
-    let mut server = start_metrics(Some(unused_ephemeral()), shutdown, &identity())
-        .unwrap_or_else(|error| panic!("retry after occupied bind: {error}"))
-        .unwrap_or_else(|| panic!("metrics server"));
+    let mut server = start_metrics(
+        Some(unused_ephemeral()),
+        shutdown,
+        &identity(),
+        Arc::new(FixedSource::enabled(CapabilityState::Ready)),
+    )
+    .unwrap_or_else(|error| panic!("retry after occupied bind: {error}"))
+    .unwrap_or_else(|| panic!("metrics server"));
     metrics::counter!("node_metrics_retry_probe").increment(1);
     let (status, body) = scrape(server.local_addr());
     assert_eq!(status, 200);
@@ -183,22 +194,35 @@ fn is_zero(value: f64) -> bool {
 }
 
 struct FixedSource {
-    enabled: bool,
-    state: CapabilityState,
+    snapshot: Mutex<CapabilitySnapshot>,
 }
 
 impl FixedSource {
     fn enabled(state: CapabilityState) -> Self {
         Self {
-            enabled: true,
-            state,
+            snapshot: Mutex::new(CapabilitySnapshot {
+                revision: CapabilityRevision {
+                    epoch: 7,
+                    sequence: 19,
+                },
+                tip: CapabilityTip {
+                    height: 101,
+                    hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                },
+                capabilities: vec![derived_index_status(true, state)],
+            }),
         }
+    }
+
+    fn set(&self, enabled: bool, state: CapabilityState) {
+        self.snapshot.lock().capabilities = vec![derived_index_status(enabled, state)];
     }
 }
 
 impl DerivedIndexCapabilitySource for FixedSource {
-    fn capability(&self) -> CapabilityStatus {
-        derived_index_status(self.enabled, self.state.clone())
+    fn snapshot(&self) -> Result<CapabilitySnapshot, CapabilitySnapshotError> {
+        Ok(self.snapshot.lock().clone())
     }
 }
 
@@ -246,19 +270,37 @@ fn assert_one_active(samples: &[RenderedSample], expected: &str) {
 fn published_gauge_flips_its_active_label_with_the_rpc_source() {
     let _guard = SERVER_TEST_LOCK.lock();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let mut server = MetricsServer::bind(unused_ephemeral(), Arc::clone(&shutdown), &identity())
-        .unwrap_or_else(|error| panic!("bind metrics: {error}"));
+    let source = Arc::new(FixedSource::enabled(CapabilityState::Ready));
+    let readiness: Arc<dyn DerivedIndexCapabilitySource> = source.clone();
+    let mut server = MetricsServer::bind_with_source(
+        unused_ephemeral(),
+        Arc::clone(&shutdown),
+        &identity(),
+        Some(readiness),
+    )
+    .unwrap_or_else(|error| panic!("bind metrics: {error}"));
 
-    publish_txindex_readiness(&FixedSource::enabled(CapabilityState::Ready));
-    let samples = readiness_samples(&scrape_body(server.local_addr()));
+    let body = scrape_body(server.local_addr());
+    let samples = readiness_samples(&body);
     assert_one_active(&samples, "Ready");
+    assert!(body.contains("node_capability_snapshot_available{"));
+    assert!(body.contains("node_capability_txindex_compiled{"));
+    assert!(body.contains("node_capability_txindex_enabled{"));
+    assert!(body.contains("field=\"epoch\",part=\"low\"} 7"));
+    assert!(body.contains("field=\"sequence\",part=\"low\"} 19"));
+    assert!(body.contains("node_capability_tip_height{"));
+    assert!(body.contains("} 101\n"));
+    assert!(body.contains("word=\"0\"} 19088743"));
 
     // A transition must retire the previous active label in the same pass:
     // a scrape after the move never reports two live outcomes.
-    publish_txindex_readiness(&FixedSource::enabled(CapabilityState::Rebuilding {
-        processed_height: 40,
-        target_height: 101,
-    }));
+    source.set(
+        true,
+        CapabilityState::Rebuilding {
+            processed_height: 40,
+            target_height: 101,
+        },
+    );
     let samples = readiness_samples(&scrape_body(server.local_addr()));
     assert_one_active(&samples, "Rebuilding");
     assert!(
@@ -270,10 +312,7 @@ fn published_gauge_flips_its_active_label_with_the_rpc_source() {
 
     // The disabled outcome is a distinct documented state, not the absence
     // of a row: the source reports enabled:false with its own label.
-    publish_txindex_readiness(&FixedSource {
-        enabled: false,
-        state: CapabilityState::Disabled,
-    });
+    source.set(false, CapabilityState::Disabled);
     let samples = readiness_samples(&scrape_body(server.local_addr()));
     assert_one_active(&samples, "Disabled");
 

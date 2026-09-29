@@ -429,6 +429,7 @@ impl DerivedIndexQueryEngine {
             synced,
             processed_height: best_block_height,
             target_height: tip_before.height,
+            target_hash: tip_before.hash,
         })
     }
 }
@@ -439,6 +440,7 @@ pub(crate) struct IndexProgress {
     pub synced: bool,
     pub processed_height: u32,
     pub target_height: u32,
+    pub target_hash: Hash256,
 }
 
 impl DerivedIndexQuery for DerivedIndexQueryEngine {

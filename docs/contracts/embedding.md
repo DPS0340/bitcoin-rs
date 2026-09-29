@@ -39,10 +39,12 @@ the first embedder — there is one lifecycle implementation, not two.
   coherent `ChainSnapshot`; `sync_progress()` derives the
   `getblockchaininfo` fields from the same handles without RPC JSON. The
   calculation is `ChainHandles::sync_progress` in `crates/rpc/src/context.rs`, the
-  identical computation `getblockchaininfo` runs. `capabilities()` returns
-  the node's concrete-service `CapabilitySnapshot`. Owners:
+  identical computation `getblockchaininfo` runs. `capabilities()` returns a
+  `Result` containing the same revision-stamped, concrete-service
+  `CapabilitySnapshot` used by `getcapabilities`; a concurrent publication
+  move is `NodeError::Unavailable`, never a guessed snapshot. Owners:
   `crates/node/src/embed.rs` and `crates/rpc/src/context.rs`; wire types:
-  `crates/rpc/src/capabilities.rs`.
+  `crates/index/src/capabilities.rs`.
 - **EMB-05 — Broadcast is the shared admission.** `Node::broadcast` runs
   `Context::admit_transaction` (`crates/rpc/src/context.rs`) — the identical
   typed admission `sendrawtransaction` runs (`crates/rpc/src/handlers/tx.rs`):
