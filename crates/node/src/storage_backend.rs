@@ -128,9 +128,9 @@ fn unsupported(namespace: &str, backend: StorageBackend) -> StorageError {
 mod tests {
     const RUNTIME_CONSUMERS: &[(&str, &str)] = &[
         ("state.rs", include_str!("state.rs")),
-        ("state_open.rs", include_str!("state_open.rs")),
-        ("state_prune.rs", include_str!("state_prune.rs")),
-        ("state_storage.rs", include_str!("state_storage.rs")),
+        ("state/open.rs", include_str!("state/open.rs")),
+        ("state/prune.rs", include_str!("state/prune.rs")),
+        ("state/storage.rs", include_str!("state/storage.rs")),
         ("storage_footprint.rs", include_str!("storage_footprint.rs")),
         (
             "chainstate/lib.rs",
