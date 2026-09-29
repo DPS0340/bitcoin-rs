@@ -132,7 +132,7 @@ below):
 | `node.durable_head.group_blocks` | `"durable_head: group commit"` field `blocks` |
 | `node.window.checks_seconds` | `tracing::debug!("prove_window: profile")` field `checks_us` |
 | `node.utxo.listener.event_batches_seconds` | `tracing::debug!("utxo listener: event batches")` field `listener_us` |
-| `mempool_observer_leg_failed_total{leg}` | aggregate `node.mempool.observer_failures_total`; leg identity remains on `tracing::warn!("mempool observer leg panicked")` |
+| `mempool_observer_leg_failed_total{leg}` | aggregate `node.mempool.observer_failures_total`; leg identity remains on `tracing::warn!(leg = *name, "mempool observer leg panicked; later legs continue")` |
 | `node.sync.frontier_rewinds` | `tracing::debug!("block sync: rewound unowned request frontier")` |
 | `node.sync.prefix_probe_wins` | `tracing::info!("block sync: prefix probe elected winner")` |
 | `node.sync.cold_front_wins` | `tracing::info!("block sync: cold-front hedge elected alternate")` |
@@ -142,6 +142,16 @@ below):
 | `node.sync.prefix_probe_peers` | `tracing::info!("block sync: started common-prefix peer probe")` field `alternates` |
 | `node.sync.cold_front_hedges` | `tracing::info!("block sync: hedged cold-start stalled front")` |
 | Prometheus global labels `binary_sha256`, `version`, `config_sha256`, `backend`, `durability`, `hardware`, `corpus_id`, `corpus_manifest_sha256` | removed from operator scrapes; `EvidenceIdentity` remains attached to benchmark ledger samples under HPA-12 |
+
+Retired validation-stage timers emit `apply_block: profile` events as each
+stage completes, before its error is propagated. They include `height` and
+`block_hash`, cover proposals as well as commits, and contain only the fields
+for the completed stage; unvisited stages have no event. The later commit
+summary retains the operational/ledger stage durations. The migrated validation
+and prevout-resolution clocks start only when DEBUG tracing is enabled; no
+retired metric is restored. `script_verify: profile` emits `script_resolution_us`
+before propagating a resolution error, then emits preparation/parallel timings
+if verification runs. Consumers must not require every field on a single event.
 
 ### Call-site audit
 
@@ -292,8 +302,18 @@ fields stay in tracing, where they can change with the implementation.
 - The metrics module docs (`crates/node/src/metrics.rs`) restate this boundary
   where a new call site is written.
 - `scrape_returns_operator_metrics_without_evidence_identity_labels` exercises
-  the rendered Prometheus boundary; evidence identity remains in benchmark
-  ledger records, not operator time-series labels.
+  the rendered Prometheus boundary using a corpus-bearing process identity and
+  scans every sample, including the real txindex readiness gauge; evidence
+  identity remains in benchmark ledger records, not operator time-series labels.
+- The chainstate observability fixtures check retired metric names only on the
+  caller thread with coinbase-only apply/window fixtures. The window verify
+  histogram is emitted after the parallel verifier joins; the local recorder
+  does not cover arbitrary Rayon-worker emissions or script sub-stage metrics.
+- Real tracing-subscriber regressions cover proposal completion, contextual
+  header rejection, and a missing-prevout script rejection. The last exercises
+  successful prevout resolution followed by verification failure, not resolution
+  failure: the resolver's fallible overlay insertion currently rejects only a
+  vout index exceeding `u32`, which is not a practical valid-block fixture.
 - `composite_isolates_a_panicking_leg` exercises the real observer failure
   path and requires the operator counter to have no leg label.
 - Review enforcement: a new `metrics::` call site must cite an OBS clause in

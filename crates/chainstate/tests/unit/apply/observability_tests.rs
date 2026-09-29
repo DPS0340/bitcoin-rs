@@ -1,13 +1,10 @@
-//! The observability boundary is exercised, not just documented: retired
-//! per-event stage timers must never reach the metrics API again
-//! (`docs/observability.md`, OBS-02/OBS-06).
+//! Caller-thread observability at the apply/window boundaries (OBS-02/OBS-06).
 //!
-//! PRE: a regtest chainstate with the in-memory test stores and the
-//! test-seam apply/window entry points.
-//! POST: one single-block apply and one grouped window drain run under a
-//! recording `metrics::Recorder`; the retired names that those paths formerly
-//! emitted are absent, while kept operator signals and hot-path ledger hooks
-//! are present.
+//! The coinbase-only fixtures exercise stage timers, group publication, and
+//! window verification accounting on the caller thread. `with_local_recorder`
+//! does not observe Rayon workers: these assertions do not cover arbitrary
+//! worker emissions, spending transactions, or script-resolution sub-stages.
+//! The kept window histogram is recorded after the parallel verifier returns.
 
 use std::sync::Arc;
 
@@ -22,7 +19,7 @@ use parking_lot::Mutex;
 
 use super::persistence_tests::{handles, mined_child, seed_genesis};
 
-/// Names the single-block fixture emitted before the #1195 boundary.
+/// Retired names exercised by the coinbase-only single-block fixture.
 const RETIRED_APPLY_METRICS: &[&str] = &[
     "node.apply_block.contextual_header_seconds",
     "node.apply_block.pow_self_consistency_seconds",
@@ -32,9 +29,6 @@ const RETIRED_APPLY_METRICS: &[&str] = &[
     "node.apply_block.durable_sync_seconds",
     "node.apply_block.durable_commit_seconds",
     "node.apply_block.script_verify_coinbase_only_seconds",
-    "node.apply_block.script_resolution_seconds",
-    "node.apply_block.script_prepare_seconds",
-    "node.apply_block.script_parallel_seconds",
     "node.utxo.listener.event_batches_seconds",
 ];
 
@@ -133,10 +127,9 @@ fn assert_names_absent(recorder: &NameRecorder, names: &[&str]) {
     }
 }
 
-/// A one-block apply runs under the recorder: retired per-block timers stay
-/// off the metrics API while the operator totals stay on it.
+/// Coinbase-only apply keeps caller-thread diagnostics off the metrics API.
 #[test]
-fn retired_apply_stage_timings_never_reach_the_metrics_api()
+fn retired_apply_stage_timings_stay_off_caller_thread_metrics()
 -> Result<(), Box<dyn std::error::Error>> {
     let recorder = NameRecorder::default();
     let genesis = Network::Regtest.genesis_block();
@@ -159,11 +152,9 @@ fn retired_apply_stage_timings_never_reach_the_metrics_api()
     Ok(())
 }
 
-/// A grouped window drain runs under the recorder: the retired group and
-/// window-check timers stay off the metrics API while the ledger hooks stay
-/// on it.
+/// Group publication and post-join window accounting stay on the caller thread.
 #[test]
-fn retired_group_and_check_timings_never_reach_the_metrics_api()
+fn retired_group_and_check_timings_stay_off_caller_thread_metrics()
 -> Result<(), Box<dyn std::error::Error>> {
     let recorder = NameRecorder::default();
     let genesis = Network::Regtest.genesis_block();
@@ -196,5 +187,125 @@ fn retired_group_and_check_timings_never_reach_the_metrics_api()
         recorder.saw("node.window.verify_seconds"),
         "the apply.prove_window hot-path hook is a kept signal (OBS-04)"
     );
+    Ok(())
+}
+
+/// Records fields delivered by real tracing events on the apply caller thread.
+#[derive(Clone, Default)]
+struct ProfileFields(Arc<Mutex<HashSet<String>>>);
+
+impl tracing::field::Visit for ProfileFields {
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+
+    fn record_u128(&mut self, field: &tracing::field::Field, _value: u128) {
+        if field.name().ends_with("_us") {
+            self.0.lock().insert(field.name().to_owned());
+        }
+    }
+}
+
+impl tracing::Subscriber for ProfileFields {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target().starts_with("bitcoin_rs_chainstate")
+    }
+
+    fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        event.record(&mut self.clone());
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+fn capture_profile<T>(fields: &ProfileFields, action: impl FnOnce() -> T) -> T {
+    // Two live dispatchers avoid tracing-core's single-dispatcher fast path:
+    // another test may first register these callsites without a subscriber.
+    let _registration_guard = tracing::Dispatch::new(ProfileFields::default());
+    let dispatch = tracing::Dispatch::new(fields.clone());
+    tracing::dispatcher::with_default(&dispatch, action)
+}
+
+#[test]
+fn proposal_emits_completed_validation_timings() -> Result<(), Box<dyn std::error::Error>> {
+    let handles = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    seed_genesis(&handles)?;
+    let block = mined_child(Network::Regtest.genesis_block().block_hash(), 1)?;
+    let fields = ProfileFields::default();
+    capture_profile(&fields, || handles.validate_block(&block))?;
+    for field in [
+        "contextual_header_us",
+        "pow_self_us",
+        "script_verify_us",
+        "coinbase_maturity_us",
+        "bip68_us",
+        "utxo_changes_us",
+    ] {
+        assert!(
+            fields.0.lock().contains(field),
+            "missing proposal timing: {field}"
+        );
+    }
+    assert!(!fields.0.lock().contains("utxo_commit_us"));
+    Ok(())
+}
+
+#[test]
+fn rejected_header_emits_only_completed_validation_timings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handles = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    seed_genesis(&handles)?;
+    let genesis = Network::Regtest.genesis_block();
+    let mut block = mined_child(genesis.block_hash(), 1)?;
+    block.header.time = genesis.header.time;
+    let fields = ProfileFields::default();
+    let result = capture_profile(&fields, || handles.validate_block(&block));
+    assert!(matches!(
+        result,
+        Err(super::ApplyError::Chain(
+            bitcoin_rs_chain::ChainError::TimestampTooEarly { .. }
+        ))
+    ));
+    assert!(fields.0.lock().contains("contextual_header_us"));
+    assert!(!fields.0.lock().contains("pow_self_us"));
+    assert!(!fields.0.lock().contains("utxo_commit_us"));
+    Ok(())
+}
+
+#[test]
+fn rejected_spend_keeps_resolution_and_dispatch_timings() -> Result<(), Box<dyn std::error::Error>>
+{
+    let handles = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    seed_genesis(&handles)?;
+    let genesis = Network::Regtest.genesis_block();
+    let mut block = mined_child(genesis.block_hash(), 1)?;
+    let mut spend = block.txs[0].clone();
+    spend.inputs[0].previous_output =
+        bitcoin_rs_primitives::OutPoint::new(genesis.txs[0].txid(), 0);
+    block.txs.push(spend);
+    let mut leaves: Vec<_> = block.txs.iter().map(|tx| *tx.txid().as_bytes()).collect();
+    let root = bitcoin_rs_consensus::verify_block::compute_merkle_root(&mut leaves)
+        .ok_or("test merkle root missing")?;
+    block.header.merkle_root = bitcoin_rs_primitives::Hash256::from_le_bytes(&root);
+    let fields = ProfileFields::default();
+    let result = capture_profile(&fields, || handles.validate_block(&block));
+    assert!(matches!(
+        result,
+        Err(super::ApplyError::Consensus(
+            bitcoin_rs_consensus::ConsensusError::MissingPrevout { input_index: 0 }
+        ))
+    ));
+    assert!(fields.0.lock().contains("script_resolution_us"));
+    assert!(fields.0.lock().contains("script_verify_us"));
+    assert!(!fields.0.lock().contains("coinbase_maturity_us"));
+    assert!(!fields.0.lock().contains("utxo_commit_us"));
     Ok(())
 }
