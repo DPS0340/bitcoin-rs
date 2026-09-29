@@ -62,6 +62,13 @@ public compatibility surface must not break ecosystem evidence merely because
 internals changed. Detailed internal diagnostics may be collected for
 debugging, but they are never part of the compatibility contract.
 
+**Deferred guarantee:** the live P2P compatibility lane (scripts/run-p2p-core-interop.sh)
+still derives some assertions from private log markers (e.g. compact-block
+reconstruction counts). This coupling is known and tracked; until the lane is
+decoupled from log markers, refactors that change those markers may break the
+lane even when public protocol behavior is unchanged. ECO-09 records that
+restriction.
+
 ### `ECO-04`: One representative consumer is enough
 
 Do not collect tools for their own sake. For a given surface, one

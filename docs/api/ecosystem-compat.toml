@@ -40,7 +40,7 @@ surface = "P2P v1 wire protocol"
 core_reference = "Bitcoin Core 31.1 net protocol (docs/policies/p2p-compatibility.md pin)"
 status = "externally verified"
 representative_consumer = "unmodified Bitcoin Core 31.1 bitcoind (scripts/run-p2p-core-interop.sh)"
-evidence = "black-box interop: handshake, IBD sync, relay, disconnect behavior, externally visible chain identity (docs/contracts/core-differential.md CORE-02/CORE-03; evidence schema bitcoin-rs-core-differential-v2 verified by crates/p2p/tests/core_interop_live.rs). Bounded to those outcomes. Per CORE-03, compact-block relay counters are still derived from internal bitcoin-rs log markers (scripts/run-p2p-core-interop.sh count_marker); per ECO-09 that derivation is diagnostic only and must trend to observable protocol outcomes before it is relied on as a compatibility contract."
+evidence = "black-box interop: handshake, IBD sync, relay, disconnect behavior, externally visible chain identity (docs/contracts/core-differential.md CORE-02/CORE-03; evidence schema bitcoin-rs-core-differential-v2 verified by crates/p2p/tests/core_interop_live.rs). Bounded to those outcomes. Per CORE-03, compact-block relay counters are still derived from internal bitcoin-rs log markers (scripts/run-p2p-core-interop.sh count_marker); per ECO-09 that derivation is diagnostic only and must trend to observable protocol outcomes before it is relied on as a compatibility contract. The evidence JSON is ephemeral (deleted after the run unless --keep is passed); a CI artifact upload is follow-up work per ECO-08."
 
 [[row]]
 surface = "BIP324 / P2P v2 transport"
@@ -54,7 +54,7 @@ surface = "Compact block relay (BIP152)"
 core_reference = "Bitcoin Core 31.1 BIP152"
 status = "externally verified"
 representative_consumer = "unmodified Bitcoin Core 31.1 bitcoind + scripted wire probe (scripts/run-p2p-core-interop.sh phases A-C)"
-evidence = "black-box request/response and relay outcomes: Core serving responses for compact-block fetches (getblocktxn recovery observed) and the raw MSG_CMPCT_BLOCK wire probe (docs/contracts/core-differential.md CORE-03; assert_bip152_relay in crates/p2p/tests/core_interop_live.rs). Reconstruction itself is not part of this claim: its completion counts come from bitcoin-rs log markers, which ECO-09 excludes from compatibility evidence; they are diagnostic only."
+evidence = "black-box request/response and relay outcomes only: Core serving responses for compact-block fetches and the raw MSG_CMPCT_BLOCK wire probe (docs/contracts/core-differential.md CORE-03; assert_bip152_relay in crates/p2p/tests/core_interop_live.rs). Reconstruction and getblocktxn-recovery counts are log-derived and excluded from this claim per ECO-09; they remain diagnostic only."
 
 [[row]]
 surface = "Compact block filters (BIP157/BIP158)"
@@ -72,7 +72,7 @@ evidence = "externally observed: handshake, relay, serving, disconnect behavior 
 
 [[row]]
 surface = "JSON-RPC"
-core_reference = "Bitcoin Core 31.0 RPC schema (crates/rpc/core-compat.toml reference pins)"
+core_reference = "Bitcoin Core 31.1 RPC schema (crates/rpc/core-compat.toml reference pins)"
 status = "implemented"
 representative_consumer = "planned: an existing Core-compatible RPC client (issue #1122 follow-up)"
 evidence = "in-tree only: dispatch, handler, and pinned-shape suites (crates/rpc/tests/*), per-method schema status in crates/rpc/src/registry.rs. A scripted in-repo client does not upgrade this row; see ECO-08."
@@ -115,9 +115,9 @@ evidence = "in-tree only: crates/mining/src/control.rs proposal/solved-block voc
 [[row]]
 surface = "Mining IPC / Stratum V2 adapters"
 core_reference = "selected Core IPC / mining protocol interfaces"
-status = "experimental"
+status = "intentionally unsupported"
 representative_consumer = "none"
-evidence = "future adapter work only (issue #1122 compatibility surfaces); no shipped adapter, so nothing to verify. When built, IPC stays an adapter, not an internal architecture template (ECO-01)."
+evidence = "no adapter is shipped; this is future work (issue #1122 compatibility surfaces), not a compatibility commitment. When built, IPC stays an adapter, not an internal architecture template (ECO-01)."
 
 [[row]]
 surface = "USDT tracepoints (validation/mempool/net providers)"
