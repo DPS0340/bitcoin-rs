@@ -97,14 +97,20 @@ impl<S: KvStore> JournalWriter<S> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         }
+        // Finish traversal before unlinking: deleting entries can invalidate
+        // directory iteration and leave some invalidated generations behind.
+        let mut invalidated_segments = Vec::new();
         for entry in self.dir.entries()? {
             let entry = entry?;
             let name = entry.file_name();
             if parse_segment_name(name.to_string_lossy().as_ref())
                 .is_some_and(|generation| generation != self.segment_gen)
             {
-                self.dir.remove_file(name)?;
+                invalidated_segments.push(name);
             }
+        }
+        for name in invalidated_segments {
+            self.dir.remove_file(name)?;
         }
         crate::checkpoint::fs::sync_dir(&self.dir)?;
         Ok(true)

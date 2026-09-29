@@ -304,6 +304,60 @@ fn recovery_compaction_cannot_clear_an_append_gap() -> TestResult {
     Ok(())
 }
 
+// Contract: docs/contracts/recovery.md, RCV-02; chainstate-journal-v1.md, JW-MARK-2.
+#[test]
+fn cold_retention_removes_all_invalidated_generations_and_preserves_recovery() -> TestResult {
+    let store = Arc::new(CountingStore::new());
+    let mut writer = open_fresh("cold-retention-generations", Arc::clone(&store))?;
+    writer.max_journal_bytes = 1024 * 1024;
+    let marker = b"force full validation\n";
+    writer.dir.write(FULL_REVALIDATION_MARKER, marker)?;
+    writer.dir.write(segment_name(0), [])?;
+    writer.dir.write("operator-note", b"preserve")?;
+    writer.dir.write("segment-invalid.log", b"not a segment")?;
+    let head_before = writer.dir.read("head.json")?;
+
+    // Span directory iterator buffers and sparse generation numbers. Cleanup
+    // must enumerate the existing names, not walk up to the largest generation.
+    for generation in (1..=2048).chain(std::iter::once(u64::MAX)) {
+        writer.dir.write(segment_name(generation), [0; 512])?;
+    }
+    assert!(writer.requires_compaction()?);
+
+    writer.prepare_for_apply()?;
+
+    for generation in (1..=2048).chain(std::iter::once(u64::MAX)) {
+        assert_eq!(
+            writer
+                .dir
+                .metadata(segment_name(generation))
+                .err()
+                .map(|error| error.kind()),
+            Some(std::io::ErrorKind::NotFound),
+            "invalidated generation {generation} survived retention relief"
+        );
+    }
+    assert_eq!(writer.dir.read(FULL_REVALIDATION_MARKER)?, marker);
+    assert_eq!(writer.dir.read("head.json")?, head_before);
+    assert_eq!(writer.dir.read(segment_name(0))?, Vec::<u8>::new());
+    assert_eq!(writer.dir.read("operator-note")?, b"preserve");
+    assert_eq!(writer.dir.read("segment-invalid.log")?, b"not a segment");
+    assert!(!writer.requires_compaction()?);
+
+    // Relief leaves the active append cursor usable and its next durable
+    // record recoverable, without retiring the cold-revalidation marker.
+    writer.append(&sample_record(1))?;
+    writer.flush_to(1)?;
+    let dir = writer.dir.try_clone()?;
+    drop(writer);
+    let reopened = JournalWriter::open(dir, store)?;
+    assert_eq!(reopened.head().height, 1);
+    assert_eq!(reopened.head().journal_gen, 0);
+    assert_eq!(reopened.head().record_count, 1);
+    assert_eq!(reopened.dir.read(FULL_REVALIDATION_MARKER)?, marker);
+    Ok(())
+}
+
 #[test]
 fn failed_boundary_retries_before_next_apply_below_lag_limit() -> TestResult {
     let store = Arc::new(CountingStore::new());
