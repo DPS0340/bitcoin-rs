@@ -249,20 +249,21 @@ impl DnsResolver for SystemDnsResolver {
 
 /// Authoritative p2p activity switch behind `setnetworkactive`.
 ///
-/// Mirrors Core's `CConnman::fNetworkActive`: flipping the flag never
-/// disconnects existing peers; it only stops new inbound accepts and new
-/// outbound dials while inactive.
+/// Mirrors Core's `CConnman::fNetworkActive`: while inactive, listeners and
+/// dialers admit no new connections. `P2pService::set_network_active` also
+/// cancels current leases so their owners tear the connections down.
 #[derive(Debug, Clone)]
 pub struct NetworkActivity {
     active: Arc<AtomicBool>,
 }
 
 impl NetworkActivity {
-    /// Shares the node-owned activity flag.
-    /// PRE: `active` is the flag the RPC `setnetworkactive` handler stores.
+    /// Shares the service-owned activity flag.
+    /// PRE: `active` is the flag [`crate::P2pService`] controls.
     /// POST: Return a switch reading exactly that flag.
     /// INVARIANT: Flag changes happen only through
-    /// [`crate::apply_network_active`]; this type never writes the flag.
+    /// [`crate::P2pService::set_network_active`]; this type never writes the
+    /// flag.
     #[must_use]
     pub const fn from_shared(active: Arc<AtomicBool>) -> Self {
         Self { active }

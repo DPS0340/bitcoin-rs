@@ -698,23 +698,10 @@ impl P2pService {
         apply_network_active(&self.network_active, &self.peer_table, active);
     }
 
-    /// Returns the shared admission switch for compatibility with node
-    /// orchestration code that passes the switch into worker constructors.
-    #[must_use]
-    pub fn network_active_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.network_active)
-    }
-
     /// Returns a snapshot of manual bans.
     #[must_use]
     pub fn banned(&self) -> Vec<crate::BannedSubnet> {
         self.banned.read().clone()
-    }
-
-    /// Returns the service-owned manual ban list handle.
-    #[must_use]
-    pub fn banned_handle(&self) -> Arc<RwLock<Vec<crate::BannedSubnet>>> {
-        Arc::clone(&self.banned)
     }
 
     /// Returns a sender for outbound dial requests, manual or not.
@@ -750,12 +737,6 @@ impl P2pService {
     #[must_use]
     pub fn added_nodes(&self) -> Vec<SocketAddr> {
         self.added_nodes.read().clone()
-    }
-
-    /// Returns the service-owned persistent addnode view.
-    #[must_use]
-    pub fn added_nodes_handle(&self) -> Arc<RwLock<Vec<SocketAddr>>> {
-        Arc::clone(&self.added_nodes)
     }
 
     /// Applies Core-like addnode state and requests a connection.
@@ -824,11 +805,115 @@ impl P2pService {
     }
 }
 
-/// Applies the network-activity transition used by [`P2pService`] and RPC.
+impl crate::P2pQuery for P2pService {
+    fn network_active(&self) -> bool {
+        Self::network_active(self)
+    }
+
+    fn local_services(&self) -> u64 {
+        Self::local_services(self).to_u64()
+    }
+
+    fn banned(&self) -> Vec<crate::BannedSubnet> {
+        Self::banned(self)
+    }
+
+    fn added_nodes(&self) -> Vec<SocketAddr> {
+        Self::added_nodes(self)
+    }
+
+    fn peers(&self) -> Vec<crate::PeerSnapshot> {
+        self.peer_table
+            .sessions()
+            .into_iter()
+            .filter_map(|session| {
+                session.info.map(|info| {
+                    let bytes_sent = info.counters.bytes_sent();
+                    let bytes_received = info.counters.bytes_recv();
+                    let last_send = info.counters.last_send();
+                    let last_received = info.counters.last_recv();
+                    crate::PeerSnapshot {
+                        addr: info.addr,
+                        version: info.version,
+                        services: info.services,
+                        user_agent: info.user_agent,
+                        conn_time: info.conn_time,
+                        inbound: info.inbound,
+                        addr_bind: info.addr_bind,
+                        time_offset: info.time_offset,
+                        bytes_sent,
+                        bytes_received,
+                        last_send,
+                        last_received,
+                        manual: session.lease.is_manual(),
+                        role: session.lease.role(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn connection_count(&self) -> usize {
+        self.peer_table.len()
+    }
+
+    fn traffic_totals(&self) -> (u64, u64) {
+        self.peer_table.traffic_totals()
+    }
+}
+
+impl crate::P2pControl for P2pService {
+    fn set_network_active(&self, active: bool) {
+        Self::set_network_active(self, active);
+    }
+
+    fn set_ban(&self, entry: crate::BannedSubnet) {
+        Self::set_ban(self, entry);
+    }
+
+    fn remove_ban(&self, subnet: crate::IpSubnet) {
+        Self::remove_ban(self, subnet);
+    }
+
+    fn clear_banned(&self) {
+        Self::clear_banned(self);
+    }
+
+    fn add_node(&self, addr: SocketAddr, persist: bool) -> Result<(), P2pControlError> {
+        Self::add_node(self, addr, persist)
+    }
+
+    fn remove_node(&self, addr: SocketAddr) {
+        Self::remove_node(self, addr);
+    }
+
+    fn disconnect(&self, addr: SocketAddr, nodeid: Option<usize>) -> bool {
+        let session = match nodeid {
+            Some(id) => self
+                .peer_table
+                .sessions()
+                .into_iter()
+                .filter(|session| session.info.is_some())
+                .nth(id)
+                .filter(|session| session.addr == addr),
+            None => self
+                .peer_table
+                .sessions()
+                .into_iter()
+                .find(|session| session.info.is_some() && session.addr == addr),
+        };
+        session.is_some_and(|session| {
+            self.peer_table
+                .disconnect_source(session.lease.source(session.addr))
+        })
+    }
+}
+
+/// Applies the network-activity transition owned by [`P2pService`].
 ///
 /// Disabling cancels current leases; connection owners remove their own
 /// sessions during teardown.
-pub fn apply_network_active(flag: &AtomicBool, table: &crate::PeerTable, active: bool) {
+fn apply_network_active(flag: &AtomicBool, table: &crate::PeerTable, active: bool) {
     flag.store(active, Ordering::Release);
     if !active {
         table.cancel_all();
@@ -1456,6 +1541,76 @@ mod tests {
         apply_network_active(&flag, &table, false);
         assert!(!flag.load(Ordering::Acquire));
         assert!(lease.is_cancelled());
+    }
+
+    #[test]
+    fn peer_query_returns_detached_counter_snapshots() {
+        use std::io::{Read as _, Write as _};
+
+        let service = P2pService::new(
+            P2pServiceConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8333));
+        let counters = Arc::new(crate::PeerCounters::default());
+        let info = crate::PeerInfo {
+            addr,
+            version: 70_016,
+            wtxid_relay: false,
+            compact_block_relay: false,
+            services: 9,
+            user_agent: "/snapshot-test/".to_owned(),
+            start_height: 0,
+            best_known_height: 0,
+            conn_time: 1,
+            inbound: false,
+            addr_bind: addr,
+            time_offset: 0,
+            counters: Arc::clone(&counters),
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        service.peer_table.register(addr, lease.clone());
+        service.peer_table.publish_info(addr, &lease, info);
+
+        let snapshot_before = crate::P2pQuery::peers(&service)
+            .into_iter()
+            .next()
+            .expect("published peer has a query snapshot");
+        assert_eq!(
+            (
+                snapshot_before.bytes_sent,
+                snapshot_before.bytes_received,
+                snapshot_before.last_send,
+                snapshot_before.last_received,
+            ),
+            (0, 0, 0, 0)
+        );
+
+        let mut writer = crate::CountingStream::new(std::io::sink(), Arc::clone(&counters));
+        writer.write_all(&[0_u8; 7]).expect("counted write");
+        let mut reader = crate::CountingStream::new(std::io::Cursor::new(vec![0_u8; 5]), counters);
+        let mut received = [0_u8; 5];
+        reader.read_exact(&mut received).expect("counted read");
+
+        assert_eq!(
+            (
+                snapshot_before.bytes_sent,
+                snapshot_before.bytes_received,
+                snapshot_before.last_send,
+                snapshot_before.last_received,
+            ),
+            (0, 0, 0, 0),
+            "a completed query must not retain live counters"
+        );
+        let snapshot_after = crate::P2pQuery::peers(&service)
+            .into_iter()
+            .next()
+            .expect("published peer still has a query snapshot");
+        assert_eq!(snapshot_after.bytes_sent, 7);
+        assert_eq!(snapshot_after.bytes_received, 5);
+        assert_ne!(snapshot_after.last_send, 0);
+        assert_ne!(snapshot_after.last_received, 0);
     }
 
     #[test]
