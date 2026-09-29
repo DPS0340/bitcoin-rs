@@ -177,12 +177,13 @@ impl<S: Read> Peer<S> {
     /// Read one framed message.
     ///
     /// With a `net:*` probe context attached, `net:inbound_message` observes
-    /// the checksum-validated wire payload as read, before any decoding
-    /// below the frame.
+    /// the checksum-validated wire payload before typed decoding, including
+    /// messages whose payload later fails to decode.
     pub fn read_message(&mut self) -> Result<(Message, bytes::Bytes), PeerError> {
-        let (message, payload) = crate::wire::read_message(&mut self.stream, self.magic)?;
-        crate::net_trace::inbound_message(self.net_trace.as_ref(), &message, &payload);
-        Ok((message, payload))
+        let net_trace = self.net_trace.as_ref();
+        crate::wire::read_message_with(&mut self.stream, self.magic, |command, payload| {
+            crate::net_trace::inbound_message(net_trace, command, payload);
+        })
     }
 }
 

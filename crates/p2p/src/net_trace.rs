@@ -1,6 +1,6 @@
 //! Bitcoin Core `net:*` tracepoint payload mapping.
 //!
-//! [`inbound_message`] fires per decoded message in the connection read
+//! [`inbound_message`] fires per checksum-valid wire message in the connection read
 //! loop and during the handshake; [`outbound_message`] fires per write
 //! attempt by the connection writer and during the handshake. Argument
 //! positions and types follow Bitcoin Core's published ABI — see
@@ -61,13 +61,14 @@ impl NetTrace {
     }
 }
 
-/// Fires `net:inbound_message` for one decoded message.
+/// Fires `net:inbound_message` for one checksum-valid wire message.
 ///
 /// `payload` is the checksum-validated wire payload as read; it must
-/// outlive this call, which the decoded frame's own buffer satisfies.
-pub(crate) fn inbound_message(trace: Option<&NetTrace>, message: &Message, payload: &[u8]) {
+/// outlive this call, which the wire reader's buffer satisfies. A malformed
+/// typed payload is still observable before decoding fails.
+pub(crate) fn inbound_message(trace: Option<&NetTrace>, command: &str, payload: &[u8]) {
     if let Some(trace) = trace {
-        bitcoin_rs_trace::inbound_message(|| message_args(trace, message, payload));
+        bitcoin_rs_trace::inbound_message(|| message_args(trace, command, payload));
     }
 }
 
@@ -79,21 +80,20 @@ pub(crate) fn inbound_message(trace: Option<&NetTrace>, message: &Message, paylo
 /// emits, so each message encodes into a frame exactly once.
 pub(crate) fn outbound_message(trace: Option<&NetTrace>, message: &Message, payload: &[u8]) {
     if let Some(trace) = trace {
-        bitcoin_rs_trace::outbound_message(|| message_args(trace, message, payload));
+        bitcoin_rs_trace::outbound_message(|| {
+            let command = message.command();
+            message_args(trace, command.as_ref(), payload)
+        });
     }
 }
 
 /// Assembles Core's six-argument payload tuple for one message.
-fn message_args(
-    trace: &NetTrace,
-    message: &Message,
-    payload: &[u8],
-) -> bitcoin_rs_trace::MessageArgs {
+fn message_args(trace: &NetTrace, command: &str, payload: &[u8]) -> bitcoin_rs_trace::MessageArgs {
     (
         node_id_i64(trace.node_id),
         trace.peer.to_string(),
         trace.connection_type.to_owned(),
-        message.command().as_ref().to_owned(),
+        command.to_owned(),
         payload_len_u64(payload.len()),
         payload.as_ptr(),
     )
