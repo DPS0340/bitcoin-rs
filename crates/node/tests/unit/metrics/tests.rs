@@ -303,6 +303,7 @@ fn published_gauge_flips_its_active_label_with_the_rpc_source() {
     assert!(body.contains("health=\"Healthy\""));
     assert!(body.contains("node_capability_tip_height{"));
     assert!(body.contains("} 101\n"));
+    // The fixture tip starts with 0x01234567: big-endian word zero is 19_088_743.
     assert!(body.contains("word=\"0\"} 19088743"));
 
     // A transition must retire the previous active label in the same pass:

@@ -206,7 +206,7 @@ fn assert_public_headers_exposed(response: &str) {
             exposed
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(required)),
-            "browser clients cannot read {required}: {exposed:?}"
+            "CORS exposure list omits {required}: {exposed:?}"
         );
     }
 }
@@ -219,6 +219,12 @@ fn public_esplora_success_and_error_responses_allow_cross_origin_reads()
         let response = request_get(address, path, "close")?;
         assert!(response.contains("Access-Control-Allow-Origin: *\r\n"));
         assert_public_headers_exposed(&response);
+        assert!(response.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("X-Bitcoin-Rs-Txindex-State")
+                    && value.trim() == "Disabled"
+            })
+        }));
     }
     Ok(())
 }
