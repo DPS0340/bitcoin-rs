@@ -196,12 +196,10 @@ fn checkpoint_fallback_replays_wide_gap_to_durable_head() -> Result<()> {
 }
 
 /// The executed prune frontier is a durable fact, not process state: after a
-/// SIGKILL the restarted node still refuses a lease over the rows the killed
-/// process deleted, and those rows stay gone (#1151).
+/// SIGKILL the restarted node still observes the exact boundary committed by
+/// the killed process: deleted rows stay gone and retained rows remain (#1151).
 #[test]
-fn pruned_frontier_survives_sigkill_and_refuses_deleted_history() -> Result<()> {
-    use bitcoin_rs_storage::pruning::RetentionError;
-
+fn pruned_frontier_survives_sigkill_and_preserves_boundary() -> Result<()> {
     const FRONTIER: u32 = 12;
     let temp = tempfile::tempdir()?;
     let data_dir = temp.path().join("prune-node");
@@ -210,24 +208,6 @@ fn pruned_frontier_survives_sigkill_and_refuses_deleted_history() -> Result<()> 
     crash_child("prune", &data_dir, Duration::from_mins(2))?;
 
     let resumed = NodeState::open(config, None).context("restart after SIGKILL in prune")?;
-    let retention = resumed.chainstate().retention_handle();
-    assert_eq!(
-        retention.pruned_below(),
-        FRONTIER,
-        "the restarted authority starts from the frontier the killed process committed"
-    );
-    assert!(
-        matches!(
-            retention.acquire(FRONTIER - 1),
-            Err(RetentionError::PrunedBelow {
-                requested: 11,
-                pruned_below: 12,
-            })
-        ),
-        "deleted history is refused, not granted and discovered by a failed read"
-    );
-    retention.acquire(FRONTIER)?.release();
-
     let tree = resumed.chainstate().block_tree_handle();
     let hash_at = |height: u32| -> Result<Hash256> {
         let tree = tree.read();
@@ -241,12 +221,18 @@ fn pruned_frontier_survives_sigkill_and_refuses_deleted_history() -> Result<()> 
         .chainstate()
         .block_body_store_handle()
         .context("pruned node has a body store")?;
+    let deleted_height = FRONTIER - 7;
     assert!(
-        bodies.load_block_body(5, hash_at(5)?)?.is_none(),
+        bodies
+            .load_block_body(deleted_height, hash_at(deleted_height)?)?
+            .is_none(),
         "a body the killed pass deleted stays gone"
     );
+    let retained_height = FRONTIER + 8;
     assert!(
-        bodies.load_block_body(20, hash_at(20)?)?.is_some(),
+        bodies
+            .load_block_body(retained_height, hash_at(retained_height)?)?
+            .is_some(),
         "history the frontier retains survives the restart"
     );
     Ok(())

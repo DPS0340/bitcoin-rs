@@ -20,9 +20,14 @@ pub(super) struct NodeStorage {
     undo_store: Arc<dyn bitcoin_rs_chainstate::UndoStore>,
     durable_head: Arc<dyn bitcoin_rs_storage::DurableHeadStore>,
     block_body_store: Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore>,
-    /// The executed prune frontier the store reports: the deletions that
-    /// committed, whether or not the datadir predates the record.
-    executed_frontier: bitcoin_rs_storage::pruning::ExecutedFrontier,
+    /// The retained-history authority storage/pruning owns, seeded once from
+    /// the deletions the store reports.
+    ///
+    /// Composition distributes it: chainstate receives the mandatory
+    /// acquisition capability, the prune service and the optional index
+    /// history receive what their role requires. Chainstate is not a
+    /// broker for it (#1151).
+    retention: Arc<bitcoin_rs_storage::RetentionRegistry>,
     pub(super) deferred: Arc<dyn DeferredChainstateServices>,
 }
 
@@ -48,11 +53,11 @@ impl crate::storage_backend::StoreConsumer for ChainstateComposer<'_> {
         // Load the commit point before block-file recovery can change bytes.
         // A clean checkpoint does not make a damaged committed frame an orphan.
         let committed = durable_head.load()?.and_then(|head| head.body_extent);
-        // The frontier is read once, before the chainstate builds its
-        // retention authority, so no lease can be granted over history a
-        // previous process deleted.
-        let executed_frontier =
-            bitcoin_rs_storage::pruning::ExecutedFrontier::reconstruct(&*store)?;
+        // The frontier is read once, before any lease can be granted, so no
+        // capability hands out history a previous process already deleted.
+        let retention = Arc::new(bitcoin_rs_storage::RetentionRegistry::seeded(
+            bitcoin_rs_storage::pruning::ExecutedFrontier::reconstruct(&*store)?,
+        ));
         let block_files = Arc::new(match committed {
             Some(extent) => FlatFileBlockStore::open_with_committed_extent(self.data_dir, extent)?,
             None => FlatFileBlockStore::open(self.data_dir)?,
@@ -68,7 +73,7 @@ impl crate::storage_backend::StoreConsumer for ChainstateComposer<'_> {
                 Arc::clone(&store),
                 Arc::clone(&block_files),
             )),
-            executed_frontier,
+            retention,
             deferred,
         };
         Ok((storage, block_files))
@@ -122,9 +127,27 @@ impl NodeStorage {
         Arc::clone(&self.durable_head)
     }
 
-    /// The executed prune frontier loaded from the store.
-    pub(super) const fn executed_frontier(&self) -> bitcoin_rs_storage::pruning::ExecutedFrontier {
-        self.executed_frontier
+    /// The retained-history authority composition owns and distributes.
+    pub(super) fn retention(&self) -> Arc<bitcoin_rs_storage::RetentionRegistry> {
+        Arc::clone(&self.retention)
+    }
+
+    /// The mandatory acquisition capability granted to chainstate.
+    pub(super) fn mandatory_retention(&self) -> bitcoin_rs_storage::MandatoryRetention {
+        bitcoin_rs_storage::MandatoryRetention::new(Arc::clone(&self.retention))
+    }
+
+    /// The bounded optional-history capability for a derived index.
+    ///
+    /// A stalled optional consumer is bounded by the reorg margin, so it
+    /// never competes with the mandatory window chainstate pins into.
+    pub(super) fn index_history(&self) -> bitcoin_rs_storage::pruning::HistoryAccess {
+        bitcoin_rs_storage::pruning::HistoryAccess::new(
+            Arc::clone(&self.retention),
+            bitcoin_rs_storage::pruning::RetentionBudget::from_blocks(
+                bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN,
+            ),
+        )
     }
 }
 

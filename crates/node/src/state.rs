@@ -123,7 +123,7 @@ impl Drop for NodeState {
         // Close the history boundary first, so a worker still reconciling
         // stops on the owner's shutdown answer instead of pinning rows a
         // process that is leaving will not serve.
-        self.chainstate.retention_handle().shutdown();
+        self.storage.retention().shutdown();
     }
 }
 
@@ -387,7 +387,8 @@ impl NodeState {
     /// authoritative — after crash recovery — so the index reconciles against
     /// the real chainstate and never mistakes a recovered gap for a stale branch.
     pub fn start_index_workers(&mut self) -> anyhow::Result<()> {
-        self.derived_index.start(&self.chainstate)
+        let history = self.storage.index_history();
+        self.derived_index.start(&self.chainstate, history)
     }
 
     /// Returns the live txindex status source for `getcapabilities`.

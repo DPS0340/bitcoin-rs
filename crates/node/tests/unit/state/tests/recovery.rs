@@ -363,7 +363,7 @@ fn forked_regtest_state() -> anyhow::Result<ForkFixture> {
 fn switch_to_branch_releases_retention_authority_once() -> anyhow::Result<()> {
     let (_dir, state, fork_tip, fork_bodies) = forked_regtest_state()?;
     let handles = state.chainstate();
-    assert_eq!(handles.retention_handle().active_leases(), 0);
+    assert_eq!(state.storage.retention().active_leases(), 0);
 
     crate::reorg::switch_to_branch(
         &handles,
@@ -373,7 +373,7 @@ fn switch_to_branch_releases_retention_authority_once() -> anyhow::Result<()> {
         |_| {},
     )?;
 
-    assert_eq!(handles.retention_handle().active_leases(), 0);
+    assert_eq!(state.storage.retention().active_leases(), 0);
     Ok(())
 }
 
@@ -385,7 +385,12 @@ fn switch_to_branch_refuses_history_the_prune_line_crossed() -> anyhow::Result<(
     let (_dir, state, fork_tip, fork_bodies) = forked_regtest_state()?;
     let handles = state.chainstate();
     let tip_before = handles.applied_tip().load_full().map(|tip| tip.hash);
-    let reservation = handles.retention_handle().reserve(5);
+    // The reservation is made against the registry storage/pruning owns and
+    // node composition holds, while chainstate acquires through the
+    // `MandatoryRetention` capability composed from that same registry. The
+    // refusal below therefore proves the two observe one authority, by
+    // behaviour rather than by a runtime identity check.
+    let reservation = state.storage.retention().reserve(5);
     reservation.commit(5);
 
     let outcome = crate::reorg::switch_to_branch(
@@ -404,7 +409,7 @@ fn switch_to_branch_refuses_history_the_prune_line_crossed() -> anyhow::Result<(
         handles.applied_tip().load_full().map(|tip| tip.hash),
         tip_before
     );
-    assert_eq!(handles.retention_handle().active_leases(), 0);
+    assert_eq!(state.storage.retention().active_leases(), 0);
     // A refused lease must not close admission: nothing was mutated.
     assert!(handles.lock_transition().is_ok());
     Ok(())
@@ -641,7 +646,7 @@ fn prune_then_reorg_refuses_deleted_history_but_keeps_retained_reorgs() -> anyho
         .prune_to_height(30)
         .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
     let handles = state.chainstate();
-    assert_eq!(handles.retention_handle().pruned_below(), 30);
+    assert_eq!(state.storage.retention().pruned_below(), 30);
 
     // A reorg rooted below the recorded line needs deleted bodies; the
     // retention lease is refused before the first mutation.
@@ -662,7 +667,7 @@ fn prune_then_reorg_refuses_deleted_history_but_keeps_retained_reorgs() -> anyho
         ),
         "deep reorg must refuse deleted history, got: {error:?}"
     );
-    assert_eq!(handles.retention_handle().active_leases(), 0);
+    assert_eq!(state.storage.retention().active_leases(), 0);
 
     // A reorg rooted above both the prune line and checkpoint base still
     // switches, disconnecting 220
@@ -679,7 +684,7 @@ fn prune_then_reorg_refuses_deleted_history_but_keeps_retained_reorgs() -> anyho
         .load_full()
         .ok_or_else(|| anyhow::anyhow!("reorg must publish a tip"))?;
     assert_eq!(landed.height, 402);
-    assert_eq!(handles.retention_handle().active_leases(), 0);
+    assert_eq!(state.storage.retention().active_leases(), 0);
     Ok(())
 }
 
@@ -764,7 +769,7 @@ fn deep_reorg_streams_bounded_prefixes_to_the_exact_reference() -> anyhow::Resul
         .load_full()
         .ok_or_else(|| anyhow::anyhow!("restored node must publish a tip"))?;
     assert_eq!(restored.chain_tx_count, reference_tip.chain_tx_count);
-    assert_eq!(handles.retention_handle().active_leases(), 0);
+    assert_eq!(state.storage.retention().active_leases(), 0);
     Ok(())
 }
 
