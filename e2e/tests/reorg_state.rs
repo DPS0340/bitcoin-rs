@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
-use bitcoin::{Block, Sequence, Transaction};
+use bitcoin::{Block, BlockHash, Sequence, Transaction};
 use bitcoin_rs_e2e::differential::{CommonFunds, compare_reply, mine_common_chain};
 use bitcoin_rs_e2e::helpers::{
     funding_address, grind_pow, mempool_txids, mine_bare_blocks, signed_spend, submit_genesis,
     tx_hex,
 };
 use bitcoin_rs_e2e::live_peer::LivePeer;
-use bitcoin_rs_e2e::{Error, Kind, ProcessNode, Result, ValueExt};
+use bitcoin_rs_e2e::{Error, Kind, ProcessNode, Result, SpawnOptions, ValueExt};
 use serde_json::{Value, json};
 
 fn core_block(core: &mut ProcessNode, hash: &str) -> Result<Block> {
@@ -255,6 +255,60 @@ fn assert_transaction_status(
     Ok(())
 }
 
+fn deliver_invalid_branch(
+    node: &mut ProcessNode,
+    rival: &[Block],
+    first_hash: BlockHash,
+) -> Result<()> {
+    assert_eq!(rival.len(), 2);
+    let mut peer = LivePeer::connect_with_height(node, "invalid-reorg", 2)?;
+    peer.offer_bodies(rival);
+    peer.headers = rival.iter().map(|block| block.header).collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let headers = peer.headers.clone();
+    peer.send(NetworkMessage::Headers(headers), deadline)?;
+    peer.send(
+        NetworkMessage::Inv(vec![Inventory::Block(rival[1].block_hash())]),
+        deadline,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut served_invalid_body = false;
+    let mut serve_error = None;
+    while Instant::now() < deadline && !served_invalid_body && !peer.dropped {
+        peer.pump(Duration::from_millis(250), &mut |peer, items| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for item in items {
+                let first = matches!(item,
+                    Inventory::WitnessBlock(hash) | Inventory::CompactBlock(hash) | Inventory::Block(hash)
+                        if *hash == first_hash
+                );
+                match peer.serve_item(item, deadline) {
+                    Ok(()) if first => served_invalid_body = true,
+                    Err(error) => serve_error = Some(error),
+                    Ok(()) => {}
+                }
+            }
+        });
+        if let Some(error) = serve_error.take() {
+            return Err(error);
+        }
+    }
+    assert!(
+        served_invalid_body,
+        "node never requested and received the invalid higher-work branch body"
+    );
+    node.wait_for("invalid branch status", Duration::from_secs(10), |node| {
+        let tips = node.rpc("getchaintips", &json!([]))?;
+        let invalid = tips.as_array().is_some_and(|tips| {
+            tips.iter().any(|tip| {
+                tip.get("hash") == Some(&json!(rival[1].block_hash().to_string()))
+                    && tip.get("status") == Some(&json!("invalid"))
+            })
+        });
+        Ok(invalid.then_some(()))
+    })
+}
+
 /// Three disconnected blocks contain a transaction that conflicts with the
 /// new branch and an independent transaction that must return to the pool.
 /// The clean path starts with the same two mempool transactions, so the
@@ -398,52 +452,7 @@ fn invalid_higher_work_body_cannot_change_active_chain() -> Result<()> {
     assert_eq!(oracle.rpc("getblockcount", &json!([]))?, json!(0));
     oracle.stop()?;
 
-    let mut peer = LivePeer::connect_with_height(&node, "invalid-reorg", 2)?;
-    peer.offer_bodies(&rival);
-    peer.headers = rival.iter().map(|block| block.header).collect();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let headers = peer.headers.clone();
-    peer.send(NetworkMessage::Headers(headers), deadline)?;
-    peer.send(
-        NetworkMessage::Inv(vec![Inventory::Block(rival[1].block_hash())]),
-        deadline,
-    )?;
-    let deadline = Instant::now() + Duration::from_secs(25);
-    let mut served_invalid_body = false;
-    let mut serve_error = None;
-    while Instant::now() < deadline && !served_invalid_body && !peer.dropped {
-        peer.pump(Duration::from_millis(250), &mut |peer, items| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            for item in items {
-                let first = matches!(item,
-                    Inventory::WitnessBlock(hash) | Inventory::CompactBlock(hash) | Inventory::Block(hash)
-                        if *hash == first_hash
-                );
-                match peer.serve_item(item, deadline) {
-                    Ok(()) if first => served_invalid_body = true,
-                    Err(error) => serve_error = Some(error),
-                    Ok(()) => {}
-                }
-            }
-        });
-        if let Some(error) = serve_error.take() {
-            return Err(error);
-        }
-    }
-    assert!(
-        served_invalid_body,
-        "node never requested and received the invalid higher-work branch body"
-    );
-    node.wait_for("invalid branch status", Duration::from_secs(10), |node| {
-        let tips = node.rpc("getchaintips", &json!([]))?;
-        let invalid = tips.as_array().is_some_and(|tips| {
-            tips.iter().any(|tip| {
-                tip.get("hash") == Some(&json!(rival[1].block_hash().to_string()))
-                    && tip.get("status") == Some(&json!("invalid"))
-            })
-        });
-        Ok(invalid.then_some(()))
-    })?;
+    deliver_invalid_branch(&mut node, &rival, first_hash)?;
     compare_reply(
         "invalid branch kept chain and UTXO",
         &before,
@@ -451,6 +460,22 @@ fn invalid_higher_work_body_cannot_change_active_chain() -> Result<()> {
     )?;
     assert!(!coin(&mut node, &old_coinbase, false)?.is_null());
     assert!(sorted_mempool(&mut node)?.is_empty());
+    assert_eq!(node.rpc("getblockhash", &json!([1]))?, json!(old_tip));
+
+    // Invalid-branch recovery reconnects the old branch through durable
+    // commits. Kill immediately after the public state has returned to that
+    // branch, then check the same tip and coins before allowing new work.
+    let datadir = node.take_datadir()?;
+    node.send_sigkill();
+    drop(node);
+    let mut node =
+        ProcessNode::spawn_in_datadir(Kind::BitcoinRs, &SpawnOptions::default(), datadir)?;
+    compare_reply(
+        "invalid-branch recovery survived SIGKILL",
+        &before,
+        &chain_view(&mut node)?,
+    )?;
+    assert!(!coin(&mut node, &old_coinbase, false)?.is_null());
     assert_eq!(node.rpc("getblockhash", &json!([1]))?, json!(old_tip));
     let valid_extension = mine_bare_blocks(&mut node, 1)?.remove(0);
     assert_eq!(
