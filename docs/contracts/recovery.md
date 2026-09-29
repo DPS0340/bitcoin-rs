@@ -225,7 +225,7 @@ tests.
 - Chainstate owns planning, body loading, mutation, invalidation, and
   disconnect-debt settlement, and takes the mandatory retention pin each of
   those transitions needs; storage/pruning owns the retained-history
-  authority those pins draw on (`RCV-08`). Node-owned observers receive
+  authority those pins draw on (`ARCH-07`). Node-owned observers receive
   each committed connect/disconnect to reconcile mempool, mining, RPC/ZMQ,
   and index wakes. Those observers are not recovery authority and cannot
   widen chainstate's dependency graph.

@@ -308,18 +308,6 @@ impl NodeState {
         Arc::clone(&self.chainstate)
     }
 
-    /// The mandatory retained-history capability this node composes.
-    ///
-    /// Node seeds storage/pruning's registry from the executed frontier the
-    /// store reports and hands the acquisition capability to chainstate, so
-    /// both observe the same authority. It answers what is already gone and
-    /// pins what a transition re-reads; it carries no prune, commit, or
-    /// shutdown path (`#1151`, `RCV-08`).
-    #[must_use]
-    pub fn mandatory_retention(&self) -> bitcoin_rs_storage::MandatoryRetention {
-        self.storage.mandatory_retention()
-    }
-
     /// Clone of the derived-consumer set used after committed transitions.
     #[must_use]
     pub fn chain_followers(&self) -> crate::chain_effects::ChainFollowers {
