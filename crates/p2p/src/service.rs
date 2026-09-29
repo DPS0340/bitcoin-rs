@@ -562,7 +562,8 @@ impl P2pService {
         self.session_cancel.lock().store(true, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
         self.worker_shutdown.store(true, Ordering::Release);
-        apply_network_active(&self.network_active, &self.peer_table, false);
+        self.peer_table
+            .apply_network_active(&self.network_active, false);
     }
 
     /// Joins listener and outbound workers. Bootstrap is joined separately so
@@ -695,7 +696,8 @@ impl P2pService {
     /// Enables or disables network activity. Disabling cancels current peers;
     /// their owners remove the leases during teardown.
     pub fn set_network_active(&self, active: bool) {
-        apply_network_active(&self.network_active, &self.peer_table, active);
+        self.peer_table
+            .apply_network_active(&self.network_active, active);
     }
 
     /// Returns a snapshot of manual bans.
@@ -906,17 +908,6 @@ impl crate::P2pControl for P2pService {
             self.peer_table
                 .disconnect_source(session.lease.source(session.addr))
         })
-    }
-}
-
-/// Applies the network-activity transition owned by [`P2pService`].
-///
-/// Disabling cancels current leases; connection owners remove their own
-/// sessions during teardown.
-fn apply_network_active(flag: &AtomicBool, table: &crate::PeerTable, active: bool) {
-    flag.store(active, Ordering::Release);
-    if !active {
-        table.cancel_all();
     }
 }
 
@@ -1534,13 +1525,106 @@ mod tests {
         table.register(SocketAddr::from((Ipv4Addr::LOCALHOST, 8333)), lease.clone());
         let flag = AtomicBool::new(true);
 
-        apply_network_active(&flag, &table, true);
+        table.apply_network_active(&flag, true);
         assert!(flag.load(Ordering::Acquire));
         assert!(!lease.is_cancelled());
 
-        apply_network_active(&flag, &table, false);
+        table.apply_network_active(&flag, false);
         assert!(!flag.load(Ordering::Acquire));
         assert!(lease.is_cancelled());
+    }
+
+    #[test]
+    fn network_disable_between_precheck_and_admission_rejects_both_directions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for inbound in [false, true] {
+            let service = P2pService::new(
+                P2pServiceConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let activity = crate::NetworkActivity::from_shared(Arc::clone(&service.network_active));
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8333));
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let lease = if inbound {
+                crate::PeerLease::new_inbound(tx)
+            } else {
+                crate::PeerLease::new(tx)
+            };
+            let boundary = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+                let admission = scope.spawn(|| {
+                    let was_active = activity.is_active();
+                    // Model the accept/dial precheck, then stop before committing
+                    // the lease. Disable must win this deterministic ordering.
+                    boundary.wait();
+                    boundary.wait();
+                    let admitted = service.peer_table.try_admit(&activity, addr, lease, 1);
+                    (was_active, admitted)
+                });
+                boundary.wait();
+                service.set_network_active(false);
+                boundary.wait();
+                let (was_active, admitted) = admission.join().map_err(|_| "admission panicked")?;
+                assert!(was_active);
+                assert!(admitted.is_none());
+                assert!(!service.network_active());
+                assert!(service.peer_table.is_empty());
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn network_disable_and_reenable_preserve_same_address_lease_ownership() {
+        for inbound in [false, true] {
+            let service = P2pService::new(
+                P2pServiceConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let activity = crate::NetworkActivity::from_shared(Arc::clone(&service.network_active));
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8333));
+            let make_lease = || {
+                let (tx, _rx) = crossbeam_channel::unbounded();
+                if inbound {
+                    crate::PeerLease::new_inbound(tx)
+                } else {
+                    crate::PeerLease::new(tx)
+                }
+            };
+            let old = make_lease();
+            assert!(
+                service
+                    .peer_table
+                    .try_admit(&activity, addr, old.clone(), 1)
+                    .is_some()
+            );
+            service.set_network_active(false);
+            assert!(old.is_cancelled());
+            let replacement = make_lease();
+            assert!(
+                service
+                    .peer_table
+                    .try_admit(&activity, addr, replacement.clone(), 1)
+                    .is_none()
+            );
+            service.set_network_active(true);
+            assert!(
+                service
+                    .peer_table
+                    .try_admit(&activity, addr, replacement.clone(), 1)
+                    .is_some()
+            );
+            // Delayed teardown from before disable must not remove the new
+            // connection occupying the same address after re-enable.
+            assert!(!service.peer_table.remove_current(addr, &old));
+            assert!(service.peer_table.is_current(replacement.source(addr)));
+            assert!(!replacement.is_cancelled());
+            service.set_network_active(false);
+            assert!(replacement.is_cancelled());
+            assert!(service.peer_table.remove_current(addr, &replacement));
+            assert!(service.peer_table.is_empty());
+        }
     }
 
     #[test]

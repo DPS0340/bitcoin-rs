@@ -39,6 +39,11 @@ one `writev` on the socket. It enforces key invariants across the node:
   cancel a newer session.
 - **Identity-bound metadata**: Post-handshake `PeerInfo` publication succeeds only if
   the publishing connection remains the active session for that address.
+- **Serialized network disable**: Live inbound and outbound admission rechecks the
+  service-owned activity switch under the table's registration lock. Disabling
+  takes that same lock and cancels every admitted lease; an outbound TCP connect
+  already in flight may finish, but cannot register while inactive. Socket I/O
+  never runs under the table lock.
 
 P2P workers — the inbound TCP `listener`, outbound connection threads, block
 download scheduler, and outbound transaction relay — use `PeerTable` through
@@ -48,7 +53,7 @@ writable P2P handle.
 
 Transaction inventory, parent requests, and outbound relay are P2P consumers of the
 shared transaction lifecycle. The authoritative cross-crate ownership split is
-[ARCH-07](../../docs/contracts/architecture.md#arch-07-chainstate-owns-authoritative-applied-chain-mutation);
+[ARCH-05](../../docs/contracts/architecture.md#arch-05-node-composition-and-orchestration-boundary);
 peer-visible inventory and relay behavior are defined in
 [P2P compatibility](../../docs/policies/p2p-compatibility.md).
 

@@ -101,11 +101,14 @@ pub trait P2pControl: Send + Sync {
     fn clear_banned(&self);
 
     /// Applies Core-like addnode state and requests a connection.
+    /// While networking is inactive (including after shutdown), retains a
+    /// persistent request without dialing and returns success unless banned.
     ///
     /// # Errors
     ///
-    /// [`crate::P2pControlError`] when the destination is banned, the dial
-    /// queue is full for a one-shot request, or the service has shut down.
+    /// [`crate::P2pControlError`] when the destination is banned, or while
+    /// networking is active, the dial queue is full or closed for a one-shot
+    /// request.
     fn add_node(&self, addr: SocketAddr, persist: bool) -> Result<(), crate::P2pControlError>;
 
     /// Removes one configured addnode add address.

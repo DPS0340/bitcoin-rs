@@ -250,8 +250,10 @@ impl DnsResolver for SystemDnsResolver {
 /// Authoritative p2p activity switch behind `setnetworkactive`.
 ///
 /// Mirrors Core's `CConnman::fNetworkActive`: while inactive, listeners and
-/// dialers admit no new connections. `P2pService::set_network_active` also
-/// cancels current leases so their owners tear the connections down.
+/// dialers admit no new connections. Live admission rechecks this flag under
+/// the peer-table lock, which `P2pService::set_network_active` also takes when
+/// changing the flag and cancelling current leases. A TCP connect already in
+/// flight stays outside that lock, but cannot register while inactive.
 #[derive(Debug, Clone)]
 pub struct NetworkActivity {
     active: Arc<AtomicBool>,
