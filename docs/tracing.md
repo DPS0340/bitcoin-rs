@@ -136,9 +136,10 @@ changing only its binary selector path between implementations.
 Both runs retained one peer per node and the tracer exited successfully.
 Counts include only complete runtime event lines, excluding compiler-warning
 excerpts that echo the script's `printf` calls. They are not a parity
-requirement. The earlier
-Ubuntu 26.04/kernel 7.0 file-script silence was **not reproduced**; this
-result does not isolate its cause or certify that original environment.
+requirement. The original Ubuntu 26.04/kernel 7.0 file-script invocation
+was **not re-tested**; its earlier silence remains unresolved. This run used
+a different kernel and inline invocation and does not isolate the cause or
+certify that original environment.
 It does show that bpftrace 0.27 can consume both implementations' `net:*`
 probes in the tested environment. No mempool event delivery is claimed.
 
