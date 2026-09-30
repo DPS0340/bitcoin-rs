@@ -649,20 +649,6 @@ impl Context {
         self
     }
 
-    /// Attaches the rollback-evidence warning source for `getblockchaininfo`.
-    #[must_use]
-    pub fn with_rollback_warnings(mut self, source: Arc<dyn RollbackWarningSource>) -> Self {
-        self.chain.rollback_warnings = Some(source);
-        self
-    }
-
-    /// Attaches the node-owned pruning mutator used by `pruneblockchain`.
-    #[must_use]
-    pub fn with_prune_service(mut self, prune_service: Arc<dyn PruneService>) -> Self {
-        self.chain.prune_service = Some(prune_service);
-        self
-    }
-
     /// Attaches the node-owned mining coordinator to a context built without
     /// handles (`Context::new`). Production wiring passes the coordinator
     /// through `ContextHandles::mining` instead.
@@ -697,13 +683,6 @@ impl Context {
     #[must_use]
     pub fn with_zmq_publisher(mut self, publisher: Arc<dyn crate::zmq::ZmqPublisher>) -> Self {
         self.zmq_publisher = publisher;
-        self
-    }
-
-    /// Attaches the configured node debug-log path.
-    #[must_use]
-    pub fn with_debug_log_path(mut self, path: PathBuf) -> Self {
-        self.debug_log_path = Some(path);
         self
     }
 
