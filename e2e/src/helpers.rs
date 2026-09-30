@@ -396,3 +396,121 @@ pub fn wait_for_mempool_tx(node: &mut ProcessNode, txid: &str, timeout: Duration
             .then_some(()))
     })
 }
+
+/// Builds a BIP141 segwit coinbase-only block on `parent`.
+///
+/// The coinbase carries the 32-byte reserved nonce in its input witness and an
+/// `OP_RETURN` commitment output (`aa21a9ed`), so the body binds to the header
+/// only when witness data is intact. `tag` separates competing branches so
+/// coinbases (and therefore txids and headers) differ across forks at equal
+/// heights.
+#[must_use]
+pub fn segwit_coinbase_block(parent: &Block, height: u32, tag: u8) -> Block {
+    let reserved = [tag; 32];
+    // Coinbase-only tree: witness leaf 0 is zeroed out, so the wtxid merkle
+    // root is exactly [0;32]; commitment = sha256d(root || reserved).
+    let mut buffer = [0_u8; 64];
+    buffer[32..].copy_from_slice(&reserved);
+    let commitment = bitcoin::hashes::sha256d::Hash::hash(&buffer).to_byte_array();
+    let mut commit_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    commit_script.extend_from_slice(&commitment);
+    let coinbase = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![
+                0x01,
+                u8::try_from(height).unwrap_or(0xff),
+                0x01,
+                tag,
+            ]),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[&reserved[..]]),
+        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(REGTEST_SUBSIDY_SATS),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(commit_script),
+            },
+        ],
+    };
+    let mut block = Block {
+        header: Header {
+            version: parent.header.version,
+            prev_blockhash: parent.block_hash(),
+            merkle_root: parent.header.merkle_root,
+            time: parent.header.time.saturating_add(1),
+            bits: parent.header.bits,
+            nonce: 0,
+        },
+        txdata: vec![coinbase],
+    };
+    if let Some(root) = block.compute_merkle_root() {
+        block.header.merkle_root = root;
+    }
+    let _ = grind_pow(&mut block.header);
+    block
+}
+
+/// Builds a chain of `count` segwit coinbase blocks extending `parent`; each
+/// block carries a distinct tag so competing branches never collide.
+#[must_use]
+pub fn build_chain(parent: &Block, count: u32, tag: u8, start_height: u32) -> Vec<Block> {
+    let mut chain = Vec::with_capacity(usize::try_from(count).unwrap_or(64));
+    let mut prev = parent.clone();
+    for index in 0..count {
+        let tag = tag.wrapping_add(u8::try_from(index).unwrap_or(0));
+        let block = segwit_coinbase_block(&prev, start_height + index, tag);
+        prev = block.clone();
+        chain.push(block);
+    }
+    chain
+}
+
+/// The node's applied height.
+pub fn block_count(node: &mut ProcessNode) -> Result<u64> {
+    Ok(node
+        .rpc("getblockcount", &json!([]))?
+        .as_u64()
+        .unwrap_or(u64::MAX))
+}
+
+/// The node's applied tip hash, hex.
+pub fn best_hash(node: &mut ProcessNode) -> Result<String> {
+    Ok(node
+        .rpc("getbestblockhash", &json!([]))?
+        .as_str()
+        .unwrap_or("")
+        .to_owned())
+}
+
+/// The node's live peer count.
+pub fn connection_count(node: &mut ProcessNode) -> Result<u64> {
+    Ok(node
+        .rpc("getconnectioncount", &json!([]))?
+        .as_u64()
+        .unwrap_or(u64::MAX))
+}
+
+/// Polls `check` every 200ms until it holds or `dur` elapses.
+pub fn wait_for(dur: Duration, check: &mut dyn FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + dur;
+    while std::time::Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// The node's stderr evidence so far.
+#[must_use]
+pub fn node_stderr(node: &ProcessNode) -> String {
+    std::fs::read_to_string(node.evidence.join("stderr.log")).unwrap_or_default()
+}

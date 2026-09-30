@@ -163,6 +163,12 @@ impl LivePeer {
         self.offer(chain, false);
     }
 
+    /// Send a `headers` frame carrying exactly the headers of `blocks`.
+    pub fn announce_headers(&mut self, blocks: &[Block], deadline: Instant) -> Result<()> {
+        let headers = blocks.iter().map(|block| block.header).collect();
+        self.send(NetworkMessage::Headers(headers), deadline)
+    }
+
     fn offer(&mut self, chain: &[Block], reveal_headers: bool) {
         for block in chain {
             self.blocks.insert(block.block_hash(), block.clone());
@@ -387,4 +393,40 @@ fn strip_witnesses(block: &Block) -> Block {
         }
     }
     stripped
+}
+
+/// Serves bodies type-faithfully until the applied tip reaches `height`.
+///
+/// Once an earlier tip has applied, every observed height must stay at or
+/// above `min_height`: a lower height is an observable rewind, unlike a normal
+/// retry of a body that has not applied yet, and fails the wait immediately.
+pub fn pump_until_tip(
+    peer: &mut LivePeer,
+    node: &mut ProcessNode,
+    min_height: u64,
+    height: u64,
+    hash: &str,
+    dur: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + dur;
+    loop {
+        let count = crate::helpers::block_count(node)?;
+        if count < min_height {
+            return Err(Error::Assertion(format!(
+                "applied tip rewound below h{min_height} while waiting for h{height}: h{count}"
+            )));
+        }
+        if count == height && crate::helpers::best_hash(node)? == hash {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline || peer.dropped {
+            return Ok(false);
+        }
+        peer.pump(Duration::from_millis(400), &mut |peer, items| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for item in items {
+                let _ = peer.serve_item(item, deadline);
+            }
+        });
+    }
 }
