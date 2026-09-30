@@ -16,9 +16,12 @@ permissions:
   contents: read
 
 # One fixed group: deep `main` generations run one at a time, newest waiting
-# behind the current one. `cancel-in-progress: false` means nothing is ever
-# cancelled — a queued generation still produces the full CI record for its
-# merged commit, so evidence is bounded in concurrency, never dropped.
+# behind the current one. `cancel-in-progress: false` protects the *running*
+# generation only; the default pending behavior would still cancel an older
+# waiting run when a newer one arrives, silently dropping that merged
+# commit's CI record. `queue: max` retains up to 100 pending generations
+# (only arrivals beyond the queue cap are rejected), so evidence is bounded
+# in concurrency and never dropped.
 #
 # Rationale (measured 2026-09-30, issue #1349): with a per-run group, every
 # `main` push fanned out all six deep lanes at once and stacked across rapid
@@ -30,6 +33,7 @@ permissions:
 # commit's evidence.
 concurrency:
   group: ci-main
+  queue: max
   cancel-in-progress: false
 
 env:

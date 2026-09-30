@@ -9,17 +9,24 @@ job start, so queue delay is never attributed to CI command cost.
 Usage: gh auth + `python3 scripts/measure-ci-queue.py` (override repo via
 GITHUB_REPOSITORY)."""
 REPO = os.environ.get("GITHUB_REPOSITORY", "gosuda/bitcoin-rs")
+# Window start for every filter below. Defaults to a rolling 48 h so the
+# script still measures after the "before" data ages out; override for a
+# fixed window, e.g. CI_SINCE=2026-09-29T00:00:00Z (the before-measurement
+# window used in PR #1350).
+SINCE = os.environ.get(
+    "CI_SINCE",
+    (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+)
 def api(path):
     out=subprocess.run(["gh","api",path],capture_output=True,text=True,timeout=120)
     if out.returncode!=0: raise RuntimeError(out.stderr[:300])
     return json.loads(out.stdout)
 
-now=datetime.datetime.now(datetime.timezone.utc)
 def runs(wf,n=25):
     d=api(f"/repos/{REPO}/actions/workflows/{wf}/runs?per_page={n}")
-    return [r for r in d["workflow_runs"] if r["created_at"]>="2026-09-29T00:00:00Z"]
+    return [r for r in d["workflow_runs"] if r["created_at"]>=SINCE]
 
-# concurrent load: all runs updated in last 2 days
+# concurrent load: all runs updated in the window
 def dt(x): return datetime.datetime.fromisoformat(x.replace("Z","+00:00"))
 def load_at(t, all_runs):
     c=0
@@ -31,14 +38,16 @@ def load_at(t, all_runs):
 
 ci=runs("ci.yml"); main=runs("main.yml")
 allr=api(f"/repos/{REPO}/actions/runs?per_page=100")["workflow_runs"]
-allr=[r for r in allr if r["created_at"]>="2026-09-29T00:00:00Z"]
+allr=[r for r in allr if r["created_at"]>=SINCE]
 
 def job_rows(run):
     jobs=api(f"/repos/{REPO}/actions/runs/{run['id']}/jobs?per_page=50")["jobs"]
     rows=[]
     for j in jobs:
+        s=j.get("started_at")
+        if not s or s.startswith("1970"): continue  # still queued: no runner yet
         c=datetime.datetime.fromisoformat(j["created_at"].replace("Z","+00:00"))
-        s=datetime.datetime.fromisoformat(j["started_at"].replace("Z","+00:00"))
+        s=datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
         e=j.get("completed_at")
         e=datetime.datetime.fromisoformat(e.replace("Z","+00:00")) if e else None
         rows.append((j["name"],(s-c).total_seconds(),((e-s).total_seconds() if e else None),s))
