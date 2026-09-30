@@ -159,8 +159,9 @@ construction and the unrun seven-pair product campaign.
 
 - All 36 product cells: `residual = "unmeasured"`, `custody = "none"`,
   `noise_floor = "unobserved"` (`HPA-03`, `HPA-08`; `cell_defaults` in
-  `docs/benchmarks/hot-path-ledger.toml` is unchanged and gate-pinned by
-  `bin/bitcoin-rs/tests/gates/g18_hot_path_ledger.rs`).
+  `docs/benchmarks/hot-path-ledger.toml` is unchanged; its schema and
+  identity rejections are checked by the `crates/node/benches/evidence.rs`
+  tests, which parse the checked-in ledger).
 - The updated residual blocker names the real remaining block: the live
   product-cell campaign cannot start because bitcoin-rs has no offline
   archive ingest, no stop-at-height, and no shipped live-IBD product
