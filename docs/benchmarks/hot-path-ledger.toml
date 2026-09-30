@@ -32,7 +32,7 @@ noise_floor = "unobserved"
 # .outline/reference-corpus/reacquire-20260909T010602Z-a721110f/.
 # Full method note, digests, and remaining residual statement:
 # docs/benchmarks/data/comparator-lanes-20260913.md. Per-cell histories
-# stay empty; noise floor stays unobserved (HPA-03, CL-23).
+# stay empty; noise floor stays unobserved (HPA-03, HPA-08).
 
 # ---------------------------------------------------------------------------
 # Interval tree. Exclusive leaves hang off these; they are not addends.
@@ -270,7 +270,7 @@ name = "shutdown drain and reopen/body/undo/index readiness"
 parent = "run.lifecycle"
 concurrency_group = "lifecycle"
 domains = ["offline", "p2p"]
-seams = ["crates/node/src/shutdown.rs", "crates/node/src/run.rs"]
+seams = ["crates/node/src/lifecycle.rs", "crates/node/src/run.rs"]
 timed_region = "domain-defined"
 disposition = "blocked"
 evidence = "Offline timed region ends at durable clean shutdown (#46). Untimed reopen validation stays outside the clock (#44)."
@@ -481,7 +481,7 @@ name = "P2P shutdown drain and reopen"
 parent = "run.lifecycle"
 concurrency_group = "lifecycle"
 domains = ["p2p"]
-seams = ["crates/node/src/shutdown.rs", "crates/p2p/src/listener.rs"]
+seams = ["crates/node/src/lifecycle.rs", "crates/p2p/src/listener.rs"]
 disposition = "blocked"
 evidence = "Lifecycle correctness gate, not a skippable stage."
 

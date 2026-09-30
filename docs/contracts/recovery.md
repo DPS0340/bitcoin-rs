@@ -280,9 +280,9 @@ tests.
   protocol; it is evidence publication, not chainstate authority. It
   publishes a recovery fact only after the restored authoritative position is
   known; neither the warning store nor the marker may move chainstate. The
-  node crate keeps `RecoveryReporter` (`crates/node/src/recovery_reporter.rs`)
-  as the composition adapter implementing `IndexAheadSink` and
-  `RollbackWarningSource`.
+  node crate keeps `RecoveryReporter` (`crates/node/src/state_storage.rs`) as
+  the composition adapter implementing `IndexAheadSink` and
+  `RollbackWarningSource` alongside the storage capabilities it adapts.
 - For checkpoint fallback and index-watermark-ahead evidence, the publisher
   first renders/logs the warning and updates the process-visible warning
   snapshot, then attempts the atomic durable marker write.
