@@ -42,30 +42,34 @@ fn assert_backend_opens(backend: &str) -> Result<()> {
 /// `dbcache` the operator set is only honored if the byte count survives every
 /// hop from [`NodeState::open`] down to `open_with_cache`. A hop that drops it
 /// falls back to the engine default, which no other assertion notices, so this
-/// reads the capacity the backend published on open.
+/// reads the capacity each compiled-in backend published on open.
 #[test]
-#[cfg(feature = "fjall")]
-fn open_gives_the_chainstate_backend_its_budgeted_cache_share() -> Result<()> {
-    const ENGINE_DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+fn open_gives_every_chainstate_backend_its_budgeted_cache_share() -> Result<()> {
+    #[cfg(feature = "rocksdb")]
+    assert_chainstate_cache_share("rocksdb")?;
+    #[cfg(feature = "fjall")]
+    assert_chainstate_cache_share("fjall")?;
+    #[cfg(feature = "redb")]
+    assert_chainstate_cache_share("redb")?;
+    Ok(())
+}
 
+#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
+fn assert_chainstate_cache_share(backend: &str) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let mut config = NodeConfig::default_for_network(Network::Regtest);
-    config.data_dir = temp.path().join("budget");
-    config.storage.backend = "fjall".parse().map_err(anyhow::Error::msg)?;
+    config.data_dir = temp.path().join(backend);
+    config.storage.backend = backend.parse().map_err(anyhow::Error::msg)?;
     config.storage.dbcache_mb = 64;
     config.p2p.listen.clear();
 
-    // No derived index in this deployment, so chainstate owns the whole budget
-    // and the txindex namespace cannot publish a capacity under the same label.
-    assert!(
-        !config.indexes.txindex,
-        "deployment must be chainstate-only"
-    );
-    let budget = bitcoin_rs_storage::clamp_dbcache_bytes(config.storage.dbcache_mb);
-    let expected = bitcoin_rs_storage::split_cache_budget(budget, false)[0].bytes;
+    let expected =
+        bitcoin_rs_storage::split_cache_budget(clamp_budget(&config), txindex_enabled(&config))[0]
+            .bytes;
     assert_ne!(
-        expected, ENGINE_DEFAULT_CACHE_BYTES,
-        "the budget must differ from the engine default or this test proves nothing"
+        expected,
+        engine_default_cache_bytes(backend),
+        "{backend}: the budget must differ from the engine default or this proves nothing"
     );
 
     let gauges = GaugeSpy::default();
@@ -73,16 +77,44 @@ fn open_gives_the_chainstate_backend_its_budgeted_cache_share() -> Result<()> {
 
     assert_capacity_eq(
         &gauges,
-        "storage.cache_capacity_bytes{backend=\"fjall\"}",
+        &format!("storage.cache_capacity_bytes{{backend=\"{backend}\"}}"),
         expected,
     );
     drop(state);
     Ok(())
 }
 
+/// The capacity each engine configures when no budget reaches it, so a dropped
+/// budget is distinguishable from a delivered one.
+#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
+fn engine_default_cache_bytes(backend: &str) -> u64 {
+    match backend {
+        "rocksdb" => 256 * 1024 * 1024,
+        "fjall" => 32 * 1024 * 1024,
+        "redb" | "redb-txindex" => 1024 * 1024 * 1024,
+        other => panic!("no engine default recorded for {other}"),
+    }
+}
+
+#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
+fn clamp_budget(config: &NodeConfig) -> u64 {
+    bitcoin_rs_storage::clamp_dbcache_bytes(config.storage.dbcache_mb)
+}
+
+/// `NodeState::open` splits the budget on the capabilities the index config
+/// enables, so read the same predicate instead of a literal.
+#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
+fn txindex_enabled(config: &NodeConfig) -> bool {
+    !config
+        .indexes
+        .script_index
+        .enabled_capabilities(config.indexes.txindex)
+        .is_empty()
+}
+
 /// Asserts a published capacity equals the expected byte count. Both are small
 /// integers (< 2^31) that `f64` represents exactly.
-#[cfg(feature = "fjall")]
+#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
 #[expect(
     clippy::cast_precision_loss,
     reason = "byte counts < 2^31, lossless in f64"

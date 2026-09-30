@@ -207,9 +207,11 @@ mod tests {
 
     use super::{COMMANDS, CORE_UNTYPED_COMMANDS};
 
-    /// The two properties the table must hold for the code that reads it:
-    /// [`super::command`] resolves a name to one row, and every name fits the
-    /// 12-byte v1 command field the framer copies it into.
+    /// The properties the table must hold for the code that reads it:
+    /// [`super::command`] resolves a name to one row, and every name is spelled
+    /// as peers send it — lowercase ASCII fitting the 12-byte v1 command field
+    /// the framer copies it into. A name that differs from the wire spelling
+    /// decodes every real peer's message as `Message::Unknown`.
     #[test]
     fn every_command_name_is_unique_and_fits_the_v1_field() {
         let names: BTreeSet<&str> = COMMANDS.iter().map(|entry| entry.name).collect();
@@ -222,6 +224,11 @@ mod tests {
             assert!(
                 !name.is_empty() && name.len() <= 12,
                 "{name} does not fit the 12-byte v1 command field"
+            );
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+                "{name} is not spelled as peers send it: lowercase ASCII"
             );
         }
         for name in CORE_UNTYPED_COMMANDS {

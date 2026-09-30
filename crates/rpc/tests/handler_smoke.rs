@@ -192,8 +192,20 @@ const FIXTURE_HEIGHT: u64 = 7;
 
 /// Asserts `expected` is contained in `actual`: objects and arrays recurse on
 /// the keys and elements `expected` names, and every other value must be equal.
+/// An empty expected object means the answer must be an empty object.
 fn assert_contains(method: &str, path: &str, actual: &sonic_rs::Value, expected: &sonic_rs::Value) {
     if let Some(fields) = expected.as_object() {
+        let found = actual
+            .as_object()
+            .unwrap_or_else(|| panic!("{method}: {path} must be an object, got {actual}"));
+        if fields.is_empty() {
+            assert_eq!(
+                found.len(),
+                0,
+                "{method}: {path} must be empty, got {actual}"
+            );
+            return;
+        }
         for (key, value) in fields {
             let found = actual
                 .get(key)

@@ -56,7 +56,7 @@ Rules, each enforced by the FSM (`crates/p2p/src/fsm.rs`) and identical to Core'
 
 ## 5. Message Surface
 
-The decoder types exactly the commands in `crates/p2p/src/compat.rs::COMMANDS` (**36**). That table is the authority for names and status; this section is the Core-comparison commentary and is checked for set equality of command names. The status for each command is defined only by `COMMANDS`; the table below records behavior and Core comparison.
+The decoder types exactly the commands in `crates/p2p/src/compat.rs::COMMANDS` (**36**). That table is the authority for names and status; this section is the Core-comparison commentary, kept in sync with `COMMANDS` by hand in the same change-set. The status for each command is defined only by `COMMANDS`; the table below records behavior and Core comparison.
 
 | Command | Behavior and Core 31.1 comparison |
 | :--- | :--- | :--- |
@@ -186,7 +186,7 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
 
 ## 8. Verification
 
-- **Deterministic fixtures**: `crates/p2p/tests/core_compat.rs` pins the command inventory against this table and against rust-bitcoin's v1 envelope (`RawNetworkMessage`), the handshake fields and service bits, the per-role `relay` advertisement and the block-relay-only prohibition on transaction traffic, per-network magic/ports and framing, getheaders/headers semantics and bounds, inv/getdata relay round-trips with `notfound`, the reject-or-ignore matrix of §6, and the peer-visible behavior across a chain switch (reorg) and a restart at the `ChainQuery` seam: a rebuilt query serves byte-identical answers, a switched active branch serves the new branch from the fork point and `notfound`s stale bodies. Run with `cargo test -p bitcoin-rs-p2p --test core_compat`.
+- **Deterministic fixtures**: `crates/p2p/tests/core_compat.rs` pins the command inventory against rust-bitcoin's v1 envelope (`RawNetworkMessage`), the handshake fields and service bits, the per-role `relay` advertisement and the block-relay-only prohibition on transaction traffic, per-network magic/ports and framing, getheaders/headers semantics and bounds, inv/getdata relay round-trips with `notfound`, the reject-or-ignore matrix of §6, and the peer-visible behavior across a chain switch (reorg) and a restart at the `ChainQuery` seam: a rebuilt query serves byte-identical answers, a switched active branch serves the new branch from the fork point and `notfound`s stale bodies. Run with `cargo test -p bitcoin-rs-p2p --test core_compat`.
 - **Transaction consumers**: `crates/p2p/src/dispatch.rs` test
   `gateway_inventory_filters_and_serves_txid_and_wtxid` exercises lookup,
   requested serialization, and retained-body immutability over the gateway.
