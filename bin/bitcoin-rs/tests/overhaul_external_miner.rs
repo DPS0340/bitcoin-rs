@@ -11,12 +11,12 @@ use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::constants::genesis_block;
 use bitcoin::hashes::Hash as _;
-use bitcoin::script::Builder;
 use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{
-    Amount, Block, CompactTarget, Network, OutPoint, ScriptBuf, Sequence, Target, Transaction,
-    TxIn, TxMerkleNode, TxOut, WPubkeyHash, Witness,
+    Amount, Block, CompactTarget, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+    TxMerkleNode, TxOut, WPubkeyHash, Witness,
 };
+use bitcoin_rs_e2e::helpers::{coinbase_script_sig, grind_pow};
 use bitcoin_rs_e2e::{Kind, ProcessNode};
 use serde_json::{Value, json};
 
@@ -222,27 +222,6 @@ fn assemble_from_template(template: &Value) -> TestResult<Block> {
         .ok_or("block must have a merkle root")?;
     grind_pow(&mut block.header)?;
     Ok(block)
-}
-
-fn coinbase_script_sig(height: u32) -> ScriptBuf {
-    let mut builder = Builder::new().push_int(i64::from(height));
-    if builder.as_bytes().len() < 2 {
-        builder = builder.push_int(0);
-    }
-    builder.into_script()
-}
-
-fn grind_pow(header: &mut Header) -> TestResult {
-    let target = Target::from(header.bits);
-    loop {
-        if target.is_met_by(header.block_hash()) {
-            return Ok(());
-        }
-        header.nonce = header
-            .nonce
-            .checked_add(1)
-            .ok_or("nonce exhausted while grinding block")?;
-    }
 }
 
 fn required_str<'a>(value: &'a Value, key: &str) -> TestResult<&'a str> {

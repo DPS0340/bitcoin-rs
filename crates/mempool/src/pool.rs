@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::entry::fee_rate;
-use crate::fee_estimator::{FeeEstimator, FeeRate, HistoryReject};
+use crate::fee_estimator::{FeeEstimator, FeeRate};
 use crate::mutation::{
     MutationChange, MutationOutcome, MutationResult, MutationSequence, RemovalReason,
 };
@@ -1414,15 +1414,6 @@ impl Mempool {
     #[must_use]
     pub fn estimator_history(&self) -> Vec<u8> {
         self.estimator.to_history_bytes()
-    }
-
-    /// Adopts persisted estimator state. A payload this build cannot
-    /// interpret — wrong magic, unknown version, corrupt layout — is
-    /// rejected and the estimator stays exactly as it was, which for a pool
-    /// that just opened is the empty, insufficient-data state.
-    pub fn restore_estimator_history(&mut self, bytes: &[u8]) -> Result<(), HistoryReject> {
-        self.adopt_estimator_history(FeeEstimator::from_history_bytes(bytes)?);
-        Ok(())
     }
 
     /// Publishes already decoded history so datadir loading can validate it

@@ -84,7 +84,7 @@ mixed-tip page.
   same integration test plus `listener_directory_table_is_closed_over_http`;
   run with `cargo test -p bitcoin-rs --test wallet_facing`.
 - **Consumer boundary:** the proof uses only HTTP against a spawned node.
-  Evidence: `source_does_not_import_node_internals` in that test target.
+  Evidence: the imports of that test target.
 
 ### `WF-03`: Proof is a public-process consumer
 
@@ -96,8 +96,6 @@ mixed-tip page.
   `getblocktemplate` and `submitblock`, then issues the
   BDK/esplora-client dialect against `/api`: tip, block height, headers,
   scripthash UTXOs and history, fee estimates, and `POST /api/tx`.
-  `source_does_not_import_node_internals` enforces `WF-01` on uncommented
-  proof source, including aliases and fully qualified paths.
 - Named out-of-repo consumer: `btcw -n regtest -u http://<rpc-bind>/api`
   against a node started with `--network regtest --scriptindex`. Failures
   of that run are public-interface defects, not reasons to patch a wallet
@@ -108,8 +106,6 @@ mixed-tip page.
 - `bin/bitcoin-rs/tests/wallet_facing.rs::external_wallet_can_scan_estimate_and_broadcast`
 - `crates/rpc/src/server.rs` tests `wf_02_classify_splits_rest_esplora_and_json_rpc` (existing)
 - `crates/rpc/src/esplora.rs` tests `esplora_lives_only_under_the_api_prefix`, `api_is_the_public_electrs_directory`, and `esplora_is_the_mempool_backend_superset` (existing)
-- `bin/bitcoin-rs/tests/wallet_facing.rs::source_does_not_import_node_internals`
-  (existing)
 
 ## Vocabulary
 

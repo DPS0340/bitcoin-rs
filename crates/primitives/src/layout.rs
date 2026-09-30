@@ -526,12 +526,6 @@ impl<'a> ParsedTransaction<'a> {
         &self.outputs
     }
 
-    /// Number of inputs.
-    #[must_use]
-    pub fn input_count(&self) -> usize {
-        self.inputs.len()
-    }
-
     /// Number of outputs.
     #[must_use]
     pub fn output_count(&self) -> usize {

@@ -199,17 +199,6 @@ pub(crate) const NO_WALLET: &str =
 /// compile unmodified.
 pub use crate::registry::MANIFEST;
 
-/// True when `name` answers a dispatch for `kind` in this build.
-///
-/// Projects from [`crate::registry::REGISTRY`], so a row and its dispatch
-/// arm cannot disagree about registrability.
-#[must_use]
-pub fn is_registered(kind: SurfaceKind, name: &str) -> bool {
-    crate::registry::REGISTRY
-        .iter()
-        .any(|row| row.entry.kind == kind && row.entry.name == name && row.entry.shipped())
-}
-
 /// Rows of one transport kind, in table order.
 ///
 /// Projects from [`crate::registry::REGISTRY`], yielding the [`Entry`] view
