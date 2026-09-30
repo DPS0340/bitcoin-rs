@@ -123,3 +123,67 @@ fn unsupported(namespace: &str, backend: StorageBackend) -> StorageError {
         "unsupported storage backend for {namespace}: {backend}"
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// Concrete open entry points that may appear only in this module. A call
+    /// anywhere else bypasses the budgeted `open_with_cache` path and silently
+    /// runs on the engine-default cache — the defect the cache-share test in
+    /// `tests/state_storage.rs` cannot see because it measures only opens that
+    /// already went through here.
+    const CONCRETE_OPEN_TOKENS: &[&str] = &[
+        "RocksDbStore::open",
+        "FjallStore::open",
+        "RedbStore::open",
+        "open_redb_tx_index_store",
+    ];
+
+    /// Runtime crates whose stores must be composed through this module.
+    /// Test-only files are skipped: unit and integration fixtures open
+    /// concrete stores by design.
+    #[test]
+    fn runtime_backend_construction_has_one_owner() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for src in [
+            crates.join("node/src"),
+            crates.join("chainstate/src"),
+            crates.join("index/src"),
+        ] {
+            assert_no_concrete_opens(&src);
+        }
+    }
+
+    fn assert_no_concrete_opens(dir: &Path) {
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        {
+            let path = entry
+                .unwrap_or_else(|e| panic!("read {} entry: {e}", dir.display()))
+                .path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) != Some("tests") {
+                    assert_no_concrete_opens(&path);
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "storage_backend.rs" || name == "tests.rs" || name.ends_with("_tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for token in CONCRETE_OPEN_TOKENS {
+                assert!(
+                    !source.contains(token),
+                    "{} constructs a concrete backend with {token}; move it to storage_backend.rs",
+                    path.display()
+                );
+            }
+        }
+    }
+}
