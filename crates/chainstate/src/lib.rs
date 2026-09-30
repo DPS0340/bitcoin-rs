@@ -903,11 +903,7 @@ impl Chainstate {
         coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
         chain_events: Arc<crate::events::ChainEventPublisher>,
     ) -> Self {
-        let ibd = Arc::new(bitcoin_rs_chain::InitialBlockDownload::new(
-            TipReader::new(Arc::clone(&applied_tip)),
-            BlockTreeReader::new(Arc::clone(&block_tree)),
-        ));
-        Self {
+        Self::from_parts(ChainstateParts {
             network,
             chain_tip,
             applied_tip,
@@ -918,20 +914,16 @@ impl Chainstate {
             block_body_store: None,
             undo_store: Arc::new(InMemoryUndoStore::default()),
             durable_head: Arc::new(bitcoin_rs_storage::InMemoryDurableHeadStore::new()),
-            admission: Arc::new(ApplyAdmission::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             chain_transition: TransitionDomain::new().authority(),
             assume_valid_height: 0,
-            assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
             validation_mode: ValidationMode::AssumeValid,
             validation_engine: bitcoin_rs_consensus::ValidationEngine::Native,
             journal: None,
-            checkpoint_publisher: None,
             capture_rawtx: false,
             capture_block_bytes: false,
             retention: bitcoin_rs_storage::MandatoryRetention::in_memory(),
-            ibd,
-        }
+        })
     }
 
     /// Captures derived payloads on later connects: per-tx wire bytes and/or
