@@ -1,6 +1,6 @@
 # Benchmark evidence rules
 
-Each page under `docs/benchmarks/` owns one measurement cell. This page owns
+Each page under `docs/benchmarks/` owns its measurement cells. This page owns
 the rules every cell shares, so a cell page states only what is specific to it.
 
 ## Required identities per sample

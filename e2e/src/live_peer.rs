@@ -409,9 +409,12 @@ pub fn pump_until_tip(
     dur: Duration,
 ) -> Result<bool> {
     let deadline = Instant::now() + dur;
+    let mut reached_min = false;
     loop {
         let count = crate::helpers::block_count(node)?;
-        if count < min_height {
+        if count >= min_height {
+            reached_min = true;
+        } else if reached_min {
             return Err(Error::Assertion(format!(
                 "applied tip rewound below h{min_height} while waiting for h{height}: h{count}"
             )));

@@ -397,6 +397,21 @@ pub fn wait_for_mempool_tx(node: &mut ProcessNode, txid: &str, timeout: Duration
     })
 }
 
+/// The coinbase `script_sig`: `height` in little-endian significant bytes,
+/// then a single-byte `tag` push that separates competing branches.
+fn bip34_script_sig(height: u32, tag: u8) -> Vec<u8> {
+    let le = height.to_le_bytes();
+    let used = le
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(1, |last| last + 1);
+    let mut script = Vec::with_capacity(used + 3);
+    script.push(u8::try_from(used).unwrap_or(1));
+    script.extend_from_slice(&le[..used]);
+    script.extend_from_slice(&[0x01, tag]);
+    script
+}
+
 /// Builds a BIP141 segwit coinbase-only block on `parent`.
 ///
 /// The coinbase carries the 32-byte reserved nonce in its input witness and an
@@ -419,12 +434,7 @@ pub fn segwit_coinbase_block(parent: &Block, height: u32, tag: u8) -> Block {
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::from_bytes(vec![
-                0x01,
-                u8::try_from(height).unwrap_or(0xff),
-                0x01,
-                tag,
-            ]),
+            script_sig: ScriptBuf::from_bytes(bip34_script_sig(height, tag)),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[&reserved[..]]),
         }],
@@ -453,7 +463,10 @@ pub fn segwit_coinbase_block(parent: &Block, height: u32, tag: u8) -> Block {
     if let Some(root) = block.compute_merkle_root() {
         block.header.merkle_root = root;
     }
-    let _ = grind_pow(&mut block.header);
+    assert!(
+        grind_pow(&mut block.header).is_ok(),
+        "segwit coinbase nonce space exhausted"
+    );
     block
 }
 
