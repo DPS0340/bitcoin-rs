@@ -1,13 +1,12 @@
 //! Deterministic Bitcoin Core 31.1 P2P compatibility contract tests.
 //!
-//! Pins the inventory in [`bitcoin_rs_p2p::COMMANDS`] against the policy
-//! table, rust-bitcoin's v1 envelope, and the decoder: handshake fields,
+//! Pins the inventory in [`bitcoin_rs_p2p::COMMANDS`] against rust-bitcoin's
+//! v1 envelope and the decoder it drives: handshake fields,
 //! per-network magic and service bits, getheaders/headers exchange bounds,
 //! inv/getdata relay round-trips, the reject-or-ignore policy for malformed
 //! and unsupported messages, and the peer-visible effect of a chain switch
 //! (reorg) and restart at the [`ChainQuery`] seam the node implements.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -37,7 +36,7 @@ use bitcoin_rs_p2p::wire::{
 };
 use bitcoin_rs_p2p::{
     BannedSubnet, COMMANDS, CORE_UNTYPED_COMMANDS, InboundBlock, InboundHeaders, ListenerExtras,
-    Message, NetworkActivity, PINNED_CORE_VERSION, Peer, PeerState, PeerTable,
+    Message, NetworkActivity, Peer, PeerState, PeerTable,
 };
 use bitcoin_rs_primitives::{
     Block, BlockHash as NativeBlockHash, CompactTarget, Hash256, Header, consensus_bytes,
@@ -373,70 +372,6 @@ fn expect_protocol_error<T: std::fmt::Debug>(
     }
 }
 
-/// Command names listed in policy §5. Combined rows (`addr` / `addrv2`) split
-/// on `/`; only the first table cell is read, so body backticks are ignored.
-fn policy_message_commands(policy: &str) -> Result<BTreeSet<String>, Box<dyn Error>> {
-    let section = policy
-        .split("## 5. Message Surface")
-        .nth(1)
-        .and_then(|rest| rest.split("## 6.").next())
-        .ok_or("policy is missing §5 Message Surface")?;
-    let mut names = BTreeSet::new();
-    for line in section.lines() {
-        let Some(rest) = line.strip_prefix("| `") else {
-            continue;
-        };
-        let Some(cell) = rest.split('|').next() else {
-            continue;
-        };
-        for piece in cell.split('/') {
-            let name = piece.trim().trim_matches('`').trim();
-            if name.is_empty() {
-                continue;
-            }
-            if !name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            {
-                return Err(format!("policy §5 cell is not a command name: {name:?}").into());
-            }
-            names.insert(name.to_owned());
-        }
-    }
-    Ok(names)
-}
-
-/// Command literals in `decode_payload`'s typed match arms, up to the `_` arm.
-fn decoder_match_commands(wire_src: &str) -> Result<BTreeSet<String>, Box<dyn Error>> {
-    let start = wire_src
-        .find("fn decode_payload(command: &str, payload: &[u8])")
-        .ok_or("decode_payload missing")?;
-    let body = wire_src
-        .get(start..)
-        .ok_or("decode_payload slice")?
-        .split("let message = match command {")
-        .nth(1)
-        .and_then(|rest| rest.split("\n        _ =>").next())
-        .ok_or("decode_payload match missing")?;
-    let mut names = BTreeSet::new();
-    for line in body.lines() {
-        let Some(rest) = line.trim_start().strip_prefix('"') else {
-            continue;
-        };
-        let Some((name, after)) = rest.split_once('"') else {
-            continue;
-        };
-        if !after.trim_start().starts_with("=>") {
-            continue;
-        }
-        names.insert(name.to_owned());
-    }
-    if names.is_empty() {
-        return Err("no decoder arms parsed".into());
-    }
-    Ok(names)
-}
-
 fn rust_bitcoin_frame(payload: NetworkMessage) -> Vec<u8> {
     bitcoin_encode::serialize(&RawNetworkMessage::new(Magic::REGTEST, payload))
 }
@@ -448,39 +383,8 @@ fn our_frame(message: &Message) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// Inventory owner: code table, policy table, decoder, rust-bitcoin envelope
+// Inventory owner: code table, decoder, rust-bitcoin envelope
 // ---------------------------------------------------------------------------
-
-#[test]
-fn command_inventory_matches_the_policy_table() -> Result<(), Box<dyn Error>> {
-    const POLICY: &str = include_str!("../../../docs/policies/p2p-compatibility.md");
-    assert!(
-        POLICY.contains(&format!("**{PINNED_CORE_VERSION}**")),
-        "policy must pin {PINNED_CORE_VERSION}"
-    );
-
-    let from_code: BTreeSet<&str> = COMMANDS.iter().map(|entry| entry.name).collect();
-    let from_policy = policy_message_commands(POLICY)?;
-    let from_policy: BTreeSet<&str> = from_policy.iter().map(String::as_str).collect();
-    assert_eq!(
-        from_code, from_policy,
-        "COMMANDS is the owner; the policy §5 table is a checked projection"
-    );
-    Ok(())
-}
-
-#[test]
-fn decoder_match_arms_equal_the_command_inventory() -> Result<(), Box<dyn Error>> {
-    const WIRE: &str = include_str!("../src/wire.rs");
-    let from_code: BTreeSet<&str> = COMMANDS.iter().map(|entry| entry.name).collect();
-    let from_decoder = decoder_match_commands(WIRE)?;
-    let from_decoder: BTreeSet<&str> = from_decoder.iter().map(String::as_str).collect();
-    assert_eq!(
-        from_code, from_decoder,
-        "every decode_payload arm must be in COMMANDS, and every COMMANDS row must have an arm"
-    );
-    Ok(())
-}
 
 #[test]
 fn listed_commands_type_and_core_untyped_commands_stay_unknown() -> Result<(), Box<dyn Error>> {

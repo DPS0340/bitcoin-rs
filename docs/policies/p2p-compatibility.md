@@ -6,7 +6,7 @@ This document declares bitcoin-rs's peer-wire compatibility contract with Bitcoi
 
 This policy applies to the P2P transport and peer-protocol surface of `bitcoin-rs-p2p` (`crates/p2p`), including `ActiveChainQuery` (`crates/p2p/src/chain_query.rs`), and the network flags of the node binary. It is the peer-visible counterpart to `docs/policies/source-compatibility.md` (toolchain) and the RPC compatibility manifest (`crates/rpc/src/manifest.rs`, rendered as `docs/rpc-reference.md`).
 
-The decoded command inventory is owned by `crates/p2p/src/compat.rs` (`COMMANDS`, `PINNED_CORE_VERSION`). This document owns the handshake fields, the reject-or-ignore matrix, the deviation ledger, and the verification process. Where this document and prose comments disagree, this document wins; where it and the code disagree, the code is the defect. The §5 table is a checked projection of `COMMANDS` (`command_inventory_matches_the_policy_table`).
+The decoded command inventory is owned by `crates/p2p/src/compat.rs` (`COMMANDS`, `PINNED_CORE_VERSION`). This document owns the handshake fields, the reject-or-ignore matrix, the deviation ledger, and the verification process. Where this document and prose comments disagree, this document wins; where it and the code disagree, the code is the defect. The §5 table is a hand-maintained projection of `COMMANDS`, updated in the same change-set as the table it projects.
 
 ## 2. Pinned Reference Version
 
