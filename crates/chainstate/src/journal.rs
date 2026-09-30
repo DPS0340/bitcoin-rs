@@ -1,24 +1,12 @@
 //! Maps block changes into journal records and replays authenticated records at boot.
-//!
-//! Creates and BIP30 overwrites precede spends, matching the UTXO commit order.
-//! Same-block spends are already netted out by the UTXO owner. Each remaining
-//! spend requires its full undo preimage; duplicate and unmatched restores fail.
-//! Replay validates header identity and live-coin preimages before committing.
 
-use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_chain::ChainTxCount;
-use bitcoin_rs_chain::NodeStatus;
-use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_primitives::Header;
-use bitcoin_rs_storage::chainstate_journal::Coin;
-use bitcoin_rs_storage::chainstate_journal::JournalRecord;
-use bitcoin_rs_storage::chainstate_journal::JournalReplayBase;
-use bitcoin_rs_storage::chainstate_journal::JournalReplayError;
-use bitcoin_rs_storage::chainstate_journal::Mutation;
-use bitcoin_rs_storage::chainstate_journal::replay_committed_range;
+use bitcoin_rs_chain::{BlockTree, ChainTxCount, NodeStatus};
+use bitcoin_rs_primitives::{Hash256, Header};
+use bitcoin_rs_storage::chainstate_journal::{
+    Coin, JournalRecord, JournalReplayBase, JournalReplayError, Mutation, replay_committed_range,
+};
 use bitcoin_rs_utxo::UtxoSet;
-use bitcoin_rs_utxo::contract::BlockChanges;
-use bitcoin_rs_utxo::contract::UtxoAdd;
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use hashbrown::HashMap;
 use thiserror::Error;
 
@@ -36,10 +24,6 @@ pub(crate) enum JournalDeltaError {
 }
 
 /// Extracts the ordered journal mutations for one fully applied block.
-///
-/// `undo_coins` supplies the full preimage of each spent or overwritten
-/// outpoint. Records are matched by outpoint, not by input order. Creates and
-/// overwrites precede spends; same-block spends are already netted out.
 pub(crate) fn mutations_for_block(
     changes: &BlockChanges<&'_ bitcoin_rs_primitives::TxOut>,
     undo_coins: impl IntoIterator<Item = Coin>,
@@ -132,10 +116,6 @@ fn validate_replayed_head(
 }
 
 /// Applies ordered records above a restored checkpoint state.
-///
-/// Headers first regenerate valid `NodeId`s and chainwork. Mutations then pass
-/// through the same `UtxoSet` commit surface as live apply, with a listener
-/// seeded from the checkpoint `CoinStats`.
 struct ReplayAccumulator {
     tree: BlockTree,
     utxo: UtxoSet,
@@ -143,8 +123,6 @@ struct ReplayAccumulator {
     applied_tip: bitcoin_rs_chain::TipSnapshot,
     chain_tx_count: u64,
     /// The base carries an unknown count: zero at a non-genesis height.
-    /// A genesis-empty base (height 0, nothing below it to total) still
-    /// counts its records, matching the journal writer.
     unknown_base: bool,
 }
 

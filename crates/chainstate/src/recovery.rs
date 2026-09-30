@@ -2,19 +2,12 @@
 
 use crate::{ChainstateJournalConfig, JournalBootstrap};
 use anyhow::Context as _;
-use anyhow::Result;
-use anyhow::bail;
+use anyhow::{Result, bail};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_utxo::UtxoSet;
 use std::path::Path;
 
 /// Threshold for classifying a restored checkpoint as catastrophically stale.
-///
-/// A checkpoint restore more than this many blocks behind the durable
-/// applied-tip witness is a catastrophic rollback, not a routine resume.
-/// The restore is still accepted — the chainstate is valid — but the node
-/// logs at ERROR and the warning snapshot carries the gap so operators
-/// and RPC consumers can see the node is starting far behind where it was.
 pub const STALE_RESTORE_ERROR_THRESHOLD: u32 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,10 +147,6 @@ pub fn prepare_initial_chainstate(
     // Check the full-revalidation marker BEFORE opening the checkpoint: the
     // marker contract says incremental recovery must be ignored, so the
     // checkpoint must not be part of the decision once the marker is present.
-    // Opening it first would validate a large artifact only to discard it, and
-    // a corrupt checkpoint could fail startup before the marker gets a chance
-    // to force cold replay — making a checkpoint artifact stronger than the
-    // marker that explicitly says not to trust incremental recovery.
     if requires_full_revalidation(data_dir) {
         metrics::counter!(
             "node.chainstate_journal.fallback_total",

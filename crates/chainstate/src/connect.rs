@@ -1,40 +1,24 @@
 //! Validated block connection and its ordered persistence/publication transaction.
 
-use super::ApplyFinish;
-use super::ApplyIntent;
-use super::Bip68Context;
-use super::BlockLocalUtxoView;
-use super::BlockProvenance;
-use super::BlockTxPlan;
-use super::BlockValidationContext;
-use super::Chainstate;
-use super::ConnectOutcome;
-use super::PreparedApply;
-use super::ProvenApply;
-use super::ResolvedUtxoView;
 use super::durable::{
     ConnectCommitFacts, commit_connect_head, stored_body_row, sync_appended_blocks,
 };
-use super::prepare::prepare_apply;
-use super::prepare::verify_block_transactions;
-use super::publication::publish_applied;
-use super::publication::tx_count_delta_for;
+use super::prepare::{prepare_apply, verify_block_transactions};
+use super::publication::{publish_applied, tx_count_delta_for};
 use super::scratch::ApplyScratch;
 use super::window::{PendingBlockCommit, PublishMode};
+use super::{
+    ApplyFinish, ApplyIntent, Bip68Context, BlockLocalUtxoView, BlockProvenance, BlockTxPlan,
+    BlockValidationContext, Chainstate, ConnectOutcome, PreparedApply, ProvenApply,
+    ResolvedUtxoView,
+};
 use crate::error::ApplyError;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::node::NodeId;
-use bitcoin_rs_consensus::MAX_SCRIPT_SIZE;
-use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
-use bitcoin_rs_consensus::UtxoView;
-use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_primitives::Txid;
-use bitcoin_rs_primitives::consensus_bytes;
+use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, MEDIAN_TIME_PAST_WINDOW, UtxoView};
+use bitcoin_rs_primitives::{Block, Hash256, Txid, consensus_bytes};
 use bitcoin_rs_storage::CommitRecords;
-use bitcoin_rs_utxo::contract::BlockChangeError;
-use bitcoin_rs_utxo::contract::build_block_changes;
-use bitcoin_rs_utxo::contract::is_coinbase_tx;
+use bitcoin_rs_utxo::contract::{BlockChangeError, build_block_changes, is_coinbase_tx};
 use hashbrown::HashMap;
 use std::sync::Arc;
 
@@ -62,14 +46,6 @@ pub(super) fn apply_committed_block_admitted<'b>(
 }
 
 /// Shared connect body for [`ApplyIntent::Commit`] and [`ApplyIntent::Propose`].
-///
-/// See `ARCH-07` in `docs/contracts/architecture.md`.
-///
-/// Kept separate from transition acquisition so a window can take both locks
-/// once across its preparation and all of its ordered commits. Re-entering per
-/// block would be two read guards on the same lock, which deadlocks against a
-/// shutdown waiting on the write side, and would leave gaps in which another
-/// applier could move the chain out from under prepared state.
 #[allow(clippy::too_many_lines)]
 pub(super) fn apply_block_admitted<'b>(
     handles: &Chainstate,
@@ -194,10 +170,6 @@ pub(super) fn apply_block_admitted<'b>(
     // implementation selected at runtime, so this one parse replaces the
     // scalar `compute_txid` pass *and* the per-transaction serialize/reparse
     // that script preparation used to perform.
-    // A window prepares several blocks against one overlay and hands the result
-    // back, so the kernel parse and the prevout resolution happen once. A proof
-    // whose context no longer matches is discarded together with its prepared
-    // view; the ordinary path rebuilds both from the live UTXO set.
     let (prepared, transactions_proven) = match proven {
         Some(ProvenApply::Proven(proof)) if proof.context == validation_context => {
             (proof.prepared, true)
@@ -224,8 +196,6 @@ pub(super) fn apply_block_admitted<'b>(
     // Witness IDs are needed only for a witness-carrying block under active
     // segwit; the view computes them once and the commitment check consumes
     // the cache, so witness-free blocks never serialize-and-hash for wtxids.
-    // The native one-pass layout already carries them; this only fills the
-    // kernel-build facts, which derive witness IDs lazily.
     let needs_wtxids = softfork_state.segwit_active && tx_plan.witness_presence.is_present();
     if needs_wtxids {
         view.witness_ids();
@@ -253,8 +223,6 @@ pub(super) fn apply_block_admitted<'b>(
 
     let script_verify_started = quanta::Instant::now();
     // A matching proof certifies exactly this transaction-validation slot.
-    // Block rules and BIP30/BIP34 remain above it; coinbase maturity and BIP68
-    // remain below it. Every other state uses the ordinary verifier.
     let script_verify_result = if transactions_proven {
         Ok(())
     } else {
@@ -361,11 +329,6 @@ pub(super) fn apply_block_admitted<'b>(
     // money. Nothing above bounds what the coinbase pays itself: block rules
     // check structure, and per-transaction verification exempts the coinbase
     // because it has no inputs to weigh its outputs against.
-    //
-    // Placed here because `build_block_changes` has just gathered the totals for
-    // free, and still before `persist_undo` -- the first write of any kind --
-    // so a rejected block leaves nothing behind. Genesis is skipped for the
-    // same reason its transactions are not connected.
     if height > 0 {
         let fees = value_totals
             .fees()
@@ -573,9 +536,6 @@ pub(super) fn apply_block_admitted<'b>(
         }
         // The gap block's durable batch committed before the crash: the
         // stored head receipt covers its body, undo, and locator rows.
-        // Replay redoes only what publication owed — the journal tail
-        // and the coherent tip — and carries the receipt's commit id, and
-        // the published tip carries the count the durable head certified.
         PublishMode::Replay { receipt } => {
             let commit_id = receipt.commit_id;
             outcome.tip = receipt.certify(outcome.tip);
@@ -625,13 +585,6 @@ pub(super) fn apply_block_admitted<'b>(
 
 /// Accumulates Core's `validation:block_connected` payload facts and fires
 /// the probe.
-///
-/// Core counts `nInputs` over every transaction and `nSigOpsCost` with
-/// `GetTransactionSigOpCost` against the connect view (the same rules as
-/// `bitcoin_rs_consensus::transaction_sigop_cost`), then fires the probe
-/// after the block is connected. The per-transaction prevout resolution runs
-/// inside `prepare`, so a build without the `usdt` feature — or a node with
-/// no consumer attached — does none of it.
 fn emit_block_connected(
     block: &Block,
     block_hash: &Hash256,
@@ -854,18 +807,6 @@ pub(super) fn check_bip30_and_bip34(
 }
 
 /// Applies the shared contextual header gate to a block being connected.
-///
-/// PRE: `prior` is the applied predecessor of `block`, if it has one, and
-/// `height` is that predecessor's child height.
-///
-/// POST: `Ok(())` only when
-/// [`bitcoin_rs_chain::validate_contextual_header`] accepts the block's
-/// header against its parent. Every failure is wrapped as
-/// [`ApplyError::Chain`]; `classify_apply_error` marks the deterministic
-/// contextual variants (including `NbitsMismatch`) as permanent.
-///
-/// INVARIANT: this operation adds no header rule of its own; header
-/// admission and block connection share the one contextual implementation.
 fn validate_contextual_block_header(
     handles: &Chainstate,
     block: &Block,
@@ -932,8 +873,6 @@ pub(super) fn applied_header_tip(
     // No header check here: the shared contextual gate
     // (`validate_contextual_block_header`) ran at the top of this function, in
     // the same pre-mutation phase, so a rejection there leaves nothing behind.
-    // A crash-recovery replay is exempt from the gate; its durable head
-    // receipt certifies the header instead.
     let node_id = match tree.lookup(block_hash) {
         Some(node_id) => node_id,
         None => tree.insert_header(block.header, bitcoin_rs_chain::node::NodeStatus::Active)?,
@@ -994,10 +933,6 @@ pub(super) fn map_block_change_error(error: &BlockChangeError) -> ApplyError {
 /// The derived journal record for one connected block, or `None` when there
 /// is nothing to derive (genesis never reaches this path; a disabled journal
 /// derives nothing).
-///
-/// Pure: the caller decides when the record may reach the writer, which is
-/// after the durable head batch — the journal may lag the head, never lead
-/// it.
 pub(super) type BuiltJournalRecord =
     Option<core::result::Result<bitcoin_rs_storage::chainstate_journal::JournalRecord, String>>;
 
@@ -1045,11 +980,6 @@ fn build_journal_record(
 }
 
 /// Emits one built journal record, best-effort.
-///
-/// The journal is a recovery accelerator, not a consensus dependency: an
-/// extraction failure records the append gap and an append failure warns,
-/// and neither fails the block. Both run after the durable head batch, so a
-/// failure here can only make the journal lag, never lead.
 pub(super) fn emit_journal_record(handles: &Chainstate, built: BuiltJournalRecord, height: u32) {
     let Some(journal) = handles.journal.as_ref() else {
         return;

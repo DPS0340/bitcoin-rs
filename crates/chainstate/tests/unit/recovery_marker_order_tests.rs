@@ -19,11 +19,10 @@ use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use parking_lot::RwLock;
 
-use crate::ChainstateJournalConfig;
-use crate::checkpoint;
 use crate::checkpoint::headers::HeaderCheckpointConfig;
 use crate::checkpoint::{CHECKPOINT_ROOT, CURRENT_FILE, MANIFEST_FILE};
 use crate::recovery::{ResumeSource, prepare_initial_chainstate};
+use crate::{ChainstateJournalConfig, checkpoint};
 
 const NETWORK: Network = Network::Regtest;
 
