@@ -25,61 +25,196 @@ use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
 mod mining_fixture;
 
+/// Every required handler must answer with the facts the fixture chain,
+/// mempool, index and network hold, not merely with a well-formed value: a
+/// handler that reads the wrong height, hashes the wrong block, or loses the
+/// transaction it was handed still returns `Ok` with a Core-shaped body.
+/// Each row pins the fields that identify the answer as coming from this
+/// fixture; extra fields are the responsibility of the per-method tests below.
+///
+/// preciousblock, invalidateblock, stop, and help are not dispatched here:
+/// preciousblock/stop/help are not implemented yet (Core-compat manifest gap),
+/// and invalidateblock requires a chain control, which the dedicated
+/// invalidateblock tests wire themselves.
 #[test]
-fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::Error>> {
+fn required_handlers_report_the_fixture_chain_mempool_and_network_facts()
+-> Result<(), Box<dyn std::error::Error>> {
     let fixture = Fixture::new()?;
     let handler = Handler::new(Arc::clone(&fixture.ctx));
-    let raw_tx = hex_encode(&consensus_bytes(&fixture.tx));
 
-    // A valid base64 PSBT for finalizepsbt / combinepsbt.
-    let valid_psbt = build_valid_base64_psbt(&fixture.tx)?;
-
-    let cases: &[(&str, sonic_rs::Value)] = &[
-        ("getblockcount", json!([])),
-        ("getbestblockhash", json!([])),
-        ("getblockhash", json!([0])),
-        (
-            "getblockheader",
-            json!([fixture.block_hash.to_string(), false]),
-        ),
-        ("getblock", json!([fixture.block_hash.to_string(), 1])),
-        ("getblockchaininfo", json!([])),
-        ("getchaintxstats", json!([])),
-        ("getmempoolinfo", json!([])),
-        ("getrawmempool", json!([])),
-        ("getmempoolentry", json!([fixture.txid.to_string()])),
-        ("gettxout", json!([fixture.txid.to_string(), 0_u64])),
-        ("gettxoutsetinfo", json!([])),
-        ("getrawtransaction", json!([fixture.txid.to_string()])),
-        ("sendrawtransaction", json!([raw_tx.as_str()])),
-        ("testmempoolaccept", json!([[raw_tx.as_str()]])),
-        ("getblockstats", json!([fixture.block_hash.to_string()])),
-        ("getindexinfo", json!([])),
-        ("getnetworkinfo", json!([])),
-        ("getpeerinfo", json!([])),
-        ("getconnectioncount", json!([])),
-        ("getnetworkhashps", json!([])),
-        ("getprioritisedtransactions", json!([])),
-        ("uptime", json!([])),
-        ("finalizepsbt", json!([valid_psbt.as_str()])),
-        ("combinepsbt", json!([[valid_psbt.as_str()]])),
-        ("verifychain", json!([])),
-        // preciousblock, invalidateblock, stop, and help are not dispatched
-        // here: preciousblock/stop/help are not implemented yet (Core-compat
-        // manifest gap), and invalidateblock requires a chain control, which
-        // the dedicated invalidateblock tests wire themselves.
-        ("getmininginfo", json!([])),
-        ("getblocktemplate", json!([{"rules": ["segwit"]}])),
-        ("submitblock", json!([fixture.block_hex.as_str()])),
-    ];
-
-    for (method, params) in cases {
-        handler
-            .dispatch(method, params)
-            .unwrap_or_else(|err| panic!("{method} should return a Core shape: {err}"));
+    for (method, params, expected) in chain_and_mempool_expectations(&fixture)
+        .into_iter()
+        .chain(network_and_wallet_expectations(&fixture)?)
+    {
+        let actual = handler
+            .dispatch(method, &params)
+            .unwrap_or_else(|err| panic!("{method} must answer: {err}"));
+        assert_contains(method, method, &actual, &expected);
     }
+
+    // uptime counts wall-clock seconds, so only its type is fixed here.
+    let uptime = handler.dispatch("uptime", &json!([]))?;
+    assert!(uptime.as_u64().is_some(), "uptime must be a second count");
     Ok(())
 }
+
+type Expectation = (&'static str, sonic_rs::Value, sonic_rs::Value);
+
+fn chain_and_mempool_expectations(fixture: &Fixture) -> Vec<Expectation> {
+    let tip = fixture.block_hash.to_string();
+    let txid = fixture.txid.to_string();
+    let raw_tx = hex_encode(&consensus_bytes(&fixture.tx));
+    // The block hex starts with the 80-byte header getblockheader serializes.
+    let header_hex = &fixture.block_hex[..160];
+
+    vec![
+        ("getblockcount", json!([]), json!(FIXTURE_HEIGHT)),
+        ("getbestblockhash", json!([]), json!(tip)),
+        ("getblockhash", json!([FIXTURE_HEIGHT]), json!(tip)),
+        ("getblockheader", json!([tip, false]), json!(header_hex)),
+        (
+            "getblock",
+            json!([tip, 1]),
+            json!({
+                "hash": tip,
+                "height": FIXTURE_HEIGHT,
+                "nTx": 1,
+                "confirmations": 1,
+                "tx": [txid],
+            }),
+        ),
+        (
+            "getblockchaininfo",
+            json!([]),
+            json!({
+                "chain": "regtest",
+                "blocks": FIXTURE_HEIGHT,
+                "headers": FIXTURE_HEIGHT,
+                "bestblockhash": tip,
+            }),
+        ),
+        (
+            "getchaintxstats",
+            json!([]),
+            json!({
+                "window_final_block_hash": tip,
+                "window_final_block_height": FIXTURE_HEIGHT,
+            }),
+        ),
+        (
+            "getblockstats",
+            json!([tip]),
+            json!({"blockhash": tip, "height": FIXTURE_HEIGHT, "txs": 1, "outs": 1}),
+        ),
+        (
+            "getmempoolinfo",
+            json!([]),
+            json!({"size": 1, "bytes": 100}),
+        ),
+        ("getrawmempool", json!([]), json!([txid])),
+        (
+            "getmempoolentry",
+            json!([txid]),
+            json!({
+                "vsize": 100,
+                "height": FIXTURE_HEIGHT,
+                "ancestorcount": 1,
+                "descendantcount": 1,
+            }),
+        ),
+        (
+            "gettxout",
+            json!([txid, 0_u64]),
+            json!({"value": 0.00005, "bestblock": tip, "coinbase": false}),
+        ),
+        (
+            "gettxoutsetinfo",
+            json!([]),
+            json!({"height": FIXTURE_HEIGHT, "bestblock": tip}),
+        ),
+        ("getrawtransaction", json!([txid]), json!(raw_tx)),
+        ("sendrawtransaction", json!([raw_tx]), json!(txid)),
+        (
+            "testmempoolaccept",
+            json!([[raw_tx]]),
+            json!([{
+                "txid": txid,
+                "allowed": false,
+                "reject-reason": "txn-already-in-mempool",
+            }]),
+        ),
+    ]
+}
+
+fn network_and_wallet_expectations(
+    fixture: &Fixture,
+) -> Result<Vec<Expectation>, Box<dyn std::error::Error>> {
+    // A valid base64 PSBT for finalizepsbt / combinepsbt.
+    let psbt = build_valid_base64_psbt(&fixture.tx)?;
+
+    Ok(vec![
+        (
+            "getindexinfo",
+            json!([]),
+            json!({"txindex": {"synced": true, "best_block_height": FIXTURE_HEIGHT}}),
+        ),
+        (
+            "getnetworkinfo",
+            json!([]),
+            json!({"protocolversion": 70016, "connections": 0, "networkactive": true}),
+        ),
+        ("getpeerinfo", json!([]), json!([])),
+        ("getconnectioncount", json!([]), json!(0)),
+        ("getnetworkhashps", json!([]), json!(0.0)),
+        ("getprioritisedtransactions", json!([]), json!({})),
+        (
+            "finalizepsbt",
+            json!([psbt]),
+            json!({"complete": false, "psbt": psbt, "hex": null}),
+        ),
+        ("combinepsbt", json!([[psbt]]), json!(psbt)),
+        // No block verifier is wired, so the chain cannot be declared verified.
+        ("verifychain", json!([]), json!(false)),
+        ("getmininginfo", json!([]), json!({"chain": "regtest"})),
+        (
+            "getblocktemplate",
+            json!([{"rules": ["segwit"]}]),
+            json!({"weightlimit": 4_000_000, "sizelimit": 4_000_000}),
+        ),
+        ("submitblock", json!([fixture.block_hex]), json!(null)),
+    ])
+}
+
+/// The fixture seeds a chain whose tip, block record, index and mempool entry
+/// all sit at this height, so every handler that reports a height must report
+/// it.
+const FIXTURE_HEIGHT: u64 = 7;
+
+/// Asserts `expected` is contained in `actual`: objects and arrays recurse on
+/// the keys and elements `expected` names, and every other value must be equal.
+fn assert_contains(method: &str, path: &str, actual: &sonic_rs::Value, expected: &sonic_rs::Value) {
+    if let Some(fields) = expected.as_object() {
+        for (key, value) in fields {
+            let found = actual
+                .get(key)
+                .unwrap_or_else(|| panic!("{method}: {path}.{key} missing from {actual}"));
+            assert_contains(method, &format!("{path}.{key}"), found, value);
+        }
+        return;
+    }
+    if let Some(items) = expected.as_array() {
+        let found = actual
+            .as_array()
+            .unwrap_or_else(|| panic!("{method}: {path} must be an array, got {actual}"));
+        assert_eq!(found.len(), items.len(), "{method}: {path} length");
+        for (index, item) in items.iter().enumerate() {
+            assert_contains(method, &format!("{path}[{index}]"), &found[index], item);
+        }
+        return;
+    }
+    assert_eq!(actual, expected, "{method}: {path}");
+}
+
 #[cfg(feature = "zmq")]
 #[test]
 fn getzmqnotifications_dispatches_compiled_notifications() -> Result<(), Box<dyn std::error::Error>>
