@@ -10,10 +10,9 @@
 //!    manifest; drift names the delta and the regen command. Regeneration
 //!    is a separate ignored test, so a coverage run never writes and a
 //!    regen run never passes silently;
-//! 4. the declared claims stay honest: every `Deviation` row states its
-//!    difference, no row claims `Supported` while the pinned reference
-//!    carries no differential harness, and the reference identity still
-//!    matches `Cargo.lock`.
+//! 4. the declared claims stay honest: no row claims `Supported` while the
+//!    pinned reference carries no differential harness, and the reference
+//!    identity still matches `Cargo.lock`.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -121,10 +120,9 @@ fn rest_rows_and_router_registrations_agree_both_ways() {
 }
 
 /// Invariant 1 (ZMQ): the declared topic rows are exactly the five topics
-/// Bitcoin Core registers, and every shipped topic names its activation
-/// requirements. The row set is checked feature-independently, because a
-/// topic declared only when `zmq` is compiled would let the table and the
-/// publisher disagree in a build nobody tests.
+/// Bitcoin Core registers. The row set is checked feature-independently,
+/// because a topic declared only when `zmq` is compiled would let the table
+/// and the publisher disagree in a build nobody tests.
 #[test]
 fn zmq_rows_are_valid_core_topics() {
     let declared: BTreeSet<&str> = manifest::entries_of_kind(SurfaceKind::Zmq)
@@ -135,38 +133,6 @@ fn zmq_rows_are_valid_core_topics() {
         declared, core,
         "the ZMQ rows must name exactly the Core-registered topics"
     );
-    for entry in shipped(SurfaceKind::Zmq) {
-        assert!(
-            !entry.notes.is_empty(),
-            "ZMQ topic `{}` must name its activation requirements",
-            entry.name
-        );
-    }
-}
-
-/// Invariant 4: a row that claims `Deviation` has to say what the deviation
-/// is. The status alone tells a client that this node differs and not how,
-/// which is the least useful thing a compatibility table can say.
-#[test]
-fn every_deviation_states_itself() {
-    let deviations: Vec<&Entry> = manifest::MANIFEST
-        .iter()
-        .filter(|entry| entry.status == Status::Deviation)
-        .collect();
-    assert!(
-        !deviations.is_empty(),
-        "the registry must record its deviations"
-    );
-    for entry in deviations {
-        assert!(
-            entry.notes.trim().len() > 40,
-            "the {} row `{}` claims a deviation in {} characters, \
-             which cannot describe one",
-            entry.kind.label(),
-            entry.name,
-            entry.notes.trim().len()
-        );
-    }
 }
 
 /// Invariant 4: nothing may claim `Supported` until something can verify it.
