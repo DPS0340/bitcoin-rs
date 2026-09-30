@@ -125,8 +125,8 @@ checkpoint or replay a journal as an authority.
   canonical estimator accounting stays inside the lifecycle, that slow
   observers never hold the pool writer, and that queue overflow produces gap
   counters and a reconcile signal with bounded memory.
-- `crates/node/tests/overhaul_durable_head.rs` (planned): tests that a new
-  durable head is published only after mempool alignment.
+- `crates/node/tests/overhaul_durable_head.rs`: tests that a new durable head
+  is published only after mempool alignment.
 - `scripts/check_models.py` (manual evidence lane): checks the
   `ChainAdmission` TLA+ model, which covers the durable commit, mempool
   reconciliation, and stable publication ordering.
