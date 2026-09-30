@@ -24,8 +24,39 @@ use crossbeam_channel::bounded;
 use crate::config::{NodeConfig, RuntimeInputs};
 use crate::embed::Node;
 use crate::event_loop::EventLoop;
-use crate::shutdown;
 use crate::state::NodeState;
+
+/// Teardown-entry observation seam local to the lifecycle owner.
+mod shutdown {
+    #[cfg(test)]
+    pub(super) struct ShutdownStageGuard;
+
+    #[cfg(test)]
+    thread_local! {
+        static SHUTDOWN_STAGES_REACHED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn mark_shutdown_stage() -> ShutdownStageGuard {
+        SHUTDOWN_STAGES_REACHED.with(|slot| slot.set(slot.get().saturating_add(1)));
+        ShutdownStageGuard
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_shutdown_stages_reached() -> u32 {
+        SHUTDOWN_STAGES_REACHED.with(core::cell::Cell::take)
+    }
+
+    #[cfg(not(test))]
+    pub(super) struct ShutdownStageMark;
+
+    #[cfg(not(test))]
+    #[must_use]
+    pub(super) fn mark_shutdown_stage() -> ShutdownStageMark {
+        ShutdownStageMark
+    }
+}
 
 /// Bounded wait for the derived-index worker join on explicit shutdown and
 /// on Drop; expiry abandons the join, revokes the generation token, and
@@ -80,7 +111,7 @@ fn bind_rpc(
             applied_tip: chainstate.applied_tip_reader(),
             ibd: Arc::clone(ibd),
             blocks: state.blocks(),
-            utxo: chainstate.utxo_handle(),
+            utxo: chainstate.utxo_reader(),
             coin_stats: chainstate.coin_stats_handle(),
             block_tree: chainstate.block_tree_reader(),
             chain_network: state.config().network,
