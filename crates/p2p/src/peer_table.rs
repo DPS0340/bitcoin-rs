@@ -571,13 +571,6 @@ impl PeerTable {
         operation(&live_sessions_of(&entries));
     }
 
-    /// Calls `f` with every live lease under the table's read lock.
-    pub fn for_each_lease(&self, mut f: impl FnMut(SocketAddr, &PeerLease)) {
-        for (addr, entry) in self.entries.read().iter() {
-            f(*addr, &entry.lease);
-        }
-    }
-
     /// Visits handshake-complete leases and their identity-bound metadata.
     /// Holds table authority through each callback, including an outbound queue
     /// operation, so replacement cannot change the target or relay preference.

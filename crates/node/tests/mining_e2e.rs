@@ -21,6 +21,7 @@ use bitcoin_rs_primitives::{
     Amount, Block, CompactTarget, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes, deserialize as native_deserialize, encode::double_sha256,
 };
+use bitcoin_rs_script::push_int;
 
 use bitcoin_rs_rpc::{
     Handler,
@@ -368,9 +369,7 @@ fn seed_chain(state: &NodeState, count: u32) -> Result<Hash256> {
                 previous_output: null_prevout(),
                 // BIP34 height push plus one pad byte: consensus requires a
                 // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
-                script_sig: Script::from_bytes(
-                    [script_push_int(i64::from(height)), script_push_int(0)].concat(),
-                ),
+                script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
                 sequence: Sequence::from_consensus(0xffff_ffff),
                 witness: Witness::new(),
             }],
@@ -476,7 +475,7 @@ fn seed_coinbase_spend_with_fee(fee_sats: u64) -> Tx {
             previous_output: null_prevout(),
             // Must mirror the height-1 seed coinbase exactly (txid anchors
             // the mempool spend).
-            script_sig: Script::from_bytes([script_push_int(1), script_push_int(0)].concat()),
+            script_sig: Script::from_bytes([push_int(1), push_int(0)].concat()),
             sequence: Sequence::from_consensus(0xffff_ffff),
             witness: Witness::new(),
         }],
@@ -524,9 +523,7 @@ fn assemble_regtest_block(prev: Hash256, height: u32, txs: Vec<Tx>) -> Result<Bl
         version: 2,
         inputs: vec![TxIn {
             previous_output: null_prevout(),
-            script_sig: Script::from_bytes(
-                [script_push_int(i64::from(height)), script_push_int(0)].concat(),
-            ),
+            script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
             sequence: Sequence::from_consensus(0xffff_ffff),
             witness: Witness::new(),
         }],
@@ -594,9 +591,7 @@ fn mine_regtest_block(
             previous_output: null_prevout(),
             // BIP34 height push plus one pad byte: consensus requires a
             // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
-            script_sig: Script::from_bytes(
-                [script_push_int(i64::from(height)), script_push_int(0)].concat(),
-            ),
+            script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
             sequence: Sequence::from_consensus(0xffff_ffff),
             witness: Witness::new(),
         }],
@@ -688,7 +683,7 @@ fn assemble_block(
         inputs: vec![TxIn {
             previous_output: null_prevout(),
             // BIP34: the coinbase scriptSig begins with the serialized height.
-            script_sig: Script::from_bytes(script_push_int(i64::from(height))),
+            script_sig: Script::from_bytes(push_int(i64::from(height))),
             sequence: Sequence::from_consensus(0xffff_ffff),
             witness: Witness::from_stack(vec![WITNESS_RESERVED.to_vec()]),
         }],
@@ -731,31 +726,6 @@ fn assemble_block(
 /// The one-input null-prevout coinbase outpoint (Core `COINBASE_OUTPOINT`).
 fn null_prevout() -> OutPoint {
     OutPoint::new(Txid::default(), u32::MAX)
-}
-
-/// Minimal script push of a small integer, mirroring rust-bitcoin
-/// `Builder::push_int`: `OP_0` for zero, `OP_N` for 1..=16, otherwise a
-/// length-prefixed little-endian payload (BIP34 heights).
-fn script_push_int(value: i64) -> Vec<u8> {
-    match value {
-        0 => vec![0x00],
-        // `value` is pinned to 1..=16 by the match arm.
-        1..=16 => vec![0x50 + u8::try_from(value).unwrap_or_default()],
-        _ => {
-            let mut payload = Vec::new();
-            let mut magnitude = value.unsigned_abs();
-            while magnitude > 0 {
-                // Low byte only; the shift below consumes it fully.
-                payload.push(u8::try_from(magnitude & 0xff).unwrap_or_default());
-                magnitude >>= 8;
-            }
-            let mut out = Vec::with_capacity(payload.len() + 1);
-            // A small-int push never exceeds 8 payload bytes.
-            out.push(u8::try_from(payload.len()).unwrap_or_default());
-            out.extend(payload);
-            out
-        }
-    }
 }
 
 /// Native BIP141 witness merkle fold with the odd-leaf duplication rule.
