@@ -41,6 +41,8 @@ pub mod kernel;
 mod sha256d64;
 /// Shared transaction-level BIP141 sigop accounting.
 mod sigops;
+/// Optional Bitcoin Core-compatible USDT tracepoints (`usdt` feature).
+pub mod trace;
 /// Block rule checks.
 pub mod verify_block;
 /// Transaction rule checks.
