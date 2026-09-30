@@ -26,8 +26,8 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -35,31 +35,34 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: taiki-e/install-action@39fa37110d4f0b0312682d675dbf52e40db30cb4 # cargo-deny
+        with:
+          tool: cargo-deny@0.20.2
       - run: cargo deny --workspace --no-default-features --features "rocksdb,fjall,redb,kernel" check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
       - run: ./scripts/ci-pr.sh clippy
 
   test-crates:
+    needs: [fmt, deny, clippy]
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
       - uses: ./.github/actions/test-deps
@@ -69,13 +72,14 @@ jobs:
 
   test-binary:
     if: github.event_name != 'pull_request'
+    needs: [fmt, deny, clippy]
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
       - uses: ./.github/actions/native-deps
@@ -84,7 +88,7 @@ jobs:
       - run: ./scripts/ci-pr.sh test-binary
       - name: Preserve process compatibility evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
           name: process-compatibility-binary-${{ github.run_attempt }}
           path: target/process-harness/**
@@ -93,13 +97,14 @@ jobs:
 
   test-workspace:
     if: github.event_name != 'pull_request'
+    needs: [fmt, deny, clippy]
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
       - uses: ./.github/actions/test-deps
@@ -107,7 +112,7 @@ jobs:
       - run: ./scripts/ci-pr.sh test-workspace
       - name: Preserve process compatibility evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
           name: process-compatibility-workspace-${{ github.run_attempt }}
           path: target/process-harness/**
@@ -127,31 +132,41 @@ jobs:
     steps:
       - name: Evaluate gate
         run: |
-          echo "Fast lanes:"
-          for job in fmt deny clippy test-crates; do
-            echo "  $job: ${{ needs[job].result }}"
-          done
-          echo "Heavy lanes:"
-          for job in test-binary test-workspace; do
-            echo "  $job: ${{ needs[job].result }}"
-          done
+          needs_json='${{ toJSON(needs) }}'
 
-          # Fast lanes must succeed.
-          for job in fmt deny clippy test-crates; do
-            if [[ "${{ needs[job].result }}" != "success" ]]; then
-              echo "::error::$job ${{ needs[job].result }}"
-              exit 1
+          check() {
+            local name="$1" allow_skip="$2"
+            local result
+            result=$(echo "$needs_json" | jq -r --arg n "$name" '.[$n].result')
+            echo "  $name: $result"
+            if [[ "$result" == "success" ]]; then
+              return 0
+            elif [[ "$allow_skip" == "true" && "$result" == "skipped" ]]; then
+              return 0
+            else
+              echo "::error::$name $result"
+              return 1
             fi
+          }
+
+          echo "Fast lanes:"
+          failed=0
+          for job in fmt deny clippy test-crates; do
+            check "$job" false || failed=1
           done
 
-          # Heavy lanes: success or skipped (PRs skip them).
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+          echo "Heavy lanes:"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             for job in test-binary test-workspace; do
-              if [[ "${{ needs[job].result }}" != "success" ]]; then
-                echo "::error::$job ${{ needs[job].result }}"
-                exit 1
-              fi
+              check "$job" true || true
+            done
+          else
+            for job in test-binary test-workspace; do
+              check "$job" false || failed=1
             done
           fi
 
+          if [[ $failed -ne 0 ]]; then
+            exit 1
+          fi
           echo "Gate passed."
