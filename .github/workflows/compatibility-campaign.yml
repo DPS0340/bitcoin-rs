@@ -12,9 +12,13 @@ on:
 permissions:
   contents: read
 
-# Preserve an evidence run for every scheduled or manual invocation.
+# Preserve an evidence run for every scheduled or manual invocation, but run
+# generations serially: a campaign that overruns its daily slot used to start
+# the next day's run beside it (per-run group), stacking long throughput
+# jobs against PR feedback (issue #1349). Fixed group + `cancel-in-progress:
+# false` queues the newer run without ever dropping evidence.
 concurrency:
-  group: ci-compatibility-${{ github.workflow }}-${{ github.run_id }}
+  group: ci-compatibility
   cancel-in-progress: false
 
 env:

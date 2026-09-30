@@ -15,13 +15,21 @@ on:
 permissions:
   contents: read
 
-# Same design as ci.yml's concurrency block: one group per run, so `main`
-# pushes never queue against each other and so are never cancelled (a pending
-# run in a shared group would be cancelled by a third push and leave the
-# commit with no CI record). This workflow never sees pull_request events, so
-# there is nothing to cancel-in-progress.
+# One fixed group: deep `main` generations run one at a time, newest waiting
+# behind the current one. `cancel-in-progress: false` means nothing is ever
+# cancelled — a queued generation still produces the full CI record for its
+# merged commit, so evidence is bounded in concurrency, never dropped.
+#
+# Rationale (measured 2026-09-30, issue #1349): with a per-run group, every
+# `main` push fanned out all six deep lanes at once and stacked across rapid
+# merges (14 concurrent workflow runs at deep-job start, max 30). Those
+# long-running generations consumed the GitHub-hosted runner pool and delayed
+# short, latency-sensitive PR jobs — `fmt`/`deny`/`clippy` execute in
+# 10-60 s but queued for up to ~34 minutes behind them. Serializing complete
+# `main` runs caps deep fan-out at six runners while preserving every
+# commit's evidence.
 concurrency:
-  group: ci-main-${{ github.workflow }}-${{ github.run_id }}
+  group: ci-main
   cancel-in-progress: false
 
 env:
