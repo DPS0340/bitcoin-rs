@@ -397,9 +397,9 @@ fn strip_witnesses(block: &Block) -> Block {
 
 /// Serves bodies type-faithfully until the applied tip reaches `height`.
 ///
-/// Once an earlier tip has applied, every observed height must stay at or
-/// above `min_height`: a lower height is an observable rewind, unlike a normal
-/// retry of a body that has not applied yet, and fails the wait immediately.
+/// Every observed height must stay at or above `min_height`, which callers set
+/// to a height already applied before the wait: a lower height is an
+/// observable rewind and fails the wait immediately.
 pub fn pump_until_tip(
     peer: &mut LivePeer,
     node: &mut ProcessNode,
@@ -409,12 +409,9 @@ pub fn pump_until_tip(
     dur: Duration,
 ) -> Result<bool> {
     let deadline = Instant::now() + dur;
-    let mut reached_min = false;
     loop {
         let count = crate::helpers::block_count(node)?;
-        if count >= min_height {
-            reached_min = true;
-        } else if reached_min {
+        if count < min_height {
             return Err(Error::Assertion(format!(
                 "applied tip rewound below h{min_height} while waiting for h{height}: h{count}"
             )));
