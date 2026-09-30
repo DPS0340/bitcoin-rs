@@ -27,18 +27,18 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bitcoin::absolute::LockTime;
 use bitcoin::bip152::{BlockTransactionsRequest, HeaderAndShortIds, PrefilledTransaction};
 use bitcoin::consensus::serialize;
-use bitcoin::hashes::{Hash as _, sha256d};
+use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
-use bitcoin::{
-    Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+use bitcoin::{Amount, Block, BlockHash};
+use bitcoin_rs_e2e::helpers::{
+    best_hash, block_count, build_chain, genesis_block, segwit_coinbase_block, wait_for,
 };
 use bitcoin_rs_e2e::node::workspace;
 use bitcoin_rs_e2e::process_peer::connect_loopback;
@@ -358,7 +358,7 @@ fn synced_peer(name: &str) -> Result<(ProcessNode, CompactPeer, Vec<Block>), Err
             "node never reported the inbound peer".to_owned(),
         ));
     }
-    let chain = build_chain(&regtest_genesis(), CHAIN_LEN, 0xB1, 1);
+    let chain = build_chain(&genesis_block(), CHAIN_LEN, 0xB1, 1);
     peer.offer_chain(&chain);
     let tip = chain.last().expect("chain has blocks");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -396,106 +396,10 @@ fn ok_count(value: &serde_json::Value) -> Option<u64> {
     value.as_u64()
 }
 
-fn block_count(node: &mut ProcessNode) -> Result<u64, Error> {
-    Ok(node
-        .rpc("getblockcount", &json!([]))?
-        .as_u64()
-        .unwrap_or(u64::MAX))
-}
-
-fn best_hash(node: &mut ProcessNode) -> Result<String, Error> {
-    Ok(node
-        .rpc("getbestblockhash", &json!([]))?
-        .as_str()
-        .unwrap_or("")
-        .to_owned())
-}
-
-fn wait_for(dur: Duration, check: &mut dyn FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + dur;
-    while Instant::now() < deadline {
-        if check() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
-}
-
 fn evidence_dir() -> std::path::PathBuf {
     let dir = workspace().join("target/compact-blocks-e2e");
     std::fs::create_dir_all(&dir).expect("evidence dir");
     dir
-}
-
-fn regtest_genesis() -> Block {
-    bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
-}
-
-/// Builds a BIP141 segwit coinbase-only block on `parent`, with the witness
-/// commitment and merkle root the node's own body check requires. `tag`
-/// separates branches so equal-height coinbases differ.
-fn segwit_coinbase_block(parent: &Block, height: u32, tag: u8) -> Block {
-    let reserved = [tag; 32];
-    // A coinbase-only tree zeroes witness leaf 0, so the witness merkle root
-    // is [0; 32] and the commitment is sha256d(root || reserved).
-    let mut buffer = [0_u8; 64];
-    buffer[32..].copy_from_slice(&reserved);
-    let commitment = sha256d::Hash::hash(&buffer).to_byte_array();
-    let mut commit_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    commit_script.extend_from_slice(&commitment);
-    let coinbase = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::from_bytes(vec![0x01, u8::try_from(height).unwrap_or(0xff)]),
-            sequence: Sequence::MAX,
-            witness: Witness::from_slice(&[&reserved[..]]),
-        }],
-        output: vec![
-            TxOut {
-                value: Amount::from_sat(5_000_000_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            },
-            TxOut {
-                value: Amount::ZERO,
-                script_pubkey: ScriptBuf::from_bytes(commit_script),
-            },
-        ],
-    };
-    let mut block = Block {
-        header: bitcoin::block::Header {
-            version: parent.header.version,
-            prev_blockhash: parent.block_hash(),
-            merkle_root: parent.header.merkle_root,
-            time: parent.header.time.saturating_add(1),
-            bits: parent.header.bits,
-            nonce: 0,
-        },
-        txdata: vec![coinbase],
-    };
-    block.header.merkle_root = block.compute_merkle_root().expect("coinbase merkle root");
-    while !bitcoin::Target::from_compact(block.header.bits).is_met_by(block.header.block_hash()) {
-        block.header.nonce = block
-            .header
-            .nonce
-            .checked_add(1)
-            .expect("nonce space exhausted");
-    }
-    block
-}
-
-fn build_chain(parent: &Block, count: u32, tag: u8, start_height: u32) -> Vec<Block> {
-    let mut chain = Vec::with_capacity(usize::try_from(count).unwrap_or(64));
-    let mut prev = parent.clone();
-    for index in 0..count {
-        let tag = tag.wrapping_add(u8::try_from(index).unwrap_or(0));
-        let block = segwit_coinbase_block(&prev, start_height + index, tag);
-        prev = block.clone();
-        chain.push(block);
-    }
-    chain
 }
 
 /// A compact `getdata` within 5 blocks of the active tip is answered with a
