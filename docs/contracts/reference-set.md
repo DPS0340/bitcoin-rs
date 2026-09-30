@@ -178,7 +178,7 @@ This is an evidence tool pin. No checker run is claimed by this page.
   `getindexinfo` to report synchronization at the confirming height under
   one fixed deadline before querying confirmed explorer status. This is
   not a claim to execute an independent Esplora server.
-- `bin/bitcoin-rs/tests/support/process_peer.rs`: independent rust-bitcoin v1
+- `e2e/src/process_peer.rs`: independent rust-bitcoin v1
   framing, one deadline per handshake/transaction barrier, bounded frames,
   message count and transcript, and socket custody. Fault cases cover
   malformed/truncated frames, wrong network/checksum, oversized lengths,
