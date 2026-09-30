@@ -62,14 +62,6 @@ pub(super) fn apply_committed_block_admitted<'b>(
 }
 
 /// Shared connect body for [`ApplyIntent::Commit`] and [`ApplyIntent::Propose`].
-///
-/// See `ARCH-07` in `docs/contracts/architecture.md`.
-///
-/// Kept separate from transition acquisition so a window can take both locks
-/// once across its preparation and all of its ordered commits. Re-entering per
-/// block would be two read guards on the same lock, which deadlocks against a
-/// shutdown waiting on the write side, and would leave gaps in which another
-/// applier could move the chain out from under prepared state.
 #[allow(clippy::too_many_lines)]
 pub(super) fn apply_block_admitted<'b>(
     handles: &Chainstate,
@@ -625,13 +617,6 @@ pub(super) fn apply_block_admitted<'b>(
 
 /// Accumulates Core's `validation:block_connected` payload facts and fires
 /// the probe.
-///
-/// Core counts `nInputs` over every transaction and `nSigOpsCost` with
-/// `GetTransactionSigOpCost` against the connect view (the same rules as
-/// `bitcoin_rs_consensus::transaction_sigop_cost`), then fires the probe
-/// after the block is connected. The per-transaction prevout resolution runs
-/// inside `prepare`, so a build without the `usdt` feature — or a node with
-/// no consumer attached — does none of it.
 fn emit_block_connected(
     block: &Block,
     block_hash: &Hash256,
@@ -854,18 +839,6 @@ pub(super) fn check_bip30_and_bip34(
 }
 
 /// Applies the shared contextual header gate to a block being connected.
-///
-/// PRE: `prior` is the applied predecessor of `block`, if it has one, and
-/// `height` is that predecessor's child height.
-///
-/// POST: `Ok(())` only when
-/// [`bitcoin_rs_chain::validate_contextual_header`] accepts the block's
-/// header against its parent. Every failure is wrapped as
-/// [`ApplyError::Chain`]; `classify_apply_error` marks the deterministic
-/// contextual variants (including `NbitsMismatch`) as permanent.
-///
-/// INVARIANT: this operation adds no header rule of its own; header
-/// admission and block connection share the one contextual implementation.
 fn validate_contextual_block_header(
     handles: &Chainstate,
     block: &Block,
@@ -994,10 +967,6 @@ pub(super) fn map_block_change_error(error: &BlockChangeError) -> ApplyError {
 /// The derived journal record for one connected block, or `None` when there
 /// is nothing to derive (genesis never reaches this path; a disabled journal
 /// derives nothing).
-///
-/// Pure: the caller decides when the record may reach the writer, which is
-/// after the durable head batch — the journal may lag the head, never lead
-/// it.
 pub(super) type BuiltJournalRecord =
     Option<core::result::Result<bitcoin_rs_storage::chainstate_journal::JournalRecord, String>>;
 
@@ -1045,11 +1014,6 @@ fn build_journal_record(
 }
 
 /// Emits one built journal record, best-effort.
-///
-/// The journal is a recovery accelerator, not a consensus dependency: an
-/// extraction failure records the append gap and an append failure warns,
-/// and neither fails the block. Both run after the durable head batch, so a
-/// failure here can only make the journal lag, never lead.
 pub(super) fn emit_journal_record(handles: &Chainstate, built: BuiltJournalRecord, height: u32) {
     let Some(journal) = handles.journal.as_ref() else {
         return;

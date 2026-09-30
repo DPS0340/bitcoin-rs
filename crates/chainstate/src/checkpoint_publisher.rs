@@ -1,23 +1,4 @@
 //! Full-checkpoint publication: the chainstate maintenance export.
-//!
-//! `CheckpointPublisher` owns the full-checkpoint write path shared by the
-//! clean-shutdown publication, retention-pressure compaction
-//! ([`crate::maintenance`]), and manual export. A checkpoint is a
-//! maintenance artifact, not a recovery authority (`RCV-10` in
-//! `docs/contracts/recovery.md`): the durable root and the ordered commit
-//! protocol make every committed tip recoverable, boot replays the journal
-//! suffix from the last checkpoint, and a node killed mid-sync restarts
-//! from that base with no periodic publisher running.
-//!
-//! ## Cost when it fires
-//!
-//! `publish` closes apply admission for the duration (pausing block
-//! application), syncs the block-body store, then writes the full checkpoint
-//! snapshot (staging dir → per-artifact fsync → generation rename → `CURRENT`
-//! atomic swap). Snapshot size scales with tip (22.8 MB at height 130k;
-//! plausibly several GB near modern tips). The pause is
-//! seconds-to-tens-of-seconds and lands on compaction pressure or shutdown,
-//! off the apply path's steady-state cadence.
 
 use arc_swap::ArcSwapOption;
 
@@ -71,10 +52,6 @@ pub(crate) enum DisconnectRetirement {
 
 /// All the shared handles needed to publish a checkpoint from a background
 /// thread without retaining the full [`crate::Chainstate`].
-///
-/// Created once from chainstate's shared handles and moved into the worker
-/// thread. The `checkpoint_data_dir` is reopened from the data-dir path
-/// (a cheap `openat`) so the worker does not borrow the service.
 pub(crate) struct CheckpointPublisher {
     pub(crate) admission: Arc<ApplyAdmission>,
     pub(crate) undo_store: Arc<dyn UndoStore>,
@@ -97,24 +74,12 @@ pub(crate) struct CheckpointPublisher {
 impl CheckpointPublisher {
     /// Publishes the same durable checkpoint exposed by
     /// [`crate::Chainstate::publish_checkpoint`].
-    ///
-    /// Both clean and periodic callers use this exact freeze → publish →
-    /// compact → resume sequence.
     pub(crate) fn publish(&self) -> core::result::Result<CheckpointWrite, CheckpointError> {
         self.publish_transaction(DisconnectRetirement::Ordinary)
     }
 
     /// Publishes the recovery checkpoint of the disconnect-marker recovery
     /// transaction.
-    ///
-    /// PRE: recovery has reconstructed a coherent applied tip at the durable
-    /// head, so the state the checkpoint captures is repaired, not damaged.
-    ///
-    /// POST: success has written the clean checkpoint and retired the
-    /// disconnect marker; failure leaves the marker armed.
-    ///
-    /// INVARIANT: only the recovery transaction may publish over an
-    /// `InFlight` marker, and only after reconstruction succeeded.
     pub(crate) fn publish_recovered(
         &self,
     ) -> core::result::Result<CheckpointWrite, CheckpointError> {
@@ -195,10 +160,6 @@ impl CheckpointPublisher {
     }
 
     /// Publishes a checkpoint when a `RolledBack` disconnect marker is present.
-    ///
-    /// Returns `Ok(false)` when there is no marker, or when the marker is
-    /// `InFlight` (a torn rollback must not be made durable). `Ok(true)` means
-    /// a checkpoint was published and the marker was disarmed.
     pub(crate) fn settle_disconnect_debt(&self) -> core::result::Result<bool, CheckpointError> {
         let Some(marker) = self.undo_store.load_disconnect_marker()? else {
             return Ok(false);

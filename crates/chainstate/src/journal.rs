@@ -1,9 +1,4 @@
 //! Maps block changes into journal records and replays authenticated records at boot.
-//!
-//! Creates and BIP30 overwrites precede spends, matching the UTXO commit order.
-//! Same-block spends are already netted out by the UTXO owner. Each remaining
-//! spend requires its full undo preimage; duplicate and unmatched restores fail.
-//! Replay validates header identity and live-coin preimages before committing.
 
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_chain::ChainTxCount;
@@ -36,10 +31,6 @@ pub(crate) enum JournalDeltaError {
 }
 
 /// Extracts the ordered journal mutations for one fully applied block.
-///
-/// `undo_coins` supplies the full preimage of each spent or overwritten
-/// outpoint. Records are matched by outpoint, not by input order. Creates and
-/// overwrites precede spends; same-block spends are already netted out.
 pub(crate) fn mutations_for_block(
     changes: &BlockChanges<&'_ bitcoin_rs_primitives::TxOut>,
     undo_coins: impl IntoIterator<Item = Coin>,
@@ -132,10 +123,6 @@ fn validate_replayed_head(
 }
 
 /// Applies ordered records above a restored checkpoint state.
-///
-/// Headers first regenerate valid `NodeId`s and chainwork. Mutations then pass
-/// through the same `UtxoSet` commit surface as live apply, with a listener
-/// seeded from the checkpoint `CoinStats`.
 struct ReplayAccumulator {
     tree: BlockTree,
     utxo: UtxoSet,

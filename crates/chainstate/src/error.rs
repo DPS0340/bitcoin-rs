@@ -7,9 +7,6 @@ pub enum ApplyError {
     #[error("block apply rejected because clean shutdown has begun")]
     Shutdown,
     /// Another node-owned chain-change reservation is already active.
-    ///
-    /// No chainstate mutation was attempted. Callers may retry after the
-    /// in-flight transition settles.
     #[error("another chain change is already active")]
     ConcurrentChainChange,
     /// The node-owned cross-domain generation counter cannot reserve another
@@ -45,9 +42,6 @@ pub enum ApplyError {
     #[error("block value total overflows the satoshi range")]
     BlockValueOverflow,
     /// A block's non-coinbase outputs exceed the inputs they spend.
-    ///
-    /// Per-transaction verification rejects this first, so reaching it means
-    /// the two disagree; refuse rather than treat the block as fee-free.
     #[error("block creates more value than it spends")]
     BlockOutputsExceedInputs,
     /// The block header hash does not satisfy its declared proof-of-work target.
@@ -72,15 +66,9 @@ pub enum ApplyError {
     #[error("block body persistence: {0}")]
     BlockBodyPersistence(#[from] bitcoin_rs_storage::StorageError),
     /// Persisting the UTXO undo record failed.
-    ///
-    /// Fatal for the block: without a recoverable undo record the node could
-    /// not disconnect it, so the block must not be applied.
     #[error("undo persistence: {0}")]
     UndoPersistence(#[source] bitcoin_rs_storage::StorageError),
     /// Journal durability or retention cannot recover within configured bounds.
-    ///
-    /// Refused before this block mutates chainstate; retry is safe after the
-    /// journal flushes or a checkpoint compacts retained segments.
     #[error("chainstate journal backpressure stopped block apply: {0}")]
     JournalBackpressure(String),
     /// A spent output had no resolved prevout, so the undo record would be
@@ -93,15 +81,9 @@ pub enum ApplyError {
         vout: u32,
     },
     /// The undo record for a block being disconnected could not be loaded.
-    ///
-    /// Fatal for the disconnect: without it the UTXO set cannot be restored,
-    /// and guessing would silently corrupt the chainstate.
     #[error(transparent)]
     UndoLoad(#[from] bitcoin_rs_utxo::contract::UndoLoadError),
     /// The block asked to be disconnected is not the applied tip.
-    ///
-    /// Blocks must be disconnected tip-first. Taking one from the middle would
-    /// restore outputs that its descendants have already spent.
     #[error("block {hash} is not the applied tip {tip}")]
     DisconnectNotTip {
         /// Block the caller asked to disconnect.
@@ -110,33 +92,15 @@ pub enum ApplyError {
         tip: bitcoin_rs_primitives::Hash256,
     },
     /// The supplied block body does not match its own header.
-    ///
-    /// The header hash commits to the merkle root, not to the transactions the
-    /// caller handed over. A body swapped under a matching header would roll
-    /// the index back over the wrong rows.
     #[error("block {hash} body does not match its header merkle root")]
     DisconnectBodyMismatch {
         /// Block whose body was rejected.
         hash: bitcoin_rs_primitives::Hash256,
     },
     /// Advancing the durable head failed.
-    ///
-    /// Includes body sync and locator reads after UTXO mutation but before
-    /// the head batch. Unlike a pre-mutation body-write refusal, these
-    /// failures cannot be retried against the published tip.
-    ///
-    /// Fatal for the attempt, like a `UtxoCommit` refusal: the atomic batch
-    /// may have applied before its durability receipt failed or was lost,
-    /// and [`bitcoin_rs_storage::StorageError`] does not classify that phase. The caller must
-    /// reconcile through recovery instead of retrying the block.
     #[error("durable head commit: {0}")]
     DurableHeadCommit(#[source] bitcoin_rs_storage::StorageError),
     /// The stored durable head names a tip other than this block's parent.
-    ///
-    /// The durable chain and the in-memory chain have diverged, typically
-    /// because a crash landed the head batch but not the publication and
-    /// recovery has not replayed the gap yet. Refusing keeps the head's
-    /// lineage intact; only recovery can close the gap.
     #[error("durable head names tip {head}, not this block's parent {prev}")]
     DurableHeadLineage {
         /// Tip the stored head certifies.
@@ -155,15 +119,6 @@ pub enum ApplyError {
     },
     /// The committed-but-unpublished gap cannot be replayed from durable
     /// facts, so startup must fail closed.
-    ///
-    /// A serviceable gap is an ancestor prefix: the head chain descends
-    /// block by block from the stored tip down to the restored tip, and
-    /// every body is still stored. Anything else — the head at or below the
-    /// restored tip on a divergent chain, a missing body, or a side chain
-    /// that does not root at the restored tip — is not a publication lag,
-    /// and replaying it would fabricate history. Recovery
-    /// is a rebuild from retained canonical data (`RCV-07`); no partial
-    /// success publishes.
     #[error(
         "durable head {head_tip} at height {head_height} cannot be reconciled with restored tip {} at height {}: {reason}",
         restored_tip.map_or_else(|| "<none>".to_owned(), |tip| tip.to_string()),
@@ -187,37 +142,18 @@ pub enum ApplyError {
     #[error("disconnect recovery checkpoint publication failed: {0}")]
     RecoveryPublication(#[source] Box<crate::checkpoint::CheckpointError>),
     /// Rewinding the block-level coinstats failed.
-    ///
-    /// The per-coin fields ride the UTXO change listener and are already
-    /// reversed by the undo; only height and transaction count are set
-    /// directly, and a refusal here means they do not describe the block being
-    /// disconnected.
     #[error("coinstats rewind: {0}")]
     CoinStatsRewind(#[source] bitcoin_rs_utxo::stats::CoinStatsRewindError),
 }
 
 /// The outcome of a refused or failed block disconnect.
-///
-/// Two variants because the caller must act differently, and a single error
-/// type let that distinction live in prose where it can be missed. Every
-/// disconnect failure is one or the other; there is no third case.
 #[derive(Debug, thiserror::Error)]
 pub enum DisconnectError {
     /// Refused before anything was touched. The chain is exactly as it was.
-    ///
-    /// Safe to report and carry on: no rollback started, so no state is half
-    /// applied. Every check that can produce this runs in the planning step
-    /// precisely so that refusing stays free.
     #[error("disconnect refused: {0}")]
     Refused(#[source] Box<ApplyError>),
     /// Failed after the rollback began. Some state is rolled back and some is
     /// not, and which is which depends on where it stopped.
-    ///
-    /// Fatal. Do not retry: the UTXO commit fires the set's change listener and
-    /// coinstats is registered as one, so a second pass double-counts even
-    /// where the set itself converges. Stop applying blocks and report the
-    /// block named here, which is why the hash and height are carried rather
-    /// than left for the caller to reconstruct.
     #[error(
         "disconnect of block {hash} at height {height} failed after mutation began, chain state is partial: {source}"
     )]
@@ -231,12 +167,6 @@ pub enum DisconnectError {
         source: Box<ApplyError>,
     },
     /// Rolled back cleanly, but the in-flight marker could not be cleared.
-    ///
-    /// The chain is consistent and no data is lost. What is broken is the
-    /// interlock: the marker still says a disconnect was in flight, so the
-    /// next start runs automatic disconnect recovery before serving. Reported
-    /// rather than folded into success because a caller that heard "done"
-    /// would restart into a recovery it had no warning of.
     #[error(
         "disconnect of block {hash} at height {height} completed but the in-flight marker remains set: {source}"
     )]

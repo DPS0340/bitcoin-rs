@@ -80,10 +80,6 @@ pub(super) fn parse_block_for_apply(
 }
 
 /// Parses a block and resolves the outputs it spends.
-///
-/// `source` is where prevouts come from. Every caller outside a window passes
-/// the committed UTXO set; a window passes an overlay so a block can see
-/// outputs an earlier block in the same window created.
 pub(super) fn prepare_apply<'b, S: bitcoin_rs_utxo::contract::OutputSource + ?Sized>(
     block: &'b Block,
     provided_serialized: Option<bytes::Bytes>,
@@ -104,12 +100,6 @@ pub(super) fn prepare_apply<'b, S: bitcoin_rs_utxo::contract::OutputSource + ?Si
 }
 
 /// Plans a block whose txids are already known.
-///
-/// Identities come from the parse-once view: the kernel parse hashes every
-/// transaction on the way past using the SHA-256 implementation Core picks at
-/// runtime, and the native parse derives them in its single layout pass.
-/// Either way the plan borrows them instead of re-hashing with a scalar
-/// implementation.
 pub(super) fn plan_block_transactions(block: &Block, txids: &[Txid]) -> BlockTxPlan {
     let mut only_coinbase = true;
     let mut needs_local_utxo_overlay = false;

@@ -9,12 +9,6 @@ use bitcoin_rs_utxo::UtxoSet;
 use std::path::Path;
 
 /// Threshold for classifying a restored checkpoint as catastrophically stale.
-///
-/// A checkpoint restore more than this many blocks behind the durable
-/// applied-tip witness is a catastrophic rollback, not a routine resume.
-/// The restore is still accepted — the chainstate is valid — but the node
-/// logs at ERROR and the warning snapshot carries the gap so operators
-/// and RPC consumers can see the node is starting far behind where it was.
 pub const STALE_RESTORE_ERROR_THRESHOLD: u32 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

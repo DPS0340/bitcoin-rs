@@ -1,13 +1,4 @@
 //! Chainstate-owned idle maintenance: journal durability and retention.
-//!
-//! This is the non-checkpoint home of the two duties that must run for the
-//! lifetime of the node regardless of whether periodic full-checkpoint
-//! publication exists (#634): flushing chainstate journal records whose
-//! wall-clock batch boundary has passed, and journal retention pressure —
-//! reporting it and draining it through a checkpoint publication, whose
-//! only role here is compaction maintenance (`RCV-10` in
-//! `docs/contracts/recovery.md`: the durable root, not the checkpoint, is
-//! the recovery authority).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -24,13 +15,6 @@ use crate::checkpoint::{CheckpointError, CheckpointWrite};
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Spawns the chainstate maintenance worker thread.
-///
-/// The worker polls every [`POLL_INTERVAL`], flushes due journal records,
-/// and on journal retention pressure reports the transition and drains it
-/// through a checkpoint publication (a compaction-base advance). A
-/// `DisconnectInFlight` refusal or an in-flight publication error is
-/// logged and retried on the next tick. The worker exits when `shutdown`
-/// is set.
 fn spawn_chainstate_maintenance_worker(
     publisher: Arc<CheckpointPublisher>,
     shutdown: Arc<AtomicBool>,
