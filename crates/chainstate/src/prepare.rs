@@ -1,24 +1,13 @@
 //! Exact serialized-body validation, transaction planning, and resolved prevout preparation.
 
-use super::BlockLocalUtxoView;
-use super::BlockProvenance;
-use super::BlockTxPlan;
-use super::BlockValidationContext;
-use super::ByteEquality;
-use super::Chainstate;
-use super::LOCAL_OVERLAY_TXID_SET_THRESHOLD;
-use super::PreparedApply;
-use super::ResolvedUtxoView;
-use super::WitnessPresence;
 use super::scratch::SameBlockSpentSet;
+use super::{
+    BlockLocalUtxoView, BlockProvenance, BlockTxPlan, BlockValidationContext, ByteEquality,
+    Chainstate, LOCAL_OVERLAY_TXID_SET_THRESHOLD, PreparedApply, ResolvedUtxoView, WitnessPresence,
+};
 use crate::error::ApplyError;
 use bitcoin_rs_consensus::UtxoView;
-use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::ConsensusEncode;
-use bitcoin_rs_primitives::OutPoint;
-use bitcoin_rs_primitives::TxOut;
-use bitcoin_rs_primitives::Txid;
-use bitcoin_rs_primitives::consensus_bytes;
+use bitcoin_rs_primitives::{Block, ConsensusEncode, OutPoint, TxOut, Txid, consensus_bytes};
 use bitcoin_rs_utxo::contract::is_coinbase_tx;
 use hashbrown::HashSet;
 use rayon::prelude::*;

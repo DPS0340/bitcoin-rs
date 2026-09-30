@@ -1,19 +1,12 @@
 //! Maps block changes into journal records and replays authenticated records at boot.
 
-use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_chain::ChainTxCount;
-use bitcoin_rs_chain::NodeStatus;
-use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_primitives::Header;
-use bitcoin_rs_storage::chainstate_journal::Coin;
-use bitcoin_rs_storage::chainstate_journal::JournalRecord;
-use bitcoin_rs_storage::chainstate_journal::JournalReplayBase;
-use bitcoin_rs_storage::chainstate_journal::JournalReplayError;
-use bitcoin_rs_storage::chainstate_journal::Mutation;
-use bitcoin_rs_storage::chainstate_journal::replay_committed_range;
+use bitcoin_rs_chain::{BlockTree, ChainTxCount, NodeStatus};
+use bitcoin_rs_primitives::{Hash256, Header};
+use bitcoin_rs_storage::chainstate_journal::{
+    Coin, JournalRecord, JournalReplayBase, JournalReplayError, Mutation, replay_committed_range,
+};
 use bitcoin_rs_utxo::UtxoSet;
-use bitcoin_rs_utxo::contract::BlockChanges;
-use bitcoin_rs_utxo::contract::UtxoAdd;
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use hashbrown::HashMap;
 use thiserror::Error;
 
@@ -130,8 +123,6 @@ struct ReplayAccumulator {
     applied_tip: bitcoin_rs_chain::TipSnapshot,
     chain_tx_count: u64,
     /// The base carries an unknown count: zero at a non-genesis height.
-    /// A genesis-empty base (height 0, nothing below it to total) still
-    /// counts its records, matching the journal writer.
     unknown_base: bool,
 }
 

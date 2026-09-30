@@ -1,15 +1,9 @@
 //! The ordered durable commit between chain mutation and publication.
-use super::BlockProvenance;
-use super::Chainstate;
-use super::ProvenApply;
-use super::PublishMode;
 use super::error::ApplyError;
-use super::publication::publish_applied;
-use super::publication::tx_count_delta_for;
+use super::publication::{publish_applied, tx_count_delta_for};
+use super::{BlockProvenance, Chainstate, ProvenApply, PublishMode};
 use bitcoin_rs_chain::{ChainTxCount, TipSnapshot};
-use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_primitives::OutPoint;
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint};
 use bitcoin_rs_storage::{CommitRecords, DurableHead};
 use bitcoin_rs_utxo::UtxoCoin;
 use bitcoin_rs_utxo::contract::{
@@ -575,8 +569,6 @@ fn replay_committed_gap(
     };
 
     // Walk the head chain down to the base, keeping only hash descriptors.
-    // Each body loads once to learn its parent and once more during replay,
-    // so peak retained bytes stay at one block.
     let mut chain = Vec::with_capacity(gap_width);
     let mut cursor = (head.height, head.tip);
     loop {

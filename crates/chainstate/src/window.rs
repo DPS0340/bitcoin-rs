@@ -1,28 +1,18 @@
 //! Bounded script-proof windows, ordered prefix commits, and failure disposition.
 
-use super::BlockProvenance;
-use super::BlockValidationContext;
-use super::BlockValidationProof;
-use super::Chainstate;
-use super::ConnectOutcome;
-use super::PreparedApply;
-use super::ProvenApply;
-use super::ResolvedUtxoView;
-use super::WindowApplyDisposition;
-use super::WindowApplyError;
-use super::connect::apply_committed_block_admitted;
-use super::connect::emit_journal_record;
+use super::connect::{apply_committed_block_admitted, emit_journal_record};
 use super::durable::{
     ConnectCommitFacts, commit_connect_head, stored_body_row, sync_appended_blocks,
 };
-use super::prepare::parse_block_for_apply;
-use super::prepare::plan_block_transactions;
-use super::prepare::resolve_block_prevouts;
+use super::prepare::{parse_block_for_apply, plan_block_transactions, resolve_block_prevouts};
 use super::publication::publish_applied;
+use super::{
+    BlockProvenance, BlockValidationContext, BlockValidationProof, Chainstate, ConnectOutcome,
+    PreparedApply, ProvenApply, ResolvedUtxoView, WindowApplyDisposition, WindowApplyError,
+};
 use crate::error::ApplyError;
 use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
-use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Block, Hash256};
 use bitcoin_rs_storage::CommitRecords;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -516,17 +506,6 @@ pub(super) fn prove_window<'a>(
         .record(prepare_started.elapsed().as_secs_f64());
 
     // Cheap structural checks before any script runs.
-    //
-    // Batching changed the cost of a bad body. The per-block path rejects a
-    // broken merkle root or witness commitment before it verifies a single
-    // script, but the window used to dispatch the whole batch first — so a peer
-    // could send a body with the expected header and one altered witness
-    // reserved value, keeping every txid intact, and force a full window of
-    // script verification for a block that is rejected immediately either way.
-    // Both checks below depend on nothing but the block, so the window runs
-    // them before any script work. The Merkle verdict is already derived in
-    // the one-pass parse, so this is a comparison, not a hash; a
-    // witness-carrying block hashes its witness IDs exactly once below.
     for ((block, unit), context) in blocks.iter().zip(prepared.iter_mut()).zip(&contexts) {
         // The one-pass derivation already reduced these txids through the
         // production walker; comparing the stored root is the same verdict

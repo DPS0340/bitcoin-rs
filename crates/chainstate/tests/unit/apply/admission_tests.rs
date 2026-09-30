@@ -1,10 +1,8 @@
 use arc_swap::ArcSwapOption;
-use std::sync::Arc;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use super::ApplyAdmission;
-use super::Chainstate;
+use super::{ApplyAdmission, Chainstate};
 use crate::ApplyError;
 
 #[test]

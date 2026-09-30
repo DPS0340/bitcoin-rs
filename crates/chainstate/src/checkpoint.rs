@@ -1,10 +1,6 @@
 //! Checkpoint formats, loading, and publication.
 
-use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_chain::ChainTxCount;
-use bitcoin_rs_chain::ChainWork;
-use bitcoin_rs_chain::NodeId;
-use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_chain::{BlockTree, ChainTxCount, ChainWork, NodeId, TipSnapshot};
 use bitcoin_rs_primitives::Hash256;
 #[cfg(test)]
 pub(crate) use bitcoin_rs_storage::checkpoint::CHECKPOINT_ROOT;
@@ -41,32 +37,21 @@ pub(crate) use bitcoin_rs_storage::checkpoint::UTXO_VERSION;
 pub(crate) use bitcoin_rs_storage::checkpoint::UtxoArtifactV1;
 use bitcoin_rs_storage::checkpoint::begin_publication;
 pub(crate) use bitcoin_rs_storage::checkpoint::classify_checkpoint_io;
-use bitcoin_rs_storage::checkpoint::coinstats_artifact_payload;
-use bitcoin_rs_storage::checkpoint::commit_publication;
 pub(crate) use bitcoin_rs_storage::checkpoint::corrupt_checkpoint;
 use bitcoin_rs_storage::checkpoint::decode_hex;
 pub(crate) use bitcoin_rs_storage::checkpoint::hex_encode;
-use bitcoin_rs_storage::checkpoint::network_name;
-use bitcoin_rs_storage::checkpoint::open_current_checkpoint;
 #[cfg(test)]
 use bitcoin_rs_storage::checkpoint::open_data_dir;
-use bitcoin_rs_storage::checkpoint::read_manifest;
-use bitcoin_rs_storage::checkpoint::require_filename;
-use bitcoin_rs_storage::checkpoint::verify_artifact;
-use bitcoin_rs_utxo::UtxoSet;
-use bitcoin_rs_utxo::read_snapshot_strict_v4_observed;
-use bitcoin_rs_utxo::stats::CoinStats;
-use bitcoin_rs_utxo::stats::CoinStatsAccumulator;
-use bitcoin_rs_utxo::stats::CoinStatsListener;
+use bitcoin_rs_storage::checkpoint::{coinstats_artifact_payload, commit_publication};
+use bitcoin_rs_storage::checkpoint::{network_name, open_current_checkpoint};
+use bitcoin_rs_storage::checkpoint::{read_manifest, require_filename, verify_artifact};
 use bitcoin_rs_utxo::stats::coin_stats::COIN_STATS_ENCODED_LEN;
-use bitcoin_rs_utxo::write_snapshot_observed;
-use cap_std::fs::Dir;
-use cap_std::fs::File;
+use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsAccumulator, CoinStatsListener};
+use bitcoin_rs_utxo::{UtxoSet, read_snapshot_strict_v4_observed, write_snapshot_observed};
+use cap_std::fs::{Dir, File};
 use parking_lot::RwLock;
-use sha2::Digest;
-use sha2::Sha256;
-use std::io::BufReader;
-use std::io::Read;
+use sha2::{Digest, Sha256};
+use std::io::{BufReader, Read};
 #[cfg(test)]
 use std::path::Path;
 use thiserror::Error;

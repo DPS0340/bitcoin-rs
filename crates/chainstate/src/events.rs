@@ -1,14 +1,12 @@
 //! Coherent chain-event publication and durable process epoch allocation.
 
 use anyhow::Context as _;
-use anyhow::Result;
-use anyhow::bail;
+use anyhow::{Result, bail};
 use bitcoin_rs_primitives::Hash256;
 use parking_lot::RwLock;
 use std::io;
 use std::io::Write as _;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A coherent, non-torn view of the applied chain tip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +64,6 @@ impl ChainEventPublisher {
     }
 
     /// Publisher detached from any node, for test handle composition only.
-    /// Anchors at an empty tip; records still sequence and publish normally.
     #[must_use]
     pub fn detached(epoch: u64) -> Self {
         Self::new(ChainSnapshot {

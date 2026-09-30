@@ -7,40 +7,27 @@ use bitcoin_rs_chain::{
     TransitionAuthority, TransitionAuthorityGuard, TransitionDomain,
 };
 use bitcoin_rs_consensus::UtxoView;
-use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::Network;
-use bitcoin_rs_primitives::OutPoint;
-use bitcoin_rs_primitives::Tx;
-use bitcoin_rs_primitives::TxOut;
-use bitcoin_rs_primitives::Txid;
+use bitcoin_rs_primitives::{Block, Network, OutPoint, Tx, TxOut, Txid};
 use bitcoin_rs_primitives::{Hash256, Header};
 pub use bitcoin_rs_storage::DisconnectPhase;
-use bitcoin_rs_storage::DurableHeadStore;
-use bitcoin_rs_storage::InMemoryUndoStore;
 pub use bitcoin_rs_storage::KvUndoStore;
 pub use bitcoin_rs_storage::UndoStore;
 use bitcoin_rs_storage::block_body::BlockBodyStore;
-use bitcoin_rs_utxo::UtxoCoin;
-use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_storage::{DurableHeadStore, InMemoryUndoStore};
 use bitcoin_rs_utxo::contract::{SpentOutputLookup, is_coinbase_tx};
-use connect::apply_block_admitted;
-use connect::apply_committed_block_admitted;
+use bitcoin_rs_utxo::{UtxoCoin, UtxoSet};
+use connect::{apply_block_admitted, apply_committed_block_admitted};
 use disconnect::disconnect_block_admitted;
 pub use durable::reconcile_at_boot;
 pub use durable::recover_disconnect_marker;
 use hashbrown::HashMap;
-use parking_lot::RwLock;
-use parking_lot::RwLockReadGuard;
-use parking_lot::RwLockWriteGuard;
-use scratch::ApplyScratchCapacities;
-use scratch::SameBlockSpentSet;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use scratch::{ApplyScratchCapacities, SameBlockSpentSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 pub use window::DURABLE_HEAD_GROUP_BLOCKS;
 pub use window::DURABLE_HEAD_GROUP_MAX_BYTES;
-use window::PublishMode;
-use window::apply_window_admitted;
+use window::{PublishMode, apply_window_admitted};
 
 mod connect;
 mod disconnect;
@@ -1045,10 +1032,6 @@ impl Chainstate {
     }
 
     /// Admits a transition, connects `block`, then releases the transition lock.
-    /// A refusal releases the same chainstate locks; retry semantics come from
-    /// [`ChainTransition::connect`], whose `serialized` rules this method
-    /// inherits: `Some` reuses the caller's wire bytes, `None` serializes
-    /// lazily, and both share one commit and publication order.
     #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_block(
         &self,
@@ -1212,20 +1195,6 @@ impl core::fmt::Display for WindowApplyError {
 impl std::error::Error for WindowApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
-    }
-}
-
-impl WindowApplyError {
-    /// Failure kind the caller should act on.
-    #[must_use]
-    pub const fn disposition(&self) -> WindowApplyDisposition {
-        self.disposition
-    }
-
-    /// Hashes invalidated for a `Permanent` failure, empty otherwise.
-    #[must_use]
-    pub fn invalidated(&self) -> &[Hash256] {
-        &self.invalidated
     }
 }
 
@@ -1424,11 +1393,6 @@ impl ResolvedUtxoView {
             .map(|input| input.previous_output);
         // Serial on purpose. A UTXO lookup is a sharded hashmap hit of order
         // 500 ns, so a rayon fan-out costs more than the work it distributes.
-        // Measured on mainnet 0..150_000, 3x medians pinned to `taskset -c
-        // 0-31`, parallel and serial interleaved: `into_par_iter` 143.8s vs
-        // serial 134.7s, and serial won every round. Apply alone goes 116.2s
-        // to 103.6s. Parallelize a stage only when per-item work exceeds the
-        // dispatch, as the script checks do at ~100 us per input.
         Self {
             external: candidates
                 .filter_map(|outpoint| utxo.get_entry(&outpoint).map(|entry| (outpoint, entry)))

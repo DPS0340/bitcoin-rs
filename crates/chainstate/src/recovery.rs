@@ -2,8 +2,7 @@
 
 use crate::{ChainstateJournalConfig, JournalBootstrap};
 use anyhow::Context as _;
-use anyhow::Result;
-use anyhow::bail;
+use anyhow::{Result, bail};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_utxo::UtxoSet;
 use std::path::Path;
@@ -148,10 +147,6 @@ pub fn prepare_initial_chainstate(
     // Check the full-revalidation marker BEFORE opening the checkpoint: the
     // marker contract says incremental recovery must be ignored, so the
     // checkpoint must not be part of the decision once the marker is present.
-    // Opening it first would validate a large artifact only to discard it, and
-    // a corrupt checkpoint could fail startup before the marker gets a chance
-    // to force cold replay — making a checkpoint artifact stronger than the
-    // marker that explicitly says not to trust incremental recovery.
     if requires_full_revalidation(data_dir) {
         metrics::counter!(
             "node.chainstate_journal.fallback_total",

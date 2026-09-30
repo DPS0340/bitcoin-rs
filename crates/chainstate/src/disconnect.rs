@@ -1,18 +1,12 @@
 //! Orders [`bitcoin_rs_utxo::contract::rollback_block`] against the journal, the
 //! durable head, and publication.
 
-use super::Chainstate;
-use super::DisconnectOutcome;
-use super::DisconnectPlan;
 use super::durable::commit_disconnect_head;
-use super::publication::publish_applied;
-use super::publication::tx_count_delta_for;
+use super::publication::{publish_applied, tx_count_delta_for};
+use super::{Chainstate, DisconnectOutcome, DisconnectPlan};
 use crate::error::ApplyError;
 use bitcoin_rs_chain::{ChainTxCount, TipSnapshot};
-use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_primitives::Tx;
-use bitcoin_rs_primitives::Txid;
+use bitcoin_rs_primitives::{Block, Hash256, Tx, Txid};
 use bitcoin_rs_utxo::contract::{RollbackError, load_block_undo, rollback_block};
 
 pub(super) fn plan_disconnect(

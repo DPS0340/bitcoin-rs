@@ -1,11 +1,9 @@
 //! Chainstate-owned idle maintenance: journal durability and retention.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::checkpoint::publisher::CheckpointPublisher;
 use crate::checkpoint::{CheckpointError, CheckpointWrite};

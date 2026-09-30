@@ -208,8 +208,6 @@ impl CheckpointPublisher {
         // follows it, so a checkpoint — which freezes the published state —
         // can never legitimately name a tip the head has not certified. The
         // two authorities must not disagree about the durable tip.
-        // No applied tip is the legitimate pre-genesis state (`SkippedNoAppliedTip`
-        // below); the guard has nothing to compare there.
         if let (Some(head), Some(tip)) = (
             self.durable_head.load().map_err(|error| {
                 CheckpointError::Store(bitcoin_rs_storage::checkpoint::CheckpointError::Invalid(
@@ -222,9 +220,6 @@ impl CheckpointPublisher {
             // crash can leave; checkpointing the older state is harmless. A
             // tip at or above the head that the head does not certify is
             // genuine divergence between the two authorities.
-            // `head.tip` and `tip.hash` name the same fact — the 32-byte
-            // block hash of the certified/applied tip — under two field
-            // names.
             let same_tip = head.tip == tip.hash;
             let diverged = head.height < tip.height || (head.height == tip.height && !same_tip);
             if diverged {
@@ -272,9 +267,6 @@ impl CheckpointPublisher {
         }
         // The disconnect marker retires in `publish_transaction`, after the
         // journal steps that can still fail the publication.
-        // Marker retirement is a second durability step after `CURRENT`.
-        // Propagate failure so the worker retries next tick; the published
-        // checkpoint stays, and the marker stays until unlink+dirsync commits.
         if matches!(written, CheckpointWrite::Published { .. }) {
             retire_full_revalidation_marker(&self.data_dir)?;
         }

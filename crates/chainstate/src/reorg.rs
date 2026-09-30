@@ -1,17 +1,10 @@
 //! Switching the applied chain from one tip to another.
 
-use crate::ApplyError;
-use crate::ChainTransition;
-use crate::Chainstate;
-use crate::ConnectOutcome;
-use crate::DisconnectError;
-use crate::DisconnectOutcome;
-use bitcoin_rs_chain::NodeId;
-use bitcoin_rs_chain::ReorgPlan;
-use bitcoin_rs_chain::plan_reorg;
-use bitcoin_rs_primitives::Block;
-use bitcoin_rs_primitives::DecodeError;
-use bitcoin_rs_primitives::Hash256;
+use crate::{
+    ApplyError, ChainTransition, Chainstate, ConnectOutcome, DisconnectError, DisconnectOutcome,
+};
+use bitcoin_rs_chain::{NodeId, ReorgPlan, plan_reorg};
+use bitcoin_rs_primitives::{Block, DecodeError, Hash256};
 use bitcoin_rs_storage::StorageError;
 
 /// Maximum number of disconnect-side block bodies held in memory at once
@@ -266,7 +259,6 @@ pub enum ReorgError {
         source: Box<Self>,
     },
     /// A target-branch body became unreadable after the switch started.
-    /// Everything counted committed fully; the chain is coherent at `stopped_at`.
     #[error(
         "reorg stopped at height {stopped_at} after {disconnected} disconnects and {connected} connects: body lost mid-switch: {source}"
     )]
@@ -293,7 +285,6 @@ pub enum ReorgError {
         /// Hash of the block that failed to connect.
         hash: Hash256,
         /// Height the applied tip reached when the target connect failed.
-        /// A successful first-body restoration can leave the final tip higher.
         stopped_at: u32,
         /// Why the connect failed.
         #[source]
@@ -333,7 +324,6 @@ pub enum ReorgError {
     #[error("reorg left the chainstate inconsistent: {0}")]
     Fatal(#[source] Box<DisconnectError>),
     /// Node-side settlement failed after the authoritative chain walk.
-    /// Admission is permanently closed and shutdown is requested.
     #[error("reorg transition could not be settled: {source}")]
     TransitionSettlement {
         /// Why the node-side settlement failed.
