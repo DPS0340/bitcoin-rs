@@ -36,25 +36,23 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Required PR gate (issue #171): the shortest useful failure signal. `fmt` and
-# `deny` stay parallel (no workspace compile). The compile graph is split into
-# parallel fail-fast lanes (issue #1081): `clippy` reports lint failures
-# without waiting behind any test lane, and the three test lanes run their
-# profiles concurrently instead of serially inside one ~11-minute job, so a
-# failing profile surfaces at its lane's position rather than after every
-# other profile. Each lane's rust-cache key includes the job id, so a lane
-# restores only its own dependency graph instead of the single 2.4 GB archive
-# the old `rust` job restored on every run. Every command lives in
-# scripts/ci-pr.sh. The kernel C++ production lint graph is checked at the
-# merge queue in ci-merge-gate.yml; post-merge behavior and reference lanes
-# live in main.yml, with version/feature campaigns on a separate schedule.
+# Required PR gate (issue #171): the shortest useful failure signal.
+#
+# PR fast path: fmt → deny → clippy → test-crates (sequential gate).
+# Fixture-heavy lanes (test-binary, test-workspace) run only on main pushes
+# and merge-queue entries, not on every PR push. This cuts the PR feedback
+# loop from ~90s to ~40s while keeping full coverage at the merge boundary.
+#
+# The compile graph is split into parallel fail-fast lanes (issue #1081):
+# clippy reports lint failures without waiting behind any test lane, and
+# test-crates runs its profiles concurrently instead of serially. Each lane's
+# rust-cache key includes the job id, so a lane restores only its own
+# dependency graph. Every command lives in scripts/ci-pr.sh.
 #
 # Test lanes link with mold (`-C link-arg=-fuse-ld=mold` via RUSTFLAGS) and
 # schedule tests under cargo-nextest, both installed by
 # .github/actions/test-deps; ci-pr.sh falls back to `cargo test` where
-# nextest is absent. The flag changes every crate fingerprint, so the first
-# run after enabling it recompiles dependencies once per lane -- the lane
-# cache then stores the mold-linked artifacts for later runs.
+# nextest is absent.
 env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: 1
@@ -101,6 +99,7 @@ jobs:
       - run: ./scripts/ci-pr.sh clippy
 
   test-crates:
+    needs: [fmt, clippy]
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -116,6 +115,11 @@ jobs:
       - run: ./scripts/ci-pr.sh test-crates
 
   test-binary:
+    # Fixture-heavy: only on main pushes and merge-queue entries. PRs get
+    # fast feedback from fmt → clippy → test-crates; full fixture coverage
+    # gates the merge boundary.
+    if: github.event_name != 'pull_request'
+    needs: [fmt, clippy]
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -143,6 +147,9 @@ jobs:
           retention-days: 7
 
   test-workspace:
+    # Fixture-heavy: only on main pushes and merge-queue entries.
+    if: github.event_name != 'pull_request'
+    needs: [fmt, clippy]
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
