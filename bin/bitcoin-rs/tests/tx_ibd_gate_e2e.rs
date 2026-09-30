@@ -32,6 +32,7 @@ use bitcoin::p2p::{Magic, ServiceFlags};
 use bitcoin::{
     Amount, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
+use bitcoin_rs_e2e::helpers::coinbase_script_sig;
 use bitcoin_rs_e2e::node::workspace;
 use bitcoin_rs_e2e::process_peer::connect_loopback;
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
@@ -359,23 +360,6 @@ fn now_unix() -> u32 {
     .unwrap_or(u32::MAX)
 }
 
-/// Minimal `CScriptNum` push, the BIP34 height encoding.
-fn script_num_push(value: u32) -> Vec<u8> {
-    let low = u8::try_from(value & 0xff).unwrap_or(0xff);
-    if value < 0x80 {
-        vec![0x01, low]
-    } else if value < 0x80_00 {
-        vec![0x02, low, u8::try_from(value >> 8).unwrap_or(0)]
-    } else {
-        vec![
-            0x03,
-            low,
-            u8::try_from((value >> 8) & 0xff).unwrap_or(0),
-            u8::try_from(value >> 16).unwrap_or(0),
-        ]
-    }
-}
-
 /// Coinbase paying `value` sats to `OP_TRUE`, with the BIP34 height push.
 fn op_true_coinbase(height: u32, value: u64) -> Transaction {
     Transaction {
@@ -383,7 +367,7 @@ fn op_true_coinbase(height: u32, value: u64) -> Transaction {
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::from_bytes(script_num_push(height)),
+            script_sig: coinbase_script_sig(height),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
