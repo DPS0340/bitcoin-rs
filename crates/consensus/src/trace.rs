@@ -1,10 +1,10 @@
 //! Optional Bitcoin Core-compatible USDT tracepoints.
 //!
-//! Every function in this crate is a no-op unless the consuming binary is
-//! built with this crate's `usdt` feature enabled. When it is, the probes
-//! carry Bitcoin Core's provider names (`validation`, `mempool`, `net`),
-//! probe names, and argument layout — see [`probe_abi`] and `docs/tracing.md`
-//! for the compatibility table.
+//! Every function in this module is a no-op unless the consuming binary is
+//! built with the `usdt` feature enabled. When it is, the probes carry
+//! Bitcoin Core's provider names (`validation`, `mempool`, `net`), probe
+//! names, and argument layout — the crate-root `probes.d` is the generator
+//! input and the compatibility table; see `docs/tracing.md`.
 //!
 //! Hot-path semantics mirror Bitcoin Core's `src/util/trace.h`: each emission
 //! site passes a `prepare` closure that *materialises* the probe arguments,
@@ -14,19 +14,17 @@
 //! feature off every call is an empty function body and the closure is
 //! dropped without running.
 
-/// Documented argument ABI of every probe this crate defines.
-pub mod probe_abi;
+// The usdt generator's probe macros cast their arguments to usize and
+// define an inline type-check item inside their expansion; that output is
+// not ours to reshape, so allow its lint set for the whole module.
+#![allow(
+    clippy::items_after_statements,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
-mod raw {
-    // The usdt generator's probe macros cast their arguments to usize and
-    // define an inline type-check item inside their expansion; that output
-    // is not ours to reshape, so allow its lint set at this module.
-    #![allow(
-        clippy::items_after_statements,
-        clippy::as_conversions,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
+mod generated {
     // Raw generated probe macros, one generated module per provider. The
     // generator names a module after each provider, so this private module
     // keeps the generated `validation`/`mempool`/`net` modules out of the
@@ -35,74 +33,17 @@ mod raw {
     // macro resolves it.
     #[cfg(feature = "usdt")]
     usdt::dtrace_provider!("probes.d");
+}
 
-    /// Buffer address for the emitter's by-value pointer arguments.
-    ///
-    /// Core passes hash and message buffers as pointers by value; see
-    /// [`crate::probe_abi`] for why these travel as `u64`.
-    #[cfg(feature = "usdt")]
-    fn address_of(buffer: *const u8) -> u64 {
-        u64::try_from(buffer.addr()).unwrap_or(0)
-    }
-
-    /// Fires `validation:block_connected` with prepared arguments.
-    #[cfg(feature = "usdt")]
-    pub(super) fn block_connected(prepare: impl FnOnce() -> super::BlockConnectedArgs) {
-        validation::block_connected!(|| {
-            let (hash, height, txs, inputs, sigops, elapsed_ns) = prepare();
-            (address_of(hash), height, txs, inputs, sigops, elapsed_ns)
-        });
-    }
-
-    /// Fires `mempool:added` with prepared arguments.
-    #[cfg(feature = "usdt")]
-    pub(super) fn added(prepare: impl FnOnce() -> super::AddedArgs) {
-        mempool::added!(|| {
-            let (txid, vsize, fee) = prepare();
-            (address_of(txid), vsize, fee)
-        });
-    }
-
-    /// Fires `mempool:removed` with prepared arguments.
-    #[cfg(feature = "usdt")]
-    pub(super) fn removed(prepare: impl FnOnce() -> super::RemovedArgs) {
-        mempool::removed!(|| {
-            let (txid, reason, vsize, fee, entry_time) = prepare();
-            (address_of(txid), reason, vsize, fee, entry_time)
-        });
-    }
-
-    /// Fires `net:inbound_message` with prepared arguments.
-    #[cfg(feature = "usdt")]
-    pub(super) fn inbound_message(prepare: impl FnOnce() -> super::MessageArgs) {
-        net::inbound_message!(|| {
-            let (node_id, addr, conn_type, msg_type, size, payload) = prepare();
-            (
-                node_id,
-                addr,
-                conn_type,
-                msg_type,
-                size,
-                address_of(payload),
-            )
-        });
-    }
-
-    /// Fires `net:outbound_message` with prepared arguments.
-    #[cfg(feature = "usdt")]
-    pub(super) fn outbound_message(prepare: impl FnOnce() -> super::MessageArgs) {
-        net::outbound_message!(|| {
-            let (node_id, addr, conn_type, msg_type, size, payload) = prepare();
-            (
-                node_id,
-                addr,
-                conn_type,
-                msg_type,
-                size,
-                address_of(payload),
-            )
-        });
-    }
+/// Buffer address for the emitter's by-value pointer arguments.
+///
+/// Core passes hash and message buffers as pointers by value (`8@%reg`); the
+/// `usdt` crate's `uint8_t*` declaration would instead emit a dereferencing
+/// operand (`8@(%reg)`), so `probes.d` declares byte-buffer arguments
+/// `uint64_t` and the call sites below feed it the address.
+#[cfg(feature = "usdt")]
+fn address_of(buffer: *const u8) -> u64 {
+    u64::try_from(buffer.addr()).unwrap_or(0)
 }
 
 /// Prepared arguments of `validation:block_connected`.
@@ -133,12 +74,15 @@ pub type MessageArgs = (i64, String, String, String, u64, *const u8);
 
 /// Fires `validation:block_connected` if probes are compiled in.
 ///
-/// Arguments follow Bitcoin Core's `validation:block_connected` ABI; see
-/// [`probe_abi::BLOCK_CONNECTED`]. `prepare` runs only while a consumer is
-/// attached.
+/// Arguments follow Bitcoin Core's `validation:block_connected` ABI (see
+/// `probes.d` and `docs/tracing.md`). `prepare` runs only while a consumer
+/// is attached.
 pub fn block_connected(prepare: impl FnOnce() -> BlockConnectedArgs) {
     #[cfg(feature = "usdt")]
-    raw::block_connected(prepare);
+    generated::validation::block_connected!(|| {
+        let (hash, height, txs, inputs, sigops, elapsed_ns) = prepare();
+        (address_of(hash), height, txs, inputs, sigops, elapsed_ns)
+    });
     #[cfg(not(feature = "usdt"))]
     drop(prepare);
 }
@@ -148,7 +92,10 @@ pub fn block_connected(prepare: impl FnOnce() -> BlockConnectedArgs) {
 /// `prepare` runs only while a consumer is attached.
 pub fn added(prepare: impl FnOnce() -> AddedArgs) {
     #[cfg(feature = "usdt")]
-    raw::added(prepare);
+    generated::mempool::added!(|| {
+        let (txid, vsize, fee) = prepare();
+        (address_of(txid), vsize, fee)
+    });
     #[cfg(not(feature = "usdt"))]
     drop(prepare);
 }
@@ -158,7 +105,10 @@ pub fn added(prepare: impl FnOnce() -> AddedArgs) {
 /// `prepare` runs only while a consumer is attached.
 pub fn removed(prepare: impl FnOnce() -> RemovedArgs) {
     #[cfg(feature = "usdt")]
-    raw::removed(prepare);
+    generated::mempool::removed!(|| {
+        let (txid, reason, vsize, fee, entry_time) = prepare();
+        (address_of(txid), reason, vsize, fee, entry_time)
+    });
     #[cfg(not(feature = "usdt"))]
     drop(prepare);
 }
@@ -168,7 +118,17 @@ pub fn removed(prepare: impl FnOnce() -> RemovedArgs) {
 /// `prepare` runs only while a consumer is attached.
 pub fn inbound_message(prepare: impl FnOnce() -> MessageArgs) {
     #[cfg(feature = "usdt")]
-    raw::inbound_message(prepare);
+    generated::net::inbound_message!(|| {
+        let (node_id, addr, conn_type, msg_type, size, payload) = prepare();
+        (
+            node_id,
+            addr,
+            conn_type,
+            msg_type,
+            size,
+            address_of(payload),
+        )
+    });
     #[cfg(not(feature = "usdt"))]
     drop(prepare);
 }
@@ -178,7 +138,17 @@ pub fn inbound_message(prepare: impl FnOnce() -> MessageArgs) {
 /// `prepare` runs only while a consumer is attached.
 pub fn outbound_message(prepare: impl FnOnce() -> MessageArgs) {
     #[cfg(feature = "usdt")]
-    raw::outbound_message(prepare);
+    generated::net::outbound_message!(|| {
+        let (node_id, addr, conn_type, msg_type, size, payload) = prepare();
+        (
+            node_id,
+            addr,
+            conn_type,
+            msg_type,
+            size,
+            address_of(payload),
+        )
+    });
     #[cfg(not(feature = "usdt"))]
     drop(prepare);
 }

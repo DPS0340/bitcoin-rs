@@ -8,7 +8,7 @@ provider validation {
      * value (`8@%reg`). The SDT note operand is what consumer scripts bind
      * to, so byte-pointer arguments are declared `uint64_t` and fed the
      * buffer address to reproduce Core's operand form exactly. See
-     * `src/probe_abi.rs` and `docs/tracing.md`.
+     * `src/trace.rs` and `docs/tracing.md`.
      */
     probe block_connected(uint64_t, int32_t, uint64_t, int32_t, int64_t, int64_t);
 };

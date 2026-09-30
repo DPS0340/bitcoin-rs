@@ -13,7 +13,7 @@
 //! a breaking change. Per-event payloads, block/tx/peer identity, and any
 //! other high-cardinality label belong in `tracing::` events (diagnostics,
 //! explicitly not an API) or in the Core-compatible USDT probes of
-//! `bitcoin-rs-trace` (`crates/trace`, see `docs/tracing.md`), never here.
+//! `bitcoin_rs_consensus::trace` (see `docs/tracing.md`), never here.
 //! Metric labels are limited to closed enumerations owned by the code.
 //! The measured product-stage histograms consumed by the hot-path ledger
 //! (`docs/contracts/hot-path-attribution.md`) are exempt, and only via that

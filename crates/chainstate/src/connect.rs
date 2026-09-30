@@ -645,7 +645,7 @@ fn emit_block_connected(
     // outlives this call: the probe argument must not point into a value the
     // prepare closure owns, because the generated macro fires only after the
     // closure has returned.
-    bitcoin_rs_trace::block_connected(move || {
+    bitcoin_rs_consensus::trace::block_connected(move || {
         let mut view = BlockLocalUtxoView::new(Arc::clone(resolved), &block.txs, height, 0);
         let mut inputs: u32 = 0;
         let mut sigops: u64 = 0;

@@ -1,19 +1,131 @@
 //! Asserts the built artifact's `SystemTap` SDT notes match the documented
 //! Bitcoin Core probe ABI.
 //!
-//! This is the host-portable half of the acceptance evidence: it parses the
-//! ELF `.note.stapsdt` notes of a built binary and checks provider names,
-//! probe names, and argument layout strings against [`probe_abi`]. Run with
-//! `SDT_ELF=<binary>` to check an arbitrary artifact (e.g. the node binary
-//! built on Linux); by default it checks the test binary itself.
+//! The crate-root `probes.d` is the single source of truth for what this
+//! module emits: this test parses it to enumerate providers, probe names,
+//! and argument types, then checks the built binary's `.note.stapsdt` notes
+//! against it. Run with `SDT_ELF=<binary>` to check an arbitrary artifact
+//! (e.g. the node binary built on Linux); by default it checks the test
+//! binary itself.
 //!
 //! On non-ELF hosts (macOS emits Mach-O/DOF instead of `.note.stapsdt`) the
-//! note assertions are skipped and only the portable ABI-table checks run.
+//! note assertions are skipped and only the `probes.d`-vs-Core check runs.
 
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 
-use bitcoin_rs_trace::probe_abi;
+/// One probe declared in `probes.d`.
+#[derive(Debug)]
+struct ProbeDef {
+    provider: String,
+    name: String,
+    /// `probes.d` argument types in emission order (`int64_t`, `char*`, …).
+    args: Vec<String>,
+}
+
+/// The Bitcoin Core probe ABI this module must emit, from Core's `doc/tracing.md`
+/// and a released `bitcoind`'s own SDT notes: provider, probe, and the
+/// `size@` prefix sequence consumer scripts bind to. A leading `-` is signed.
+///
+/// Args 5 and 6 of `block_connected` are `-8@` (signed) in Core's shipped
+/// notes although `doc/tracing.md` documents `uint64`; this table matches
+/// the **binary**, which is what consumers bind to. Byte-buffer arguments are
+/// pointers by value (`8@`, not the dereferencing `8@(%reg)` the `usdt`
+/// crate's `uint8_t*` would emit) — `probes.d` declares them `uint64_t` and
+/// the call sites feed the buffer address, reproducing Core's operand form.
+const CORE_ABI: &[(&str, &str, &[&str])] = &[
+    (
+        "validation",
+        "block_connected",
+        &["8@", "-4@", "8@", "-4@", "-8@", "-8@"],
+    ),
+    ("mempool", "added", &["8@", "-4@", "-8@"]),
+    ("mempool", "removed", &["8@", "8@", "-4@", "-8@", "8@"]),
+    (
+        "net",
+        "inbound_message",
+        &["-8@", "8@", "8@", "8@", "8@", "8@"],
+    ),
+    (
+        "net",
+        "outbound_message",
+        &["-8@", "8@", "8@", "8@", "8@", "8@"],
+    ),
+];
+
+/// The expected `size@` prefix of a `probes.d` argument type.
+fn layout_prefix(d_type: &str) -> &'static str {
+    match d_type {
+        "int8_t" => "-1@",
+        "uint8_t" => "1@",
+        "int16_t" => "-2@",
+        "uint16_t" => "2@",
+        "int32_t" => "-4@",
+        "uint32_t" => "4@",
+        "int64_t" => "-8@",
+        // `char*` and byte-buffer `uint64_t` are pointer-sized unsigned.
+        "uint64_t" | "char*" => "8@",
+        other => panic!("unhandled probe argument type `{other}`"),
+    }
+}
+
+fn layout_prefixes(def: &ProbeDef) -> Vec<&'static str> {
+    def.args.iter().map(|arg| layout_prefix(arg)).collect()
+}
+
+/// Parses the `provider`/`probe` declarations out of `text` (the crate-root
+/// `probes.d`), in declaration order. The grammar exercised here is the
+/// small subset this repository's `probes.d` uses.
+fn parse_probes_d(text: &str) -> Vec<ProbeDef> {
+    // `probes.d` comments are all `/* */` blocks.
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("/*") {
+        stripped.push_str(&rest[..start]);
+        rest = &rest[rest.find("*/").map_or(rest.len(), |end| end + 2)..];
+    }
+    stripped.push_str(rest);
+
+    let mut probes = Vec::new();
+    for block in stripped.split("provider").skip(1) {
+        let Some((head, _)) = block.split_once('}') else {
+            continue;
+        };
+        let Some((provider, body)) = head.split_once('{') else {
+            continue;
+        };
+        let provider = provider.trim().to_owned();
+        for decl in body.split(';') {
+            let decl = decl.trim();
+            let Some(sig) = decl.strip_prefix("probe") else {
+                continue;
+            };
+            let Some((name, args)) = sig.trim().split_once('(') else {
+                continue;
+            };
+            probes.push(ProbeDef {
+                provider: provider.clone(),
+                name: name.trim().to_owned(),
+                args: args
+                    .trim_end_matches(')')
+                    .split(',')
+                    .map(|arg| arg.trim().to_owned())
+                    .filter(|arg| !arg.is_empty())
+                    .collect(),
+            });
+        }
+    }
+    probes
+}
+
+/// `probes.d` as compiled into this crate (resolved at build time).
+fn probes_d() -> io::Result<Vec<ProbeDef>> {
+    let text = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/probes.d"))?;
+    let probes = parse_probes_d(&text);
+    assert!(!probes.is_empty(), "probes.d declares no probes");
+    Ok(probes)
+}
 
 /// One parsed `SystemTap` SDT note.
 struct SdtNote {
@@ -154,11 +266,11 @@ fn width_index(d_type: &str) -> usize {
     }
 }
 
-/// Returns the expected full `SystemTap` layout string for `spec` on
+/// Returns the expected full `SystemTap` layout string for `def` on
 /// x86-64, `None` on other architectures.
 ///
-/// The operand half is architecture- and register-allocation specific: this
-/// crate's generator passes arguments in the platform ABI registers, so the
+/// The operand half is architecture- and register-allocation specific: the
+/// `usdt` generator passes arguments in the platform ABI registers, so the
 /// spelling is deterministic per architecture — but only x86-64's spellings
 /// are verified (the width-dependent `%edi`/`%rdi` table below). `AArch64`'s
 /// generator may spell narrower arguments as `w`-registers, which upstream
@@ -166,19 +278,19 @@ fn width_index(d_type: &str) -> usize {
 /// A consumer binds to both halves, so the verified architecture asserts
 /// both — Core's own binaries use a different register assignment only
 /// because the compiler allocated different registers at its probe sites.
-fn expected_layout(spec: &probe_abi::ProbeSpec, machine: u16) -> Option<String> {
+fn expected_layout(def: &ProbeDef, machine: u16) -> Option<String> {
     // EM_X86_64: register name depends on the argument's width.
     if machine != 0x3E {
         return None;
     }
     let mut operands = Vec::new();
-    for (index, arg) in spec.args.iter().enumerate() {
+    for (index, arg) in def.args.iter().enumerate() {
         // `layout_prefix` already ends in ARG_SEPARATOR (`size@`), matching
         // the SystemTap grammar's `Nf@OP`; only the operand is appended.
         operands.push(format!(
             "{}{}",
-            arg.layout_prefix,
-            X86_REGISTERS[width_index(arg.d_type)][index]
+            layout_prefix(arg),
+            X86_REGISTERS[width_index(arg)][index]
         ));
     }
     Some(operands.join(" "))
@@ -196,32 +308,20 @@ fn layout_prefixes_of(layout: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Portable ABI-table assertions: the spec table itself must match Core's
-/// published argument layout for every probe this slice implements.
+/// `probes.d` itself must declare exactly the probes Core's ABI publishes:
+/// same providers, probe names, and argument layout prefixes, in order.
 #[test]
-fn probe_table_matches_core_argument_layout() {
-    let expected: &[(&str, &[&str])] = &[
-        (
-            "validation:block_connected",
-            &["8@", "-4@", "8@", "-4@", "-8@", "-8@"],
-        ),
-        ("mempool:added", &["8@", "-4@", "-8@"]),
-        ("mempool:removed", &["8@", "8@", "-4@", "-8@", "8@"]),
-        (
-            "net:inbound_message",
-            &["-8@", "8@", "8@", "8@", "8@", "8@"],
-        ),
-        (
-            "net:outbound_message",
-            &["-8@", "8@", "8@", "8@", "8@", "8@"],
-        ),
-    ];
-    assert_eq!(probe_abi::PROBES.len(), expected.len());
-    for (spec, (name, prefixes)) in probe_abi::PROBES.iter().zip(expected) {
-        let full_name = format!("{}:{}", spec.provider, spec.name);
-        assert_eq!(&full_name, name);
-        assert_eq!(&probe_abi::layout_prefixes(spec), prefixes);
+fn probes_d_matches_core_argument_layout() -> io::Result<()> {
+    let probes = probes_d()?;
+    assert_eq!(probes.len(), CORE_ABI.len());
+    for (def, (provider, name, prefixes)) in probes.iter().zip(CORE_ABI) {
+        assert_eq!(
+            (def.provider.as_str(), def.name.as_str()),
+            (*provider, *name)
+        );
+        assert_eq!(&layout_prefixes(def), prefixes);
     }
+    Ok(())
 }
 
 /// Forces monomorphisation of every probe wrapper so the test binary links
@@ -238,10 +338,10 @@ fn probe_table_matches_core_argument_layout() {
 fn instantiate_probes() {
     if std::hint::black_box(false) {
         let hash = [0u8; 32];
-        bitcoin_rs_trace::block_connected(|| (hash.as_ptr(), 0, 0, 0, 0, 0));
-        bitcoin_rs_trace::added(|| (hash.as_ptr(), 0, 0));
-        bitcoin_rs_trace::removed(|| (hash.as_ptr(), "block", 0, 0, 0));
-        bitcoin_rs_trace::inbound_message(|| {
+        bitcoin_rs_consensus::trace::block_connected(|| (hash.as_ptr(), 0, 0, 0, 0, 0));
+        bitcoin_rs_consensus::trace::added(|| (hash.as_ptr(), 0, 0));
+        bitcoin_rs_consensus::trace::removed(|| (hash.as_ptr(), "block", 0, 0, 0));
+        bitcoin_rs_consensus::trace::inbound_message(|| {
             (
                 0,
                 String::new(),
@@ -251,7 +351,7 @@ fn instantiate_probes() {
                 hash.as_ptr(),
             )
         });
-        bitcoin_rs_trace::outbound_message(|| {
+        bitcoin_rs_consensus::trace::outbound_message(|| {
             (
                 0,
                 String::new(),
@@ -277,6 +377,7 @@ fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Erro
         None => std::env::current_exe()?,
     };
     let bytes = fs::read(&path)?;
+    let probes = probes_d()?;
     if !cfg!(feature = "usdt") {
         // Feature-off artifact: the whole point of the default build is that
         // no probe notes leak into it, so assert exactly that for whichever
@@ -289,16 +390,16 @@ fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Erro
             SdtParse::Notes(_, notes) => notes,
         };
         assert!(
-            notes.iter().all(|note| probe_abi::PROBES
+            notes.iter().all(|note| probes
                 .iter()
-                .all(|spec| { note.provider != spec.provider || note.name != spec.name })),
+                .all(|def| { note.provider != def.provider || note.name != def.name })),
             "a feature-off build must embed no Core-compatible probe notes"
         );
         return Ok(());
     }
     let (machine, notes) = match parse_sdt_notes(&bytes) {
         // Non-ELF artifact (Mach-O on macOS carries DOF instead of SDT
-        // notes). The portable table test above still guards the ABI.
+        // notes). The `probes.d` table test above still guards the ABI.
         SdtParse::NotElf => {
             eprintln!(
                 "skipping SDT note assertion: {} is not a little-endian ELF64 binary",
@@ -311,35 +412,35 @@ fn embedded_sdt_notes_match_core_layout() -> Result<(), Box<dyn std::error::Erro
         }
         SdtParse::Notes(machine, notes) => (machine, notes),
     };
-    for spec in probe_abi::PROBES {
+    for def in &probes {
         let note = notes
             .iter()
-            .find(|note| note.provider == spec.provider && note.name == spec.name)
-            .ok_or_else(|| format!("missing SDT note {}:{}", spec.provider, spec.name))?;
-        if let Some(expected) = expected_layout(spec, machine) {
+            .find(|note| note.provider == def.provider && note.name == def.name)
+            .ok_or_else(|| format!("missing SDT note {}:{}", def.provider, def.name))?;
+        if let Some(expected) = expected_layout(def, machine) {
             // Full-string check: both the size/sign prefix and the operand
             // form (register-direct like Core's `8@%reg`, never the
             // dereferencing `8@(%reg)` that binds a different value).
             assert_eq!(
                 note.args, expected,
                 "argument layout of {}:{} must match byte-for-byte",
-                spec.provider, spec.name,
+                def.provider, def.name,
             );
         } else {
             assert_eq!(
                 layout_prefixes_of(&note.args),
-                probe_abi::layout_prefixes(spec),
+                layout_prefixes(def),
                 "argument layout of {}:{} does not match the Core-compatible table \
                  (actual `{}`)",
-                spec.provider,
-                spec.name,
+                def.provider,
+                def.name,
                 note.args,
             );
         }
         assert_ne!(
             note.semaphore, 0,
             "SDT note {}:{} carries no semaphore address",
-            spec.provider, spec.name
+            def.provider, def.name
         );
     }
     Ok(())

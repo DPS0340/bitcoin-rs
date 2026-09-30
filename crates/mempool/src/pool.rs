@@ -648,7 +648,7 @@ impl Mempool {
         // `unknown`, Core's `MemPoolRemovalReason::UNKNOWN` string.
         let mut txids = Vec::with_capacity(self.entries.len());
         for (_id, entry) in self.entries.iter() {
-            bitcoin_rs_trace::removed(|| {
+            bitcoin_rs_consensus::trace::removed(|| {
                 (
                     entry.txid.as_bytes().as_ptr(),
                     "unknown",
@@ -891,7 +891,7 @@ impl Mempool {
         // Core fires `mempool:added` from `CTxMemPool::addUnchecked`, the
         // pool-internal install funnel, after the entry is linked into the
         // pool. `prepare` runs only while a consumer is attached.
-        bitcoin_rs_trace::added(|| {
+        bitcoin_rs_consensus::trace::added(|| {
             (
                 txid.as_bytes().as_ptr(),
                 i32::try_from(added_vsize).unwrap_or(i32::MAX),
@@ -1943,7 +1943,7 @@ impl Mempool {
             // Core fires `mempool:removed` from `CTxMemPool::removeUnchecked`,
             // the pool-internal retire funnel, per entry as it leaves the
             // pool. `prepare` runs only while a consumer is attached.
-            bitcoin_rs_trace::removed(|| {
+            bitcoin_rs_consensus::trace::removed(|| {
                 (
                     entry.txid.as_bytes().as_ptr(),
                     Self::core_removal_reason(*reason),
