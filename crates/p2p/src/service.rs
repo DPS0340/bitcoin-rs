@@ -692,12 +692,6 @@ impl P2pService {
         self.network_active.load(Ordering::Acquire)
     }
 
-    /// Enables or disables network activity. Disabling cancels current peers;
-    /// their owners remove the leases during teardown.
-    pub fn set_network_active(&self, active: bool) {
-        apply_network_active(&self.network_active, &self.peer_table, active);
-    }
-
     /// Returns the shared admission switch for compatibility with node
     /// orchestration code that passes the switch into worker constructors.
     #[must_use]
@@ -723,29 +717,6 @@ impl P2pService {
         self.outbound_tx.clone()
     }
 
-    /// Returns the service-owned outbound request receiver.
-    #[must_use]
-    pub fn outbound_receiver(&self) -> Arc<Mutex<Receiver<OutboundDial>>> {
-        Arc::clone(&self.outbound_rx)
-    }
-
-    /// Adds or replaces one manual ban entry.
-    pub fn set_ban(&self, entry: crate::BannedSubnet) {
-        let mut banned = self.banned.write();
-        banned.retain(|current| current.subnet != entry.subnet);
-        banned.push(entry);
-    }
-
-    /// Removes one manual ban entry.
-    pub fn remove_ban(&self, subnet: crate::IpSubnet) {
-        self.banned.write().retain(|entry| entry.subnet != subnet);
-    }
-
-    /// Clears all manual bans.
-    pub fn clear_banned(&self) {
-        self.banned.write().clear();
-    }
-
     /// Returns configured addnode add addresses.
     #[must_use]
     pub fn added_nodes(&self) -> Vec<SocketAddr> {
@@ -756,33 +727,6 @@ impl P2pService {
     #[must_use]
     pub fn added_nodes_handle(&self) -> Arc<RwLock<Vec<SocketAddr>>> {
         Arc::clone(&self.added_nodes)
-    }
-
-    /// Applies Core-like addnode state and requests a connection.
-    pub fn add_node(&self, addr: SocketAddr, persist: bool) -> Result<(), P2pControlError> {
-        if crate::subnet::is_banned(&self.banned.read(), addr.ip(), SystemTime::now()) {
-            return Err(P2pControlError::Banned);
-        }
-        if persist {
-            let mut added = self.added_nodes.write();
-            if !added.contains(&addr) {
-                added.push(addr);
-            }
-        }
-        if !self.network_active() {
-            return Ok(());
-        }
-        match self.outbound_tx.try_send(OutboundDial::pinned(addr)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) if persist => Ok(()),
-            Err(TrySendError::Full(_)) => Err(P2pControlError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(P2pControlError::Closed),
-        }
-    }
-
-    /// Removes one configured addnode add address.
-    pub fn remove_node(&self, addr: SocketAddr) {
-        self.added_nodes.write().retain(|current| *current != addr);
     }
 
     /// Sends a message only to the connection identified by source.
@@ -803,12 +747,6 @@ impl P2pService {
     #[must_use]
     pub fn inbound_headers_receiver(&self) -> Arc<Mutex<Receiver<crate::InboundHeaders>>> {
         Arc::clone(&self.inbound_headers_rx)
-    }
-
-    /// Returns a sender for inbound header notifications.
-    #[must_use]
-    pub fn inbound_headers_sender(&self) -> Sender<crate::InboundHeaders> {
-        self.inbound_headers_tx.clone()
     }
 
     /// Returns a cloned inbound block receiver for the node sync coordinator.

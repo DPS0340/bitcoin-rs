@@ -310,18 +310,6 @@ impl LivePeer {
             .count()
     }
 
-    /// The first getdata frame whose item set equals `expected` (order-free).
-    #[must_use]
-    pub fn find_getdata(&self, expected: &[Inventory]) -> Option<&GetdataSeen> {
-        self.getdata_seen.iter().find(|frame| {
-            let mut want: Vec<(u32, String)> = expected.iter().map(inv_item_desc).collect();
-            let mut got = frame.items.clone();
-            want.sort();
-            got.sort();
-            want == got
-        })
-    }
-
     /// Every hash requested at least once, deduplicated, in first-seen order.
     #[must_use]
     pub fn requested_hashes(&self) -> Vec<String> {
