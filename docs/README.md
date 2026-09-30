@@ -11,7 +11,7 @@
 | Read repository-wide invariants | [Project invariants](../CONSTRAINTS.md) |
 | Change the repository | [Agent guidelines](../AGENTS.md) and [contributing](../CONTRIBUTING.md) |
 | Operate recovery or REST | [Recovery contract](contracts/recovery.md) and [REST guide](rest-interface.md) |
-| Place instrumentation in the right layer | [Observability boundary](observability.md), [tracing/USDT](tracing.md) |
+| Place instrumentation in the right layer | [Observability boundary](observability.md) |
 
 The contract index owns the clause/proof map; this page does not maintain a
 second inventory. Contracts take precedence over local source comments,

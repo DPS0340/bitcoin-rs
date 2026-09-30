@@ -675,12 +675,6 @@ fn run_outbound_connection(
     let addr_bind = stream.local_addr().map_err(crate::wire::PeerError::Io)?;
     let counters = std::sync::Arc::clone(stream.counters());
     let mut peer = Peer::new(stream, shared.magic);
-    peer.attach_net_trace(crate::net_trace::NetTrace::outbound(
-        lease.node_id(),
-        addr,
-        role,
-        manual,
-    ));
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let best_block_depth = shared.approximate_best_block_depth();
     if let Err(error) = run_outbound_handshake(
@@ -884,10 +878,6 @@ fn run_handshake(
 
     let nonce = generate_nonce(peer_addr);
     let mut peer = Peer::new(stream, shared.magic);
-    peer.attach_net_trace(crate::net_trace::NetTrace::inbound(
-        lease.node_id(),
-        peer_addr,
-    ));
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     if let Err(error) = run_inbound_handshake(
         &mut peer,
@@ -969,7 +959,6 @@ fn run_connected_session(
             lease.close_signal(),
             lease.budget_handle(),
             peer_addr,
-            peer.net_trace,
         )
         .map_err(crate::wire::PeerError::Io)
     })();
@@ -1578,8 +1567,6 @@ fn process_compact_message(
 ///
 /// PRE: `stream` is a clone of the connection's counted stream, and
 /// `outbound_rx`, `close_rx`, and `budget` belong to the same lease.
-/// `net_trace` is the connection's probe context, `None` on probe-free
-/// connections.
 /// POST: Return the writer thread's handle, or the spawn error.
 /// INVARIANT: The counted stream accounts every sent byte once.
 fn spawn_connection_writer(
@@ -1589,19 +1576,11 @@ fn spawn_connection_writer(
     close_rx: crossbeam_channel::Receiver<()>,
     budget: Arc<crate::connection::OutboundBudget>,
     peer_addr: SocketAddr,
-    net_trace: Option<crate::net_trace::NetTrace>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("bitcoin-rs-p2p-writer-{peer_addr}"))
         .spawn(move || {
-            run_writer_loop(
-                &outbound_rx,
-                close_rx,
-                &budget,
-                &mut stream,
-                magic,
-                net_trace.as_ref(),
-            );
+            run_writer_loop(&outbound_rx, close_rx, &budget, &mut stream, magic);
             let _ = stream.shutdown(std::net::Shutdown::Both);
         })
 }
@@ -1657,14 +1636,10 @@ fn write_ready_burst(
     writer: &mut dyn std::io::Write,
     magic: Magic,
     budget: &Arc<crate::connection::OutboundBudget>,
-    net_trace: Option<&crate::net_trace::NetTrace>,
 ) -> bool {
     let mut pending = Some(first);
     while let Some(head) = pending.take() {
         let (burst, leftover) = collect_write_burst(head, outbound_rx);
-        // Encode once per message: the probe consumes the same frame bytes
-        // the write emits, the way Core's `CSerializedNetMsg` is shared by
-        // its send path and the `net:outbound_message` probe.
         let frames = match crate::wire::encode_frames(magic, &burst) {
             Ok(frames) => frames,
             Err(error) => {
@@ -1672,9 +1647,6 @@ fn write_ready_burst(
                 return false;
             }
         };
-        for (message, frame) in burst.iter().zip(&frames) {
-            crate::net_trace::outbound_message(net_trace, message, frame.payload());
-        }
         match crate::wire::write_frames(writer, &frames) {
             Ok(sizes) => {
                 account_written(&sizes, budget);
@@ -1707,13 +1679,12 @@ fn run_writer_loop(
     budget: &Arc<crate::connection::OutboundBudget>,
     writer: &mut dyn std::io::Write,
     magic: Magic,
-    net_trace: Option<&crate::net_trace::NetTrace>,
 ) {
     loop {
         crossbeam_channel::select! {
             recv(outbound_rx) -> message => {
                 let Ok(first) = message else { break };
-                if !write_ready_burst(first, outbound_rx, writer, magic, budget, net_trace) {
+                if !write_ready_burst(first, outbound_rx, writer, magic, budget) {
                     break;
                 }
             }
@@ -2715,7 +2686,6 @@ mod writer_shutdown_tests {
             lease.close_signal(),
             lease.budget_handle(),
             peer_addr,
-            None,
         )
         .expect("spawn writer");
         let waiter = std::thread::spawn(move || {
@@ -2760,21 +2730,8 @@ mod writer_shutdown_tests {
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         let budget = lease.budget_handle();
         let close_rx = lease.close_signal();
-        let net_trace = crate::net_trace::NetTrace::outbound(
-            9,
-            "127.0.0.1:18444".parse().expect("valid socket address"),
-            crate::peer_info::PeerRole::BlockRelayOnly,
-            false,
-        );
         let worker = std::thread::spawn(move || {
-            run_writer_loop(
-                &outbound_rx,
-                close_rx,
-                &budget,
-                &mut writer,
-                Magic::BITCOIN,
-                Some(&net_trace),
-            );
+            run_writer_loop(&outbound_rx, close_rx, &budget, &mut writer, Magic::BITCOIN);
             let _ = done_tx.send(());
         });
 
@@ -2830,7 +2787,6 @@ mod writer_shutdown_tests {
                 &worker_budget,
                 &mut writer,
                 Magic::BITCOIN,
-                None,
             );
             let _ = done_tx.send(());
         });
@@ -2870,7 +2826,6 @@ mod writer_shutdown_tests {
             lease.close_signal(),
             lease.budget_handle(),
             peer_addr,
-            None,
         )
         .expect("spawn writer");
 

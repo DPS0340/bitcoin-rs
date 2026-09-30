@@ -321,11 +321,6 @@ impl FramedMessage {
     fn wire_len(&self) -> usize {
         HEADER_LEN + self.payload.len()
     }
-
-    /// The encoded payload bytes the vectored write emits.
-    pub(crate) fn payload(&self) -> &[u8] {
-        &self.payload
-    }
 }
 
 /// Encodes `message` into its wire frame.
@@ -428,18 +423,6 @@ pub fn read_message<R: Read>(
     reader: &mut R,
     expected_magic: Magic,
 ) -> Result<(Message, bytes::Bytes), PeerError> {
-    read_message_with(reader, expected_magic, |_, _| {})
-}
-
-/// Read one validated wire payload, observing it before typed decoding.
-///
-/// The callback sees checksum-valid messages even when their typed payload is
-/// malformed. It does not run for invalid framing or checksums.
-pub(crate) fn read_message_with<R: Read>(
-    reader: &mut R,
-    expected_magic: Magic,
-    observe: impl FnOnce(&str, &[u8]),
-) -> Result<(Message, bytes::Bytes), PeerError> {
     let mut header = [0u8; HEADER_LEN];
     reader.read_exact(&mut header)?;
 
@@ -467,7 +450,6 @@ pub(crate) fn read_message_with<R: Read>(
         return Err(PeerError::BadChecksum);
     }
 
-    observe(&command, &payload);
     let message = decode_payload(&command, &payload)?;
     Ok((message, bytes::Bytes::from(payload)))
 }
@@ -813,31 +795,24 @@ mod tests {
     }
 
     #[test]
-    fn observer_sees_valid_wire_payload_before_typed_decode() {
+    fn read_message_rejects_malformed_payload_after_checksum() {
         // A zero-length version payload has a valid wire checksum but cannot
-        // decode as a VersionMessage. Core's inbound probe sees this frame.
-        let mut frame = Vec::with_capacity(HEADER_LEN);
-        frame.extend_from_slice(&Magic::REGTEST.to_bytes());
-        frame.extend_from_slice(b"version\0\0\0\0\0");
-        frame.extend_from_slice(&0u32.to_le_bytes());
-        frame.extend_from_slice(&super::checksum(&[]));
+        // decode as a VersionMessage.
+        let frame = [
+            Magic::REGTEST.to_bytes().as_slice(),
+            b"version\0\0\0\0\0".as_slice(),
+            0u32.to_le_bytes().as_slice(),
+            super::checksum(&[]).as_slice(),
+        ]
+        .concat();
 
-        let mut observed = None;
-        let result = super::read_message_with(
-            &mut Cursor::new(&frame),
-            Magic::REGTEST,
-            |command, payload| observed = Some((command.to_owned(), payload.to_vec())),
-        );
+        let result = super::read_message(&mut Cursor::new(&frame), Magic::REGTEST);
         assert!(matches!(result, Err(PeerError::Encode(_))));
-        assert_eq!(observed, Some(("version".to_owned(), Vec::new())));
 
-        frame[20] ^= 1;
-        let mut observed_bad_checksum = false;
-        let result = super::read_message_with(&mut Cursor::new(frame), Magic::REGTEST, |_, _| {
-            observed_bad_checksum = true;
-        });
+        let mut bad_frame = frame;
+        bad_frame[20] ^= 1;
+        let result = super::read_message(&mut Cursor::new(bad_frame), Magic::REGTEST);
         assert!(matches!(result, Err(PeerError::BadChecksum)));
-        assert!(!observed_bad_checksum);
     }
 
     #[test]

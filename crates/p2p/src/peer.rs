@@ -113,10 +113,6 @@ pub struct Peer<S> {
     pub compact_blocks: CompactBlockNegotiation,
     /// BIP339 state for the peer.
     pub wtxid_relay: WtxidRelayState,
-    /// `net:*` probe context attached by live connection roots; `None` on
-    /// probe-free constructions, which keeps the probes out of their
-    /// binaries.
-    pub(crate) net_trace: Option<crate::net_trace::NetTrace>,
 }
 
 impl<S> Peer<S> {
@@ -132,17 +128,7 @@ impl<S> Peer<S> {
             capabilities: PeerCapabilities::default(),
             compact_blocks: CompactBlockNegotiation::default(),
             wtxid_relay: WtxidRelayState::default(),
-            net_trace: None,
         }
-    }
-
-    /// Attaches the `net:*` probe context captured at the connection root.
-    ///
-    /// The inbound accept path and the outbound dial call this once, before
-    /// the handshake, so every read and write of the connection emits the
-    /// Core-compatible probes.
-    pub(crate) fn attach_net_trace(&mut self, net_trace: crate::net_trace::NetTrace) {
-        self.net_trace = Some(net_trace);
     }
 
     /// Mark the peer ready once both version and verack have arrived.
@@ -158,32 +144,15 @@ impl<S: Read + Write> Peer<S> {
     ///
     /// Returns the framed wire length so handshake accounting can charge the
     /// same bytes `write_message` emitted, without encoding the payload twice.
-    ///
-    /// With a `net:*` probe context attached, the frame is encoded once and
-    /// `net:outbound_message` observes its payload before the write attempt,
-    /// the way Core's `CSerializedNetMsg` is shared by its send path and the
-    /// probe.
     pub fn send(&mut self, message: &Message) -> Result<usize, PeerError> {
-        if self.net_trace.is_some() {
-            let frame = crate::wire::encode_frame(self.magic, message)?;
-            crate::net_trace::outbound_message(self.net_trace.as_ref(), message, frame.payload());
-            return crate::wire::write_frame(&mut self.stream, &frame);
-        }
         write_message(&mut self.stream, self.magic, message)
     }
 }
 
 impl<S: Read> Peer<S> {
     /// Read one framed message.
-    ///
-    /// With a `net:*` probe context attached, `net:inbound_message` observes
-    /// the checksum-validated wire payload before typed decoding, including
-    /// messages whose payload later fails to decode.
     pub fn read_message(&mut self) -> Result<(Message, bytes::Bytes), PeerError> {
-        let net_trace = self.net_trace.as_ref();
-        crate::wire::read_message_with(&mut self.stream, self.magic, |command, payload| {
-            crate::net_trace::inbound_message(net_trace, command, payload);
-        })
+        crate::wire::read_message(&mut self.stream, self.magic)
     }
 }
 
@@ -325,16 +294,10 @@ mod tests {
     }
 
     #[test]
-    fn traced_send_emits_a_parseable_frame_of_the_reported_length() -> Result<(), PeerError> {
+    fn send_emits_a_parseable_frame_of_the_reported_length() -> Result<(), PeerError> {
         use std::io::Cursor;
 
         let mut peer = Peer::new(Cursor::new(Vec::new()), Magic::BITCOIN);
-        peer.attach_net_trace(crate::net_trace::NetTrace::outbound(
-            4,
-            SocketAddr::from(([127, 0, 0, 1], 8333)),
-            crate::peer_info::PeerRole::FullRelay,
-            false,
-        ));
 
         let written = peer.send(&Message::Ping(9))?;
 
@@ -352,17 +315,13 @@ mod tests {
     }
 
     #[test]
-    fn traced_read_returns_the_checksum_validated_message() -> Result<(), PeerError> {
+    fn read_returns_the_checksum_validated_message() -> Result<(), PeerError> {
         use std::io::Cursor;
 
         let mut frame = Vec::new();
         write_message(&mut frame, Magic::BITCOIN, &Message::Pong(2))?;
 
         let mut peer = Peer::new(Cursor::new(frame), Magic::BITCOIN);
-        peer.attach_net_trace(crate::net_trace::NetTrace::inbound(
-            2,
-            SocketAddr::from(([127, 0, 0, 1], 8333)),
-        ));
 
         let (message, payload) = peer.read_message()?;
 

@@ -1,23 +1,21 @@
 # Observability boundary
 
 The normative rule for where instrumentation lands in bitcoin-rs. The
-observability surface has three layers — `metrics::` counters/histograms/
-gauges, `tracing::` logs, and USDT probes (`bitcoin-rs-trace`) — and this page
-is what keeps new instrumentation in the right one. Raised by issue #1195 as a
-follow-up to the USDT work of #1187/#1194.
+observability surface has two layers — `metrics::` counters/histograms/
+gauges and `tracing::` logs — and this page is what keeps new
+instrumentation in the right one. Raised by issue #1195; the USDT probe
+layer from #1187/#1194 is removed, so detailed per-event data now belongs
+in `tracing::`, never in metric labels.
 
 Owners:
 
-- Boundary rule and audit: this page (`OBS-01`..`OBS-06`)
-- USDT probe ABI and compatibility table: [`tracing.md`](tracing.md)
-  (`crates/trace/`, `crates/trace/probes.d`)
+- Boundary rule and audit: this page (`OBS-01`..`OBS-02`, `OBS-04`..`OBS-06`)
 - Hot-path attribution of measured product stages:
   [`contracts/hot-path-attribution.md`](contracts/hot-path-attribution.md)
   (HPA-01..HPA-13), inventory in [`benchmarks/hot-path-ledger.toml`](benchmarks/hot-path-ledger.toml)
 - Metrics module docs and signal registry: `crates/node/src/metrics.rs`
 
 ## Clauses
-
 ### `OBS-01`: `metrics::` is a small, stable set of operator signals
 
 The metrics API carries only signals an operator would dashboard or alert on:
@@ -45,15 +43,6 @@ investigation, and anything whose fields or verbosity will change with the
 code. `tracing::` content is explicitly not a stable surface: field names,
 event names, and levels may change without notice. Operator runbooks
 (`docs/operations/runtime-stall.md`) do not depend on log field shapes.
-
-### `OBS-03`: USDT probes carry the detailed payloads
-
-Core-compatible per-event payloads — block hashes, txids, raw message bytes,
-per-event durations — belong in the USDT probes of `crates/trace`
-(see [`tracing.md`](tracing.md), issues #1121/#1194). Probe payloads are the
-layer that must not pollute metrics cardinality. If a detailed per-event datum
-is worth keeping in production but is not operator-facing, it is a probe
-argument, not a metric label. This slice adds no new probes.
 
 ### `OBS-04`: Hot-path attribution hooks are exempt, and only via the ledger
 
@@ -92,9 +81,8 @@ become a ledger path row. The named hooks are:
 | --- | --- |
 | Would an operator alert or dashboard on it? Is it a rate/total, backlog, or stable latency? | `metrics::` (OBS-01) |
 | Is it a per-event decomposition a developer attaches to one investigation? | `tracing::` (OBS-02) |
-| Is it detailed per-event data (hashes, payloads, peer identity, raw durations) worth keeping in production? | USDT probe argument (OBS-03) |
 | Is it a measured product stage the hot-path attribution consumes? | ledger path first, then `metrics::` hook (OBS-04) |
-| Does it need a block hash, txid, or peer address as a metric label? | none of the above — it is a `tracing::` field or probe argument |
+| Does it need a block hash, txid, or peer address as a metric label? | none of the above — it is a `tracing::` field |
 
 ### `OBS-06`: Audit trail and migration
 

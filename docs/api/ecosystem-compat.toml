@@ -120,22 +120,8 @@ representative_consumer = "none"
 evidence = "no adapter is shipped; this is future work (issue #1122 compatibility surfaces), not a compatibility commitment. When built, IPC stays an adapter, not an internal architecture template (ECO-01)."
 
 [[row]]
-surface = "USDT tracepoints (validation/mempool/net providers)"
-core_reference = "Bitcoin Core doc/tracing.md probe ABI"
-status = "implemented"
-representative_consumer = "planned: bpftrace/BCC or bitcoin-dev-tools/usdt-dash workflow (issue #1122, #1121)"
-evidence = "in-tree only: crates/trace/src/probe_abi.rs table asserted against built SDT notes by crates/trace/tests/sdt_notes.rs; docs/tracing/smoke.bt is adapted from Core's contrib/tracing script but no external-tool run is recorded. ABI table alone is not external verification (ECO-08)."
-
-[[row]]
-surface = "Observability via bpftrace/BCC and bitcoin-dev-tools"
-core_reference = "Bitcoin Core tracing/benchmark tooling conventions"
-status = "implemented"
-representative_consumer = "planned: bitcoin-dev-tools/usdt-dash or benchkit against bitcoin-rs (issue #1122 follow-up)"
-evidence = "no external tool has been run against bitcoin-rs in the recorded evidence (issue #1122 follow-up work). Benchmark story is owned by docs/benchmarks/ and docs/contracts/hot-path-attribution.md; those are internal evidence."
-
-[[row]]
 surface = "Core IPC component interfaces"
 core_reference = "selected Bitcoin Core IPC interfaces"
 status = "intentionally unsupported"
 representative_consumer = "none"
-evidence = "not a goal in the current surface set: IPC compatibility is not pursued (docs/tracing.md not-implemented note); the non-goals forbid cloning Core interfaces or importing Core's ownership model (docs/contracts/ecosystem-compatibility.md ECO-01). Any future IPC is a narrowly scoped adapter, not an architecture template."
+evidence = "not a goal in the current surface set: IPC compatibility is not pursued; the non-goals forbid cloning Core interfaces or importing Core's ownership model (docs/contracts/ecosystem-compatibility.md ECO-01). Any future IPC is a narrowly scoped adapter, not an architecture template."

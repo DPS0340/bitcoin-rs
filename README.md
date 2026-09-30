@@ -194,10 +194,9 @@ everything else is reported honestly as implemented or weaker.
 Today the one real external-consumer lane is live interoperability with an
 unmodified Bitcoin Core peer ([Core differential
 contract](docs/contracts/core-differential.md)): black-box handshake, sync,
-relay, and chain identity. JSON-RPC, REST, ZMQ, GBT/mining, and the
-Core-compatible USDT probes are implemented and covered by in-tree tests,
-but not yet externally verified; the matrix names the evidence and the
-planned representative consumers.
+relay, and chain identity. JSON-RPC, REST, ZMQ, and GBT/mining are
+implemented and covered by in-tree tests, but not yet externally verified;
+the matrix names the evidence and the planned representative consumers.
 
 ## Contributing
 

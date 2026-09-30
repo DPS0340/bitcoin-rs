@@ -38,15 +38,13 @@ duplicate correctness suites:
 Correctness: unit tests | contract tests | Core differential tests | focused internal e2e
   -> owns detailed state transitions, edge cases, implementation invariants
 
-External compatibility: Bitcoin Core peer | RPC/REST/ZMQ consumer | bpftrace/BCC
+External compatibility: Bitcoin Core peer | RPC/REST/ZMQ consumer
                         | benchmark tooling | mining software
-  -> proves the public surface is consumable in the real ecosystem
 ```
 
 External evidence answers only consumability questions: can an unmodified
 Core peer sync/relay with bitcoin-rs; can an existing RPC client parse a
-response; can an existing ZMQ subscriber consume notifications; can a
-Core-style USDT script attach and read the expected probe ABI; can mining or
+response; can an existing ZMQ subscriber consume notifications; can mining or
 benchmark tooling invoke bitcoin-rs through the documented public surface.
 Detailed correctness stays owned by the correctness tier; external evidence
 never re-tests internal branches.
@@ -73,12 +71,11 @@ restriction.
 
 Do not collect tools for their own sake. For a given surface, one
 representative external consumer is sufficient unless another consumer proves
-a materially different compatibility property: a distinct protocol mode, ABI
-property, deployment environment, or regression risk. One real Core interop
+a materially different compatibility property: a distinct protocol mode,
+deployment environment, or regression risk. One real Core interop
 lane proves basic P2P compatibility; one ordinary Core-compatible RPC client
-proves RPC consumability; one bpftrace/BCC workflow proves the USDT ABI; one
-mining consumer proves GBT/mining integration. External-tool count is never a
-KPI.
+proves RPC consumability; one mining consumer proves GBT/mining integration.
+External-tool count is never a KPI.
 
 ### `ECO-05`: No production dependency creep
 
@@ -122,7 +119,6 @@ existing external tool -> generic Bitcoin implementation interface -> Core | bit
   /v2, tx/block relay, compact blocks and filters, peer lifecycle);
   Application APIs (JSON-RPC, REST, ZMQ); Mining (GBT, block
   submission/proposal, future mining IPC or Stratum V2 adapters);
-  Observability (Core-compatible USDT, bpftrace/BCC, bitcoin-dev-tools);
   Process/component interfaces (optional Core IPC as a narrowly scoped
   adapter).
 - This matrix is a different axis from

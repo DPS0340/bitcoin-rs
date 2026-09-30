@@ -12,14 +12,13 @@
 //! distributions. Names and semantics are an API; renaming or removing one is
 //! a breaking change. Per-event payloads, block/tx/peer identity, and any
 //! other high-cardinality label belong in `tracing::` events (diagnostics,
-//! explicitly not an API) or in the Core-compatible USDT probes of
-//! `bitcoin-rs-trace` (`crates/trace`, see `docs/tracing.md`), never here.
+//! explicitly not an API), never here.
 //! Metric labels are limited to closed enumerations owned by the code.
 //! The measured product-stage histograms consumed by the hot-path ledger
 //! (`docs/contracts/hot-path-attribution.md`) are exempt, and only via that
 //! ledger's `histogram` keys. Before adding a call site, apply the decision
-//! table in `docs/observability.md` (OBS-01..OBS-05) and cite the clause in
-//! review.
+//! table in `docs/observability.md` (OBS-01..OBS-02, OBS-04..OBS-06) and cite
+//! the clause in review.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
