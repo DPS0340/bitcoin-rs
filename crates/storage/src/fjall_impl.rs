@@ -8,7 +8,7 @@ use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, PersistM
 use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteCondition};
 
 /// Fjall's default block-cache capacity for unbudgeted opens.
-const FJALL_DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+pub const FJALL_DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Fjall-backed key-value store.
 pub struct FjallStore {

@@ -10,7 +10,7 @@ use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteCondition};
 
 const BLOCK_SIZE: usize = 4 * 1024 * 1024;
 /// `RocksDB`'s block-cache capacity for unbudgeted opens.
-const BLOCK_CACHE_SIZE: u64 = 256 * 1024 * 1024;
+pub const ROCKSDB_DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const BLOOM_BITS_PER_KEY: f64 = 10.0;
 const WRITE_BUFFER_SIZE: usize = 128 << 20;
 
@@ -25,12 +25,12 @@ pub struct RocksDbStore {
 impl RocksDbStore {
     /// Opens or creates a `RocksDB` store at `path` with all column families.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_with_cache(path, BLOCK_CACHE_SIZE)
+        Self::open_with_cache(path, ROCKSDB_DEFAULT_CACHE_BYTES)
     }
 
     /// Opens or creates a `RocksDB` store with an explicit block-cache capacity.
     ///
-    /// `cache_bytes` replaces the historical hardcoded 256 MiB `BLOCK_CACHE_SIZE`
+    /// `cache_bytes` replaces the historical hardcoded 256 MiB `ROCKSDB_DEFAULT_CACHE_BYTES`
     /// as the shared LRU block cache (index and filter blocks included through
     /// `set_cache_index_and_filter_blocks`) and is configured exactly: a
     /// budgeted share is never raised above its allocation. Zero selects the
@@ -38,7 +38,7 @@ impl RocksDbStore {
     /// fixed setting.
     pub fn open_with_cache(path: impl AsRef<Path>, cache_bytes: u64) -> Result<Self, StorageError> {
         let cache_bytes = if cache_bytes == 0 {
-            BLOCK_CACHE_SIZE
+            ROCKSDB_DEFAULT_CACHE_BYTES
         } else {
             cache_bytes
         };

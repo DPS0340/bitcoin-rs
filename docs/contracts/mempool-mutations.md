@@ -354,8 +354,6 @@ state (`crates/mempool/src/orphan.rs`).
   `policy_eviction_publishes_r_frames_with_contiguous_sequences`,
   `mempool_event_payloads_carry_reversed_txid_label_and_le_sequence`,
   `sequence_event_payload_uses_core_hash_orientation_and_label`.
-- `crates/mining/src/generation_signal/tests.rs`:
-  `attached_signal_forwards_sequence_wake_without_mempool_lock`.
 - `crates/node/tests/mining.rs`:
   `publish_generation_from_does_not_take_mempool_lock`,
   `concurrent_publish_generation_paths_do_not_deadlock`,
