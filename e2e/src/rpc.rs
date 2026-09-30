@@ -1,18 +1,10 @@
-//! One HTTP/1.1 transport for every harness request to a node listener.
+//! One HTTP/1.1 transport for every harness request to a node listener: the
+//! keep-alive connection, the strict reply parser, the request wire builder,
+//! and the Basic-authorization encoder.
 //!
-//! PRE: the address given to [`Connection::new`] is the RPC/REST/Esplora
-//! loopback endpoint a spawned node bound.
-//! POST: every returned value was parsed from one complete HTTP/1.1 reply
-//! with a valid status line and a body whose length matches its
-//! `Content-Length`.
-//! INVARIANT: a request that reached the peer's dispatch is never resent.
-//! Only a socket provably closed or broken before any request byte could
-//! have been processed is retried, and at most once per call.
-//!
-//! This module owns the keep-alive connection, the strict reply parser, the
-//! request wire builder, and the Basic-authorization encoder. Callers supply
-//! method, path, body bytes, and credentials; nothing else in the workspace
-//! builds an HTTP request by hand.
+//! A request that reached the peer's dispatch is never resent. Only a socket
+//! provably closed or broken before any request byte could have been
+//! processed is retried, and at most once per call.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
@@ -34,13 +26,9 @@ enum ConnFail {
     Error(Error),
 }
 
-/// A persistent HTTP/1.1 connection to one node listener.
-///
-/// PRE: the node is listening on `addr` (readiness already observed, or the
-/// caller accepts a connect failure).
-/// POST: the kept-alive socket holds no unread reply bytes.
-/// INVARIANT: a socket whose peer closed it is dropped before any request
-/// byte leaves the client, so a retry always runs on a fresh connection.
+/// A persistent HTTP/1.1 connection to one node listener. A socket whose
+/// peer closed it is dropped before any request byte leaves the client, so a
+/// retry always runs on a fresh connection.
 #[derive(Debug)]
 pub struct Connection {
     addr: SocketAddr,
@@ -57,22 +45,15 @@ impl Connection {
 
     /// POST one pre-built JSON-RPC envelope to `/` and return the parsed
     /// envelope. Error conversion into [`Error::Rpc`] is the caller's policy.
-    ///
-    /// PRE: `request` is a complete JSON-RPC envelope.
-    /// POST: the reply parsed as a JSON value, or the call failed.
     pub fn rpc(&mut self, request: &Value, auth: (&str, &str), deadline: Instant) -> Result<Value> {
         let wire = request_wire(self.addr, request, Some(auth))?;
         let response = self.round_trip(&wire, deadline)?;
         response.json()
     }
 
-    /// Send one HTTP request and return the parsed reply.
-    ///
-    /// PRE: `path` begins with `/`; `body` fits [`MAX_BODY`].
-    /// POST: the reply carries a validated status line, lower-cased headers,
-    /// and exactly `Content-Length` body bytes.
-    /// INVARIANT: non-2xx replies are returned, not converted to errors;
-    /// only protocol and transport violations fail the call.
+    /// Send one HTTP request and return the parsed reply. Non-2xx replies
+    /// are returned, not converted to errors; only protocol and transport
+    /// violations fail the call.
     pub fn http(
         &mut self,
         method: &str,
@@ -235,12 +216,9 @@ impl Connection {
     }
 }
 
-/// One-shot JSON-RPC exchange: connect, send, read to EOF, close.
-///
-/// PRE: `addr` accepts a TCP connection before `deadline`.
-/// POST: the returned value is the parsed reply body.
-/// INVARIANT: the total deadline bounds connect, every write, and every
-/// read; a peer that dribbles bytes cannot renew it.
+/// One-shot JSON-RPC exchange: connect, send, read to EOF, close. The total
+/// deadline bounds connect, every write, and every read; a peer that
+/// dribbles bytes cannot renew it.
 pub fn exchange(addr: SocketAddr, request: &Value, deadline: Instant) -> Result<Value> {
     let wire = request_wire(addr, request, Some(("parity", "parity")))?;
     let remaining = || remaining_time(deadline, Instant::now(), "RPC deadline reached");
@@ -327,13 +305,10 @@ fn http_wire(
     Ok(wire)
 }
 
-/// Validates the head of a complete reply and splits its parts.
-///
-/// INVARIANT: duplicate `Content-Length`, any `Transfer-Encoding`, a
-/// non-HTTP/1.x version, and a status code outside 100..=599 are protocol
-/// failures; header names come back lower-cased.
-/// The parts of a reply head: status code, lower-cased headers, declared
-/// body length, and whether the peer announced a close.
+/// Status code, lower-cased headers, declared body length, and whether the
+/// peer announced a close. Duplicate `Content-Length`, any
+/// `Transfer-Encoding`, a non-HTTP/1.x version, and a status code outside
+/// 100..=599 are protocol failures.
 type ReplyHeadParts = (u16, Vec<(String, String)>, Option<usize>, bool);
 
 fn parse_reply_head(head: &[u8]) -> Result<ReplyHeadParts> {

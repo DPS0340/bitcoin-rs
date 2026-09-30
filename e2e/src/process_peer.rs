@@ -1,12 +1,7 @@
 //! Bounded, recorded v1 wire peer for the public-process lane.
-//! Uses rust-bitcoin envelopes, never bitcoin-rs's listener or dispatcher.
 //!
-//! PRE: the node's P2P listener is bound on loopback.
-//! POST: every frame written or read is journaled to the node's evidence
-//! directory before the call returns.
-//! INVARIANT: the payload cap is the protocol limit (`MAX_MESSAGE_PAYLOAD`
-//! in `crates/p2p/src/wire.rs`), so a legitimate `block` frame never trips
-//! the harness.
+//! Uses rust-bitcoin envelopes, never bitcoin-rs's listener or dispatcher,
+//! and journals every frame to the node's evidence directory.
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};

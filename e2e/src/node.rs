@@ -206,7 +206,7 @@ fn core_binary() -> PathBuf {
 
 /// Verify the resolved bitcoind matches the pinned digest in the compiled
 /// `core-compat.toml` manifest. Returns the binary path on success.
-pub fn verified_core_binary() -> Result<PathBuf> {
+fn verified_core_binary() -> Result<PathBuf> {
     if let Some(path) = VERIFIED_CORE.get() {
         return Ok(path.clone());
     }
@@ -638,9 +638,6 @@ impl ProcessNode {
     }
 
     /// GET one `/api/` explorer path and return its parsed JSON body.
-    ///
-    /// PRE: `path` names a resource under the `/api/` namespace.
-    /// POST: the reply carried status 200 and a JSON body.
     pub fn http_get_json(&mut self, path: &str) -> Result<Value> {
         if !path.starts_with("/api/") || path.bytes().any(|byte| byte <= b' ' || byte == 127) {
             return Err(Error::Protocol("invalid explorer HTTP path".into()));
@@ -653,8 +650,7 @@ impl ProcessNode {
     }
 
     /// Common monotonic clock for RPC and P2P evidence.
-    #[must_use]
-    pub const fn evidence_clock(&self) -> Instant {
+    pub(crate) const fn evidence_clock(&self) -> Instant {
         self.started
     }
 
@@ -762,7 +758,7 @@ impl ProcessNode {
     }
 
     /// Send SIGTERM to the child.
-    pub fn send_sigterm(&self) {
+    fn send_sigterm(&self) {
         let pid = self.pid().to_string();
         let _ = Command::new("kill").args(["-TERM", pid.as_str()]).status();
     }

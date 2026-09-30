@@ -1,13 +1,7 @@
-//! The differential lane: one pinned reference process, one candidate, and
-//! the comparisons that turn two public processes into behavioral evidence.
+//! The differential lane: one pinned reference process and one candidate.
 //!
-//! PRE: both processes are spawned through [`crate::node::ProcessNode`] and
-//! answer only through their public RPC surface.
-//! POST: every comparison here either passes with identical values or fails
-//! with a typed difference that names both replies.
-//! INVARIANT: no handler, type, or in-process state is ever consulted — the
-//! reference is an independent binary, and a missing or substituted
-//! reference binary is a typed failure that names the pinned digest.
+//! The reference is an independent binary; a comparison either passes with
+//! identical values or fails with a typed difference naming both replies.
 
 use std::path::Path;
 
@@ -20,12 +14,8 @@ use crate::helpers;
 use crate::node::ProcessNode;
 
 /// Verify the reference binary at `path` matches the digest the compiled
-/// `core-compat.toml` manifest pins.
-///
-/// PRE: `path` names a file the test claims is the pinned `bitcoind`.
-/// POST: the file's SHA256 equals the manifest digest.
-/// INVARIANT: a mismatch is a typed [`Error::Reference`] naming the pinned
-/// digest; it is never a skipped check.
+/// `core-compat.toml` manifest pins. A mismatch is a typed
+/// [`Error::Reference`] naming the pinned digest, never a skipped check.
 pub fn verify_reference_binary(path: &Path) -> Result<()> {
     let expected = crate::node::manifest_reference_sha256()?;
     let actual = crate::node::file_sha256(path).map_err(|error| Error::Reference {
@@ -94,12 +84,8 @@ pub struct CommonFunds {
 }
 
 /// Mine `blocks` blocks on Core, feed the identical bytes to the candidate,
-/// and collect the shared coinbase funds.
-///
-/// PRE: both nodes are on regtest genesis.
-/// POST: every block is accepted by the candidate and its coinbase
-/// outpoint is recorded.
-/// INVARIANT: block bytes come only from the independent reference process.
+/// and collect the shared coinbase funds. Block bytes come only from the
+/// independent reference process.
 pub fn mine_common_chain(
     core: &mut ProcessNode,
     node: &mut ProcessNode,
