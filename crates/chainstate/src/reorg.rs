@@ -1048,13 +1048,8 @@ where
     O: ReorgObserver + ?Sized,
     S: FnMut(&mut O, core::result::Result<(), ReorgError>) -> core::result::Result<(), ReorgError>,
 {
-    let handles = transition.chainstate();
-    let outcome = settle(observer, outcome);
-    if outcome.as_ref().is_err_and(ReorgError::requires_recovery) {
-        handles.fail_closed_for_recovery();
-        drop(transition);
-        return outcome;
-    }
+    let outcome =
+        settle_reorg_without_transition(transition.chainstate(), observer, outcome, settle);
     drop(transition);
     outcome
 }
