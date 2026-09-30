@@ -85,13 +85,19 @@ fn assert_chainstate_cache_share(backend: &str) -> Result<()> {
 }
 
 /// The capacity each engine configures when no budget reaches it, so a dropped
-/// budget is distinguishable from a delivered one.
+/// budget is distinguishable from a delivered one. Read from the storage crate
+/// so a changed default cannot make the guard below vacuous.
 #[cfg(any(feature = "rocksdb", feature = "fjall", feature = "redb"))]
 fn engine_default_cache_bytes(backend: &str) -> u64 {
     match backend {
-        "rocksdb" => 256 * 1024 * 1024,
-        "fjall" => 32 * 1024 * 1024,
-        "redb" | "redb-txindex" => 1024 * 1024 * 1024,
+        #[cfg(feature = "rocksdb")]
+        "rocksdb" => bitcoin_rs_storage::ROCKSDB_DEFAULT_CACHE_BYTES,
+        #[cfg(feature = "fjall")]
+        "fjall" => bitcoin_rs_storage::FJALL_DEFAULT_CACHE_BYTES,
+        #[cfg(feature = "redb")]
+        "redb" => bitcoin_rs_storage::REDB_DEFAULT_CACHE_BYTES,
+        #[cfg(feature = "redb")]
+        "redb-txindex" => bitcoin_rs_storage::REDB_TXINDEX_DEFAULT_CACHE_BYTES,
         other => panic!("no engine default recorded for {other}"),
     }
 }
