@@ -25,7 +25,7 @@ The promotion, regression, reporting, retention and `BLOCKED` rules of [`README.
 
 ## Status
 
-`planned_not_executed`. No end-state cell in this document has run. Every value in the end-state tables is a required contract value, not a measurement. The section `Prior candidate evidence` below is historical and unchanged; it does not prove any end-state cell.
+`planned_not_executed`, as defined in [`README.md`](README.md).
 
 ## Prior candidate evidence (former checkpoint RSS hook, height-412,732 chainstate, 2026-08-16 correction)
 

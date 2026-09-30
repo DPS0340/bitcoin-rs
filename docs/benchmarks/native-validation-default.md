@@ -63,7 +63,7 @@ The promotion, regression, reporting, retention and `BLOCKED` rules of [`README.
 
 ## Status
 
-`planned_not_executed`. No end-state cell in this document has run. Every value in the end-state tables is a required contract value, not a measurement. The section `Prior candidate evidence` below is historical and unchanged; it does not prove any end-state cell.
+`planned_not_executed`, as defined in [`README.md`](README.md).
 
 PR #1124's chainstate extraction is a structural ownership change, not a
 performance-promotion campaign. It carries no baseline-linked before/after
