@@ -27,10 +27,10 @@ const TXINDEX_SCRIPT_LIVE: FixedTable<SCRIPT_LIVE_KEY_LEN> =
 const TXINDEX_META: ByteTable = TableDefinition::new("txindex_v1_meta");
 
 /// redb's builder-default page-cache capacity for the transaction index.
-const REDB_TXINDEX_DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const REDB_TXINDEX_DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// redb's builder-default page-cache capacity for unbudgeted opens.
-const REDB_DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const REDB_DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// redb-backed key-value store.
 pub struct RedbStore {

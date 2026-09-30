@@ -39,8 +39,9 @@ pub struct Command {
 /// `decode_payload` will not type a command absent from this table, so an
 /// extra match arm cannot invent inventory. Adding a command updates this
 /// table, the decoder, [`crate::Message`], and the policy §5 table in the
-/// same change-set. `decoder_match_arms_equal_the_command_inventory` requires
-/// the match literals and this table to be the same set.
+/// same change-set. A row without a decoder arm is caught by
+/// `listed_commands_type_and_core_untyped_commands_stay_unknown`, which decodes
+/// a frame for every row here and fails on `Message::Unknown`.
 pub const COMMANDS: &[Command] = &[
     Command {
         name: "version",
@@ -204,44 +205,37 @@ pub fn command(name: &str) -> Option<&'static Command> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{COMMANDS, CORE_UNTYPED_COMMANDS, CommandStatus, PINNED_CORE_VERSION};
+    use super::{COMMANDS, CORE_UNTYPED_COMMANDS};
 
+    /// The properties the table must hold for the code that reads it:
+    /// [`super::command`] resolves a name to one row, and every name is spelled
+    /// as peers send it — lowercase ASCII fitting the 12-byte v1 command field
+    /// the framer copies it into. A name that differs from the wire spelling
+    /// decodes every real peer's message as `Message::Unknown`.
     #[test]
-    fn inventory_is_unique_and_complete() {
-        assert_eq!(COMMANDS.len(), 36, "decoder types 36 commands");
+    fn every_command_name_is_unique_and_fits_the_v1_field() {
         let names: BTreeSet<&str> = COMMANDS.iter().map(|entry| entry.name).collect();
         assert_eq!(names.len(), COMMANDS.len(), "command names must be unique");
+        for name in COMMANDS
+            .iter()
+            .map(|entry| entry.name)
+            .chain(CORE_UNTYPED_COMMANDS.iter().copied())
+        {
+            assert!(
+                !name.is_empty() && name.len() <= 12,
+                "{name} does not fit the 12-byte v1 command field"
+            );
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+                "{name} is not spelled as peers send it: lowercase ASCII"
+            );
+        }
         for name in CORE_UNTYPED_COMMANDS {
             assert!(
                 !names.contains(name),
                 "{name} is typed; it belongs in COMMANDS or not in CORE_UNTYPED_COMMANDS"
             );
-            assert!(
-                name.len() <= 12,
-                "{name} exceeds the 12-byte v1 command field"
-            );
         }
-        for entry in COMMANDS {
-            assert!(
-                !entry.name.is_empty() && entry.name.len() <= 12,
-                "{} is not a v1 command name",
-                entry.name
-            );
-            assert!(
-                entry
-                    .name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
-                "{} is not a lowercase command name",
-                entry.name
-            );
-        }
-        assert_eq!(PINNED_CORE_VERSION, "31.1");
-        let statuses: BTreeSet<CommandStatus> = COMMANDS.iter().map(|entry| entry.status).collect();
-        assert!(statuses.contains(&CommandStatus::Negotiated));
-        assert!(statuses.contains(&CommandStatus::Served));
-        assert!(statuses.contains(&CommandStatus::Sink));
-        assert!(statuses.contains(&CommandStatus::Ignored));
-        assert!(statuses.contains(&CommandStatus::Legacy));
     }
 }

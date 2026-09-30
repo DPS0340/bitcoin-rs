@@ -40,13 +40,16 @@ pub use durable_head::{
 };
 
 #[cfg(feature = "fjall")]
-pub use fjall_impl::FjallStore;
+pub use fjall_impl::{FJALL_DEFAULT_CACHE_BYTES, FjallStore};
 
 #[cfg(feature = "redb")]
-pub use redb_impl::{RedbStore, open_redb_tx_index_store, open_redb_tx_index_store_with_cache};
+pub use redb_impl::{
+    REDB_DEFAULT_CACHE_BYTES, REDB_TXINDEX_DEFAULT_CACHE_BYTES, RedbStore,
+    open_redb_tx_index_store, open_redb_tx_index_store_with_cache,
+};
 
 #[cfg(feature = "rocksdb")]
-pub use rocksdb_impl::RocksDbStore;
+pub use rocksdb_impl::{ROCKSDB_DEFAULT_CACHE_BYTES, RocksDbStore};
 
 /// Selectable storage backend.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]

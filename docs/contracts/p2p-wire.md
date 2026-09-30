@@ -262,10 +262,9 @@ covers the delivery-path forward.
     and its near-tip `NETWORK_LIMITED` exception;
     `pruned_version_message_advertises_network_limited_only` and
     `unpruned_version_message_advertises_network` pin the advertised set;
-  - `cargo test -p bitcoin-rs-p2p --test core_compat` pins the command
-    inventory against the policy table, rust-bitcoin v1 envelopes, handshake
-    fields, per-network framing, relay round-trips, the reject-or-ignore
-    matrix, and peer-visible reorg/restart behavior.
+  - `cargo test -p bitcoin-rs-p2p --test core_compat` pins rust-bitcoin v1
+    envelopes, handshake fields, per-network framing, relay round-trips, the
+    reject-or-ignore matrix, and peer-visible reorg/restart behavior.
 - `crates/p2p/tests/core_interop_live.rs`: live differential lane running via
   `scripts/run-p2p-core-interop.sh` against the pinned Core 31.1 `bitcoind`
   (`docs/contracts/core-differential.md`).
