@@ -10,9 +10,10 @@
 //!    manifest; drift names the delta and the regen command. Regeneration
 //!    is a separate ignored test, so a coverage run never writes and a
 //!    regen run never passes silently;
-//! 4. the declared claims stay honest: no row claims `Supported` while the
-//!    pinned reference carries no differential harness, and the reference
-//!    identity still matches `Cargo.lock`.
+//! 4. the declared claims stay honest: every `Deviation` row names its
+//!    difference, no row claims `Supported` while the pinned reference
+//!    carries no differential harness, and the reference identity still
+//!    matches `Cargo.lock`.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -132,6 +133,24 @@ fn zmq_rows_are_valid_core_topics() {
     assert_eq!(
         declared, core,
         "the ZMQ rows must name exactly the Core-registered topics"
+    );
+}
+
+/// Invariant 4: a row that claims `Deviation` names the difference.
+///
+/// The status alone tells a client that this node differs and not how, and
+/// the regenerated reference renders the empty note without complaint, so
+/// nothing else would notice.
+#[test]
+fn deviation_rows_name_their_difference() {
+    let silent: Vec<&str> = manifest::MANIFEST
+        .iter()
+        .filter(|entry| entry.status == Status::Deviation && entry.notes.trim().is_empty())
+        .map(|entry| entry.name)
+        .collect();
+    assert!(
+        silent.is_empty(),
+        "these rows claim a deviation without stating it: {silent:?}"
     );
 }
 
