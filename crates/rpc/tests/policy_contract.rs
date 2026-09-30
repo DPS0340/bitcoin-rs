@@ -30,6 +30,7 @@ use bitcoin_rs_primitives::{
     Amount, Block, CompactTarget, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes,
 };
+use bitcoin_rs_script::push_int;
 
 use bitcoin_rs_rpc::{
     Handler, RpcError,
@@ -1541,31 +1542,6 @@ fn null_prevout() -> OutPoint {
     OutPoint::new(Txid::default(), u32::MAX)
 }
 
-/// Minimal script push of a small integer, mirroring rust-bitcoin
-/// `Builder::push_int`: `OP_0` for zero, `OP_N` for 1..=16, otherwise a
-/// length-prefixed little-endian payload (BIP34 heights).
-fn script_push_int(value: i64) -> Vec<u8> {
-    match value {
-        0 => vec![0x00],
-        // `value` is pinned to 1..=16 by the match arm.
-        1..=16 => vec![0x50 + u8::try_from(value).unwrap_or_default()],
-        _ => {
-            let mut payload = Vec::new();
-            let mut magnitude = value.unsigned_abs();
-            while magnitude > 0 {
-                // Low byte only; the shift below consumes it fully.
-                payload.push(u8::try_from(magnitude & 0xff).unwrap_or_default());
-                magnitude >>= 8;
-            }
-            let mut out = Vec::with_capacity(payload.len() + 1);
-            // A small-int push never exceeds 8 payload bytes.
-            out.push(u8::try_from(payload.len()).unwrap_or_default());
-            out.extend(payload);
-            out
-        }
-    }
-}
-
 /// Core `IsCoinBase` shape: exactly one input spending the null prevout.
 fn is_coinbase(tx: &Tx) -> bool {
     tx.inputs.len() == 1 && tx.inputs[0].previous_output == null_prevout()
@@ -1578,9 +1554,7 @@ fn reorg_seed_coinbase(height: u32) -> Tx {
             previous_output: null_prevout(),
             // BIP34 height push plus one pad byte: consensus requires a
             // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
-            script_sig: Script::from_bytes(
-                [script_push_int(i64::from(height)), script_push_int(0)].concat(),
-            ),
+            script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
             sequence: Sequence::from_consensus(0xffff_ffff),
             witness: Witness::new(),
         }],
