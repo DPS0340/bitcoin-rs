@@ -1,8 +1,25 @@
 //! Metrics instrumentation and optional exposition.
 //!
-//! `MetricsServer` serves the Prometheus text scrape and projects one coherent
-//! txindex capability snapshot per request; `EvidenceIdentity` carries the
-//! artifact/configuration/durability every sample is labeled with.
+//! `MetricsServer` serves the Prometheus text scrape and projects one
+//! coherent txindex capability snapshot per request. `EvidenceIdentity`
+//! belongs to benchmark evidence and is deliberately not attached to operator
+//! series as high-cardinality labels.
+//!
+//! # Instrumentation boundary
+//!
+//! The metrics API is a small, stable set of operator-facing signals: rates,
+//! totals, backpressure/fallback counts, backlog gauges, and stable latency
+//! distributions. Names and semantics are an API; renaming or removing one is
+//! a breaking change. Per-event payloads, block/tx/peer identity, and any
+//! other high-cardinality label belong in `tracing::` events (diagnostics,
+//! explicitly not an API) or in the Core-compatible USDT probes of
+//! `bitcoin-rs-trace` (`crates/trace`, see `docs/tracing.md`), never here.
+//! Metric labels are limited to closed enumerations owned by the code.
+//! The measured product-stage histograms consumed by the hot-path ledger
+//! (`docs/contracts/hot-path-attribution.md`) are exempt, and only via that
+//! ledger's `histogram` keys. Before adding a call site, apply the decision
+//! table in `docs/observability.md` (OBS-01..OBS-05) and cite the clause in
+//! review.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -150,7 +167,10 @@ impl EvidenceIdentity {
         })
     }
 
-    /// The identity as Prometheus global labels.
+    /// The identity as label pairs for controlled benchmark evidence tooling.
+    ///
+    /// The operator Prometheus exporter deliberately does not install these
+    /// high-cardinality fields as global labels (OBS-01).
     #[must_use]
     pub fn labels(&self) -> Vec<(&'static str, String)> {
         let mut labels = vec![
@@ -178,6 +198,10 @@ fn describe_node_metrics() {
     metrics::describe_gauge!(
         "node.shutdown.requested",
         "whether shutdown has been requested"
+    );
+    metrics::describe_counter!(
+        "node.mempool.observer_failures_total",
+        "mempool observer callback failures"
     );
     metrics::describe_histogram!(
         "node.event_loop.tick_seconds",
@@ -228,9 +252,8 @@ fn describe_node_metrics() {
 
 static PROMETHEUS_HANDLE: Mutex<Option<(EvidenceIdentity, PrometheusHandle)>> = Mutex::new(None);
 
-/// One process serves one identity: every scraped sample carries the
-/// artifact, configuration, corpus and durability it was taken under as
-/// global labels, so a reader can never attribute a value to the wrong build.
+/// One process serves one evidence identity, but operator series do not carry
+/// that high-cardinality identity as labels.
 fn prometheus_handle(identity: &EvidenceIdentity) -> Result<PrometheusHandle> {
     let mut slot = PROMETHEUS_HANDLE.lock();
     if let Some((installed, handle)) = slot.as_ref() {
@@ -240,11 +263,7 @@ fn prometheus_handle(identity: &EvidenceIdentity) -> Result<PrometheusHandle> {
         );
         return Ok(handle.clone());
     }
-    let mut builder = PrometheusBuilder::new();
-    for (label, value) in identity.labels() {
-        builder = builder.add_global_label(label, value);
-    }
-    let handle = builder
+    let handle = PrometheusBuilder::new()
         .install_recorder()
         .map_err(|error| anyhow::anyhow!("install prometheus recorder: {error}"))?;
     *slot = Some((identity.clone(), handle.clone()));
@@ -287,7 +306,6 @@ impl MetricsServer {
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let identity = identity.clone();
         let thread = thread::Builder::new()
             .name("bitcoin-rs-metrics".into())
             .spawn(move || {
@@ -296,7 +314,6 @@ impl MetricsServer {
                     &handle,
                     &thread_stop,
                     &shutdown,
-                    &identity,
                     source.as_deref(),
                 );
             })?;
@@ -346,7 +363,6 @@ fn serve_metrics(
     handle: &PrometheusHandle,
     stop: &Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
-    identity: &EvidenceIdentity,
     source: Option<&dyn DerivedIndexCapabilitySource>,
 ) {
     loop {
@@ -359,7 +375,7 @@ fn serve_metrics(
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                serve_scrape(&mut stream, handle, identity, source);
+                serve_scrape(&mut stream, handle, source);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -373,14 +389,13 @@ fn serve_metrics(
 fn serve_scrape(
     stream: &mut TcpStream,
     handle: &PrometheusHandle,
-    identity: &EvidenceIdentity,
     source: Option<&dyn DerivedIndexCapabilitySource>,
 ) {
     let mut buf = [0_u8; 1024];
     let _ = stream.read(&mut buf);
     let mut body = handle.render();
     if let Some(source) = source {
-        render_capability_metrics(&mut body, source, identity);
+        render_capability_metrics(&mut body, source);
     }
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -400,18 +415,12 @@ fn escaped_label(value: &str) -> String {
         .replace('"', "\\\"")
 }
 
-fn labels(identity: &EvidenceIdentity, extra: &[(&str, &str)]) -> String {
-    let mut rendered = identity
-        .labels()
-        .into_iter()
-        .map(|(name, value)| format!("{name}=\"{}\"", escaped_label(&value)))
-        .collect::<Vec<_>>();
-    rendered.extend(
-        extra
-            .iter()
-            .map(|(name, value)| format!("{name}=\"{}\"", escaped_label(value))),
-    );
-    rendered.join(",")
+fn labels(extra: &[(&str, &str)]) -> String {
+    extra
+        .iter()
+        .map(|(name, value)| format!("{name}=\"{}\"", escaped_label(value)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn hash_words(hash: &str) -> Option<[u32; 8]> {
@@ -426,42 +435,36 @@ fn hash_words(hash: &str) -> Option<[u32; 8]> {
     Some(words)
 }
 
-fn write_sample(
-    body: &mut String,
-    name: &str,
-    identity: &EvidenceIdentity,
-    extra: &[(&str, &str)],
-    value: u64,
-) {
-    let _ = writeln!(body, "{name}{{{}}} {value}", labels(identity, extra));
+fn write_sample(body: &mut String, name: &str, extra: &[(&str, &str)], value: u64) {
+    if extra.is_empty() {
+        let _ = writeln!(body, "{name} {value}");
+    } else {
+        let _ = writeln!(body, "{name}{{{}}} {value}", labels(extra));
+    }
 }
 
 /// Appends all readiness facts from one immutable source snapshot. Revision
 /// halves and hash words stay within Prometheus' exact integer range and use
 /// bounded labels, avoiding both precision loss and hash-label cardinality.
-fn render_capability_metrics(
-    body: &mut String,
-    source: &dyn DerivedIndexCapabilitySource,
-    identity: &EvidenceIdentity,
-) {
+fn render_capability_metrics(body: &mut String, source: &dyn DerivedIndexCapabilitySource) {
     if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
     }
     body.push_str("# HELP node_capability_snapshot_available Whether one coherent capability snapshot was captured for this scrape.\n");
     body.push_str("# TYPE node_capability_snapshot_available gauge\n");
     let Ok(snapshot) = source.snapshot() else {
-        write_sample(body, "node_capability_snapshot_available", identity, &[], 0);
+        write_sample(body, "node_capability_snapshot_available", &[], 0);
         return;
     };
     let (Some(revision), Some(tip)) = (snapshot.revision, snapshot.tip.as_ref()) else {
-        write_sample(body, "node_capability_snapshot_available", identity, &[], 0);
+        write_sample(body, "node_capability_snapshot_available", &[], 0);
         return;
     };
     let Some(words) = hash_words(&tip.hash) else {
-        write_sample(body, "node_capability_snapshot_available", identity, &[], 0);
+        write_sample(body, "node_capability_snapshot_available", &[], 0);
         return;
     };
-    write_sample(body, "node_capability_snapshot_available", identity, &[], 1);
+    write_sample(body, "node_capability_snapshot_available", &[], 1);
 
     let status = snapshot.capabilities.first();
     let active = status.map_or("Disabled", |status| status.state.wire_name());
@@ -483,7 +486,7 @@ fn render_capability_metrics(
             status.is_some_and(|status| status.enabled),
         ),
     ] {
-        write_sample(body, name, identity, &[], u64::from(value));
+        write_sample(body, name, &[], u64::from(value));
     }
     body.push_str("# HELP node_capability_txindex_readiness Txindex lifecycle outcome from this scrape's capability snapshot.\n");
     body.push_str("# TYPE node_capability_txindex_readiness gauge\n");
@@ -492,13 +495,12 @@ fn render_capability_metrics(
         write_sample(
             body,
             TXINDEX_READINESS_GAUGE,
-            identity,
             &[("state", state)],
             u64::from(state == active),
         );
     }
 
-    render_owner_revision(body, identity, revision);
+    render_owner_revision(body, revision);
     body.push_str(
         "# HELP node_capability_tip_height Applied tip height in this capability snapshot.\n",
     );
@@ -506,7 +508,6 @@ fn render_capability_metrics(
     write_sample(
         body,
         "node_capability_tip_height",
-        identity,
         &[],
         u64::from(tip.height),
     );
@@ -517,18 +518,13 @@ fn render_capability_metrics(
         write_sample(
             body,
             "node_capability_tip_hash_word",
-            identity,
             &[("word", &word_index)],
             u64::from(word),
         );
     }
 }
 
-fn render_owner_revision(
-    body: &mut String,
-    identity: &EvidenceIdentity,
-    revision: bitcoin_rs_index::CapabilityRevision,
-) {
+fn render_owner_revision(body: &mut String, revision: bitcoin_rs_index::CapabilityRevision) {
     body.push_str("# HELP node_capability_chain_revision Authoritative chain revision split into exact 32-bit parts.\n");
     body.push_str("# TYPE node_capability_chain_revision gauge\n");
     for (field, value) in [("epoch", revision.epoch), ("sequence", revision.sequence)] {
@@ -536,7 +532,6 @@ fn render_owner_revision(
             write_sample(
                 body,
                 "node_capability_chain_revision",
-                identity,
                 &[("field", field), ("part", part)],
                 half,
             );
@@ -547,7 +542,6 @@ fn render_owner_revision(
     write_sample(
         body,
         "node_capability_index_state_revision_available",
-        identity,
         &[],
         u64::from(revision.index_state.is_some()),
     );
@@ -561,7 +555,6 @@ fn render_owner_revision(
             write_sample(
                 body,
                 "node_capability_index_state_revision",
-                identity,
                 &[("part", part)],
                 half,
             );
@@ -574,7 +567,6 @@ fn render_owner_revision(
     write_sample(
         body,
         "node_capability_index_owner",
-        identity,
         &[
             ("lifecycle", revision.index_owner.lifecycle.wire_name()),
             ("health", revision.index_owner.health.wire_name()),
@@ -603,7 +595,6 @@ fn render_owner_revision(
             write_sample(
                 body,
                 "node_capability_index_phase",
-                identity,
                 &[("capability", name), ("field", field)],
                 u64::from(value),
             );

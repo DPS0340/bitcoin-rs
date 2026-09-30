@@ -107,7 +107,7 @@ impl NodeState {
         // txindex worker detects later — through one warning snapshot and one
         // event marker.
         let genesis_hex = config.network.genesis_block_hash().to_string_be();
-        let recovery_reporter = Arc::new(crate::recovery_reporter::RecoveryReporter(
+        let recovery_reporter = Arc::new(super::storage::RecoveryReporter(
             bitcoin_rs_storage::recovery_evidence::RecoveryEvidencePublisher::new(
                 config.data_dir.clone(),
                 genesis_hex.clone(),
@@ -232,7 +232,7 @@ impl NodeState {
             build_derived_index_open_spec(&config, txindex_cache_bytes, epoch)?;
         let derived_index_parts = match derived_index_open_spec {
             Some(mut spec) => {
-                spec.utxo = Some(Arc::clone(&utxo));
+                spec.utxo = Some(bitcoin_rs_utxo::UtxoReader::new(Arc::clone(&utxo)));
                 spec.chain_transition = Some(transition.stable_read());
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
                 let runtime =

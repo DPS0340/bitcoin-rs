@@ -242,8 +242,9 @@ pub struct ChainHandles {
     pub closed_for_recovery: LatchReader,
     /// Applied block metadata log.
     pub blocks: Arc<RwLock<BlockLog>>,
-    /// Authoritative UTXO set.
-    pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
+    /// Authoritative UTXO set, read-only: mutation stays with the chain
+    /// owner through `utxo::contract`.
+    pub utxo: bitcoin_rs_utxo::UtxoReader,
     /// Incremental UTXO statistics.
     pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     /// Shared block tree.
@@ -275,7 +276,7 @@ pub struct ChainHandles {
 /// generation fence, and gateway generation/sequence revalidation discards any
 /// facts collected across such a mutation before they can affect admission.
 pub struct ChainAdmissionView {
-    utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
+    utxo: bitcoin_rs_utxo::UtxoReader,
     applied_tip: TipReader,
     block_tree: BlockTreeReader,
     network: Network,
@@ -285,7 +286,7 @@ impl ChainAdmissionView {
     /// Borrows the chain owner's existing handles without retaining state.
     #[must_use]
     pub const fn new(
-        utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
+        utxo: bitcoin_rs_utxo::UtxoReader,
         applied_tip: TipReader,
         block_tree: BlockTreeReader,
         network: Network,
@@ -491,7 +492,7 @@ impl ChainHandles {
                 false,
             ))),
             blocks: Arc::new(RwLock::new(BlockLog::new())),
-            utxo: Arc::new(utxo),
+            utxo: bitcoin_rs_utxo::UtxoReader::new(Arc::new(utxo)),
             coin_stats: Arc::new(coin_stats_listener),
             block_tree: BlockTreeReader::new(block_tree),
             chain_network: Network::Mainnet,
@@ -962,7 +963,7 @@ impl ChainHandles {
     #[must_use]
     pub(crate) fn admission_chain(&self) -> ChainAdmissionView {
         ChainAdmissionView::new(
-            Arc::clone(&self.utxo),
+            self.utxo.clone(),
             self.applied_tip.clone(),
             self.block_tree.clone(),
             self.chain_network,
@@ -1691,7 +1692,7 @@ mod tests {
                 applied_tip: TipReader::new(Arc::clone(&applied_tip)),
                 ibd: Arc::clone(&ibd),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
-                utxo: Arc::clone(&utxo),
+                utxo: bitcoin_rs_utxo::UtxoReader::new(Arc::clone(&utxo)),
                 coin_stats: Arc::clone(&coin_stats),
                 block_tree: BlockTreeReader::new(Arc::clone(&block_tree)),
                 chain_network: Network::Mainnet,
@@ -1755,7 +1756,7 @@ mod tests {
             "ibd must be shared with caller"
         );
         assert!(
-            Arc::ptr_eq(&ctx.chain.utxo, &utxo),
+            Arc::ptr_eq(&ctx.chain.utxo.fixture_set(), &utxo),
             "utxo must be shared with caller"
         );
         assert!(
@@ -1860,7 +1861,7 @@ mod tests {
         changes.add(UtxoAdd::new(outpoint, txout, true, 7));
 
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &ctx.chain.utxo,
+            &ctx.chain.utxo.fixture_set(),
             &changes,
             &Hash256::default(),
         )
@@ -2262,7 +2263,7 @@ mod tests {
                     BlockTreeReader::new(Arc::clone(&block_tree)),
                 )),
                 blocks: Arc::new(RwLock::new(BlockLog::new())),
-                utxo: Arc::new(bitcoin_rs_utxo::UtxoSet::new()),
+                utxo: bitcoin_rs_utxo::UtxoReader::new(Arc::new(bitcoin_rs_utxo::UtxoSet::new())),
                 coin_stats: Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
                     bitcoin_rs_utxo::stats::CoinStats::default(),
                 )),
@@ -2408,7 +2409,7 @@ mod admission_chain_tests {
             0,
         ));
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &ctx.chain.utxo,
+            &ctx.chain.utxo.fixture_set(),
             &changes,
             &Hash256::default(),
         )?;
@@ -2444,7 +2445,7 @@ mod admission_chain_tests {
             0,
         ));
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &ctx.chain.utxo,
+            &ctx.chain.utxo.fixture_set(),
             &changes,
             &Hash256::default(),
         )?;
@@ -2481,7 +2482,7 @@ mod admission_chain_tests {
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(output, tx.outputs[0].clone(), false, 0));
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &ctx.chain.utxo,
+            &ctx.chain.utxo.fixture_set(),
             &changes,
             &Hash256::default(),
         )?;
@@ -2511,7 +2512,8 @@ mod admission_chain_tests {
 
         // A borrowed capability observes current handles even in isolated
         // contexts that replace test state after construction.
-        ctx.chain.utxo = Arc::new(bitcoin_rs_utxo::UtxoSet::new());
+        ctx.chain.utxo =
+            bitcoin_rs_utxo::UtxoReader::new(Arc::new(bitcoin_rs_utxo::UtxoSet::new()));
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
             outpoint,
@@ -2523,7 +2525,7 @@ mod admission_chain_tests {
             0,
         ));
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &ctx.chain.utxo,
+            &ctx.chain.utxo.fixture_set(),
             &changes,
             &Hash256::default(),
         )
@@ -2573,7 +2575,7 @@ mod admission_chain_tests {
         // funded transaction through the one operation.
         let embedded_ctx = Context::new();
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &embedded_ctx.chain.utxo,
+            &embedded_ctx.chain.utxo.fixture_set(),
             &changes,
             &Hash256::default(),
         )?;
@@ -2590,7 +2592,7 @@ mod admission_chain_tests {
         );
         let rpc_ctx = Arc::new(Context::new());
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &rpc_ctx.chain.utxo,
+            &rpc_ctx.chain.utxo.fixture_set(),
             &changes,
             &Hash256::default(),
         )?;
@@ -2629,7 +2631,7 @@ mod admission_chain_tests {
         // without inserting it.
         let preview_ctx = Arc::new(Context::new());
         bitcoin_rs_utxo::contract::commit_block_changes(
-            &preview_ctx.chain.utxo,
+            &preview_ctx.chain.utxo.fixture_set(),
             &changes,
             &Hash256::default(),
         )?;

@@ -921,7 +921,10 @@ impl Chainstate {
         BlockTreeReader::new(Arc::clone(&self.block_tree))
     }
 
-    /// Clones the block-tree cell for the RPC capability bundle.
+    /// Fixture-only block-tree Arc clone. Not present in production builds.
+    ///
+    /// Production consumers use [`Self::block_tree_reader`] instead.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn block_tree_handle(&self) -> Arc<RwLock<BlockTree>> {
         Arc::clone(&self.block_tree)
@@ -962,16 +965,29 @@ impl Chainstate {
         &self.block_tree
     }
 
-    /// Returns the authoritative UTXO set.
+    /// Fixture-only access to the authoritative UTXO set. Not present in
+    /// production builds.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn utxo(&self) -> &UtxoSet {
         &self.utxo
     }
 
-    /// Clones the authoritative UTXO handle for node-owned readers.
+    /// Fixture-only writable UTXO handle. Not present in production builds.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn utxo_handle(&self) -> Arc<UtxoSet> {
         Arc::clone(&self.utxo)
+    }
+
+    /// Returns the UTXO owner's read-only lookup capability.
+    ///
+    /// This is the only UTXO surface production consumers receive: it answers
+    /// coin lookups and stable whole-set scans but carries no path to
+    /// `utxo::contract`, which is what the owner keeps the set for.
+    #[must_use]
+    pub fn utxo_reader(&self) -> bitcoin_rs_utxo::UtxoReader {
+        bitcoin_rs_utxo::UtxoReader::new(Arc::clone(&self.utxo))
     }
 
     /// Clones the coin-statistics listener handle.
@@ -1909,6 +1925,10 @@ mod chain_tx_count_tests;
 #[cfg(test)]
 #[path = "../tests/unit/apply/persistence_tests.rs"]
 mod persistence_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/apply/observability_tests.rs"]
+mod observability_tests;
 
 #[cfg(test)]
 #[path = "../tests/unit/apply/window_disposition_tests.rs"]

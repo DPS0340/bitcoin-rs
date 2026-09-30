@@ -210,7 +210,7 @@ fn prune_to_height_advances_published_height() -> anyhow::Result<()> {
         &bitcoin_rs_storage::encode_block_file_max_height(10),
     );
     store.write(seed)?;
-    let service = Arc::new(super::super::prune::NodePruneService::new(
+    let service = Arc::new(super::super::storage::NodePruneService::new(
         Arc::clone(&store),
         block_files,
         authority_state.chainstate().prune_authority(),
