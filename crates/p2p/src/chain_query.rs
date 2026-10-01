@@ -1301,7 +1301,7 @@ mod tests {
     #[test]
     fn compact_exchange_uses_peer_version_for_prefills_and_blocktxn()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::dispatch::dispatch_inbound_with_chain;
+        use crate::dispatch::dispatch_inbound_full;
         use crate::peer::{Peer, PeerState};
         use bitcoin::p2p::Magic;
         use bitcoin::p2p::message::NetworkMessage;
@@ -1330,15 +1330,18 @@ mod tests {
             peer.state = PeerState::Ready;
             for version in versions {
                 if let Some(version) = version {
-                    dispatch_inbound_with_chain(
+                    dispatch_inbound_full(
                         &mut peer,
                         &Message::SendCmpct(SendCmpct {
                             send_compact: false,
                             version,
                         }),
                         Some(&query),
+                        None,
+                        &|| true,
                         &|| true,
                         &mut |_| panic!("sendcmpct does not emit a response"),
+                        &mut |_| {},
                     )?;
                 }
                 let strip_witness = matches!(version, Some(1 | 99));
@@ -1396,7 +1399,7 @@ mod tests {
     #[test]
     fn getblocktxn_versions_preserve_missing_body_and_invalid_index_outcomes()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::dispatch::dispatch_inbound_with_chain;
+        use crate::dispatch::dispatch_inbound_full;
         use crate::peer::{Peer, PeerState};
         use bitcoin::p2p::Magic;
         use bitcoin::p2p::message_compact_blocks::{GetBlockTxn, SendCmpct};
@@ -1416,15 +1419,18 @@ mod tests {
             let mut peer = Peer::new(std::io::Cursor::new(Vec::<u8>::new()), Magic::REGTEST);
             peer.state = PeerState::Ready;
             if let Some(version) = version {
-                dispatch_inbound_with_chain(
+                dispatch_inbound_full(
                     &mut peer,
                     &Message::SendCmpct(SendCmpct {
                         send_compact: false,
                         version,
                     }),
                     Some(&query),
+                    None,
+                    &|| true,
                     &|| true,
                     &mut |_| panic!("sendcmpct does not emit a response"),
+                    &mut |_| {},
                 )?;
             }
             for (requested_hash, indexes, invalid) in [
@@ -1441,7 +1447,7 @@ mod tests {
                 } else {
                     None
                 };
-                let result = dispatch_inbound_with_chain(
+                let result = dispatch_inbound_full(
                     &mut peer,
                     &Message::GetBlockTxn(GetBlockTxn {
                         txs_request: BlockTransactionsRequest {
@@ -1450,8 +1456,11 @@ mod tests {
                         },
                     }),
                     Some(&query),
+                    None,
+                    &|| true,
                     &|| true,
                     &mut |_| panic!("missing or invalid request cannot emit transactions"),
+                    &mut |_| {},
                 );
                 if let Some(expected) = expected {
                     assert!(
@@ -1499,15 +1508,18 @@ mod tests {
         request: &Message,
     ) -> Result<bitcoin::p2p::message::RawNetworkMessage, Box<dyn std::error::Error>> {
         let mut wire = Vec::new();
-        crate::dispatch::dispatch_inbound_with_chain(
+        crate::dispatch::dispatch_inbound_full(
             peer,
             request,
             Some(query),
+            None,
+            &|| true,
             &|| true,
             &mut |response| {
                 crate::wire::write_message(&mut wire, bitcoin::p2p::Magic::REGTEST, &response)?;
                 Ok(())
             },
+            &mut |_| {},
         )?;
         Ok(bitcoin::consensus::deserialize(&wire)?)
     }
