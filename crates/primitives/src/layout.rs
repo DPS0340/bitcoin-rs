@@ -94,6 +94,12 @@ impl ByteSpan {
         self.len
     }
 
+    /// Whether the span covers no bytes.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
     /// Offset one past the last byte, computed in `u64` (the sum of two
     /// `u32` offsets never overflows `u64`).
     #[must_use]
