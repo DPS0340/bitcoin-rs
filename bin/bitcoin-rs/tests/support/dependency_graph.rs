@@ -47,12 +47,10 @@ pub(crate) const CHAINSTATE_CRATE: &str = "bitcoin-rs-chainstate";
 pub(crate) const MEMPOOL_CONSUMER_CRATES: [&str; 4] =
     ["bitcoin-rs-p2p", RPC_CRATE, NODE_CRATE, BIN_CRATE];
 /// Crates permitted to define and forward storage backend feature selection.
-pub(crate) const BACKEND_FORWARDING_CRATES: [&str; 8] = [
+pub(crate) const BACKEND_FORWARDING_CRATES: [&str; 6] = [
     STORAGE_CRATE,
-    "bitcoin-rs-chain",
     CHAINSTATE_CRATE,
     "bitcoin-rs-utxo",
-    "bitcoin-rs-p2p",
     "bitcoin-rs-index",
     NODE_CRATE,
     BIN_CRATE,

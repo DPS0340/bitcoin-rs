@@ -248,7 +248,6 @@ dependencies = [
  "bitcoin-rs-chain",
  "bitcoin-rs-consensus",
  "bitcoin-rs-primitives",
- "bitcoin-rs-storage",
  "bytemuck",
  "hashbrown 0.17.1",
  "parking_lot",

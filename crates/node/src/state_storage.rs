@@ -3,8 +3,8 @@
 use crate::NodeConfig;
 use anyhow::Context as _;
 use anyhow::Result;
-use bitcoin_rs_chain::BlockBodyMetadata;
 use bitcoin_rs_chain::BlockBodySource;
+use bitcoin_rs_primitives::BlockBodyMetadata;
 use bitcoin_rs_rpc::context::{PruneResult, PruneService, PruneServiceError, PruneStatus};
 use bitcoin_rs_storage::DurableHeadStore as _;
 use bitcoin_rs_storage::FlatFileBlockStore;

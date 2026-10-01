@@ -28,10 +28,5 @@ latch over the published applied-tip and block-tree handles; the node builds
 one `Arc` shared by RPC and P2P, so both surfaces answer identically
 (Core `IsInitialBlockDownload` / `m_cached_is_ibd` semantics).
 
-## Features
-- `rocksdb`: enables the `RocksDB` backend in `bitcoin-rs-storage`
-- `fjall`: enables the fjall backend in `bitcoin-rs-storage`
-- `redb`: enables the redb backend in `bitcoin-rs-storage`
-
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the
 project vocabulary.

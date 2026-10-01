@@ -106,7 +106,6 @@ dependencies = [
  "arc-swap",
  "bitcoin-rs-consensus",
  "bitcoin-rs-primitives",
- "bitcoin-rs-storage",
  "bytemuck",
  "hashbrown",
  "parking_lot",

@@ -11,18 +11,12 @@ description = "bitcoin-rs :: p2p"
 [lints]
 workspace = true
 
-# Backend features forward through `bitcoin-rs-chain` (an approved adapter),
-# which propagates the selection into `bitcoin-rs-storage`; p2p itself holds
-# no storage handle (ARCH-03).
 [features]
 # Worker injection for cross-crate teardown tests; never enabled in release
 # builds.
 test-seam = []
 
-default = ["fjall"]
-rocksdb = ["bitcoin-rs-chain/rocksdb"]
-fjall = ["bitcoin-rs-chain/fjall"]
-redb = ["bitcoin-rs-chain/redb"]
+default = []
 
 [dependencies]
 bitcoin-rs-consensus.workspace = true

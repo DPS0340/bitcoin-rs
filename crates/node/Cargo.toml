@@ -32,25 +32,19 @@ workspace = true
 default = ["fjall", "zmq"]
 rocksdb = [
     "bitcoin-rs-chainstate/rocksdb",
-    "bitcoin-rs-chain/rocksdb",
     "bitcoin-rs-index/rocksdb",
-    "bitcoin-rs-p2p/rocksdb",
     "bitcoin-rs-storage/rocksdb",
     "bitcoin-rs-utxo/rocksdb",
 ]
 fjall = [
     "bitcoin-rs-chainstate/fjall",
-    "bitcoin-rs-chain/fjall",
     "bitcoin-rs-index/fjall",
-    "bitcoin-rs-p2p/fjall",
     "bitcoin-rs-storage/fjall",
     "bitcoin-rs-utxo/fjall",
 ]
 redb = [
     "bitcoin-rs-chainstate/redb",
-    "bitcoin-rs-chain/redb",
     "bitcoin-rs-index/redb",
-    "bitcoin-rs-p2p/redb",
     "bitcoin-rs-storage/redb",
     "bitcoin-rs-utxo/redb",
 ]
