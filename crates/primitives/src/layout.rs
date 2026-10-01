@@ -17,9 +17,7 @@
 //! rejected up front, so a malformed length can never drive an oversized
 //! allocation or an out-of-bounds access.
 //!
-//! Span offsets are `u32` relative to the parsed image. File consumers widen
-//! them to `u64` through [`ByteSpan::file_range`], which adds the image base
-//! in checked `u64` arithmetic (the `u32`-to-`u64` file-offset discipline).
+//! Span offsets are `u32` relative to the parsed image.
 //! Lengths outside the representable span domain surface as an impossible
 //! [`DecodeError::EndOfData`] requirement, following `read_script`'s
 //! convention for lengths beyond `usize`.
@@ -56,8 +54,7 @@ const OUTPOINT_LEN: u64 = 36;
 /// Construction validates `start + len` in `u64` arithmetic against the image
 /// limit before the range is ever used for slicing, so every [`ByteSpan`] is
 /// in-bounds by construction. Offsets are `u32` relative to the image; widen
-/// with [`ByteSpan::end`] or [`ByteSpan::file_range`] instead of storing
-/// absolute file positions in `u32`.
+/// with [`ByteSpan::end`] instead of storing absolute positions in `u32`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
     start: u32,
@@ -108,18 +105,6 @@ impl ByteSpan {
     #[must_use]
     pub fn end(self) -> u64 {
         u64::from(self.start) + u64::from(self.len)
-    }
-
-    /// Locates the span inside a segment file that starts at `base`,
-    /// widening the `u32` image offset in checked `u64` arithmetic.
-    ///
-    /// Returns `None` when the addition would overflow `u64`; callers never
-    /// silently wrap a file position.
-    #[must_use]
-    pub fn file_range(self, base: u64) -> Option<Range<u64>> {
-        let start = u64::from(self.start).checked_add(base)?;
-        let end = start.checked_add(u64::from(self.len))?;
-        Some(start..end)
     }
 }
 
