@@ -94,12 +94,6 @@ impl ByteSpan {
         self.len
     }
 
-    /// Whether the span covers no bytes.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.len == 0
-    }
-
     /// Offset one past the last byte, computed in `u64` (the sum of two
     /// `u32` offsets never overflows `u64`).
     #[must_use]
@@ -134,24 +128,6 @@ impl MetadataRange {
         let start = u32::try_from(start).map_err(|_| impossible(available))?;
         let end = u32::try_from(end).map_err(|_| impossible(available))?;
         Ok(Self { start, end })
-    }
-
-    /// Index of the first selected record.
-    #[must_use]
-    pub const fn start(self) -> u32 {
-        self.start
-    }
-
-    /// Index one past the last selected record.
-    #[must_use]
-    pub const fn end(self) -> u32 {
-        self.end
-    }
-
-    /// Number of selected records.
-    #[must_use]
-    pub const fn len(self) -> u32 {
-        self.end.saturating_sub(self.start)
     }
 
     /// Whether no records are selected.
@@ -287,12 +263,6 @@ impl InputLayout {
         self.script_sig
     }
 
-    /// Span of the 4-byte sequence number.
-    #[must_use]
-    pub const fn sequence(&self) -> ByteSpan {
-        self.sequence
-    }
-
     /// Index range of this input's witness stack items within
     /// [`ParsedTransaction::witness_spans`]; empty for legacy inputs.
     #[must_use]
@@ -309,12 +279,6 @@ pub struct OutputLayout {
 }
 
 impl OutputLayout {
-    /// Span of the 8-byte little-endian value.
-    #[must_use]
-    pub const fn value(&self) -> ByteSpan {
-        self.value
-    }
-
     /// Span of the scriptPubKey contents (without the length prefix).
     #[must_use]
     pub const fn script_pubkey(&self) -> ByteSpan {
@@ -484,12 +448,6 @@ impl<'a> ParsedTransaction<'a> {
         self.span
     }
 
-    /// The immutable byte image every span indexes into.
-    #[must_use]
-    pub fn bytes(&self) -> &'a [u8] {
-        self.bytes
-    }
-
     /// Whether the BIP144 marker/flag was present in the wire encoding. For
     /// every parseable encoding this coincides with witness data being
     /// present, because an all-empty witness section is rejected as
@@ -509,12 +467,6 @@ impl<'a> ParsedTransaction<'a> {
     #[must_use]
     pub fn outputs(&self) -> &[OutputLayout] {
         &self.outputs
-    }
-
-    /// Number of outputs.
-    #[must_use]
-    pub fn output_count(&self) -> usize {
-        self.outputs.len()
     }
 
     /// Witness stack item spans concatenated across inputs; each input's
@@ -790,12 +742,6 @@ impl<'a> ParsedBlock<'a> {
     #[must_use]
     pub fn transaction(&self, index: usize) -> Option<&ParsedTransaction<'a>> {
         self.txs.get(index)
-    }
-
-    /// The immutable byte image every span indexes into.
-    #[must_use]
-    pub fn bytes(&self) -> &'a [u8] {
-        self.bytes
     }
 
     /// Bytes this block occupies inside the owning image.
