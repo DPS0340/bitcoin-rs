@@ -35,32 +35,6 @@ pub struct HeadersSyncParams {
     pub redownload_buffer_size: usize,
 }
 
-/// Parses 64 hex characters into 32 big-endian bytes at compile time.
-///
-/// The `nMinimumChainWork` values below are copied from Bitcoin Core as the hex
-/// strings Core writes them as. Transcribing those into a byte array by hand is
-/// exactly the kind of edit that goes wrong silently, so it is done here instead.
-const fn hex_be_32(hex: &str) -> [u8; 32] {
-    const fn nibble(byte: u8) -> u8 {
-        match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
-            _ => panic!("chain-work constants must be hex"),
-        }
-    }
-
-    let bytes = hex.as_bytes();
-    assert!(bytes.len() == 64, "chain work must be 64 hex characters");
-    let mut out = [0_u8; 32];
-    let mut index = 0;
-    while index < 32 {
-        out[index] = (nibble(bytes[index * 2]) << 4) | nibble(bytes[index * 2 + 1]);
-        index += 1;
-    }
-    out
-}
-
 // `nMinimumChainWork` and `chainTxData`, copied from `src/kernel/chainparams.cpp`
 // in the Bitcoin Core tree this workspace already links against — the one
 // vendored by `libbitcoinkernel-sys`, client version 31.99, whose chain-tx data
@@ -71,16 +45,16 @@ const fn hex_be_32(hex: &str) -> [u8; 32] {
 // per-release tuning, not consensus rules, and they need re-copying whenever the
 // pinned Core revision moves — the assume-valid anchor is the tell that it has.
 const MAINNET_MINIMUM_CHAIN_WORK: [u8; 32] =
-    hex_be_32("0000000000000000000000000000000000000001128750f82f4c366153a3a030");
+    decode_compiled_hex("0000000000000000000000000000000000000001128750f82f4c366153a3a030");
 
 const TESTNET3_MINIMUM_CHAIN_WORK: [u8; 32] =
-    hex_be_32("0000000000000000000000000000000000000000000017dde1c649f3708d14b6");
+    decode_compiled_hex("0000000000000000000000000000000000000000000017dde1c649f3708d14b6");
 
 const TESTNET4_MINIMUM_CHAIN_WORK: [u8; 32] =
-    hex_be_32("0000000000000000000000000000000000000000000009a0fe15d0177d086304");
+    decode_compiled_hex("0000000000000000000000000000000000000000000009a0fe15d0177d086304");
 
 const SIGNET_MINIMUM_CHAIN_WORK: [u8; 32] =
-    hex_be_32("00000000000000000000000000000000000000000000000000000b463ea0a4b8");
+    decode_compiled_hex("00000000000000000000000000000000000000000000000000000b463ea0a4b8");
 
 /// Bitcoin Core's mainnet `consensus.BIP16Exception` — block 170060, whose display
 /// hash is `00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22`. Stored
@@ -836,7 +810,7 @@ mod tests {
 
 #[cfg(test)]
 mod chain_params_tests {
-    use super::{Network, hex_be_32};
+    use super::{Network, decode_compiled_hex};
 
     fn to_hex(bytes: [u8; 32]) -> String {
         let mut out = String::with_capacity(64);
@@ -847,8 +821,9 @@ mod chain_params_tests {
     }
 
     #[test]
-    fn hex_be_32_places_the_first_character_in_the_high_bit_of_byte_zero() {
-        let parsed = hex_be_32("8000000000000000000000000000000000000000000000000000000000000001");
+    fn decode_compiled_hex_places_the_first_character_in_the_high_bit_of_byte_zero() {
+        let parsed: [u8; 32] =
+            decode_compiled_hex("8000000000000000000000000000000000000000000000000000000000000001");
         assert_eq!(
             parsed[0], 0x80,
             "the leading nibble is the most significant"
@@ -896,8 +871,12 @@ mod chain_params_tests {
     fn minimum_chain_work_compares_as_a_number_when_compared_as_bytes() {
         // Big-endian, fixed width: array order is numeric order. The whole
         // chain-work check rests on this, so state it rather than assume it.
-        let smaller = hex_be_32("00000000000000000000000000000000000000000000000000000000000000ff");
-        let larger = hex_be_32("0000000000000000000000000000000000000000000000000000000000000100");
+        let smaller: [u8; 32] = decode_compiled_hex(
+            "00000000000000000000000000000000000000000000000000000000000000ff",
+        );
+        let larger: [u8; 32] = decode_compiled_hex(
+            "0000000000000000000000000000000000000000000000000000000000000100",
+        );
         assert!(smaller < larger);
         assert!(Network::Regtest.minimum_chain_work() < Network::Signet.minimum_chain_work());
         assert!(Network::Signet.minimum_chain_work() < Network::Mainnet.minimum_chain_work());
