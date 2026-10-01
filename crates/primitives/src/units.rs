@@ -54,39 +54,9 @@ impl Amount {
     }
 }
 
-impl fmt::Display for Amount {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<u64> for Amount {
-    fn from(sat: u64) -> Self {
-        Self::from_sat(sat)
-    }
-}
-
 impl PartialEq<u64> for Amount {
     fn eq(&self, other: &u64) -> bool {
         self.0 == *other
-    }
-}
-
-impl PartialEq<Amount> for u64 {
-    fn eq(&self, other: &Amount) -> bool {
-        *self == other.0
-    }
-}
-
-impl PartialOrd<u64> for Amount {
-    fn partial_cmp(&self, other: &u64) -> Option<core::cmp::Ordering> {
-        self.0.partial_cmp(other)
-    }
-}
-
-impl PartialOrd<Amount> for u64 {
-    fn partial_cmp(&self, other: &Amount) -> Option<core::cmp::Ordering> {
-        self.partial_cmp(&other.0)
     }
 }
 
@@ -121,51 +91,15 @@ impl Sequence {
     }
 }
 
-impl fmt::Display for Sequence {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<u32> for Sequence {
-    fn from(n: u32) -> Self {
-        Self::from_consensus(n)
-    }
-}
-
 impl PartialEq<u32> for Sequence {
     fn eq(&self, other: &u32) -> bool {
         self.0 == *other
     }
 }
 
-impl PartialEq<Sequence> for u32 {
-    fn eq(&self, other: &Sequence) -> bool {
-        *self == other.0
-    }
-}
-
 impl PartialOrd<u32> for Sequence {
     fn partial_cmp(&self, other: &u32) -> Option<core::cmp::Ordering> {
         self.0.partial_cmp(other)
-    }
-}
-
-impl PartialOrd<Sequence> for u32 {
-    fn partial_cmp(&self, other: &Sequence) -> Option<core::cmp::Ordering> {
-        self.partial_cmp(&other.0)
-    }
-}
-
-impl fmt::LowerHex for Sequence {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::LowerHex::fmt(&self.0, f)
-    }
-}
-
-impl fmt::UpperHex for Sequence {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::UpperHex::fmt(&self.0, f)
     }
 }
 
@@ -210,48 +144,6 @@ impl fmt::Display for LockTime {
     }
 }
 
-impl From<u32> for LockTime {
-    fn from(n: u32) -> Self {
-        Self::from_consensus(n)
-    }
-}
-
-impl PartialEq<u32> for LockTime {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<LockTime> for u32 {
-    fn eq(&self, other: &LockTime) -> bool {
-        *self == other.0
-    }
-}
-
-impl PartialOrd<u32> for LockTime {
-    fn partial_cmp(&self, other: &u32) -> Option<core::cmp::Ordering> {
-        self.0.partial_cmp(other)
-    }
-}
-
-impl PartialOrd<LockTime> for u32 {
-    fn partial_cmp(&self, other: &LockTime) -> Option<core::cmp::Ordering> {
-        self.partial_cmp(&other.0)
-    }
-}
-
-impl fmt::LowerHex for LockTime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::LowerHex::fmt(&self.0, f)
-    }
-}
-
-impl fmt::UpperHex for LockTime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::UpperHex::fmt(&self.0, f)
-    }
-}
-
 /// Compact proof-of-work target (`nBits`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CompactTarget(u32);
@@ -282,18 +174,6 @@ impl fmt::LowerHex for CompactTarget {
     }
 }
 
-impl fmt::UpperHex for CompactTarget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::UpperHex::fmt(&self.0, f)
-    }
-}
-
-impl fmt::Display for CompactTarget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:#010x}", self.0)
-    }
-}
-
 impl From<u32> for CompactTarget {
     fn from(n: u32) -> Self {
         Self::from_consensus(n)
@@ -303,12 +183,6 @@ impl From<u32> for CompactTarget {
 impl PartialEq<u32> for CompactTarget {
     fn eq(&self, other: &u32) -> bool {
         self.0 == *other
-    }
-}
-
-impl PartialEq<CompactTarget> for u32 {
-    fn eq(&self, other: &CompactTarget) -> bool {
-        *self == other.0
     }
 }
 
