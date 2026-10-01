@@ -126,12 +126,6 @@ pub fn consensus_bytes<T: ConsensusEncode + ?Sized>(value: &T) -> Vec<u8> {
     bytes
 }
 
-/// Consensus serialization length without allocating the encoded bytes.
-#[must_use]
-pub fn consensus_len<T: ConsensusEncode + ?Sized>(value: &T) -> usize {
-    value.consensus_size()
-}
-
 /// Decodes a complete value from `bytes`, rejecting any trailing bytes.
 pub fn deserialize<T: ConsensusDecode>(bytes: &[u8]) -> Result<T, DecodeError> {
     let mut reader = bytes;

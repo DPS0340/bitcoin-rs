@@ -83,7 +83,7 @@ impl Tx {
     /// Full consensus serialization length, including BIP144 witness sections.
     #[must_use]
     pub fn total_size(&self) -> usize {
-        crate::encode::consensus_len(self)
+        self.consensus_size()
     }
 
     /// BIP141 transaction weight: `base_size * 3 + total_size` weight units.

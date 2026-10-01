@@ -2,7 +2,7 @@
 
 use crate::{
     BlockHash, Header, Tx, Txid,
-    encode::{DecodeError, consensus_len, deserialize},
+    encode::{ConsensusEncode, DecodeError, deserialize},
 };
 
 /// A Bitcoin block in native owned form.
@@ -36,7 +36,7 @@ impl Block {
     /// Full consensus serialization length, including BIP144 witness sections.
     #[must_use]
     pub fn total_size(&self) -> usize {
-        consensus_len(self)
+        self.consensus_size()
     }
 
     /// Consensus serialization length without BIP144 witness sections.
