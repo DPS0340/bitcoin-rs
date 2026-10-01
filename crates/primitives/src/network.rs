@@ -871,12 +871,10 @@ mod chain_params_tests {
     fn minimum_chain_work_compares_as_a_number_when_compared_as_bytes() {
         // Big-endian, fixed width: array order is numeric order. The whole
         // chain-work check rests on this, so state it rather than assume it.
-        let smaller: [u8; 32] = decode_compiled_hex(
-            "00000000000000000000000000000000000000000000000000000000000000ff",
-        );
-        let larger: [u8; 32] = decode_compiled_hex(
-            "0000000000000000000000000000000000000000000000000000000000000100",
-        );
+        let smaller: [u8; 32] =
+            decode_compiled_hex("00000000000000000000000000000000000000000000000000000000000000ff");
+        let larger: [u8; 32] =
+            decode_compiled_hex("0000000000000000000000000000000000000000000000000000000000000100");
         assert!(smaller < larger);
         assert!(Network::Regtest.minimum_chain_work() < Network::Signet.minimum_chain_work());
         assert!(Network::Signet.minimum_chain_work() < Network::Mainnet.minimum_chain_work());
