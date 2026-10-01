@@ -42,11 +42,12 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
     `chainstate` is the authoritative applied-chain owner. It composes only
     lower/same-layer protocol, chain, UTXO, and storage capabilities; it must
     not depend on mempool, P2P, index, mining, RPC, node, or the binary.
-    `chain` and `utxo` sit in Layer 2 because they depend on `storage` for
-    block index records, undo storage, and UTXO snapshots. `chain` also
-    depends on `consensus` for BIP9 parameters and the BIP113 locktime
-    cutoff. `mining` sits in Layer 2 because it depends on `mempool` for
-    candidate selection and `chain` for candidate header/work/time context.
+    `utxo` sits in Layer 2 because it depends on `storage` for undo records
+    and persisted coin statistics. `chain` depends on `consensus` for BIP9
+    parameters and the BIP113 locktime cutoff, and reads persisted block
+    bodies only through its `BlockBodySource` capability. `mining` sits in
+    Layer 2 because it depends on `mempool` for candidate selection and
+    `chain` for candidate header/work/time context.
     `p2p` depends on `mempool` for the transaction inventory view and
     committed-mutation relay consumer. This same-layer edge keeps peer
     protocol mechanics with their consumer; `mempool` must not depend on
@@ -81,20 +82,20 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   confined to:
   1. Operator-facing entry points (`bitcoin-rs-node`, `bitcoin-rs`) that expose
      backend selection to operators and packaging scripts.
-  2. Services-tier adapter crates (`bitcoin-rs-chain`, `bitcoin-rs-chainstate`,
-     `bitcoin-rs-utxo`, `bitcoin-rs-p2p`, `bitcoin-rs-index`) whose features exist solely so `-p`
-     package builds propagate backend selection into `bitcoin-rs-storage`.
+  2. Services-tier adapter crates (`bitcoin-rs-chainstate`, `bitcoin-rs-utxo`,
+     `bitcoin-rs-index`) whose features exist solely so `-p` package builds
+     propagate backend selection into `bitcoin-rs-storage`.
   3. `bitcoin-rs-storage` itself, which owns the concrete backend engine
      dependencies and exposes them through the `KvStore` facade.
 - Crates in Layer 0 (Core) and Layer 3 (Surface / RPC) must never define or
   forward storage backend features.
-- `bitcoin-rs-mempool` and `bitcoin-rs-mining` do not own storage and must not
-  define or forward backend feature names; an empty `rocksdb = []` marker
-  counts as defining a backend feature and is forbidden.
+- `bitcoin-rs-chain`, `bitcoin-rs-p2p`, `bitcoin-rs-mempool`, and
+  `bitcoin-rs-mining` do not own storage and must not define or forward
+  backend feature names; an empty `rocksdb = []` marker counts as defining a
+  backend feature and is forbidden.
 - `bitcoin-rs-node` and `bitcoin-rs` may forward backend selection only into
-  engine-selecting crates (`bitcoin-rs-storage`, `bitcoin-rs-chain`,
-  `bitcoin-rs-chainstate`, `bitcoin-rs-utxo`, `bitcoin-rs-p2p`,
-  `bitcoin-rs-index`).
+  engine-selecting crates (`bitcoin-rs-storage`, `bitcoin-rs-chainstate`,
+  `bitcoin-rs-utxo`, `bitcoin-rs-index`).
 - `fjall` is the default shipped product backend. `redb` and `rocksdb` are
   retained shipped alternatives and independent product-matrix comparisons.
   MDBX had only a diagnostic role and no current consumer; it is removed as a

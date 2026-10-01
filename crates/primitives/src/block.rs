@@ -67,6 +67,15 @@ impl Block {
     }
 }
 
+/// Block payload facts available without materializing a full block body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockBodyMetadata {
+    /// Serialized block byte length.
+    pub body_size: usize,
+    /// Number of transactions encoded in the block.
+    pub tx_count: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::Block;

@@ -32,7 +32,7 @@ pub mod varint;
 /// Workspace release version constants for wire/RPC user-agent strings.
 pub mod version;
 
-pub use block::Block;
+pub use block::{Block, BlockBodyMetadata};
 pub use encode::{
     ConsensusDecode, ConsensusEncode, DecodeError, Sink, consensus_bytes, consensus_len,
     deserialize,

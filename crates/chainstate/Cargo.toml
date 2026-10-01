@@ -25,17 +25,14 @@ default = []
 test-seam = []
 kernel = ["bitcoin-rs-consensus/kernel"]
 rocksdb = [
-    "bitcoin-rs-chain/rocksdb",
     "bitcoin-rs-storage/rocksdb",
     "bitcoin-rs-utxo/rocksdb",
 ]
 fjall = [
-    "bitcoin-rs-chain/fjall",
     "bitcoin-rs-storage/fjall",
     "bitcoin-rs-utxo/fjall",
 ]
 redb = [
-    "bitcoin-rs-chain/redb",
     "bitcoin-rs-storage/redb",
     "bitcoin-rs-utxo/redb",
 ]

@@ -64,11 +64,5 @@ through its `tx_relay_open` callback: while the gate is closed, transaction-type
 `InboundBlock`, `InboundHeaders`, and `InboundTx` with their delivering peer
 stamped.
 
-## Features
-- `default` (enables `fjall`): build with the fjall storage backend selected.
-- `rocksdb`: forward the rocksdb storage backend to `bitcoin-rs-storage`.
-- `fjall`: forward the fjall storage backend to `bitcoin-rs-storage`.
-- `redb`: forward the redb storage backend to `bitcoin-rs-storage`.
-
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the
 project vocabulary.

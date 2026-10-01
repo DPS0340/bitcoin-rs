@@ -1,7 +1,7 @@
 //! Indexed authoritative block bodies, read sessions, and durability.
 
 use crate::durable_head::BodyExtent;
-use bitcoin_rs_primitives::{Hash256, varint};
+use bitcoin_rs_primitives::{BlockBodyMetadata, Hash256, varint};
 
 use crate::{
     BlockFilePosition, FlatFileBlockReader, FlatFileBlockStore, KvSnapshot, KvStore, StorageError,
@@ -12,15 +12,6 @@ use std::sync::Arc;
 
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 const SERIALIZED_BLOCK_METADATA_PREFIX_LEN: usize = SERIALIZED_BLOCK_HEADER_LEN + 9;
-
-/// Block payload facts available without materializing a full block body.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockBodyMetadata {
-    /// Serialized block byte length.
-    pub body_size: usize,
-    /// Number of transactions encoded in the block.
-    pub tx_count: usize,
-}
 
 fn decode_block_tx_count(bytes: &[u8]) -> Option<usize> {
     let cursor = bytes.get(SERIALIZED_BLOCK_HEADER_LEN..)?;
