@@ -1,14 +1,7 @@
 //! One scripted loopback wire peer for the live-sync scenarios.
 //!
-//! PRE: the node's P2P listener is bound; the caller supplies the blocks
-//! the peer may serve.
-//! POST: every frame in either direction is journaled next to the node's
-//! evidence, and every getdata the node sent is recorded for inspection.
-//! INVARIANT: `NODE_NETWORK|WITNESS` service, no compact relay, regtest
-//! v70016. Bodies are served type-faithfully: witness inventory gets the
-//! full body, a plain `MSG_BLOCK` gets a witness-stripped body — the same
-//! behavior a real peer exhibits, which is what makes a plain `MSG_BLOCK`
-//! request fatal for segwit bodies.
+//! Regtest v70016, `NODE_NETWORK|WITNESS`, no compact relay. Witness
+//! inventory gets the full body, a plain `MSG_BLOCK` a witness-stripped one.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -78,9 +71,6 @@ impl LivePeer {
     /// deep chain (discovery probes fire and self-recover a
     /// pre-bootstrap-rejected batch); `0` keeps the wire quiet so a lone
     /// `getheaders` can only be the staged-header recovery send.
-    ///
-    /// `NODE_NETWORK|WITNESS`: the recovery getheaders path only considers
-    /// fully-serving peers eligible.
     pub fn connect_with_height(node: &ProcessNode, name: &str, start_height: i32) -> Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let stream = crate::process_peer::connect_loopback(node.p2p_addr, deadline)?;

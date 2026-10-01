@@ -42,9 +42,8 @@ pub fn funding_address() -> Result<Address> {
     ))
 }
 
-/// A fresh bech32 address owned by nobody in particular — used as a sink.
-#[must_use]
-pub fn sink_script() -> ScriptBuf {
+/// The sink every unsigned test spend pays: owned by nobody in particular.
+fn sink_script() -> ScriptBuf {
     ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([2; 20]))
 }
 
@@ -166,22 +165,10 @@ pub fn raw_spend_to(
     }
 }
 
-/// Build an unsigned spend of `outpoint`/`prevout` paying `sink_script()`
-/// minus `fee_sats`. Works for both `OP_TRUE` and signed prevouts.
-#[must_use]
-pub fn raw_spend(
-    outpoint: OutPoint,
-    prevout: &TxOut,
-    fee_sats: u64,
-    sequence: Sequence,
-) -> Transaction {
-    raw_spend_to(outpoint, prevout, fee_sats, sequence, &sink_script())
-}
-
 /// An unsigned spend of an `OP_TRUE` coinbase: valid with an empty scriptSig.
 #[must_use]
 pub fn spend_anyone(outpoint: OutPoint, prevout: &TxOut, fee_sats: u64) -> Transaction {
-    raw_spend(outpoint, prevout, fee_sats, Sequence::MAX)
+    raw_spend_to(outpoint, prevout, fee_sats, Sequence::MAX, &sink_script())
 }
 
 /// A signed P2PKH spend of `outpoint`/`prevout` under the funding key.
@@ -191,7 +178,7 @@ pub fn signed_spend(
     fee_sats: u64,
     sequence: Sequence,
 ) -> Result<Transaction> {
-    let mut tx = raw_spend(outpoint, prevout, fee_sats, sequence);
+    let mut tx = raw_spend_to(outpoint, prevout, fee_sats, sequence, &sink_script());
     sign_p2pkh_inputs(&mut tx, std::slice::from_ref(prevout))?;
     Ok(tx)
 }

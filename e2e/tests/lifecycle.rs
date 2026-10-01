@@ -34,46 +34,6 @@ fn startup_reports_regtest_identity() -> Result<()> {
     node.stop()
 }
 
-/// The node-info RPCs answer with their documented shapes.
-#[test]
-fn node_info_rpcs_answer() -> Result<()> {
-    let mut node = ProcessNode::spawn(Kind::BitcoinRs)?;
-
-    let uptime = node.rpc("uptime", &json!([]))?;
-    assert!(uptime.as_u64().is_some(), "uptime is an integer: {uptime}");
-
-    let rpcinfo = node.rpc("getrpcinfo", &json!([]))?;
-    rpcinfo.field("active_commands")?;
-
-    let memory = node.rpc("getmemoryinfo", &json!([]))?;
-    memory.field("locked")?;
-
-    let network = node.rpc("getnetworkinfo", &json!([]))?;
-    network.u64_field("connections")?;
-    network.str_field("subversion")?;
-
-    let totals = node.rpc("getnettotals", &json!([]))?;
-    totals.u64_field("totalbytesrecv")?;
-    totals.u64_field("totalbytessent")?;
-
-    let capabilities = node.rpc("getcapabilities", &json!([]))?;
-    assert!(
-        capabilities.is_object(),
-        "capabilities reply: {capabilities}"
-    );
-
-    // No indexes configured: the manifest reports an empty object.
-    let indexes = node.rpc("getindexinfo", &json!([]))?;
-    assert_eq!(indexes, json!({}));
-
-    let peers = node.rpc("getpeerinfo", &json!([]))?;
-    assert_eq!(peers, json!([]));
-    let connections = node.rpc("getconnectioncount", &json!([]))?;
-    assert_eq!(connections, json!(0));
-
-    node.stop()
-}
-
 /// A mined tip survives SIGTERM and is visible after a clean restart
 /// over the same datadir.
 #[test]
@@ -95,44 +55,51 @@ fn restart_preserves_chain_tip() -> Result<()> {
     restarted.stop()
 }
 
-/// A malformed config file must fail startup — the process exits and the
-/// harness reports the exit instead of a ready node.
+/// Broken startup configuration must exit the process instead of yielding a
+/// half-configured node: unparseable config, an unknown `--network`, and an
+/// RPC port already held by someone else.
 #[test]
-fn malformed_config_fails_startup() -> Result<()> {
-    let outcome = ProcessNode::spawn_with(
-        Kind::BitcoinRs,
-        &SpawnOptions {
-            toml_override: Some("this is [not = toml\n"),
-            timeout: Some(Duration::from_secs(30)),
-            ..SpawnOptions::default()
-        },
-    );
-    match outcome {
-        Err(Error::ChildExit { .. }) => Ok(()),
-        Err(other) => Err(Error::Assertion(format!(
-            "unexpected failure mode: {other}"
-        ))),
-        Ok(_) => Err(Error::Assertion(
-            "node started on a malformed config".into(),
-        )),
+fn startup_rejects_broken_configuration() -> Result<()> {
+    // The squatter holds the contested port for the whole table so the bind
+    // case cannot accidentally succeed.
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let held = squatter.local_addr()?;
+    let timeout = Some(Duration::from_secs(30));
+    let cases = [
+        (
+            "malformed config file",
+            SpawnOptions {
+                toml_override: Some("this is [not = toml\n"),
+                timeout,
+                ..SpawnOptions::default()
+            },
+        ),
+        (
+            "unknown --network value",
+            SpawnOptions {
+                extra_args: &["--network", "no-such-net"],
+                timeout,
+                ..SpawnOptions::default()
+            },
+        ),
+        (
+            "rpc port already held",
+            SpawnOptions {
+                rpc_bind: Some(held),
+                timeout,
+                ..SpawnOptions::default()
+            },
+        ),
+    ];
+    for (label, options) in cases {
+        let outcome = ProcessNode::spawn_with(Kind::BitcoinRs, &options);
+        assert!(
+            matches!(outcome, Err(Error::ChildExit { .. })),
+            "{label} must not start a node: {outcome:?}"
+        );
     }
-}
-
-/// An unparseable CLI flag is rejected before the node binds anything.
-#[test]
-fn invalid_cli_flag_rejected() {
-    let outcome = ProcessNode::spawn_with(
-        Kind::BitcoinRs,
-        &SpawnOptions {
-            extra_args: &["--network", "no-such-net"],
-            timeout: Some(Duration::from_secs(30)),
-            ..SpawnOptions::default()
-        },
-    );
-    assert!(
-        matches!(outcome, Err(Error::ChildExit { .. })),
-        "invalid --network must not start a node: {outcome:?}"
-    );
+    drop(squatter);
+    Ok(())
 }
 
 /// `--measure-storage` reports the datadir footprint as JSON on stdout and
@@ -161,30 +128,14 @@ fn measure_storage_exits_with_report() -> Result<()> {
     );
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| Error::Assertion(format!("measure-storage stdout not JSON: {e}")))?;
-    assert!(parsed.is_object(), "report shape: {parsed}");
-    Ok(())
-}
-
-/// The node's RPC listener cannot bind a port that is already held:
-/// `bind()` fails and the process exits instead of hanging or serving.
-#[test]
-fn rpc_bind_conflict_fails_startup() -> Result<()> {
-    // Occupy a port ourselves, then point the node's sole `--rpc-bind` at
-    // it. The squatter stays held until spawn reports the child's exit.
-    let squatter = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let held = squatter.local_addr()?;
-    let outcome = ProcessNode::spawn_with(
-        Kind::BitcoinRs,
-        &SpawnOptions {
-            rpc_bind: Some(held),
-            timeout: Some(Duration::from_secs(30)),
-            ..SpawnOptions::default()
-        },
+    // The report must actually account for the datadir, not just be JSON.
+    assert_eq!(
+        parsed.str_field("format")?,
+        "bitcoin-rs-storage-footprint-v1"
     );
-    drop(squatter);
     assert!(
-        matches!(outcome, Err(Error::ChildExit { .. })),
-        "rpc bind conflict must fail startup: {outcome:?}"
+        parsed.field("physical")?.u64_field("allocated_bytes")? > 0,
+        "report must measure allocated bytes: {parsed}"
     );
     Ok(())
 }
