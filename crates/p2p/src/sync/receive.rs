@@ -94,12 +94,12 @@ impl BlockSync {
                 let tree = self.chain.block_tree();
                 dropped
                     .iter()
-                    .map(|dropped| {
+                    .map(|hash| {
                         let height = tree
-                            .lookup(dropped.hash)
+                            .lookup(*hash)
                             .and_then(|node_id| tree.node(node_id).ok())
                             .map(|node| node.height);
-                        (dropped.hash, height)
+                        (*hash, height)
                     })
                     .collect()
             };
@@ -634,7 +634,7 @@ impl BlockSync {
                     };
                     let dropped_heights = match &staged {
                         StagedBlock::Memory { dropped, .. } => {
-                            dropped.iter().map(|entry| resolve(entry.hash)).collect()
+                            dropped.iter().map(|entry| resolve(*entry)).collect()
                         }
                         _ => Vec::new(),
                     };
@@ -666,12 +666,12 @@ impl BlockSync {
                                 DeliveryCredit::Delivery(pending_height),
                             ));
                         }
-                        for (entry, height) in dropped.into_iter().zip(dropped_heights) {
-                            window.requeue_for_retry(&entry.hash, height, now);
+                        for (dropped_hash, height) in dropped.into_iter().zip(dropped_heights) {
+                            window.requeue_for_retry(&dropped_hash, height, now);
                             retry_count = retry_count.saturating_add(1);
                         }
                     }
-                    StagedBlock::DroppedForRetry { dropped } => {
+                    StagedBlock::DroppedForRetry { hash } => {
                         // Count-evicted before staging: release what the
                         // window holds without a cursor rewind. Unlike the
                         // `Memory` arm's evictions — staged victims whose
@@ -680,7 +680,7 @@ impl BlockSync {
                         // staged, so a live pending still carries its
                         // request height and an unrequested body must not
                         // move the cursor at all.
-                        window.requeue_for_retry(&dropped.hash, None, now);
+                        window.requeue_for_retry(&hash, None, now);
                         retry_count = retry_count.saturating_add(1);
                         tracing::warn!(%hash, "block sync: received block buffer full; dropping block for retry");
                     }
