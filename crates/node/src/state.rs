@@ -385,7 +385,9 @@ impl NodeState {
 
     /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
-    pub(crate) fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
+    pub(crate) fn script_index_query(
+        &self,
+    ) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
         if !self.config.indexes.script_index.is_enabled() {
             return None;
         }
