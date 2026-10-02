@@ -5537,6 +5537,7 @@ mod float_conversion_tests {
     use super::{i64_to_f64, u64_to_f64};
 
     #[test]
+    #[allow(clippy::suboptimal_flops)]
     fn u64_to_f64_is_exact_below_two_to_the_fifty_third() {
         for value in [
             0_u64,
@@ -5547,11 +5548,9 @@ mod float_conversion_tests {
             1 << 52,
         ] {
             // Independently derived: the halves recombined by hand.
-            let expected = f64::mul_add(
-                f64::from(u32::try_from(value >> 32).unwrap_or(u32::MAX)),
-                4_294_967_296.0_f64,
-                f64::from(u32::try_from(value & 0xffff_ffff).unwrap_or(u32::MAX)),
-            );
+            let expected = f64::from(u32::try_from(value >> 32).unwrap_or(u32::MAX))
+                * 4_294_967_296.0_f64
+                + f64::from(u32::try_from(value & 0xffff_ffff).unwrap_or(u32::MAX));
             assert!(
                 (u64_to_f64(value) - expected).abs() < f64::EPSILON,
                 "{value}"

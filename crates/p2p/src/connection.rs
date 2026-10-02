@@ -15,11 +15,20 @@ pub struct ConnectionId(u64);
 
 impl ConnectionId {
     fn allocate() -> Self {
-        match NEXT_CONNECTION_ID
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        {
-            Ok(id) => Self(id),
-            Err(_) => std::process::abort(),
+        let mut id = NEXT_CONNECTION_ID.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = id.checked_add(1) else {
+                std::process::abort();
+            };
+            match NEXT_CONNECTION_ID.compare_exchange_weak(
+                id,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Self(id),
+                Err(actual) => id = actual,
+            }
         }
     }
 
@@ -183,16 +192,24 @@ impl OutboundBudget {
     /// Write errors deliberately do not release: the connection and its
     /// counters are dying, and releasing there would risk double-accounting.
     pub(crate) fn release(&self, wire_len: usize) {
-        let _ = self
-            .pending_messages
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                Some(pending.saturating_sub(1))
-            });
-        let _ = self
-            .pending_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                Some(pending.saturating_sub(wire_len))
-            });
+        let mut messages = self.pending_messages.load(Ordering::Acquire);
+        while let Err(actual) = self.pending_messages.compare_exchange_weak(
+            messages,
+            messages.saturating_sub(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            messages = actual;
+        }
+        let mut bytes = self.pending_bytes.load(Ordering::Acquire);
+        while let Err(actual) = self.pending_bytes.compare_exchange_weak(
+            bytes,
+            bytes.saturating_sub(wire_len),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            bytes = actual;
+        }
     }
 
     /// Returns the charged `(messages, full wire bytes)` awaiting release.
