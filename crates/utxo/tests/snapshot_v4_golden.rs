@@ -50,14 +50,12 @@ fn a_v4_snapshot_loads_to_the_hash_and_trailer_it_was_written_with() {
         "the MuHash trailer must survive the load byte for byte"
     );
     assert_eq!(
-        hex(
-            &loaded
-                .set
-                .lock_stable_view()
-                .hash_serialized_3()
-                .expect("hash")
-                .to_le_bytes()
-        ),
+        hex(&loaded
+            .set
+            .lock_stable_view()
+            .hash_serialized_3()
+            .expect("hash")
+            .to_le_bytes()),
         GOLDEN_HASH_HEX,
         "a v4 snapshot no longer hashes to what the v4 build computed"
     );

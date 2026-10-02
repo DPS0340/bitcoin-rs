@@ -132,10 +132,7 @@ fn owned_and_borrowed_commits_match_independent_state_hashes()
                 )?;
                 let expected = expected_hash_serialized_3(&entries)?;
                 assert_eq!(owned.lock_stable_view().hash_serialized_3()?, expected);
-                assert_eq!(
-                    borrowed.lock_stable_view().hash_serialized_3()?,
-                    expected
-                );
+                assert_eq!(borrowed.lock_stable_view().hash_serialized_3()?, expected);
                 removes = entries.drain(..16).map(|entry| entry.0).collect();
                 for (_, txout, coinbase, height) in &mut entries {
                     txout.value = Amount::from_sat(77);
