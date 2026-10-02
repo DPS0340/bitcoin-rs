@@ -10,8 +10,7 @@ use bitcoin_rs_mempool::{
 };
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_primitives::{
-    BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, consensus_bytes,
-    unix_time_secs,
+    BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, consensus_bytes, unix_time_secs,
 };
 
 use bitcoin_rs_consensus::ValidationEngine;
