@@ -211,9 +211,7 @@ pub struct DisconnectReceipt {
 /// Returns true when `tx` is a coinbase: one input with the null outpoint.
 #[must_use]
 pub fn is_coinbase_tx(tx: &Tx) -> bool {
-    tx.inputs.len() == 1
-        && tx.inputs[0].previous_output.txid == Txid::default()
-        && tx.inputs[0].previous_output.vout == u32::MAX
+    tx.inputs.len() == 1 && tx.inputs[0].previous_output.is_null()
 }
 
 /// Lookup for the full resolved coin of a spent output, including creation

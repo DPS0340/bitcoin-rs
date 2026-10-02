@@ -12,7 +12,7 @@ use bitcoin_rs_mining::{
     BlockTemplate, Candidate, MiningCapability, MiningInfo, TemplateId, TemplateMutation,
 };
 use bitcoin_rs_primitives::{
-    CompactTarget, Hash256, LockTime, Network, OutPoint, Script, Sequence, Tx, TxIn, Txid, Witness,
+    CompactTarget, Hash256, LockTime, Network, OutPoint, Script, Sequence, Tx, TxIn, Witness,
 };
 
 /// Canned template; callers pin `capabilities` and `mutable` to the contract
@@ -41,7 +41,7 @@ pub(crate) fn canned_template(
                 version: 1,
                 lock_time: LockTime::ZERO,
                 inputs: vec![TxIn {
-                    previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                    previous_output: OutPoint::null(),
                     script_sig: Script::new(),
                     sequence: Sequence::MAX,
                     witness: Witness::new(),

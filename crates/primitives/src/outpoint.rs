@@ -44,7 +44,15 @@ impl OutPoint {
     /// Bitcoin's null / coinbase prevout: an all-zero txid with `vout == u32::MAX`.
     ///
     /// `OutPoint::default()` is the derived all-zero layout (`vout == 0`) and
-    /// is not null. Consensus coinbase detection uses this predicate.
+    /// is not null.
+    #[must_use]
+    pub fn null() -> Self {
+        Self::new(Txid::default(), u32::MAX)
+    }
+
+    /// Returns true for the null / coinbase prevout.
+    ///
+    /// Consensus coinbase detection uses this predicate.
     #[must_use]
     pub fn is_null(self) -> bool {
         self.vout == u32::MAX && self.txid.as_bytes().iter().all(|&byte| byte == 0)
@@ -87,7 +95,7 @@ mod tests {
 
     #[test]
     fn null_outpoint_is_zero_txid_and_max_vout() {
-        let coinbase = OutPoint::new(Txid::default(), u32::MAX);
+        let coinbase = OutPoint::null();
         assert!(coinbase.is_null());
         assert!(!OutPoint::default().is_null());
         assert!(!OutPoint::new(Txid::default(), 0).is_null());

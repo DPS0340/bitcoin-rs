@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use bitcoin::hex::FromHex;
 use bitcoin_rs_primitives::{
     Amount, Script, Sequence, Sighash, SighashCache, Tx as NativeTx, TxOut, Witness,
     encode::deserialize,
@@ -45,13 +46,7 @@ fn taproot_hash_type(byte: u8) -> Sighash {
 }
 
 fn hex_decode(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&hex[index..index + 2], 16)
-                .unwrap_or_else(|error| panic!("bad hex at {index}: {error}"))
-        })
-        .collect()
+    Vec::from_hex(hex).unwrap_or_else(|error| panic!("bad hex: {error}"))
 }
 
 /// BIP test vectors publish digests in computation (internal) byte order.

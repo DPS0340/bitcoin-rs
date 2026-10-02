@@ -14,7 +14,7 @@
 use bitcoin_rs_consensus::{block_subsidy, compute_merkle_root};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
-    Sequence, Tx, TxIn, TxOut, Txid, Witness,
+    Sequence, Tx, TxIn, TxOut, Witness,
 };
 
 use crate::compact_is_met_by;
@@ -98,7 +98,7 @@ pub fn coinbase(height: u32) -> Tx {
         version: 2,
         lock_time: LockTime::from_consensus(0),
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(script_sig),
             sequence: Sequence::from_consensus(u32::MAX),
             witness: Witness::new(),

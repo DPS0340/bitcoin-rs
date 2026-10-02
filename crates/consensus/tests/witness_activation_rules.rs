@@ -11,7 +11,7 @@ use bitcoin_rs_consensus::verify_block::{
 };
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Header, LockTime, OutPoint, Script, Sequence, Tx,
-    TxIn, TxOut, Txid, Witness,
+    TxIn, TxOut, Witness,
 };
 
 const PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
@@ -34,7 +34,7 @@ fn coinbase(with_witness: bool, with_commitment: bool) -> Tx {
     let mut tx = Tx {
         version: 1,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(vec![1, 1]),
             sequence: Sequence::from_consensus(u32::MAX),
             witness: if with_witness {

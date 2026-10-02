@@ -898,7 +898,7 @@ mod tests {
             version: 1,
             lock_time: LockTime::from_consensus(0),
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                previous_output: OutPoint::null(),
                 script_sig: Script::from_bytes(vec![0x51; 4]),
                 sequence: Sequence::from_consensus(u32::MAX),
                 witness: Witness::new(),

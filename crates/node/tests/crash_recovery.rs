@@ -6,7 +6,7 @@ use bitcoin_rs_node::{Network, NodeConfig, state::NodeState};
 
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script, Sequence,
-    Tx, TxIn, TxOut, Txid, Witness,
+    Tx, TxIn, TxOut, Witness,
 };
 
 use sha2::{Digest, Sha256};
@@ -588,7 +588,7 @@ fn mined_regtest_child_at(prev_blockhash: BlockHash, height: u32) -> Result<Bloc
         version: 2,
         lock_time: LockTime::from_consensus(0),
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(coinbase_height_push(height)?),
             sequence: Sequence::from_consensus(u32::MAX),
             witness: Witness::new(),

@@ -167,7 +167,7 @@ mod uncommitted_witness_tests {
     };
     use bitcoin_rs_primitives::{
         Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script,
-        Sequence, Tx, TxIn, TxOut, Txid, Witness,
+        Sequence, Tx, TxIn, TxOut, Witness,
     };
 
     fn commitment_block(witness: Vec<Vec<u8>>, with_commitment: bool) -> Block {
@@ -194,7 +194,7 @@ mod uncommitted_witness_tests {
             txs: vec![Tx {
                 version: 2,
                 inputs: vec![TxIn {
-                    previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                    previous_output: OutPoint::null(),
                     script_sig: Script::from_bytes(vec![0x51, 0x00]),
                     sequence: Sequence::MAX,
                     witness: witness.into(),

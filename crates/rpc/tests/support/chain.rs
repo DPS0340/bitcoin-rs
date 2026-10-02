@@ -11,8 +11,7 @@ use super::{GateResult, fail};
 use bitcoin_rs_chain::regtest_fixture;
 use bitcoin_rs_node::{Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::{
-    Amount, Block, CompactTarget, Hash256, LockTime, OutPoint, Sequence, Tx, TxIn, TxOut, Txid,
-    Witness,
+    Amount, Block, CompactTarget, Hash256, LockTime, OutPoint, Sequence, Tx, TxIn, TxOut, Witness,
 };
 use bitcoin_rs_script::push_int;
 
@@ -54,7 +53,7 @@ pub(crate) fn seed_chain(state: &NodeState, count: u32) -> GateResult<SeedChain>
         let coinbase = Tx {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: null_prevout(),
+                previous_output: OutPoint::null(),
                 // BIP34 height push plus one pad byte: consensus requires a
                 // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
                 script_sig: [push_int(i64::from(height)), push_int(0)].concat().into(),
@@ -113,9 +112,4 @@ pub(crate) fn regtest_config(dir: &std::path::Path) -> NodeConfig {
     config.data_dir = dir.to_path_buf();
     config.p2p.listen.clear();
     config
-}
-
-/// The one-input null-prevout coinbase outpoint (Core `COINBASE_OUTPOINT`).
-fn null_prevout() -> OutPoint {
-    OutPoint::new(Txid::default(), u32::MAX)
 }

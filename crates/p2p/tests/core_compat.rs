@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use bitcoin::bip152::BlockTransactionsRequest;
 use bitcoin::consensus::encode as bitcoin_encode;
 use bitcoin::hashes::Hash as _;
+use bitcoin::hex::FromHex;
 use bitcoin::p2p::message::{CommandString, NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
 use bitcoin::p2p::{Magic, ServiceFlags};
@@ -69,30 +70,8 @@ const NETWORK_TABLE: [(Network, Magic, u16); 5] = [
 ];
 
 fn genesis_block() -> Result<Block, Box<dyn Error>> {
-    let bytes = hex_decode(REGTEST_GENESIS_HEX)?;
+    let bytes = Vec::<u8>::from_hex(REGTEST_GENESIS_HEX)?;
     Ok(Block::consensus_decode(&bytes)?)
-}
-
-fn hex_decode(hex: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    let (chunks, remainder) = hex.as_bytes().as_chunks::<2>();
-    if !remainder.is_empty() {
-        return Err("odd hex length".into());
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for pair in chunks {
-        let high = hex_nibble(pair[0])?;
-        let low = hex_nibble(pair[1])?;
-        bytes.push((high << 4) | low);
-    }
-    Ok(bytes)
-}
-
-fn hex_nibble(byte: u8) -> Result<u8, Box<dyn Error>> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err("invalid hex digit".into()),
-    }
 }
 
 /// Chains `count` synthetic headers onto `parent`, deterministically.

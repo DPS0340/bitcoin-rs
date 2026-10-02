@@ -382,9 +382,7 @@ pub(crate) fn evaluate_one(
 /// Returns true if `tx` is a coinbase transaction: exactly one input whose
 /// previous output is the null outpoint (zero txid, `vout == u32::MAX`).
 fn is_coinbase(tx: &Tx) -> bool {
-    tx.inputs.len() == 1
-        && tx.inputs[0].previous_output.txid == Txid::default()
-        && tx.inputs[0].previous_output.vout == u32::MAX
+    tx.inputs.len() == 1 && tx.inputs[0].previous_output.is_null()
 }
 
 /// Minimum non-witness serialization Core relays, `tx-size-small`.

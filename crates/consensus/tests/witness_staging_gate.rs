@@ -10,7 +10,7 @@ use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_consensus::{check_block_body_binding, compute_merkle_root};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script, Sequence,
-    Tx, TxIn, TxOut, Txid, Witness,
+    Tx, TxIn, TxOut, Witness,
 };
 
 const PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
@@ -33,7 +33,7 @@ fn coinbase(witness: Option<Vec<Vec<u8>>>, commitment: Option<[u8; 32]>) -> Tx {
     let mut tx = Tx {
         version: 1,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(vec![1, 1]),
             sequence: Sequence::from_consensus(u32::MAX),
             witness: witness.map_or_else(Witness::new, Witness::from_stack),

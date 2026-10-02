@@ -8,10 +8,10 @@
 // the sanctioned rust-bitcoin compat seam (`Address<T>`/`Script` disassembly);
 // all transaction/amount/hash plumbing here is native. The script-shape
 // classification behind `type` lives once in `compat::convert`.
-use bitcoin_rs_primitives::{BlockHash, Network, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes};
+use bitcoin_rs_primitives::{BlockHash, Network, Tx, TxIn, TxOut, consensus_bytes};
 
 #[cfg(test)]
-use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
+use bitcoin_rs_primitives::{Amount, LockTime, OutPoint, Script, Sequence, Txid, Witness};
 use sonic_rs::{Value, json};
 
 use bitcoin::hex::DisplayHex;
@@ -176,9 +176,7 @@ fn output_json(output: &TxOut, n: usize, network: Network) -> Value {
 /// A one-input, null-prevout transaction (Core's `IsCoinBase`).
 #[must_use]
 pub(crate) fn is_coinbase(tx: &Tx) -> bool {
-    // Core's `COutPoint::IsNull`: zero txid and `u32::MAX` vout. `OutPoint`'s
-    // derived `Default` has vout `0`, which is not the null outpoint.
-    tx.inputs.len() == 1 && tx.inputs[0].previous_output == OutPoint::new(Txid::default(), u32::MAX)
+    tx.inputs.len() == 1 && tx.inputs[0].previous_output.is_null()
 }
 
 fn script_desc(script: &[u8], network: Network) -> String {
@@ -192,14 +190,14 @@ fn script_desc(script: &[u8], network: Network) -> String {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
-    use bitcoin_rs_primitives::{Hash256, OutPoint};
+    use bitcoin_rs_primitives::Hash256;
     use core::str::FromStr as _;
 
     use sonic_rs::JsonValueTrait;
 
     /// Core's null outpoint: zero txid, `u32::MAX` vout.
     fn null_outpoint() -> OutPoint {
-        OutPoint::new(Txid::default(), u32::MAX)
+        OutPoint::null()
     }
 
     fn sample_tx() -> Tx {

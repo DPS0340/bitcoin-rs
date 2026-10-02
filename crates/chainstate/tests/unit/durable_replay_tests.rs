@@ -5,7 +5,7 @@ use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::{BlockTree, current_unix_seconds};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
-    Sequence, Tx, TxIn, TxOut, Txid, Witness, consensus_bytes,
+    Sequence, Tx, TxIn, TxOut, Witness, consensus_bytes,
 };
 use bitcoin_rs_storage::block_body::BlockBodyStore;
 use bitcoin_rs_storage::{
@@ -47,7 +47,7 @@ fn restored_chainstate() -> Result<(Chainstate, Block), Box<dyn std::error::Erro
     let tx = Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(vec![1, 1, 0]),
             sequence: Sequence::from_consensus(u32::MAX),
             witness: Witness::new(),
@@ -377,7 +377,7 @@ fn mined_child(
     let tx = Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             // `push_int` is the encoding `check_bip34` requires as a prefix;
             // the trailing byte keeps the script_sig at its minimum size at
             // heights that encode as a single opcode.
