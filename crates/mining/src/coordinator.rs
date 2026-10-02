@@ -893,41 +893,38 @@ fn parse_long_poll_id(id: &str) -> Option<GenerationKey> {
 /// Signet challenge and flag for `network`, or `None` off signet.
 #[must_use]
 fn signet_info(network: Network) -> Option<SignetMiningInfo> {
+    /// Bitcoin Core's default signet challenge.
     const DEFAULT_SIGNET_CHALLENGE: &str = concat!(
         "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430",
         "210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
     );
+    const CHALLENGE: [u8; DEFAULT_SIGNET_CHALLENGE.len() / 2] =
+        decode_hex(DEFAULT_SIGNET_CHALLENGE);
 
-    if network != Network::Signet {
-        return None;
-    }
-    let challenge = hex_decode(DEFAULT_SIGNET_CHALLENGE)
-        .unwrap_or_else(|| panic!("Bitcoin Core's default Signet challenge is invalid hex"));
-    Some(SignetMiningInfo { challenge })
+    (network == Network::Signet).then(|| SignetMiningInfo {
+        challenge: CHALLENGE.to_vec(),
+    })
 }
 
-/// Decodes a lowercase hex string to bytes. Returns `None` on invalid input.
-fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
+/// Compile-time hex decode; invalid input fails the build.
+const fn decode_hex<const N: usize>(hex: &str) -> [u8; N] {
+    let bytes = hex.as_bytes();
+    assert!(bytes.len() == 2 * N, "hex literal must match output width");
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = (decode_nibble(bytes[2 * i]) << 4) | decode_nibble(bytes[2 * i + 1]);
+        i += 1;
     }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let mut chars = hex.as_bytes().iter();
-    while let Some(&hi) = chars.next() {
-        let &lo = chars.next()?;
-        let high = decode_nibble(hi)?;
-        let low = decode_nibble(lo)?;
-        bytes.push((high << 4) | low);
-    }
-    Some(bytes)
+    out
 }
 
-fn decode_nibble(byte: u8) -> Option<u8> {
+const fn decode_nibble(byte: u8) -> u8 {
     match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => panic!("invalid hex digit"),
     }
 }
 
