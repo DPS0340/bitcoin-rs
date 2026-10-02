@@ -852,7 +852,7 @@ impl MempoolGateway {
     /// the capacity evictions verified before insertion.
     // The public atomic API consumes its prepared request; the private path
     // borrows it so the shared retry owner can recover the Arc after a mismatch.
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn admit_transaction(&self, request: AdmissionRequest) -> Result<AdmitOutcome, AdmitError> {
         self.admit_transaction_claimed(&request, None, crate::admission::AdmissionFence::Stable)
     }
@@ -861,7 +861,6 @@ impl MempoolGateway {
     /// Evicted or refreshed retry bodies may not mutate pool or lifecycle.
     // Keep token checks, mutation, lifecycle finalization and FIFO publication
     // in one auditable write-lock interval instead of splitting the commit.
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn admit_transaction_claimed(
         &self,
         request: &AdmissionRequest,
@@ -1639,7 +1638,7 @@ pub fn reset_admission_park() {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::{
         AdmissionMode, AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeError,

@@ -617,7 +617,7 @@ mod ping_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod addnode_validation_tests {
     use super::*;
     use alloc::sync::Arc;
@@ -806,7 +806,7 @@ mod addnode_validation_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod admin_rpc_tests {
     use super::*;
     use alloc::sync::Arc;
@@ -1491,7 +1491,7 @@ mod peer_counter_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod getnodeaddresses_tests {
     use super::*;
     use alloc::sync::Arc;

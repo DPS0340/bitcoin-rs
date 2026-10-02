@@ -235,7 +235,7 @@ fn block_template(handler: &Handler) -> Response {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod pagination_tests {
     use alloc::sync::Arc;
 

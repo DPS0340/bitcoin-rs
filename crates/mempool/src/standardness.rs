@@ -548,7 +548,6 @@ fn is_standard_nulldata(script: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

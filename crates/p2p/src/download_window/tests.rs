@@ -2430,7 +2430,7 @@ fn adaptive_floor_still_convicts_true_staller_after_limit_cycle() {
 /// ADV-DRIP-1 limit-cycle scenario: EWMA seeded at 3s cadence, one fire
 /// and release, four more 3s front advances with the decay clamped at the
 /// adaptive floor. Returns `(window, stager, front_height, now, silent_peer)`.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn limit_cycle_window_state() -> (
     DownloadWindow,
     BlockStager,

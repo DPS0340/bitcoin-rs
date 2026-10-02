@@ -189,7 +189,7 @@ fn script_desc(script: &[u8], network: Network) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use bitcoin_rs_primitives::{Hash256, OutPoint};

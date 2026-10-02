@@ -1677,7 +1677,7 @@ fn decode_block(ctx: &Context, record: &BlockRecord) -> Result<(Vec<u8>, Block),
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[expect(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -3592,7 +3592,6 @@ mod tests {
     }
 }
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod getdifficulty_tests {
     use super::*;
     use alloc::sync::Arc;
@@ -3607,7 +3606,6 @@ mod getdifficulty_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod pruneblockchain_tests {
     use alloc::sync::Arc;
 
@@ -3828,7 +3826,6 @@ mod pruneblockchain_tests {
     }
 }
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod getchaintips_tests {
     use alloc::sync::Arc;
 
@@ -4417,7 +4414,6 @@ mod getchaintips_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod verifychain_tests {
     use alloc::sync::Arc;
 
@@ -4474,7 +4470,7 @@ fn compute_branchlen(
     }
 }
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[expect(clippy::unwrap_used)]
 mod chaintxstats_durability_tests {
     use alloc::sync::Arc;
 
@@ -4905,7 +4901,6 @@ mod chaintxstats_durability_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod chaintxstats_window_tests {
     use alloc::sync::Arc;
 
@@ -5442,7 +5437,6 @@ mod chaintxstats_window_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod verification_progress_wiring_tests {
     use alloc::sync::Arc;
 
@@ -5527,12 +5521,10 @@ mod verification_progress_wiring_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod float_conversion_tests {
     use super::{i64_to_f64, u64_to_f64};
 
     #[test]
-    #[allow(clippy::suboptimal_flops)]
     fn u64_to_f64_is_exact_below_two_to_the_fifty_third() {
         for value in [
             0_u64,

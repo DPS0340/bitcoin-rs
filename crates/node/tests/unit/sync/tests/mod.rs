@@ -12,7 +12,6 @@ use parking_lot::RwLock;
 
 use bitcoin_rs_chainstate::Chainstate;
 
-#[allow(clippy::arc_with_non_send_sync)]
 fn apply_handles(
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,

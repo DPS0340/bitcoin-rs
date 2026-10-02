@@ -248,7 +248,7 @@ mod mempoolminfee_pressure_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;

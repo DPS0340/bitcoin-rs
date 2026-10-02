@@ -147,7 +147,7 @@ impl ConnectionShared {
     /// POST: Every field is set from the arguments; a caller cannot obtain
     /// a half-wired value.
     /// INVARIANT: `None` for `ibd` means transaction relay is open.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         peer_table: Arc<crate::PeerTable>,
@@ -478,7 +478,7 @@ pub fn bind_listener(addr: SocketAddr) -> Result<TcpListener, ListenerError> {
 ///
 /// Returns [`ListenerError::Accept`] when the listener cannot report its
 /// local address.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn serve(
     listener: TcpListener,
     shutdown: Arc<AtomicBool>,
@@ -1280,7 +1280,7 @@ mod keepalive_tests {
 /// reconnect, and unrelated messages never read it.
 // The transaction-relay gate adds one documented parameter and one lazy
 // closure to an already-large dispatch loop.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn run_message_loop<S: std::io::Read + std::io::Write>(
     peer: &mut Peer<S>,
     peer_addr: SocketAddr,
@@ -1895,7 +1895,7 @@ mod outbound_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod relay_role_tests {
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_blockdata::Inventory;
@@ -1961,7 +1961,7 @@ mod sync_wake_tests {
 static ACCEPT_ERROR_INJECT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod session_socket_tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 
@@ -1995,7 +1995,7 @@ mod session_socket_tests {
 static WRITER_SETUP_FAIL: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod resilient_accept_tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
     use std::sync::Arc;
@@ -2040,7 +2040,7 @@ mod resilient_accept_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod inbound_admission_tests {
     use std::io::Read;
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -2099,7 +2099,7 @@ mod inbound_admission_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod writer_setup_cleanup_tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
@@ -2175,7 +2175,7 @@ mod writer_setup_cleanup_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod writer_shutdown_tests {
     use std::cell::Cell;
     use std::io;
@@ -3099,7 +3099,7 @@ mod ready_notify_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod block_forward_tests {
     use std::net::SocketAddr;
     use std::sync::Arc;

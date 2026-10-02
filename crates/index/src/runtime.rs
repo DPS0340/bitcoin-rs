@@ -406,7 +406,7 @@ pub struct DerivedIndexOpenSpec {
     /// Opens the durable store inside `dir`. Concrete backend construction
     /// stays with the node's storage composition; the runtime only calls the
     /// closure on its worker thread.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub open_store:
         Arc<dyn Fn(&Path) -> Result<OpenDerivedIndex, DerivedIndexWorkerError> + Send + Sync>,
     /// Authoritative UTXO set used to seed and resolve the compact live view.
@@ -518,7 +518,7 @@ impl crate::reconcile::ChainCursorSource for TestChainCursor {
 pub(crate) struct RecordedIndexAhead {
     /// One entry per call: `(capability, index_height, tip_height,
     /// tip_hash_be, index_hash_be, depth, unix_secs)`.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub(crate) calls: Mutex<Vec<(String, u32, u32, String, String, u32, u64)>>,
 }
 
@@ -738,5 +738,5 @@ mod query_tests;
 mod integration_tests;
 
 #[cfg(all(test, feature = "fjall"))]
-#[allow(clippy::expect_used, clippy::panic)]
+#[expect(clippy::expect_used, clippy::panic)]
 mod recovery_tests;

@@ -19,7 +19,7 @@ use bitcoin_rs_primitives::{
 
 /// Checks whole-block scalars and selected dependency indexes against wire and hash oracles.
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box<dyn Error>> {
     let mut mempool = Mempool::new(MempoolLimits {
         min_relay_fee_sat_per_kvb: 0,

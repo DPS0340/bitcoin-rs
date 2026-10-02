@@ -756,7 +756,7 @@ fn map_mining_control_error(error: MiningControlError) -> RpcError {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use alloc::sync::Arc;

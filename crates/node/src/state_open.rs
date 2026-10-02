@@ -40,8 +40,7 @@ impl NodeState {
     /// Derived-index workers are constructed dormant (`Opening`) and started
     /// by [`Self::start_index_workers`] once crash recovery has made the
     /// applied tip authoritative; `start_node` performs both steps.
-    #[allow(clippy::arc_with_non_send_sync)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn open(
         config: NodeConfig,
         mempool_observer: Option<&Arc<dyn bitcoin_rs_mempool::MempoolObserver>>,

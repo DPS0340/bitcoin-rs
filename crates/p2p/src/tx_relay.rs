@@ -377,7 +377,7 @@ pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::PeerLease;

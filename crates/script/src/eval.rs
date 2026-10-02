@@ -631,7 +631,7 @@ fn check_minimal_push(data: &[u8], op: u8) -> bool {
               families into helpers would fragment the shared op-count and \
               codeseparator state"
 )]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn dispatch(
     op: u8,
     f_exec: bool,

@@ -48,7 +48,7 @@ const MEMPOOL_TX_FEE_SATS: u64 = 10_000;
 const WITNESS_RESERVED: [u8; 32] = [0_u8; 32];
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn template_mines_to_tip_and_drains_mempool() -> Result<()> {
     let (state, _guard) = open_regtest()?;
     apply_genesis(&state)?;
@@ -551,7 +551,7 @@ fn assemble_regtest_block(prev: Hash256, height: u32, txs: Vec<Tx>) -> Result<Bl
 }
 /// Admits `tx` through the run-composed shared gateway exactly like
 /// `sendrawtransaction` does: full policy admission over the provisional
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 fn admit_to_mempool(state: &NodeState, tx: &Tx) -> Result<()> {
     let utxo = state.chainstate().utxo_reader();
     let applied_tip = state.chainstate().applied_tip_reader();

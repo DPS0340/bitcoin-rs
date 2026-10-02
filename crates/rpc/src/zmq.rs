@@ -881,7 +881,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::as_conversions)]
+#[expect(clippy::expect_used, clippy::as_conversions)]
 mod manifest_tests {
     use super::*;
 
@@ -1118,7 +1118,6 @@ mod manifest_tests {
     #[test]
     // Allow: end-to-end fan-out coverage in one readable sequence; splitting
     // would scatter the arrange-act-assert across helpers with no reuse.
-    #[allow(clippy::too_many_lines)]
     fn composite_observer_fans_out_to_sequence_then_mining_wake() {
         use bitcoin_rs_mempool::{
             AdmissionOrigin, CompositeObserver, Mempool, MempoolGateway, MempoolLimits,

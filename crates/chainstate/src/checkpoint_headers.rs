@@ -53,7 +53,6 @@ pub(crate) struct RestoredHeaders {
     pub(crate) applied_tip_id: NodeId,
 }
 
-#[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum HeaderCheckpointError {
     #[error("configured genesis {configured} does not match {network:?} genesis {expected}")]

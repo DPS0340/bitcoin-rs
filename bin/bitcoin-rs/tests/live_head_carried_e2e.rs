@@ -166,7 +166,7 @@ fn announced_live_head_applies_and_continues() -> Result<(), Error> {
 /// staged body in place once the ancestors land. The staged h4 body keeps no
 /// height of its own; the tree places it once its header lands, so the node
 /// must never re-request h4 and must apply it.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[test]
 fn missing_parent_delivery_recovers_via_getheaders() -> Result<(), Error> {
     let mut node = ProcessNode::spawn(Kind::BitcoinRs)?;

@@ -161,6 +161,6 @@ impl TxIngressConsumer {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[expect(clippy::expect_used, clippy::unwrap_used)]
 #[path = "../tests/unit/tx_ingress/tests.rs"]
 mod tests;

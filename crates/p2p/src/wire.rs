@@ -173,7 +173,7 @@ impl Message {
             Self::SendAddrV2 => "sendaddrv2",
             Self::Unknown { command, .. } => return command.clone(),
         };
-        #[allow(clippy::expect_used)]
+        #[expect(clippy::expect_used)]
         CommandString::try_from_static(name).expect("static P2P command")
     }
 

@@ -32,7 +32,7 @@ impl DerivedIndexWorker {
     /// abandonment. The `shutdown` signal is checked immediately after
     /// backend open returns. `reporter` receives the index-ahead rollback
     /// evidence the worker detects against the restored tip.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn spawn_with_open(
         runtime: Arc<DerivedIndexRuntime>,
         spec: DerivedIndexOpenSpec,
@@ -59,7 +59,6 @@ impl DerivedIndexWorker {
         let join_handle = thread::Builder::new()
             .name("bitcoin-rs-txindex".to_owned())
             .spawn(move || {
-                #[allow(clippy::needless_borrow)]
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_worker_with_open(
                         &runtime_for_thread,

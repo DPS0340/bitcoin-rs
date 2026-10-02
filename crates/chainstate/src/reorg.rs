@@ -28,7 +28,6 @@ pub trait ReorgObserver {
 
 /// Invalidates `hash` and its descendants, then moves applied chainstate to the
 /// best remaining valid tip.
-#[allow(clippy::too_many_lines)]
 pub fn invalidate_block<O, S>(
     handles: &Chainstate,
     observer: &mut O,
@@ -510,7 +509,6 @@ where
 }
 
 /// Switches the applied chain to `target`.
-#[allow(clippy::too_many_lines)]
 pub fn switch_to_branch<F, O, S>(
     handles: &Chainstate,
     target: NodeId,

@@ -2483,7 +2483,6 @@ pub(crate) fn connect_peer(
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn service_and_range_gate_both_request_paths() -> Result<(), Box<dyn std::error::Error>> {
     use super::frontier::{BodyState, ChainFrontier, RequiredBody, SyncFrontier, UsablePeer};
 

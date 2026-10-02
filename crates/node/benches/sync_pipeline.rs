@@ -1227,7 +1227,6 @@ fn install_synthetic_peers(
     outbound_rxs
 }
 
-#[allow(clippy::arc_with_non_send_sync)]
 fn apply_handles(
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
