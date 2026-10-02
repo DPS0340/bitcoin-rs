@@ -269,13 +269,6 @@ impl UtxoSetView<'_> {
 }
 
 impl UtxoSet {
-    /// Byte-level memory report over a stable view (measurement only).
-    #[must_use]
-    pub fn memory_report(&self) -> UtxoMemoryReport {
-        #[expect(clippy::redundant_closure_for_method_calls, reason = "HRTB lifetime")]
-        self.with_stable_view(|view| view.memory_report())
-    }
-
     /// Creates an empty UTXO set.
     #[must_use]
     pub fn new() -> Self {
@@ -985,7 +978,7 @@ mod tests {
         }
         set.commit_block(&changes, &Hash256::from_le_bytes(&[0x22; 32]))?;
 
-        let report = set.memory_report();
+        let report = set.lock_stable_view().memory_report();
         assert_eq!(report.records, 1);
         assert_eq!(report.outputs, 3);
         assert!(report.record_payload_bytes > 0);
