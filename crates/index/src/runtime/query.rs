@@ -204,6 +204,18 @@ pub(crate) struct CapabilityFloors {
     pub(crate) script_history: u32,
 }
 
+impl CapabilityFloors {
+    /// Assigns `floor` to `capability`'s slot. `ScriptLive` has no coverage
+    /// floor — it reseeds from the UTXO view — so it stores nothing.
+    pub(crate) fn set(&mut self, capability: IndexCapability, floor: u32) {
+        match capability {
+            IndexCapability::TxLookup => self.tx_lookup = floor,
+            IndexCapability::ScriptHistory => self.script_history = floor,
+            IndexCapability::ScriptLive => {}
+        }
+    }
+}
+
 /// Node-owned, snapshot-gated transaction-index query engine.
 ///
 /// Implements `crate::query_api::DerivedIndexQuery` and [`ScriptIndexQuery`] as the
@@ -331,11 +343,7 @@ impl DerivedIndexQueryEngine {
             let floor = snapshot
                 .capability_floor(capability)
                 .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-            match capability {
-                IndexCapability::TxLookup => floors.tx_lookup = floor,
-                IndexCapability::ScriptHistory => floors.script_history = floor,
-                IndexCapability::ScriptLive => {}
-            }
+            floors.set(capability, floor);
         }
 
         for capability in IndexCapability::ALL {
