@@ -17,7 +17,7 @@ pub mod config;
 /// service graph the daemon wires.
 pub mod embed;
 /// Central synchronous event loop.
-pub mod event_loop;
+mod event_loop;
 /// The node option table and the source-layer types generated from it.
 pub mod options;
 
