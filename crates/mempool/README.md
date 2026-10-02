@@ -7,11 +7,15 @@ and the history-based fee-rate estimator.
 `Mempool` owns the entry arena plus the txid, funding (keyed by `ScriptHash`, the
 double-SHA256 of a script), spending, and fee-priority indexes; every accepted
 transaction becomes a `MempoolEntry` addressed by its slab-index `EntryId`.
-`insert_entry` enforces the `MempoolLimits` (including min-relay fee) and reports
-violations as `PolicyError` or `MempoolError`; `enforce_size_limit` delegates to
+Production admission runs through `MempoolGateway`'s capture/commit doors
+(`submit_transaction`, `capture_admission`), which enforce the `MempoolLimits`
+(including min-relay fee) and report violations as `PolicyError` or
+`MempoolError`; `enforce_size_limit` delegates to
 `evict_lowest_fee_packages` over the same dependency-closed chunks that mining and replacement consume;
-`prioritise` adjusts an entry's effective fee, and `evict_below_fee_rate` /
-`remove_for_block` handle removal. `MempoolStats` supplies the aggregate counters
+`prioritise` adjusts an entry's effective fee, and `remove_for_block` /
+`remove_for_reorg` handle chain-driven removal. The trusted-facts doors
+`insert_entry`, `clear`, and `evict_below_fee_rate` remain as `test-seam`
+fixture surfaces only. `MempoolStats` supplies the aggregate counters
 behind `getmempoolinfo` and Esplora fee estimates. The `rbf` module plans
 replacements as a `ReplacementCandidate` and `ReplacementPlan`, and `standardness`
 holds the relay policy. For the transaction lifecycle ownership boundary, see
