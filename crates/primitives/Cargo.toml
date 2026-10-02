@@ -21,4 +21,3 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
-bitcoin.workspace = true
