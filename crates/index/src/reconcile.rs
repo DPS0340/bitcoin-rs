@@ -63,7 +63,7 @@ pub(crate) fn rollback_depth(
 /// applied tip. Forward is the resting leg: a watermark that names the
 /// applied tip is ready; one below it is catching up.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ReconcileLeg {
+pub(crate) enum ReconcileLeg {
     /// Rows extend the active chain from the durable watermark.
     #[default]
     Forward,
@@ -81,7 +81,7 @@ pub enum ReconcileLeg {
 
 /// Reconciliation legs of every capability the worker owns.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ReconcilePhase([ReconcileLeg; 3]);
+pub(crate) struct ReconcilePhase([ReconcileLeg; 3]);
 
 impl ReconcilePhase {
     /// Every capability moving forward.
@@ -92,7 +92,7 @@ impl ReconcilePhase {
     ///
     /// INVARIANT: `legs[capability.index()]` is that capability's leg.
     #[must_use]
-    pub fn with_leg(mut self, capabilities: IndexCapabilities, leg: ReconcileLeg) -> Self {
+    pub(crate) fn with_leg(mut self, capabilities: IndexCapabilities, leg: ReconcileLeg) -> Self {
         for capability in capabilities.iter() {
             self.0[capability.index()] = leg;
         }
@@ -101,7 +101,7 @@ impl ReconcilePhase {
 
     /// Capabilities whose rows are rebuilding from genesis.
     #[must_use]
-    pub fn rebuilding(self) -> IndexCapabilities {
+    pub(crate) fn rebuilding(self) -> IndexCapabilities {
         IndexCapability::ALL
             .into_iter()
             .filter(|&capability| matches!(self.0[capability.index()], ReconcileLeg::Rebuilding))
