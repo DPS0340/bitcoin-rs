@@ -40,12 +40,6 @@ pub(crate) struct CachedState {
 }
 
 impl Bip9Cache {
-    /// Builds an empty cache.
-    #[must_use]
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Inserts or updates the cached state for `(node_id, deployment_id)`.
     pub(crate) fn insert(&self, node_id: NodeId, deployment_id: u32, state: CachedState) {
         self.entries.write().insert((node_id, deployment_id), state);

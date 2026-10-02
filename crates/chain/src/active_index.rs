@@ -31,10 +31,6 @@ impl ActiveHeightIndex {
         self.entries.last().copied()
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     pub(super) fn contains_at_height(&self, height: u32, id: NodeId) -> bool {
         self.get(height) == Some(id)
     }
@@ -59,7 +55,7 @@ impl ActiveHeightIndex {
     ) -> bool {
         if self.is_trusted()
             && self.last() == Some(parent)
-            && u32::try_from(self.len()).ok() == Some(tip_height)
+            && u32::try_from(self.entries.len()).ok() == Some(tip_height)
         {
             self.entries.push(tip);
             true

@@ -36,7 +36,7 @@ impl BlockTree {
             by_hash: HashTable::new(),
             active_by_height: ActiveHeightIndex::new(),
             tip: Arc::new(ArcSwapOption::empty()),
-            bip9_cache: Bip9Cache::new(),
+            bip9_cache: Bip9Cache::default(),
         }
     }
 
