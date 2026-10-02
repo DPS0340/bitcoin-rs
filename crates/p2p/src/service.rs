@@ -635,11 +635,7 @@ impl P2pService {
     pub fn test_install_outbound_worker(&self, handle: JoinHandle<()>) {
         self.workers
             .lock()
-            .get_or_insert_with(|| Workers {
-                listeners: Vec::new(),
-                outbound: None,
-                bootstrap: None,
-            })
+            .get_or_insert_with(Workers::default)
             .outbound = Some(handle);
     }
 
@@ -650,11 +646,7 @@ impl P2pService {
     pub fn test_install_bootstrap_worker(&self, handle: JoinHandle<()>) {
         self.workers
             .lock()
-            .get_or_insert_with(|| Workers {
-                listeners: Vec::new(),
-                outbound: None,
-                bootstrap: None,
-            })
+            .get_or_insert_with(Workers::default)
             .bootstrap = Some(handle);
     }
 
