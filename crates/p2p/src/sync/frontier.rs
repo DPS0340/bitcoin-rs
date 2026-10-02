@@ -162,6 +162,20 @@ pub(crate) struct SyncFrontier {
     pub usable_peers: Vec<UsablePeer>,
 }
 
+impl SyncFrontier {
+    /// `(applied, header)` heights; the header height falls back to applied
+    /// when no chain tip is known.
+    pub(crate) fn heights(&self) -> (u32, u32) {
+        let applied = self.chain.applied_tip.as_ref().map_or(0, |tip| tip.height);
+        let header = self
+            .chain
+            .chain_tip
+            .as_ref()
+            .map_or(applied, |tip| tip.height);
+        (applied, header)
+    }
+}
+
 /// What the header side of the scheduler does this tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HeaderAction {

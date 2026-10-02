@@ -31,13 +31,13 @@ pub struct PeerSession {
     /// Handshake metadata, `None` while the handshake is still in progress.
     pub info: Option<PeerInfo>,
     /// Header tips this connection has delivered and the node accepted.
-    pub demonstrated_tips: Vec<Hash256>,
+    pub(crate) demonstrated_tips: Vec<Hash256>,
     /// Headers tip this connection demonstrated by ending a download-twice
     /// sync with nothing past it — the cap header selection reads. `None`
     /// until a presync proves a ceiling; body eligibility keeps reading
     /// [`PeerInfo::best_known_height`], the P2P-03 credit this does not
     /// disturb.
-    pub headers_horizon: Option<u32>,
+    pub(crate) headers_horizon: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -46,6 +46,27 @@ struct Entry {
     info: Option<PeerInfo>,
     demonstrated_tips: Vec<Hash256>,
     headers_horizon: Option<u32>,
+}
+
+impl Entry {
+    fn fresh(lease: PeerLease) -> Self {
+        Self {
+            lease,
+            info: None,
+            demonstrated_tips: Vec::new(),
+            headers_horizon: None,
+        }
+    }
+
+    fn session(&self, addr: SocketAddr) -> PeerSession {
+        PeerSession {
+            addr,
+            lease: self.lease.clone(),
+            info: self.info.clone(),
+            demonstrated_tips: self.demonstrated_tips.clone(),
+            headers_horizon: self.headers_horizon,
+        }
+    }
 }
 
 /// The table's live entries plus the traffic accounting it retains of
@@ -110,15 +131,7 @@ impl PeerTable {
         match entries.get(&addr) {
             Some(current) if current.lease.same_connection(&lease) => false,
             Some(_) => {
-                let prior = entries.insert(
-                    addr,
-                    Entry {
-                        lease,
-                        info: None,
-                        demonstrated_tips: Vec::new(),
-                        headers_horizon: None,
-                    },
-                );
+                let prior = entries.insert(addr, Entry::fresh(lease));
                 if let Some(prior) = prior {
                     prior.lease.cancel();
                     Self::retain_traffic(&mut entries, &prior);
@@ -126,15 +139,7 @@ impl PeerTable {
                 true
             }
             None => {
-                entries.insert(
-                    addr,
-                    Entry {
-                        lease,
-                        info: None,
-                        demonstrated_tips: Vec::new(),
-                        headers_horizon: None,
-                    },
-                );
+                entries.insert(addr, Entry::fresh(lease));
                 false
             }
         }
@@ -201,15 +206,7 @@ impl PeerTable {
         if grows_count && Self::live_inbound_count_of(&entries) >= max_inbound {
             return None;
         }
-        let prior = entries.insert(
-            addr,
-            Entry {
-                lease: lease.clone(),
-                info: None,
-                demonstrated_tips: Vec::new(),
-                headers_horizon: None,
-            },
-        );
+        let prior = entries.insert(addr, Entry::fresh(lease.clone()));
         if let Some(prior) = prior {
             prior.lease.cancel();
             Self::retain_traffic(&mut entries, &prior);
@@ -620,13 +617,7 @@ impl PeerTable {
         let entries = self.entries.read();
         let mut sessions: Vec<PeerSession> = entries
             .iter()
-            .map(|(addr, entry)| PeerSession {
-                addr: *addr,
-                lease: entry.lease.clone(),
-                info: entry.info.clone(),
-                demonstrated_tips: entry.demonstrated_tips.clone(),
-                headers_horizon: entry.headers_horizon,
-            })
+            .map(|(addr, entry)| entry.session(*addr))
             .collect();
         sessions.sort_unstable_by_key(|session| session.lease.connection_id().get());
         sessions
@@ -642,13 +633,7 @@ impl PeerTable {
         let mut sessions: Vec<PeerSession> = entries
             .iter()
             .filter(|(_, entry)| !entry.lease.is_cancelled() && entry.info.is_some())
-            .map(|(addr, entry)| PeerSession {
-                addr: *addr,
-                lease: entry.lease.clone(),
-                info: entry.info.clone(),
-                demonstrated_tips: entry.demonstrated_tips.clone(),
-                headers_horizon: entry.headers_horizon,
-            })
+            .map(|(addr, entry)| entry.session(*addr))
             .collect();
         sessions.sort_unstable_by_key(|session| session.lease.connection_id().get());
         sessions

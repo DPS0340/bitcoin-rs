@@ -68,7 +68,7 @@ impl SyncBudget {
 
 /// A batch of block requests prepared for a single peer.
 #[derive(Clone, Debug)]
-pub struct PeerRequest {
+pub(crate) struct PeerRequest {
     owner: PeerSource,
     entries: Vec<PeerRequestEntry>,
     next_request_height: u32,
@@ -76,23 +76,18 @@ pub struct PeerRequest {
 
 impl PeerRequest {
     /// Returns the exact connection this request is directed to.
-    pub fn owner(&self) -> PeerSource {
+    pub(crate) fn owner(&self) -> PeerSource {
         self.owner
     }
 
     /// Iterates over the `(height, hash)` pairs in this request.
-    pub fn entries(&self) -> impl Iterator<Item = (u32, Hash256)> + '_ {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (u32, Hash256)> + '_ {
         self.entries.iter().map(|entry| (entry.height, entry.hash))
     }
 
     /// Returns the number of block entries in this request.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    /// Returns `true` if the request contains no block entries.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -234,7 +229,7 @@ enum ColdFrontState {
 /// INVARIANT: a frontier without a next-expected block has `None` height
 ///      and `None` hash; only the pending timeout still runs there.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockedContext {
+pub(crate) struct BlockedContext {
     /// The next height apply expects, or `None` at the chain tip.
     pub next_apply_height: Option<u32>,
     /// The hash of that next-expected body, or `None` at the chain tip.
@@ -245,7 +240,7 @@ pub struct BlockedContext {
 
 /// Why the unified blockage observation convicted an owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BlameReason {
+pub(crate) enum BlameReason {
     /// The window-blocked stall predicate fired on this owner.
     Staller,
     /// This owner's pending block passed its timeout twice.
@@ -263,7 +258,7 @@ pub enum BlameReason {
 ///      every observation keys on the exact [`PeerSource`]; only the
 ///      apply-side bound can produce [`BlockedDecision::EvictStaged`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BlockedDecision {
+pub(crate) enum BlockedDecision {
     /// Disconnect `owner`: it is stalling the window or missed its
     /// request timeout.
     Blame {
@@ -339,7 +334,7 @@ fn count_stall_episode_cleared(reason: &'static str) {
 /// Block download window: tracks pending and in-flight block requests with
 /// stall detection, cold-front hedging, and fan-out policy.
 #[derive(Debug)]
-pub struct DownloadWindow {
+pub(crate) struct DownloadWindow {
     budget: SyncBudget,
     pending: HashMap<Hash256, PendingBlock>,
     pending_bytes: usize,
@@ -435,7 +430,7 @@ pub struct DownloadWindow {
 
 impl DownloadWindow {
     /// Creates a new download window with the given budget.
-    pub fn new(budget: SyncBudget) -> Self {
+    pub(crate) fn new(budget: SyncBudget) -> Self {
         Self {
             budget,
             pending: HashMap::with_capacity(budget.max_pending_blocks),
@@ -516,7 +511,7 @@ impl DownloadWindow {
     }
 
     /// Whether requests use a distributed cap or the one-peer deep fallback.
-    pub const fn fanout_active(&self) -> bool {
+    pub(crate) const fn fanout_active(&self) -> bool {
         self.fanout_engaged
     }
 
@@ -545,12 +540,12 @@ impl DownloadWindow {
     /// Used as the horizon cap when the apply-side cache is repopulated on a
     /// miss: at most this many blocks can be in flight (and therefore stage)
     /// before the cache's validity keys change and force a refresh.
-    pub const fn max_pending_blocks(&self) -> usize {
+    pub(crate) const fn max_pending_blocks(&self) -> usize {
         self.budget.max_pending_blocks
     }
 
     /// Returns the total estimated bytes of pending blocks.
-    pub const fn pending_bytes(&self) -> usize {
+    pub(crate) const fn pending_bytes(&self) -> usize {
         self.pending_bytes
     }
 
@@ -1104,7 +1099,7 @@ impl DownloadWindow {
     }
 
     /// Exposes the pending high-water marks for the metrics gauges.
-    pub const fn pending_high_water(&self) -> (usize, usize) {
+    pub(crate) const fn pending_high_water(&self) -> (usize, usize) {
         (
             self.pending_blocks_high_water,
             self.pending_bytes_high_water,
@@ -1308,12 +1303,12 @@ impl DownloadWindow {
     }
 
     /// Preferred deep-window peer after winning a cold-front race.
-    pub const fn preferred_peer(&self) -> Option<PeerSource> {
+    pub(crate) const fn preferred_peer(&self) -> Option<PeerSource> {
         self.preferred_peer
     }
 
     /// Number of eligible peers that activates striped fanout.
-    pub const fn min_peers_for_fanout(&self) -> usize {
+    pub(crate) const fn min_peers_for_fanout(&self) -> usize {
         self.budget.min_peers_for_fanout
     }
 
@@ -1402,7 +1397,8 @@ impl DownloadWindow {
     }
 
     /// Current adaptive stalling threshold (2s doubling to 64s).
-    pub const fn stall_timeout(&self) -> Duration {
+    #[cfg(test)]
+    pub(crate) const fn stall_timeout(&self) -> Duration {
         self.stall_timeout
     }
 
@@ -2238,7 +2234,8 @@ impl DownloadWindow {
     }
 
     /// Current inter-front-advance EWMA in milliseconds, if seeded.
-    pub const fn front_interval_ewma_ms(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) const fn front_interval_ewma_ms(&self) -> Option<u64> {
         self.front_interval_ewma_ms
     }
 
@@ -2248,7 +2245,8 @@ impl DownloadWindow {
     /// (the recorded wedge constructions) use this instead of replaying two
     /// real front deliveries; the real sampling path is pinned by the window
     /// tests.
-    pub const fn seed_front_cadence_for_test(&mut self, ewma_ms: u64, now: Instant) {
+    #[cfg(test)]
+    pub(crate) const fn seed_front_cadence_for_test(&mut self, ewma_ms: u64, now: Instant) {
         self.front_interval_ewma_ms = Some(ewma_ms);
         self.last_front_advance = Some(now);
     }
@@ -2371,7 +2369,7 @@ impl DownloadWindow {
     /// into a re-request sweep of heights already applied.
     /// `false` when capacity refused the mark: the caller keeps the deferred
     /// ownership record so a fast delivery still counts as requested.
-    pub fn mark_owned_fetch(
+    pub(crate) fn mark_owned_fetch(
         &mut self,
         stager: &mut BlockStager,
         owner: PeerSource,
@@ -2463,7 +2461,7 @@ impl DownloadWindow {
 /// becomes re-requestable; an unsolicited malformed body from a different peer
 /// is discarded without disturbing the in-flight request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RejectDelivery {
+pub(crate) enum RejectDelivery {
     /// The pending owner delivered the malformed body. Its pending request was
     /// released so the block can be re-requested from a different peer. Any
     /// matching timeout observation and cold-front race participation are
