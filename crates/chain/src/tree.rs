@@ -221,24 +221,19 @@ impl BlockTree {
     /// Order is iteration order of the underlying slab.
     #[must_use]
     pub fn leaf_node_ids(&self) -> Vec<NodeId> {
-        let mut parents: hashbrown::HashSet<u32> = hashbrown::HashSet::new();
+        let mut parents: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
         for (_index, node) in &self.nodes {
-            if let Some(parent_id) = node.parent
-                && let Some(parent_index) = parent_id.index()
-            {
-                // NodeId stores a u32; track parent indices to skip them later.
-                if let Ok(idx_u32) = u32::try_from(parent_index) {
-                    parents.insert(idx_u32);
-                }
+            if let Some(parent_index) = node.parent.and_then(NodeId::index) {
+                parents.insert(parent_index);
             }
         }
 
         let mut leaves = Vec::new();
         for (index, _node) in &self.nodes {
-            if let Ok(idx_u32) = u32::try_from(index)
-                && !parents.contains(&idx_u32)
+            if !parents.contains(&index)
+                && let Ok(id_u32) = u32::try_from(index)
             {
-                leaves.push(NodeId::new(idx_u32));
+                leaves.push(NodeId::new(id_u32));
             }
         }
         leaves
@@ -483,29 +478,6 @@ impl BlockTree {
             return Some(0);
         }
 
-        if window == 11 {
-            let mut times = [0_u32; 11];
-            let mut len = 0;
-            let mut cursor = start_id;
-            while len < times.len() {
-                let Ok(node) = self.node(cursor) else {
-                    if len == 0 {
-                        return None;
-                    }
-                    break;
-                };
-                times[len] = node.header.time;
-                len += 1;
-                let Some(parent) = node.parent else {
-                    break;
-                };
-                cursor = parent;
-            }
-
-            times[..len].sort_unstable();
-            return Some(times[len / 2]);
-        }
-
         let mut times = Vec::with_capacity(window);
         let mut cursor = start_id;
         while times.len() < window {
@@ -522,9 +494,6 @@ impl BlockTree {
             cursor = parent;
         }
 
-        if times.is_empty() {
-            return None;
-        }
         times.sort_unstable();
         Some(times[times.len() / 2])
     }
@@ -579,7 +548,7 @@ impl BlockTree {
             return Err(ChainError::DuplicateHeader { hash });
         }
 
-        let block_work = crate::header_sync::pow::work_from_header(&header);
+        let block_work = crate::block_work(&header);
         let (height, chainwork, status) = match parent {
             Some(parent_id) => {
                 let parent_node = self.node(parent_id)?;

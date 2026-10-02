@@ -88,24 +88,13 @@ pub fn signalling_deployments(
     previous_tip_id: NodeId,
     height: u32,
 ) -> Vec<SignallingDeployment> {
-    let ctx = DeploymentView::new(tree, previous_tip_id);
-    NAMED_DEPLOYMENTS
-        .into_iter()
-        .filter_map(|(name, deployment_id)| {
-            let params = deployment_params(network, deployment_id)?;
-            let state =
-                cached_deployment_state(tree, &ctx, previous_tip_id, height, deployment_id, params);
-            match state {
-                DeploymentState::Started | DeploymentState::LockedIn => {
-                    Some(SignallingDeployment {
-                        name,
-                        bit: params.bit,
-                    })
-                }
-                DeploymentState::Defined | DeploymentState::Active | DeploymentState::Failed => {
-                    None
-                }
-            }
+    deployment_states(tree, network, previous_tip_id, height)
+        .filter_map(|(name, params, state)| match state {
+            DeploymentState::Started | DeploymentState::LockedIn => Some(SignallingDeployment {
+                name,
+                bit: params.bit,
+            }),
+            DeploymentState::Defined | DeploymentState::Active | DeploymentState::Failed => None,
         })
         .collect()
 }
@@ -118,14 +107,29 @@ pub fn candidate_version(
     previous_tip_id: NodeId,
     height: u32,
 ) -> i32 {
+    versionbits_block_version(
+        deployment_states(tree, network, previous_tip_id, height)
+            .map(|(_, params, state)| (params.bit, state)),
+    )
+}
+
+/// Resolves each named deployment's parameters and BIP9 state at `height`,
+/// reading through the tree's cache.
+fn deployment_states(
+    tree: &BlockTree,
+    network: Network,
+    previous_tip_id: NodeId,
+    height: u32,
+) -> impl Iterator<Item = (&'static str, DeploymentParams, DeploymentState)> + '_ {
     let ctx = DeploymentView::new(tree, previous_tip_id);
-    versionbits_block_version(NAMED_DEPLOYMENTS.iter().filter_map(|&(_, deployment_id)| {
-        deployment_params(network, deployment_id).map(|params| {
+    NAMED_DEPLOYMENTS
+        .into_iter()
+        .filter_map(move |(name, deployment_id)| {
+            let params = deployment_params(network, deployment_id)?;
             let state =
                 cached_deployment_state(tree, &ctx, previous_tip_id, height, deployment_id, params);
-            (params.bit, state)
+            Some((name, params, state))
         })
-    }))
 }
 
 /// Returns whether the BIP30 duplicate-txid scan is required at `height`.
