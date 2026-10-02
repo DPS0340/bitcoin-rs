@@ -70,10 +70,9 @@ struct CompactPeer {
 }
 
 impl CompactPeer {
-    /// Handshakes at v70016 and, when `cmpct_version` is given, negotiates
-    /// BIP152 with that recorded version so the node will serve compact
-    /// requests at it.
-    fn connect(node: &ProcessNode, name: &str, cmpct_version: Option<u64>) -> Result<Self, Error> {
+    /// Handshakes at v70016 and negotiates BIP152 at `cmpct_version` so the
+    /// node will serve compact requests at it.
+    fn connect(node: &ProcessNode, name: &str, cmpct_version: u64) -> Result<Self, Error> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let stream = connect_loopback(node.p2p_addr, deadline)?;
         stream.set_nodelay(true)?;
@@ -120,15 +119,13 @@ impl CompactPeer {
                     peer.send(NetworkMessage::Verack, deadline)?;
                 }
                 NetworkMessage::Verack if saw_version => {
-                    if let Some(v) = cmpct_version {
-                        peer.send(
-                            NetworkMessage::SendCmpct(SendCmpct {
-                                send_compact: false,
-                                version: v,
-                            }),
-                            deadline,
-                        )?;
-                    }
+                    peer.send(
+                        NetworkMessage::SendCmpct(SendCmpct {
+                            send_compact: false,
+                            version: cmpct_version,
+                        }),
+                        deadline,
+                    )?;
                     return Ok(peer);
                 }
                 NetworkMessage::Ping(nonce) => peer.send(NetworkMessage::Pong(nonce), deadline)?,
@@ -264,7 +261,7 @@ fn block_at_depth(chain: &[Block], tip_height: u32, depth: u32) -> &Block {
 
 fn synced_peer(name: &str) -> Result<(ProcessNode, CompactPeer, Vec<Block>), Error> {
     let mut node = ProcessNode::spawn(Kind::BitcoinRs)?;
-    let mut peer = CompactPeer::connect(&node, name, Some(2))?;
+    let mut peer = CompactPeer::connect(&node, name, 2)?;
     if !wait_for(Duration::from_secs(10), &mut || {
         node.rpc("getconnectioncount", &json!([]))
             .ok()
