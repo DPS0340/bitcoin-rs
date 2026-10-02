@@ -1631,7 +1631,7 @@ fn collect_write_burst(
 /// Releases the outbound budget for each successfully written frame.
 ///
 /// PRE: `sizes` holds the full wire length of each written frame, as
-/// `write_ready_burst` returned it.
+/// `write_frames` returned it.
 /// POST: The budget releases exactly those byte counts.
 /// INVARIANT: This function counts no bytes; the counted stream owns byte
 /// accounting.
