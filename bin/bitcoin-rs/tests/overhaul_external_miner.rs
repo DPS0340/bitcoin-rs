@@ -8,7 +8,7 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin_rs_e2e::helpers::{
     COINBASE_MATURITY, assemble_block_from_template, mature_funding, op_true_script, spend_anyone,
 };
-use bitcoin_rs_e2e::{Kind, ProcessNode};
+use bitcoin_rs_e2e::{Kind, ProcessNode, ValueExt};
 use serde_json::{Value, json};
 
 const FEE_SATS: u64 = 10_000;
@@ -35,7 +35,7 @@ fn external_miner_assembles_template_and_submits_block() -> TestResult {
 
     let template = node.rpc("getblocktemplate", &json!([{"rules": ["segwit"]}]))?;
     assert_eq!(
-        required_u64(&template, "height")?,
+        template.u64_field("height")?,
         u64::from(COINBASE_MATURITY) + 2,
         "template must extend the current tip"
     );
@@ -50,17 +50,17 @@ fn external_miner_assembles_template_and_submits_block() -> TestResult {
     );
     let entry = &template_txs[0];
     assert_eq!(
-        required_str(entry, "hash")?,
+        entry.str_field("hash")?,
         spend.compute_wtxid().to_string(),
         "rendered hash must be the spend wtxid"
     );
     assert_eq!(
-        required_u64(entry, "fee")?,
+        entry.u64_field("fee")?,
         FEE_SATS,
         "rendered fee must match the spend fee"
     );
     assert!(
-        required_u64(entry, "weight")? > 0,
+        entry.u64_field("weight")? > 0,
         "rendered weight must be positive"
     );
     let depends = entry
@@ -78,7 +78,7 @@ fn external_miner_assembles_template_and_submits_block() -> TestResult {
     );
 
     let info = node.rpc("getblockchaininfo", &json!([]))?;
-    let tip_height = required_u64(&info, "blocks")?;
+    let tip_height = info.u64_field("blocks")?;
     assert_eq!(
         tip_height,
         u64::from(COINBASE_MATURITY) + 2,
@@ -87,7 +87,7 @@ fn external_miner_assembles_template_and_submits_block() -> TestResult {
 
     let mempool = node.rpc("getmempoolinfo", &json!([]))?;
     assert_eq!(
-        required_u64(&mempool, "size")?,
+        mempool.u64_field("size")?,
         0,
         "mempool must be empty after block inclusion"
     );
@@ -95,18 +95,4 @@ fn external_miner_assembles_template_and_submits_block() -> TestResult {
     // `node` is dropped here, killing the child and cleaning up.
     let _ = node.stop();
     Ok(())
-}
-
-fn required_str<'a>(value: &'a Value, key: &str) -> TestResult<&'a str> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("template missing string {key}").into())
-}
-
-fn required_u64(value: &Value, key: &str) -> TestResult<u64> {
-    value
-        .get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("template missing u64 {key}").into())
 }
