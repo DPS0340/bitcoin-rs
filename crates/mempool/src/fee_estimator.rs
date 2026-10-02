@@ -46,12 +46,6 @@ impl FeeRate {
     pub const fn as_sat_per_kvb(self) -> u64 {
         self.0
     }
-
-    /// Returns the fee rate in sat/vB (truncated toward zero).
-    #[must_use]
-    pub const fn as_sat_per_vb(self) -> u64 {
-        self.0 / 1_000
-    }
 }
 
 /// Why a persisted estimator-history payload was not adopted.
