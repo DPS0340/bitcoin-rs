@@ -21,8 +21,8 @@ use crate::node::{Kind, ProcessNode, SpawnOptions};
 
 /// Regtest block subsidy in satoshis (50 BTC).
 pub const REGTEST_SUBSIDY_SATS: u64 = 50 * 100_000_000;
-/// Blocks until a coinbase is spendable on regtest.
-pub const COINBASE_MATURITY: u32 = 100;
+/// Blocks until a coinbase is spendable.
+pub use bitcoin::constants::COINBASE_MATURITY;
 /// Fixed regtest funding key: deterministic, unrelated to any wallet.
 const FUNDING_SECRET: [u8; 32] = [1_u8; 32];
 
