@@ -12,7 +12,7 @@ use bitcoin_rs_consensus::{
 };
 use bitcoin_rs_primitives::Network;
 
-use crate::{BlockTree, CachedState, NodeId};
+use crate::{BlockTree, NodeId};
 
 /// Read-only [`DeploymentContext`] over a [`BlockTree`] rooted at `tip_id`.
 struct DeploymentView<'a> {
@@ -194,20 +194,14 @@ fn cached_deployment_state(
     let Some(anchor_node) = tree.node_at_height_from(previous_tip_id, anchor_height) else {
         return compute_state(ctx, height, params);
     };
-    if let Some(cached) = tree.cached_bip9_state(anchor_node, deployment_id)
-        && let Some(state) = DeploymentState::from_cache_tag(cached.tag)
+    if let Some(tag) = tree.cached_bip9_state(anchor_node, deployment_id)
+        && let Some(state) = DeploymentState::from_cache_tag(tag)
     {
         return state;
     }
 
     let state = compute_state(ctx, height, params);
-    tree.cache_bip9_state(
-        anchor_node,
-        deployment_id,
-        CachedState {
-            tag: state.cache_tag(),
-        },
-    );
+    tree.cache_bip9_state(anchor_node, deployment_id, state.cache_tag());
     state
 }
 
