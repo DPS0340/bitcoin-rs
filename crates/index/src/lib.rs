@@ -24,12 +24,12 @@ pub use capabilities::{
     CapabilitySnapshot, CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource,
     TXINDEX_CAPABILITY, derived_index_status, disabled_txindex, txindex_snapshot,
 };
+pub(crate) use index::NoSpentScripts;
 pub use index::{
     BlockSource, ConsumerCursorUpdate, IndexCapabilities, IndexCapability, IndexError, IndexReader,
     IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriteFence, IndexWriter, Indexer,
-    MAX_LIVE_SCRIPT_SIZE, NoSpentScripts, PreparedBatch, PreparedBatchLimits, PreparedBlock,
-    ScriptHistoryEntry, ScriptLiveScan, SpentCoinScripts, TxIndexScan, TxIndexScanRow,
-    TxIndexSnapshot,
+    MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptHistoryEntry,
+    ScriptLiveScan, SpentCoinScripts, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
 };
 pub use query_api::{
     DerivedIndexInfo, DerivedIndexQuery, RollbackWarningSource, ScriptHistoryRecord,
