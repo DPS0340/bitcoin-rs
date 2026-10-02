@@ -87,12 +87,9 @@ impl ReplacementCandidate {
         }
     }
 
-    /// Attaches a sigop cost counted against resolved prevouts.
-    ///
-    /// Test seam: replacement fixtures set the fact admission would resolve;
-    /// production callers build the candidate through `ReplacementCandidate::new`
-    /// with the gateway-resolved cost already in place.
-    #[cfg(any(test, feature = "test-seam"))]
+    /// Attaches a sigop cost counted against resolved prevouts, as a test
+    /// fixture would set the fact admission resolves itself (see
+    /// `capture_replacement`'s invariant note).
     #[must_use]
     pub const fn with_sigop_cost(mut self, sigop_cost: u32) -> Self {
         self.sigop_cost = sigop_cost;

@@ -8,13 +8,15 @@
 //! A commit that touches exactly one shard delivers its same-transaction runs
 //! directly through [`CoinStatsListener::on_insert_coins`] and
 //! [`CoinStatsListener::on_remove_coins`]; a commit that touches two or more
-//! shards collects every shard's events and delivers them once, after all
-//! shard mutations have landed, through
-//! [`CoinStatsListener::on_committed_event_batches`].
+//! shards collects every shard's events and delivers them once after all
+//! shard attempts complete, through
+//! [`CoinStatsListener::on_committed_event_batches`]. The batch callback
+//! delivers every event for a mutation that landed, even when a shard fails,
+//! before that shard error is returned.
 //!
-//! [`CoinStatsListener::on_insert_coins`]: crate::stats::CoinStatsListener
-//! [`CoinStatsListener::on_remove_coins`]: crate::stats::CoinStatsListener
-//! [`CoinStatsListener::on_committed_event_batches`]: crate::stats::CoinStatsListener
+//! [`CoinStatsListener::on_insert_coins`]: crate::stats::CoinStatsListener::on_insert_coins
+//! [`CoinStatsListener::on_remove_coins`]: crate::stats::CoinStatsListener::on_remove_coins
+//! [`CoinStatsListener::on_committed_event_batches`]: crate::stats::CoinStatsListener::on_committed_event_batches
 //!
 //! Multi-shard batch order and chunking are not semantic. Batches arrive in
 //! shard order and each groups one shard's same-transaction runs, but they may
