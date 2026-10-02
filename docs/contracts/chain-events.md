@@ -27,7 +27,7 @@ Owners:
   disconnect. It starts at `1` on the first record of a run; `0` means no
   committed event yet this run.
 - The snapshot is a live value. It is never persisted per event.
-- Readers use `NodeState::active_chain_snapshot()`.
+- Readers use `Chainstate::chain_snapshot()` (via `NodeState::chainstate()`).
 
 ### `EVT-02`: Ordered commit and best-effort observer delivery
 
