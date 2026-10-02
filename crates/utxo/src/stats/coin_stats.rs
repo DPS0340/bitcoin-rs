@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use core::convert::Infallible;
 
 use crate::listener::{
     UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent, UtxoInserted, UtxoRemoved,
@@ -921,12 +920,6 @@ fn read_array<const N: usize>(
     out.copy_from_slice(slice);
     *cursor = end;
     Ok(out)
-}
-
-impl From<Infallible> for CoinStatsDecodeError {
-    fn from(value: Infallible) -> Self {
-        match value {}
-    }
 }
 
 #[inline]
