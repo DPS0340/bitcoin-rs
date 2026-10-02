@@ -13,7 +13,7 @@ use std::sync::Arc;
 ///
 /// The mutex itself never leaves this type. A holder of only one role cannot
 /// reach the shared cell or obtain the other role from that value.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct TransitionDomain {
     inner: Arc<Mutex<()>>,
 }
@@ -86,6 +86,8 @@ impl StableRead {
 
     /// Attempts the same exclusion without blocking, so a caller can fail fast
     /// instead of queueing behind a transition it cannot help finish.
+    /// Only exercised by test fixtures. Not present in production builds.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn try_lock(&self) -> Option<StableReadGuard<'_>> {
         self.inner
             .try_lock()

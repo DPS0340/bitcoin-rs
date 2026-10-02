@@ -12,7 +12,7 @@ use bitcoin_rs_consensus::{
 };
 use bitcoin_rs_primitives::Network;
 
-use crate::{BlockTree, CachedState, NodeId};
+use crate::{BlockTree, NodeId};
 
 /// Read-only [`DeploymentContext`] over a [`BlockTree`] rooted at `tip_id`.
 struct DeploymentView<'a> {
@@ -65,14 +65,12 @@ pub fn softfork_state(
 }
 
 /// A BIP9 deployment currently in `Started` or `LockedIn` at a candidate height.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct SignallingDeployment {
     /// BIP22 rule name (`csv`, `segwit`).
     pub name: &'static str,
     /// Header-version bit assigned to the deployment.
     pub bit: u8,
-    /// Whether the deployment is `LockedIn` (bit required on the candidate).
-    pub locked_in: bool,
 }
 
 const NAMED_DEPLOYMENTS: [(&str, u32); 2] =
@@ -98,16 +96,12 @@ pub fn signalling_deployments(
             let state =
                 cached_deployment_state(tree, &ctx, previous_tip_id, height, deployment_id, params);
             match state {
-                DeploymentState::Started => Some(SignallingDeployment {
-                    name,
-                    bit: params.bit,
-                    locked_in: false,
-                }),
-                DeploymentState::LockedIn => Some(SignallingDeployment {
-                    name,
-                    bit: params.bit,
-                    locked_in: true,
-                }),
+                DeploymentState::Started | DeploymentState::LockedIn => {
+                    Some(SignallingDeployment {
+                        name,
+                        bit: params.bit,
+                    })
+                }
                 DeploymentState::Defined | DeploymentState::Active | DeploymentState::Failed => {
                     None
                 }
@@ -200,20 +194,14 @@ fn cached_deployment_state(
     let Some(anchor_node) = tree.node_at_height_from(previous_tip_id, anchor_height) else {
         return compute_state(ctx, height, params);
     };
-    if let Some(cached) = tree.cached_bip9_state(anchor_node, deployment_id)
-        && let Some(state) = DeploymentState::from_cache_tag(cached.tag)
+    if let Some(tag) = tree.cached_bip9_state(anchor_node, deployment_id)
+        && let Some(state) = DeploymentState::from_cache_tag(tag)
     {
         return state;
     }
 
     let state = compute_state(ctx, height, params);
-    tree.cache_bip9_state(
-        anchor_node,
-        deployment_id,
-        CachedState {
-            tag: state.cache_tag(),
-        },
-    );
+    tree.cache_bip9_state(anchor_node, deployment_id, state.cache_tag());
     state
 }
 
