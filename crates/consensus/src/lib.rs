@@ -34,7 +34,7 @@ pub mod bip9;
 /// Parse-once block state shared by the native apply path.
 pub mod block_view;
 /// The one runtime validation-engine selector.
-pub mod engine;
+mod engine;
 /// Feature-gated bitcoinkernel wrapper.
 pub mod kernel;
 /// Private AVX2 SHA256d64 kernel for Merkle hashing.
