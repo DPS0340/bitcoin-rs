@@ -1,7 +1,4 @@
-use core::{
-    fmt,
-    mem::{align_of, size_of},
-};
+use core::mem::{align_of, size_of};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -51,14 +48,6 @@ impl OutPoint {
     }
 }
 
-impl fmt::Display for OutPoint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let txid = self.txid;
-        let vout = self.vout;
-        write!(f, "{txid}:{vout}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use zerocopy::IntoBytes;
@@ -79,10 +68,6 @@ mod tests {
         assert_eq!(bytes.len(), 36);
         assert_eq!(&bytes[..32], &txid);
         assert_eq!(&bytes[32..], &[0x0d, 0x0c, 0x0b, 0x0a]);
-        assert_eq!(
-            outpoint.to_string(),
-            Txid(Hash256::from_le_bytes(&txid)).to_string() + ":168496141"
-        );
     }
 
     #[test]
