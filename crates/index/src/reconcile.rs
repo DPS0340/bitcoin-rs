@@ -45,23 +45,6 @@ impl ConsumerCursor {
         bytes[20..].copy_from_slice(&self.hash.to_le_bytes());
         bytes
     }
-
-    /// Decodes the durable representation; `None` on any length mismatch.
-    ///
-    /// Cursor corruption is advisory-state corruption only. Row correctness is
-    /// anchored by capability watermarks, so consumers re-plan from row state.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != CURSOR_BYTE_LEN {
-            return None;
-        }
-        Some(Self {
-            epoch: u64::from_le_bytes(bytes[..8].try_into().ok()?),
-            sequence: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
-            height: u32::from_le_bytes(bytes[16..20].try_into().ok()?),
-            hash: Hash256::from_le_bytes(&bytes[20..].try_into().ok()?),
-        })
-    }
 }
 
 /// Canonical stale-branch depth used to choose rollback versus rebuild.
