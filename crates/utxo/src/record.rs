@@ -829,8 +829,8 @@ fn remove_part_at<'a>(
 }
 
 /// Strictly-increasing-vout test for the `add_unique` fast path, seeded with
-/// the maximum vout live before the additions (`None` when nothing is live
-/// yet or survives removal). A non-strictly-greater addition fails on `<=`.
+/// the maximum vout live before the additions; `None` means no seed was
+/// supplied. A non-strictly-greater vout fails on `<=`.
 pub(crate) fn vouts_are_strictly_increasing(
     previous: Option<u32>,
     vouts: impl IntoIterator<Item = u32>,

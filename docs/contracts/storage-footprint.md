@@ -27,7 +27,7 @@ Owners:
   are explicit categories or an unattributed residual. Root-level files live in
   `residual`.
 - The two ledgers must not be added together. The physical namespace ledger is the source
-  of the data-directory budget (`PhysicalLedger::data_directory_allocated_bytes`).
+  of the data-directory budget (`PhysicalLedger::allocated_bytes`).
 - Hard links, sparse files, and engine-reserved space require correct
   accounting. A final `du`-style snapshot is a lower bound on peak allocation
   and cannot prove the peak gate.

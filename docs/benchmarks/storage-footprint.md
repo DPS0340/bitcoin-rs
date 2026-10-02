@@ -15,7 +15,7 @@ The default-lane physical peak of a data directory during fresh replay to the pi
 | Stop identity | Pinned mainnet height and block hash, recorded before the run | `UNMEASURED` |
 | Filesystem | Isolated filesystem or project quota; conservative high-water captured by the quota, not by a `du` snapshot | fixed |
 | Lifecycle covered | Sync, compaction, restart, reorg, migration where applicable | fixed |
-| Physical high-water budget | `<= 1_000_000_000_000` decimal bytes (`PhysicalLedger::data_directory_allocated_bytes`, `FP-04`) | required |
+| Physical high-water budget | `<= 1_000_000_000_000` decimal bytes (`PhysicalLedger::allocated_bytes`, `FP-04`) | required |
 | Logical ledger | Separate per-owner serialized bytes (`FP-01`); never added to the physical ledger | fixed |
 | Baseline | T02 captures the original candidate's physical high-water on the matched workload before the T14 authority cut; T39 compares the final integrated binary against it and must not exceed it | `UNMEASURED` |
 | Verdict | pending | `planned_not_executed` |

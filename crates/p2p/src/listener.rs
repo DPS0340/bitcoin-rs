@@ -1749,7 +1749,6 @@ fn forward_tx_if_relay_open(
     }
 }
 
-/// UNIX seconds for the chain-owned initial-block-download latch.
 fn wake_sync(sync_wake_tx: Option<&Sender<()>>) {
     if let Some(tx) = sync_wake_tx {
         let _ = tx.try_send(());

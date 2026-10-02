@@ -19,7 +19,7 @@
 //! a running node.
 //!
 //! [`spawn_tx_relay_worker`] drains the queue on a dedicated thread; tests
-//! call [`drain_relay_queue`] synchronously for deterministic fixtures. Both
+//! call `drain_relay_queue` synchronously for deterministic fixtures. Both
 //! paths re-check the shared mempool at send time and announce only
 //! transactions still resident there with the queued wtxid. The gate
 //! narrows the stale-announcement window without closing it: a request is
@@ -348,7 +348,7 @@ pub(crate) fn drain_relay_queue(
 /// witness-mutated transaction is consumed with no announcement. The
 /// thread ends on `shutdown` or queue close.
 /// INVARIANT: no mempool guard is held while `sink` sends to peers. The
-/// worker applies the same send-time rule as [`drain_relay_queue`] and never
+/// worker applies the same send-time rule as `drain_relay_queue` and never
 /// retains a strong gateway reference while it waits for queue input.
 pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
     sink: S,

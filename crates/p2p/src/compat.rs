@@ -63,7 +63,7 @@ pub const CORE_UNTYPED_COMMANDS: &[&str] = &["sendtxrcncl"];
 
 /// Reports whether `name` is a typed command.
 #[must_use]
-pub fn is_typed_command(name: &str) -> bool {
+pub(crate) fn is_typed_command(name: &str) -> bool {
     COMMANDS.contains(&name)
 }
 
@@ -74,7 +74,7 @@ mod tests {
     use super::{COMMANDS, CORE_UNTYPED_COMMANDS};
 
     /// The properties the table must hold for the code that reads it:
-    /// [`super::is_typed_command`] resolves a name to one row, and every name
+    /// [`super::is_typed_command`] checks table membership, and every name
     /// is spelled
     /// as peers send it — lowercase ASCII fitting the 12-byte v1 command field
     /// the framer copies it into. A name that differs from the wire spelling
