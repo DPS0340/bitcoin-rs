@@ -17,7 +17,7 @@ use std::sync::Arc;
 fn candidate_cache_evicts_the_oldest_entry_at_the_bound() {
     use bitcoin_rs_primitives::{Amount, CompactTarget, LockTime, Script};
 
-    let mut state = CoordinatorState::new();
+    let mut state = CoordinatorState::default();
     let coinbase = Tx {
         version: 2,
         lock_time: LockTime::from_consensus(0),
@@ -117,7 +117,6 @@ fn template_for(
         Arc::new(candidate),
         submit_old,
         Vec::new(),
-        0,
     )
 }
 
@@ -170,7 +169,6 @@ fn signet_template_carries_challenge_and_mandatory_rule() {
         )),
         None,
         Vec::new(),
-        0,
     );
     assert!(
         template

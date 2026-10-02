@@ -801,7 +801,7 @@ mod addnode_validation_tests {
         assert!(result.is_null());
         assert!(lease.is_cancelled());
         assert!(ctx.network.peer_table.is_empty());
-        assert!(ctx.network.peer_table.infos().is_empty());
+        assert_eq!(ctx.network.peer_table.infos(), []);
     }
 }
 

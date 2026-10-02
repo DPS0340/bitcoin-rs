@@ -379,7 +379,7 @@ hwm = 5000
         )
         .unwrap_or_else(|error| panic!("valid toml configuration: {error}"));
 
-        let endpoints = config.zmq_endpoints();
+        let endpoints = &config.notifications.zmq;
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].endpoint, "tcp://127.0.0.1:28332");
         assert_eq!(endpoints[0].effective_hwm(), 1_000);

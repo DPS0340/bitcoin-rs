@@ -113,14 +113,6 @@ impl<T> BlockChanges<T> {
     pub fn spent_outpoints(&self) -> &[OutPoint] {
         &self.removes
     }
-
-    pub(crate) fn adds_slice(&self) -> &[UtxoAdd<T>] {
-        &self.adds
-    }
-
-    pub(crate) fn removes_slice(&self) -> &[OutPoint] {
-        &self.removes
-    }
 }
 
 /// Inverse mutations needed to disconnect one block.
@@ -170,12 +162,6 @@ impl UndoBatch {
     /// Crate-visible on purpose: see [`Self::restore`].
     pub(crate) fn remove(&mut self, outpoint: OutPoint) {
         self.removes.push(outpoint);
-    }
-
-    /// Returns true when the undo batch is empty.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.restores.is_empty() && self.removes.is_empty()
     }
 
     /// Rebuilds a batch from its decoded parts.
@@ -686,7 +672,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::snapshot::aggregate_hash;
+    use crate::snapshot::hash_serialized_3;
     use crate::stats::CoinStats;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -740,7 +726,7 @@ mod tests {
     fn observe(utxo: &UtxoSet, coin_stats: &CoinStatsListener) -> Result<State, UtxoError> {
         let s = coin_stats.snapshot();
         Ok((
-            aggregate_hash(utxo)?,
+            hash_serialized_3(utxo)?,
             s.muhash.finalize_hash(),
             [
                 s.height.into(),
@@ -1055,7 +1041,7 @@ mod tests {
             commit_block_changes(&first_five, changes, &undo_txid(height))?;
         }
 
-        assert_eq!(aggregate_hash(&full)?, aggregate_hash(&first_five)?);
+        assert_eq!(hash_serialized_3(&full)?, hash_serialized_3(&first_five)?);
         assert_eq!(full.len(), first_five.len());
 
         Ok(())

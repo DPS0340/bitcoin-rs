@@ -1817,7 +1817,7 @@ fn generate_without_submit_does_not_advance_the_tip() -> anyhow::Result<()> {
         submit: false,
     })?;
     assert_eq!(generated.len(), 1);
-    assert!(!generated[0].hex.is_empty());
+    assert_ne!(generated[0].hex, "");
     let after = state
         .chainstate()
         .applied_tip_snapshot()

@@ -8,7 +8,6 @@
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-seam"))]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::vec::Vec;
 
 use bitcoin_rs_mempool::SnapshotEntry;
 #[cfg(any(test, feature = "test-seam"))]
@@ -122,8 +121,6 @@ pub struct BlockTemplate {
     pub submit_old: Option<bool>,
     /// Signet challenge, present only on signet.
     pub signet: Option<SignetMiningInfo>,
-    /// Opaque server work identity when the producer requires one on submission.
-    pub work_id: Option<CompactString>,
 }
 
 /// BIP22 validation vocabulary shared by proposal and solved-block submission.

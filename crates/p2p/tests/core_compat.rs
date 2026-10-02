@@ -398,14 +398,12 @@ fn our_frame(message: &Message) -> Result<Vec<u8>, Box<dyn Error>> {
 fn listed_commands_type_and_core_untyped_commands_stay_unknown() -> Result<(), Box<dyn Error>> {
     let magic = Magic::REGTEST;
     for spec in COMMANDS {
-        let frame = raw_frame(magic, &command_field(spec.name)?, &[]);
+        let frame = raw_frame(magic, &command_field(spec)?, &[]);
         match read_message(&mut Cursor::new(frame), magic) {
             Ok((Message::Unknown { command, .. }, _)) => {
-                return Err(format!(
-                    "{} is in COMMANDS but decoded as Unknown ({command})",
-                    spec.name
-                )
-                .into());
+                return Err(
+                    format!("{spec} is in COMMANDS but decoded as Unknown ({command})").into(),
+                );
             }
             Ok(_)
             | Err(
@@ -415,7 +413,7 @@ fn listed_commands_type_and_core_untyped_commands_stay_unknown() -> Result<(), B
                 | PeerError::Varint(_),
             ) => {}
             Err(error) => {
-                return Err(format!("{}: unexpected decode error {error}", spec.name).into());
+                return Err(format!("{spec}: unexpected decode error {error}").into());
             }
         }
     }
@@ -671,7 +669,7 @@ fn getheaders_serves_active_chain_with_stop_hash_and_limit() -> Result<(), Box<d
     let Some(Message::Headers(served)) = response.first() else {
         return Err("expected headers response".into());
     };
-    assert!(served.is_empty());
+    assert_eq!(served.as_slice(), []);
     Ok(())
 }
 
@@ -810,7 +808,7 @@ fn inbound_block_and_tx_messages_decode_and_leave_no_response() -> Result<(), Bo
     let mut peer = ready_peer(Magic::REGTEST)?;
 
     let responses = dispatch_inbound(&mut peer, &Message::Block(genesis.clone()))?;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
 
     let coinbase = genesis
         .txs
@@ -1030,7 +1028,7 @@ fn unknown_commands_are_ignored_once_ready_like_core() -> Result<(), Box<dyn Err
             payload: vec![0u8; 8],
         },
     )?;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
     assert_eq!(
         peer.state,
         PeerState::Ready,
@@ -1055,19 +1053,19 @@ fn decode_only_messages_are_accepted_silently_per_policy() -> Result<(), Box<dyn
         )),
         Some(&chain),
     )?;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
 
     // BIP35 mempool snapshot request: accepted, unanswered (documented deviation).
     let responses = dispatch_inbound(&mut peer, &Message::MemPool)?;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
 
     // getaddr: accepted, unanswered (no address gossip).
     let responses = dispatch_inbound(&mut peer, &Message::GetAddr)?;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
 
     // BIP133 feefilter: accepted, never enforced or echoed.
     let responses = dispatch_inbound(&mut peer, &Message::FeeFilter(1_000))?;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
 
     assert_eq!(peer.state, PeerState::Ready);
     Ok(())

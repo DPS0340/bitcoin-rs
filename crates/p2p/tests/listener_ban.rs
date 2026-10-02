@@ -254,7 +254,7 @@ fn live_handshake_traffic_reaches_the_aggregate_ledger() -> Result<(), Box<dyn E
     let (received, sent) = peer_table.traffic_totals();
     assert!(received > 0, "aggregate recv must count handshake bytes");
     assert!(sent > 0, "aggregate sent must count handshake bytes");
-    assert!(!peer_table.is_empty());
+    assert_ne!(peer_table.len(), 0);
 
     teardown_epoch(
         &session_cancel,

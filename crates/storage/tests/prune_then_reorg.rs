@@ -312,7 +312,7 @@ fn target_pruning_deletes_old_indexes_in_the_current_flat_file()
         AGGRESSIVE,
         &reservation,
     )?;
-    assert!(staged.file_numbers.is_empty());
+    assert_eq!(staged.file_numbers, Vec::<u32>::new());
     assert_eq!(staged.blocks.blocks_removed, 1);
     assert_eq!(staged.blocks.bytes_freed, 16);
 
@@ -1127,15 +1127,22 @@ impl MemoryStore {
 impl KvStore for MemoryStore {
     fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         if cf == ColumnFamily::UtxoMeta && key == EXECUTED_FRONTIER_KEY {
-            let remaining = self
-                .executed_reads_allowed
-                .fetch_update(
+            let mut remaining = self.executed_reads_allowed.load(AtomicOrdering::Relaxed);
+            let exhausted = loop {
+                let Some(next) = remaining.checked_sub(1) else {
+                    break true;
+                };
+                match self.executed_reads_allowed.compare_exchange_weak(
+                    remaining,
+                    next,
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_err();
-            if remaining {
+                ) {
+                    Ok(_) => break false,
+                    Err(actual) => remaining = actual,
+                }
+            };
+            if exhausted {
                 return Err(StorageError::InvalidOperation(
                     "injected executed-frontier read failure",
                 ));

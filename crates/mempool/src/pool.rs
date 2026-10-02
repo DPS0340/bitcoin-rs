@@ -1201,12 +1201,6 @@ impl Mempool {
         self.entries.is_empty()
     }
 
-    /// Returns the count of in-pool transactions.
-    #[must_use]
-    pub fn tx_count(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Returns the txids of every entry in the pool.
     ///
     /// Order is the underlying slab iteration order (i.e., NOT fee-rate sorted;
@@ -1732,7 +1726,7 @@ impl Mempool {
         changes: &mut Vec<MutationChange>,
     ) {
         let mut ids = Vec::new();
-        self.collect_descendants_inclusive(id, &mut ids);
+        self.collect_descendants(id, &mut ids, true);
         ids.sort_unstable();
         ids.dedup();
         let removals = ids.into_iter().map(|id| (id, reason)).collect::<Vec<_>>();
@@ -1869,7 +1863,7 @@ impl Mempool {
     pub(crate) fn descendants_of_conflicts(&self, direct: &[EntryId]) -> Vec<EntryId> {
         let mut conflicts = direct.to_vec();
         for &id in direct {
-            self.collect_descendants_exclusive(id, &mut conflicts);
+            self.collect_descendants(id, &mut conflicts, false);
         }
         conflicts.sort_unstable();
         conflicts.dedup();
@@ -1882,22 +1876,11 @@ impl Mempool {
     /// edges between them — not a per-input txid lookup per step.
     #[must_use]
     pub fn ancestor_ids_for_entry(&self, id: EntryId) -> Vec<EntryId> {
-        let mut seen = VisitSet::new();
-        let mut stack: Vec<EntryId> = Vec::new();
-        if let Some(links) = self.links(id) {
-            stack.extend_from_slice(&links.parents);
-        }
-        while let Some(ancestor) = stack.pop() {
-            if !seen.insert(ancestor) {
-                continue;
-            }
-            if let Some(links) = self.links(ancestor) {
-                stack.extend_from_slice(&links.parents);
-            }
-        }
-        let mut ancestors = seen.members().to_vec();
-        ancestors.sort_unstable();
-        ancestors
+        self.collect_ancestors(
+            self.links(id)
+                .map(|links| links.parents.clone())
+                .unwrap_or_default(),
+        )
     }
 
     /// Returns all descendant entry ids for `id`, EXCLUDING `id` itself.
@@ -1907,8 +1890,7 @@ impl Mempool {
     #[must_use]
     pub fn descendant_ids_for_entry(&self, id: EntryId) -> Vec<EntryId> {
         let mut ids = Vec::new();
-        self.collect_descendants_inclusive(id, &mut ids);
-        ids.retain(|other| *other != id);
+        self.collect_descendants(id, &mut ids, false);
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -2067,34 +2049,11 @@ impl Mempool {
         let own_fee = entry.fee;
         let own_delta = i128::from(entry.fee_delta);
 
-        let (ancestor_size, ancestor_fee, ancestor_fee_delta) = self
-            .ancestor_ids_for_entry(id)
-            .into_iter()
-            .filter_map(|ancestor| self.entry(ancestor))
-            .fold(
-                (own_size, own_fee, own_delta),
-                |(size, fee, delta), ancestor| {
-                    (
-                        size.saturating_add(u64::from(ancestor.vsize)),
-                        fee.saturating_add(ancestor.fee),
-                        delta.saturating_add(i128::from(ancestor.fee_delta)),
-                    )
-                },
-            );
-        let (descendant_size, descendant_fee, descendant_fee_delta) = self
-            .descendant_ids_for_entry(id)
-            .into_iter()
-            .filter_map(|descendant| self.entry(descendant))
-            .fold(
-                (own_size, own_fee, own_delta),
-                |(size, fee, delta), descendant| {
-                    (
-                        size.saturating_add(u64::from(descendant.vsize)),
-                        fee.saturating_add(descendant.fee),
-                        delta.saturating_add(i128::from(descendant.fee_delta)),
-                    )
-                },
-            );
+        let own = (own_size, own_fee, own_delta);
+        let (ancestor_size, ancestor_fee, ancestor_fee_delta) =
+            self.package_totals(self.ancestor_ids_for_entry(id), own);
+        let (descendant_size, descendant_fee, descendant_fee_delta) =
+            self.package_totals(self.descendant_ids_for_entry(id), own);
 
         if let Some(entry) = self.entry_mut(id) {
             entry.ancestor_size = ancestor_size;
@@ -2104,6 +2063,19 @@ impl Mempool {
             entry.descendant_fee = descendant_fee;
             entry.descendant_fee_delta = descendant_fee_delta;
         }
+    }
+
+    /// The vsize, fee, and fee-delta sums of `own` plus every live id.
+    fn package_totals(&self, ids: Vec<EntryId>, own: (u64, u64, i128)) -> (u64, u64, i128) {
+        ids.into_iter()
+            .filter_map(|id| self.entry(id))
+            .fold(own, |(size, fee, delta), entry| {
+                (
+                    size.saturating_add(u64::from(entry.vsize)),
+                    fee.saturating_add(entry.fee),
+                    delta.saturating_add(i128::from(entry.fee_delta)),
+                )
+            })
     }
 
     /// Every entry whose totals a change at `seeds` can have altered.
@@ -2373,25 +2345,23 @@ impl Mempool {
     }
 
     fn ancestor_ids_for_tx(&self, tx: &Tx) -> Vec<EntryId> {
-        // For a candidate that has no entry yet: resolve parents through the
-        // txid index, one step per in-pool ancestor, with the visited set as
-        // a growing bitset rather than a scanned Vec.
+        // For a candidate that has no entry yet: resolve its direct parents
+        // through the txid index, then walk the cached links like any entry.
+        self.collect_ancestors(self.in_pool_parents(tx))
+    }
+
+    /// Transitive in-pool ancestors of `seeds`, deduplicated and in `EntryId`
+    /// order. Iterative over the cached parent links, so depth follows
+    /// membership, not the recursion stack.
+    fn collect_ancestors(&self, seeds: Vec<EntryId>) -> Vec<EntryId> {
         let mut seen = VisitSet::new();
-        let mut stack = tx
-            .inputs
-            .iter()
-            .filter_map(|input| self.entry_id_by_txid(&input.previous_output.txid))
-            .collect::<Vec<_>>();
+        let mut stack = seeds;
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
             }
-            if let Some(entry) = self.entry(id) {
-                for input in &entry.tx.inputs {
-                    if let Some(parent) = self.entry_id_by_txid(&input.previous_output.txid) {
-                        stack.push(parent);
-                    }
-                }
+            if let Some(links) = self.links(id) {
+                stack.extend_from_slice(&links.parents);
             }
         }
         let mut ancestors = seen.members().to_vec();
@@ -2399,32 +2369,19 @@ impl Mempool {
         ancestors
     }
 
-    fn collect_descendants_inclusive(&self, id: EntryId, out: &mut Vec<EntryId>) {
-        let mut seen = VisitSet::new();
-        seen.insert(id);
-        let mut stack = vec![id];
-        while let Some(current) = stack.pop() {
-            out.push(current);
-            let Some(links) = self.links(current) else {
-                continue;
-            };
-            for child in links.children.iter().copied() {
-                if seen.insert(child) {
-                    stack.push(child);
-                }
-            }
-        }
-    }
-
-    /// Descendants of `id` appended to `out`, skipping anything already in
-    /// it. Iterative over the child links, so depth follows membership, not
+    /// Descendants of `id` appended to `out`, including `id` itself when
+    /// `include_root` holds, and skipping anything already in `out`.
+    /// Iterative over the child links, so depth follows membership, not
     /// the recursion stack.
-    fn collect_descendants_exclusive(&self, id: EntryId, out: &mut Vec<EntryId>) {
+    fn collect_descendants(&self, id: EntryId, out: &mut Vec<EntryId>, include_root: bool) {
         let mut seen = VisitSet::new();
         for existing in out.iter() {
             seen.insert(*existing);
         }
-        seen.insert(id);
+        let fresh = seen.insert(id);
+        if include_root && fresh {
+            out.push(id);
+        }
         let mut stack = vec![id];
         while let Some(current) = stack.pop() {
             let Some(links) = self.links(current) else {
@@ -2464,7 +2421,7 @@ impl Mempool {
     #[must_use]
     pub fn descendant_count_inclusive(&self, id: EntryId) -> u32 {
         let mut descendants = Vec::new();
-        self.collect_descendants_inclusive(id, &mut descendants);
+        self.collect_descendants(id, &mut descendants, true);
         u32::try_from(descendants.len()).unwrap_or(u32::MAX)
     }
 
@@ -3409,7 +3366,7 @@ mod tests {
             }]
         );
         assert!(pool.contains_txid(&child_txid));
-        assert!(pool.ancestor_ids_for_entry(child_id).is_empty());
+        assert_eq!(pool.ancestor_ids_for_entry(child_id), Vec::<u32>::new());
         let incremental = totals(&pool);
         pool.recompute_all_metadata();
         assert_eq!(incremental, totals(&pool));
@@ -3823,7 +3780,7 @@ mod tests {
         assert_eq!(child_entry.txid, child_txid);
         assert_eq!(parent_entry.txid, parent_txid);
         assert_eq!(child_entry.ancestors, vec![1], "positions are in-snapshot");
-        assert!(parent_entry.ancestors.is_empty());
+        assert_eq!(parent_entry.ancestors, Vec::<u32>::new());
         // Metadata fidelity: copied scalars are the ones derived from the
         // transaction itself, not policy reconstructions of them.
         assert_eq!(child_entry.fee, 2_000);
@@ -5010,7 +4967,7 @@ mod spend_index_tests {
             ))
             .expect("replacement preview excludes its victim");
         assert_eq!(preview.evicted, vec![a_id]);
-        assert_eq!(pool.tx_count(), 3, "preview does not mutate");
+        assert_eq!(pool.len(), 3, "preview does not mutate");
         assert_eq!(
             pool.insert_entry(MempoolEntry::new(
                 Arc::new(replacement),
@@ -5131,12 +5088,12 @@ mod spend_index_tests {
         let root_tx = root.tx.clone();
         let before = pool.len();
         let removed = pool.remove_for_block(&[&root_tx], &[root_txid], 8);
-        assert!(!removed.is_empty());
+        assert_ne!(removed.len(), 0);
         // The root left, while its descendants remain as transactions that
         // now spend confirmed outputs.
         assert!(pool.entry_id_by_txid(&root_txid).is_none());
         assert_eq!(pool.len(), before - 1);
-        assert!(!pool.is_empty());
+        assert_ne!(pool.len(), 0);
     }
 }
 
@@ -5644,17 +5601,18 @@ mod graph_tests {
         assert!(pool.entry_by_txid(&child).is_none());
         assert!(pool.entry_by_wtxid(&child_wtxid).is_none());
         let links = pool.links(child_id).expect("reused slot");
-        assert!(links.parents.is_empty());
-        assert!(links.children.is_empty());
+        assert_eq!(links.parents, Vec::<u32>::new());
+        assert_eq!(links.children, Vec::<u32>::new());
         let parent_id = pool.entry_id_by_txid(&parent).expect("pooled parent");
         let leaf_id = pool.entry_id_by_txid(&leaf).expect("pooled leaf");
-        assert!(
-            pool.links(parent_id)
-                .expect("parent links")
-                .children
-                .is_empty()
+        assert_eq!(
+            pool.links(parent_id).expect("parent links").children,
+            Vec::<u32>::new()
         );
-        assert!(pool.links(leaf_id).expect("leaf links").parents.is_empty());
+        assert_eq!(
+            pool.links(leaf_id).expect("leaf links").parents,
+            Vec::<u32>::new()
+        );
         assert_graph_exact(&pool);
 
         let retained_slots = pool.entries.capacity();
@@ -5662,7 +5620,7 @@ mod graph_tests {
         assert_eq!(pool.entries.capacity(), retained_slots);
         let fresh = insert_ok(&mut pool, 5, &[], 100);
         assert_eq!(pool.entry_id_by_txid(&fresh), Some(0));
-        assert_eq!(pool.tx_count(), 1);
+        assert_eq!(pool.len(), 1);
         for retired in [parent, leaf, replacement] {
             assert!(pool.entry_by_txid(&retired).is_none());
         }
@@ -5724,7 +5682,7 @@ mod graph_tests {
             error,
             MempoolError::Policy(PolicyError::ClusterCountLimit)
         ));
-        assert_eq!(pool.tx_count(), 4, "rejection commits nothing");
+        assert_eq!(pool.len(), 4, "rejection commits nothing");
         assert!(!pool.contains_txid(&joiner.txid()));
 
         // The acceptance preview quotes the same verdict.
@@ -5845,7 +5803,7 @@ mod graph_tests {
         let parent_txid = parent_tx.txid();
         let _child = insert_ok(&mut pool, 2, &[OutPoint::new(parent_txid, 0)], 100);
         agrees(&pool, &parent_tx, 400, Ok(()));
-        assert_eq!(pool.tx_count(), 1, "the fixture pools the child only");
+        assert_eq!(pool.len(), 1, "the fixture pools the child only");
     }
 
     #[test]
@@ -5906,7 +5864,7 @@ mod graph_tests {
                 nonce += 1;
             }
         }
-        assert_eq!(pool.tx_count(), 400);
+        assert_eq!(pool.len(), 400);
 
         // A new root joins nothing: no walk at all, whatever the pool size.
         pool.graph_steps.store(0, Ordering::Relaxed);
@@ -6081,7 +6039,7 @@ mod graph_tests {
                             history.push((id, candidate.txid()));
                         }
                     }
-                    9 if pool.tx_count() > 8 => {
+                    9 if pool.len() > 8 => {
                         // Trim pressure.
                         let target = u64::try_from(rng.below(200) * 100).unwrap_or(0);
                         crate::evict_lowest_fee_packages(&mut pool, target)

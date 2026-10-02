@@ -19,7 +19,6 @@ use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 
-use crate::connection::PeerSource;
 use crate::listener::ListenerError;
 
 /// Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS` (`net.h:69`).
@@ -124,7 +123,7 @@ impl P2pServiceConfig {
     /// INVARIANT: manual peers do not consume these slots; the two slot
     ///   counts are the only automatic outbound population knobs.
     #[must_use]
-    pub fn total_outbound_active_limit(&self) -> usize {
+    pub(crate) fn total_outbound_active_limit(&self) -> usize {
         self.outbound_full_relay_slots
             .saturating_add(self.outbound_block_relay_slots)
     }
@@ -174,20 +173,6 @@ pub enum P2pJoinError {
     /// The bootstrap worker panicked.
     #[error("p2p bootstrap worker panicked")]
     BootstrapPanic,
-}
-
-/// Errors returned by RPC-facing P2P control operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
-pub enum P2pControlError {
-    /// The destination is covered by an active manual ban.
-    #[error("destination is banned")]
-    Banned,
-    /// The bounded dial queue has no capacity.
-    #[error("p2p outbound queue is full")]
-    QueueFull,
-    /// The P2P service has already shut down.
-    #[error("p2p outbound queue is closed")]
-    Closed,
 }
 
 struct Workers {
@@ -699,12 +684,6 @@ impl P2pService {
         Arc::clone(&self.network_active)
     }
 
-    /// Returns a snapshot of manual bans.
-    #[must_use]
-    pub fn banned(&self) -> Vec<crate::BannedSubnet> {
-        self.banned.read().clone()
-    }
-
     /// Returns the service-owned manual ban list handle.
     #[must_use]
     pub fn banned_handle(&self) -> Arc<RwLock<Vec<crate::BannedSubnet>>> {
@@ -717,30 +696,10 @@ impl P2pService {
         self.outbound_tx.clone()
     }
 
-    /// Returns configured addnode add addresses.
-    #[must_use]
-    pub fn added_nodes(&self) -> Vec<SocketAddr> {
-        self.added_nodes.read().clone()
-    }
-
     /// Returns the service-owned persistent addnode view.
     #[must_use]
     pub fn added_nodes_handle(&self) -> Arc<RwLock<Vec<SocketAddr>>> {
         Arc::clone(&self.added_nodes)
-    }
-
-    /// Sends a message only to the connection identified by source.
-    ///
-    /// The message is returned when the source is stale or its writer has
-    /// gone away, allowing callers to keep ownership of retry decisions.
-    #[allow(clippy::result_large_err)]
-    pub fn send(&self, source: PeerSource, message: crate::Message) -> Result<(), crate::Message> {
-        self.peer_table.send(source, message)
-    }
-
-    /// Disconnects only the connection identified by source.
-    pub fn disconnect(&self, source: PeerSource) -> bool {
-        self.peer_table.disconnect_source(source)
     }
 
     /// Returns a cloned inbound headers receiver for the node sync coordinator.
@@ -969,7 +928,7 @@ fn next_outbound_role(
     // liveness checks from separate table passes could drop a dial that
     // registers in between into neither population and over-dial its class.
     let sessions = peer_table.sessions();
-    let census: Vec<&crate::PeerSession> = sessions
+    let census: Vec<&crate::peer_table::PeerSession> = sessions
         .iter()
         .filter(|session| {
             !session.lease.is_inbound()
@@ -1071,12 +1030,12 @@ fn newest_excess_full_relay(
     slots: usize,
     now: Instant,
     is_downloading: impl Fn(crate::PeerSource) -> bool,
-) -> Option<crate::PeerSession> {
+) -> Option<crate::peer_table::PeerSession> {
     // A hand-pinned full-relay connection is outside the census, as Core's
     // `IsFullOutboundConn()` excludes `ConnectionType::MANUAL`
     // (`net_processing.cpp:5558-5604`): it creates no excess and the victim
     // selection below only ever sees automatic connections.
-    let sessions: Vec<crate::PeerSession> = peer_table
+    let sessions: Vec<crate::peer_table::PeerSession> = peer_table
         .sessions()
         .into_iter()
         .filter(|session| {
@@ -1174,7 +1133,7 @@ fn run_dns_peer_maintenance(
         dns_queue,
     }: DnsPeerMaintenance,
 ) {
-    let resolver = crate::SystemDnsResolver::new(port);
+    let resolver = crate::peer::SystemDnsResolver::new(port);
     let seeds: Vec<&str> = seeds.iter().map(String::as_str).collect();
     let mut cursor = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1261,7 +1220,7 @@ fn drain_dns_peer_deficit<R>(
     needed: usize,
 ) -> usize
 where
-    R: crate::DnsResolver + ?Sized,
+    R: crate::peer::DnsResolver + ?Sized,
 {
     if !network_active.load(Ordering::Acquire) || needed == 0 || seeds.is_empty() {
         return 0;
@@ -1314,6 +1273,7 @@ where
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::PeerSource;
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
     fn idle_ready() -> Arc<dyn Fn(PeerSource) + Send + Sync> {
@@ -1323,7 +1283,7 @@ mod tests {
     /// Every DNS lookup answers with this single address.
     struct OneAddrResolver(SocketAddr);
 
-    impl crate::DnsResolver for OneAddrResolver {
+    impl crate::peer::DnsResolver for OneAddrResolver {
         fn resolve(&self, _seed: &str) -> Result<Vec<SocketAddr>, crate::PeerError> {
             Ok(vec![self.0])
         }

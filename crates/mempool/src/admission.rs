@@ -1128,7 +1128,7 @@ mod tests {
         );
         assert_eq!(gateway.orphan_count(), 0);
         assert!(gateway.is_rejected(Hash256::from(invalid.wtxid())));
-        assert!(gateway.retry_orphans(&Coins(vec![]), 3).is_empty());
+        assert_eq!(gateway.retry_orphans(&Coins(vec![]), 3), []);
     }
 
     // MPL-04: only the resident body's claim may mutate its lifecycle state.
@@ -1352,7 +1352,7 @@ mod tests {
             child.inputs[0].previous_output,
             parent.outputs[0].clone(),
         )]);
-        assert!(gateway.retry_orphans(&chain, 2).is_empty());
+        assert_eq!(gateway.retry_orphans(&chain, 2), []);
         assert_eq!(gateway.orphan_count(), 1);
         assert!(reservation.finish().is_ok());
         let retried = gateway.retry_orphans(&chain, 2);
@@ -1389,7 +1389,7 @@ mod tests {
         let retried = gateway.retry_orphans(&chain, 3);
         assert_eq!(retried.len(), 1);
         assert!(matches!(retried[0].result, Ok(SubmitOutcome::Committed(_))));
-        assert!(gateway.retry_orphans(&chain, 4).is_empty());
+        assert_eq!(gateway.retry_orphans(&chain, 4), []);
     }
 
     struct ParentArrivesDuringPreparation {
@@ -1663,7 +1663,7 @@ mod tests {
                 );
                 assert!(!gateway.is_rejected(Hash256::from(child.txid())));
                 assert!(!gateway.is_rejected(Hash256::from(replacement.txid())));
-                assert!(gateway.retry_orphans(&Unavailable, 3).is_empty());
+                assert_eq!(gateway.retry_orphans(&Unavailable, 3), []);
             }
         }
     }

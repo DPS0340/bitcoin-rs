@@ -69,7 +69,7 @@ impl NodeState {
 
         let block_body_store = storage.block_body_store();
 
-        let zmq_endpoints = config.zmq_endpoints();
+        let zmq_endpoints = &config.notifications.zmq;
         #[cfg(feature = "zmq")]
         let zmq_publisher: Arc<dyn crate::ZmqPublisher> = if zmq_endpoints.is_empty() {
             Arc::new(crate::NoOpZmqPublisher)

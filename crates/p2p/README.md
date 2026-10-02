@@ -49,8 +49,8 @@ shared transaction lifecycle. The authoritative cross-crate ownership split is
 peer-visible inventory and relay behavior are defined in
 [P2P compatibility](../../docs/policies/p2p-compatibility.md).
 
-`PeerManager` owns DNS resolver and seed configuration and bootstraps outbound
-addresses. The `listener` module has one entry point per role: `bind_listener`
+`P2pService` owns DNS seed configuration and bootstraps outbound addresses in
+its bootstrap worker. The `listener` module has one entry point per role: `bind_listener`
 binds a local address, `serve` runs the accept loop on that bound listener until
 shutdown, and `spawn_outbound_connection` dials one peer. `serve` and
 `spawn_outbound_connection` read one cloneable `ConnectionShared` wiring value

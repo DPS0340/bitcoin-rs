@@ -1,7 +1,7 @@
 use bitcoin_rs_consensus::{MAX_TIMEWARP, MEDIAN_TIME_PAST_WINDOW};
 use bitcoin_rs_primitives::{CompactTarget, Hash256, Network};
 
-pub use pow::{compact_is_met_by, compact_within_pow_limit};
+pub use pow::compact_is_met_by;
 use pow::{compact_to_target, target_to_compact};
 
 use crate::{
@@ -534,7 +534,7 @@ pub fn permitted_difficulty_transition(
 /// reject the header in practice. `target_to_compact` covers `GetCompact`
 /// for non-negative targets.
 pub(crate) mod pow {
-    use bitcoin_rs_primitives::{CompactTarget, Hash256, Network};
+    use bitcoin_rs_primitives::{CompactTarget, Hash256};
 
     use crate::node::{BlockHeader, ChainWork};
 
@@ -579,20 +579,6 @@ pub(crate) mod pow {
     pub fn compact_is_met_by(bits: CompactTarget, hash: Hash256) -> bool {
         let target = compact_to_target(bits);
         target != ChainWork::ZERO && ChainWork::from_le_bytes(hash.to_le_bytes()) <= target
-    }
-
-    /// Returns `true` when `bits` decodes to a nonzero target at or below
-    /// `network`'s proof-of-work limit.
-    ///
-    /// Core's `CheckProofOfWork` bounds (`pow.cpp:CheckProofOfWork`), minus
-    /// the hash comparison [`compact_is_met_by`] performs.
-    /// Difficulty-transition rules can accept any bits on
-    /// `allow_min_difficulty_blocks` networks, so the network cap has to be
-    /// checked on its own there.
-    #[must_use]
-    pub fn compact_within_pow_limit(network: Network, bits: CompactTarget) -> bool {
-        let target = compact_to_target(bits);
-        target != ChainWork::ZERO && target <= network.max_target()
     }
 
     /// The block-header proof of work: `~target / (target + 1) + 1`.

@@ -327,7 +327,7 @@ impl UtxoSet {
             removes = changes.remove_count(),
             "commit utxo block"
         );
-        self.commit_adds_and_removes(changes.adds_slice(), changes.removes_slice())
+        self.commit_adds_and_removes(changes.adds(), changes.spent_outpoints())
     }
 
     /// Returns an owned transaction output if the outpoint is live.

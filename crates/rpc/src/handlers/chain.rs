@@ -3632,11 +3632,7 @@ mod pruneblockchain_tests {
             requested_height: u32,
         ) -> Result<crate::context::PruneResult, crate::context::PruneServiceError> {
             Ok(crate::context::PruneResult {
-                requested_height,
                 pruneheight: self.result_pruneheight.unwrap_or(requested_height),
-                block_rows_removed: 0,
-                undo_rows_removed: 0,
-                bytes_freed: 0,
             })
         }
 
@@ -5541,6 +5537,7 @@ mod float_conversion_tests {
     use super::{i64_to_f64, u64_to_f64};
 
     #[test]
+    #[allow(clippy::suboptimal_flops)]
     fn u64_to_f64_is_exact_below_two_to_the_fifty_third() {
         for value in [
             0_u64,

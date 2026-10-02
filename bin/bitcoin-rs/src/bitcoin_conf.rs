@@ -283,7 +283,7 @@ mod compat_tests {
 
         assert_eq!(config.storage.prune_target_mb, 550);
         assert_auth(&config.rpc.auth, "foo", "bar");
-        assert!(config.p2p.listen.is_empty());
+        assert_eq!(config.p2p.listen, []);
         assert!(config.indexes.txindex);
         assert_eq!(config.storage.dbcache_mb, 768);
         Ok(())
@@ -335,7 +335,7 @@ mod compat_tests {
         let layer_refs: Vec<_> = layer.iter().collect();
         let config = resolve(&layer_refs)?;
 
-        assert!(config.notifications.zmq.is_empty());
+        assert_eq!(config.notifications.zmq, []);
         Ok(())
     }
 

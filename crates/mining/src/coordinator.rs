@@ -58,7 +58,7 @@ const GENERATION_RACE: &str = "generation key changed during candidate assembly"
 const LONG_POLL_SLICE: Duration = Duration::from_secs(1);
 
 /// Applied-tip hash plus mempool sequence that identify one candidate generation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GenerationKey {
     /// Applied tip hash in consensus little-endian storage order.
     pub tip_hash: Hash256,
@@ -103,19 +103,6 @@ struct CoordinatorState {
 }
 
 impl CoordinatorState {
-    /// Creates the empty lifecycle state.
-    #[must_use]
-    fn new() -> Self {
-        Self {
-            published: None,
-            cache: HashMap::new(),
-            cache_order: VecDeque::new(),
-            in_flight: None,
-            next_flight_id: 0,
-            last_candidate: None,
-        }
-    }
-
     /// Returns the cached candidate for `id`, if one is retained.
     fn cache_get(&self, id: &TemplateId) -> Option<Arc<Candidate>> {
         self.cache.get(id).cloned()
@@ -276,7 +263,7 @@ impl MiningService {
             chain,
             coinbase_script,
             shutdown,
-            state: Mutex::new(CoordinatorState::new()),
+            state: Mutex::default(),
             wake: Condvar::new(),
         }
     }
@@ -412,14 +399,12 @@ impl MiningService {
                 continue;
             }
             let submit_old = waited.map(|waited| candidate.previous_block_hash == waited.tip_hash);
-            let (version_bits_available, version_bits_required) =
-                self.version_bits_for(&candidate, &tip);
+            let version_bits_available = self.chain.signalling_rules(&tip, candidate.height);
             return Ok(template_from_candidate(
                 self.network,
                 candidate,
                 submit_old,
                 version_bits_available,
-                version_bits_required,
             ));
         }
         Err(generation_race())
@@ -677,24 +662,6 @@ impl MiningService {
             }
         })
     }
-
-    fn version_bits_for(
-        &self,
-        candidate: &Candidate,
-        tip: &TipSnapshot,
-    ) -> (Vec<AvailableMiningRule>, u32) {
-        if tip.hash != candidate.previous_block_hash {
-            return (Vec::new(), 0);
-        }
-        // Core v31 `getblocktemplate` hardcodes `vbrequired` to 0.
-        (self.chain.signalling_rules(tip, candidate.height), 0)
-    }
-}
-
-impl MempoolSequenceWake for MiningService {
-    fn publish_generation_from(&self, sequence: u64) {
-        Self::publish_generation_from(self, sequence);
-    }
 }
 
 /// Clears an abandoned single-flight slot if candidate assembly unwinds.
@@ -736,7 +703,6 @@ fn template_from_candidate(
     candidate: Arc<Candidate>,
     submit_old: Option<bool>,
     version_bits_available: Vec<AvailableMiningRule>,
-    version_bits_required: u32,
 ) -> BlockTemplate {
     let mut rules = Vec::new();
     if candidate.segwit_active {
@@ -753,11 +719,12 @@ fn template_from_candidate(
         rules.push(MiningRule::new("signet"));
     }
     // API-11 advertises producer capabilities, never client-requested names.
+    // Core v31 `getblocktemplate` hardcodes `vbrequired` to 0.
     BlockTemplate {
         rules,
         candidate,
         version_bits_available,
-        version_bits_required,
+        version_bits_required: 0,
         capabilities: vec![
             MiningCapability::new("proposal"),
             MiningCapability::new("longpoll"),
@@ -769,7 +736,6 @@ fn template_from_candidate(
         ],
         submit_old,
         signet,
-        work_id: None,
     }
 }
 

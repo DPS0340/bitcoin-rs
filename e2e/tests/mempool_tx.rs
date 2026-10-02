@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 fn mempool_lifecycle_from_broadcast_to_confirmation() -> Result<()> {
     let mut node = ProcessNode::spawn(Kind::BitcoinRs)?;
     let (outpoint, prevout) = mature_funding(&mut node)?;
-    assert!(mempool_txids(&mut node)?.is_empty());
+    assert_eq!(mempool_txids(&mut node)?, Vec::<String>::new());
 
     let spend = spend_anyone(outpoint, &prevout, 1_000);
     let txid = spend.compute_txid().to_string();

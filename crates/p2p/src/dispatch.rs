@@ -752,7 +752,7 @@ mod tests {
 
         let responses = dispatch_inbound(&mut peer, &message)?;
 
-        assert!(responses.is_empty());
+        assert_eq!(responses, []);
         assert_eq!(peer.state, PeerState::Ready);
         Ok(())
     }
@@ -1532,9 +1532,9 @@ mod tests {
             if wtxid_relay {
                 peer.wtxid_relay.mark_peer_supported();
             }
-            assert!(
-                dispatch_collect_full(&mut peer, &Message::Inv(vec![item]), None, Some(&gateway),)
-                    .is_empty()
+            assert_eq!(
+                dispatch_collect_full(&mut peer, &Message::Inv(vec![item]), None, Some(&gateway),),
+                []
             );
         }
 
@@ -1634,15 +1634,12 @@ mod tests {
                         .is_ok()
                 );
             }
-            for (local_requested, remote_requested, item) in [
-                (true, false, Inventory::WTx(wtxid)),
-                (false, true, Inventory::Transaction(txid)),
-                (false, true, Inventory::WitnessTransaction(txid)),
+            for (remote_requested, item) in [
+                (false, Inventory::WTx(wtxid)),
+                (true, Inventory::Transaction(txid)),
+                (true, Inventory::WitnessTransaction(txid)),
             ] {
                 let mut peer = ready_peer();
-                if local_requested {
-                    peer.wtxid_relay.mark_local_advertised();
-                }
                 if remote_requested {
                     peer.wtxid_relay.mark_peer_supported();
                 }

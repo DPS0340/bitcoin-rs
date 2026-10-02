@@ -62,7 +62,7 @@ fn assert_limit_semantics<S: KvStore>(store: &S) -> Result<(), StorageError> {
             max_bytes: usize::MAX,
         },
     )?;
-    assert!(scan.rows.is_empty());
+    assert_eq!(scan.rows, []);
     assert!(!scan.complete);
 
     // max_bytes = 0 with max_rows > 0 still admits the first row (soft limit),

@@ -65,11 +65,11 @@ fn chain_state_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn s
     assert_eq!(info.chain, "main");
     assert_eq!(info.blocks, 42);
     assert_eq!(info.headers, 42);
-    assert!(!info.best_block_hash.is_empty());
-    assert!(!info.bits.is_empty());
-    assert!(!info.target.is_empty());
-    assert!(!info.chain_work.is_empty());
-    assert!(info.warnings.is_empty());
+    assert_ne!(info.best_block_hash, "");
+    assert_ne!(info.bits, "");
+    assert_ne!(info.target, "");
+    assert_ne!(info.chain_work, "");
+    assert_eq!(info.warnings, Vec::<String>::new());
 
     let difficulty: corepc_types::v31::GetDifficulty =
         typed(&handler.dispatch("getdifficulty", &json!([]))?)?;
@@ -150,11 +150,11 @@ fn mempool_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::
 
     let raw: corepc_types::v31::GetRawMempool =
         typed(&handler.dispatch("getrawmempool", &json!([]))?)?;
-    assert!(raw.0.is_empty());
+    assert_eq!(raw.0, Vec::<String>::new());
 
     let sequenced: corepc_types::v31::GetRawMempoolSequence =
         typed(&handler.dispatch("getrawmempool", &json!([false, true]))?)?;
-    assert!(sequenced.txids.is_empty());
+    assert_eq!(sequenced.txids, Vec::<String>::new());
     assert_eq!(sequenced.mempool_sequence, 0);
 
     let verbose: corepc_types::v31::GetRawMempoolVerbose =
@@ -181,11 +181,11 @@ fn network_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::
     assert_eq!(network.protocol_version, 70016);
     assert_eq!(network.connections, 0);
     assert_eq!(network.networks.len(), 3);
-    assert!(network.warnings.is_empty());
+    assert_eq!(network.warnings, Vec::<String>::new());
 
     let peers: corepc_types::v31::GetPeerInfo =
         typed(&handler.dispatch("getpeerinfo", &json!([]))?)?;
-    assert!(peers.0.is_empty());
+    assert_eq!(peers.0, []);
 
     let totals: corepc_types::v31::GetNetTotals =
         typed(&handler.dispatch("getnettotals", &json!([]))?)?;
@@ -198,15 +198,15 @@ fn network_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::
 
     let added: corepc_types::v31::GetAddedNodeInfo =
         typed(&handler.dispatch("getaddednodeinfo", &json!([]))?)?;
-    assert!(added.0.is_empty());
+    assert_eq!(added.0, []);
 
     let banned: corepc_types::v31::ListBanned =
         typed(&handler.dispatch("listbanned", &json!([]))?)?;
-    assert!(banned.0.is_empty());
+    assert_eq!(banned.0, []);
 
     let addresses: corepc_types::v31::GetNodeAddresses =
         typed(&handler.dispatch("getnodeaddresses", &json!([0]))?)?;
-    assert!(addresses.0.is_empty());
+    assert_eq!(addresses.0, []);
 
     Ok(())
 }
@@ -257,7 +257,7 @@ fn util_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::err
     let valid: corepc_types::v31::ValidateAddress =
         typed(&handler.dispatch("validateaddress", &json!(["1111111111111111111114oLvT2"]))?)?;
     assert!(valid.is_valid);
-    assert!(!valid.script_pubkey.is_empty());
+    assert_ne!(valid.script_pubkey, "");
 
     // Core answers a malformed address with the sparse `{"isvalid": false}`
     // object only, and a well-formed address from another network fails
@@ -373,8 +373,8 @@ fn mining_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::e
         template.coinbase_aux.get("flags").map(String::as_str),
         Some("")
     );
-    assert!(template.transactions.is_empty());
-    assert!(template.rules.is_empty());
+    assert_eq!(template.transactions, []);
+    assert_eq!(template.rules, Vec::<String>::new());
     assert!(template.version_bits_available.is_empty());
     assert_eq!(template.version_bits_required, 0);
     assert_eq!(template.min_time, 0);
@@ -403,7 +403,7 @@ fn mining_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::e
     assert!((mining.block_min_tx_fee - 1e-5).abs() < f64::EPSILON);
     assert!((mining.next.difficulty - 1.0).abs() < f64::EPSILON);
     assert!(mining.signet_challenge.is_none());
-    assert!(mining.warnings.is_empty());
+    assert_eq!(mining.warnings, Vec::<String>::new());
     // Nested next-block facts must survive the round-trip.
     assert_eq!(mining.next.height, 1);
     assert_eq!(mining.next.bits, "207fffff");

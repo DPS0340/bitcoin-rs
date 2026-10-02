@@ -2,12 +2,12 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::ServiceFlags;
-use bitcoin_rs_primitives::Network;
+use bitcoin_rs_primitives::{Network, unix_time_secs};
 use crossbeam_channel::{SendTimeoutError, Sender};
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -242,7 +242,7 @@ impl ConnectionShared {
     /// INVARIANT: reads the shared chain view once; no per-handshake block
     ///   tree walk exists.
     #[must_use]
-    pub fn approximate_best_block_depth(&self) -> u64 {
+    pub(crate) fn approximate_best_block_depth(&self) -> u64 {
         let Some(tip_time) = self
             .chain_query
             .as_ref()
@@ -250,9 +250,7 @@ impl ConnectionShared {
         else {
             return u64::MAX;
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
+        let now = unix_time_secs();
         now.saturating_sub(u64::from(tip_time)) / POW_TARGET_SPACING_SECS
     }
 
@@ -590,7 +588,7 @@ pub fn spawn_outbound_connection(
 /// INVARIANT: The lease records the pinned origin at spawn, and the eviction
 ///   rules read it back from there.
 #[must_use]
-pub fn spawn_pinned_outbound_connection(
+pub(crate) fn spawn_pinned_outbound_connection(
     addr: SocketAddr,
     shared: ConnectionShared,
     role: crate::peer_info::PeerRole,
@@ -712,7 +710,7 @@ fn run_outbound_connection(
             "missing remote version after outbound handshake",
         ));
     };
-    let conn_time = unix_secs(SystemTime::now());
+    let conn_time = unix_time_secs();
     let info = crate::PeerInfo::outbound_from_version(
         addr,
         addr_bind,
@@ -917,7 +915,7 @@ fn run_handshake(
             "missing remote version after successful handshake",
         ));
     };
-    let conn_time = unix_secs(SystemTime::now());
+    let conn_time = unix_time_secs();
     let info = crate::PeerInfo::inbound_from_version(
         peer_addr,
         addr_bind,
@@ -1730,11 +1728,6 @@ fn run_writer_loop(
     }
 }
 
-fn unix_secs(now: SystemTime) -> u64 {
-    now.duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
-
 /// Forwards a decoded transaction into ingress while the relay gate is open.
 ///
 /// PRE: `relay_open` was read from the node-owned IBD handle for this
@@ -1754,13 +1747,6 @@ fn forward_tx_if_relay_open(
         // them unpunished while in initial block download (:4716).
         tracing::debug!(peer_addr = %peer_addr, "tx dropped: initial block download");
     }
-}
-
-/// UNIX seconds for the chain-owned initial-block-download latch.
-fn unix_time_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 fn wake_sync(sync_wake_tx: Option<&Sender<()>>) {
@@ -1856,7 +1842,7 @@ mod outbound_tests {
         clippy::expect_used,
         reason = "a helper that cannot build its fixture has nothing to report"
     )]
-    fn registered_session(dial: Dial) -> crate::PeerSession {
+    fn registered_session(dial: Dial) -> crate::peer_table::PeerSession {
         use std::time::{Duration, Instant};
 
         let listener =
@@ -2939,8 +2925,6 @@ mod writer_shutdown_tests {
                 // advertisement alone must not switch the remote preference.
                 if peer_requested_wtxid {
                     peer.wtxid_relay.mark_peer_supported();
-                } else {
-                    peer.wtxid_relay.mark_local_advertised();
                 }
                 let result =
                     run_connected_session(&mut peer, peer_addr, &shared, lease, outbound_rx, info);
@@ -3091,7 +3075,7 @@ mod ready_notify_tests {
             "replaced predecessor must not publish or notify"
         );
         assert_eq!(notified.load(Ordering::Relaxed), 0);
-        assert!(shared.peer_table.infos().is_empty());
+        assert_eq!(shared.peer_table.infos(), []);
 
         assert!(shared.publish_info_and_notify_ready(addr, &current, peer_info(addr, 2)));
         assert_eq!(notified.load(Ordering::Relaxed), 1);

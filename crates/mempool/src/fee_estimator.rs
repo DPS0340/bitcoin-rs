@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(
+    #[allow(
         clippy::float_cmp,
         reason = "confirmation counts are small integers, exact in f64; exact accounting is the assertion"
     )]
@@ -1089,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(
+    #[allow(
         clippy::float_cmp,
         reason = "confirmation counts are small integers, exact in f64; exact accounting is the assertion"
     )]

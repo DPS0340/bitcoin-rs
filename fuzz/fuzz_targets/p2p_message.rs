@@ -32,7 +32,7 @@ fuzz_target!(|data: &[u8]| {
     else {
         return;
     };
-    let command = spec.name;
+    let command = *spec;
 
     let magic = bitcoin::p2p::Magic::REGTEST;
     let mut framed = Vec::with_capacity(24usize.saturating_add(payload.len()));

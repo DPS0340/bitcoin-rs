@@ -10,7 +10,7 @@ use bitcoin_rs_mempool::{
 };
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_primitives::{
-    BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, consensus_bytes,
+    BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, consensus_bytes, unix_time_secs,
 };
 
 use bitcoin_rs_consensus::ValidationEngine;
@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::compat::convert::hex_encode;
 
@@ -131,16 +131,8 @@ pub struct PruneStatus {
 /// Summary of one completed manual prune request.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PruneResult {
-    /// Height requested by the RPC caller.
-    pub requested_height: u32,
     /// Highest prune height now recorded by the service.
     pub pruneheight: u32,
-    /// Serialized block-body rows removed from storage.
-    pub block_rows_removed: u64,
-    /// Serialized undo rows removed from storage.
-    pub undo_rows_removed: u64,
-    /// Payload bytes removed from storage.
-    pub bytes_freed: u64,
 }
 
 /// Error returned by the node-owned pruning implementation.
@@ -472,7 +464,7 @@ impl ChainHandles {
     /// are empty publications with no owner behind them.
     #[allow(clippy::arc_with_non_send_sync)]
     #[must_use]
-    pub fn with_transition(chain_transition: bitcoin_rs_chain::StableRead) -> Self {
+    fn with_transition(chain_transition: bitcoin_rs_chain::StableRead) -> Self {
         let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
             bitcoin_rs_utxo::stats::CoinStats::default(),
         );
@@ -802,12 +794,6 @@ pub(crate) fn admit_transaction(
     }
 }
 
-fn unix_time_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
-
 impl ChainHandles {
     /// Runs a read with authoritative UTXO and applied-tip transitions excluded.
     ///
@@ -817,14 +803,14 @@ impl ChainHandles {
     /// INVARIANT: this is mutable-chainstate exclusion, not status
     ///   synchronization: published status reads answer from a retained
     ///   `AppliedView` capture and never call it.
-    pub fn with_stable_chainstate<R>(&self, read: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_stable_chainstate<R>(&self, read: impl FnOnce() -> R) -> R {
         let _transition = self.chain_transition.lock();
         read()
     }
 
     /// Returns the pruning state reported by `getblockchaininfo`.
     #[must_use]
-    pub fn prune_status(&self) -> PruneStatus {
+    fn prune_status(&self) -> PruneStatus {
         self.prune_service
             .as_ref()
             .map_or_else(PruneStatus::default, |service| service.status())
@@ -951,28 +937,15 @@ impl ChainHandles {
 
     /// Returns the current tip height, or zero before initial sync publishes one.
     #[must_use]
-    pub fn height(&self) -> u32 {
+    fn height(&self) -> u32 {
         self.chain_tip.load_full().map_or(0, |tip| tip.height)
     }
 
     /// Returns the current best-applied-block height (lags `height()` when
     /// headers are ahead of downloaded blocks).
     #[must_use]
-    pub fn applied_height(&self) -> u32 {
+    pub(crate) fn applied_height(&self) -> u32 {
         self.applied_view().height()
-    }
-
-    /// Returns the cumulative transaction count of the applied chain, or `None`
-    /// when this node cannot know it.
-    ///
-    /// This is Bitcoin Core's `CBlockIndex::m_chain_tx_count`, and `None` is its
-    /// `HaveNumChainTxs() == false`: a chain whose history was applied before
-    /// the node tracked the count cannot recover it without re-reading every
-    /// block body. Callers must treat `None` as *unknown*, never as zero — the
-    /// two differ by an entire chain.
-    #[must_use]
-    pub fn chain_tx_count(&self) -> Option<u64> {
-        self.applied_view().chain_tx_count()
     }
 
     /// Returns the current best-applied-block hash.
@@ -982,7 +955,7 @@ impl ChainHandles {
     /// `block_hash_at_height(0)` answers the genesis hash — callers must never
     /// see an all-zero tip for a chain that always has a height-0 block.
     #[must_use]
-    pub fn applied_hash(&self) -> Hash256 {
+    pub(crate) fn applied_hash(&self) -> Hash256 {
         self.applied_view().hash(self.chain_network)
     }
 
@@ -990,7 +963,7 @@ impl ChainHandles {
     /// big-endian hex string. Returns "00" when no tip is published yet (a
     /// 2-char placeholder matching `bitcoind`'s pre-genesis behavior).
     #[must_use]
-    pub fn chainwork_hex(&self) -> String {
+    fn chainwork_hex(&self) -> String {
         self.chain_tip
             .load_full()
             .map_or_else(|| "00".to_owned(), |tip| Self::tip_chainwork_hex(&tip))
@@ -1157,7 +1130,7 @@ impl ChainHandles {
     ///
     /// `None` when there is no durable body source, or it does not track usage.
     #[must_use]
-    pub fn block_storage_disk_usage(&self) -> Option<u64> {
+    fn block_storage_disk_usage(&self) -> Option<u64> {
         self.block_body_source.as_ref()?.disk_usage()
     }
 
@@ -1354,9 +1327,9 @@ mod tests {
             })
         };
         ctx.chain.applied_tip.store(Some(counted(1)));
-        assert_eq!(ctx.chain.chain_tx_count(), Some(1));
+        assert_eq!(ctx.chain.applied_view().chain_tx_count(), Some(1));
         ctx.chain.applied_tip.store(Some(counted(42)));
-        assert_eq!(ctx.chain.chain_tx_count(), Some(42));
+        assert_eq!(ctx.chain.applied_view().chain_tx_count(), Some(42));
     }
 
     /// Every fact projected from one view describes the publication that view
@@ -1707,9 +1680,9 @@ mod tests {
             Some(7),
             "applied_tip must be shared with caller"
         );
-        assert_eq!(ctx.chain.chain_tx_count(), Some(1));
+        assert_eq!(ctx.chain.applied_view().chain_tx_count(), Some(1));
         applied_tip.store(Some(snapshot(42)));
-        assert_eq!(ctx.chain.chain_tx_count(), Some(42));
+        assert_eq!(ctx.chain.applied_view().chain_tx_count(), Some(42));
         assert!(
             Arc::ptr_eq(&ctx.chain.ibd, &ibd),
             "ibd must be shared with caller"
@@ -1978,7 +1951,7 @@ mod tests {
             BlockRecord::synthetic(7, BlockHash::from(Hash256::from_le_bytes(&[3_u8; 32])));
 
         assert!(record.header_bytes().is_none());
-        assert!(record.header_hex().is_empty());
+        assert_eq!(record.header_hex(), "");
     }
 
     /// Covers the record the block tree derives, which had no test at all.
@@ -2460,13 +2433,13 @@ mod admission_chain_tests {
         let mut ctx = Context::new();
         let outpoint = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[7; 32])), 0);
         let tx = spending(outpoint);
-        assert!(
+        assert_eq!(
             ctx.chain
                 .admission_chain()
                 .snapshot(&tx)
                 .context("empty snapshot")?
-                .prevouts
-                .is_empty()
+                .prevouts,
+            []
         );
 
         // A borrowed capability observes current handles even in isolated

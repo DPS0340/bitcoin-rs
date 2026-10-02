@@ -74,18 +74,6 @@ impl TemplateId {
     }
 }
 
-impl AsRef<str> for TemplateId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl core::fmt::Display for TemplateId {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 /// One non-coinbase transaction selected into a candidate.
 #[derive(Clone, Debug)]
 pub struct CandidateTransaction {
@@ -105,8 +93,6 @@ pub struct CandidateTransaction {
     pub sigop_cost: u32,
     /// Consensus transaction weight.
     pub weight: u64,
-    /// Consensus serialization size including witness.
-    pub size: u32,
     /// One-based indexes of in-candidate ancestors.
     pub depends: Vec<u32>,
 }
@@ -471,7 +457,6 @@ fn candidate_transactions(
             modified_fee: modified_fee(entry),
             sigop_cost: entry.sigop_cost,
             weight: entry.weight,
-            size: entry.size,
             depends: depends(&entry.tx, &tx_positions),
         });
     }

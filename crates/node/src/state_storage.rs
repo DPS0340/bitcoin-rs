@@ -348,7 +348,7 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             .lock()
             .map_or(requested_height, |height| height.max(requested_height));
         let durable_tip_height = self.durable_tip_height.load(Ordering::Acquire);
-        let staged = bitcoin_rs_storage::pruning::prune_to_height(
+        bitcoin_rs_storage::pruning::prune_to_height(
             &*self.store,
             &self.block_files,
             &self.retention,
@@ -373,14 +373,7 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         }
 
         Ok(PruneResult {
-            requested_height,
             pruneheight: updated_pruneheight,
-            block_rows_removed: staged.blocks.blocks_removed,
-            undo_rows_removed: staged.undo.blocks_removed,
-            bytes_freed: staged
-                .blocks
-                .bytes_freed
-                .saturating_add(staged.undo.bytes_freed),
         })
     }
 

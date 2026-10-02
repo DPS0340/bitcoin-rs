@@ -561,7 +561,7 @@ fn admit_to_mempool(state: &NodeState, tx: &Tx) -> Result<()> {
         Arc::new(tx.clone()),
         AdmissionOrigin::Rpc,
         None,
-        unix_time_secs(),
+        bitcoin_rs_primitives::unix_time_secs(),
         &view,
     );
     assert!(
@@ -569,12 +569,6 @@ fn admit_to_mempool(state: &NodeState, tx: &Tx) -> Result<()> {
         "gateway admission must commit the spend, got: {outcome:?}"
     );
     Ok(())
-}
-
-fn unix_time_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 /// Mines and applies the regtest block at `height` over `prev`: the seed
