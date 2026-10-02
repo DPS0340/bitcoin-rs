@@ -17,7 +17,7 @@ use smallvec::SmallVec;
 
 use crate::checker::{SigVersion, TxSignatureChecker};
 use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
-use crate::script::{Instruction, instructions, opcode, push_data};
+use crate::script::{Instruction, instructions, minimal_push, opcode, push_data};
 use crate::stack::{ScriptItem, Stack};
 
 use bitcoin_hashes::{Hash as _, ripemd160, sha1};
@@ -417,7 +417,7 @@ pub(crate) fn eval_script(
                     // Core checks MINIMALDATA only in executed branches
                     // (interpreter.cpp:489, inside `if (fExec && ... <= OP_PUSHDATA4)`).
                     if flags.contains(VerifyFlags::MINIMALDATA)
-                        && !check_minimal_push(data, opcode_byte)
+                        && !minimal_push(data, opcode_byte)
                     {
                         return Err(ScriptError::Invalid {
                             code: ScriptErrCode::MinimalData,
@@ -540,34 +540,6 @@ const fn is_op_success(op: u8) -> bool {
         || (op >= 141 && op <= 142)
         || (op >= 149 && op <= 153)
         || (op >= 187 && op <= 254)
-}
-
-/// Core's `CheckMinimalPush`.
-fn check_minimal_push(data: &[u8], op: u8) -> bool {
-    if data.is_empty() {
-        // Should have used OP_0.
-        return op == opcode::OP_0;
-    }
-    let first = data.first().copied().unwrap_or(0);
-    if data.len() == 1 && (1..=16).contains(&first) {
-        // Should have used OP_1 .. OP_16.
-        return false;
-    }
-    if data.len() == 1 && first == 0x81 {
-        // Should have used OP_1NEGATE.
-        return false;
-    }
-    if data.len() <= 75 {
-        // Must have used a direct push.
-        return usize::from(op) == data.len();
-    }
-    if data.len() <= 255 {
-        return op == opcode::OP_PUSHDATA1;
-    }
-    if data.len() <= 65535 {
-        return op == opcode::OP_PUSHDATA2;
-    }
-    true
 }
 
 /// Executes one opcode. `f_exec` reports whether the enclosing conditional
@@ -1111,56 +1083,24 @@ fn remove_all(haystack: &[u8], needle: &[u8]) -> (Vec<u8>, usize) {
     }
     let mut out = Vec::with_capacity(haystack.len());
     let mut removed = 0_usize;
-    let mut cursor = haystack;
-    while !cursor.is_empty() {
-        let consumed = instruction_len(cursor);
-        let (instr, rest) = cursor.split_at(consumed);
-        if instr == needle {
+    let mut iter = instructions(haystack);
+    let mut start = 0_usize;
+    while let Some(item) = iter.next() {
+        // A malformed tail is one instruction: it is compared and emitted
+        // whole, the same span Core's failed GetOp leaves behind.
+        let end = if item.is_err() {
+            haystack.len()
+        } else {
+            haystack.len() - iter.remaining.len()
+        };
+        if haystack[start..end] == *needle {
             removed += 1;
         } else {
-            out.extend_from_slice(instr);
+            out.extend_from_slice(&haystack[start..end]);
         }
-        cursor = rest;
+        start = end;
     }
     (out, removed)
-}
-
-/// Returns the total byte length of the instruction at the head of `script`.
-fn instruction_len(script: &[u8]) -> usize {
-    let Some(&op) = script.first() else {
-        return 0;
-    };
-    let (header, payload) = if (0x01..=0x4b).contains(&op) {
-        (1_usize, usize::from(op))
-    } else {
-        match op {
-            opcode::OP_PUSHDATA1 => {
-                let len = usize::from(script.get(1).copied().unwrap_or(0));
-                (2, len)
-            }
-            opcode::OP_PUSHDATA2 => {
-                let len = u16::from_le_bytes([
-                    script.get(1).copied().unwrap_or(0),
-                    script.get(2).copied().unwrap_or(0),
-                ]);
-                (3, usize::from(len))
-            }
-            opcode::OP_PUSHDATA4 => {
-                let bytes = [
-                    script.get(1).copied().unwrap_or(0),
-                    script.get(2).copied().unwrap_or(0),
-                    script.get(3).copied().unwrap_or(0),
-                    script.get(4).copied().unwrap_or(0),
-                ];
-                // u32 always fits in usize (>= 32 bits) on supported targets.
-                let wide = u64::from(u32::from_le_bytes(bytes));
-                let len = usize::try_from(wide).unwrap_or(usize::MAX);
-                (5, len)
-            }
-            _ => (1, 0),
-        }
-    };
-    header.saturating_add(payload).min(script.len())
 }
 
 /// Core's `EvalChecksig`: dispatches to pre-tapscript (ECDSA) or tapscript

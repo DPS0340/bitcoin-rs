@@ -12,7 +12,9 @@
 use bitcoin_rs_primitives::{Amount, Hash256, Sighash, SighashCache, SighashError, Tx, TxOut};
 use secp256k1::{Message, PublicKey, XOnlyPublicKey, ecdsa::Signature as EcdsaSig};
 
+use crate::eval::OP_CODESEPARATOR;
 use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
+use crate::script::{Instruction, instructions};
 
 /// Signature version context: which sighash algorithm and encoding rules apply.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -59,54 +61,23 @@ pub struct TxSignatureChecker<'a> {
 
 /// Removes `OP_CODESEPARATOR` (0xab) opcodes from a script, matching Core's
 /// `CTransactionSignatureSerializer::SerializeScriptCode`. Bytes inside data
-/// pushes are preserved. The legacy sighash must exclude CS opcode bytes.
+/// pushes — and any malformed trailing push — are preserved. The legacy
+/// sighash must exclude CS opcode bytes.
 fn remove_codeseparators(script: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(script.len());
-    let mut pos = 0;
-    while pos < script.len() {
-        let op = script[pos];
-        if op == 0xab {
-            // OP_CODESEPARATOR: skip this single byte.
-            pos += 1;
-        } else if (0x01..=0x4b).contains(&op) {
-            // Direct push: copy the opcode and the data bytes.
-            let end = pos + 1 + usize::from(op);
-            out.extend_from_slice(&script[pos..end.min(script.len())]);
-            pos = end;
-        } else if op == 0x4c {
-            // OP_PUSHDATA1: next byte is length.
-            let len_pos = pos + 1;
-            let len = script.get(len_pos).copied().unwrap_or(0);
-            let end = len_pos + 1 + usize::from(len);
-            out.extend_from_slice(&script[pos..end.min(script.len())]);
-            pos = end;
-        } else if op == 0x4d {
-            // OP_PUSHDATA2: next 2 bytes are length (LE).
-            let len_pos = pos + 1;
-            let len = u16::from_le_bytes([
-                script.get(len_pos).copied().unwrap_or(0),
-                script.get(len_pos + 1).copied().unwrap_or(0),
-            ]);
-            let end = len_pos + 2 + usize::from(len);
-            out.extend_from_slice(&script[pos..end.min(script.len())]);
-            pos = end;
-        } else if op == 0x4e {
-            // OP_PUSHDATA4: next 4 bytes are length (LE).
-            let len_pos = pos + 1;
-            let len = u32::from_le_bytes([
-                script.get(len_pos).copied().unwrap_or(0),
-                script.get(len_pos + 1).copied().unwrap_or(0),
-                script.get(len_pos + 2).copied().unwrap_or(0),
-                script.get(len_pos + 3).copied().unwrap_or(0),
-            ]);
-            let end = len_pos + 4 + usize::try_from(len).unwrap_or(usize::MAX);
-            out.extend_from_slice(&script[pos..end.min(script.len())]);
-            pos = end;
+    let mut iter = instructions(script);
+    let mut start = 0_usize;
+    while let Some(item) = iter.next() {
+        // A malformed tail is copied verbatim, as Core's serializer emits it.
+        let end = if item.is_err() {
+            script.len()
         } else {
-            // Other opcode (including OP_0 = 0x00): copy single byte.
-            out.push(op);
-            pos += 1;
+            script.len() - iter.remaining.len()
+        };
+        if !matches!(item, Ok(Instruction::Op(OP_CODESEPARATOR))) {
+            out.extend_from_slice(&script[start..end]);
         }
+        start = end;
     }
     out
 }
