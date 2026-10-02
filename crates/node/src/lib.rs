@@ -38,7 +38,7 @@ mod signal;
 pub mod state;
 mod storage_backend;
 /// Custody-grade data-directory storage-footprint evidence.
-pub mod storage_footprint;
+mod storage_footprint;
 /// Adapter between the P2P block-download executor and Chainstate.
 #[path = "p2p_chain_adapter.rs"]
 pub mod sync;

@@ -31,7 +31,7 @@ use bitcoin_rs_storage::footprint::evidence::EvidenceIdentity;
 use bitcoin_rs_storage::footprint::evidence::IndexWatermarkEvidence;
 use bitcoin_rs_storage::footprint::evidence::LogicalEvidence;
 use bitcoin_rs_storage::footprint::evidence::PhysicalEvidence;
-pub use bitcoin_rs_storage::footprint::evidence::StorageFootprintEvidence;
+pub(crate) use bitcoin_rs_storage::footprint::evidence::StorageFootprintEvidence;
 use bitcoin_rs_storage::footprint::evidence::WatermarkEvidence;
 pub use bitcoin_rs_storage::footprint::evidence::storage_footprint_json;
 use bitcoin_rs_storage::logical_store_owners;
