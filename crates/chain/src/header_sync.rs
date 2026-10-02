@@ -99,7 +99,12 @@ pub fn accept_headers(
             continue;
         }
         validate_pow(header, hash, network)?;
-        validate_empty_tree_root(tree, header, hash, network)?;
+        // An empty tree only roots at the network's genesis hash.
+        if tree.is_empty() && hash != network.genesis_block_hash() {
+            return Err(ChainError::MissingParent {
+                prev_hash: prev_hash_from_header(header),
+            });
+        }
         let prev_hash = prev_hash_from_header(header);
         let parent_id = match tree.lookup(prev_hash) {
             Some(parent_id) => parent_id,
@@ -258,21 +263,6 @@ pub fn minimum_candidate_time(parent_time: u32, height: u32, network: Network) -
         .then(|| parent_time.saturating_sub(MAX_TIMEWARP))
 }
 
-fn validate_empty_tree_root(
-    tree: &BlockTree,
-    header: &BlockHeader,
-    hash: bitcoin_rs_primitives::Hash256,
-    network: Network,
-) -> Result<(), ChainError> {
-    if !tree.is_empty() || hash == network.genesis_block_hash() {
-        return Ok(());
-    }
-
-    Err(ChainError::MissingParent {
-        prev_hash: prev_hash_from_header(header),
-    })
-}
-
 /// Computes the compact target a block extending `parent_id` must carry.
 ///
 /// This is the one next-work source: [`validate_header_nbits`] enforces
@@ -321,7 +311,15 @@ pub fn validate_header_nbits(
         .checked_add(1)
         .ok_or(ChainError::HeightOverflow { parent: parent_id })?;
     let expected = next_work_required(tree, parent_id, header.time, network)?;
-    compare_expected_bits(header, height, expected)
+    let actual = header.bits;
+    if actual != expected {
+        return Err(ChainError::NbitsMismatch {
+            actual: actual.to_consensus(),
+            expected: expected.to_consensus(),
+            height,
+        });
+    }
+    Ok(())
 }
 
 /// Validates a header's proof-of-work target and hash.
@@ -443,22 +441,6 @@ fn expected_retarget_bits(
         .saturating_add(scaled_remainder)
         .min(max_target);
     Ok(target_to_compact(new_target))
-}
-
-fn compare_expected_bits(
-    header: &BlockHeader,
-    height: u32,
-    expected: CompactTarget,
-) -> Result<(), ChainError> {
-    let actual = header.bits;
-    if actual != expected {
-        return Err(ChainError::NbitsMismatch {
-            actual: actual.to_consensus(),
-            expected: expected.to_consensus(),
-            height,
-        });
-    }
-    Ok(())
 }
 
 fn pow_limit_bits(network: Network) -> CompactTarget {
