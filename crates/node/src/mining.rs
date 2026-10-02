@@ -372,7 +372,7 @@ impl MiningControl for MiningCoordinator {
             tip.as_ref().map_or(0.0, |tip| {
                 bitcoin_rs_mining::estimate_network_hashps(
                     &tree,
-                    Some(tip.tip_id),
+                    tip.tip_id,
                     120,
                     self.chainstate.network(),
                 )

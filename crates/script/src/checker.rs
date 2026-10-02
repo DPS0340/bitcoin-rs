@@ -605,7 +605,7 @@ mod tests {
     use bitcoin::hex::FromHex;
     use bitcoin_rs_primitives::{
         Amount, Hash256, LockTime, OutPoint, Script, Sequence, SighashCache, Tx, TxIn, TxOut, Txid,
-        Witness,
+        Witness, deserialize,
     };
 
     use super::{
@@ -1089,7 +1089,7 @@ mod tests {
                 .expect("expected hash");
 
             let tx_bytes = hex_decode(tx_hex);
-            let tx = Tx::consensus_decode(&tx_bytes)
+            let tx = deserialize::<Tx>(&tx_bytes)
                 .unwrap_or_else(|e| panic!("tx decode at row {tested}: {e}"));
 
             // Core's SignatureHash removes OP_CODESEPARATOR (0xab) from

@@ -10,7 +10,7 @@ use std::{
 
 use bitcoin_rs_primitives::{
     Block, DecodeError, LockTime, Network, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness,
-    consensus_bytes, encode::double_sha256,
+    consensus_bytes, deserialize, encode::double_sha256,
 };
 use parking_lot::{Mutex, RwLock};
 
@@ -856,7 +856,7 @@ fn snapshot_scan_preserves_position_values() -> Result<(), Box<dyn std::error::E
     let store = Arc::new(MemoryStore::default());
     let mut writer = IndexWriter::open(Arc::clone(&store), 1)?;
     let body = read_fixture(0)?;
-    let block = Block::consensus_decode(&body)?;
+    let block = deserialize::<Block>(&body)?;
     let txid = block.txs[0].txid();
     let prepared = writer.prepare_block(0, block_hash(&body), &body)?;
     let mut batch = PreparedBatch::new(PreparedBatchLimits {
@@ -946,7 +946,7 @@ fn spending_rows_carry_transaction_positions() -> Result<(), Box<dyn std::error:
         usize::try_from(position.end().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "position end")
         })?)?;
-    assert_eq!(Tx::consensus_decode(&body[start..end])?, spending_tx);
+    assert_eq!(deserialize::<Tx>(&body[start..end])?, spending_tx);
     Ok(())
 }
 
@@ -2069,7 +2069,7 @@ fn redb_snapshot_preserves_position_values() -> Result<(), Box<dyn std::error::E
     let store = Arc::new(bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?);
     let mut writer = IndexWriter::open(Arc::clone(&store), 1)?;
     let body = read_fixture(0)?;
-    let block = Block::consensus_decode(&body)?;
+    let block = deserialize::<Block>(&body)?;
     let txid = block.txs[0].txid();
     let scripthash = ScriptHash::new(&block.txs[0].outputs[0].script_pubkey);
     let prepared = writer.prepare_block(0, block_hash(&body), &body)?;

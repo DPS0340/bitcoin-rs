@@ -2,9 +2,9 @@ use super::format::{decode_hex, generation_name, hex_encode, network_name, valid
 use super::fs::{CheckpointRoot, open_file, read_file};
 use super::{
     COINSTATS_ARTIFACT_LEN, COINSTATS_MAGIC, COINSTATS_VERSION, CURRENT_FILE, CURRENT_FORMAT,
-    CURRENT_VERSION, CheckpointCorruption, CheckpointError, CheckpointIdentity,
-    CheckpointLoadError, CheckpointManifestV1, CurrentV1, MANIFEST_FILE, MANIFEST_FORMAT,
-    MANIFEST_VERSION, MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_PAYLOAD_BYTES,
+    CURRENT_VERSION, CheckpointError, CheckpointIdentity, CheckpointLoadError,
+    CheckpointManifestV1, CurrentV1, MANIFEST_FILE, MANIFEST_FORMAT, MANIFEST_VERSION,
+    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_PAYLOAD_BYTES,
 };
 use cap_std::fs::{Dir, File};
 use sha2::{Digest, Sha256};
@@ -42,9 +42,7 @@ pub fn classify_checkpoint_io(error: std::io::Error) -> CheckpointLoadError {
 }
 /// Wraps a validation reason as a fail-closed checkpoint corruption error.
 pub fn corrupt_checkpoint(reason: impl Into<String>) -> CheckpointLoadError {
-    CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid {
-        reason: reason.into(),
-    })
+    CheckpointLoadError::Corrupt(reason.into())
 }
 fn is_checkpoint_corruption(error: &std::io::Error) -> bool {
     matches!(

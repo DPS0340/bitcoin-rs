@@ -1,4 +1,4 @@
-use bitcoin_rs_consensus::{MAX_TIMEWARP, MEDIAN_TIME_PAST_WINDOW};
+use bitcoin_rs_consensus::MAX_TIMEWARP;
 use bitcoin_rs_primitives::{CompactTarget, Hash256, Network};
 
 pub use pow::compact_is_met_by;
@@ -185,7 +185,7 @@ pub fn validate_contextual_header(
     // Median-time-past floor: the candidate must beat the median of its
     // eleven most recent ancestors.
     let median = tree
-        .median_time_past_at(parent_id, MEDIAN_TIME_PAST_WINDOW)
+        .median_time_past_at(parent_id)
         .ok_or(ChainError::UnknownNode { id: parent_id })?;
     if header.time <= median {
         return Err(ChainError::TimestampTooEarly {

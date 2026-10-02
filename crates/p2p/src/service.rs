@@ -175,6 +175,7 @@ pub enum P2pJoinError {
     BootstrapPanic,
 }
 
+#[derive(Default)]
 struct Workers {
     listeners: Vec<JoinHandle<Result<(), ListenerError>>>,
     outbound: Option<JoinHandle<()>>,

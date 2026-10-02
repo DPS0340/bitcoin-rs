@@ -7,8 +7,8 @@
 use bitcoin_rs_consensus::bip9::versionbits_block_version;
 use bitcoin_rs_consensus::bip30::BIP34_IMPLIES_BIP30_LIMIT;
 use bitcoin_rs_consensus::{
-    CSV_DEPLOYMENT_ID, DeploymentContext, DeploymentParams, DeploymentState,
-    MEDIAN_TIME_PAST_WINDOW, SEGWIT_DEPLOYMENT_ID, SoftforkState, compute_state, deployment_params,
+    CSV_DEPLOYMENT_ID, DeploymentContext, DeploymentParams, DeploymentState, SEGWIT_DEPLOYMENT_ID,
+    SoftforkState, compute_state, deployment_params,
 };
 use bitcoin_rs_primitives::Network;
 
@@ -37,8 +37,7 @@ impl DeploymentContext for DeploymentView<'_> {
 
     fn median_time_past(&self, height: u32) -> Option<u32> {
         let node_id = self.tree.node_at_height_from(self.tip_id, height)?;
-        self.tree
-            .median_time_past_at(node_id, MEDIAN_TIME_PAST_WINDOW)
+        self.tree.median_time_past_at(node_id)
     }
 }
 

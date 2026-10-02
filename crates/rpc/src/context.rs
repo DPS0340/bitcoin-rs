@@ -296,7 +296,7 @@ impl AdmissionChain for ChainAdmissionView {
         let tree = self.block_tree.read();
         let tip_node = tip.as_ref().and_then(|tip| tree.lookup(tip.hash));
         let locktime_cutoff = tip_node
-            .and_then(|node| tree.median_time_past_at(node, 11))
+            .and_then(|node| tree.median_time_past_at(node))
             .unwrap_or(0);
         // CSV activation at the next block gates BIP68 relative locks,
         // matching the block-connect and mining evaluation contexts.
@@ -320,7 +320,7 @@ impl AdmissionChain for ChainAdmissionView {
                             .checked_sub(1)
                             .and_then(|prior| tree.node_at_height_from(tip, prior))
                     })
-                    .and_then(|prior| tree.median_time_past_at(prior, 11))
+                    .and_then(|prior| tree.median_time_past_at(prior))
                     .unwrap_or(0)
             });
             prevout_meta.insert(
@@ -827,7 +827,7 @@ impl ChainHandles {
                 (
                     self.difficulty_for_bits(node.header.bits),
                     u64::from(node.header.time),
-                    u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
+                    u64::from(tree.median_time_past_at(tip.tip_id).unwrap_or(0)),
                 )
             })
         });
@@ -1131,7 +1131,7 @@ impl ChainHandles {
     ) -> Option<u32> {
         let tree = self.block_tree.read();
         let node_id = tree.lookup(hash)?;
-        tree.median_time_past_at(node_id, 11)
+        tree.median_time_past_at(node_id)
     }
 
     /// Returns the block height for `hash` via the in-memory `BlockTree`, or

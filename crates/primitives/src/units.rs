@@ -32,6 +32,12 @@ impl Amount {
         self.0
     }
 
+    /// Saturating addition.
+    #[must_use]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
     /// Little-endian consensus encoding of the satoshi count.
     #[must_use]
     pub const fn to_le_bytes(self) -> [u8; 8] {

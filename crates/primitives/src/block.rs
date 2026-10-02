@@ -1,9 +1,6 @@
 //! Native block type and block-level hashing helpers.
 
-use crate::{
-    BlockHash, Header, Tx, Txid,
-    encode::{ConsensusEncode, DecodeError, deserialize},
-};
+use crate::{BlockHash, Header, Tx, Txid, encode::ConsensusEncode};
 
 /// A Bitcoin block in native owned form.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -25,12 +22,6 @@ impl Block {
     #[must_use]
     pub fn txids(&self) -> Vec<Txid> {
         self.txs.iter().map(Tx::txid).collect()
-    }
-
-    /// Decodes exactly one block (80-byte header, transaction count, transactions),
-    /// rejecting any trailing bytes.
-    pub fn consensus_decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        deserialize(bytes)
     }
 
     /// Full consensus serialization length, including BIP144 witness sections.
@@ -79,6 +70,7 @@ pub struct BlockBodyMetadata {
 #[cfg(test)]
 mod tests {
     use super::Block;
+    use crate::deserialize;
     use crate::encode::DecodeError;
 
     use crate::{BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid};
@@ -88,7 +80,7 @@ mod tests {
     #[test]
     fn genesis_block_hash_matches_known_value() -> Result<()> {
         let bytes = std::fs::read("tests/testdata/0.bin")?;
-        let block = Block::consensus_decode(&bytes)?;
+        let block = deserialize::<Block>(&bytes)?;
 
         assert_eq!(
             block.block_hash(),
@@ -101,7 +93,7 @@ mod tests {
     #[test]
     fn fixture_block_reencodes_and_hashes_to_published_id() -> Result<()> {
         let bytes = std::fs::read("tests/testdata/363731.bin")?;
-        let block = Block::consensus_decode(&bytes)?;
+        let block = deserialize::<Block>(&bytes)?;
 
         assert_eq!(crate::encode::consensus_bytes(&block), bytes);
         assert_eq!(
@@ -120,7 +112,7 @@ mod tests {
         ];
         for (fixture, total, stripped, weight) in cases {
             let bytes = std::fs::read(fixture)?;
-            let block = Block::consensus_decode(&bytes)?;
+            let block = deserialize::<Block>(&bytes)?;
 
             assert_eq!(block.total_size(), bytes.len(), "{fixture}");
             assert_eq!(
@@ -203,11 +195,11 @@ mod tests {
     #[test]
     fn block_decode_rejects_trailing_bytes() -> Result<()> {
         let mut bytes = std::fs::read("tests/testdata/0.bin")?;
-        assert!(Block::consensus_decode(&bytes).is_ok());
+        assert!(deserialize::<Block>(&bytes).is_ok());
         bytes.push(0xFF);
 
         assert_eq!(
-            Block::consensus_decode(&bytes),
+            deserialize::<Block>(&bytes),
             Err(DecodeError::TrailingBytes { remaining: 1 })
         );
         Ok(())

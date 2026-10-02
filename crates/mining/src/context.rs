@@ -8,7 +8,7 @@
 use bitcoin_rs_chain::{
     BlockTree, ChainError, candidate_version, header_sync, node::NodeId, softfork_state,
 };
-use bitcoin_rs_consensus::{MEDIAN_TIME_PAST_WINDOW, locktime_cutoff};
+use bitcoin_rs_consensus::locktime_cutoff;
 use bitcoin_rs_primitives::{CompactTarget, Hash256, Network};
 
 /// Contextual facts for the block that would extend `previous_tip_id`.
@@ -61,11 +61,11 @@ impl MiningChainContext {
                 parent: previous_tip_id,
             })?;
         let softfork = softfork_state(tree, network, Some(previous_tip_id), height);
-        let prev_median_time_past = tree
-            .median_time_past_at(previous_tip_id, MEDIAN_TIME_PAST_WINDOW)
-            .ok_or(ChainError::UnknownNode {
-                id: previous_tip_id,
-            })?;
+        let prev_median_time_past =
+            tree.median_time_past_at(previous_tip_id)
+                .ok_or(ChainError::UnknownNode {
+                    id: previous_tip_id,
+                })?;
         let mut min_time = prev_median_time_past.saturating_add(1);
         // The chain owns the boundary predicate and its floor: the template
         // reads the same [`header_sync::minimum_candidate_time`] that

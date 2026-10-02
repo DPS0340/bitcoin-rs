@@ -31,9 +31,9 @@ The gateway registers these Core REST prefixes:
 
 ## Coherent views
 
-Every REST request reads one `ReadStamp` (process epoch, chain generation,
-chain tip, mempool sequence, policy epoch) at entry and assembles its whole
-response from that view. A response never mixes a tip loaded from one commit
+Every REST request captures the applied-tip publication
+(`ChainHandles::applied_view`, one `TipSnapshot` load) at entry and assembles
+its whole response from that view. A response never mixes a tip loaded from one commit
 with coins, mempool contents, or index rows from another.
 
 - If the chain generation is odd when the request arrives, or moves before the

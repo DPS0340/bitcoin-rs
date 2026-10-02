@@ -132,8 +132,6 @@ pub(crate) fn select_packages(
         ordered,
         fees,
         weight: used_weight.saturating_sub(reservation.weight),
-        size: used_size.saturating_sub(reservation.size),
-        sigops: used_sigops.saturating_sub(reservation.sigops),
     })
 }
 

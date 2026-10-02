@@ -198,14 +198,14 @@ impl<S: KvStore> DeferredChainstateServices for ChainstateStoreServices<S> {
         dir: cap_std::fs::Dir,
         bootstrap: bitcoin_rs_chainstate::JournalBootstrap,
     ) -> Result<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter> {
-        build_journal_writer(dir, Arc::clone(&self.store), bootstrap)
+        build_journal_writer(dir, Arc::clone(&self.store), &bootstrap)
     }
 }
 
 fn build_journal_writer<S: KvStore + 'static>(
     dir: cap_std::fs::Dir,
     store: Arc<S>,
-    bootstrap: bitcoin_rs_chainstate::JournalBootstrap,
+    bootstrap: &bitcoin_rs_chainstate::JournalBootstrap,
 ) -> Result<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter> {
     let mut writer = if bootstrap.open_existing {
         bitcoin_rs_storage::chainstate_journal::JournalWriter::open(dir, store)?

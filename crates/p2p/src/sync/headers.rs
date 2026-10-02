@@ -29,7 +29,6 @@ use crate::peer_info::PeerInfo;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
 use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus, validate_pow};
-use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
 use std::time::Instant;
@@ -1209,7 +1208,7 @@ impl BlockSync {
                 return None;
             }
         }
-        let median_time_past = tree.median_time_past_at(fork_id, MEDIAN_TIME_PAST_WINDOW)?;
+        let median_time_past = tree.median_time_past_at(fork_id)?;
         Some(HeaderAnchor {
             network,
             height: fork.height,

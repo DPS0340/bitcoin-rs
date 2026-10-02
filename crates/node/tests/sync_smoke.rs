@@ -8,7 +8,7 @@ use bitcoin_rs_chain::{BlockTree, TipSnapshot, regtest_fixture};
 use bitcoin_rs_chainstate::Chainstate;
 use bitcoin_rs_node::Network;
 use bitcoin_rs_primitives::{
-    Amount, Block, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness,
+    Amount, Block, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness, deserialize,
 };
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::contract::is_coinbase_tx;
@@ -277,7 +277,7 @@ fn apply_handles_with_coin_stats_and_utxo(
 
 fn regtest_genesis_block() -> Result<Block, Box<dyn std::error::Error>> {
     let bytes = Vec::<u8>::from_hex(REGTEST_GENESIS_HEX)?;
-    Ok(Block::consensus_decode(&bytes)?)
+    Ok(deserialize::<Block>(&bytes)?)
 }
 
 fn child_coinbase_block(parent: &Block, height: u8) -> Result<Block, Box<dyn std::error::Error>> {

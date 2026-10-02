@@ -11,7 +11,6 @@ use super::{
     PreparedApply, ProvenApply, ResolvedUtxoView, WindowApplyDisposition, WindowApplyError,
 };
 use crate::error::ApplyError;
-use bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
 use bitcoin_rs_primitives::{Block, Hash256};
 use bitcoin_rs_storage::CommitRecords;
 use rayon::prelude::*;
@@ -425,8 +424,7 @@ fn prove_window<'a>(
                 bitcoin_rs_chain::softfork_state(&tree, handles.network, Some(parent_id), height);
             let cutoff = bitcoin_rs_consensus::locktime_cutoff(
                 softfork.csv_active,
-                tree.median_time_past_at(parent_id, MEDIAN_TIME_PAST_WINDOW)
-                    .unwrap_or(0),
+                tree.median_time_past_at(parent_id).unwrap_or(0),
                 block.header.time,
             );
             // The next block's context needs this one in the tree. Header-first

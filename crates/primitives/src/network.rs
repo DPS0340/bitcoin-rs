@@ -526,7 +526,7 @@ impl Network {
             Self::Signet => &SIGNET_GENESIS,
             Self::Regtest => &REGTEST_GENESIS,
         };
-        let block = crate::Block::consensus_decode(bytes)
+        let block = crate::deserialize::<crate::Block>(bytes)
             .unwrap_or_else(|error| panic!("compiled-in genesis must decode: {error}"));
         debug_assert_eq!(
             crate::Hash256::from_le_bytes(block.block_hash().as_bytes()),

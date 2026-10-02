@@ -54,7 +54,14 @@ fn raw_consensus_costs_obey_exact_ordered_limits() -> TestResult {
             // The P2PKH coinbase contributes four more cost units.
             let mut context = context(segwit_active, u64::from(expected) + 4);
             let candidate = assemble_ordered_candidate(&context, &snapshot, &p2pkh())?;
-            assert_eq!(candidate.sigop_cost, u64::from(expected) + 4);
+            assert_eq!(
+                candidate
+                    .transactions
+                    .iter()
+                    .map(|tx| u64::from(tx.sigop_cost))
+                    .sum::<u64>(),
+                u64::from(expected)
+            );
             context.max_sigops -= 1;
             assert!(matches!(
                 assemble_ordered_candidate(&context, &snapshot, &p2pkh()),

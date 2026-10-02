@@ -40,6 +40,7 @@ use bitcoin_rs_p2p::{
 };
 use bitcoin_rs_primitives::{
     Block, BlockHash as NativeBlockHash, CompactTarget, Hash256, Header, consensus_bytes,
+    deserialize,
 };
 use bitcoin_rs_primitives::{Network, USER_AGENT};
 use hashbrown::HashMap;
@@ -71,7 +72,7 @@ const NETWORK_TABLE: [(Network, Magic, u16); 5] = [
 
 fn genesis_block() -> Result<Block, Box<dyn Error>> {
     let bytes = Vec::<u8>::from_hex(REGTEST_GENESIS_HEX)?;
-    Ok(Block::consensus_decode(&bytes)?)
+    Ok(deserialize::<Block>(&bytes)?)
 }
 
 /// Chains `count` synthetic headers onto `parent`, deterministically.
@@ -270,7 +271,7 @@ fn serve_collect(
         let Message::BlockPayload(payload) = message else {
             return Ok(());
         };
-        blocks.borrow_mut().push(Block::consensus_decode(&payload)?);
+        blocks.borrow_mut().push(deserialize::<Block>(&payload)?);
         Ok(())
     })?;
     Ok((blocks.into_inner(), outcome.not_found))
@@ -736,7 +737,7 @@ fn inv_getdata_relay_round_trip_serves_blocks_and_notfounds_misses() -> Result<(
     )?;
     let (served, not_found) = match response.as_slice() {
         [Message::BlockPayload(payload), Message::NotFound(items)] => {
-            (Block::consensus_decode(payload)?, items)
+            (deserialize::<Block>(payload)?, items)
         }
         other => return Err(format!("unexpected relay response {other:?}").into()),
     };
@@ -1138,7 +1139,7 @@ fn reorg_switches_which_chain_a_peer_sees() -> Result<(), Box<dyn Error>> {
     )?;
     match response.as_slice() {
         [Message::BlockPayload(payload), Message::NotFound(items)] => {
-            let block = Block::consensus_decode(payload)?;
+            let block = deserialize::<Block>(payload)?;
             assert_eq!(block.block_hash(), branch_b[0].compute_hash());
             assert_eq!(
                 items,

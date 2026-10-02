@@ -912,15 +912,6 @@ impl Chainstate {
         })
     }
 
-    /// Captures derived payloads on later connects: per-tx wire bytes and/or
-    /// the canonical block serialization.
-    #[must_use]
-    pub fn capturing(mut self, rawtx: bool, block_bytes: bool) -> Self {
-        self.capture_rawtx = rawtx;
-        self.capture_block_bytes = block_bytes;
-        self
-    }
-
     /// Copies the published applied tip and its transaction count.
     #[must_use]
     pub fn snapshot(&self) -> ChainstateSnapshot {

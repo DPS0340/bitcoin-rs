@@ -796,9 +796,9 @@ mod tests {
             short_id(&second_bytes),
             "precomputed fixture must actually collide"
         );
-        let first = Tx::consensus_decode(&first_bytes)
+        let first = deserialize::<Tx>(&first_bytes)
             .unwrap_or_else(|error| panic!("fixture decodes: {error}"));
-        let second = Tx::consensus_decode(&second_bytes)
+        let second = deserialize::<Tx>(&second_bytes)
             .unwrap_or_else(|error| panic!("fixture decodes: {error}"));
         (first, second, sid)
     }

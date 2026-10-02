@@ -142,4 +142,4 @@ checkpoint or replay a journal as an authority.
 ## Vocabulary
 
 Terms used above are defined in [`../../CONCEPTS.md`](../../CONCEPTS.md):
-ordered commit protocol, coherent view, `ReadStamp`.
+ordered commit protocol, coherent view, `ChainSnapshot`, chain generation.

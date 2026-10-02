@@ -204,24 +204,15 @@ pub enum CheckpointError {
     #[error("checkpoint invariant failed: {0}")]
     Invalid(String),
 }
-/// A checkpoint cannot be trusted and requires a full resync.
-#[derive(Debug, Error)]
-pub enum CheckpointCorruption {
-    /// The checkpoint failed a current-schema integrity or format check.
-    #[error(
-        "corrupt current-schema checkpoint: {reason}; remove or replace the datadir and restart to perform a full resync"
-    )]
-    Invalid {
-        /// Human-readable corruption reason.
-        reason: String,
-    },
-}
 /// Errors returned while opening the current checkpoint.
 #[derive(Debug, Error)]
 pub enum CheckpointLoadError {
-    /// The checkpoint is corrupt or fails authentication.
-    #[error(transparent)]
-    Corrupt(#[from] CheckpointCorruption),
+    /// The checkpoint failed a current-schema integrity or format check and
+    /// cannot be trusted; a full resync is required.
+    #[error(
+        "corrupt current-schema checkpoint: {0}; remove or replace the datadir and restart to perform a full resync"
+    )]
+    Corrupt(String),
     /// Opening or reading the checkpoint failed with I/O.
     #[error(transparent)]
     Io(#[from] std::io::Error),

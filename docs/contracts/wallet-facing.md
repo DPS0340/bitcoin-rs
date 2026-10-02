@@ -31,7 +31,7 @@ stay in the external process.
 
 Esplora lives at `/api` on the JSON-RPC listener. That directory is the
 electrs/mempool.space base URL. Relative routes below are appended to it.
-Every read captures a `ReadStamp` and answers from one coherent view. A
+Every read captures the applied-tip publication and answers from one coherent view. A
 moved chain generation returns the declared unavailable response, never a
 mixed-tip page.
 
@@ -110,5 +110,5 @@ mixed-tip page.
 ## Vocabulary
 
 [Wallet-free RPC boundary](../../CONCEPTS.md),
-[ReadStamp](../../CONCEPTS.md),
+[Chain snapshot](../../CONCEPTS.md),
 [embedded node](../../CONCEPTS.md).

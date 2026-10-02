@@ -4,7 +4,7 @@ use crate::{
     ApplyError, ChainTransition, Chainstate, ConnectOutcome, DisconnectError, DisconnectOutcome,
 };
 use bitcoin_rs_chain::{NodeId, ReorgPlan, plan_reorg};
-use bitcoin_rs_primitives::{Block, DecodeError, Hash256};
+use bitcoin_rs_primitives::{Block, DecodeError, Hash256, deserialize};
 use bitcoin_rs_storage::StorageError;
 
 /// Maximum number of disconnect-side block bodies held in memory at once
@@ -713,7 +713,7 @@ fn decode_branch_body(
     serialized: bytes::Bytes,
 ) -> core::result::Result<LoadedBranchBody, ReorgError> {
     let block =
-        Block::consensus_decode(serialized.as_ref()).map_err(|source| ReorgError::BodyDecode {
+        deserialize::<Block>(serialized.as_ref()).map_err(|source| ReorgError::BodyDecode {
             hash,
             height,
             source,

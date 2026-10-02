@@ -638,12 +638,12 @@ impl SyncFixture {
         let derived_index_runtime = tx_index_for_mode(tx_index_mode);
         let followers =
             bitcoin_rs_node::ChainFollowers::noop().with_tx_index(derived_index_runtime);
-        let handles = apply_handles(
+        let mut handles = apply_handles(
             Arc::clone(&chain_tip),
             Arc::clone(&applied_tip),
             Arc::clone(&block_tree),
-        )
-        .capturing(followers.needs_rawtx(), followers.needs_block_bytes());
+        );
+        handles.set_capture_flags(followers.needs_rawtx(), followers.needs_block_bytes());
         let ibd = handles.ibd_latch();
         let sync = bitcoin_rs_node::sync::block_sync(
             Arc::new(handles),

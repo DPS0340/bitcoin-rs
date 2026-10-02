@@ -85,10 +85,6 @@ pub struct CandidateTransaction {
     pub wtxid: Wtxid,
     /// Actual fee in satoshis.
     pub fee: u64,
-    /// Signed mining-only fee overlay.
-    pub fee_delta: i64,
-    /// Modified fee (`fee + fee_delta`) used for ranking overlays.
-    pub modified_fee: i128,
     /// Consensus sigop cost.
     pub sigop_cost: u32,
     /// Consensus transaction weight.
@@ -130,20 +126,10 @@ pub struct Candidate {
     pub coinbase: Tx,
     /// Coinbase output value: subsidy plus actual selected fees.
     pub coinbase_value: u64,
-    /// Sum of actual fees from selected non-coinbase transactions.
-    pub fees: u64,
     /// Total block weight including the header, transaction count, and coinbase.
     pub weight: u64,
-    /// Total serialized size including the header, transaction count, and coinbase.
-    pub size: u64,
-    /// Total sigop cost including the coinbase.
-    pub sigop_cost: u64,
     /// Selected non-coinbase transactions in topological order.
     pub transactions: Vec<CandidateTransaction>,
-    /// Witness merkle root over `[0, wtxid_1, …]` when `SegWit` is active.
-    pub witness_merkle_root: Option<Hash256>,
-    /// Reserved value committed in the coinbase witness.
-    pub witness_reserved_value: Option<[u8; 32]>,
     /// `SHA256D(witness_merkle_root || witness_reserved_value)` commitment hash.
     pub witness_commitment: Option<Hash256>,
 }
@@ -245,8 +231,6 @@ pub(crate) struct SelectedBody {
     pub(crate) fees: u64,
     // Include the exact CompactSize transaction count as well as body transactions.
     pub(crate) weight: u64,
-    pub(crate) size: u64,
-    pub(crate) sigops: u64,
 }
 
 /// Size of the block transaction count, including its reserved coinbase.
@@ -347,8 +331,6 @@ fn exact_order(
         ordered: (0..snapshot.entries.len()).collect(),
         fees: 0,
         weight,
-        size,
-        sigops,
     })
 }
 
@@ -360,13 +342,11 @@ fn finish_candidate(
     body: &SelectedBody,
     reservation: FixedReservation,
 ) -> Result<Candidate, MiningError> {
-    let (witness_merkle_root, witness_reserved_value, witness_commitment) = if context.segwit_active
-    {
+    let witness_commitment = if context.segwit_active {
         let root = witness_merkle_root(snapshot, &body.ordered)?;
-        let commitment = witness_commitment_hash(&root, &WITNESS_RESERVED_VALUE);
-        (Some(root), Some(WITNESS_RESERVED_VALUE), Some(commitment))
+        Some(witness_commitment_hash(&root, &WITNESS_RESERVED_VALUE))
     } else {
-        (None, None, None)
+        None
     };
 
     let coinbase = build_coinbase(
@@ -387,15 +367,6 @@ fn finish_candidate(
         .weight
         .checked_add(body.weight)
         .ok_or(MiningError::CandidateScalarOverflow { field: "weight" })?;
-    let size = reservation
-        .size
-        .checked_add(body.size)
-        .ok_or(MiningError::CandidateScalarOverflow { field: "size" })?;
-    let sigop_cost = reservation.sigops.checked_add(body.sigops).ok_or(
-        MiningError::CandidateScalarOverflow {
-            field: "sigop cost",
-        },
-    )?;
 
     Ok(Candidate {
         template_id: TemplateId::new(&context.previous_block_hash, snapshot.sequence),
@@ -413,13 +384,8 @@ fn finish_candidate(
         mempool_sequence: snapshot.sequence,
         coinbase,
         coinbase_value,
-        fees: body.fees,
         weight,
-        size,
-        sigop_cost,
         transactions,
-        witness_merkle_root,
-        witness_reserved_value,
         witness_commitment,
     })
 }
@@ -446,8 +412,6 @@ fn candidate_transactions(
             txid: entry.txid,
             wtxid: entry.wtxid,
             fee: entry.fee,
-            fee_delta: entry.fee_delta,
-            modified_fee: i128::from(entry.fee).saturating_add(i128::from(entry.fee_delta)),
             sigop_cost: entry.sigop_cost,
             weight: entry.weight,
             depends: depends(&entry.tx, &tx_positions),
