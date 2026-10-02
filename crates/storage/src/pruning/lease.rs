@@ -15,7 +15,7 @@
 //!
 //! Leases are bounded by what still exists. A floor at or below the highest
 //! prune line already executed is refused with
-//! [`RetentionError::PrunedBelow`] — the defined required-history-is-gone
+//! [`RetentionError`] — the defined required-history-is-gone
 //! result (`RCV-08`: optional consumer lag cannot retain unlimited
 //! segments, and missing required history is an unavailable result, never a
 //! partial success). An optional consumer that falls that far behind must
@@ -232,19 +232,18 @@ pub enum HistoryUnavailable {
 }
 
 /// Why a retention lease could not be granted.
+///
+/// The requested floor names data pruning has already deleted. The
+/// caller's retention budget was exceeded while it was not holding a
+/// lease; the defined recovery is to rebuild from what remains, not to
+/// retry.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Error)]
-pub enum RetentionError {
-    /// The requested floor names data pruning has already deleted. The
-    /// caller's retention budget was exceeded while it was not holding a
-    /// lease; the defined recovery is to rebuild from what remains, not to
-    /// retry.
-    #[error("required history at height {requested} is already pruned (prune line {pruned_below})")]
-    PrunedBelow {
-        /// Floor the caller asked to pin.
-        requested: u32,
-        /// Highest prune line already executed.
-        pruned_below: u32,
-    },
+#[error("required history at height {requested} is already pruned (prune line {pruned_below})")]
+pub struct RetentionError {
+    /// Floor the caller asked to pin.
+    pub requested: u32,
+    /// Highest prune line already executed.
+    pub pruned_below: u32,
 }
 
 impl fmt::Debug for RetentionRegistry {
@@ -298,7 +297,7 @@ impl RetentionRegistry {
         let mut inner = self.inner.lock();
         let line = inner.refusal_line();
         if floor < line {
-            return Err(RetentionError::PrunedBelow {
+            return Err(RetentionError {
                 requested: floor,
                 pruned_below: line,
             });
@@ -770,7 +769,7 @@ mod tests {
 
         assert!(matches!(
             registry.acquire(499),
-            Err(RetentionError::PrunedBelow {
+            Err(RetentionError {
                 requested: 499,
                 pruned_below: 500
             })
@@ -796,7 +795,7 @@ mod tests {
         let reservation = registry.reserve(500);
         assert!(matches!(
             registry.acquire(499),
-            Err(RetentionError::PrunedBelow {
+            Err(RetentionError {
                 requested: 499,
                 pruned_below: 500
             })
