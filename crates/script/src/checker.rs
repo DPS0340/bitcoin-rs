@@ -18,7 +18,7 @@ use crate::script::{Instruction, instructions};
 
 /// Signature version context: which sighash algorithm and encoding rules apply.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum SigVersion {
+pub(crate) enum SigVersion {
     /// Pre-segwit legacy signatures (double-SHA256 legacy sighash).
     Base,
     /// Segwit v0 signatures (BIP143).
@@ -48,7 +48,7 @@ const SIGHASH_ANYONECANPAY: u8 = 0x80;
 
 /// Transaction signature checker that holds a transaction, input index, amount,
 /// prevouts, and a lazily-initialized sighash cache.
-pub struct TxSignatureChecker<'a> {
+pub(crate) struct TxSignatureChecker<'a> {
     tx: &'a Tx,
     input_index: usize,
     amount: Amount,
@@ -86,7 +86,12 @@ impl<'a> TxSignatureChecker<'a> {
     /// Builds a checker for one input of `tx`, with `prevouts` covering every
     /// input so taproot sighashes can commit to all spent outputs.
     #[must_use]
-    pub fn new(tx: &'a Tx, input_index: usize, amount: Amount, prevouts: &'a [TxOut]) -> Self {
+    pub(crate) fn new(
+        tx: &'a Tx,
+        input_index: usize,
+        amount: Amount,
+        prevouts: &'a [TxOut],
+    ) -> Self {
         Self {
             tx,
             input_index,
@@ -115,7 +120,7 @@ impl<'a> TxSignatureChecker<'a> {
     /// Returns `Ok(true)` when the signature is valid, `Ok(false)` when it is
     /// empty (clean failure), and `Err` when encoding or verification fails
     /// under the active flags.
-    pub fn check_ecdsa_signature(
+    pub(crate) fn check_ecdsa_signature(
         &mut self,
         sig: &[u8],
         pubkey: &[u8],

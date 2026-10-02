@@ -8,7 +8,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 /// Transaction signature checker: ECDSA, Schnorr, locktime, and sequence verification.
-pub mod checker;
+mod checker;
 /// The opcode evaluator: the bounded stack machine behind the interpreter.
 mod eval;
 /// Script verification wrapper.
