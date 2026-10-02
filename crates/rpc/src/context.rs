@@ -198,7 +198,6 @@ pub use bitcoin_rs_index::{
 /// these capability groups — RPC consumes node capabilities and never names a
 /// storage backend or backend engine type, and production wiring attaches
 /// nothing to a constructed `Context` afterwards.
-#[derive(Clone)]
 pub struct ContextHandles {
     /// Chain capability: tips, block log, UTXO set, block tree, transition
     /// barrier, and the chain-owned control surfaces.
@@ -218,7 +217,6 @@ pub struct ContextHandles {
 }
 
 /// Chain capability handles.
-#[derive(Clone)]
 pub struct ChainHandles {
     /// Best header-chain tip. Read-only: only Chainstate publishes.
     pub chain_tip: TipReader,
@@ -353,14 +351,13 @@ impl AdmissionChain for ChainAdmissionView {
 }
 
 /// Mempool capability handles.
-#[derive(Clone)]
 pub struct MempoolHandles {
     /// The process-wide mutation gateway in front of the in-memory pool.
     pub gateway: Arc<MempoolGateway>,
 }
 
 /// Index capability handles.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct IndexHandles {
     /// Complete transaction-index query adapter.
     pub derived_index: Option<Arc<dyn DerivedIndexQuery>>,
@@ -375,7 +372,6 @@ pub struct IndexHandles {
 }
 
 /// Network capability handles.
-#[derive(Clone)]
 pub struct NetworkHandles {
     /// Whether the node accepts or starts P2P connections.
     pub network_active: Arc<core::sync::atomic::AtomicBool>,
@@ -394,7 +390,7 @@ pub struct NetworkHandles {
 }
 
 /// Mining capability handles.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct MiningHandles {
     /// Node-owned mining coordinator. `None` when mining is not wired.
     pub mining_control: Option<Arc<dyn MiningControl>>,
