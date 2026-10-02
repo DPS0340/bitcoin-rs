@@ -5,9 +5,7 @@
 
 use bitcoin_rs_consensus::kernel::BlockParse;
 #[cfg(feature = "kernel")]
-use bitcoin_rs_consensus::{
-    BlockFacts, BlockView, ScriptStageTimings, verify_block_input_scripts,
-};
+use bitcoin_rs_consensus::{BlockFacts, BlockView, ScriptStageTimings, verify_block_input_scripts};
 use bitcoin_rs_consensus::{ConsensusError, UtxoView, ValidationEngine, verify_transaction};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script, Sequence,

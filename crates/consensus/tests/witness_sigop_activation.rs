@@ -97,7 +97,8 @@ impl WitnessFixture {
         block: &'b BlockParse,
     ) -> Result<BlockScriptChecks<'b>, ConsensusError> {
         let txs = core::slice::from_ref(&self.tx);
-        let mut view = BlockView::from_facts(txs, BlockFacts::from_txids(txs, vec![self.tx.txid()]));
+        let mut view =
+            BlockView::from_facts(txs, BlockFacts::from_txids(txs, vec![self.tx.txid()]));
         let resolved = self
             .prevouts
             .iter()

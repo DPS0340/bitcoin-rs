@@ -131,7 +131,8 @@ fn empty_blocks_preserve_lazy_and_parsed_fact_shapes() {
     assert!(!actual.has_witness());
     assert!(actual.merkle_root().is_none());
     assert!(!actual.merkle_mutated());
-    let mut view = BlockView::from_facts(&block.txs, BlockFacts::from_txids(&block.txs, Vec::new()));
+    let mut view =
+        BlockView::from_facts(&block.txs, BlockFacts::from_txids(&block.txs, Vec::new()));
     assert_eq!(view.witness_ids(), []);
 }
 
