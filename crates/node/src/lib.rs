@@ -15,9 +15,9 @@ pub mod chain_effects;
 pub mod config;
 /// Typed in-process node lifecycle: the embedding surface over the same
 /// service graph the daemon wires.
-pub mod embed;
+mod embed;
 /// Central synchronous event loop.
-pub mod event_loop;
+mod event_loop;
 /// The node option table and the source-layer types generated from it.
 pub mod options;
 
@@ -31,14 +31,14 @@ pub mod mining;
 #[path = "reorg_effects.rs"]
 pub mod reorg;
 /// Top-level node runner.
-pub mod run;
+mod run;
 /// Signal handling.
 mod signal;
 /// Shared node state.
 pub mod state;
 mod storage_backend;
 /// Custody-grade data-directory storage-footprint evidence.
-pub mod storage_footprint;
+mod storage_footprint;
 /// Adapter between the P2P block-download executor and Chainstate.
 #[path = "p2p_chain_adapter.rs"]
 pub mod sync;
@@ -46,7 +46,8 @@ pub mod sync;
 pub mod tx_ingress;
 pub use bitcoin_rs_primitives::Network;
 
-pub use bitcoin_rs_rpc::zmq::{NoOpZmqPublisher, ZmqEndpointConfig, ZmqPublisher};
+pub use bitcoin_rs_rpc::zmq::ZmqEndpointConfig;
+pub(crate) use bitcoin_rs_rpc::zmq::{NoOpZmqPublisher, ZmqPublisher};
 
 pub use chain_effects::{ChainFollowers, ConnectMutationError};
 
@@ -75,4 +76,4 @@ pub use sync::BlockSync;
 pub use bitcoin_rs_index::runtime::DerivedIndexRuntime;
 
 #[cfg(feature = "zmq")]
-pub use bitcoin_rs_rpc::zmq::SocketZmqPublisher;
+pub(crate) use bitcoin_rs_rpc::zmq::SocketZmqPublisher;

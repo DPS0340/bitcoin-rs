@@ -24,7 +24,7 @@ pub use bitcoin_rs_p2p::sync::{BlockSync, default_sync_budget};
 /// The [`SyncChain`] implementation over [`bitcoin_rs_chainstate::Chainstate`]:
 /// applied-tip mutation behind the chain-transition lock plus the derived
 /// consumers that must fire inside it.
-pub struct NodeSyncChain {
+struct NodeSyncChain {
     handles: Arc<bitcoin_rs_chainstate::Chainstate>,
     followers: crate::chain_effects::ChainFollowers,
 }

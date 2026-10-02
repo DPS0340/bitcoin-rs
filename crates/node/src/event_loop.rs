@@ -2,7 +2,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use crossbeam_channel::{Receiver, select, tick};
 
 const STATS_INTERVAL: u64 = 1024;
@@ -16,7 +15,7 @@ const SYNC_PROGRESS_INTERVAL: Duration = Duration::from_mins(1);
 /// The p2p, JSON-RPC, and `ScriptIndex` subsystems still own their connection
 /// channels and worker threads. This loop coordinates the shared tick-style
 /// work that must stop cleanly with the process.
-pub struct EventLoop {
+pub(crate) struct EventLoop {
     shutdown_signal: Receiver<()>,
     sync_tick: Receiver<Instant>,
     sync_wake: Receiver<()>,
@@ -33,7 +32,7 @@ impl EventLoop {
     /// INVARIANT: every caller supplies a wake receiver, and sync work
     /// progresses on both the wake and the one-second sync tick.
     #[must_use]
-    pub fn with_sync_wake(
+    pub(crate) fn with_sync_wake(
         shutdown_signal: Receiver<()>,
         sync: Arc<crate::BlockSync>,
         sync_wake: Receiver<()>,
@@ -47,7 +46,7 @@ impl EventLoop {
     }
 
     /// Runs the event loop until a shutdown notification arrives.
-    pub fn spin(self, shutdown: &AtomicBool) -> Result<()> {
+    pub(crate) fn spin(self, shutdown: &AtomicBool) {
         let mut iterations: u64 = 0;
         let mut sync_ticks: u64 = 0;
         let mut last_progress = Instant::now();
@@ -82,7 +81,6 @@ impl EventLoop {
                 last_progress = now;
             }
         }
-        Ok(())
     }
 
     fn on_sync_tick(&self) {
