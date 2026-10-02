@@ -54,7 +54,7 @@ pub(crate) mod wtxid;
 
 pub use block_stager::{BlockStager, StagedBlock};
 pub use chain_query::ActiveChainQuery;
-pub use compact_blocks::{CompactBlockHints, Reconstruction};
+pub use compact_blocks::CompactBlockHints;
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, PINNED_CORE_VERSION};
 pub use connection::{ConnectionId, PeerLease, PeerSource};
 pub use counters::{CountingStream, PeerCounters};
