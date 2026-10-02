@@ -12,7 +12,7 @@
 use std::borrow::Cow;
 
 use bitcoin_rs_primitives::{CODESEPARATOR_POSITION, Hash256};
-use sha2::{Digest, Sha256};
+use sha2::Digest as _;
 use smallvec::SmallVec;
 
 use crate::checker::{SigVersion, TxSignatureChecker};
@@ -164,7 +164,7 @@ pub(crate) const MAX_OPS_PER_SCRIPT: usize = 201;
 /// Maximum public keys in a bare multisig.
 pub(crate) const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
 /// Maximum combined depth of the main and alt stacks.
-pub(crate) const MAX_STACK_SIZE: usize = 1000;
+pub(crate) const MAX_STACK_SIZE: usize = Stack::MAX_DEPTH;
 /// Bytes per passed signature charged against BIP342's validation weight.
 pub(crate) const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
 /// BIP342 validation-weight offset accounting for the witness itself.
@@ -557,10 +557,6 @@ fn dispatch(
     tapleaf_hash: Option<&Hash256>,
     script: &[u8],
 ) -> Result<(), ScriptError> {
-    let invalid_stack = || ScriptError::Invalid {
-        code: ScriptErrCode::InvalidStackOperation,
-    };
-
     // Push value: OP_1NEGATE and the OP_1..OP_16 small integers. OP_RESERVED
     // (0x50) sits between them and pushes nothing - it falls through to the
     // dispatch below, where an executed OP_RESERVED is a BAD_OPCODE.
@@ -1028,16 +1024,19 @@ fn dispatch(
     Ok(())
 }
 
+/// Underflow/invalid-depth error for stack-op dispatch.
+fn invalid_stack() -> ScriptError {
+    ScriptError::Invalid {
+        code: ScriptErrCode::InvalidStackOperation,
+    }
+}
+
 /// Computes the digest for a hash opcode.
 fn hash_bytes(op: u8, data: &[u8]) -> SmallVec<[u8; 32]> {
     match op {
         OP_RIPEMD160 => SmallVec::from_slice(&ripemd160::Hash::hash(data)[..]),
         OP_SHA1 => SmallVec::from_slice(&sha1::Hash::hash(data)[..]),
-        OP_SHA256 => {
-            let mut engine = Sha256::new();
-            Digest::update(&mut engine, data);
-            SmallVec::from_slice(&Digest::finalize(engine))
-        }
+        OP_SHA256 => SmallVec::from_slice(&sha2::Sha256::digest(data)),
         OP_HASH160 => {
             let sha = sha2::Sha256::digest(data);
             SmallVec::from_slice(&ripemd160::Hash::hash(&sha)[..])
@@ -1187,9 +1186,6 @@ fn check_multisig(
     script: &[u8],
     verify_only: bool,
 ) -> Result<(), ScriptError> {
-    let invalid_stack = || ScriptError::Invalid {
-        code: ScriptErrCode::InvalidStackOperation,
-    };
     if stack.is_empty() {
         return Err(invalid_stack());
     }
