@@ -65,6 +65,8 @@ def _emit(output: Path, seed: bytes) -> None:
 def _mask_rust_raw_strings(text: str) -> str:
     """Hide raw-string bodies from regexes that locate Rust declarations."""
     raw_start = re.compile(r'(?:b|c)?r(#{0,255})"')
+    # 'x', '\'', '\n', '\u{41}', b'x' — a bare " inside must not toggle in_string.
+    char_literal = re.compile(r"'(?:\\u\{[0-9a-fA-F_]{1,6}\}|\\.|[^'\\])'")
     out: list[str] = []
     index = 0
     in_string = False
@@ -81,6 +83,12 @@ def _mask_rust_raw_strings(text: str) -> str:
             continue
         raw = raw_start.match(text, index)
         if raw is None:
+            if text[index] == "'":
+                literal = char_literal.match(text, index)
+                if literal is not None:
+                    out.append(literal.group(0))
+                    index = literal.end()
+                    continue
             char = text[index]
             out.append(char)
             in_string = char == '"'
