@@ -183,13 +183,13 @@ impl QueryBudget {
 
 /// Authoritative Live query sources: capability selection, the UTXO set, and
 /// the chain-transition lock Live composition requires.
-pub struct QueryEngineLive {
+pub(crate) struct QueryEngineLive {
     /// Authoritative UTXO set for the compact live view.
-    pub utxo: Option<bitcoin_rs_utxo::UtxoReader>,
+    pub(crate) utxo: Option<bitcoin_rs_utxo::UtxoReader>,
     /// Serializes live-view work against a chain transition.
-    pub chain_transition: Option<bitcoin_rs_chain::StableRead>,
+    pub(crate) chain_transition: Option<bitcoin_rs_chain::StableRead>,
     /// Capability set this engine serves.
-    pub enabled: IndexCapabilities,
+    pub(crate) enabled: IndexCapabilities,
 }
 
 /// First covered height per history-derived capability, loaded from the
@@ -234,7 +234,7 @@ impl core::fmt::Debug for DerivedIndexQueryEngine {
 impl DerivedIndexQueryEngine {
     /// Builds a query engine over the shared reader and authoritative block source.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         runtime: Arc<DerivedIndexRuntime>,
         reader: Arc<dyn IndexReader>,
         block_source: IndexBlockSource,

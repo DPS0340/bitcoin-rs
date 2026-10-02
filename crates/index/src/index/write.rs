@@ -5,8 +5,8 @@ use super::{
     capability::IndexCapability, capability::IndexWatermark, capability::IndexWatermarks,
     capability::SCRIPT_LIVE_WATERMARK_KEY, capability::put_selected_watermarks,
     capability::selected_watermark, error::IndexError, prepared::PreparedBatch,
-    prepared::PreparedBatchLimits, reader::Indexer, rows::PendingRows,
-    rows::delete_rows, rows::put_rows, state::CONSUMER_CURSOR_KEY, state::ConsumerCursorUpdate,
+    prepared::PreparedBatchLimits, reader::Indexer, rows::PendingRows, rows::delete_rows,
+    rows::put_rows, state::CONSUMER_CURSOR_KEY, state::ConsumerCursorUpdate,
     state::FORMAT_VERSION_KEY, state::FORMAT_VERSION_VALUE, state::IndexWriteFence,
     state::capture_write_fence, state::commit_ordinary, state::ensure_fence_live,
     state::resume_capability_reset,
@@ -238,7 +238,7 @@ impl<S: KvStore> IndexWriter<S> {
     /// `capabilities` must name only history-derived indexes: `ScriptLive`
     /// reseeds from the authoritative UTXO view, so anchoring it would
     /// publish a live watermark with no rows behind it.
-    pub fn anchor_watermark(
+    pub(crate) fn anchor_watermark(
         &self,
         capabilities: IndexCapabilities,
         watermark: IndexWatermark,
@@ -558,11 +558,6 @@ impl<S: KvStore> IndexWriter<S> {
             &fence,
             store_batch,
         )
-    }
-
-    /// Forces all completed writes to durable storage.
-    pub fn flush(&self) -> Result<(), IndexError> {
-        self.indexer.store.flush().map_err(IndexError::Storage)
     }
 }
 

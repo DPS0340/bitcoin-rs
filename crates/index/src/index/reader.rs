@@ -22,13 +22,8 @@ impl<S: KvStore> Indexer<S> {
         Self { store }
     }
 
-    /// Returns the underlying key-value store.
-    pub const fn store(&self) -> &std::sync::Arc<S> {
-        &self.store
-    }
-
     /// Loads the exact durable `TxIndex` watermark, or `None` for an empty v2 index.
-    pub fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
+    pub(super) fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
         self.capability_watermark(IndexCapability::TxLookup)
     }
 
