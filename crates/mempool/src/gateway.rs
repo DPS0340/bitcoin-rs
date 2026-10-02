@@ -713,6 +713,9 @@ impl MempoolGateway {
     }
 
     /// Returns `true` when the gateway was constructed with an observer.
+    ///
+    /// Test seam: lifecycle assertions only.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn has_observer(&self) -> bool {
         self.observer.is_some()

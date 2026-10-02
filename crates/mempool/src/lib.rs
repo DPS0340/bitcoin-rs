@@ -63,8 +63,8 @@ pub use pool::{
     Mempool, MempoolChunk, MempoolError, MempoolMiningSnapshot, MempoolStats, OutpointSpender,
     PrioritiseError, PrioritisedTransaction, ScriptHash, SnapshotEntry,
 };
+pub use rbf::RbfError;
 #[cfg(any(test, feature = "test-seam"))]
-pub use rbf::ReplacementPlan;
-pub use rbf::{RbfError, ReplacementCandidate};
+pub use rbf::{ReplacementCandidate, ReplacementPlan};
 pub use standardness::{StandardnessError, StandardnessPolicy, is_standard_tx};
 pub use truc::TrucError;

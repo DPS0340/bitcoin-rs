@@ -140,6 +140,7 @@ impl OrphanPool {
         }
     }
 
+    #[cfg(any(test, feature = "test-seam"))]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -602,9 +603,11 @@ impl AdmissionLifecycle {
             .get(&hash)
             .is_some_and(|scope| wtxid || *scope == RejectScope::Transaction)
     }
+    #[cfg(any(test, feature = "test-seam"))]
     pub(crate) fn is_rejected(&self, hash: Hash256) -> bool {
         self.rejects.contains_key(&hash)
     }
+    #[cfg(any(test, feature = "test-seam"))]
     pub(crate) fn rejects_len(&self) -> usize {
         self.rejects.len()
     }

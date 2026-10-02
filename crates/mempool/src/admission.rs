@@ -763,18 +763,30 @@ impl MempoolGateway {
     }
 
     /// Number of resident orphan transaction bodies.
+    ///
+    /// Test seam: peer-eviction assertions in this crate's and the node's
+    /// suites read it; production inventory suppression goes through
+    /// `have_tx`/`rejects_inventory`, never a count.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn orphan_count(&self) -> usize {
         self.lifecycle.lock().orphans.len()
     }
 
     /// Number of retained rejection hashes with transaction or witness scope.
+    ///
+    /// Test seam: reject-cache assertions only.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn recent_rejects_count(&self) -> usize {
         self.lifecycle.lock().rejects_len()
     }
 
     /// Whether a hash belongs to the bounded recent peer rejection cache.
+    ///
+    /// Test seam: reject-cache assertions only; production checks
+    /// `rejects_inventory`/`rejects_transaction` for scope.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn is_rejected(&self, hash: Hash256) -> bool {
         self.lifecycle.lock().is_rejected(hash)

@@ -324,6 +324,7 @@ impl FeeEstimator {
     /// when it confirms nothing the pool tracked, so this is the observable
     /// proof that `block_connected` fired.
     #[must_use]
+    #[cfg(any(test, feature = "test-seam"))]
     pub(crate) fn last_decayed_height(&self) -> Option<u32> {
         self.last_decayed_height
     }

@@ -1,6 +1,8 @@
+#[cfg(any(test, feature = "test-seam"))]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+#[cfg(any(test, feature = "test-seam"))]
 use bitcoin_rs_primitives::Tx;
 use hashbrown::HashSet;
 use thiserror::Error;
@@ -48,6 +50,11 @@ pub(crate) enum LimitEnforcement {
 }
 
 /// Candidate transaction and feerate policy used for replacement validation.
+///
+/// Test seam: every replacement door (`capture_replacement`,
+/// `check_replacement`, `replace_transaction`) is a test seam, so the
+/// candidate it consumes is one too.
+#[cfg(any(test, feature = "test-seam"))]
 #[derive(Clone, Debug)]
 pub struct ReplacementCandidate {
     /// Replacement transaction.
@@ -66,6 +73,7 @@ pub struct ReplacementCandidate {
     pub sigop_cost: u32,
 }
 
+#[cfg(any(test, feature = "test-seam"))]
 impl ReplacementCandidate {
     /// Builds a replacement candidate.
     #[must_use]
@@ -80,6 +88,11 @@ impl ReplacementCandidate {
     }
 
     /// Attaches a sigop cost counted against resolved prevouts.
+    ///
+    /// Test seam: replacement fixtures set the fact admission would resolve;
+    /// production callers build the candidate through `ReplacementCandidate::new`
+    /// with the gateway-resolved cost already in place.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub const fn with_sigop_cost(mut self, sigop_cost: u32) -> Self {
         self.sigop_cost = sigop_cost;
