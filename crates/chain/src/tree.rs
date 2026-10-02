@@ -548,7 +548,7 @@ impl BlockTree {
             return Err(ChainError::DuplicateHeader { hash });
         }
 
-        let block_work = crate::header_sync::pow::work_from_header(&header);
+        let block_work = crate::block_work(&header);
         let (height, chainwork, status) = match parent {
             Some(parent_id) => {
                 let parent_node = self.node(parent_id)?;

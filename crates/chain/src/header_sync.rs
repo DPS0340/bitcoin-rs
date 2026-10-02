@@ -455,7 +455,11 @@ fn pow_limit_bits(network: Network) -> CompactTarget {
 /// computed by one function.
 #[must_use]
 pub fn block_work(header: &BlockHeader) -> ChainWork {
-    pow::work_from_header(header)
+    let target = pow::compact_to_target(header.bits);
+    if target == ChainWork::ZERO {
+        return ChainWork::ZERO;
+    }
+    (!target / (target + ChainWork::from(1u32))) + ChainWork::from(1u32)
 }
 
 /// Whether a difficulty transition to `new_bits` at `height` is permitted.
@@ -504,7 +508,7 @@ pub fn permitted_difficulty_transition(
     pow::compact_to_target(pow::target_to_compact(smallest)) <= observed
 }
 
-/// Compact proof-of-work target decode/encode and block-work helpers.
+/// Compact proof-of-work target decode/encode helpers.
 ///
 /// `decode_compact` mirrors Bitcoin Core's `arith_uint256::SetCompact`: the
 /// sign bit is masked out of the mantissa, the magnitude is decoded, and
@@ -518,7 +522,7 @@ pub fn permitted_difficulty_transition(
 pub(crate) mod pow {
     use bitcoin_rs_primitives::{CompactTarget, Hash256};
 
-    use crate::node::{BlockHeader, ChainWork};
+    use crate::node::ChainWork;
 
     struct DecodedCompact {
         target: ChainWork,
@@ -561,16 +565,6 @@ pub(crate) mod pow {
     pub fn compact_is_met_by(bits: CompactTarget, hash: Hash256) -> bool {
         let target = compact_to_target(bits);
         target != ChainWork::ZERO && ChainWork::from_le_bytes(hash.to_le_bytes()) <= target
-    }
-
-    /// The block-header proof of work: `~target / (target + 1) + 1`.
-    #[must_use]
-    pub(crate) fn work_from_header(header: &BlockHeader) -> ChainWork {
-        let target = compact_to_target(header.bits);
-        if target == ChainWork::ZERO {
-            return ChainWork::ZERO;
-        }
-        (!target / (target + ChainWork::from(1u32))) + ChainWork::from(1u32)
     }
 
     /// Encodes a non-negative 256-bit target into compact consensus form.
