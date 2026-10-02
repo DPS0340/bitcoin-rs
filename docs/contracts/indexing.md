@@ -132,7 +132,8 @@ remove another script's output.
   namespace per `docs/policies/db-migration.md` (never an in-place migration).
   `IndexWriter::open` (`crates/index/src/index.rs`) accepts the current
   durability marker only (row-format 5: big-endian heights, 43-byte live rows,
-  6-byte positions); every older marker is `IndexError::UnsupportedTxIndexFormatVersion`
+  6-byte positions — format owned by
+  `docs/benchmarks/scriptindex-format.md`); every older marker is `IndexError::UnsupportedTxIndexFormatVersion`
   and recovery full-resets the store for rebuild. No in-place upgrade path
   exists. (`IDX-04` selective reset still covers corrupt watermarks, not versions.)
 - On node startup, index workers read their persisted watermarks and reconcile

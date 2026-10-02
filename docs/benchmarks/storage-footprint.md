@@ -26,7 +26,10 @@ Physical categories: body segments, undo segments, chainstate files, engine WAL,
 
 ## Verdict machine
 
-`bin/bitcoin-rs/tests/overhaul_storage_evidence.rs` passes only for default-lane unpruned fjall, pinned stop, isolated-filesystem peak and separate logical and physical ledgers; anything else fails closed.
+`bin/bitcoin-rs/tests/overhaul_storage_evidence.rs` (planned harness, not yet
+landed) passes only for default-lane unpruned fjall, pinned stop,
+isolated-filesystem peak and separate logical and physical ledgers; anything
+else fails closed.
 
 ```bash
 cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_storage_evidence -- --nocapture

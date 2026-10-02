@@ -37,6 +37,7 @@ When code and a contract disagree, fix the drift in the same change. Do not dupl
 | [reference-set.md](reference-set.md) | `REF-01`–`REF-07` | Released Core, kernel, corpus, and formal-tool identities | reference record and `overhaul_reference_set` |
 | [ecosystem-compatibility.md](ecosystem-compatibility.md) | `ECO-01`–`ECO-09` | External ecosystem compatibility strategy: black-box evidence, one representative consumer, evidence matrix and status vocabulary | [api/ecosystem-compat.toml](../api/ecosystem-compat.toml) rows; live Core interop lane (`core-differential.md`) |
 | [formal-verification.md](formal-verification.md) | Formal inventory | Model hashes, runner identity, return-code mapping, and proof status | `scripts/check_models.py`; manual model-check workflow |
+| [chainstate-journal-v1.md](chainstate-journal-v1.md) | `JW-*-1` | Chainstate journal writer: append ordering, durable head, rotation, retention, lifecycle | `crates/storage/src/chainstate_journal/writer/tests/` |
 
 ## Permanent suite traceability
 
