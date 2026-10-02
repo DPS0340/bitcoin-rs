@@ -40,9 +40,7 @@ use bitcoin::{
 };
 use bitcoin_rs_e2e::helpers::coinbase_script_sig;
 use bitcoin_rs_e2e::node::workspace;
-use bitcoin_rs_e2e::process_peer::{
-    FrameBuffer, connect_loopback, decode_frame, read_frame,
-};
+use bitcoin_rs_e2e::process_peer::{FrameBuffer, connect_loopback, decode_frame, read_frame};
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
 use serde_json::{Value, json};
 use wire::is_soft_recv_error;

@@ -405,4 +405,3 @@ fn collect_window_requests_serving_only(
         });
     }
 }
-

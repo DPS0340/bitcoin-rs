@@ -44,9 +44,7 @@ use bitcoin_rs_e2e::helpers::{
     best_hash, block_count, build_chain, genesis_block, segwit_coinbase_block, wait_for,
 };
 use bitcoin_rs_e2e::node::workspace;
-use bitcoin_rs_e2e::process_peer::{
-    FrameBuffer, connect_loopback, decode_frame, read_frame,
-};
+use bitcoin_rs_e2e::process_peer::{FrameBuffer, connect_loopback, decode_frame, read_frame};
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
 use serde_json::json;
 use wire::{is_soft_recv_error, remaining};

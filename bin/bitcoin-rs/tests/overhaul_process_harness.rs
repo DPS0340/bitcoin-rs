@@ -34,8 +34,8 @@ use bitcoin_rs_e2e::node::START_TIMEOUT;
 use bitcoin_rs_e2e::process_peer::connect_loopback;
 use bitcoin_rs_e2e::rpc::exchange;
 use bitcoin_rs_e2e::{ClockControl, Error, Kind, ProcessNode, SpawnOptions};
-use serde_json::{Value, json};
 use reference_set::reference_set;
+use serde_json::{Value, json};
 
 // A height-1 coinbase is mature for admission after 101 common blocks.
 const COMMON_BLOCKS: u32 = 101;
