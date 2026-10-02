@@ -176,8 +176,6 @@ type Bytes = SmallVec<[u8; 32]>;
 /// A condition stack mirroring Core's `ConditionStack`: tracks only whether
 /// every open `IF` level is executing.
 struct ConditionStack {
-    /// Levels currently open; the top is the innermost.
-    all_true: bool,
     /// Position (from the bottom) of the first `false` level, if any.
     first_false: Option<usize>,
     size: usize,
@@ -186,14 +184,13 @@ struct ConditionStack {
 impl ConditionStack {
     fn new() -> Self {
         Self {
-            all_true: true,
             first_false: None,
             size: 0,
         }
     }
 
     fn all_true(&self) -> bool {
-        self.all_true
+        self.first_false.is_none()
     }
 
     fn is_empty(&self) -> bool {
@@ -203,7 +200,6 @@ impl ConditionStack {
     fn push(&mut self, value: bool) {
         if self.first_false.is_none() && !value {
             self.first_false = Some(self.size);
-            self.all_true = false;
         }
         self.size += 1;
     }
@@ -212,20 +208,13 @@ impl ConditionStack {
         self.size -= 1;
         if self.first_false == Some(self.size) {
             self.first_false = None;
-            self.all_true = true;
         }
     }
 
     fn toggle_top(&mut self) {
         match self.first_false {
-            None => {
-                self.first_false = Some(self.size - 1);
-                self.all_true = false;
-            }
-            Some(pos) if pos == self.size - 1 => {
-                self.first_false = None;
-                self.all_true = true;
-            }
+            None => self.first_false = Some(self.size - 1),
+            Some(pos) if pos == self.size - 1 => self.first_false = None,
             Some(_) => {}
         }
     }
@@ -569,9 +558,6 @@ fn dispatch(
     tapleaf_hash: Option<&Hash256>,
     script: &[u8],
 ) -> Result<(), ScriptError> {
-    if !f_exec && !(OP_IF..=OP_ENDIF).contains(&op) {
-        return Ok(());
-    }
     let invalid_stack = || ScriptError::Invalid {
         code: ScriptErrCode::InvalidStackOperation,
     };
@@ -748,10 +734,15 @@ fn dispatch(
             })?;
         }
         OP_2ROT => {
-            let top_six = stack.drain(6).map_err(|_| invalid_stack())?;
-            let x1 = top_six.first().cloned().unwrap_or_default();
-            let x2 = top_six.get(1).cloned().unwrap_or_default();
-            for item in top_six.into_iter().skip(2) {
+            // drain(6) can only succeed with a full six items.
+            let mut top_six = stack.drain(6).map_err(|_| invalid_stack())?.into_iter();
+            let x1 = top_six
+                .next()
+                .unwrap_or_else(|| unreachable!("drain(6) yields six items"));
+            let x2 = top_six
+                .next()
+                .unwrap_or_else(|| unreachable!("drain(6) yields six items"));
+            for item in top_six {
                 stack.push(item).map_err(|_| ScriptError::Invalid {
                     code: ScriptErrCode::StackSize,
                 })?;
@@ -1290,11 +1281,12 @@ fn check_multisig(
         }
     }
 
-    // Clean up the actual arguments (keys + sigs + the two counts).
+    // Clean up the actual arguments (keys + sigs + the two counts). The last
+    // `sigs` pops are the signature operands; NULLFAIL requires them empty
+    // on failure.
     let mut args = keys + sigs + 2;
-    let mut key_scan = keys + 2;
     while args > 0 {
-        if !success && flags.contains(VerifyFlags::NULLFAIL) && key_scan == 0 {
+        if !success && flags.contains(VerifyFlags::NULLFAIL) && args <= sigs {
             let top = stack.peek().map_err(|_| invalid_stack())?;
             if !item_bytes(top).is_empty() {
                 return Err(ScriptError::Invalid {
@@ -1302,7 +1294,6 @@ fn check_multisig(
                 });
             }
         }
-        key_scan = key_scan.saturating_sub(1);
         stack.pop().map_err(|_| invalid_stack())?;
         args -= 1;
     }

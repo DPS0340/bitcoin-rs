@@ -531,6 +531,7 @@ fn is_valid_der_encoding(sig: &[u8]) -> bool {
 }
 
 /// Core's `IsLowDERSignature`: checks that the S value is at most half the
+/// group order.
 fn is_low_der_signature(sig: &[u8]) -> bool {
     // secp256k1's group order / 2 in big-endian:
     // n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
