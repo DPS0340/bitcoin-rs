@@ -290,7 +290,7 @@ pub(super) fn apply_window_admitted(
 /// Flushes the group's staged prefix into `committed`. A flush failure is
 /// the ambiguous-batch case — the durable head may or may not name it — so
 /// the group is abandoned and the error is fatal, never retried.
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 fn flush_group(
     group: &mut WindowGroup,
     handles: &Chainstate,

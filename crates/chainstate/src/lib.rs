@@ -1262,7 +1262,7 @@ impl bitcoin_rs_primitives::Sink for ByteEquality<'_> {
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 struct BlockTxPlan {
     only_coinbase: bool,
     needs_local_utxo_overlay: bool,
