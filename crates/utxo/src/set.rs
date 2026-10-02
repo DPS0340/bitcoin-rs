@@ -375,7 +375,8 @@ impl UtxoSet {
     /// Returns the number of live outpoint entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.with_stable_view(stable_view_len)
+        #[expect(clippy::redundant_closure_for_method_calls, reason = "HRTB lifetime")]
+        self.with_stable_view(|view| view.len())
     }
 
     /// Returns true when the set has no live outpoint entries.
@@ -387,7 +388,8 @@ impl UtxoSet {
     /// Returns the number of transaction-level records.
     #[must_use]
     pub fn record_count(&self) -> usize {
-        self.with_stable_view(stable_view_record_count)
+        #[expect(clippy::redundant_closure_for_method_calls, reason = "HRTB lifetime")]
+        self.with_stable_view(|view| view.record_count())
     }
 
     pub(crate) fn insert_snapshot_record(
@@ -961,14 +963,6 @@ fn active_shards(
         len = len.saturating_add(1);
     }
     (active, len)
-}
-
-fn stable_view_len(view: &UtxoSetView<'_>) -> usize {
-    view.len()
-}
-
-fn stable_view_record_count(view: &UtxoSetView<'_>) -> usize {
-    view.record_count()
 }
 
 #[cfg(test)]
