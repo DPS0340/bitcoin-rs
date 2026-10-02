@@ -1201,12 +1201,6 @@ impl Mempool {
         self.entries.is_empty()
     }
 
-    /// Returns the count of in-pool transactions.
-    #[must_use]
-    pub fn tx_count(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Returns the txids of every entry in the pool.
     ///
     /// Order is the underlying slab iteration order (i.e., NOT fee-rate sorted;
@@ -4973,7 +4967,7 @@ mod spend_index_tests {
             ))
             .expect("replacement preview excludes its victim");
         assert_eq!(preview.evicted, vec![a_id]);
-        assert_eq!(pool.tx_count(), 3, "preview does not mutate");
+        assert_eq!(pool.len(), 3, "preview does not mutate");
         assert_eq!(
             pool.insert_entry(MempoolEntry::new(
                 Arc::new(replacement),
@@ -5625,7 +5619,7 @@ mod graph_tests {
         assert_eq!(pool.entries.capacity(), retained_slots);
         let fresh = insert_ok(&mut pool, 5, &[], 100);
         assert_eq!(pool.entry_id_by_txid(&fresh), Some(0));
-        assert_eq!(pool.tx_count(), 1);
+        assert_eq!(pool.len(), 1);
         for retired in [parent, leaf, replacement] {
             assert!(pool.entry_by_txid(&retired).is_none());
         }
@@ -5687,7 +5681,7 @@ mod graph_tests {
             error,
             MempoolError::Policy(PolicyError::ClusterCountLimit)
         ));
-        assert_eq!(pool.tx_count(), 4, "rejection commits nothing");
+        assert_eq!(pool.len(), 4, "rejection commits nothing");
         assert!(!pool.contains_txid(&joiner.txid()));
 
         // The acceptance preview quotes the same verdict.
@@ -5808,7 +5802,7 @@ mod graph_tests {
         let parent_txid = parent_tx.txid();
         let _child = insert_ok(&mut pool, 2, &[OutPoint::new(parent_txid, 0)], 100);
         agrees(&pool, &parent_tx, 400, Ok(()));
-        assert_eq!(pool.tx_count(), 1, "the fixture pools the child only");
+        assert_eq!(pool.len(), 1, "the fixture pools the child only");
     }
 
     #[test]
@@ -5869,7 +5863,7 @@ mod graph_tests {
                 nonce += 1;
             }
         }
-        assert_eq!(pool.tx_count(), 400);
+        assert_eq!(pool.len(), 400);
 
         // A new root joins nothing: no walk at all, whatever the pool size.
         pool.graph_steps.store(0, Ordering::Relaxed);
@@ -6044,7 +6038,7 @@ mod graph_tests {
                             history.push((id, candidate.txid()));
                         }
                     }
-                    9 if pool.tx_count() > 8 => {
+                    9 if pool.len() > 8 => {
                         // Trim pressure.
                         let target = u64::try_from(rng.below(200) * 100).unwrap_or(0);
                         crate::evict_lowest_fee_packages(&mut pool, target)

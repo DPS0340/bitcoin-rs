@@ -76,7 +76,7 @@ fn fixture(members: u32) -> TestResult<Fixture> {
     }
     assert_eq!(pool.limits.cluster_count, MEMBERS);
     assert_eq!(pool.limits.max_replacement_clusters, CLUSTERS);
-    assert_eq!(pool.tx_count(), usize::try_from(CLUSTERS * members)?);
+    assert_eq!(pool.len(), usize::try_from(CLUSTERS * members)?);
     Ok(Fixture {
         gateway: MempoolGateway::new(Arc::new(RwLock::new(pool)), None, ValidationEngine::Native),
         roots,
@@ -105,7 +105,7 @@ fn sample(gateway: &MempoolGateway) -> TestResult<Value> {
     let pool = gateway.read();
     assert!(pool.total_vsize() <= pool.limits.max_total_bytes);
     Ok(json!({
-        "entries": pool.tx_count(), "vsize": pool.total_vsize(),
+        "entries": pool.len(), "vsize": pool.total_vsize(),
         "vsize_limit": pool.limits.max_total_bytes,
         "retained_estimate_bytes": pool.dynamic_memory_usage(),
         "rss_kib": rss_kib("VmRSS:")?, "process_rss_high_water_kib": rss_kib("VmHWM:")?,
@@ -165,7 +165,7 @@ fn exercise(stage: &str, fixture: &Fixture) -> TestResult<Value> {
                 1,
             )?;
             assert_eq!(changes.len(), usize::try_from(CLUSTERS * MEMBERS + 1)?);
-            assert_eq!(gateway.read().tx_count(), 1);
+            assert_eq!(gateway.read().len(), 1);
             Ok(json!({"mutation_changes": changes.len(), "change_bound": CLUSTERS * MEMBERS + 1}))
         }
         "package-preview" => {
