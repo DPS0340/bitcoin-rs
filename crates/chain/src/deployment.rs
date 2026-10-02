@@ -65,14 +65,12 @@ pub fn softfork_state(
 }
 
 /// A BIP9 deployment currently in `Started` or `LockedIn` at a candidate height.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct SignallingDeployment {
     /// BIP22 rule name (`csv`, `segwit`).
     pub name: &'static str,
     /// Header-version bit assigned to the deployment.
     pub bit: u8,
-    /// Whether the deployment is `LockedIn` (bit required on the candidate).
-    pub locked_in: bool,
 }
 
 const NAMED_DEPLOYMENTS: [(&str, u32); 2] =
@@ -98,16 +96,12 @@ pub fn signalling_deployments(
             let state =
                 cached_deployment_state(tree, &ctx, previous_tip_id, height, deployment_id, params);
             match state {
-                DeploymentState::Started => Some(SignallingDeployment {
-                    name,
-                    bit: params.bit,
-                    locked_in: false,
-                }),
-                DeploymentState::LockedIn => Some(SignallingDeployment {
-                    name,
-                    bit: params.bit,
-                    locked_in: true,
-                }),
+                DeploymentState::Started | DeploymentState::LockedIn => {
+                    Some(SignallingDeployment {
+                        name,
+                        bit: params.bit,
+                    })
+                }
                 DeploymentState::Defined | DeploymentState::Active | DeploymentState::Failed => {
                     None
                 }
