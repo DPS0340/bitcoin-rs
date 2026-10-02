@@ -30,7 +30,7 @@ pub(crate) struct BlockChainContext {
 }
 
 /// Transaction array shape for `getblock` verbosity levels.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockTxVerbosity {
     /// Verbosity 1: array of txid strings.
     Ids,

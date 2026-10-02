@@ -333,7 +333,7 @@ fn with_checksum(canonical: &str) -> String {
 /// will send money to, so Core passes `require_checksum = true` -- a mistyped
 /// descriptor derives perfectly good addresses that nobody holds the keys for,
 /// and the checksum is the only thing standing between a typo and that.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChecksumRequirement {
     /// Accept a descriptor with no checksum; verify one that is present.
     Optional,
