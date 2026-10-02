@@ -46,12 +46,11 @@ pub mod reorg;
 mod scratch;
 
 /// Historical script-verification policy owned by authoritative chainstate.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationMode {
     /// Every script executes; assume-valid settings are ignored.
     Full,
     /// Skip scripts through a pinned assume-valid anchor.
-    #[default]
     AssumeValid,
     /// Skip scripts below the best header tip.
     Fast,
@@ -71,7 +70,7 @@ impl ValidationMode {
 }
 
 /// Chainstate journal durability and retention policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct ChainstateJournalConfig {
     /// Whether journal recovery is enabled.
     pub enabled: bool,
@@ -105,7 +104,6 @@ impl Default for ChainstateJournalConfig {
 }
 
 /// Inputs required to open a chainstate journal writer.
-#[derive(Clone, Copy)]
 pub struct JournalBootstrap {
     /// Whether to open an existing journal instead of initializing one.
     pub open_existing: bool,
@@ -209,7 +207,6 @@ impl<'a> TransitionLock<'a> {
 }
 
 /// Chain-mutation authority required by destructive block-body pruning.
-#[derive(Clone)]
 pub struct PruneAuthority {
     admission: Arc<ApplyAdmission>,
     chain_transition: TransitionAuthority,
@@ -241,7 +238,6 @@ impl PruneGuard<'_> {
 }
 
 /// Hash-pinned assume-valid trust gate (Bitcoin Core `-assumevalid` semantics).
-#[derive(Debug)]
 pub(crate) struct AssumeValidGate {
     /// Pinned `(height, hash)` anchor, or `None` when no pin applies.
     anchor: Option<(u32, Hash256)>,
@@ -310,7 +306,7 @@ impl AssumeValidGate {
 }
 
 /// Where a block being applied came from. Decides whether its scripts execute.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum BlockProvenance {
     /// Untrusted input (peer delivery, submitblock, file import): scripts run
     /// unless the assume-valid gate covers the height.
@@ -341,7 +337,7 @@ pub struct ConnectOutcome {
 }
 
 /// Committed disconnect. Derived consumers read this after the tip is published.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DisconnectOutcome {
     /// Hash of the disconnected block.
     pub hash: Hash256,
@@ -366,7 +362,7 @@ enum ApplyFinish {
 }
 
 /// Coherent read of the applied tip and its transaction count.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ChainstateSnapshot {
     /// Authoritative applied tip, if any block has committed.
     pub applied: Option<TipSnapshot>,
@@ -375,7 +371,7 @@ pub struct ChainstateSnapshot {
 }
 
 /// Facts returned after Chainstate admits one contiguous header batch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct HeaderAdmissionOutcome {
     /// Number of accepted inputs, including idempotent duplicates.
     pub accepted: usize,
@@ -1199,7 +1195,7 @@ pub enum WindowApplyDisposition {
 }
 
 /// Chain context that determines the ordered transaction checks for one block.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 struct BlockValidationContext {
     hash: Hash256,
     parent: Hash256,
@@ -1266,7 +1262,7 @@ impl bitcoin_rs_primitives::Sink for ByteEquality<'_> {
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 struct BlockTxPlan {
     only_coinbase: bool,
     needs_local_utxo_overlay: bool,
