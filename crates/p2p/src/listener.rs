@@ -3075,7 +3075,7 @@ mod ready_notify_tests {
             "replaced predecessor must not publish or notify"
         );
         assert_eq!(notified.load(Ordering::Relaxed), 0);
-        assert!(shared.peer_table.infos().is_empty());
+        assert_eq!(shared.peer_table.infos(), []);
 
         assert!(shared.publish_info_and_notify_ready(addr, &current, peer_info(addr, 2)));
         assert_eq!(notified.load(Ordering::Relaxed), 1);

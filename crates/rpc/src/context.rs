@@ -1951,7 +1951,7 @@ mod tests {
             BlockRecord::synthetic(7, BlockHash::from(Hash256::from_le_bytes(&[3_u8; 32])));
 
         assert!(record.header_bytes().is_none());
-        assert!(record.header_hex().is_empty());
+        assert_eq!(record.header_hex(), "");
     }
 
     /// Covers the record the block tree derives, which had no test at all.
@@ -2433,13 +2433,13 @@ mod admission_chain_tests {
         let mut ctx = Context::new();
         let outpoint = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[7; 32])), 0);
         let tx = spending(outpoint);
-        assert!(
+        assert_eq!(
             ctx.chain
                 .admission_chain()
                 .snapshot(&tx)
                 .context("empty snapshot")?
-                .prevouts
-                .is_empty()
+                .prevouts,
+            []
         );
 
         // A borrowed capability observes current handles even in isolated

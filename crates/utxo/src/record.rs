@@ -1509,7 +1509,7 @@ mod tests {
             record.remove_run_replacement(&[], Some(&mut removed))?,
             RemovedRecord::Emptied
         ));
-        assert!(removed.is_empty());
+        assert_eq!(removed, []);
         Ok(())
     }
 

@@ -3366,7 +3366,7 @@ mod tests {
             }]
         );
         assert!(pool.contains_txid(&child_txid));
-        assert!(pool.ancestor_ids_for_entry(child_id).is_empty());
+        assert_eq!(pool.ancestor_ids_for_entry(child_id), Vec::<u32>::new());
         let incremental = totals(&pool);
         pool.recompute_all_metadata();
         assert_eq!(incremental, totals(&pool));
@@ -3780,7 +3780,7 @@ mod tests {
         assert_eq!(child_entry.txid, child_txid);
         assert_eq!(parent_entry.txid, parent_txid);
         assert_eq!(child_entry.ancestors, vec![1], "positions are in-snapshot");
-        assert!(parent_entry.ancestors.is_empty());
+        assert_eq!(parent_entry.ancestors, Vec::<u32>::new());
         // Metadata fidelity: copied scalars are the ones derived from the
         // transaction itself, not policy reconstructions of them.
         assert_eq!(child_entry.fee, 2_000);
@@ -5088,12 +5088,12 @@ mod spend_index_tests {
         let root_tx = root.tx.clone();
         let before = pool.len();
         let removed = pool.remove_for_block(&[&root_tx], &[root_txid], 8);
-        assert!(!removed.is_empty());
+        assert_ne!(removed.len(), 0);
         // The root left, while its descendants remain as transactions that
         // now spend confirmed outputs.
         assert!(pool.entry_id_by_txid(&root_txid).is_none());
         assert_eq!(pool.len(), before - 1);
-        assert!(!pool.is_empty());
+        assert_ne!(pool.len(), 0);
     }
 }
 
@@ -5601,17 +5601,18 @@ mod graph_tests {
         assert!(pool.entry_by_txid(&child).is_none());
         assert!(pool.entry_by_wtxid(&child_wtxid).is_none());
         let links = pool.links(child_id).expect("reused slot");
-        assert!(links.parents.is_empty());
-        assert!(links.children.is_empty());
+        assert_eq!(links.parents, Vec::<u32>::new());
+        assert_eq!(links.children, Vec::<u32>::new());
         let parent_id = pool.entry_id_by_txid(&parent).expect("pooled parent");
         let leaf_id = pool.entry_id_by_txid(&leaf).expect("pooled leaf");
-        assert!(
-            pool.links(parent_id)
-                .expect("parent links")
-                .children
-                .is_empty()
+        assert_eq!(
+            pool.links(parent_id).expect("parent links").children,
+            Vec::<u32>::new()
         );
-        assert!(pool.links(leaf_id).expect("leaf links").parents.is_empty());
+        assert_eq!(
+            pool.links(leaf_id).expect("leaf links").parents,
+            Vec::<u32>::new()
+        );
         assert_graph_exact(&pool);
 
         let retained_slots = pool.entries.capacity();

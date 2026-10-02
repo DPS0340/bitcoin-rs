@@ -1147,7 +1147,7 @@ mod tests {
         // parent-walk fallback once the height index is cleared.
         let side = mid_node.ok_or("height 10 node was recorded")?;
         let side_locator = tree.block_locator(side, 32);
-        assert!(!side_locator.is_empty());
+        assert_ne!(side_locator, []);
         assert_eq!(side_locator[0], tree.node(side)?.hash);
         Ok(())
     }

@@ -970,7 +970,7 @@ mod tests {
         table.register(addr(1), stale.clone());
         table.register(addr(1), current.clone());
         assert!(!table.publish_info(addr(1), &stale, info(addr(1), 1)));
-        assert!(table.infos().is_empty());
+        assert_eq!(table.infos(), []);
         assert!(table.publish_info(addr(1), &current, info(addr(1), 2)));
         assert_eq!(table.infos()[0].start_height, 2);
     }
@@ -1000,7 +1000,7 @@ mod tests {
         assert!(table.disconnect(addr(1)));
         assert!(!table.disconnect(addr(1)));
         assert!(current.is_cancelled());
-        assert!(table.infos().is_empty());
+        assert_eq!(table.infos(), []);
         assert!(table.lease(addr(1)).is_none());
     }
 
@@ -1295,7 +1295,7 @@ mod tests {
         let fourth = lease();
         table.register(addr(3), fourth);
         assert!(table.disconnect(addr(3)));
-        assert!(table.entries.read().retired.is_empty());
+        assert_eq!(table.entries.read().retired, []);
         assert_eq!(table.traffic_totals(), (0, 42));
     }
 

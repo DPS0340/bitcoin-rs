@@ -1287,7 +1287,7 @@ mod tests {
             true,
         );
         let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
-        assert!(values.is_empty());
+        assert_eq!(values, Vec::<sonic_rs::Value>::new());
     }
 
     #[test]
@@ -1391,7 +1391,7 @@ mod tests {
             true,
         );
         let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
-        assert!(values.is_empty());
+        assert_eq!(values, Vec::<sonic_rs::Value>::new());
     }
 
     #[test]

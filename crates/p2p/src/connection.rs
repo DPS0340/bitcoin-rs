@@ -16,7 +16,7 @@ pub struct ConnectionId(u64);
 impl ConnectionId {
     fn allocate() -> Self {
         match NEXT_CONNECTION_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         {
             Ok(id) => Self(id),
             Err(_) => std::process::abort(),
@@ -183,14 +183,14 @@ impl OutboundBudget {
     /// Write errors deliberately do not release: the connection and its
     /// counters are dying, and releasing there would risk double-accounting.
     pub(crate) fn release(&self, wire_len: usize) {
-        let _ =
-            self.pending_messages
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                    Some(pending.saturating_sub(1))
-                });
+        let _ = self
+            .pending_messages
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                Some(pending.saturating_sub(1))
+            });
         let _ = self
             .pending_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 Some(pending.saturating_sub(wire_len))
             });
     }
@@ -629,10 +629,10 @@ mod tests {
         let replacement = PeerLease::new(replacement_tx);
         assert!(table.register(addr, replacement.clone()));
         assert!(old.is_cancelled());
-        assert!(table.infos().is_empty());
+        assert_eq!(table.infos(), []);
         assert_eq!(table.ready_source(addr), None);
         assert!(!table.publish_info(addr, &old, peer_info(addr, 2)));
-        assert!(table.infos().is_empty());
+        assert_eq!(table.infos(), []);
 
         assert!(table.publish_info(addr, &replacement, peer_info(addr, 3)));
         assert_eq!(table.infos(), vec![peer_info(addr, 3)]);
@@ -666,7 +666,7 @@ mod tests {
         assert!(table.disconnect_source(replacement.source(addr)));
         assert!(replacement.is_cancelled());
         assert!(!table.is_connected(addr));
-        assert!(table.infos().is_empty());
+        assert_eq!(table.infos(), []);
     }
 
     #[test]

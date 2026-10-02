@@ -511,11 +511,10 @@ mod tests {
         let headers = seed_headers(3);
         let query = query_with(headers)?;
 
-        assert!(query.headers_after(&[], BlockHash::default(), 2).is_empty());
-        assert!(
-            query
-                .headers_after(&[], BlockHash::from(Hash256::from_le_bytes(&[9; 32])), 2)
-                .is_empty()
+        assert_eq!(query.headers_after(&[], BlockHash::default(), 2), []);
+        assert_eq!(
+            query.headers_after(&[], BlockHash::from(Hash256::from_le_bytes(&[9; 32])), 2),
+            []
         );
         Ok(())
     }
@@ -569,11 +568,7 @@ mod tests {
             header_hashes(&response),
             vec![active1.compute_hash(), active2.compute_hash()]
         );
-        assert!(
-            query
-                .headers_after(&[], fork1.compute_hash(), 10)
-                .is_empty()
-        );
+        assert_eq!(query.headers_after(&[], fork1.compute_hash(), 10), []);
         Ok(())
     }
 
@@ -764,7 +759,7 @@ mod tests {
                 panic!("denied headroom cannot serve")
             })?;
             assert!(outcome.halted);
-            assert!(outcome.not_found.is_empty());
+            assert_eq!(outcome.not_found, []);
             assert_eq!(source.loads.load(Ordering::Relaxed), 0);
 
             let mut corrupt = body.clone();
@@ -865,7 +860,7 @@ mod tests {
 
         let (outcome, blocks) = serve_collect(&query, &[Inventory::Block(wire_hash(hash))])?;
 
-        assert!(blocks.is_empty());
+        assert_eq!(blocks, []);
         assert_eq!(outcome.not_found, vec![Inventory::Block(wire_hash(hash))]);
         Ok(())
     }
@@ -889,7 +884,7 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].block_hash(), block.block_hash());
-        assert!(outcome.not_found.is_empty());
+        assert_eq!(outcome.not_found, []);
         Ok(())
     }
 
@@ -1082,7 +1077,7 @@ mod tests {
             Ok(())
         })?;
         assert_eq!(outcome.not_found, vec![item]);
-        assert!(served.is_empty());
+        assert_eq!(served, []);
 
         let mut served = Vec::new();
         let outcome = query.serve_inventory_blocks(&[item], Some(2), &|| true, &mut |message| {

@@ -309,7 +309,7 @@ fn deep_reorg_mempool_matches_clean_sync() -> Result<()> {
         json!(3),
         "survivor must first be confirmed on the losing branch"
     );
-    assert!(sorted_mempool(&mut reorg)?.is_empty());
+    assert_eq!(sorted_mempool(&mut reorg)?, Vec::<String>::new());
 
     // Core mines only the specified conflicting transaction. Its independent
     // spend stays out of the winning branch and remains eligible for mempool.
@@ -411,7 +411,7 @@ fn invalid_higher_work_body_cannot_change_active_chain() -> Result<()> {
         &chain_view(&mut node)?,
     )?;
     assert!(!coin(&mut node, &old_coinbase, false)?.is_null());
-    assert!(sorted_mempool(&mut node)?.is_empty());
+    assert_eq!(sorted_mempool(&mut node)?, Vec::<String>::new());
     assert_eq!(node.rpc("getblockhash", &json!([1]))?, json!(old_tip));
 
     // Invalid-branch recovery reconnects the old branch through durable

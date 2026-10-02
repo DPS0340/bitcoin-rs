@@ -479,7 +479,7 @@ fn check_sync_frontier_pair(
         .map(|id| tree.node(*id).map(|node| BlockHash(node.hash)))
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(requested, expected_hashes);
-    assert!(!requested.is_empty());
+    assert_ne!(requested, []);
     assert!(rx.try_recv().is_err());
     Ok(())
 }
@@ -705,7 +705,7 @@ fn purge_of_one_invalidated_batch_keeps_the_owner_queue_start_at_one_instant()
 fn getdata_uses_compact_flavor_only_for_relaying_peers_near_tip()
 -> Result<(), Box<dyn std::error::Error>> {
     let assert_flavor = |inventory: &[Inventory], compact: bool| {
-        assert!(!inventory.is_empty());
+        assert_ne!(inventory, []);
         for item in inventory {
             if compact {
                 assert!(matches!(item, Inventory::CompactBlock(_)), "got {item:?}");

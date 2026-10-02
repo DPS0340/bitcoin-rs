@@ -790,7 +790,7 @@ fn witness_transaction_relays_txid_and_wtxid_to_mixed_peers() -> anyhow::Result<
         harness.magic,
         Instant::now() + ABSENCE_WINDOW,
     )?;
-    assert!(inventories(&source_frames).is_empty());
+    assert_eq!(inventories(&source_frames), []);
     Ok(())
 }
 

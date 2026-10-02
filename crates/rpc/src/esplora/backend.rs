@@ -373,7 +373,7 @@ mod pagination_tests {
         }
         assert_eq!(page(&ctx, None, "max_txs=invalid&max_txs=2"), all[..2]);
         assert_eq!(page(&ctx, None, "max_txs=1&max_txs=2"), all[..1]);
-        assert!(page(&ctx, None, "max_txs=0&max_txs=2").is_empty());
+        assert_eq!(page(&ctx, None, "max_txs=0&max_txs=2"), []);
     }
 
     #[test]
@@ -403,7 +403,7 @@ mod pagination_tests {
             .expect("insert unresolved-prevout fixture");
         assert_eq!(internal_mempool_txs(&ctx, None, "max_txs=1").status, 503);
         assert_eq!(page(&ctx, Some(&cursor), "max_txs=1"), vec![expected[0].1]);
-        assert!(page(&ctx, None, "max_txs=0").is_empty());
+        assert_eq!(page(&ctx, None, "max_txs=0"), []);
     }
 
     // API-09 in docs/contracts/external-api.md owns order and strict cursor

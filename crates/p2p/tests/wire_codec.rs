@@ -369,7 +369,7 @@ fn decoded_getblocktxn(deltas: &[u64]) -> Result<Vec<u64>, PeerError> {
 #[test]
 fn getblocktxn_differential_indexes_decode_to_absolute_order() -> Result<(), PeerError> {
     assert_eq!(decoded_getblocktxn(&[1, 0, 0])?, vec![1, 2, 3]);
-    assert!(decoded_getblocktxn(&[])?.is_empty());
+    assert_eq!(decoded_getblocktxn(&[])?, []);
 
     let mut cursor = Cursor::new(getblocktxn_frame(&[0, u64::MAX])?);
     assert!(

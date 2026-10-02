@@ -5547,9 +5547,11 @@ mod float_conversion_tests {
             1 << 52,
         ] {
             // Independently derived: the halves recombined by hand.
-            let expected = f64::from(u32::try_from(value >> 32).unwrap_or(u32::MAX))
-                * 4_294_967_296.0_f64
-                + f64::from(u32::try_from(value & 0xffff_ffff).unwrap_or(u32::MAX));
+            let expected = f64::mul_add(
+                f64::from(u32::try_from(value >> 32).unwrap_or(u32::MAX)),
+                4_294_967_296.0_f64,
+                f64::from(u32::try_from(value & 0xffff_ffff).unwrap_or(u32::MAX)),
+            );
             assert!(
                 (u64_to_f64(value) - expected).abs() < f64::EPSILON,
                 "{value}"

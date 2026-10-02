@@ -19,7 +19,7 @@ fn standard_network_uses_builtin_defaults() -> Result<()> {
     let config = resolve(&[&layer])?;
     assert_eq!(config.network, Network::Testnet4);
     assert_eq!(config.p2p.magic, Network::Testnet4.magic());
-    assert!(config.p2p.connect.is_empty());
+    assert_eq!(config.p2p.connect, Vec::<String>::new());
     assert!(config.p2p.dns_seeds_enabled);
     Ok(())
 }

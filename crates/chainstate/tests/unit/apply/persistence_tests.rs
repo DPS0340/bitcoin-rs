@@ -217,7 +217,7 @@ fn bip30_overwrite_undo_restores_original_coin() -> Result<(), Box<dyn std::erro
         MAX_SCRIPT_SIZE,
     )?;
 
-    assert!(undo.removes().is_empty());
+    assert_eq!(undo.removes(), []);
     let restored = undo
         .restores()
         .iter()

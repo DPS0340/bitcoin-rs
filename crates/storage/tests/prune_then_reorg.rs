@@ -312,7 +312,7 @@ fn target_pruning_deletes_old_indexes_in_the_current_flat_file()
         AGGRESSIVE,
         &reservation,
     )?;
-    assert!(staged.file_numbers.is_empty());
+    assert_eq!(staged.file_numbers, Vec::<u32>::new());
     assert_eq!(staged.blocks.blocks_removed, 1);
     assert_eq!(staged.blocks.bytes_freed, 16);
 
@@ -1129,7 +1129,7 @@ impl KvStore for MemoryStore {
         if cf == ColumnFamily::UtxoMeta && key == EXECUTED_FRONTIER_KEY {
             let remaining = self
                 .executed_reads_allowed
-                .fetch_update(
+                .try_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
                     |remaining| remaining.checked_sub(1),
