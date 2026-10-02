@@ -15,12 +15,6 @@
 
 #![expect(clippy::expect_used, reason = "process test assertions")]
 
-// Only the soft/hard recv classification is used here; `remaining` stays
-// dead in this binary.
-#[expect(dead_code, reason = "only is_soft_recv_error is used")]
-#[path = "support/wire.rs"]
-mod wire;
-
 use std::fs::File;
 use std::io::Write as _;
 use std::net::TcpStream;
@@ -40,10 +34,11 @@ use bitcoin::{
 };
 use bitcoin_rs_e2e::helpers::coinbase_script_sig;
 use bitcoin_rs_e2e::node::workspace;
-use bitcoin_rs_e2e::process_peer::{FrameBuffer, connect_loopback, decode_frame, read_frame};
+use bitcoin_rs_e2e::process_peer::{
+    FrameBuffer, connect_loopback, decode_frame, is_soft_recv_error, read_frame,
+};
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
 use serde_json::{Value, json};
-use wire::is_soft_recv_error;
 
 const REGTEST_BITS: u32 = 0x207f_ffff;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

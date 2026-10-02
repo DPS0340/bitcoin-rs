@@ -242,6 +242,19 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     remaining_time(deadline, Instant::now(), "P2P operation deadline")
 }
 
+/// True when a frame-read failure is just "no data yet" (read timeout or
+/// deadline bookkeeping) rather than a dropped connection.
+pub fn is_soft_recv_error(error: &Error) -> bool {
+    match error {
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        Error::Protocol(detail) => detail.contains("deadline"),
+        _ => false,
+    }
+}
+
 /// Partial bytes of an in-flight wire frame carried between calls.
 ///
 /// A read interrupted by its deadline resumes here instead of leaving the

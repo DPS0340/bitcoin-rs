@@ -22,7 +22,7 @@ use serde_json::json;
 
 use crate::error::{Error, Result};
 use crate::node::ProcessNode;
-use crate::process_peer::{FrameBuffer, decode_frame, read_frame};
+use crate::process_peer::{FrameBuffer, decode_frame, is_soft_recv_error, read_frame};
 
 /// One decoded getdata frame: every item flattened to `(inv_type, hash)`.
 #[derive(Clone, Debug)]
@@ -327,19 +327,6 @@ impl LivePeer {
             );
         }
         eprintln!("[E2E {:>5}ms {direction}] {detail}", self.at_ms());
-    }
-}
-
-/// True when a frame-read failure is just "no data yet" (read timeout or
-/// deadline bookkeeping) rather than a dropped connection.
-fn is_soft_recv_error(error: &Error) -> bool {
-    match error {
-        Error::Io(io) => matches!(
-            io.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ),
-        Error::Protocol(detail) => detail.contains("deadline"),
-        _ => false,
     }
 }
 
