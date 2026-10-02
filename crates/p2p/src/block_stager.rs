@@ -690,7 +690,7 @@ mod tests {
 
         let second_drop = stager.prune_expired(now + Duration::from_secs(1));
 
-        assert!(second_drop.is_empty());
+        assert_eq!(second_drop, Vec::<Hash256>::new());
         assert!(stager.contains(&fresh));
 
         let final_drop = stager.prune_expired(now + Duration::from_secs(10));
@@ -895,7 +895,7 @@ mod tests {
         );
         let dropped = stager.prune_expired(now + Duration::from_secs(10));
 
-        assert!(dropped.is_empty());
+        assert_eq!(dropped, Vec::<Hash256>::new());
         assert!(stager.contains(&fresh));
     }
 
@@ -1166,7 +1166,7 @@ mod tests {
         ) else {
             panic!("fork block should stage");
         };
-        assert!(dropped.is_empty());
+        assert_eq!(dropped, Vec::<Hash256>::new());
 
         let super::StagedBlock::Memory { dropped, .. } = stager.insert(
             expected_hash,

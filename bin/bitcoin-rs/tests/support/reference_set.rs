@@ -135,38 +135,49 @@ pub(crate) enum CorpusCustody {
 }
 
 /// Why a reference identity failed to load.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ReferenceError {
     /// The manifest does not parse as TOML.
+    #[error("the compatibility manifest does not parse: {detail}")]
     ManifestUnreadable {
         /// The parser's own message.
         detail: String,
     },
     /// An identity field is absent, leaving a version label without the
     /// digest or record that makes it custody.
+    #[error("`reference.{field}` is absent: a version label alone is not a reference")]
     VersionLabelOnly {
         /// The absent identity field.
         field: &'static str,
     },
     /// A digest is present but is not 64 lowercase hex characters.
+    #[error("`{field}` must be 64 lowercase hex characters")]
     DigestMalformed {
         /// The malformed digest field.
         field: &'static str,
     },
     /// A source identity is a mutable name or malformed commit hash.
+    #[error("`{field}` must be a full 40-character lowercase hex commit")]
     RevisionMalformed {
         /// The malformed source revision field.
         field: &'static str,
     },
     /// A syntactically valid identity does not match the audited artifact
     /// tuple selected by this test gate.
+    #[error("`{identity}` does not match its audited artifact custody binding")]
     CustodyMismatch {
         /// The complete identity tuple that did not match.
         identity: &'static str,
     },
     /// The released product and the kernel development tree were confused.
+    #[error(
+        "the released product identity and the 31.99.x kernel tree identity were \
+         confused: the release must be a MAJOR.MINOR product version distinct from \
+         the kernel tree"
+    )]
     IdentityConfusion,
     /// A required corpus is absent from the reference set.
+    #[error("the `{id}` corpus is missing from the reference set")]
     MissingCorpus {
         /// The corpus identifier that is missing.
         id: String,

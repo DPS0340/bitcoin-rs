@@ -1841,9 +1841,9 @@ mod tests {
             let expected_outpoint = oracle.input[0].previous_output;
             let oracle_output = bitcoin::TxOut {
                 value: bitcoin::Amount::from_sat(parent.outputs[1].value.to_sat()),
-                script_pubkey: bitcoin::ScriptBuf::from_bytes(Vec::from(
-                    parent.outputs[1].script_pubkey.clone(),
-                )),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(
+                    parent.outputs[1].script_pubkey.as_bytes().to_vec(),
+                ),
             };
             assert_eq!(
                 u32::try_from(oracle.total_sigop_cost(|outpoint| {

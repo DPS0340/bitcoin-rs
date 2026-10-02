@@ -2794,9 +2794,9 @@ mod tests {
             bitcoin::consensus::deserialize(&bitcoin_rs_primitives::consensus_bytes(&tx))?;
         let previous = bitcoin::TxOut {
             value: bitcoin::Amount::from_sat(request.prevouts[0].1.value.to_sat()),
-            script_pubkey: bitcoin::ScriptBuf::from_bytes(Vec::from(
-                request.prevouts[0].1.script_pubkey.clone(),
-            )),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(
+                request.prevouts[0].1.script_pubkey.as_bytes().to_vec(),
+            ),
         };
         let cost = oracle.total_sigop_cost(|_| Some(previous.clone()));
         assert!(u32::try_from(cost)? > crate::standardness::MAX_STANDARD_TX_SIGOPS_COST);

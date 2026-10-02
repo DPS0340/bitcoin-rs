@@ -607,12 +607,6 @@ impl UtxoReader {
         Self { set }
     }
 
-    /// Looks up one live output.
-    #[must_use]
-    pub fn get(&self, op: &OutPoint) -> Option<TxOut> {
-        self.set.get(op)
-    }
-
     /// Looks up one live output with its confirmation metadata.
     #[must_use]
     pub fn get_entry(&self, op: &OutPoint) -> Option<UtxoCoin> {
