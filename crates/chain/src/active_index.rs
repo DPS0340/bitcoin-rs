@@ -31,10 +31,12 @@ impl ActiveHeightIndex {
         self.entries.last().copied()
     }
 
+    #[cfg(any(test, feature = "test-seam"))]
     pub(super) fn contains_at_height(&self, height: u32, id: NodeId) -> bool {
         self.get(height) == Some(id)
     }
 
+    #[cfg(any(test, feature = "test-seam"))]
     pub(super) fn taint(&mut self) {
         self.state = TrustState::Tainted;
     }
