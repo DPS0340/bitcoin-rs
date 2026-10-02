@@ -280,7 +280,7 @@ pub fn is_p2a(script: &[u8]) -> bool {
 /// Returns the witness version and program of a segwit output script, or
 /// `None` when the script is not a well-formed witness program.
 #[must_use]
-pub fn witness_program(script: &[u8]) -> Option<(u8, &[u8])> {
+pub(crate) fn witness_program(script: &[u8]) -> Option<(u8, &[u8])> {
     if script.len() < 4 || script.len() > 42 {
         return None;
     }
