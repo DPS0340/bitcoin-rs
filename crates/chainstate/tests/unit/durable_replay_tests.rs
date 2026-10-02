@@ -49,14 +49,14 @@ fn restored_chainstate() -> Result<(Chainstate, Block), Box<dyn std::error::Erro
         inputs: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(vec![1, 1, 0]),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(1),
             script_pubkey: Script::new(),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     let mut leaves = vec![*tx.txid().as_bytes()];
     let merkle = bitcoin_rs_consensus::verify_block::compute_merkle_root(&mut leaves)
@@ -388,14 +388,14 @@ fn mined_child(
                 ]
                 .concat(),
             ),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(1),
             script_pubkey: Script::new(),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     let mut leaves = vec![*tx.txid().as_bytes()];
     let merkle = bitcoin_rs_consensus::verify_block::compute_merkle_root(&mut leaves)

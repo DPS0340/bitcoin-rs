@@ -214,7 +214,7 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
                 inputs: vec![TxIn {
                     previous_output: OutPoint::new(first_txid, 0),
                     script_sig: Script::from_bytes(push_int(1)),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 }],
                 outputs: vec![
@@ -227,21 +227,21 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
                         script_pubkey: p2sh.clone(),
                     },
                 ],
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
             };
             let child = Tx {
                 version: 2,
                 inputs: vec![TxIn {
                     previous_output: OutPoint::new(parent.txid(), 0),
                     script_sig: redeem_sig.clone(),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 }],
                 outputs: vec![TxOut {
                     value: Amount::from_sat(1_900_000_000),
                     script_pubkey: p2sh.clone(),
                 }],
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
             };
             txs.push(parent.clone());
             txs.push(child);

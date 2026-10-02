@@ -2266,14 +2266,14 @@ mod admission_chain_tests {
             inputs: vec![TxIn {
                 previous_output: outpoint,
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::from_stack(vec![vec![0x51]]),
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(9_000),
                 script_pubkey: Script::from_bytes(spendable_script()),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         }
     }
 

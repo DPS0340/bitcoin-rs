@@ -30,7 +30,7 @@ fn coinbase_tx(value: u64) -> Tx {
             value: Amount::from_sat(value),
             script_pubkey: Script::from_bytes(vec![0x6A]),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     }
 }
 
@@ -53,7 +53,7 @@ fn spending_tx() -> Tx {
             value: Amount::from_sat(49_000),
             script_pubkey: Script::from_bytes(vec![0x6A, 0x04, 0xAA, 0xBB, 0xCC, 0xDD]),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     }
 }
 
@@ -279,7 +279,7 @@ fn oversized_missing_input_tx_is_rejected_not_orphaned() {
             value: Amount::from_sat(1_000),
             script_pubkey: Script::from_bytes(vec![0x6A, 0x04, 0xAA, 0xBB, 0xCC, 0xDD]),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     assert!(
         tx.weight() > 400_000,

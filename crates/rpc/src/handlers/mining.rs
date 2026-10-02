@@ -798,7 +798,7 @@ mod tests {
                 version: 2,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
             },
             coinbase_value: 5_000_000_000,
             fees: 0,
@@ -871,16 +871,16 @@ mod tests {
         let coinbase = Tx {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(Txid::default(), 0xffff_ffff),
+                previous_output: OutPoint::null(),
                 script_sig: Script::from_bytes(vec![0x51]),
-                sequence: Sequence::from_consensus(0xffff_ffff),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(50 * 100_000_000),
                 script_pubkey: Script::new(),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         };
         let merkle_root = coinbase.txid().0;
         Block {
@@ -1303,7 +1303,7 @@ mod tests {
             version: 1,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         };
         let block = Block {
             header: sample_block().header,
@@ -1423,7 +1423,7 @@ mod tests {
             version: 2,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         };
         let txid = tx.txid();
         {
@@ -1485,7 +1485,7 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: Script::from_bytes(vec![0x51]),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         }
     }
 
@@ -1552,7 +1552,7 @@ mod tests {
                 value: Amount::from_sat(1_000),
                 script_pubkey: Script::new(),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         };
         let txid = tx.txid();
         let wtxid = tx.wtxid();
@@ -1767,7 +1767,7 @@ mod tests {
             version: 2,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         };
         let pooled = pooled_tx.txid();
         {
@@ -1837,14 +1837,14 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid::default(), 0),
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(50_000),
                 script_pubkey: Script::from_bytes(vec![0x51]),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         }
     }
 

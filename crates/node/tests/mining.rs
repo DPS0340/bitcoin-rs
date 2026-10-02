@@ -148,11 +148,11 @@ fn mined_child_labeled(prev: BlockHash, label: i64) -> anyhow::Result<Block> {
     let script_opcode = u8::try_from(label + 0x50)?;
     let coinbase = Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(vec![script_opcode, 0x51]),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
@@ -193,11 +193,11 @@ fn excess_coinbase_child(prev: BlockHash) -> anyhow::Result<Block> {
 fn mempool_sequence_tx() -> Tx {
     Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
             previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[0x42; 32])), 0),
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
@@ -1278,11 +1278,11 @@ fn last_candidate_counts_include_the_coinbase() -> anyhow::Result<()> {
 
     let tx = Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
             previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[0x42; 32])), 0),
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
@@ -1746,14 +1746,14 @@ fn generateblock_raw_tx_does_not_require_mempool_admission() -> anyhow::Result<(
         inputs: vec![TxIn {
             previous_output: OutPoint::new(Txid::from(Hash256::from_le_bytes(&[0x11; 32])), 0),
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(50_000),
             script_pubkey: Script::from_bytes(vec![0x51]),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     let error = mining
         .generate(GenerateRequest {

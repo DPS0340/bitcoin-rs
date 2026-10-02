@@ -300,11 +300,11 @@ mod tests {
         ]);
         let spending = |previous_output: OutPoint| Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
                 previous_output,
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(0xffff_ffff),
+                sequence: Sequence::MAX,
                 witness: Witness::from_stack(vec![vec![0x51]]),
             }],
             outputs: vec![TxOut {

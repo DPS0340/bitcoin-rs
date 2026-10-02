@@ -672,14 +672,14 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: outpoint,
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(49_000),
                 script_pubkey: Script::from_bytes(vec![0x6a, 0x04, 0xaa, 0xbb, 0xcc, 0xdd]),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         })
     }
 

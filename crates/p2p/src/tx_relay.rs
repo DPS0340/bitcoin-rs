@@ -1051,14 +1051,14 @@ mod tests {
                 inputs: vec![TxIn {
                     previous_output: OutPoint::new(dummy_txid(marker), 0),
                     script_sig: Script::new(),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::from_stack(vec![vec![0x51]]),
                 }],
                 outputs: vec![TxOut {
                     value: Amount::from_sat(1_000),
                     script_pubkey: Script::from_bytes(vec![0x6a, 4, 1, 2, 3, 4]),
                 }],
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
             });
             let txid = tx.txid();
             let wtxid = tx.wtxid();
@@ -1119,7 +1119,7 @@ mod tests {
                 value: Amount::from_sat(1_000),
                 script_pubkey: Script::from_bytes(vec![0x6a, 4, 1, 2, 3, 4]),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         })
     }
 

@@ -52,7 +52,7 @@ fn fixture(outputs: usize) -> (Tx, bitcoin::Transaction) {
 }
 
 fn double_sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(Sha256::digest(bytes)).into()
+    bitcoin_rs_primitives::encode::double_sha256(bytes).to_le_bytes()
 }
 
 /// BIP143 reference serialization. Raw hash-type bits select fields using the

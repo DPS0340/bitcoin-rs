@@ -619,14 +619,14 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[1; 32])), 0),
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: Script::new(),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         };
         let block = Block {
             header: Header {
@@ -1181,14 +1181,14 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: OutPoint::null(),
                 script_sig: Script::from_bytes(vec![1, 1]),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(50),
                 script_pubkey: Script::new(),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         }
     }
 
@@ -1198,14 +1198,14 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[2; 32])), 0),
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::from_stack(vec![vec![1; 32]]),
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: Script::new(),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         }
     }
 
@@ -1215,14 +1215,14 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[seed; 32])), 0),
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: Script::new(),
             }],
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         }
     }
 

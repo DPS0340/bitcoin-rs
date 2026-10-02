@@ -131,14 +131,14 @@ fn spending_tx(parent: Txid, output_value: u64) -> Tx {
         inputs: vec![TxIn {
             previous_output: OutPoint::new(parent, 0),
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(0xffff_ffff),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(output_value),
             script_pubkey: Script::from_bytes(vec![0x6A, 0x04, 0xAA, 0xBB, 0xCC, 0xDD]),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     }
 }
 

@@ -268,7 +268,7 @@ mod wire_metadata_tests {
                 TxIn {
                     previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[0x22; 32])), 7),
                     script_sig: Script::new(),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 },
             ],

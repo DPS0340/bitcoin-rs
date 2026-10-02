@@ -49,7 +49,7 @@ impl WitnessFixture {
             inputs.push(TxIn {
                 previous_output: outpoint,
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::from_stack(vec![script]),
             });
             prevouts.push((
@@ -68,7 +68,7 @@ impl WitnessFixture {
                     value: Amount::from_sat(1),
                     script_pubkey: Script::from_bytes(vec![opcode::OP_PUSHNUM_1]),
                 }],
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
             },
             prevouts,
         }
