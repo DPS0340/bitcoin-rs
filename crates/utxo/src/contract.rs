@@ -202,7 +202,7 @@ impl UndoRecord {
 }
 
 /// The outcome of rolling one block back out of the UTXO set.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct DisconnectReceipt {
     /// Parent transactions of the outputs restored into the live set.
     pub restored_parents: Vec<Txid>,
