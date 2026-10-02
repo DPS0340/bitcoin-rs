@@ -14,8 +14,8 @@ use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid, Wtxid};
 #[cfg(test)]
 use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
 use bitcoin_rs_script::{
-    Instruction, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
-    is_push_only, minimal_non_dust, multisig_key_count, opcode, script::instructions,
+    Instruction, instructions, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_p2tr,
+    is_p2wpkh, is_p2wsh, is_push_only, minimal_non_dust, multisig_key_count, opcode,
 };
 use thiserror::Error;
 

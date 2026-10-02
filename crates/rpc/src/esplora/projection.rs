@@ -11,7 +11,7 @@ use bitcoin_rs_mempool::ScriptHash as MempoolScriptHash;
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, OutPoint, Tx, TxOut, Txid, deserialize,
 };
-use bitcoin_rs_script::script::{instructions, is_p2sh, is_p2wsh};
+use bitcoin_rs_script::{instructions, is_p2sh, is_p2wsh};
 
 use crate::compat::convert::{self};
 use crate::context::{Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError};

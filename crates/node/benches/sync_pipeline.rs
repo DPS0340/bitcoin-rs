@@ -46,7 +46,7 @@ use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script, Sequence,
     Tx, TxIn, TxOut, Txid, Witness,
 };
-use bitcoin_rs_script::script::push_int;
+use bitcoin_rs_script::push_int;
 // seam: getdata inventory items stay rust-bitcoin at the p2p wire boundary.
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::Inventory;

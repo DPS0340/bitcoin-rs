@@ -16,7 +16,7 @@ use bitcoin_rs_mining::{
 use bitcoin_rs_primitives::{
     Amount, Hash256, LockTime, OutPoint, Sequence, Tx, TxIn, TxOut, Txid, consensus_bytes,
 };
-use bitcoin_rs_script::script::push_data;
+use bitcoin_rs_script::push_data;
 use common::{context, oracle_transaction, p2pkh};
 
 type TestResult = Result<(), Box<dyn Error>>;

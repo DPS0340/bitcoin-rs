@@ -64,7 +64,7 @@ mod tests {
     use bitcoin_rs_primitives::{
         Amount, LockTime, Script, Sequence, TxIn, Txid, Witness, consensus_bytes,
     };
-    use bitcoin_rs_script::script::{opcode, push_data};
+    use bitcoin_rs_script::{opcode, push_data};
 
     use super::*;
 

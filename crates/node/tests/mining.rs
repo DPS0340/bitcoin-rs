@@ -1851,7 +1851,7 @@ fn generateblock_raw_p2sh_costs_use_confirmed_prevouts() -> anyhow::Result<()> {
         let block = solved_template_block(&mining)?;
         inputs.push(TxIn {
             previous_output: OutPoint::new(block.txs[0].txid(), 0),
-            script_sig: bitcoin_rs_script::script::push_data(&redeem).into(),
+            script_sig: bitcoin_rs_script::push_data(&redeem).into(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         });
