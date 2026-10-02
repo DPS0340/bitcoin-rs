@@ -211,7 +211,7 @@ impl NodeState {
     /// Returns the mining generation wake shared with the apply path and the
     /// gateway observer. The template coordinator attaches itself here.
     #[must_use]
-    pub fn mining_generation_signal(&self) -> Arc<crate::mining::MiningGenerationSignal> {
+    pub(crate) fn mining_generation_signal(&self) -> Arc<crate::mining::MiningGenerationSignal> {
         Arc::clone(self.followers.mining())
     }
 
@@ -360,7 +360,7 @@ impl NodeState {
 
     /// Returns the node-owned complete transaction-index query adapter.
     #[must_use]
-    pub fn derived_index_query(
+    pub(crate) fn derived_index_query(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_rpc::context::DerivedIndexQuery>> {
         if !self.config.indexes.txindex {
@@ -374,7 +374,7 @@ impl NodeState {
     /// `--scriptindex` builds this dependency as well, but that does not
     /// enable or advertise the Core `--txindex` contract.
     #[must_use]
-    pub fn esplora_derived_index_query(
+    pub(crate) fn esplora_derived_index_query(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_rpc::context::DerivedIndexQuery>> {
         self.derived_index.adapter().map(|adapter| {
@@ -385,7 +385,7 @@ impl NodeState {
 
     /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
-    pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
+    pub(crate) fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
         if !self.config.indexes.script_index.is_enabled() {
             return None;
         }

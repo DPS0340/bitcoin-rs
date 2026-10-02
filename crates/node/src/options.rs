@@ -66,7 +66,7 @@ pub fn parse_validation_engine(value: &str) -> std::result::Result<ValidationEng
 }
 
 /// Parses an environment or file boolean.
-pub fn parse_bool(value: &str) -> Result<bool> {
+fn parse_bool(value: &str) -> Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
@@ -107,7 +107,7 @@ pub fn parse_connect_endpoint(value: &str) -> std::result::Result<String, String
 }
 
 /// Parses a comma-separated listener bind list.
-pub fn parse_socket_list(value: &str) -> Result<Vec<SocketAddr>> {
+fn parse_socket_list(value: &str) -> Result<Vec<SocketAddr>> {
     value
         .split(',')
         .filter(|part| !part.trim().is_empty())
@@ -121,7 +121,7 @@ pub fn parse_socket_list(value: &str) -> Result<Vec<SocketAddr>> {
 /// CLI applies after its delimiter split and TOML applies per array element,
 /// so no surface quietly accepts a trailing or doubled comma that another
 /// rejects. An all-empty value still means "unset".
-pub fn parse_connect_list(value: &str) -> Result<Vec<String>> {
+fn parse_connect_list(value: &str) -> Result<Vec<String>> {
     let value = value.trim();
     if value.is_empty() {
         return Ok(Vec::new());

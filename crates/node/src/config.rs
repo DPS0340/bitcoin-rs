@@ -505,7 +505,7 @@ impl Auth {
     }
 
     /// Converts this configuration into the RPC crate's runtime auth policy.
-    pub fn to_rpc_auth(&self) -> Result<bitcoin_rs_rpc::Auth> {
+    pub(crate) fn to_rpc_auth(&self) -> Result<bitcoin_rs_rpc::Auth> {
         match self {
             Self::Basic { user, password } => {
                 Ok(bitcoin_rs_rpc::Auth::basic(user.clone(), password))
@@ -537,8 +537,8 @@ impl Default for Auth {
     }
 }
 
-pub(super) const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
-pub(super) const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
+const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
+const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
 
 /// A built-in node network and its associated P2P bootstrap profile.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -624,6 +624,7 @@ impl RuntimeInputs {
     }
 
     /// Returns a copy with the given mempool observer.
+    #[cfg(test)]
     #[must_use]
     pub fn with_mempool_observer(
         mut self,
