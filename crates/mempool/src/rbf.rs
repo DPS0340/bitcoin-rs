@@ -6,7 +6,6 @@ use hashbrown::HashSet;
 use thiserror::Error;
 
 use crate::mutation::{AdmissionOrigin, RemovalReason};
-use crate::pool::tx_fee_rate;
 use crate::{EntryId, Mempool, MempoolEntry, MempoolError};
 
 /// Whether a committed entry registers with the fee estimator.
@@ -85,12 +84,6 @@ impl ReplacementCandidate {
     pub const fn with_sigop_cost(mut self, sigop_cost: u32) -> Self {
         self.sigop_cost = sigop_cost;
         self
-    }
-
-    /// Candidate fee rate in sat/vB multiplied by 1000.
-    #[must_use]
-    pub fn fee_rate(&self) -> u64 {
-        tx_fee_rate(self.fee, self.vsize)
     }
 }
 

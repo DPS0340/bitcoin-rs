@@ -10,7 +10,6 @@ use hashbrown::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::entry::fee_rate;
 use crate::fee_estimator::{FeeEstimator, FeeRate};
 use crate::mutation::{
     MutationChange, MutationOutcome, MutationResult, MutationSequence, RemovalReason,
@@ -2443,10 +2442,6 @@ impl Mempool {
     fn entry_mut(&mut self, id: EntryId) -> Option<&mut MempoolEntry> {
         self.entries.get_mut(id)
     }
-}
-
-pub(crate) fn tx_fee_rate(fee: u64, vsize: u32) -> u64 {
-    fee_rate(fee, u64::from(vsize))
 }
 
 /// Spending-index key over the raw 36-byte `OutPoint` consensus encoding.
