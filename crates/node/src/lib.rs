@@ -10,7 +10,7 @@
 extern crate alloc;
 
 /// Derived post-commit consumers of a committed chain transition.
-pub mod chain_effects;
+mod chain_effects;
 /// Layered node configuration.
 pub mod config;
 /// Typed in-process node lifecycle: the embedding surface over the same

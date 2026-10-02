@@ -70,7 +70,7 @@ impl ChainFollowers {
     /// consumer; effects run only through [`Self::on_connect`] and
     /// [`Self::on_disconnect`].
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         blocks: Arc<RwLock<BlockLog>>,
         zmq: Arc<dyn ZmqPublisher>,
         derived_index: Option<Arc<DerivedIndexRuntime>>,
@@ -129,13 +129,13 @@ impl ChainFollowers {
 
     /// Shared RPC block log owned by this committed-effect dispatcher.
     #[must_use]
-    pub fn block_log(&self) -> &Arc<RwLock<BlockLog>> {
+    pub(crate) fn block_log(&self) -> &Arc<RwLock<BlockLog>> {
         &self.blocks
     }
 
     /// Publisher used by committed chain effects and RPC notifier discovery.
     #[must_use]
-    pub fn zmq_publisher(&self) -> Arc<dyn ZmqPublisher> {
+    pub(crate) fn zmq_publisher(&self) -> Arc<dyn ZmqPublisher> {
         Arc::clone(&self.zmq)
     }
 
@@ -148,7 +148,7 @@ impl ChainFollowers {
 
     /// Mining generation signal.
     #[must_use]
-    pub fn mining(&self) -> &Arc<crate::mining::MiningGenerationSignal> {
+    pub(crate) fn mining(&self) -> &Arc<crate::mining::MiningGenerationSignal> {
         &self.mining
     }
 
@@ -205,7 +205,7 @@ impl ChainFollowers {
     /// block event already covers the departures.
     ///
     /// INVARIANT: consumer failure cannot invalidate chainstate.
-    pub fn on_connect(&self, block: &Block, outcome: &ConnectOutcome) {
+    pub(crate) fn on_connect(&self, block: &Block, outcome: &ConnectOutcome) {
         if let Some(gateway) = &self.mempool {
             let block_txs: Vec<&bitcoin_rs_primitives::Tx> = block.txs.iter().collect();
             gateway.remove_for_block(
@@ -241,7 +241,7 @@ impl ChainFollowers {
     ///
     /// INVARIANT: a non-matching tail is not popped, and no consumer
     /// failure changes the chainstate result.
-    pub fn on_disconnect(&self, outcome: &DisconnectOutcome) {
+    pub(crate) fn on_disconnect(&self, outcome: &DisconnectOutcome) {
         self.pop_matching_tail(outcome.hash);
         self.wake_index();
         if self.zmq.wants_notifications() {
@@ -311,7 +311,7 @@ impl ChainFollowers {
     ///
     /// INVARIANT: fatal errors drop guards without settlement; operational
     /// refusal attempts settlement.
-    pub fn apply_connect(
+    pub(crate) fn apply_connect(
         &self,
         handles: &bitcoin_rs_chainstate::Chainstate,
         block: &Block,
