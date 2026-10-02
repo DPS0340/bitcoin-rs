@@ -619,7 +619,6 @@ mod tests {
         );
 
         followers.on_disconnect(&DisconnectOutcome {
-            parent_tip: tip,
             hash,
             restored_parents: Vec::new(),
         });
@@ -640,7 +639,6 @@ mod tests {
         let followers = ChainFollowers::noop();
         followers.on_connect(&genesis, &connect_outcome(&tip, &genesis));
         followers.on_disconnect(&DisconnectOutcome {
-            parent_tip: tip,
             hash: Hash256::from_le_bytes(&[0xAB; 32]),
             restored_parents: Vec::new(),
         });
@@ -765,8 +763,7 @@ mod tests {
             followers.on_connect(&block, &connect_outcome(&tip, &block));
         } else {
             followers.on_disconnect(&DisconnectOutcome {
-                parent_tip: tip,
-                hash,
+                    hash,
                 restored_parents: vec![parent],
             });
         }

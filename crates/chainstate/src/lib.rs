@@ -343,8 +343,6 @@ pub struct ConnectOutcome {
 /// Committed disconnect. Derived consumers read this after the tip is published.
 #[derive(Clone, Debug)]
 pub struct DisconnectOutcome {
-    /// Applied tip after the rollback (the parent).
-    pub parent_tip: TipSnapshot,
     /// Hash of the disconnected block.
     pub hash: Hash256,
     /// Creating txids of coins the undo restored, for orphan re-evaluation.

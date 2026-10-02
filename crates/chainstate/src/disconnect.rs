@@ -213,7 +213,6 @@ pub(super) fn disconnect_block_admitted(
     // checkpoint still holding this block, and `write_clean_checkpoint`
     // disarms it only after publishing the rolled-back set.
     Ok(DisconnectOutcome {
-        parent_tip,
         hash: block_hash,
         restored_parents: rollback.restored_parents,
     })
