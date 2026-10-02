@@ -1,10 +1,8 @@
 use std::time::{Duration, Instant};
 
-use bitcoin_rs_primitives::Hash256;
-
-use bitcoin_rs_chain::Network;
 use bitcoin_rs_primitives::{
-    Amount, Block, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness, consensus_bytes,
+    Amount, Block, Hash256, LockTime, Network, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
+    Witness, consensus_bytes,
 };
 
 use super::{
