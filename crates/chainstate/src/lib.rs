@@ -35,8 +35,7 @@ pub use prepare::bytes_are_block;
 pub use window::classify_apply_error;
 
 mod checkpoint;
-pub use checkpoint::CheckpointError;
-pub use checkpoint::headers::HeaderCheckpointError;
+use checkpoint::CheckpointError;
 /// Typed chainstate mutation failures.
 mod error;
 pub mod events;
