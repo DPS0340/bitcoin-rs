@@ -63,16 +63,6 @@ pub struct BlockRuleContext {
     pub segwit_active: bool,
 }
 
-impl BlockRuleContext {
-    /// Conservative non-contextual mode: enforce checks from active softforks.
-    #[must_use]
-    pub const fn non_contextual() -> Self {
-        Self {
-            segwit_active: true,
-        }
-    }
-}
-
 /// Verifies non-contextual block rules that do not require a UTXO set.
 pub fn verify_block_rules(block: &Block) -> Result<(), ConsensusError> {
     let txids: Vec<Txid> = block.txs.iter().map(Tx::txid).collect();
@@ -80,7 +70,11 @@ pub fn verify_block_rules(block: &Block) -> Result<(), ConsensusError> {
     if facts.has_witness() {
         facts.or_insert_wtxids_from(&block.txs);
     }
-    verify_block_rules_precomputed(block, BlockRuleContext::non_contextual(), &facts)
+    // Conservative non-contextual mode: enforce checks from active softforks.
+    let context = BlockRuleContext {
+        segwit_active: true,
+    };
+    verify_block_rules_precomputed(block, context, &facts)
 }
 
 /// Verifies block rules from facts derived once for the supplied block.
