@@ -22,7 +22,7 @@ mod writer;
 
 pub use capabilities::{
     CapabilitySnapshot, CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource,
-    TXINDEX_CAPABILITY, derived_index_status, disabled_txindex, txindex_snapshot,
+    derived_index_status, txindex_snapshot,
 };
 pub(crate) use index::NoSpentScripts;
 pub use index::{
