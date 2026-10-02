@@ -54,7 +54,7 @@ mod policy;
 /// Undo-data pruning over persisted undo rows.
 mod undo_pruner;
 
-pub use block_pruner::{BLOCK_DATA_CF, BlockPruner, block_body_key};
+pub use block_pruner::{BLOCK_DATA_CF, block_body_key};
 pub use lease::{
     HistoryAccess, HistoryLease, HistoryUnavailable, MandatoryRetention, PruneReservation,
     RetentionBudget, RetentionError, RetentionLease, RetentionRegistry,
