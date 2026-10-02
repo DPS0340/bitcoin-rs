@@ -148,7 +148,7 @@ fn golden_facts_match_oracle_on_ids_weight_positions_and_merkle() {
         // Byte positions: the count prefix sits after the header, the spans
         // tile the tree without gaps, and every span slices exactly the
         // oracle's serialization of the same transaction.
-        let spans = facts.transaction_spans();
+        let spans = parsed.transaction_spans();
         assert_eq!(spans.len(), facts.tx_count(), "height {height}: span count");
         assert_eq!(
             parsed.tx_count_span().start(),
@@ -284,7 +284,6 @@ fn native_block_parse_matches_oracle_identities() {
     assert_parse_matches_oracle(&parsed, &oracle, &materialized);
 
     let facts = parsed.derive_facts(&materialized.txs, &parsed.txids().expect("native txids"));
-    assert_eq!(facts.transaction_spans().len(), facts.tx_count());
     assert!(facts.wtxids().is_some());
     let mut padded = bytes;
     padded.push(0x00);

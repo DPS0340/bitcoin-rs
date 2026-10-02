@@ -1,12 +1,12 @@
 //! Shared parse-once block facts for native validation.
 //!
-//! `BlockFacts` owns identifiers, weight, layout spans, witness presence, and
+//! `BlockFacts` owns identifiers, weight, witness presence, and
 //! the Merkle result so later validation stages do not derive them again.
 
 use bitcoin_rs_primitives::{
     Tx, TxOut, Txid, Wtxid,
     encode::{double_sha256, finalize_double_sha256},
-    layout::{ByteSpan, ParsedBlock, ParsedTransaction},
+    layout::{ParsedBlock, ParsedTransaction},
 };
 use sha2::{Digest, Sha256};
 
@@ -21,7 +21,6 @@ pub struct BlockFacts {
     wtxids: Option<Vec<Wtxid>>,
     has_witness: bool,
     weight: u64,
-    tx_spans: Vec<ByteSpan>,
     merkle_root: Option<Txid>,
     merkle_mutated: bool,
 }
@@ -65,7 +64,6 @@ impl BlockFacts {
             wtxids,
             has_witness,
             weight,
-            tx_spans: parsed.transaction_spans().to_vec(),
             merkle_root,
             merkle_mutated,
         }
@@ -88,7 +86,6 @@ impl BlockFacts {
             wtxids: None,
             has_witness,
             weight,
-            tx_spans: Vec::new(),
             merkle_root,
             merkle_mutated,
         }
@@ -128,12 +125,6 @@ impl BlockFacts {
     #[must_use]
     pub const fn weight(&self) -> u64 {
         self.weight
-    }
-
-    /// Returns transaction spans in block order, or an empty slice without a layout.
-    #[must_use]
-    pub fn transaction_spans(&self) -> &[ByteSpan] {
-        &self.tx_spans
     }
 
     /// Returns the transaction Merkle root, or `None` for an empty tree.

@@ -58,7 +58,7 @@ fn ensure_prevout_count(
 ///
 /// The native path parses the serialized block once through the checked
 /// borrowed layout and keeps every fact derived from that single pass:
-/// transaction IDs, witness IDs, weight, byte positions, and the Merkle root
+/// transaction IDs, witness IDs, weight, and the Merkle root
 /// with its mutation flag. Later stages consume those facts through
 /// [`NativeBlock::derive_facts`] instead of re-walking or re-hashing the
 /// decoded block, so the production native path decodes the transaction tree
@@ -257,8 +257,7 @@ mod kernel_backend {
         /// Derives the shared block facts (weight, Merkle root, and mutation
         /// flag) by reducing the caller's already-surfaced transaction IDs
         /// in one pass over the decoded transactions — the same IDs the
-        /// parse produced, without a second kernel FFI crossing. Byte
-        /// positions are a native-layout fact and stay empty on this path.
+        /// parse produced, without a second kernel FFI crossing.
         #[expect(
             clippy::unused_self,
             reason = "shape parity with the native backend's derive_facts"
