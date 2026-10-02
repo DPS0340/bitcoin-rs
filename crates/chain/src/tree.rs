@@ -64,6 +64,7 @@ impl BlockTree {
     ///
     /// Invalidates the active-height index when callers mutate an indexed node,
     /// because they can change its parent or height.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn node_mut(&mut self, id: NodeId) -> Result<&mut BlockTreeNode, ChainError> {
         let is_indexed_active_node = {
             let node = self.node(id)?;
