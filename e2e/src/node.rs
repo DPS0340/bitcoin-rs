@@ -803,6 +803,12 @@ fn capture_output(mut reader: impl Read + Send + 'static, file: PathBuf) -> Join
                 }
             }
         }
+        // Rest state: file is exactly the retained tail, honoring MAX_OUTPUT.
+        if stale > 0 {
+            let _ = file.rewind();
+            let _ = file.set_len(0);
+            let _ = file.write_all(tail.make_contiguous());
+        }
         let _ = file.flush();
     })
 }
