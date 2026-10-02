@@ -1253,11 +1253,12 @@ impl bitcoin_rs_primitives::Sink for ByteEquality<'_> {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct BlockTxPlan {
     only_coinbase: bool,
     needs_local_utxo_overlay: bool,
     overlay_capacity: usize,
-    witness_presence: WitnessPresence,
+    has_witness: bool,
     has_bip68_sequence_locks: bool,
     created_output_count: usize,
     spent_input_count: usize,
@@ -1291,26 +1292,6 @@ impl BlockTxPlan {
             self.same_block_spent,
             self.same_block_spent_input_count,
         )
-    }
-}
-
-#[derive(Clone, Copy)]
-enum WitnessPresence {
-    Absent,
-    Present,
-}
-
-impl WitnessPresence {
-    const fn from_bool(has_witness: bool) -> Self {
-        if has_witness {
-            Self::Present
-        } else {
-            Self::Absent
-        }
-    }
-
-    const fn is_present(self) -> bool {
-        matches!(self, Self::Present)
     }
 }
 

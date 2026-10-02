@@ -196,7 +196,7 @@ pub(super) fn apply_block_admitted<'b>(
     // Witness IDs are needed only for a witness-carrying block under active
     // segwit; the view computes them once and the commitment check consumes
     // the cache, so witness-free blocks never serialize-and-hash for wtxids.
-    let needs_wtxids = softfork_state.segwit_active && tx_plan.witness_presence.is_present();
+    let needs_wtxids = softfork_state.segwit_active && tx_plan.has_witness;
     if needs_wtxids {
         view.witness_ids();
     }
