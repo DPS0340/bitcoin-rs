@@ -345,7 +345,7 @@ pub trait MiningControl: Send + Sync {
 #[cfg(any(test, feature = "test-seam"))]
 pub struct FakeMiningControl {
     /// Template returned by template-mode `get_block_template` calls.
-    pub template: Mutex<Option<BlockTemplate>>,
+    template: Mutex<Option<BlockTemplate>>,
     /// Proposal-mode `get_block_template` result.
     pub proposal: Mutex<BlockValidationResult>,
     /// `submit_block` result.
@@ -367,7 +367,7 @@ pub struct FakeMiningControl {
     /// Armed failure returned by every result-returning operation.
     pub fail: Mutex<Option<MiningControlError>>,
     /// `publish_generation` wake count.
-    pub publishes: AtomicU64,
+    publishes: AtomicU64,
     /// Every `publish_generation_from` sequence, in call order.
     pub published_from: Mutex<Vec<u64>>,
 }

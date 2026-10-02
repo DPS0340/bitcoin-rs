@@ -16,17 +16,17 @@ thread_local! {
 
 /// One dependency-closed package selected for a candidate.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SelectedPackage {
+struct SelectedPackage {
     /// Snapshot positions in topological order.
-    pub indices: Vec<usize>,
+    indices: Vec<usize>,
     /// Sum of actual fees for the residual package.
-    pub fee: u64,
+    fee: u64,
     /// Sum of weights for the residual package.
-    pub weight: u64,
+    weight: u64,
     /// Sum of serialized sizes for the residual package.
-    pub size: u64,
+    size: u64,
     /// Sum of sigop costs for the residual package.
-    pub sigop_cost: u64,
+    sigop_cost: u64,
 }
 
 /// Selects dependency-closed packages under the candidate's resource limits.

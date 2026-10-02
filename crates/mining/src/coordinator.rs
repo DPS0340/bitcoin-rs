@@ -59,17 +59,17 @@ const LONG_POLL_SLICE: Duration = Duration::from_secs(1);
 
 /// Applied-tip hash plus mempool sequence that identify one candidate generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct GenerationKey {
+struct GenerationKey {
     /// Applied tip hash in consensus little-endian storage order.
-    pub tip_hash: Hash256,
+    tip_hash: Hash256,
     /// Mempool sequence captured with the tip.
-    pub mempool_sequence: u64,
+    mempool_sequence: u64,
 }
 
 impl GenerationKey {
     /// Opaque BIP22/BIP23 long-poll identity for this generation.
     #[must_use]
-    pub(crate) fn template_id(self) -> TemplateId {
+    fn template_id(self) -> TemplateId {
         TemplateId::new(&self.tip_hash, self.mempool_sequence)
     }
 }
