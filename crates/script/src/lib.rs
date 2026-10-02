@@ -29,4 +29,3 @@ pub use script::{
     minimal_non_dust, multisig_key_count, opcode, push_data, push_int, witness_program,
 };
 pub use sigops::{count_segwit, count_tx_legacy};
-pub use stack::{ScriptItem, Stack, StackError};

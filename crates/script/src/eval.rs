@@ -816,10 +816,7 @@ fn dispatch(
                     code: ScriptErrCode::StackSize,
                 })?;
             } else {
-                let item = stack.remove_at(depth).map_err(|_| invalid_stack())?;
-                stack.push(item).map_err(|_| ScriptError::Invalid {
-                    code: ScriptErrCode::StackSize,
-                })?;
+                stack.roll(depth).map_err(|_| invalid_stack())?;
             }
         }
         OP_ROT => {
