@@ -5525,6 +5525,9 @@ mod float_conversion_tests {
     use super::{i64_to_f64, u64_to_f64};
 
     #[test]
+    // suboptimal_flops fires on 1.99 clippy but not 1.97 — toolchain-dependent
+    // suppression, so expect's self-audit can't be used here.
+    #[allow(clippy::suboptimal_flops)]
     fn u64_to_f64_is_exact_below_two_to_the_fifty_third() {
         for value in [
             0_u64,

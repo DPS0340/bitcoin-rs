@@ -14,7 +14,7 @@ does not hold a second copy. The node supplies chain queries and coordinates
 chain application. A connection
 negotiates version/verack in `handshake`, then runs the peer finite-state machine
 in `fsm`; `wire` is the protocol codec. The per-connection writer coalesces a ready
-burst of control messages into one `write_ready_burst` writev; blocks and transactions
+burst of control messages into `write_ready_burst`'s vectored write pass; blocks and transactions
 stay one frame. Inbound traffic reaches the host through
 `dispatch_inbound_full`, which streams getdata responses behind the outbound
 budget's pre-load production headroom gate and reads the active chain through the
