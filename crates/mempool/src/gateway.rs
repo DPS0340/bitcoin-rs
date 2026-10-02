@@ -1555,7 +1555,7 @@ impl ChainChangeGuard {
     /// Returns the reserved even value `finish` will store on success.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn reserved_even(&self) -> u64 {
+    fn reserved_even(&self) -> u64 {
         self.even
     }
 

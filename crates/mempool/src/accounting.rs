@@ -10,9 +10,9 @@ use bitcoin_rs_script::VerifyFlags;
 
 use crate::standardness::PackageTxContext;
 
-pub(crate) const BYTES_PER_SIGOP: u64 = 20;
+const BYTES_PER_SIGOP: u64 = 20;
 
-pub(crate) fn adjusted_weight(wire_weight: u64, sigop_cost: u32) -> u64 {
+fn adjusted_weight(wire_weight: u64, sigop_cost: u32) -> u64 {
     wire_weight.max(u64::from(sigop_cost) * BYTES_PER_SIGOP)
 }
 

@@ -122,7 +122,7 @@ struct FeeRateAggregate {
 #[derive(Debug)]
 pub struct Mempool {
     /// Entry arena. Public ids are reusable slot indices represented as `u32`.
-    pub(crate) entries: EntryArena,
+    entries: EntryArena,
     /// Indexes and running totals derived from `entries`: the txid, wtxid,
     /// funding, and spending indexes, the component summaries, the priority
     /// index, and the vsize, fee, and fee-rate totals. One owner keeps them
@@ -185,7 +185,7 @@ struct Derived {
     /// its id here instead of growing the arena forever.
     free_components: Vec<u32>,
     /// Fee-priority index for mining and eviction consumers.
-    pub(crate) pareto: ParetoFront,
+    pareto: ParetoFront,
     /// Running sum of `vsize` over `entries`.
     ///
     /// Maintained by the mutation methods below rather than folded on demand.
@@ -193,8 +193,7 @@ struct Derived {
     /// whether the pool is over its size limit, so folding it there cost `O(n)`
     /// per acceptance and made insertion quadratic in pool size on its own.
     ///
-    /// `entries` is crate-visible so eviction can walk the arena, but every
-    /// mutation still goes through `insert_entry`, `remove_entries`,
+    /// Every mutation still goes through `insert_entry`, `remove_entries`,
     /// `prioritise` or `clear` — and
     /// `running_totals_track_inserts_removals_and_prioritise` holds both
     /// running sums to an independent fold of `entries` across every mutation
@@ -318,7 +317,7 @@ struct ComponentSummary {
 /// Entry slots with LIFO reuse. The pool unlinks indexes and graph edges
 /// before a vacated slot can acquire a new occupant.
 #[derive(Debug)]
-pub(crate) struct EntryArena {
+struct EntryArena {
     slots: Vec<Option<LiveEntry>>,
     /// Vacated slot indices, most recent last: the next `insert` reuses
     /// them, matching `Slab`'s vacancy stack.
@@ -1223,7 +1222,7 @@ impl Mempool {
     /// replacements of entries without that signal.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn iter_replaceable_txids(&self) -> Vec<Txid> {
+    fn iter_replaceable_txids(&self) -> Vec<Txid> {
         self.entries
             .iter()
             .filter(|(_id, entry)| entry.is_replaceable())
@@ -1276,7 +1275,7 @@ impl Mempool {
     /// `running_totals_track_inserts_removals_and_prioritise` holds it to the
     /// entries it summarizes.
     #[must_use]
-    pub(crate) fn aggregate_fees(&self) -> u64 {
+    fn aggregate_fees(&self) -> u64 {
         u64::try_from(self.derived.total_fee).unwrap_or(u64::MAX)
     }
 
@@ -1559,7 +1558,7 @@ impl Mempool {
     /// modified fees with ancestor-aware package scoring).
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn iter_by_fee_rate_desc(&self) -> Vec<EntryId> {
+    fn iter_by_fee_rate_desc(&self) -> Vec<EntryId> {
         let mut pairs: Vec<(u64, EntryId)> = self
             .entries
             .iter()
@@ -1599,7 +1598,7 @@ impl Mempool {
     /// Linear scan over `entries`: a fee-rate cohort without sorting.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn iter_above_fee_rate(&self, threshold_sat_per_kvb: u64) -> Vec<EntryId> {
+    fn iter_above_fee_rate(&self, threshold_sat_per_kvb: u64) -> Vec<EntryId> {
         self.entries
             .iter()
             .filter(|(_index, entry)| entry.fee_rate >= threshold_sat_per_kvb)
@@ -1730,7 +1729,7 @@ impl Mempool {
 
     /// Reason-carrying core for composite mutations that remove an entry and
     /// all descendants that spend its outputs.
-    pub(crate) fn remove_entry_and_descendants_into(
+    fn remove_entry_and_descendants_into(
         &mut self,
         id: EntryId,
         reason: RemovalReason,
@@ -2357,7 +2356,7 @@ impl Mempool {
     /// `policy_snapshot`, so these report enforced policy, not a constant.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn cluster_limits(&self) -> (u32, u64) {
+    const fn cluster_limits(&self) -> (u32, u64) {
         (self.limits.cluster_count, self.limits.cluster_size_vbytes)
     }
 
