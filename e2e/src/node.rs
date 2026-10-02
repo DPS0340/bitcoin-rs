@@ -107,14 +107,6 @@ impl HttpResponse {
         String::from_utf8(self.body.clone())
             .map_err(|e| Error::Assertion(format!("response is not utf-8: {e}")))
     }
-
-    /// Look up a header value by name (case-insensitive).
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    }
 }
 
 /// A spawned node process with its RPC endpoint and evidence files.
@@ -479,12 +471,6 @@ impl ProcessNode {
         self.child.id()
     }
 
-    /// Which binary this process wraps.
-    #[must_use]
-    pub fn kind(&self) -> Kind {
-        self.kind
-    }
-
     /// Move datadir custody out for a restart.
     pub fn take_datadir(&mut self) -> Result<TempDir> {
         self.datadir
@@ -750,11 +736,6 @@ impl ProcessNode {
         self.child.kill()?;
         self.child.wait()?;
         Ok(())
-    }
-
-    /// Ask the process for its current exit status.
-    pub fn exited(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait().map_err(Error::Io)
     }
 
     /// Send SIGTERM to the child.
