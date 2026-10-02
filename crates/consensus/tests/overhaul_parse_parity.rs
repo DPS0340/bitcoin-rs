@@ -286,13 +286,6 @@ fn native_block_parse_matches_oracle_identities() {
     let facts = parsed.derive_facts(&materialized.txs, &parsed.txids().expect("native txids"));
     assert_eq!(facts.transaction_spans().len(), facts.tx_count());
     assert!(facts.wtxids().is_some());
-    let native_facts = parsed
-        .native_facts()
-        .expect("native parse carries its facts");
-    assert_eq!(
-        native_facts.transaction_spans().len(),
-        parsed.transaction_count()
-    );
     let mut padded = bytes;
     padded.push(0x00);
     assert!(

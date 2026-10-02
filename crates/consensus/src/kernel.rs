@@ -113,12 +113,6 @@ mod native {
             self.facts.tx_count()
         }
 
-        /// The facts derived in the one parse pass.
-        #[must_use]
-        pub const fn facts(&self) -> &crate::block_view::BlockFacts {
-            &self.facts
-        }
-
         /// The shared block facts for a view that owns them.
         ///
         /// The parse already derived everything in one pass, so this clones
@@ -398,17 +392,6 @@ impl BlockParse {
             Self::Native(block) => block.transaction_count(),
             #[cfg(feature = "kernel")]
             Self::Kernel(block) => block.transaction_count(),
-        }
-    }
-
-    /// The native one-pass facts, or `None` for a kernel parse (whose facts
-    /// are derived on demand from the caller's transaction IDs).
-    #[must_use]
-    pub const fn native_facts(&self) -> Option<&crate::block_view::BlockFacts> {
-        match self {
-            Self::Native(block) => Some(block.facts()),
-            #[cfg(feature = "kernel")]
-            Self::Kernel(_) => None,
         }
     }
 
