@@ -67,10 +67,23 @@ def _mask_rust_raw_strings(text: str) -> str:
     raw_start = re.compile(r'(?:b|c)?r(#{0,255})"')
     out: list[str] = []
     index = 0
+    in_string = False
     while index < len(text):
+        if in_string:
+            char = text[index]
+            out.append(char)
+            index += 1
+            if char == "\\" and index < len(text):
+                out.append(text[index])
+                index += 1
+            elif char == '"':
+                in_string = False
+            continue
         raw = raw_start.match(text, index)
         if raw is None:
-            out.append(text[index])
+            char = text[index]
+            out.append(char)
+            in_string = char == '"'
             index += 1
             continue
         hashes = raw.group(1)
@@ -87,14 +100,14 @@ def _mask_rust_raw_strings(text: str) -> str:
 def _commands(source: Path) -> dict[str, bytes]:
     text = _mask_rust_raw_strings(_strip_rust_comments(source.read_text()))
     table = re.search(
-        r"pub\s+const\s+COMMANDS\s*:\s*&\[Command\]\s*=\s*&\[(.*?)\];",
+        r"pub\s+const\s+COMMANDS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
         text, re.S,
     )
     if table is None:
         raise ValueError("Cannot find the P2P COMMANDS inventory")
-    commands = re.findall(r'\bname\s*:\s*"([a-z0-9]{1,12})"', table.group(1))
+    commands = re.findall(r'"([a-z0-9]{1,12})"', table.group(1))
     if (not commands or len(commands) > 256 or len(set(commands)) != len(commands)
-            or len(commands) != len(re.findall(r"\bCommand\s*\{", table.group(1)))):
+            or len(commands) != len(re.findall(r'"[^"]*"', table.group(1)))):
         raise ValueError("Invalid P2P COMMANDS inventory")
     return {name: bytes([index]) for index, name in enumerate(commands)}
 
