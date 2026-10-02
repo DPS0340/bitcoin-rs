@@ -48,7 +48,7 @@ pub fn block_sync(
     )
 }
 
-pub(crate) fn settle_window_failure(
+fn settle_window_failure(
     transition: bitcoin_rs_chainstate::ChainTransition<'_>,
     mempool_change: Option<bitcoin_rs_mempool::ChainChangeGuard>,
     mut error: bitcoin_rs_chainstate::WindowApplyError,
@@ -81,7 +81,7 @@ pub(crate) fn settle_window_failure(
 /// and surface a `Fatal` disposition when the CAS fails, so the caller
 /// stops retrying instead of wedging on an odd generation.
 #[allow(clippy::result_large_err)]
-pub(crate) fn settle_window_success(
+fn settle_window_success(
     transition: bitcoin_rs_chainstate::ChainTransition<'_>,
     mempool_change: Option<bitcoin_rs_mempool::ChainChangeGuard>,
     applied: usize,
