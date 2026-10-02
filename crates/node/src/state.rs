@@ -360,7 +360,7 @@ impl NodeState {
 
     /// Returns the node-owned complete transaction-index query adapter.
     #[must_use]
-    pub(crate) fn derived_index_query(
+    pub fn derived_index_query(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_rpc::context::DerivedIndexQuery>> {
         if !self.config.indexes.txindex {
@@ -385,7 +385,7 @@ impl NodeState {
 
     /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
-    pub(crate) fn script_index_query(
+    pub fn script_index_query(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
         if !self.config.indexes.script_index.is_enabled() {
