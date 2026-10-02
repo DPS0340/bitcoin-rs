@@ -31,13 +31,13 @@ pub struct PeerSession {
     /// Handshake metadata, `None` while the handshake is still in progress.
     pub info: Option<PeerInfo>,
     /// Header tips this connection has delivered and the node accepted.
-    pub demonstrated_tips: Vec<Hash256>,
+    pub(crate) demonstrated_tips: Vec<Hash256>,
     /// Headers tip this connection demonstrated by ending a download-twice
     /// sync with nothing past it — the cap header selection reads. `None`
     /// until a presync proves a ceiling; body eligibility keeps reading
     /// [`PeerInfo::best_known_height`], the P2P-03 credit this does not
     /// disturb.
-    pub headers_horizon: Option<u32>,
+    pub(crate) headers_horizon: Option<u32>,
 }
 
 #[derive(Debug)]
