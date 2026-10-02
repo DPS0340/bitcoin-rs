@@ -274,14 +274,7 @@ impl MiningService {
     /// captured from live applied-tip / mempool state under the coordinator lock.
     pub fn publish_generation(&self) {
         let key = self.live_generation_key();
-        let mut state = self.state.lock();
-        if let Some(previous) = state.published
-            && previous != key
-        {
-            state.invalidate_key(previous);
-        }
-        state.published = Some(key);
-        self.wake.notify_all();
+        self.publish_key(key);
     }
 
     /// Publishes a generation key built from `applied_tip` and `sequence`
@@ -293,14 +286,28 @@ impl MiningService {
     /// [`Self::publish_generation`] instead, which captures the live sequence
     /// safely (no write lock is held on that path).
     pub fn publish_generation_from(&self, sequence: u64) {
-        let tip_hash = self
-            .applied_tip
-            .applied_tip()
-            .map_or_else(|| self.network.genesis_block_hash(), |tip| tip.hash);
         let key = GenerationKey {
-            tip_hash,
+            tip_hash: self.live_tip_hash(),
             mempool_sequence: sequence,
         };
+        self.publish_key(key);
+    }
+
+    fn live_tip_hash(&self) -> Hash256 {
+        self.applied_tip
+            .applied_tip()
+            .map_or_else(|| self.network.genesis_block_hash(), |tip| tip.hash)
+    }
+
+    fn live_generation_key(&self) -> GenerationKey {
+        GenerationKey {
+            tip_hash: self.live_tip_hash(),
+            mempool_sequence: self.mempool.current_sequence(),
+        }
+    }
+
+    /// Installs `key` as the published generation and wakes every waiter.
+    fn publish_key(&self, key: GenerationKey) {
         let mut state = self.state.lock();
         if let Some(previous) = state.published
             && previous != key
@@ -309,18 +316,6 @@ impl MiningService {
         }
         state.published = Some(key);
         self.wake.notify_all();
-    }
-
-    fn live_generation_key(&self) -> GenerationKey {
-        let tip_hash = self
-            .applied_tip
-            .applied_tip()
-            .map_or_else(|| self.network.genesis_block_hash(), |tip| tip.hash);
-        let mempool_sequence = self.mempool.current_sequence();
-        GenerationKey {
-            tip_hash,
-            mempool_sequence,
-        }
     }
 
     fn ensure_published(&self, state: &mut CoordinatorState) -> GenerationKey {
