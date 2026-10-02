@@ -57,7 +57,7 @@ pub fn verify_flags(
 }
 
 /// Context needed for block rules whose activation is height-dependent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct BlockRuleContext {
     /// Whether BIP141 segwit block rules are active for the candidate block.
     pub segwit_active: bool,

@@ -72,7 +72,7 @@ pub struct DeploymentParams {
 }
 
 /// CSV/Segwit activation at one connect height.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct SoftforkState {
     /// Whether CSV (BIP68/112/113) is active.
     pub csv_active: bool,
