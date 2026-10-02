@@ -3,7 +3,7 @@
 use core::ops::{Deref, DerefMut};
 
 /// A Bitcoin script (`scriptSig` or `scriptPubKey`) as owned consensus bytes.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Script(Vec<u8>);
 
 impl Script {
@@ -53,7 +53,7 @@ impl PartialEq<Vec<u8>> for Script {
 }
 
 /// A BIP144 witness stack.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Witness(Vec<Vec<u8>>);
 
 impl Witness {

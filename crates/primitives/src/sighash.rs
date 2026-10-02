@@ -36,7 +36,7 @@ pub const CODESEPARATOR_POSITION: u32 = 0xFFFF_FFFF;
 const TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
 
 /// Standard Bitcoin signature hash modes used by legacy, segwit, and taproot signing.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Sighash {
     /// `SIGHASH_ALL`.
     All,
@@ -112,7 +112,7 @@ pub enum AnnexError {
 }
 
 /// The masked base type of a legacy sighash flag (Core's `nHashType & 0x1f | 0x80` mask).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone)]
 enum EcdsaType {
     All,
     None,
