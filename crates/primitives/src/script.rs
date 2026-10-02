@@ -46,12 +46,6 @@ impl From<Vec<u8>> for Script {
     }
 }
 
-impl From<Script> for Vec<u8> {
-    fn from(script: Script) -> Self {
-        script.0
-    }
-}
-
 impl PartialEq<Vec<u8>> for Script {
     fn eq(&self, other: &Vec<u8>) -> bool {
         &self.0 == other
