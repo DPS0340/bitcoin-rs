@@ -731,7 +731,7 @@ impl AdmissionFailure {
 
     /// Maps this failure to the string envelope used by
     /// [`Context::admit_transaction`].
-    pub(crate) fn into_string(self) -> String {
+    fn into_string(self) -> String {
         match self {
             Self::Policy(reason) => reason.to_string(),
             Self::Consensus => "consensus-verification-failed".to_owned(),

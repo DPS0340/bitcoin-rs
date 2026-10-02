@@ -126,7 +126,7 @@ fn json_type_name(value: &Value) -> &'static str {
 ///   argument label, the value's type, and the expected type, in Core 31.1's
 ///   `Wrong type passed` shape.
 /// INVARIANT: the message is built only from the call's inputs; no state.
-pub(crate) fn wrong_type(position: usize, label: &str, value: &Value, expected: &str) -> RpcError {
+fn wrong_type(position: usize, label: &str, value: &Value, expected: &str) -> RpcError {
     RpcError::InvalidType(format!(
         "Wrong type passed:\n{{\n    \"Position {} ({})\": \"JSON value of type {} is not of expected type {}\"\n}}",
         position,

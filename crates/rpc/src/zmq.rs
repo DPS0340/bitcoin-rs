@@ -470,7 +470,7 @@ impl ZmqPublisher for SocketZmqPublisher {
 /// Body frame for a `hashblock`/`hashtx`/`sequence` event: the hash or txid's
 /// natural byte order reversed for the wire.
 #[cfg(any(feature = "zmq", test))]
-pub(crate) fn reversed_hash_body(mut bytes: [u8; 32]) -> [u8; 32] {
+fn reversed_hash_body(mut bytes: [u8; 32]) -> [u8; 32] {
     bytes.reverse();
     bytes
 }
@@ -480,7 +480,7 @@ pub(crate) fn reversed_hash_body(mut bytes: [u8; 32]) -> [u8; 32] {
 /// as a little-endian u64. The transport's own 4-byte counter stays in its
 /// separate trailing frame.
 #[cfg(any(feature = "zmq", test))]
-pub(crate) fn sequence_payload(event: SequenceEvent) -> Vec<u8> {
+fn sequence_payload(event: SequenceEvent) -> Vec<u8> {
     match event {
         SequenceEvent::Added(txid, mempool_sequence)
         | SequenceEvent::Removed(txid, mempool_sequence) => {
