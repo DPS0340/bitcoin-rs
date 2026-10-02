@@ -65,7 +65,6 @@ pub(crate) fn canned_template(
         mutable,
         submit_old: None,
         signet: None,
-        work_id: None,
     }
 }
 

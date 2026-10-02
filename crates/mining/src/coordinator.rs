@@ -736,7 +736,6 @@ fn template_from_candidate(
         ],
         submit_old,
         signet,
-        work_id: None,
     }
 }
 

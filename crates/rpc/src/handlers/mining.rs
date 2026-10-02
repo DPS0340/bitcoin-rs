@@ -829,7 +829,6 @@ mod tests {
             ],
             submit_old: None,
             signet: None,
-            work_id: None,
         }
     }
 
@@ -1605,7 +1604,6 @@ mod tests {
             },
         ];
         template.version_bits_required = 1 << 2;
-        template.work_id = Some(CompactString::from("work-abc"));
         let control = FakeMiningControl::with_template(template, sample_mining_info());
         let ctx = ctx_with_control(control);
         let result = getblocktemplate(&ctx, &json!([{"rules":["segwit"]}]))
