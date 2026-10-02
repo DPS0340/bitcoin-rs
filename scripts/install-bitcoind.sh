@@ -5,7 +5,6 @@
 # against the hardcoded SHA-256, and extracts bitcoind. Prints the bitcoind
 # path on stdout (log lines go to stderr).
 #
-#   eval "$(scripts/install-bitcoind.sh --export)"
 #   scripts/install-bitcoind.sh --print-path
 #
 # Owner: docs/contracts/core-differential.md (CORE-01).
@@ -20,13 +19,12 @@ readonly PREFIX="${BITCOIND_PREFIX:-${HOME}/bitcoin-core-${CORE_VERSION}}"
 readonly BITCOIND="${PREFIX}/bin/bitcoind"
 
 usage() {
-  printf '%s\n' 'usage: scripts/install-bitcoind.sh [--print-path|--export]'
+  printf '%s\n' 'usage: scripts/install-bitcoind.sh [--print-path]'
 }
 
 MODE=install
 case "${1:-}" in
   --print-path) MODE=print-path ;;
-  --export) MODE=export ;;
   -h|--help) usage; exit 0 ;;
   "") ;;
   *) usage >&2; exit 2 ;;
@@ -83,6 +81,5 @@ fi
 
 case "${MODE}" in
   print-path) printf '%s\n' "${BITCOIND}" ;;
-  export) printf 'export BITCOIND_COMMAND=%q\n' "${BITCOIND}" ;;
   install) printf '%s\n' "${BITCOIND}" ;;
 esac
