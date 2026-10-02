@@ -68,7 +68,7 @@ pub trait CompactBlockHints: Send + Sync {
 
 /// What the listener must do after one receive-side BIP152 step.
 #[derive(Debug)]
-pub(crate) enum Outcome {
+pub enum Outcome {
     /// Reconstruction finished; deliver through the ordinary block sink.
     Complete(Block),
     /// Request the listed missing transaction indexes on the same connection.
@@ -82,7 +82,7 @@ pub(crate) enum Outcome {
 
 /// Bounded per-peer pending-reconstruction state.
 #[derive(Debug, Default)]
-pub(crate) struct Reconstruction {
+pub struct Reconstruction {
     pending: HashMap<BlockHash, Pending>,
 }
 
@@ -103,7 +103,7 @@ struct Pending {
 impl Reconstruction {
     /// Creates an empty reconstruction state.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
         }
@@ -118,7 +118,7 @@ impl Reconstruction {
     /// is [`Outcome::Complete`] (all filled), [`Outcome::RequestMissing`]
     /// (bounded missing list), or [`Outcome::Fallback`] (ambiguity,
     /// malformed indexes, or the bounded state is exhausted).
-    pub(crate) fn receive_cmpctblock(
+    pub fn receive_cmpctblock(
         &mut self,
         cmpct: &CmpctBlock,
         identity_version: u64,
@@ -206,7 +206,7 @@ impl Reconstruction {
     /// not match the outstanding request. A completion that fails
     /// verification flags the entry first: a late `blocktxn` for the same
     /// block is then ignored, not re-guessed.
-    pub(crate) fn receive_blocktxn(&mut self, txn: &BlockTxn, now: Instant) -> Outcome {
+    pub fn receive_blocktxn(&mut self, txn: &BlockTxn, now: Instant) -> Outcome {
         self.prune(now);
         let hash = native_block_hash(txn.transactions.block_hash);
         let Some(entry) = self.pending.get_mut(&hash) else {
@@ -248,7 +248,7 @@ impl Reconstruction {
     }
 
     /// Drops pending entries whose deadline passed.
-    pub(crate) fn prune(&mut self, now: Instant) {
+    pub fn prune(&mut self, now: Instant) {
         self.pending.retain(|_, entry| now < entry.deadline);
     }
 
