@@ -149,7 +149,7 @@ mod tests {
         let p2wpkh = [vec![0x00, 0x14], vec![2; 20]].concat();
         let cases = [
             (
-                vec![bitcoin_rs_script::eval::OP_DROP, opcode::OP_PUSHNUM_1],
+                vec![bitcoin_rs_script::opcode::OP_DROP, opcode::OP_PUSHNUM_1],
                 push_data(&p2wpkh),
                 0,
             ),

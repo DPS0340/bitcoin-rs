@@ -27,6 +27,8 @@ pub mod opcode {
     pub const OP_ENDIF: u8 = 0x68;
     /// `OP_RETURN`: marks an unspendable provably-prunable output.
     pub const OP_RETURN: u8 = 0x6a;
+    /// `OP_DROP`: drops the top stack item.
+    pub const OP_DROP: u8 = 0x75;
     /// `OP_DUP`: duplicates the top stack item.
     pub const OP_DUP: u8 = 0x76;
     /// `OP_EQUAL`: pushes whether the top two stack items are equal.

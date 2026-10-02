@@ -57,7 +57,7 @@ pub(crate) const OP_IFDUP: u8 = 0x73;
 /// `OP_DEPTH` (0x74).
 pub(crate) const OP_DEPTH: u8 = 0x74;
 /// `OP_DROP` (0x75).
-pub const OP_DROP: u8 = 0x75;
+pub(crate) const OP_DROP: u8 = crate::script::opcode::OP_DROP;
 /// `OP_DUP` (0x76).
 pub(crate) const OP_DUP: u8 = 0x76;
 /// `OP_NIP` (0x77).

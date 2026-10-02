@@ -10,7 +10,7 @@
 /// Transaction signature checker: ECDSA, Schnorr, locktime, and sequence verification.
 pub mod checker;
 /// The opcode evaluator: the bounded stack machine behind the interpreter.
-pub mod eval;
+mod eval;
 /// Script verification wrapper.
 mod interpreter;
 /// Native script parsing, classification, and building helpers.
