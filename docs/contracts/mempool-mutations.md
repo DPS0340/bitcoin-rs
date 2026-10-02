@@ -67,7 +67,7 @@ state (`crates/mempool/src/orphan.rs`).
   order. Each change carries the txid and a `MutationOutcome`:
   `Accepted`, or `Removed(RemovalReason)`.
 - `RemovalReason` is one of `BlockInclusion`, `Conflict`, `Replaced`,
-  `Descendant`, `PolicyEviction`, `Expiry`, `Clear`, `Reorg`.
+  `Descendant`, `PolicyEviction`, `Clear`, `Reorg`.
 - `Mempool::sequence_number` advances exactly once per emitted change while
   the write lock is held. A failed insert, a no-op removal, and a clear of
   an empty pool assign nothing.
@@ -324,12 +324,12 @@ state (`crates/mempool/src/orphan.rs`).
   `admission_state_accepts_only_the_current_generation`.
 - `crates/rpc/src/context.rs` (`admission_chain_tests`):
   `stable_chainstate_reader_does_not_block_transaction_admission`,
-  `cached_unconfirmed_transaction_is_still_admitted_from_a_peer`,
-  `confirmed_hint_requires_live_chain_outputs_and_survives_no_cache`,
+  `unconfirmed_transaction_is_admitted_from_a_peer`,
+  `confirmed_hint_requires_live_chain_outputs`,
   `admission_chain_uses_current_handles_and_one_applied_tip`.
 - `crates/mempool/src/orphan.rs` (inline tests):
   `zero_quota_retains_no_body_or_index`,
-  `witness_refresh_keeps_fifo_position_and_announcer_set`,
+  `witness_refresh_keeps_announce_order_and_announcer_set`,
   `readiness_is_deduplicated_and_removed_with_eviction`,
   `maintenance_expires_old_bodies_and_cleans_every_index`,
   `maintenance_uses_exact_connection_identity`,
