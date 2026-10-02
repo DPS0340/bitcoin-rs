@@ -1052,21 +1052,6 @@ impl Chainstate {
         blocks: &[&Block],
         serialized: &[bytes::Bytes],
     ) -> core::result::Result<Vec<ConnectOutcome>, WindowApplyError> {
-        if blocks.len() != serialized.len() {
-            return Err(WindowApplyError {
-                applied: 0,
-                committed: Vec::new(),
-                source: ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Kernel(
-                    format!(
-                        "window has {} blocks but {} serialized bodies",
-                        blocks.len(),
-                        serialized.len()
-                    ),
-                )),
-                disposition: WindowApplyDisposition::Operational,
-                invalidated: Box::default(),
-            });
-        }
         let transition = self.begin_transition().map_err(|source| WindowApplyError {
             applied: 0,
             committed: Vec::new(),
@@ -1074,16 +1059,9 @@ impl Chainstate {
             disposition: WindowApplyDisposition::Operational,
             invalidated: Box::default(),
         })?;
-        match transition.connect_window(blocks, serialized) {
-            Ok(committed) => {
-                drop(transition);
-                Ok(committed)
-            }
-            Err(error) => {
-                drop(transition);
-                Err(error)
-            }
-        }
+        let result = transition.connect_window(blocks, serialized);
+        drop(transition);
+        result
     }
 
     /// See `ARCH-07` in `docs/contracts/architecture.md`.
