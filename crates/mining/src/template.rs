@@ -203,20 +203,7 @@ pub fn assemble_candidate(
     payout: &[u8],
 ) -> Result<Candidate, MiningError> {
     let reservation = fixed_reservation(context, payout)?;
-    let (ordered, fees, weight, size, sigops) = select_packages(
-        context,
-        snapshot,
-        reservation.weight,
-        reservation.size,
-        reservation.sigops,
-    )?;
-    let body = SelectedBody {
-        ordered,
-        fees,
-        weight,
-        size,
-        sigops,
-    };
+    let body = select_packages(context, snapshot, reservation)?;
     finish_candidate(context, snapshot, payout, &body, reservation)
 }
 
@@ -236,19 +223,29 @@ pub fn assemble_ordered_candidate(
 
 // The fixed block header and coinbase are reserved before selecting the body.
 #[derive(Clone, Copy)]
-struct FixedReservation {
-    weight: u64,
-    size: u64,
-    sigops: u64,
+pub(crate) struct FixedReservation {
+    pub(crate) weight: u64,
+    pub(crate) size: u64,
+    pub(crate) sigops: u64,
 }
 
-struct SelectedBody {
-    ordered: Vec<usize>,
-    fees: u64,
+#[cfg(test)]
+impl FixedReservation {
+    /// Zero reservation for callers that select without a header or coinbase.
+    pub(crate) const EMPTY: Self = Self {
+        weight: 0,
+        size: 0,
+        sigops: 0,
+    };
+}
+
+pub(crate) struct SelectedBody {
+    pub(crate) ordered: Vec<usize>,
+    pub(crate) fees: u64,
     // Include the exact CompactSize transaction count as well as body transactions.
-    weight: u64,
-    size: u64,
-    sigops: u64,
+    pub(crate) weight: u64,
+    pub(crate) size: u64,
+    pub(crate) sigops: u64,
 }
 
 /// Size of the block transaction count, including its reserved coinbase.
