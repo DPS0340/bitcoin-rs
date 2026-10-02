@@ -89,7 +89,7 @@ impl PreparedBatch {
     }
 
     /// Returns whether no blocks have been admitted.
-    pub const fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 
@@ -125,7 +125,7 @@ impl PreparedBatch {
     }
 
     /// Returns the row families represented by the admitted blocks.
-    pub const fn capabilities(&self) -> Option<IndexCapabilities> {
+    pub(crate) const fn capabilities(&self) -> Option<IndexCapabilities> {
         self.capabilities
     }
 }
