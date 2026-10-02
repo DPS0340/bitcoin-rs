@@ -61,10 +61,10 @@ pub enum ApplyError {
     Chain(#[from] bitcoin_rs_chain::ChainError),
     /// UTXO commit failed during block apply.
     #[error("utxo commit: {0}")]
-    UtxoCommit(#[from] bitcoin_rs_utxo::UtxoError),
+    UtxoCommit(#[source] bitcoin_rs_utxo::UtxoError),
     /// Persisting the canonical prunable block body failed.
     #[error("block body persistence: {0}")]
-    BlockBodyPersistence(#[from] bitcoin_rs_storage::StorageError),
+    BlockBodyPersistence(#[source] bitcoin_rs_storage::StorageError),
     /// Persisting the UTXO undo record failed.
     #[error("undo persistence: {0}")]
     UndoPersistence(#[source] bitcoin_rs_storage::StorageError),

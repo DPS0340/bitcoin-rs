@@ -196,7 +196,7 @@ pub(super) fn apply_block_admitted<'b>(
     // Witness IDs are needed only for a witness-carrying block under active
     // segwit; the view computes them once and the commitment check consumes
     // the cache, so witness-free blocks never serialize-and-hash for wtxids.
-    let needs_wtxids = softfork_state.segwit_active && tx_plan.witness_presence.is_present();
+    let needs_wtxids = softfork_state.segwit_active && tx_plan.has_witness;
     if needs_wtxids {
         view.witness_ids();
     }
@@ -291,16 +291,7 @@ pub(super) fn apply_block_admitted<'b>(
     );
     bip68_result?;
     let wants_rawtx = handles.capture_rawtx;
-    let (txids, scratch_capacities, same_block_spent, same_block_spent_input_count) =
-        tx_plan.into_scratch_parts(view.into_txids());
-    let scratch = ApplyScratch::from_prepared_parts(
-        block,
-        wants_rawtx,
-        txids,
-        scratch_capacities,
-        same_block_spent,
-        same_block_spent_input_count,
-    );
+    let scratch = ApplyScratch::from_prepared_parts(block, wants_rawtx, view.into_txids(), tx_plan);
 
     let utxo_changes_started = tracing::enabled!(tracing::Level::DEBUG).then(quanta::Instant::now);
     let (utxo_add_capacity, utxo_remove_capacity) = scratch.utxo_change_capacity();

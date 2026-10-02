@@ -56,7 +56,6 @@ pub(super) struct PendingBlockCommit {
 pub(super) struct WindowGroup {
     pending: Vec<PendingBlockCommit>,
     staged_bytes: usize,
-    first_prev: Option<Hash256>,
 }
 
 impl WindowGroup {
@@ -85,9 +84,6 @@ impl WindowGroup {
 
     pub(super) fn stage(&mut self, pending: PendingBlockCommit) {
         self.staged_bytes += pending.outcome.block_bytes.len();
-        if self.pending.is_empty() {
-            self.first_prev = Some(pending.prev_hash);
-        }
         self.pending.push(pending);
     }
 
@@ -104,10 +100,11 @@ impl WindowGroup {
         &mut self,
         handles: &Chainstate,
     ) -> core::result::Result<Vec<ConnectOutcome>, ApplyError> {
-        let (last, first_prev) = match (self.pending.last(), self.first_prev) {
-            (Some(last), Some(first_prev)) => (last, first_prev),
+        let (first, last) = match (self.pending.first(), self.pending.last()) {
+            (Some(first), Some(last)) => (first, last),
             _ => return Ok(Vec::new()),
         };
+        let first_prev = first.prev_hash;
         let sync_started = quanta::Instant::now();
         sync_appended_blocks(handles)?;
         let group_sync_us = sync_started.elapsed().as_micros();
@@ -171,7 +168,6 @@ impl WindowGroup {
         // values are the ones the batch certified, so this tail is as
         // infallible as the single-block publication.
         self.staged_bytes = 0;
-        self.first_prev = None;
         let published = self
             .pending
             .drain(..)
@@ -194,7 +190,6 @@ impl WindowGroup {
     fn abandon(&mut self) {
         self.pending.clear();
         self.staged_bytes = 0;
-        self.first_prev = None;
     }
 }
 
@@ -274,17 +269,7 @@ pub(super) fn apply_window_admitted(
                 // its durable group before reporting, so the durable head
                 // and the published tip keep moving together. A flush
                 // failure is the ambiguous-batch case: fatal, never retried.
-                let flushed = group.flush(handles).map_err(|flush_error| {
-                    group.abandon();
-                    WindowApplyError {
-                        applied: committed.len(),
-                        committed: std::mem::take(&mut committed),
-                        source: flush_error,
-                        disposition: WindowApplyDisposition::Fatal,
-                        invalidated: Box::default(),
-                    }
-                })?;
-                committed.extend(flushed);
+                flush_group(&mut group, handles, &mut committed)?;
                 return Err(WindowApplyError {
                     applied: committed.len(),
                     committed,
@@ -295,30 +280,38 @@ pub(super) fn apply_window_admitted(
             }
         }
         if group.should_flush() {
-            let flushed = group.flush(handles).map_err(|flush_error| {
-                group.abandon();
-                WindowApplyError {
-                    applied: committed.len(),
-                    committed: std::mem::take(&mut committed),
-                    source: flush_error,
-                    disposition: WindowApplyDisposition::Fatal,
-                    invalidated: Box::default(),
-                }
-            })?;
-            committed.extend(flushed);
+            flush_group(&mut group, handles, &mut committed)?;
         }
     }
-    let flushed = group
-        .flush(handles)
-        .map_err(|flush_error| WindowApplyError {
-            applied: committed.len(),
-            committed: std::mem::take(&mut committed),
-            source: flush_error,
-            disposition: WindowApplyDisposition::Fatal,
-            invalidated: Box::default(),
-        })?;
-    committed.extend(flushed);
+    flush_group(&mut group, handles, &mut committed)?;
     Ok(committed)
+}
+
+/// Flushes the group's staged prefix into `committed`. A flush failure is
+/// the ambiguous-batch case — the durable head may or may not name it — so
+/// the group is abandoned and the error is fatal, never retried.
+#[allow(clippy::result_large_err)]
+fn flush_group(
+    group: &mut WindowGroup,
+    handles: &Chainstate,
+    committed: &mut Vec<ConnectOutcome>,
+) -> core::result::Result<(), WindowApplyError> {
+    match group.flush(handles) {
+        Ok(flushed) => {
+            committed.extend(flushed);
+            Ok(())
+        }
+        Err(flush_error) => {
+            group.abandon();
+            Err(WindowApplyError {
+                applied: committed.len(),
+                committed: std::mem::take(committed),
+                source: flush_error,
+                disposition: WindowApplyDisposition::Fatal,
+                invalidated: Box::default(),
+            })
+        }
+    }
 }
 
 /// Invalidates a permanently invalid block's subtree through the shared
