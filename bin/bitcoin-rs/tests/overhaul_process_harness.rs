@@ -11,7 +11,11 @@
     reason = "process custody failures must name the offending identity"
 )]
 
-mod support;
+// The harness consumes only the release identity's binary digest; the rest
+// of the reference record stays dead in this binary.
+#[expect(dead_code, reason = "only the release bitcoind digest is read")]
+#[path = "support/reference_set.rs"]
+mod reference_set;
 
 #[path = "support/policy_cases.rs"]
 mod policy_cases;
@@ -31,7 +35,7 @@ use bitcoin_rs_e2e::process_peer::connect_loopback;
 use bitcoin_rs_e2e::rpc::exchange;
 use bitcoin_rs_e2e::{ClockControl, Error, Kind, ProcessNode, SpawnOptions};
 use serde_json::{Value, json};
-use support::reference_set::reference_set;
+use reference_set::reference_set;
 
 // A height-1 coinbase is mature for admission after 101 common blocks.
 const COMMON_BLOCKS: u32 = 101;
