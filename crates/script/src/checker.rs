@@ -16,7 +16,7 @@ use crate::eval::{OP_CODESEPARATOR, remove_all};
 use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
 
 /// Signature version context: which sighash algorithm and encoding rules apply.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum SigVersion {
     /// Pre-segwit legacy signatures (double-SHA256 legacy sighash).
     Base,

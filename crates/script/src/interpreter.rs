@@ -671,12 +671,12 @@ fn verify_witness_program(
 /// The implicit P2WPKH witness script: `DUP HASH160 <program> EQUALVERIFY CHECKSIG`.
 fn p2wpkh_script_code(program: &[u8]) -> Vec<u8> {
     let mut script = Vec::with_capacity(5 + program.len());
-    script.push(0x76);
-    script.push(0xa9);
+    script.push(crate::script::opcode::OP_DUP);
+    script.push(crate::script::opcode::OP_HASH160);
     script.push(0x14);
     script.extend_from_slice(program);
-    script.push(0x88);
-    script.push(0xac);
+    script.push(crate::script::opcode::OP_EQUALVERIFY);
+    script.push(crate::script::opcode::OP_CHECKSIG);
     script
 }
 
