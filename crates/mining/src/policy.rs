@@ -15,7 +15,6 @@ thread_local! {
 }
 
 /// One dependency-closed package selected for a candidate.
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct SelectedPackage {
     /// Snapshot positions in topological order.
     indices: Vec<usize>,

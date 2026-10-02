@@ -18,7 +18,7 @@ use crate::policy::{modified_fee, select_packages};
 ///
 /// Callers derive these from the C1 mining context plus configured block limits.
 /// The mining crate never takes node locks or re-derives consensus state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CandidateContext {
     /// Parent tip hash in consensus little-endian storage order.
     pub previous_block_hash: Hash256,
@@ -75,7 +75,7 @@ impl TemplateId {
 }
 
 /// One non-coinbase transaction selected into a candidate.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CandidateTransaction {
     /// Transaction payload shared with the mempool snapshot.
     pub tx: Arc<Tx>,
@@ -98,7 +98,7 @@ pub struct CandidateTransaction {
 }
 
 /// Transport-neutral assembled block candidate.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Candidate {
     /// Generation identity for this tip and mempool sequence.
     pub template_id: TemplateId,

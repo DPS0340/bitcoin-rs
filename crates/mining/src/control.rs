@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use crate::Candidate;
 
 /// One capability advertised by a `getblocktemplate` caller.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MiningCapability(CompactString);
 
 impl MiningCapability {
@@ -38,7 +38,7 @@ impl MiningCapability {
 }
 
 /// One versionbits rule named by a template request or response.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MiningRule(CompactString);
 
 impl MiningRule {
@@ -78,7 +78,7 @@ pub struct BlockTemplateRequest {
 }
 
 /// One versionbits deployment available for caller negotiation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AvailableMiningRule {
     /// Deployment rule name.
     pub rule: MiningRule,
@@ -87,7 +87,7 @@ pub struct AvailableMiningRule {
 }
 
 /// Candidate fields a template consumer may change before solving.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub enum TemplateMutation {
     /// Header time may advance within the consensus bounds.
     Time,
@@ -147,7 +147,7 @@ pub enum BlockValidationResult {
 }
 
 /// Semantic result of template assembly or proposal validation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum BlockTemplateResult {
     /// A candidate ready for projection into a BIP22 template.
     Template(BlockTemplate),
@@ -156,7 +156,7 @@ pub enum BlockTemplateResult {
 }
 
 /// Facts from the most recently assembled candidate, when one exists.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct LastCandidateInfo {
     /// Total candidate weight.
     pub weight: u64,
@@ -165,14 +165,14 @@ pub struct LastCandidateInfo {
 }
 
 /// Signet-specific mining configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct SignetMiningInfo {
     /// Consensus signet challenge script.
     pub challenge: Vec<u8>,
 }
 
 /// Authoritative semantic state returned by [`MiningControl::mining_info`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MiningInfo {
     /// Current applied-chain height.
     pub blocks: u32,
@@ -240,7 +240,7 @@ pub enum GenerateSelection {
 }
 
 /// Request to assemble, solve, and optionally submit one or more blocks.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GenerateRequest {
     /// Coinbase `scriptPubKey`.
     pub payout: Vec<u8>,
@@ -255,7 +255,7 @@ pub struct GenerateRequest {
 }
 
 /// One solved block produced by [`MiningControl::generate`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GeneratedBlock {
     /// Header hash of the solved block.
     pub hash: BlockHash,

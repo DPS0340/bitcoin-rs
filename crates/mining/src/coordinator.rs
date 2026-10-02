@@ -75,7 +75,6 @@ impl GenerationKey {
 }
 
 /// Single in-flight assembly record.
-#[derive(Debug)]
 struct InFlight {
     /// Generation key the flight assembles for.
     key: GenerationKey,
@@ -86,7 +85,7 @@ struct InFlight {
 }
 
 /// Bounded template cache, single-flight guard, and published generation.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct CoordinatorState {
     /// Last generation published to long-poll waiters.
     published: Option<GenerationKey>,
