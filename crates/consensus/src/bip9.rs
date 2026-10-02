@@ -124,7 +124,7 @@ pub trait DeploymentContext {
     fn block_version(&self, height: u32) -> Option<i32>;
 
     /// Returns the median-time-past at `height` over `window` blocks, or `None` if unknown.
-    fn median_time_past(&self, height: u32, window: usize) -> Option<u32>;
+    fn median_time_past(&self, height: u32) -> Option<u32>;
 }
 
 /// Computes the BIP9 deployment state at `height`.
@@ -133,8 +133,6 @@ pub trait DeploymentContext {
 /// recursively computes the state at the parent boundary, applying
 /// transition rules.
 ///
-/// `mtp_window` is the BIP113 MTP window, typically 11.
-///
 /// Returns `Defined` when `height` is below the first period boundary
 /// or when context can't supply the needed data.
 #[must_use]
@@ -142,31 +140,29 @@ pub fn compute_state(
     ctx: &impl DeploymentContext,
     height: u32,
     params: DeploymentParams,
-    mtp_window: usize,
 ) -> DeploymentState {
     if params.period == 0 {
         return DeploymentState::Defined;
     }
 
     let boundary = (height / params.period).saturating_mul(params.period);
-    compute_state_at_boundary(ctx, boundary, params, mtp_window)
+    compute_state_at_boundary(ctx, boundary, params)
 }
 
 fn compute_state_at_boundary(
     ctx: &impl DeploymentContext,
     boundary: u32,
     params: DeploymentParams,
-    mtp_window: usize,
 ) -> DeploymentState {
     if boundary == 0 {
         return DeploymentState::Defined;
     }
 
     let prior_boundary = boundary.saturating_sub(params.period);
-    let prior_state = compute_state_at_boundary(ctx, prior_boundary, params, mtp_window);
+    let prior_state = compute_state_at_boundary(ctx, prior_boundary, params);
     match prior_state {
         DeploymentState::Defined => {
-            let Some(mtp) = ctx.median_time_past(boundary.saturating_sub(1), mtp_window) else {
+            let Some(mtp) = ctx.median_time_past(boundary.saturating_sub(1)) else {
                 return DeploymentState::Defined;
             };
 
@@ -179,7 +175,7 @@ fn compute_state_at_boundary(
             }
         }
         DeploymentState::Started => {
-            let Some(mtp) = ctx.median_time_past(boundary.saturating_sub(1), mtp_window) else {
+            let Some(mtp) = ctx.median_time_past(boundary.saturating_sub(1)) else {
                 return DeploymentState::Started;
             };
 
@@ -265,7 +261,7 @@ mod tests {
             self.versions.get(&height).copied()
         }
 
-        fn median_time_past(&self, height: u32, _window: usize) -> Option<u32> {
+        fn median_time_past(&self, height: u32) -> Option<u32> {
             self.mtps.get(&height).copied()
         }
     }
@@ -283,13 +279,13 @@ mod tests {
 
         ctx.mtps.insert(9, 50);
         assert_eq!(
-            compute_state(&ctx, 10, params, 11),
+            compute_state(&ctx, 10, params),
             DeploymentState::Defined
         );
 
         ctx.mtps.insert(9, 150);
         assert_eq!(
-            compute_state(&ctx, 10, params, 11),
+            compute_state(&ctx, 10, params),
             DeploymentState::Started
         );
     }
@@ -313,12 +309,12 @@ mod tests {
         }
 
         assert_eq!(
-            compute_state(&ctx, 20, params, 11),
+            compute_state(&ctx, 20, params),
             DeploymentState::LockedIn
         );
 
         ctx.mtps.insert(29, 300);
-        assert_eq!(compute_state(&ctx, 30, params, 11), DeploymentState::Active);
+        assert_eq!(compute_state(&ctx, 30, params), DeploymentState::Active);
     }
 
     #[test]
@@ -339,7 +335,7 @@ mod tests {
         }
 
         assert_eq!(
-            compute_state(&ctx, 20, params, 11),
+            compute_state(&ctx, 20, params),
             DeploymentState::Started
         );
     }
@@ -398,6 +394,6 @@ mod tests {
             ctx.versions.insert(height, 0);
         }
 
-        assert_eq!(compute_state(&ctx, 20, params, 11), DeploymentState::Failed);
+        assert_eq!(compute_state(&ctx, 20, params), DeploymentState::Failed);
     }
 }
