@@ -604,29 +604,25 @@ pub(crate) mod pow {
 }
 
 #[cfg(test)]
-mod timestamp_tests {
-    use super::{
-        HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, compact_is_met_by,
-        validate_contextual_header,
-    };
-    use crate::{
-        ChainError,
-        node::{BlockHeader, NodeStatus},
-        tree::{BlockTree, hash_from_header},
-    };
-    use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Network};
+mod fixture {
+    use super::compact_is_met_by;
+    use crate::node::BlockHeader;
+    use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256};
 
-    const REGTEST_BITS: u32 = 0x207f_ffff;
-
-    fn mine(prev_blockhash: BlockHash, height: u32, time: u32) -> BlockHeader {
+    pub(super) fn mine_regtest(
+        prev_blockhash: BlockHash,
+        height: u32,
+        time: u32,
+        version: i32,
+    ) -> BlockHeader {
         let mut merkle = [0_u8; 32];
         merkle[..4].copy_from_slice(&height.to_le_bytes());
         let mut header = BlockHeader {
-            version: 1,
+            version,
             prev_blockhash,
             merkle_root: Hash256::from_le_bytes(&merkle),
             time,
-            bits: CompactTarget::from_consensus(REGTEST_BITS),
+            bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: 0,
         };
         while !compact_is_met_by(header.bits, header.compute_hash().0) {
@@ -634,6 +630,20 @@ mod timestamp_tests {
         }
         header
     }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::{
+        HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, fixture::mine_regtest,
+        validate_contextual_header,
+    };
+    use crate::{
+        ChainError,
+        node::{BlockHeader, NodeStatus},
+        tree::{BlockTree, hash_from_header},
+    };
+    use bitcoin_rs_primitives::{BlockHash, Network};
 
     /// The future bound must follow the supplied time, not the host clock.
     ///
@@ -645,10 +655,11 @@ mod timestamp_tests {
         let (tree, tip) = chain_with_median_five();
         // Far past any plausible host clock, so a raw-clock bound rejects it.
         let network_now = 2_000_000_000_u32;
-        let header = mine(
+        let header = mine_regtest(
             tip.compute_hash(),
             11,
             network_now + MAX_FUTURE_TIME_SECONDS,
+            1,
         );
 
         assert!(
@@ -661,10 +672,11 @@ mod timestamp_tests {
         );
 
         // One second past it is not.
-        let beyond = mine(
+        let beyond = mine_regtest(
             tip.compute_hash(),
             12,
             network_now + MAX_FUTURE_TIME_SECONDS + 1,
+            1,
         );
 
         assert!(
@@ -682,9 +694,9 @@ mod timestamp_tests {
     fn chain_with_median_five() -> (BlockTree, BlockHeader) {
         let mut tree = BlockTree::new();
         let mut prev = BlockHash::default();
-        let mut tip = mine(prev, 0, 0);
+        let mut tip = None;
         for height in 0_u32..11 {
-            let header = mine(prev, height, height);
+            let header = mine_regtest(prev, height, height, 1);
             prev = header.compute_hash();
             let hash = hash_from_header(&header);
             let inserted = tree.insert_header_with_hash(header, hash, NodeStatus::HeaderValid);
@@ -692,9 +704,9 @@ mod timestamp_tests {
                 inserted.is_ok(),
                 "fixture header failed to insert: {inserted:?}"
             );
-            tip = header;
+            tip = Some(header);
         }
-        (tree, tip)
+        (tree, tip.unwrap_or_else(|| panic!("fixture inserts eleven headers")))
     }
 
     fn check(tree: &BlockTree, header: &BlockHeader, now: u32) -> Result<(), ChainError> {
@@ -716,7 +728,7 @@ mod timestamp_tests {
     #[test]
     fn timestamp_equal_to_median_is_rejected() {
         let (tree, tip) = chain_with_median_five();
-        let candidate = mine(tip.compute_hash(), 11, 5);
+        let candidate = mine_regtest(tip.compute_hash(), 11, 5, 1);
         assert!(matches!(
             check(&tree, &candidate, 1_000_000),
             Err(ChainError::TimestampTooEarly { median: 5, .. })
@@ -726,7 +738,7 @@ mod timestamp_tests {
     #[test]
     fn timestamp_one_past_median_is_accepted() {
         let (tree, tip) = chain_with_median_five();
-        let candidate = mine(tip.compute_hash(), 11, 6);
+        let candidate = mine_regtest(tip.compute_hash(), 11, 6, 1);
         assert!(check(&tree, &candidate, 1_000_000).is_ok());
     }
 
@@ -734,7 +746,7 @@ mod timestamp_tests {
     fn timestamp_exactly_at_the_drift_bound_is_accepted() {
         let (tree, tip) = chain_with_median_five();
         let now = 1_000_000_u32;
-        let candidate = mine(tip.compute_hash(), 11, now + MAX_FUTURE_TIME_SECONDS);
+        let candidate = mine_regtest(tip.compute_hash(), 11, now + MAX_FUTURE_TIME_SECONDS, 1);
         assert!(check(&tree, &candidate, now).is_ok());
     }
 
@@ -742,7 +754,7 @@ mod timestamp_tests {
     fn timestamp_one_past_the_drift_bound_is_rejected() {
         let (tree, tip) = chain_with_median_five();
         let now = 1_000_000_u32;
-        let candidate = mine(tip.compute_hash(), 11, now + MAX_FUTURE_TIME_SECONDS + 1);
+        let candidate = mine_regtest(tip.compute_hash(), 11, now + MAX_FUTURE_TIME_SECONDS + 1, 1);
         assert!(matches!(
             check(&tree, &candidate, now),
             Err(ChainError::TimestampTooFarAhead { .. })
@@ -768,10 +780,11 @@ mod timestamp_tests {
         // Simulate a host clock rollback: `now` is far behind the header
         // time, so the live future-drift ceiling rejects it.
         let rolled_back_now = 1_000_u32;
-        let candidate = mine(
+        let candidate = mine_regtest(
             tip.compute_hash(),
             11,
             rolled_back_now + MAX_FUTURE_TIME_SECONDS + 100,
+            1,
         );
         let parent_id = tree
             .lookup(tip.compute_hash().0)
@@ -819,7 +832,7 @@ mod timestamp_tests {
             })
             .unwrap_or_else(|e| panic!("tip not in tree: {e:?}"));
         // Candidate with time <= median (5): rejected in BOTH modes.
-        let candidate = mine(tip.compute_hash(), 11, 5);
+        let candidate = mine_regtest(tip.compute_hash(), 11, 5, 1);
         assert!(matches!(
             validate_contextual_header(
                 &tree,
@@ -837,7 +850,7 @@ mod timestamp_tests {
 #[cfg(test)]
 mod contextual_header_tests {
     use super::{
-        HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, accept_headers, compact_is_met_by,
+        HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, accept_headers, fixture::mine_regtest,
         next_work_required, validate_contextual_header,
     };
     use crate::{
@@ -847,30 +860,7 @@ mod contextual_header_tests {
     };
     use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Network};
 
-    const REGTEST_BITS: u32 = 0x207f_ffff;
     const TESTNET4_POW_LIMIT: u32 = 0x1d00_ffff;
-
-    fn mine_regtest(
-        prev_blockhash: BlockHash,
-        height: u32,
-        time: u32,
-        version: i32,
-    ) -> BlockHeader {
-        let mut merkle = [0_u8; 32];
-        merkle[..4].copy_from_slice(&height.to_le_bytes());
-        let mut header = BlockHeader {
-            version,
-            prev_blockhash,
-            merkle_root: Hash256::from_le_bytes(&merkle),
-            time,
-            bits: CompactTarget::from_consensus(REGTEST_BITS),
-            nonce: 0,
-        };
-        while !compact_is_met_by(header.bits, header.compute_hash().0) {
-            header.nonce = header.nonce.wrapping_add(1);
-        }
-        header
-    }
 
     fn extend_regtest(
         tree: &mut BlockTree,
