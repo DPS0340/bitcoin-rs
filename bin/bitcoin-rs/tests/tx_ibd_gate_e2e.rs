@@ -15,8 +15,11 @@
 
 #![expect(clippy::expect_used, reason = "process test assertions")]
 
+#[path = "support/wire.rs"]
+mod wire;
+
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::net::TcpStream;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,10 +40,9 @@ use bitcoin_rs_e2e::node::workspace;
 use bitcoin_rs_e2e::process_peer::connect_loopback;
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
 use serde_json::{Value, json};
+use wire::{decode_frame, is_soft_recv_error, read_frame};
 
 const REGTEST_BITS: u32 = 0x207f_ffff;
-const HEADER_BYTES: usize = 24;
-const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounded window during which an absence must persist: admission and relay
@@ -274,70 +276,6 @@ impl GatePeer {
             .iter()
             .any(|announced| announced == &txid || announced == &wtxid)
     }
-}
-
-fn is_soft_recv_error(error: &Error) -> bool {
-    match error {
-        Error::Io(io) => matches!(
-            io.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ),
-        Error::Protocol(detail) => detail.contains("deadline"),
-        _ => false,
-    }
-}
-
-fn read_frame(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, Error> {
-    fn read_exact(
-        stream: &mut TcpStream,
-        mut bytes: &mut [u8],
-        deadline: Instant,
-    ) -> Result<(), Error> {
-        let total = bytes.len();
-        while !bytes.is_empty() {
-            // The deadline bounds the wait for the first byte only: a frame
-            // that is already partially consumed must run to completion or
-            // the wire stream desynchronizes for every later read.
-            let wait = if bytes.len() == total {
-                deadline
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or(Duration::from_millis(1))
-            } else {
-                REQUEST_TIMEOUT
-            };
-            stream.set_read_timeout(Some(wait))?;
-            let count = stream.read(bytes)?;
-            if count == 0 {
-                return Err(Error::Protocol("truncated P2P frame".to_owned()));
-            }
-            bytes = &mut bytes[count..];
-        }
-        Ok(())
-    }
-    let mut header = [0; HEADER_BYTES];
-    read_exact(stream, &mut header, deadline)?;
-    let length = usize::try_from(u32::from_le_bytes(
-        header[16..20]
-            .try_into()
-            .map_err(|_| Error::Protocol("truncated P2P header".to_owned()))?,
-    ))
-    .map_err(|error| Error::Protocol(error.to_string()))?;
-    if length > MAX_PAYLOAD_BYTES {
-        return Err(Error::Protocol("P2P payload byte limit".to_owned()));
-    }
-    let mut frame = header.to_vec();
-    frame.resize(HEADER_BYTES + length, 0);
-    read_exact(stream, &mut frame[HEADER_BYTES..], deadline)?;
-    Ok(frame)
-}
-
-fn decode_frame(frame: &[u8]) -> Result<NetworkMessage, Error> {
-    let envelope: RawNetworkMessage = bitcoin::consensus::deserialize(frame)
-        .map_err(|error| Error::Protocol(format!("invalid P2P envelope: {error}")))?;
-    if *envelope.magic() != Magic::REGTEST {
-        return Err(Error::Protocol("P2P network mismatch".to_owned()));
-    }
-    Ok(envelope.into_payload())
 }
 
 fn evidence_dir() -> std::path::PathBuf {
