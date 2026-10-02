@@ -744,12 +744,6 @@ impl<'a> ParsedBlock<'a> {
         &self.txs
     }
 
-    /// The transaction at `index`, if present.
-    #[must_use]
-    pub fn transaction(&self, index: usize) -> Option<&ParsedTransaction<'a>> {
-        self.txs.get(index)
-    }
-
     /// Bytes this block occupies inside the owning image.
     #[must_use]
     pub fn consumed_len(&self) -> usize {

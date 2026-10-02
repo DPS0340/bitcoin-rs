@@ -49,7 +49,8 @@ fn golden_blocks_validate_all_spans_and_consumed_counts() {
         let mut per_tx_total = 0_usize;
         for (index, span) in parsed.transaction_spans().iter().enumerate() {
             let transaction = parsed
-                .transaction(index)
+                .transactions()
+                .get(index)
                 .unwrap_or_else(|| panic!("height {height} tx {index} missing"));
             let slice = parsed
                 .span_bytes(*span)

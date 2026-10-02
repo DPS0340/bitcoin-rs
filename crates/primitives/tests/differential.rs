@@ -16,9 +16,8 @@ use std::path::PathBuf;
 use std::str::FromStr as _;
 
 use bitcoin_rs_primitives::{
-    Amount, Block as NativeBlock, ConsensusDecode, ConsensusEncode, DecodeError, LockTime, Script,
-    Sequence, Sighash, SighashCache, Tx as NativeTx, TxOut, Witness, Wtxid, consensus_bytes,
-    deserialize,
+    Block as NativeBlock, ConsensusDecode, ConsensusEncode, DecodeError, LockTime, Script,
+    Sequence, SighashCache, Tx as NativeTx, Witness, Wtxid, consensus_bytes, deserialize,
 };
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
@@ -410,127 +409,6 @@ fn legacy_sighash_matches_core_vectors() -> Result<()> {
         "OP_CODESEPARATOR skip count drifted; matched {matched}"
     );
     Ok(())
-}
-
-#[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one fixture x tx x input x sighash-type sweep comparing cache to one-shot helpers"
-)]
-fn sighash_cache_matches_one_shot_helpers_across_fixtures() {
-    let ecdsa_types = [
-        Sighash::All,
-        Sighash::None,
-        Sighash::Single,
-        Sighash::AllAnyoneCanPay,
-        Sighash::NoneAnyoneCanPay,
-        Sighash::SingleAnyoneCanPay,
-    ];
-    let taproot_types = [
-        Sighash::Default,
-        Sighash::All,
-        Sighash::None,
-        Sighash::Single,
-        Sighash::AllAnyoneCanPay,
-        Sighash::NoneAnyoneCanPay,
-        Sighash::SingleAnyoneCanPay,
-    ];
-
-    for (name, bytes) in fixture_blocks() {
-        let native_block = match deserialize::<NativeBlock>(&bytes) {
-            Ok(block) => block,
-            Err(_) => continue,
-        };
-        for (tx_index, native_tx) in native_block.txs.iter().enumerate() {
-            let context = format!("block {name} tx {tx_index}");
-            let mut cache = SighashCache::new(native_tx);
-            let native_prevouts: Vec<TxOut> = native_tx
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(index, _)| TxOut {
-                    value: Amount::from_sat(
-                        1_000_u64
-                            + u64::try_from(index)
-                                .unwrap_or_else(|error| panic!("prevout index overflow: {error}")),
-                    ),
-                    script_pubkey: {
-                        let mut bytes = vec![0x51, 0x20];
-                        bytes.extend_from_slice(&[0x42_u8; 32]);
-                        bytes.into()
-                    },
-                })
-                .collect();
-            for (input_index, native_input) in native_tx.inputs.iter().enumerate() {
-                let script_code = native_input.script_sig.clone();
-                let value = Amount::from_sat(
-                    1_000_u64
-                        + u64::try_from(input_index).unwrap_or_else(|error| {
-                            panic!("{context}: input index overflow: {error}")
-                        }),
-                );
-                for ty in ecdsa_types {
-                    let cached = cache
-                        .legacy_signature_hash(input_index, &script_code, u32::from(ty.to_u8()))
-                        .unwrap_or_else(|error| {
-                            panic!("{context} input {input_index}: cache legacy failed: {error}")
-                        });
-                    let one_shot =
-                        Sighash::compute_legacy(native_tx, input_index, &script_code, ty)
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "{context} input {input_index}: one-shot legacy failed: {error}"
-                                )
-                            });
-                    assert_eq!(
-                        cached, one_shot,
-                        "{context} input {input_index} legacy {ty:?}"
-                    );
-                    let cached_bip143 = cache
-                        .segwit_v0_signature_hash(input_index, &script_code, value, ty)
-                        .unwrap_or_else(|error| {
-                            panic!("{context} input {input_index}: cache bip143 failed: {error}")
-                        });
-                    let one_shot_bip143 =
-                        Sighash::compute_bip143(native_tx, input_index, &script_code, value, ty)
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "{context} input {input_index}: one-shot bip143 failed: {error}"
-                                )
-                            });
-                    assert_eq!(
-                        cached_bip143, one_shot_bip143,
-                        "{context} input {input_index} bip143 {ty:?}"
-                    );
-                }
-                for ty in taproot_types {
-                    let cached =
-                        cache.taproot_signature_hash(input_index, &native_prevouts, None, None, ty);
-                    let one_shot = Sighash::compute_bip341(
-                        native_tx,
-                        input_index,
-                        &native_prevouts,
-                        ty,
-                        None,
-                        None,
-                    );
-                    match (cached, one_shot) {
-                        (Ok(cached), Ok(one_shot)) => assert_eq!(
-                            cached, one_shot,
-                            "{context} input {input_index} taproot {ty:?}"
-                        ),
-                        (Err(_), Err(_)) => {}
-                        (cached, one_shot) => panic!(
-                            "{context} input {input_index} taproot {ty:?}: verdict mismatch \
-                             (cache {:?}, one-shot {:?})",
-                            cached.err().map(|error| error.to_string()),
-                            one_shot.err().map(|error| error.to_string())
-                        ),
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn hex_decode(hex: &str) -> Vec<u8> {

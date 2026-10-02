@@ -88,7 +88,7 @@ const MAINNET_ASSUME_VALID_HASH: Hash256 = Hash256::from_le_bytes(&[
 ]);
 
 /// A supported Bitcoin network.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Network {
     /// Bitcoin mainnet.
     Mainnet,
