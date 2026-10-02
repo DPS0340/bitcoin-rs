@@ -549,49 +549,6 @@ impl<'t> SighashCache<'t> {
 }
 
 impl Sighash {
-    /// Computes the pre-segwit legacy signature hash.
-    pub fn compute_legacy(
-        tx: &Tx,
-        input_idx: usize,
-        script_code: &[u8],
-        sighash_type: Self,
-    ) -> Result<Hash256, SighashError> {
-        SighashCache::new(tx).legacy_signature_hash(
-            input_idx,
-            script_code,
-            u32::from(sighash_type.to_u8()),
-        )
-    }
-
-    /// Computes the BIP143 segwit-v0 signature hash.
-    pub fn compute_bip143(
-        tx: &Tx,
-        input_idx: usize,
-        script_code: &[u8],
-        value: crate::Amount,
-        sighash_type: Self,
-    ) -> Result<Hash256, SighashError> {
-        SighashCache::new(tx).segwit_v0_signature_hash(input_idx, script_code, value, sighash_type)
-    }
-
-    /// Computes the BIP341 taproot signature hash for key-path or script-path spends.
-    pub fn compute_bip341(
-        tx: &Tx,
-        input_idx: usize,
-        prevouts: &[TxOut],
-        sighash_type: Self,
-        leaf_hash: Option<Hash256>,
-        annex: Option<&[u8]>,
-    ) -> Result<Hash256, SighashError> {
-        SighashCache::new(tx).taproot_signature_hash(
-            input_idx,
-            prevouts,
-            annex,
-            leaf_hash.map(|leaf_hash| (leaf_hash, CODESEPARATOR_POSITION)),
-            sighash_type,
-        )
-    }
-
     /// Returns the consensus byte for the sighash mode.
     #[must_use]
     pub const fn to_u8(self) -> u8 {
@@ -711,7 +668,10 @@ fn tagged_hash(tag: &[u8], msg: &[u8]) -> Hash256 {
 mod tests {
     #![expect(clippy::expect_used, reason = "test assertions")]
 
-    use super::{Sighash, SighashCache, SighashError, TAPSCRIPT_LEAF_VERSION, tapleaf_hash};
+    use super::{
+        CODESEPARATOR_POSITION, Sighash, SighashCache, SighashError, TAPSCRIPT_LEAF_VERSION,
+        tapleaf_hash,
+    };
     use crate::{Hash256, OutPoint, Tx, Txid};
 
     fn pin(hex: &str) -> Hash256 {
@@ -775,7 +735,7 @@ mod tests {
         ];
         for (mode, expected) in pins {
             assert_eq!(
-                Sighash::compute_legacy(&tx, 0, &script, mode),
+                SighashCache::new(&tx).legacy_signature_hash(0, &script, u32::from(mode.to_u8())),
                 Ok(pin(expected))
             );
         }
@@ -790,8 +750,7 @@ mod tests {
         let tx = synthetic_tx(2);
         let script = vec![0x51_u8, 0x51];
         assert_eq!(
-            Sighash::compute_bip143(
-                &tx,
+            SighashCache::new(&tx).segwit_v0_signature_hash(
                 0,
                 &script,
                 crate::Amount::from_sat(50_000),
@@ -814,7 +773,13 @@ mod tests {
             script_pubkey: crate::Script::new(),
         }];
         assert_eq!(
-            Sighash::compute_bip341(&tx, 0, &prevouts, Sighash::AllAnyoneCanPay, None, None),
+            SighashCache::new(&tx).taproot_signature_hash(
+                0,
+                &prevouts,
+                None,
+                None,
+                Sighash::AllAnyoneCanPay
+            ),
             Ok(pin(
                 "8910eff2c9430e82893c47e1ba29da7ff76285dcb7a386bb9cbdd04fc97b8c8f"
             ))
@@ -825,7 +790,13 @@ mod tests {
             pin("75d68237360f5032d84419d0d32e2061cbc7ce286c58e7846ab291f707215ba8")
         );
         assert_eq!(
-            Sighash::compute_bip341(&tx, 0, &prevouts, Sighash::Default, Some(leaf), None),
+            SighashCache::new(&tx).taproot_signature_hash(
+                0,
+                &prevouts,
+                None,
+                Some((leaf, CODESEPARATOR_POSITION)),
+                Sighash::Default
+            ),
             Ok(pin(
                 "4cc7918733b1c9abd997206fac92d03183ec712d059dd5da5bd099e39b66a1d6"
             ))
@@ -837,7 +808,7 @@ mod tests {
         let tx = synthetic_tx(1);
 
         assert!(matches!(
-            Sighash::compute_legacy(&tx, 999, &[], Sighash::All),
+            SighashCache::new(&tx).legacy_signature_hash(999, &[], u32::from(Sighash::All.to_u8())),
             Err(SighashError::InputOutOfRange {
                 index: 999,
                 total: 1
@@ -850,8 +821,7 @@ mod tests {
         let tx = synthetic_tx(1);
 
         assert_eq!(
-            Sighash::compute_bip143(
-                &tx,
+            SighashCache::new(&tx).segwit_v0_signature_hash(
                 0,
                 &[],
                 crate::Amount::from_sat(50_000),
@@ -870,7 +840,13 @@ mod tests {
         }];
 
         assert!(matches!(
-            Sighash::compute_bip341(&tx, 0, &prevouts, Sighash::All, None, Some(&[0x51])),
+            SighashCache::new(&tx).taproot_signature_hash(
+                0,
+                &prevouts,
+                Some(&[0x51]),
+                None,
+                Sighash::All
+            ),
             Err(SighashError::InvalidAnnex(_))
         ));
     }
