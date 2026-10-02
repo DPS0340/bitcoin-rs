@@ -3,10 +3,10 @@
 //! Callers supply applied-chain facts. This module never queries node state and
 //! does not choose JSON-RPC versus REST transport policy.
 
+use bitcoin::hex::DisplayHex as _;
 use bitcoin_rs_primitives::{Block, Header, Network, consensus_bytes};
 use sonic_rs::{Value, json};
 
-use crate::compat::convert::hex_encode;
 use crate::tx_render::transaction_json;
 
 /// Applied-chain facts required to project a header or block.
@@ -74,7 +74,7 @@ pub(crate) fn block_json(
 /// Hex-encode a header using consensus serialization.
 #[must_use]
 pub(crate) fn header_hex(header: &Header) -> String {
-    hex_encode(&consensus_bytes(header))
+    consensus_bytes(header).to_lower_hex_string()
 }
 
 /// Compute Bitcoin Core confirmations from applied-chain membership facts.

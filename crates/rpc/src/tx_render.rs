@@ -14,7 +14,9 @@ use bitcoin_rs_primitives::{BlockHash, Network, OutPoint, Tx, TxIn, TxOut, Txid,
 use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
 use sonic_rs::{Value, json};
 
-use crate::compat::convert::{self, hex_encode};
+use bitcoin::hex::DisplayHex;
+
+use crate::compat::convert::{self};
 
 /// Optional confirmed-chain fields projected beside a transaction object.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,7 +95,7 @@ pub(crate) fn transaction_json(
         "locktime": tx.lock_time.to_consensus(),
         "vin": vin,
         "vout": vout,
-        "hex": hex_encode(&consensus_bytes(tx))
+        "hex": consensus_bytes(tx).to_lower_hex_string()
     });
     if let Some(chain) = chain {
         let _ = value.insert("blockhash", json!(chain.block_hash.to_string()));
@@ -114,7 +116,7 @@ pub(crate) fn script_pub_key_json(script: &[u8], network: Network) -> Value {
     let mut value = json!({
         "asm": convert::script_asm(script),
         "desc": script_desc(script, network),
-        "hex": hex_encode(script),
+        "hex": script.to_lower_hex_string(),
         "type": script_type
     });
     if let Some(address) = convert::script_address(script, network) {
@@ -126,11 +128,15 @@ pub(crate) fn script_pub_key_json(script: &[u8], network: Network) -> Value {
 fn input_json(input: &TxIn, coinbase: bool) -> Value {
     if coinbase {
         let mut value = json!({
-            "coinbase": hex_encode(&input.script_sig),
+            "coinbase": input.script_sig.to_lower_hex_string(),
             "sequence": input.sequence.to_consensus()
         });
         if !input.witness.is_empty() {
-            let witness: Vec<String> = input.witness.iter().map(|item| hex_encode(item)).collect();
+            let witness: Vec<String> = input
+                .witness
+                .iter()
+                .map(DisplayHex::to_lower_hex_string)
+                .collect();
             let _ = value.insert("txinwitness", json!(witness));
         }
         return value;
@@ -144,12 +150,16 @@ fn input_json(input: &TxIn, coinbase: bool) -> Value {
         "vout": prev_vout,
         "scriptSig": {
             "asm": convert::script_asm(&input.script_sig),
-            "hex": hex_encode(&input.script_sig)
+            "hex": input.script_sig.to_lower_hex_string()
         },
         "sequence": input.sequence.to_consensus()
     });
     if !input.witness.is_empty() {
-        let witness: Vec<String> = input.witness.iter().map(|item| hex_encode(item)).collect();
+        let witness: Vec<String> = input
+            .witness
+            .iter()
+            .map(DisplayHex::to_lower_hex_string)
+            .collect();
         let _ = value.insert("txinwitness", json!(witness));
     }
     value
@@ -175,7 +185,7 @@ fn script_desc(script: &[u8], network: Network) -> String {
     if let Some(address) = convert::script_address(script, network) {
         return format!("addr({address})");
     }
-    format!("raw({})", hex_encode(script))
+    format!("raw({})", script.to_lower_hex_string())
 }
 
 #[cfg(test)]

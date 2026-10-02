@@ -13,6 +13,7 @@ use bitcoin_rs_primitives::{
     BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, consensus_bytes, unix_time_secs,
 };
 
+use bitcoin::hex::DisplayHex as _;
 use bitcoin_rs_consensus::ValidationEngine;
 #[cfg(test)]
 use bitcoin_rs_primitives::{Amount, Script, Txid};
@@ -22,8 +23,6 @@ use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
 use std::time::Instant;
-
-use crate::compat::convert::hex_encode;
 
 #[cfg(test)]
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
@@ -1144,7 +1143,7 @@ impl ChainHandles {
     /// Returns lowercase serialized block hex from durable body storage.
     #[must_use]
     pub(crate) fn block_body_hex(&self, record: &BlockRecord) -> Option<String> {
-        Some(hex_encode(&self.block_body_bytes(record)?))
+        Some(self.block_body_bytes(record)?.to_lower_hex_string())
     }
 
     /// Returns the median-time-past at the block with `hash`, or `None` if the
@@ -1177,7 +1176,7 @@ impl ChainHandles {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
         let bytes: [u8; 32] = node.chainwork.to_be_bytes();
-        Some(hex_encode(&bytes))
+        Some(bytes.to_lower_hex_string())
     }
 }
 
@@ -1860,7 +1859,7 @@ mod tests {
             ctx.chain.block_body_bytes(&record).as_deref(),
             Some(body.as_slice())
         );
-        let expected_hex = hex_encode(&body);
+        let expected_hex = body.to_lower_hex_string();
         assert_eq!(
             ctx.chain.block_body_hex(&record).as_deref(),
             Some(expected_hex.as_str())
@@ -1889,7 +1888,7 @@ mod tests {
 
         assert_eq!(
             record.header_hex(),
-            hex_encode(&consensus_bytes(&block.header))
+            consensus_bytes(&block.header).to_lower_hex_string()
         );
         assert_eq!(record.header_hex().len(), SERIALIZED_BLOCK_HEADER_LEN * 2);
     }
@@ -2001,7 +2000,10 @@ mod tests {
             Some(consensus_bytes(&header).as_slice()),
             "the tree-derived record must carry the header the tree holds"
         );
-        assert_eq!(record.header_hex(), hex_encode(&consensus_bytes(&header)));
+        assert_eq!(
+            record.header_hex(),
+            consensus_bytes(&header).to_lower_hex_string()
+        );
     }
 
     #[test]
@@ -2498,7 +2500,7 @@ mod admission_chain_tests {
 
         let outpoint = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[21; 32])), 0);
         let spend = spending(outpoint);
-        let raw = hex_encode(&consensus_bytes(&spend));
+        let raw = consensus_bytes(&spend).to_lower_hex_string();
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
             outpoint,
@@ -2553,7 +2555,7 @@ mod admission_chain_tests {
             bitcoin_rs_mempool::standardness::AcceptanceRejectReason::MissingInputs.to_string(),
             "the embedded envelope maps the shared policy failure verbatim"
         );
-        let orphan_raw = hex_encode(&consensus_bytes(&orphan));
+        let orphan_raw = consensus_bytes(&orphan).to_lower_hex_string();
         let refused = tx::sendrawtransaction(&rpc_ctx, &json!([orphan_raw]))
             .expect_err("the RPC surface refuses the same transaction");
         assert_eq!(refused.code(), RpcError::CORE_VERIFY_ERROR);

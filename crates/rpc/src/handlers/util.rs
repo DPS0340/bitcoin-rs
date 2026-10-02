@@ -10,9 +10,9 @@ use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value, json};
 
 use corepc_types::v31;
 
-use crate::compat::convert::{
-    self, hex_encode, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
-};
+use bitcoin::hex::DisplayHex as _;
+
+use crate::compat::convert::{self, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls};
 use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::{
@@ -213,11 +213,11 @@ pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     };
 
     let script = address.script_pubkey();
-    let script_hex = hex_encode(script.as_bytes());
+    let script_hex = script.as_bytes().to_lower_hex_string();
     let witness_version = script.witness_version();
     let witness_program = witness_version
         .filter(|_| script.as_bytes().len() >= 2)
-        .map(|_| hex_encode(&script.as_bytes()[2..]));
+        .map(|_| script.as_bytes()[2..].to_lower_hex_string());
     typed_to_sonic(&v31::ValidateAddress {
         is_valid: true,
         address: address.to_string(),
