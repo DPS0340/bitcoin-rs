@@ -20,7 +20,7 @@ use crate::download_window::SyncBudget;
 
 /// Bounded in-memory staging set for inbound block bodies.
 #[derive(Debug)]
-pub struct BlockStager {
+pub(crate) struct BlockStager {
     budget: SyncBudget,
     received: HashMap<Hash256, ReceivedBlock>,
     received_order: VecDeque<Hash256>,
@@ -86,7 +86,7 @@ impl DrainedBlock {
 
 /// Result of attempting to stage one inbound body.
 #[derive(Clone, Debug)]
-pub enum StagedBlock {
+pub(crate) enum StagedBlock {
     /// The hash is already in the staging set.
     AlreadyStaged,
     /// The body is retained. `dropped` are count-budget evictions caused by
@@ -108,7 +108,7 @@ pub enum StagedBlock {
 impl BlockStager {
     /// Empty stager sized to `budget`.
     #[must_use]
-    pub fn new(budget: SyncBudget) -> Self {
+    pub(crate) fn new(budget: SyncBudget) -> Self {
         Self {
             budget,
             received: HashMap::with_capacity(budget.max_received_blocks),
@@ -129,19 +129,19 @@ impl BlockStager {
 
     /// Total serialized bytes of currently staged bodies.
     #[must_use]
-    pub fn received_bytes(&self) -> usize {
+    pub(crate) fn received_bytes(&self) -> usize {
         self.received_bytes
     }
 
     /// Highest staged-block population ever observed this run.
     #[must_use]
-    pub const fn received_high_water(&self) -> usize {
+    pub(crate) const fn received_high_water(&self) -> usize {
         self.received_blocks_high_water
     }
 
     /// Highest staged-byte total ever observed this run; feeds the high-water gauge.
     #[must_use]
-    pub const fn received_bytes_high_water(&self) -> usize {
+    pub(crate) const fn received_bytes_high_water(&self) -> usize {
         self.received_bytes_high_water
     }
 
@@ -171,7 +171,7 @@ impl BlockStager {
     }
 
     /// Stages `block` or refuses it for retry under the byte budget.
-    pub fn insert(
+    pub(crate) fn insert(
         &mut self,
         hash: Hash256,
         next_expected_hash: Option<Hash256>,
@@ -232,7 +232,7 @@ impl BlockStager {
     /// no-blame guard: a staged next-expected block means the apply side owns
     /// the frontier.
     #[must_use]
-    pub fn contains(&self, hash: &Hash256) -> bool {
+    pub(crate) fn contains(&self, hash: &Hash256) -> bool {
         self.received.contains_key(hash)
     }
 
@@ -263,7 +263,7 @@ impl BlockStager {
     /// Clones one staged decoded body and its original wire bytes without
     /// removing it from the bounded staging set.
     #[must_use]
-    pub fn staged_body(&self, hash: Hash256) -> Option<(Block, bytes::Bytes)> {
+    pub(crate) fn staged_body(&self, hash: Hash256) -> Option<(Block, bytes::Bytes)> {
         self.received
             .get(&hash)
             .map(|entry| (entry.block.clone(), entry.serialized.clone()))
@@ -440,7 +440,7 @@ impl BlockStager {
     /// Drops the staged body for `hash`, releasing its staging-budget bytes.
     /// Used for bodies whose embedded header is permanently inadmissible —
     /// they can never become expected, so they are dead inventory.
-    pub fn discard(&mut self, hash: &Hash256) -> bool {
+    pub(crate) fn discard(&mut self, hash: &Hash256) -> bool {
         self.remove(hash).is_some()
     }
 

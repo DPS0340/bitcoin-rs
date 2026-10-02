@@ -52,7 +52,7 @@ pub mod wire;
 /// BIP339 wtxid-relay state.
 pub(crate) mod wtxid;
 
-pub use block_stager::{BlockStager, StagedBlock};
+pub(crate) use block_stager::BlockStager;
 pub use chain_query::ActiveChainQuery;
 pub use compact_blocks::CompactBlockHints;
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, PINNED_CORE_VERSION};
