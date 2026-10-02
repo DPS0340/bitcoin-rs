@@ -73,7 +73,6 @@ pub(crate) fn approved_layer(crate_name: &str) -> u8 {
 }
 
 /// A normal or build workspace dependency, before dev-feature unification.
-#[derive(Clone, Debug)]
 struct FeatureDependency {
     name: String,
     alias: String,
@@ -82,7 +81,6 @@ struct FeatureDependency {
 }
 
 /// Parsed workspace dependency graph used by the gates.
-#[derive(Clone, Debug)]
 pub(crate) struct WorkspaceGraph {
     /// Normal `bitcoin-rs-*` dependencies per crate.
     pub normal_deps: BTreeMap<String, Vec<String>>,
