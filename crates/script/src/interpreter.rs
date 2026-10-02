@@ -188,12 +188,6 @@ impl VerifyFlags {
     }
 }
 
-impl From<VerifyFlags> for u32 {
-    fn from(flags: VerifyFlags) -> Self {
-        flags.bits()
-    }
-}
-
 /// Core-named script error codes, one variant per case in `ScriptErrorString`.
 ///
 /// The [`fmt::Display`] impl renders the exact Core case name (without the
