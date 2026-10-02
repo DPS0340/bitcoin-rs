@@ -47,10 +47,7 @@ fn load(
     args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
     vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> anyhow::Result<bitcoin_rs_node::NodeConfig> {
-    let cli = match <cli::CliArgs as clap::Parser>::try_parse_from(args) {
-        Ok(cli) => cli,
-        Err(error) => error.exit(),
-    };
+    let cli = <cli::CliArgs as clap::Parser>::try_parse_from(args)?;
     config_from(cli, vars)
 }
 
