@@ -1110,7 +1110,7 @@ mod tests {
         assert_eq!(tree.node_at_height_from(side_ids[3], 1), Some(side_ids[1]));
 
         let active_prefix = main_ids[4];
-        let active_prefix_index = usize::try_from(active_prefix.get())?;
+        let active_prefix_index = active_prefix.index().ok_or("active prefix index")?;
         tree.nodes
             .get_mut(active_prefix_index)
             .ok_or("missing active prefix")?
