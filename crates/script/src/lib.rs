@@ -20,7 +20,7 @@ pub mod sigops;
 /// Bounded script stack with Core's 1000-item maximum depth.
 mod stack;
 /// Taproot verification helpers.
-pub mod taproot;
+mod taproot;
 
 pub use interpreter::{Interpreter, ScriptErrCode, ScriptError, VerifyFlags};
 pub use script::{

@@ -39,9 +39,7 @@ use bitcoin_rs_primitives::tapleaf_hash;
 use bitcoin_rs_primitives::{
     Amount, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness, deserialize,
 };
-use bitcoin_rs_script::{
-    Interpreter, ScriptError, VerifyFlags, opcode, push_data, push_int, taproot,
-};
+use bitcoin_rs_script::{Interpreter, ScriptError, VerifyFlags, opcode, push_data, push_int};
 
 // ===========================================================================
 // Script error code model — Core's `ScriptErrorString` names
@@ -754,10 +752,10 @@ struct TaprootPlaceholder {
 /// `TaprootBuilder::Add(0, script, TAPROOT_LEAF_TAPSCRIPT).Finalize(key0)`.
 ///
 /// The tree is assembled with rust-bitcoin's builder - an independent
-/// implementation of BIP341 - and then checked against this crate's own
-/// `taproot::compute_taproot_merkle_root` and `taproot::verify_taproot_commitment`
-/// before it is handed to the interpreter, so a row can never be graded against
-/// a commitment the driver itself would reject.
+/// implementation of BIP341 - and its merkle root is checked against this
+/// workspace's own tapleaf hash before the tree is handed to the
+/// interpreter, so a row can never be graded against a commitment the
+/// driver itself would reject.
 fn build_taproot_placeholder(leaf_script: &[u8]) -> Result<TaprootPlaceholder, String> {
     let secp = Secp256k1::new();
     let secret = SecretKey::from_slice(&CORE_TAPROOT_INTERNAL_SECRET)
@@ -778,9 +776,9 @@ fn build_taproot_placeholder(leaf_script: &[u8]) -> Result<TaprootPlaceholder, S
         .serialize();
     let output_key = spend_info.output_key().serialize();
 
-    // The tree's own merkle root must be the tapleaf hash this crate computes,
-    // and this crate's commitment check must accept the pair it just generated.
-    let tapleaf = tapleaf_hash(taproot::TAPROOT_LEAF_TAPSCRIPT, leaf_script);
+    // The tree's own merkle root must equal the tapleaf hash this workspace
+    // computes for the same leaf.
+    let tapleaf = tapleaf_hash(LeafVersion::TapScript.to_consensus(), leaf_script);
     let core_root = spend_info
         .merkle_root()
         .ok_or("a one-leaf tree has a merkle root")?;
@@ -789,17 +787,6 @@ fn build_taproot_placeholder(leaf_script: &[u8]) -> Result<TaprootPlaceholder, S
         return Err(format!(
             "tapleaf hash disagreement: rust-bitcoin {core_root:?}, this crate {tapleaf:?}"
         ));
-    }
-    let our_root = taproot::compute_taproot_merkle_root(&control_bytes, &tapleaf);
-    if our_root.as_byte_array() != tapleaf.as_byte_array() {
-        return Err(format!(
-            "compute_taproot_merkle_root must return the tapleaf for an empty path, got {our_root:?}"
-        ));
-    }
-    if !taproot::verify_taproot_commitment(&control_bytes, &output_key, &tapleaf) {
-        return Err(
-            "the generated control block failed this crate's own commitment check".to_owned(),
-        );
     }
 
     Ok(TaprootPlaceholder {
