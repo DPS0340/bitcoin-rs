@@ -15,7 +15,7 @@ use crate::handlers::{chain, mempool, mining, network, tx, util};
 use crate::manifest::{CORE_VERSION, Entry, NO_WALLET, Status, SurfaceKind};
 
 /// Signature of one dispatch arm.
-pub(crate) type HandlerFn = fn(&Arc<Context>, &Value) -> Result<Value, RpcError>;
+type HandlerFn = fn(&Arc<Context>, &Value) -> Result<Value, RpcError>;
 
 /// One unified registry row: compat metadata plus the dispatch arm.
 ///

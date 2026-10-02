@@ -334,7 +334,7 @@ fn with_checksum(canonical: &str) -> String {
 /// descriptor derives perfectly good addresses that nobody holds the keys for,
 /// and the checksum is the only thing standing between a typo and that.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ChecksumRequirement {
+enum ChecksumRequirement {
     /// Accept a descriptor with no checksum; verify one that is present.
     Optional,
     /// Refuse a descriptor with no checksum.
