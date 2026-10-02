@@ -12,7 +12,7 @@ mod deployment;
 /// Header acceptance and proof-of-work validation.
 pub mod header_sync;
 /// Initial block download state of the applied chain.
-pub mod ibd;
+mod ibd;
 /// Block-tree node types.
 pub mod node;
 /// Regtest block and proof-of-work builders shared by cross-crate test
@@ -20,13 +20,13 @@ pub mod node;
 #[cfg(feature = "test-seam")]
 pub mod regtest_fixture;
 /// Reorganization planning.
-pub mod reorg;
+mod reorg;
 /// Best-tip snapshot type.
-pub mod tip;
+mod tip;
 /// One transition domain split into mutation and stable-read roles.
 mod transition;
 /// In-memory block tree.
-pub mod tree;
+mod tree;
 /// Read-only capabilities over chain publications and topology.
 mod view;
 
