@@ -376,11 +376,7 @@ fn finish_candidate(
         payout,
         witness_commitment.as_ref(),
     )?;
-    let coinbase_value = coinbase
-        .outputs
-        .first()
-        .map(|output| output.value.to_sat())
-        .ok_or(MiningError::CoinbaseValueOverflow)?;
+    let coinbase_value = coinbase.outputs[0].value.to_sat();
     // Fees change a fixed-width amount and the witness commitment replaces a
     // fixed-width hash, so the reserved and final coinbase have the same
     // weight, serialized size, and sigop cost.
