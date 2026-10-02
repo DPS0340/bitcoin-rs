@@ -1,7 +1,3 @@
-use core::fmt;
-use std::io;
-
-use bitcoin_rs_primitives::{DecodeError, HashError};
 use thiserror::Error;
 
 /// JSON-RPC 2.0 and Bitcoin Core-compatible RPC errors.
@@ -114,45 +110,15 @@ impl RpcError {
     }
 }
 
-impl From<sonic_rs::Error> for RpcError {
-    fn from(error: sonic_rs::Error) -> Self {
-        Self::Parse(error.to_string())
-    }
-}
-
-impl From<serde_json::Error> for RpcError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Internal(error.to_string())
-    }
-}
-
-impl From<io::Error> for RpcError {
-    fn from(error: io::Error) -> Self {
-        Self::Internal(error.to_string())
-    }
-}
-
-impl From<DecodeError> for RpcError {
-    fn from(_error: DecodeError) -> Self {
-        Self::InvalidParams("consensus decoding failed")
-    }
-}
-
-impl From<HashError> for RpcError {
-    fn from(_error: HashError) -> Self {
-        Self::InvalidParams("hex string is invalid")
-    }
-}
-
 impl From<core::str::Utf8Error> for RpcError {
     fn from(error: core::str::Utf8Error) -> Self {
         Self::Parse(error.to_string())
     }
 }
 
-impl From<fmt::Error> for RpcError {
-    fn from(error: fmt::Error) -> Self {
-        Self::Internal(error.to_string())
+impl From<sonic_rs::Error> for RpcError {
+    fn from(error: sonic_rs::Error) -> Self {
+        Self::Parse(error.to_string())
     }
 }
 

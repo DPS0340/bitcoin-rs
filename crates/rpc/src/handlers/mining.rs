@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::str::FromStr as _;
 
-use bitcoin::hex::FromHex as _;
+use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin_rs_mempool::MempoolMiningSnapshot;
 use bitcoin_rs_mining::{
     AvailableMiningRule, BlockTemplate, BlockTemplateMode, BlockTemplateRequest,
@@ -16,8 +16,8 @@ use compact_str::CompactString;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value, json};
 
 use crate::compat::convert::{
-    self, compact_target_hex, hex_encode, i64_saturated, sat_to_btc, signed_sat_to_i64,
-    typed_to_sonic, typed_to_sonic_omitting_nulls,
+    self, compact_target_hex, i64_saturated, sat_to_btc, signed_sat_to_i64, typed_to_sonic,
+    typed_to_sonic_omitting_nulls,
 };
 use crate::context::Context;
 use crate::error::RpcError;
@@ -619,7 +619,7 @@ fn render_template_transactions(
     transactions
         .iter()
         .map(|tx| v31::BlockTemplateTransaction {
-            data: hex_encode(&consensus_bytes(tx.tx.as_ref())),
+            data: consensus_bytes(tx.tx.as_ref()).to_lower_hex_string(),
             txid: tx.txid.to_string(),
             hash: tx.wtxid.to_string(),
             depends: tx.depends.iter().map(|index| i64::from(*index)).collect(),
@@ -690,7 +690,7 @@ fn render_block_template(template: &BlockTemplate) -> Result<Value, RpcError> {
         default_witness_commitment: candidate
             .witness_commitment
             .as_ref()
-            .map(|commitment| hex_encode(&witness_commitment_script(commitment))),
+            .map(|commitment| witness_commitment_script(commitment).to_lower_hex_string()),
     })
 }
 
@@ -724,7 +724,7 @@ fn render_mining_info(info: &MiningInfo) -> Result<Value, RpcError> {
         signet_challenge: info
             .signet
             .as_ref()
-            .map(|signet| hex_encode(&signet.challenge)),
+            .map(|signet| signet.challenge.to_lower_hex_string()),
         next: v31::NextBlockInfo {
             height: next_height,
             bits: next_bits,
@@ -954,7 +954,7 @@ mod tests {
         ctx.mining.mining_control = Some(control);
         let ctx = Arc::new(ctx);
         let genesis = sample_block();
-        let hex = hex_encode(&consensus_bytes(&genesis));
+        let hex = consensus_bytes(&genesis).to_lower_hex_string();
         let result = getblocktemplate(
             &ctx,
             &json!([{
@@ -1116,7 +1116,7 @@ mod tests {
         *control.proposal.lock() = BlockValidationResult::Accepted;
         let ctx = ctx_with_control_on_network(control.clone(), Network::Signet);
         let genesis = sample_block();
-        let hex = hex_encode(&consensus_bytes(&genesis));
+        let hex = consensus_bytes(&genesis).to_lower_hex_string();
         let result = getblocktemplate(
             &ctx,
             &json!([{
@@ -1168,7 +1168,7 @@ mod tests {
             assert_eq!(error.to_string(), "Block decode failed");
         }
         let genesis = sample_block();
-        let mut hex = hex_encode(&consensus_bytes(&genesis));
+        let mut hex = consensus_bytes(&genesis).to_lower_hex_string();
         hex.push_str("ffff");
         let result = getblocktemplate(
             &ctx,
@@ -1199,7 +1199,7 @@ mod tests {
         let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
         let ctx = ctx_with_control(control.clone());
         let genesis = sample_block();
-        let hex = hex_encode(&consensus_bytes(&genesis));
+        let hex = consensus_bytes(&genesis).to_lower_hex_string();
 
         *control.submit.lock() = BlockValidationResult::Accepted;
         assert!(
@@ -1251,7 +1251,7 @@ mod tests {
         let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
         let ctx = ctx_with_control(control.clone());
         let genesis = sample_block();
-        let mut hex = hex_encode(&consensus_bytes(&genesis));
+        let mut hex = consensus_bytes(&genesis).to_lower_hex_string();
         hex.push_str("ffff");
         let result = submitblock(&ctx, &json!([hex.as_str(), "ignored"]))
             .unwrap_or_else(|err| panic!("dummy and trailing bytes must be ignored: {err}"));
@@ -1271,7 +1271,7 @@ mod tests {
         let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
         let ctx = ctx_with_control(control.clone());
         let genesis = sample_block();
-        let hex = hex_encode(&consensus_bytes(&genesis));
+        let hex = consensus_bytes(&genesis).to_lower_hex_string();
         for dummy in [json!(123), json!(true), json!([]), json!({})] {
             let error = submitblock(&ctx, &json!([hex.as_str(), dummy]))
                 .expect_err("non-string BIP22 dummy must fail");
@@ -1309,7 +1309,7 @@ mod tests {
             header: sample_block().header,
             txs: vec![empty],
         };
-        let hex = hex_encode(&consensus_bytes(&block));
+        let hex = consensus_bytes(&block).to_lower_hex_string();
         let result = submitblock(&ctx, &json!([hex.as_str()]))
             .unwrap_or_else(|err| panic!("zero-input zero-flag block must decode: {err}"));
         assert!(result.is_null());
@@ -1579,7 +1579,7 @@ mod tests {
             .expect("transactions array");
         assert_eq!(transactions.len(), 1);
         let txid_hex = txid.to_string();
-        let tx_hex = hex_encode(&consensus_bytes(&tx));
+        let tx_hex = consensus_bytes(&tx).to_lower_hex_string();
         assert_eq!(
             transactions[0].get("txid").and_then(JsonValueTrait::as_str),
             Some(txid_hex.as_str())
@@ -1993,7 +1993,7 @@ mod tests {
         }
         let mut raw = sample_raw_tx();
         raw.lock_time = LockTime::from_consensus(1);
-        let raw_hex = hex_encode(&consensus_bytes(&raw));
+        let raw_hex = consensus_bytes(&raw).to_lower_hex_string();
         generateblock(&ctx, &json!([REGTEST_ADDRESS, [txid.to_string(), raw_hex]]))
             .unwrap_or_else(|err| panic!("generateblock failed: {err}"));
         let request = control
@@ -2182,7 +2182,7 @@ mod tests {
             "bad-prevblk",
         )));
         let ctx = ctx_with_control(control);
-        let header = hex_encode(&consensus_bytes(&sample_block().header));
+        let header = consensus_bytes(&sample_block().header).to_lower_hex_string();
         let error = submitheader(&ctx, &json!([header.as_str()]))
             .expect_err("armed control failure must reject the header");
         assert_eq!(error.code(), RpcError::CORE_VERIFY_ERROR);

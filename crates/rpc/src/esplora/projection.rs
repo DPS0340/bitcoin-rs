@@ -4,6 +4,7 @@ use core::str::FromStr as _;
 use std::sync::Arc;
 
 use bitcoin::Network as BitcoinNetwork;
+use bitcoin::hex::DisplayHex;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::ScriptHash as MempoolScriptHash;
@@ -12,7 +13,7 @@ use bitcoin_rs_primitives::{
 };
 use bitcoin_rs_script::script::{instructions, is_p2sh, is_p2wsh};
 
-use crate::compat::convert::{self, hex_encode};
+use crate::compat::convert::{self};
 use crate::context::{Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError};
 use crate::rest::{Response, bad_request, internal_error, not_found, service_unavailable};
 
@@ -235,14 +236,14 @@ impl<'a> Projection<'a> {
                 prevout: previous
                     .as_ref()
                     .map(|output| self.transaction_output(output)),
-                scriptsig: hex_encode(&input.script_sig),
+                scriptsig: input.script_sig.to_lower_hex_string(),
                 scriptsig_asm: convert::script_asm(&input.script_sig),
                 witness: (!input.witness.is_empty()).then(|| {
                     input
                         .witness
                         .iter()
                         .map(Vec::as_slice)
-                        .map(hex_encode)
+                        .map(DisplayHex::to_lower_hex_string)
                         .collect()
                 }),
                 is_coinbase: coinbase,
@@ -275,7 +276,7 @@ impl<'a> Projection<'a> {
     pub(super) fn transaction_output(&self, output: &TxOut) -> TransactionOutput {
         let script = &output.script_pubkey;
         TransactionOutput {
-            scriptpubkey: hex_encode(script),
+            scriptpubkey: script.to_lower_hex_string(),
             scriptpubkey_asm: convert::script_asm(script),
             scriptpubkey_type: esplora_type_name(convert::classify(script)),
             scriptpubkey_address: convert::script_address(script, self.ctx.chain.chain_network),

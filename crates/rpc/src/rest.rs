@@ -9,7 +9,7 @@
 use alloc::sync::Arc;
 use std::str::FromStr;
 
-use bitcoin::hex::FromHex as _;
+use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, TxOut, Txid, consensus_bytes, deserialize,
 };
@@ -18,7 +18,6 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_primitives::{Amount, CompactTarget, LockTime, Script, Sequence, Witness};
 use sonic_rs::{JsonValueTrait as _, Value, json};
 
-use crate::compat::convert::hex_encode;
 use crate::context::{AppliedView, Context};
 use crate::error::RpcError;
 use crate::handlers::chain::getblockchaininfo;
@@ -184,7 +183,7 @@ fn route_block(ctx: &Arc<Context>, suffix: &str, with_details: bool) -> Response
         "bin" => binary_response("application/octet-stream", &body),
         "hex" => text_response(
             "text/plain",
-            format!("{}\n", hex_encode(&body)).into_bytes(),
+            format!("{}\n", body.to_lower_hex_string()).into_bytes(),
         ),
         "json" => {
             let block = match deserialize::<Block>(&body) {
@@ -230,7 +229,7 @@ fn route_block_part(ctx: &Arc<Context>, suffix: &str) -> Response {
         "bin" => binary_response("application/octet-stream", &body),
         "hex" => text_response(
             "text/plain",
-            format!("{}\n", hex_encode(&body)).into_bytes(),
+            format!("{}\n", body.to_lower_hex_string()).into_bytes(),
         ),
         _ => format_not_found(available_formats()),
     }
@@ -342,7 +341,7 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
         "hex" => {
             let body = records
                 .iter()
-                .map(|record| hex_encode(&consensus_bytes(&record.header)))
+                .map(|record| consensus_bytes(&record.header).to_lower_hex_string())
                 .collect::<String>();
             text_response("text/plain", body.into_bytes())
         }
@@ -486,12 +485,8 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str) -> Response {
             "text/plain",
             format!(
                 "{}\n",
-                hex_encode(&serialize_getutxos_bin(
-                    active_height,
-                    active_hash,
-                    &bitmap,
-                    &outs
-                ))
+                serialize_getutxos_bin(active_height, active_hash, &bitmap, &outs)
+                    .to_lower_hex_string()
             )
             .into_bytes(),
         ),
@@ -1583,7 +1578,7 @@ mod tests {
         let path = format!("/rest/headers/{}.hex", genesis.block_hash());
         let response = route(&ctx, &path, "count=1", true);
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, hex_encode(&expected).into_bytes());
+        assert_eq!(response.body, expected.to_lower_hex_string().into_bytes());
     }
 
     /// A log-only hash remains an empty success in every REST format.

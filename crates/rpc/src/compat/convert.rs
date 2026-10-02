@@ -14,6 +14,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use bitcoin::Address;
+use bitcoin::hex::DisplayHex;
 use bitcoin_rs_primitives::{CompactTarget, Network, Tx, TxIn, TxOut, consensus_bytes};
 use bitcoin_rs_script::{
     is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_push_only, multisig_key_count,
@@ -122,7 +123,7 @@ pub(crate) fn compact_target_hex(bits: CompactTarget) -> String {
         }
     }
     target.reverse();
-    hex_encode(&target)
+    target.to_lower_hex_string()
 }
 
 /// Script disassembly (`asm`) via the sanctioned rust-bitcoin seam.
@@ -311,7 +312,7 @@ pub(crate) fn script_pub_key_typed(
 pub(crate) fn script_sig_typed(script: &[u8]) -> corepc_types::ScriptSig {
     corepc_types::ScriptSig {
         asm: script_asm(script),
-        hex: hex_encode(script),
+        hex: script.to_lower_hex_string(),
     }
 }
 
@@ -329,8 +330,8 @@ pub(crate) fn coinbase_transaction_typed(
         version: tx.version,
         locktime: tx.lock_time.to_consensus(),
         sequence: input.sequence.to_consensus(),
-        coinbase: hex_encode(&input.script_sig),
-        witness: input.witness.first().map(|item| hex_encode(item)),
+        coinbase: input.script_sig.to_lower_hex_string(),
+        witness: input.witness.first().map(DisplayHex::to_lower_hex_string),
     })
 }
 
@@ -380,7 +381,7 @@ pub(crate) fn raw_transaction_verbose(
         });
     Ok(corepc_types::v31::GetRawTransactionVerbose {
         in_active_chain,
-        hex: hex_encode(&consensus_bytes(tx)),
+        hex: consensus_bytes(tx).to_lower_hex_string(),
         txid: tx.txid().to_string(),
         hash: tx.wtxid().to_string(),
         size: u64::try_from(tx.total_size()).unwrap_or(u64::MAX),
@@ -439,12 +440,12 @@ fn raw_input_typed(input: &TxIn, coinbase: bool) -> corepc_types::v31::RawTransa
         input
             .witness
             .iter()
-            .map(|item| hex_encode(item))
+            .map(DisplayHex::to_lower_hex_string)
             .collect::<Vec<_>>()
     });
     if coinbase {
         return corepc_types::v31::RawTransactionInput {
-            coinbase: Some(hex_encode(&input.script_sig)),
+            coinbase: Some(input.script_sig.to_lower_hex_string()),
             txid: None,
             vout: None,
             script_sig: None,
@@ -477,18 +478,6 @@ fn raw_output_typed(
         index: u64::try_from(index).unwrap_or(u64::MAX),
         script_pubkey: script_pub_key_typed(&output.script_pubkey, network)?,
     })
-}
-
-/// Lowercase hex encoding for wire strings.
-#[must_use]
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }
 
 /// Representative raw `scriptPubKey` bytes for every [`ScriptShape`].
@@ -604,20 +593,6 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hex_encoding_matches_standard_formatting_for_every_byte() -> core::fmt::Result {
-        use core::fmt::Write as _;
-
-        let bytes: Vec<u8> = (u8::MIN..=u8::MAX).collect();
-        let mut expected = String::new();
-        for byte in &bytes {
-            write!(&mut expected, "{byte:02x}")?;
-        }
-        assert_eq!(hex_encode(&bytes), expected);
-        assert_eq!(hex_encode(&[]), "");
-        Ok(())
-    }
 
     #[test]
     fn compact_target_places_mantissa_bytes_core_style() {
