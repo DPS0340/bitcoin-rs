@@ -669,7 +669,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::snapshot::hash_serialized_3;
     use crate::stats::CoinStats;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -723,7 +722,7 @@ mod tests {
     fn observe(utxo: &UtxoSet, coin_stats: &CoinStatsListener) -> Result<State, UtxoError> {
         let s = coin_stats.snapshot();
         Ok((
-            hash_serialized_3(utxo)?,
+            utxo.with_stable_view(|view| view.hash_serialized_3())?,
             s.muhash.finalize_hash(),
             [
                 s.height.into(),
@@ -1038,7 +1037,10 @@ mod tests {
             commit_block_changes(&first_five, changes, &undo_txid(height))?;
         }
 
-        assert_eq!(hash_serialized_3(&full)?, hash_serialized_3(&first_five)?);
+        assert_eq!(
+            full.with_stable_view(|view| view.hash_serialized_3())?,
+            first_five.with_stable_view(|view| view.hash_serialized_3())?
+        );
         assert_eq!(full.len(), first_five.len());
 
         Ok(())
