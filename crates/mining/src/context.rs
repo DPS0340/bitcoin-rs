@@ -91,7 +91,7 @@ impl MiningChainContext {
 
     /// BIP113 locktime cutoff for a candidate carrying `candidate_time`.
     #[must_use]
-    pub const fn locktime_cutoff(&self, candidate_time: u32) -> u32 {
+    pub(crate) const fn locktime_cutoff(&self, candidate_time: u32) -> u32 {
         locktime_cutoff(self.csv_active, self.prev_median_time_past, candidate_time)
     }
 }
