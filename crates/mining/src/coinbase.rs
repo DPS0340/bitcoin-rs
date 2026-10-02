@@ -6,7 +6,6 @@ use thiserror::Error;
 
 const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
 const MIN_COINBASE_SCRIPT_SIG_LEN: usize = 2;
-const WITNESS_COMMITMENT_TAG: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 /// BIP141 `OP_RETURN` `PUSH36` `aa21a9ed` prefix. Core `MINIMUM_WITNESS_COMMITMENT` is 38 bytes.
 const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
@@ -103,9 +102,7 @@ pub(crate) fn build_coinbase(
 /// Builds the BIP141 `OP_RETURN` witness-commitment script (`6a24aa21a9ed || commitment`).
 pub fn witness_commitment_script(commitment: &Hash256) -> Vec<u8> {
     let mut script = Vec::with_capacity(38);
-    script.push(0x6a); // OP_RETURN
-    script.push(36); // PUSH36
-    script.extend_from_slice(&WITNESS_COMMITMENT_TAG);
+    script.extend_from_slice(&WITNESS_COMMITMENT_PREFIX);
     script.extend_from_slice(commitment.as_byte_array());
     script
 }

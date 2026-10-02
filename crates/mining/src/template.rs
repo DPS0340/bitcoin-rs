@@ -12,7 +12,7 @@ use hashbrown::HashMap;
 
 use crate::MiningError;
 use crate::coinbase::{WITNESS_RESERVED_VALUE, build_coinbase};
-use crate::policy::{modified_fee, select_packages};
+use crate::policy::select_packages;
 
 /// Chain and limit facts required to assemble one candidate.
 ///
@@ -162,10 +162,11 @@ impl Candidate {
         let mut txs = Vec::with_capacity(self.transactions.len().saturating_add(1));
         txs.push(self.coinbase.clone());
         txs.extend(self.transactions.iter().map(|tx| (*tx.tx).clone()));
-        let merkle_root = merkle_root_from_txids(
-            core::iter::once(self.coinbase.txid())
-                .chain(self.transactions.iter().map(|tx| tx.tx.txid())),
-        )?;
+        let mut leaves = core::iter::once(self.coinbase.txid())
+            .chain(self.transactions.iter().map(|tx| tx.tx.txid()))
+            .map(|txid| *txid.as_bytes())
+            .collect::<Vec<_>>();
+        let merkle_root = merkle_root_from_leaves(&mut leaves)?;
         Ok(Block {
             header: Header {
                 version: self.version,
@@ -203,20 +204,7 @@ pub fn assemble_candidate(
     payout: &[u8],
 ) -> Result<Candidate, MiningError> {
     let reservation = fixed_reservation(context, payout)?;
-    let (ordered, fees, weight, size, sigops) = select_packages(
-        context,
-        snapshot,
-        reservation.weight,
-        reservation.size,
-        reservation.sigops,
-    )?;
-    let body = SelectedBody {
-        ordered,
-        fees,
-        weight,
-        size,
-        sigops,
-    };
+    let body = select_packages(context, snapshot, reservation)?;
     finish_candidate(context, snapshot, payout, &body, reservation)
 }
 
@@ -236,19 +224,29 @@ pub fn assemble_ordered_candidate(
 
 // The fixed block header and coinbase are reserved before selecting the body.
 #[derive(Clone, Copy)]
-struct FixedReservation {
-    weight: u64,
-    size: u64,
-    sigops: u64,
+pub(crate) struct FixedReservation {
+    pub(crate) weight: u64,
+    pub(crate) size: u64,
+    pub(crate) sigops: u64,
 }
 
-struct SelectedBody {
-    ordered: Vec<usize>,
-    fees: u64,
+#[cfg(test)]
+impl FixedReservation {
+    /// Zero reservation for callers that select without a header or coinbase.
+    pub(crate) const EMPTY: Self = Self {
+        weight: 0,
+        size: 0,
+        sigops: 0,
+    };
+}
+
+pub(crate) struct SelectedBody {
+    pub(crate) ordered: Vec<usize>,
+    pub(crate) fees: u64,
     // Include the exact CompactSize transaction count as well as body transactions.
-    weight: u64,
-    size: u64,
-    sigops: u64,
+    pub(crate) weight: u64,
+    pub(crate) size: u64,
+    pub(crate) sigops: u64,
 }
 
 /// Size of the block transaction count, including its reserved coinbase.
@@ -312,7 +310,6 @@ fn exact_order(
     }
 
     // Core's generateblock does not claim fees from explicitly ordered transactions.
-    let fees = 0_u64;
     let mut size = transaction_count_size(snapshot.entries.len())?;
     let mut weight = size * 4;
     let mut sigops = 0_u64;
@@ -348,7 +345,7 @@ fn exact_order(
     }
     Ok(SelectedBody {
         ordered: (0..snapshot.entries.len()).collect(),
-        fees,
+        fees: 0,
         weight,
         size,
         sigops,
@@ -454,7 +451,7 @@ fn candidate_transactions(
             wtxid: entry.wtxid,
             fee: entry.fee,
             fee_delta: entry.fee_delta,
-            modified_fee: modified_fee(entry),
+            modified_fee: i128::from(entry.fee).saturating_add(i128::from(entry.fee_delta)),
             sigop_cost: entry.sigop_cost,
             weight: entry.weight,
             depends: depends(&entry.tx, &tx_positions),
@@ -485,14 +482,6 @@ fn witness_merkle_root(
     for &index in ordered {
         leaves.push(*snapshot.entries[index].wtxid.as_bytes());
     }
-    merkle_root_from_leaves(&mut leaves)
-}
-
-fn merkle_root_from_txids(txids: impl IntoIterator<Item = Txid>) -> Result<Hash256, MiningError> {
-    let mut leaves = txids
-        .into_iter()
-        .map(|txid| *txid.as_bytes())
-        .collect::<Vec<_>>();
     merkle_root_from_leaves(&mut leaves)
 }
 

@@ -380,31 +380,27 @@ impl FakeMiningControl {
     /// The placeholder mining info is never returned through the control:
     /// an armed failure short-circuits before it can be read.
     pub fn unavailable(reason: &str) -> Arc<Self> {
-        Arc::new(Self {
-            template: Mutex::new(None),
-            proposal: Mutex::new(BlockValidationResult::Accepted),
-            submit: Mutex::new(BlockValidationResult::Accepted),
-            info: Mutex::new(placeholder_mining_info()),
-            last_request: Mutex::new(None),
-            last_hash_ps: Mutex::new(None),
-            last_generate: Mutex::new(None),
-            template_calls: AtomicUsize::new(0),
-            submit_calls: AtomicUsize::new(0),
-            info_calls: AtomicUsize::new(0),
-            fail: Mutex::new(Some(MiningControlError::Unavailable(CompactString::from(
-                reason,
-            )))),
-            publishes: AtomicU64::new(0),
-            published_from: Mutex::new(Vec::new()),
-        })
+        Self::from_parts(
+            None,
+            placeholder_mining_info(),
+            Some(MiningControlError::Unavailable(CompactString::from(reason))),
+        )
     }
 
     /// Builds a control that answers template requests with `template` and
     /// mining-info reads with `info`. Submissions and proposals are accepted
     /// by default; no failure is armed and every counter starts at zero.
     pub fn with_template(template: BlockTemplate, info: MiningInfo) -> Arc<Self> {
+        Self::from_parts(Some(template), info, None)
+    }
+
+    fn from_parts(
+        template: Option<BlockTemplate>,
+        info: MiningInfo,
+        fail: Option<MiningControlError>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            template: Mutex::new(Some(template)),
+            template: Mutex::new(template),
             proposal: Mutex::new(BlockValidationResult::Accepted),
             submit: Mutex::new(BlockValidationResult::Accepted),
             info: Mutex::new(info),
@@ -414,7 +410,7 @@ impl FakeMiningControl {
             template_calls: AtomicUsize::new(0),
             submit_calls: AtomicUsize::new(0),
             info_calls: AtomicUsize::new(0),
-            fail: Mutex::new(None),
+            fail: Mutex::new(fail),
             publishes: AtomicU64::new(0),
             published_from: Mutex::new(Vec::new()),
         })
