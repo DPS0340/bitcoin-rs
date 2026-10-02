@@ -15,7 +15,7 @@ pub mod chain_effects;
 pub mod config;
 /// Typed in-process node lifecycle: the embedding surface over the same
 /// service graph the daemon wires.
-pub mod embed;
+mod embed;
 /// Central synchronous event loop.
 mod event_loop;
 /// The node option table and the source-layer types generated from it.
