@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// Object-safe `ScriptLive` seed producer used by [`TxIndexWriter`].
-pub type ScriptLiveSeedProduce<'a> = dyn FnMut(&mut dyn FnMut(OutPoint, ScriptHash) -> Result<(), IndexError>) -> Result<(), IndexError>
+pub(crate) type ScriptLiveSeedProduce<'a> = dyn FnMut(&mut dyn FnMut(OutPoint, ScriptHash) -> Result<(), IndexError>) -> Result<(), IndexError>
     + 'a;
 
 /// Erased prepared-index writer used by derived-index reconciliation.
@@ -25,7 +25,7 @@ pub type ScriptLiveSeedProduce<'a> = dyn FnMut(&mut dyn FnMut(OutPoint, ScriptHa
 /// Durability, crash visibility, and failure classification for rollback are
 /// owned by [`IndexWriter::commit_rollback_one_for_with_cursor_with_spent_scripts`]
 /// (`IDX-06` / `IDX-07`).
-pub trait TxIndexWriter: Send + Sync {
+pub(crate) trait TxIndexWriter: Send + Sync {
     /// Captures the exact write fence and all capability watermarks together.
     fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError>;
     /// Prepares rows using the supplied spent-coin script authority.

@@ -575,7 +575,7 @@ fn a_stale_rollback_body_leaves_a_replacement_blocks_rows_alone()
     writer.commit_block(0, &old_body)?;
     commit_rollback_one(&mut writer, None, &old_body)?;
     writer.commit_block(0, &consensus_bytes(&replacement))?;
-    writer.flush()?;
+    writer.indexer.store.flush()?;
     let after_replacement = stored_rows(writer.indexer())?;
     assert!(
         !after_replacement.is_empty(),
@@ -586,7 +586,7 @@ fn a_stale_rollback_body_leaves_a_replacement_blocks_rows_alone()
         commit_rollback_one(&mut writer, None, &old_body).is_err(),
         "rolling back the old body against the replacement watermark must fail"
     );
-    writer.flush()?;
+    writer.indexer.store.flush()?;
 
     assert_eq!(
         stored_rows(writer.indexer())?,
@@ -668,7 +668,7 @@ fn stored_rows(indexer: &Indexer<RocksDbStore>) -> Result<StoredRows, Box<dyn st
         ColumnFamily::Spending,
         ColumnFamily::BlockHeaders,
     ] {
-        for row in indexer.store().iter_prefix(cf, &[])? {
+        for row in indexer.store.iter_prefix(cf, &[])? {
             let (key, _value) = row?;
             rows.push((cf, key));
         }
