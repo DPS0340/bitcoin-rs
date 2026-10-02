@@ -132,7 +132,7 @@ impl<'a> TxSignatureChecker<'a> {
     ///
     /// The driver calls this after stripping an annex from the witness stack
     /// so that subsequent Schnorr signature checks commit to the annex.
-    pub fn set_annex(&mut self, annex: Option<Vec<u8>>) {
+    pub(crate) fn set_annex(&mut self, annex: Option<Vec<u8>>) {
         self.annex = annex;
     }
 
@@ -243,7 +243,7 @@ impl<'a> TxSignatureChecker<'a> {
     /// Returns `Ok(true)` when valid, `Ok(false)` when the signature is empty
     /// (tapscript empty-sig convention), and `Err` for size/hashtype/verification
     /// failures.
-    pub fn check_schnorr_signature(
+    pub(crate) fn check_schnorr_signature(
         &mut self,
         sig: &[u8],
         pubkey: &[u8],
@@ -341,7 +341,7 @@ impl<'a> TxSignatureChecker<'a> {
     /// (both block-height or both timestamp), `locktime <= tx.lock_time`,
     /// and the input's sequence is not `SEQUENCE_FINAL`.
     #[must_use]
-    pub fn check_locktime(&self, locktime: i64) -> bool {
+    pub(crate) fn check_locktime(&self, locktime: i64) -> bool {
         let tx_locktime = i64::from(self.tx.lock_time.to_consensus());
 
         // Both must be the same type: below threshold = block height,
@@ -378,7 +378,7 @@ impl<'a> TxSignatureChecker<'a> {
     /// match (both block-height or both time-based), and the masked `sequence`
     /// is <= the masked input sequence.
     #[must_use]
-    pub fn check_sequence(&self, sequence: i64) -> bool {
+    pub(crate) fn check_sequence(&self, sequence: i64) -> bool {
         let input = match self.tx.inputs.get(self.input_index) {
             Some(inp) => inp,
             None => return false,

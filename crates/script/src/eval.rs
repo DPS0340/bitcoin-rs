@@ -23,162 +23,152 @@ use crate::stack::{ScriptItem, Stack};
 use bitcoin_hashes::{Hash as _, ripemd160, sha1};
 
 /// `OP_NOP` (0x61).
-pub const OP_NOP: u8 = 0x61;
+pub(crate) const OP_NOP: u8 = 0x61;
 /// `OP_IF` (0x63).
-pub const OP_IF: u8 = 0x63;
+pub(crate) const OP_IF: u8 = 0x63;
 /// `OP_NOTIF` (0x64).
-pub const OP_NOTIF: u8 = 0x64;
+pub(crate) const OP_NOTIF: u8 = 0x64;
 /// `OP_ELSE` (0x67).
-pub const OP_ELSE: u8 = 0x67;
+pub(crate) const OP_ELSE: u8 = 0x67;
 /// `OP_ENDIF` (0x68).
-pub const OP_ENDIF: u8 = 0x68;
+pub(crate) const OP_ENDIF: u8 = 0x68;
 /// `OP_VERIFY` (0x69).
-pub const OP_VERIFY: u8 = 0x69;
+pub(crate) const OP_VERIFY: u8 = 0x69;
 /// `OP_RETURN` (0x6a).
-pub const OP_RETURN: u8 = 0x6a;
+pub(crate) const OP_RETURN: u8 = 0x6a;
 /// `OP_TOALTSTACK` (0x6b).
-pub const OP_TOALTSTACK: u8 = 0x6b;
+pub(crate) const OP_TOALTSTACK: u8 = 0x6b;
 /// `OP_FROMALTSTACK` (0x6c).
-pub const OP_FROMALTSTACK: u8 = 0x6c;
+pub(crate) const OP_FROMALTSTACK: u8 = 0x6c;
 /// `OP_2DROP` (0x6d).
-pub const OP_2DROP: u8 = 0x6d;
+pub(crate) const OP_2DROP: u8 = 0x6d;
 /// `OP_2DUP` (0x6e).
-pub const OP_2DUP: u8 = 0x6e;
+pub(crate) const OP_2DUP: u8 = 0x6e;
 /// `OP_3DUP` (0x6f).
-pub const OP_3DUP: u8 = 0x6f;
+pub(crate) const OP_3DUP: u8 = 0x6f;
 /// `OP_2OVER` (0x70).
-pub const OP_2OVER: u8 = 0x70;
+pub(crate) const OP_2OVER: u8 = 0x70;
 /// `OP_2ROT` (0x71).
-pub const OP_2ROT: u8 = 0x71;
+pub(crate) const OP_2ROT: u8 = 0x71;
 /// `OP_2SWAP` (0x72).
-pub const OP_2SWAP: u8 = 0x72;
+pub(crate) const OP_2SWAP: u8 = 0x72;
 /// `OP_IFDUP` (0x73).
-pub const OP_IFDUP: u8 = 0x73;
+pub(crate) const OP_IFDUP: u8 = 0x73;
 /// `OP_DEPTH` (0x74).
-pub const OP_DEPTH: u8 = 0x74;
+pub(crate) const OP_DEPTH: u8 = 0x74;
 /// `OP_DROP` (0x75).
 pub const OP_DROP: u8 = 0x75;
 /// `OP_DUP` (0x76).
-pub const OP_DUP: u8 = 0x76;
+pub(crate) const OP_DUP: u8 = 0x76;
 /// `OP_NIP` (0x77).
-pub const OP_NIP: u8 = 0x77;
+pub(crate) const OP_NIP: u8 = 0x77;
 /// `OP_OVER` (0x78).
-pub const OP_OVER: u8 = 0x78;
+pub(crate) const OP_OVER: u8 = 0x78;
 /// `OP_PICK` (0x79).
-pub const OP_PICK: u8 = 0x79;
+pub(crate) const OP_PICK: u8 = 0x79;
 /// `OP_ROLL` (0x7a).
-pub const OP_ROLL: u8 = 0x7a;
+pub(crate) const OP_ROLL: u8 = 0x7a;
 /// `OP_ROT` (0x7b).
-pub const OP_ROT: u8 = 0x7b;
+pub(crate) const OP_ROT: u8 = 0x7b;
 /// `OP_SWAP` (0x7c).
-pub const OP_SWAP: u8 = 0x7c;
+pub(crate) const OP_SWAP: u8 = 0x7c;
 /// `OP_TUCK` (0x7d).
-pub const OP_TUCK: u8 = 0x7d;
+pub(crate) const OP_TUCK: u8 = 0x7d;
 /// `OP_SIZE` (0x82).
-pub const OP_SIZE: u8 = 0x82;
+pub(crate) const OP_SIZE: u8 = 0x82;
 /// `OP_EQUAL` (0x87).
-pub const OP_EQUAL: u8 = 0x87;
+pub(crate) const OP_EQUAL: u8 = 0x87;
 /// `OP_EQUALVERIFY` (0x88).
-pub const OP_EQUALVERIFY: u8 = 0x88;
+pub(crate) const OP_EQUALVERIFY: u8 = 0x88;
 /// `OP_1NEGATE` (0x4f).
-pub const OP_1NEGATE: u8 = 0x4f;
+pub(crate) const OP_1NEGATE: u8 = 0x4f;
 /// `OP_1ADD` (0x8b).
-pub const OP_1ADD: u8 = 0x8b;
+pub(crate) const OP_1ADD: u8 = 0x8b;
 /// `OP_1SUB` (0x8c).
-pub const OP_1SUB: u8 = 0x8c;
+pub(crate) const OP_1SUB: u8 = 0x8c;
 /// `OP_NEGATE` (0x8f).
-pub const OP_NEGATE: u8 = 0x8f;
+pub(crate) const OP_NEGATE: u8 = 0x8f;
 /// `OP_ABS` (0x90).
-pub const OP_ABS: u8 = 0x90;
+pub(crate) const OP_ABS: u8 = 0x90;
 /// `OP_NOT` (0x91).
-pub const OP_NOT: u8 = 0x91;
+pub(crate) const OP_NOT: u8 = 0x91;
 /// `OP_0NOTEQUAL` (0x92).
-pub const OP_0NOTEQUAL: u8 = 0x92;
+pub(crate) const OP_0NOTEQUAL: u8 = 0x92;
 /// `OP_ADD` (0x93).
-pub const OP_ADD: u8 = 0x93;
+pub(crate) const OP_ADD: u8 = 0x93;
 /// `OP_SUB` (0x94).
-pub const OP_SUB: u8 = 0x94;
+pub(crate) const OP_SUB: u8 = 0x94;
 /// `OP_BOOLAND` (0x9a).
-pub const OP_BOOLAND: u8 = 0x9a;
+pub(crate) const OP_BOOLAND: u8 = 0x9a;
 /// `OP_BOOLOR` (0x9b).
-pub const OP_BOOLOR: u8 = 0x9b;
+pub(crate) const OP_BOOLOR: u8 = 0x9b;
 /// `OP_NUMEQUAL` (0x9c).
-pub const OP_NUMEQUAL: u8 = 0x9c;
+pub(crate) const OP_NUMEQUAL: u8 = 0x9c;
 /// `OP_NUMEQUALVERIFY` (0x9d).
-pub const OP_NUMEQUALVERIFY: u8 = 0x9d;
+pub(crate) const OP_NUMEQUALVERIFY: u8 = 0x9d;
 /// `OP_NUMNOTEQUAL` (0x9e).
-pub const OP_NUMNOTEQUAL: u8 = 0x9e;
+pub(crate) const OP_NUMNOTEQUAL: u8 = 0x9e;
 /// `OP_LESSTHAN` (0x9f).
-pub const OP_LESSTHAN: u8 = 0x9f;
+pub(crate) const OP_LESSTHAN: u8 = 0x9f;
 /// `OP_GREATERTHAN` (0xa0).
-pub const OP_GREATERTHAN: u8 = 0xa0;
+pub(crate) const OP_GREATERTHAN: u8 = 0xa0;
 /// `OP_LESSTHANOREQUAL` (0xa1).
-pub const OP_LESSTHANOREQUAL: u8 = 0xa1;
+pub(crate) const OP_LESSTHANOREQUAL: u8 = 0xa1;
 /// `OP_GREATERTHANOREQUAL` (0xa2).
-pub const OP_GREATERTHANOREQUAL: u8 = 0xa2;
+pub(crate) const OP_GREATERTHANOREQUAL: u8 = 0xa2;
 /// `OP_MIN` (0xa3).
-pub const OP_MIN: u8 = 0xa3;
+pub(crate) const OP_MIN: u8 = 0xa3;
 /// `OP_MAX` (0xa4).
-pub const OP_MAX: u8 = 0xa4;
+pub(crate) const OP_MAX: u8 = 0xa4;
 /// `OP_WITHIN` (0xa5).
-pub const OP_WITHIN: u8 = 0xa5;
+pub(crate) const OP_WITHIN: u8 = 0xa5;
 /// `OP_RIPEMD160` (0xa6).
-pub const OP_RIPEMD160: u8 = 0xa6;
+pub(crate) const OP_RIPEMD160: u8 = 0xa6;
 /// `OP_SHA1` (0xa7).
-pub const OP_SHA1: u8 = 0xa7;
+pub(crate) const OP_SHA1: u8 = 0xa7;
 /// `OP_SHA256` (0xa8).
-pub const OP_SHA256: u8 = 0xa8;
+pub(crate) const OP_SHA256: u8 = 0xa8;
 /// `OP_HASH160` (0xa9).
-pub const OP_HASH160: u8 = 0xa9;
+pub(crate) const OP_HASH160: u8 = 0xa9;
 /// `OP_HASH256` (0xaa).
-pub const OP_HASH256: u8 = 0xaa;
+pub(crate) const OP_HASH256: u8 = 0xaa;
 /// `OP_CODESEPARATOR` (0xab).
-pub const OP_CODESEPARATOR: u8 = 0xab;
+pub(crate) const OP_CODESEPARATOR: u8 = 0xab;
 /// `OP_CHECKSIG` (0xac).
-pub const OP_CHECKSIG: u8 = 0xac;
+pub(crate) const OP_CHECKSIG: u8 = 0xac;
 /// `OP_CHECKSIGVERIFY` (0xad).
-pub const OP_CHECKSIGVERIFY: u8 = 0xad;
+pub(crate) const OP_CHECKSIGVERIFY: u8 = 0xad;
 /// `OP_CHECKMULTISIG` (0xae).
-pub const OP_CHECKMULTISIG: u8 = 0xae;
+pub(crate) const OP_CHECKMULTISIG: u8 = 0xae;
 /// `OP_CHECKMULTISIGVERIFY` (0xaf).
-pub const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+pub(crate) const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
 /// `OP_NOP1` (0xb0).
-pub const OP_NOP1: u8 = 0xb0;
+pub(crate) const OP_NOP1: u8 = 0xb0;
 /// `OP_CHECKLOCKTIMEVERIFY` (0xb1).
-pub const OP_CHECKLOCKTIMEVERIFY: u8 = 0xb1;
+pub(crate) const OP_CHECKLOCKTIMEVERIFY: u8 = 0xb1;
 /// `OP_CHECKSEQUENCEVERIFY` (0xb2).
-pub const OP_CHECKSEQUENCEVERIFY: u8 = 0xb2;
+pub(crate) const OP_CHECKSEQUENCEVERIFY: u8 = 0xb2;
 /// `OP_NOP4` (0xb3).
-pub const OP_NOP4: u8 = 0xb3;
-/// `OP_NOP5` (0xb4).
-pub const OP_NOP5: u8 = 0xb4;
-/// `OP_NOP6` (0xb5).
-pub const OP_NOP6: u8 = 0xb5;
-/// `OP_NOP7` (0xb6).
-pub const OP_NOP7: u8 = 0xb6;
-/// `OP_NOP8` (0xb7).
-pub const OP_NOP8: u8 = 0xb7;
-/// `OP_NOP9` (0xb8).
-pub const OP_NOP9: u8 = 0xb8;
-/// `OP_NOP10` (0xb9).
-pub const OP_NOP10: u8 = 0xb9;
+pub(crate) const OP_NOP4: u8 = 0xb3;
+/// `OP_NOP10` (0xb9); `OP_NOP4..=OP_NOP10` matches the NOP5..NOP9 bytes in between.
+pub(crate) const OP_NOP10: u8 = 0xb9;
 /// `OP_CHECKSIGADD` (0xba), tapscript only.
-pub const OP_CHECKSIGADD: u8 = 0xba;
+pub(crate) const OP_CHECKSIGADD: u8 = 0xba;
 
 /// Maximum serialized script size accepted for `Base`/`WitnessV0` evaluation.
-pub const MAX_SCRIPT_SIZE: usize = 10_000;
+pub(crate) const MAX_SCRIPT_SIZE: usize = 10_000;
 /// Maximum size of one pushed stack element.
-pub const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+pub(crate) const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 /// Maximum non-push opcodes per script.
-pub const MAX_OPS_PER_SCRIPT: usize = 201;
+pub(crate) const MAX_OPS_PER_SCRIPT: usize = 201;
 /// Maximum public keys in a bare multisig.
 pub(crate) const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
 /// Maximum combined depth of the main and alt stacks.
-pub const MAX_STACK_SIZE: usize = 1000;
+pub(crate) const MAX_STACK_SIZE: usize = 1000;
 /// Bytes per passed signature charged against BIP342's validation weight.
 pub(crate) const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
 /// BIP342 validation-weight offset accounting for the witness itself.
-pub const VALIDATION_WEIGHT_OFFSET: i64 = 50;
+pub(crate) const VALIDATION_WEIGHT_OFFSET: i64 = 50;
 
 /// Byte slice view of a stack item, in script-encoding terms.
 type Bytes = SmallVec<[u8; 32]>;
@@ -328,7 +318,7 @@ fn cast_to_bool(bytes: &[u8]) -> bool {
 /// Core's `CastToBool` over a stack item: the truth test every script
 /// terminator and conditional uses.
 #[must_use]
-pub fn item_is_true(item: &ScriptItem) -> bool {
+pub(crate) fn item_is_true(item: &ScriptItem) -> bool {
     cast_to_bool(&item_bytes(item))
 }
 
@@ -349,7 +339,7 @@ fn item_bytes(item: &ScriptItem) -> Cow<'_, [u8]> {
     reason = "one dispatch arm per opcode family mirrors Core's EvalScript switch; \
               splitting arms into helpers would obscure the shared state flow"
 )]
-pub fn eval_script(
+pub(crate) fn eval_script(
     stack: &mut Stack,
     script: &[u8],
     flags: VerifyFlags,
