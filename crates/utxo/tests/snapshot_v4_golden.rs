@@ -53,7 +53,8 @@ fn a_v4_snapshot_loads_to_the_hash_and_trailer_it_was_written_with() {
         hex(
             &loaded
                 .set
-                .with_stable_view(|view| view.hash_serialized_3())
+                .lock_stable_view()
+                .hash_serialized_3()
                 .expect("hash")
                 .to_le_bytes()
         ),

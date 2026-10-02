@@ -722,7 +722,7 @@ mod tests {
     fn observe(utxo: &UtxoSet, coin_stats: &CoinStatsListener) -> Result<State, UtxoError> {
         let s = coin_stats.snapshot();
         Ok((
-            utxo.with_stable_view(|view| view.hash_serialized_3())?,
+            utxo.lock_stable_view().hash_serialized_3()?,
             s.muhash.finalize_hash(),
             [
                 s.height.into(),
@@ -1038,8 +1038,8 @@ mod tests {
         }
 
         assert_eq!(
-            full.with_stable_view(|view| view.hash_serialized_3())?,
-            first_five.with_stable_view(|view| view.hash_serialized_3())?
+            full.lock_stable_view().hash_serialized_3()?,
+            first_five.lock_stable_view().hash_serialized_3()?
         );
         assert_eq!(full.len(), first_five.len());
 
