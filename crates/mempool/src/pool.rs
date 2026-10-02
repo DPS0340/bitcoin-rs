@@ -2378,8 +2378,8 @@ impl Mempool {
         for existing in out.iter() {
             seen.insert(*existing);
         }
-        seen.insert(id);
-        if include_root {
+        let fresh = seen.insert(id);
+        if include_root && fresh {
             out.push(id);
         }
         let mut stack = vec![id];

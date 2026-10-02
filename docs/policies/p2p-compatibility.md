@@ -56,7 +56,7 @@ Rules, each enforced by the FSM (`crates/p2p/src/fsm.rs`) and identical to Core'
 
 ## 5. Message Surface
 
-The decoder types exactly the commands in `crates/p2p/src/compat.rs::COMMANDS` (**36**). That table is the authority for names and status; this section is the Core-comparison commentary, kept in sync with `COMMANDS` by hand in the same change-set. The status for each command is defined only by `COMMANDS`; the table below records behavior and Core comparison.
+The decoder types exactly the commands in `crates/p2p/src/compat.rs::COMMANDS` (**36**). That table is the authority for names; this section owns each command's status and is the Core-comparison commentary, kept in sync with `COMMANDS` by hand in the same change-set.
 
 | Command | Behavior and Core 31.1 comparison |
 | :--- | :--- | :--- |
