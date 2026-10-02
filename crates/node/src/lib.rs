@@ -31,7 +31,7 @@ pub mod mining;
 #[path = "reorg_effects.rs"]
 pub mod reorg;
 /// Top-level node runner.
-pub mod run;
+mod run;
 /// Signal handling.
 mod signal;
 /// Shared node state.
