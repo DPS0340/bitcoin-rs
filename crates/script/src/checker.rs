@@ -12,9 +12,8 @@
 use bitcoin_rs_primitives::{Amount, Hash256, Sighash, SighashCache, SighashError, Tx, TxOut};
 use secp256k1::{Message, PublicKey, XOnlyPublicKey, ecdsa::Signature as EcdsaSig};
 
-use crate::eval::OP_CODESEPARATOR;
+use crate::eval::{OP_CODESEPARATOR, remove_all};
 use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
-use crate::script::{Instruction, instructions};
 
 /// Signature version context: which sighash algorithm and encoding rules apply.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -57,29 +56,6 @@ pub(crate) struct TxSignatureChecker<'a> {
     /// Raw taproot annex bytes, when present (BIP341). Used by
     /// `check_schnorr_signature` to commit the annex to the sighash.
     annex: Option<Vec<u8>>,
-}
-
-/// Removes `OP_CODESEPARATOR` (0xab) opcodes from a script, matching Core's
-/// `CTransactionSignatureSerializer::SerializeScriptCode`. Bytes inside data
-/// pushes — and any malformed trailing push — are preserved. The legacy
-/// sighash must exclude CS opcode bytes.
-fn remove_codeseparators(script: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(script.len());
-    let mut iter = instructions(script);
-    let mut start = 0_usize;
-    while let Some(item) = iter.next() {
-        // A malformed tail is copied verbatim, as Core's serializer emits it.
-        let end = if item.is_err() {
-            script.len()
-        } else {
-            script.len() - iter.remaining.len()
-        };
-        if !matches!(item, Ok(Instruction::Op(OP_CODESEPARATOR))) {
-            out.extend_from_slice(&script[start..end]);
-        }
-        start = end;
-    }
-    out
 }
 
 impl<'a> TxSignatureChecker<'a> {
@@ -167,7 +143,7 @@ impl<'a> TxSignatureChecker<'a> {
         let sighash = match sigversion {
             SigVersion::Base => {
                 let raw_hashtype = u32::from(*hashtype_byte);
-                let cleaned = remove_codeseparators(script_code);
+                let cleaned = remove_all(script_code, &[OP_CODESEPARATOR]).0;
                 self.cache
                     .legacy_signature_hash(self.input_index, &cleaned, raw_hashtype)
                     .map_err(|e| sighash_to_script_error(&e))?
@@ -634,8 +610,9 @@ mod tests {
 
     use super::{
         LOCKTIME_THRESHOLD, SEQUENCE_FINAL, SEQUENCE_LOCKTIME_DISABLE_FLAG,
-        SEQUENCE_LOCKTIME_TYPE_FLAG, SigVersion, TxSignatureChecker, remove_codeseparators,
+        SEQUENCE_LOCKTIME_TYPE_FLAG, SigVersion, TxSignatureChecker,
     };
+    use crate::eval::{OP_CODESEPARATOR, remove_all};
     use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
 
     // --- Helper: build a minimal 1-input, 1-output transaction ---
@@ -1118,7 +1095,7 @@ mod tests {
             // Core's SignatureHash removes OP_CODESEPARATOR (0xab) from
             // script_code before hashing; our legacy_signature_hash expects
             // the pre-processed script. Match Core's SerializeScriptCode.
-            let script_code = remove_codeseparators(&hex_decode(script_hex));
+            let script_code = remove_all(&hex_decode(script_hex), &[OP_CODESEPARATOR]).0;
 
             // The hashtype in sighash.json is a signed 32-bit integer;
             // Core casts `int nHashType` to `uint32_t` (bit-preserving).

@@ -1064,7 +1064,7 @@ fn script_code(codeseparator_pos: u32, instruction_start: usize, script: &[u8]) 
 
 /// Removes every byte-identical occurrence of `needle` from `haystack`,
 /// returning the cleaned script and the number of removals.
-fn remove_all(haystack: &[u8], needle: &[u8]) -> (Vec<u8>, usize) {
+pub(crate) fn remove_all(haystack: &[u8], needle: &[u8]) -> (Vec<u8>, usize) {
     if needle.is_empty() {
         return (haystack.to_vec(), 0);
     }
