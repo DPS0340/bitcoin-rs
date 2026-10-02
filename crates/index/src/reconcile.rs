@@ -27,7 +27,7 @@ pub struct ConsumerCursor {
 impl ConsumerCursor {
     /// Encodes the durable representation in `CURSOR_BYTE_LEN` bytes.
     #[must_use]
-    pub(crate) fn to_bytes(&self) -> [u8; CURSOR_BYTE_LEN] {
+    pub(crate) fn to_bytes(self) -> [u8; CURSOR_BYTE_LEN] {
         let mut bytes = [0_u8; CURSOR_BYTE_LEN];
         bytes[..8].copy_from_slice(&self.epoch.to_le_bytes());
         bytes[8..16].copy_from_slice(&self.sequence.to_le_bytes());

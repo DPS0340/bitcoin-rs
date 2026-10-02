@@ -89,7 +89,7 @@ impl PreparedBatch {
     }
 
     /// Returns whether no blocks have been admitted.
-    pub(crate) const fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 
