@@ -187,7 +187,7 @@ impl NodeState {
 
     /// Returns the configured ZMQ publisher handle (default: `NoOpZmqPublisher`).
     #[must_use]
-    pub fn zmq_publisher(&self) -> Arc<dyn crate::ZmqPublisher> {
+    pub(crate) fn zmq_publisher(&self) -> Arc<dyn crate::ZmqPublisher> {
         self.followers.zmq_publisher()
     }
 
@@ -297,7 +297,7 @@ impl NodeState {
 
     /// Returns the node's one initial-block-download latch.
     #[must_use]
-    pub fn ibd(&self) -> Arc<bitcoin_rs_chain::InitialBlockDownload> {
+    pub(crate) fn ibd(&self) -> Arc<bitcoin_rs_chain::InitialBlockDownload> {
         self.chainstate.ibd_latch()
     }
 
