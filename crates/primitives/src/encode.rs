@@ -279,10 +279,6 @@ impl ConsensusDecode for TxIn {
     }
 }
 
-fn tx_has_witness(tx: &Tx) -> bool {
-    tx.inputs.iter().any(|input| !input.witness.is_empty())
-}
-
 fn witness_stack_size(witness: &[Vec<u8>]) -> usize {
     varint::encoded_len(compact_len(witness.len())).saturating_add(
         witness
@@ -296,7 +292,7 @@ fn witness_stack_size(witness: &[Vec<u8>]) -> usize {
 /// sections (emitted only when some input carries witness data).
 pub(crate) fn encode_tx(tx: &Tx, sink: &mut impl Sink, with_witness: bool) {
     sink.write_all(&tx.version.to_le_bytes());
-    let has_witness = with_witness && tx_has_witness(tx);
+    let has_witness = with_witness && tx.has_witness();
     if has_witness {
         sink.write_all(&[0x00, 0x01]);
     }
@@ -340,7 +336,7 @@ pub(crate) fn tx_base_size(tx: &Tx) -> usize {
 }
 
 fn tx_witness_size(tx: &Tx) -> usize {
-    if !tx_has_witness(tx) {
+    if !tx.has_witness() {
         return 0;
     }
     2_usize.saturating_add(
