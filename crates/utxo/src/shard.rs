@@ -254,7 +254,7 @@ fn commit_batch_collect_events<'a>(
     adds: &'a [(UtxoKey, Hash256, BuildPayload<'a>)],
     removes: &[SpendPayload<'_>],
 ) -> (UtxoChangeEvents<'a>, Result<(), UtxoError>) {
-    let mut events = UtxoChangeEvents::with_capacity_hint(adds.len(), removes.len());
+    let mut events = UtxoChangeEvents::new();
 
     let result = for_each_run(
         removes,

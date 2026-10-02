@@ -120,9 +120,9 @@ pub(crate) enum UtxoCommittedEvent<'batch, 'coin> {
 }
 
 impl<'a> UtxoChangeEvents<'a> {
-    pub(crate) fn with_capacity_hint(insertions: usize, removals: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            events: Vec::with_capacity(usize::from(insertions > 0) + usize::from(removals > 0)),
+            events: Vec::new(),
             operation_count: 0,
         }
     }
