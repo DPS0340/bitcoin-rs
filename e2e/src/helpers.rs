@@ -517,3 +517,19 @@ pub fn wait_for(dur: Duration, check: &mut dyn FnMut() -> bool) -> bool {
 pub fn node_stderr(node: &ProcessNode) -> String {
     std::fs::read_to_string(node.evidence.join("stderr.log")).unwrap_or_default()
 }
+
+/// Asserts the node's stderr shows no panic and no `PrevHashMismatch` —
+/// `context` names where a mismatch would indicate commit churn.
+pub fn assert_clean_stderr(node: &ProcessNode, context: &str) {
+    let stderr = node_stderr(node);
+    assert_eq!(
+        stderr.matches("panic").count(),
+        0,
+        "node stderr contains a panic"
+    );
+    assert_eq!(
+        stderr.matches("PrevHashMismatch").count(),
+        0,
+        "node stderr shows PrevHashMismatch: {context}"
+    );
+}
