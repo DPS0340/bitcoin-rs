@@ -1444,7 +1444,7 @@ impl DownloadWindow {
     /// POST: equals the population of `owner_downloading_since`.
     /// INVARIANT: announced or merely-assigned peers never count; only
     ///      ownership of at least one pending block does.
-    pub(crate) fn active_downloading_peers(&self) -> usize {
+    fn active_downloading_peers(&self) -> usize {
         self.owner_downloading_since.len()
     }
 

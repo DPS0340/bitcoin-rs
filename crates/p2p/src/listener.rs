@@ -242,7 +242,7 @@ impl ConnectionShared {
     /// INVARIANT: reads the shared chain view once; no per-handshake block
     ///   tree walk exists.
     #[must_use]
-    pub(crate) fn approximate_best_block_depth(&self) -> u64 {
+    fn approximate_best_block_depth(&self) -> u64 {
         let Some(tip_time) = self
             .chain_query
             .as_ref()

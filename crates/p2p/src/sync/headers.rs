@@ -915,7 +915,7 @@ impl BlockSync {
     /// Whether an unexpired request with these exact parameters is already
     /// pending on this exact connection. Identity is the full `PeerSource`:
     /// a same-address replacement is a different request.
-    pub(super) fn has_pending_getheaders(
+    fn has_pending_getheaders(
         &self,
         source: PeerSource,
         locator_tip_hash: Hash256,
@@ -1279,7 +1279,7 @@ impl BlockSync {
         );
     }
 
-    pub(super) fn build_locator(&self) -> Vec<Hash256> {
+    fn build_locator(&self) -> Vec<Hash256> {
         if let Some(tip) = self.chain.chain_tip() {
             return self
                 .chain

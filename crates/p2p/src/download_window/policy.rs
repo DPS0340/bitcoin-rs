@@ -40,7 +40,7 @@ pub(super) const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 /// Core's limited-service race buffer (`net_processing.cpp:1637`): a peer
 /// that keeps only the retained window may have pruned two of its newest
 /// blocks by the time the request lands.
-pub(super) const NODE_NETWORK_LIMITED_RACE_BUFFER: u32 = 2;
+const NODE_NETWORK_LIMITED_RACE_BUFFER: u32 = 2;
 /// `NODE_NETWORK_LIMITED` (bit 10) has no `ServiceFlags` variant in this
 /// `rust-bitcoin` version; the bit follows the protocol assignment also
 /// decoded in `PeerInfo::services_names`.
@@ -59,7 +59,7 @@ pub(crate) const RECEIVED_BLOCK_BUDGET: usize = 256;
 /// Mainnet-oriented block-size estimate for sizing the in-flight request window.
 pub(crate) const PENDING_BLOCK_BYTE_ESTIMATE: usize = 2 * 1024 * 1024;
 /// Maximum estimated bytes in the in-flight request window.
-pub(crate) const PENDING_BYTE_BUDGET: usize = PENDING_BUDGET * PENDING_BLOCK_BYTE_ESTIMATE;
+const PENDING_BYTE_BUDGET: usize = PENDING_BUDGET * PENDING_BLOCK_BYTE_ESTIMATE;
 /// Maximum serialized bytes staged in memory while waiting for predecessors.
 ///
 /// Defined as [`PENDING_BYTE_BUDGET`] so the in-flight and staged byte bounds
@@ -67,10 +67,10 @@ pub(crate) const PENDING_BYTE_BUDGET: usize = PENDING_BUDGET * PENDING_BLOCK_BYT
 /// at the high-height `PENDING_BLOCK_BYTE_ESTIMATE`) always fits in staging
 /// without eviction. At the 150k acceptance window this bound rarely binds —
 /// blocks there are far below the per-slot estimate.
-pub(crate) const RECEIVED_BLOCK_BYTE_BUDGET: usize = PENDING_BYTE_BUDGET;
+const RECEIVED_BLOCK_BYTE_BUDGET: usize = PENDING_BYTE_BUDGET;
 /// Consensus-maximum serialized block size in bytes: a witness-serialized
 /// block cannot exceed its 4,000,000 weight, so no valid block is larger.
-pub(crate) const MAX_SERIALIZED_BLOCK_SIZE: usize = crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE;
+const MAX_SERIALIZED_BLOCK_SIZE: usize = crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE;
 // Staller-arming reachability invariant (Phase 1 of the staller arming
 // redesign): the stall episode arms on a staged-count fraction
 // (`received >= max_received_blocks / 2`, `window_blocked_on` term 3), so the
@@ -121,10 +121,10 @@ pub(crate) const MINIMUM_CONNECT_TIME: Duration = Duration::from_secs(30);
 
 /// Fast-sync per-peer stripe floor. Half the Core cap so the window spreads
 /// across a larger outbound set; opt-in, not measured against the default.
-pub(crate) const FAST_BLOCKS_IN_TRANSIT_PER_PEER: usize = 8;
+pub(super) const FAST_BLOCKS_IN_TRANSIT_PER_PEER: usize = 8;
 /// Fast-sync fan-out threshold: stripe as soon as a second eligible peer
 /// exists instead of waiting for a full outbound set.
-pub(crate) const FAST_MIN_PEERS_FOR_FANOUT: usize = 2;
+pub(super) const FAST_MIN_PEERS_FOR_FANOUT: usize = 2;
 /// Fast-sync outbound peer target.
 ///
 /// The peer count that fully stripes [`PENDING_BUDGET`] (and thus
@@ -147,7 +147,7 @@ pub(crate) const BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
 /// disconnecting every peer at the 2s floor, and decays by x0.85 per
 /// window-front arrival (never snapping back) so the elevation survives a
 /// peer rotation.
-pub(crate) const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
+const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 /// How long a disconnected staller stays excluded from fan-out eligibility
 /// and non-last-resort block requests.
 ///
@@ -156,7 +156,7 @@ pub(crate) const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 /// (window-global) doubled threshold bounds each capture — Core has no
 /// equivalent only because its reconnecting peer cannot re-acquire in-flight
 /// assignments this cheaply.
-pub(crate) const STALLER_COOLDOWN: Duration = BLOCK_STALLING_TIMEOUT_MAX;
+const STALLER_COOLDOWN: Duration = BLOCK_STALLING_TIMEOUT_MAX;
 
 // The apply-side cache horizon (`expected_apply_horizon`) stays within the
 // inline capacity below only because the staging budget equals the in-flight
@@ -182,7 +182,7 @@ const _: () = assert!(
 pub(crate) const GETDATA_BATCH_SIZE: usize = PENDING_BUDGET;
 
 /// Clamp a `usize` to at least 1, preventing zero-sized budgets.
-pub(crate) const fn at_least_one(value: usize) -> usize {
+const fn at_least_one(value: usize) -> usize {
     if value == 0 { 1 } else { value }
 }
 
@@ -334,7 +334,7 @@ pub(crate) fn statically_fanout_eligible(peer: &PeerInfo, policy: &BlockDownload
     !peer.inbound && serves_requested_height(peer, policy)
 }
 
-pub(super) fn peer_advertises_block_service(peer: &PeerInfo) -> bool {
+fn peer_advertises_block_service(peer: &PeerInfo) -> bool {
     let network = ServiceFlags::NETWORK.to_u64();
     peer.services & (network | NETWORK_LIMITED) != 0
 }

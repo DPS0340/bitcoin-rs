@@ -6,7 +6,7 @@ pub struct WtxidRelayState {
 
 impl WtxidRelayState {
     /// Mark that the remote peer sent `wtxidrelay`.
-    pub const fn mark_peer_supported(&mut self) {
+    pub(crate) const fn mark_peer_supported(&mut self) {
         self.peer_advertised = true;
     }
 

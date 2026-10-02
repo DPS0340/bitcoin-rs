@@ -123,7 +123,7 @@ impl P2pServiceConfig {
     /// INVARIANT: manual peers do not consume these slots; the two slot
     ///   counts are the only automatic outbound population knobs.
     #[must_use]
-    pub(crate) fn total_outbound_active_limit(&self) -> usize {
+    fn total_outbound_active_limit(&self) -> usize {
         self.outbound_full_relay_slots
             .saturating_add(self.outbound_block_relay_slots)
     }
@@ -137,7 +137,7 @@ impl P2pServiceConfig {
     /// INVARIANT: this is the only inbound capacity derivation; the listener
     ///   refuses admission at the result, it never evicts.
     #[must_use]
-    pub fn max_inbound(&self) -> usize {
+    pub(crate) fn max_inbound(&self) -> usize {
         self.max_peer_connections
             .saturating_sub(self.outbound_full_relay_slots)
             .saturating_sub(self.outbound_block_relay_slots)
@@ -635,11 +635,7 @@ impl P2pService {
     pub fn test_install_outbound_worker(&self, handle: JoinHandle<()>) {
         self.workers
             .lock()
-            .get_or_insert_with(|| Workers {
-                listeners: Vec::new(),
-                outbound: None,
-                bootstrap: None,
-            })
+            .get_or_insert_with(Workers::default)
             .outbound = Some(handle);
     }
 
@@ -650,11 +646,7 @@ impl P2pService {
     pub fn test_install_bootstrap_worker(&self, handle: JoinHandle<()>) {
         self.workers
             .lock()
-            .get_or_insert_with(|| Workers {
-                listeners: Vec::new(),
-                outbound: None,
-                bootstrap: None,
-            })
+            .get_or_insert_with(Workers::default)
             .bootstrap = Some(handle);
     }
 

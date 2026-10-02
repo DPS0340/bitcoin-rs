@@ -180,8 +180,7 @@ type ExpectedBlockHashes = SmallVec<[Hash256; RECEIVED_BLOCK_BUDGET]>;
 pub struct BlockSync {
     /// Applied-chain seam: header admission, window commit, branch switch,
     /// and genesis bootstrap live behind it (node owns them, ARCH-07).
-    #[doc(hidden)]
-    pub chain: Arc<dyn SyncChain>,
+    pub(crate) chain: Arc<dyn SyncChain>,
     peer_table: Arc<PeerTable>,
     /// The node's one chain-owned initial-block-download latch, shared with
     /// RPC and the listener. Block-body peer choice reads it through
