@@ -405,8 +405,7 @@ pub(crate) fn eval_script(
                 if conditions.all_true() {
                     // Core checks MINIMALDATA only in executed branches
                     // (interpreter.cpp:489, inside `if (fExec && ... <= OP_PUSHDATA4)`).
-                    if flags.contains(VerifyFlags::MINIMALDATA)
-                        && !minimal_push(data, opcode_byte)
+                    if flags.contains(VerifyFlags::MINIMALDATA) && !minimal_push(data, opcode_byte)
                     {
                         return Err(ScriptError::Invalid {
                             code: ScriptErrCode::MinimalData,
