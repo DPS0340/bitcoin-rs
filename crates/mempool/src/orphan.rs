@@ -41,7 +41,7 @@ pub(crate) struct HeldOrphan {
 
 /// One queued reconsideration of a resident body for one selected announcer.
 #[derive(Debug)]
-pub(crate) struct OrphanRetryClaim {
+struct OrphanRetryClaim {
     wtxid: Wtxid,
     announcer: PeerToken,
 }
@@ -154,7 +154,7 @@ impl OrphanPool {
     /// One arbitrary resident variant of a txid, for tests and retry
     /// selection only. Inventory suppression must never consult it.
     #[cfg(test)]
-    pub(crate) fn get_by_txid(&self, txid: Txid) -> Option<&HeldOrphan> {
+    fn get_by_txid(&self, txid: Txid) -> Option<&HeldOrphan> {
         self.entries.values().find(|held| held.tx.txid() == txid)
     }
 
@@ -173,7 +173,7 @@ impl OrphanPool {
     /// POST: the pair is recorded exactly once. The body, its first-seen time,
     /// its FIFO position and the resident weight stay unchanged. False when
     /// the body is absent or the pair was already recorded.
-    pub(crate) fn add_announcer(&mut self, wtxid: Wtxid, announcer: PeerToken) -> bool {
+    fn add_announcer(&mut self, wtxid: Wtxid, announcer: PeerToken) -> bool {
         let charge = {
             let Some(held) = self.entries.get_mut(&wtxid) else {
                 return false;
