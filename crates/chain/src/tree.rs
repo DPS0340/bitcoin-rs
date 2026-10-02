@@ -1,6 +1,4 @@
-extern crate alloc;
-
-use alloc::sync::Arc;
+use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_primitives::Hash256;
