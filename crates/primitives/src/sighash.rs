@@ -32,7 +32,8 @@ use crate::{
 pub const CODESEPARATOR_POSITION: u32 = 0xFFFF_FFFF;
 
 /// BIP342 leaf version byte for tapscript leaves.
-pub const TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
+#[cfg(test)]
+const TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
 
 /// Standard Bitcoin signature hash modes used by legacy, segwit, and taproot signing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -633,7 +634,7 @@ impl Sighash {
 }
 
 /// Computes the BIP341 tapleaf hash for a leaf script at `leaf_version`
-/// (use [`TAPSCRIPT_LEAF_VERSION`] for BIP342 tapscript).
+/// (`0xc0` for BIP342 tapscript).
 #[must_use]
 pub fn tapleaf_hash(leaf_version: u8, script: &[u8]) -> Hash256 {
     let len = varint::encode(compact_len(script.len()))

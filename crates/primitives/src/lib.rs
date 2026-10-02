@@ -43,8 +43,7 @@ pub use network::{ChainTxData, HeadersSyncParams, Network};
 pub use outpoint::OutPoint;
 pub use script::{Script, Witness};
 pub use sighash::{
-    AnnexError, CODESEPARATOR_POSITION, Sighash, SighashCache, SighashError,
-    TAPSCRIPT_LEAF_VERSION, tapleaf_hash,
+    AnnexError, CODESEPARATOR_POSITION, Sighash, SighashCache, SighashError, tapleaf_hash,
 };
 pub use tx::{Tx, TxIn, TxOut};
 pub use units::{Amount, CompactTarget, LockTime, Sequence};
