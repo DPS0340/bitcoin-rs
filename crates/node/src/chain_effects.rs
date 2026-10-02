@@ -118,6 +118,7 @@ impl ChainFollowers {
     }
 
     /// Returns `self` with `zmq` swapped to `publisher`.
+    #[cfg(test)]
     #[must_use]
     pub fn with_zmq_publisher(mut self, publisher: Arc<dyn ZmqPublisher>) -> Self {
         self.zmq = publisher;
@@ -156,6 +157,7 @@ impl ChainFollowers {
     }
 
     /// `TxIndex` runtime, when one is wired.
+    #[cfg(test)]
     #[must_use]
     pub fn derived_index(&self) -> Option<&Arc<DerivedIndexRuntime>> {
         self.derived_index.as_ref()

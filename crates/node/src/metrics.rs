@@ -165,27 +165,6 @@ impl EvidenceIdentity {
             hardware: hardware_identity(),
         })
     }
-
-    /// The identity as label pairs for controlled benchmark evidence tooling.
-    ///
-    /// The operator Prometheus exporter deliberately does not install these
-    /// high-cardinality fields as global labels (OBS-01).
-    #[must_use]
-    pub fn labels(&self) -> Vec<(&'static str, String)> {
-        let mut labels = vec![
-            ("binary_sha256", self.binary_sha256.to_string()),
-            ("version", self.version.clone()),
-            ("config_sha256", self.config_sha256.to_string()),
-            ("backend", self.backend.clone()),
-            ("durability", self.durability.clone()),
-            ("hardware", self.hardware.clone()),
-        ];
-        if let Some(corpus) = &self.corpus {
-            labels.push(("corpus_id", corpus.id.clone()));
-            labels.push(("corpus_manifest_sha256", corpus.manifest_sha256.to_string()));
-        }
-        labels
-    }
 }
 
 fn describe_node_metrics() {

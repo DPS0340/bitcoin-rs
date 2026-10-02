@@ -495,7 +495,7 @@ impl crate::storage_backend::StoreConsumer for DerivedIndexComposer {
     }
 }
 
-pub(crate) struct TxIndexSpawn {
+struct TxIndexSpawn {
     spec: bitcoin_rs_index::runtime::DerivedIndexOpenSpec,
     generation: bitcoin_rs_index::runtime::Generation,
     block_source: bitcoin_rs_index::runtime::IndexBlockSource,
