@@ -59,7 +59,7 @@ impl FeeRate {
 /// CONTRACT: docs/policies/db-migration.md — every rejection degrades to
 /// insufficient-data status; none of them fails startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HistoryReject {
+pub(crate) enum HistoryReject {
     /// Leading magic bytes are not the estimator's.
     BadMagic,
     /// The format version is not one this build reads.

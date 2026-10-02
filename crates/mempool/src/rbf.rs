@@ -95,6 +95,9 @@ impl ReplacementCandidate {
 }
 
 /// Successful replacement validation result.
+///
+/// Produced only by [`Mempool::check_replacement`], the test-seam oracle.
+#[cfg(any(test, feature = "test-seam"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplacementPlan {
     /// Conflicts and descendants removed by the replacement.
