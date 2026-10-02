@@ -100,21 +100,21 @@ pub fn accept_headers(
         }
         validate_pow(header, hash, network)?;
         // An empty tree only roots at the network's genesis hash.
-        if tree.is_empty() && hash != network.genesis_block_hash() {
-            return Err(ChainError::MissingParent {
-                prev_hash: prev_hash_from_header(header),
-            });
+        if tree.is_empty() {
+            if hash != network.genesis_block_hash() {
+                return Err(ChainError::MissingParent {
+                    prev_hash: prev_hash_from_header(header),
+                });
+            }
+            // The validated genesis root: the tree is empty, so the
+            // header has no parent and no contextual rule applies.
+            let id = tree.insert_header_with_hash(*header, hash, NodeStatus::HeaderValid)?;
+            accepted.push(id);
+            continue;
         }
         let prev_hash = prev_hash_from_header(header);
         let parent_id = match tree.lookup(prev_hash) {
             Some(parent_id) => parent_id,
-            None if tree.is_empty() => {
-                // The validated genesis root: the tree is empty, so the
-                // header has no parent and no contextual rule applies.
-                let id = tree.insert_header_with_hash(*header, hash, NodeStatus::HeaderValid)?;
-                accepted.push(id);
-                continue;
-            }
             None => return Err(ChainError::MissingParent { prev_hash }),
         };
         if tree.node(parent_id)?.status == NodeStatus::Invalid {
@@ -289,9 +289,9 @@ pub fn next_work_required(
     let retarget_interval = network.retarget_interval();
     let is_retarget = retarget_interval != 0 && height.is_multiple_of(retarget_interval);
     if is_retarget {
-        expected_retarget_bits(network, tree, parent_id, height, retarget_interval)
+        expected_retarget_bits(network, tree, parent_id)
     } else {
-        expected_non_retarget_bits(network, tree, parent_id, candidate_time, retarget_interval)
+        expected_non_retarget_bits(network, tree, parent_id, candidate_time)
     }
 }
 
@@ -305,21 +305,23 @@ pub fn validate_header_nbits(
     header: &BlockHeader,
     network: Network,
 ) -> Result<(), ChainError> {
-    let parent = tree.node(parent_id)?;
-    let height = parent
+    let expected = next_work_required(tree, parent_id, header.time, network)?;
+    let actual = header.bits;
+    if actual == expected {
+        return Ok(());
+    }
+    // `height` only reports the mismatch; resolve it on the failure path
+    // since `next_work_required` already proved the parent resolves.
+    let height = tree
+        .node(parent_id)?
         .height
         .checked_add(1)
         .ok_or(ChainError::HeightOverflow { parent: parent_id })?;
-    let expected = next_work_required(tree, parent_id, header.time, network)?;
-    let actual = header.bits;
-    if actual != expected {
-        return Err(ChainError::NbitsMismatch {
-            actual: actual.to_consensus(),
-            expected: expected.to_consensus(),
-            height,
-        });
-    }
-    Ok(())
+    Err(ChainError::NbitsMismatch {
+        actual: actual.to_consensus(),
+        expected: expected.to_consensus(),
+        height,
+    })
 }
 
 /// Validates a header's proof-of-work target and hash.
@@ -359,7 +361,6 @@ fn expected_non_retarget_bits(
     tree: &BlockTree,
     parent_id: NodeId,
     candidate_time: u32,
-    retarget_interval: u32,
 ) -> Result<CompactTarget, ChainError> {
     let parent = tree.node(parent_id)?;
     if !network.allow_min_difficulty_blocks() {
@@ -375,6 +376,7 @@ fn expected_non_retarget_bits(
     }
 
     let pow_limit = pow_limit_bits(network);
+    let retarget_interval = network.retarget_interval();
     let mut cursor_id = parent_id;
     loop {
         let cursor = tree.node(cursor_id)?;
@@ -394,15 +396,17 @@ fn expected_retarget_bits(
     network: Network,
     tree: &BlockTree,
     parent_id: NodeId,
-    height: u32,
-    retarget_interval: u32,
 ) -> Result<CompactTarget, ChainError> {
     let prev_node = tree.node(parent_id)?;
     if network.pow_no_retargeting() {
         return Ok(prev_node.header.bits);
     }
 
-    let Some(anchor_height) = height.checked_sub(retarget_interval) else {
+    let height = prev_node
+        .height
+        .checked_add(1)
+        .ok_or(ChainError::HeightOverflow { parent: parent_id })?;
+    let Some(anchor_height) = height.checked_sub(network.retarget_interval()) else {
         return Ok(prev_node.header.bits);
     };
     let Some(anchor_id) = tree.node_at_height_from(parent_id, anchor_height) else {
@@ -530,7 +534,7 @@ pub(crate) mod pow {
     }
 
     fn decode_compact(bits: u32) -> DecodedCompact {
-        let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
+        let exponent = usize::try_from(bits >> 24).unwrap_or(0);
         let mut mantissa = bits & 0x007f_ffff;
         let target = if exponent <= 3 {
             mantissa >>= 8 * (3 - exponent);
