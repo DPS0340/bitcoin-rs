@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 
 use bitcoin_rs_consensus::is_final_tx;
-use bitcoin_rs_mempool::{MempoolMiningSnapshot, SnapshotEntry};
+use bitcoin_rs_mempool::MempoolMiningSnapshot;
 use bitcoin_rs_primitives::{Tx, Txid};
 
 use crate::MiningError;
@@ -216,12 +216,6 @@ fn next_block_sequence_locks_final(
             context.locktime_cutoff,
         )
     })
-}
-
-/// Modified fee used for ranking overlays: actual fee plus the signed delta.
-#[must_use]
-pub(crate) fn modified_fee(entry: &SnapshotEntry) -> i128 {
-    i128::from(entry.fee).saturating_add(i128::from(entry.fee_delta))
 }
 
 #[cfg(test)]

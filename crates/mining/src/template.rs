@@ -12,7 +12,7 @@ use hashbrown::HashMap;
 
 use crate::MiningError;
 use crate::coinbase::{WITNESS_RESERVED_VALUE, build_coinbase};
-use crate::policy::{modified_fee, select_packages};
+use crate::policy::select_packages;
 
 /// Chain and limit facts required to assemble one candidate.
 ///
@@ -451,7 +451,7 @@ fn candidate_transactions(
             wtxid: entry.wtxid,
             fee: entry.fee,
             fee_delta: entry.fee_delta,
-            modified_fee: modified_fee(entry),
+            modified_fee: i128::from(entry.fee).saturating_add(i128::from(entry.fee_delta)),
             sigop_cost: entry.sigop_cost,
             weight: entry.weight,
             depends: depends(&entry.tx, &tx_positions),
