@@ -129,6 +129,12 @@ impl LockTime {
     }
 }
 
+impl fmt::Display for LockTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Compact proof-of-work target (`nBits`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CompactTarget(u32);
