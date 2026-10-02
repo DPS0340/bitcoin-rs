@@ -32,7 +32,7 @@ use bitcoin_rs_primitives::{OutPoint, TxOut};
 use smallvec::SmallVec;
 
 /// One inserted UTXO event delivered to a change listener.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct UtxoInserted<'a> {
     /// Outpoint that was inserted.
     pub op: &'a OutPoint,
@@ -63,7 +63,7 @@ impl<'a> UtxoInserted<'a> {
 }
 
 /// One removed UTXO event delivered to a change listener.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct UtxoRemoved {
     /// Outpoint that was removed.
     pub op: OutPoint,

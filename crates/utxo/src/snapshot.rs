@@ -316,11 +316,8 @@ fn read_snapshot_output(reader: &mut impl Read) -> Result<OwnedUtxoOut, UtxoErro
     Ok(OwnedUtxoOut::new(vout, value, script, coinbase, height))
 }
 
-/// Computes Bitcoin Core's `hash_serialized_3` UTXO-set commitment.
-pub fn hash_serialized_3(set: &UtxoSet) -> Result<Hash256, UtxoError> {
-    set.with_stable_view(hash_serialized_3_stable)
-}
-
+/// Computes Bitcoin Core's `hash_serialized_3` UTXO-set commitment over a
+/// stable view.
 pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256, UtxoError> {
     let mut engine = Sha256::new();
     for shard_idx in 0_u8..=u8::MAX {
