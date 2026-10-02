@@ -219,16 +219,7 @@ pub fn scan_coin_stats(
     } else {
         CoinStatsAccumulator::without_muhash(height)
     };
-    view.for_each_coin(|txid, vout, value, script_pubkey, coin_height, coinbase| {
-        accumulator.observe_coin(SnapshotCoin {
-            txid,
-            vout,
-            value,
-            script_pubkey,
-            height: coin_height,
-            coinbase,
-        });
-    })?;
+    view.for_each_coin(|coin| accumulator.observe_coin(coin))?;
     Ok(accumulator.into_stats())
 }
 
@@ -1001,7 +992,7 @@ mod tests {
     #[test]
     fn scan_coin_stats_matches_rolling_listener() {
         use crate::contract::{BlockChanges, UtxoAdd};
-        use crate::{SnapshotCoin, SnapshotCoinObserver, UtxoSet};
+        use crate::{SnapshotCoinObserver, UtxoSet};
         use bitcoin_rs_primitives::{Hash256, OutPoint};
 
         let mut utxo = UtxoSet::new();
@@ -1040,15 +1031,7 @@ mod tests {
                 .unwrap_or_else(|err| panic!("scan_coin_stats failed: {err}"));
             let mut accumulated = super::CoinStatsAccumulator::with_muhash(rolling.height);
             let mut without_muhash = super::CoinStatsAccumulator::without_muhash(rolling.height);
-            view.for_each_coin(|txid, vout, value, script_pubkey, height, coinbase| {
-                let coin = SnapshotCoin {
-                    txid,
-                    vout,
-                    value,
-                    script_pubkey,
-                    height,
-                    coinbase,
-                };
+            view.for_each_coin(|coin| {
                 accumulated.observe_coin(coin);
                 without_muhash.observe_coin(coin);
             })
