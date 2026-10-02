@@ -38,12 +38,6 @@ pub(crate) enum BlockTxVerbosity {
     Full,
 }
 
-/// Render a block header using Bitcoin Core's verbose header shape.
-#[must_use]
-pub(crate) fn header_json(header: &Header, chain: &BlockChainContext) -> Value {
-    header_common_json(header, chain)
-}
-
 /// Render a block using Bitcoin Core's verbose block shape.
 #[must_use]
 pub(crate) fn block_json(
@@ -53,7 +47,7 @@ pub(crate) fn block_json(
     network: Network,
 ) -> Value {
     let header = &block.header;
-    let mut value = header_common_json(header, chain);
+    let mut value = header_json(header, chain);
     let size = block.total_size();
     let weight = block.weight();
     let stripped_size = block.stripped_size();
@@ -97,7 +91,9 @@ pub(crate) fn confirmations(applied_height: u32, block_height: u32, on_active_ch
         .saturating_add(1)
 }
 
-fn header_common_json(header: &Header, chain: &BlockChainContext) -> Value {
+/// Render a block header using Bitcoin Core's verbose header shape.
+#[must_use]
+pub(crate) fn header_json(header: &Header, chain: &BlockChainContext) -> Value {
     let version = header.version;
     let bits = header.bits;
     let mut value = json!({
