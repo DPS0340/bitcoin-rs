@@ -165,12 +165,6 @@ impl From<u32> for CompactTarget {
     }
 }
 
-impl PartialEq<u32> for CompactTarget {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Amount, LockTime, Sequence};
