@@ -456,7 +456,7 @@ durable.
   - `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
     (`RCV-05`);
   - `pruned_history_rebuilds_from_the_frontier_and_absent_history_waits`
-    (`RCV-06`, `RCV-07`).
+    (`RCV-07`).
 
 - `crates/node/tests/overhaul_fee_history.rs` (existing):
   - `restart_adopts_persisted_estimator_history`,

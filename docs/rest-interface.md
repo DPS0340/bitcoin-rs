@@ -31,10 +31,13 @@ The gateway registers these Core REST prefixes:
 
 ## Coherent views
 
-Every REST request captures the applied-tip publication
-(`ChainHandles::applied_view`, one `TipSnapshot` load) at entry and assembles
-its whole response from that view. A response never mixes a tip loaded from one commit
-with coins, mempool contents, or index rows from another.
+Handlers that read chain state capture the applied-tip publication
+(`ChainHandles::applied_view`, one `TipSnapshot` load) and assemble their
+responses from that view: `route_block` in its `json` arm, `route_getutxos`
+after its mempool pool read, plus headers, chaininfo, and deploymentinfo.
+`/rest/tx/<hash>.hex` and `/rest/blockpart` return without it. A response
+never mixes a tip loaded from one commit with coins, mempool contents, or
+index rows from another.
 
 - If the chain generation is odd when the request arrives, or moves before the
   response is assembled, the gateway returns HTTP 503 with a short retry

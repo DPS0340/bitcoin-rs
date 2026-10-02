@@ -476,24 +476,27 @@ impl BlockTree {
     #[must_use]
     pub fn median_time_past_at(&self, start_id: NodeId) -> Option<u32> {
         const WINDOW: usize = bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
-        let mut times = Vec::with_capacity(WINDOW);
+        let mut times = [0_u32; WINDOW];
+        let mut len = 0usize;
         let mut cursor = start_id;
-        while times.len() < WINDOW {
+        while len < WINDOW {
             let Ok(node) = self.node(cursor) else {
-                if times.is_empty() {
+                if len == 0 {
                     return None;
                 }
                 break;
             };
-            times.push(node.header.time);
+            times[len] = node.header.time;
+            len += 1;
             let Some(parent) = node.parent else {
                 break;
             };
             cursor = parent;
         }
 
+        let times = &mut times[..len];
         times.sort_unstable();
-        Some(times[times.len() / 2])
+        Some(times[len / 2])
     }
 
     /// Inserts a header whose parent is inferred from `prev_blockhash`.
