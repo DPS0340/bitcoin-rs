@@ -427,7 +427,7 @@ impl<S: KvStore> JournalWriter<S> {
     }
 
     /// Records that a failed append leaves a live-chain gap.
-    pub fn mark_append_gap(&mut self, height: u32) {
+    pub(crate) fn mark_append_gap(&mut self, height: u32) {
         self.append_gap_height.get_or_insert(height);
         metrics::gauge!("node.chainstate_journal.append_gap").set(1.0);
         self.record_lag_metrics();
