@@ -636,23 +636,15 @@ struct CoinStatsListenerState {
 }
 
 impl CoinStatsListenerState {
-    fn insert_utxo_hash(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
+    fn insert_utxo(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
         coin_hash_bytes_into(&mut self.scratch, op, txout, height, coinbase);
         self.stats.muhash.insert(self.scratch.as_slice());
-    }
-
-    fn insert_utxo(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
-        self.insert_utxo_hash(op, txout, height, coinbase);
         self.stats.account_insert(txout);
     }
 
-    fn remove_utxo_hash(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
+    fn remove_utxo(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
         coin_hash_bytes_into(&mut self.scratch, op, txout, height, coinbase);
         self.stats.muhash.remove(self.scratch.as_slice());
-    }
-
-    fn remove_utxo(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
-        self.remove_utxo_hash(op, txout, height, coinbase);
         self.stats.account_remove(txout);
     }
 
