@@ -3632,11 +3632,7 @@ mod pruneblockchain_tests {
             requested_height: u32,
         ) -> Result<crate::context::PruneResult, crate::context::PruneServiceError> {
             Ok(crate::context::PruneResult {
-                requested_height,
                 pruneheight: self.result_pruneheight.unwrap_or(requested_height),
-                block_rows_removed: 0,
-                undo_rows_removed: 0,
-                bytes_freed: 0,
             })
         }
 

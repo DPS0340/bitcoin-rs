@@ -311,12 +311,6 @@ impl NodeConfig {
         }
     }
 
-    /// Returns configured ZMQ endpoint groups.
-    #[must_use]
-    pub fn zmq_endpoints(&self) -> &[bitcoin_rs_rpc::zmq::ZmqEndpointConfig] {
-        &self.notifications.zmq
-    }
-
     /// Validates backend availability and cross-field constraints.
     ///
     /// This is the fail-early gate for engine selection: an engine this build

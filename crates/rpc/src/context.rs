@@ -131,16 +131,8 @@ pub struct PruneStatus {
 /// Summary of one completed manual prune request.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PruneResult {
-    /// Height requested by the RPC caller.
-    pub requested_height: u32,
     /// Highest prune height now recorded by the service.
     pub pruneheight: u32,
-    /// Serialized block-body rows removed from storage.
-    pub block_rows_removed: u64,
-    /// Serialized undo rows removed from storage.
-    pub undo_rows_removed: u64,
-    /// Payload bytes removed from storage.
-    pub bytes_freed: u64,
 }
 
 /// Error returned by the node-owned pruning implementation.
