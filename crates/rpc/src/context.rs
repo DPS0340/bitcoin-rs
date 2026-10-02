@@ -1291,6 +1291,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<Context>();
+        assert_send_sync::<ContextHandles>();
         assert_send_sync::<ChainHandles>();
         assert_send_sync::<IndexHandles>();
         assert_send_sync::<NetworkHandles>();
@@ -1570,16 +1571,6 @@ mod tests {
             "a log that does not start at zero must still resolve by search"
         );
         assert!(record_at_height(&records, 1).is_none());
-    }
-
-    /// The aggregate `Context` keeps Rust's auto-derived thread-safety traits:
-    /// every capability group is built from handles whose interior mutability
-    /// is already `Send` and `Sync`, so no `unsafe impl` is needed.
-    #[test]
-    fn context_derives_send_and_sync_without_an_unsafe_impl() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Context>();
-        assert_send_sync::<ContextHandles>();
     }
 
     #[test]
