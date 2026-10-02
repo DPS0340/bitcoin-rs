@@ -63,8 +63,6 @@ struct CompactPeer {
     blocks: BTreeMap<BlockHash, Block>,
     /// The header chain, so a `getheaders` probe is answered.
     headers: Vec<bitcoin::block::Header>,
-    /// Every block-typed `getdata` item the node sent, in arrival order.
-    requested: Vec<(u32, BlockHash)>,
     /// The peer socket died (node disconnected or transport error).
     dropped: bool,
     /// Partial bytes of an in-flight frame carried between reads.
@@ -86,7 +84,6 @@ impl CompactPeer {
             t0: Instant::now(),
             blocks: BTreeMap::new(),
             headers: Vec::new(),
-            requested: Vec::new(),
             dropped: false,
             pending: FrameBuffer::default(),
         };
@@ -196,7 +193,6 @@ impl CompactPeer {
             | Inventory::Block(hash) => *hash,
             _ => return Ok(()),
         };
-        self.requested.push((inv_type(item), hash));
         // The wire takes an owned body; the map keeps serving further requests.
         let Some(body) = self.blocks.get(&hash).cloned() else {
             return self.send(NetworkMessage::NotFound(vec![*item]), deadline);
@@ -256,15 +252,6 @@ impl CompactPeer {
             }
         }
         false
-    }
-}
-
-fn inv_type(item: &Inventory) -> u32 {
-    match item {
-        Inventory::Block(_) => 0x0000_0002,
-        Inventory::CompactBlock(_) => 0x0000_0004,
-        Inventory::WitnessBlock(_) => 0x4000_0002,
-        _ => 0,
     }
 }
 
