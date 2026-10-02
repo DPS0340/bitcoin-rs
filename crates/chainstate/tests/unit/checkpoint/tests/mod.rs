@@ -168,12 +168,8 @@ fn next_header(prev_blockhash: BlockHash, height: u32) -> Header {
 fn mine_header_to_declared_target(
     header: &mut Header,
 ) -> Result<(), headers::HeaderCheckpointError> {
-    while !compact_is_met_by(header.bits, header.compute_hash().0) {
-        header.nonce = header.nonce.checked_add(1).ok_or_else(|| {
-            headers::HeaderCheckpointError::Codec("exhausted test nonce".to_owned())
-        })?;
-    }
-    Ok(())
+    bitcoin_rs_chain::regtest_fixture::mine_header_to_declared_target(header)
+        .map_err(|error| headers::HeaderCheckpointError::Codec(error.to_string()))
 }
 
 fn header_from_row(row: &[u8]) -> Result<Header, headers::HeaderCheckpointError> {

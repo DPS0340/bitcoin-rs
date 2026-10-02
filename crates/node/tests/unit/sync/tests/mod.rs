@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot, compact_is_met_by, regtest_fixture};
+use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot, regtest_fixture};
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
 };
@@ -46,8 +46,8 @@ fn mined_block_with_prev_hash(prev_blockhash: BlockHash, height: u32, txdata: Ve
         txs: txdata,
     };
     block.header.merkle_root = regtest_fixture::merkle_root(&block.txs).unwrap_or_default();
-    while !compact_is_met_by(block.header.bits, block.block_hash().into()) {
-        block.header.nonce = block.header.nonce.saturating_add(1);
+    if let Err(error) = regtest_fixture::mine_block_to_declared_target(&mut block) {
+        panic!("regtest target must be reachable: {error}");
     }
     block
 }
