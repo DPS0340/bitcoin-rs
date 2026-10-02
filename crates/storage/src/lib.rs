@@ -50,7 +50,7 @@ pub use redb_impl::{
 pub use rocksdb_impl::{ROCKSDB_DEFAULT_CACHE_BYTES, RocksDbStore};
 
 /// Selectable storage backend.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StorageBackend {
     /// `RocksDB`.
     RocksDb,

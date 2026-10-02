@@ -143,7 +143,7 @@ pub fn load_executed_frontier<S: crate::KvStore>(
 /// INVARIANT: the frontier never moves backwards, every height below it is
 /// gone, and no lease is granted below it, so no reader can pin rows the
 /// frontier names as deleted.
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ExecutedFrontier(u32);
 
 impl ExecutedFrontier {
@@ -226,7 +226,7 @@ impl ExecutedFrontier {
 /// reclaims the flat files, and then promotes [`StagedPrune::pruned_below`]
 /// through [`PruneReservation::commit`] so later lease requests learn what
 /// is actually gone.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct StagedPrune {
     /// Block-body rows the batch deletes.
     pub blocks: PruneOutcome,
@@ -450,7 +450,7 @@ pub fn reclaim_staged_flat_block_files<S: crate::KvStore>(
 }
 
 /// Result of one pruning pass.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct PruneOutcome {
     /// Number of payload bytes deleted from storage.
     pub bytes_freed: u64,
