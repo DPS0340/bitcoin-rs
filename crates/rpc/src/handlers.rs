@@ -28,7 +28,7 @@ pub fn live_registry() -> impl Iterator<Item = &'static str> {
 }
 
 /// JSON-RPC method dispatcher backed by shared node context.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Handler {
     ctx: Arc<Context>,
 }

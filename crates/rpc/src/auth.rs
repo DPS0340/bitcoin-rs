@@ -7,7 +7,7 @@ use thiserror::Error;
 
 /// RPC authentication policy: one expected `(user, password)` pair hashed at
 /// construction, regardless of how the password was sourced.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Auth {
     /// Expected username.
     user: String,
