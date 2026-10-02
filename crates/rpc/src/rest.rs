@@ -52,7 +52,7 @@ pub const REGISTRATIONS: [&str; 12] = [
 ];
 
 /// HTTP response produced by a REST route.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct Response {
     /// HTTP status code.
     pub status: u16,

@@ -19,7 +19,7 @@ use bitcoin::hex::DisplayHex;
 use crate::compat::convert::{self};
 
 /// Optional confirmed-chain fields projected beside a transaction object.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct TransactionChainContext {
     /// Confirming block hash.
     pub block_hash: BlockHash,

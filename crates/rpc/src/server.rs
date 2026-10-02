@@ -616,7 +616,7 @@ enum HttpSurface {
     EsploraBackend,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum CorsPolicy {
     Disabled,
     Public {

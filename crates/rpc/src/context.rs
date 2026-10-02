@@ -88,7 +88,7 @@ use bitcoin_rs_index::block_log::{BlockLog, BlockRecord, record_at_height, recor
 use bitcoin_rs_index::query_api::RollbackWarningSource;
 
 /// Typed synchronization progress behind `getblockchaininfo`.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct SyncProgress {
     /// Consensus network the node follows.
     pub network: Network,
@@ -119,7 +119,7 @@ pub struct SyncProgress {
 }
 
 /// Current pruning state reported by chain RPCs.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct PruneStatus {
     /// Whether block pruning is enabled for this node.
     pub pruned: bool,
@@ -128,14 +128,14 @@ pub struct PruneStatus {
 }
 
 /// Summary of one completed manual prune request.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct PruneResult {
     /// Highest prune height now recorded by the service.
     pub pruneheight: u32,
 }
 
 /// Error returned by the node-owned pruning implementation.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum PruneServiceError {
     /// Storage or backend-specific pruning failure.
     #[error("{0}")]
@@ -169,7 +169,7 @@ pub trait ChainControl: Send + Sync {
 }
 
 /// Failure from a node-owned chain mutation.
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ChainControlError {
     /// The requested block is unknown.
     #[error("unknown block")]

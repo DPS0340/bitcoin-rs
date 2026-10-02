@@ -488,7 +488,7 @@ pub(crate) fn strip_addr_wrapper(payload: &str) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 /// What `getdescriptorinfo` reports about a descriptor.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct DescriptorInfo {
     /// Canonical form, with private keys replaced by their public counterparts.
     ///
