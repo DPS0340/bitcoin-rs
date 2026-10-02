@@ -44,10 +44,12 @@ use bitcoin_rs_e2e::helpers::{
     best_hash, block_count, build_chain, genesis_block, segwit_coinbase_block, wait_for,
 };
 use bitcoin_rs_e2e::node::workspace;
-use bitcoin_rs_e2e::process_peer::connect_loopback;
+use bitcoin_rs_e2e::process_peer::{
+    FrameBuffer, connect_loopback, decode_frame, read_frame,
+};
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
 use serde_json::json;
-use wire::{decode_frame, is_soft_recv_error, read_frame, remaining};
+use wire::{is_soft_recv_error, remaining};
 
 /// Blocks applied before the serving probes: deep enough that a request 11
 /// below the tip exists on the active chain.
@@ -67,6 +69,8 @@ struct CompactPeer {
     requested: Vec<(u32, BlockHash)>,
     /// The peer socket died (node disconnected or transport error).
     dropped: bool,
+    /// Partial bytes of an in-flight frame carried between reads.
+    pending: FrameBuffer,
 }
 
 impl CompactPeer {
@@ -86,6 +90,7 @@ impl CompactPeer {
             headers: Vec::new(),
             requested: Vec::new(),
             dropped: false,
+            pending: FrameBuffer::default(),
         };
         let services = ServiceFlags::WITNESS | ServiceFlags::NETWORK;
         let mut version = VersionMessage::new(
@@ -162,7 +167,7 @@ impl CompactPeer {
     }
 
     fn recv(&mut self, deadline: Instant) -> Result<NetworkMessage, Error> {
-        match read_frame(&mut self.stream, deadline) {
+        match read_frame(&mut self.stream, deadline, &mut self.pending) {
             Ok(frame) => {
                 let message = decode_frame(&frame)?;
                 self.log("recv", message.cmd());
