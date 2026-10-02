@@ -56,7 +56,6 @@ pub(super) struct PendingBlockCommit {
 pub(super) struct WindowGroup {
     pending: Vec<PendingBlockCommit>,
     staged_bytes: usize,
-    first_prev: Option<Hash256>,
 }
 
 impl WindowGroup {
@@ -85,9 +84,6 @@ impl WindowGroup {
 
     pub(super) fn stage(&mut self, pending: PendingBlockCommit) {
         self.staged_bytes += pending.outcome.block_bytes.len();
-        if self.pending.is_empty() {
-            self.first_prev = Some(pending.prev_hash);
-        }
         self.pending.push(pending);
     }
 
@@ -104,10 +100,11 @@ impl WindowGroup {
         &mut self,
         handles: &Chainstate,
     ) -> core::result::Result<Vec<ConnectOutcome>, ApplyError> {
-        let (last, first_prev) = match (self.pending.last(), self.first_prev) {
-            (Some(last), Some(first_prev)) => (last, first_prev),
+        let (first, last) = match (self.pending.first(), self.pending.last()) {
+            (Some(first), Some(last)) => (first, last),
             _ => return Ok(Vec::new()),
         };
+        let first_prev = first.prev_hash;
         let sync_started = quanta::Instant::now();
         sync_appended_blocks(handles)?;
         let group_sync_us = sync_started.elapsed().as_micros();
@@ -171,7 +168,6 @@ impl WindowGroup {
         // values are the ones the batch certified, so this tail is as
         // infallible as the single-block publication.
         self.staged_bytes = 0;
-        self.first_prev = None;
         let published = self
             .pending
             .drain(..)
@@ -194,7 +190,6 @@ impl WindowGroup {
     fn abandon(&mut self) {
         self.pending.clear();
         self.staged_bytes = 0;
-        self.first_prev = None;
     }
 }
 
