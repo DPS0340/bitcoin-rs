@@ -670,13 +670,6 @@ impl Context {
         self
     }
 
-    /// Attaches the live ZMQ publisher used by `getzmqnotifications`.
-    #[must_use]
-    pub fn with_zmq_publisher(mut self, publisher: Arc<dyn crate::zmq::ZmqPublisher>) -> Self {
-        self.zmq_publisher = publisher;
-        self
-    }
-
     /// Acquires a bounded full-block REST render slot, if one is available.
     pub(crate) fn try_acquire_rest_render(&self) -> Option<RestRenderPermit> {
         self.rest_render_budget.try_acquire()

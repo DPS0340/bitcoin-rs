@@ -359,8 +359,7 @@ pub(crate) fn raw_transaction_verbose(
     let inputs = tx
         .inputs
         .iter()
-        .enumerate()
-        .map(|(index, input)| raw_input_typed(input, index == 0 && coinbase))
+        .map(|input| raw_input_typed(input, coinbase))
         .collect::<Vec<_>>();
     let outputs = tx
         .outputs
@@ -412,8 +411,7 @@ pub(crate) fn raw_transaction(
     let inputs = tx
         .inputs
         .iter()
-        .enumerate()
-        .map(|(index, input)| raw_input_typed(input, index == 0 && coinbase))
+        .map(|input| raw_input_typed(input, coinbase))
         .collect::<Vec<_>>();
     let outputs = tx
         .outputs
