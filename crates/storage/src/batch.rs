@@ -109,7 +109,8 @@ impl BufferedWriteBatch {
     }
 }
 
-/// A strict non-empty prefix of `ops` for the partial-apply fault.
+/// Half of `ops` (rounded up; the whole batch for a single op, empty when
+/// `ops` is empty) for the partial-apply fault.
 #[cfg(any(feature = "fjall", feature = "redb"))]
 pub(crate) fn prefix_ops(ops: Vec<BatchOp>) -> std::vec::IntoIter<BatchOp> {
     let mut ops = ops;

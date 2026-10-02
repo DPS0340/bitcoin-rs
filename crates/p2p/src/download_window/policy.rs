@@ -51,11 +51,11 @@ pub(super) const NETWORK_LIMITED: u64 = 1_u64 << 10;
 /// run at this window was 1.52× the 128-block control. Fan-out still stripes
 /// at [`MAX_BLOCKS_IN_TRANSIT_PER_PEER`] once [`MIN_PEERS_FOR_FANOUT`] eligible
 /// peers exist, so a full outbound set does not deepen per-peer pipelines.
-pub const PENDING_BUDGET: usize = 256;
+pub(crate) const PENDING_BUDGET: usize = 256;
 /// Time after which a received out-of-order block is discarded.
 pub(crate) const RECEIVED_BLOCK_TIMEOUT: Duration = Duration::from_mins(1);
 /// Maximum number of received blocks waiting for their predecessor.
-pub const RECEIVED_BLOCK_BUDGET: usize = 256;
+pub(crate) const RECEIVED_BLOCK_BUDGET: usize = 256;
 /// Mainnet-oriented block-size estimate for sizing the in-flight request window.
 pub(crate) const PENDING_BLOCK_BYTE_ESTIMATE: usize = 2 * 1024 * 1024;
 /// Maximum estimated bytes in the in-flight request window.
