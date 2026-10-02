@@ -80,7 +80,9 @@ pub struct EarlyEndOfScript;
 /// is an [`Instruction::Op`].
 #[derive(Clone, Debug)]
 pub struct Instructions<'a> {
-    remaining: &'a [u8],
+    /// Unconsumed tail; its length maps the current position back to an
+    /// offset in the source script.
+    pub(crate) remaining: &'a [u8],
     failed: bool,
 }
 

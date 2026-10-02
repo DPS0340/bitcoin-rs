@@ -389,9 +389,9 @@ pub(crate) fn eval_script(
     // Byte offset of the instruction start, tracked for codeseparator
     // positioning relative to the whole script.
     let mut instruction_start: usize = 0;
-    let mut remaining = script;
+    let mut iter = instructions(script);
 
-    while let Some(parsed) = instructions(remaining).next() {
+    while let Some(parsed) = iter.next() {
         let instruction = match parsed {
             Ok(instruction) => instruction,
             // Core's GetOp returning false is a BAD_OPCODE.
@@ -403,7 +403,8 @@ pub(crate) fn eval_script(
         };
         let opcode_byte = match instruction {
             Instruction::PushBytes(data) => {
-                let opcode_byte = push_opcode_for(remaining)?;
+                // The instruction's head byte is the push opcode.
+                let opcode_byte = script[instruction_start];
                 // Core checks push size unconditionally (interpreter.cpp:457),
                 // before testing fExec — a >520-byte push in a non-executed
                 // branch is still PUSH_SIZE.
@@ -424,19 +425,11 @@ pub(crate) fn eval_script(
                     }
                     push_bytes(stack, data)?;
                 }
-                advance(&mut remaining, opcode_byte, data.len());
-                instruction_start = script.len() - remaining.len();
+                instruction_start = script.len() - iter.remaining.len();
                 continue;
             }
             Instruction::Op(op) => op,
         };
-
-        let executed_push = opcode_byte <= opcode::OP_PUSHDATA4;
-        if executed_push {
-            // Handled above; unreachable for Op(_) variant, kept for parity.
-            advance(&mut remaining, opcode_byte, 0);
-            continue;
-        }
 
         if sigversion == SigVersion::Base || sigversion == SigVersion::WitnessV0 {
             // OP_RESERVED does not count towards the opcode limit.
@@ -494,8 +487,7 @@ pub(crate) fn eval_script(
             });
         }
 
-        advance(&mut remaining, opcode_byte, 0);
-        instruction_start = script.len() - remaining.len();
+        instruction_start = script.len() - iter.remaining.len();
     }
 
     if !conditions.is_empty() {
@@ -504,42 +496,6 @@ pub(crate) fn eval_script(
         });
     }
     Ok(())
-}
-
-/// Advances `remaining` past the instruction that starts with `op` and, for
-/// pushes, carries `data_len` payload bytes.
-fn advance(remaining: &mut &[u8], op: u8, data_len: usize) {
-    let header = if (0x01..=0x4b).contains(&op) {
-        1
-    } else {
-        match op {
-            opcode::OP_PUSHDATA1 => 2,
-            opcode::OP_PUSHDATA2 => 3,
-            opcode::OP_PUSHDATA4 => 5,
-            _ => 1,
-        }
-    };
-    *remaining = remaining.get(header + data_len..).unwrap_or_default();
-}
-
-/// Returns the push opcode byte at the head of `remaining` for a
-/// `PushBytes` instruction, reconstructing it from the length encoding.
-fn push_opcode_for(remaining: &[u8]) -> Result<u8, ScriptError> {
-    let head = remaining.first().copied().ok_or(ScriptError::Invalid {
-        code: ScriptErrCode::BadOpcode,
-    })?;
-    if (0x01..=0x4b).contains(&head) {
-        Ok(head)
-    } else {
-        match head {
-            opcode::OP_PUSHDATA1 | opcode::OP_PUSHDATA2 | opcode::OP_PUSHDATA4 | opcode::OP_0 => {
-                Ok(head)
-            }
-            _ => Err(ScriptError::Invalid {
-                code: ScriptErrCode::BadOpcode,
-            }),
-        }
-    }
 }
 
 /// Pushes raw bytes as a stack item, bounding the stack.
