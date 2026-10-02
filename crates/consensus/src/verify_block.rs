@@ -348,7 +348,7 @@ fn hash_avx2_parent_batches<T: Copy>(
 /// `wtxids` must contain one witness ID per block transaction in block order;
 /// computing them here would re-serialize and re-hash every transaction on a
 /// path the node can already serve from its parse-once view.
-pub(crate) fn witness_commitment(block: &Block) -> Option<&[u8]> {
+fn witness_commitment(block: &Block) -> Option<&[u8]> {
     block
         .txs
         .first()?

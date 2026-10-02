@@ -10,7 +10,7 @@
 use std::str::FromStr;
 
 use bitcoin::merkle_tree::calculate_root;
-use bitcoin_rs_consensus::block_view::BlockFacts;
+use bitcoin_rs_consensus::BlockFacts;
 use bitcoin_rs_consensus::kernel::BlockParse;
 use bitcoin_rs_consensus::verify_block::{
     BlockRuleContext, block_witness_commitment_matches, verify_block_rules,

@@ -10,7 +10,7 @@
 use bitcoin_rs_index::CapabilitySnapshot;
 use bitcoin_rs_mempool::{FeeRate, MempoolStats, MutationResult};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Tx, Txid, deserialize};
-pub use bitcoin_rs_rpc::context::SyncProgress;
+pub(crate) use bitcoin_rs_rpc::context::SyncProgress;
 use std::sync::Arc;
 use thiserror::Error;
 

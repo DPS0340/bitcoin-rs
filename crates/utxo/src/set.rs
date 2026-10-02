@@ -233,12 +233,12 @@ impl UtxoSetView<'_> {
     }
 
     /// Scans every live output for exact scriptPubKey matches.
-    pub fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
+    pub(crate) fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> UtxoScan {
         let mut scan = UtxoScan::default();
         for shard in &self.set.shards {
             shard.scan_script_pubkeys(scripts, &mut scan);
         }
-        Ok(scan)
+        scan
     }
 
     /// Visits every live output without materializing the complete set.
@@ -347,7 +347,7 @@ impl UtxoSet {
 
     /// Scans a stable whole-set view for exact scriptPubKey matches.
     pub fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
-        self.with_stable_view(|view| view.scan_script_pubkeys(scripts))
+        Ok(self.with_stable_view(|view| view.scan_script_pubkeys(scripts)))
     }
 
     /// Returns true when any output of `txid` is live in the set.

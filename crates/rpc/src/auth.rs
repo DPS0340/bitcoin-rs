@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -17,8 +17,6 @@ pub enum Auth {
     },
     /// Bitcoin Core cookie auth loaded from `path` during construction.
     Cookie {
-        /// Cookie file path retained for diagnostics and reload decisions.
-        path: PathBuf,
         /// Username read from the cookie file.
         user: String,
         /// SHA256 of the cookie password.
@@ -56,7 +54,6 @@ impl Auth {
             return Err(AuthError::InvalidCookie);
         };
         Ok(Self::Cookie {
-            path,
             user: user.to_owned(),
             password_hash: hash_password(password),
         })
@@ -89,7 +86,6 @@ impl Auth {
             | Self::Cookie {
                 user,
                 password_hash,
-                ..
             } => {
                 constant_time_eq(candidate_user.as_bytes(), user.as_bytes())
                     && constant_time_eq(&candidate_hash, password_hash)

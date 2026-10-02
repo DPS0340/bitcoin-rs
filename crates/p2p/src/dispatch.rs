@@ -16,7 +16,7 @@ use crate::wire::{Message, PeerError};
 /// Maximum headers returned by one `headers` response.
 pub const MAX_HEADERS_RESPONSE: usize = 2_000;
 /// Maximum block locator hashes accepted in one locator-based request.
-pub use crate::wire::MAX_LOCATOR_HASHES;
+pub(crate) use crate::wire::MAX_LOCATOR_HASHES;
 
 /// Outcome of streamed inventory serving. Bodies pass through the serving
 /// sink as they load and are never materialized as a whole.

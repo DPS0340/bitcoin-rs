@@ -10,11 +10,11 @@ pub mod opcode {
     /// `OP_0`: pushes an empty byte string.
     pub const OP_0: u8 = 0x00;
     /// `OP_PUSHDATA1`: the next byte is the push length.
-    pub const OP_PUSHDATA1: u8 = 0x4c;
+    pub(crate) const OP_PUSHDATA1: u8 = 0x4c;
     /// `OP_PUSHDATA2`: the next two little-endian bytes are the push length.
-    pub const OP_PUSHDATA2: u8 = 0x4d;
+    pub(crate) const OP_PUSHDATA2: u8 = 0x4d;
     /// `OP_PUSHDATA4`: the next four little-endian bytes are the push length.
-    pub const OP_PUSHDATA4: u8 = 0x4e;
+    pub(crate) const OP_PUSHDATA4: u8 = 0x4e;
     /// `OP_1NEGATE`: pushes the number -1.
     pub const OP_1NEGATE: u8 = 0x4f;
     /// `OP_1`: pushes the number 1 (`OP_PUSHNUM_1`).
@@ -27,6 +27,8 @@ pub mod opcode {
     pub const OP_ENDIF: u8 = 0x68;
     /// `OP_RETURN`: marks an unspendable provably-prunable output.
     pub const OP_RETURN: u8 = 0x6a;
+    /// `OP_DROP`: drops the top stack item.
+    pub const OP_DROP: u8 = 0x75;
     /// `OP_DUP`: duplicates the top stack item.
     pub const OP_DUP: u8 = 0x76;
     /// `OP_EQUAL`: pushes whether the top two stack items are equal.
@@ -38,16 +40,16 @@ pub mod opcode {
     /// `OP_CHECKSIG`: verifies a signature against the top public key.
     pub const OP_CHECKSIG: u8 = 0xac;
     /// `OP_CHECKSIGVERIFY`: `OP_CHECKSIG` followed by `OP_VERIFY`.
-    pub const OP_CHECKSIGVERIFY: u8 = 0xad;
+    pub(crate) const OP_CHECKSIGVERIFY: u8 = 0xad;
     /// `OP_CHECKMULTISIG`: verifies an m-of-n multisignature set.
     pub const OP_CHECKMULTISIG: u8 = 0xae;
     /// `OP_CHECKMULTISIGVERIFY`: `OP_CHECKMULTISIG` followed by `OP_VERIFY`.
-    pub const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+    pub(crate) const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
 
     /// Returns the small-integer value an `OP_PUSHNUM_*` opcode encodes,
     /// or `None` for every other opcode.
     #[must_use]
-    pub const fn decode_pushnum(opcode: u8) -> Option<u8> {
+    pub(crate) const fn decode_pushnum(opcode: u8) -> Option<u8> {
         if opcode >= OP_PUSHNUM_1 && opcode <= OP_PUSHNUM_16 {
             Some(opcode - OP_PUSHNUM_1 + 1)
         } else {
@@ -230,7 +232,7 @@ pub fn is_p2sh(script: &[u8]) -> bool {
 /// `0x02`/`0x03`, 65-byte keys `0x04`/`0x06`/`0x07`), the strictness Core's
 /// `Solver` applies before classifying `pubkey`.
 #[must_use]
-pub fn p2pk_pubkey_bytes(script: &[u8]) -> Option<&[u8]> {
+fn p2pk_pubkey_bytes(script: &[u8]) -> Option<&[u8]> {
     let key = match script.len() {
         67 if script[0] == 0x41 && script[66] == opcode::OP_CHECKSIG => &script[1..66],
         35 if script[0] == 0x21 && script[34] == opcode::OP_CHECKSIG => &script[1..34],

@@ -35,9 +35,10 @@ impl DeploymentContext for DeploymentView<'_> {
         Some(node.header.version)
     }
 
-    fn median_time_past(&self, height: u32, window: usize) -> Option<u32> {
+    fn median_time_past(&self, height: u32) -> Option<u32> {
         let node_id = self.tree.node_at_height_from(self.tip_id, height)?;
-        self.tree.median_time_past_at(node_id, window)
+        self.tree
+            .median_time_past_at(node_id, MEDIAN_TIME_PAST_WINDOW)
     }
 }
 
@@ -192,12 +193,12 @@ fn cached_deployment_state(
 ) -> DeploymentState {
     let period_start = (height / params.period).saturating_mul(params.period);
     if period_start == 0 {
-        return compute_state(ctx, height, params, MEDIAN_TIME_PAST_WINDOW);
+        return compute_state(ctx, height, params);
     }
 
     let anchor_height = period_start.saturating_sub(1);
     let Some(anchor_node) = tree.node_at_height_from(previous_tip_id, anchor_height) else {
-        return compute_state(ctx, height, params, MEDIAN_TIME_PAST_WINDOW);
+        return compute_state(ctx, height, params);
     };
     if let Some(cached) = tree.cached_bip9_state(anchor_node, deployment_id)
         && let Some(state) = DeploymentState::from_cache_tag(cached.tag)
@@ -205,7 +206,7 @@ fn cached_deployment_state(
         return state;
     }
 
-    let state = compute_state(ctx, height, params, MEDIAN_TIME_PAST_WINDOW);
+    let state = compute_state(ctx, height, params);
     tree.cache_bip9_state(
         anchor_node,
         deployment_id,

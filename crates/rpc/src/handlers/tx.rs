@@ -4,7 +4,7 @@ use hashbrown::HashSet;
 
 use bitcoin::consensus::encode::serialize as bitcoin_serialize;
 use bitcoin::hashes::Hash as _;
-use bitcoin::hex::FromHex as _;
+use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin_rs_mempool::SubmitError;
 use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
@@ -17,7 +17,7 @@ use miniscript::psbt::PsbtExt as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
 use crate::compat::convert::{
-    self, VerboseTxChain, hex_encode, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
+    self, VerboseTxChain, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
 };
 use crate::context::{self, AdmissionFailure, Context};
 use crate::error::RpcError;
@@ -146,7 +146,9 @@ fn render_raw_transaction(
     explicit_block: bool,
 ) -> Result<Value, RpcError> {
     if !verbose {
-        return typed_to_sonic(&v31::GetRawTransaction(hex_encode(&consensus_bytes(tx))));
+        return typed_to_sonic(&v31::GetRawTransaction(
+            consensus_bytes(tx).to_lower_hex_string(),
+        ));
     }
     let chain = record.map(|record| {
         let confirmations = super::chain::confirmations(
@@ -412,7 +414,9 @@ fn proof_from_body(bytes: &[u8], wanted: &hashbrown::HashSet<Txid>) -> Option<Va
     let merkle_block = MerkleBlock::from_block_with_predicate(&bitcoin_block, |txid| {
         bitcoin_wanted.contains(txid)
     });
-    Some(json!(hex_encode(&bitcoin_serialize(&merkle_block))))
+    Some(json!(
+        bitcoin_serialize(&merkle_block).to_lower_hex_string()
+    ))
 }
 
 pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -664,9 +668,9 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
         inputs: tx_inputs,
         outputs: tx_outputs,
     };
-    typed_to_sonic(&v31::CreateRawTransaction(hex_encode(&consensus_bytes(
-        &tx,
-    ))))
+    typed_to_sonic(&v31::CreateRawTransaction(
+        consensus_bytes(&tx).to_lower_hex_string(),
+    ))
 }
 
 /// Deserialize a raw transaction hex string, reporting failures as Core's
@@ -802,7 +806,7 @@ pub(crate) fn finalizepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value,
     };
     let complete = finalized_tx.is_some();
     if extract && let Some(tx) = finalized_tx {
-        let hex = hex_encode(&bitcoin_serialize(&tx));
+        let hex = bitcoin_serialize(&tx).to_lower_hex_string();
         typed_to_sonic(&v31::FinalizePsbt {
             psbt: None,
             hex: Some(hex),
@@ -878,10 +882,10 @@ mod tests {
     use std::thread;
 
     use super::getrawtransaction;
-    use super::hex_encode;
     use crate::Handler;
     use crate::context::{Context, DerivedIndexQuery, TxQueryError};
     use crate::error::RpcError;
+    use bitcoin::hex::DisplayHex as _;
     use bitcoin_rs_index::block_log::BlockRecord;
 
     /// Minimal one-coinbase-tx fixture block standing in for the chain genesis.
@@ -941,7 +945,7 @@ mod tests {
 
         let result = getrawtransaction(&ctx, &json!([txid.to_string()]))?;
 
-        let expected = hex_encode(&consensus_bytes(&coinbase));
+        let expected = consensus_bytes(&coinbase).to_lower_hex_string();
         assert_eq!(result.as_str(), Some(expected.as_str()));
         Ok(())
     }
@@ -988,7 +992,7 @@ mod tests {
 
         let result = getrawtransaction(&ctx, &json!([txid.to_string()]))?;
 
-        let expected = hex_encode(&consensus_bytes(&coinbase));
+        let expected = consensus_bytes(&coinbase).to_lower_hex_string();
         assert_eq!(result.as_str(), Some(expected.as_str()));
         Ok(())
     }
@@ -1103,7 +1107,7 @@ mod tests {
             .expect("raw lookup");
             assert_eq!(
                 raw.as_str(),
-                Some(hex_encode(&consensus_bytes(tx)).as_str())
+                Some(consensus_bytes(tx).to_lower_hex_string().as_str())
             );
         }
         let missing = getrawtransaction(
@@ -1169,7 +1173,7 @@ mod tests {
         let result = getrawtransaction(&ctx, &json!([txid.to_string()]))
             .unwrap_or_else(|err| panic!("txindex lookup failed: {err}"));
 
-        let expected = hex_encode(&consensus_bytes(&coinbase));
+        let expected = consensus_bytes(&coinbase).to_lower_hex_string();
         assert_eq!(result.as_str(), Some(expected.as_str()));
         let verbose = getrawtransaction(&ctx, &json!([txid.to_string(), true]))
             .expect("verbose txindex lookup");
@@ -1997,7 +2001,7 @@ mod tests {
 
     /// Consensus hex for RPC submission.
     fn retry_raw_hex(tx: &Tx) -> String {
-        hex_encode(&consensus_bytes(tx))
+        consensus_bytes(tx).to_lower_hex_string()
     }
 
     /// Proves `sendrawtransaction` rebuilds admission context on retry: the

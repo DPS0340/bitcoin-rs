@@ -351,7 +351,7 @@ pub enum ReorgError {
     CheckpointSettlement {
         /// Checkpoint publication failure.
         #[source]
-        source: crate::CheckpointError,
+        source: crate::checkpoint::CheckpointError,
         /// Earlier coherent reorg failure retained when debt settlement also
         /// failed.
         original: Option<Box<Self>>,

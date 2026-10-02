@@ -10,11 +10,11 @@
 /// Transaction signature checker: ECDSA, Schnorr, locktime, and sequence verification.
 pub mod checker;
 /// The opcode evaluator: the bounded stack machine behind the interpreter.
-pub mod eval;
+mod eval;
 /// Script verification wrapper.
 mod interpreter;
 /// Native script parsing, classification, and building helpers.
-pub mod script;
+mod script;
 /// Signature operation counters.
 pub mod sigops;
 /// Bounded script stack with Core's 1000-item maximum depth.
@@ -24,10 +24,9 @@ pub mod taproot;
 
 pub use interpreter::{Interpreter, ScriptErrCode, ScriptError, VerifyFlags};
 pub use script::{
-    EarlyEndOfScript, Instruction, Instructions, is_multisig, is_op_return, is_p2a, is_p2pk,
-    is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, is_push_only, is_witness_program,
-    minimal_non_dust, multisig_key_count, opcode, p2pk_pubkey_bytes, push_data, push_int,
-    witness_program,
+    EarlyEndOfScript, Instruction, Instructions, instructions, is_multisig, is_op_return, is_p2a,
+    is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, is_push_only, is_witness_program,
+    minimal_non_dust, multisig_key_count, opcode, push_data, push_int, witness_program,
 };
-pub use sigops::{count_block, count_legacy, count_segwit, count_taproot, count_tx_legacy};
+pub use sigops::{count_segwit, count_tx_legacy};
 pub use stack::{ScriptItem, Stack, StackError};

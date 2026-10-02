@@ -46,7 +46,7 @@ impl ConnectionId {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PeerSource {
     /// Remote socket address at delivery time.
-    pub addr: SocketAddr,
+    pub(crate) addr: SocketAddr,
     connection_id: ConnectionId,
 }
 

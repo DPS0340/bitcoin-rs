@@ -221,7 +221,7 @@ pub(crate) enum TeardownMode {
 /// shutdown followed by Drop safe, and prevents repeated lifecycle work.
 #[derive(Default)]
 pub(crate) struct NodeServices {
-    event_loop: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    event_loop: Option<std::thread::JoinHandle<()>>,
     event_loop_signal: Option<crossbeam_channel::Sender<()>>,
     /// Stops and joins its listener in Drop.
     metrics: Option<crate::metrics::MetricsServer>,
@@ -289,13 +289,9 @@ impl NodeServices {
         first_error: &mut Option<anyhow::Error>,
     ) {
         if let Some(handle) = self.event_loop.take() {
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => set_first_error(first_error, error),
+            if handle.join().is_err() {
                 // Event loop thread panic.
-                Err(_) => {
-                    set_first_error(first_error, anyhow::anyhow!("event loop thread panicked"));
-                }
+                set_first_error(first_error, anyhow::anyhow!("event loop thread panicked"));
             }
         }
         if let Some(handle) = self.rpc_thread.take() {

@@ -407,7 +407,7 @@ impl RetentionRegistry {
     /// claimed. That is the same linearization point [`Self::acquire`] uses
     /// for mandatory readers, in one registry.
     #[must_use = "a dropped lease releases the history pin"]
-    pub fn history_from(
+    pub(crate) fn history_from(
         self: &Arc<Self>,
         floor: u32,
         budget: RetentionBudget,
@@ -507,16 +507,6 @@ impl MandatoryRetention {
     pub fn acquire(&self, floor: u32) -> Result<RetentionLease, RetentionError> {
         self.registry.acquire(floor)
     }
-
-    /// The highest prune line a completed pass recorded.
-    ///
-    /// The read-only companion to [`Self::acquire`]: rows below it are gone,
-    /// so a mandatory consumer learns what it may no longer pin without
-    /// having to provoke the refusal.
-    #[must_use]
-    pub fn pruned_below(&self) -> u32 {
-        self.registry.pruned_below()
-    }
 }
 
 /// One prune pass's claim on the rows it is about to delete.
@@ -575,7 +565,7 @@ impl PruneReservation {
     /// pin rows that no longer exist. Holding it refuses every lease below
     /// the reserved line until restart-time recovery reconciles the durable
     /// record with its deletions — the closed failure mode.
-    pub fn fail_closed(self) {
+    pub(crate) fn fail_closed(self) {
         core::mem::forget(self);
     }
 }

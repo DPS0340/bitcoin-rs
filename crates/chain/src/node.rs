@@ -21,12 +21,6 @@ impl NodeId {
         Self(id)
     }
 
-    /// Returns the compact integer representation.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-
     pub(crate) fn index(self) -> Option<usize> {
         usize::try_from(self.0).ok()
     }

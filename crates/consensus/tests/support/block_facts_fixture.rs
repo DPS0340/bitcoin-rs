@@ -1,7 +1,7 @@
 //! Deterministic wire fixtures shared by borrowed-fact tests and benchmarks.
 //! These are parse/identity workloads, not signed consensus-valid blocks.
 
-use bitcoin_rs_consensus::block_view::BlockFacts;
+use bitcoin_rs_consensus::BlockFacts;
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script, Sequence,
     Tx, TxIn, TxOut, Txid, Witness,

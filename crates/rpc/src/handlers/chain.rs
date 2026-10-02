@@ -15,9 +15,11 @@ use hashbrown::HashMap;
 use sonic_rs::{JsonContainerTrait as _, JsonValueMutTrait as _, JsonValueTrait, Value, json};
 
 use super::util::{descriptor_checksum, strip_addr_wrapper};
+use bitcoin::hex::DisplayHex as _;
+
 use crate::compat::convert::{
-    self, compact_target_hex, hex_encode, i32_saturated, i64_saturated, i64_saturated_len,
-    sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
+    self, compact_target_hex, i32_saturated, i64_saturated, i64_saturated_len, sat_to_btc,
+    typed_to_sonic, typed_to_sonic_omitting_nulls,
 };
 use crate::context::{AppliedView, ChainControlError, Context, TxQueryError};
 use crate::error::RpcError;
@@ -83,13 +85,6 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
         );
     }
     Ok(response)
-}
-
-/// UNIX seconds now.
-pub(crate) fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Bitcoin Core's `GuessVerificationProgress`, as a fraction in `[0, 1]`.
@@ -1421,7 +1416,7 @@ fn scan_unspents(
             v31::ScanTxOutSetUnspent {
                 txid: txid.to_string(),
                 vout,
-                script_pubkey: hex_encode(&utxo.txout.script_pubkey),
+                script_pubkey: utxo.txout.script_pubkey.to_lower_hex_string(),
                 descriptor: desc.to_owned(),
                 amount: sat_to_btc(utxo.txout.value.to_sat()),
                 coinbase: utxo.coinbase,
@@ -2049,7 +2044,7 @@ mod tests {
         let ctx = Arc::new(ctx);
         seed_block(&ctx, &genesis, record);
 
-        let expected_hex = hex_encode(&body);
+        let expected_hex = body.to_lower_hex_string();
         assert_eq!(
             getblock(&ctx, &json!([block_hash_hex.as_str(), 0]))?.as_str(),
             Some(expected_hex.as_str())
@@ -2121,7 +2116,7 @@ mod tests {
             let bytes = consensus_bytes(tx);
             assert_eq!(
                 object.get("hex").and_then(JsonValueTrait::as_str),
-                Some(hex_encode(&bytes).as_str()),
+                Some(bytes.to_lower_hex_string().as_str()),
                 "hex must serialize the transaction itself: {object:?}"
             );
             assert_eq!(
@@ -2585,7 +2580,7 @@ mod tests {
         let raw = getblockheader(&ctx, &json!([hash.as_str(), false]))?;
         assert_eq!(
             raw.as_str(),
-            Some(hex_encode(&consensus_bytes(&fork_header)).as_str())
+            Some(consensus_bytes(&fork_header).to_lower_hex_string().as_str())
         );
 
         let verbose = getblockheader(&ctx, &json!([hash.as_str(), true]))?;
@@ -5657,7 +5652,7 @@ mod scantxoutset_tests {
         assert_eq!(first.get("vout").and_then(Value::as_u64), Some(0));
         assert_eq!(
             first.get("scriptPubKey").and_then(Value::as_str),
-            Some(hex_encode(&script).as_str())
+            Some(script.to_lower_hex_string().as_str())
         );
         assert_eq!(
             first.get("amount").and_then(Value::as_f64),

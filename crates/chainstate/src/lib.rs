@@ -35,8 +35,7 @@ pub use prepare::bytes_are_block;
 pub use window::classify_apply_error;
 
 mod checkpoint;
-pub use checkpoint::CheckpointError;
-pub use checkpoint::headers::HeaderCheckpointError;
+use checkpoint::CheckpointError;
 /// Typed chainstate mutation failures.
 mod error;
 pub mod events;
@@ -344,8 +343,6 @@ pub struct ConnectOutcome {
 /// Committed disconnect. Derived consumers read this after the tip is published.
 #[derive(Clone, Debug)]
 pub struct DisconnectOutcome {
-    /// Applied tip after the rollback (the parent).
-    pub parent_tip: TipSnapshot,
     /// Hash of the disconnected block.
     pub hash: Hash256,
     /// Creating txids of coins the undo restored, for orphan re-evaluation.
@@ -369,11 +366,9 @@ enum ApplyFinish {
     Proposed,
 }
 
-/// Coherent read of the header tip and the applied tip.
+/// Coherent read of the applied tip and its transaction count.
 #[derive(Clone, Debug)]
 pub struct ChainstateSnapshot {
-    /// Best-work header tip, if the tree has one.
-    pub header: Option<TipSnapshot>,
     /// Authoritative applied tip, if any block has committed.
     pub applied: Option<TipSnapshot>,
     /// Cumulative transaction count of the applied chain.
@@ -932,7 +927,7 @@ impl Chainstate {
         self
     }
 
-    /// Copies the published header tip and the published applied tip.
+    /// Copies the published applied tip and its transaction count.
     #[must_use]
     pub fn snapshot(&self) -> ChainstateSnapshot {
         let applied = self.applied_tip.load_full().as_deref().cloned();
@@ -940,7 +935,6 @@ impl Chainstate {
             .as_ref()
             .map_or(ChainTxCount::UNKNOWN, |tip| tip.chain_tx_count);
         ChainstateSnapshot {
-            header: self.chain_tip.load_full().as_deref().cloned(),
             applied,
             chain_tx_count,
         }

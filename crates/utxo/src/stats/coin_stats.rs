@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use core::convert::Infallible;
 
 use crate::listener::{
     UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent, UtxoInserted, UtxoRemoved,
@@ -126,7 +125,7 @@ impl CoinStats {
     /// # Errors
     ///
     /// [`Self::check_rewind`].
-    pub fn rewind_block(
+    pub(crate) fn rewind_block(
         &mut self,
         disconnected_height: u32,
         parent_height: u32,
@@ -144,7 +143,7 @@ impl CoinStats {
     ///
     /// Stats not at `disconnected_height`; `tx_delta` exceeding `tx_count`
     /// (a second rewind of the same block, which saturation would hide).
-    pub fn check_rewind(
+    pub(crate) fn check_rewind(
         &self,
         disconnected_height: u32,
         tx_delta: u64,
@@ -330,7 +329,7 @@ impl EncodedPreimageArena {
 impl CoinStatsAccumulator {
     /// Creates an accumulator that derives `CoinStats` and a `MuHash` trailer.
     #[must_use]
-    pub fn with_muhash(height: u32) -> Self {
+    pub(crate) fn with_muhash(height: u32) -> Self {
         Self::new(height, MuHashMode::Serial(Vec::new()))
     }
 
@@ -343,7 +342,7 @@ impl CoinStatsAccumulator {
 
     /// Creates an accumulator that derives `CoinStats` without hashing coins.
     #[must_use]
-    pub fn without_muhash(height: u32) -> Self {
+    pub(crate) fn without_muhash(height: u32) -> Self {
         Self::new(height, MuHashMode::Disabled)
     }
 
@@ -694,7 +693,7 @@ impl CoinStatsListener {
     /// # Errors
     ///
     /// Propagates [`CoinStats::rewind_block`]'s invariant failures.
-    pub fn rewind_block(
+    pub(crate) fn rewind_block(
         &self,
         disconnected_height: u32,
         parent_height: u32,
@@ -921,12 +920,6 @@ fn read_array<const N: usize>(
     out.copy_from_slice(slice);
     *cursor = end;
     Ok(out)
-}
-
-impl From<Infallible> for CoinStatsDecodeError {
-    fn from(value: Infallible) -> Self {
-        match value {}
-    }
 }
 
 #[inline]

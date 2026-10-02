@@ -15,7 +15,8 @@ use std::{
 use bitcoin_rs_primitives::{Block, Hash256, Header};
 use hashbrown::{HashMap, hash_map::Entry};
 
-use crate::{PeerSource, SyncBudget};
+use crate::PeerSource;
+use crate::download_window::SyncBudget;
 
 /// Bounded in-memory staging set for inbound block bodies.
 #[derive(Debug)]
@@ -59,7 +60,7 @@ struct ReceivedBlock {
 
 /// A contiguous apply-prefix body drained from staging.
 #[derive(Clone, Debug)]
-pub struct DrainedBlock {
+pub(crate) struct DrainedBlock {
     /// Identity of the drained body.
     pub hash: Hash256,
     /// Decoded block.
@@ -556,7 +557,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{BlockStager, block_size};
-    use crate::{SyncBudget, default_sync_budget};
+    use crate::default_sync_budget;
+    use crate::download_window::SyncBudget;
 
     #[test]
     fn block_size_matches_consensus_serialized_len() {

@@ -7,10 +7,8 @@
 use crate::verify_tx::is_coinbase;
 use bitcoin_rs_primitives::{OutPoint, Tx, TxOut};
 use bitcoin_rs_script::VerifyFlags;
-use bitcoin_rs_script::script::{
-    Instruction, instructions, is_p2sh, is_push_only, is_witness_program,
-};
 use bitcoin_rs_script::sigops::{count_accurate, count_segwit, count_tx_legacy};
+use bitcoin_rs_script::{Instruction, instructions, is_p2sh, is_push_only, is_witness_program};
 use hashbrown::HashMap;
 
 /// Counts transaction sigop cost against resolved previous outputs.
@@ -91,7 +89,7 @@ fn last_push(script: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use bitcoin_rs_primitives::{Amount, Hash256, LockTime, Script, Sequence, TxIn, Txid, Witness};
-    use bitcoin_rs_script::script::{opcode, push_data};
+    use bitcoin_rs_script::{opcode, push_data};
 
     use super::*;
 
@@ -149,7 +147,7 @@ mod tests {
         let p2wpkh = [vec![0x00, 0x14], vec![2; 20]].concat();
         let cases = [
             (
-                vec![bitcoin_rs_script::eval::OP_DROP, opcode::OP_PUSHNUM_1],
+                vec![bitcoin_rs_script::opcode::OP_DROP, opcode::OP_PUSHNUM_1],
                 push_data(&p2wpkh),
                 0,
             ),

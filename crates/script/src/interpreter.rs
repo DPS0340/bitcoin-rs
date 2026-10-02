@@ -13,6 +13,7 @@ use bitcoin_rs_primitives::{
     Amount, Script, Sighash, SighashCache, Tx, TxOut, Witness, varint::encoded_len,
 };
 use secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::checker::{SigVersion, TxSignatureChecker};
@@ -185,12 +186,6 @@ impl VerifyFlags {
             });
         }
         Ok(flags)
-    }
-}
-
-impl From<VerifyFlags> for u32 {
-    fn from(flags: VerifyFlags) -> Self {
-        flags.bits()
     }
 }
 
@@ -410,40 +405,13 @@ pub enum ScriptError {
 pub struct Interpreter;
 
 impl Interpreter {
-    /// Executes a script spend through the enabled script backend.
+    /// Executes a script spend with the complete ordered prevout set.
     ///
     /// When `script_sig` and `witness` already match the bytes stored on
     /// `tx.inputs[input_idx]` — true for every block/mempool validation caller,
     /// which reads them straight off the transaction — `tx` is used as-is with
     /// no clone. Only callers that pass substitute bytes (e.g. vector tests
     /// grafting a foreign witness) pay for a clone to splice them in.
-    ///
-    /// This wrapper supplies one prevout and therefore only supports
-    /// single-input transactions. A multi-input transaction returns
-    /// [`ScriptError::TaprootPrevoutsUnavailable`]; use
-    /// [`Self::execute_with_prevouts`] with the complete ordered set instead.
-    pub fn execute(
-        &self,
-        script_pubkey: &[u8],
-        script_sig: &[u8],
-        witness: &[Vec<u8>],
-        flags: VerifyFlags,
-        prevout: &TxOut,
-        tx: &Tx,
-        input_idx: usize,
-    ) -> Result<bool, ScriptError> {
-        self.execute_with_prevouts(
-            script_pubkey,
-            script_sig,
-            witness,
-            flags,
-            std::slice::from_ref(prevout),
-            tx,
-            input_idx,
-        )
-    }
-
-    /// Executes a script spend with the complete ordered prevout set.
     ///
     /// `prevouts` must contain one spent output for each input, in input order.
     ///
@@ -719,7 +687,6 @@ fn p2wpkh_script_code(program: &[u8]) -> Vec<u8> {
 }
 
 fn sha256_of(bytes: &[u8]) -> [u8; 32] {
-    use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher.finalize().into()

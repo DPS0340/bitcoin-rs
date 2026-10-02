@@ -321,7 +321,7 @@ pub struct ParsedTransaction<'a> {
 impl<'a> ParsedTransaction<'a> {
     /// Parses one transaction from the front of `reader`, advancing `reader`
     /// past exactly the consumed bytes.
-    pub fn parse(reader: &mut &'a [u8]) -> Result<Self, DecodeError> {
+    pub(crate) fn parse(reader: &mut &'a [u8]) -> Result<Self, DecodeError> {
         let image = *reader;
         let mut cursor = 0_u64;
         let parsed = Self::parse_at(image, &mut cursor)?;

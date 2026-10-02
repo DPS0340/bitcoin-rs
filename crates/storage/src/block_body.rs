@@ -3,8 +3,9 @@
 use crate::durable_head::BodyExtent;
 use bitcoin_rs_primitives::{BlockBodyMetadata, Hash256, varint};
 
+use crate::block_file::FlatFileBlockReader;
 use crate::{
-    BlockFilePosition, FlatFileBlockReader, FlatFileBlockStore, KvSnapshot, KvStore, StorageError,
+    BlockFilePosition, FlatFileBlockStore, KvSnapshot, KvStore, StorageError,
     block_file_max_height_key, decode_block_file_max_height, encode_block_file_max_height,
 };
 

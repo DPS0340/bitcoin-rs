@@ -58,7 +58,7 @@ macro_rules! emit_cli {
             )*
         }
     ) => {
-        #[derive(Clone, Debug, Parser)]
+        #[derive(Parser)]
         #[command(name = "bitcoin-rs", about = "Run a bitcoin-rs node")]
         pub(crate) struct CliArgs {
             #[arg(long)]

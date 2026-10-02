@@ -675,16 +675,7 @@ impl BlockSync {
         frontier: &SyncFrontier,
         exclude: Option<PeerSource>,
     ) {
-        let applied_height = frontier
-            .chain
-            .applied_tip
-            .as_ref()
-            .map_or(0, |tip| tip.height);
-        let header_height = frontier
-            .chain
-            .chain_tip
-            .as_ref()
-            .map_or(applied_height, |tip| tip.height);
+        let (applied_height, header_height) = frontier.heights();
         let mut header_peer: Option<(PeerSource, SyncPeer)> = None;
         for peer in &frontier.usable_peers {
             let Some(candidate) = sync_peer_candidate(

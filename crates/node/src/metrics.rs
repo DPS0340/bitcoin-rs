@@ -274,7 +274,8 @@ fn prometheus_handle(identity: &EvidenceIdentity) -> Result<PrometheusHandle> {
 }
 
 /// Process-global Prometheus scrape listener bound by [`start_metrics`].
-pub struct MetricsServer {
+pub(crate) struct MetricsServer {
+    #[cfg(test)]
     local_addr: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -286,13 +287,16 @@ impl MetricsServer {
     /// Listener-first ordering keeps an occupied-address failure from consuming
     /// the process-global recorder slot, so a later in-process retry cannot hit
     /// `SetRecorderError`.
-    pub fn bind(
+    pub(crate) fn bind(
         addr: SocketAddr,
         shutdown: Arc<AtomicBool>,
         identity: &EvidenceIdentity,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr)?;
+        #[cfg(test)]
         let local_addr = listener.local_addr()?;
+        #[cfg(not(test))]
+        listener.local_addr()?;
         let handle = prometheus_handle(identity)?;
         describe_node_metrics();
         listener.set_nonblocking(true)?;
@@ -302,6 +306,7 @@ impl MetricsServer {
             .name("bitcoin-rs-metrics".into())
             .spawn(move || serve_metrics(&listener, &handle, &thread_stop, &shutdown))?;
         Ok(Self {
+            #[cfg(test)]
             local_addr,
             stop,
             thread: Some(thread),
@@ -309,8 +314,9 @@ impl MetricsServer {
     }
 
     /// Address the scrape thread is listening on.
+    #[cfg(test)]
     #[must_use]
-    pub const fn local_addr(&self) -> SocketAddr {
+    pub(crate) const fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 

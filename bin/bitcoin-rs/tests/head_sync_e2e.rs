@@ -13,16 +13,20 @@
 
 #![expect(clippy::expect_used, reason = "process test assertions")]
 
+#[path = "support/clean_stderr.rs"]
+mod clean_stderr;
+
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_e2e::helpers::{
-    best_hash, block_count, build_chain, connection_count, genesis_block, node_stderr, wait_for,
+    best_hash, block_count, build_chain, connection_count, genesis_block, wait_for,
 };
 use bitcoin_rs_e2e::live_peer::LivePeer;
 use bitcoin_rs_e2e::live_peer::pump_until_tip;
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
+use clean_stderr::assert_clean_stderr;
 
 /// T1+T2: a block announced by `inv` is availability, not a body order: the
 /// node fetches headers first, and the admitted tip's body rides a window
@@ -400,20 +404,4 @@ fn collect_window_requests_serving_only(
             }
         });
     }
-}
-
-/// Asserts the node's stderr shows no panic and no `PrevHashMismatch` —
-/// `context` names where a mismatch would indicate commit churn.
-fn assert_clean_stderr(node: &ProcessNode, context: &str) {
-    let stderr = node_stderr(node);
-    assert_eq!(
-        stderr.matches("panic").count(),
-        0,
-        "node stderr contains a panic"
-    );
-    assert_eq!(
-        stderr.matches("PrevHashMismatch").count(),
-        0,
-        "node stderr shows PrevHashMismatch: {context}"
-    );
 }

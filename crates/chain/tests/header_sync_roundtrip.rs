@@ -1,12 +1,12 @@
 //! Header synchronization integration tests.
 use bitcoin_rs_chain::header_sync::{next_work_required, validate_header_nbits};
 use bitcoin_rs_chain::{
-    BlockHeader, BlockTree, ChainError, Network, NodeStatus, accept_headers, current_unix_seconds,
+    BlockHeader, BlockTree, ChainError, NodeStatus, accept_headers, current_unix_seconds,
 };
 
 #[path = "support/pow_oracle.rs"]
 mod pow_oracle;
-use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256};
+use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Network};
 use pow_oracle::pow_is_met;
 
 #[test]

@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use bitcoin::p2p::ServiceFlags;
 use bitcoin_rs_primitives::Network;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,11 +51,11 @@ pub(super) const NETWORK_LIMITED: u64 = 1_u64 << 10;
 /// run at this window was 1.52× the 128-block control. Fan-out still stripes
 /// at [`MAX_BLOCKS_IN_TRANSIT_PER_PEER`] once [`MIN_PEERS_FOR_FANOUT`] eligible
 /// peers exist, so a full outbound set does not deepen per-peer pipelines.
-pub const PENDING_BUDGET: usize = 256;
+pub(crate) const PENDING_BUDGET: usize = 256;
 /// Time after which a received out-of-order block is discarded.
 pub(crate) const RECEIVED_BLOCK_TIMEOUT: Duration = Duration::from_mins(1);
 /// Maximum number of received blocks waiting for their predecessor.
-pub const RECEIVED_BLOCK_BUDGET: usize = 256;
+pub(crate) const RECEIVED_BLOCK_BUDGET: usize = 256;
 /// Mainnet-oriented block-size estimate for sizing the in-flight request window.
 pub(crate) const PENDING_BLOCK_BYTE_ESTIMATE: usize = 2 * 1024 * 1024;
 /// Maximum estimated bytes in the in-flight request window.
@@ -105,7 +104,7 @@ pub(crate) const PEER_INFLIGHT_BUDGET: usize = PENDING_BUDGET;
 /// reproduces the early-height under-fill regression — both were established
 /// by a live-tested and reverted attempt (commit 5608279, recoverable from
 /// git history).
-pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 /// Minimum eligible peers before fan-out stripes.
 ///
 /// Matches the default outbound target. Below this count, one healthy peer's
@@ -114,11 +113,11 @@ pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 /// does not reproduce the recorded head-of-line collapse. Do not scale this
 /// with [`PENDING_BUDGET`]: `PENDING_BUDGET / 16` would be 16, and fan-out
 /// would never engage at the 8-outbound default.
-pub const MIN_PEERS_FOR_FANOUT: usize = 8;
+pub(crate) const MIN_PEERS_FOR_FANOUT: usize = 8;
 
 /// How young a connection may be before policy may hold its silence against
 /// it. Core's `MINIMUM_CONNECT_TIME` (`net_processing.cpp:115`).
-pub const MINIMUM_CONNECT_TIME: Duration = Duration::from_secs(30);
+pub(crate) const MINIMUM_CONNECT_TIME: Duration = Duration::from_secs(30);
 
 /// Fast-sync per-peer stripe floor. Half the Core cap so the window spreads
 /// across a larger outbound set; opt-in, not measured against the default.
@@ -183,7 +182,7 @@ const _: () = assert!(
 pub(crate) const GETDATA_BATCH_SIZE: usize = PENDING_BUDGET;
 
 /// Clamp a `usize` to at least 1, preventing zero-sized budgets.
-pub const fn at_least_one(value: usize) -> usize {
+pub(crate) const fn at_least_one(value: usize) -> usize {
     if value == 0 { 1 } else { value }
 }
 
@@ -193,23 +192,16 @@ pub const fn at_least_one(value: usize) -> usize {
 
 /// A peer selected for block-header or block-body synchronization.
 #[derive(Clone, Copy, Debug)]
-pub struct SyncPeer {
+pub(crate) struct SyncPeer {
     /// The exact connection that may carry requests for this selection.
     pub source: PeerSource,
     /// Best known block height the peer advertises.
     pub best_known_height: i32,
 }
 
-impl SyncPeer {
-    /// Peer network address.
-    pub fn addr(&self) -> SocketAddr {
-        self.source.addr
-    }
-}
-
 /// The set of peers chosen for the current sync cycle.
 #[derive(Clone, Debug, Default)]
-pub struct SyncPeerSelection {
+pub(crate) struct SyncPeerSelection {
     /// Peers used for block-body requests.
     pub request_peers: Vec<SyncPeer>,
     /// Peers used for cold-front prefix probes.
@@ -226,7 +218,7 @@ pub struct SyncPeerSelection {
 /// node must still sync. A soft-blocked peer still serves as the last
 /// resort when nothing better exists.
 #[derive(Clone, Copy, Debug)]
-pub struct FanoutCandidate {
+pub(crate) struct FanoutCandidate {
     /// The peer this candidate refers to.
     pub peer: SyncPeer,
     /// Whether [`serves_requested_height`] accepted this peer: the one
@@ -248,7 +240,7 @@ pub struct FanoutCandidate {
 /// POST: [`serves_requested_height`] answers for that height.
 /// INVARIANT: one shared latch decides initial block download for every
 ///   selection path; no path caches or re-derives the answer.
-pub struct BlockDownloadPolicy {
+pub(crate) struct BlockDownloadPolicy {
     /// The node's chain-owned initial-block-download latch.
     pub ibd: Arc<InitialBlockDownload>,
     /// The height of the block body this selection fills.
@@ -338,7 +330,7 @@ pub(crate) fn servable_floor(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> u
 ///   set and the single-peer fallback are not fan-out paths and read the
 ///   service clause alone, so an inbound-only node still syncs.
 /// INVARIANT: this is the only fan-out service clause.
-pub fn statically_fanout_eligible(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> bool {
+pub(crate) fn statically_fanout_eligible(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> bool {
     !peer.inbound && serves_requested_height(peer, policy)
 }
 

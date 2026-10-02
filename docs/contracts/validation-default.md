@@ -1,4 +1,4 @@
-- `Interpreter::execute` / `execute_with_prevouts` in
+- `Interpreter::execute_with_prevouts` in
   `crates/script/src/interpreter.rs` verify every consensus spend class:
   legacy and P2SH through `eval::eval_script`, SegWit v0 through BIP143,
   Taproot key-path and script-path through local BIP341/BIP342.

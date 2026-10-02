@@ -46,12 +46,6 @@ impl FeeRate {
     pub const fn as_sat_per_kvb(self) -> u64 {
         self.0
     }
-
-    /// Returns the fee rate in sat/vB (truncated toward zero).
-    #[must_use]
-    pub const fn as_sat_per_vb(self) -> u64 {
-        self.0 / 1_000
-    }
 }
 
 /// Why a persisted estimator-history payload was not adopted.
@@ -59,7 +53,7 @@ impl FeeRate {
 /// CONTRACT: docs/policies/db-migration.md — every rejection degrades to
 /// insufficient-data status; none of them fails startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HistoryReject {
+pub(crate) enum HistoryReject {
     /// Leading magic bytes are not the estimator's.
     BadMagic,
     /// The format version is not one this build reads.

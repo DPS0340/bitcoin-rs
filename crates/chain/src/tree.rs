@@ -36,7 +36,7 @@ impl BlockTree {
             by_hash: HashTable::new(),
             active_by_height: ActiveHeightIndex::new(),
             tip: Arc::new(ArcSwapOption::empty()),
-            bip9_cache: Bip9Cache::new(),
+            bip9_cache: Bip9Cache::default(),
         }
     }
 
@@ -64,6 +64,7 @@ impl BlockTree {
     ///
     /// Invalidates the active-height index when callers mutate an indexed node,
     /// because they can change its parent or height.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn node_mut(&mut self, id: NodeId) -> Result<&mut BlockTreeNode, ChainError> {
         let is_indexed_active_node = {
             let node = self.node(id)?;
@@ -263,13 +264,6 @@ impl BlockTree {
     #[must_use]
     pub fn tip_height(&self) -> Option<u32> {
         self.tip().map(|tip| tip.height)
-    }
-
-    /// Returns the hash of the published tip, or `None` if no tip is
-    /// published yet.
-    #[must_use]
-    pub fn tip_hash(&self) -> Option<Hash256> {
-        self.tip().map(|tip| tip.hash)
     }
 
     /// Returns a cheap-clonable handle to the canonical best-tip pointer.
@@ -1110,7 +1104,7 @@ mod tests {
         assert_eq!(tree.node_at_height_from(side_ids[3], 1), Some(side_ids[1]));
 
         let active_prefix = main_ids[4];
-        let active_prefix_index = usize::try_from(active_prefix.get())?;
+        let active_prefix_index = active_prefix.index().ok_or("active prefix index")?;
         tree.nodes
             .get_mut(active_prefix_index)
             .ok_or("missing active prefix")?
@@ -1289,7 +1283,6 @@ mod tests {
         // The published snapshot is coherent with the active insertion:
         // genesis's height and hash, not hand-stored values.
         assert_eq!(tree.tip_height(), Some(0));
-        assert_eq!(tree.tip_hash(), Some(genesis_hash));
         Ok(())
     }
 

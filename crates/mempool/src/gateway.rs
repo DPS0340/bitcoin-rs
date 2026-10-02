@@ -24,7 +24,7 @@ use bitcoin_rs_consensus::{
 };
 use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid};
 use bitcoin_rs_script::VerifyFlags;
-use bitcoin_rs_script::script::{is_p2sh, is_witness_program};
+use bitcoin_rs_script::{is_p2sh, is_witness_program};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::sync::LazyLock;
@@ -1535,13 +1535,14 @@ pub struct ChainChangeGuard {
 impl ChainChangeGuard {
     /// Returns the exact odd generation this guard reserved.
     #[must_use]
-    pub fn odd_generation(&self) -> u64 {
+    pub(crate) fn odd_generation(&self) -> u64 {
         self.odd
     }
 
     /// Returns the reserved even value `finish` will store on success.
+    #[cfg(test)]
     #[must_use]
-    pub fn reserved_even(&self) -> u64 {
+    pub(crate) fn reserved_even(&self) -> u64 {
         self.even
     }
 
@@ -2770,8 +2771,7 @@ mod tests {
         let gateway = gateway_with(None);
         let mut tx = standard_tx(0x84);
         let redeem_script = vec![0xae; 201];
-        tx.inputs[0].script_sig =
-            Script::from_bytes(bitcoin_rs_script::script::push_data(&redeem_script));
+        tx.inputs[0].script_sig = Script::from_bytes(bitcoin_rs_script::push_data(&redeem_script));
         let mut request = admit_request(&gateway, &tx, AdmissionOrigin::Rpc);
         request.prevouts[0].1.script_pubkey =
             Script::from_bytes([vec![0xa9, 0x14], vec![1; 20], vec![0x87]].concat());

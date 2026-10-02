@@ -67,7 +67,7 @@ impl WriteCondition<'_> {
 /// Persistence boundary used by fault-injection tests.
 #[doc(hidden)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum PersistBoundary {
+pub(crate) enum PersistBoundary {
     /// Atomic batch application.
     Apply,
     /// Durability synchronization.
@@ -98,7 +98,7 @@ pub enum PersistFault {
 
 impl PersistFault {
     /// Returns the boundary at which this fault fires.
-    pub const fn boundary(self) -> PersistBoundary {
+    pub(crate) const fn boundary(self) -> PersistBoundary {
         match self {
             Self::FailApply | Self::LostApply | Self::PartialApply => PersistBoundary::Apply,
             Self::FailSync | Self::LostSync => PersistBoundary::Sync,
@@ -107,7 +107,11 @@ impl PersistFault {
     }
 
     /// Builds the storage error surfaced by this injected fault.
-    pub fn injected_error(self) -> StorageError {
+    #[cfg_attr(
+        not(any(feature = "fjall", feature = "redb", feature = "rocksdb")),
+        allow(dead_code)
+    )]
+    pub(crate) fn injected_error(self) -> StorageError {
         let boundary = self.boundary();
         StorageError::Io(std::io::Error::other(format!(
             "injected persistence fault {self:?} at the {boundary:?} boundary"
@@ -118,11 +122,15 @@ impl PersistFault {
 /// One-shot persistence fault slot used by storage backends.
 #[doc(hidden)]
 #[derive(Default)]
-pub struct PersistFaultSlot(parking_lot::Mutex<Option<PersistFault>>);
+pub(crate) struct PersistFaultSlot(parking_lot::Mutex<Option<PersistFault>>);
 
 impl PersistFaultSlot {
     /// Arms one fault, replacing any previously armed fault.
-    pub fn arm(&self, fault: PersistFault) {
+    #[cfg_attr(
+        not(any(feature = "fjall", feature = "redb", feature = "rocksdb")),
+        allow(dead_code)
+    )]
+    pub(crate) fn arm(&self, fault: PersistFault) {
         *self.0.lock() = Some(fault);
     }
 

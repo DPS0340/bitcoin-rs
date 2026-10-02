@@ -8,8 +8,8 @@
 
 use std::sync::atomic::AtomicBool;
 
-use crate::Network;
 use crate::view::{BlockTreeReader, TipReader};
+use bitcoin_rs_primitives::Network;
 
 /// How stale the applied tip may be while the node still counts as synced.
 ///

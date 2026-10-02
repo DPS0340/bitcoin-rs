@@ -10,7 +10,6 @@ use hashbrown::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::entry::fee_rate;
 use crate::fee_estimator::{FeeEstimator, FeeRate};
 use crate::mutation::{
     MutationChange, MutationOutcome, MutationResult, MutationSequence, RemovalReason,
@@ -710,7 +709,6 @@ impl Mempool {
             RemovalReason::Conflict => "conflict",
             RemovalReason::Replaced | RemovalReason::Descendant => "replaced",
             RemovalReason::PolicyEviction => "sizelimit",
-            RemovalReason::Expiry => "expiry",
             RemovalReason::Reorg => "reorg",
             RemovalReason::Clear => "unknown",
         }
@@ -1214,8 +1212,9 @@ impl Mempool {
     ///
     /// This reports transaction metadata. Full-RBF admission also considers
     /// replacements of entries without that signal.
+    #[cfg(test)]
     #[must_use]
-    pub fn iter_replaceable_txids(&self) -> Vec<Txid> {
+    pub(crate) fn iter_replaceable_txids(&self) -> Vec<Txid> {
         self.entries
             .iter()
             .filter(|(_id, entry)| entry.is_replaceable())
@@ -1268,7 +1267,7 @@ impl Mempool {
     /// `running_totals_track_inserts_removals_and_prioritise` holds it to the
     /// entries it summarizes.
     #[must_use]
-    pub fn aggregate_fees(&self) -> u64 {
+    pub(crate) fn aggregate_fees(&self) -> u64 {
         u64::try_from(self.derived.total_fee).unwrap_or(u64::MAX)
     }
 
@@ -1528,7 +1527,7 @@ impl Mempool {
     ///
     /// Indexed by `by_wtxid`; O(1) lookup.
     #[must_use]
-    pub fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
+    pub(crate) fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
         self.derived.by_wtxid.contains_key(wtxid)
     }
 
@@ -1536,19 +1535,19 @@ impl Mempool {
     ///
     /// Indexed by `by_wtxid`; O(1) lookup.
     #[must_use]
-    pub fn entry_by_wtxid(&self, wtxid: &Wtxid) -> Option<&MempoolEntry> {
+    pub(crate) fn entry_by_wtxid(&self, wtxid: &Wtxid) -> Option<&MempoolEntry> {
         let id = *self.derived.by_wtxid.get(wtxid)?;
         self.entry(id)
     }
 
     /// Returns mempool entry ids in order of descending `fee_rate` (sat/kvB).
     ///
-    /// Walks `entries` and sorts; cost O(N log N) per call. Used by mining
-    /// template builders and fee estimators that want actual-fee-ordered
+    /// Walks `entries` and sorts; cost O(N log N) per call. Actual-fee-ordered
     /// traversal without going through `ParetoFront` (which ranks on signed
     /// modified fees with ancestor-aware package scoring).
+    #[cfg(test)]
     #[must_use]
-    pub fn iter_by_fee_rate_desc(&self) -> Vec<EntryId> {
+    pub(crate) fn iter_by_fee_rate_desc(&self) -> Vec<EntryId> {
         let mut pairs: Vec<(u64, EntryId)> = self
             .entries
             .iter()
@@ -1571,7 +1570,7 @@ impl Mempool {
     /// and `lowest_fee_rate_tracks_duplicate_rates_and_every_removal_path`
     /// holds the multiset to the entries across removals and replacements.
     #[must_use]
-    pub fn lowest_fee_rate(&self) -> Option<u64> {
+    pub(crate) fn lowest_fee_rate(&self) -> Option<u64> {
         debug_assert_eq!(
             self.derived.fee_rate_floor,
             self.derived
@@ -1585,10 +1584,10 @@ impl Mempool {
 
     /// Returns mempool entry ids whose `fee_rate` >= `threshold_sat_per_kvb`.
     ///
-    /// Linear scan over `entries`. Used by mining template builders and eviction
-    /// strategies that want a fee-rate cohort without sorting.
+    /// Linear scan over `entries`: a fee-rate cohort without sorting.
+    #[cfg(test)]
     #[must_use]
-    pub fn iter_above_fee_rate(&self, threshold_sat_per_kvb: u64) -> Vec<EntryId> {
+    pub(crate) fn iter_above_fee_rate(&self, threshold_sat_per_kvb: u64) -> Vec<EntryId> {
         self.entries
             .iter()
             .filter(|(_index, entry)| entry.fee_rate >= threshold_sat_per_kvb)
@@ -2337,10 +2336,11 @@ impl Mempool {
 
     /// The cluster limits this pool enforces at admission.
     ///
-    /// Read by `getmempoolinfo`, which reports enforced policy rather than a
-    /// constant: change a limit and the reported number changes with it.
+    /// Test seam: `getmempoolinfo` reads the same `limits` through
+    /// `policy_snapshot`, so these report enforced policy, not a constant.
+    #[cfg(test)]
     #[must_use]
-    pub const fn cluster_limits(&self) -> (u32, u64) {
+    pub(crate) const fn cluster_limits(&self) -> (u32, u64) {
         (self.limits.cluster_count, self.limits.cluster_size_vbytes)
     }
 
@@ -2441,10 +2441,6 @@ impl Mempool {
     fn entry_mut(&mut self, id: EntryId) -> Option<&mut MempoolEntry> {
         self.entries.get_mut(id)
     }
-}
-
-pub(crate) fn tx_fee_rate(fee: u64, vsize: u32) -> u64 {
-    fee_rate(fee, u64::from(vsize))
 }
 
 /// Spending-index key over the raw 36-byte `OutPoint` consensus encoding.
