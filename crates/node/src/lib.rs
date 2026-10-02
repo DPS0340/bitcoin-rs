@@ -46,7 +46,8 @@ pub mod sync;
 pub mod tx_ingress;
 pub use bitcoin_rs_primitives::Network;
 
-pub use bitcoin_rs_rpc::zmq::{NoOpZmqPublisher, ZmqEndpointConfig, ZmqPublisher};
+pub use bitcoin_rs_rpc::zmq::ZmqEndpointConfig;
+pub(crate) use bitcoin_rs_rpc::zmq::{NoOpZmqPublisher, ZmqPublisher};
 
 pub use chain_effects::{ChainFollowers, ConnectMutationError};
 
@@ -75,4 +76,4 @@ pub use sync::BlockSync;
 pub use bitcoin_rs_index::runtime::DerivedIndexRuntime;
 
 #[cfg(feature = "zmq")]
-pub use bitcoin_rs_rpc::zmq::SocketZmqPublisher;
+pub(crate) use bitcoin_rs_rpc::zmq::SocketZmqPublisher;
