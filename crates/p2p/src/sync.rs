@@ -724,16 +724,7 @@ impl BlockSync {
             return;
         }
         metrics::counter!("node.sync.no_progress_ticks", "reason" => reason.as_str()).increment(1);
-        let applied_height = frontier
-            .chain
-            .applied_tip
-            .as_ref()
-            .map_or(0, |tip| tip.height);
-        let header_height = frontier
-            .chain
-            .chain_tip
-            .as_ref()
-            .map_or(applied_height, |tip| tip.height);
+        let (applied_height, header_height) = frontier.heights();
         tracing::debug!(
             applied_height,
             header_height,
