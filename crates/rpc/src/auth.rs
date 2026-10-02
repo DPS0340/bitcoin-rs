@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
