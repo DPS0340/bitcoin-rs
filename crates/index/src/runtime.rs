@@ -426,7 +426,7 @@ pub struct DerivedIndexWorker {
     runtime: Arc<DerivedIndexRuntime>,
     join_handle: Option<JoinHandle<()>>,
     /// Publication token; revoked on abandonment.
-    pub generation: Option<Generation>,
+    pub generation: Generation,
     /// Canonical namespace key for poisoning on abandonment.
     namespace_key: Option<PathBuf>,
     /// Set by `finish_worker` when this worker abandoned its backend open;

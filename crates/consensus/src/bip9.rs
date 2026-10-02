@@ -278,16 +278,10 @@ mod tests {
         let mut ctx = SyntheticCtx::new();
 
         ctx.mtps.insert(9, 50);
-        assert_eq!(
-            compute_state(&ctx, 10, params),
-            DeploymentState::Defined
-        );
+        assert_eq!(compute_state(&ctx, 10, params), DeploymentState::Defined);
 
         ctx.mtps.insert(9, 150);
-        assert_eq!(
-            compute_state(&ctx, 10, params),
-            DeploymentState::Started
-        );
+        assert_eq!(compute_state(&ctx, 10, params), DeploymentState::Started);
     }
 
     #[test]
@@ -308,10 +302,7 @@ mod tests {
             ctx.versions.insert(height, version);
         }
 
-        assert_eq!(
-            compute_state(&ctx, 20, params),
-            DeploymentState::LockedIn
-        );
+        assert_eq!(compute_state(&ctx, 20, params), DeploymentState::LockedIn);
 
         ctx.mtps.insert(29, 300);
         assert_eq!(compute_state(&ctx, 30, params), DeploymentState::Active);
@@ -334,10 +325,7 @@ mod tests {
             ctx.versions.insert(height, 1);
         }
 
-        assert_eq!(
-            compute_state(&ctx, 20, params),
-            DeploymentState::Started
-        );
+        assert_eq!(compute_state(&ctx, 20, params), DeploymentState::Started);
     }
 
     #[test]

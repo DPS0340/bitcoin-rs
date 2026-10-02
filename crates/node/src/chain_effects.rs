@@ -763,7 +763,7 @@ mod tests {
             followers.on_connect(&block, &connect_outcome(&tip, &block));
         } else {
             followers.on_disconnect(&DisconnectOutcome {
-                    hash,
+                hash,
                 restored_parents: vec![parent],
             });
         }

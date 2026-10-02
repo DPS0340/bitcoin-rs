@@ -181,9 +181,7 @@ impl DerivedIndexHost {
         }
         tracing::warn!("txindex worker still blocked; abandoning join");
         // Revoke the generation token so late publication is a no-op.
-        if let Some(generation_token) = &worker.generation {
-            generation_token.revoke();
-        }
+        worker.generation.revoke();
         enabled.lifecycle.store(Arc::new(
             bitcoin_rs_index::runtime::DerivedIndexLifecycle::ShutdownAbandoned,
         ));

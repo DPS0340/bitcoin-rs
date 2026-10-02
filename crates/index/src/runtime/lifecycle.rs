@@ -100,7 +100,7 @@ impl DerivedIndexWorker {
         Ok(Self {
             runtime,
             join_handle: Some(join_handle),
-            generation: Some(generation),
+            generation,
             namespace_key,
             open_abandoned,
         })
@@ -141,7 +141,7 @@ impl DerivedIndexWorker {
     /// abandonment path so the namespace is permanently `Poisoned` and
     /// subsequent claims are rejected.
     pub fn poison_namespace(&self) {
-        if let (Some(key), Some(token)) = (&self.namespace_key, &self.generation) {
+        if let (Some(key), token) = (&self.namespace_key, &self.generation) {
             NAMESPACE_REGISTRY.poison(key, token.id());
         }
     }
