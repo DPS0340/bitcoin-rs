@@ -24,18 +24,6 @@ impl Script {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
-
-    /// Returns true when the script is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Returns the script length in bytes.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
 }
 
 impl Deref for Script {
@@ -67,12 +55,6 @@ impl From<Script> for Vec<u8> {
 impl PartialEq<Vec<u8>> for Script {
     fn eq(&self, other: &Vec<u8>) -> bool {
         &self.0 == other
-    }
-}
-
-impl PartialEq<Script> for Vec<u8> {
-    fn eq(&self, other: &Script) -> bool {
-        self == &other.0
     }
 }
 
@@ -129,12 +111,6 @@ impl From<Vec<Vec<u8>>> for Witness {
 impl PartialEq<Vec<Vec<u8>>> for Witness {
     fn eq(&self, other: &Vec<Vec<u8>>) -> bool {
         &self.0 == other
-    }
-}
-
-impl PartialEq<Witness> for Vec<Vec<u8>> {
-    fn eq(&self, other: &Witness) -> bool {
-        self == &other.0
     }
 }
 
