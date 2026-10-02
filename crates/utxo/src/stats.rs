@@ -28,7 +28,7 @@
 /// Running UTXO statistics.
 pub mod coin_stats;
 /// `MuHash3072` accumulator.
-pub mod muhash3072;
+mod muhash3072;
 
 pub use coin_stats::{
     CoinStats, CoinStatsAccumulator, CoinStatsDecodeError, CoinStatsListener, CoinStatsRewindError,
